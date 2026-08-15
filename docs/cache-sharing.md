@@ -18,13 +18,12 @@ own root-bound variant.
 
 The CAS can reuse graduated dependency and workspace-library `.rmeta`, metadata-only proc-macro producer `.rmeta`,
 optional `.rlib`, dep-info, and captured diagnostic output, including actions that consume exact native-static search
-namespaces. On macOS, certified default Apple-linker actions can additionally restore build-script executables,
-proc-macro producer dylibs, ordinary final binaries, `dylib`, and `cdylib` outputs. Thin-LTO results require the adapter
-to prove that reported intermediate objects were created after snapshotting an owner-controlled rustc temporary
-namespace that is not writable by group or other users; temporary aggregate archives must be selected by the exact
-rustc driver and absent from user compiler arguments. Every hit revalidates the action/witness/result binding and
-stored bytes before replacing an output. Cargo still owns fingerprints and incremental compilation; an intact target
-normally removes the compiler invocation at L0 before L1 is involved.
+namespaces. On Linux, the installed default `cc`-selected ELF linker can additionally restore build-script
+executables, proc-macro producer dylibs, ordinary final binaries, `dylib`, and `cdylib` outputs when it supplies
+GNU-compatible dependency-file evidence. Every hit revalidates the action/witness/result binding and stored bytes
+before replacing an output. Cargo still owns
+fingerprints and incremental compilation; an intact target normally removes the compiler invocation at L0 before L1
+is involved.
 
 Native proc-macro consumers, build-script execution and generated output production, rustdoc, test mode, cross-target
 work, incremental compilation, nonstandard target layouts, custom linkers, and ambiguous wrapper composition bypass

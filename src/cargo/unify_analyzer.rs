@@ -79,7 +79,7 @@ impl UnifyAnalyzer {
 
     // Parse all manifests once
     let workspace_packages = ctx.cargo().workspace_members();
-    let manifests = ManifestAnalyzer::parse_workspace(ctx.workspace_root(), &workspace_packages)?;
+    let manifests = ManifestAnalyzer::parse_snapshot(ctx.snapshot()?, &workspace_packages)?;
 
     // Parse existing workspace.dependencies to avoid duplicates
     let existing_workspace_deps = parse_existing_workspace_deps(ctx.workspace_root())?;

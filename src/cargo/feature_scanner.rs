@@ -19,19 +19,52 @@ use std::path::Path;
 
 use super::multi_target_metadata::MultiTargetMetadata;
 use crate::compiler::cfg_eval::{TargetCfgSet, cfg_expression_may_apply};
+use crate::error::{RailError, RailResult};
+use crate::workspace::WorkspaceSnapshot;
 
-/// Condition-derived feature selections found in package Rust sources.
-pub(crate) fn scan_source_for_feature_selections(crate_dir: &Path) -> Vec<Vec<String>> {
+/// Derive condition feature selections from source bytes bound to one workspace capture.
+pub(crate) fn scan_snapshot_source_for_feature_selections(
+  snapshot: &WorkspaceSnapshot,
+  package_root: &Path,
+) -> RailResult<Vec<Vec<String>>> {
   let mut selections = BTreeSet::new();
-  for_each_rust_source(crate_dir, |content| {
+  let entries = snapshot.source().tree().entries();
+  let package_start = entries.partition_point(|entry| entry.path.as_path() < package_root);
+  for entry in &entries[package_start..] {
+    let Ok(package_path) = entry.path.as_path().strip_prefix(package_root) else {
+      break;
+    };
+    if !analysis_rust_source(package_path) {
+      continue;
+    }
+    let bytes = snapshot.read_source_file(&entry.path)?.ok_or_else(|| {
+      RailError::message(format!(
+        "captured analysis source '{}' is absent from its workspace snapshot",
+        entry.path
+      ))
+    })?;
+    let content = std::str::from_utf8(&bytes)
+      .map_err(|_| RailError::message(format!("captured analysis source '{}' is not valid UTF-8", entry.path)))?;
     for expression in extract_cfg_expressions(content) {
       selections.extend(crate::compiler::cfg_eval::feature_selections_for_cfg(expression));
     }
-  });
-  selections
-    .into_iter()
-    .filter(|selection| !selection.is_empty())
-    .collect()
+  }
+  Ok(
+    selections
+      .into_iter()
+      .filter(|selection| !selection.is_empty())
+      .collect(),
+  )
+}
+
+fn analysis_rust_source(package_path: &Path) -> bool {
+  if package_path == Path::new("build.rs") {
+    return true;
+  }
+  package_path.extension().and_then(std::ffi::OsStr::to_str) == Some("rs")
+    && ["src", "tests", "benches", "examples"]
+      .iter()
+      .any(|root| package_path.starts_with(root))
 }
 
 /// Scan source files for `cfg(feature = "...")` patterns

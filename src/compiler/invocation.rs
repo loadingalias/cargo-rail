@@ -6,6 +6,8 @@
 //! executable because Cargo has no rustdoc-wrapper setting.
 
 use std::ffi::OsString;
+use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -38,6 +40,12 @@ pub(crate) const OBSERVATION_SOURCE_ROOT_ENV: &str = "CARGO_RAIL_COMPILER_OBSERV
 /// Record invocations without enabling cargo-rail's workspace diagnostic lint.
 pub(crate) const OBSERVATION_ONLY_ENV: &str = "CARGO_RAIL_COMPILER_OBSERVATION_ONLY";
 
+/// Marker inherited only by rustdoc's generated doctest compiler children.
+pub(crate) const FACT_DOCTEST_BUILDER_ENV: &str = "CARGO_RAIL_COMPILER_FACT_DOCTEST_BUILDER";
+
+/// Marker for cargo-rail's compile-only doctest runtool boundary.
+pub(crate) const FACT_DOCTEST_RUNNER_ENV: &str = "CARGO_RAIL_COMPILER_FACT_DOCTEST_RUNNER";
+
 /// Result of classifying the process before Clap or workspace acquisition.
 #[doc(hidden)]
 pub enum PreClapDispatch {
@@ -54,6 +62,8 @@ enum InvocationRole {
   MarkedCache,
   RustcObservation,
   RustdocObservation,
+  DoctestBuilder,
+  DoctestRunner,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -63,10 +73,25 @@ struct InvocationSignals {
   marked_cache: bool,
   rustc_observation: bool,
   rustdoc_observation: bool,
+  rustc_wrapper_argv: bool,
+  doctest_builder: bool,
+  doctest_runner: bool,
 }
 
 impl InvocationSignals {
   fn classify(self) -> Result<Option<InvocationRole>, &'static str> {
+    if self.doctest_builder && self.doctest_runner && !self.rustc_wrapper_argv {
+      if self.link_adapter || self.direct_cache || self.marked_cache || self.rustdoc_observation {
+        return Err("doctest compiler received conflicting compiler role markers");
+      }
+      return Ok(Some(InvocationRole::DoctestBuilder));
+    }
+    if self.doctest_runner && !self.rustc_wrapper_argv {
+      if self.link_adapter || self.direct_cache || self.marked_cache || self.doctest_builder {
+        return Err("doctest runner received conflicting compiler role markers");
+      }
+      return Ok(Some(InvocationRole::DoctestRunner));
+    }
     if self.link_adapter {
       if self.marked_cache || self.rustc_observation || self.rustdoc_observation {
         return Err("linker adapter received conflicting compiler role markers");
@@ -74,12 +99,25 @@ impl InvocationSignals {
       return Ok(Some(InvocationRole::LinkAdapter));
     }
     if self.direct_cache {
-      if self.marked_cache || self.rustc_observation || self.rustdoc_observation {
+      // Cargo passes workspace-wrapper markers through the configured global
+      // wrapper. The direct wrapper must run first and preserve the marker for
+      // the selected workspace wrapper child.
+      if self.marked_cache || self.rustdoc_observation {
         return Err("direct cache wrapper received conflicting compiler role markers");
       }
       return Ok(Some(InvocationRole::DirectCache));
     }
-    if self.rustdoc_observation && (self.marked_cache || self.rustc_observation) {
+    if self.rustdoc_observation && self.rustc_observation {
+      if self.marked_cache {
+        return Err("compiler observation received conflicting cache and rustdoc role markers");
+      }
+      return Ok(Some(if self.rustc_wrapper_argv {
+        InvocationRole::RustcObservation
+      } else {
+        InvocationRole::RustdocObservation
+      }));
+    }
+    if self.rustdoc_observation && self.marked_cache {
       return Err("rustdoc proxy received conflicting compiler role markers");
     }
     if self.marked_cache {
@@ -178,6 +216,9 @@ pub fn dispatch() -> PreClapDispatch {
     marked_cache: std::env::var_os(CACHE_WRAPPER_MARKER).is_some(),
     rustc_observation: std::env::var_os(WRAPPER_MARKER).is_some(),
     rustdoc_observation: std::env::var_os(RUSTDOC_WRAPPER_MARKER).is_some(),
+    rustc_wrapper_argv: rustc_wrapper_argument_shape(),
+    doctest_builder: std::env::var_os(FACT_DOCTEST_BUILDER_ENV).is_some() && direct_rustc_argument_shape(),
+    doctest_runner: std::env::var_os(FACT_DOCTEST_RUNNER_ENV).is_some(),
   };
   let role = match signals.classify() {
     Ok(role) => role,
@@ -203,8 +244,30 @@ pub fn dispatch() -> PreClapDispatch {
     ),
     InvocationRole::RustcObservation => run_rustc(),
     InvocationRole::RustdocObservation => run_rustdoc(),
+    InvocationRole::DoctestBuilder => run_doctest_builder(),
+    InvocationRole::DoctestRunner => run_doctest_runner(),
   };
   PreClapDispatch::Exit(exit_code)
+}
+
+fn rustc_wrapper_argument_shape() -> bool {
+  std::env::args_os().nth(1).is_some_and(|program| {
+    Path::new(&program)
+      .file_stem()
+      .and_then(std::ffi::OsStr::to_str)
+      .is_some_and(|name| name.eq_ignore_ascii_case("rustc"))
+  })
+}
+
+fn direct_rustc_argument_shape() -> bool {
+  let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+  arguments.len() > 1
+    || arguments.iter().any(|argument| {
+      matches!(argument.to_str(), Some("--crate-name"))
+        || argument
+          .to_str()
+          .is_some_and(|argument| argument.starts_with("--crate-name="))
+    })
 }
 
 fn run_link_adapter() -> i32 {
@@ -281,7 +344,14 @@ fn run_direct_cache() -> i32 {
     eprintln!("cargo-rail compiler cache wrapper: recursive transparent wrapper configuration");
     return 2;
   }
-  if let Some(reason) = cache_fast_bypass_reason(&invocation, false) {
+  let configured_workspace_wrapper = std::env::var_os("RUSTC_WORKSPACE_WRAPPER");
+  let observation_wrapper = direct_fact_observation_wrapper(
+    &invocation,
+    std::env::var_os(WRAPPER_MARKER).is_some(),
+    std::env::var_os(crate::compiler::session::FACT_SESSION_ENV).is_some(),
+    configured_workspace_wrapper.as_deref(),
+  );
+  if let Some(reason) = cache_fast_bypass_reason(&invocation, observation_wrapper) {
     crate::compiler::native_cache::record_benchmark_coverage_bypass(&invocation.program, &invocation.arguments, reason);
     let mut command = invocation.command();
     if cache_control == CacheControl::BenchmarkCoverage {
@@ -325,6 +395,12 @@ fn run_cache(context: Option<crate::compiler::native_cache::NativeCacheContext>,
 }
 
 fn cache_fast_bypass_reason(invocation: &CompilerInvocation, observation_wrapper: bool) -> Option<&'static str> {
+  if compiler_fact_requires_execution(
+    observation_wrapper,
+    std::env::var_os(crate::compiler::session::FACT_SESSION_ENV).is_some(),
+  ) {
+    return Some("compiler_fact_required");
+  }
   let Some((program, arguments)) = invocation.compiler_selection(observation_wrapper) else {
     return Some("compiler_argv_unavailable");
   };
@@ -332,6 +408,19 @@ fn cache_fast_bypass_reason(invocation: &CompilerInvocation, observation_wrapper
     return Some("compiler_program_not_graduated");
   }
   crate::compiler::native_cache::fast_bypass_reason(program, arguments)
+}
+
+fn direct_fact_observation_wrapper(
+  invocation: &CompilerInvocation,
+  rustc_observation: bool,
+  fact_session_present: bool,
+  configured_workspace_wrapper: Option<&std::ffi::OsStr>,
+) -> bool {
+  rustc_observation && fact_session_present && configured_workspace_wrapper == Some(invocation.program.as_os_str())
+}
+
+fn compiler_fact_requires_execution(observation_wrapper: bool, fact_session_present: bool) -> bool {
+  observation_wrapper && fact_session_present
 }
 
 fn direct_rustc_program_shape(program: &std::ffi::OsStr) -> bool {
@@ -449,7 +538,52 @@ fn run_rustc() -> i32 {
       return 2;
     }
   };
-  let recorder = match crate::compiler::observation::begin_invocation(
+  run_rustc_with_session(invocation, inner_wrapper.as_deref(), fact_session)
+}
+
+fn run_doctest_builder() -> i32 {
+  let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+  if is_merged_doctest_probe(&arguments) {
+    // Stable rustdoc's automatic merged mode would next compile an internal
+    // runner under its own RUSTC_BOOTSTRAP authority. Fail only the documented
+    // probe so rustdoc falls back to standalone tests before that process can
+    // exist in cargo-rail's runtime boundary.
+    return 1;
+  }
+  let fact_session = match fact_session() {
+    Ok(Some(session)) => session,
+    Ok(None) => {
+      eprintln!("cargo-rail doctest compiler: missing compiler fact session");
+      return 2;
+    }
+    Err(error) => {
+      eprintln!("cargo-rail doctest compiler: {error}");
+      return 2;
+    }
+  };
+  let Some(typed) = fact_session.typed().filter(|typed| typed.doctest) else {
+    eprintln!("cargo-rail doctest compiler: missing typed doctest authority");
+    return 2;
+  };
+  let invocation = CompilerInvocation::selected(typed.rustc_program.clone().into(), arguments);
+  run_rustc_with_session(invocation, None, fact_session)
+}
+
+fn is_merged_doctest_probe(arguments: &[OsString]) -> bool {
+  arguments.iter().any(|argument| {
+    Path::new(argument)
+      .file_name()
+      .and_then(std::ffi::OsStr::to_str)
+      .is_some_and(|name| name.starts_with("doctest_bundle_") && name.ends_with(".rs"))
+  })
+}
+
+fn run_rustc_with_session(
+  invocation: CompilerInvocation,
+  inner_wrapper: Option<&std::ffi::OsStr>,
+  fact_session: crate::compiler::session::CompilerFactSession,
+) -> i32 {
+  let mut recorder = match crate::compiler::observation::begin_invocation(
     fact_session.observation_directory(),
     fact_session.source_root(),
     &invocation.program,
@@ -461,9 +595,53 @@ fn run_rustc() -> i32 {
       return 2;
     }
   };
-  let mut command = rustc_command(&invocation.program, None, inner_wrapper.as_deref());
+  let doctest_builder = std::env::var_os(FACT_DOCTEST_BUILDER_ENV).is_some();
+  let typed_invocation = match fact_session.typed() {
+    Some(typed) => match typed.authorize_invocation(
+      recorder.observation(),
+      fact_session.observation_directory(),
+      fact_session.source_root(),
+      doctest_builder,
+    ) {
+      Ok(invocation) => invocation,
+      Err(error) => {
+        eprintln!("cargo-rail rustc wrapper: failed to authorize typed compiler facts: {error}");
+        return 2;
+      }
+    },
+    None => None,
+  };
+  if typed_invocation.is_some() && inner_wrapper.is_some() {
+    eprintln!("cargo-rail rustc wrapper: typed compiler facts cannot delegate to another workspace wrapper");
+    return 2;
+  }
+  let capability = match typed_invocation.as_ref() {
+    Some(invocation) => match write_compiler_fact_invocation(fact_session.observation_directory(), invocation) {
+      Ok(capability) => Some(capability),
+      Err(error) => {
+        eprintln!("cargo-rail rustc wrapper: failed to write typed compiler fact capability: {error}");
+        return 2;
+      }
+    },
+    None => None,
+  };
+  if let Some(invocation) = &typed_invocation {
+    recorder.set_compiler_fact_unit(invocation.unit.clone());
+  }
+  let typed = typed_invocation.as_ref().and_then(|_| fact_session.typed());
+  let mut command = rustc_command(
+    &invocation.program,
+    None,
+    typed
+      .map(|typed| std::ffi::OsStr::new(&typed.driver_program))
+      .or(inner_wrapper),
+  );
   command.args(&invocation.arguments);
-  if std::env::var_os(OBSERVATION_ONLY_ENV).is_none() {
+  if std::env::var_os(OBSERVATION_ONLY_ENV).is_none()
+    && fact_session
+      .fact_families()
+      .contains(&crate::compiler::scheduler::CompilerFactFamily::StableDiagnostics)
+  {
     command.arg("--warn=unused-crate-dependencies");
   }
   command
@@ -471,8 +649,15 @@ fn run_rustc() -> i32 {
     .env_remove(INNER_WRAPPER_ENV)
     .env_remove(OBSERVATION_DIRECTORY_ENV)
     .env_remove(OBSERVATION_SOURCE_ROOT_ENV)
-    .env_remove(OBSERVATION_ONLY_ENV);
+    .env_remove(OBSERVATION_ONLY_ENV)
+    .env_remove(FACT_DOCTEST_BUILDER_ENV);
   crate::compiler::native_cache::remove_private_environment(&mut command);
+  if let (Some(typed), Some(capability)) = (typed, capability.as_ref())
+    && let Err(error) = configure_fact_driver_environment(&mut command, typed, capability)
+  {
+    eprintln!("cargo-rail rustc wrapper: failed to configure the compiler fact driver: {error}");
+    return 2;
+  }
 
   let status = command.status();
   let fact_result = recorder.finish(status.as_ref().is_ok_and(std::process::ExitStatus::success));
@@ -526,7 +711,32 @@ fn run_rustdoc() -> i32 {
       return 2;
     }
   };
-  let arguments = rustdoc_observation_arguments(&rustdoc, original_arguments);
+  let rustdoc = if let Some(typed) = fact_session.typed()
+    && typed.doctest
+  {
+    let Some(root) = typed.doctest_sysroot.as_deref().map(PathBuf::from) else {
+      eprintln!("cargo-rail rustdoc proxy: typed doctest sysroot authority is missing");
+      return 2;
+    };
+    root
+      .join("bin")
+      .join(if cfg!(windows) { "rustdoc.exe" } else { "rustdoc" })
+      .into_os_string()
+  } else {
+    rustdoc
+  };
+  let mut arguments = rustdoc_observation_arguments(&rustdoc, original_arguments);
+  if let Some(typed) = fact_session.typed()
+    && typed.doctest
+  {
+    match configure_doctest_builder_arguments(arguments, typed) {
+      Ok(configured) => arguments = configured,
+      Err(error) => {
+        eprintln!("cargo-rail rustdoc proxy: failed to authorize doctest compiler: {error}");
+        return 2;
+      }
+    }
+  }
   let invocation = CompilerInvocation::selected(rustdoc, arguments);
   let recorder = match crate::compiler::observation::begin_rustdoc_invocation(
     fact_session.observation_directory(),
@@ -540,6 +750,12 @@ fn run_rustdoc() -> i32 {
     }
   };
   let mut command = invocation.command();
+  #[cfg(unix)]
+  if fact_session.typed().is_some_and(|typed| typed.doctest) {
+    use std::os::unix::process::CommandExt as _;
+
+    command.arg0(&invocation.program);
+  }
   command
     .env("RUSTDOC", &invocation.program)
     .env_remove(RUSTDOC_WRAPPER_MARKER)
@@ -547,6 +763,35 @@ fn run_rustdoc() -> i32 {
     .env_remove(OBSERVATION_DIRECTORY_ENV)
     .env_remove(OBSERVATION_SOURCE_ROOT_ENV);
   crate::compiler::native_cache::remove_private_environment(&mut command);
+  if let Some(typed) = fact_session.typed().filter(|typed| typed.doctest) {
+    let Some(capability) = std::env::var_os(crate::compiler::session::FACT_SESSION_ENV) else {
+      eprintln!("cargo-rail rustdoc proxy: typed doctest session capability disappeared");
+      return 2;
+    };
+    command
+      .env(crate::compiler::session::FACT_SESSION_ENV, capability)
+      .env(OBSERVATION_DIRECTORY_ENV, fact_session.observation_directory())
+      .env(OBSERVATION_SOURCE_ROOT_ENV, fact_session.source_root())
+      .env(WRAPPER_MARKER, "1")
+      .env(FACT_DOCTEST_BUILDER_ENV, "1")
+      .env(FACT_DOCTEST_RUNNER_ENV, "1")
+      .env_remove("RUSTC_BOOTSTRAP");
+    let Some(library) = typed
+      .doctest_sysroot
+      .as_deref()
+      .map(PathBuf::from)
+      .map(|root| root.join("lib"))
+    else {
+      eprintln!("cargo-rail rustdoc proxy: typed doctest sysroot authority disappeared");
+      return 2;
+    };
+    #[cfg(target_os = "macos")]
+    command.env("DYLD_LIBRARY_PATH", &library);
+    #[cfg(target_os = "linux")]
+    command.env("LD_LIBRARY_PATH", &library);
+    #[cfg(windows)]
+    command.env("PATH", &library);
+  }
   let status = command.status();
   let fact_result = recorder.finish(status.as_ref().is_ok_and(std::process::ExitStatus::success));
 
@@ -564,11 +809,94 @@ fn run_rustdoc() -> i32 {
   }
 }
 
+fn configure_doctest_builder_arguments(
+  mut arguments: Vec<OsString>,
+  typed: &crate::compiler::session::CompilerFactTypedSession,
+) -> crate::error::RailResult<Vec<OsString>> {
+  let has_test = arguments
+    .iter()
+    .any(|argument| matches!(argument.to_str(), Some("--test")));
+  if arguments.iter().any(|argument| {
+    matches!(
+      argument.to_str(),
+      Some(
+        "--no-run"
+          | "--sysroot"
+          | "--test-runtool"
+          | "--test-runtool-arg"
+          | "--test-builder"
+          | "--test-builder-wrapper"
+      )
+    ) || argument.to_str().is_some_and(|argument| {
+      argument.starts_with("--sysroot=")
+        || argument.starts_with("--test-runtool=")
+        || argument.starts_with("--test-runtool-arg=")
+        || argument.starts_with("--test-builder=")
+        || argument.starts_with("--test-builder-wrapper=")
+    })
+  }) {
+    return Err(crate::error::RailError::message(
+      "typed doctest collection requires the fixed compile-only rustdoc builder boundary",
+    ));
+  }
+  if !has_test {
+    return Err(crate::error::RailError::message(
+      "typed doctest collection requires Cargo's doctest rustdoc invocation",
+    ));
+  }
+  let wrapper = crate::utils::canonicalize_existing(
+    &std::env::current_exe()
+      .map_err(|error| crate::error::RailError::message(format!("failed to locate cargo-rail: {error}")))?,
+  )?;
+  let sysroot = typed
+    .doctest_sysroot
+    .as_ref()
+    .ok_or_else(|| crate::error::RailError::message("typed doctest sysroot authority is missing"))?;
+  arguments.extend([
+    "--sysroot".into(),
+    sysroot.clone().into(),
+    "--test-runtool".into(),
+    wrapper.into_os_string(),
+  ]);
+  Ok(arguments)
+}
+
 fn run_rustdoc_bypass(invocation: CompilerInvocation) -> i32 {
   let mut command = invocation.command();
   command.env("RUSTDOC", &invocation.program);
   crate::compiler::native_cache::remove_private_environment(&mut command);
   run_transparently(command, "cargo-rail rustdoc proxy")
+}
+
+fn run_doctest_runner() -> i32 {
+  let session = match fact_session() {
+    Ok(Some(session)) if session.typed().is_some_and(|typed| typed.doctest) => session,
+    Ok(_) => {
+      eprintln!("cargo-rail doctest runner: missing typed doctest authority");
+      return 2;
+    }
+    Err(error) => {
+      eprintln!("cargo-rail doctest runner: {error}");
+      return 2;
+    }
+  };
+  let Some(executable) = std::env::args_os().nth(1).map(PathBuf::from) else {
+    eprintln!("cargo-rail doctest runner: rustdoc supplied no compiled doctest executable");
+    return 2;
+  };
+  let metadata = match fs::symlink_metadata(&executable) {
+    Ok(metadata) => metadata,
+    Err(error) => {
+      eprintln!("cargo-rail doctest runner: failed to inspect compiled doctest executable: {error}");
+      return 2;
+    }
+  };
+  if !metadata.is_file() || crate::utils::is_symlink_or_reparse(&metadata) || metadata.len() == 0 {
+    eprintln!("cargo-rail doctest runner: rustdoc did not supply a real compiled doctest executable");
+    return 2;
+  }
+  let _ = session;
+  0
 }
 
 #[cfg(unix)]
@@ -602,6 +930,60 @@ fn fact_session() -> crate::error::RailResult<Option<crate::compiler::session::C
       "compiler fact capability is incomplete",
     )),
   }
+}
+
+fn write_compiler_fact_invocation(
+  directory: &Path,
+  invocation: &crate::compiler::facts::CompilerFactInvocation,
+) -> crate::error::RailResult<tempfile::TempPath> {
+  let encoded = serde_json::to_vec(invocation)?;
+  let mut builder = tempfile::Builder::new();
+  builder.prefix(".cargo-rail-invocation-").suffix(".cap");
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    builder.permissions(fs::Permissions::from_mode(0o600));
+  }
+  let mut capability = builder.tempfile_in(directory)?;
+  capability.write_all(&encoded)?;
+  capability.as_file_mut().sync_all()?;
+  #[cfg(unix)]
+  capability
+    .as_file()
+    .set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o400))?;
+  Ok(capability.into_temp_path())
+}
+
+fn configure_fact_driver_environment(
+  command: &mut Command,
+  typed: &crate::compiler::session::CompilerFactTypedSession,
+  capability: &Path,
+) -> crate::error::RailResult<()> {
+  command
+    .env(crate::compiler::facts::COMPILER_FACT_INVOCATION_ENV, capability)
+    .env_remove("RUSTC_BOOTSTRAP");
+  #[cfg(target_os = "macos")]
+  command
+    .env("DYLD_LIBRARY_PATH", &typed.compiler_library_directory)
+    .env_remove("DYLD_FALLBACK_LIBRARY_PATH")
+    .env_remove("DYLD_INSERT_LIBRARIES");
+  #[cfg(target_os = "linux")]
+  command
+    .env("LD_LIBRARY_PATH", &typed.compiler_library_directory)
+    .env_remove("LD_PRELOAD")
+    .env_remove("LD_AUDIT");
+  #[cfg(windows)]
+  {
+    let mut paths = vec![PathBuf::from(&typed.compiler_library_directory)];
+    if let Some(inherited) = std::env::var_os("PATH") {
+      paths.extend(std::env::split_paths(&inherited));
+    }
+    let path = std::env::join_paths(paths)
+      .map_err(|error| crate::error::RailError::message(format!("compiler fact driver PATH is invalid: {error}")))?;
+    command.env("PATH", path);
+  }
+  Ok(())
 }
 
 fn rustdoc_observation_arguments(rustdoc: &std::ffi::OsStr, mut arguments: Vec<OsString>) -> Vec<OsString> {
@@ -775,6 +1157,52 @@ mod tests {
       .classify(),
       Ok(Some(InvocationRole::MarkedCache))
     );
+    assert_eq!(
+      InvocationSignals {
+        direct_cache: true,
+        rustc_observation: true,
+        ..InvocationSignals::default()
+      }
+      .classify(),
+      Ok(Some(InvocationRole::DirectCache))
+    );
+    assert_eq!(
+      InvocationSignals {
+        rustc_observation: true,
+        rustdoc_observation: true,
+        rustc_wrapper_argv: true,
+        ..InvocationSignals::default()
+      }
+      .classify(),
+      Ok(Some(InvocationRole::RustcObservation))
+    );
+    assert_eq!(
+      InvocationSignals {
+        rustc_observation: true,
+        rustdoc_observation: true,
+        ..InvocationSignals::default()
+      }
+      .classify(),
+      Ok(Some(InvocationRole::RustdocObservation))
+    );
+    assert_eq!(
+      InvocationSignals {
+        rustc_observation: true,
+        doctest_builder: true,
+        doctest_runner: true,
+        ..InvocationSignals::default()
+      }
+      .classify(),
+      Ok(Some(InvocationRole::DoctestBuilder))
+    );
+    assert_eq!(
+      InvocationSignals {
+        doctest_runner: true,
+        ..InvocationSignals::default()
+      }
+      .classify(),
+      Ok(Some(InvocationRole::DoctestRunner))
+    );
 
     for signals in [
       InvocationSignals {
@@ -783,18 +1211,52 @@ mod tests {
         ..InvocationSignals::default()
       },
       InvocationSignals {
-        rustc_observation: true,
+        marked_cache: true,
         rustdoc_observation: true,
         ..InvocationSignals::default()
       },
       InvocationSignals {
-        marked_cache: true,
+        doctest_builder: true,
+        doctest_runner: true,
         rustdoc_observation: true,
         ..InvocationSignals::default()
       },
     ] {
       assert!(signals.classify().is_err(), "ambiguous role was accepted: {signals:?}");
     }
+  }
+
+  #[test]
+  fn fact_required_workspace_compilation_bypasses_native_result_reuse() {
+    assert!(compiler_fact_requires_execution(true, true));
+    assert!(!compiler_fact_requires_execution(false, true));
+    assert!(!compiler_fact_requires_execution(true, false));
+
+    let invocation = CompilerInvocation::selected("fact-wrapper".into(), vec!["rustc".into()]);
+    assert!(direct_fact_observation_wrapper(
+      &invocation,
+      true,
+      true,
+      Some(std::ffi::OsStr::new("fact-wrapper"))
+    ));
+    assert!(!direct_fact_observation_wrapper(
+      &invocation,
+      false,
+      true,
+      Some(std::ffi::OsStr::new("fact-wrapper"))
+    ));
+    assert!(!direct_fact_observation_wrapper(
+      &invocation,
+      true,
+      false,
+      Some(std::ffi::OsStr::new("fact-wrapper"))
+    ));
+    assert!(!direct_fact_observation_wrapper(
+      &invocation,
+      true,
+      true,
+      Some(std::ffi::OsStr::new("other-wrapper"))
+    ));
   }
 
   #[cfg(unix)]

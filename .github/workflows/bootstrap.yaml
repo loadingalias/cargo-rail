@@ -45,7 +45,7 @@ jobs:
         uses: ./.github/actions/setup
         with:
           cache-key: bootstrap-quality
-          install-nextest: "false"
+          install-nextest: "true"
 
       - name: Install cargo-deny
         uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf  # v2.85.5
@@ -59,6 +59,11 @@ jobs:
 
       - name: Quality checks
         run: just check-ci
+
+      - name: Exact compiler fact driver
+        run: |
+          rustup component add rustc-dev
+          just check-compiler-fact-driver
 
   compatibility:
     name: Compatibility

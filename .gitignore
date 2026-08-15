@@ -1,6 +1,7 @@
 # Rust
 /target
 /benchmark_results/
+/tools/compiler-fact-driver/**/target/
 
 # Python
 __pycache__
@@ -28,3 +29,4 @@ AGENTS.md
 notes/
 docs/marketing/
 docs/tasks/
+first-draft.md

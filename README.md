@@ -174,9 +174,9 @@ Cargo-Rail does not restore an old target directory or manufacture Cargo freshne
 - every compiler-visible environment name and value;
 - rustc's selected-input containment proof;
 - exact native-static search namespaces and generated inputs;
-- on macOS linked actions, the default Apple driver/linker, found and missing lookup paths, SDK inputs, symlink
-  resolution, direct driver inputs, adapter-certified LTO objects and rustc-selected aggregate archives in an
-  owner-controlled namespace that is not writable by group or other users, and stable debug-map normalization;
+- on Linux linked actions, the default `cc` driver and its selected dependency-file-capable ELF linker, auxiliary
+  tools, direct inputs, found and missing search candidates, exact dependency archives, and rustc-generated objects
+  under the linked output directory;
 - action and result identity; and
 - exact stored output bytes and regular-file modes.
 
@@ -190,11 +190,12 @@ The pre-Clap compiler boundary rejects ambiguous wrapper roles and skips session
 incremental, clippy, response-file, and other clearly unsupported invocations.
 
 Metadata/rlib results, including metadata-only proc-macro producers, and exact native-static consumers use the direct
-action protocol. On macOS, the installed default Apple linker can also certify build-script executables, proc-macro
-producer dylibs, ordinary final binaries, `dylib`, and `cdylib` outputs. The pre-link action is only a candidate
-selector; a hit requires the complete witnessed action and exact result pack. Native proc-macro consumers remain cold
-because running a proc macro can observe ambient filesystem, environment, process, network, clock, and randomness
-state that rustc does not certify.
+action protocol. On Linux, the installed default `cc`-selected ELF linker can also certify build-script executables,
+proc-macro producer dylibs, ordinary final binaries, `dylib`, and `cdylib` outputs when it supplies GNU-compatible
+dependency-file evidence. The pre-link action is only a candidate selector; a hit requires the complete witnessed
+action and exact result pack. Native proc-macro
+consumers remain cold because running a proc macro can observe ambient filesystem, environment, process, network,
+clock, and randomness state that rustc does not certify.
 
 **Fast when proven. Normal Cargo when not.**
 

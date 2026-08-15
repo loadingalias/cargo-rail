@@ -63,15 +63,6 @@ impl FeatureSelection {
   }
 }
 
-/// Complete identity for one Cargo analysis configuration.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct AnalysisConfiguration {
-  /// Platform target triple or native-target marker.
-  pub platform: PlatformTarget,
-  /// Workspace feature-selection mode.
-  pub features: FeatureSelection,
-}
-
 /// Cargo target domain reported by compiler messages.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum CargoTargetKind {

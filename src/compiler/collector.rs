@@ -7,14 +7,23 @@ use crate::build_script::{
 use crate::cache::cas::{LocalCacheSelection, LocalCas};
 use crate::cargo::manifest_analyzer::ManifestAnalyzer;
 use crate::cargo::{CargoConfigSnapshot, DepKind, ToolchainIdentity};
-use crate::compiler::diagnostics_store::CompilerDiagnosticsStore;
+use crate::compiler::diagnostics_store::{CompilerDiagnosticsStore, CompilerFactCacheKey};
+use crate::compiler::driver::{CompilerFactDoctestSysroot, CompilerFactDriverAuthority, PreparedCompilerFactDriver};
+use crate::compiler::fact_store::CompilerFactStore;
+use crate::compiler::facts::{
+  COMPILER_FACT_ANNOUNCEMENT_CODE, COMPILER_FACT_ANNOUNCEMENT_PREFIX, CompilerFactAnnouncement,
+  CompilerFactAnnouncementExpectation, CompilerFactExpectation, CompilerFactRunAuthority, CompilerFactTargetKind,
+  RUN_IDENTITY_PREFIX, ValidatedCompilerFactAnnouncement, ValidatedCompilerFactFragment, ValidatedCompilerFactObject,
+  load_announced_fragment, load_discovered_doctest_fragment, required_compiler_fact_coverage,
+};
 use crate::compiler::invocation::{
-  CACHE_WRAPPER_MARKER, INNER_WRAPPER_ENV, OBSERVATION_DIRECTORY_ENV, OBSERVATION_SOURCE_ROOT_ENV, WRAPPER_MARKER,
+  CACHE_WRAPPER_MARKER, INNER_RUSTDOC_ENV, INNER_WRAPPER_ENV, OBSERVATION_DIRECTORY_ENV, OBSERVATION_SOURCE_ROOT_ENV,
+  RUSTDOC_WRAPPER_MARKER, WRAPPER_MARKER,
 };
 use crate::compiler::model::{
-  AnalysisConfiguration, COLLECTOR_VERSION, CargoTargetKind, CompilationUnitEvidence, CompilationUnitId,
-  CompilerDiagEntry, CompilerDiagKey, DependencyEvidenceState, DiagnosticsCompleteness, EvidenceCacheSummary,
-  FeatureSelection, MemberEvidence, PlatformTarget, TargetEvidence,
+  COLLECTOR_VERSION, CargoTargetKind, CompilationUnitEvidence, CompilationUnitId, CompilerDiagEntry, CompilerDiagKey,
+  DependencyEvidenceState, DiagnosticsCompleteness, EvidenceCacheSummary, FeatureSelection, MemberEvidence,
+  PlatformTarget, TargetEvidence,
 };
 use crate::compiler::native_cache::{NativeCompilerSession, NativeSessionAuthority};
 use crate::compiler::observation::{
@@ -23,44 +32,42 @@ use crate::compiler::observation::{
   CompilerWrapperRole, FileObservation, ObservationPath, attach_build_script_result_dependencies,
   attach_execution_identities, build_manifests, load_raw,
 };
-use crate::compiler::session::{CompilerFactSession, FACT_SESSION_ENV};
+use crate::compiler::scheduler::{AnalysisSchedule, AnalysisView, CompilerCandidate};
+use crate::compiler::session::{CompilerFactSession, CompilerFactTypedSession, FACT_SESSION_ENV};
 use crate::error::{RailError, RailResult, ResultExt};
 use crate::executable::{ExecutableIdentity, ToolchainExecutableIdentities};
 use crate::progress;
 use crate::source::{ContentDigest, SourceEntryKind};
-use crate::workspace::{WorkspaceContext, WorkspaceSnapshot};
+use crate::workspace::WorkspaceSnapshot;
 use cargo_metadata::{Message, PackageId, TargetKind};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-/// One exact rustc crate candidate and the platforms where its declaration applies.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct CompilerCandidate {
-  /// Workspace member owning the declaration.
-  pub member: String,
-  /// rustc crate name passed through `--extern`.
-  pub crate_name: String,
-  /// Dependency domain whose compilation units provide evidence.
-  pub kind: crate::cargo::manifest_analyzer::DepKind,
-  /// Configured platform targets where this declaration applies.
-  pub applicable_targets: BTreeSet<String>,
-  /// Restrict evidence to one feature mode (used for optional activation proofs).
-  pub required_features: Option<FeatureSelection>,
-}
+#[cfg(test)]
+static QUALIFICATION_CARGO_VIEWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static QUALIFICATION_COMPILER_INVOCATIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Compiler diagnostics collector and cache coordinator.
-pub struct CompilerDiagnosticsCollector<'a> {
+pub(crate) struct CompilerDiagnosticsCollector<'a> {
   workspace_root: &'a Path,
   manifests: &'a ManifestAnalyzer,
   targets: Vec<&'a str>,
   identity: CompilerCacheIdentity,
+}
+
+/// Independently validated products from one shared set of Cargo acquisitions.
+#[allow(dead_code, reason = "typed facts are consumed by the Task 7 surface analyzer")]
+pub(crate) struct CompilerAnalysisEvidence {
+  pub(crate) diagnostics: HashMap<PackageId, MemberEvidence>,
+  pub(crate) compiler_facts: Vec<ValidatedCompilerFactObject>,
 }
 
 /// Exact snapshot-derived inputs shared by every compiler-evidence key.
@@ -75,11 +82,13 @@ pub(crate) struct CompilerCacheIdentity {
   compiler_env_fingerprint: String,
   cargo_config_fingerprint: String,
   cargo_program: OsString,
+  rustdoc_program: OsString,
   rustc_workspace_wrapper: Option<OsString>,
   manifest_fingerprints: HashMap<PackageId, String>,
   source_fingerprints: HashMap<PackageId, String>,
   observation_context: CompilationObservationContext,
   package_observation_identities: HashMap<PackageId, String>,
+  package_observation_manifests: HashMap<PathBuf, String>,
   package_dependencies: HashMap<String, BTreeSet<String>>,
   build_script_packages: HashMap<String, BuildScriptPackageContext>,
   rustc_executable: ExecutableIdentity,
@@ -172,14 +181,22 @@ impl CompilerCacheBypass {
   }
 }
 
+fn compiler_observation_wrapper() -> RailResult<PathBuf> {
+  #[cfg(test)]
+  if let Some(path) = std::env::var_os("CARGO_RAIL_TEST_OBSERVATION_WRAPPER") {
+    return crate::utils::canonicalize_existing(Path::new(&path))
+      .with_context(|| "locating the explicitly provisioned compiler-observation test wrapper".to_string());
+  }
+  std::env::current_exe().with_context(|| "locating cargo-rail compiler-observation wrapper".to_string())
+}
+
 impl CompilerCacheIdentity {
   /// Capture exact compiler-cache identity from one immutable workspace snapshot.
   pub fn capture(snapshot: &WorkspaceSnapshot) -> RailResult<Self> {
     let rustc_version = snapshot.toolchain().rustc_verbose_version().to_string();
     let cargo_version = snapshot.toolchain().cargo_verbose_version().to_string();
     let host_triple = snapshot.toolchain().host_target().to_string();
-    let current_executable =
-      std::env::current_exe().with_context(|| "locating cargo-rail compiler-observation wrapper".to_string())?;
+    let current_executable = compiler_observation_wrapper()?;
     let cargo_rail_executable = ExecutableIdentity::capture(
       current_executable.as_os_str(),
       snapshot.source_root(),
@@ -194,6 +211,7 @@ impl CompilerCacheIdentity {
     let compiler_env_fingerprint = compiler_env_fingerprint(snapshot.cargo_config())?;
     let cargo_config_fingerprint = cargo_config_fingerprint(snapshot.cargo_config(), snapshot.source_root())?;
     let cargo_program = snapshot.toolchain().cargo_program().to_owned();
+    let rustdoc_program = snapshot.toolchain().rustdoc_program().to_owned();
     let rustc_workspace_wrapper = snapshot
       .toolchain()
       .rustc_workspace_wrapper_program()
@@ -203,6 +221,8 @@ impl CompilerCacheIdentity {
     let source_fingerprints = source_closure_fingerprints(snapshot, &local_dependencies)?;
     let observation_context = CompilationObservationContext::capture(snapshot)?;
     let package_observation_identities = package_observation_identities(snapshot)?;
+    let package_observation_manifests =
+      package_observation_manifest_identities(snapshot, &package_observation_identities)?;
     let package_dependencies = package_dependency_graph(snapshot, &package_observation_identities)?;
     let build_script_packages = build_script_package_contexts(snapshot, &package_observation_identities)?;
     let rustc_executable = executables.rustc().clone();
@@ -255,11 +275,13 @@ impl CompilerCacheIdentity {
       compiler_env_fingerprint,
       cargo_config_fingerprint,
       cargo_program,
+      rustdoc_program,
       rustc_workspace_wrapper,
       manifest_fingerprints,
       source_fingerprints,
       observation_context,
       package_observation_identities,
+      package_observation_manifests,
       package_dependencies,
       build_script_packages,
       rustc_executable,
@@ -470,18 +492,6 @@ fn transparent_rustc_query(program: &OsStr, argument: &str, current_dir: &Path) 
 }
 
 impl<'a> CompilerDiagnosticsCollector<'a> {
-  /// Create a new collector for a workspace-level analysis pass.
-  pub fn new(workspace_root: &'a Path, manifests: &'a ManifestAnalyzer, targets: Vec<&'a str>) -> RailResult<Self> {
-    let context = WorkspaceContext::build_with_snapshot(workspace_root)?;
-    let identity = CompilerCacheIdentity::capture(context.snapshot()?)?;
-    Ok(Self {
-      workspace_root,
-      manifests,
-      targets,
-      identity,
-    })
-  }
-
   pub(crate) fn with_identity(
     workspace_root: &'a Path,
     manifests: &'a ManifestAnalyzer,
@@ -497,18 +507,69 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
   }
 
   /// Collect diagnostics for selected workspace members.
-  pub fn collect_for_candidates(
+  pub(crate) fn collect_for_candidates(
     &self,
     candidates: &[CompilerCandidate],
   ) -> RailResult<HashMap<PackageId, MemberEvidence>> {
-    let members: HashSet<&str> = candidates.iter().map(|candidate| candidate.member.as_str()).collect();
+    Ok(
+      self
+        .collect_requirements(candidates, &BTreeSet::new(), &BTreeSet::new(), None)?
+        .diagnostics,
+    )
+  }
+
+  /// Collect diagnostics and typed items through the same normalized Cargo views.
+  #[allow(dead_code, reason = "the surface-analysis consumer is introduced by Task 7")]
+  pub(crate) fn collect_with_typed_items(
+    &self,
+    snapshot: &WorkspaceSnapshot,
+    candidates: &[CompilerCandidate],
+    typed_packages: &BTreeSet<String>,
+    doctest_packages: &BTreeSet<String>,
+  ) -> RailResult<CompilerAnalysisEvidence> {
+    self.collect_requirements(candidates, typed_packages, doctest_packages, Some(snapshot))
+  }
+
+  fn collect_requirements(
+    &self,
+    candidates: &[CompilerCandidate],
+    typed_packages: &BTreeSet<String>,
+    doctest_packages: &BTreeSet<String>,
+    snapshot: Option<&WorkspaceSnapshot>,
+  ) -> RailResult<CompilerAnalysisEvidence> {
+    let schedule = AnalysisSchedule::for_combined(
+      &self.manifests.members,
+      &self.targets,
+      candidates,
+      typed_packages,
+      doctest_packages,
+    )?;
+    let members = schedule.packages().iter().map(String::as_str).collect::<HashSet<_>>();
     if members.is_empty() {
-      return Ok(HashMap::new());
+      return Ok(CompilerAnalysisEvidence {
+        diagnostics: HashMap::new(),
+        compiler_facts: Vec::new(),
+      });
     }
+    let typed_snapshot =
+      if typed_packages.is_empty() {
+        None
+      } else {
+        Some(snapshot.ok_or_else(|| {
+          RailError::message("typed compiler fact collection requires its captured workspace snapshot")
+        })?)
+      };
+    let producer_authority = typed_snapshot
+      .map(|snapshot| {
+        CompilerFactDriverAuthority::producer_authority(snapshot.toolchain(), &self.identity.toolchain_fingerprint)
+      })
+      .transpose()?;
+    let mut prepared_driver = None;
+    let mut prepared_doctest_sysroot = None;
 
     let mut store = CompilerDiagnosticsStore::load(self.workspace_root);
-    let key_inputs = self.build_key_inputs(&members)?;
-    let manifest_to_member = build_manifest_member_index(&self.manifests.members);
+    let fact_store = CompilerFactStore::load();
+    let package_to_member = build_package_member_index(&self.manifests.members);
     let member_ids: HashMap<&str, &PackageId> = self
       .manifests
       .members
@@ -518,98 +579,219 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
     let candidate_targets = build_candidate_target_index(candidates);
 
     let mut result: HashMap<PackageId, MemberEvidence> = HashMap::with_capacity(members.len());
+    let mut compiler_facts = Vec::new();
     let mut cache_by_member: HashMap<String, EvidenceCacheSummary> = HashMap::with_capacity(members.len());
-    let mut stale_by_configuration: BTreeMap<AnalysisConfiguration, Vec<&str>> = BTreeMap::new();
+    let mut stale_by_configuration: BTreeMap<AnalysisView, Vec<&str>> = BTreeMap::new();
     let mut retained_observations = HashMap::<String, CompilationObservationManifest>::new();
     let mut surviving_unused: HashMap<String, BTreeSet<CandidateId>> = candidate_targets
       .iter()
       .map(|(member, candidates)| (member.clone(), candidates.keys().cloned().collect()))
       .collect();
 
-    for (member, target, features, key) in key_inputs {
-      let package_id = member_ids
-        .get(member)
-        .ok_or_else(|| RailError::message(format!("missing package identity for member '{member}'")))?;
-      let mut cache_hit = false;
-      let observation_miss = if self.identity.cache_bypass_reason.is_none() {
-        store.get(&key).and_then(|entry| {
-          let miss = compiler_observation_miss_reason(&entry.observations, self.workspace_root).map(str::to_string);
-          if miss.is_none() {
-            cache_hit = true;
-            cache_by_member.entry(member.to_string()).or_default().hits += 1;
-            update_candidate_survivors(
-              &mut surviving_unused,
-              &candidate_targets,
-              member,
-              target,
-              &entry.evidence,
-            );
-            record_target_evidence(&mut result, package_id, &entry.evidence);
-          }
-          miss
-        })
-      } else {
-        None
-      };
-      if cache_hit {
-        continue;
+    for view in schedule.views() {
+      let target = view.platform().as_str();
+      let collects_diagnostics = view
+        .fact_families()
+        .contains(&crate::compiler::scheduler::CompilerFactFamily::StableDiagnostics);
+      let collects_typed = view
+        .fact_families()
+        .contains(&crate::compiler::scheduler::CompilerFactFamily::TypedRustItems);
+      if collects_typed {
+        stale_by_configuration.entry(view.clone()).or_default();
       }
+      for member in view.packages() {
+        let member = member.as_str();
+        if !collects_diagnostics {
+          continue;
+        }
+        let package_id = member_ids
+          .get(member)
+          .ok_or_else(|| RailError::message(format!("missing package identity for member '{member}'")))?;
+        let manifest = self
+          .manifests
+          .members
+          .iter()
+          .find(|manifest| manifest.package_name == member)
+          .ok_or_else(|| RailError::message(format!("missing manifest entry for member '{member}'")))?;
+        let key = self.key_for(manifest, target, view.features().clone())?;
+        let mut cache_hit = false;
+        let observation_miss = if self.identity.cache_bypass_reason.is_none() {
+          store.get(&key).and_then(|entry| {
+            let miss = compiler_observation_miss_reason(&entry.observations, self.workspace_root).map(str::to_string);
+            if miss.is_none() {
+              cache_hit = true;
+              cache_by_member.entry(member.to_string()).or_default().hits += 1;
+              update_candidate_survivors(
+                &mut surviving_unused,
+                &candidate_targets,
+                member,
+                target,
+                &entry.evidence,
+              );
+              record_target_evidence(&mut result, package_id, &entry.evidence);
+            }
+            miss
+          })
+        } else {
+          None
+        };
+        if cache_hit {
+          continue;
+        }
 
-      let reason = self
-        .identity
-        .cache_bypass_reason
-        .map(|reason| reason.as_str().to_string())
-        .or(observation_miss)
-        .unwrap_or_else(|| store.miss_reason(&key).to_string());
-      let summary = cache_by_member.entry(member.to_string()).or_default();
-      summary.misses += 1;
-      *summary.miss_reasons.entry(reason).or_default() += 1;
+        let reason = self
+          .identity
+          .cache_bypass_reason
+          .map(|reason| reason.as_str().to_string())
+          .or(observation_miss)
+          .unwrap_or_else(|| store.miss_reason(&key).to_string());
+        let summary = cache_by_member.entry(member.to_string()).or_default();
+        summary.misses += 1;
+        *summary.miss_reasons.entry(reason).or_default() += 1;
 
-      stale_by_configuration
-        .entry(AnalysisConfiguration {
-          platform: PlatformTarget::from(target),
-          features,
-        })
-        .or_default()
-        .push(member);
+        stale_by_configuration.entry(view.clone()).or_default().push(member);
+      }
     }
 
     let mut skipped_member_targets = 0usize;
-    for (configuration, stale_members) in stale_by_configuration {
-      let target = configuration.platform.as_str();
-      let features = configuration.features;
-      let active_members: Vec<&str> = stale_members
+    for (view, stale_members) in stale_by_configuration {
+      let target = view.platform().as_str();
+      let features = view.features();
+      let diagnostic_members: Vec<&str> = stale_members
         .iter()
         .copied()
-        .filter(|member| has_applicable_survivor(&surviving_unused, &candidate_targets, member, target, &features))
+        .filter(|member| has_applicable_survivor(&surviving_unused, &candidate_targets, member, target, features))
         .collect();
-      skipped_member_targets += stale_members.len() - active_members.len();
+      skipped_member_targets += stale_members.len() - diagnostic_members.len();
+      let typed_members = if view
+        .fact_families()
+        .contains(&crate::compiler::scheduler::CompilerFactFamily::TypedRustItems)
+      {
+        view
+          .packages()
+          .intersection(typed_packages)
+          .cloned()
+          .collect::<BTreeSet<_>>()
+      } else {
+        BTreeSet::new()
+      };
+      let mut acquisition_members = diagnostic_members.iter().copied().collect::<BTreeSet<_>>();
+      acquisition_members.extend(typed_members.iter().map(String::as_str));
+      let fact_members = acquisition_members.iter().copied().collect::<Vec<_>>();
+      let fact_cache_key = if typed_members.is_empty() || self.identity.cache_bypass_reason.is_some() {
+        None
+      } else {
+        Some(
+          self.fact_cache_key(
+            &view,
+            &fact_members,
+            &typed_members,
+            producer_authority
+              .as_ref()
+              .ok_or_else(|| RailError::message("typed compiler fact producer authority disappeared"))?,
+          )?,
+        )
+      };
+      let cached_facts = fact_cache_key
+        .as_ref()
+        .and_then(|key| fact_store.get(key).ok().flatten());
+      let collect_typed = !typed_members.is_empty() && cached_facts.is_none();
+      if let Some(cached) = cached_facts {
+        compiler_facts.extend(cached);
+      }
+      let active_members = if collect_typed {
+        fact_members
+      } else {
+        diagnostic_members.clone()
+      };
       if active_members.is_empty() {
         continue;
       }
 
-      let mut stale_set = HashSet::with_capacity(active_members.len());
-      for member in &active_members {
+      let mut stale_set = HashSet::with_capacity(diagnostic_members.len());
+      for member in &diagnostic_members {
         stale_set.insert(*member);
       }
 
       progress!(
-        "  Checking unused dependencies for target {} ({} package{})...",
+        "  Collecting compiler evidence for target {} ({} package{})...",
         format_args!("{} / {}", target, features.label()),
         active_members.len(),
         if active_members.len() == 1 { "" } else { "s" }
       );
       let started = Instant::now();
-      let mut run = run_workspace_check(self.workspace_root, &self.identity, target, &features, &active_members)?;
+      if collect_typed && prepared_driver.is_none() {
+        prepared_driver = Some(PreparedCompilerFactDriver::prepare(
+          typed_snapshot.ok_or_else(|| RailError::message("typed compiler fact snapshot disappeared"))?,
+          producer_authority
+            .as_ref()
+            .ok_or_else(|| RailError::message("typed compiler fact producer authority disappeared"))?,
+        )?);
+      }
+      if collect_typed && view.compiles_doctests() && prepared_doctest_sysroot.is_none() {
+        let wrapper = compiler_observation_wrapper()?;
+        prepared_doctest_sysroot = Some(
+          prepared_driver
+            .as_ref()
+            .ok_or_else(|| RailError::message("typed compiler fact driver disappeared before doctest staging"))?
+            .stage_doctest_sysroot(
+              typed_snapshot.ok_or_else(|| RailError::message("typed compiler fact snapshot disappeared"))?,
+              &wrapper,
+              Path::new(&self.identity.rustdoc_program),
+            )?,
+        );
+      }
+      let typed_context = if collect_typed {
+        Some(TypedAcquisitionContext {
+          snapshot: typed_snapshot.ok_or_else(|| RailError::message("typed compiler fact snapshot disappeared"))?,
+          driver: prepared_driver
+            .as_ref()
+            .ok_or_else(|| RailError::message("typed compiler fact driver disappeared"))?,
+          doctest_sysroot: prepared_doctest_sysroot.as_ref(),
+          packages: &typed_members,
+        })
+      } else {
+        None
+      };
+      let mut run = run_workspace_check(
+        self.workspace_root,
+        &self.identity,
+        &view,
+        &active_members,
+        typed_context.as_ref(),
+      )?;
+      if collect_typed {
+        let fresh_facts = std::mem::take(&mut run.compiler_facts)
+          .into_iter()
+          .map(ValidatedCompilerFactFragment::into_object)
+          .collect::<Vec<_>>();
+        if run.success
+          && fact_cache_key.is_some()
+          && fact_invocations_are_cacheable(&run.invocations)
+          && let Some(key) = &fact_cache_key
+        {
+          let _ = fact_store.put(key, &fresh_facts);
+        }
+        compiler_facts.extend(fresh_facts);
+      }
       progress!(
         "    Finished target {} in {:.1}s",
         format_args!("{} / {}", target, features.label()),
         started.elapsed().as_secs_f64()
       );
+      if !run.success && !run.stderr.trim().is_empty() {
+        progress!("    Cargo analysis failed:\n{}", run.stderr.trim_end());
+      }
+      if !view
+        .fact_families()
+        .contains(&crate::compiler::scheduler::CompilerFactFamily::StableDiagnostics)
+      {
+        continue;
+      }
       let parsed = parse_target_run(
         &run.stdout,
         self.workspace_root,
-        &manifest_to_member,
+        &package_to_member,
         &stale_set,
         candidates,
       );
@@ -623,7 +805,7 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
         DiagnosticsCompleteness::Incomplete
       };
 
-      for member in active_members {
+      for member in diagnostic_members {
         let manifests_member = self
           .manifests
           .members
@@ -673,23 +855,24 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
           unit_evidence,
           completeness,
         };
+        let observations: Vec<CompilationObservationManifest> = self
+          .identity
+          .package_observation_identities
+          .get(&manifests_member.package_id)
+          .map(|package| {
+            compilation_observations
+              .iter()
+              .filter(|manifest| manifest.unit.package == *package)
+              .cloned()
+              .collect()
+          })
+          .unwrap_or_default();
         let entry = CompilerDiagEntry {
           key,
           evidence: evidence.clone(),
           generated_at_unix_ms: now_unix_ms(),
           collector_version: COLLECTOR_VERSION,
-          observations: self
-            .identity
-            .package_observation_identities
-            .get(&manifests_member.package_id)
-            .map(|package| {
-              compilation_observations
-                .iter()
-                .filter(|manifest| manifest.unit.package == *package)
-                .cloned()
-                .collect()
-            })
-            .unwrap_or_default(),
+          observations,
         };
 
         update_candidate_survivors(
@@ -719,34 +902,11 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
       }
     }
 
-    Ok(result)
-  }
-
-  fn build_key_inputs(
-    &self,
-    members: &HashSet<&str>,
-  ) -> RailResult<Vec<(&str, &str, FeatureSelection, CompilerDiagKey)>> {
-    let mut keys = Vec::with_capacity(members.len() * self.targets.len() * FeatureSelection::BASELINES.len());
-
-    for member in &self.manifests.members {
-      if !members.contains(member.package_name.as_str()) {
-        continue;
-      }
-
-      let selections = planned_feature_selections(member);
-      for target in &self.targets {
-        for features in &selections {
-          keys.push((
-            member.package_name.as_str(),
-            *target,
-            features.clone(),
-            self.key_for(member, target, features.clone())?,
-          ));
-        }
-      }
-    }
-
-    Ok(keys)
+    compiler_facts.sort_by(|left, right| left.identity().cmp(right.identity()));
+    Ok(CompilerAnalysisEvidence {
+      diagnostics: result,
+      compiler_facts,
+    })
   }
 
   fn key_for(
@@ -784,6 +944,34 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
       compiler_env_fingerprint: identity.compiler_env_fingerprint.clone(),
       cargo_config_fingerprint: identity.cargo_config_fingerprint.clone(),
     })
+  }
+
+  fn fact_cache_key(
+    &self,
+    view: &AnalysisView,
+    cargo_members: &[&str],
+    typed_members: &BTreeSet<String>,
+    producer_authority: &crate::compiler::facts::CompilerFactProducerAuthority,
+  ) -> RailResult<CompilerFactCacheKey> {
+    let packages = cargo_members
+      .iter()
+      .map(|member| {
+        let manifest = self
+          .manifests
+          .members
+          .iter()
+          .find(|manifest| manifest.package_name == *member)
+          .ok_or_else(|| RailError::message(format!("missing manifest entry for member '{member}'")))?;
+        self.key_for(manifest, view.platform().as_str(), view.features().clone())
+      })
+      .collect::<RailResult<Vec<_>>>()?;
+    CompilerFactCacheKey::new(
+      view.fact_cache_identity(cargo_members, typed_members)?,
+      packages,
+      typed_members.clone(),
+      producer_authority.clone(),
+      required_compiler_fact_coverage(),
+    )
   }
 }
 
@@ -858,31 +1046,6 @@ pub fn verify_standalone_member(workspace_root: &Path, member: &str) -> RailResu
     "standalone check failed for member '{member}': {}",
     String::from_utf8_lossy(&output.stderr).trim()
   )))
-}
-
-fn planned_feature_selections(member: &crate::cargo::manifest_analyzer::ParsedManifest) -> Vec<FeatureSelection> {
-  let mut selections = FeatureSelection::BASELINES.to_vec();
-  let crate_root = member.path.parent().unwrap_or(member.path.as_path());
-  selections.extend(
-    crate::cargo::feature_scanner::scan_source_for_feature_selections(crate_root)
-      .into_iter()
-      .filter(|selected| {
-        selected
-          .iter()
-          .all(|feature| member.declared_features.contains(feature))
-      })
-      .map(FeatureSelection::Selected),
-  );
-  selections.extend(
-    member
-      .required_feature_selections
-      .iter()
-      .cloned()
-      .map(FeatureSelection::Selected),
-  );
-  selections.sort();
-  selections.dedup();
-  selections
 }
 
 fn record_target_evidence(
@@ -971,59 +1134,76 @@ fn update_candidate_survivors(
   });
 }
 
-#[derive(Debug)]
 struct WorkspaceCheckOutput {
   stdout: String,
+  stderr: String,
   success: bool,
   invocations: Vec<crate::compiler::observation::RawCompilerInvocation>,
+  compiler_facts: Vec<ValidatedCompilerFactFragment>,
+}
+
+struct TypedAcquisitionContext<'a> {
+  snapshot: &'a WorkspaceSnapshot,
+  driver: &'a PreparedCompilerFactDriver,
+  doctest_sysroot: Option<&'a CompilerFactDoctestSysroot>,
+  packages: &'a BTreeSet<String>,
 }
 
 fn run_workspace_check(
   workspace_root: &Path,
   identity: &CompilerCacheIdentity,
-  target: &str,
-  features: &FeatureSelection,
+  view: &AnalysisView,
   members: &[&str],
+  typed: Option<&TypedAcquisitionContext<'_>>,
 ) -> RailResult<WorkspaceCheckOutput> {
-  let wrapper =
-    std::env::current_exe().with_context(|| "locating cargo-rail executable for rustc wrapper".to_string())?;
+  let wrapper = compiler_observation_wrapper()?;
   let existing_workspace_wrapper = identity.rustc_workspace_wrapper.as_deref();
   let observation_directory = tempfile::Builder::new()
     .prefix("cargo-rail-compiler-observations-")
     .tempdir()
     .with_context(|| "creating compiler observation directory".to_string())?;
-  let fact_session = CompilerFactSession::write(observation_directory.path(), workspace_root)?;
+  let typed_cargo_target = typed.map(|_| observation_directory.path().join("cargo-target"));
+  let doctest_sysroot = if view.compiles_doctests() {
+    let typed = typed.ok_or_else(|| RailError::message("compile-only doctest view has no typed compiler authority"))?;
+    Some(
+      typed
+        .doctest_sysroot
+        .ok_or_else(|| RailError::message("compile-only doctest view has no staged compiler sysroot"))?,
+    )
+  } else {
+    None
+  };
+  let typed_session = typed
+    .map(|typed| {
+      typed_session(
+        typed,
+        view,
+        members,
+        observation_directory.path(),
+        typed_cargo_target
+          .as_deref()
+          .ok_or_else(|| RailError::message("typed Cargo output authority disappeared"))?,
+        doctest_sysroot,
+      )
+    })
+    .transpose()?;
+  let fact_families = if typed.is_some() {
+    view.fact_families().clone()
+  } else {
+    BTreeSet::from([crate::compiler::scheduler::CompilerFactFamily::StableDiagnostics])
+  };
+  let fact_session = CompilerFactSession::write_with_typed(
+    observation_directory.path(),
+    workspace_root,
+    &fact_families,
+    typed_session.clone(),
+  )?;
+  let args = view.cargo_arguments(members)?;
 
-  let mut args: Vec<OsString> = vec![
-    "check".into(),
-    "--locked".into(),
-    "--all-targets".into(),
-    "--message-format=json".into(),
-  ];
-  match features {
-    FeatureSelection::Default => {}
-    FeatureSelection::NoDefaultFeatures => args.push("--no-default-features".into()),
-    FeatureSelection::AllFeatures => args.push("--all-features".into()),
-    FeatureSelection::Selected(selected) => {
-      args.push("--no-default-features".into());
-      for member in members {
-        for feature in selected {
-          args.push("--features".into());
-          args.push(format!("{member}/{feature}").into());
-        }
-      }
-    }
-  }
-  for member in members {
-    args.push("--package".into());
-    args.push((*member).into());
-  }
-  if target != "default" {
-    args.push("--target".into());
-    args.push(target.into());
-  }
-
-  let mut command = Command::new(&identity.cargo_program);
+  let mut command = typed.map_or_else(
+    || Command::new(&identity.cargo_program),
+    |typed| typed.driver.cargo_command(&identity.cargo_program),
+  );
   command
     .current_dir(workspace_root)
     .env("RUSTC_WORKSPACE_WRAPPER", &wrapper)
@@ -1033,24 +1213,452 @@ fn run_workspace_check(
     .env(FACT_SESSION_ENV, fact_session)
     .env_remove(CACHE_WRAPPER_MARKER)
     .args(&args);
+  if let Some(target) = &typed_cargo_target {
+    command.env("CARGO_TARGET_DIR", target);
+  }
+  if view.compiles_doctests() {
+    command
+      .env("RUSTDOC", &wrapper)
+      .env(INNER_RUSTDOC_ENV, &identity.rustdoc_program)
+      .env(RUSTDOC_WRAPPER_MARKER, "1");
+  }
+  if typed.is_some() && existing_workspace_wrapper.is_some() {
+    return Err(RailError::message(
+      "typed compiler fact acquisition cannot compose with a configured workspace wrapper",
+    ));
+  }
   if let Some(inner_wrapper) = existing_workspace_wrapper
     && inner_wrapper != wrapper.as_os_str()
   {
     command.env(INNER_WRAPPER_ENV, inner_wrapper);
   }
 
+  #[cfg(test)]
+  QUALIFICATION_CARGO_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
   let output = command.output().with_context(|| {
     format!(
       "running cargo check for target '{target}' in {}",
-      workspace_root.display()
+      workspace_root.display(),
+      target = view.platform().as_str()
     )
   })?;
+  if typed_session.is_some() && !output.status.success() {
+    let diagnostics = cargo_failure_diagnostics(&output.stdout);
+    return Err(RailError::message(format!(
+      "typed Cargo acquisition failed with status {}: {}{}",
+      output.status,
+      String::from_utf8_lossy(&output.stderr).trim(),
+      if diagnostics.is_empty() {
+        String::new()
+      } else {
+        format!("\n{diagnostics}")
+      }
+    )));
+  }
+  if let Some(doctest_sysroot) = doctest_sysroot {
+    doctest_sysroot.revalidate()?;
+  }
 
+  let invocations = load_raw(observation_directory.path())?;
+  #[cfg(test)]
+  QUALIFICATION_COMPILER_INVOCATIONS.fetch_add(invocations.len(), std::sync::atomic::Ordering::Relaxed);
+  let compiler_facts = typed_session.as_ref().map_or_else(
+    || Ok(Vec::new()),
+    |typed| {
+      let expected_artifacts =
+        selected_typed_artifact_count(&String::from_utf8_lossy(&output.stdout), workspace_root, typed)?;
+      let fragments = load_compiler_fact_fragments(
+        &String::from_utf8_lossy(&output.stdout),
+        observation_directory.path(),
+        &invocations,
+        typed,
+      )?;
+      if !typed.doctest && fragments.len() != expected_artifacts {
+        return Err(RailError::message(format!(
+          "typed compiler fact acquisition produced {} fragments for {expected_artifacts} selected Cargo artifacts",
+          fragments.len()
+        )));
+      }
+      Ok(fragments)
+    },
+  )?;
   Ok(WorkspaceCheckOutput {
     stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     success: output.status.success(),
-    invocations: load_raw(observation_directory.path())?,
+    invocations,
+    compiler_facts,
   })
+}
+
+fn cargo_failure_diagnostics(stdout: &[u8]) -> String {
+  const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
+  let mut diagnostics = String::new();
+  for line in String::from_utf8_lossy(stdout).lines() {
+    let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+      continue;
+    };
+    if event["reason"] != "compiler-message" || event["message"]["level"] != "error" {
+      continue;
+    }
+    let message = event["message"]["rendered"]
+      .as_str()
+      .or_else(|| event["message"]["message"].as_str())
+      .unwrap_or("compiler reported an error");
+    if diagnostics.len().saturating_add(message.len()) > MAX_DIAGNOSTIC_BYTES {
+      diagnostics.push_str("compiler diagnostics truncated");
+      break;
+    }
+    diagnostics.push_str(message.trim_end());
+    diagnostics.push('\n');
+  }
+  diagnostics
+}
+
+fn fact_invocations_are_cacheable(invocations: &[crate::compiler::observation::RawCompilerInvocation]) -> bool {
+  let mut observed = false;
+  for invocation in invocations
+    .iter()
+    .filter(|invocation| invocation.compiler_fact_unit.is_some())
+  {
+    observed = true;
+    if !invocation.success || !invocation.bypasses.is_empty() {
+      return false;
+    }
+  }
+  observed
+}
+
+fn selected_typed_artifact_count(
+  stdout: &str,
+  source_root: &Path,
+  session: &CompilerFactTypedSession,
+) -> RailResult<usize> {
+  if session.doctest {
+    return Ok(0);
+  }
+  let selected = session
+    .targets
+    .iter()
+    .map(|target| {
+      Ok((
+        target.cargo_target.clone(),
+        crate::utils::canonicalize_existing(&source_root.join(&target.source))?,
+      ))
+    })
+    .collect::<RailResult<BTreeSet<_>>>()?;
+  selected_typed_artifact_count_for(stdout, &selected)
+}
+
+fn selected_typed_artifact_count_for(stdout: &str, selected: &BTreeSet<(String, PathBuf)>) -> RailResult<usize> {
+  let mut count = 0usize;
+  for line in stdout.lines() {
+    let Ok(event) = serde_json::from_str::<CargoEvent>(line) else {
+      continue;
+    };
+    if event.reason != "compiler-artifact" {
+      continue;
+    }
+    let Some(target) = event.target else {
+      continue;
+    };
+    let Some(source) = target
+      .src_path
+      .as_deref()
+      .map(Path::new)
+      .and_then(|path| crate::utils::canonicalize_existing(path).ok())
+    else {
+      continue;
+    };
+    if !selected.contains(&(target.name.clone(), source)) {
+      continue;
+    }
+    if event.fresh != Some(false) {
+      return Err(RailError::message(format!(
+        "Cargo freshness suppressed required typed facts for selected target '{}'",
+        target.name
+      )));
+    }
+    count = count
+      .checked_add(1)
+      .ok_or_else(|| RailError::message("selected typed Cargo artifact count overflowed"))?;
+  }
+  Ok(count)
+}
+
+fn typed_session(
+  context: &TypedAcquisitionContext<'_>,
+  view: &AnalysisView,
+  members: &[&str],
+  observation_directory: &Path,
+  typed_cargo_target: &Path,
+  doctest_sysroot: Option<&CompilerFactDoctestSysroot>,
+) -> RailResult<CompilerFactTypedSession> {
+  if !view
+    .fact_families()
+    .contains(&crate::compiler::scheduler::CompilerFactFamily::TypedRustItems)
+  {
+    return Err(RailError::message(
+      "typed compiler driver was supplied to a view that does not request typed facts",
+    ));
+  }
+  let targets = CompilerFactTypedSession::targets_from_snapshot(context.snapshot, context.packages)?;
+  let view_identity = view.fact_cache_identity(members, context.packages)?;
+  let mut hasher = Sha256::new();
+  hasher.update(b"cargo-rail-compiler-fact-run-v1\0");
+  hasher.update((view_identity.len() as u64).to_le_bytes());
+  hasher.update(view_identity.as_bytes());
+  hasher.update((observation_directory.as_os_str().as_encoded_bytes().len() as u64).to_le_bytes());
+  hasher.update(observation_directory.as_os_str().as_encoded_bytes());
+  let run_identity = format!(
+    "{RUN_IDENTITY_PREFIX}{}",
+    ContentDigest::from_sha256_bytes(hasher.finalize().into())
+  );
+  let host_platform = context.snapshot.toolchain().host_target().to_string();
+  let target_platform = if view.platform().as_str() == "default" {
+    host_platform.clone()
+  } else {
+    view.platform().as_str().to_string()
+  };
+  let driver_program = context
+    .driver
+    .program()
+    .to_str()
+    .ok_or_else(|| RailError::message("compiler fact driver path is not valid UTF-8"))?
+    .to_string();
+  let compiler_library_directory = context
+    .driver
+    .compiler_library_directory()
+    .to_str()
+    .ok_or_else(|| RailError::message("compiler fact runtime library path is not valid UTF-8"))?
+    .to_string();
+  let rustc_program = crate::executable::resolve_executable_path(
+    context.snapshot.toolchain().rustc_program(),
+    context.snapshot.cargo_current_dir(),
+  )?
+  .to_str()
+  .ok_or_else(|| RailError::message("selected rustc path is not valid UTF-8"))?
+  .to_string();
+  let generated_roots = vec![typed_cargo_target.to_path_buf()];
+  let mut generated_roots = generated_roots
+    .into_iter()
+    .map(|root| {
+      crate::utils::canonicalize_allow_missing(&root)?
+        .to_str()
+        .map(str::to_string)
+        .ok_or_else(|| RailError::message("Cargo generated-source root is not valid UTF-8"))
+    })
+    .collect::<RailResult<Vec<_>>>()?;
+  generated_roots.sort();
+  generated_roots.dedup();
+  Ok(CompilerFactTypedSession {
+    run_authority: CompilerFactRunAuthority {
+      run_identity,
+      view_identity,
+    },
+    producer_authority: context.driver.producer_authority().clone(),
+    driver_program,
+    rustc_program,
+    compiler_library_directory,
+    host_platform,
+    target_platform,
+    doctest: view.compiles_doctests(),
+    doctest_sysroot: doctest_sysroot
+      .map(CompilerFactDoctestSysroot::path)
+      .map(|path| {
+        path
+          .to_str()
+          .map(str::to_string)
+          .ok_or_else(|| RailError::message("private doctest sysroot path is not valid UTF-8"))
+      })
+      .transpose()?,
+    generated_roots,
+    required_coverage: required_compiler_fact_coverage(),
+    targets,
+  })
+}
+
+fn load_compiler_fact_fragments(
+  stdout: &str,
+  observation_directory: &Path,
+  invocations: &[crate::compiler::observation::RawCompilerInvocation],
+  session: &CompilerFactTypedSession,
+) -> RailResult<Vec<ValidatedCompilerFactFragment>> {
+  let mut expected = BTreeMap::new();
+  for invocation in invocations {
+    let Some(unit) = &invocation.compiler_fact_unit else {
+      continue;
+    };
+    if !invocation.success {
+      return Err(RailError::message(
+        "typed compiler fact invocation failed before publishing complete facts",
+      ));
+    }
+    if expected.insert(unit.identity.clone(), unit).is_some() {
+      return Err(RailError::message(
+        "typed compiler fact acquisition observed a duplicate compilation-unit identity",
+      ));
+    }
+  }
+  let authorized_count = expected.len();
+  let mut fragments = Vec::with_capacity(expected.len());
+  let mut announced_sidecars = BTreeSet::new();
+  for line in stdout.lines() {
+    let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+      continue;
+    };
+    if event["reason"] != "compiler-message"
+      || event["message"]["code"]["code"].as_str() != Some(COMPILER_FACT_ANNOUNCEMENT_CODE)
+    {
+      continue;
+    }
+    let message = event["message"]["message"]
+      .as_str()
+      .ok_or_else(|| RailError::message("compiler fact announcement has no diagnostic message"))?;
+    let payload = message
+      .strip_prefix(COMPILER_FACT_ANNOUNCEMENT_PREFIX)
+      .ok_or_else(|| RailError::message("compiler fact announcement has an incompatible message envelope"))?;
+    let untrusted: CompilerFactAnnouncement = serde_json::from_str(payload)?;
+    let unit = expected.remove(&untrusted.unit_identity).ok_or_else(|| {
+      RailError::message("compiler fact announcement names an unauthorized or duplicate compilation unit")
+    })?;
+    validate_compiler_fact_cargo_envelope(&event, unit, session)?;
+    let announcement_expectation = CompilerFactAnnouncementExpectation::new(
+      session.run_authority.clone(),
+      session.producer_authority.clone(),
+      unit.identity.clone(),
+    );
+    let announcement = ValidatedCompilerFactAnnouncement::from_compiler_message(
+      Some(COMPILER_FACT_ANNOUNCEMENT_CODE),
+      message,
+      &announcement_expectation,
+    )?
+    .ok_or_else(|| RailError::message("reserved compiler fact announcement was ignored"))?;
+    let digest = announcement
+      .content_digest()
+      .strip_prefix("sha256:")
+      .ok_or_else(|| RailError::message("compiler fact announcement content digest is invalid"))?;
+    announced_sidecars.insert(format!("compiler-fact-fragment-sha256-{digest}.json"));
+    let fragment_expectation = CompilerFactExpectation::new(
+      session.run_authority.clone(),
+      session.producer_authority.clone(),
+      unit.identity.clone(),
+      session.required_coverage.clone(),
+    );
+    fragments.push(load_announced_fragment(
+      observation_directory,
+      &announcement,
+      &fragment_expectation,
+    )?);
+  }
+  if expected
+    .values()
+    .any(|unit| unit.domain != crate::compiler::facts::CompilerFactDomain::Doctest)
+  {
+    return Err(RailError::message(
+      "typed compiler fact acquisition omitted a Cargo-routed announcement",
+    ));
+  }
+  let doctest_expectations = expected
+    .iter()
+    .map(|(identity, unit)| {
+      (
+        identity.clone(),
+        CompilerFactExpectation::new(
+          session.run_authority.clone(),
+          session.producer_authority.clone(),
+          unit.identity.clone(),
+          session.required_coverage.clone(),
+        ),
+      )
+    })
+    .collect::<BTreeMap<_, _>>();
+  let mut sidecar_count = 0_usize;
+  for entry in fs::read_dir(observation_directory)? {
+    let entry = entry?;
+    let file_name = entry.file_name();
+    let Some(file_name) = file_name.to_str() else {
+      continue;
+    };
+    if !file_name.starts_with("compiler-fact-fragment-sha256-") {
+      continue;
+    }
+    sidecar_count = sidecar_count
+      .checked_add(1)
+      .ok_or_else(|| RailError::message("compiler fact sidecar count overflow"))?;
+    if sidecar_count > authorized_count {
+      return Err(RailError::message(
+        "typed compiler fact acquisition produced more sidecars than authorized units",
+      ));
+    }
+    if announced_sidecars.contains(file_name) {
+      continue;
+    }
+    let (unit_identity, fragment) = load_discovered_doctest_fragment(&entry.path(), &doctest_expectations)?;
+    if expected.remove(&unit_identity).is_none() {
+      return Err(RailError::message(
+        "typed doctest fact acquisition produced a duplicate compilation unit",
+      ));
+    }
+    fragments.push(fragment);
+  }
+  if !expected.is_empty() {
+    return Err(RailError::message(format!(
+      "typed compiler fact acquisition is incomplete for {} compilation unit{}",
+      expected.len(),
+      if expected.len() == 1 { "" } else { "s" }
+    )));
+  }
+  fragments.sort_by(|left, right| left.object_identity().cmp(right.object_identity()));
+  if fragments
+    .windows(2)
+    .any(|pair| pair[0].object_identity() == pair[1].object_identity())
+  {
+    return Err(RailError::message(
+      "typed compiler fact acquisition produced duplicate object identities",
+    ));
+  }
+  Ok(fragments)
+}
+
+fn validate_compiler_fact_cargo_envelope(
+  event: &serde_json::Value,
+  unit: &crate::compiler::facts::CompilerFactUnit,
+  session: &CompilerFactTypedSession,
+) -> RailResult<()> {
+  let target = session
+    .targets
+    .iter()
+    .find(|target| target.package == unit.package && target.cargo_target == unit.cargo_target)
+    .ok_or_else(|| RailError::message("compiler fact unit is outside its captured Cargo target authority"))?;
+  if event["target"]["name"].as_str() != Some(unit.cargo_target.as_str()) {
+    return Err(RailError::message(
+      "compiler fact announcement does not match Cargo's target envelope",
+    ));
+  }
+  let kinds = event["target"]["kind"]
+    .as_array()
+    .ok_or_else(|| RailError::message("compiler fact Cargo envelope has no target kinds"))?;
+  let kind_matches = kinds.iter().filter_map(serde_json::Value::as_str).any(|kind| {
+    matches!(
+      (&unit.target_kind, kind),
+      (
+        CompilerFactTargetKind::Library,
+        "lib" | "rlib" | "dylib" | "cdylib" | "staticlib"
+      ) | (CompilerFactTargetKind::Binary, "bin")
+        | (CompilerFactTargetKind::Test, "test")
+        | (CompilerFactTargetKind::Example, "example")
+        | (CompilerFactTargetKind::Benchmark, "bench")
+        | (CompilerFactTargetKind::ProcMacro, "proc-macro")
+        | (CompilerFactTargetKind::BuildScript, "custom-build")
+    ) || matches!(&unit.target_kind, CompilerFactTargetKind::Other(other) if other == kind)
+  });
+  if !kind_matches || target.target_kind != unit.target_kind {
+    return Err(RailError::message(
+      "compiler fact announcement does not match Cargo's target kind",
+    ));
+  }
+  Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -1082,7 +1690,7 @@ impl ParsedMemberTarget {
 fn parse_target_run(
   stdout: &str,
   workspace_root: &Path,
-  manifest_to_member: &HashMap<String, String>,
+  package_to_member: &HashMap<String, String>,
   stale_members: &HashSet<&str>,
   candidates: &[CompilerCandidate],
 ) -> HashMap<String, ParsedMemberTarget> {
@@ -1097,10 +1705,10 @@ fn parse_target_run(
       continue;
     }
 
-    let Some(manifest_path) = message.manifest_path.as_deref() else {
+    let Some(package_id) = message.package_id.as_deref() else {
       continue;
     };
-    let Some(member_name) = manifest_to_member.get(manifest_path) else {
+    let Some(member_name) = package_to_member.get(package_id) else {
       continue;
     };
     if !stale_members.contains(member_name.as_str()) {
@@ -1195,29 +1803,27 @@ fn parse_compilation_observations(
   let source_root = &identity.observation_context.source_root;
   let mut artifacts = Vec::new();
   let mut build_script_outputs = HashMap::<String, CargoBuildScriptOutput>::new();
+  let mut build_scripts = Vec::new();
+  let mut observed_package_identities = identity.package_observation_identities.clone();
   for message in Message::parse_stream(BufReader::new(stdout.as_bytes())) {
     let message =
       message.map_err(|error| RailError::message(format!("failed to parse stable Cargo JSON message: {error}")))?;
     if let Message::BuildScriptExecuted(script) = message {
-      if let Some(package) = identity.package_observation_identities.get(&script.package_id)
-        && package.starts_with("local:")
-      {
-        let summary = build_script_output_summary(&script);
-        build_script_outputs
-          .entry(package.clone())
-          .and_modify(|output| *output = CargoBuildScriptOutput::Ambiguous)
-          .or_insert_with(|| CargoBuildScriptOutput::One(summary));
-      }
+      build_scripts.push(script);
       continue;
     }
     let Message::CompilerArtifact(artifact) = message else {
       continue;
     };
     let mut bypasses = BTreeSet::new();
-    let package = identity
-      .package_observation_identities
+    let package = observed_package_identities
       .get(&artifact.package_id)
       .cloned()
+      .or_else(|| {
+        crate::utils::canonicalize_existing(artifact.manifest_path.as_std_path())
+          .ok()
+          .and_then(|manifest| identity.package_observation_manifests.get(&manifest).cloned())
+      })
       .unwrap_or_else(|| {
         bypasses.insert("cargo_package_identity_unavailable".to_string());
         format!("unknown:{}", artifact.package_id)
@@ -1225,6 +1831,7 @@ fn parse_compilation_observations(
     if !package.starts_with("local:") {
       continue;
     }
+    observed_package_identities.insert(artifact.package_id.clone(), package.clone());
     let is_custom_build = artifact.target.kind.contains(&TargetKind::CustomBuild);
     let explicit_executable_path = artifact
       .executable
@@ -1285,6 +1892,17 @@ fn parse_compilation_observations(
       fresh: artifact.fresh,
       bypasses,
     });
+  }
+  for script in build_scripts {
+    if let Some(package) = observed_package_identities.get(&script.package_id)
+      && package.starts_with("local:")
+    {
+      let summary = build_script_output_summary(&script);
+      build_script_outputs
+        .entry(package.clone())
+        .and_modify(|output| *output = CargoBuildScriptOutput::Ambiguous)
+        .or_insert_with(|| CargoBuildScriptOutput::One(summary));
+    }
   }
   let mut manifests = build_manifests(
     invocations,
@@ -1457,7 +2075,7 @@ fn compiler_observation_miss_reason<'a>(
     return Some(reason);
   }
   for manifest in observations {
-    if let Some(reason) = manifest.revalidation_reason(workspace_root) {
+    if let Some(reason) = manifest.diagnostic_revalidation_reason(workspace_root) {
       return Some(reason);
     }
   }
@@ -2270,6 +2888,27 @@ fn package_observation_identities(snapshot: &WorkspaceSnapshot) -> RailResult<Ha
     .collect()
 }
 
+fn package_observation_manifest_identities(
+  snapshot: &WorkspaceSnapshot,
+  identities: &HashMap<PackageId, String>,
+) -> RailResult<HashMap<PathBuf, String>> {
+  snapshot
+    .base_resolution()
+    .metadata()
+    .packages
+    .iter()
+    .filter(|package| package.source.is_none())
+    .map(|package| {
+      let manifest = crate::utils::canonicalize_existing(package.manifest_path.as_std_path())?;
+      let identity = identities
+        .get(&package.id)
+        .cloned()
+        .ok_or_else(|| RailError::message(format!("local package '{}' has no observation identity", package.id)))?;
+      Ok((manifest, identity))
+    })
+    .collect()
+}
+
 fn package_dependency_graph(
   snapshot: &WorkspaceSnapshot,
   identities: &HashMap<PackageId, String>,
@@ -2854,13 +3493,10 @@ fn append_identity_frame(output: &mut Vec<u8>, tag: &[u8], value: &[u8]) {
   output.extend_from_slice(value);
 }
 
-fn build_manifest_member_index(members: &[crate::cargo::manifest_analyzer::ParsedManifest]) -> HashMap<String, String> {
-  let mut index = HashMap::with_capacity(members.len() * 2);
+fn build_package_member_index(members: &[crate::cargo::manifest_analyzer::ParsedManifest]) -> HashMap<String, String> {
+  let mut index = HashMap::with_capacity(members.len());
   for member in members {
-    index.insert(member.path.to_string_lossy().into_owned(), member.package_name.clone());
-    if let Ok(canonical) = member.path.canonicalize() {
-      index.insert(canonical.to_string_lossy().into_owned(), member.package_name.clone());
-    }
+    index.insert(member.package_id.to_string(), member.package_name.clone());
   }
   index
 }
@@ -2876,10 +3512,11 @@ fn parse_unused_crate_name(message: &str) -> Option<&str> {
 #[derive(Debug, Deserialize)]
 struct CargoEvent {
   reason: String,
-  manifest_path: Option<String>,
+  package_id: Option<String>,
   target: Option<CargoTarget>,
   message: Option<CargoDiagnostic>,
   profile: Option<CargoProfile>,
+  fresh: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2951,6 +3588,511 @@ fn is_relevant_target(target: &CargoTarget) -> bool {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn target_run_attributes_cargo_messages_by_package_identity() {
+    let package_id = "path+file:///C:/workspace/member#0.1.0";
+    let target = serde_json::json!({
+      "kind": ["lib"],
+      "name": "member",
+      "src_path": "C:\\workspace\\member\\src\\lib.rs",
+    });
+    let diagnostic = serde_json::json!({
+      "reason": "compiler-message",
+      "package_id": package_id,
+      "manifest_path": "C:\\workspace\\member\\Cargo.toml",
+      "target": target.clone(),
+      "message": {
+        "message": "extern crate `log` is unused in crate `member`",
+        "code": { "code": "unused_crate_dependencies" },
+      },
+    });
+    let artifact = serde_json::json!({
+      "reason": "compiler-artifact",
+      "package_id": package_id,
+      "manifest_path": "\\\\?\\C:\\workspace\\member\\Cargo.toml",
+      "target": target,
+      "profile": { "test": false },
+    });
+    let stdout = format!("{diagnostic}\n{artifact}\n");
+    let package_to_member = HashMap::from([(package_id.to_string(), "member".to_string())]);
+    let stale_members = HashSet::from(["member"]);
+    let candidates = [CompilerCandidate {
+      member: "member".to_string(),
+      crate_name: "log".to_string(),
+      kind: DepKind::Normal,
+      applicable_targets: BTreeSet::from(["default".to_string()]),
+      required_features: None,
+    }];
+
+    let parsed = parse_target_run(
+      &stdout,
+      Path::new("C:\\workspace"),
+      &package_to_member,
+      &stale_members,
+      &candidates,
+    );
+    let member = parsed.get("member").expect("member evidence");
+    assert_eq!(member.compiled_targets.len(), 1);
+    assert_eq!(member.warned_targets_by_dep.get("log").map(BTreeSet::len), Some(1));
+  }
+
+  #[test]
+  fn typed_artifact_completeness_rejects_cargo_freshness() {
+    let root = tempfile::tempdir().expect("typed source root");
+    let source = root.path().join("src/lib.rs");
+    fs::create_dir_all(source.parent().expect("source parent")).expect("source directory");
+    fs::write(&source, "pub fn item() {}\n").expect("source");
+    let source = crate::utils::canonicalize_existing(&source).expect("canonical source");
+    let selected = BTreeSet::from([("unit".to_string(), source.clone())]);
+    let event = |fresh| {
+      serde_json::json!({
+        "reason": "compiler-artifact",
+        "target": {
+          "kind": ["lib"],
+          "name": "unit",
+          "src_path": source,
+        },
+        "fresh": fresh,
+      })
+      .to_string()
+    };
+
+    assert!(selected_typed_artifact_count_for(&event(true), &selected).is_err());
+    assert_eq!(
+      selected_typed_artifact_count_for(&event(false), &selected).expect("non-fresh selected artifact"),
+      1
+    );
+  }
+
+  #[cfg(any(unix, windows))]
+  struct InstalledTestFactDriver {
+    path: PathBuf,
+    installed: bool,
+  }
+
+  #[cfg(any(unix, windows))]
+  impl InstalledTestFactDriver {
+    fn install() -> RailResult<Self> {
+      let source = std::env::var_os("CARGO_RAIL_TEST_FACT_DRIVER")
+        .map(PathBuf::from)
+        .ok_or_else(|| RailError::message("CARGO_RAIL_TEST_FACT_DRIVER is required for the exact-reuse workload"))?;
+      let executable = std::env::current_exe()?;
+      let path = executable
+        .parent()
+        .ok_or_else(|| RailError::message("test executable has no companion directory"))?
+        .join(if cfg!(windows) {
+          "cargo-rail-fact-driver.exe"
+        } else {
+          "cargo-rail-fact-driver"
+        });
+      if path.exists() {
+        return Err(RailError::message(format!(
+          "refusing to replace pre-existing test driver sibling '{}'",
+          path.display()
+        )));
+      }
+      fs::copy(&source, &path)?;
+      #[cfg(unix)]
+      {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o500))?;
+      }
+      Ok(Self { path, installed: true })
+    }
+
+    fn remove(&mut self) -> RailResult<()> {
+      if self.installed {
+        fs::remove_file(&self.path)?;
+        self.installed = false;
+      }
+      Ok(())
+    }
+  }
+
+  #[cfg(any(unix, windows))]
+  impl Drop for InstalledTestFactDriver {
+    fn drop(&mut self) {
+      if self.installed {
+        let _ = fs::remove_file(&self.path);
+      }
+    }
+  }
+
+  #[cfg(any(unix, windows))]
+  fn exact_reuse_workspace() -> RailResult<tempfile::TempDir> {
+    let workspace = tempfile::Builder::new()
+      .prefix("cargo-rail-compiler-fact-reuse-")
+      .tempdir()?;
+    crate::git::init_repo(workspace.path(), "main")?;
+    fs::create_dir_all(workspace.path().join(".config"))?;
+    fs::create_dir_all(workspace.path().join("app/src"))?;
+    fs::create_dir_all(workspace.path().join("dep/src"))?;
+    fs::write(
+      workspace.path().join("Cargo.toml"),
+      r#"[workspace]
+members = ["app", "dep"]
+resolver = "3"
+"#,
+    )?;
+    fs::write(
+      workspace.path().join("Cargo.lock"),
+      r#"# This file is automatically @generated by Cargo.
+# It is not intended for manual editing.
+version = 4
+
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = [
+ "dep",
+]
+
+[[package]]
+name = "dep"
+version = "0.1.0"
+"#,
+    )?;
+    fs::write(workspace.path().join(".gitignore"), "/target\n/.cargo-rail\n")?;
+    fs::write(workspace.path().join(".config/rail.toml"), "")?;
+    fs::write(
+      workspace.path().join("app/Cargo.toml"),
+      r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["default-mode"]
+default-mode = []
+extra = []
+
+[dependencies]
+dep = { path = "../dep" }
+"#,
+    )?;
+    fs::write(
+      workspace.path().join("app/src/lib.rs"),
+      r#"pub fn answer() -> u32 {
+  42
+}
+"#,
+    )?;
+    fs::write(
+      workspace.path().join("dep/Cargo.toml"),
+      r#"[package]
+name = "dep"
+version = "0.1.0"
+edition = "2024"
+"#,
+    )?;
+    fs::write(
+      workspace.path().join("dep/src/lib.rs"),
+      "pub fn unused() -> u32 { 7 }\n",
+    )?;
+
+    let git = crate::git::SystemGit::open(workspace.path())?;
+    git.set_config("user.name", "Compiler Fact Test")?;
+    git.set_config("user.email", "compiler-fact-test@example.invalid")?;
+    git.set_config("commit.gpgSign", "false")?;
+    git.stage_all()?;
+    git.commit("fixture")?;
+    Ok(workspace)
+  }
+
+  /// This is an ignored, explicitly provisioned native-driver workload rather
+  /// than an ordinary unit test. It proves the cold acquisition and the warm
+  /// exact-CAS path through the production collector.
+  #[cfg(any(unix, windows))]
+  #[test]
+  #[ignore = "requires the exact rustc-dev companion authority embedded by the protocol harness"]
+  fn exact_compiler_fact_cas_reuse_eliminates_independent_acquisitions() -> RailResult<()> {
+    let workspace = exact_reuse_workspace()?;
+    let context = crate::workspace::WorkspaceContext::build_with_snapshot(workspace.path())?;
+    let snapshot = context.snapshot()?;
+    let packages = context.cargo().workspace_members();
+    let manifests = ManifestAnalyzer::parse_snapshot(snapshot, &packages)?;
+    let identity = CompilerCacheIdentity::capture(snapshot)?;
+    let targets = vec!["default"];
+    let collector =
+      CompilerDiagnosticsCollector::with_identity(workspace.path(), &manifests, targets.clone(), &identity);
+    let candidates = [CompilerCandidate {
+      member: "app".to_string(),
+      crate_name: "dep".to_string(),
+      kind: DepKind::Normal,
+      applicable_targets: BTreeSet::from(["default".to_string()]),
+      required_features: None,
+    }];
+    let typed_packages = BTreeSet::from(["app".to_string()]);
+    let doctest_packages = BTreeSet::new();
+
+    let combined = AnalysisSchedule::for_combined(
+      &manifests.members,
+      &targets,
+      &candidates,
+      &typed_packages,
+      &doctest_packages,
+    )?
+    .views()
+    .len();
+    let diagnostics = AnalysisSchedule::for_diagnostics(&manifests.members, &targets, &candidates)?
+      .views()
+      .len();
+    let typed = AnalysisSchedule::for_combined(&manifests.members, &targets, &[], &typed_packages, &doctest_packages)?
+      .views()
+      .len();
+    assert_eq!((combined, diagnostics + typed), (3, 6));
+
+    let driver_source = std::env::var_os("CARGO_RAIL_TEST_FACT_DRIVER")
+      .map(PathBuf::from)
+      .ok_or_else(|| RailError::message("CARGO_RAIL_TEST_FACT_DRIVER is required for the exact-reuse workload"))?;
+    let driver_bytes = fs::metadata(driver_source)?.len();
+    let mut installed_driver = InstalledTestFactDriver::install()?;
+    let cold_started = Instant::now();
+    let cold = collector.collect_with_typed_items(snapshot, &candidates, &typed_packages, &doctest_packages)?;
+    let cold_elapsed = cold_started.elapsed();
+    if cold.compiler_facts.is_empty() {
+      return Err(RailError::message(
+        "cold compiler fact workload returned no exact objects",
+      ));
+    }
+    let app = context
+      .cargo()
+      .get_package("app")
+      .ok_or_else(|| RailError::message("fixture app package disappeared"))?;
+    let cold_cache = &cold
+      .diagnostics
+      .get(&app.id)
+      .ok_or_else(|| RailError::message("cold compiler diagnostics disappeared"))?
+      .cache;
+    assert_eq!((cold_cache.hits, cold_cache.misses), (0, diagnostics));
+    let cold_objects = cold
+      .compiler_facts
+      .iter()
+      .map(|fact| serde_json::to_vec(fact.object()))
+      .collect::<Result<Vec<_>, _>>()?;
+    let cold_identities = cold
+      .compiler_facts
+      .iter()
+      .map(|fact| fact.identity().to_string())
+      .collect::<Vec<_>>();
+
+    installed_driver.remove()?;
+    let warm_started = Instant::now();
+    let warm = collector.collect_with_typed_items(snapshot, &[], &typed_packages, &doctest_packages)?;
+    let warm_elapsed = warm_started.elapsed();
+    assert!(warm.diagnostics.is_empty());
+    assert_eq!(
+      warm
+        .compiler_facts
+        .iter()
+        .map(|fact| fact.identity())
+        .collect::<Vec<_>>(),
+      cold_identities.iter().map(String::as_str).collect::<Vec<_>>()
+    );
+    assert_eq!(
+      warm
+        .compiler_facts
+        .iter()
+        .map(|fact| serde_json::to_vec(fact.object()))
+        .collect::<Result<Vec<_>, _>>()?,
+      cold_objects
+    );
+    assert!(
+      warm_elapsed < cold_elapsed,
+      "warm exact reuse ({warm_elapsed:?}) must be faster than cold acquisition ({cold_elapsed:?})"
+    );
+
+    println!(
+      "{}",
+      serde_json::to_string(&serde_json::json!({
+        "schema_version": 1,
+        "workload": "compiler-fact-exact-reuse",
+        "host": snapshot.toolchain().host_target(),
+        "combined_cold_cargo_views": combined,
+        "independent_cold_cargo_views": diagnostics + typed,
+        "cold_cargo_views_eliminated": diagnostics + typed - combined,
+        "warm_cargo_views": 0,
+        "cold_wall_ms": u64::try_from(cold_elapsed.as_millis()).unwrap_or(u64::MAX),
+        "warm_wall_ms": u64::try_from(warm_elapsed.as_millis()).unwrap_or(u64::MAX),
+        "exact_fact_objects": cold_objects.len(),
+        "exact_fact_bytes": cold_objects.iter().map(Vec::len).sum::<usize>(),
+        "driver_bytes": driver_bytes,
+      }))?
+    );
+    Ok(())
+  }
+
+  /// Execute one release-optimized acquisition sample for the retained Task 6
+  /// qualification harness. The lane is explicit so the harness measures the
+  /// real independent collectors instead of inferring their cost from a view
+  /// count.
+  #[cfg(any(unix, windows))]
+  #[test]
+  #[ignore = "requires the exact rustc-dev companion authority embedded by the qualification harness"]
+  fn compiler_fact_acquisition_qualification_sample() -> RailResult<()> {
+    let lane = std::env::var("CARGO_RAIL_COMPILER_FACT_QUALIFICATION_LANE")
+      .map_err(|_| RailError::message("CARGO_RAIL_COMPILER_FACT_QUALIFICATION_LANE is required"))?;
+    if lane != "combined" && lane != "independent" {
+      return Err(RailError::message(format!(
+        "unsupported compiler fact qualification lane '{lane}'"
+      )));
+    }
+
+    let workspace = exact_reuse_workspace()?;
+    let context = crate::workspace::WorkspaceContext::build_with_snapshot(workspace.path())?;
+    let snapshot = context.snapshot()?;
+    let packages = context.cargo().workspace_members();
+    let manifests = ManifestAnalyzer::parse_snapshot(snapshot, &packages)?;
+    let identity = CompilerCacheIdentity::capture(snapshot)?;
+    let targets = vec!["default"];
+    let collector =
+      CompilerDiagnosticsCollector::with_identity(workspace.path(), &manifests, targets.clone(), &identity);
+    let candidates = [CompilerCandidate {
+      member: "app".to_string(),
+      crate_name: "dep".to_string(),
+      kind: DepKind::Normal,
+      applicable_targets: BTreeSet::from(["default".to_string()]),
+      required_features: None,
+    }];
+    let typed_packages = BTreeSet::from(["app".to_string()]);
+    let doctest_packages = BTreeSet::new();
+    let combined_views = AnalysisSchedule::for_combined(
+      &manifests.members,
+      &targets,
+      &candidates,
+      &typed_packages,
+      &doctest_packages,
+    )?
+    .views()
+    .len();
+    let diagnostic_views = AnalysisSchedule::for_diagnostics(&manifests.members, &targets, &candidates)?
+      .views()
+      .len();
+    let typed_views =
+      AnalysisSchedule::for_combined(&manifests.members, &targets, &[], &typed_packages, &doctest_packages)?
+        .views()
+        .len();
+    assert_eq!((combined_views, diagnostic_views + typed_views), (3, 6));
+
+    let driver_source = std::env::var_os("CARGO_RAIL_TEST_FACT_DRIVER")
+      .map(PathBuf::from)
+      .ok_or_else(|| RailError::message("CARGO_RAIL_TEST_FACT_DRIVER is required for the qualification workload"))?;
+    let driver_bytes = fs::metadata(driver_source)?.len();
+    let mut installed_driver = InstalledTestFactDriver::install()?;
+    QUALIFICATION_CARGO_VIEWS.store(0, std::sync::atomic::Ordering::Relaxed);
+    QUALIFICATION_COMPILER_INVOCATIONS.store(0, std::sync::atomic::Ordering::Relaxed);
+
+    let cold_started = Instant::now();
+    let cold = if lane == "combined" {
+      collector.collect_with_typed_items(snapshot, &candidates, &typed_packages, &doctest_packages)?
+    } else {
+      let diagnostics = collector.collect_for_candidates(&candidates)?;
+      let mut typed = collector.collect_with_typed_items(snapshot, &[], &typed_packages, &doctest_packages)?;
+      assert!(typed.diagnostics.is_empty());
+      typed.diagnostics = diagnostics;
+      typed
+    };
+    let cold_elapsed = cold_started.elapsed();
+    let cold_cargo_views = QUALIFICATION_CARGO_VIEWS.load(std::sync::atomic::Ordering::Relaxed);
+    let cold_compiler_invocations = QUALIFICATION_COMPILER_INVOCATIONS.load(std::sync::atomic::Ordering::Relaxed);
+    let expected_cold_views = if lane == "combined" {
+      combined_views
+    } else {
+      diagnostic_views + typed_views
+    };
+    assert_eq!(cold_cargo_views, expected_cold_views);
+    if cold.compiler_facts.is_empty() {
+      return Err(RailError::message(
+        "compiler fact qualification workload returned no exact objects",
+      ));
+    }
+    let app = context
+      .cargo()
+      .get_package("app")
+      .ok_or_else(|| RailError::message("qualification fixture app package disappeared"))?;
+    let cold_cache = &cold
+      .diagnostics
+      .get(&app.id)
+      .ok_or_else(|| RailError::message("qualification compiler diagnostics disappeared"))?
+      .cache;
+    assert_eq!((cold_cache.hits, cold_cache.misses), (0, diagnostic_views));
+    let cold_objects = cold
+      .compiler_facts
+      .iter()
+      .map(|fact| serde_json::to_vec(fact.object()))
+      .collect::<Result<Vec<_>, _>>()?;
+    let cold_identities = cold
+      .compiler_facts
+      .iter()
+      .map(|fact| fact.identity().to_string())
+      .collect::<Vec<_>>();
+    let mut framed_objects = Vec::new();
+    for object in &cold_objects {
+      framed_objects.extend_from_slice(&(object.len() as u64).to_le_bytes());
+      framed_objects.extend_from_slice(object);
+    }
+    let object_set_digest = format!("sha256:{}", ContentDigest::sha256(&framed_objects));
+
+    let mut warm_wall_ns = None;
+    let mut warm_cargo_views = None;
+    let mut warm_compiler_invocations = None;
+    if lane == "combined" {
+      installed_driver.remove()?;
+      QUALIFICATION_CARGO_VIEWS.store(0, std::sync::atomic::Ordering::Relaxed);
+      QUALIFICATION_COMPILER_INVOCATIONS.store(0, std::sync::atomic::Ordering::Relaxed);
+      let warm_started = Instant::now();
+      let warm = collector.collect_with_typed_items(snapshot, &[], &typed_packages, &doctest_packages)?;
+      let warm_elapsed = warm_started.elapsed();
+      assert!(warm.diagnostics.is_empty());
+      assert_eq!(
+        warm
+          .compiler_facts
+          .iter()
+          .map(|fact| fact.identity())
+          .collect::<Vec<_>>(),
+        cold_identities.iter().map(String::as_str).collect::<Vec<_>>()
+      );
+      assert_eq!(
+        warm
+          .compiler_facts
+          .iter()
+          .map(|fact| serde_json::to_vec(fact.object()))
+          .collect::<Result<Vec<_>, _>>()?,
+        cold_objects
+      );
+      warm_wall_ns = Some(u64::try_from(warm_elapsed.as_nanos()).unwrap_or(u64::MAX));
+      warm_cargo_views = Some(QUALIFICATION_CARGO_VIEWS.load(std::sync::atomic::Ordering::Relaxed));
+      warm_compiler_invocations = Some(QUALIFICATION_COMPILER_INVOCATIONS.load(std::sync::atomic::Ordering::Relaxed));
+      assert_eq!((warm_cargo_views, warm_compiler_invocations), (Some(0), Some(0)));
+      assert!(warm_elapsed < cold_elapsed);
+    }
+
+    println!(
+      "{}",
+      serde_json::to_string(&serde_json::json!({
+        "schema_version": 2,
+        "workload": "compiler-fact-acquisition",
+        "lane": lane,
+        "host": snapshot.toolchain().host_target(),
+        "combined_scheduled_cargo_views": combined_views,
+        "diagnostic_scheduled_cargo_views": diagnostic_views,
+        "typed_scheduled_cargo_views": typed_views,
+        "cold_cargo_views": cold_cargo_views,
+        "cold_compiler_invocations": cold_compiler_invocations,
+        "cold_wall_ns": u64::try_from(cold_elapsed.as_nanos()).unwrap_or(u64::MAX),
+        "warm_cargo_views": warm_cargo_views,
+        "warm_compiler_invocations": warm_compiler_invocations,
+        "warm_wall_ns": warm_wall_ns,
+        "exact_fact_objects": cold_objects.len(),
+        "exact_fact_bytes": cold_objects.iter().map(Vec::len).sum::<usize>(),
+        "exact_fact_identities": cold_identities,
+        "exact_fact_set_digest": object_set_digest,
+        "driver_bytes": driver_bytes,
+      }))?
+    );
+    Ok(())
+  }
 
   #[test]
   fn native_session_environment_excludes_launcher_and_build_script_only_state() {

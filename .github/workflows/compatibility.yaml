@@ -92,10 +92,10 @@ jobs:
           key: ${{ inputs.cache-prefix }}-${{ matrix.compatibility.cache-key }}
           cache-on-failure: true
 
-      - name: Build cargo-rail with selected toolchain
+      - name: Build cargo-rail executables with selected toolchain
         env:
           RUSTUP_TOOLCHAIN: ${{ matrix.compatibility.toolchain }}
-        run: cargo build --locked --bin cargo-rail
+        run: cargo build --locked --bins
 
       - name: Verify default native filesystem
         if: matrix.compatibility.selection-probes
@@ -148,6 +148,14 @@ jobs:
         env:
           RUSTUP_TOOLCHAIN: ${{ matrix.compatibility.toolchain }}
         run: just test-all
+
+      - name: Qualify exact compiler fact driver
+        if: matrix.compatibility.full-suite
+        env:
+          RUSTUP_TOOLCHAIN: ${{ matrix.compatibility.toolchain }}
+        run: |
+          rustup component add rustc-dev
+          just check-compiler-fact-driver
 
       - name: Upload JUnit test report
         if: always() && matrix.compatibility.full-suite
@@ -222,29 +230,6 @@ jobs:
       - name: Strip Linux native wrapper debug sections
         if: runner.os == 'Linux'
         run: strip --strip-debug target/debug/cargo-rail-native-rustc-wrapper
-
-      - name: Provision case-sensitive APFS volume
-        if: matrix.filesystem.setup == 'macos-apfs-case-sensitive'
-        shell: bash
-        run: |
-          set -euo pipefail
-          image="$RUNNER_TEMP/cargo-rail-case-sensitive.dmg"
-          mount="$RUNNER_TEMP/cargo-rail-case-sensitive"
-          rm -f "$image"
-          mkdir -p "$mount"
-          hdiutil create -quiet -size 256m -fs 'Case-sensitive APFS' -volname cargo-rail-case-sensitive "$image"
-          attach_output="$(hdiutil attach -nobrowse -mountpoint "$mount" "$image")"
-          device="$(awk '/^\/dev\// { print $1; exit }' <<< "$attach_output")"
-          test -n "$device"
-          mkdir "$mount/tmp"
-          {
-            echo "FILESYSTEM_IMAGE=$image"
-            echo "FILESYSTEM_DEVICE=$device"
-            echo "FILESYSTEM_ROOT=$mount"
-            echo "TMPDIR=$mount/tmp"
-            echo "TMP=$mount/tmp"
-            echo "TEMP=$mount/tmp"
-          } >> "$GITHUB_ENV"
 
       - name: Provision Linux tmpfs volume
         if: matrix.filesystem.setup == 'linux-tmpfs'
@@ -360,17 +345,6 @@ jobs:
         run: |
           cargo nextest run -p cargo-rail --all-features --lib \
             -E 'test(=utils::tests::atomic_replacement_preserves_the_old_file_when_the_filesystem_is_full)'
-
-      - name: Detach case-sensitive APFS volume
-        if: always() && matrix.filesystem.setup == 'macos-apfs-case-sensitive'
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -n "${FILESYSTEM_DEVICE:-}" ]; then
-            hdiutil detach -force "$FILESYSTEM_DEVICE"
-          fi
-          rm -f "${FILESYSTEM_IMAGE:-$RUNNER_TEMP/cargo-rail-case-sensitive.dmg}"
-          rmdir "$RUNNER_TEMP/cargo-rail-case-sensitive" 2>/dev/null || true
 
       - name: Unmount Linux tmpfs volume
         if: always() && matrix.filesystem.setup == 'linux-tmpfs'

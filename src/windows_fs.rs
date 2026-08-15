@@ -83,6 +83,21 @@ pub(crate) fn open_for_stable_byte_observation(path: &Path) -> io::Result<File> 
   options.open(path)
 }
 
+/// Open one existing file or directory as an execution-path guard.
+///
+/// Other readers remain valid, including the Windows image loader, while byte
+/// writes, deletion, and namespace replacement remain excluded until the
+/// handle is dropped. Callers must retain guards for both an executable and
+/// its parent directory when the pathname itself is the capability.
+pub(crate) fn open_for_execution_guard(path: &Path) -> io::Result<File> {
+  let mut options = OpenOptions::new();
+  options
+    .read(true)
+    .share_mode(FILE_SHARE_READ)
+    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+  options.open(path)
+}
+
 /// Observe identity, topology, size, attributes, and mutation times through
 /// one already-open file or directory handle.
 ///

@@ -54,8 +54,14 @@ ssh-qualify-native-cache-s3-performance target runs run_id remote_url bucket reg
 ssh-collect-bench target run_id destination:
     @"{{ dev_machine }}" collect-bench cargo-rail "{{ target }}" "{{ run_id }}" "{{ destination }}"
 
+ssh-collect-compiler-facts target run_id destination:
+    @"{{ dev_machine }}" collect-results cargo-rail "{{ target }}" compiler-facts "{{ run_id }}" "{{ destination }}"
+
 check:
     @scripts/check/check.sh
+
+check-compiler-fact-driver:
+    @scripts/check-compiler-fact-driver.sh
 
 fix:
     @scripts/check/check.sh --fix
@@ -136,6 +142,33 @@ bench-native-cache-archive run_id:
 
 bench-native-cache-prune *run_ids:
     @scripts/bench/native-cache-prune.sh {{ run_ids }}
+
+bench-compiler-facts runs="20":
+    @if command -v python3 >/dev/null 2>&1; then python3 scripts/bench/compiler-facts.py run "{{ runs }}"; else python scripts/bench/compiler-facts.py run "{{ runs }}"; fi
+
+bench-compiler-facts-smoke:
+    @if command -v python3 >/dev/null 2>&1; then python3 scripts/bench/compiler-facts.py smoke; else python scripts/bench/compiler-facts.py smoke; fi
+
+bench-compiler-facts-summarize results:
+    @if command -v python3 >/dev/null 2>&1; then python3 scripts/bench/compiler-facts.py summarize "{{ results }}"; else python scripts/bench/compiler-facts.py summarize "{{ results }}"; fi
+
+bench-compiler-facts-validate results:
+    @if command -v python3 >/dev/null 2>&1; then python3 scripts/bench/compiler-facts.py validate "{{ results }}"; else python scripts/bench/compiler-facts.py validate "{{ results }}"; fi
+
+qualify-compiler-facts-remote mode runs run_id:
+    @scripts/ci/qualify-compiler-facts.sh "{{ mode }}" "{{ runs }}" "{{ run_id }}"
+
+bench-compiler-facts-archive run_id:
+    @scripts/bench/compiler-facts-archive.sh "{{ run_id }}"
+
+bench-compiler-facts-remote-plan target:
+    @scripts/bench/remote-compiler-facts.sh plan "{{ target }}"
+
+bench-compiler-facts-remote-smoke target:
+    @scripts/bench/remote-compiler-facts.sh smoke "{{ target }}" --execute
+
+bench-compiler-facts-remote target runs="20":
+    @scripts/bench/remote-compiler-facts.sh run "{{ target }}" "{{ runs }}" --execute
 
 gen-fixture members output:
     @scripts/fixtures/generate-workspace.sh "{{ members }}" "{{ output }}"

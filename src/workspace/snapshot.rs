@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
@@ -516,6 +517,11 @@ impl WorkspaceSnapshot {
     &self.source
   }
 
+  /// Read one regular source file only when it still matches this capture.
+  pub(crate) fn read_source_file(&self, path: &RepositoryPath) -> RailResult<Option<Vec<u8>>> {
+    read_captured_source_file(&self.source_root, &self.source, path)
+  }
+
   pub(crate) fn cargo(&self) -> &Arc<CargoState> {
     &self.cargo
   }
@@ -680,6 +686,105 @@ fn validate_authoritative_file_unchanged(file: &SnapshotFile, path: &Path) -> Ra
     ));
   }
   Ok(())
+}
+
+fn read_captured_source_file(
+  source_root: &Path,
+  source: &SourceSnapshot,
+  path: &RepositoryPath,
+) -> RailResult<Option<Vec<u8>>> {
+  let entries = source.tree().entries();
+  let Ok(index) = entries.binary_search_by(|entry| entry.path.cmp(path)) else {
+    return Ok(None);
+  };
+  let expected_digest = match entries[index].kind {
+    SourceEntryKind::RegularFile { digest, .. } => digest,
+    SourceEntryKind::Symlink { .. } => {
+      return Err(RailError::with_help(
+        format!("captured source '{}' is a symbolic link", path),
+        "replace analysis source symlinks with regular files before collecting compiler facts",
+      ));
+    }
+    SourceEntryKind::Deleted => {
+      return Err(RailError::message(format!(
+        "captured source '{}' has an invalid deleted final-tree entry",
+        path
+      )));
+    }
+  };
+
+  let absolute = source_root.join(path.as_path());
+  let metadata = fs::symlink_metadata(&absolute).map_err(|error| {
+    RailError::with_help(
+      format!("captured source '{}' cannot be inspected: {error}", path),
+      "retry after workspace source changes have stopped",
+    )
+  })?;
+  if !metadata.file_type().is_file() || crate::utils::is_symlink_or_reparse(&metadata) {
+    return Err(RailError::with_help(
+      format!("captured source '{}' is no longer a regular file", path),
+      "retry after workspace source changes have stopped",
+    ));
+  }
+  let mut opened = fs::File::open(&absolute).map_err(|error| {
+    RailError::with_help(
+      format!("captured source '{}' cannot be opened: {error}", path),
+      "retry after workspace source changes have stopped",
+    )
+  })?;
+  if !crate::utils::opened_file_matches_path(&opened, &absolute, metadata.len()).map_err(|error| {
+    RailError::with_help(
+      format!(
+        "captured source '{}' cannot be revalidated after opening: {error}",
+        path
+      ),
+      "retry after workspace source changes have stopped",
+    )
+  })? {
+    return Err(RailError::with_help(
+      format!("captured source '{}' changed before it was read", path),
+      "retry after workspace source changes have stopped",
+    ));
+  }
+  let capacity = usize::try_from(metadata.len()).map_err(|_| {
+    RailError::with_help(
+      format!("captured source '{}' is too large to read on this platform", path),
+      "reduce the source file size before collecting compiler facts",
+    )
+  })?;
+  let mut bytes = Vec::with_capacity(capacity);
+  (&mut opened)
+    .take(metadata.len().saturating_add(1))
+    .read_to_end(&mut bytes)
+    .map_err(|error| {
+      RailError::with_help(
+        format!("captured source '{}' cannot be read: {error}", path),
+        "retry after workspace source changes have stopped",
+      )
+    })?;
+  if bytes.len() as u64 != metadata.len()
+    || !crate::utils::opened_file_matches_path(&opened, &absolute, metadata.len()).map_err(|error| {
+      RailError::with_help(
+        format!(
+          "captured source '{}' cannot be revalidated after reading: {error}",
+          path
+        ),
+        "retry after workspace source changes have stopped",
+      )
+    })?
+  {
+    return Err(RailError::with_help(
+      format!("captured source '{}' changed while it was read", path),
+      "retry after workspace source changes have stopped",
+    ));
+  }
+  if ContentDigest::sha256(&bytes) != expected_digest {
+    return Err(RailError::with_help(
+      format!("captured source '{}' changed after workspace capture", path),
+      "retry after workspace source changes have stopped",
+    ));
+  }
+  Ok(Some(bytes))
 }
 
 fn capture_rail_config(
@@ -1232,5 +1337,49 @@ mod tests {
         && error.to_string().contains("appeared after workspace snapshot capture"),
       "{error}"
     );
+  }
+
+  #[test]
+  fn captured_source_read_rejects_post_capture_content_drift() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let source_directory = workspace.path().join("src");
+    fs::create_dir(&source_directory).expect("source directory");
+    let source_path = source_directory.join("lib.rs");
+    fs::write(&source_path, b"pub const VALUE: u8 = 1;\n").expect("initial source");
+    let source = SourceSnapshot::capture_filesystem(workspace.path(), &[]).expect("source capture");
+    let relative = RepositoryPath::new(Path::new("src/lib.rs")).expect("source path");
+
+    assert_eq!(
+      read_captured_source_file(workspace.path(), &source, &relative).expect("matching source"),
+      Some(b"pub const VALUE: u8 = 1;\n".to_vec())
+    );
+
+    fs::write(&source_path, b"pub const VALUE: u8 = 2;\n").expect("changed source");
+    let error = read_captured_source_file(workspace.path(), &source, &relative)
+      .expect_err("changed source must not satisfy the capture");
+    assert!(error.to_string().contains("changed after workspace capture"), "{error}");
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn captured_source_read_rejects_post_capture_symlink_replacement() {
+    use std::os::unix::fs::symlink;
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let source_directory = workspace.path().join("src");
+    fs::create_dir(&source_directory).expect("source directory");
+    let source_path = source_directory.join("lib.rs");
+    fs::write(&source_path, b"pub const VALUE: u8 = 1;\n").expect("initial source");
+    let source = SourceSnapshot::capture_filesystem(workspace.path(), &[]).expect("source capture");
+    let relative = RepositoryPath::new(Path::new("src/lib.rs")).expect("source path");
+
+    let replacement = workspace.path().join("replacement.rs");
+    fs::write(&replacement, b"pub const VALUE: u8 = 1;\n").expect("replacement source");
+    fs::remove_file(&source_path).expect("remove captured source");
+    symlink(&replacement, &source_path).expect("replacement symlink");
+
+    let error = read_captured_source_file(workspace.path(), &source, &relative)
+      .expect_err("a symlink must not satisfy a captured regular file");
+    assert!(error.to_string().contains("no longer a regular file"), "{error}");
   }
 }

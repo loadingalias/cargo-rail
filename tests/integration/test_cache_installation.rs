@@ -1202,6 +1202,111 @@ fn direct_cargo_reuses_verified_outputs_and_off_never_touches_l1() -> Result<()>
   Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn compiler_fact_collection_bypasses_an_ordinary_native_result_hit() -> Result<()> {
+  use std::os::unix::fs::PermissionsExt as _;
+
+  let workspace = TestWorkspace::new_single_crate("fact-cache-guard", "0.1.0")?;
+  fs::create_dir_all(workspace.path.join("helper/src"))?;
+  fs::write(
+    workspace.path.join("helper/Cargo.toml"),
+    "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+  )?;
+  fs::write(workspace.path.join("helper/src/lib.rs"), "pub fn helper() {}\n")?;
+  let manifest = workspace.path.join("Cargo.toml");
+  fs::write(
+    &manifest,
+    fs::read_to_string(&manifest)?.replace("[dependencies]\n", "[dependencies]\nhelper = { path = \"helper\" }\n"),
+  )?;
+  let lock = Command::new("cargo")
+    .current_dir(&workspace.path)
+    .args(["generate-lockfile"])
+    .output()?;
+  assert!(lock.status.success(), "lockfile generation failed: {lock:?}");
+  workspace.commit("Add unused path dependency")?;
+
+  let cargo_home = tempfile::tempdir()?;
+  let setup = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "setup"])?;
+  assert!(setup.status.success(), "cache setup failed: {setup:?}");
+  let cold = Command::new("cargo")
+    .current_dir(&workspace.path)
+    .args([
+      "check",
+      "--locked",
+      "--all-targets",
+      "--message-format=json",
+      "--package",
+      "fact-cache-guard",
+    ])
+    .env("CARGO_HOME", cargo_home.path())
+    .env("CARGO_INCREMENTAL", "0")
+    .env_remove("RUSTC_WRAPPER")
+    .env_remove("RUSTC_WORKSPACE_WRAPPER")
+    .output()?;
+  assert!(cold.status.success(), "ordinary cache seed failed: {cold:?}");
+  let native_actions = cargo_home.path().join("cargo-rail/local-cas-v2/native-actions-v2");
+  assert!(
+    fs::read_dir(&native_actions)?.next().transpose()?.is_some(),
+    "ordinary cargo check did not publish a native result"
+  );
+  let metadata = Command::new("cargo")
+    .current_dir(&workspace.path)
+    .args(["metadata", "--format-version=1", "--no-deps"])
+    .env("CARGO_HOME", cargo_home.path())
+    .output()?;
+  assert!(metadata.status.success(), "target discovery failed: {metadata:?}");
+  let metadata: serde_json::Value = serde_json::from_slice(&metadata.stdout)?;
+  let target_directory = PathBuf::from(
+    metadata["target_directory"]
+      .as_str()
+      .context("Cargo metadata target directory")?,
+  );
+  fs::remove_dir_all(&target_directory)?;
+  assert!(!target_directory.exists(), "Cargo target directory survived removal");
+
+  let rustc_probe = tempfile::tempdir()?;
+  let rustc_log = rustc_probe.path().join("fact-rustc.log");
+  let rustc_shim = rustc_probe.path().join("fact-rustc-shim");
+  fs::write(
+    &rustc_shim,
+    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$RUSTC_LOG\"\nexec \"$REAL_RUSTC\" \"$@\"\n",
+  )?;
+  fs::set_permissions(&rustc_shim, fs::Permissions::from_mode(0o700))?;
+  let analysis = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+    .current_dir(&workspace.path)
+    .args(["rail", "unify", "--check"])
+    .env("CARGO_HOME", cargo_home.path())
+    .env("CARGO_INCREMENTAL", "0")
+    .env("RUSTC", &rustc_shim)
+    .env("REAL_RUSTC", "rustc")
+    .env("RUSTC_LOG", &rustc_log)
+    .env_remove("RUSTC_WRAPPER")
+    .env_remove("RUSTC_WORKSPACE_WRAPPER")
+    .output()?;
+  let rustc_invocations = fs::read_to_string(&rustc_log).unwrap_or_else(|error| format!("<unavailable: {error}>"));
+  assert_eq!(
+    analysis.status.code(),
+    Some(1),
+    "unused dependency analysis lost required compiler facts\nstdout:\n{}\nstderr:\n{}\nrustc:\n{}",
+    String::from_utf8_lossy(&analysis.stdout),
+    String::from_utf8_lossy(&analysis.stderr),
+    rustc_invocations
+  );
+  assert!(
+    String::from_utf8_lossy(&analysis.stdout).contains("unused deps removed: 1"),
+    "unused path dependency was not planned\nstdout:\n{}",
+    String::from_utf8_lossy(&analysis.stdout)
+  );
+  assert!(
+    rustc_invocations.lines().any(|invocation| {
+      invocation.contains("--crate-name fact_cache_guard") && invocation.contains("unused-crate-dependencies")
+    }),
+    "fact-required workspace compilation was restored from the ordinary native result:\n{rustc_invocations}"
+  );
+  Ok(())
+}
+
 #[test]
 fn unsupported_shapes_bypass_before_acquisition_while_proc_macro_producers_remain_cacheable() -> Result<()> {
   let workspace = TestWorkspace::new_single_crate("transparent-early-bypass", "0.1.0")?;

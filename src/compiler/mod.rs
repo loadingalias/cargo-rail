@@ -3,15 +3,19 @@
 pub mod cfg_eval;
 pub mod collector;
 pub mod diagnostics_store;
+pub(crate) mod driver;
+pub(crate) mod fact_protocol;
+pub(crate) mod fact_store;
+pub(crate) mod facts;
 /// Exact pre-Clap compiler process classification and execution.
 pub mod invocation;
 pub mod model;
 pub(crate) mod native_cache;
 pub(crate) mod observation;
+pub(crate) mod scheduler;
 pub(crate) mod session;
 
-pub(crate) use collector::CompilerCacheIdentity;
-pub use collector::{
-  CompilerCandidate, CompilerDiagnosticsCollector, standalone_missing_features, verify_standalone_member,
-};
+pub(crate) use collector::{CompilerCacheIdentity, CompilerDiagnosticsCollector};
+pub use collector::{standalone_missing_features, verify_standalone_member};
 pub use model::{DependencyEvidenceState, DependencyIdentity, FeatureSelection, MemberEvidence};
+pub use scheduler::CompilerCandidate;

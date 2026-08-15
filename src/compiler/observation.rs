@@ -18,7 +18,7 @@ use crate::workspace::WorkspaceSnapshot;
 pub(crate) const COMPILATION_OBSERVATION_VERSION: u32 = 6;
 const COMPILER_CACHE_WRAPPER_METADATA_VERSION: u32 = 2;
 const COMPILATION_UNIT_VERSION: u32 = 2;
-const RAW_INVOCATION_VERSION: u32 = 5;
+const RAW_INVOCATION_VERSION: u32 = 6;
 
 /// Typed Cargo target domain for one compiler or rustdoc invocation.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -468,11 +468,13 @@ pub(crate) struct CompilationObservationManifest {
 }
 
 impl CompilationObservationManifest {
-  /// Re-digest every file that supplied result evidence.
+  /// Revalidate only the authority that can change compiler diagnostics.
   ///
-  /// Executables are re-digested once by the enclosing compiler-cache identity;
-  /// repeating that work for every unit would hash the same toolchain many times.
-  pub(crate) fn revalidation_reason(&self, source_root: &Path) -> Option<&'static str> {
+  /// Dependency artifacts and emitted outputs are products of the captured
+  /// inputs, so their continued presence does not affect already-derived
+  /// diagnostic evidence. Executables are bound once by the enclosing cache
+  /// identity rather than re-digested for every compilation unit.
+  pub(crate) fn diagnostic_revalidation_reason(&self, source_root: &Path) -> Option<&'static str> {
     if self.version != COMPILATION_OBSERVATION_VERSION
       || self
         .execution
@@ -485,8 +487,6 @@ impl CompilationObservationManifest {
     for (files, reason) in [
       (&self.declared_inputs, "declared_compiler_input_changed"),
       (&self.observed_reads, "observed_compiler_read_changed"),
-      (&self.dependency_artifacts, "dependency_artifact_changed"),
-      (&self.emitted_outputs, "compiler_output_changed"),
     ] {
       for file in files {
         if !file.revalidate(source_root) {
@@ -591,6 +591,35 @@ pub(crate) struct RawCompilerInvocation {
   pub(crate) cache_wrapper: Option<CompilerCacheWrapperMetadata>,
   pub(crate) success: bool,
   pub(crate) bypasses: BTreeSet<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) compiler_fact_unit: Option<crate::compiler::facts::CompilerFactUnit>,
+}
+
+impl RawCompilerInvocation {
+  /// Root-independent identity of the fact-relevant compiler-unit shape.
+  ///
+  /// The enclosing fact-set key owns source, dependency, environment, Cargo,
+  /// and toolchain authority. Keeping Cargo's root-derived output namespace
+  /// (`-C metadata`, artifact paths, and dependency filenames) out of this
+  /// unit identity lets an otherwise exact object move between workspace roots.
+  pub(crate) fn compiler_fact_invocation_identity(&self) -> RailResult<String> {
+    let bytes = serde_json::to_vec(&(
+      self.version,
+      self.mode,
+      &self.crate_name,
+      &self.crate_types,
+      &self.target_argument,
+      &self.cfg,
+      &self.emit_modes,
+      self.test_mode,
+      &self.declared_inputs,
+    ))?;
+    Ok(format!(
+      "{}{}",
+      crate::compiler::facts::INVOCATION_IDENTITY_PREFIX,
+      ContentDigest::sha256(&bytes)
+    ))
+  }
 }
 
 /// Stable Cargo JSON fields correlated with one wrapper invocation.
@@ -1296,6 +1325,7 @@ fn begin_compiler_invocation(
       cache_wrapper: crate::compiler::native_cache::metadata_from_environment(),
       success: false,
       bypasses,
+      compiler_fact_unit: None,
     },
   })
 }
@@ -1369,6 +1399,10 @@ impl InvocationRecorder {
 
   pub(crate) fn set_cache_wrapper(&mut self, metadata: CompilerCacheWrapperMetadata) {
     self.raw.cache_wrapper = Some(metadata);
+  }
+
+  pub(crate) fn set_compiler_fact_unit(&mut self, unit: crate::compiler::facts::CompilerFactUnit) {
+    self.raw.compiler_fact_unit = Some(unit);
   }
 
   /// Capture dep-info and emitted bytes after the compiler exits, then atomically publish raw evidence.
@@ -1509,13 +1543,29 @@ fn raw_publication_path(directory: &Path, compiler: &str, identity: ContentDiges
   directory.join(format!("{compiler}-sha256-{identity}.json"))
 }
 
+fn is_raw_publication_path(path: &Path) -> bool {
+  let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+    return false;
+  };
+  ["rustc-sha256-", "rustdoc-sha256-", "compiler-sha256-"]
+    .into_iter()
+    .find_map(|prefix| name.strip_prefix(prefix))
+    .and_then(|identity| identity.strip_suffix(".json"))
+    .is_some_and(|identity| {
+      identity.len() == 64
+        && identity
+          .bytes()
+          .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
 /// Load all complete wrapper records from one private invocation directory.
 pub(crate) fn load_raw(directory: &Path) -> RailResult<Vec<RawCompilerInvocation>> {
   let mut paths = fs::read_dir(directory)
     .map_err(|error| RailError::message(format!("failed to read compiler observation directory: {error}")))?
     .filter_map(Result::ok)
     .map(|entry| entry.path())
-    .filter(|path| path.extension().is_some_and(|extension| extension == "json"))
+    .filter(|path| is_raw_publication_path(path))
     .collect::<Vec<_>>();
   paths.sort();
   paths
@@ -1528,6 +1578,17 @@ pub(crate) fn load_raw(directory: &Path) -> RailResult<Vec<RawCompilerInvocation
           "compiler observation '{}' has unsupported version {}",
           path.display(),
           raw.version
+        )));
+      }
+      let compiler = match raw.mode {
+        CompilerMode::Rustc => "rustc",
+        CompilerMode::Rustdoc => "rustdoc",
+        CompilerMode::Unknown => "compiler",
+      };
+      if raw_publication_path(directory, compiler, ContentDigest::sha256(&bytes)) != path {
+        return Err(RailError::message(format!(
+          "compiler observation '{}' does not match its content-addressed name",
+          path.display()
         )));
       }
       Ok(raw)
@@ -2862,11 +2923,15 @@ mod tests {
     assert_eq!(manifest.emitted_outputs.len(), 2);
     assert!(manifest.bypasses.contains("rustdoc_output_tree_unavailable"));
     assert!(!manifest.bypasses.contains("rustdoc_dep_info_unavailable"));
-    assert_eq!(manifest.revalidation_reason(source_root), None);
+    assert_eq!(manifest.diagnostic_revalidation_reason(source_root), None);
+
+    fs::write(&index, "<html>changed</html>").expect("output mutation");
+    assert_eq!(manifest.diagnostic_revalidation_reason(source_root), None);
+    fs::write(&index, "<html>docs</html>").expect("restore output");
 
     fs::write(&nested, "pub fn other() {}\n").expect("same-size nested mutation");
     assert_eq!(
-      manifest.revalidation_reason(source_root),
+      manifest.diagnostic_revalidation_reason(source_root),
       Some("observed_compiler_read_changed")
     );
   }
@@ -2892,7 +2957,39 @@ mod tests {
       cache_wrapper: None,
       success: true,
       bypasses: BTreeSet::new(),
+      compiler_fact_unit: None,
     }
+  }
+
+  #[test]
+  fn compiler_fact_unit_identity_ignores_cargo_output_namespace_but_binds_semantics() {
+    let baseline = raw_invocation();
+    let identity = baseline
+      .compiler_fact_invocation_identity()
+      .expect("baseline fact invocation identity");
+
+    let mut moved_root = baseline.clone();
+    moved_root.compiler_arguments = vec![
+      "-C".to_string(),
+      "metadata=root-derived".to_string(),
+      "--out-dir".to_string(),
+      "/different/workspace/target".to_string(),
+    ];
+    assert_eq!(
+      moved_root
+        .compiler_fact_invocation_identity()
+        .expect("moved-root fact invocation identity"),
+      identity
+    );
+
+    let mut changed_cfg = baseline;
+    changed_cfg.cfg.insert("feature=\"other\"".to_string());
+    assert_ne!(
+      changed_cfg
+        .compiler_fact_invocation_identity()
+        .expect("changed fact invocation identity"),
+      identity
+    );
   }
 
   #[test]
@@ -2910,5 +3007,31 @@ mod tests {
     assert_eq!(loaded.len(), 2);
     assert!(loaded.contains(&first));
     assert!(loaded.contains(&second));
+  }
+
+  #[test]
+  fn raw_loader_ignores_typed_sidecars_and_binds_content_addressed_names() {
+    let directory = tempfile::tempdir().expect("observation directory");
+    fs::write(
+      directory
+        .path()
+        .join(format!("compiler-fact-fragment-sha256-{}.json", "a".repeat(64))),
+      b"{}",
+    )
+    .expect("typed sidecar");
+    assert!(load_raw(directory.path()).expect("ignore typed sidecar").is_empty());
+
+    let raw = raw_invocation();
+    publish_raw(directory.path(), &raw).expect("raw observation");
+    let path = fs::read_dir(directory.path())
+      .expect("observation directory")
+      .filter_map(Result::ok)
+      .map(|entry| entry.path())
+      .find(|path| is_raw_publication_path(path))
+      .expect("raw observation path");
+    let mut changed = raw;
+    changed.crate_name = Some("changed".to_string());
+    fs::write(path, serde_json::to_vec(&changed).expect("changed observation")).expect("replace observation bytes");
+    assert!(load_raw(directory.path()).is_err());
   }
 }

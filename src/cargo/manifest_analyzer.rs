@@ -1,6 +1,7 @@
 //! Parse workspace manifests and classify dependency feature usage.
 
-use crate::error::{RailResult, ResultExt};
+use crate::error::{RailError, RailResult, ResultExt};
+use crate::workspace::WorkspaceSnapshot;
 use cargo_metadata::{DependencyKind as MetadataDepKind, PackageId};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
@@ -172,6 +173,8 @@ pub struct ParsedManifest {
   pub declared_features: BTreeSet<String>,
   /// Feature selections required by Cargo targets such as examples and binaries.
   pub required_feature_selections: BTreeSet<Vec<String>>,
+  /// Feature selections derived from source conditions in the captured workspace.
+  pub(crate) condition_feature_selections: BTreeSet<Vec<String>>,
   /// All dependencies with their usages (Vec because same dep can appear in multiple sections)
   pub dependencies: HashMap<DepKey, Vec<DepUsage>>,
 }
@@ -213,13 +216,36 @@ impl ManifestAnalyzer {
       .unwrap_or_default()
   }
 
-  /// Parse all workspace member manifests (in parallel)
-  pub fn parse_workspace(_workspace_root: &Path, members: &[&cargo_metadata::Package]) -> RailResult<Self> {
-    // Parse independent manifests in parallel.
+  /// Parse all workspace member manifests from one authoritative snapshot.
+  pub(crate) fn parse_snapshot(snapshot: &WorkspaceSnapshot, members: &[&cargo_metadata::Package]) -> RailResult<Self> {
+    let package_locations = snapshot
+      .packages()
+      .iter()
+      .filter_map(|package| Some((package.id(), (package.manifest_path()?, package.package_root()?))))
+      .collect::<HashMap<_, _>>();
+    let manifests = snapshot
+      .manifests()
+      .iter()
+      .map(|manifest| (manifest.path(), manifest))
+      .collect::<HashMap<_, _>>();
+
+    // Parse independent captured manifests and source conditions in parallel.
     let results: Vec<RailResult<ParsedManifest>> = members
       .par_iter()
       .map(|pkg| {
-        let manifest_path = pkg.manifest_path.as_std_path();
+        let (manifest_path, package_root) = package_locations.get(&pkg.id).copied().ok_or_else(|| {
+          RailError::message(format!(
+            "workspace package '{}' is absent from the captured local package inventory",
+            pkg.id
+          ))
+        })?;
+        let manifest = manifests.get(manifest_path).copied().ok_or_else(|| {
+          RailError::message(format!(
+            "workspace package '{}' manifest '{}' is absent from the workspace snapshot",
+            pkg.id, manifest_path
+          ))
+        })?;
+        let absolute_manifest_path = snapshot.source_root().join(manifest_path.as_path());
         let required_feature_selections = pkg
           .targets
           .iter()
@@ -230,7 +256,18 @@ impl ManifestAnalyzer {
             features
           })
           .collect();
-        Self::parse_single_manifest(manifest_path, &pkg.id, &pkg.name, required_feature_selections)
+        let condition_feature_selections =
+          crate::cargo::feature_scanner::scan_snapshot_source_for_feature_selections(snapshot, package_root)?
+            .into_iter()
+            .collect();
+        Self::parse_manifest(
+          &absolute_manifest_path,
+          manifest.bytes(),
+          &pkg.id,
+          &pkg.name,
+          required_feature_selections,
+          condition_feature_selections,
+        )
       })
       .collect();
 
@@ -281,15 +318,17 @@ impl ManifestAnalyzer {
     })
   }
 
-  /// Parse a single manifest file
-  fn parse_single_manifest(
+  /// Parse one exact captured manifest.
+  fn parse_manifest(
     manifest_path: &Path,
+    bytes: &[u8],
     package_id: &PackageId,
     package_name: &str,
     required_feature_selections: BTreeSet<Vec<String>>,
+    condition_feature_selections: BTreeSet<Vec<String>>,
   ) -> RailResult<ParsedManifest> {
-    let content =
-      std::fs::read_to_string(manifest_path).with_context(|| format!("Failed to read {}", manifest_path.display()))?;
+    let content = std::str::from_utf8(bytes)
+      .map_err(|_| RailError::message(format!("Failed to parse {} as UTF-8", manifest_path.display())))?;
 
     let doc: DocumentMut = content
       .parse()
@@ -390,6 +429,7 @@ impl ManifestAnalyzer {
       package_name: package_name.to_string(),
       declared_features,
       required_feature_selections,
+      condition_feature_selections,
       dependencies,
     })
   }

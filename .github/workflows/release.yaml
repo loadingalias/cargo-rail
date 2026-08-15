@@ -218,6 +218,85 @@ jobs:
         with:
           toolchain: ${{ needs.verify-release.outputs.msrv }}
 
+      - name: Manufacture exact compiler fact driver
+        id: fact-driver
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          if [[ "$TARGET" == *-musl ]]; then
+            echo "include=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          sha256_file() {
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$1" | awk '{print $1}'
+            else
+              shasum -a 256 "$1" | awk '{print $1}'
+            fi
+          }
+
+          sha256_stream() {
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum | awk '{print $1}'
+            else
+              shasum -a 256 | awk '{print $1}'
+            fi
+          }
+
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          test "$host" = "$TARGET"
+          rustup component add rustc-dev
+          scripts/build-compiler-fact-driver.sh
+
+          suffix=""
+          if [[ "$TARGET" == *-windows-* ]]; then
+            suffix=".exe"
+          fi
+          source="tools/compiler-fact-driver/target/release/cargo-rail-fact-driver${suffix}"
+          component="cargo-rail-fact-driver${suffix}"
+          cp "$source" "$component"
+          digest="$(sha256_file "$component")"
+          provenance="$({
+            for file in \
+              tools/compiler-fact-driver/Cargo.lock \
+              tools/compiler-fact-driver/Cargo.toml \
+              tools/compiler-fact-driver/build.rs \
+              tools/compiler-fact-driver/src/*.rs \
+              src/compiler/fact_protocol.rs; do
+              printf '%s  %s\n' "$(sha256_file "$file")" "$file"
+            done
+          } | sha256_stream)"
+          release="$(rustc -vV | sed -n 's/^release: //p')"
+          commit="$(rustc -vV | sed -n 's/^commit-hash: //p')"
+          sysroot="$(rustc --print sysroot)"
+          if command -v cygpath >/dev/null 2>&1; then
+            sysroot="$(cygpath -u "$sysroot")"
+          fi
+          compiler_libraries="$(find "$sysroot/lib" "$sysroot/bin" -maxdepth 1 -type f \( \
+            -name 'librustc_driver-*.so' -o \
+            -name 'rustc_driver-*.dll' \
+          \) 2>/dev/null || true)"
+          test "$(printf '%s\n' "$compiler_libraries" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
+          compiler_library="$compiler_libraries"
+          compiler_library_relative="${compiler_library#"$sysroot"/}"
+          test "$compiler_library_relative" != "$compiler_library"
+          compiler_library_digest="$(sha256_file "$compiler_library")"
+
+          {
+            echo "CARGO_RAIL_FACT_DRIVER_FILE=$component"
+            echo "CARGO_RAIL_FACT_DRIVER_SHA256=sha256:$digest"
+            echo "CARGO_RAIL_FACT_DRIVER_PROVENANCE=sha256:$provenance"
+            echo "CARGO_RAIL_FACT_DRIVER_RUSTC_RELEASE=$release"
+            echo "CARGO_RAIL_FACT_DRIVER_RUSTC_COMMIT=$commit"
+            echo "CARGO_RAIL_FACT_DRIVER_RUSTC_HOST=$host"
+            echo "CARGO_RAIL_FACT_DRIVER_COMPILER_LIBRARY=$compiler_library_relative"
+            echo "CARGO_RAIL_FACT_DRIVER_COMPILER_LIBRARY_SHA256=sha256:$compiler_library_digest"
+          } >> "$GITHUB_ENV"
+          echo "include=$component" >> "$GITHUB_OUTPUT"
+
       - name: Configure path remapping
         shell: bash
         run: |
@@ -242,11 +321,6 @@ jobs:
         shell: bash
         run: echo "RUSTFLAGS=${RUSTFLAGS} -C target-feature=+crt-static" >> "$GITHUB_ENV"
 
-      - name: Set macOS deployment target
-        if: contains(matrix.target, '-apple-darwin')
-        shell: bash
-        run: echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"
-
       - name: Build archive
         id: build
         uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6  # v1.30.2
@@ -259,12 +333,14 @@ jobs:
           zip: windows
           dry-run: true
           dry-run-intended: true
+          include: ${{ steps.fact-driver.outputs.include }}
 
       - name: Smoke-test tar archive
         if: matrix.archive == 'tar'
         shell: bash
         env:
           ARCHIVE: ${{ steps.build.outputs.tar }}
+          TARGET: ${{ matrix.target }}
           VERSION: ${{ needs.verify-release.outputs.version }}
         run: |
           set -euo pipefail
@@ -274,11 +350,23 @@ jobs:
           binary="$(find smoke -type f -name cargo-rail -print -quit)"
           wrapper="$(find smoke -type f -name cargo-rail-native-rustc-wrapper -print -quit)"
           worker="$(find smoke -type f -name cargo-rail-native-rustc-worker -print -quit)"
+          driver="$(find smoke -type f -name cargo-rail-fact-driver -print -quit)"
           test -n "$binary"
           test -n "$wrapper"
           test -n "$worker"
           test "$(dirname "$binary")" = "$(dirname "$wrapper")"
           test "$(dirname "$binary")" = "$(dirname "$worker")"
+          if [[ "$TARGET" == *-musl ]]; then
+            test -z "$driver"
+          else
+            test -n "$driver"
+            test "$(dirname "$binary")" = "$(dirname "$driver")"
+            chmod +x "$driver"
+            compiler_library="$(rustc --print sysroot)/$CARGO_RAIL_FACT_DRIVER_COMPILER_LIBRARY"
+            compiler_library_directory="$(dirname "$compiler_library")"
+            protocol="$(LD_LIBRARY_PATH="$compiler_library_directory" "$driver" --cargo-rail-fact-protocol-version)"
+            [[ "$protocol" =~ ^[1-9][0-9]*$ ]]
+          fi
           chmod +x "$binary"
           chmod +x "$wrapper"
           chmod +x "$worker"
@@ -298,6 +386,7 @@ jobs:
           $binary = Get-ChildItem smoke -Recurse -Filter cargo-rail.exe | Select-Object -First 1
           $wrapper = Get-ChildItem smoke -Recurse -Filter cargo-rail-native-rustc-wrapper.exe | Select-Object -First 1
           $worker = Get-ChildItem smoke -Recurse -Filter cargo-rail-native-rustc-worker.exe | Select-Object -First 1
+          $driver = Get-ChildItem smoke -Recurse -Filter cargo-rail-fact-driver.exe | Select-Object -First 1
           if (-not $binary) {
             throw "cargo-rail.exe is missing from $env:ARCHIVE"
           }
@@ -307,8 +396,18 @@ jobs:
           if (-not $worker) {
             throw "cargo-rail-native-rustc-worker.exe is missing from $env:ARCHIVE"
           }
-          if ($binary.DirectoryName -ne $wrapper.DirectoryName -or $binary.DirectoryName -ne $worker.DirectoryName) {
+          if (-not $driver) {
+            throw "cargo-rail-fact-driver.exe is missing from $env:ARCHIVE"
+          }
+          if ($binary.DirectoryName -ne $wrapper.DirectoryName -or $binary.DirectoryName -ne $worker.DirectoryName -or $binary.DirectoryName -ne $driver.DirectoryName) {
             throw "cargo-rail compiler cache binaries are not adjacent to cargo-rail.exe"
+          }
+          $sysroot = (& rustc --print sysroot).Trim()
+          $compilerLibrary = Join-Path $sysroot ($env:CARGO_RAIL_FACT_DRIVER_COMPILER_LIBRARY -replace '/', '\')
+          $env:PATH = "$(Split-Path $compilerLibrary);$env:PATH"
+          $protocol = (& $driver.FullName --cargo-rail-fact-protocol-version).Trim()
+          if ($LASTEXITCODE -ne 0 -or $protocol -notmatch '^[1-9][0-9]*$') {
+            throw "archive compiler fact driver failed to load: $protocol"
           }
           $actual = (& $binary.FullName rail --version).Trim()
           if ($LASTEXITCODE -ne 0 -or $actual -ne "cargo-rail $env:VERSION") {

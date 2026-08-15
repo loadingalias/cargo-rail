@@ -3911,6 +3911,9 @@ fn private_compiler_environment(name: &OsStr) -> bool {
         | crate::compiler::invocation::OBSERVATION_DIRECTORY_ENV
         | crate::compiler::invocation::OBSERVATION_SOURCE_ROOT_ENV
         | crate::compiler::invocation::OBSERVATION_ONLY_ENV
+        | crate::compiler::invocation::FACT_DOCTEST_BUILDER_ENV
+        | crate::compiler::invocation::FACT_DOCTEST_RUNNER_ENV
+        | crate::compiler::facts::COMPILER_FACT_INVOCATION_ENV
         | crate::compiler::session::FACT_SESSION_ENV
         | APPLE_LINK_ADAPTER_ENV
         | APPLE_LINK_DRIVER_ENV
@@ -4554,7 +4557,7 @@ impl NativeCompilerValidation {
       .iter()
       .map(|environment| environment.name.as_str());
     if !self.class.is_valid()
-      || self.observation.version != 5
+      || self.observation.version != 6
       || !self.observation.success
       || self.observation.mode != CompilerMode::Rustc
       || self.observation.compiler_arguments.is_empty()
@@ -9149,6 +9152,9 @@ pub(crate) fn remove_private_environment(command: &mut Command) {
     .env_remove(crate::compiler::invocation::OBSERVATION_DIRECTORY_ENV)
     .env_remove(crate::compiler::invocation::OBSERVATION_SOURCE_ROOT_ENV)
     .env_remove(crate::compiler::invocation::OBSERVATION_ONLY_ENV)
+    .env_remove(crate::compiler::invocation::FACT_DOCTEST_BUILDER_ENV)
+    .env_remove(crate::compiler::invocation::FACT_DOCTEST_RUNNER_ENV)
+    .env_remove(crate::compiler::facts::COMPILER_FACT_INVOCATION_ENV)
     .env_remove(crate::compiler::session::FACT_SESSION_ENV)
     .env_remove(APPLE_LINK_ADAPTER_ENV)
     .env_remove(APPLE_LINK_DRIVER_ENV)
@@ -11167,7 +11173,7 @@ pub(crate) mod tests {
   fn graduated_observation() -> RawCompilerInvocation {
     let source = observed_file("src/lib.rs", b"pub fn value() -> u8 { 1 }\n");
     RawCompilerInvocation {
-      version: 5,
+      version: 6,
       mode: CompilerMode::Rustc,
       crate_name: Some("fixture".to_string()),
       crate_types: BTreeSet::from(["lib".to_string()]),
@@ -11206,6 +11212,7 @@ pub(crate) mod tests {
       cache_wrapper: None,
       success: true,
       bypasses: BTreeSet::new(),
+      compiler_fact_unit: None,
     }
   }
 

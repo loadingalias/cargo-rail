@@ -191,6 +191,17 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def artifact_digest(path: Path, relative: str) -> str:
+    if relative == ".rustc_info.json":
+        try:
+            value = json.loads(path.read_bytes())
+        except (OSError, json.JSONDecodeError) as error:
+            raise CompatibilityError(f"Cargo rustc-info cache is invalid JSON: {error}") from error
+        canonical = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
+    return sha256(path)
+
+
 def output_manifest(root: Path) -> tuple[tuple[str, str, int, str], ...]:
     if not root.is_dir():
         raise CompatibilityError(f"Cargo produced no target directory at {root}")
@@ -207,7 +218,7 @@ def output_manifest(root: Path) -> tuple[tuple[str, str, int, str], ...]:
             if os.name == "nt" and path.suffix.casefold() == ".pdb":
                 digest = "msvc-pdb-nondeterministic"
             else:
-                digest = sha256(path)
+                digest = artifact_digest(path, relative)
             entries.append((relative, "file", mode, digest))
         else:
             raise CompatibilityError(f"unsupported output kind at {path}")

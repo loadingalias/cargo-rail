@@ -268,7 +268,7 @@ def load_compatibility_manifest() -> CompatibilityManifest:
         )
         setup = require_string(profile["setup"], f"filesystem_profiles[{index}].setup")
         require(
-            setup in {"linux-tmpfs", "macos-apfs-case-sensitive", "windows-ntfs-vhd"},
+            setup in {"linux-tmpfs", "windows-ntfs-vhd"},
             f"filesystem_profiles[{index}].setup is not implemented by compatibility CI",
         )
         filesystem_profiles.append(
@@ -732,13 +732,14 @@ def render_markdown(
             execution = f"Advertised; full-suite CI required (`{host.runner}`)"
             cross = "—"
             release = "Native artifact required"
+            linked_class = ""
+            if target.endswith("-unknown-linux-gnu"):
+                linked_class = (
+                    " and certified default-ELF-linker producers/final artifacts"
+                )
             cache = (
                 f"Active for structurally eligible `{native_cache.cache_class}` units"
-                + (
-                    " and certified default-Apple-linker producers/final artifacts"
-                    if target.endswith("-apple-darwin")
-                    else ""
-                )
+                + linked_class
                 + "; exact compiler identity is part of every key"
             )
         rows.append(
@@ -835,9 +836,10 @@ clippy, rustdoc, response-file, information, test-mode, cross-target, custom-tar
 consumer, explicitly configured linker, and otherwise unsupported shapes execute the selected compiler chain before
 session or CAS acquisition. Eligible metadata/rlib units, including exact native-static consumers, use L1 only when
 Cargo-Rail can identify the exact toolchain, complete bounded source and native-search namespaces, compiler
-environment, dependency artifacts, arguments, outputs, and physical workspace root. On macOS, the graduated default
-Apple-linker path also admits build-script executables, proc-macro producers, ordinary final binaries, `dylib`, and
-`cdylib` outputs after linker certification. Build-script execution itself is never cached.
+environment, dependency artifacts, arguments, outputs, and physical workspace root. On Linux, the graduated default
+ELF driver/linker path also admits build-script executables, proc-macro producers, ordinary final binaries, `dylib`,
+and `cdylib` outputs when the selected linker supplies GNU-compatible dependency-file evidence. Build-script
+execution itself is never cached.
 
 Every compiler process first enters one pre-Clap boundary that captures Cargo's selected program and byte-exact argv.
 Transparent execution preserves the working directory, inherited non-private environment, wrapper order, streams, and
@@ -859,20 +861,19 @@ exact private controls. Rustc observation then proves that the successful invoca
 capabilities. The action identity is available before lookup; lookup work does not grow with retained source history.
 
 One protocol owns every accepted result. The pre-execution action binds the compiler session, argv, source topology,
-environment, dependencies, generated inputs, and native-search state. Linked Apple actions use that value only as a
-non-authoritative candidate selector until the cold linker certificate closes found and missing lookup paths, driver
-and linker bytes, SDK inputs, exact dependency archives, and rustc-endogenous objects. The witnessed action then binds
-one result descriptor and exact output/stream objects. L1 verifies the same action, witness, result association, and
-objects at restore time. L2 transports the same pack and cannot redefine its authority.
+environment, dependencies, generated inputs, and native-search state. Linked Linux ELF actions use that value only as
+a non-authoritative candidate selector until the cold linker witness closes found and missing lookup paths, driver
+and linker bytes, platform tool inputs, exact dependency archives, and rustc-endogenous objects. The witnessed action
+then binds one result descriptor and exact output/stream objects. L1 verifies the same action, witness, result
+association, and objects at restore time. L2 transports the same pack and cannot redefine its authority.
 
-Apple certification is deliberately narrow. Cargo-Rail invokes the selected default `/usr/bin/cc` chain, asks the
-installed Apple linker for dependency evidence, and records direct driver inputs in a private sidecar. For LTO, the
-adapter snapshots owner-controlled rustc temporary namespaces that are not writable by group or other users before
-driver execution, certifies new regular objects reported by the linker before those namespaces disappear, and treats
-only non-user-selected temporary aggregate archives passed by the exact rustc driver as endogenous. Cargo-Rail uses
-`-oso_prefix` only for that certified random temporary prefix. A user link argument, custom linker, unknown certificate
-record, preexisting or unbound temporary object/archive, appeared negative lookup, changed symlink resolution,
-SDK/tool change, or non-byte-stable result runs cold and receives no linked cache authority.
+Linux ELF certification is similarly bounded. Cargo-Rail resolves the installed default `cc` driver and its selected
+linker, requires GNU-compatible dependency-file evidence, and records direct driver inputs, selected auxiliary tools,
+and driver/linker search directories. The cold witness binds every reported link input, closes relevant search
+namespaces with found and missing same-name candidates, and treats only rustc-generated objects under the exact linked
+output directory as endogenous. A changed driver, linker, tool, input, or symlink; an appeared negative lookup;
+missing dependency evidence; no certified rustc object; or a non-byte-stable result runs cold and receives no linked
+cache authority.
 
 The cache deliberately over-invalidates when an unused file in the bounded source directory changes. This is the
 smallest sound contract for Rust's path discovery: positive dep-info alone does not record failed probes such as the
@@ -1066,7 +1067,7 @@ runtime platform allowlist.
 
 | Capability | Advertised non-default implementations | Current contract |
 |---|---|---|
-| Linker | {linkers} | The installed default Apple driver/linker is certified for the explicit macOS linked class. Other defaults remain pass-through for linked outputs; an explicitly configured linker always keeps the complete linked action on Cargo's path. |
+| Linker | {linkers} | On Linux, the installed default `cc`-selected ELF linker is certified when it supplies GNU-compatible dependency-file evidence. Other defaults remain pass-through for linked outputs; an explicitly configured linker always keeps the complete linked action on Cargo's path. |
 | Codegen backend | {backends} | Bundled named backends are bound by the complete sysroot identity and compiler arguments. An external backend path bypasses until its executable bytes are content-identified. |
 
 Pass-through execution is not cache graduation. A non-default implementation needs a named compatibility fixture on
@@ -1078,13 +1079,13 @@ every applicable native host before Cargo-Rail advertises it.
 |---|---|---|
 | Dependency and workspace library metadata/rlib | Active for any exact, content-identified native toolchain | One physical-root-bound session and unit source namespace, complete bounded source topology and bytes, exact compiler environment, containment observation, `.rmeta`, optional `.rlib`, dependency contents, and exact native-static search namespaces |
 | Incremental compilation | Bypassed before session or CAS acquisition | Cargo owns freshness and incremental policy; Cargo-Rail never disables incremental compilation |
-| Certified Apple linked producers and final binaries | Active for the installed default Apple driver/linker on macOS | The witnessed action binds the linker certificate's found/missing namespace, driver/linker and SDK bytes, symlink resolution, dependency archives, certified rustc-generated objects, and byte-stable linked output |
-| Tests and unsupported binary/example/benchmark shapes | Bypassed; compiler/linker executes | Test mode and shapes outside the explicit Apple linked class are not graduated |
-| `dylib` and `cdylib` | Structurally admitted only through certified Apple linking | Other native linker, SDK, runtime, and post-link boundaries remain incomplete |
+| Certified linked producers and final binaries | Active for a dependency-file-capable default ELF linker on Linux | The platform witness binds found/missing lookup namespaces, driver/linker and tool bytes, symlink resolution, dependency archives, certified rustc-generated objects, and byte-stable linked output |
+| Tests and unsupported binary/example/benchmark shapes | Bypassed; compiler/linker executes | Test mode and shapes outside the explicit certified linked classes are not graduated |
+| `dylib` and `cdylib` | Structurally admitted only through certified Linux ELF linking | Other native linker, SDK, runtime, and post-link boundaries remain incomplete |
 | `staticlib` | Bypassed; compiler/archive creation executes | Archive creation is a distinct deterministic boundary and is not covered by native-static consumption evidence |
-| Proc-macro producers | Metadata-only producer `.rmeta` is active directly; the producer dylib is active only through certified Apple linking | Neither result certifies later macro execution |
+| Proc-macro producers | Metadata-only producer `.rmeta` is active directly; the producer dylib is active only through certified Linux ELF linking | Neither result certifies later macro execution |
 | Native proc-macro consumers | Bypassed before context acquisition | Compile-time filesystem, environment, process, network, clock, and randomness reads are not completely observed; unsafe sccache hits are not copied |
-| Build-script executable compilation | Active only through certified Apple linking | The compiler result is reusable; build-script execution and its generated outputs remain Cargo-owned cold work |
+| Build-script executable compilation | Active only through certified Linux ELF linking | The compiler result is reusable; build-script execution and its generated outputs remain Cargo-owned cold work |
 | Native dependencies and `links` contracts | Exact native-static consumers may reuse metadata/rlib; native tools still execute | Search order, modifiers, missing candidates, shadowing, replacement, symlinks, archives, and generated namespaces are bound; external tool execution is not cached |
 | rustdoc and doctests | Bypassed; rustdoc/test executes | Stable Cargo output does not enumerate the complete documentation tree |
 | Cross compilation and custom targets | Bypassed; compiler executes | Host/target tools, runners, SDKs, and target specifications are not graduated |
