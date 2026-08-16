@@ -264,6 +264,8 @@ fn run_cargo(
   command.current_dir(fixture).arg(workload);
   if workload == "build" {
     command.arg("--release");
+  } else if workload == "test" {
+    command.args(["--no-run", "--all-targets"]);
   }
   command
     .args([
@@ -337,7 +339,7 @@ fn reusable_outputs(target: &Path) -> Result<BTreeMap<PathBuf, String>> {
       } else if metadata.is_file()
         && matches!(
           path.extension().and_then(|value| value.to_str()),
-          Some("d" | "rmeta" | "rlib")
+          Some("a" | "d" | "dll" | "dylib" | "lib" | "rlib" | "rmeta" | "so")
         )
       {
         outputs.insert(path.strip_prefix(target)?.to_path_buf(), digest_file(&path)?);
@@ -391,19 +393,13 @@ fn benchmark_action_keys(directory: &Path, status: &str) -> Result<Vec<String>> 
 }
 
 fn benchmark_action_crates(directory: &Path, status: &str) -> Result<Vec<String>> {
-  benchmark_events(directory)?
-    .into_iter()
-    .filter(|event| event["status"] == status)
-    .map(|event| {
-      let arguments = event["arguments"].as_array().context("benchmark compiler arguments")?;
-      arguments
-        .windows(2)
-        .find(|arguments| arguments[0] == "--crate-name")
-        .and_then(|arguments| arguments[1].as_str())
-        .map(str::to_string)
-        .context("benchmark compiler crate name")
-    })
-    .collect()
+  Ok(
+    benchmark_events(directory)?
+      .into_iter()
+      .filter(|event| event["status"] == status)
+      .filter_map(|event| event["action"]["crate_name"].as_str().map(str::to_string))
+      .collect(),
+  )
 }
 
 fn benchmark_event_summary(directory: &Path) -> Result<BTreeMap<String, u64>> {
@@ -414,6 +410,43 @@ fn benchmark_event_summary(directory: &Path) -> Result<BTreeMap<String, u64>> {
     *summary.entry(format!("{status}:{reason}")).or_default() += 1;
   }
   Ok(summary)
+}
+
+fn ensure_typed_benchmark_events(directory: &Path) -> Result<()> {
+  let events = benchmark_events(directory)?;
+  ensure!(!events.is_empty(), "benchmark compiler operation inventory is empty");
+  for event in events {
+    ensure!(
+      event["schema_version"] == 8,
+      "benchmark compiler operation has an incompatible schema: {event}"
+    );
+    let action = event["action"].as_object().context("benchmark compiler operation")?;
+    ensure!(
+      action.get("schema_version") == Some(&serde_json::json!(3))
+        && action.get("action_class").and_then(serde_json::Value::as_str).is_some()
+        && action.get("driver").and_then(serde_json::Value::as_str).is_some()
+        && action
+          .get("crate_types")
+          .and_then(serde_json::Value::as_array)
+          .is_some()
+        && action.get("emit").and_then(serde_json::Value::as_array).is_some(),
+      "benchmark compiler operation is incomplete: {event}"
+    );
+    let identity = event["action_id"]
+      .as_str()
+      .context("benchmark compiler operation identity")?;
+    let digest = identity
+      .strip_prefix("coverage-action-v3:sha256:")
+      .context("benchmark compiler operation identity prefix")?;
+    ensure!(
+      digest.len() == 64
+        && digest
+          .bytes()
+          .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+      "benchmark compiler operation identity is not canonical: {identity}"
+    );
+  }
+  Ok(())
 }
 
 #[cfg(windows)]
@@ -431,7 +464,7 @@ fn ensure_windows_native_miss_boundary(
       && observed_native_misses.is_subset(&allowed_native_misses)
       && (observed_native_misses.is_empty()
         || summary
-          .get("bypassed:dependency_artifact_class_not_graduated")
+          .get("bypassed:dynamic_dependency_execution_observation_unavailable")
           .is_some_and(|count| *count > 0)),
     "Windows {phase} misses escaped the explicitly ungraduated native-artifact boundary: \
      usage={usage:?}, misses={miss_crates:?}, events={summary:?}"
@@ -455,6 +488,24 @@ fn executable(path: PathBuf) -> PathBuf {
     path.with_extension("exe")
   } else {
     path
+  }
+}
+
+fn static_archive(directory: &Path) -> PathBuf {
+  if cfg!(windows) {
+    directory.join("fixture_static.lib")
+  } else {
+    directory.join("libfixture_static.a")
+  }
+}
+
+fn dynamic_library(directory: &Path, crate_name: &str) -> PathBuf {
+  if cfg!(windows) {
+    directory.join(format!("{crate_name}.dll"))
+  } else if cfg!(target_os = "macos") {
+    directory.join(format!("lib{crate_name}.dylib"))
+  } else {
+    directory.join(format!("lib{crate_name}.so"))
   }
 }
 
@@ -511,6 +562,7 @@ fn real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority() ->
   )?;
   let root_bound_hits = benchmark_action_keys(&root_bound_events, "hit")?;
   let root_bound_misses = benchmark_action_keys(&root_bound_events, "miss")?;
+  ensure_typed_benchmark_events(&root_bound_events)?;
   ensure!(
     root_bound_hits.len() as u64 == root_bound_cold.hits,
     "usage and action ledgers disagree: {root_bound_cold:?}, {root_bound_hits:?}"
@@ -553,6 +605,7 @@ fn real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority() ->
     ],
   )?;
   let second_warm_summary = benchmark_event_summary(&second_warm_events)?;
+  ensure_typed_benchmark_events(&second_warm_events)?;
   let second_warm_miss_crates = benchmark_action_crates(&second_warm_events, "miss")?;
   ensure!(
     second_warm.hits.saturating_add(second_warm.misses) == second_keys.len() as u64,
@@ -592,6 +645,12 @@ fn real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority() ->
   ensure!(build_cold.hits == 0 && build_cold.misses >= 8, "{build_cold:?}");
   let build_outputs = reusable_outputs(&first.join("target/release"))?;
   let binary = executable(first.join("target/release/fixture-cli"));
+  let dylib = dynamic_library(&first.join("target/release"), "fixture_dylib");
+  let cdylib = dynamic_library(&first.join("target/release"), "fixture_cdylib");
+  ensure!(
+    dylib.is_file() && cdylib.is_file(),
+    "dynamic library outputs are missing"
+  );
   let cold_binary = Command::new(&binary).output()?;
   ensure!(cold_binary.status.success());
   ensure!(String::from_utf8_lossy(&cold_binary.stdout).trim() == "119");
@@ -600,7 +659,7 @@ fn real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority() ->
   let build_warm_events = fs::canonicalize(root.path())?.join("build-warm-events");
   create_private_directory(&build_warm_events)?;
   let build_warm_events_value = build_warm_events.to_string_lossy().into_owned();
-  let (_, build_warm) = run_cargo(
+  let (build_warm_output, build_warm) = run_cargo(
     &first,
     &first_cargo_home,
     "build",
@@ -629,10 +688,124 @@ fn real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority() ->
     "build",
   )?;
   ensure!(build_warm.failures == 0);
+  ensure_typed_benchmark_events(&build_warm_events)?;
+  #[cfg(not(windows))]
+  {
+    let hits = benchmark_action_crates(&build_warm_events, "hit")?;
+    let dynamic_events = benchmark_events(&build_warm_events)?
+      .into_iter()
+      .filter(|event| {
+        matches!(
+          event["action"]["action_class"].as_str(),
+          Some("rust_dynamic_library" | "c_dynamic_library")
+        )
+      })
+      .map(|event| {
+        serde_json::json!({
+          "action": event["action"],
+          "reason": event["reason"],
+          "status": event["status"],
+        })
+      })
+      .collect::<Vec<_>>();
+    for crate_name in ["fixture_static", "fixture_dylib", "fixture_cdylib"] {
+      ensure!(
+        hits.iter().any(|observed| observed == crate_name),
+        "the exact {crate_name} result was not restored: hits={hits:?}, dynamic={dynamic_events:?}, stderr={}",
+        String::from_utf8_lossy(&build_warm_output.stderr)
+      );
+    }
+  }
   ensure!(reusable_outputs(&first.join("target/release"))? == build_outputs);
+  ensure!(
+    dylib.is_file() && cdylib.is_file(),
+    "restored dynamic library outputs are missing"
+  );
   let warm_binary = Command::new(binary).output()?;
   ensure!(warm_binary.status.success());
   ensure!(String::from_utf8_lossy(&warm_binary.stdout).trim() == "119");
+
+  fs::remove_dir_all(first.join("target"))?;
+  let test_cold_events = fs::canonicalize(root.path())?.join("test-cold-events");
+  create_private_directory(&test_cold_events)?;
+  let test_cold_events_value = test_cold_events.to_string_lossy().into_owned();
+  let (_, test_cold) = run_cargo(
+    &first,
+    &first_cargo_home,
+    "test",
+    &[
+      ("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1"),
+      (
+        "CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY",
+        test_cold_events_value.as_str(),
+      ),
+    ],
+  )?;
+  ensure!(
+    test_cold.failures == 0,
+    "test-target cold compile failed: {test_cold:?}"
+  );
+  ensure_typed_benchmark_events(&test_cold_events)?;
+  let new_test_targets = ["fixture_cli_bench", "fixture_cli_example", "fixture_cli_smoke"];
+  #[cfg(not(windows))]
+  {
+    let misses = benchmark_action_crates(&test_cold_events, "miss")?;
+    for target in new_test_targets {
+      ensure!(
+        misses.iter().any(|crate_name| crate_name == target),
+        "test-target cold compile did not publish {target}: {misses:?}"
+      );
+    }
+  }
+  #[cfg(windows)]
+  {
+    let bypasses = benchmark_action_crates(&test_cold_events, "bypass")?;
+    for target in new_test_targets {
+      ensure!(
+        bypasses.iter().any(|crate_name| crate_name == target),
+        "COFF test-target compile did not preserve the explicit cold boundary for {target}: {bypasses:?}"
+      );
+    }
+  }
+
+  fs::remove_dir_all(first.join("target"))?;
+  let test_warm_events = fs::canonicalize(root.path())?.join("test-warm-events");
+  create_private_directory(&test_warm_events)?;
+  let test_warm_events_value = test_warm_events.to_string_lossy().into_owned();
+  let (_, test_warm) = run_cargo(
+    &first,
+    &first_cargo_home,
+    "test",
+    &[
+      ("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1"),
+      (
+        "CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY",
+        test_warm_events_value.as_str(),
+      ),
+    ],
+  )?;
+  ensure!(
+    test_warm.failures == 0,
+    "test-target warm compile failed: {test_warm:?}"
+  );
+  ensure_typed_benchmark_events(&test_warm_events)?;
+  #[cfg(not(windows))]
+  {
+    let hits = benchmark_action_crates(&test_warm_events, "hit")?;
+    for target in new_test_targets {
+      ensure!(
+        hits.iter().any(|crate_name| crate_name == target),
+        "test-target warm compile did not restore {target}: {hits:?}"
+      );
+    }
+  }
+  #[cfg(windows)]
+  ensure_windows_native_miss_boundary(
+    test_warm,
+    &benchmark_action_crates(&test_warm_events, "miss")?,
+    &benchmark_event_summary(&test_warm_events)?,
+    "test targets",
+  )?;
   Ok(())
 }
 
@@ -662,6 +835,15 @@ fn real_world_native_cache_fixture_exercises_required_compiler_classes() -> Resu
       .as_str()
       .is_some_and(|source| source.starts_with("registry+"))
   }));
+  for required_kind in ["cdylib", "dylib", "staticlib"] {
+    ensure!(packages.iter().any(|package| {
+      package["targets"].as_array().into_iter().flatten().any(|target| {
+        target["kind"]
+          .as_array()
+          .is_some_and(|kinds| kinds.iter().any(|kind| kind == required_kind))
+      })
+    }));
+  }
   ensure!(packages.iter().any(|package| {
     package["source"]
       .as_str()
@@ -682,6 +864,23 @@ fn real_world_native_cache_fixture_exercises_required_compiler_classes() -> Resu
     })
   }));
 
+  let integrated_assembly = fs::read_to_string(fixture.join("crates/fixture-static/src/lib.rs"))?;
+  for required in [
+    "core::arch::asm!",
+    "core::arch::global_asm!(include_str!",
+    "core::arch::naked_asm!",
+    "target_feature(enable",
+  ] {
+    ensure!(
+      integrated_assembly.contains(required),
+      "fixture does not exercise required integrated-assembly shape {required}"
+    );
+  }
+  ensure!(
+    fs::metadata(fixture.join("crates/fixture-static/src/integrated_assembly.s"))?.len() > 0,
+    "fixture included assembly text is empty"
+  );
+
   let check = Command::new("cargo")
     .current_dir(&fixture)
     .args([
@@ -699,6 +898,22 @@ fn real_world_native_cache_fixture_exercises_required_compiler_classes() -> Resu
     .args(["build", "--workspace", "--all-features", "--locked", "--offline"])
     .output()?;
   ensure!(build.status.success(), "fixture build failed");
+  let test = Command::new("cargo")
+    .current_dir(&fixture)
+    .args([
+      "test",
+      "--workspace",
+      "--all-targets",
+      "--all-features",
+      "--no-run",
+      "--locked",
+      "--offline",
+    ])
+    .output()?;
+  ensure!(test.status.success(), "fixture test-target compile failed");
   ensure!(executable(target.join("debug/fixture-cli")).is_file());
+  ensure!(static_archive(&target.join("debug")).is_file());
+  ensure!(dynamic_library(&target.join("debug"), "fixture_dylib").is_file());
+  ensure!(dynamic_library(&target.join("debug"), "fixture_cdylib").is_file());
   Ok(())
 }

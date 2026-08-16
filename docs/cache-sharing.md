@@ -16,18 +16,19 @@ own root-bound variant.
 
 ## What is shared
 
-The CAS can reuse graduated dependency and workspace-library `.rmeta`, metadata-only proc-macro producer `.rmeta`,
-optional `.rlib`, dep-info, and captured diagnostic output, including actions that consume exact native-static search
-namespaces. On Linux, the installed default `cc`-selected ELF linker can additionally restore build-script
-executables, proc-macro producer dylibs, ordinary final binaries, `dylib`, and `cdylib` outputs when it supplies
-GNU-compatible dependency-file evidence. Every hit revalidates the action/witness/result binding and stored bytes
-before replacing an output. Cargo still owns
-fingerprints and incremental compilation; an intact target normally removes the compiler invocation at L0 before L1
-is involved.
+The CAS can reuse graduated dependency and workspace-library `.rmeta`, optional `.rlib`, compiler-owned static
+archives, metadata-only proc-macro producer `.rmeta`, dep-info, and captured diagnostic output, including actions that
+consume exact native-static search namespaces. Certified default Apple and Linux ELF linker paths can additionally
+restore build-script executables, proc-macro producer dylibs, ordinary binaries, tests, examples, benchmarks, `dylib`,
+and `cdylib` outputs. Every hit revalidates the action/witness/result binding and stored bytes before replacing an
+output. Cargo still owns fingerprints and incremental compilation; an intact target normally removes the compiler
+invocation at L0 before L1 is involved.
 
-Native proc-macro consumers, build-script execution and generated output production, rustdoc, test mode, cross-target
-work, incremental compilation, nonstandard target layouts, custom linkers, and ambiguous wrapper composition bypass
-L1. A bypass executes the selected compiler chain and is not a build failure.
+Native proc-macro consumers, build-script execution and generated output production, Clippy diagnostics, rustdoc,
+doctests, cross-target work, incremental compilation, nonstandard target layouts, COFF-linked output, custom linkers,
+and ambiguous wrapper composition bypass L1 with a specific missing-capability reason. Rust-required native compiler,
+assembler, preprocessing, archive, and probe children remain typed cold operations until their complete input and
+mutation authority exists. A bypass executes the selected tool chain and is not a build failure.
 
 ## Isolate a machine role
 

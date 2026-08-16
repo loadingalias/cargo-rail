@@ -566,6 +566,53 @@ impl NativeOutputRole {
       Self::Staticlib => "staticlib",
     }
   }
+
+  pub(crate) fn from_crate_types(crate_types: &BTreeSet<String>) -> Option<Self> {
+    let mut crate_types = crate_types.iter();
+    let crate_type = crate_types.next()?;
+    if crate_types.next().is_some() {
+      return None;
+    }
+    match crate_type.as_str() {
+      "lib" | "rlib" => Some(Self::Rlib),
+      "bin" => Some(Self::Executable),
+      "proc-macro" => Some(Self::ProcMacro),
+      "dylib" => Some(Self::Dylib),
+      "cdylib" => Some(Self::Cdylib),
+      "staticlib" => Some(Self::Staticlib),
+      _ => None,
+    }
+  }
+
+  pub(crate) fn from_invocation(crate_types: &BTreeSet<String>, test_mode: bool) -> Option<Self> {
+    if test_mode {
+      Some(Self::Executable)
+    } else {
+      Self::from_crate_types(crate_types)
+    }
+  }
+
+  pub(crate) const fn requires_linker(self) -> bool {
+    matches!(self, Self::Executable | Self::ProcMacro | Self::Dylib | Self::Cdylib)
+  }
+
+  fn implicit_file_name(self, crate_name: &str, extra_filename: &str) -> Option<String> {
+    match self {
+      Self::Metadata => None,
+      Self::Rlib => Some(format!("lib{crate_name}{extra_filename}.rlib")),
+      Self::Executable if cfg!(windows) => Some(format!("{crate_name}{extra_filename}.exe")),
+      Self::Executable => Some(format!("{crate_name}{extra_filename}")),
+      Self::ProcMacro | Self::Dylib | Self::Cdylib if cfg!(target_os = "macos") => {
+        Some(format!("lib{crate_name}{extra_filename}.dylib"))
+      }
+      Self::ProcMacro | Self::Dylib | Self::Cdylib if cfg!(windows) => {
+        Some(format!("{crate_name}{extra_filename}.dll"))
+      }
+      Self::ProcMacro | Self::Dylib | Self::Cdylib => Some(format!("lib{crate_name}{extra_filename}.so")),
+      Self::Staticlib if cfg!(windows) => Some(format!("{crate_name}{extra_filename}.lib")),
+      Self::Staticlib => Some(format!("lib{crate_name}{extra_filename}.a")),
+    }
+  }
 }
 
 /// Wrapper evidence before Cargo compiler-artifact correlation.
@@ -1379,19 +1426,8 @@ impl InvocationRecorder {
       let [linked] = linked.as_slice() else {
         return None;
       };
-      let role = if self.raw.crate_types == BTreeSet::from(["bin".to_string()]) {
-        NativeOutputRole::Executable
-      } else if self.raw.crate_types == BTreeSet::from(["proc-macro".to_string()]) {
-        NativeOutputRole::ProcMacro
-      } else if self.raw.crate_types == BTreeSet::from(["dylib".to_string()]) {
-        NativeOutputRole::Dylib
-      } else if self.raw.crate_types == BTreeSet::from(["cdylib".to_string()]) {
-        NativeOutputRole::Cdylib
-      } else if self.raw.crate_types == BTreeSet::from(["staticlib".to_string()]) {
-        NativeOutputRole::Staticlib
-      } else {
-        return None;
-      };
+      let role = NativeOutputRole::from_invocation(&self.raw.crate_types, self.raw.test_mode)
+        .filter(|role| *role != NativeOutputRole::Rlib)?;
       artifacts.push(NativeOutputArtifact {
         role,
         path: (*linked).clone(),
@@ -1779,23 +1815,19 @@ impl ParsedArguments {
     }
     if parsed.emit_modes.contains("metadata")
       && parsed.metadata_paths.is_empty()
-      && matches!(
-        parsed.crate_types.iter().next().map(String::as_str),
-        Some("lib" | "proc-macro")
-      )
-      && parsed.crate_types.len() == 1
+      && NativeOutputRole::from_invocation(&parsed.crate_types, parsed.test_mode).is_some()
       && let (Some(out_dir), Some(crate_name)) = (&parsed.out_dir, &parsed.crate_name)
     {
       let path = out_dir.join(format!("lib{crate_name}{}.rmeta", parsed.extra_filename));
       parsed.metadata_paths.push(path.clone());
       parsed.output_paths.push(path);
     }
-    if parsed.crate_types == BTreeSet::from(["lib".to_string()]) {
+    if NativeOutputRole::from_invocation(&parsed.crate_types, parsed.test_mode) == Some(NativeOutputRole::Rlib) {
       parsed.rlib_paths.append(&mut parsed.explicit_link_paths);
     }
     if parsed.emit_modes.contains("link")
       && parsed.rlib_paths.is_empty()
-      && parsed.crate_types == BTreeSet::from(["lib".to_string()])
+      && NativeOutputRole::from_invocation(&parsed.crate_types, parsed.test_mode) == Some(NativeOutputRole::Rlib)
       && let (Some(out_dir), Some(crate_name)) = (&parsed.out_dir, &parsed.crate_name)
     {
       let path = out_dir.join(format!("lib{crate_name}{}.rlib", parsed.extra_filename));
@@ -1805,7 +1837,8 @@ impl ParsedArguments {
     if parsed.emit_modes.contains("link")
       && parsed.explicit_link_paths.is_empty()
       && let (Some(out_dir), Some(crate_name)) = (&parsed.out_dir, &parsed.crate_name)
-      && let Some(file_name) = implicit_native_link_output(&parsed.crate_types, crate_name, &parsed.extra_filename)
+      && let Some(file_name) = NativeOutputRole::from_invocation(&parsed.crate_types, parsed.test_mode)
+        .and_then(|role| role.implicit_file_name(crate_name, &parsed.extra_filename))
     {
       let known_outputs = parsed
         .dep_info_paths
@@ -1864,25 +1897,6 @@ impl ParsedArguments {
     if let Some(extra_filename) = value.strip_prefix("extra-filename=") {
       self.extra_filename = extra_filename.to_string();
     }
-  }
-}
-
-fn implicit_native_link_output(
-  crate_types: &BTreeSet<String>,
-  crate_name: &str,
-  extra_filename: &str,
-) -> Option<String> {
-  if !cfg!(any(target_os = "macos", target_os = "linux")) || crate_types.len() != 1 {
-    return None;
-  }
-  match crate_types.iter().next().map(String::as_str) {
-    Some("bin") => Some(format!("{crate_name}{extra_filename}")),
-    #[cfg(target_os = "macos")]
-    Some("proc-macro" | "dylib" | "cdylib") => Some(format!("lib{crate_name}{extra_filename}.dylib")),
-    #[cfg(target_os = "linux")]
-    Some("proc-macro" | "dylib" | "cdylib") => Some(format!("lib{crate_name}{extra_filename}.so")),
-    Some("staticlib") => Some(format!("lib{crate_name}{extra_filename}.a")),
-    _ => None,
   }
 }
 
@@ -2491,7 +2505,7 @@ mod tests {
   }
 
   #[test]
-  fn native_metadata_path_inference_does_not_reject_other_observation_classes() {
+  fn native_metadata_path_inference_covers_every_single_crate_type() {
     let mut bypasses = BTreeSet::new();
     let arguments = [
       "--crate-name".to_string(),
@@ -2506,31 +2520,45 @@ mod tests {
 
     let parsed = ParsedArguments::parse(&arguments, Path::new("/workspace"), CompilerMode::Rustc, &mut bypasses);
 
-    assert!(parsed.metadata_paths.is_empty());
+    assert_eq!(parsed.metadata_paths, [PathBuf::from("/tmp/target/libexample.rmeta")]);
     assert!(bypasses.is_empty());
   }
 
-  #[cfg(any(target_os = "macos", target_os = "linux"))]
   #[test]
   fn native_link_path_inference_matches_platform_rustc_names() {
-    #[cfg(target_os = "macos")]
-    let dynamic_suffix = "dylib";
-    #[cfg(target_os = "linux")]
-    let dynamic_suffix = "so";
+    let (dynamic_prefix, dynamic_suffix, static_prefix, static_suffix, executable_suffix) = if cfg!(windows) {
+      ("", "dll", "", "lib", ".exe")
+    } else if cfg!(target_os = "macos") {
+      ("lib", "dylib", "lib", "a", "")
+    } else {
+      ("lib", "so", "lib", "a", "")
+    };
     for (crate_type, crate_name, expected) in [
-      ("bin", "build_script_build", "build_script_build-1234".to_string()),
+      (
+        "bin",
+        "build_script_build",
+        format!("build_script_build-1234{executable_suffix}"),
+      ),
       (
         "proc-macro",
         "fixture_macros",
-        format!("libfixture_macros-1234.{dynamic_suffix}"),
+        format!("{dynamic_prefix}fixture_macros-1234.{dynamic_suffix}"),
       ),
       (
         "dylib",
         "fixture_dynamic",
-        format!("libfixture_dynamic-1234.{dynamic_suffix}"),
+        format!("{dynamic_prefix}fixture_dynamic-1234.{dynamic_suffix}"),
       ),
-      ("cdylib", "fixture_c", format!("libfixture_c-1234.{dynamic_suffix}")),
-      ("staticlib", "fixture_static", "libfixture_static-1234.a".to_string()),
+      (
+        "cdylib",
+        "fixture_c",
+        format!("{dynamic_prefix}fixture_c-1234.{dynamic_suffix}"),
+      ),
+      (
+        "staticlib",
+        "fixture_static",
+        format!("{static_prefix}fixture_static-1234.{static_suffix}"),
+      ),
     ] {
       let mut bypasses = BTreeSet::new();
       let arguments = [
@@ -2921,7 +2949,7 @@ mod tests {
     assert_eq!(manifests.len(), 1);
     manifests[0].execution.cache_wrapper = Some(CompilerCacheWrapperMetadata::new(
       CompilerCacheWrapperStatus::Bypassed,
-      "rustdoc_not_graduated",
+      "rustdoc_output_tree_observation_unavailable",
     ));
     let manifest = &manifests[0];
     assert_eq!(manifest.unit.mode, CompilerMode::Rustdoc);

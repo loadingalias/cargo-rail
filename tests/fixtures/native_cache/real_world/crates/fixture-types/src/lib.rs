@@ -6,6 +6,12 @@ pub struct Record {
 }
 
 impl Record {
+  /// Creates a record.
+  ///
+  /// ```
+  /// let record = fixture_types::Record::new(7, "retained doctest");
+  /// assert_eq!(record.id, 7);
+  /// ```
   pub fn new(id: u64, value: impl Into<String>) -> Self {
     Self { id, value: value.into() }
   }

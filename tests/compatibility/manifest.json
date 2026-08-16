@@ -1,5 +1,5 @@
 {
-  "schema_version": 5,
+  "schema_version": 7,
   "front_door_corpus": {
     "fixture": "tests/compatibility/fixtures/front-door",
     "runner": "scripts/ci/run-compatibility.py"
@@ -88,14 +88,82 @@
   ],
   "deferred_native_hosts": [
     {
+      "evidence_gate": "native_powerpc64le_hardware_access_unavailable",
       "name": "IBM Power",
       "target": "powerpc64le-unknown-linux-gnu"
     },
     {
+      "evidence_gate": "native_riscv64gc_hardware_access_unavailable",
+      "name": "RISC-V 64",
+      "target": "riscv64gc-unknown-linux-gnu"
+    },
+    {
+      "evidence_gate": "native_s390x_hardware_access_unavailable",
       "name": "IBM Z",
       "target": "s390x-unknown-linux-gnu"
     }
   ],
+  "task9_open_evidence_gates": {
+    "native_hosts": [
+      {
+        "target": "aarch64-apple-darwin",
+        "evidence_gate": "task9_aarch64_apple_darwin_cache_off_performance_incomplete"
+      },
+      {
+        "target": "aarch64-pc-windows-msvc",
+        "evidence_gate": "task9_aarch64_pc_windows_msvc_native_evidence_unavailable"
+      },
+      {
+        "target": "aarch64-unknown-linux-gnu",
+        "evidence_gate": "task9_aarch64_unknown_linux_gnu_native_evidence_unavailable"
+      },
+      {
+        "target": "powerpc64le-unknown-linux-gnu",
+        "evidence_gate": "native_powerpc64le_hardware_access_unavailable"
+      },
+      {
+        "target": "riscv64gc-unknown-linux-gnu",
+        "evidence_gate": "native_riscv64gc_hardware_access_unavailable"
+      },
+      {
+        "target": "s390x-unknown-linux-gnu",
+        "evidence_gate": "native_s390x_hardware_access_unavailable"
+      },
+      {
+        "target": "x86_64-apple-darwin",
+        "evidence_gate": "task9_x86_64_apple_darwin_native_evidence_unavailable"
+      },
+      {
+        "target": "x86_64-pc-windows-msvc",
+        "evidence_gate": "task9_x86_64_pc_windows_msvc_native_evidence_unavailable"
+      },
+      {
+        "target": "x86_64-unknown-linux-gnu",
+        "evidence_gate": "task9_x86_64_unknown_linux_gnu_native_evidence_unavailable"
+      }
+    ],
+    "remote_providers": [
+      {
+        "provider": "aws-s3",
+        "evidence_gates": [
+          "task9_aws_s3_correctness_evidence_unavailable",
+          "task9_aws_s3_performance_evidence_unavailable"
+        ]
+      },
+      {
+        "provider": "azure-blob",
+        "evidence_gates": [
+          "task9_azure_blob_correctness_evidence_unavailable"
+        ]
+      },
+      {
+        "provider": "cloudflare-r2",
+        "evidence_gates": [
+          "task9_cloudflare_r2_correctness_evidence_unavailable"
+        ]
+      }
+    ]
+  },
   "advertised_non_default_linkers": [],
   "advertised_non_default_codegen_backends": []
 }

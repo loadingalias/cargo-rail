@@ -8,7 +8,7 @@ coverage="$repo_root/scripts/bench/native-cache-coverage.py"
 timing_wrapper="$repo_root/scripts/bench/rustc-timing-wrapper.sh"
 
 usage() {
-  echo "usage: $0 <runs>|run <runs>|smoke|resume <result-directory>" >&2
+  echo "usage: $0 <20-30 runs>|run <20-30 runs>|smoke|resume <result-directory>" >&2
   exit 2
 }
 
@@ -49,10 +49,17 @@ case "$operation" in
     ;;
 esac
 
-[[ "$runs" =~ ^[0-9]+$ && "$runs" -gt 0 ]] || {
-  echo "native-cache benchmark runs must be a positive integer" >&2
-  exit 2
-}
+if [[ "$operation" == resume ]]; then
+  [[ "$runs" =~ ^[0-9]+$ && "$runs" -gt 0 ]] || {
+    echo "native-cache benchmark evidence has an invalid sample count" >&2
+    exit 2
+  }
+elif [[ "$evidence_kind" == retained ]]; then
+  [[ "$runs" =~ ^[0-9]+$ && "$runs" -ge 20 && "$runs" -le 30 ]] || {
+    echo "retained native-cache qualification requires 20-30 accepted samples per lane" >&2
+    exit 2
+  }
+fi
 for tool in cargo git jq python3 sccache; do
   command -v "$tool" >/dev/null || {
     echo "missing required benchmark tool: $tool" >&2
@@ -185,7 +192,7 @@ lanes=(
   sccache-client
   transparent-incremental
 )
-workloads=(check build)
+workloads=(check build test)
 installed_lanes=(transparent-l0 cache-off transparent-cold transparent-warm transparent-incremental)
 
 mkdir -p "$state/homes" "$state/fixtures" "$state/caches" "$results/raw"
@@ -216,9 +223,67 @@ for workload in "${workloads[@]}"; do
     fi
   done
 done
+compiler_mode_root="$state/fixtures/compiler-modes-transparent-warm"
+if [[ ! -f "$compiler_mode_root/Cargo.toml" ]]; then
+  "$repo_root/scripts/fixtures/materialize-native-cache.sh" "$compiler_mode_root" "$shared_git" >/dev/null
+fi
+(
+  cd "$compiler_mode_root"
+  env -u RUSTC_WRAPPER -u CARGO_BUILD_RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER \
+    -u CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER CARGO_HOME="$state/homes/transparent-warm/cargo" \
+    cargo fetch --locked --quiet
+)
 for lane in "${installed_lanes[@]}"; do
   setup_lane "$lane"
 done
+
+run_compiler_mode_inventory() {
+  local directory="$results/coverage/compiler-modes"
+  local report="$directory/coverage.json"
+  if [[ -f "$report" ]]; then
+    jq -e '.schema_version == 1 and .passed' "$report" >/dev/null
+    return
+  fi
+  local events="$directory/events"
+  local stdout="$directory/stdout"
+  local stderr="$directory/stderr"
+  local cargo_home="$state/homes/transparent-warm/cargo"
+  local rustdoc_program
+  rustdoc_program="$(command -v rustdoc)"
+  rm -rf -- "$directory" "$compiler_mode_root/target"
+  mkdir -p "$events"
+  chmod 700 "$directory" "$events"
+  : >"$stdout"
+  : >"$stderr"
+  local environment=(
+    -u RUSTC_WRAPPER -u CARGO_BUILD_RUSTC_WRAPPER
+    -u RUSTC_WORKSPACE_WRAPPER -u CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER
+    -u CARGO_TARGET_DIR -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS
+    "CARGO_HOME=$cargo_home" CARGO_TERM_COLOR=never CARGO_NET_OFFLINE=true
+    CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1
+    CARGO_RAIL_CACHE=__cargo_rail_benchmark_coverage_v1
+    "CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY=$events"
+  )
+  (
+    cd "$compiler_mode_root"
+    env "${environment[@]}" \
+      cargo clippy --workspace --all-features --all-targets --locked --offline \
+        --message-format=json-render-diagnostics -vv >>"$stdout" 2>>"$stderr"
+    env "${environment[@]}" RUSTDOC="$binary" CARGO_RAIL_RUSTDOC_WRAPPER=1 \
+      "CARGO_RAIL_INNER_RUSTDOC=$rustdoc_program" \
+      cargo doc --workspace --all-features --no-deps --locked --offline \
+        --message-format=json-render-diagnostics -vv >>"$stdout" 2>>"$stderr"
+    env "${environment[@]}" RUSTDOC="$binary" CARGO_RAIL_RUSTDOC_WRAPPER=1 \
+      "CARGO_RAIL_INNER_RUSTDOC=$rustdoc_program" \
+      cargo test --workspace --all-features --doc --locked --offline \
+        --message-format=json-render-diagnostics -vv >>"$stdout" 2>>"$stderr"
+  )
+  python3 "$coverage" compiler-modes \
+    --cargo-rail-events "$events" \
+    --cargo-rail-verbose "$stderr" \
+    --cargo-rail-root "$compiler_mode_root" \
+    --output "$report"
+}
 for workload in "${workloads[@]}"; do
   for lane in "${lanes[@]}"; do
     (
@@ -233,12 +298,17 @@ done
 command_args() {
   local workload="$1"
   local lane="$2"
+  local corpus="${3:-performance}"
   CARGO_COMMAND=(cargo "$workload")
   [[ "$workload" == build ]] && CARGO_COMMAND+=(--release)
+  [[ "$workload" == test ]] && CARGO_COMMAND+=(--no-run --all-targets)
   if [[ "$lane" == transparent-incremental ]]; then
     CARGO_COMMAND+=(--package fixture-types --no-default-features)
   else
     CARGO_COMMAND+=(--workspace --all-features)
+    if [[ "$corpus" == performance ]]; then
+      CARGO_COMMAND+=(--exclude fixture-static)
+    fi
   fi
   CARGO_COMMAND+=(--locked --offline --message-format=json-render-diagnostics)
 }
@@ -266,7 +336,7 @@ run_lane_command() {
   local timing="$5"
   local root="$state/fixtures/$workload-$lane"
   local home="$state/homes/$lane/cargo"
-  command_args "$workload" "$lane"
+  command_args "$workload" "$lane" performance
   common_measure_args "$root" "$home" "$stdout" "$stderr" "$timing"
   MEASURE_ARGS+=(--env CARGO_INCREMENTAL=0)
   case "$lane" in
@@ -455,18 +525,22 @@ else
     --argjson lanes "$(printf '%s\n' "${lanes[@]}" | jq -Rsc 'split("\n")[:-1]')" \
     --argjson workloads "$(printf '%s\n' "${workloads[@]}" | jq -Rsc 'split("\n")[:-1]')" \
     '{
-      schema_version: 11,
+      schema_version: 14,
       evidence_kind: $evidence_kind,
       required_accepted_samples: $runs,
       workloads: $workloads,
       lanes: $lanes,
       interleaving: "deterministic rotation by workload and round",
+      performance_exclusions: {
+        "fixture-static": "pinned sccache omits the requested metadata output on a cache hit"
+      },
       qualification: {
-        rust_action_coverage_gate: "same_and_faster_or_four_dimensional_more_and_faster",
-        minimum_samples: 5,
+        rust_action_coverage_gate: "strict_safe_action_superset",
+        minimum_samples: 20,
         l0_and_disabled_p95_overhead_max_percent: 3,
         l0_and_disabled_p95_overhead_max_seconds: 0.05,
-        empty_target_l1_vs_sccache_p50_and_p95_min_percent: 0
+        empty_target_l1_vs_sccache_p50_and_p95_min_percent: 10,
+        empty_target_l1_vs_sccache_p50_and_p95_target_percent: 15
       }
     }' >"$results/run.json"
 fi
@@ -478,10 +552,10 @@ run_coverage_command() {
   local retain_evidence="${4:-true}"
   local root="$state/fixtures/$workload-$lane"
   local home="$state/homes/$lane/cargo"
-  command_args "$workload" "$lane"
+  command_args "$workload" "$lane" coverage
   CARGO_COMMAND+=(--verbose --verbose)
   common_measure_args "$root" "$home" "$directory/stdout" "$directory/stderr" "$directory/timing.json"
-  MEASURE_ARGS+=(--env CARGO_INCREMENTAL=0 --env CARGO_BUILD_JOBS=1)
+  MEASURE_ARGS+=(--env CARGO_INCREMENTAL=0 --env CARGO_BUILD_JOBS=1 --env CC_ENABLE_DEBUG_OUTPUT=1)
   case "$lane" in
     transparent-warm)
       if [[ "$retain_evidence" == true ]]; then
@@ -521,7 +595,7 @@ run_cold_cost_ledger() {
   [[ -f "$directory/.complete" ]] && return
   rm -rf -- "$directory" "$root/target"
   mkdir -p "$directory"
-  command_args "$workload" transparent-cold
+  command_args "$workload" transparent-cold coverage
   (
     cd "$root"
     env -u CARGO_BUILD_RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER -u CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER \
@@ -541,7 +615,7 @@ for workload in "${workloads[@]}"; do
   directory="$results/coverage/$workload"
   report="$directory/coverage.json"
   if [[ -f "$report" ]]; then
-    jq -e '.schema_version == 3 and .coverage_gate.passed' "$report" >/dev/null || coverage_failures=$((coverage_failures + 1))
+    jq -e '.schema_version == 6 and .coverage_gate.passed' "$report" >/dev/null || coverage_failures=$((coverage_failures + 1))
     continue
   fi
   rm -rf -- "$directory"
@@ -565,6 +639,7 @@ for workload in "${workloads[@]}"; do
   stop_sccache_lane sccache-server
   if ! python3 "$coverage" report \
     --cargo-rail-events "$directory/cargo-rail/events" \
+    --cargo-rail-messages "$directory/cargo-rail/stdout" \
     --cargo-rail-verbose "$directory/cargo-rail/stderr" \
     --cargo-rail-root "$state/fixtures/$workload-transparent-warm" \
     --sccache-log "$directory/sccache/sccache.log" \
@@ -574,6 +649,9 @@ for workload in "${workloads[@]}"; do
     coverage_failures=$((coverage_failures + 1))
   fi
 done
+if ! run_compiler_mode_inventory; then
+  coverage_failures=$((coverage_failures + 1))
+fi
 if [[ "$coverage_failures" -ne 0 ]]; then
   echo "native-cache timing blocked: verified Rust action coverage does not pass the four-dimensional gate" >&2
   exit 1
@@ -699,6 +777,5 @@ for ((round = 1; round <= runs; round++)); do
   done
 done
 
-"$reporter" summarize "$results"
 "$reporter" validate "$results"
 echo "native-cache benchmark result: $results"

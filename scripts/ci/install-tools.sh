@@ -365,6 +365,18 @@ case "$profile" in
     install_cargo_nextest
     cargo nextest --version
     ;;
+  native-cache-qualification)
+    install_cargo_nextest
+    install_cargo_deny
+    install_cargo_audit
+    install_hyperfine
+    install_sccache
+    cargo nextest --version
+    cargo deny --version
+    cargo audit --version
+    hyperfine --version
+    sccache --version
+    ;;
   *-qualification)
     # Benchmark images stay lean. Qualification explicitly adds the tools used
     # by `just check` and `just test-all` before measurements are retained.

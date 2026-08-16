@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 <bucket> <region> <cache/cargo-rail/sccache/v3/aws/task5/run-prefix>" >&2
+  echo "usage: $0 <bucket> <region> <exact Task 9 Cargo-Rail or sccache prefix>" >&2
   exit 2
 }
 
@@ -12,8 +12,11 @@ prefix="${3:-}"
 [[ "$#" -eq 3 ]] || usage
 [[ "$bucket" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || usage
 [[ "$region" =~ ^[a-z0-9-]+$ ]] || usage
-[[ "$prefix" =~ ^cache/cargo-rail/sccache/v3/aws/task5/[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || usage
-[[ "$prefix" != */ && "$prefix" != *..* ]] || usage
+if [[ ! "$prefix" =~ ^cache/cargo-rail/s3/v3/task9/[A-Za-z0-9][A-Za-z0-9._-]*$ \
+  && ! "$prefix" =~ ^cache/cargo-rail/sccache/v3/aws/task9/[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  usage
+fi
+[[ "$prefix" != *..* ]] || usage
 
 for tool in aws jq; do
   command -v "$tool" >/dev/null || {

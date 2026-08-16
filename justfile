@@ -101,13 +101,13 @@ bench-native-cache-summarize results:
 bench-native-cache-validate results:
     @scripts/bench/native-cache-report.sh validate "{{ results }}"
 
-bench-native-cache-aws-plan target:
+qualify-native-cache-native-plan target:
     @scripts/bench/remote-native-cache.sh plan "{{ target }}"
 
-bench-native-cache-aws-smoke target *args="":
-    @scripts/bench/remote-native-cache.sh smoke "{{ target }}" {{ args }}
+qualify-native-cache-native-smoke target execute:
+    @scripts/bench/remote-native-cache.sh smoke "{{ target }}" "{{ execute }}"
 
-bench-native-cache-aws target runs execute:
+qualify-native-cache-native target runs execute:
     @scripts/bench/remote-native-cache.sh run "{{ target }}" "{{ runs }}" "{{ execute }}"
 
 bench-native-cache-remote mode runs run_id:
@@ -116,11 +116,14 @@ bench-native-cache-remote mode runs run_id:
 qualify-native-cache-s3 phase run_id remote_url:
     @scripts/ci/qualify-native-cache-s3.sh "{{ phase }}" "{{ run_id }}" "{{ remote_url }}"
 
-qualify-native-cache-r2-faults run_id remote_url bucket:
-    @scripts/ci/qualify-native-cache-r2-faults.sh "{{ run_id }}" "{{ remote_url }}" "{{ bucket }}"
+validate-native-cache-remote-pair producer consumer output:
+    @scripts/ci/validate-native-cache-remote-pair.py validate "{{ producer }}" "{{ consumer }}" "{{ output }}"
 
-qualify-native-cache-r2-faults-resume-outage run_id remote_url bucket:
-    @scripts/ci/qualify-native-cache-r2-faults.sh "{{ run_id }}" "{{ remote_url }}" "{{ bucket }}" resume-outage
+qualify-native-cache-remote-faults run_id remote_url:
+    @scripts/ci/qualify-native-cache-remote-faults.sh "{{ run_id }}" "{{ remote_url }}"
+
+qualify-native-cache-remote-faults-resume-outage run_id remote_url:
+    @scripts/ci/qualify-native-cache-remote-faults.sh "{{ run_id }}" "{{ remote_url }}" resume-outage
 
 qualify-native-cache-s3-performance runs run_id remote_url bucket region prefix:
     @scripts/ci/qualify-native-cache-s3-performance.sh "{{ runs }}" "{{ run_id }}" "{{ remote_url }}" "{{ bucket }}" "{{ region }}" "{{ prefix }}"
@@ -133,6 +136,9 @@ cleanup-native-cache-s3-prefix bucket region prefix:
 
 cleanup-native-cache-r2-prefix account bucket prefix:
     @scripts/ci/cleanup-native-cache-r2-prefix.sh "{{ account }}" "{{ bucket }}" "{{ prefix }}"
+
+cleanup-native-cache-azure-container account container run_id:
+    @scripts/ci/cleanup-native-cache-azure-container.sh "{{ account }}" "{{ container }}" "{{ run_id }}"
 
 install-qualification-tools:
     @scripts/ci/install-qualification-tools.sh

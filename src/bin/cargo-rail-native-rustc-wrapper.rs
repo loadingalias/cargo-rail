@@ -10,7 +10,7 @@ fn main() {
     eprintln!("cargo-rail compiler cache wrapper: missing compiler executable");
     std::process::exit(1);
   };
-  if std::env::var_os("CARGO_RAIL_CACHE").as_deref() == Some(std::ffi::OsStr::new("off")) {
+  if std::env::var_os("CARGO_RAIL_CACHE").as_deref() == Some(std::ffi::OsStr::new("off")) && !has_non_cache_role() {
     let mut command = std::process::Command::new(program);
     command.args(arguments);
     exit_with(command, "cargo-rail compiler cache wrapper");
@@ -36,6 +36,20 @@ fn main() {
     .args(arguments)
     .env("CARGO_RAIL_DIRECT_CACHE_LAUNCHER", launcher);
   exit_with(command, "cargo-rail compiler cache launcher");
+}
+
+fn has_non_cache_role() -> bool {
+  [
+    "CARGO_RAIL_APPLE_LINK_ADAPTER",
+    "CARGO_RAIL_COMPILER_CACHE_WRAPPER",
+    "CARGO_RAIL_COMPILER_FACT_DOCTEST_BUILDER",
+    "CARGO_RAIL_COMPILER_FACT_DOCTEST_RUNNER",
+    "CARGO_RAIL_ELF_LINK_ADAPTER",
+    "CARGO_RAIL_RUSTC_WRAPPER",
+    "CARGO_RAIL_RUSTDOC_WRAPPER",
+  ]
+  .iter()
+  .any(|name| std::env::var_os(name).is_some())
 }
 
 #[cfg(unix)]

@@ -102,11 +102,20 @@ impl InvocationSignals {
       }
       return Ok(Some(InvocationRole::LinkAdapter));
     }
+    if self.direct_cache && self.rustdoc_observation && !self.rustc_wrapper_argv {
+      // The installed cache wrapper is also Cargo's rustdoc proxy. Its file
+      // name therefore produces the direct-cache signal even though the
+      // explicit rustdoc marker owns this invocation.
+      if self.marked_cache {
+        return Err("direct rustdoc proxy received a conflicting cache role marker");
+      }
+      return Ok(Some(InvocationRole::RustdocObservation));
+    }
     if self.direct_cache {
       // Cargo passes workspace-wrapper markers through the configured global
-      // wrapper. The direct wrapper must run first and preserve the marker for
-      // the selected workspace wrapper child.
-      if self.marked_cache || self.rustdoc_observation {
+      // wrapper, and a configured rustdoc proxy marker is inherited by Cargo's
+      // rustc probes. The direct wrapper argv is authoritative for both cases.
+      if self.marked_cache {
         return Err("direct cache wrapper received conflicting compiler role markers");
       }
       return Ok(Some(InvocationRole::DirectCache));
@@ -256,10 +265,13 @@ pub fn dispatch() -> PreClapDispatch {
 
 fn rustc_wrapper_argument_shape() -> bool {
   std::env::args_os().nth(1).is_some_and(|program| {
-    Path::new(&program)
+    let rustc = Path::new(&program)
       .file_stem()
       .and_then(std::ffi::OsStr::to_str)
-      .is_some_and(|name| name.eq_ignore_ascii_case("rustc"))
+      .is_some_and(|name| name.eq_ignore_ascii_case("rustc"));
+    rustc
+      || crate::compiler::native_cache::NativeCacheContext::is_direct_invocation()
+        && program.as_encoded_bytes().first() != Some(&b'-')
   })
 }
 
@@ -408,8 +420,8 @@ fn cache_fast_bypass_reason(invocation: &CompilerInvocation, observation_wrapper
   let Some((program, arguments)) = invocation.compiler_selection(observation_wrapper) else {
     return Some("compiler_argv_unavailable");
   };
-  if !observation_wrapper && !direct_rustc_program_shape(program) {
-    return Some("compiler_program_not_graduated");
+  if !observation_wrapper && !direct_supported_compiler_program_shape(program) {
+    return Some("alternate_compiler_program_identity_unavailable");
   }
   crate::compiler::native_cache::fast_bypass_reason(program, arguments)
 }
@@ -427,12 +439,14 @@ fn compiler_fact_requires_execution(observation_wrapper: bool, fact_session_pres
   observation_wrapper && fact_session_present
 }
 
-fn direct_rustc_program_shape(program: &std::ffi::OsStr) -> bool {
+fn direct_supported_compiler_program_shape(program: &std::ffi::OsStr) -> bool {
   Path::new(program)
     .file_stem()
     .and_then(std::ffi::OsStr::to_str)
     .is_some_and(|name| {
-      name.eq_ignore_ascii_case("rustc") || name.get(..5).is_some_and(|prefix| prefix.eq_ignore_ascii_case("rustc"))
+      name.eq_ignore_ascii_case("clippy-driver")
+        || name.eq_ignore_ascii_case("rustc")
+        || name.get(..5).is_some_and(|prefix| prefix.eq_ignore_ascii_case("rustc"))
     })
 }
 
@@ -744,12 +758,32 @@ fn run_rustdoc() -> i32 {
     return 1;
   };
   let original_arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+  let benchmark_coverage = cache_control() == CacheControl::BenchmarkCoverage;
+  if benchmark_coverage {
+    crate::compiler::native_cache::activate_benchmark_coverage();
+  }
   if is_rustdoc_information_request(&original_arguments) {
+    if benchmark_coverage {
+      crate::compiler::native_cache::record_benchmark_coverage_bypass(
+        &rustdoc,
+        &original_arguments,
+        "compiler_information_request",
+      );
+    }
     return run_rustdoc_bypass(CompilerInvocation::selected(rustdoc, original_arguments));
   }
   let fact_session = match fact_session() {
     Ok(Some(session)) => session,
-    Ok(None) => return run_rustdoc_bypass(CompilerInvocation::selected(rustdoc, original_arguments)),
+    Ok(None) => {
+      if benchmark_coverage {
+        crate::compiler::native_cache::record_benchmark_coverage_bypass(
+          &rustdoc,
+          &original_arguments,
+          rustdoc_cache_bypass_reason(&original_arguments),
+        );
+      }
+      return run_rustdoc_bypass(CompilerInvocation::selected(rustdoc, original_arguments));
+    }
     Err(error) => {
       eprintln!("cargo-rail rustdoc proxy: {error}");
       return 2;
@@ -850,6 +884,14 @@ fn run_rustdoc() -> i32 {
       eprintln!("cargo-rail rustdoc proxy: failed to execute rustdoc: {error}");
       1
     }
+  }
+}
+
+fn rustdoc_cache_bypass_reason(arguments: &[OsString]) -> &'static str {
+  if arguments.iter().any(|argument| argument == "--test") {
+    "doctest_execution_result_authority_unavailable"
+  } else {
+    "rustdoc_output_tree_observation_unavailable"
   }
 }
 
@@ -1224,6 +1266,16 @@ mod tests {
     );
     assert_eq!(
       InvocationSignals {
+        direct_cache: true,
+        rustdoc_observation: true,
+        rustc_wrapper_argv: true,
+        ..InvocationSignals::default()
+      }
+      .classify(),
+      Ok(Some(InvocationRole::DirectCache))
+    );
+    assert_eq!(
+      InvocationSignals {
         rustc_observation: true,
         rustdoc_observation: true,
         rustc_wrapper_argv: true,
@@ -1234,6 +1286,16 @@ mod tests {
     );
     assert_eq!(
       InvocationSignals {
+        rustc_observation: true,
+        rustdoc_observation: true,
+        ..InvocationSignals::default()
+      }
+      .classify(),
+      Ok(Some(InvocationRole::RustdocObservation))
+    );
+    assert_eq!(
+      InvocationSignals {
+        direct_cache: true,
         rustc_observation: true,
         rustdoc_observation: true,
         ..InvocationSignals::default()
@@ -1313,6 +1375,16 @@ mod tests {
       true,
       Some(std::ffi::OsStr::new("other-wrapper"))
     ));
+  }
+
+  #[test]
+  fn direct_compiler_programs_include_clippy_only_for_explicit_bypass() {
+    assert!(direct_supported_compiler_program_shape(OsStr::new("rustc")));
+    assert!(direct_supported_compiler_program_shape(OsStr::new("rustc.exe")));
+    assert!(direct_supported_compiler_program_shape(OsStr::new("clippy-driver")));
+    assert!(!direct_supported_compiler_program_shape(OsStr::new(
+      "alternate-rust-compiler"
+    )));
   }
 
   #[cfg(unix)]

@@ -31,16 +31,17 @@ jq -s \
   --slurpfile environment "$results/environment.json" \
   --slurpfile check_coverage "$results/coverage/check/coverage.json" \
   --slurpfile build_coverage "$results/coverage/build/coverage.json" \
+  --slurpfile test_coverage "$results/coverage/test/coverage.json" \
+  --slurpfile compiler_modes "$results/coverage/compiler-modes/coverage.json" \
   --slurpfile run "$results/run.json" '
   def quantile($values; $p):
     ($values | sort) as $sorted
     | if ($sorted | length) == 0 then null
       else $sorted[((($sorted | length) - 1) * $p | floor)]
       end;
-  def times($samples; $workload; $lane):
-    [$samples[] | select(.accepted and .workload == $workload and .lane == $lane) | .measurement.elapsed_seconds];
   def metric($samples; $workload; $lane):
-    times($samples; $workload; $lane) as $times
+    [$samples[] | select(.accepted and .workload == $workload and .lane == $lane)] as $selected
+    | [$selected[].measurement.elapsed_seconds] as $times
     | {
         workload: $workload,
         lane: $lane,
@@ -49,7 +50,10 @@ jq -s \
         p95_elapsed_seconds: quantile($times; 0.95),
         mean_elapsed_seconds: (if ($times | length) == 0 then null else ($times | add / length) end),
         min_elapsed_seconds: (if ($times | length) == 0 then null else ($times | min) end),
-        max_elapsed_seconds: (if ($times | length) == 0 then null else ($times | max) end)
+        max_elapsed_seconds: (if ($times | length) == 0 then null else ($times | max) end),
+        total_user_seconds: ([$selected[].measurement.user_seconds | select(. != null)] | add // null),
+        total_system_seconds: ([$selected[].measurement.system_seconds | select(. != null)] | add // null),
+        max_rss_bytes: ([$selected[].measurement.max_rss_bytes | select(. != null)] | max // null)
       };
   def reduction($baseline; $candidate):
     if $baseline == null or $candidate == null or $baseline == 0 then null
@@ -89,34 +93,79 @@ jq -s \
           cache_off_p95_within_bound: overhead_within_bound($cargo_empty.p95_elapsed_seconds; $cache_off.p95_elapsed_seconds)
         }
     ] as $comparisons
+  | [
+      $check_coverage[0].operation_inventory.rust_class_counts,
+      $build_coverage[0].operation_inventory.rust_class_counts,
+      $test_coverage[0].operation_inventory.rust_class_counts
+    ]
+  | map(to_entries[] | select(.value > 0) | .key)
+  | unique as $observed_compiler_classes
+  | [
+      "binary",
+      "build_script",
+      "c_dynamic_library",
+      "proc_macro_producer",
+      "rust_dynamic_library",
+      "rust_library",
+      "static_library",
+      "test"
+    ] as $required_compiler_classes
+  | ($required_compiler_classes - $observed_compiler_classes) as $missing_compiler_classes
+  | ([$samples[] | select(.accepted)] | length) as $accepted_samples
+  | ([$samples[] | select(.accepted | not)] | length) as $rejected_samples
+  | ([$samples[] | select((.lane == "transparent-warm") and (.cache_outcome_valid | not))] | length) as $false_hits
+  | ($metrics | map(.accepted_samples) | min // 0) as $minimum_accepted_samples
+  | ([$contract.qualification.empty_target_l1_vs_sccache_p50_and_p95_min_percent, 10] | max) as $superiority_minimum
+  | ($contract.qualification.empty_target_l1_vs_sccache_p50_and_p95_target_percent // 15) as $performance_target
+  | (
+      $contract.evidence_kind == "retained"
+      and $contract.required_accepted_samples >= $contract.qualification.minimum_samples
+      and $contract.required_accepted_samples <= 30
+      and ($metrics | all(.accepted_samples == $contract.required_accepted_samples))
+      and $rejected_samples == 0
+      and $false_hits == 0
+      and $check_coverage[0].coverage_gate.passed
+      and $build_coverage[0].coverage_gate.passed
+      and $test_coverage[0].coverage_gate.passed
+      and $compiler_modes[0].passed
+      and ($missing_compiler_classes | length) == 0
+    ) as $evidence_qualified
+  | ($comparisons | all(.l0_p95_within_bound and .cache_off_p95_within_bound)) as $overhead_within_bounds
+  | ($comparisons | all(
+      .l1_vs_sccache_p50_reduction_percent >= $superiority_minimum
+      and .l1_vs_sccache_p95_reduction_percent >= $superiority_minimum
+    )) as $superiority_reached
+  | ($comparisons | all(
+      .l1_vs_sccache_p50_reduction_percent >= $performance_target
+      and .l1_vs_sccache_p95_reduction_percent >= $performance_target
+    )) as $target_reached
   | {
-      schema_version: 11,
+      schema_version: 17,
       evidence_kind: $contract.evidence_kind,
       requested_samples_per_lane: $contract.required_accepted_samples,
       total_samples: ($samples | length),
-      accepted_samples: ([$samples[] | select(.accepted)] | length),
-      rejected_samples: ([$samples[] | select(.accepted | not)] | length),
-      minimum_accepted_samples_per_lane: ($metrics | map(.accepted_samples) | min // 0),
-      false_hits: ([$samples[] | select((.lane == "transparent-warm") and (.cache_outcome_valid | not))] | length),
+      accepted_samples: $accepted_samples,
+      rejected_samples: $rejected_samples,
+      minimum_accepted_samples_per_lane: $minimum_accepted_samples,
+      false_hits: $false_hits,
       metrics: $metrics,
       comparisons: $comparisons,
       coverage: {
         check: $check_coverage[0],
-        build: $build_coverage[0]
+        build: $build_coverage[0],
+        test: $test_coverage[0],
+        compiler_modes: $compiler_modes[0]
       },
-      performance_qualified: (
-        $contract.required_accepted_samples >= $contract.qualification.minimum_samples
-        and $check_coverage[0].coverage_gate.passed
-        and $build_coverage[0].coverage_gate.passed
-        and ($comparisons | all(
-          .l0_p95_within_bound
-          and .cache_off_p95_within_bound
-          and .l1_vs_sccache_p50_reduction_percent
-            > $contract.qualification.empty_target_l1_vs_sccache_p50_and_p95_min_percent
-          and .l1_vs_sccache_p95_reduction_percent
-            > $contract.qualification.empty_target_l1_vs_sccache_p50_and_p95_min_percent
-        ))
-      ),
+      compiler_class_coverage: {
+        complete: ($missing_compiler_classes | length) == 0,
+        required: $required_compiler_classes,
+        observed: $observed_compiler_classes,
+        missing: $missing_compiler_classes
+      },
+      overhead_qualified: ($evidence_qualified and $overhead_within_bounds),
+      superiority_qualified: ($evidence_qualified and $superiority_reached),
+      target_qualified: ($evidence_qualified and $target_reached),
+      performance_qualified: ($evidence_qualified and $overhead_within_bounds and $superiority_reached),
       environment: $environment[0],
       contract: $contract
     }
@@ -129,7 +178,10 @@ if [[ "$mode" == validate ]]; then
     and .false_hits == 0
     and .coverage.check.coverage_gate.passed
     and .coverage.build.coverage_gate.passed
-    and .minimum_accepted_samples_per_lane >= $required
+    and .coverage.test.coverage_gate.passed
+    and .coverage.compiler_modes.passed
+    and .compiler_class_coverage.complete
+    and (.metrics | all(.accepted_samples == $required))
   ' "$results/summary.json" >/dev/null; then
     echo "native-cache benchmark did not retain the requested accepted samples" >&2
     jq '{requested_samples_per_lane, accepted_samples, rejected_samples, false_hits, minimum_accepted_samples_per_lane}' \
@@ -145,6 +197,10 @@ jq '{
   rejected_samples,
   false_hits,
   minimum_accepted_samples_per_lane,
+  overhead_qualified,
+  superiority_qualified,
+  target_qualified,
   performance_qualified,
+  compiler_class_coverage,
   comparisons
 }' "$results/summary.json"

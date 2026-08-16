@@ -16,9 +16,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 const DESCRIPTOR_MAGIC: &[u8; 8] = b"CRNDESC1";
-const DESCRIPTOR_VERSION: u16 = 6;
-const IDENTITY_CONTRACT_VERSION: u16 = 11;
-const RESULT_CLASS_VERSION: u16 = 4;
+const DESCRIPTOR_VERSION: u16 = 7;
+const IDENTITY_CONTRACT_VERSION: u16 = 12;
+const RESULT_CLASS_VERSION: u16 = 5;
 const MAX_DESCRIPTOR_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DESCRIPTOR_STRING_BYTES: usize = 4 * 1024;
 const FIXED_DESCRIPTOR_PREFIX_BYTES: usize = 8 + 2 + 2 + 2 + 2;
@@ -154,8 +154,7 @@ impl NativeResultDescriptor {
     push_strings(&mut bytes, &self.witness.generated_paths)?;
     push_strings(&mut bytes, &self.witness.dependency_names)?;
     push_strings(&mut bytes, &self.witness.environment_names)?;
-    push_bytes(&mut bytes, &serde_json::to_vec(&self.witness.apple_linker)?)?;
-    push_bytes(&mut bytes, &serde_json::to_vec(&self.witness.elf_linker)?)?;
+    push_bytes(&mut bytes, &serde_json::to_vec(&self.witness.linker)?)?;
     bytes.push(
       u8::try_from(self.outputs.len() + 2)
         .map_err(|_| RailError::message("native result descriptor slot count is out of range"))?,
@@ -212,20 +211,18 @@ impl NativeResultDescriptor {
           .and_then(|total| total.checked_add(value.len()))
           .ok_or_else(|| RailError::message("native result descriptor size overflow"))
       })?;
-    let apple_linker = serde_json::to_vec(&self.witness.apple_linker)?;
-    let elf_linker = serde_json::to_vec(&self.witness.elf_linker)?;
+    let linker = serde_json::to_vec(&self.witness.linker)?;
     FIXED_DESCRIPTOR_PREFIX_BYTES
       .checked_add(strings)
       .and_then(|total| total.checked_add(2 + 1 + 4 * 4 + 1))
-      .and_then(|total| total.checked_add(4 + apple_linker.len()))
-      .and_then(|total| total.checked_add(4 + elf_linker.len()))
+      .and_then(|total| total.checked_add(4 + linker.len()))
       .and_then(|total| total.checked_add((self.outputs.len() + 2) * (1 + 2 + 8 + 32)))
       .ok_or_else(|| RailError::message("native result descriptor size overflow"))
   }
 
   fn validate(&self) -> RailResult<()> {
     validate_action_key(&self.action_key)?;
-    if self.witness.version != 4
+    if self.witness.version != 5
       || !self.witness.complete
       || self.witness.source_paths.is_empty()
       || self.witness.source_paths.len() > MAX_SOURCE_ENTRIES
@@ -238,15 +235,9 @@ impl NativeResultDescriptor {
       || !strictly_sorted(&self.witness.environment_names)
       || self
         .witness
-        .apple_linker
+        .linker
         .as_ref()
-        .is_some_and(|witness| super::validate_apple_linker_witness(witness).is_err())
-      || self
-        .witness
-        .elf_linker
-        .as_ref()
-        .is_some_and(|witness| super::validate_elf_linker_witness(witness).is_err())
-      || self.witness.apple_linker.is_some() && self.witness.elf_linker.is_some()
+        .is_some_and(|witness| super::validate_linker_witness(witness).is_err())
     {
       return Err(RailError::message("native result descriptor has an invalid witness"));
     }
@@ -270,7 +261,7 @@ impl NativeResultDescriptor {
         ));
     if !valid_contract
       || self.outputs.iter().any(|output| {
-        output.bytes == 0
+        output.bytes == 0 && output.role != "metadata"
           || output.file_name.is_empty()
           || output.file_name.len() > MAX_DESCRIPTOR_STRING_BYTES
           || output.file_name.as_bytes().contains(&0)
@@ -804,10 +795,15 @@ mod tests {
 
   fn exported_fixture(stdout: &[u8]) -> (super::super::NativeCompilerValidation, Vec<u8>) {
     let validation = super::super::tests::cas_validation_with_stdout(stdout);
+    let bytes = export_fixture(&validation, stdout, b"metadata");
+    (validation, bytes)
+  }
+
+  fn export_fixture(validation: &super::super::NativeCompilerValidation, stdout: &[u8], metadata: &[u8]) -> Vec<u8> {
     let source = tempfile::tempdir().expect("pack source");
     for (path, bytes) in [
       (DEP_INFO_SLOT, b"dep-info".as_slice()),
-      (METADATA_SLOT, b"metadata".as_slice()),
+      (METADATA_SLOT, metadata),
       (STDOUT_SLOT, stdout),
       (STDERR_SLOT, b"".as_slice()),
     ] {
@@ -817,13 +813,13 @@ mod tests {
     }
 
     let mut bytes = Vec::new();
-    let exported = export(&validation, &mut bytes, |slot| {
+    let exported = export(validation, &mut bytes, |slot| {
       Ok(File::open(source.path().join(slot.path))?)
     })
     .expect("canonical export");
     assert_eq!(exported.content_length, bytes.len() as u64);
     assert_eq!(exported.bytes_written, bytes.len() as u64);
-    (validation, bytes)
+    bytes
   }
 
   #[test]
@@ -856,6 +852,39 @@ mod tests {
     );
     assert_eq!(
       fs::read(decoded.staging.path().join(STDERR_SLOT)).expect("decoded stderr"),
+      b""
+    );
+  }
+
+  #[test]
+  fn canonical_pack_round_trips_zero_byte_metadata() {
+    let mut validation = super::super::tests::cas_validation_with_stdout(b"");
+    let empty_digest = super::super::digest(b"");
+    validation.outputs[1].bytes = 0;
+    validation.outputs[1].content_digest = empty_digest.clone();
+    validation.observation.emitted_outputs[1].content_digest = empty_digest;
+    validation.result_key = super::super::result_key(
+      &validation.action_key,
+      &validation.witness,
+      &validation.outputs,
+      &validation.stdout_digest,
+      validation.stdout_bytes,
+      &validation.stderr_digest,
+      validation.stderr_bytes,
+    )
+    .expect("zero-byte metadata result identity");
+
+    let bytes = export_fixture(&validation, b"", b"");
+    let (decoded, association) = decode_for_action(
+      Cursor::new(&bytes),
+      validation.action_key(),
+      Some(bytes.len() as u64),
+      None,
+    )
+    .expect("zero-byte metadata decode");
+    assert_eq!(association.result_key(), validation.result_key());
+    assert_eq!(
+      fs::read(decoded.staging.path().join(METADATA_SLOT)).expect("decoded metadata"),
       b""
     );
   }

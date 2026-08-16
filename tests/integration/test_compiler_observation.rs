@@ -585,6 +585,30 @@ fn cache_off_bypasses_direct_wrapper_context_and_cas_acquisition() -> Result<()>
 }
 
 #[test]
+fn cache_off_preserves_the_rustdoc_proxy_role() -> Result<()> {
+  let state = tempfile::tempdir()?;
+  let absent_cache = state.path().join("cache-must-not-exist");
+
+  let output = Command::new(env!("CARGO_BIN_EXE_cargo-rail-native-rustc-wrapper"))
+    .arg("--version")
+    .env(CACHE_CONTROL_ENV, "off")
+    .env("CARGO_RAIL_CACHE_DIR", &absent_cache)
+    .env("CARGO_RAIL_RUSTDOC_WRAPPER", "1")
+    .env("CARGO_RAIL_INNER_RUSTDOC", which_rustdoc()?)
+    .env_remove(CACHE_WRAPPER_MARKER)
+    .env_remove("CARGO_RAIL_RUSTC_WRAPPER")
+    .output()?;
+
+  assert!(output.status.success(), "cache-off rustdoc proxy failed: {output:?}");
+  assert!(
+    String::from_utf8_lossy(&output.stdout).starts_with("rustdoc "),
+    "selected rustdoc output was not preserved: {output:?}"
+  );
+  assert!(!absent_cache.exists(), "cache-off rustdoc proxy acquired the CAS");
+  Ok(())
+}
+
+#[test]
 fn unsupported_incremental_invocation_bypasses_before_direct_context_load() -> Result<()> {
   let state = tempfile::tempdir()?;
   fs::create_dir_all(state.path().join("src"))?;
@@ -653,6 +677,128 @@ fn benchmark_coverage_records_fast_bypass_without_cache_context() -> Result<()> 
   assert_eq!(event["reason"], "compiler_information_request");
   assert_eq!(event["compiler"], "rustc");
   assert_eq!(event["arguments"], serde_json::json!(["--version"]));
+  Ok(())
+}
+
+#[test]
+fn benchmark_coverage_records_compiler_mode_cold_boundaries() -> Result<()> {
+  let state = tempfile::tempdir()?;
+  let state_root = fs::canonicalize(state.path())?;
+  let coverage = state_root.join("coverage");
+  let docs = state_root.join("docs");
+  fs::create_dir(&coverage)?;
+  fs::create_dir(&docs)?;
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::set_permissions(&coverage, fs::Permissions::from_mode(0o700))?;
+  }
+  fs::write(
+    state_root.join("lib.rs"),
+    "/// Returns seven.\n///\n/// ```\n/// assert_eq!(7, 7);\n/// ```\npub fn value() -> u8 { 7 }\n",
+  )?;
+  let absent_cache = state_root.join("cache-must-not-exist");
+  let wrapper = env!("CARGO_BIN_EXE_cargo-rail-native-rustc-wrapper");
+  let run_rustdoc = |arguments: &[&str]| -> Result<std::process::Output> {
+    Ok(
+      Command::new(wrapper)
+        .current_dir(&state_root)
+        .args(arguments)
+        .env("CARGO_RAIL_RUSTDOC_WRAPPER", "1")
+        .env("CARGO_RAIL_INNER_RUSTDOC", which_rustdoc()?)
+        .env(CACHE_CONTROL_ENV, BENCH_COVERAGE_CONTROL)
+        .env(BENCH_COVERAGE_DIRECTORY_ENV, &coverage)
+        .env("CARGO_RAIL_CACHE_DIR", &absent_cache)
+        .env_remove(CACHE_WRAPPER_MARKER)
+        .env_remove("CARGO_RAIL_RUSTC_WRAPPER")
+        .env_remove("CARGO_RAIL_COMPILER_FACT_SESSION")
+        .output()?,
+    )
+  };
+
+  let rustc_probe = Command::new(wrapper)
+    .arg(which_rustc()?)
+    .arg("-vV")
+    .env("CARGO_RAIL_RUSTDOC_WRAPPER", "1")
+    .env("CARGO_RAIL_INNER_RUSTDOC", which_rustdoc()?)
+    .env(CACHE_CONTROL_ENV, BENCH_COVERAGE_CONTROL)
+    .env(BENCH_COVERAGE_DIRECTORY_ENV, &coverage)
+    .env("CARGO_RAIL_CACHE_DIR", &absent_cache)
+    .env_remove(CACHE_WRAPPER_MARKER)
+    .env_remove("CARGO_RAIL_RUSTC_WRAPPER")
+    .env_remove("CARGO_RAIL_COMPILER_FACT_SESSION")
+    .output()?;
+  assert!(
+    rustc_probe.status.success(),
+    "rustc probe inherited by the rustdoc proxy failed: {rustc_probe:?}"
+  );
+
+  let mut clippy = Command::new(wrapper);
+  clippy
+    .current_dir(&state_root)
+    .arg("clippy-driver")
+    .arg(which_rustc()?)
+    .args([
+      "--crate-name",
+      "fixture_clippy",
+      "--crate-type=lib",
+      "--edition=2024",
+      "--emit=metadata",
+      "--out-dir",
+      "docs",
+      "lib.rs",
+    ])
+    .env(CACHE_CONTROL_ENV, BENCH_COVERAGE_CONTROL)
+    .env(BENCH_COVERAGE_DIRECTORY_ENV, &coverage)
+    .env("CARGO_RAIL_CACHE_DIR", &absent_cache)
+    .env_remove(CACHE_WRAPPER_MARKER)
+    .env_remove("CARGO_RAIL_RUSTC_WRAPPER")
+    .env_remove("CARGO_RAIL_RUSTDOC_WRAPPER")
+    .env_remove("CARGO_RAIL_COMPILER_FACT_SESSION");
+  let clippy = clippy.output()?;
+  assert!(clippy.status.success(), "Clippy bypass failed: {clippy:?}");
+
+  let documentation = run_rustdoc(&[
+    "--crate-name",
+    "fixture",
+    "--crate-type=lib",
+    "--edition=2024",
+    "-o",
+    "docs",
+    "lib.rs",
+  ])?;
+  assert!(
+    documentation.status.success(),
+    "rustdoc bypass failed: {documentation:?}"
+  );
+  assert!(docs.join("fixture/index.html").is_file());
+  let doctest = run_rustdoc(&["--test", "--crate-name", "fixture", "--edition=2024", "lib.rs"])?;
+  assert!(doctest.status.success(), "doctest bypass failed: {doctest:?}");
+  assert!(!absent_cache.exists(), "documentation bypass acquired the CAS");
+
+  let mut events = fs::read_dir(&coverage)?
+    .map(|entry| -> Result<serde_json::Value> { Ok(serde_json::from_slice(&fs::read(entry?.path())?)?) })
+    .collect::<Result<Vec<_>>>()?;
+  events.sort_by(|left, right| left["reason"].as_str().cmp(&right["reason"].as_str()));
+  assert_eq!(events.len(), 4);
+  assert_eq!(events[0]["reason"], "clippy_diagnostic_result_authority_unavailable");
+  assert_eq!(events[0]["action"]["driver"], "clippy");
+  assert_eq!(events[0]["action"]["test"], false);
+  assert_eq!(events[1]["reason"], "compiler_information_request");
+  assert_eq!(events[1]["action"]["driver"], "rustc");
+  assert_eq!(events[2]["reason"], "doctest_execution_result_authority_unavailable");
+  assert_eq!(events[2]["action"]["driver"], "rustdoc");
+  assert_eq!(events[2]["action"]["test"], true);
+  assert_eq!(events[3]["reason"], "rustdoc_output_tree_observation_unavailable");
+  assert_eq!(events[3]["action"]["driver"], "rustdoc");
+  assert_eq!(events[3]["action"]["test"], false);
+  assert!(events.iter().all(|event| {
+    event["status"] == "bypassed"
+      && event["action_key"].is_null()
+      && event["result_key"].is_null()
+      && event["cache_bytes_read"] == 0
+      && event["remote_request_attempts"] == 0
+  }));
   Ok(())
 }
 

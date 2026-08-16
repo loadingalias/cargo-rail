@@ -13,13 +13,16 @@ usage:
   remote-native-cache.sh smoke <target> --execute
   remote-native-cache.sh run <target> <runs> --execute
 
-Targets: aws-linux-x64-bench, aws-linux-arm64-bench, aws-windows-x64-bench
+Targets: aws-linux-x64-bench, aws-linux-arm64-bench,
+         aws-windows-x64-bench, azure-windows-arm64-profile
 USAGE
   exit 2
 }
 
 case "$target" in
-  aws-linux-x64-bench | aws-linux-arm64-bench | aws-windows-x64-bench) ;;
+  aws-linux-x64-bench | aws-linux-arm64-bench | aws-windows-x64-bench | azure-windows-arm64-profile)
+    tool_profile=native-cache-qualification
+    ;;
   *) usage ;;
 esac
 [[ -x "$dev_machine" ]] || {
@@ -45,8 +48,8 @@ case "$operation" in
     else
       usage
     fi
-    [[ "$runs" =~ ^[0-9]+$ && "$runs" -ge 1 ]] || {
-      echo "remote benchmark runs must be a positive integer" >&2
+    [[ "$runs" =~ ^[0-9]+$ && "$runs" -ge 20 && "$runs" -le 30 ]] || {
+      echo "retained native-cache qualification requires 20-30 rounds" >&2
       exit 2
     }
     benchmark_mode=run
@@ -74,7 +77,7 @@ cleanup() {
   local status="$?"
   trap - EXIT INT TERM
   if [[ "$created" == true ]]; then
-    echo "remote-native-cache: destroying $target and verifying tagged EBS deletion" >&2
+    echo "remote-native-cache: destroying $target and verifying attached storage deletion" >&2
     if ! "$dev_machine" kill cargo-rail "$target"; then
       echo "remote-native-cache: teardown failed for $target" >&2
       [[ "$status" -ne 0 ]] || status=1
@@ -86,9 +89,10 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+"$dev_machine" preflight cargo-rail "$target"
 "$dev_machine" create cargo-rail "$target" --execute
 created=true
-"$dev_machine" bootstrap cargo-rail "$target"
+"$dev_machine" bootstrap cargo-rail "$target" "$tool_profile"
 
 set +e
 "$dev_machine" just cargo-rail "$target" bench-native-cache-remote \
@@ -96,7 +100,15 @@ set +e
 benchmark_status=$?
 set -e
 
+set +e
 "$dev_machine" just cargo-rail "$target" bench-native-cache-archive "$run_id"
+archive_status=$?
+set -e
+if [[ "$archive_status" -ne 0 ]]; then
+  echo "remote-native-cache: could not archive exact run $run_id" >&2
+  [[ "$benchmark_status" -ne 0 ]] && exit "$benchmark_status"
+  exit "$archive_status"
+fi
 
 collection_status=1
 for attempt in 1 2 3; do

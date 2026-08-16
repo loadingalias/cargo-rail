@@ -61,7 +61,7 @@ const CAPTURE_PAUSE_CRATE_ENV: &str = "CARGO_RAIL_TEST_NATIVE_CAPTURE_PAUSE_CRAT
 #[cfg(debug_assertions)]
 const CAPTURE_PAUSE_DIRECTORY_ENV: &str = "CARGO_RAIL_TEST_NATIVE_CAPTURE_PAUSE_DIRECTORY";
 pub(crate) const DIAGNOSTIC_EXECUTION_CONTRACT: &str = "diagnostic-workspace-wrapper-v13";
-pub(crate) const DIRECT_EXECUTION_CONTRACT: &str = "direct-global-wrapper-v13";
+pub(crate) const DIRECT_EXECUTION_CONTRACT: &str = "direct-global-wrapper-v14";
 #[cfg(not(windows))]
 const DIRECT_WRAPPER_NAME: &str = "cargo-rail-native-rustc-wrapper";
 #[cfg(windows)]
@@ -71,10 +71,10 @@ const DIRECT_WORKER_NAME: &str = "cargo-rail-native-rustc-worker";
 #[cfg(windows)]
 const DIRECT_WORKER_NAME: &str = "cargo-rail-native-rustc-worker.exe";
 const DIRECT_LAUNCHER_ENV: &str = "CARGO_RAIL_DIRECT_CACHE_LAUNCHER";
-const GRADUATED_NATIVE_CACHE_CLASS: &str = "library_metadata_rlib";
-const NATIVE_CACHE_CAPABILITY_SCHEMA_VERSION: u32 = 9;
-const NATIVE_CACHE_IDENTITY_CONTRACT_VERSION: u32 = 15;
-const NATIVE_COMPILER_SESSION_VERSION: u32 = 15;
+const GRADUATED_NATIVE_CACHE_CLASS: &str = "exact_rustc_result";
+const NATIVE_CACHE_CAPABILITY_SCHEMA_VERSION: u32 = 11;
+const NATIVE_CACHE_IDENTITY_CONTRACT_VERSION: u32 = 16;
+const NATIVE_COMPILER_SESSION_VERSION: u32 = 16;
 const MAX_SESSION_BYTES: u64 = 64 * 1024;
 const MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BENCH_COVERAGE_EVENT_BYTES: usize = 1024 * 1024;
@@ -103,8 +103,8 @@ const MAX_COMPILER_ENVIRONMENT_NAME_BYTES: usize = 256;
 const MAX_COMPILER_ENVIRONMENT_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(target_os = "macos")]
 const MAX_APPLE_LINK_CERTIFICATE_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_APPLE_LINK_INPUTS: usize = 16 * 1024;
-const MAX_APPLE_LINK_PATH_BYTES: usize = 16 * 1024 * 1024;
+const MAX_LINK_INPUTS: usize = 16 * 1024;
+const MAX_LINK_PATH_BYTES: usize = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const MAX_ELF_LINK_DEPENDENCY_BYTES: u64 = 8 * 1024 * 1024;
 const DEP_INFO_SLOT: &str = "target/outputs/dep-info";
@@ -339,6 +339,10 @@ pub(crate) const fn native_cache_execution_contract() -> &'static str {
   DIRECT_EXECUTION_CONTRACT
 }
 
+pub(crate) const fn native_cache_transported_work_boundary() -> &'static str {
+  "moved_root_compiler_work_product_validation_unavailable"
+}
+
 pub(crate) const fn native_cache_capability_schema_version() -> u32 {
   NATIVE_CACHE_CAPABILITY_SCHEMA_VERSION
 }
@@ -567,9 +571,18 @@ struct NativeCompilerWitness {
   dependency_names: Vec<String>,
   environment_names: Vec<String>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
-  apple_linker: Option<AppleLinkerWitness>,
-  #[serde(default, skip_serializing_if = "Option::is_none")]
-  elf_linker: Option<ElfLinkerWitness>,
+  linker: Option<LinkerWitness>,
+}
+
+/// Exact platform-specific closure selected by one linked compiler action.
+///
+/// Provider lookup rules remain separate, while the enum makes it impossible
+/// for one action to claim multiple linker authorities.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "witness", rename_all = "snake_case")]
+enum LinkerWitness {
+  Apple(AppleLinkerWitness),
+  Elf(ElfLinkerWitness),
 }
 
 /// Revalidatable closure emitted by one certified Apple linker execution.
@@ -1804,14 +1817,13 @@ impl NativeActionCapture {
     environment_names.sort_unstable();
     environment_names.dedup();
     Ok(NativeCompilerWitness {
-      version: 4,
+      version: 5,
       complete: true,
       source_paths,
       generated_paths,
       dependency_names,
       environment_names,
-      apple_linker: None,
-      elf_linker: None,
+      linker: None,
     })
   }
 
@@ -1822,7 +1834,7 @@ impl NativeActionCapture {
       .map(|(name, _)| name.as_str())
       .collect::<Vec<_>>();
     dependencies.sort_unstable();
-    witness.version == 4
+    witness.version == 5
       && witness.complete
       && !witness.source_paths.is_empty()
       && strictly_sorted_unique_strings(&witness.source_paths)
@@ -1868,14 +1880,16 @@ impl NativeActionCapture {
             .is_ok_and(|index| !self.approved_environment.entries[index].root_mapped)
       })
       && witness
-        .apple_linker
+        .linker
         .as_ref()
-        .is_none_or(|witness| validate_apple_linker_witness(witness).is_ok())
-      && witness
-        .elf_linker
-        .as_ref()
-        .is_none_or(|witness| validate_elf_linker_witness(witness).is_ok())
-      && !(witness.apple_linker.is_some() && witness.elf_linker.is_some())
+        .is_none_or(|witness| validate_linker_witness(witness).is_ok())
+  }
+}
+
+fn validate_linker_witness(witness: &LinkerWitness) -> RailResult<()> {
+  match witness {
+    LinkerWitness::Apple(witness) => validate_apple_linker_witness(witness),
+    LinkerWitness::Elf(witness) => validate_elf_linker_witness(witness),
   }
 }
 
@@ -1898,8 +1912,8 @@ fn validate_apple_linker_witness(witness: &AppleLinkerWitness) -> RailResult<()>
     || witness.certificate_version.is_empty()
     || witness.certificate_version.len() > 256
     || witness.certificate_version.as_bytes().contains(&0)
-    || witness.found.len() > MAX_APPLE_LINK_INPUTS
-    || witness.missing.len() > MAX_APPLE_LINK_INPUTS
+    || witness.found.len() > MAX_LINK_INPUTS
+    || witness.missing.len() > MAX_LINK_INPUTS
     || witness.endogenous_objects == 0
     || !strictly_sorted_unique_strings(&witness.missing)
     || !strictly_sorted_unique_strings(&witness.dependency_archives)
@@ -1945,7 +1959,7 @@ fn validate_apple_linker_witness(witness: &AppleLinkerWitness) -> RailResult<()>
     }
     path_bytes = path_bytes.saturating_add(path.len());
   }
-  if path_bytes > MAX_APPLE_LINK_PATH_BYTES
+  if path_bytes > MAX_LINK_PATH_BYTES
     || witness
       .dependency_archives
       .iter()
@@ -1975,8 +1989,8 @@ fn validate_apple_linker_generations(
 
 fn validate_elf_linker_witness(witness: &ElfLinkerWitness) -> RailResult<()> {
   if witness.version != 1
-    || witness.found.len() > MAX_APPLE_LINK_INPUTS
-    || witness.missing.len() > MAX_APPLE_LINK_INPUTS
+    || witness.found.len() > MAX_LINK_INPUTS
+    || witness.missing.len() > MAX_LINK_INPUTS
     || witness.endogenous_objects == 0
     || !strictly_sorted_unique_strings(&witness.missing)
     || !strictly_sorted_unique_strings(&witness.dependency_archives)
@@ -2010,7 +2024,7 @@ fn validate_elf_linker_witness(witness: &ElfLinkerWitness) -> RailResult<()> {
     }
     path_bytes = path_bytes.saturating_add(path.len());
   }
-  if path_bytes > MAX_APPLE_LINK_PATH_BYTES
+  if path_bytes > MAX_LINK_PATH_BYTES
     || witness
       .dependency_archives
       .iter()
@@ -2061,29 +2075,23 @@ fn platform_linker_witness_is_valid(
   generations: Option<&LinkerGenerationWitness>,
 ) -> bool {
   if apple_linked_observation(observation) {
-    witness.elf_linker.is_none()
-      && witness
-        .apple_linker
-        .as_ref()
-        .is_some_and(|linker| validate_apple_linker_witness(linker).is_ok())
-      && match (&witness.apple_linker, generations) {
-        (Some(linker), Some(generations)) => validate_apple_linker_generations(generations, linker).is_ok(),
-        (Some(_), None) => true,
-        _ => false,
+    match (&witness.linker, generations) {
+      (Some(LinkerWitness::Apple(linker)), Some(generations)) => {
+        validate_apple_linker_witness(linker).is_ok() && validate_apple_linker_generations(generations, linker).is_ok()
       }
+      (Some(LinkerWitness::Apple(linker)), None) => validate_apple_linker_witness(linker).is_ok(),
+      _ => false,
+    }
   } else if elf_linked_observation(observation) {
-    witness.apple_linker.is_none()
-      && witness
-        .elf_linker
-        .as_ref()
-        .is_some_and(|linker| validate_elf_linker_witness(linker).is_ok())
-      && match (&witness.elf_linker, generations) {
-        (Some(linker), Some(generations)) => validate_elf_linker_generations(generations, linker).is_ok(),
-        (Some(_), None) => true,
-        _ => false,
+    match (&witness.linker, generations) {
+      (Some(LinkerWitness::Elf(linker)), Some(generations)) => {
+        validate_elf_linker_witness(linker).is_ok() && validate_elf_linker_generations(generations, linker).is_ok()
       }
+      (Some(LinkerWitness::Elf(linker)), None) => validate_elf_linker_witness(linker).is_ok(),
+      _ => false,
+    }
   } else {
-    witness.apple_linker.is_none() && witness.elf_linker.is_none() && generations.is_none()
+    witness.linker.is_none() && generations.is_none()
   }
 }
 
@@ -2129,6 +2137,8 @@ fn capture_apple_linker_witness(
     .file_name()
     .and_then(OsStr::to_str)
     .ok_or_else(|| RailError::message("Apple linked output has no UTF-8 file name"))?;
+  let object_prefix = apple_rustc_object_prefix(linked.role, linked_name)
+    .ok_or_else(|| RailError::message("Apple linked output has no rustc object prefix"))?;
   let mut dependency_by_file = BTreeMap::new();
   for (name, artifact) in &observation.dependency_artifacts {
     let file_name = observation_path_basename(&artifact.path)
@@ -2167,7 +2177,7 @@ fn capture_apple_linker_witness(
         let certified_generated_input = driver_inputs.generated.contains(&path) && !selected_by_rustc;
         let generated_object = path.extension() == Some(OsStr::new("o"))
           && (certified_driver_input || certified_generated_input)
-          && (path.parent() == linked_path.parent() && file_name.starts_with(&format!("{linked_name}."))
+          && (path.parent() == linked_path.parent() && file_name.starts_with(&object_prefix)
             || path
               .parent()
               .and_then(Path::file_name)
@@ -2227,7 +2237,7 @@ fn capture_apple_linker_witness(
       "Apple linker certificate does not bind the exact linked output",
     ));
   }
-  if found_paths.len().saturating_add(missing.len()) > MAX_APPLE_LINK_INPUTS {
+  if found_paths.len().saturating_add(missing.len()) > MAX_LINK_INPUTS {
     return Err(RailError::message("Apple linker certificate exceeds its input bound"));
   }
 
@@ -2238,7 +2248,14 @@ fn capture_apple_linker_witness(
   let (linker, linker_generation) = capture_link_file(&linker_path, started, &mut budget)?;
   let found = found_paths
     .into_iter()
-    .map(|path| capture_link_file(&path, started, &mut budget))
+    .map(|path| {
+      capture_link_file(&path, started, &mut budget).map_err(|error| {
+        RailError::message(format!(
+          "Apple linker input '{}' is unavailable: {error}",
+          path.display()
+        ))
+      })
+    })
     .collect::<RailResult<Vec<_>>>()?;
   let (found, found_generations): (Vec<_>, Vec<_>) = found.into_iter().unzip();
   let witness = AppleLinkerWitness {
@@ -2431,7 +2448,7 @@ fn capture_elf_linker_witness(
         }
         Err(error) => return Err(error.into()),
       }
-      if found_paths.len().saturating_add(missing.len()) > MAX_APPLE_LINK_INPUTS {
+      if found_paths.len().saturating_add(missing.len()) > MAX_LINK_INPUTS {
         return Err(RailError::message("ELF linker witness exceeds its input bound"));
       }
     }
@@ -2490,7 +2507,7 @@ fn read_elf_link_driver_evidence(path: &Path) -> RailResult<ElfLinkDriverEvidenc
     .saturating_add(evidence.tool_inputs.len())
     .saturating_add(evidence.search_directories.len());
   if evidence.version != 1
-    || path_count > MAX_APPLE_LINK_INPUTS
+    || path_count > MAX_LINK_INPUTS
     || serde_json::to_vec(&evidence)? != bytes
     || !Path::new(&evidence.current_directory).is_absolute()
     || !Path::new(&evidence.driver).is_absolute()
@@ -2531,7 +2548,7 @@ fn complete_linked_witness(
       driver_inputs,
       installation_authority,
     )?;
-    witness.apple_linker = Some(apple_linker);
+    witness.linker = Some(LinkerWitness::Apple(apple_linker));
     Ok((
       Some(link_candidate_selector(pre_link_action)?),
       generations,
@@ -2547,7 +2564,7 @@ fn complete_linked_witness(
       driver_inputs,
       installation_authority,
     )?;
-    witness.elf_linker = Some(elf_linker);
+    witness.linker = Some(LinkerWitness::Elf(elf_linker));
     Ok((
       Some(link_candidate_selector(pre_link_action)?),
       generations,
@@ -2581,7 +2598,7 @@ fn read_apple_link_driver_evidence(path: &Path) -> RailResult<AppleLinkDriverEvi
     .saturating_add(evidence.preexisting_paths.len())
     .saturating_add(evidence.generated_inputs.len());
   if evidence.version != APPLE_LINK_DRIVER_EVIDENCE_VERSION
-    || path_count > MAX_APPLE_LINK_INPUTS
+    || path_count > MAX_LINK_INPUTS
     || !strictly_sorted_unique_strings(&evidence.direct_inputs)
     || !strictly_sorted_unique_strings(&evidence.temporary_directories)
     || !strictly_sorted_unique_strings(&evidence.preexisting_paths)
@@ -2605,7 +2622,7 @@ fn read_apple_link_driver_evidence(path: &Path) -> RailResult<AppleLinkDriverEvi
     }
     path_bytes = path_bytes.saturating_add(input.len());
   }
-  if path_bytes > MAX_APPLE_LINK_PATH_BYTES {
+  if path_bytes > MAX_LINK_PATH_BYTES {
     return Err(RailError::message(
       "Apple linker driver-input certificate exceeds its path bound",
     ));
@@ -2680,7 +2697,7 @@ fn parse_apple_link_certificate(bytes: &[u8]) -> RailResult<(String, Vec<(u8, St
   }
   let mut entries = Vec::new();
   while offset < bytes.len() {
-    if entries.len() >= MAX_APPLE_LINK_INPUTS.saturating_add(1) {
+    if entries.len() >= MAX_LINK_INPUTS.saturating_add(1) {
       return Err(RailError::message("Apple linker certificate has too many entries"));
     }
     let opcode = bytes[offset];
@@ -2709,6 +2726,20 @@ fn read_apple_link_c_string(bytes: &[u8], offset: &mut usize) -> RailResult<Stri
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn is_rustc_temporary_name(name: &str) -> bool {
   name.len() == 11 && name.starts_with("rustc") && name[5..].bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+#[cfg(target_os = "macos")]
+fn apple_rustc_object_prefix(role: NativeOutputRole, linked_name: &str) -> Option<String> {
+  let stem = Path::new(linked_name).file_stem()?.to_str()?;
+  let stem = if matches!(
+    role,
+    NativeOutputRole::ProcMacro | NativeOutputRole::Dylib | NativeOutputRole::Cdylib
+  ) {
+    stem.strip_prefix("lib")?
+  } else {
+    stem
+  };
+  (!stem.is_empty()).then(|| format!("{stem}."))
 }
 
 #[cfg(target_os = "macos")]
@@ -4584,7 +4615,7 @@ impl NativeCompilerValidation {
         "native compiler observation is outside the graduated class",
       ));
     }
-    if self.witness.version != 4
+    if self.witness.version != 5
       || !self.witness.complete
       || !strictly_sorted_unique_strings(&self.witness.source_paths)
       || !strictly_sorted_unique_strings(&self.witness.generated_paths)
@@ -4619,7 +4650,7 @@ impl NativeCompilerValidation {
       return Err(RailError::message("native compiler witness is invalid"));
     }
     for output in &self.outputs {
-      if output.bytes == 0 {
+      if output.bytes == 0 && output.role != "metadata" {
         return Err(RailError::message(
           "native compiler observation contains an empty compiler output",
         ));
@@ -4819,37 +4850,21 @@ fn link_candidate_selector(pre_link_action: &str) -> RailResult<String> {
 
 fn witnessed_action_key(pre_link_action: &str, witness: &NativeCompilerWitness) -> RailResult<String> {
   validate_action_key(pre_link_action)?;
-  match (&witness.apple_linker, &witness.elf_linker) {
-    (Some(linker), None) => {
-      validate_apple_linker_witness(linker)?;
-      let linker = serde_json::to_vec(linker)?;
-      Ok(sha256_identity(
-        ACTION_KEY_PREFIX,
-        b"cargo-rail-native-witnessed-compiler-action\0",
-        &[
-          (b"version", &16_u32.to_le_bytes()),
-          (b"pre-link-action", pre_link_action.as_bytes()),
-          (b"apple-linker", &linker),
-        ],
-      ))
-    }
-    (None, Some(linker)) => {
-      validate_elf_linker_witness(linker)?;
-      let linker = serde_json::to_vec(linker)?;
-      Ok(sha256_identity(
-        ACTION_KEY_PREFIX,
-        b"cargo-rail-native-witnessed-compiler-action\0",
-        &[
-          (b"version", &16_u32.to_le_bytes()),
-          (b"pre-link-action", pre_link_action.as_bytes()),
-          (b"elf-linker", &linker),
-        ],
-      ))
-    }
-    _ => Err(RailError::message(
-      "linked compiler action must contain exactly one platform linker witness",
-    )),
-  }
+  let linker = witness
+    .linker
+    .as_ref()
+    .ok_or_else(|| RailError::message("linked compiler action has no platform linker witness"))?;
+  validate_linker_witness(linker)?;
+  let linker = serde_json::to_vec(linker)?;
+  Ok(sha256_identity(
+    ACTION_KEY_PREFIX,
+    b"cargo-rail-native-witnessed-compiler-action\0",
+    &[
+      (b"version", &17_u32.to_le_bytes()),
+      (b"pre-link-action", pre_link_action.as_bytes()),
+      (b"linker", &linker),
+    ],
+  ))
 }
 
 fn revalidate_selected_action(
@@ -4860,7 +4875,7 @@ fn revalidate_selected_action(
   installation_authority: Option<&str>,
 ) -> RailResult<(String, u64)> {
   if !linked_observation(observation) {
-    if witness.apple_linker.is_some() || witness.elf_linker.is_some() || generations.is_some() {
+    if witness.linker.is_some() || generations.is_some() {
       return Err(RailError::message(
         "non-linked compiler action contains a linker witness",
       ));
@@ -4869,19 +4884,17 @@ fn revalidate_selected_action(
   }
   #[cfg(target_os = "macos")]
   {
-    let linker = witness
-      .apple_linker
-      .as_ref()
-      .ok_or_else(|| RailError::message("linked compiler action has no Apple linker witness"))?;
+    let Some(LinkerWitness::Apple(linker)) = witness.linker.as_ref() else {
+      return Err(RailError::message("linked compiler action has no Apple linker witness"));
+    };
     let bytes_hashed = revalidate_apple_linker_witness(linker, generations, installation_authority)?;
     Ok((witnessed_action_key(pre_link_action, witness)?, bytes_hashed))
   }
   #[cfg(target_os = "linux")]
   {
-    let linker = witness
-      .elf_linker
-      .as_ref()
-      .ok_or_else(|| RailError::message("linked compiler action has no ELF linker witness"))?;
+    let Some(LinkerWitness::Elf(linker)) = witness.linker.as_ref() else {
+      return Err(RailError::message("linked compiler action has no ELF linker witness"));
+    };
     let bytes_hashed = revalidate_elf_linker_witness(linker, generations, installation_authority)?;
     Ok((witnessed_action_key(pre_link_action, witness)?, bytes_hashed))
   }
@@ -5271,21 +5284,23 @@ fn output_contract_matches(outputs: &[NativeCompilerOutput], observation: &RawCo
   let mut expected = vec![("dep_info", DEP_INFO_SLOT)];
   if observation.emit_modes.contains("metadata") {
     expected.push(("metadata", METADATA_SLOT));
-    if observation.crate_types == BTreeSet::from(["lib".to_string()]) && observation.emit_modes.contains("link") {
+    if NativeOutputRole::from_invocation(&observation.crate_types, observation.test_mode)
+      == Some(NativeOutputRole::Rlib)
+      && observation.emit_modes.contains("link")
+    {
       expected.push(("rlib", RLIB_SLOT));
     }
-  } else if observation.crate_types == BTreeSet::from(["bin".to_string()]) {
-    expected.push(("executable", EXECUTABLE_SLOT));
-  } else if observation.crate_types == BTreeSet::from(["proc-macro".to_string()]) {
-    expected.push(("proc_macro", PROC_MACRO_SLOT));
-  } else if observation.crate_types == BTreeSet::from(["dylib".to_string()]) {
-    expected.push(("dylib", DYLIB_SLOT));
-  } else if observation.crate_types == BTreeSet::from(["cdylib".to_string()]) {
-    expected.push(("cdylib", CDYLIB_SLOT));
-  } else if observation.crate_types == BTreeSet::from(["staticlib".to_string()]) {
-    expected.push(("staticlib", STATICLIB_SLOT));
   } else {
-    return false;
+    expected.push(
+      match NativeOutputRole::from_invocation(&observation.crate_types, observation.test_mode) {
+        Some(NativeOutputRole::Executable) => ("executable", EXECUTABLE_SLOT),
+        Some(NativeOutputRole::ProcMacro) => ("proc_macro", PROC_MACRO_SLOT),
+        Some(NativeOutputRole::Dylib) => ("dylib", DYLIB_SLOT),
+        Some(NativeOutputRole::Cdylib) => ("cdylib", CDYLIB_SLOT),
+        Some(NativeOutputRole::Staticlib) => ("staticlib", STATICLIB_SLOT),
+        Some(NativeOutputRole::Metadata | NativeOutputRole::Rlib) | None => return false,
+      },
+    );
   }
   outputs.len() == expected.len()
     && outputs
@@ -5334,83 +5349,70 @@ fn invocation_bypass_reason(
   host_target: &str,
 ) -> Option<&'static str> {
   if observation.mode != CompilerMode::Rustc {
-    return Some("rustdoc_not_graduated");
+    return Some(if observation.test_mode {
+      "doctest_execution_result_authority_unavailable"
+    } else {
+      "rustdoc_output_tree_observation_unavailable"
+    });
   }
   if observation
     .target_argument
     .as_deref()
     .is_some_and(|target| target != host_target)
   {
-    return Some("cross_target_not_graduated");
+    return Some("cross_target_toolchain_evidence_unavailable");
   }
-  if observation.test_mode {
-    return Some("test_compilation_not_graduated");
-  }
-  let library = observation.crate_types == BTreeSet::from(["lib".to_string()]);
-  let proc_macro = observation.crate_types == BTreeSet::from(["proc-macro".to_string()]);
+  let output_role = NativeOutputRole::from_invocation(&observation.crate_types, observation.test_mode);
+  let library = output_role == Some(NativeOutputRole::Rlib);
   let metadata = BTreeSet::from(["dep-info".to_string(), "metadata".to_string()]);
   let metadata_and_rlib = BTreeSet::from(["dep-info".to_string(), "link".to_string(), "metadata".to_string()]);
-  let linked = BTreeSet::from(["dep-info".to_string(), "link".to_string()]);
-  let linked = cfg!(any(target_os = "macos", target_os = "linux"))
-    && observation.emit_modes == linked
-    && matches!(
-      observation.crate_types.iter().next().map(String::as_str),
-      Some("bin" | "proc-macro" | "dylib" | "cdylib")
-    )
-    && observation.crate_types.len() == 1;
-  let compiler_only = proc_macro && observation.emit_modes == metadata;
-  if !library && !linked && !compiler_only {
-    return Some("compiler_crate_type_not_graduated");
+  let linked_emit = BTreeSet::from(["dep-info".to_string(), "link".to_string()]);
+  let linked = observation.emit_modes == linked_emit && output_role.is_some_and(NativeOutputRole::requires_linker);
+  let compiler_only = output_role.is_some() && observation.emit_modes == metadata;
+  let compiler_archive = output_role == Some(NativeOutputRole::Staticlib) && observation.emit_modes == linked_emit;
+  if !library && !linked && !compiler_only && !compiler_archive {
+    return Some("compiler_output_contract_unavailable");
   }
   if library && observation.emit_modes != metadata && observation.emit_modes != metadata_and_rlib {
-    return Some("compiler_emit_mode_not_graduated");
+    return Some("compiler_emit_contract_unavailable");
   }
   if compiler_long_option_value(&observation.compiler_arguments, "--error-format")
     .is_some_and(|format| !matches!(format, "json" | "human" | "short"))
   {
-    return Some("compiler_diagnostic_format_not_graduated");
+    return Some("compiler_diagnostic_replay_unavailable");
   }
   if observation.compiler_arguments.iter().any(|argument| argument == "-") {
-    return Some("compiler_stdin_not_graduated");
+    return Some("compiler_stdin_observation_unavailable");
   }
-  if observation
-    .compiler_arguments
-    .iter()
-    .any(|argument| argument.contains("linker=") || argument.contains("link-arg=") || argument.contains("link-args="))
-    || observation.compiler_arguments.windows(2).any(|pair| {
-      pair[0] == "-C"
-        && matches!(
-          pair[1].split_once('=').map(|(name, _)| name),
-          Some("linker" | "link-arg" | "link-args")
-        )
-    })
-  {
-    return Some("native_linking_not_graduated");
+  if let Some(reason) = compiler_linker_configuration_bypass_reason(&observation.compiler_arguments) {
+    return Some(reason);
+  }
+  if linked && let Some(reason) = platform_linker_bypass_reason(std::env::consts::OS) {
+    return Some(reason);
   }
   if observation
     .compiler_arguments
     .iter()
     .any(|argument| argument.contains("incremental="))
   {
-    return Some("incremental_compilation_not_graduated");
+    return Some("incremental_work_product_observation_unavailable");
   }
   if !supported_pathless_toolchain_externs(&observation.compiler_arguments, &observation.crate_types) {
     return Some("dependency_artifact_path_unavailable");
   }
-  if unsupported_compiler_argument(&observation.compiler_arguments) {
-    return Some("compiler_flag_not_graduated");
+  if let Some(reason) = compiler_argument_bypass_reason(&observation.compiler_arguments) {
+    return Some(reason);
   }
-  if observation.dependency_artifacts.iter().any(|(_, artifact)| {
-    !matches!(
+  if let Some(reason) = observation.dependency_artifacts.iter().find_map(|(_, artifact)| {
+    dependency_artifact_bypass_reason(
       artifact
         .path
         .resolve(Path::new("/"))
         .extension()
         .and_then(OsStr::to_str),
-      Some("rmeta" | "rlib")
     )
   }) {
-    return Some("dependency_artifact_class_not_graduated");
+    return Some(reason);
   }
   if observation
     .environment_reads
@@ -5419,8 +5421,30 @@ fn invocation_bypass_reason(
   {
     return Some("secret_compiler_environment");
   }
-  if !observation.bypasses.is_empty() {
-    return Some("compiler_inputs_incomplete");
+  if let Some(reason) = observation.bypasses.iter().next() {
+    return Some(match reason.as_str() {
+      "declared_input_bytes_unavailable" => "declared_input_bytes_unavailable",
+      "declared_input_symlink_unavailable" => "declared_input_symlink_unavailable",
+      "dep-info_output_path_unavailable" => "dep_info_output_path_unavailable",
+      "dep_info_path_unavailable" => "dep_info_path_unavailable",
+      "dep_info_unavailable" => "dep_info_observation_unavailable",
+      "dep_info_output_bytes_unavailable" => "dep_info_output_bytes_unavailable",
+      "dep_info_output_symlink_unavailable" => "dep_info_output_symlink_unavailable",
+      "dependency_artifact_bytes_unavailable" => "dependency_artifact_bytes_unavailable",
+      "dependency_artifact_path_unavailable" => "dependency_artifact_path_unavailable",
+      "dependency_artifact_symlink_unavailable" => "dependency_artifact_symlink_unavailable",
+      "emitted_output_bytes_unavailable" => "compiler_emitted_output_bytes_unavailable",
+      "emitted_output_symlink_unavailable" => "compiler_emitted_output_symlink_unavailable",
+      "link_output_path_unavailable" => "link_output_path_unavailable",
+      "metadata_output_path_unavailable" => "metadata_output_path_unavailable",
+      "non_utf8_compiler_argument" => "non_utf8_compiler_argument",
+      "response_file_expansion_unavailable" => "response_file_expansion_unavailable",
+      "rlib_output_path_unavailable" => "rlib_output_path_unavailable",
+      "rustdoc_dep_info_unavailable" => "rustdoc_dep_info_unavailable",
+      "rustdoc_external_tool_identity_unavailable" => "rustdoc_external_tool_identity_unavailable",
+      "rustdoc_output_tree_unavailable" => "rustdoc_output_tree_observation_unavailable",
+      _ => "compiler_observation_bypass_reason_unrecognized",
+    });
   }
   if observation.declared_inputs.is_empty() {
     return Some("declared_compiler_inputs_unavailable");
@@ -5430,8 +5454,11 @@ fn invocation_bypass_reason(
   } else {
     2
   };
-  if complete && (observation.observed_reads.is_empty() || observation.emitted_outputs.len() != expected_outputs) {
-    return Some("complete_compiler_observation_unavailable");
+  if complete && observation.observed_reads.is_empty() {
+    return Some("compiler_observed_read_set_unavailable");
+  }
+  if complete && observation.emitted_outputs.len() != expected_outputs {
+    return Some("compiler_emitted_output_set_unavailable");
   }
   None
 }
@@ -5443,14 +5470,14 @@ fn invocation_bypass_reason(
 /// turn an eligible invocation into a cache hit or store under a second rule.
 pub(crate) fn fast_bypass_reason(program: &OsStr, arguments: &[OsString]) -> Option<&'static str> {
   if std::env::var_os("CARGO_TARGET_DIR").is_some() {
-    return Some("custom_target_directory_not_graduated");
+    return Some("custom_target_directory_authority_unavailable");
   }
   if Path::new(program)
     .file_stem()
     .and_then(OsStr::to_str)
     .is_some_and(|name| name.eq_ignore_ascii_case("clippy-driver"))
   {
-    return Some("clippy_not_graduated");
+    return Some("clippy_diagnostic_result_authority_unavailable");
   }
   let mut crate_types = BTreeSet::new();
   let mut emit_seen = false;
@@ -5461,27 +5488,35 @@ pub(crate) fn fast_bypass_reason(program: &OsStr, arguments: &[OsString]) -> Opt
   let mut diagnostic_format_supported = true;
   let mut output_directory = false;
   let mut pathless_externs = BTreeSet::new();
+  let mut test_mode = false;
+  let mut argument_text = Vec::with_capacity(arguments.len());
 
   for (index, argument) in arguments.iter().enumerate() {
     let Some(argument) = argument.to_str() else {
       return Some("non_utf8_compiler_argument");
     };
+    argument_text.push(argument);
     let next = || arguments.get(index + 1).and_then(|argument| argument.to_str());
     if matches!(argument, "-h" | "--help" | "-V" | "--version" | "-vV" | "--print") || argument.starts_with("--print=")
     {
       return Some("compiler_information_request");
     }
     if argument.starts_with('@') {
-      return Some("response_file_not_graduated");
+      return Some("response_file_expansion_unavailable");
     }
     if argument == "--test" {
-      return Some("test_compilation_not_graduated");
+      test_mode = true;
     }
     if argument == "-" {
-      return Some("compiler_stdin_not_graduated");
+      return Some("compiler_stdin_observation_unavailable");
     }
     if argument.contains("incremental=") {
-      return Some("incremental_compilation_not_graduated");
+      return Some("incremental_work_product_observation_unavailable");
+    }
+    if let Some(option) = short_option_value(argument, next(), "-C")
+      && let Some(reason) = linker_option_bypass_reason(option)
+    {
+      return Some(reason);
     }
     if let Some(value) = inline_or_next(argument, next(), "--crate-type") {
       crate_types.extend(value.split(',').map(str::to_string));
@@ -5508,11 +5543,8 @@ pub(crate) fn fast_bypass_reason(program: &OsStr, arguments: &[OsString]) -> Opt
         pathless_externs.insert(value.to_string());
         continue;
       };
-      if !matches!(
-        Path::new(artifact).extension().and_then(OsStr::to_str),
-        Some("rmeta" | "rlib")
-      ) {
-        return Some("dependency_artifact_class_not_graduated");
+      if let Some(reason) = dependency_artifact_bypass_reason(Path::new(artifact).extension().and_then(OsStr::to_str)) {
+        return Some(reason);
       }
     }
     if inline_or_next(argument, next(), "--out-dir").is_some() {
@@ -5520,36 +5552,33 @@ pub(crate) fn fast_bypass_reason(program: &OsStr, arguments: &[OsString]) -> Opt
     }
   }
 
-  let library = crate_types == BTreeSet::from(["lib".to_string()]);
-  let proc_macro = crate_types == BTreeSet::from(["proc-macro".to_string()]);
-  let linked = cfg!(any(target_os = "macos", target_os = "linux"))
-    && emits_link
-    && !emits_metadata
-    && crate_types.len() == 1
-    && matches!(
-      crate_types.iter().next().map(String::as_str),
-      Some("bin" | "proc-macro" | "dylib" | "cdylib")
-    );
-  let compiler_only = proc_macro && emits_metadata && !emits_link;
+  let output_role = NativeOutputRole::from_invocation(&crate_types, test_mode);
+  let library = output_role == Some(NativeOutputRole::Rlib);
+  let linked = emits_link && !emits_metadata && output_role.is_some_and(NativeOutputRole::requires_linker);
+  if linked && let Some(reason) = platform_linker_bypass_reason(std::env::consts::OS) {
+    return Some(reason);
+  }
+  let compiler_only = output_role.is_some() && emits_metadata && !emits_link;
+  let compiler_archive = output_role == Some(NativeOutputRole::Staticlib) && emits_link && !emits_metadata;
   if !pathless_externs.is_empty()
     && (crate_types != BTreeSet::from(["proc-macro".to_string()])
       || pathless_externs != BTreeSet::from(["proc_macro".to_string()]))
   {
     return Some("dependency_artifact_path_unavailable");
   }
-  if !library && !linked && !compiler_only {
-    return Some("compiler_crate_type_not_graduated");
+  if !library && !linked && !compiler_only && !compiler_archive {
+    return Some("compiler_output_contract_unavailable");
   }
   if !emit_seen || !emit_supported || !emits_dep_info || library && !emits_metadata {
-    return Some("compiler_emit_mode_not_graduated");
+    return Some("compiler_emit_contract_unavailable");
   }
   if !diagnostic_format_supported {
-    return Some("compiler_diagnostic_format_not_graduated");
+    return Some("compiler_diagnostic_replay_unavailable");
   }
   if !output_directory {
     return Some("compiler_output_paths_unavailable");
   }
-  None
+  compiler_argument_bypass_reason(&argument_text)
 }
 
 fn inline_or_next<'a>(argument: &'a str, next: Option<&'a str>, option: &str) -> Option<&'a str> {
@@ -5558,6 +5587,50 @@ fn inline_or_next<'a>(argument: &'a str, next: Option<&'a str>, option: &str) ->
   } else {
     argument.strip_prefix(option).and_then(|value| value.strip_prefix('='))
   }
+}
+
+fn short_option_value<'a>(argument: &'a str, next: Option<&'a str>, option: &str) -> Option<&'a str> {
+  if argument == option {
+    next
+  } else {
+    argument.strip_prefix(option).filter(|value| !value.is_empty())
+  }
+}
+
+fn platform_linker_bypass_reason(os: &str) -> Option<&'static str> {
+  match os {
+    "macos" | "linux" => None,
+    "windows" => Some("coff_linker_evidence_unavailable"),
+    _ => Some("platform_linker_evidence_unavailable"),
+  }
+}
+
+fn linker_option_bypass_reason(option: &str) -> Option<&'static str> {
+  match option.split_once('=').map_or(option, |(name, _)| name) {
+    "linker" => Some("explicit_linker_evidence_unavailable"),
+    "link-arg" | "link-args" => Some("explicit_link_argument_evidence_unavailable"),
+    "dlltool" | "link-self-contained" | "linker-features" | "linker-flavor" => {
+      Some("linker_configuration_evidence_unavailable")
+    }
+    _ => None,
+  }
+}
+
+fn compiler_linker_configuration_bypass_reason(arguments: &[String]) -> Option<&'static str> {
+  let mut index = 0usize;
+  while index < arguments.len() {
+    let argument = &arguments[index];
+    if let Some(option) = short_option_value(
+      argument,
+      arguments.get(index.saturating_add(1)).map(String::as_str),
+      "-C",
+    ) && let Some(reason) = linker_option_bypass_reason(option)
+    {
+      return Some(reason);
+    }
+    index = index.saturating_add(if argument == "-C" { 2 } else { 1 });
+  }
+  None
 }
 
 fn compiler_long_option_value<'a>(arguments: &'a [String], option: &str) -> Option<&'a str> {
@@ -5607,12 +5680,44 @@ fn supported_pathless_toolchain_externs(arguments: &[String], crate_types: &BTre
     || crate_types == &BTreeSet::from(["proc-macro".to_string()]) && names.iter().all(|name| *name == "proc_macro")
 }
 
-fn unsupported_compiler_argument(arguments: &[String]) -> bool {
+fn compiler_argument_bypass_reason<T: AsRef<str>>(arguments: &[T]) -> Option<&'static str> {
   let mut index = 0usize;
   let mut source_inputs = 0usize;
   while index < arguments.len() {
-    let argument = arguments[index].as_str();
-    let next = arguments.get(index + 1).map(String::as_str);
+    let argument = arguments[index].as_ref();
+    let next = arguments.get(index + 1).map(AsRef::as_ref);
+    if matches!(
+      argument,
+      "--crate-name"
+        | "--crate-type"
+        | "--emit"
+        | "--out-dir"
+        | "--target"
+        | "--edition"
+        | "--error-format"
+        | "--json"
+        | "--cfg"
+        | "--check-cfg"
+        | "--cap-lints"
+        | "--color"
+        | "--diagnostic-width"
+        | "--allow"
+        | "--warn"
+        | "--deny"
+        | "--forbid"
+        | "--extern"
+        | "-L"
+        | "-l"
+        | "-C"
+        | "-Z"
+        | "-A"
+        | "-W"
+        | "-D"
+        | "-F"
+    ) && next.is_none()
+    {
+      return Some("compiler_option_value_unavailable");
+    }
     let consumes_next = match argument {
       "--crate-name" | "--crate-type" | "--emit" | "--out-dir" | "--target" | "--edition" | "--error-format"
       | "--json" | "--cfg" | "--check-cfg" | "--cap-lints" | "--color" | "--diagnostic-width" | "--allow"
@@ -5623,6 +5728,7 @@ fn unsupported_compiler_argument(arguments: &[String]) -> bool {
       "-C" => next.is_some_and(supported_codegen_option),
       "-Z" => next.is_some_and(supported_unstable_option),
       "-A" | "-W" | "-D" | "-F" => next.is_some(),
+      "--test" => false,
       _ if argument.starts_with("--crate-name=")
         || argument.starts_with("--crate-type=")
         || argument.starts_with("--emit=")
@@ -5650,25 +5756,26 @@ fn unsupported_compiler_argument(arguments: &[String]) -> bool {
       }
       _ if argument.starts_with("-L") && argument.len() > 2 => {
         if !supported_library_search(argument.trim_start_matches("-L")) {
-          return true;
+          return Some("library_search_input_evidence_unavailable");
         }
         false
       }
       _ if argument.starts_with("-l") && argument.len() > 2 => {
         if !supported_native_library(argument.trim_start_matches("-l")) {
-          return true;
+          return Some(native_library_bypass_reason(argument.trim_start_matches("-l")));
         }
         false
       }
       _ if argument.starts_with("-C") && argument.len() > 2 => {
         if !supported_codegen_option(argument.trim_start_matches("-C")) {
-          return true;
+          return Some("codegen_option_input_evidence_unavailable");
         }
         false
       }
       _ if argument.starts_with("-Z") && argument.len() > 2 => {
-        if !supported_unstable_option(argument.trim_start_matches("-Z")) {
-          return true;
+        let option = argument.trim_start_matches("-Z");
+        if !supported_unstable_option(option) {
+          return Some(unstable_option_bypass_reason(option));
         }
         false
       }
@@ -5676,14 +5783,57 @@ fn unsupported_compiler_argument(arguments: &[String]) -> bool {
         source_inputs += 1;
         false
       }
-      _ => return true,
+      _ if argument.starts_with("--remap-path-prefix") || argument.starts_with("--remap-path-scope") => {
+        return Some("remapped_path_observation_unavailable");
+      }
+      _ => return Some("compiler_option_input_evidence_unavailable"),
     };
     if consumes_next && next.is_none() {
-      return true;
+      return Some("compiler_option_value_unavailable");
+    }
+    if argument == "-L" && next.is_some_and(|value| !supported_library_search(value)) {
+      return Some("library_search_input_evidence_unavailable");
+    }
+    if argument == "-l"
+      && let Some(value) = next.filter(|value| !supported_native_library(value))
+    {
+      return Some(native_library_bypass_reason(value));
+    }
+    if argument == "-C" && next.is_some_and(|value| !supported_codegen_option(value)) {
+      return Some("codegen_option_input_evidence_unavailable");
+    }
+    if argument == "-Z"
+      && let Some(value) = next.filter(|value| !supported_unstable_option(value))
+    {
+      return Some(unstable_option_bypass_reason(value));
     }
     index += usize::from(consumes_next) + 1;
   }
-  source_inputs != 1
+  (source_inputs != 1).then_some("compiler_source_input_observation_unavailable")
+}
+
+fn dependency_artifact_bypass_reason(extension: Option<&str>) -> Option<&'static str> {
+  match extension {
+    Some("rmeta" | "rlib") => None,
+    Some("dll" | "dylib" | "so") => Some("dynamic_dependency_execution_observation_unavailable"),
+    _ => Some("dependency_artifact_format_observation_unavailable"),
+  }
+}
+
+fn native_library_bypass_reason(value: &str) -> &'static str {
+  if value.starts_with("dylib=") || value.starts_with("framework=") {
+    "dynamic_native_library_search_evidence_unavailable"
+  } else {
+    "native_library_input_evidence_unavailable"
+  }
+}
+
+fn unstable_option_bypass_reason(value: &str) -> &'static str {
+  if value.starts_with("codegen-backend=") {
+    "external_codegen_backend_identity_unavailable"
+  } else {
+    "unstable_compiler_option_evidence_unavailable"
+  }
 }
 
 fn supported_library_search(value: &str) -> bool {
@@ -5785,7 +5935,7 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
     configure_cold(
       command,
       CompilerCacheWrapperStatus::Bypassed,
-      "forced_incremental_compilation_not_graduated",
+      "incremental_work_product_observation_unavailable",
       None,
       0,
       diagnostic_wrapper,
@@ -5902,7 +6052,7 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
     configure_cold(
       command,
       CompilerCacheWrapperStatus::Bypassed,
-      "compiler_output_root_not_graduated",
+      "compiler_output_root_authority_unavailable",
       None,
       estimated_input_bytes(observation, source_root),
       diagnostic_wrapper,
@@ -6693,23 +6843,18 @@ fn prepare_observed_cold_child(
 }
 
 fn apple_linked_observation(observation: &RawCompilerInvocation) -> bool {
-  cfg!(target_os = "macos")
-    && observation.emit_modes == BTreeSet::from(["dep-info".to_string(), "link".to_string()])
-    && observation.crate_types.len() == 1
-    && matches!(
-      observation.crate_types.iter().next().map(String::as_str),
-      Some("bin" | "proc-macro" | "dylib" | "cdylib")
-    )
+  cfg!(target_os = "macos") && native_linked_output_role(observation).is_some()
 }
 
 fn elf_linked_observation(observation: &RawCompilerInvocation) -> bool {
-  cfg!(target_os = "linux")
-    && observation.emit_modes == BTreeSet::from(["dep-info".to_string(), "link".to_string()])
-    && observation.crate_types.len() == 1
-    && matches!(
-      observation.crate_types.iter().next().map(String::as_str),
-      Some("bin" | "proc-macro" | "dylib" | "cdylib")
-    )
+  cfg!(target_os = "linux") && native_linked_output_role(observation).is_some()
+}
+
+fn native_linked_output_role(observation: &RawCompilerInvocation) -> Option<NativeOutputRole> {
+  (observation.emit_modes == BTreeSet::from(["dep-info".to_string(), "link".to_string()]))
+    .then(|| NativeOutputRole::from_invocation(&observation.crate_types, observation.test_mode))
+    .flatten()
+    .filter(|role| role.requires_linker())
 }
 
 fn linked_observation(observation: &RawCompilerInvocation) -> bool {
@@ -8517,7 +8662,7 @@ fn validated_output_parent(outputs: &NativeOutputPaths, source_root: &Path) -> R
   }
   let canonical_parent = crate::utils::canonicalize_existing(output_parent)?;
   let canonical_root = crate::utils::canonicalize_existing(source_root)?;
-  if !canonical_parent.starts_with(&canonical_root)
+  if !canonical_parent.starts_with(canonical_root.join("target"))
     || bindings
       .iter()
       .any(|(role, _, output)| !output_role_path_matches(role, output))
@@ -8557,11 +8702,19 @@ fn output_role_path_matches(role: &str, output: &Path) -> bool {
     "dep_info" => output.extension() == Some(OsStr::new("d")),
     "metadata" => output.extension() == Some(OsStr::new("rmeta")),
     "rlib" => output.extension() == Some(OsStr::new("rlib")),
+    "executable" if cfg!(windows) => output.extension() == Some(OsStr::new("exe")),
     "executable" => output.file_name().is_some() && output.extension().is_none(),
     "proc_macro" | "dylib" | "cdylib" => {
-      output.extension() == Some(OsStr::new(if cfg!(target_os = "linux") { "so" } else { "dylib" }))
+      let extension = if cfg!(windows) {
+        "dll"
+      } else if cfg!(target_os = "macos") {
+        "dylib"
+      } else {
+        "so"
+      };
+      output.extension() == Some(OsStr::new(extension))
     }
-    "staticlib" => output.extension() == Some(OsStr::new("a")),
+    "staticlib" => output.extension() == Some(OsStr::new(if cfg!(windows) { "lib" } else { "a" })),
     _ => false,
   }
 }
@@ -9267,7 +9420,7 @@ pub(crate) fn configure_apple_link_adapter(command: &mut Command, arguments: &[O
           return false;
         };
         preexisting_paths.insert(path.to_string());
-        if preexisting_paths.len() > MAX_APPLE_LINK_INPUTS {
+        if preexisting_paths.len() > MAX_LINK_INPUTS {
           return false;
         }
       }
@@ -9588,7 +9741,7 @@ pub(crate) fn finalize_apple_link_adapter() -> bool {
         return false;
       };
       generated.insert(path);
-      if generated.len() > MAX_APPLE_LINK_INPUTS {
+      if generated.len() > MAX_LINK_INPUTS {
         return false;
       }
     }
@@ -10574,6 +10727,8 @@ struct NativeBenchmarkCoverageEvent<'a> {
   lane: &'static str,
   status: CompilerCacheWrapperStatus,
   reason: &'a str,
+  action: crate::compiler::operation::CompilerOperation,
+  action_id: String,
   #[serde(skip_serializing_if = "Option::is_none")]
   action_key: Option<&'a str>,
   #[serde(skip_serializing_if = "Option::is_none")]
@@ -10659,6 +10814,8 @@ fn write_benchmark_coverage_invocation(
     .into_os_string()
     .into_string()
     .map_err(|_| RailError::message("benchmark compiler coverage has a non-UTF-8 working directory"))?;
+  let action = crate::compiler::operation::CompilerOperation::capture(&compiler, &arguments)?;
+  let action_id = action.identity()?;
   let remote_state = active_context().and_then(|context| context.remote_store.get());
   let remote = remote_state
     .and_then(|store| store.as_ref().ok())
@@ -10675,10 +10832,12 @@ fn write_benchmark_coverage_invocation(
         .map(ToString::to_string)
     });
   let encoded = serde_json::to_vec(&NativeBenchmarkCoverageEvent {
-    schema_version: 5,
+    schema_version: 8,
     lane: "cargo-rail",
     status,
     reason,
+    action,
+    action_id,
     action_key,
     result_key,
     remote_base_action_key,
@@ -10936,6 +11095,54 @@ pub(crate) mod tests {
 
     fs::write(&found, b"stable-two").expect("mutated stable input");
     assert!(revalidate_apple_linker_witness(&witness, Some(&generations), Some(&authority)).is_err());
+  }
+
+  #[cfg(target_os = "macos")]
+  #[test]
+  fn apple_link_witness_recognizes_dynamic_rustc_object_names() {
+    let state = tempfile::tempdir().expect("Apple witness state");
+    let root = fs::canonicalize(state.path()).expect("canonical state");
+    let certificate = root.join("linker-dependencies.bin");
+    let driver_inputs = root.join("linker-driver-inputs.json");
+
+    for (role, crate_type, linked_name, object_name) in [
+      (
+        NativeOutputRole::ProcMacro,
+        "proc-macro",
+        "libfixture_macros.dylib",
+        "fixture_macros.0.rcgu.o",
+      ),
+      (
+        NativeOutputRole::Dylib,
+        "dylib",
+        "libfixture_dylib.dylib",
+        "fixture_dylib.0.rcgu.o",
+      ),
+      (
+        NativeOutputRole::Cdylib,
+        "cdylib",
+        "libfixture_cdylib.dylib",
+        "fixture_cdylib.0.rcgu.o",
+      ),
+    ] {
+      let linked = root.join(linked_name);
+      let removed_object = root.join(object_name);
+      fs::write(&linked, b"linked-output").expect("linked output");
+      write_apple_link_certificate(&certificate, &[(0x10, &removed_object), (0x40, &linked)]);
+      write_apple_link_driver_inputs(&driver_inputs, &[&removed_object]);
+      let outputs = NativeOutputPaths {
+        dep_info: root.join(format!("{crate_type}.d")),
+        artifacts: vec![crate::compiler::observation::NativeOutputArtifact { role, path: linked }],
+      };
+      let mut observation = graduated_observation();
+      observation.crate_types = BTreeSet::from([crate_type.to_string()]);
+      observation.emit_modes = BTreeSet::from(["dep-info".to_string(), "link".to_string()]);
+
+      let (witness, _, _) = capture_apple_linker_witness(&observation, &outputs, &certificate, &driver_inputs, None)
+        .expect("dynamic Apple witness");
+      assert_eq!(witness.endogenous_objects, 1, "{crate_type}");
+      assert!(witness.found.is_empty(), "{crate_type}");
+    }
   }
 
   #[cfg(target_os = "macos")]
@@ -11289,19 +11496,22 @@ pub(crate) mod tests {
       );
     }
 
-    for dependency in [
-      ["--extern", "derive=target/debug/deps/libderive.dylib"],
-      ["--extern=derive=target/debug/deps/libderive.wasm", ""],
+    for (dependency, reason) in [
+      (
+        ["--extern", "derive=target/debug/deps/libderive.dylib"],
+        "dynamic_dependency_execution_observation_unavailable",
+      ),
+      (
+        ["--extern=derive=target/debug/deps/libderive.wasm", ""],
+        "dependency_artifact_format_observation_unavailable",
+      ),
     ] {
       let mut unsupported = eligible.to_vec();
       unsupported.push(dependency[0].into());
       if !dependency[1].is_empty() {
         unsupported.push(dependency[1].into());
       }
-      assert_eq!(
-        fast_bypass_reason(OsStr::new("rustc"), &unsupported),
-        Some("dependency_artifact_class_not_graduated")
-      );
+      assert_eq!(fast_bypass_reason(OsStr::new("rustc"), &unsupported), Some(reason));
     }
     let mut missing_dependency_path = eligible.to_vec();
     missing_dependency_path.extend([OsString::from("--extern"), OsString::from("derive")]);
@@ -11310,13 +11520,30 @@ pub(crate) mod tests {
       Some("dependency_artifact_path_unavailable")
     );
 
+    let test = [
+      "--crate-name",
+      "fixture_test",
+      "--test",
+      "--emit=dep-info,link",
+      "--error-format=json",
+      "--out-dir",
+      "target/debug/deps",
+      "tests/fixture.rs",
+    ]
+    .map(OsString::from);
+    assert_eq!(
+      fast_bypass_reason(OsStr::new("rustc"), &test),
+      platform_linker_bypass_reason(std::env::consts::OS)
+    );
+
     for (argument, reason) in [
-      ("--test", "test_compilation_not_graduated"),
       (
         "-Cincremental=target/incremental",
-        "incremental_compilation_not_graduated",
+        "incremental_work_product_observation_unavailable",
       ),
-      ("@rustc.rsp", "response_file_not_graduated"),
+      ("-Clinker=/tmp/linker", "explicit_linker_evidence_unavailable"),
+      ("-Clink-arg=-dead_strip", "explicit_link_argument_evidence_unavailable"),
+      ("@rustc.rsp", "response_file_expansion_unavailable"),
     ] {
       let mut unsupported = eligible.to_vec();
       unsupported.push(argument.into());
@@ -11324,13 +11551,27 @@ pub(crate) mod tests {
     }
     assert_eq!(
       fast_bypass_reason(OsStr::new("clippy-driver"), &eligible),
-      Some("clippy_not_graduated")
+      Some("clippy_diagnostic_result_authority_unavailable")
+    );
+  }
+
+  #[test]
+  fn linked_platforms_have_exact_provider_boundaries() {
+    assert_eq!(platform_linker_bypass_reason("macos"), None);
+    assert_eq!(platform_linker_bypass_reason("linux"), None);
+    assert_eq!(
+      platform_linker_bypass_reason("windows"),
+      Some("coff_linker_evidence_unavailable")
+    );
+    assert_eq!(
+      platform_linker_bypass_reason("unsupported"),
+      Some("platform_linker_evidence_unavailable")
     );
   }
 
   fn graduated_session(source_root_identity: String) -> NativeCompilerSession {
     let class = NativeCompilerClass {
-      name: "library_metadata_rlib".to_string(),
+      name: "exact_rustc_result".to_string(),
       platform: "unix-test-x86_64".to_string(),
       host_target: "x86_64-unknown-test".to_string(),
       rustc_release: "1.97.1".to_string(),
@@ -11421,7 +11662,7 @@ pub(crate) mod tests {
       .collect::<Vec<_>>();
     dependency_names.sort_unstable();
     NativeCompilerWitness {
-      version: 4,
+      version: 5,
       complete: true,
       source_paths: vec!["lib.rs".to_string()],
       generated_paths: Vec::new(),
@@ -11431,8 +11672,7 @@ pub(crate) mod tests {
         .iter()
         .map(|entry| entry.name.clone())
         .collect(),
-      apple_linker: None,
-      elf_linker: None,
+      linker: None,
     }
   }
 
@@ -11487,6 +11727,35 @@ pub(crate) mod tests {
 
   pub(crate) fn cas_validation_with_stdout(stdout: &[u8]) -> NativeCompilerValidation {
     graduated_validation_with_streams(graduated_observation(), stdout, b"")
+  }
+
+  #[test]
+  fn zero_byte_metadata_is_an_exact_compiler_output() {
+    let mut validation = cas_validation_with_stdout(b"");
+    let empty_digest = digest(b"");
+    validation.outputs[1].bytes = 0;
+    validation.outputs[1].content_digest = empty_digest.clone();
+    validation.observation.emitted_outputs[1].content_digest = empty_digest;
+    validation.result_key = result_key(
+      &validation.action_key,
+      &validation.witness,
+      &validation.outputs,
+      &validation.stdout_digest,
+      validation.stdout_bytes,
+      &validation.stderr_digest,
+      validation.stderr_bytes,
+    )
+    .expect("zero-byte metadata result identity");
+    validation
+      .validate_object()
+      .expect("rustc may intentionally emit an empty metadata artifact");
+
+    validation.outputs[0].bytes = 0;
+    validation.observation.emitted_outputs[0].content_digest = digest(b"");
+    validation.outputs[0].content_digest = digest(b"");
+    validation
+      .validate_object()
+      .expect_err("dep-info must still contain an authoritative dependency graph");
   }
 
   #[test]
@@ -12585,11 +12854,46 @@ pub(crate) mod tests {
       invocation_bypass_reason(&bundled_backend, true, &session.class.host_target),
       None
     );
-    assert_bypass("rustdoc_not_graduated", |value| value.mode = CompilerMode::Rustdoc);
-    assert_bypass("cross_target_not_graduated", |value| {
+    assert_bypass("rustdoc_output_tree_observation_unavailable", |value| {
+      value.mode = CompilerMode::Rustdoc;
+    });
+    assert_bypass("doctest_execution_result_authority_unavailable", |value| {
+      value.mode = CompilerMode::Rustdoc;
+      value.test_mode = true;
+    });
+    assert_bypass("cross_target_toolchain_evidence_unavailable", |value| {
       value.target_argument = Some("x86_64-unknown-linux-gnu".to_string());
     });
-    assert_bypass("test_compilation_not_graduated", |value| value.test_mode = true);
+    let mut test = baseline.clone();
+    test.crate_name = Some("fixture_test".to_string());
+    test.crate_types.clear();
+    test.test_mode = true;
+    test.emit_modes = BTreeSet::from(["dep-info".to_string(), "link".to_string()]);
+    test.compiler_arguments = [
+      "--crate-name",
+      "fixture_test",
+      "--edition=2024",
+      "--error-format=json",
+      "tests/fixture.rs",
+      "--test",
+      "--emit=dep-info,link",
+      "-C",
+      "metadata=0123456789abcdef",
+      "-Cextra-filename=-0123456789abcdef",
+      "--out-dir",
+      "target/debug/deps",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    assert_eq!(
+      invocation_bypass_reason(&test, true, &session.class.host_target),
+      platform_linker_bypass_reason(std::env::consts::OS)
+    );
+    assert_eq!(
+      linked_observation(&test),
+      cfg!(any(target_os = "macos", target_os = "linux"))
+    );
     for (crate_type, crate_name) in [
       ("proc-macro", "fixture_macros"),
       ("dylib", "fixture_dylib"),
@@ -12613,18 +12917,28 @@ pub(crate) mod tests {
         .expect("emit modes") = "--emit=dep-info,link".to_string();
       assert_eq!(
         invocation_bypass_reason(&linked, true, &session.class.host_target),
-        if cfg!(any(target_os = "macos", target_os = "linux")) {
-          None
-        } else {
-          Some("compiler_crate_type_not_graduated")
-        },
+        platform_linker_bypass_reason(std::env::consts::OS),
         "{crate_name}"
       );
     }
-    assert_bypass("compiler_emit_mode_not_graduated", |value| {
+    let mut staticlib = baseline.clone();
+    staticlib.crate_types = BTreeSet::from(["staticlib".to_string()]);
+    staticlib.emit_modes = BTreeSet::from(["dep-info".to_string(), "link".to_string()]);
+    assert_eq!(
+      invocation_bypass_reason(&staticlib, true, &session.class.host_target),
+      None,
+      "rustc owns static archive creation"
+    );
+    let mut explicit_rlib = baseline.clone();
+    explicit_rlib.crate_types = BTreeSet::from(["rlib".to_string()]);
+    assert_eq!(
+      invocation_bypass_reason(&explicit_rlib, true, &session.class.host_target),
+      None
+    );
+    assert_bypass("compiler_emit_contract_unavailable", |value| {
       value.emit_modes.insert("llvm-bc".to_string());
     });
-    assert_bypass("compiler_stdin_not_graduated", |value| {
+    assert_bypass("compiler_stdin_observation_unavailable", |value| {
       value.compiler_arguments.push("-".to_string());
     });
     let mut human_diagnostics = baseline.clone();
@@ -12637,7 +12951,7 @@ pub(crate) mod tests {
       invocation_bypass_reason(&human_diagnostics, true, &session.class.host_target),
       None
     );
-    assert_bypass("compiler_diagnostic_format_not_graduated", |value| {
+    assert_bypass("compiler_diagnostic_replay_unavailable", |value| {
       *value
         .compiler_arguments
         .iter_mut()
@@ -12673,38 +12987,41 @@ pub(crate) mod tests {
       None,
       "the exact compiler arguments bind rustc's dynamic-link preference"
     );
-    assert_bypass("compiler_flag_not_graduated", |value| {
+    assert_bypass("dynamic_native_library_search_evidence_unavailable", |value| {
       value
         .compiler_arguments
         .extend(["-l".to_string(), "dylib=fixture".to_string()]);
     });
-    assert_bypass("native_linking_not_graduated", |value| {
+    assert_bypass("explicit_linker_evidence_unavailable", |value| {
       value
         .compiler_arguments
         .extend(["-C".to_string(), "linker=/tmp/linker".to_string()]);
     });
-    assert_bypass("incremental_compilation_not_graduated", |value| {
+    assert_bypass("explicit_link_argument_evidence_unavailable", |value| {
+      value.compiler_arguments.push("-Clink-arg=-dead_strip".to_string());
+    });
+    assert_bypass("incremental_work_product_observation_unavailable", |value| {
       value
         .compiler_arguments
         .extend(["-C".to_string(), "incremental=target/incremental".to_string()]);
     });
-    assert_bypass("compiler_flag_not_graduated", |value| {
+    assert_bypass("unstable_compiler_option_evidence_unavailable", |value| {
       value.compiler_arguments.push("-Zunproven".to_string());
     });
-    assert_bypass("compiler_flag_not_graduated", |value| {
+    assert_bypass("remapped_path_observation_unavailable", |value| {
       value
         .compiler_arguments
         .push("--remap-path-prefix=/workspace=/other".to_string());
     });
-    assert_bypass("compiler_flag_not_graduated", |value| {
+    assert_bypass("remapped_path_observation_unavailable", |value| {
       value.compiler_arguments.push("--remap-path-scope=all".to_string());
     });
-    assert_bypass("compiler_flag_not_graduated", |value| {
+    assert_bypass("external_codegen_backend_identity_unavailable", |value| {
       value
         .compiler_arguments
         .push("-Zcodegen-backend=/opt/backend.so".to_string());
     });
-    assert_bypass("dependency_artifact_class_not_graduated", |value| {
+    assert_bypass("dynamic_dependency_execution_observation_unavailable", |value| {
       value.dependency_artifacts.push((
         "dep".to_string(),
         observed_file("target/debug/deps/libdep.dylib", b"dylib"),
@@ -12717,14 +13034,29 @@ pub(crate) mod tests {
         secret_capability: true,
       });
     });
-    assert_bypass("compiler_inputs_incomplete", |value| {
-      value.bypasses.insert("unknown_input".to_string());
+    assert_bypass("declared_input_bytes_unavailable", |value| {
+      value.bypasses.insert("declared_input_bytes_unavailable".to_string());
+    });
+    assert_bypass("dep_info_output_bytes_unavailable", |value| {
+      value.bypasses.insert("dep_info_output_bytes_unavailable".to_string());
+    });
+    assert_bypass("dep_info_output_symlink_unavailable", |value| {
+      value.bypasses.insert("dep_info_output_symlink_unavailable".to_string());
+    });
+    assert_bypass("compiler_emitted_output_bytes_unavailable", |value| {
+      value.bypasses.insert("emitted_output_bytes_unavailable".to_string());
+    });
+    assert_bypass("compiler_emitted_output_symlink_unavailable", |value| {
+      value.bypasses.insert("emitted_output_symlink_unavailable".to_string());
     });
     assert_bypass("declared_compiler_inputs_unavailable", |value| {
       value.declared_inputs.clear();
     });
-    assert_bypass("complete_compiler_observation_unavailable", |value| {
+    assert_bypass("compiler_observed_read_set_unavailable", |value| {
       value.observed_reads.clear();
+    });
+    assert_bypass("compiler_emitted_output_set_unavailable", |value| {
+      value.emitted_outputs.pop();
     });
   }
 
@@ -12849,13 +13181,19 @@ pub(crate) mod tests {
   }
 
   #[test]
-  fn publication_root_must_remain_inside_the_source_root() {
+  fn publication_root_must_remain_inside_the_standard_target_root() {
     let source = tempfile::tempdir().expect("source root");
     let external = tempfile::tempdir().expect("external root");
     let internal = source.path().join("target/debug/deps");
     fs::create_dir_all(&internal).expect("internal target");
     let valid = metadata_output_paths(internal.join("fixture.d"), internal.join("libfixture.rmeta"));
     assert!(validated_output_parent(&valid, source.path()).is_ok());
+
+    let source_output = source.path().join("generated");
+    fs::create_dir(&source_output).expect("source output");
+    let source_mutation =
+      metadata_output_paths(source_output.join("fixture.d"), source_output.join("libfixture.rmeta"));
+    assert!(validated_output_parent(&source_mutation, source.path()).is_err());
 
     let escaped = metadata_output_paths(
       external.path().join("fixture.d"),

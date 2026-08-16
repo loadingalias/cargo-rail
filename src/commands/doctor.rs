@@ -34,6 +34,10 @@ pub fn run_native_cache_doctor(ctx: &WorkspaceContext, format: TextJsonOutputFor
   println!("  platform: {}", capability.platform());
   println!("  host target: {}", capability.host_target());
   println!("  identity: {}", capability.identity());
+  println!(
+    "  transported work: {}",
+    crate::compiler::native_cache::native_cache_transported_work_boundary()
+  );
   println!("  installation: {}", installation.state);
   println!("  installation healthy: {}", installation.healthy);
   for issue in &installation.issues {

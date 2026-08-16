@@ -1470,7 +1470,7 @@ resolver = "3"
       });
     if consumes_fixture_macro {
       assert_eq!(event["status"], "bypassed");
-      assert_eq!(event["reason"], "dependency_artifact_class_not_graduated");
+      assert_eq!(event["reason"], "dynamic_dependency_execution_observation_unavailable");
       assert!(event.get("action_key").is_none());
       assert_eq!(event["bytes_hashed"], 0);
       assert_eq!(event["cache_bytes_read"], 0);

@@ -299,7 +299,9 @@ def assert_native_cache_identity(cargo_rail: Path, expected_host: str, workspace
     if (
         report.get("result") != "success"
         or capability.get("host_target") != expected_host
-        or capability.get("cache_class") != "library_metadata_rlib"
+        or capability.get("cache_class") != "exact_rustc_result"
+        or capability.get("transported_work_boundary")
+        != "moved_root_compiler_work_product_validation_unavailable"
         or re.fullmatch(r"sha256:[0-9a-f]{64}", capability.get("identity", "")) is None
     ):
         raise CompatibilityError("native-cache doctor did not report an exact compiler identity")

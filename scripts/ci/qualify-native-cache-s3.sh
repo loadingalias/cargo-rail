@@ -43,6 +43,48 @@ remote_provider="$(jq -r '.remote.provider' <<<"$normalized")"
 credential_model=ec2-instance-profile
 [[ "$remote_provider" == azure-blob ]] && credential_model=azure-passwordless-chain
 [[ "$remote_provider" == cloudflare-r2 ]] && credential_model=r2-api-token
+normalized_url="$(jq -r '.normalized_url' <<<"$normalized")"
+location="${normalized_url%%\?*}"
+authority="${location#*://}"
+case "$remote_provider" in
+  aws-s3)
+    provider_slug=s3
+    bucket="${authority%%/*}"
+    prefix="${authority#*/}"
+    [[ "$bucket" != "$authority" ]] || usage
+    ;;
+  azure-blob)
+    provider_slug=azure
+    account="${authority%%/*}"
+    remainder="${authority#*/}"
+    container="${remainder%%/*}"
+    prefix="${remainder#*/}"
+    [[ "$account" =~ ^[a-z0-9]{3,24}$ && "$container" != "$remainder" ]] || usage
+    [[ "$run_id" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || {
+      echo "Azure Blob qualification requires a lowercase DNS-safe run ID" >&2
+      exit 2
+    }
+    expected_container="cargo-rail-task9-$run_id"
+    [[ "${#expected_container}" -le 63 && "$container" == "$expected_container" ]] || {
+      echo "Azure Blob qualification requires disposable container $expected_container" >&2
+      exit 2
+    }
+    ;;
+  cloudflare-r2)
+    provider_slug=r2
+    account="${authority%%/*}"
+    remainder="${authority#*/}"
+    bucket="${remainder%%/*}"
+    prefix="${remainder#*/}"
+    [[ "$account" =~ ^[0-9a-f]{32}$ && "$bucket" != "$remainder" ]] || usage
+    ;;
+  *) usage ;;
+esac
+expected_prefix="cache/cargo-rail/$provider_slug/v3/task9/$run_id"
+[[ "$prefix" == "$expected_prefix" ]] || {
+  echo "remote qualification requires exact disposable prefix $expected_prefix" >&2
+  exit 2
+}
 
 results="$repo_root/benchmark_results/native-cache/$run_id-$phase"
 state="$repo_root/benchmark_results/native-cache-s3-state/$run_id"
@@ -83,7 +125,7 @@ capture_worktree_patch() {
 }
 
 shared_git="$state/fixture-git-source"
-workloads=(check build)
+workloads=(check build test)
 setup_mode=read
 [[ "$phase" == producer ]] && setup_mode=read-write
 source_cargo_home="${CARGO_HOME:-${HOME:?HOME is required}/.cargo}"
@@ -157,6 +199,15 @@ event_summary() {
         .status == "miss" and .reason == "remote_entry_not_found;stored_verified_result;remote_read_only"
       )] | length),
       remote_publications: ([.[] | select(.reason | contains("remote_published"))] | length),
+      published_action_ids: ([.[] | select(.reason | contains("remote_published")) | .action_id] | sort),
+      remote_hit_action_ids: ([.[] | select(
+        .status == "hit" and .reason == "verified_remote_result"
+      ) | .action_id] | sort),
+      local_hit_action_ids: ([.[] | select(
+        .status == "hit" and .reason == "verified_local_result"
+      ) | .action_id] | sort),
+      rust_class_counts: (reduce [.[].action.action_class][] as $class ({};
+        .[$class] = ((.[$class] // 0) + 1))),
       remote_request_attempts: ([.[].remote_request_attempts] | add // 0),
       remote_coordinator_requests: ([.[].remote_coordinator_requests] | add // 0),
       remote_payload_bytes_read: ([.[].remote_payload_bytes_read] | add // 0),
@@ -183,6 +234,7 @@ run_workload() {
   chmod 700 "$directory" "$directory/events"
   local -a command=(cargo "$workload")
   [[ "$workload" == build ]] && command+=(--release)
+  [[ "$workload" == test ]] && command+=(--no-run --all-targets)
   command+=(--workspace --all-features --locked --offline --message-format=json-render-diagnostics)
   local -a measurement=(
     "$measure"
@@ -258,7 +310,8 @@ for workload in "${workloads[@]}"; do
       and .hit_remote_coordinator_requests == 0
       and .remote_payload_bytes_read == 0
       and .remote_payload_bytes_written == 0
-    ' "$offline" >/dev/null || {
+      and (($remote[0].remote_hit_action_ids - .local_hit_action_ids) | length) == 0
+    ' --slurpfile remote "$summary" "$offline" >/dev/null || {
       echo "remote-cache consumer L1 hit attempted remote access: $workload" >&2
       exit 1
     }
@@ -268,6 +321,40 @@ for workload in "${workloads[@]}"; do
     }
   fi
 done
+
+jq -n \
+  --slurpfile check "$results/raw/check/$phase/events.json" \
+  --slurpfile build "$results/raw/build/$phase/events.json" \
+  --slurpfile test "$results/raw/test/$phase/events.json" '
+  [
+    "binary",
+    "build_script",
+    "c_dynamic_library",
+    "proc_macro_producer",
+    "rust_dynamic_library",
+    "rust_library",
+    "static_library",
+    "test"
+  ] as $required
+  | [$check[0].rust_class_counts, $build[0].rust_class_counts, $test[0].rust_class_counts]
+  | (reduce (.[] | to_entries[]) as $entry ({};
+      .[$entry.key] = ((.[$entry.key] // 0) + $entry.value))) as $counts
+  | ($counts | to_entries | map(select(.value > 0) | .key) | sort) as $observed
+  | ($required - $observed) as $missing
+  | {
+      schema_version: 1,
+      complete: ($missing | length) == 0,
+      required: $required,
+      observed: $observed,
+      missing: $missing,
+      counts: $counts
+    }
+' >"$results/compiler-class-coverage.json"
+jq -e '.complete' "$results/compiler-class-coverage.json" >/dev/null || {
+  echo "remote-cache qualification did not exercise every required compiler class" >&2
+  jq . "$results/compiler-class-coverage.json" >&2
+  exit 1
+}
 
 git -C "$repo_root" status --porcelain=v1 --untracked-files=all >"$results/worktree-status.txt"
 capture_worktree_patch "$results/worktree.diff"
@@ -322,24 +409,31 @@ jq -n \
 
 offline_check=null
 offline_build=null
+offline_test=null
 if [[ "$phase" == consumer ]]; then
   offline_check="$(jq -c . "$results/raw/check/l1-offline/events.json")"
   offline_build="$(jq -c . "$results/raw/build/l1-offline/events.json")"
+  offline_test="$(jq -c . "$results/raw/test/l1-offline/events.json")"
 fi
 
 jq -n \
   --arg phase "$phase" \
   --slurpfile check "$results/raw/check/$phase/events.json" \
   --slurpfile build "$results/raw/build/$phase/events.json" \
+  --slurpfile test "$results/raw/test/$phase/events.json" \
+  --slurpfile classes "$results/compiler-class-coverage.json" \
   --argjson offline_check "$offline_check" \
   --argjson offline_build "$offline_build" \
+  --argjson offline_test "$offline_test" \
   '{
-    schema_version: 1,
+    schema_version: 2,
     phase: $phase,
     workloads: {
       check: {primary: $check[0], l1_offline: $offline_check},
-      build: {primary: $build[0], l1_offline: $offline_build}
+      build: {primary: $build[0], l1_offline: $offline_build},
+      test: {primary: $test[0], l1_offline: $offline_test}
     },
+    compiler_class_coverage: $classes[0],
     passed: true
   }' >"$results/result.json"
 

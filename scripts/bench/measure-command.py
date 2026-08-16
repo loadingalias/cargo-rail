@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import subprocess
 import sys
 import time
@@ -52,15 +53,20 @@ def main() -> int:
         completed = subprocess.run(command, cwd=arguments.cwd, env=environment, stdout=stdout, stderr=stderr)
     finished = time.perf_counter_ns()
     after = resource.getrusage(resource.RUSAGE_CHILDREN) if resource is not None else None
+    max_rss_bytes = None
+    if after is not None:
+        # Darwin reports ru_maxrss in bytes; Linux reports KiB. The retained
+        # contract normalizes both supported benchmark hosts to bytes.
+        max_rss_bytes = after.ru_maxrss if platform.system() == "Darwin" else after.ru_maxrss * 1024
 
     evidence = {
-        "schema_version": 1,
+        "schema_version": 2,
         "argv": command,
         "cwd": str(Path(arguments.cwd).resolve()),
         "elapsed_seconds": (finished - started) / 1_000_000_000,
         "user_seconds": None if before is None else after.ru_utime - before.ru_utime,
         "system_seconds": None if before is None else after.ru_stime - before.ru_stime,
-        "max_rss_observed": None if after is None else after.ru_maxrss,
+        "max_rss_bytes": max_rss_bytes,
         "exit_code": completed.returncode,
     }
     Path(arguments.output).write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")

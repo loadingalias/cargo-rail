@@ -3,9 +3,10 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 measure="$repo_root/scripts/bench/measure-command.py"
+coverage_reporter="$repo_root/scripts/bench/native-cache-coverage.py"
 
 usage() {
-  echo "usage: $0 <5-7 rounds> <run-id> <cargo-rail-s3-url> <sccache-bucket> <sccache-region> <sccache-prefix>" >&2
+  echo "usage: $0 <20-30 rounds> <run-id> <cargo-rail-s3-url> <sccache-bucket> <sccache-region> <sccache-prefix>" >&2
   echo "       CARGO_RAIL_PERFORMANCE_SMOKE=1 permits exactly one non-qualifying run" >&2
   exit 2
 }
@@ -18,7 +19,7 @@ sccache_region="${5:-}"
 sccache_prefix="${6:-}"
 smoke="${CARGO_RAIL_PERFORMANCE_SMOKE:-0}"
 case "$smoke" in
-  0) [[ "$runs" =~ ^[0-9]+$ && "$runs" -ge 5 && "$runs" -le 7 ]] || usage ;;
+  0) [[ "$runs" =~ ^[0-9]+$ && "$runs" -ge 20 && "$runs" -le 30 ]] || usage ;;
   1) [[ "$runs" == 1 ]] || usage ;;
   *) usage ;;
 esac
@@ -74,6 +75,21 @@ jq -e '.remote.provider == "aws-s3" and .remote.activation == "direct_transport_
   echo "official-S3 performance qualification requires a normalized official AWS authority" >&2
   exit 2
 }
+normalized_url="$(jq -r '.normalized_url' <<<"$normalized")"
+location="${normalized_url%%\?*}"
+authority="${location#s3://}"
+normalized_bucket="${authority%%/*}"
+cargo_rail_prefix="${authority#*/}"
+expected_cargo_rail_prefix="cache/cargo-rail/s3/v3/task9/$run_id"
+expected_sccache_prefix="cache/cargo-rail/sccache/v3/aws/task9/$run_id"
+[[ "$normalized_bucket" == "$sccache_bucket" && "$cargo_rail_prefix" == "$expected_cargo_rail_prefix" ]] || {
+  echo "official-S3 performance qualification requires exact Cargo-Rail prefix $expected_cargo_rail_prefix" >&2
+  exit 2
+}
+[[ "$sccache_prefix" == "$expected_sccache_prefix" ]] || {
+  echo "official-S3 performance qualification requires exact sccache prefix $expected_sccache_prefix" >&2
+  exit 2
+}
 
 results="$repo_root/benchmark_results/native-cache/$run_id"
 state="$repo_root/benchmark_results/native-cache-s3-performance-state/$run_id"
@@ -122,7 +138,7 @@ capture_worktree_patch() {
   done < <(git -C "$repo_root" ls-files --others --exclude-standard -z)
 }
 
-workloads=(check build)
+workloads=(check build test)
 lanes=(cargo-rail-s3 sccache-s3)
 source_cargo_home="${CARGO_HOME:-${HOME:?HOME is required}/.cargo}"
 source_cargo_home="$(cd "$source_cargo_home" && pwd -P)"
@@ -264,7 +280,11 @@ command_args() {
   local workload="$1"
   cargo_command=(cargo "$workload")
   [[ "$workload" == build ]] && cargo_command+=(--release)
-  cargo_command+=(--workspace --all-features --locked --offline --message-format=json-render-diagnostics)
+  [[ "$workload" == test ]] && cargo_command+=(--no-run --all-targets)
+  cargo_command+=(
+    --workspace --all-features --exclude fixture-static
+    --locked --offline --message-format=json-render-diagnostics
+  )
 }
 
 measure_args() {
@@ -392,6 +412,8 @@ run_sccache() {
     --env "SCCACHE_S3_RW_MODE=$mode"
     --env "SCCACHE_DIR=$directory/cache"
     --env "SCCACHE_SERVER_UDS=$socket"
+    --env "SCCACHE_ERROR_LOG=$directory/sccache.log"
+    --env SCCACHE_LOG=trace
   )
   python3 "${measurement[@]}" -- "${cargo_command[@]}"
   env "${sccache_env[@]}" "$sccache_bin" --show-stats --stats-format json >"$directory/cache.json"
@@ -500,42 +522,41 @@ verify_remote_coverage() {
   local round="$2"
   local directory="$results/raw/$workload/round-$round"
   local cargo_rail="$directory/cargo-rail-s3/cache.json"
-  local sccache="$directory/sccache-s3/cache.json"
   local seed="$results/seed/$workload/cargo-rail-s3/cache.json"
-  local minimum_hits
-  case "$workload" in
-    check) minimum_hits="${CARGO_RAIL_EXPECTED_REMOTE_CHECK_HITS:-49}" ;;
-    build) minimum_hits="${CARGO_RAIL_EXPECTED_REMOTE_BUILD_HITS:-51}" ;;
-    *) return 2 ;;
-  esac
-  [[ "$minimum_hits" =~ ^[0-9]+$ && "$minimum_hits" -gt 0 ]] || {
-    echo "official-S3 performance minimum remote hit count is invalid: $workload=$minimum_hits" >&2
-    return 2
-  }
+  local semantic="$directory/semantic-coverage.json"
+  if ! python3 "$coverage_reporter" remote \
+    --cargo-rail-events "$directory/cargo-rail-s3/events" \
+    --cargo-rail-verbose "$directory/cargo-rail-s3/stderr" \
+    --cargo-rail-root "$state/fixtures/$workload-cargo-rail-s3" \
+    --sccache-log "$directory/sccache-s3/sccache.log" \
+    --sccache-root "$state/fixtures/$workload-sccache-s3" \
+    --output "$semantic"; then
+    echo "official-S3 performance safe action coverage failed: $workload/round-$round" >&2
+    return 1
+  fi
   jq -n \
     --arg workload "$workload" \
     --argjson round "$round" \
-    --argjson minimum_hits "$minimum_hits" \
     --slurpfile cargo_rail "$cargo_rail" \
-    --slurpfile sccache "$sccache" \
-    --slurpfile seed "$seed" '
+    --slurpfile seed "$seed" \
+    --slurpfile semantic "$semantic" '
       ($cargo_rail[0].remote_hits) as $cargo_rail_hits
-      | ([$sccache[0].stats.cache_hits.counts[]] | add // 0) as $sccache_hits
       | ($seed[0].remote_publications) as $published_actions
       | {
           schema_version: 1,
           workload: $workload,
           round: $round,
-          gate: "all_published_actions_restored_remotely_and_more_verified_hits_than_sccache",
-          minimum_expected_cargo_rail_remote_hits: $minimum_hits,
+          gate: "all_published_actions_restored_remotely_and_strictly_contain_safe_sccache_hits",
           cargo_rail_published_actions: $published_actions,
           cargo_rail_verified_remote_hits: $cargo_rail_hits,
-          sccache_remote_hits: $sccache_hits,
+          safe_sccache_remote_hits: $semantic[0].safe_sccache_hits,
+          unsafe_sccache_hits: $semantic[0].unsafe_sccache_hits,
+          semantic_coverage: $semantic[0],
           passed: (
             $published_actions > 0
             and $cargo_rail_hits == $published_actions
-            and $cargo_rail_hits >= $minimum_hits
-            and $cargo_rail_hits > $sccache_hits
+            and $semantic[0].passed
+            and $semantic[0].cargo_rail_verified_hits == $cargo_rail_hits
           )
         }
     ' >"$directory/coverage.json"
@@ -582,10 +603,10 @@ jq -n \
         max_elapsed_seconds: ($elapsed | max),
         total_user_seconds: ([$selected[].measurement.user_seconds] | add),
         total_system_seconds: ([$selected[].measurement.system_seconds] | add),
-        max_rss_observed: ([$selected[].measurement.max_rss_observed] | max)
+        max_rss_bytes: ([$selected[].measurement.max_rss_bytes] | max)
       };
   def reduction($baseline; $candidate): 100 * ($baseline - $candidate) / $baseline;
-  ["check", "build"] as $workloads
+  ["check", "build", "test"] as $workloads
   | ["cargo-rail-s3", "sccache-s3"] as $lanes
   | [$workloads[] as $workload | $lanes[] as $lane | metric($workload; $lane)] as $metrics
   | {
@@ -665,9 +686,9 @@ jq -n \
     }
   | .target_qualified = (
       ($smoke | not)
-      and $runs >= 5 and $runs <= 7
-      and .accepted_samples == (4 * $runs)
-      and (.remote_coverage | length) == (2 * $runs)
+      and $runs >= 20 and $runs <= 30
+      and .accepted_samples == (6 * $runs)
+      and (.remote_coverage | length) == (3 * $runs)
       and (.remote_coverage | all(.passed))
       and (.comparisons | all(
         .cargo_rail_vs_sccache_p50_reduction_percent >= 15
@@ -676,9 +697,9 @@ jq -n \
     )
   | .superiority_qualified = (
       ($smoke | not)
-      and $runs >= 5 and $runs <= 7
-      and .accepted_samples == (4 * $runs)
-      and (.remote_coverage | length) == (2 * $runs)
+      and $runs >= 20 and $runs <= 30
+      and .accepted_samples == (6 * $runs)
+      and (.remote_coverage | length) == (3 * $runs)
       and (.remote_coverage | all(.passed))
       and (.comparisons | all(
         .cargo_rail_vs_sccache_p50_reduction_percent >= 10
@@ -693,6 +714,9 @@ printf '%s  %s\n' \
   "$(sha256_file "$repo_root/scripts/ci/qualify-native-cache-s3-performance.sh")" \
   scripts/ci/qualify-native-cache-s3-performance.sh >"$results/harness-sha256.txt"
 printf '%s  %s\n' "$(sha256_file "$measure")" scripts/bench/measure-command.py >>"$results/harness-sha256.txt"
+printf '%s  %s\n' \
+  "$(sha256_file "$coverage_reporter")" \
+  scripts/bench/native-cache-coverage.py >>"$results/harness-sha256.txt"
 printf '%s  %s\n' \
   "$(sha256_file "$repo_root/scripts/fixtures/materialize-native-cache.sh")" \
   scripts/fixtures/materialize-native-cache.sh >>"$results/harness-sha256.txt"
@@ -733,4 +757,8 @@ jq -n \
   }' >"$results/environment.json"
 
 jq . "$results/summary.json"
+if [[ "$smoke" == 0 ]] && ! jq -e '.superiority_qualified' "$results/summary.json" >/dev/null; then
+  echo "official-S3 performance qualification did not reach the required 10% p50/p95 superiority" >&2
+  exit 1
+fi
 echo "official-S3 performance result: $results"
