@@ -31,7 +31,8 @@ pub use resolution::{
 pub use unify_analyzer::UnifyAnalyzer;
 pub use unify_report::UnifyReport;
 pub use unify_types::{
-  DependencyProof, DuplicateCleanup, FeatureEnablingPath, IssueSeverity, MemberEdit, OptionalFeature, PrunedFeature,
-  ReachableFeature, TransitivePin, UndeclaredFeature, UnificationPlan, UnifiedDep, UnifyDecision, UnifyDecisionCode,
-  UnifyDecisionReason, UnifyDecisionSubject, UnifyIssue, UnusedDep, UnusedReason, ValidationResult, VersionMismatch,
+  DependencyProof, DuplicateCleanup, FeatureEnablingPath, IssueSeverity, MemberEdit, OptionalFeature,
+  PackageInheritanceField, PrunedFeature, ReachableFeature, TransitivePin, UndeclaredFeature, UnificationPlan,
+  UnifiedDep, UnifyDecision, UnifyDecisionCode, UnifyDecisionReason, UnifyDecisionSubject, UnifyIssue, UnusedDep,
+  UnusedReason, ValidationResult, VersionMismatch,
 };

@@ -86,15 +86,13 @@ impl<'a> UnusedDepFinder<'a> {
           if required_targets.is_empty() {
             continue;
           }
-          let crate_root = declaration
-            .member
-            .path
-            .parent()
-            .unwrap_or(declaration.member.path.as_path());
-          if documentation_uses_dependency(crate_root, &resolved.crate_names) {
+          if resolved
+            .crate_names
+            .iter()
+            .any(|crate_name| declaration.member.retention_identifiers.contains(crate_name))
+          {
             continue;
           }
-
           let Some(member_evidence) = source_unused.get(&declaration.member.package_id) else {
             continue;
           };
@@ -327,10 +325,9 @@ impl<'a> UnusedDepFinder<'a> {
     if usage.referenced_in_features && !self.only_referenced_by_unreachable_features(member, usage) {
       return false;
     }
-    let crate_root = member.path.parent().unwrap_or(member.path.as_path());
-    let source_features = crate::cargo::feature_scanner::scan_source_for_cfg_features(crate_root);
-    !source_features.contains(usage.cargo_toml_key.as_ref())
-      && !documentation_uses_dependency(crate_root, &BTreeSet::from([usage.cargo_toml_key.replace('-', "_")]))
+    let crate_name = usage.cargo_toml_key.replace('-', "_");
+    !member.source_cfg_features.contains(usage.cargo_toml_key.as_ref())
+      && !member.retention_identifiers.contains(&crate_name)
   }
 
   fn only_referenced_by_unreachable_features(&self, member: &ParsedManifest, usage: &DepUsage) -> bool {
@@ -574,36 +571,6 @@ fn graph_proof(applicable_targets: usize) -> DependencyProof {
   }
 }
 
-fn documentation_uses_dependency(crate_root: &Path, crate_names: &BTreeSet<String>) -> bool {
-  let mut paths = vec![crate_root.join("README.md")];
-  for directory in ["src", "tests", "examples", "benches"] {
-    let pattern = format!("{}/**/*.rs", crate_root.join(directory).display());
-    if let Ok(entries) = glob::glob(&pattern) {
-      paths.extend(entries.flatten());
-    }
-  }
-  paths.into_iter().any(|path| {
-    std::fs::read_to_string(path).ok().is_some_and(|source| {
-      crate_names
-        .iter()
-        .any(|crate_name| contains_identifier(&source, crate_name))
-    })
-  })
-}
-
-fn contains_identifier(source: &str, identifier: &str) -> bool {
-  source.match_indices(identifier).any(|(start, value)| {
-    let before = source[..start].chars().next_back();
-    let after = source[start + value.len()..].chars().next();
-    before.is_none_or(|character| !is_identifier_character(character))
-      && after.is_none_or(|character| !is_identifier_character(character))
-  })
-}
-
-fn is_identifier_character(character: char) -> bool {
-  character.is_ascii_alphanumeric() || character == '_'
-}
-
 /// Check if a target constraint (cfg expression) matches any configured target.
 fn target_constraint_matches_any(
   cfg: &str,
@@ -672,6 +639,7 @@ mod tests {
   fn test_usage_required_targets_filters_by_cfg() {
     let usage = DepUsage {
       unconditional_features: std::collections::BTreeSet::new(),
+      local_features: std::collections::BTreeSet::new(),
       conditional_features: std::collections::BTreeSet::new(),
       default_features: true,
       kind: DepKind::Normal,
@@ -683,6 +651,7 @@ mod tests {
       manifest_path: None,
       cargo_toml_key: Arc::from("dep"),
       referenced_in_features: false,
+      workspace_inherited: false,
     };
 
     let configured = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"];
@@ -697,12 +666,5 @@ mod tests {
     );
     let required = usage_required_targets(&usage, &configured, &cfg_sets);
     assert_eq!(required, vec!["x86_64-pc-windows-msvc"]);
-  }
-
-  #[test]
-  fn test_contains_identifier_respects_rust_token_boundaries() {
-    assert!(contains_identifier("log::info!()", "log"));
-    assert!(!contains_identifier("catalog::entry()", "log"));
-    assert!(!contains_identifier("logger::init()", "log"));
   }
 }

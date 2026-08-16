@@ -44,7 +44,7 @@ filter = 'binary(integration) & test(=test_compiler_observation::source_capture_
 leak-timeout = { period = "10s", result = "fail" }
 
 [[profile.default.overrides]]
-filter = 'binary(integration) & test(/test_(instrumentation|scale_fixture|source_snapshot|unify|unused_detection|undeclared_features)/)'
+filter = 'binary(integration) & test(/test_(instrumentation|scale_fixture|source_snapshot|surface|unify|unused_detection|undeclared_features)/)'
 test-group = 'cargo-subprocess'
 
 [profile.commit]
@@ -89,7 +89,7 @@ filter = 'binary(integration) & test(=test_compiler_observation::source_capture_
 leak-timeout = { period = "10s", result = "fail" }
 
 [[profile.commit.overrides]]
-filter = 'binary(integration) & test(/test_(instrumentation|scale_fixture|source_snapshot|unify|unused_detection|undeclared_features)/)'
+filter = 'binary(integration) & test(/test_(instrumentation|scale_fixture|source_snapshot|surface|unify|unused_detection|undeclared_features)/)'
 test-group = 'cargo-subprocess'
 
 [profile.commit.junit]

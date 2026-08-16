@@ -1,10 +1,13 @@
 # Cargo-Rail
 
-**Cargo already knows your workspace. Stop teaching it to ten other tools.**
+**Cargo already knows your workspace. Keep it authoritative.**
 
-Cargo-Rail turns Cargo's resolved graph into one monorepo engine. `unify` replaces the dep-hygiene stack. `plan` emits typed affected scope for Cargo, nextest, Just, and CI. Verified compiler reuse survives `cargo clean`. `change` and `release` turn reviewed changesets into version bumps, changelogs, dep-ordered publication, and resumable exact-SHA releases. `split` and `sync` keep standalone crates tied to monorepo source and history.
+Cargo-Rail turns Cargo's resolved graph into one monorepo engine. `unify` produces one dependency-coherence report and
+mutation plan. `plan` emits typed affected scope for Cargo, nextest, Just, and CI. Verified compiler reuse survives
+`cargo clean`. `change` and `release` turn reviewed changesets into version bumps, changelogs, dep-ordered publication,
+and resumable exact-SHA releases. `split` and `sync` keep standalone crates tied to monorepo source and history.
 
-**Keep Cargo. Delete the Rest.**
+**One captured workspace. Explicit authority.**
 
 [![Crates.io](https://img.shields.io/crates/v/cargo-rail.svg)](https://crates.io/crates/cargo-rail)
 [![CI](https://img.shields.io/github/actions/workflow/status/loadingalias/cargo-rail/commit.yaml?branch=main)](https://github.com/loadingalias/cargo-rail/actions/workflows/commit.yaml)
@@ -14,17 +17,18 @@ Cargo-Rail turns Cargo's resolved graph into one monorepo engine. `unify` replac
 
 Rust monorepos usually acquire a tool for every symptom. Each tool reconstructs part of the same workspace, carries its own configuration, and makes decisions against a slightly different model.
 
-Cargo-Rail replaces that collection with one local, Cargo-native engine:
+Cargo-Rail consolidates those decisions in one local, Cargo-native engine:
 
-| Retire | Use | What changes |
+| Fragmented workflow | Use | What changes |
 |---|---|---|
-| `cargo-hakari`, `cargo-udeps`, `cargo-shear`, `cargo-machete`, feature auditors, workspace-inheritance checks, and MSRV scripts | `cargo rail unify` | One reviewable and reversible graph-repair plan |
+| Dependency version, feature, unused-edge, inheritance, and MSRV analysis | `cargo rail unify` | One reviewable and reversible graph-repair plan |
 | `dorny/paths-filter`, YAML path globs, and package-selection scripts | `cargo rail plan` | Typed affected scope derived from Git and the resolved Cargo graph |
 | Persisted `target/` directories and local cache glue | Verified compiler reuse | Exact reusable results remain available after `cargo clean` and across target directories within one physical source root |
 | `release-plz`, `cargo-release`, `git-cliff`, and publish-order scripts | `cargo rail change` and `cargo rail release` | Reviewed release intent carried through exact-SHA publication and recovery |
 | Copybara or custom monorepo-to-crate scripts | `cargo rail split` and `cargo rail sync` | Cargo-aware synchronization with source history and recovery evidence |
 
-Cargo-Rail does not coordinate those tools behind the scenes. It replaces the duplicated workspace models they require and shares the same contextual authority.
+Cargo-Rail does not coordinate other tools behind the scenes. Its workflows derive decisions from the same captured
+Cargo and source authority.
 
 ```mermaid
 flowchart TB
@@ -82,7 +86,7 @@ One pass detects and plans repairs for:
 - unused dependency edges;
 - workspace-inheritance drift;
 - MSRV mismatches; and
-- transitive feature unification normally handled through a generated workspace-hack crate.
+- optional host-owned pins for fragmented transitive features.
 
 Graph-removing decisions carry compiler evidence. Cargo-Rail validates the resulting Cargo graph before applying lossless TOML edits.
 
@@ -100,7 +104,7 @@ cargo rail unify undo
 
 **One install. One configuration. One report. One explanation format. One rollback path.**
 
-That is the real replacement for a directory full of Cargo plugins and maintenance scripts.
+That gives dependency changes one evidence model, review surface, and recovery path.
 
 ## Affected CI is a graph query, not a path glob
 

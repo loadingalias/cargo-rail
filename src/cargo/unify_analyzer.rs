@@ -6,25 +6,26 @@
 
 use crate::cargo::{
   DepKind,
-  manifest_analyzer::{ExistingWorkspaceDep, ManifestAnalyzer, parse_existing_workspace_deps},
+  manifest_analyzer::{ExistingWorkspaceDep, ManifestAnalyzer},
   multi_target_metadata::MultiTargetMetadata,
   unify::version_utils::{find_major_version_conflicts, is_exact_pin, versions_compatible},
   unify::{CandidateIterator, FeaturePruner, TransitivePlanner, UnusedDepFinder},
   unify_types::{
-    DuplicateCleanup, FeatureEnablingPath, IssueSeverity, MemberEdit, PrunedFeature, UndeclaredFeature,
-    UnificationPlan, UnifiedDep, UnifyDecision, UnifyDecisionCode, UnifyDecisionReason, UnifyDecisionSubject,
-    UnifyIssue, UnifyIssueKind, UnusedDep, ValidationResult, VersionMismatch,
+    DuplicateCleanup, FeatureEnablingPath, IssueSeverity, MemberEdit, PackageInheritanceField, PrunedFeature,
+    UndeclaredFeature, UnificationPlan, UnifiedDep, UnifyDecision, UnifyDecisionCode, UnifyDecisionReason,
+    UnifyDecisionSubject, UnifyIssue, UnifyIssueKind, UnusedDep, VersionMismatch,
   },
 };
 use crate::compiler::CompilerCacheIdentity;
 use crate::compiler::cfg_eval::{TargetCfgSet, target_constraint_matches_target};
 use crate::config::{ConsumerScope, ExactPinHandling, MajorVersionConflict, UnifyConfig};
-use crate::error::{RailResult, ResultExt};
+use crate::error::RailResult;
 use crate::progress;
 use crate::workspace::WorkspaceContext;
 use rustc_hash::{FxHashMap, FxHashSet};
 use semver::Version;
 use semver::VersionReq;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -43,6 +44,10 @@ pub struct UnifyAnalyzer {
   cohort_decisions: FxHashMap<Arc<str>, Vec<CohortDecision>>,
   /// Workspace root path (for path normalization)
   workspace_root: PathBuf,
+  /// Exact captured root-manifest bytes used by every manifest policy.
+  workspace_manifest: Arc<[u8]>,
+  /// Physical root-manifest path used only for diagnostics.
+  workspace_manifest_path: PathBuf,
   /// Canonical workspace root path (computed once)
   canonical_workspace_root: PathBuf,
   /// Exact rustc cfg sets shared across target-aware unify analyses.
@@ -72,6 +77,7 @@ struct CohortDecision {
 impl UnifyAnalyzer {
   /// Create a new analyzer from workspace context
   pub fn new(ctx: &WorkspaceContext) -> RailResult<Self> {
+    let snapshot = ctx.snapshot()?;
     // Get multi-target metadata (lazily loaded on first access)
     // Uses Arc::clone for cheap reference counting instead of cloning the entire cache
     let metadata = ctx.multi_target_metadata()?;
@@ -79,10 +85,12 @@ impl UnifyAnalyzer {
 
     // Parse all manifests once
     let workspace_packages = ctx.cargo().workspace_members();
-    let manifests = ManifestAnalyzer::parse_snapshot(ctx.snapshot()?, &workspace_packages)?;
+    let manifests = ManifestAnalyzer::parse_snapshot(snapshot, &workspace_packages)?;
 
-    // Parse existing workspace.dependencies to avoid duplicates
-    let existing_workspace_deps = parse_existing_workspace_deps(ctx.workspace_root())?;
+    // Reuse the workspace dependencies parsed with the captured member manifests.
+    let workspace_manifest_path = ctx.workspace_root().join("Cargo.toml");
+    let workspace_manifest = snapshot.workspace_manifest()?;
+    let existing_workspace_deps = manifests.workspace_dependencies().clone();
 
     // Build config from context, then enforce workspace-member cohort semantics.
     let base_config = ctx.config().map(|c| c.unify.clone()).unwrap_or_default();
@@ -94,7 +102,7 @@ impl UnifyAnalyzer {
       Self::apply_workspace_member_cohort_policy(base_config, &manifests, &workspace_member_names);
     let workspace_root = ctx.workspace_root().to_path_buf();
     let canonical_workspace_root = workspace_root.canonicalize().unwrap_or_else(|_| workspace_root.clone());
-    let compiler_cache_identity = match CompilerCacheIdentity::capture(ctx.snapshot()?) {
+    let compiler_cache_identity = match CompilerCacheIdentity::capture(snapshot) {
       Ok(identity) => Some(identity),
       Err(error) => {
         crate::warn!(
@@ -113,6 +121,8 @@ impl UnifyAnalyzer {
       cohort_issues,
       cohort_decisions,
       workspace_root,
+      workspace_manifest: Arc::from(workspace_manifest.bytes()),
+      workspace_manifest_path,
       canonical_workspace_root,
       target_cfg_sets,
       compiler_cache_identity,
@@ -124,7 +134,7 @@ impl UnifyAnalyzer {
       .iter()
       .map(|usage| {
         let features = usage
-          .unconditional_features
+          .local_features
           .union(&usage.conditional_features)
           .map(|feature| Arc::from(feature.as_str()))
           .collect();
@@ -451,6 +461,33 @@ impl UnifyAnalyzer {
       member_paths.insert(member_name, manifest_path);
     }
 
+    let package_inheritance = self
+      .manifests
+      .package_inheritance_analysis()
+      .into_iter()
+      .map(|analysis| {
+        let field: Arc<str> = Arc::from(analysis.field);
+        let planned = analysis.planned.into_iter().map(Arc::<str>::from).collect::<Vec<_>>();
+        for member in &planned {
+          member_edits
+            .entry(Arc::clone(member))
+            .or_default()
+            .push(MemberEdit::InheritPackageField {
+              field: Arc::clone(&field),
+            });
+        }
+        PackageInheritanceField {
+          field,
+          inherited: analysis.inherited.into_iter().map(Arc::<str>::from).collect(),
+          planned,
+          local_overrides: analysis.local_overrides.into_iter().map(Arc::<str>::from).collect(),
+          missing: analysis.missing.into_iter().map(Arc::<str>::from).collect(),
+          retained_equivalent: analysis.retained_equivalent.into_iter().map(Arc::<str>::from).collect(),
+          retention_reason: analysis.retention_reason,
+        }
+      })
+      .collect::<Vec<_>>();
+
     progress!("Analyzing {} dependencies...", self.manifests.all_dependencies().len());
 
     // Process each dependency using the CandidateIterator
@@ -633,37 +670,35 @@ impl UnifyAnalyzer {
       }
 
       // Check for version mismatches with existing workspace.dependencies
-      if let Some(existing_ws_dep) = self.existing_workspace_deps.get(&*dep_key.name)
-        && let Some(ref ws_version) = existing_ws_dep.version
-      {
-        for usage in &usage_sites {
-          if let Some(ref declared) = usage.declared_version
-            && !versions_compatible(declared, ws_version)
-          {
-            version_mismatches.push(VersionMismatch {
-              member: Arc::clone(&usage.used_by),
-              dep_name: Arc::clone(&dep_key.name),
-              member_version: Arc::from(declared.as_str()),
-              workspace_version: Arc::from(ws_version.as_str()),
-            });
+      for usage in &usage_sites {
+        if let Some(existing_ws_dep) = self.existing_workspace_deps.get(usage.cargo_toml_key.as_ref())
+          && let Some(ref ws_version) = existing_ws_dep.version
+          && let Some(ref declared) = usage.declared_version
+          && !versions_compatible(declared, ws_version)
+        {
+          version_mismatches.push(VersionMismatch {
+            member: Arc::clone(&usage.used_by),
+            dep_name: Arc::clone(&usage.cargo_toml_key),
+            member_version: Arc::from(declared.as_str()),
+            workspace_version: Arc::from(ws_version.as_str()),
+          });
 
-            // Add as issue based on strictness config
-            let severity = if self.config.strict_version_compat {
-              IssueSeverity::Error
-            } else {
-              IssueSeverity::Warning
-            };
-            issues.push(UnifyIssue {
-              kind: UnifyIssueKind::General,
-              dep_name: Arc::clone(&dep_key.name),
-              severity,
-              message: Arc::from(format!(
-                "{} declares \"{}\" but workspace.dependencies has \"{}\". \
-                 Converting to workspace = true may break this crate.",
-                usage.used_by, declared, ws_version
-              )),
-            });
-          }
+          // Add as issue based on strictness config
+          let severity = if self.config.strict_version_compat {
+            IssueSeverity::Error
+          } else {
+            IssueSeverity::Warning
+          };
+          issues.push(UnifyIssue {
+            kind: UnifyIssueKind::General,
+            dep_name: Arc::clone(&usage.cargo_toml_key),
+            severity,
+            message: Arc::from(format!(
+              "{} declares \"{}\" but workspace.dependencies has \"{}\". \
+               Converting to workspace = true may break this crate.",
+              usage.used_by, declared, ws_version
+            )),
+          });
         }
       }
 
@@ -691,39 +726,21 @@ impl UnifyAnalyzer {
           }),
         )
       } else {
-        // Default-feature policy spans every declaration because inherited
-        // declarations cannot disable a workspace-level default.
-        // When include_renamed = true, check across all package variants
-        let has_mixed_defaults = if self.config.include_renamed {
-          self.manifests.package_has_mixed_defaults(&dep_key.name)
-        } else {
-          self.manifests.has_mixed_defaults(dep_key)
-        };
+        let has_mixed_defaults = self.manifests.has_mixed_defaults(dep_key);
 
-        // Compute features - when include_renamed = true, aggregate across all variants
-        // Note: intersection doesn't make sense across renamed deps (they're separate usages)
-        // so we use union to ensure all needed features are included
         if self.config.include_renamed {
-          // For package-level aggregation, always use union strategy
-          // (renamed deps typically have distinct feature needs)
-          let features = self.manifests.compute_package_union(&dep_key.name);
-          // When mixed defaults detected, use default-features = true to preserve
-          // features for crates that rely on them (same logic as non-include_renamed path)
-          let df = self
-            .manifests
-            .package_default_features_policy(&dep_key.name)
-            .unwrap_or(true);
-          let mut feature_list: Vec<Arc<str>> = features.iter().map(|feature| Arc::from(feature.as_str())).collect();
-          feature_list.sort();
+          // The package cohort decides whether every alias participates, but
+          // each Cargo.toml key keeps an independent minimal baseline. A union
+          // here would activate alias-specific features in the wrong domain.
           (
-            features,
-            df,
+            BTreeSet::new(),
+            true,
             Some(UnifyDecisionReason {
-              code: UnifyDecisionCode::FeatureUnion,
+              code: UnifyDecisionCode::FeatureIntersection,
               summary: Arc::from(
-                "Used union because include_renamed aggregates distinct Cargo.toml keys at the package level.",
+                "Computed an independent minimal feature/default baseline for each exact renamed Cargo.toml key.",
               ),
-              features: feature_list,
+              features: Vec::new(),
               members: usage_sites.iter().map(|usage| Arc::clone(&usage.used_by)).collect(),
               borrowed_from: Vec::new(),
               feature_paths: feature_paths.clone(),
@@ -764,33 +781,6 @@ impl UnifyAnalyzer {
         decision_reasons.push(reason);
       }
 
-      // Note: Target constraints stay in member manifests, not workspace.dependencies.
-      // Members use `[target.'cfg(...)'.dependencies] dep = { workspace = true }`.
-      // We don't set target on UnifiedDep because [workspace.dependencies] cannot
-      // have [target] sections in virtual workspaces, and even in non-virtual ones
-      // it's cleaner to keep target constraints where they're used.
-      let target = None;
-
-      // Get users - use Arc<str> to share allocations
-      let users: FxHashSet<Arc<str>> = usage_sites.iter().map(|u| Arc::clone(&u.used_by)).collect();
-
-      // Workspace members must always carry `path` so member-to-member deps stay local.
-      // This prevents dual-resolution in fresh lockfiles (local member + crates.io package).
-      let dep_path: Option<PathBuf> = if is_workspace_member_dep {
-        workspace_member_paths.get(&dep_key.name).cloned()
-      } else if self.config.include_paths {
-        // Include explicit path deps for non-member packages only when requested.
-        usage_sites.iter().find_map(|u| {
-          u.path.as_ref().and_then(|p| {
-            u.manifest_path
-              .as_ref()
-              .map(|manifest_path| self.normalize_dep_path(manifest_path, p))
-          })
-        })
-      } else {
-        None // include_paths = false, skip all path deps
-      };
-
       // Compute the unified features (this is what workspace.dependencies should have)
       let computed_features: Vec<Arc<str>> = features.into_iter().map(Arc::from).collect();
       if let Some(cohort_entries) = self.cohort_decisions.get(&dep_key.name) {
@@ -806,47 +796,91 @@ impl UnifyAnalyzer {
         }
       }
 
-      // Check if this dep already exists in workspace.dependencies
-      let existing_dep = self.existing_workspace_deps.get(&*dep_key.name);
-
-      // Determine if we need to update workspace.dependencies
-      // Update if: dep doesn't exist, OR features differ, OR default-features differs, OR has path
-      let needs_workspace_update = match existing_dep {
-        None => true, // Doesn't exist, need to add
-        Some(existing) => {
-          // Check if features are different (compare as &str)
-          let mut existing_features: Vec<&str> = existing.features.iter().map(String::as_str).collect();
-          let mut computed: Vec<&str> = computed_features.iter().map(|s| &**s).collect();
-          existing_features.sort();
-          computed.sort();
-
-          // Also check if existing path is missing or differs from resolved path.
-          let path_differs = match (&dep_path, &existing.path) {
-            (Some(new_path), Some(existing_path)) => Path::new(existing_path) != new_path,
-            (Some(_), None) => true,
-            _ => false,
-          };
-
-          existing_features != computed || existing.default_features != default_features || path_differs
-        }
-      };
-
       // The features to use for local feature calculation
       // Use computed features (which will be what goes in workspace.dependencies)
       let workspace_features = computed_features.clone();
 
-      // Create unified dep if workspace needs update
-      if needs_workspace_update {
-        let unified = UnifiedDep {
-          name: Arc::clone(&dep_key.name),
-          version_req,
-          features: workspace_features.clone(),
-          default_features,
-          used_by: users.into_iter().collect(),
-          target,
-          path: dep_path, // Include path for workspace member deps
+      // Workspace inheritance is keyed by the exact Cargo.toml alias. A renamed
+      // package therefore needs its own workspace entry carrying `package = ...`.
+      let mut aliases = std::collections::BTreeMap::<Arc<str>, Vec<&crate::cargo::manifest_analyzer::DepUsage>>::new();
+      for usage in &usage_sites {
+        aliases
+          .entry(Arc::clone(&usage.cargo_toml_key))
+          .or_default()
+          .push(*usage);
+      }
+      let mut workspace_policies = std::collections::BTreeMap::<Arc<str>, (Vec<Arc<str>>, bool)>::new();
+      for (alias, alias_usages) in aliases {
+        let (alias_features, alias_default_features) = if self.config.include_renamed {
+          let (features, defaults) = Self::workspace_feature_policy(&alias_usages);
+          let features = if is_workspace_member_dep {
+            Vec::new()
+          } else {
+            features.into_iter().map(Arc::from).collect()
+          };
+          (features, defaults)
+        } else {
+          (workspace_features.clone(), default_features)
         };
-        workspace_deps.push(unified);
+        // Workspace members must always carry `path` so member-to-member deps stay local.
+        let dep_path: Option<PathBuf> = if is_workspace_member_dep {
+          workspace_member_paths.get(&dep_key.name).cloned()
+        } else if self.config.include_paths {
+          alias_usages.iter().find_map(|usage| {
+            usage.path.as_ref().and_then(|path| {
+              if usage.workspace_inherited {
+                Some(PathBuf::from(path))
+              } else {
+                usage
+                  .manifest_path
+                  .as_ref()
+                  .map(|manifest_path| self.normalize_dep_path(manifest_path, path))
+              }
+            })
+          })
+        } else {
+          None
+        };
+        let package = (alias != dep_key.name).then(|| Arc::clone(&dep_key.name));
+        let existing_dep = self.existing_workspace_deps.get(alias.as_ref());
+        let needs_workspace_update = match existing_dep {
+          None => true,
+          Some(existing) => {
+            let mut existing_features: Vec<&str> = existing.features.iter().map(String::as_str).collect();
+            let mut computed: Vec<&str> = alias_features.iter().map(|feature| &**feature).collect();
+            existing_features.sort();
+            computed.sort();
+            let path_differs = match (&dep_path, &existing.path) {
+              (Some(new_path), Some(existing_path)) => Path::new(existing_path) != new_path,
+              (Some(_), None) => true,
+              _ => false,
+            };
+            let package_differs = existing.package.as_deref() != package.as_deref();
+            existing_features != computed
+              || existing.default_features != alias_default_features
+              || path_differs
+              || package_differs
+          }
+        };
+        if needs_workspace_update {
+          let users = alias_usages
+            .iter()
+            .map(|usage| Arc::clone(&usage.used_by))
+            .collect::<FxHashSet<_>>()
+            .into_iter()
+            .collect();
+          workspace_deps.push(UnifiedDep {
+            name: Arc::clone(&alias),
+            package,
+            version_req: version_req.clone(),
+            features: alias_features.clone(),
+            default_features: alias_default_features,
+            used_by: users,
+            target: None,
+            path: dep_path,
+          });
+        }
+        workspace_policies.insert(alias, (alias_features, alias_default_features));
       }
       Self::record_decision_reasons(
         &mut dependency_decisions,
@@ -861,6 +895,13 @@ impl UnifyAnalyzer {
       // Per design doc: all dep kinds should be unified, not just Normal
       // This happens whether or not the dep already exists in workspace.dependencies
       for usage in usage_sites {
+        let (workspace_features, default_features) =
+          workspace_policies.get(usage.cargo_toml_key.as_ref()).ok_or_else(|| {
+            crate::error::RailError::message(format!(
+              "missing workspace feature policy for dependency alias '{}'",
+              usage.cargo_toml_key
+            ))
+          })?;
         // Compute local features (member features - workspace features)
         // Convert to Arc<str> and filter out features already in workspace
         let mut local_features: Vec<Arc<str>> = usage
@@ -869,12 +910,24 @@ impl UnifyAnalyzer {
           .filter(|f| !workspace_features.iter().any(|wf| &**wf == *f))
           .map(|f| Arc::from(f.as_str()))
           .collect();
-        if !default_features && usage.default_features && !local_features.iter().any(|feature| &**feature == "default")
+        if !*default_features && usage.default_features && !local_features.iter().any(|feature| &**feature == "default")
         {
           local_features.push(Arc::from("default"));
         }
         local_features.sort();
         local_features.dedup();
+
+        if usage.workspace_inherited {
+          let mut existing_local: Vec<Arc<str>> = usage
+            .local_features
+            .iter()
+            .map(|feature| Arc::from(feature.as_str()))
+            .collect();
+          existing_local.sort();
+          if existing_local == local_features {
+            continue;
+          }
+        }
 
         // Use the cargo_toml_key from the usage - this is the actual key in Cargo.toml
         // For renamed deps like `old_serde = { package = "serde" }`, this is "old_serde"
@@ -921,7 +974,9 @@ impl UnifyAnalyzer {
     // Compute MSRV if enabled
     let computed_msrv = if let Some(source) = self.config.msrv_policy.source() {
       progress!("Computing MSRV from dependency graph...");
-      self.metadata.compute_msrv_with_config(&self.workspace_root, source)
+      self
+        .metadata
+        .compute_msrv_with_config(&self.workspace_manifest_path, &self.workspace_manifest, source)?
     } else {
       None
     };
@@ -943,12 +998,12 @@ impl UnifyAnalyzer {
         });
       } else {
         progress!("Enforcing MSRV inheritance on workspace members...");
-        for (member_name, manifest_path) in &member_paths {
-          if member_manifest_inherits_msrv(manifest_path)? {
+        for member in &self.manifests.members {
+          if member.inherits_workspace_msrv {
             continue;
           }
           member_edits
-            .entry(Arc::clone(member_name))
+            .entry(Arc::from(member.package_name.as_str()))
             .or_default()
             .push(MemberEdit::EnforceMsrvInheritance);
         }
@@ -1041,9 +1096,6 @@ impl UnifyAnalyzer {
       }
     }
 
-    // Run validation
-    let validation_results = self.validate_targets()?;
-
     // Defensive cleanup: avoid representing "no-op members" as pending changes.
     member_edits.retain(|_, edits| !edits.is_empty());
     for decision in &mut dependency_decisions {
@@ -1069,7 +1121,7 @@ impl UnifyAnalyzer {
       member_edits,
       member_paths,
       transitive_pins,
-      validation_results,
+      validation_results: Vec::new(),
       issues,
       computed_msrv,
       duplicates_cleaned,
@@ -1079,32 +1131,18 @@ impl UnifyAnalyzer {
       version_mismatches,
       unused_deps,
       undeclared_features,
+      package_inheritance,
       dependency_decisions,
     })
   }
 
-  /// Validate that the unification works for all targets
-  fn validate_targets(&self) -> RailResult<Vec<ValidationResult>> {
-    let targets = self.metadata.targets();
-    let mut results = Vec::with_capacity(targets.len());
-
-    for target in targets {
-      // Simple check: does metadata load successfully for this target?
-      // In production, you might want to run `cargo check --target=X`
-      let success = self.metadata.get(target).is_some();
-
-      results.push(ValidationResult {
-        target: Arc::from(target),
-        success,
-        error: if !success {
-          Some(Arc::from("Failed to load metadata"))
-        } else {
-          None
-        },
-      });
-    }
-
-    Ok(results)
+  /// Derive executable feature/target inputs from this analyzer's captured graph.
+  pub(crate) fn coverage_views(&self) -> RailResult<Vec<crate::compiler::CoverageView>> {
+    crate::compiler::scheduler::planned_coverage_views(
+      &self.manifests.members,
+      &self.metadata.targets(),
+      &self.target_cfg_sets,
+    )
   }
 
   // ============================================================================
@@ -1185,12 +1223,12 @@ impl UnifyAnalyzer {
 
     for member in &self.manifests.members {
       for (dep_key, usages) in &member.dependencies {
-        let baseline = workspace_baseline.get(&*dep_key.name);
         // Compute dep name string once per (member, dep) pair instead of per-feature
         let dep_name_str = dep_key.name.to_string();
 
         for usage in usages {
-          let mut feats: FxHashSet<&String> = usage.unconditional_features.iter().collect();
+          let baseline = workspace_baseline.get(usage.cargo_toml_key.as_ref());
+          let mut feats: FxHashSet<&String> = usage.local_features.iter().collect();
           feats.extend(usage.conditional_features.iter());
 
           for feat in feats {
@@ -1503,27 +1541,27 @@ impl UnifyAnalyzer {
       .collect();
     consumer_targets.is_subset(&provider_targets)
   }
-}
 
-fn member_manifest_inherits_msrv(manifest_path: &Path) -> RailResult<bool> {
-  let content =
-    std::fs::read_to_string(manifest_path).context(format!("Failed to read {}", manifest_path.display()))?;
-  let doc: toml_edit::DocumentMut = content
-    .parse()
-    .context(format!("Failed to parse {}", manifest_path.display()))?;
-
-  let Some(pkg) = doc.get("package").and_then(|p| p.as_table()) else {
-    // No [package] section (likely a virtual workspace member). Nothing to enforce.
-    return Ok(true);
-  };
-
-  let Some(rv) = pkg.get("rust-version") else {
-    return Ok(false);
-  };
-
-  let Some(rv_tbl) = rv.as_table_like() else {
-    return Ok(false);
-  };
-
-  Ok(rv_tbl.get("workspace").and_then(|v| v.as_bool()) == Some(true))
+  fn workspace_feature_policy(usages: &[&crate::cargo::manifest_analyzer::DepUsage]) -> (BTreeSet<String>, bool) {
+    let default_features = !usages.iter().any(|usage| !usage.default_features);
+    let mut unconditional = usages.iter().filter(|usage| usage.target.is_none());
+    let Some(first) = unconditional.next() else {
+      return (BTreeSet::new(), default_features);
+    };
+    let Some(second) = unconditional.next() else {
+      return (BTreeSet::new(), default_features);
+    };
+    let mut features = first
+      .unconditional_features
+      .intersection(&second.unconditional_features)
+      .cloned()
+      .collect::<BTreeSet<_>>();
+    for usage in unconditional {
+      features = features.intersection(&usage.unconditional_features).cloned().collect();
+    }
+    if !default_features {
+      features.remove("default");
+    }
+    (features, default_features)
+  }
 }

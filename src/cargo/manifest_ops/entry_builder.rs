@@ -14,8 +14,8 @@ use super::fields::build_feature_array;
 /// Simple version-only deps return `Item::Value(Value::String("^1.0"))`.
 /// Deps with features/path/default-features=false return inline tables.
 pub fn build_dep_entry(dep: &UnifiedDep) -> Item {
-  // Simple case: just version, no features, defaults enabled, no path
-  if dep.features.is_empty() && dep.default_features && dep.path.is_none() {
+  // Simple case: just version, no features, defaults enabled, no path or rename.
+  if dep.features.is_empty() && dep.default_features && dep.path.is_none() && dep.package.is_none() {
     let mut value = Value::from(dep.version_req.to_string());
     value.decor_mut().set_suffix(" #unified");
     return Item::Value(value);
@@ -23,6 +23,10 @@ pub fn build_dep_entry(dep: &UnifiedDep) -> Item {
 
   // Complex case: use inline table
   let mut table = InlineTable::new();
+
+  if let Some(package) = &dep.package {
+    table.insert("package", Value::from(package.as_ref()));
+  }
 
   // Add path if present (for workspace member deps)
   if let Some(ref path) = dep.path {
@@ -84,7 +88,7 @@ pub fn build_workspace_dep_entry<S: AsRef<str>>(local_features: Option<&[S]>, is
 
 /// Build a transitive dependency entry for pinning
 ///
-/// Used for workspace-hack replacement (dev-dependencies with workspace = true and features).
+/// Used for host-owned transitive pins (dev-dependencies with workspace inheritance and features).
 pub fn build_transitive_entry<S: AsRef<str>>(features: &[S]) -> Item {
   let mut table = InlineTable::new();
   table.insert("workspace", Value::from(true));
@@ -144,6 +148,7 @@ mod tests {
   fn create_test_dep(name: &str, version: &str) -> UnifiedDep {
     UnifiedDep {
       name: Arc::from(name),
+      package: None,
       version_req: version.parse().unwrap(),
       features: vec![],
       default_features: true,
@@ -171,6 +176,17 @@ mod tests {
     assert!(entry.as_inline_table().is_some());
     let features = extract_features(&entry).unwrap();
     assert_eq!(features, vec!["derive"]);
+  }
+
+  #[test]
+  fn test_build_dep_entry_preserves_renamed_package_identity() {
+    let mut dep = create_test_dep("renamed_serde", "1.0");
+    dep.package = Some(Arc::from("serde"));
+
+    let entry = build_dep_entry(&dep);
+    let table = entry.as_inline_table().expect("renamed dependency uses a table");
+    assert_eq!(table.get("package").and_then(Value::as_str), Some("serde"));
+    assert_eq!(table.get("version").and_then(Value::as_str), Some("^1.0"));
   }
 
   #[test]

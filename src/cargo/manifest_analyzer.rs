@@ -6,12 +6,59 @@ use cargo_metadata::{DependencyKind as MetadataDepKind, PackageId};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use toml_edit::{DocumentMut, Item, Value};
 
 // Core Types
+
+/// Cargo package fields that may inherit from `[workspace.package]` and are
+/// analyzed by unify. `rust-version` remains owned by the MSRV policy.
+const PACKAGE_INHERITANCE_FIELDS: [&str; 15] = [
+  "authors",
+  "categories",
+  "description",
+  "documentation",
+  "edition",
+  "exclude",
+  "homepage",
+  "include",
+  "keywords",
+  "license",
+  "license-file",
+  "publish",
+  "readme",
+  "repository",
+  "version",
+];
+
+/// Captured semantic value for one Cargo-inheritable package field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PackageFieldValue {
+  String(String),
+  Boolean(bool),
+  Strings(Vec<String>),
+}
+
+/// Captured declaration state for one member package field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PackageFieldDeclaration {
+  Inherited,
+  Explicit(PackageFieldValue),
+}
+
+/// One deterministic package-inheritance analysis record.
+#[derive(Debug, Clone)]
+pub(crate) struct PackageInheritanceAnalysis {
+  pub(crate) field: String,
+  pub(crate) inherited: Vec<String>,
+  pub(crate) planned: Vec<String>,
+  pub(crate) local_overrides: Vec<String>,
+  pub(crate) missing: Vec<String>,
+  pub(crate) retained_equivalent: Vec<String>,
+  pub(crate) retention_reason: Option<&'static str>,
+}
 
 /// Unique identifier for a dep
 ///
@@ -86,6 +133,8 @@ impl Ord for DepKey {
 pub struct DepUsage {
   /// Features explicitly listed in the dependency entry
   pub unconditional_features: BTreeSet<String>,
+  /// Features written on this exact member declaration, excluding inherited workspace features.
+  pub local_features: BTreeSet<String>,
   /// Features referenced in `[features]` table (dep/feat syntax)
   pub conditional_features: BTreeSet<String>,
   /// Whether default features are enabled
@@ -112,6 +161,8 @@ pub struct DepUsage {
   /// True if the dep appears as: `dep:name`, `name` (for optional deps), or `name/feat`
   /// Used to distinguish truly unused optional deps from feature-gated ones
   pub referenced_in_features: bool,
+  /// Whether this declaration already uses `{ workspace = true }`.
+  pub workspace_inherited: bool,
 }
 
 /// Parsed dependency table info (used internally during manifest parsing)
@@ -120,10 +171,12 @@ struct ParsedDepTable {
   renamed_from: Option<String>,
   actual_name: Option<String>,
   unconditional_features: BTreeSet<String>,
+  local_features: BTreeSet<String>,
   default_features: bool,
   optional: bool,
   path: Option<String>,
   declared_version: Option<String>,
+  workspace_inherited: bool,
 }
 
 /// Type of dependency (normal, dev, or build)
@@ -175,6 +228,16 @@ pub struct ParsedManifest {
   pub required_feature_selections: BTreeSet<Vec<String>>,
   /// Feature selections derived from source conditions in the captured workspace.
   pub(crate) condition_feature_selections: BTreeSet<Vec<String>>,
+  /// Feature names referenced by source conditions in the captured workspace.
+  pub(crate) source_cfg_features: BTreeSet<String>,
+  /// Parsed cfg expressions retained for captured target applicability.
+  pub(crate) source_cfg_expressions: BTreeSet<String>,
+  /// Captured source/README identifiers that conservatively retain dependency declarations.
+  pub(crate) retention_identifiers: BTreeSet<String>,
+  /// Whether `[package].rust-version` inherits the captured workspace value.
+  pub(crate) inherits_workspace_msrv: bool,
+  /// Captured declarations for Cargo-inheritable package fields other than MSRV.
+  pub(crate) package_fields: BTreeMap<String, PackageFieldDeclaration>,
   /// All dependencies with their usages (Vec because same dep can appear in multiple sections)
   pub dependencies: HashMap<DepKey, Vec<DepUsage>>,
 }
@@ -190,6 +253,7 @@ struct ParseContext<'a> {
   manifest_path: &'a Path,
   /// Output map to collect parsed dependencies (Vec allows same dep in multiple sections)
   dependencies: &'a mut HashMap<DepKey, Vec<DepUsage>>,
+  workspace_dependencies: &'a FxHashMap<String, ExistingWorkspaceDep>,
 }
 
 // Main Analyzer
@@ -205,6 +269,10 @@ pub struct ManifestAnalyzer {
   /// Package name index for O(1) lookup of dep keys by package name
   /// Maps package_name -> list of DepKeys that refer to that package
   package_index: HashMap<Arc<str>, Vec<DepKey>>,
+  /// Captured `[workspace.dependencies]` entries keyed by their Cargo.toml alias.
+  workspace_dependencies: FxHashMap<String, ExistingWorkspaceDep>,
+  /// Captured `[workspace.package]` values, excluding MSRV policy.
+  workspace_package_fields: BTreeMap<String, PackageFieldValue>,
 }
 
 impl ManifestAnalyzer {
@@ -218,6 +286,11 @@ impl ManifestAnalyzer {
 
   /// Parse all workspace member manifests from one authoritative snapshot.
   pub(crate) fn parse_snapshot(snapshot: &WorkspaceSnapshot, members: &[&cargo_metadata::Package]) -> RailResult<Self> {
+    let workspace_manifest = snapshot.workspace_manifest()?;
+    let workspace_manifest_path = snapshot.source_root().join(workspace_manifest.path().as_path());
+    let (workspace_dependencies, workspace_package_fields) =
+      parse_workspace_manifest_policy(&workspace_manifest_path, workspace_manifest.bytes())?;
+    let workspace_dependencies = Arc::new(workspace_dependencies);
     let package_locations = snapshot
       .packages()
       .iter()
@@ -233,6 +306,7 @@ impl ManifestAnalyzer {
     let results: Vec<RailResult<ParsedManifest>> = members
       .par_iter()
       .map(|pkg| {
+        let workspace_dependencies = Arc::clone(&workspace_dependencies);
         let (manifest_path, package_root) = package_locations.get(&pkg.id).copied().ok_or_else(|| {
           RailError::message(format!(
             "workspace package '{}' is absent from the captured local package inventory",
@@ -256,17 +330,15 @@ impl ManifestAnalyzer {
             features
           })
           .collect();
-        let condition_feature_selections =
-          crate::cargo::feature_scanner::scan_snapshot_source_for_feature_selections(snapshot, package_root)?
-            .into_iter()
-            .collect();
+        let source_features = crate::cargo::feature_scanner::scan_snapshot_source_features(snapshot, package_root)?;
         Self::parse_manifest(
           &absolute_manifest_path,
           manifest.bytes(),
           &pkg.id,
           &pkg.name,
           required_feature_selections,
-          condition_feature_selections,
+          source_features,
+          &workspace_dependencies,
         )
       })
       .collect();
@@ -315,7 +387,14 @@ impl ManifestAnalyzer {
       usage_index,
       usage_counts,
       package_index,
+      workspace_dependencies: Arc::unwrap_or_clone(workspace_dependencies),
+      workspace_package_fields,
     })
+  }
+
+  /// Return captured workspace dependency policy keyed by manifest alias.
+  pub(crate) fn workspace_dependencies(&self) -> &FxHashMap<String, ExistingWorkspaceDep> {
+    &self.workspace_dependencies
   }
 
   /// Parse one exact captured manifest.
@@ -325,7 +404,8 @@ impl ManifestAnalyzer {
     package_id: &PackageId,
     package_name: &str,
     required_feature_selections: BTreeSet<Vec<String>>,
-    condition_feature_selections: BTreeSet<Vec<String>>,
+    source_features: crate::cargo::feature_scanner::CapturedSourceFeatures,
+    workspace_dependencies: &FxHashMap<String, ExistingWorkspaceDep>,
   ) -> RailResult<ParsedManifest> {
     let content = std::str::from_utf8(bytes)
       .map_err(|_| RailError::message(format!("Failed to parse {} as UTF-8", manifest_path.display())))?;
@@ -335,10 +415,19 @@ impl ManifestAnalyzer {
       .with_context(|| format!("Failed to parse {}", manifest_path.display()))?;
 
     let mut dependencies = HashMap::new();
+    let inherits_workspace_msrv = doc
+      .get("package")
+      .and_then(|package| package.get("rust-version"))
+      .and_then(Item::as_table_like)
+      .and_then(|rust_version| rust_version.get("workspace"))
+      .and_then(Item::as_bool)
+      == Some(true);
+    let package_fields = parse_member_package_fields(&doc, manifest_path)?;
     let mut ctx = ParseContext {
       package_name,
       manifest_path,
       dependencies: &mut dependencies,
+      workspace_dependencies,
     };
 
     // Parse [dependencies]
@@ -423,15 +512,66 @@ impl ManifestAnalyzer {
       }
     }
 
+    let crate::cargo::feature_scanner::CapturedSourceFeatures {
+      selections,
+      referenced,
+      expressions,
+      retention_identifiers,
+    } = source_features;
     Ok(ParsedManifest {
       package_id: package_id.clone(),
       path: manifest_path.to_path_buf(),
       package_name: package_name.to_string(),
       declared_features,
       required_feature_selections,
-      condition_feature_selections,
+      condition_feature_selections: selections.into_iter().collect(),
+      source_cfg_features: referenced,
+      source_cfg_expressions: expressions,
+      retention_identifiers,
+      inherits_workspace_msrv,
+      package_fields,
       dependencies,
     })
+  }
+
+  /// Compare member package declarations with the captured workspace policy.
+  pub(crate) fn package_inheritance_analysis(&self) -> Vec<PackageInheritanceAnalysis> {
+    self
+      .workspace_package_fields
+      .iter()
+      .map(|(field, workspace_value)| {
+        let retention_reason = package_field_retention_reason(field);
+        let mut analysis = PackageInheritanceAnalysis {
+          field: field.clone(),
+          inherited: Vec::new(),
+          planned: Vec::new(),
+          local_overrides: Vec::new(),
+          missing: Vec::new(),
+          retained_equivalent: Vec::new(),
+          retention_reason,
+        };
+        for member in &self.members {
+          match member.package_fields.get(field) {
+            Some(PackageFieldDeclaration::Inherited) => analysis.inherited.push(member.package_name.clone()),
+            Some(PackageFieldDeclaration::Explicit(value)) if value == workspace_value => {
+              if retention_reason.is_some() {
+                analysis.retained_equivalent.push(member.package_name.clone());
+              } else {
+                analysis.planned.push(member.package_name.clone());
+              }
+            }
+            Some(PackageFieldDeclaration::Explicit(_)) => analysis.local_overrides.push(member.package_name.clone()),
+            None => analysis.missing.push(member.package_name.clone()),
+          }
+        }
+        analysis.inherited.sort();
+        analysis.planned.sort();
+        analysis.local_overrides.sort();
+        analysis.missing.sort();
+        analysis.retained_equivalent.sort();
+        analysis
+      })
+      .collect()
   }
 
   /// Parse a dependency section
@@ -457,8 +597,10 @@ impl ManifestAnalyzer {
             ..Default::default()
           })
         }
-        Item::Value(Value::InlineTable(inline_table)) => Self::parse_dep_table(inline_table, dep_name),
-        Item::Table(table) => Self::parse_dep_table(table, dep_name),
+        Item::Value(Value::InlineTable(inline_table)) => {
+          Self::parse_dep_table(inline_table, dep_name, ctx.workspace_dependencies)?
+        }
+        Item::Table(table) => Self::parse_dep_table(table, dep_name, ctx.workspace_dependencies)?,
         _ => None,
       };
 
@@ -476,6 +618,7 @@ impl ManifestAnalyzer {
         // which is the alias if renamed, or the package name otherwise
         let usage = DepUsage {
           unconditional_features: p.unconditional_features,
+          local_features: p.local_features,
           conditional_features: BTreeSet::new(), // Filled in later by features parsing
           default_features: p.default_features,
           kind,
@@ -487,6 +630,7 @@ impl ManifestAnalyzer {
           manifest_path: Some(ctx.manifest_path.to_path_buf()),
           cargo_toml_key: Arc::from(dep_name),
           referenced_in_features: false, // Filled in later by features parsing
+          workspace_inherited: p.workspace_inherited,
         };
 
         ctx.dependencies.entry(dep_key).or_default().push(usage);
@@ -496,21 +640,43 @@ impl ManifestAnalyzer {
     Ok(())
   }
 
-  /// Parse a dependency table (either InlineTable or Table)
-  /// Returns None if the dependency should be skipped (uses workspace inheritance)
-  fn parse_dep_table<T: toml_edit::TableLike>(table: &T, dep_name: &str) -> Option<ParsedDepTable> {
-    // Skip dependencies that already use workspace inheritance
-    if table.get("workspace").and_then(|v| v.as_bool()) == Some(true) {
-      return None;
-    }
-
-    let mut parsed = ParsedDepTable {
-      default_features: true, // Cargo default
-      ..Default::default()
+  /// Parse a dependency table (either inline or full), resolving captured workspace inheritance.
+  fn parse_dep_table<T: toml_edit::TableLike>(
+    table: &T,
+    dep_name: &str,
+    workspace_dependencies: &FxHashMap<String, ExistingWorkspaceDep>,
+  ) -> RailResult<Option<ParsedDepTable>> {
+    let workspace_inherited = table.get("workspace").and_then(|value| value.as_bool()) == Some(true);
+    let mut parsed = if workspace_inherited {
+      let workspace = workspace_dependencies.get(dep_name).ok_or_else(|| {
+        RailError::message(format!(
+          "dependency '{dep_name}' inherits an absent [workspace.dependencies] entry"
+        ))
+      })?;
+      ParsedDepTable {
+        renamed_from: workspace
+          .package
+          .as_ref()
+          .filter(|package| package.as_str() != dep_name)
+          .map(|_| dep_name.to_string()),
+        actual_name: workspace.package.clone(),
+        unconditional_features: workspace.features.iter().cloned().collect(),
+        default_features: workspace.default_features,
+        optional: false,
+        path: workspace.path.clone(),
+        declared_version: workspace.version.clone(),
+        workspace_inherited: true,
+        ..Default::default()
+      }
+    } else {
+      ParsedDepTable {
+        default_features: true, // Cargo default
+        ..Default::default()
+      }
     };
 
     // Check for renamed package (only when package name differs from dependency key)
-    if let Some(pkg) = table.get("package").and_then(|v| v.as_str()) {
+    if !workspace_inherited && let Some(pkg) = table.get("package").and_then(|v| v.as_str()) {
       // Only flag as renamed when there's actual renaming, not redundant package fields
       if pkg != dep_name {
         parsed.renamed_from = Some(dep_name.to_string());
@@ -519,22 +685,27 @@ impl ManifestAnalyzer {
     }
 
     // Parse version - this is the DECLARED version from the manifest
-    parsed.declared_version = table.get("version").and_then(|v| v.as_str()).map(String::from);
+    if !workspace_inherited {
+      parsed.declared_version = table.get("version").and_then(|v| v.as_str()).map(String::from);
+    }
 
     // Parse path for path dependencies
-    parsed.path = table.get("path").and_then(|v| v.as_str()).map(String::from);
+    if !workspace_inherited {
+      parsed.path = table.get("path").and_then(|v| v.as_str()).map(String::from);
+    }
 
     // Parse features
     if let Some(features) = table.get("features").and_then(|f| f.as_array()) {
       for feat in features {
         if let Some(s) = feat.as_str() {
           parsed.unconditional_features.insert(s.to_string());
+          parsed.local_features.insert(s.to_string());
         }
       }
     }
 
     // Parse default-features
-    if let Some(df) = table.get("default-features").and_then(|v| v.as_bool()) {
+    if !workspace_inherited && let Some(df) = table.get("default-features").and_then(|v| v.as_bool()) {
       parsed.default_features = df;
     }
 
@@ -543,60 +714,7 @@ impl ManifestAnalyzer {
       parsed.optional = opt;
     }
 
-    Some(parsed)
-  }
-
-  /// Compute the union of all features used across all usage sites
-  ///
-  /// Used when mixed default-features are detected or intersection is empty.
-  /// Includes ALL dep kinds (Normal, Dev, Build) per design doc requirements.
-  ///
-  /// **IMPORTANT**: Only includes features from UNCONDITIONAL usages (no target constraint).
-  /// Features from target-specific usages (e.g., `[target.'cfg(linux)'.dependencies]`)
-  /// are excluded because they may not be valid on all platforms and should stay local.
-  pub fn compute_union(&self, dep: &DepKey) -> BTreeSet<String> {
-    let Some(usages) = self.usage_index.get(dep) else {
-      return BTreeSet::new();
-    };
-
-    // Include ALL dep kinds - workspace deps serve all usage contexts
-    if usages.is_empty() {
-      return BTreeSet::new();
-    }
-
-    // Union features from UNCONDITIONAL usages only
-    // Target-specific features stay local to avoid platform incompatibilities
-    let mut union = BTreeSet::new();
-    for usage in usages {
-      if usage.target.is_none() {
-        union.extend(usage.unconditional_features.iter().cloned());
-      }
-    }
-
-    union
-  }
-
-  /// Compute features that are ONLY declared with target constraints
-  ///
-  /// These features should stay local (in member Cargo.toml) because they may
-  /// have platform-specific requirements (like cfg flags or OS restrictions).
-  /// Produces features that appear only in target-constrained usages.
-  pub fn compute_target_local_features(&self, dep: &DepKey) -> BTreeSet<String> {
-    let Some(usages) = self.usage_index.get(dep) else {
-      return BTreeSet::new();
-    };
-
-    // Collect features from target-constrained usages
-    let mut target_features = BTreeSet::new();
-    for usage in usages {
-      if usage.target.is_some() {
-        target_features.extend(usage.unconditional_features.iter().cloned());
-      }
-    }
-
-    // Subtract features that also appear unconditionally
-    let unconditional = self.compute_union(dep);
-    target_features.difference(&unconditional).cloned().collect()
+    Ok(Some(parsed))
   }
 
   /// Compute the intersection of features used by all packages that depend on this dependency
@@ -737,52 +855,6 @@ impl ManifestAnalyzer {
     all_usages
   }
 
-  /// Compute union of features across all usages of a package (including renamed)
-  ///
-  /// When include_renamed = true, aggregate features from all variants
-  pub fn compute_package_union(&self, package_name: &str) -> BTreeSet<String> {
-    let mut union = BTreeSet::new();
-
-    for usage in self.get_package_usage_sites(package_name) {
-      if usage.target.is_none() {
-        union.extend(usage.unconditional_features.iter().cloned());
-      }
-    }
-
-    union
-  }
-
-  /// Check if a package has mixed default-features across all usages (including renamed)
-  ///
-  /// When include_renamed = true, check across all variants
-  pub fn package_has_mixed_defaults(&self, package_name: &str) -> bool {
-    let usages = self.get_package_usage_sites(package_name);
-
-    if usages.len() < 2 {
-      return false;
-    }
-
-    let first_default = usages[0].default_features;
-    !usages.iter().all(|u| u.default_features == first_default)
-  }
-
-  /// Get default-features policy across all usages of a package (including renamed)
-  ///
-  /// When include_renamed = true, use conservative policy across all variants
-  pub fn package_default_features_policy(&self, package_name: &str) -> Option<bool> {
-    let usages = self.get_package_usage_sites(package_name);
-
-    if usages.is_empty() {
-      return None;
-    }
-
-    if usages.iter().any(|usage| !usage.default_features) {
-      Some(false)
-    } else {
-      Some(true)
-    }
-  }
-
   /// Get unique package names from all dependencies
   ///
   /// Used to iterate by package rather than by dep key
@@ -793,11 +865,118 @@ impl ManifestAnalyzer {
 
 // Workspace Dependencies Parser
 
+fn package_field_retention_reason(field: &str) -> Option<&'static str> {
+  match field {
+    "version" => Some("release-policy-owned"),
+    "license-file" | "readme" => Some("workspace-relative-path"),
+    _ => None,
+  }
+}
+
+pub(crate) fn package_field_is_automatically_inheritable(field: &str) -> bool {
+  PACKAGE_INHERITANCE_FIELDS.contains(&field) && package_field_retention_reason(field).is_none()
+}
+
+fn parse_member_package_fields(
+  doc: &DocumentMut,
+  manifest_path: &Path,
+) -> RailResult<BTreeMap<String, PackageFieldDeclaration>> {
+  let mut fields = BTreeMap::new();
+  let Some(package) = doc.get("package").and_then(Item::as_table_like) else {
+    return Ok(fields);
+  };
+  for field in PACKAGE_INHERITANCE_FIELDS {
+    let Some(item) = package.get(field) else {
+      continue;
+    };
+    if item
+      .as_table_like()
+      .and_then(|table| table.get("workspace"))
+      .and_then(Item::as_bool)
+      == Some(true)
+    {
+      fields.insert(field.to_string(), PackageFieldDeclaration::Inherited);
+      continue;
+    }
+    fields.insert(
+      field.to_string(),
+      PackageFieldDeclaration::Explicit(parse_package_field_value(item, field, manifest_path)?),
+    );
+  }
+  Ok(fields)
+}
+
+fn parse_workspace_package_fields(
+  doc: &DocumentMut,
+  manifest_path: &Path,
+) -> RailResult<BTreeMap<String, PackageFieldValue>> {
+  let mut fields = BTreeMap::new();
+  let Some(package) = doc
+    .get("workspace")
+    .and_then(|workspace| workspace.get("package"))
+    .and_then(Item::as_table_like)
+  else {
+    return Ok(fields);
+  };
+  for field in PACKAGE_INHERITANCE_FIELDS {
+    if let Some(item) = package.get(field) {
+      fields.insert(
+        field.to_string(),
+        parse_package_field_value(item, field, manifest_path)?,
+      );
+    }
+  }
+  Ok(fields)
+}
+
+fn parse_package_field_value(item: &Item, field: &str, manifest_path: &Path) -> RailResult<PackageFieldValue> {
+  if let Some(value) = item.as_str() {
+    return Ok(PackageFieldValue::String(value.to_string()));
+  }
+  if let Some(value) = item.as_bool() {
+    return Ok(PackageFieldValue::Boolean(value));
+  }
+  if let Some(values) = item.as_array() {
+    let mut parsed = Vec::with_capacity(values.len());
+    for value in values {
+      let value = value.as_str().ok_or_else(|| {
+        RailError::message(format!(
+          "package field '{field}' in '{}' contains a non-string array value",
+          manifest_path.display()
+        ))
+      })?;
+      parsed.push(value.to_string());
+    }
+    return Ok(PackageFieldValue::Strings(parsed));
+  }
+  Err(RailError::message(format!(
+    "package field '{field}' in '{}' has an unsupported declaration shape",
+    manifest_path.display()
+  )))
+}
+
+fn parse_workspace_manifest_policy(
+  manifest_path: &Path,
+  bytes: &[u8],
+) -> RailResult<(
+  FxHashMap<String, ExistingWorkspaceDep>,
+  BTreeMap<String, PackageFieldValue>,
+)> {
+  let content = std::str::from_utf8(bytes)
+    .map_err(|_| RailError::message(format!("Failed to parse {} as UTF-8", manifest_path.display())))?;
+  let doc: DocumentMut = content
+    .parse()
+    .with_context(|| format!("Failed to parse {}", manifest_path.display()))?;
+  let dependencies = parse_existing_workspace_deps_from_doc(&doc);
+  let package_fields = parse_workspace_package_fields(&doc, manifest_path)?;
+  Ok((dependencies, package_fields))
+}
+
 /// Information about an existing workspace dependency
 #[derive(Debug, Clone)]
 pub struct ExistingWorkspaceDep {
-  /// Dependency name
-  pub name: String,
+  /// Actual package name when the workspace entry is renamed.
+  pub package: Option<String>,
   /// Version requirement (if specified)
   pub version: Option<String>,
   /// Features enabled
@@ -808,45 +987,42 @@ pub struct ExistingWorkspaceDep {
   pub path: Option<String>,
 }
 
-/// Parse existing [workspace.dependencies] from the workspace root Cargo.toml
+/// Parse existing `[workspace.dependencies]` from captured root-manifest bytes.
 ///
 /// Produces a map of dependency name to current workspace configuration.
 /// This is used to detect deps that already exist in workspace.dependencies
 /// so we don't add duplicates.
-pub fn parse_existing_workspace_deps(workspace_root: &Path) -> RailResult<FxHashMap<String, ExistingWorkspaceDep>> {
-  let workspace_toml = workspace_root.join("Cargo.toml");
-  let content = match std::fs::read_to_string(&workspace_toml) {
-    Ok(c) => c,
-    Err(_) => return Ok(FxHashMap::default()), // No workspace Cargo.toml
-  };
+pub fn parse_existing_workspace_deps(
+  manifest_path: &Path,
+  bytes: &[u8],
+) -> RailResult<FxHashMap<String, ExistingWorkspaceDep>> {
+  parse_workspace_manifest_policy(manifest_path, bytes).map(|(dependencies, _)| dependencies)
+}
 
-  let doc: DocumentMut = content
-    .parse()
-    .with_context(|| format!("Failed to parse {}", workspace_toml.display()))?;
-
+fn parse_existing_workspace_deps_from_doc(doc: &DocumentMut) -> FxHashMap<String, ExistingWorkspaceDep> {
   let mut existing = FxHashMap::default();
 
   // Check for [workspace.dependencies] section
   let Some(workspace) = doc.get("workspace").and_then(|w| w.as_table()) else {
-    return Ok(existing); // No [workspace] section
+    return existing; // No [workspace] section
   };
 
   let Some(deps) = workspace.get("dependencies").and_then(|d| d.as_table_like()) else {
-    return Ok(existing); // No [workspace.dependencies] section
+    return existing; // No [workspace.dependencies] section
   };
 
   for (name, value) in deps.iter() {
-    let dep = parse_workspace_dep_entry(name, value);
+    let dep = parse_workspace_dep_entry(value);
     existing.insert(name.to_string(), dep);
   }
 
-  Ok(existing)
+  existing
 }
 
 /// Parse a single workspace dependency entry
-fn parse_workspace_dep_entry(name: &str, value: &Item) -> ExistingWorkspaceDep {
+fn parse_workspace_dep_entry(value: &Item) -> ExistingWorkspaceDep {
   let mut dep = ExistingWorkspaceDep {
-    name: name.to_string(),
+    package: None,
     version: None,
     features: Vec::new(),
     default_features: true,
@@ -861,6 +1037,9 @@ fn parse_workspace_dep_entry(name: &str, value: &Item) -> ExistingWorkspaceDep {
 
   // Inline table: dep = { version = "1.0", features = [...] }
   if let Some(table) = value.as_inline_table() {
+    if let Some(package) = table.get("package").and_then(|value| value.as_str()) {
+      dep.package = Some(package.to_string());
+    }
     if let Some(v) = table.get("version").and_then(|v| v.as_str()) {
       dep.version = Some(v.to_string());
     }
@@ -878,6 +1057,13 @@ fn parse_workspace_dep_entry(name: &str, value: &Item) -> ExistingWorkspaceDep {
 
   // Full table: [workspace.dependencies.dep]
   if let Some(table) = value.as_table() {
+    if let Some(package) = table
+      .get("package")
+      .and_then(|item| item.as_value())
+      .and_then(|value| value.as_str())
+    {
+      dep.package = Some(package.to_string());
+    }
     if let Some(v) = table.get("version").and_then(|i| i.as_value()).and_then(|v| v.as_str()) {
       dep.version = Some(v.to_string());
     }
@@ -918,6 +1104,12 @@ mod tests {
     dir
   }
 
+  fn parse_test_workspace(dir: &TempDir) -> FxHashMap<String, ExistingWorkspaceDep> {
+    let path = dir.path().join("Cargo.toml");
+    let bytes = std::fs::read(&path).unwrap();
+    parse_existing_workspace_deps(&path, &bytes).unwrap()
+  }
+
   #[test]
   fn test_parse_existing_workspace_deps_empty() {
     let dir = create_test_workspace(
@@ -927,7 +1119,7 @@ members = ["crate-a"]
 "#,
     );
 
-    let result = parse_existing_workspace_deps(dir.path()).unwrap();
+    let result = parse_test_workspace(&dir);
     assert!(
       result.is_empty(),
       "Should return empty map when no workspace.dependencies"
@@ -947,7 +1139,7 @@ anyhow = "1.0.50"
 "#,
     );
 
-    let result = parse_existing_workspace_deps(dir.path()).unwrap();
+    let result = parse_test_workspace(&dir);
     assert_eq!(result.len(), 2);
     assert_eq!(result["serde"].version.as_ref().unwrap(), "1.0");
     assert_eq!(result["anyhow"].version.as_ref().unwrap(), "1.0.50");
@@ -968,7 +1160,7 @@ tokio = { version = "1.0", features = ["full"] }
 "#,
     );
 
-    let result = parse_existing_workspace_deps(dir.path()).unwrap();
+    let result = parse_test_workspace(&dir);
     assert_eq!(result.len(), 2);
 
     let serde = &result["serde"];
@@ -995,7 +1187,7 @@ external = "1.0"
 "#,
     );
 
-    let result = parse_existing_workspace_deps(dir.path()).unwrap();
+    let result = parse_test_workspace(&dir);
     assert_eq!(result.len(), 2);
 
     let crate_a = &result["crate-a"];

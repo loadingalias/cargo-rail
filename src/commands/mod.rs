@@ -3,7 +3,7 @@
 //! This module contains all user-facing command implementations:
 //!
 //! ## Dependency Unification
-//! - **unify**: Eliminate workspace-hack crates via native workspace dependency unification
+//! - **unify**: Analyze and repair workspace dependency coherence
 //!
 //! ## Configuration Management
 //! - **init**: Initialize cargo-rail configuration (rail.toml)
@@ -75,7 +75,7 @@ pub use release::{
 pub use split::{run_split, run_split_init};
 pub use surface::{SurfaceOptions, run_surface};
 pub use sync::run_sync;
-pub use unify::{run_unify_analyze, run_unify_apply, run_unify_doctor, run_unify_undo};
+pub use unify::{UnifyAnalyzeOptions, run_unify_analyze, run_unify_apply, run_unify_doctor, run_unify_undo};
 
 use crate::error::RailResult;
 use crate::workspace::WorkspaceContext;
@@ -359,7 +359,18 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
     } => match command {
       Some(cli::UnifyCommand::Doctor { format }) => run_unify_doctor(ctx, format),
       Some(cli::UnifyCommand::Undo { .. }) => unreachable!("Undo subcommand should be handled before dispatch"),
-      None if check => run_unify_analyze(ctx, show_diff, explain, format, output.as_ref()),
+      None if check => run_unify_analyze(
+        ctx,
+        UnifyAnalyzeOptions {
+          show_diff,
+          explain,
+          format,
+          output: output.as_ref(),
+          backup,
+          no_report: skip_report,
+          report_path: report_path.as_ref(),
+        },
+      ),
       None => run_unify_apply(ctx, backup, skip_report, report_path, plan, format),
     },
 

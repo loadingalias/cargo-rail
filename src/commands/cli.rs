@@ -316,7 +316,7 @@ pub enum Commands {
     schema: bool,
   },
 
-  /// Unify workspace dependencies (replaces workspace-hack crates)
+  /// Analyze and repair workspace dependency coherence
   #[command(after_long_help = UNIFY_HELP)]
   Unify {
     /// Subcommand (doctor or undo)

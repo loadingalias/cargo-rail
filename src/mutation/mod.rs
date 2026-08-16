@@ -486,20 +486,29 @@ pub fn write_receipt_with_objects(
     sanitize_for_filename(phase),
     nonce
   ));
-  let mut file = fs::OpenOptions::new()
-    .create_new(true)
-    .write(true)
-    .open(&path)
-    .map_err(|e| RailError::message(format!("failed to create receipt '{}': {}", path.display(), e)))?;
-
-  let bytes = serde_json::to_vec_pretty(&receipt)
+  let mut bytes = serde_json::to_vec_pretty(&receipt)
     .map_err(|e| RailError::message(format!("failed to serialize receipt: {}", e)))?;
-  file
+  bytes.push(b'\n');
+  let mut temporary = tempfile::Builder::new()
+    .prefix(".cargo-rail-receipt-")
+    .suffix(".tmp")
+    .tempfile_in(&dir)
+    .map_err(|error| RailError::message(format!("failed to prepare receipt '{}': {error}", path.display())))?;
+  temporary
     .write_all(&bytes)
-    .map_err(|e| RailError::message(format!("failed to write receipt '{}': {}", path.display(), e)))?;
-  file
-    .write_all(b"\n")
-    .map_err(|e| RailError::message(format!("failed to finalize receipt '{}': {}", path.display(), e)))?;
+    .and_then(|()| temporary.as_file().sync_all())
+    .map_err(|error| RailError::message(format!("failed to write receipt '{}': {error}", path.display())))?;
+  temporary.persist_noclobber(&path).map_err(|error| {
+    RailError::message(format!(
+      "failed to publish immutable receipt '{}': {}",
+      path.display(),
+      error.error
+    ))
+  })?;
+  #[cfg(unix)]
+  fs::File::open(&dir)
+    .and_then(|directory| directory.sync_all())
+    .map_err(|error| RailError::message(format!("failed to persist receipt '{}': {error}", path.display())))?;
 
   Ok(path)
 }

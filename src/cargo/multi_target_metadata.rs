@@ -4,7 +4,7 @@
 //! We load metadata per target (in parallel) and cache it for reuse.
 
 use crate::cargo::resolution::{ResolutionFeatures, ResolutionPackages, ResolutionRequest, ResolutionViews};
-use crate::error::RailResult;
+use crate::error::{RailError, RailResult};
 use cargo_metadata::{Metadata, Node, Package, PackageId};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
@@ -498,7 +498,7 @@ impl MultiTargetMetadata {
   }
 
   /// Detect transitive dependencies with fragmented features
-  /// These are candidates for pinning (workspace-hack replacement)
+  /// These are candidates for explicit host-owned pinning.
   pub fn find_fragmented_transitives(&self) -> Vec<FragmentedTransitive> {
     let mut transitives = Vec::new();
 
@@ -635,29 +635,50 @@ impl MultiTargetMetadata {
   /// MSRV; otherwise returns the computed version and provenance details.
   pub fn compute_msrv_with_config(
     &self,
-    workspace_root: &Path,
+    workspace_manifest_path: &Path,
+    workspace_manifest: &[u8],
     msrv_source: crate::config::MsrvSource,
-  ) -> Option<ComputedMsrv> {
+  ) -> RailResult<Option<ComputedMsrv>> {
     use crate::config::MsrvSource;
 
     // Get MSRV from dependencies
     let deps_result = self.compute_deps_msrv();
 
     // Read existing rust-version baseline (prefer workspace.package, fallback to root package)
-    let (workspace_msrv, used_package_fallback) = read_workspace_rust_version(workspace_root);
+    let (workspace_msrv, used_package_fallback) =
+      read_workspace_rust_version(workspace_manifest_path, workspace_manifest)?;
 
     // Apply msrv_source logic
-    match msrv_source {
+    Ok(match msrv_source {
       MsrvSource::Deps => {
-        // Original behavior: use deps only, ignore workspace
-        deps_result.map(|(version, contributors, deps_with_msrv)| ComputedMsrv {
-          version: version.clone(),
-          contributors,
-          deps_with_msrv,
-          deps_msrv: Some(version),
-          workspace_msrv,
-          source_used: MsrvSourceUsed::Deps,
-          warning: None,
+        // Dependency metadata provides a lower-bound candidate, not proof that
+        // the workspace compiles on an older toolchain. Never lower an existing
+        // declaration without a successful fixed compiler probe.
+        deps_result.map(|(deps_version, contributors, deps_with_msrv)| {
+          let retain_workspace = workspace_msrv
+            .as_ref()
+            .is_some_and(|workspace_version| workspace_version > &deps_version);
+          let version = if retain_workspace {
+            workspace_msrv.clone().unwrap_or_else(|| deps_version.clone())
+          } else {
+            deps_version.clone()
+          };
+          ComputedMsrv {
+            version,
+            contributors,
+            deps_with_msrv,
+            deps_msrv: Some(deps_version),
+            workspace_msrv,
+            source_used: if retain_workspace {
+              MsrvSourceUsed::Workspace
+            } else {
+              MsrvSourceUsed::Deps
+            },
+            warning: retain_workspace.then(|| {
+              "dependency rust-version metadata is lower than the declared workspace MSRV; preserving the declaration because no compiler probe proves a safe lowering"
+                .to_string()
+            }),
+          }
         })
       }
 
@@ -794,7 +815,7 @@ consider enabling MSRV inheritance (rust-version = { workspace = true }) to avoi
           (None, None) => None,
         }
       }
-    }
+    })
   }
 }
 
@@ -804,14 +825,12 @@ consider enabling MSRV inheritance (rust-version = { workspace = true }) to avoi
 /// `[package].rust-version` (if it is a string value).
 ///
 /// Returns `(version, used_package_fallback)`.
-fn read_workspace_rust_version(workspace_root: &Path) -> (Option<Version>, bool) {
-  let cargo_toml_path = workspace_root.join("Cargo.toml");
-  let Ok(content) = std::fs::read_to_string(&cargo_toml_path) else {
-    return (None, false);
-  };
-  let Ok(doc) = content.parse::<toml_edit::DocumentMut>() else {
-    return (None, false);
-  };
+fn read_workspace_rust_version(manifest_path: &Path, manifest: &[u8]) -> RailResult<(Option<Version>, bool)> {
+  let content = std::str::from_utf8(manifest)
+    .map_err(|_| RailError::message(format!("Failed to parse {} as UTF-8", manifest_path.display())))?;
+  let doc = content
+    .parse::<toml_edit::DocumentMut>()
+    .map_err(|error| RailError::message(format!("Failed to parse {}: {error}", manifest_path.display())))?;
 
   // Try [workspace.package].rust-version
   let workspace_rust_version_str = doc
@@ -821,7 +840,7 @@ fn read_workspace_rust_version(workspace_root: &Path) -> (Option<Version>, bool)
     .and_then(|v| v.as_str());
 
   if let Some(s) = workspace_rust_version_str {
-    return (parse_rust_version(s), false);
+    return Ok((parse_rust_version(s), false));
   }
 
   // Fallback: root [package].rust-version (string only, not workspace inheritance)
@@ -831,16 +850,16 @@ fn read_workspace_rust_version(workspace_root: &Path) -> (Option<Version>, bool)
     .and_then(|v| v.as_str());
 
   if let Some(s) = package_rust_version_str {
-    return (parse_rust_version(s), true);
+    return Ok((parse_rust_version(s), true));
   }
 
-  (None, false)
+  Ok((None, false))
 }
 
 /// Parse a rust-version string into a semver Version
 ///
 /// Handles formats like "1.70", "1.70.0", etc.
-fn parse_rust_version(s: &str) -> Option<Version> {
+pub(crate) fn parse_rust_version(s: &str) -> Option<Version> {
   // Try parsing directly
   if let Ok(v) = Version::parse(s) {
     return Some(v);
@@ -877,10 +896,10 @@ impl FragmentedTransitive {
   }
 }
 
-/// Result of MSRV computation from dependency graph
+/// Manifest/dependency MSRV candidate that has not necessarily been compiler-probed.
 #[derive(Debug, Clone)]
 pub struct ComputedMsrv {
-  /// The final MSRV to write (after applying msrv_source logic)
+  /// The candidate MSRV to retain or write after applying source policy.
   pub version: Version,
   /// Dependencies that contributed to the deps-based MSRV
   pub contributors: Vec<String>,
@@ -892,7 +911,7 @@ pub struct ComputedMsrv {
   pub workspace_msrv: Option<Version>,
   /// Which source was used to determine the final version
   pub source_used: MsrvSourceUsed,
-  /// Warning message if workspace MSRV is lower than deps require
+  /// Warning when the manifest evidence is incomplete or internally inconsistent.
   pub warning: Option<String>,
 }
 

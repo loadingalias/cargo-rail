@@ -22,8 +22,10 @@ use std::sync::Arc;
 /// The same package/feature names are shared across multiple structures.
 #[derive(Debug, Clone)]
 pub struct UnifiedDep {
-  /// Dependency package name
+  /// Workspace dependency key.
   pub name: Arc<str>,
+  /// Actual package name when the workspace dependency key is renamed.
+  pub package: Option<Arc<str>>,
   /// Version requirement (e.g., "^1.0.0")
   pub version_req: VersionReq,
   /// Features to enable (minimal intersection across all uses)
@@ -85,6 +87,30 @@ pub enum MemberEdit {
   ///
   /// Sets `[package].rust-version = { workspace = true }`.
   EnforceMsrvInheritance,
+  /// Replace one semantically equivalent package field with workspace inheritance.
+  InheritPackageField {
+    /// Cargo package field under `[package]`.
+    field: Arc<str>,
+  },
+}
+
+/// Captured workspace-package policy compared with every member declaration.
+#[derive(Debug, Clone)]
+pub struct PackageInheritanceField {
+  /// Cargo field declared by `[workspace.package]`.
+  pub field: Arc<str>,
+  /// Members that already inherit the field.
+  pub inherited: Vec<Arc<str>>,
+  /// Members whose equivalent explicit declaration will be inherited.
+  pub planned: Vec<Arc<str>>,
+  /// Members whose explicit declaration intentionally differs.
+  pub local_overrides: Vec<Arc<str>>,
+  /// Members that do not declare the field.
+  pub missing: Vec<Arc<str>>,
+  /// Equivalent declarations retained because another domain owns mutation policy.
+  pub retained_equivalent: Vec<Arc<str>>,
+  /// Stable reason for retaining equivalent declarations, when applicable.
+  pub retention_reason: Option<&'static str>,
 }
 
 /// Issue that prevents or warns about unification
@@ -118,14 +144,18 @@ pub enum IssueSeverity {
   Warning,
 }
 
-/// Result of validation across targets
+/// Legacy target-load observation retained for API compatibility.
+///
+/// Unification plans no longer populate this type: successful metadata loading
+/// is an analysis prerequisite, not post-analysis validation. Use the versioned
+/// coverage views in `unify --check -f json` for executable target inputs.
 #[derive(Debug)]
 pub struct ValidationResult {
-  /// Target platform being validated
+  /// Target platform that was observed.
   pub target: Arc<str>,
-  /// Whether validation passed
+  /// Whether the observation succeeded.
   pub success: bool,
-  /// Error message if validation failed
+  /// Error reported by the observation.
   pub error: Option<Arc<str>>,
 }
 
@@ -253,7 +283,7 @@ pub enum UnusedReason {
   },
 }
 
-/// A transitive dependency to pin for workspace-hack replacement
+/// A fragmented transitive dependency to pin in an explicitly selected host.
 #[derive(Debug, Clone)]
 pub struct TransitivePin {
   /// Dependency name
@@ -423,7 +453,7 @@ pub struct UnificationPlan {
   pub member_paths: FxHashMap<Arc<str>, PathBuf>,
   /// Transitive dependencies to pin (with version info)
   pub transitive_pins: Vec<TransitivePin>,
-  /// Results from validating across target platforms
+  /// Legacy target-load observations; retained empty because metadata loading is a prerequisite.
   pub validation_results: Vec<ValidationResult>,
   /// Issues detected during analysis
   pub issues: Vec<UnifyIssue>,
@@ -445,6 +475,8 @@ pub struct UnificationPlan {
   /// Undeclared features detected (resolved > declared)
   /// These indicate crates relying on feature unification from other workspace members
   pub undeclared_features: Vec<UndeclaredFeature>,
+  /// Versioned-output source for captured package-field inheritance decisions.
+  pub package_inheritance: Vec<PackageInheritanceField>,
   /// Per-dependency explainability records for text/JSON output.
   pub dependency_decisions: Vec<UnifyDecision>,
 }
@@ -461,6 +493,11 @@ impl UnificationPlan {
   /// actual edit count and is the right basis for "would this mutate files?" checks.
   pub fn member_edit_count(&self) -> usize {
     self.member_edits.values().map(|v| v.len()).sum()
+  }
+
+  /// Number of equivalent package declarations planned for workspace inheritance.
+  pub fn package_inheritance_edit_count(&self) -> usize {
+    self.package_inheritance.iter().map(|field| field.planned.len()).sum()
   }
 
   /// Returns true if the plan would mutate manifests or workspace MSRV.
@@ -526,6 +563,7 @@ impl UnificationPlan {
             MemberEdit::EnforceMsrvInheritance => {
               msrv_inheritance_crates.insert(Arc::clone(member_name));
             }
+            MemberEdit::InheritPackageField { .. } => {}
           }
         }
       }
@@ -595,13 +633,6 @@ impl UnificationPlan {
           issue.dep_name,
           issue.message
         ));
-      }
-    }
-
-    if !self.validation_results.is_empty() {
-      let failed = self.validation_results.iter().filter(|v| !v.success).count();
-      if failed > 0 {
-        s.push_str(&format!("\n  {} target validations failed\n", failed));
       }
     }
 
@@ -881,6 +912,7 @@ mod tests {
       version_mismatches: vec![],
       unused_deps: vec![],
       undeclared_features: vec![],
+      package_inheritance: vec![],
       dependency_decisions: vec![],
     };
 
@@ -916,6 +948,7 @@ mod tests {
       version_mismatches: vec![],
       unused_deps: vec![],
       undeclared_features: vec![],
+      package_inheritance: vec![],
       dependency_decisions: vec![],
     };
 
@@ -980,6 +1013,7 @@ mod tests {
         enabling_paths: vec![],
         required_by: vec![],
       }],
+      package_inheritance: vec![],
       dependency_decisions: vec![],
     };
 
@@ -1078,6 +1112,7 @@ mod tests {
       version_mismatches: vec![],
       unused_deps: vec![],
       undeclared_features: vec![],
+      package_inheritance: vec![],
       dependency_decisions: vec![],
     };
 

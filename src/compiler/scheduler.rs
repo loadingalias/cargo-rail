@@ -6,8 +6,9 @@ use std::ffi::OsString;
 use serde::{Deserialize, Serialize};
 
 use crate::cargo::manifest_analyzer::{DepKind, ParsedManifest};
+use crate::compiler::cfg_eval::{TargetCfgSet, cfg_expression_may_apply, feature_selections_for_cfg};
 use crate::compiler::facts::CompilerFactDomain;
-use crate::compiler::model::{FeatureSelection, PlatformTarget};
+use crate::compiler::model::{CoverageView, FeatureSelection, PlatformTarget};
 use crate::error::{RailError, RailResult};
 
 /// One exact rustc crate candidate and the platforms where its declaration applies.
@@ -410,6 +411,81 @@ pub(crate) fn planned_feature_selections(member: &ParsedManifest) -> Vec<Feature
   selections
 }
 
+/// Derive root-independent coverage views from the same feature scheduler used
+/// by compiler-fact acquisition.
+pub(crate) fn planned_coverage_views(
+  manifests: &[ParsedManifest],
+  targets: &[&str],
+  target_cfg_sets: &std::collections::HashMap<String, TargetCfgSet>,
+) -> RailResult<Vec<CoverageView>> {
+  let packages = manifests
+    .iter()
+    .map(|manifest| manifest.package_name.clone())
+    .collect::<BTreeSet<_>>();
+  if packages.len() != manifests.len() {
+    return Err(RailError::message(
+      "coverage scheduling requires unique workspace package names",
+    ));
+  }
+
+  let mut grouped = BTreeMap::<(PlatformTarget, FeatureSelection), BTreeSet<String>>::new();
+  for target in targets.iter().copied().collect::<BTreeSet<_>>() {
+    let cfg_set = target_cfg_sets.get(target);
+    for manifest in manifests {
+      for selection in coverage_feature_selections(manifest, cfg_set) {
+        grouped
+          .entry((PlatformTarget::from(target), selection))
+          .or_default()
+          .insert(manifest.package_name.clone());
+      }
+    }
+  }
+
+  Ok(
+    grouped
+      .into_iter()
+      .map(|((target, features), packages)| CoverageView::new(target, features, packages))
+      .collect(),
+  )
+}
+
+fn coverage_feature_selections(member: &ParsedManifest, cfg_set: Option<&TargetCfgSet>) -> Vec<FeatureSelection> {
+  let has_optional_dependency = member
+    .dependencies
+    .values()
+    .flatten()
+    .any(|dependency| dependency.optional);
+  let mut selections = if member.declared_features.is_empty() && !has_optional_dependency {
+    vec![FeatureSelection::Default]
+  } else {
+    FeatureSelection::BASELINES.to_vec()
+  };
+  selections.extend(
+    member
+      .source_cfg_expressions
+      .iter()
+      .filter(|expression| cfg_expression_may_apply(expression, std::iter::once(cfg_set)))
+      .flat_map(|expression| feature_selections_for_cfg(expression))
+      .filter(|selected| {
+        !selected.is_empty()
+          && selected
+            .iter()
+            .all(|feature| member.declared_features.contains(feature))
+      })
+      .map(FeatureSelection::Selected),
+  );
+  selections.extend(
+    member
+      .required_feature_selections
+      .iter()
+      .cloned()
+      .map(FeatureSelection::Selected),
+  );
+  selections.sort();
+  selections.dedup();
+  selections
+}
+
 #[cfg(test)]
 mod tests {
   use std::collections::HashMap;
@@ -429,6 +505,11 @@ mod tests {
       declared_features: BTreeSet::from(["backend".to_string(), "common".to_string(), "example".to_string()]),
       required_feature_selections: BTreeSet::from([vec!["example".to_string()]]),
       condition_feature_selections: BTreeSet::from([vec!["backend".to_string(), "common".to_string()]]),
+      source_cfg_features: BTreeSet::from(["backend".to_string(), "common".to_string()]),
+      source_cfg_expressions: BTreeSet::from([r#"all(feature = "backend", feature = "common")"#.to_string()]),
+      retention_identifiers: BTreeSet::new(),
+      inherits_workspace_msrv: false,
+      package_fields: BTreeMap::new(),
       dependencies: HashMap::new(),
     }
   }
@@ -507,6 +588,70 @@ mod tests {
       .into_iter()
       .map(OsString::from)
       .collect::<Vec<_>>()
+    );
+  }
+
+  #[test]
+  fn coverage_views_are_root_independent_and_emit_non_shell_argv() {
+    let targets = ["x86_64-unknown-linux-gnu"];
+    let target_cfg_sets = HashMap::from([(
+      "x86_64-unknown-linux-gnu".to_string(),
+      TargetCfgSet::from_test_lines(&[r#"target_os="linux""#]),
+    )]);
+    let left = planned_coverage_views(
+      &[
+        manifest("app", "first/root/app"),
+        manifest("worker", "first/root/worker"),
+      ],
+      &targets,
+      &target_cfg_sets,
+    )
+    .expect("left coverage");
+    let right = planned_coverage_views(
+      &[
+        manifest("worker", "another/root/worker"),
+        manifest("app", "another/root/app"),
+      ],
+      &targets,
+      &target_cfg_sets,
+    )
+    .expect("right coverage");
+
+    assert_eq!(left, right);
+    assert_eq!(left.len(), 5);
+    assert!(
+      left
+        .iter()
+        .all(|view| view.packages == ["app".to_string(), "worker".to_string()])
+    );
+    let selected = left
+      .iter()
+      .find(
+        |view| matches!(view.features, FeatureSelection::Selected(ref features) if features == &["backend", "common"]),
+      )
+      .expect("condition-derived coverage view");
+    assert_eq!(
+      selected.cargo_arguments(),
+      [
+        "check",
+        "--locked",
+        "--all-targets",
+        "--no-default-features",
+        "--features",
+        "app/backend",
+        "--features",
+        "app/common",
+        "--features",
+        "worker/backend",
+        "--features",
+        "worker/common",
+        "--package",
+        "app",
+        "--package",
+        "worker",
+        "--target",
+        "x86_64-unknown-linux-gnu",
+      ]
     );
   }
 
@@ -602,6 +747,7 @@ mod tests {
       .or_default()
       .push(crate::cargo::manifest_analyzer::DepUsage {
         unconditional_features: BTreeSet::new(),
+        local_features: BTreeSet::new(),
         conditional_features: BTreeSet::new(),
         default_features: true,
         kind: DepKind::Normal,
@@ -613,6 +759,7 @@ mod tests {
         manifest_path: None,
         cargo_toml_key: "optional-dep".into(),
         referenced_in_features: false,
+        workspace_inherited: false,
       });
     assert_eq!(planned_feature_selections(&app), FeatureSelection::BASELINES);
   }

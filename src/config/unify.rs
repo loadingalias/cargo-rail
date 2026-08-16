@@ -37,7 +37,7 @@ pub struct UnifyConfig {
   #[serde(default)]
   pub include_renamed: bool,
 
-  /// Workspace-hack-style transitive pinning and its owning manifest.
+  /// Host-owned pins for fragmented transitive features and their owning manifest.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub transitive_pinning: Option<TransitivePinning>,
 
@@ -239,10 +239,10 @@ fn validate_glob_patterns(field: &str, patterns: &[String]) -> Result<(), crate:
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MsrvSource {
-  /// Use maximum from dependencies only (original behavior)
+  /// Use the maximum dependency rust-version as the candidate floor.
   ///
-  /// Computes the highest rust-version from all resolved dependencies.
-  /// Overwrites any existing workspace rust-version.
+  /// A higher existing workspace declaration is retained because dependency
+  /// metadata does not prove that the workspace compiles on an older compiler.
   Deps,
   /// Preserve existing workspace rust-version
   ///
@@ -343,7 +343,7 @@ impl<'de> Deserialize<'de> for TransitiveFeatureHost {
   }
 }
 
-/// Enabled workspace-hack-style transitive pinning policy.
+/// Enabled host-owned pinning policy for fragmented transitive features.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TransitivePinning {

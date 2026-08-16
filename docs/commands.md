@@ -34,7 +34,7 @@ Commands:
   cache        Inspect or reclaim explicitly scoped cache state
   plan         Build a deterministic file-first change plan
   surface      Analyze complete Rust declaration reachability and visibility
-  unify        Unify workspace dependencies (replaces workspace-hack crates)
+  unify        Analyze and repair workspace dependency coherence
   init         Initialize configuration (rail.toml)
   split        (Advanced) Split a crate to a standalone repository with git history
   sync         (Advanced) Sync changes between monorepo and split repos
@@ -574,7 +574,7 @@ Examples:
 ## cargo rail unify
 
 ```
-Unify workspace dependencies (replaces workspace-hack crates)
+Analyze and repair workspace dependency coherence
 
 Usage: cargo rail unify [OPTIONS] [COMMAND]
 

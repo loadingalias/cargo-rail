@@ -733,6 +733,40 @@ tracing_log = { package = "log", version = "0.4" }
 }
 
 #[test]
+fn test_unused_detection_includes_workspace_inherited_declarations() -> Result<()> {
+  let workspace = TestWorkspace::new_named("unused-workspace-inherited")?;
+  workspace.add_crate("app", "0.1.0", &[("serde", r#"{ workspace = true }"#)])?;
+  std::fs::write(
+    workspace.path.join(".config/rail.toml"),
+    "[unify]\nmsrv_policy = { mode = \"disabled\" }\n",
+  )?;
+  workspace.commit("Declare an unused inherited dependency")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--format", "json"])?;
+  assert_eq!(
+    output.status.code(),
+    Some(1),
+    "unused inherited dependency should produce a pending removal: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+  let certificate = value["proof_certificates"]
+    .as_array()
+    .into_iter()
+    .flatten()
+    .find(|certificate| {
+      certificate["member"] == "app"
+        && certificate["subject"]["kind"] == "dependency"
+        && certificate["subject"]["declaration"] == "serde"
+    })
+    .expect("inherited dependency removal must carry a proof certificate");
+  assert_eq!(certificate["decision"], "remove");
+  assert_eq!(certificate["evidence_source"], "compiler");
+
+  Ok(())
+}
+
+#[test]
 fn test_unused_detection_preserves_dependency_used_only_without_default_features() -> Result<()> {
   let workspace = create_workspace_with_unused_detection()?;
 

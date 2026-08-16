@@ -15,14 +15,13 @@ impl UnifyReport {
     let mut md = String::new();
 
     md.push_str("# Cargo-Rail Unification Report\n\n");
-    md.push_str(&format!(
-      "Generated: {}\n\n",
-      chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
-    ));
-
     md.push_str("## Summary\n\n");
     md.push_str(&format!("- **Dependencies Unified:** {}\n", plan.workspace_deps.len()));
     md.push_str(&format!("- **Members Updated:** {}\n", plan.member_edits.len()));
+    md.push_str(&format!(
+      "- **Package Fields Inherited:** {}\n",
+      plan.package_inheritance_edit_count()
+    ));
     md.push_str(&format!("- **Transitive Pins:** {}\n", plan.transitive_pins.len()));
     md.push_str(&format!(
       "- **Duplicates Cleaned:** {}\n",
@@ -117,6 +116,37 @@ impl UnifyReport {
             local_features.join(", ")
           ));
         }
+      }
+      md.push('\n');
+    }
+
+    if !plan.package_inheritance.is_empty() {
+      md.push_str("## Package Inheritance\n\n");
+      md.push_str(
+        "Only explicit declarations equal to captured `[workspace.package]` policy are planned for inheritance.\n\n",
+      );
+      md.push_str("| Field | Inherited | Planned | Local Overrides | Missing | Retained |\n");
+      md.push_str("|-------|-----------|---------|-----------------|---------|----------|\n");
+
+      for field in &plan.package_inheritance {
+        let retained = if field.retained_equivalent.is_empty() {
+          "(none)".to_string()
+        } else {
+          format!(
+            "{} ({})",
+            field.retained_equivalent.join(", "),
+            field.retention_reason.unwrap_or("domain-owned")
+          )
+        };
+        md.push_str(&format!(
+          "| {} | {} | {} | {} | {} | {} |\n",
+          field.field,
+          report_member_list(&field.inherited),
+          report_member_list(&field.planned),
+          report_member_list(&field.local_overrides),
+          report_member_list(&field.missing),
+          retained
+        ));
       }
       md.push('\n');
     }
@@ -226,8 +256,15 @@ impl UnifyReport {
       std::fs::create_dir_all(parent)?;
     }
 
-    std::fs::write(path, content)?;
-    Ok(())
+    crate::utils::write_file_atomic(path, content.as_bytes())
+  }
+}
+
+fn report_member_list(members: &[std::sync::Arc<str>]) -> String {
+  if members.is_empty() {
+    "(none)".to_string()
+  } else {
+    members.join(", ")
   }
 }
 

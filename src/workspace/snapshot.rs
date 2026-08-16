@@ -235,6 +235,16 @@ impl DerivedViews {
     self.resolutions.view(request)
   }
 
+  pub(crate) fn post_mutation_resolution_view(
+    &self,
+    request: ResolutionRequest,
+    post_mutation_metadata: &Metadata,
+  ) -> RailResult<Arc<ResolutionView>> {
+    self
+      .resolutions
+      .load_post_mutation_view(request, post_mutation_metadata)
+  }
+
   pub(crate) fn cargo_current_dir(&self) -> &Path {
     self.resolutions.cargo_current_dir()
   }
@@ -531,6 +541,21 @@ impl WorkspaceSnapshot {
     &self.manifests
   }
 
+  /// Return the exact captured Cargo workspace root manifest.
+  pub(crate) fn workspace_manifest(&self) -> RailResult<&SnapshotFile> {
+    let path = relative_path(&self.source_root, &self.derived.workspace_root.join("Cargo.toml"))?;
+    self
+      .manifests
+      .iter()
+      .find(|manifest| manifest.path() == &path)
+      .ok_or_else(|| {
+        RailError::message(format!(
+          "workspace root manifest '{}' is absent from the authoritative snapshot",
+          path
+        ))
+      })
+  }
+
   /// Return the exact lockfile and parsed identities, when present.
   pub fn lockfile(&self) -> Option<&LockfileSnapshot> {
     self.lockfile.as_ref()
@@ -593,6 +618,16 @@ impl WorkspaceSnapshot {
     self.derived.resolution_view(request)
   }
 
+  pub(crate) fn post_mutation_resolution_view(
+    &self,
+    request: ResolutionRequest,
+    post_mutation_metadata: &Metadata,
+  ) -> RailResult<Arc<ResolutionView>> {
+    self
+      .derived
+      .post_mutation_resolution_view(request, post_mutation_metadata)
+  }
+
   pub(crate) fn cargo_current_dir(&self) -> &Path {
     self.derived.cargo_current_dir()
   }
@@ -615,6 +650,30 @@ impl WorkspaceSnapshot {
   pub(crate) fn validate_live_authoritative_inputs(&self) -> RailResult<()> {
     self.validate_resolution_environment_unchanged()?;
     self.validate_authoritative_files_unchanged()?;
+    self.validate_external_targets_unchanged()
+  }
+
+  /// Revalidate every captured resolution input that an authorized manifest
+  /// mutation does not own.
+  pub(crate) fn validate_post_mutation_resolution_inputs_unchanged(&self) -> RailResult<()> {
+    self.validate_post_mutation_environment_unchanged()?;
+    if let Some(lockfile) = &self.lockfile {
+      let path = self.source_root.join(lockfile.file().path().as_path());
+      validate_authoritative_file_unchanged(lockfile.file(), &path)?;
+    }
+    Ok(())
+  }
+
+  /// Revalidate captured resolution inputs other than the lockfile and the
+  /// manifests owned by the active mutation.
+  pub(crate) fn validate_post_mutation_environment_unchanged(&self) -> RailResult<()> {
+    self.validate_resolution_environment_unchanged()?;
+    if let (Some(file), Some(path)) = (&self.rail_config, &self.rail_config_path) {
+      validate_authoritative_file_unchanged(file, path)?;
+    }
+    if let Some(root) = &self.rail_config_discovery_root {
+      validate_discovered_rail_config_absence(root)?;
+    }
     self.validate_external_targets_unchanged()
   }
 

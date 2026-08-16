@@ -53,6 +53,7 @@ impl<'a> FeaturePruner<'a> {
     // Analyze workspace using resolved metadata
     let results = FeatureScanner::analyze_workspace(
       self.metadata,
+      self.manifests,
       |feature| self.config.should_preserve_feature(feature),
       self.config.consumer_scope == ConsumerScope::Workspace,
       self.target_cfg_sets,

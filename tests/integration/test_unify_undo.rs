@@ -12,8 +12,12 @@ fn test_unify_undo_restores_latest_backup() -> Result<()> {
   workspace.add_crate("crate-b", "0.1.0", &[("serde", r#""1.0""#)])?;
   workspace.commit("Add test crates")?;
 
+  let check = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+  assert_eq!(check.status.code(), Some(1));
+
   // Create initial state
   let original_workspace_toml = std::fs::read_to_string(workspace.path.join("Cargo.toml"))?;
+  let original_lockfile = std::fs::read(workspace.path.join("Cargo.lock"))?;
 
   // Run unify with --backup flag to create a backup
   let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "--backup"])?;
@@ -45,6 +49,11 @@ fn test_unify_undo_restores_latest_backup() -> Result<()> {
   assert_eq!(
     original_workspace_toml, restored_workspace_toml,
     "Workspace Cargo.toml should be restored to original"
+  );
+  assert_eq!(
+    original_lockfile,
+    std::fs::read(workspace.path.join("Cargo.lock"))?,
+    "Cargo.lock should be restored with the manifests"
   );
 
   Ok(())

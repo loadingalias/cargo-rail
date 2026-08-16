@@ -98,7 +98,7 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
   ),
   policy(
     "unify.transitive_pinning.host",
-    "Enables workspace-hack-style transitive pinning and selects its owning manifest.",
+    "Enables host-owned pins for fragmented transitive features and selects the owning manifest.",
   ),
   compatibility(
     "unify.pin_transitives",

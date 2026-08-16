@@ -58,6 +58,62 @@ fn test_unify_doctor_reports_exact_resolution_domains_in_text_and_json() -> Resu
 }
 
 #[test]
+fn test_unify_check_json_emits_versioned_feature_target_coverage_views() -> Result<()> {
+  let workspace = TestWorkspace::new_named("unify-coverage-views")?;
+  workspace.add_crate("app", "0.1.0", &[])?;
+  let manifest_path = workspace.path.join("crates/app/Cargo.toml");
+  let manifest = std::fs::read_to_string(&manifest_path)?;
+  std::fs::write(&manifest_path, format!("{manifest}\n[features]\nbackend = []\n"))?;
+  std::fs::write(
+    workspace.path.join("crates/app/src/lib.rs"),
+    "#[cfg(feature = \"backend\")]\npub fn backend() {}\n",
+  )?;
+  std::fs::write(
+    workspace.path.join(".config/rail.toml"),
+    "targets = [\"x86_64-unknown-linux-gnu\"]\n\n[unify]\nmsrv_policy = { mode = \"disabled\" }\n",
+  )?;
+  workspace.commit("Declare one target-aware feature coverage matrix")?;
+
+  let first = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--format", "json"])?;
+  assert!(
+    first.status.success(),
+    "coverage reporting must not create manifest changes: {}",
+    String::from_utf8_lossy(&first.stderr)
+  );
+  let first_value: serde_json::Value = serde_json::from_slice(&first.stdout)?;
+  assert_eq!(first_value["coverage"]["schema_version"], 1);
+  let views = first_value["coverage"]["views"].as_array().expect("coverage views");
+  assert_eq!(views.len(), 4, "default, no-default, all, and selected views");
+  assert!(views.iter().all(|view| {
+    view["id"]
+      .as_str()
+      .is_some_and(|identity| identity.starts_with("coverage:v1-sha256-"))
+      && view["target"] == "x86_64-unknown-linux-gnu"
+      && view["packages"] == serde_json::json!(["app"])
+      && view["cargo"]["program"] == "cargo"
+      && view["cargo"]["args"].is_array()
+      && view["nextest"]["program"] == "cargo"
+      && view["nextest"]["args"].is_array()
+  }));
+  let selected = views
+    .iter()
+    .find(|view| view["features"]["mode"] == "selected")
+    .expect("source-derived selected feature view");
+  assert_eq!(selected["features"]["selected"], serde_json::json!(["backend"]));
+  assert!(
+    selected["cargo"]["args"]
+      .as_array()
+      .is_some_and(|args| args.iter().any(|argument| argument == "app/backend"))
+  );
+
+  let second = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--format", "json"])?;
+  let second_value: serde_json::Value = serde_json::from_slice(&second.stdout)?;
+  assert_eq!(first_value["coverage"], second_value["coverage"]);
+
+  Ok(())
+}
+
+#[test]
 fn test_unify_apply_json_is_a_single_machine_envelope() -> Result<()> {
   let workspace = TestWorkspace::new_named("unify-json-apply")?;
   workspace.add_crate("crate-a", "0.1.0", &[("tempfile", r#""3.0""#)])?;
@@ -67,15 +123,56 @@ fn test_unify_apply_json_is_a_single_machine_envelope() -> Result<()> {
   let check = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--format", "json"])?;
   assert_eq!(check.status.code(), Some(1));
   let check_json: serde_json::Value = serde_json::from_slice(&check.stdout)?;
+  let check_actions = check_json["mutation_plan"]["actions"]
+    .as_array()
+    .expect("check mutation actions");
+  assert!(check_actions.iter().any(|action| action["code"] == "CREATE_BACKUP"));
+  assert!(check_actions.iter().any(|action| {
+    action["code"] == "REFRESH_CARGO_LOCK"
+      && action["expected_mutations"]
+        .as_array()
+        .is_some_and(|mutations| mutations.iter().any(|mutation| mutation["path"] == "Cargo.lock"))
+  }));
+  assert!(check_actions.iter().any(|action| {
+    action["code"] == "WRITE_REPORT"
+      && action["expected_mutations"].as_array().is_some_and(|mutations| {
+        mutations
+          .iter()
+          .any(|mutation| mutation["path"] == "target/cargo-rail/unify-report.md")
+      })
+  }));
+
+  let skip_report_check = run_cargo_rail(
+    &workspace.path,
+    &["rail", "unify", "--check", "--skip-report", "--format", "json"],
+  )?;
+  assert_eq!(skip_report_check.status.code(), Some(1));
+  let skip_report_json: serde_json::Value = serde_json::from_slice(&skip_report_check.stdout)?;
+  assert!(
+    skip_report_json["mutation_plan"]["actions"]
+      .as_array()
+      .is_some_and(|actions| actions.iter().all(|action| action["code"] != "WRITE_REPORT")),
+    "--skip-report check plans must not authorize report output"
+  );
   let check_proof = check_json["proof_fingerprint"]
     .as_str()
     .expect("check proof fingerprint")
     .to_string();
+  let mut check_coverage_identities = check_json["coverage"]["views"]
+    .as_array()
+    .expect("check coverage views")
+    .iter()
+    .map(|view| view["id"].as_str().expect("coverage identity").to_string())
+    .collect::<Vec<_>>();
+  check_coverage_identities.sort();
 
   let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--format", "json"])?;
   let stdout = String::from_utf8_lossy(&output.stdout);
   let stderr = String::from_utf8_lossy(&output.stderr);
-  assert!(output.status.success(), "JSON apply should succeed. stderr:\n{stderr}");
+  assert!(
+    output.status.success(),
+    "JSON apply should succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+  );
   assert!(
     stderr.is_empty(),
     "JSON success must not leak progress or warnings: {stderr}"
@@ -99,7 +196,208 @@ fn test_unify_apply_json_is_a_single_machine_envelope() -> Result<()> {
       .as_str()
       .is_some_and(|fingerprint| fingerprint.starts_with("sha256:"))
   );
+  assert!(
+    value["graph_delta"]["lockfile_fingerprint"]
+      .as_str()
+      .is_some_and(|fingerprint| fingerprint.starts_with("sha256:"))
+  );
+  assert_eq!(value["coverage_verification"]["schema_version"], 1);
+  assert_eq!(
+    value["coverage_verification"]["verified_views"],
+    check_coverage_identities.len()
+  );
+  assert_eq!(
+    value["coverage_verification"]["identities"],
+    serde_json::json!(check_coverage_identities)
+  );
+  assert!(
+    value["coverage_verification"]["fingerprint"]
+      .as_str()
+      .is_some_and(|fingerprint| fingerprint.starts_with("sha256:"))
+  );
   assert_eq!(value["proof_fingerprint"], check_proof);
+
+  Ok(())
+}
+
+#[test]
+fn test_unify_apply_verifies_the_captured_target_and_selected_feature_views() -> Result<()> {
+  let workspace = TestWorkspace::new_named("unify-apply-coverage")?;
+  workspace.add_crate("app", "0.1.0", &[("tempfile", r#""3.0""#)])?;
+  workspace.add_crate("worker", "0.1.0", &[("tempfile", r#""3.0""#)])?;
+
+  let app_manifest_path = workspace.path.join("crates/app/Cargo.toml");
+  let app_manifest = std::fs::read_to_string(&app_manifest_path)?;
+  std::fs::write(
+    &app_manifest_path,
+    format!("{app_manifest}\n[features]\nbackend = []\n"),
+  )?;
+  std::fs::write(
+    workspace.path.join("crates/app/src/lib.rs"),
+    "#[cfg(feature = \"backend\")]\npub fn backend() -> tempfile::TempDir { tempfile::tempdir().unwrap() }\n",
+  )?;
+  std::fs::write(
+    workspace.path.join(".config/rail.toml"),
+    "targets = [\"x86_64-unknown-linux-gnu\"]\n\n[unify]\nmsrv_policy = { mode = \"disabled\" }\n",
+  )?;
+  workspace.commit("Create target-specific coverage and a unification edit")?;
+
+  let check = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--format", "json"])?;
+  assert_eq!(check.status.code(), Some(1));
+  let check_json: serde_json::Value = serde_json::from_slice(&check.stdout)?;
+  let views = check_json["coverage"]["views"].as_array().expect("coverage views");
+  assert!(
+    views.iter().all(|view| view["target"] == "x86_64-unknown-linux-gnu"),
+    "every emitted view must retain the configured target"
+  );
+  assert!(
+    views.iter().any(|view| view["features"]["mode"] == "selected"),
+    "source feature conditions must produce a selected view"
+  );
+  let mut expected_identities = views
+    .iter()
+    .map(|view| view["id"].as_str().expect("coverage identity").to_string())
+    .collect::<Vec<_>>();
+  expected_identities.sort();
+
+  let apply = run_cargo_rail(&workspace.path, &["rail", "unify", "--format", "json"])?;
+  assert!(
+    apply.status.success(),
+    "target/feature coverage verification should succeed.\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&apply.stdout),
+    String::from_utf8_lossy(&apply.stderr)
+  );
+  let apply_json: serde_json::Value = serde_json::from_slice(&apply.stdout)?;
+  assert_eq!(
+    apply_json["coverage_verification"]["identities"],
+    serde_json::json!(expected_identities)
+  );
+  assert_eq!(apply_json["coverage_verification"]["verified_views"], views.len());
+
+  Ok(())
+}
+
+#[test]
+fn test_unify_apply_restores_manifests_and_lockfile_when_a_late_output_fails() -> Result<()> {
+  let workspace = TestWorkspace::new_named("unify-late-output-rollback")?;
+  workspace.add_crate("crate-a", "0.1.0", &[("tempfile", r#""3.0""#)])?;
+  workspace.add_crate("crate-b", "0.1.0", &[("tempfile", r#""3.0""#)])?;
+  workspace.commit("Add shared dependency for rollback")?;
+
+  let check = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--format", "json"])?;
+  assert_eq!(check.status.code(), Some(1));
+  let root_manifest = workspace.path.join("Cargo.toml");
+  let member_manifests = [
+    workspace.path.join("crates/crate-a/Cargo.toml"),
+    workspace.path.join("crates/crate-b/Cargo.toml"),
+  ];
+  let lockfile = workspace.path.join("Cargo.lock");
+  let original_root = std::fs::read(&root_manifest)?;
+  let original_members = member_manifests
+    .iter()
+    .map(std::fs::read)
+    .collect::<std::io::Result<Vec<_>>>()?;
+  let original_lockfile = std::fs::read(&lockfile)?;
+
+  let report_parent = workspace.path.join("late-report");
+  std::fs::create_dir(&report_parent)?;
+  let watched_manifest = root_manifest.clone();
+  let blocked_parent = report_parent.clone();
+  let sabotage = std::thread::spawn(move || -> std::io::Result<bool> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+      if std::fs::read_to_string(&watched_manifest).is_ok_and(|manifest| manifest.contains("tempfile =")) {
+        std::fs::remove_dir(&blocked_parent)?;
+        std::fs::write(&blocked_parent, "block report directory creation")?;
+        return Ok(true);
+      }
+      std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    Ok(false)
+  });
+
+  let apply = run_cargo_rail(
+    &workspace.path,
+    &[
+      "rail",
+      "unify",
+      "--format",
+      "json",
+      "--report-path",
+      "late-report/report.md",
+    ],
+  )?;
+  assert!(sabotage.join().expect("report sabotage thread")?);
+  assert!(!apply.status.success(), "late report failure must fail apply");
+  let error: serde_json::Value = serde_json::from_slice(&apply.stdout)?;
+  assert!(
+    error["help"]
+      .as_str()
+      .is_some_and(|help| help.contains("manifests, Cargo.lock, and report output were restored")),
+    "failure must state the completed recovery: {error:#?}"
+  );
+  assert_eq!(std::fs::read(&root_manifest)?, original_root);
+  for (path, original) in member_manifests.iter().zip(&original_members) {
+    assert_eq!(std::fs::read(path)?, *original, "{} was not restored", path.display());
+  }
+  assert_eq!(std::fs::read(&lockfile)?, original_lockfile);
+  assert!(!workspace.path.join("late-report/report.md").exists());
+
+  Ok(())
+}
+
+#[test]
+fn test_unify_rejects_a_report_path_that_aliases_graph_state() -> Result<()> {
+  let workspace = TestWorkspace::new_named("unify-report-alias")?;
+  workspace.add_crate("crate-a", "0.1.0", &[("tempfile", r#""3.0""#)])?;
+  workspace.add_crate("crate-b", "0.1.0", &[("tempfile", r#""3.0""#)])?;
+  workspace.commit("Add shared dependency for report alias rejection")?;
+
+  let check = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+  assert_eq!(check.status.code(), Some(1));
+  let root_manifest = workspace.path.join("Cargo.toml");
+  let original_root = std::fs::read(&root_manifest)?;
+  let original_lockfile = std::fs::read(workspace.path.join("Cargo.lock"))?;
+
+  let apply = run_cargo_rail(
+    &workspace.path,
+    &["rail", "unify", "--format", "json", "--report-path", "Cargo.toml"],
+  )?;
+  assert!(!apply.status.success());
+  let error: serde_json::Value = serde_json::from_slice(&apply.stdout)?;
+  assert!(
+    error["message"]
+      .as_str()
+      .is_some_and(|message| message.contains("aliases a graph mutation target")),
+    "alias rejection should name the violated boundary: {error:#?}"
+  );
+  assert_eq!(std::fs::read(&root_manifest)?, original_root);
+  assert_eq!(std::fs::read(workspace.path.join("Cargo.lock"))?, original_lockfile);
+
+  let outside = tempfile::tempdir()?;
+  let outside_report = outside.path().join("report.md");
+  let outside_apply = run_cargo_rail(
+    &workspace.path,
+    &[
+      "rail",
+      "unify",
+      "--format",
+      "json",
+      "--report-path",
+      outside_report.to_string_lossy().as_ref(),
+    ],
+  )?;
+  assert!(!outside_apply.status.success());
+  let outside_error: serde_json::Value = serde_json::from_slice(&outside_apply.stdout)?;
+  assert!(
+    outside_error["message"]
+      .as_str()
+      .is_some_and(|message| message.contains("outside authority root")),
+    "outside output rejection should name the containment boundary: {outside_error:#?}"
+  );
+  assert!(!outside_report.exists());
+  assert_eq!(std::fs::read(&root_manifest)?, original_root);
+  assert_eq!(std::fs::read(workspace.path.join("Cargo.lock"))?, original_lockfile);
 
   Ok(())
 }
@@ -826,6 +1124,236 @@ serde = { version = "1.0", features = ["derive"] }
     "Member should use workspace inheritance.\nContent:\n{}",
     crate_a_toml
   );
+
+  Ok(())
+}
+
+#[test]
+fn test_unify_existing_inherited_dependencies_are_not_noop_edits() -> Result<()> {
+  let workspace = TestWorkspace::new_named("unify-existing-inheritance")?;
+  workspace.add_crate("crate-a", "0.1.0", &[("serde", r#"{ workspace = true }"#)])?;
+  workspace.add_crate(
+    "crate-b",
+    "0.1.0",
+    &[("serde", r#"{ workspace = true, features = ["rc"] }"#)],
+  )?;
+  for member in ["crate-a", "crate-b"] {
+    std::fs::write(
+      workspace.path.join("crates").join(member).join("src/lib.rs"),
+      "pub fn requires_serde<T: serde::Serialize>(_value: &T) {}\n",
+    )?;
+  }
+  std::fs::write(
+    workspace.path.join(".config/rail.toml"),
+    "[unify]\nmsrv_policy = { mode = \"disabled\" }\n",
+  )?;
+  workspace.commit("Use inherited dependencies with one local feature overlay")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--format", "json"])?;
+  assert!(
+    output.status.success(),
+    "an already coherent inherited dependency must not produce a no-op edit: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+  assert_eq!(value["has_changes"], false);
+  assert_eq!(value["summary"]["workspace_deps_count"], 0);
+  assert_eq!(value["summary"]["member_edits_count"], 0);
+
+  Ok(())
+}
+
+#[test]
+fn test_unify_package_inheritance_only_rewrites_captured_equivalent_fields() -> Result<()> {
+  let workspace = TestWorkspace::new_named("unify-package-inheritance")?;
+  let crate_a = workspace.add_crate("crate-a", "0.1.0", &[])?;
+  let crate_b = workspace.add_crate("crate-b", "0.1.0", &[])?;
+
+  let root_path = workspace.path.join("Cargo.toml");
+  let root = std::fs::read_to_string(&root_path)?;
+  std::fs::write(
+    &root_path,
+    root.replace(
+      "authors = [\"Test Author\"]",
+      "authors = [\"Test Author\"]\nversion = \"0.1.0\"\ndescription = \"shared description\"\npublish = false\nrepository = \"https://example.invalid/repository\"\nreadme = \"README.md\"",
+    ),
+  )?;
+  std::fs::write(workspace.path.join("README.md"), "# Workspace\n")?;
+
+  std::fs::write(
+    crate_a.join("Cargo.toml"),
+    r#"[package]
+name = "crate-a"
+version = "0.1.0"
+edition = "2021" # preserve this comment
+license = "MIT"
+authors = [ "Test Author" ]
+description = "shared description"
+publish = false
+repository = "https://example.invalid/repository"
+readme = "README.md"
+
+[package.metadata.fixture]
+unknown = "preserve"
+
+[dependencies]
+"#,
+  )?;
+  std::fs::write(
+    crate_b.join("Cargo.toml"),
+    r#"[package]
+name = "crate-b"
+version = "0.1.0"
+edition.workspace = true
+license = "Apache-2.0"
+description = "crate-specific description"
+publish = true
+repository = "https://example.invalid/repository"
+
+[dependencies]
+"#,
+  )?;
+  std::fs::write(
+    workspace.path.join(".config/rail.toml"),
+    "[unify]\nmsrv_policy = { mode = \"disabled\" }\n",
+  )?;
+  workspace.commit("Declare shared and package-local metadata")?;
+
+  let check = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--format", "json"])?;
+  assert_eq!(
+    check.status.code(),
+    Some(1),
+    "equivalent package fields should produce inheritance edits: {}",
+    String::from_utf8_lossy(&check.stderr)
+  );
+  let report: serde_json::Value = serde_json::from_slice(&check.stdout)?;
+  assert_eq!(report["package_inheritance"]["schema_version"], 1);
+  assert_eq!(report["summary"]["package_fields_inherited"], 7);
+  assert!(
+    report["reason_codes"]
+      .as_array()
+      .is_some_and(|codes| codes.iter().any(|code| code == "UNIFY_PACKAGE_INHERITANCE_DECISIONS"))
+  );
+  let fields = report["package_inheritance"]["fields"]
+    .as_array()
+    .expect("package inheritance fields");
+  let field = |name: &str| {
+    fields
+      .iter()
+      .find(|field| field["field"] == name)
+      .unwrap_or_else(|| panic!("missing package inheritance field {name}: {fields:#?}"))
+  };
+  assert_eq!(field("authors")["planned"], serde_json::json!(["crate-a"]));
+  assert_eq!(field("authors")["missing"], serde_json::json!(["crate-b"]));
+  assert_eq!(field("edition")["planned"], serde_json::json!(["crate-a"]));
+  assert_eq!(field("edition")["inherited"], serde_json::json!(["crate-b"]));
+  assert_eq!(field("license")["planned"], serde_json::json!(["crate-a"]));
+  assert_eq!(field("license")["local_overrides"], serde_json::json!(["crate-b"]));
+  assert_eq!(field("publish")["planned"], serde_json::json!(["crate-a"]));
+  assert_eq!(field("publish")["local_overrides"], serde_json::json!(["crate-b"]));
+  assert_eq!(
+    field("repository")["planned"],
+    serde_json::json!(["crate-a", "crate-b"])
+  );
+  assert_eq!(
+    field("version")["retained_equivalent"],
+    serde_json::json!(["crate-a", "crate-b"])
+  );
+  assert_eq!(field("version")["retention_reason"], "release-policy-owned");
+  assert_eq!(field("readme")["retained_equivalent"], serde_json::json!(["crate-a"]));
+  assert_eq!(field("readme")["retention_reason"], "workspace-relative-path");
+  assert!(report["proof_certificates"].as_array().is_some_and(|certificates| {
+    certificates.iter().any(|certificate| {
+      certificate["subject"]["kind"] == "package_field"
+        && certificate["subject"]["declaration"] == "package.repository"
+        && certificate["member"] == "crate-b"
+    })
+  }));
+
+  let apply = run_cargo_rail(&workspace.path, &["rail", "unify", "--format", "json"])?;
+  assert!(
+    apply.status.success(),
+    "package inheritance apply failed:\nstdout: {}\nstderr: {}",
+    String::from_utf8_lossy(&apply.stdout),
+    String::from_utf8_lossy(&apply.stderr)
+  );
+  let apply_report: serde_json::Value = serde_json::from_slice(&apply.stdout)?;
+  assert_eq!(apply_report["package_fields_inherited"], 7);
+  let markdown_report = std::fs::read_to_string(workspace.path.join("target/cargo-rail/unify-report.md"))?;
+  assert!(markdown_report.contains("- **Package Fields Inherited:** 7"));
+  assert!(markdown_report.contains("## Package Inheritance"));
+  let crate_a_manifest = std::fs::read_to_string(crate_a.join("Cargo.toml"))?;
+  for field in ["authors", "description", "edition", "license", "publish", "repository"] {
+    assert!(
+      crate_a_manifest.contains(&format!("{field} = {{ workspace = true }}")),
+      "{field} should inherit without disturbing unrelated TOML: {crate_a_manifest}"
+    );
+  }
+  assert!(crate_a_manifest.contains("version = \"0.1.0\""));
+  assert!(crate_a_manifest.contains("readme = \"README.md\""));
+  assert!(crate_a_manifest.contains("preserve this comment"));
+  assert!(crate_a_manifest.contains("unknown = \"preserve\""));
+
+  let crate_b_manifest = std::fs::read_to_string(crate_b.join("Cargo.toml"))?;
+  assert!(crate_b_manifest.contains("repository = { workspace = true }"));
+  assert!(crate_b_manifest.contains("edition.workspace = true"));
+  assert!(crate_b_manifest.contains("license = \"Apache-2.0\""));
+  assert!(crate_b_manifest.contains("description = \"crate-specific description\""));
+  assert!(crate_b_manifest.contains("publish = true"));
+  assert!(!crate_b_manifest.contains("authors"));
+
+  let repeated = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--format", "json"])?;
+  assert!(
+    repeated.status.success(),
+    "one apply must leave package inheritance idempotent: {}",
+    String::from_utf8_lossy(&repeated.stderr)
+  );
+  let repeated: serde_json::Value = serde_json::from_slice(&repeated.stdout)?;
+  assert_eq!(repeated["has_changes"], false);
+  assert!(
+    repeated["package_inheritance"]["fields"]
+      .as_array()
+      .is_some_and(|fields| fields.iter().all(|field| field["planned"] == serde_json::json!([])))
+  );
+
+  Ok(())
+}
+
+#[test]
+fn test_unify_renamed_workspace_inheritance_keeps_exact_alias_authority() -> Result<()> {
+  let workspace = TestWorkspace::new_named("unify-renamed-inheritance")?;
+  let root_manifest = workspace.path.join("Cargo.toml");
+  let root = std::fs::read_to_string(&root_manifest)?;
+  std::fs::write(
+    &root_manifest,
+    root.replace(
+      "serde = { version = \"1.0\", features = [\"derive\"] }",
+      "serde = { version = \"1.0\", features = [\"derive\"] }\nrenamed_serde = { package = \"serde\", version = \"1.0\", features = [\"derive\"] }",
+    ),
+  )?;
+  for member in ["crate-a", "crate-b"] {
+    workspace.add_crate(member, "0.1.0", &[("renamed_serde", r#"{ workspace = true }"#)])?;
+    std::fs::write(
+      workspace.path.join("crates").join(member).join("src/lib.rs"),
+      "pub fn requires_serde<T: renamed_serde::Serialize>(_value: &T) {}\n",
+    )?;
+  }
+  std::fs::write(
+    workspace.path.join(".config/rail.toml"),
+    "[unify]\ninclude_renamed = true\nmsrv_policy = { mode = \"disabled\" }\n",
+  )?;
+  workspace.commit("Use a renamed inherited workspace dependency")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--format", "json"])?;
+  assert!(
+    output.status.success(),
+    "the existing renamed workspace alias must remain authoritative: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+  assert_eq!(value["has_changes"], false);
+  assert_eq!(value["summary"]["workspace_deps_count"], 0);
+  assert_eq!(value["summary"]["member_edits_count"], 0);
 
   Ok(())
 }
@@ -1587,7 +2115,7 @@ my_serde = { package = "serde", version = "1.0", features = ["rc"] }
   )?;
   std::fs::write(
     crate_b_path.join("src/lib.rs"),
-    "use serde as _;\nuse anyhow as _;\npub fn b() {}",
+    "use my_serde as _;\nuse anyhow as _;\npub fn b() {}",
   )?;
 
   workspace.commit("Add crates with renamed dep")?;
@@ -1606,6 +2134,7 @@ my_serde = { package = "serde", version = "1.0", features = ["rc"] }
     workspace.path.join("rail.toml"),
     r#"[unify]
 include_renamed = true
+msrv_policy = { mode = "disabled" }
 "#,
   )?;
 
@@ -1629,6 +2158,50 @@ include_renamed = true
   assert!(
     aliases.contains("serde") && aliases.contains("my_serde"),
     "feature explanations must preserve both exact Cargo.toml aliases: {feature_paths:#?}"
+  );
+  let workspace_dependencies = value["workspace_deps"].as_array().expect("workspace dependency plan");
+  assert!(
+    workspace_dependencies
+      .iter()
+      .any(|dependency| dependency["name"] == "my_serde" && dependency["package"] == "serde"),
+    "renamed inheritance requires an exact alias entry with package identity: {workspace_dependencies:#?}"
+  );
+  let renamed = workspace_dependencies
+    .iter()
+    .find(|dependency| dependency["name"] == "my_serde")
+    .expect("renamed workspace dependency plan");
+  assert_eq!(
+    renamed["features"],
+    serde_json::json!([]),
+    "a feature used by one exact alias must remain on that declaration"
+  );
+
+  let apply = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+  assert!(
+    apply.status.success(),
+    "renamed dependency unification should apply: {}",
+    String::from_utf8_lossy(&apply.stderr)
+  );
+  let root_manifest = std::fs::read_to_string(workspace.path.join("Cargo.toml"))?;
+  assert!(
+    root_manifest.contains("my_serde = { package = \"serde\""),
+    "workspace root must retain the renamed package identity:\n{root_manifest}"
+  );
+  assert!(
+    !root_manifest
+      .lines()
+      .find(|line| line.starts_with("my_serde ="))
+      .is_some_and(|line| line.contains("derive") || line.contains("rc")),
+    "renamed aliases must not receive a package-wide feature union:\n{root_manifest}"
+  );
+  let member_manifest = std::fs::read_to_string(crate_b_path.join("Cargo.toml"))?;
+  assert!(
+    member_manifest.contains("my_serde = { workspace = true"),
+    "member must inherit through its exact alias:\n{member_manifest}"
+  );
+  assert!(
+    member_manifest.contains("features = [\"rc\"]"),
+    "the renamed alias feature must remain local:\n{member_manifest}"
   );
 
   Ok(())
@@ -2079,6 +2652,10 @@ generate_report = true
   );
   assert!(report_content.contains("Summary"), "Report should have summary section");
   assert!(
+    !report_content.contains("Generated:"),
+    "Equivalent plans must not embed wall-clock state in the report"
+  );
+  assert!(
     report_content.contains("serde"),
     "Report should mention unified dependency"
   );
@@ -2207,6 +2784,10 @@ root = "."
     "Backup should contain workspace Cargo.toml"
   );
   assert!(
+    backup_dir.join("Cargo.lock").exists(),
+    "Backup should contain Cargo.lock"
+  );
+  assert!(
     backup_dir.join("crates/crate-a/Cargo.toml").exists() || backup_dir.join("crate-a/Cargo.toml").exists(),
     "Backup should contain crate-a Cargo.toml"
   );
@@ -2284,6 +2865,18 @@ fn test_unify_apply_writes_mutation_receipts() -> Result<()> {
             .is_some_and(|fingerprint| fingerprint.starts_with("sha256:"))
       })
     }));
+    assert!(json["plan"]["actions"].as_array().is_some_and(|actions| {
+      actions.iter().any(|action| {
+        action["code"] == "REFRESH_CARGO_LOCK"
+          && action["expected_mutations"].as_array().is_some_and(|mutations| {
+            mutations.iter().any(|mutation| {
+              mutation["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("Cargo.lock"))
+            })
+          })
+      })
+    }));
     assert!(json["plan"]["risks"].is_array());
     assert!(json["plan"]["trace"].is_array());
     if json["phase"] == "apply" {
@@ -2294,6 +2887,11 @@ fn test_unify_apply_writes_mutation_receipts() -> Result<()> {
               .as_str()
               .is_some_and(|message| message.contains("sha256:"))
         })
+      }));
+      assert!(json["trace"].as_array().is_some_and(|trace| {
+        trace
+          .iter()
+          .any(|entry| entry["code"] == "UNIFY_COVERAGE_VIEWS_VERIFIED")
       }));
       assert!(json["trace"].as_array().is_some_and(|trace| {
         trace.iter().any(|entry| {
@@ -2338,13 +2936,7 @@ fn test_unify_apply_from_plan_file() -> Result<()> {
 
   let apply_output = run_cargo_rail(
     &workspace.path,
-    &[
-      "rail",
-      "unify",
-      "--plan",
-      plan_path.to_string_lossy().as_ref(),
-      "--skip-report",
-    ],
+    &["rail", "unify", "--plan", plan_path.to_string_lossy().as_ref()],
   )?;
   assert!(
     apply_output.status.success(),
@@ -2629,7 +3221,7 @@ fn test_unify_does_not_prune_cargo_synthetic_optional_features() -> Result<()> {
     r#"[package]
 name = "private-crate"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
 publish = false
 
 [dependencies]
@@ -2730,6 +3322,16 @@ pub fn impossible_platform_root() {}
     "cyclic feature reachability and certificates must be deterministic"
   );
   let json: serde_json::Value = serde_json::from_slice(&check.stdout)?;
+  assert!(
+    json["coverage"]["views"].as_array().is_some_and(|views| {
+      views.iter().all(|view| {
+        view["features"]["selected"]
+          .as_array()
+          .is_none_or(|features| features.iter().all(|feature| feature != "impossible-platform-root"))
+      })
+    }),
+    "coverage must not schedule a source feature whose platform predicate cannot match"
+  );
   let certificates = json["proof_certificates"]
     .as_array()
     .expect("proof_certificates should be an array");
@@ -2832,7 +3434,7 @@ fn test_unify_feature_pruning_preserves_compiler_observed_optional_activation() 
     r#"[package]
 name = "private-crate"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
 publish = false
 build = "build.rs"
 

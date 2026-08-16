@@ -98,26 +98,71 @@ fn test_msrv_source_workspace_preserves_existing() -> Result<()> {
 }
 
 #[test]
-fn test_msrv_source_deps_uses_dependency_version() -> Result<()> {
-  // Test that msrv_source = "deps" uses deps version (ignoring workspace)
+fn test_msrv_source_deps_reports_dependency_floor_without_lowering() -> Result<()> {
   let workspace = create_workspace_with_rust_version("1.80.0")?;
   write_rail_config(&workspace, "deps")?;
 
-  // Add a crate
   workspace.add_crate("my-crate", "0.1.0", &[("anyhow", r#""1.0""#)])?;
+  std::fs::write(
+    workspace.path.join("crates/my-crate/src/lib.rs"),
+    "pub fn result() -> anyhow::Result<()> { Ok(()) }\n",
+  )?;
   workspace.commit("Add crate with dep")?;
 
-  // Run unify --check
-  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
-  let stdout = String::from_utf8_lossy(&output.stdout);
-
-  // Should complete successfully with deps mode
-  // (exact version depends on what deps require)
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--format", "json"])?;
   assert!(
-    output.status.success() || stdout.contains("ready:") || stdout.contains("rust-version"),
-    "Should complete analysis with deps mode.\nOutput:\n{}",
-    stdout
+    output.status.success(),
+    "dependency metadata should report a floor without lowering the declaration: {}",
+    String::from_utf8_lossy(&output.stderr)
   );
+  let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+  assert!(value["msrv"]["candidate"]["dependency_floor"].is_string());
+  assert_eq!(value["msrv"]["candidate"]["declared_workspace"], "1.80.0");
+  assert_eq!(value["msrv"]["candidate"]["version"], "1.80.0");
+  assert_eq!(value["msrv"]["write_needed"], false);
+
+  Ok(())
+}
+
+#[test]
+fn test_msrv_deps_policy_never_silently_lowers_declared_workspace_version() -> Result<()> {
+  let workspace = create_workspace_with_rust_version("1.90.0")?;
+  write_rail_config(&workspace, "deps")?;
+  workspace.add_crate("my-crate", "0.1.0", &[("anyhow", r#""1.0""#)])?;
+  std::fs::write(
+    workspace.path.join("crates/my-crate/src/lib.rs"),
+    "pub fn result() -> anyhow::Result<()> { Ok(()) }\n",
+  )?;
+  workspace.commit("Keep a declared MSRV above dependency metadata")?;
+
+  let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--format", "json"])?;
+  assert!(
+    output.status.success(),
+    "dependency metadata must not plan an unproven MSRV lowering: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+  assert_eq!(value["has_changes"], false);
+  assert_eq!(value["msrv"]["schema_version"], 1);
+  assert_eq!(value["msrv"]["candidate"]["version"], "1.90.0");
+  assert_eq!(value["msrv"]["candidate"]["declared_workspace"], "1.90.0");
+  assert_eq!(value["msrv"]["candidate"]["source"], "workspace");
+  assert_eq!(value["msrv"]["write_needed"], false);
+  assert_eq!(value["msrv"]["compiler_probe"]["status"], "not_run");
+  assert_eq!(value["msrv"]["compiler_probe"]["lowering_authorized"], false);
+  assert_eq!(
+    value["msrv"]["compiler_probe"]["required_scope"],
+    "all configured coverage views"
+  );
+  assert_eq!(value["msrv"]["toolchain_constraint"]["status"], "satisfied");
+  assert_eq!(value["msrv"]["toolchain_constraint"]["required"], "1.90.0");
+  assert!(value["msrv"]["toolchain_constraint"]["selected"].is_string());
+  assert_eq!(
+    value["msrv"]["toolchain_constraint"]["evidence_source"],
+    "captured_rustc_identity"
+  );
+  assert!(value["msrv"]["selected_toolchain"]["rustc_release"].is_string());
+  assert!(value["msrv"]["selected_toolchain"]["fingerprint"].is_string());
 
   Ok(())
 }

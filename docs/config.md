@@ -102,7 +102,7 @@ Unused dependencies are removed only with complete declaration-kind, target, fea
 | `strict_version_compat` | `true` | Treat incompatible existing workspace requirements as blocking. |
 | `exact_pin_handling` | `"warn"` | Handle exact pins with `"skip"`, `"preserve"`, or `"warn"`. |
 | `major_version_conflict` | `"warn"` | `"warn"` keeps incompatible majors split; `"bump"` explicitly accepts unification to the highest resolved major. |
-| `transitive_pinning` | unset | Enable workspace-hack-style pinning and select `host = "root"` or a member path. Virtual workspaces require a member path. |
+| `transitive_pinning` | unset | Enable host-owned pins for fragmented transitive features and select `host = "root"` or a member path. Virtual workspaces require a member path. |
 | `msrv_policy` | compute/max/no inheritance | `{ mode = "disabled" }` or `{ mode = "compute", source = "deps|workspace|max", inherit = true|false }`. |
 | `consumer_scope` | `"open"` | Use `"workspace"` only for a closed private consumer graph. |
 | `preserve_features` | `[]` | Glob patterns for dormant features that must survive closed-world pruning. |

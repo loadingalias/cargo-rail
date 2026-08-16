@@ -14,7 +14,6 @@
 
 use cargo_metadata::Package;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::fs;
 use std::path::Path;
 
 use super::multi_target_metadata::MultiTargetMetadata;
@@ -22,19 +21,38 @@ use crate::compiler::cfg_eval::{TargetCfgSet, cfg_expression_may_apply};
 use crate::error::{RailError, RailResult};
 use crate::workspace::WorkspaceSnapshot;
 
-/// Derive condition feature selections from source bytes bound to one workspace capture.
-pub(crate) fn scan_snapshot_source_for_feature_selections(
+/// Feature conditions derived from source bytes bound to one workspace capture.
+pub(crate) struct CapturedSourceFeatures {
+  /// Minimal feature selections that can make a parsed cfg expression true.
+  pub(crate) selections: Vec<Vec<String>>,
+  /// Every feature name referenced by captured source.
+  pub(crate) referenced: BTreeSet<String>,
+  /// Parsed cfg expressions retained for target applicability decisions.
+  pub(crate) expressions: BTreeSet<String>,
+  /// Identifiers mentioned by captured Rust source or the package README.
+  ///
+  /// These conservatively retain declarations when compiler evidence cannot
+  /// distinguish a documented integration from an accidental unused entry.
+  pub(crate) retention_identifiers: BTreeSet<String>,
+}
+
+/// Derive source feature evidence from one authoritative workspace capture.
+pub(crate) fn scan_snapshot_source_features(
   snapshot: &WorkspaceSnapshot,
   package_root: &Path,
-) -> RailResult<Vec<Vec<String>>> {
+) -> RailResult<CapturedSourceFeatures> {
   let mut selections = BTreeSet::new();
+  let mut referenced = BTreeSet::new();
+  let mut expressions = BTreeSet::new();
+  let mut retention_identifiers = BTreeSet::new();
   let entries = snapshot.source().tree().entries();
   let package_start = entries.partition_point(|entry| entry.path.as_path() < package_root);
   for entry in &entries[package_start..] {
     let Ok(package_path) = entry.path.as_path().strip_prefix(package_root) else {
       break;
     };
-    if !analysis_rust_source(package_path) {
+    let rust_source = analysis_rust_source(package_path);
+    if !rust_source && package_path != Path::new("README.md") {
       continue;
     }
     let bytes = snapshot.read_source_file(&entry.path)?.ok_or_else(|| {
@@ -45,16 +63,36 @@ pub(crate) fn scan_snapshot_source_for_feature_selections(
     })?;
     let content = std::str::from_utf8(&bytes)
       .map_err(|_| RailError::message(format!("captured analysis source '{}' is not valid UTF-8", entry.path)))?;
+    extract_identifiers(content, &mut retention_identifiers);
+    if !rust_source {
+      continue;
+    }
+    let mut file_features = HashSet::new();
+    extract_cfg_features(content, &mut file_features);
+    referenced.extend(file_features);
     for expression in extract_cfg_expressions(content) {
       selections.extend(crate::compiler::cfg_eval::feature_selections_for_cfg(expression));
+      expressions.insert(expression.to_string());
     }
   }
-  Ok(
-    selections
+  Ok(CapturedSourceFeatures {
+    selections: selections
       .into_iter()
       .filter(|selection| !selection.is_empty())
       .collect(),
-  )
+    referenced,
+    expressions,
+    retention_identifiers,
+  })
+}
+
+fn extract_identifiers(content: &str, identifiers: &mut BTreeSet<String>) {
+  identifiers.extend(
+    content
+      .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+      .filter(|identifier| !identifier.is_empty())
+      .map(str::to_string),
+  );
 }
 
 fn analysis_rust_source(package_path: &Path) -> bool {
@@ -65,41 +103,6 @@ fn analysis_rust_source(package_path: &Path) -> bool {
     && ["src", "tests", "benches", "examples"]
       .iter()
       .any(|root| package_path.starts_with(root))
-}
-
-/// Scan source files for `cfg(feature = "...")` patterns
-///
-/// Produces the set of feature names referenced in source.
-/// This prevents pruning features that are used for conditional compilation.
-pub(crate) fn scan_source_for_cfg_features(crate_dir: &Path) -> HashSet<String> {
-  let mut features = HashSet::new();
-  for_each_rust_source(crate_dir, |content| extract_cfg_features(content, &mut features));
-  features
-}
-
-fn scan_applicable_source_features(
-  crate_dir: &Path,
-  targets: &[&str],
-  cfg_sets: &HashMap<String, TargetCfgSet>,
-) -> HashSet<String> {
-  let mut applicable = HashSet::new();
-  for_each_rust_source(crate_dir, |content| {
-    let mut all = HashSet::new();
-    extract_cfg_features(content, &mut all);
-    let mut expression_features = HashSet::new();
-    for expression in extract_cfg_expressions(content) {
-      let mut features = HashSet::new();
-      extract_cfg_features(expression, &mut features);
-      expression_features.extend(features.iter().cloned());
-      if cfg_expression_may_apply(expression, targets.iter().map(|target| cfg_sets.get(*target))) {
-        applicable.extend(features);
-      }
-    }
-    // Preserve references not attributable to a parsed cfg expression. This
-    // includes cfg_attr and malformed syntax, where absence is not proven.
-    applicable.extend(all.difference(&expression_features).cloned());
-  });
-  applicable
 }
 
 /// Whether a Cargo feature edge activates or configures a dependency alias.
@@ -121,31 +124,31 @@ where
   }
 }
 
-fn for_each_rust_source(crate_dir: &Path, mut inspect: impl FnMut(&str)) {
-  // Feature gates can be used in multiple crate targets, not only src/.
-  // Scan the common Rust target roots to avoid pruning test-only features.
-  for dir_name in ["src", "tests", "benches", "examples"] {
-    let dir = crate_dir.join(dir_name);
-    if !dir.exists() {
-      continue;
-    }
-
-    if let Ok(entries) = glob::glob(&format!("{}/**/*.rs", dir.display())) {
-      for entry in entries.flatten() {
-        if let Ok(content) = fs::read_to_string(&entry) {
-          inspect(&content);
-        }
-      }
+fn applicable_source_features(
+  manifest: &crate::cargo::manifest_analyzer::ParsedManifest,
+  targets: &[&str],
+  cfg_sets: &HashMap<String, TargetCfgSet>,
+) -> HashSet<String> {
+  let mut applicable = HashSet::new();
+  let mut expression_features = HashSet::new();
+  for expression in &manifest.source_cfg_expressions {
+    let mut features = HashSet::new();
+    extract_cfg_features(expression, &mut features);
+    expression_features.extend(features.iter().cloned());
+    if cfg_expression_may_apply(expression, targets.iter().map(|target| cfg_sets.get(*target))) {
+      applicable.extend(features);
     }
   }
-
-  // build.rs may also use feature cfgs.
-  let build_script = crate_dir.join("build.rs");
-  if build_script.exists()
-    && let Ok(content) = fs::read_to_string(build_script)
-  {
-    inspect(&content);
-  }
+  // Preserve references not attributable to a parsed cfg expression. This
+  // includes malformed syntax, where absence is not proven.
+  applicable.extend(
+    manifest
+      .source_cfg_features
+      .iter()
+      .filter(|feature| !expression_features.contains(*feature))
+      .cloned(),
+  );
+  applicable
 }
 
 fn extract_cfg_expressions(content: &str) -> Vec<&str> {
@@ -272,9 +275,9 @@ impl FeatureScanner {
     pkg: &Package,
     metadata: &MultiTargetMetadata,
     referenced_features: &HashMap<String, HashSet<String>>,
+    source_referenced: &HashSet<String>,
     preserved_features: &HashSet<String>,
     workspace_is_consumer_scope: bool,
-    target_cfg_sets: &HashMap<String, TargetCfgSet>,
   ) -> FeatureScanResult {
     let crate_name = pkg.name.to_string();
 
@@ -288,11 +291,6 @@ impl FeatureScanner {
     // Get features referenced by other workspace crates (even if not currently enabled)
     let externally_referenced = referenced_features.get(&crate_name).cloned().unwrap_or_default();
 
-    // Scan source code for cfg(feature = "...") patterns
-    // This prevents pruning features used for conditional compilation
-    let crate_dir = pkg.manifest_path.parent().map(Path::new).unwrap_or(Path::new("."));
-    let targets: Vec<_> = metadata.targets();
-    let source_referenced = scan_applicable_source_features(crate_dir, &targets, target_cfg_sets);
     let cargo_target_required: HashSet<&str> = pkg
       .targets
       .iter()
@@ -305,7 +303,7 @@ impl FeatureScanner {
     if removable_package {
       insert_feature_roots(&mut roots, enabled_features.iter(), "resolved");
       insert_feature_roots(&mut roots, externally_referenced.iter(), "workspace_consumer");
-      insert_feature_roots(&mut roots, source_referenced.iter(), "source_cfg");
+      insert_feature_roots(&mut roots, source_referenced, "source_cfg");
       insert_feature_roots(&mut roots, cargo_target_required, "cargo_target_required");
       insert_feature_roots(&mut roots, preserved_features.iter(), "preservation_policy");
       if declared_features.contains("default") {
@@ -411,6 +409,7 @@ impl FeatureScanner {
   /// Returns results for crates that have dead or optional features.
   pub fn analyze_workspace(
     metadata: &MultiTargetMetadata,
+    manifests: &crate::cargo::manifest_analyzer::ManifestAnalyzer,
     preserve: impl Fn(&str) -> bool,
     workspace_is_consumer_scope: bool,
     target_cfg_sets: &HashMap<String, TargetCfgSet>,
@@ -418,6 +417,11 @@ impl FeatureScanner {
     // First, build a map of all features referenced by workspace crates
     // This catches conditional features like `dep/feature` in [features] tables
     let referenced_features = Self::build_referenced_features_map(metadata);
+    let manifests_by_package = manifests
+      .members
+      .iter()
+      .map(|manifest| (&manifest.package_id, manifest))
+      .collect::<HashMap<_, _>>();
 
     let workspace_pkg_count = metadata.workspace_packages().len();
     let mut results = Vec::with_capacity(workspace_pkg_count);
@@ -434,13 +438,17 @@ impl FeatureScanner {
         .filter(|feature| preserve(feature))
         .cloned()
         .collect();
+      let source_referenced = manifests_by_package
+        .get(&pkg.id)
+        .map(|manifest| applicable_source_features(manifest, &metadata.targets(), target_cfg_sets))
+        .unwrap_or_default();
       let result = Self::analyze_crate(
         pkg,
         metadata,
         &referenced_features,
+        &source_referenced,
         &preserved_features,
         workspace_is_consumer_scope,
-        target_cfg_sets,
       );
 
       results.push(result);
@@ -750,26 +758,5 @@ mod tests {
     assert!(!is_valid_feature_name("foo bar"));
     assert!(!is_valid_feature_name("foo/bar"));
     assert!(!is_valid_feature_name("foo:bar"));
-  }
-
-  #[test]
-  fn test_scan_source_for_cfg_features_includes_tests_dir() {
-    let temp = tempfile::TempDir::new().expect("tempdir");
-    let crate_dir = temp.path();
-
-    fs::create_dir_all(crate_dir.join("src")).expect("mkdir src");
-    fs::create_dir_all(crate_dir.join("tests")).expect("mkdir tests");
-    fs::write(crate_dir.join("src/lib.rs"), "pub fn ping() {}").expect("write lib.rs");
-    fs::write(
-      crate_dir.join("tests/integration.rs"),
-      r#"#[cfg(feature = "test-ollama")] fn run() {}"#,
-    )
-    .expect("write integration test");
-
-    let features = scan_source_for_cfg_features(crate_dir);
-    assert!(
-      features.contains("test-ollama"),
-      "should detect feature cfg used from tests/"
-    );
   }
 }

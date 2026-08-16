@@ -18,6 +18,7 @@ use rustc_hash::FxHashMap;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use crate::compiler::cfg_eval::{TargetCfgSet, cargo_target_constraint_matches};
+use crate::compiler::{CoverageView, FeatureSelection};
 use crate::error::{RailError, RailResult};
 use crate::executable::resolve_program as resolve_executable_program;
 use crate::graph::WorkspaceGraph;
@@ -1020,6 +1021,28 @@ impl ResolutionViews {
     cached_value(result)
   }
 
+  /// Reload one exact view after an authorized manifest mutation.
+  ///
+  /// This deliberately bypasses the captured pre-mutation cache. The supplied
+  /// metadata is the freshly accepted post-mutation workspace and is used to
+  /// validate package and feature roots before Cargo runs. Toolchain and Cargo
+  /// configuration identities remain bound to the original capture.
+  pub(crate) fn load_post_mutation_view(
+    &self,
+    request: ResolutionRequest,
+    post_mutation_metadata: &Metadata,
+  ) -> RailResult<Arc<ResolutionView>> {
+    let options = command_options(&request, post_mutation_metadata)?;
+    let inputs = self.inputs()?;
+    let key = ResolutionViewKey {
+      request,
+      toolchain: inputs.toolchain,
+      cargo_config: inputs.cargo_config.digest,
+      credential_sensitive: inputs.cargo_config.has_credential_capability(),
+    };
+    self.load(&key, options)
+  }
+
   fn load(&self, key: &ResolutionViewKey, options: ResolutionCommandOptions) -> RailResult<Arc<ResolutionView>> {
     self.validate_cargo_config_unchanged(key.cargo_config)?;
     let mut command = MetadataCommand::new();
@@ -1167,6 +1190,52 @@ fn command_options(request: &ResolutionRequest, metadata: &Metadata) -> RailResu
   Ok(options)
 }
 
+/// Convert a reported coverage view back into Cargo's exact semantic request.
+pub(crate) fn coverage_resolution_request(view: &CoverageView, metadata: &Metadata) -> RailResult<ResolutionRequest> {
+  let workspace_ids: HashSet<_> = metadata.workspace_members.iter().collect();
+  let mut packages_by_name = BTreeMap::<&str, Vec<&Package>>::new();
+  for package in metadata
+    .packages
+    .iter()
+    .filter(|package| workspace_ids.contains(&package.id))
+  {
+    packages_by_name.entry(package.name.as_ref()).or_default().push(package);
+  }
+
+  let mut packages = BTreeSet::new();
+  for name in &view.packages {
+    let matches = packages_by_name
+      .get(name.as_str())
+      .map(Vec::as_slice)
+      .unwrap_or_default();
+    let [package] = matches else {
+      return Err(RailError::message(format!(
+        "coverage view package `{name}` resolved to {} post-mutation workspace packages",
+        matches.len()
+      )));
+    };
+    packages.insert(package.id.clone());
+  }
+
+  let features = match &view.features {
+    FeatureSelection::Default => ResolutionFeatures::Default,
+    FeatureSelection::NoDefaultFeatures => ResolutionFeatures::NoDefaultFeatures,
+    FeatureSelection::AllFeatures => ResolutionFeatures::AllFeatures,
+    FeatureSelection::Selected(selected) => ResolutionFeatures::Selected(
+      packages
+        .iter()
+        .cloned()
+        .map(|package| (package, selected.iter().cloned().collect()))
+        .collect(),
+    ),
+  };
+  ResolutionRequest::new(
+    ResolutionPackages::Selected(packages),
+    features,
+    (view.target.as_str() != "default").then(|| view.target.as_str().to_string()),
+  )
+}
+
 fn selected_packages<'a>(request: &ResolutionRequest, metadata: &'a Metadata) -> RailResult<Vec<&'a Package>> {
   let workspace_ids: HashSet<&PackageId> = metadata.workspace_members.iter().collect();
   let workspace_packages: FxHashMap<&PackageId, &Package> = metadata
@@ -1191,7 +1260,7 @@ fn selected_packages<'a>(request: &ResolutionRequest, metadata: &'a Metadata) ->
 
 fn selected_package_error(package_id: &PackageId) -> RailError {
   RailError::message(format!(
-    "Package '{}' is not an exact workspace member in the canonical resolution",
+    "Package '{}' is not an exact workspace member in the selected resolution",
     package_id
   ))
 }

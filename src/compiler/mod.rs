@@ -17,5 +17,5 @@ pub(crate) mod session;
 
 pub(crate) use collector::{CompilerAnalysisMetrics, CompilerCacheIdentity, CompilerDiagnosticsCollector};
 pub use collector::{standalone_missing_features, verify_standalone_member};
-pub use model::{DependencyEvidenceState, DependencyIdentity, FeatureSelection, MemberEvidence};
+pub use model::{CoverageView, DependencyEvidenceState, DependencyIdentity, FeatureSelection, MemberEvidence};
 pub use scheduler::CompilerCandidate;

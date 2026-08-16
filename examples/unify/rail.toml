@@ -9,7 +9,7 @@ msrv_policy = { mode = "compute", source = "workspace", inherit = true }
 consumer_scope = "workspace"
 preserve_features = ["unstable-*", "bench*"]
 
-# Workspace-hack replacement: enabling it also selects its host.
+# Fragmented transitive feature pins require an explicit host.
 transitive_pinning = { host = "root" }
 
 # Workspace-member cohorts remain atomic when these safety hatches are used.

@@ -5,7 +5,7 @@
 use crate::cargo::manifest_analyzer::DepKind;
 use crate::cargo::manifest_ops;
 use crate::cargo::unify_types::{TransitivePin, UnifiedDep};
-use crate::error::{RailResult, ResultExt};
+use crate::error::{RailError, RailResult, ResultExt};
 use crate::toml::format::TomlFormatter;
 use std::path::Path;
 
@@ -98,7 +98,7 @@ impl ManifestWriter {
     Ok(())
   }
 
-  /// Add transitive dependencies for pinning (workspace-hack replacement)
+  /// Add fragmented transitive dependencies to the selected pin host.
   ///
   /// This adds entries with `workspace = true` to the host's dev-dependencies.
   /// IMPORTANT: The caller must ensure these deps are already in [workspace.dependencies]
@@ -205,6 +205,39 @@ impl ManifestWriter {
     self.formatter.format_manifest(&mut doc)?;
     manifest_ops::write_toml_file(member_toml_path, &doc)?;
     Ok(())
+  }
+
+  /// Replace one equivalent member package field with workspace inheritance.
+  pub fn inherit_member_package_field(&self, member_toml_path: &Path, field: &str) -> RailResult<()> {
+    if !crate::cargo::manifest_analyzer::package_field_is_automatically_inheritable(field) {
+      return Err(RailError::message(format!(
+        "package field '{field}' is not authorized for automatic workspace inheritance"
+      )));
+    }
+    let mut doc = manifest_ops::read_toml_file(member_toml_path)?;
+    let package = doc
+      .get_mut("package")
+      .and_then(|item| item.as_table_like_mut())
+      .ok_or_else(|| RailError::message(format!("'{}' has no [package] table", member_toml_path.display())))?;
+    let decor = package
+      .get(field)
+      .and_then(toml_edit::Item::as_value)
+      .map(|value| value.decor().clone())
+      .ok_or_else(|| {
+        RailError::message(format!(
+          "package field '{field}' disappeared from '{}' before mutation",
+          member_toml_path.display()
+        ))
+      })?;
+
+    let mut table = toml_edit::InlineTable::new();
+    table.insert("workspace", true.into());
+    let mut value = toml_edit::Value::InlineTable(table);
+    *value.decor_mut() = decor;
+    package.insert(field, toml_edit::value(value));
+
+    self.formatter.format_manifest(&mut doc)?;
+    manifest_ops::write_toml_file(member_toml_path, &doc)
   }
 
   /// Remove an unused dependency from a member's Cargo.toml

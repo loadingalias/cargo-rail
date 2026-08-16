@@ -8,7 +8,7 @@
 use crate::cargo::{ManifestWriter, UnifyAnalyzer, UnifyReport};
 use crate::commands::common::{UnifyOutputFormat, format_preview_list};
 use crate::error::{RailError, RailResult};
-use crate::mutation::{self, MutationAction, MutationRisk, MutationTrace};
+use crate::mutation::{self, ExpectedMutation, MutationAction, MutationEffect, MutationRisk, MutationTrace};
 use crate::progress;
 use crate::workspace::WorkspaceContext;
 use sha2::{Digest, Sha256};
@@ -112,33 +112,14 @@ fn dependency_section<'a>(dep_kind: &crate::cargo::DepKind, target: Option<&'a s
   }
 }
 
-fn mutation_targets(
-  plan: &crate::cargo::UnificationPlan,
-  workspace_root: &std::path::Path,
-  msrv_write_needed: bool,
-) -> Vec<String> {
-  let mut targets = Vec::new();
-  if !plan.workspace_deps.is_empty() || !plan.transitive_pins.is_empty() || msrv_write_needed {
-    targets.push("Cargo.toml".to_string());
-  }
-
-  let mut members: Vec<String> = plan
-    .member_edits
-    .keys()
-    .filter_map(|member| {
-      plan.member_paths.get(member).map(|path| {
-        let relative = if path.is_absolute() {
-          path.strip_prefix(workspace_root).unwrap_or(path)
-        } else {
-          path.strip_prefix(std::path::Path::new(".")).unwrap_or(path)
-        };
-        crate::utils::path_to_git_format(relative)
-      })
-    })
-    .collect();
-  members.sort();
-  targets.extend(members);
-  targets
+fn mutation_targets(actions: &[MutationAction]) -> Vec<String> {
+  actions
+    .iter()
+    .flat_map(|action| action.expected_mutations.iter())
+    .map(|mutation| crate::utils::path_to_git_format(&mutation.path))
+    .collect::<BTreeSet<_>>()
+    .into_iter()
+    .collect()
 }
 
 fn blocked_issue_lines(plan: &crate::cargo::UnificationPlan) -> Vec<String> {
@@ -153,9 +134,9 @@ fn blocked_issue_lines(plan: &crate::cargo::UnificationPlan) -> Vec<String> {
 fn write_compact_summary(
   sink: &mut UnifyTextSink,
   plan: &crate::cargo::UnificationPlan,
-  workspace_root: &std::path::Path,
   msrv_write_needed: bool,
   has_changes: bool,
+  actions: &[MutationAction],
 ) {
   outln!(sink, "unify");
   outln!(sink);
@@ -187,6 +168,15 @@ fn write_compact_summary(
         "  member edits: {} across {} crate(s)",
         plan.member_edit_count(),
         members_affected
+      );
+    }
+
+    let package_inheritance_edits = plan.package_inheritance_edit_count();
+    if package_inheritance_edits > 0 {
+      outln!(
+        sink,
+        "  package-field inheritance: {} declaration(s)",
+        package_inheritance_edits
       );
     }
 
@@ -246,7 +236,7 @@ fn write_compact_summary(
 
   outln!(sink);
   outln!(sink, "will mutate:");
-  let targets = mutation_targets(plan, workspace_root, msrv_write_needed);
+  let targets = mutation_targets(actions);
   if targets.is_empty() {
     outln!(sink, "  none");
   } else {
@@ -416,7 +406,11 @@ fn proof_certificates_to_json(plan: &crate::cargo::UnificationPlan, msrv_write_n
     serde_json::json!({
       "schema_version": 1,
       "member": serde_json::Value::Null,
-      "subject": { "kind": "workspace_dependency", "declaration": &*dependency.name },
+      "subject": {
+        "kind": "workspace_dependency",
+        "declaration": &*dependency.name,
+        "package": dependency.package.as_deref(),
+      },
       "decision": "unify",
       "evidence_source": "cargo_resolve_and_manifest_intersection",
       "version_requirement": dependency.version_req.to_string(),
@@ -457,6 +451,14 @@ fn proof_certificates_to_json(plan: &crate::cargo::UnificationPlan, msrv_write_n
         "subject": { "kind": "package_msrv", "declaration": "package.rust-version" },
         "decision": "inherit_workspace",
         "evidence_source": "computed_workspace_msrv",
+        "uncertainties": [],
+      })),
+      crate::cargo::MemberEdit::InheritPackageField { field } => Some(serde_json::json!({
+        "schema_version": 1,
+        "member": &**member,
+        "subject": { "kind": "package_field", "declaration": format!("package.{field}") },
+        "decision": "inherit_workspace",
+        "evidence_source": "captured_semantic_manifest_equality",
         "uncertainties": [],
       })),
       crate::cargo::MemberEdit::RemoveDep { .. }
@@ -520,18 +522,191 @@ fn sha256_fingerprint(bytes: &[u8]) -> String {
 }
 
 fn root_manifest_value(ctx: &WorkspaceContext) -> RailResult<serde_json::Value> {
-  let mut path = ctx.workspace_prefix().unwrap_or_default();
-  path.push("Cargo.toml");
-  let manifest = ctx
-    .snapshot()?
-    .manifests()
-    .iter()
-    .find(|manifest| manifest.path().as_path() == path)
-    .ok_or_else(|| RailError::message("workspace root Cargo.toml is missing from the authoritative snapshot"))?;
+  let manifest = ctx.snapshot()?.workspace_manifest()?;
   let text = std::str::from_utf8(manifest.bytes())
     .map_err(|_| RailError::message("workspace root Cargo.toml is not valid UTF-8"))?;
   toml_edit::de::from_str(text)
     .map_err(|error| RailError::message(format!("failed to parse workspace resolver: {error}")))
+}
+
+fn root_manifest_document(ctx: &WorkspaceContext) -> RailResult<toml_edit::DocumentMut> {
+  let manifest = ctx.snapshot()?.workspace_manifest()?;
+  let text = std::str::from_utf8(manifest.bytes())
+    .map_err(|_| RailError::message("workspace root Cargo.toml is not valid UTF-8"))?;
+  text
+    .parse()
+    .map_err(|error| RailError::message(format!("failed to parse workspace root Cargo.toml: {error}")))
+}
+
+fn coverage_views_to_json(coverage_views: &[crate::compiler::CoverageView]) -> RailResult<serde_json::Value> {
+  let views = coverage_views
+    .iter()
+    .map(|view| {
+      let (mode, selected) = match &view.features {
+        crate::compiler::FeatureSelection::Default => ("default", Vec::new()),
+        crate::compiler::FeatureSelection::NoDefaultFeatures => ("no_default_features", Vec::new()),
+        crate::compiler::FeatureSelection::AllFeatures => ("all_features", Vec::new()),
+        crate::compiler::FeatureSelection::Selected(features) => ("selected", features.clone()),
+      };
+      Ok(serde_json::json!({
+        "id": view.identity()?,
+        "target": view.target.as_str(),
+        "features": {
+          "mode": mode,
+          "selected": selected,
+        },
+        "packages": view.packages,
+        "cargo": {
+          "program": "cargo",
+          "args": view.cargo_arguments(),
+        },
+        "nextest": {
+          "program": "cargo",
+          "args": view.nextest_arguments(),
+        },
+      }))
+    })
+    .collect::<RailResult<Vec<_>>>()?;
+  Ok(serde_json::json!({
+    "schema_version": 1,
+    "views": views,
+  }))
+}
+
+fn package_inheritance_to_json(plan: &crate::cargo::UnificationPlan) -> serde_json::Value {
+  let fields = plan
+    .package_inheritance
+    .iter()
+    .map(|field| {
+      serde_json::json!({
+        "field": &*field.field,
+        "inherited": field.inherited.iter().map(|member| &**member).collect::<Vec<_>>(),
+        "planned": field.planned.iter().map(|member| &**member).collect::<Vec<_>>(),
+        "local_overrides": field.local_overrides.iter().map(|member| &**member).collect::<Vec<_>>(),
+        "missing": field.missing.iter().map(|member| &**member).collect::<Vec<_>>(),
+        "retained_equivalent": field.retained_equivalent.iter().map(|member| &**member).collect::<Vec<_>>(),
+        "retention_reason": field.retention_reason,
+      })
+    })
+    .collect::<Vec<_>>();
+  serde_json::json!({
+    "schema_version": 1,
+    "authority": "workspace.package",
+    "fields": fields,
+  })
+}
+
+fn msrv_to_json(
+  ctx: &WorkspaceContext,
+  plan: &crate::cargo::UnificationPlan,
+  write_needed: bool,
+) -> RailResult<serde_json::Value> {
+  let snapshot = ctx.snapshot()?;
+  let (rustc_release, rustc_channel) = tool_release_and_channel(snapshot.toolchain().rustc_verbose_version());
+  let candidate_version = plan.computed_msrv.as_ref().map(|msrv| &msrv.version);
+  let toolchain_constraint = msrv_toolchain_constraint_to_json(candidate_version, &rustc_release);
+  let policy = match ctx.config() {
+    Some(config) => serde_json::to_value(config.unify.msrv_policy)?,
+    None => serde_json::to_value(crate::config::MsrvPolicy::default())?,
+  };
+  let candidate = plan.computed_msrv.as_ref().map(|msrv| {
+    let source = match msrv.source_used {
+      crate::cargo::MsrvSourceUsed::Deps => "dependencies",
+      crate::cargo::MsrvSourceUsed::Workspace => "workspace",
+      crate::cargo::MsrvSourceUsed::MaxWorkspace => "max_workspace",
+      crate::cargo::MsrvSourceUsed::MaxDeps => "max_dependencies",
+    };
+    serde_json::json!({
+      "version": msrv.version.to_string(),
+      "source": source,
+      "declared_workspace": msrv.workspace_msrv.as_ref().map(ToString::to_string),
+      "dependency_floor": msrv.deps_msrv.as_ref().map(ToString::to_string),
+      "dependency_evidence_count": msrv.deps_with_msrv,
+      "contributors": msrv.contributors,
+      "warning": msrv.warning,
+    })
+  });
+  Ok(serde_json::json!({
+    "schema_version": 1,
+    "policy": policy,
+    "candidate": candidate,
+    "write_needed": write_needed,
+    "selected_toolchain": {
+      "rustc_release": rustc_release,
+      "channel": rustc_channel,
+      "host": snapshot.toolchain().host_target(),
+      "fingerprint": snapshot.toolchain_fingerprint(),
+    },
+    "toolchain_constraint": toolchain_constraint,
+    "compiler_probe": {
+      "status": "not_run",
+      "lowering_authorized": false,
+      "required_scope": "all configured coverage views",
+      "meaning": "the candidate is a manifest/dependency lower bound; validation requires builds under that compiler",
+    },
+  }))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MsrvToolchainConstraintStatus {
+  Satisfied,
+  Unsatisfied,
+  Unknown,
+  NotApplicable,
+}
+
+impl MsrvToolchainConstraintStatus {
+  fn as_str(self) -> &'static str {
+    match self {
+      Self::Satisfied => "satisfied",
+      Self::Unsatisfied => "unsatisfied",
+      Self::Unknown => "unknown",
+      Self::NotApplicable => "not_applicable",
+    }
+  }
+}
+
+fn normalized_rustc_release(release: &str) -> Option<semver::Version> {
+  let release = semver::Version::parse(release).ok()?;
+  Some(semver::Version::new(release.major, release.minor, release.patch))
+}
+
+fn msrv_toolchain_constraint(
+  candidate: Option<&semver::Version>,
+  rustc_release: &str,
+) -> (MsrvToolchainConstraintStatus, Option<semver::Version>) {
+  let Some(candidate) = candidate else {
+    return (MsrvToolchainConstraintStatus::NotApplicable, None);
+  };
+  let Some(selected) = normalized_rustc_release(rustc_release) else {
+    return (MsrvToolchainConstraintStatus::Unknown, None);
+  };
+  let required = semver::Version::new(candidate.major, candidate.minor, candidate.patch);
+  let status = if selected >= required {
+    MsrvToolchainConstraintStatus::Satisfied
+  } else {
+    MsrvToolchainConstraintStatus::Unsatisfied
+  };
+  (status, Some(selected))
+}
+
+fn msrv_toolchain_constraint_to_json(candidate: Option<&semver::Version>, rustc_release: &str) -> serde_json::Value {
+  let (status, selected) = msrv_toolchain_constraint(candidate, rustc_release);
+  let meaning = match status {
+    MsrvToolchainConstraintStatus::Satisfied => {
+      "the captured compiler is at or above the candidate; this does not validate the candidate compiler"
+    }
+    MsrvToolchainConstraintStatus::Unsatisfied => "the captured compiler is older than the candidate",
+    MsrvToolchainConstraintStatus::Unknown => "the captured compiler release could not be parsed",
+    MsrvToolchainConstraintStatus::NotApplicable => "no MSRV candidate was computed",
+  };
+  serde_json::json!({
+    "status": status.as_str(),
+    "required": candidate.map(ToString::to_string),
+    "selected": selected.map(|version| version.to_string()),
+    "evidence_source": "captured_rustc_identity",
+    "meaning": meaning,
+  })
 }
 
 fn resolver_diagnostic(root: &serde_json::Value) -> (String, String) {
@@ -610,7 +785,7 @@ fn unify_policy_overrides(ctx: &WorkspaceContext) -> RailResult<Vec<String>> {
   )
 }
 
-fn cargo_release_and_channel(verbose_version: &str) -> (String, &'static str) {
+fn tool_release_and_channel(verbose_version: &str) -> (String, &'static str) {
   let release = verbose_version
     .lines()
     .find_map(|line| line.strip_prefix("release: "))
@@ -639,7 +814,7 @@ pub fn run_unify_doctor(ctx: &WorkspaceContext, format: UnifyOutputFormat) -> Ra
   let snapshot = ctx.snapshot()?;
   let root = root_manifest_value(ctx)?;
   let (resolver, resolver_source) = resolver_diagnostic(&root);
-  let (cargo_version, cargo_channel) = cargo_release_and_channel(snapshot.toolchain().cargo_verbose_version());
+  let (cargo_version, cargo_channel) = tool_release_and_channel(snapshot.toolchain().cargo_verbose_version());
   let cargo_overrides = cargo_source_overrides(&root, snapshot.cargo_config().effective_file_settings());
   let policy_overrides = unify_policy_overrides(ctx)?;
   let ambiguous_aliases = ctx.graph().ambiguous_aliases();
@@ -767,14 +942,29 @@ pub fn run_unify_doctor(ctx: &WorkspaceContext, format: UnifyOutputFormat) -> Ra
   write_output(&rendered, None)
 }
 
+/// Prepared options for dependency-coherence check mode.
+#[doc(hidden)]
+pub struct UnifyAnalyzeOptions<'a> {
+  pub(crate) show_diff: bool,
+  pub(crate) explain: bool,
+  pub(crate) format: UnifyOutputFormat,
+  pub(crate) output: Option<&'a PathBuf>,
+  pub(crate) backup: bool,
+  pub(crate) no_report: bool,
+  pub(crate) report_path: Option<&'a PathBuf>,
+}
+
 /// Analyze workspace dependencies (check mode)
-pub fn run_unify_analyze(
-  ctx: &WorkspaceContext,
-  show_diff: bool,
-  explain: bool,
-  format: UnifyOutputFormat,
-  output: Option<&PathBuf>,
-) -> RailResult<()> {
+pub fn run_unify_analyze(ctx: &WorkspaceContext, options: UnifyAnalyzeOptions<'_>) -> RailResult<()> {
+  let UnifyAnalyzeOptions {
+    show_diff,
+    explain,
+    format,
+    output,
+    backup,
+    no_report,
+    report_path,
+  } = options;
   ctx.snapshot()?;
   let json = format.is_json();
 
@@ -789,20 +979,25 @@ pub fn run_unify_analyze(
   // Run analysis
   ctx.validate_snapshot_unchanged()?;
   let plan = analyzer.analyze()?;
+  let coverage_views = analyzer.coverage_views()?;
   ctx.validate_snapshot_unchanged()?;
   let msrv_write_needed = if let Some(msrv) = plan.computed_msrv.as_ref() {
-    workspace_msrv_write_needed(ctx.workspace_root(), &msrv.version)?
+    workspace_msrv_write_needed(ctx, &msrv.version)?
   } else {
     false
   };
 
   let has_changes = plan.has_planned_changes(msrv_write_needed);
+  let should_backup = has_changes && (backup || !crate::backup::BackupManager::new(ctx.workspace_root()).has_backups());
+  let (actions, risks, trace) =
+    build_unify_mutation_parts(ctx, &plan, msrv_write_needed, should_backup, no_report, report_path)?;
 
   // JSON output mode (but still honor exit codes)
   if json {
+    let coverage = coverage_views_to_json(&coverage_views)?;
+    let msrv = msrv_to_json(ctx, &plan, msrv_write_needed)?;
     let proof_certificates = proof_certificates_to_json(&plan, msrv_write_needed);
     let proof_fingerprint = proof_set_fingerprint(&proof_certificates);
-    let (actions, risks, trace) = build_unify_mutation_parts(&plan, msrv_write_needed, false, true, output);
     let mutation_plan = if ctx.has_git() {
       Some(mutation::build_plan(
         ctx,
@@ -851,6 +1046,7 @@ pub fn run_unify_analyze(
         let features: Vec<&str> = d.features.iter().map(|f| &**f).collect();
         serde_json::json!({
           "name": &*d.name,
+          "package": d.package.as_deref(),
           "version": d.version_req,
           "features": features,
         })
@@ -858,6 +1054,7 @@ pub fn run_unify_analyze(
       "summary": {
         "workspace_deps_count": plan.workspace_deps.len(),
         "member_edits_count": plan.member_edit_count(),
+        "package_fields_inherited": plan.package_inheritance_edit_count(),
         "members_affected": plan.member_edits.len(),
         "transitive_pins_count": plan.transitive_pins.len(),
         "duplicates_unified": plan.duplicates_cleaned.len(),
@@ -875,6 +1072,9 @@ pub fn run_unify_analyze(
       })).collect::<Vec<_>>(),
       "dependency_decisions": dependency_decisions_to_json(&plan),
       "feature_reachability": feature_reachability_to_json(&plan),
+      "package_inheritance": package_inheritance_to_json(&plan),
+      "coverage": coverage,
+      "msrv": msrv,
       "evidence_cache": evidence_cache_to_json(&plan),
       "proof_fingerprint": proof_fingerprint,
       "proof_certificates": proof_certificates,
@@ -915,7 +1115,7 @@ pub fn run_unify_analyze(
   let mut sink = UnifyTextSink::new(output.is_some());
 
   // Default output stays terse; detailed reasoning belongs behind --explain or JSON.
-  write_compact_summary(&mut sink, &plan, ctx.workspace_root(), msrv_write_needed, has_changes);
+  write_compact_summary(&mut sink, &plan, msrv_write_needed, has_changes, &actions);
 
   // Show explain output if requested
   if explain {
@@ -1034,20 +1234,12 @@ pub fn run_unify_analyze(
           crate::cargo::MemberEdit::EnforceMsrvInheritance => {
             outln!(sink, "  [package] rust-version = {{ workspace = true }}");
           }
+          crate::cargo::MemberEdit::InheritPackageField { field } => {
+            outln!(sink, "  [package] {} = {{ workspace = true }}", field);
+          }
         }
       }
       outln!(sink);
-    }
-  }
-
-  // Show validation results if any failed
-  let failed_validations: Vec<_> = plan.validation_results.iter().filter(|v| !v.success).collect();
-
-  if !failed_validations.is_empty() {
-    eprintln!();
-    crate::error!("validation errors:");
-    for val in failed_validations {
-      eprintln!("  {}: {}", val.target, val.error.as_deref().unwrap_or("unknown"));
     }
   }
 
@@ -1078,7 +1270,12 @@ pub fn run_unify_analyze(
 
 /// Execute dependency unification
 struct ManifestTransaction {
-  originals: Vec<(std::path::PathBuf, Vec<u8>)>,
+  originals: Vec<(std::path::PathBuf, OriginalFileState)>,
+}
+
+enum OriginalFileState {
+  File(Vec<u8>),
+  Absent,
 }
 
 #[derive(Debug, Default)]
@@ -1093,6 +1290,14 @@ struct VerifiedGraphDelta {
   removed: usize,
   fingerprint: String,
   facts: Vec<String>,
+  post_mutation_lock_fingerprint: String,
+  post_mutation_metadata: std::sync::Arc<cargo_metadata::Metadata>,
+}
+
+#[derive(Debug)]
+struct VerifiedCoverageSet {
+  identities: Vec<String>,
+  fingerprint: String,
 }
 
 fn resolved_graph_snapshot(metadata: &cargo_metadata::Metadata) -> RailResult<ResolvedGraphSnapshot> {
@@ -1201,6 +1406,12 @@ fn authorized_graph_names(plan: &crate::cargo::UnificationPlan) -> BTreeSet<Stri
   names.extend(plan.workspace_deps.iter().map(|dependency| dependency.name.to_string()));
   names.extend(
     plan
+      .workspace_deps
+      .iter()
+      .filter_map(|dependency| dependency.package.as_deref().map(str::to_string)),
+  );
+  names.extend(
+    plan
       .transitive_pins
       .iter()
       .map(|dependency| dependency.name.to_string()),
@@ -1258,6 +1469,7 @@ impl ManifestTransaction {
     ctx: &WorkspaceContext,
     plan: &crate::cargo::UnificationPlan,
     msrv_write_needed: bool,
+    additional_paths: &[PathBuf],
   ) -> RailResult<Self> {
     let mut paths = std::collections::BTreeSet::new();
     if !plan.workspace_deps.is_empty() || !plan.transitive_pins.is_empty() || msrv_write_needed {
@@ -1271,25 +1483,70 @@ impl ManifestTransaction {
     if !plan.transitive_pins.is_empty() {
       paths.insert(transitive_pins_host_manifest_path(ctx)?);
     }
+    let lockfile_path = ctx.workspace_root().join("Cargo.lock");
+    paths.insert(lockfile_path.clone());
+    paths.extend(additional_paths.iter().cloned());
     let mut originals = Vec::with_capacity(paths.len());
     for path in paths {
-      originals.push((
-        path.clone(),
-        std::fs::read(&path)
-          .map_err(|error| RailError::message(format!("capturing {} before unify apply: {error}", path.display())))?,
-      ));
+      let state = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => OriginalFileState::File(
+          std::fs::read(&path)
+            .map_err(|error| RailError::message(format!("capturing {} before unify apply: {error}", path.display())))?,
+        ),
+        Ok(_) => {
+          return Err(RailError::message(format!(
+            "unify mutation target '{}' is not a regular file",
+            path.display()
+          )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => OriginalFileState::Absent,
+        Err(error) => {
+          return Err(RailError::message(format!(
+            "inspecting {} before unify apply: {error}",
+            path.display()
+          )));
+        }
+      };
+      originals.push((path, state));
     }
     Ok(Self { originals })
   }
 
   fn restore(&self) -> RailResult<()> {
-    for (path, content) in &self.originals {
-      std::fs::write(path, content).map_err(|error| {
-        RailError::message(format!(
-          "restoring {} after failed verification: {error}",
-          path.display()
-        ))
-      })?;
+    for (path, state) in &self.originals {
+      match state {
+        OriginalFileState::File(content) => crate::utils::write_file_atomic(path, content).map_err(|error| {
+          RailError::message(format!(
+            "restoring {} after failed unify apply: {error}",
+            path.display()
+          ))
+        })?,
+        OriginalFileState::Absent => match std::fs::symlink_metadata(path) {
+          Ok(metadata) if metadata.file_type().is_file() => std::fs::remove_file(path).map_err(|error| {
+            RailError::message(format!(
+              "removing transaction-created {} after failed unify apply: {error}",
+              path.display()
+            ))
+          })?,
+          Ok(_) => {
+            return Err(RailError::message(format!(
+              "refusing to remove non-file transaction target '{}' during rollback",
+              path.display()
+            )));
+          }
+          Err(error)
+            if matches!(
+              error.kind(),
+              std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) => {}
+          Err(error) => {
+            return Err(RailError::message(format!(
+              "inspecting transaction-created {} during rollback: {error}",
+              path.display()
+            )));
+          }
+        },
+      }
     }
     Ok(())
   }
@@ -1307,6 +1564,9 @@ fn verify_applied_unify_graph(
   let mut delta_lines = BTreeSet::new();
   let mut added = 0usize;
   let mut removed = 0usize;
+  let mut post_mutation_metadata = None;
+  let lockfile_path = ctx.workspace_root().join("Cargo.lock");
+  let mut post_mutation_lock_fingerprint = None;
   for target in targets {
     let before_metadata = target_metadata
       .metadata_for_target(target)
@@ -1317,12 +1577,24 @@ fn verify_applied_unify_graph(
       .cargo_path(std::path::PathBuf::from(snapshot.toolchain().cargo_program()))
       .current_dir(snapshot.cargo_current_dir())
       .manifest_path(ctx.workspace_root().join("Cargo.toml"));
-    if target != "default" {
-      command.other_options(vec![String::from("--filter-platform"), target.to_string()]);
+    let mut options = Vec::new();
+    if post_mutation_lock_fingerprint.is_some() {
+      options.push(String::from("--locked"));
     }
-    snapshot.validate_resolution_environment_unchanged()?;
+    if target != "default" {
+      options.extend([String::from("--filter-platform"), target.to_string()]);
+    }
+    if !options.is_empty() {
+      command.other_options(options);
+    }
+    if let Some(expected) = post_mutation_lock_fingerprint.as_deref() {
+      snapshot.validate_post_mutation_environment_unchanged()?;
+      validate_post_mutation_lockfile(&lockfile_path, expected)?;
+    } else {
+      snapshot.validate_post_mutation_resolution_inputs_unchanged()?;
+    }
     crate::instrumentation::record_cargo_metadata_load(target != "default");
-    let metadata = command.exec().map_err(|error| {
+    let metadata = std::sync::Arc::new(command.exec().map_err(|error| {
       if snapshot.cargo_config().has_credential_capability() {
         RailError::with_help(
           format!(
@@ -1333,8 +1605,19 @@ fn verify_applied_unify_graph(
       } else {
         RailError::message(format!("resolving post-edit metadata for target `{target}`: {error}"))
       }
-    })?;
-    snapshot.validate_resolution_environment_unchanged()?;
+    })?);
+    snapshot.validate_post_mutation_environment_unchanged()?;
+    let current_lock_fingerprint = lockfile_content_fingerprint(&lockfile_path)?;
+    if let Some(expected) = post_mutation_lock_fingerprint.as_deref() {
+      if current_lock_fingerprint != expected {
+        return Err(RailError::message(format!(
+          "Cargo.lock changed while resolving post-mutation target `{target}`"
+        )));
+      }
+    } else {
+      post_mutation_lock_fingerprint = Some(current_lock_fingerprint);
+    }
+    post_mutation_metadata.get_or_insert_with(|| std::sync::Arc::clone(&metadata));
     let after = resolved_graph_snapshot(&metadata)?;
     let closure = graph_name_closure(&authorized_names, &before, &after);
     for (fact, participants) in after.facts.iter().filter(|(fact, _)| !before.facts.contains_key(*fact)) {
@@ -1454,7 +1737,121 @@ fn verify_applied_unify_graph(
     removed,
     fingerprint: sha256_fingerprint(encoded.as_bytes()),
     facts,
+    post_mutation_lock_fingerprint: post_mutation_lock_fingerprint
+      .ok_or_else(|| RailError::message("unify graph verification produced no post-mutation lockfile identity"))?,
+    post_mutation_metadata: post_mutation_metadata
+      .ok_or_else(|| RailError::message("unify graph verification had no configured target views"))?,
   })
+}
+
+fn validate_post_mutation_lockfile(path: &Path, expected: &str) -> RailResult<()> {
+  let actual = lockfile_content_fingerprint(path)?;
+  if actual == expected {
+    return Ok(());
+  }
+  Err(RailError::with_help(
+    format!("Cargo.lock changed after the authorized graph refresh (expected {expected}, found {actual})"),
+    "retry after lockfile writers have stopped",
+  ))
+}
+
+fn lockfile_content_fingerprint(path: &Path) -> RailResult<String> {
+  let bytes = std::fs::read(path)
+    .map_err(|error| RailError::message(format!("reading post-mutation lockfile '{}': {error}", path.display())))?;
+  Ok(sha256_fingerprint(&bytes))
+}
+
+fn verify_applied_coverage_views(
+  ctx: &WorkspaceContext,
+  coverage_views: &[crate::compiler::CoverageView],
+  post_mutation_metadata: &cargo_metadata::Metadata,
+  post_mutation_lock_fingerprint: &str,
+) -> RailResult<VerifiedCoverageSet> {
+  let snapshot = ctx.snapshot()?;
+  let lockfile_path = ctx.workspace_root().join("Cargo.lock");
+  let mut identities = Vec::with_capacity(coverage_views.len());
+  for view in coverage_views {
+    snapshot.validate_post_mutation_environment_unchanged()?;
+    validate_post_mutation_lockfile(&lockfile_path, post_mutation_lock_fingerprint)?;
+    let identity = view.identity()?;
+    let request = crate::cargo::resolution::coverage_resolution_request(view, post_mutation_metadata)
+      .map_err(|error| RailError::message(format!("reconstructing {identity}: {error}")))?;
+    snapshot
+      .post_mutation_resolution_view(request, post_mutation_metadata)
+      .map_err(|error| RailError::message(format!("resolving {identity}: {error}")))?;
+    snapshot.validate_post_mutation_environment_unchanged()?;
+    validate_post_mutation_lockfile(&lockfile_path, post_mutation_lock_fingerprint)?;
+    identities.push(identity);
+  }
+  identities.sort();
+  if identities.windows(2).any(|pair| pair[0] == pair[1]) {
+    return Err(RailError::message(
+      "post-mutation coverage verification received duplicate view identities",
+    ));
+  }
+  let mut encoded = identities.join("\n");
+  encoded.push('\n');
+  Ok(VerifiedCoverageSet {
+    identities,
+    fingerprint: sha256_fingerprint(encoded.as_bytes()),
+  })
+}
+
+fn display_unify_apply_summary(
+  plan: &crate::cargo::UnificationPlan,
+  features_fixed: usize,
+  crates_fixed: usize,
+  backup_id: Option<&str>,
+) {
+  println!(
+    "\nunified {} dependencies across {} members",
+    plan.workspace_deps.len(),
+    plan.member_edits.len()
+  );
+  if !plan.transitive_pins.is_empty() {
+    println!("  {} transitives pinned", plan.transitive_pins.len());
+  }
+  if !plan.duplicates_cleaned.is_empty() {
+    println!("  {} duplicates resolved", plan.duplicates_cleaned.len());
+  }
+  if !plan.pruned_features.is_empty() {
+    println!("  {} unreachable private features pruned", plan.pruned_features.len());
+  }
+  if !plan.optional_features.is_empty() {
+    println!(
+      "  {} optional features detected (user-facing, preserved)",
+      plan.optional_features.len()
+    );
+  }
+  if features_fixed > 0 {
+    println!(
+      "  {} undeclared features fixed across {} crates",
+      features_fixed, crates_fixed
+    );
+  }
+  let package_fields_inherited = plan.package_inheritance_edit_count();
+  if package_fields_inherited > 0 {
+    println!("  {} package fields inherited", package_fields_inherited);
+  }
+  if let Some(msrv) = &plan.computed_msrv {
+    use crate::cargo::MsrvSourceUsed;
+    let source_desc = match msrv.source_used {
+      MsrvSourceUsed::Deps | MsrvSourceUsed::MaxDeps => format!(
+        "from deps: {}",
+        msrv.contributors.first().map_or("unknown", AsRef::as_ref)
+      ),
+      MsrvSourceUsed::Workspace => "preserved from workspace".to_string(),
+      MsrvSourceUsed::MaxWorkspace => "from workspace (higher than deps)".to_string(),
+    };
+    println!(
+      "  rust-version = {}.{}.{} ({})",
+      msrv.version.major, msrv.version.minor, msrv.version.patch, source_desc
+    );
+  }
+  println!("\nnext: cargo check && cargo test");
+  if let Some(backup_id) = backup_id {
+    println!("undo: cargo rail unify undo  (backup: {backup_id})");
+  }
 }
 
 /// Apply a verified dependency-unification plan transactionally.
@@ -1480,9 +1877,10 @@ pub fn run_unify_apply(
 
   ctx.validate_snapshot_unchanged()?;
   let plan = analyzer.analyze()?;
+  let coverage_views = analyzer.coverage_views()?;
   ctx.validate_snapshot_unchanged()?;
   let msrv_write_needed = if let Some(msrv) = plan.computed_msrv.as_ref() {
-    workspace_msrv_write_needed(ctx.workspace_root(), &msrv.version)?
+    workspace_msrv_write_needed(ctx, &msrv.version)?
   } else {
     false
   };
@@ -1520,8 +1918,17 @@ pub fn run_unify_apply(
     return Ok(());
   }
 
-  let expected_mutation_plan =
-    build_unify_mutation_plan(ctx, &plan, msrv_write_needed, backup, no_report, report_path.as_ref())?;
+  let backup_manager = BackupManager::new(ctx.workspace_root());
+  let is_first_run = !backup_manager.has_backups();
+  let should_backup = backup || is_first_run;
+  let expected_mutation_plan = build_unify_mutation_plan(
+    ctx,
+    &plan,
+    msrv_write_needed,
+    should_backup,
+    no_report,
+    report_path.as_ref(),
+  )?;
   let mutation_plan = if let Some(path) = plan_path.as_ref() {
     let from_file = mutation::read_plan_file(path)?;
     if from_file.contract_version != mutation::MUTATION_CONTRACT_VERSION {
@@ -1564,9 +1971,6 @@ pub fn run_unify_apply(
   progress!("receipt: {}", plan_receipt.display());
 
   // Create backup if requested or first run
-  let backup_manager = BackupManager::new(ctx.workspace_root());
-  let is_first_run = !backup_manager.has_backups();
-  let should_backup = backup || is_first_run;
   let mut created_backup_id: Option<String> = None;
 
   if should_backup {
@@ -1580,6 +1984,9 @@ pub fn run_unify_apply(
     let mut files_to_backup = Vec::with_capacity(1 + plan.member_edits.len());
     if !plan.workspace_deps.is_empty() || !plan.transitive_pins.is_empty() || msrv_write_needed {
       files_to_backup.push(PathBuf::from("Cargo.toml"));
+    }
+    if ctx.workspace_root().join("Cargo.lock").is_file() {
+      files_to_backup.push(PathBuf::from("Cargo.lock"));
     }
 
     // Transitive pins may also modify the configured host's Cargo.toml.
@@ -1608,156 +2015,195 @@ pub fn run_unify_apply(
     created_backup_id = Some(backup_id);
   }
 
+  let report_output_path = unify_report_output_path(ctx, &plan, no_report, report_path.as_deref())?;
+  ctx.validate_snapshot_unchanged()?;
+  let manifest_transaction =
+    ManifestTransaction::capture(ctx, &plan, msrv_write_needed, report_output_path.as_slice())?;
+  ctx.validate_snapshot_unchanged()?;
   let writer = ManifestWriter::new();
-  let manifest_transaction = ManifestTransaction::capture(ctx, &plan, msrv_write_needed)?;
+  let msrv_warning = plan.computed_msrv.as_ref().and_then(|msrv| msrv.warning.clone());
 
-  if !plan.workspace_deps.is_empty() {
-    progress!("writing [workspace.dependencies]...");
-    writer.write_workspace_deps(&ctx.workspace_root().join("Cargo.toml"), &plan.workspace_deps)?;
-  }
+  let apply_result = (|| -> RailResult<(VerifiedGraphDelta, VerifiedCoverageSet, Option<PathBuf>)> {
+    if !plan.workspace_deps.is_empty() {
+      progress!("writing [workspace.dependencies]...");
+      writer.write_workspace_deps(&ctx.workspace_root().join("Cargo.toml"), &plan.workspace_deps)?;
+    }
 
-  progress!("updating {} members...", plan.member_edits.len());
-  for (member_name, edits) in &plan.member_edits {
-    let member_path = plan
-      .member_paths
-      .get(member_name)
-      .ok_or_else(|| crate::error::RailError::message(format!("member path not found: {}", member_name)))?;
+    progress!("updating {} members...", plan.member_edits.len());
+    let mut member_edits = plan.member_edits.iter().collect::<Vec<_>>();
+    member_edits.sort_unstable_by_key(|(member, _)| *member);
+    for (member_name, edits) in member_edits {
+      let member_path = plan
+        .member_paths
+        .get(member_name)
+        .ok_or_else(|| crate::error::RailError::message(format!("member path not found: {}", member_name)))?;
 
-    for edit in edits {
-      match edit {
-        crate::cargo::MemberEdit::UseWorkspace {
-          dep_name,
-          dep_kind,
-          target,
-          local_features,
-          is_optional,
-        } => {
-          writer.update_member(
-            member_path,
+      for edit in edits {
+        match edit {
+          crate::cargo::MemberEdit::UseWorkspace {
             dep_name,
-            *dep_kind,
-            target.as_deref(),
-            if local_features.is_empty() {
-              None
-            } else {
-              Some(local_features.as_slice())
-            },
-            *is_optional,
-          )?;
-        }
-        crate::cargo::MemberEdit::RemoveDep {
-          dep_name,
-          dep_kind,
-          target,
-        } => {
-          writer.remove_dep(member_path, dep_name, *dep_kind, target.as_deref())?;
-        }
-        crate::cargo::MemberEdit::RemoveFeature { feature_name } => {
-          writer.remove_feature(member_path, feature_name)?;
-        }
-        crate::cargo::MemberEdit::AddFeatures {
-          dep_name,
-          dep_kind,
-          target,
-          features_to_add,
-        } => {
-          writer.add_features(member_path, dep_name, *dep_kind, target.as_deref(), features_to_add)?;
-        }
-        crate::cargo::MemberEdit::EnforceMsrvInheritance => {
-          writer.enforce_member_msrv_inheritance(member_path)?;
+            dep_kind,
+            target,
+            local_features,
+            is_optional,
+          } => {
+            writer.update_member(
+              member_path,
+              dep_name,
+              *dep_kind,
+              target.as_deref(),
+              if local_features.is_empty() {
+                None
+              } else {
+                Some(local_features.as_slice())
+              },
+              *is_optional,
+            )?;
+          }
+          crate::cargo::MemberEdit::RemoveDep {
+            dep_name,
+            dep_kind,
+            target,
+          } => {
+            writer.remove_dep(member_path, dep_name, *dep_kind, target.as_deref())?;
+          }
+          crate::cargo::MemberEdit::RemoveFeature { feature_name } => {
+            writer.remove_feature(member_path, feature_name)?;
+          }
+          crate::cargo::MemberEdit::AddFeatures {
+            dep_name,
+            dep_kind,
+            target,
+            features_to_add,
+          } => {
+            writer.add_features(member_path, dep_name, *dep_kind, target.as_deref(), features_to_add)?;
+          }
+          crate::cargo::MemberEdit::EnforceMsrvInheritance => {
+            writer.enforce_member_msrv_inheritance(member_path)?;
+          }
+          crate::cargo::MemberEdit::InheritPackageField { field } => {
+            writer.inherit_member_package_field(member_path, field)?;
+          }
         }
       }
     }
-  }
 
-  if !plan.transitive_pins.is_empty() {
-    progress!("pinning {} transitives...", plan.transitive_pins.len());
+    if !plan.transitive_pins.is_empty() {
+      progress!("pinning {} transitives...", plan.transitive_pins.len());
 
-    // Add transitive deps to [workspace.dependencies] first
-    // This is required before we can reference them with `workspace = true`
-    progress!("  adding to [workspace.dependencies]...");
-    writer.write_transitive_workspace_deps(&ctx.workspace_root().join("Cargo.toml"), &plan.transitive_pins)?;
+      // Add transitive deps to [workspace.dependencies] first
+      // This is required before we can reference them with `workspace = true`
+      progress!("  adding to [workspace.dependencies]...");
+      writer.write_transitive_workspace_deps(&ctx.workspace_root().join("Cargo.toml"), &plan.transitive_pins)?;
 
-    // Add to host's [dev-dependencies] with workspace = true
-    let host_path = transitive_pins_host_manifest_path(ctx)?;
-    let host_dir = host_path.parent().unwrap_or(&host_path);
-    let relative_path = host_dir.strip_prefix(ctx.workspace_root()).unwrap_or(host_dir);
-    if relative_path != std::path::Path::new("") && host_path != ctx.workspace_root().join("Cargo.toml") {
-      progress!("  host: {}", relative_path.display());
+      // Add to host's [dev-dependencies] with workspace = true
+      let host_path = transitive_pins_host_manifest_path(ctx)?;
+      let host_dir = host_path.parent().unwrap_or(&host_path);
+      let relative_path = host_dir.strip_prefix(ctx.workspace_root()).unwrap_or(host_dir);
+      if relative_path != std::path::Path::new("") && host_path != ctx.workspace_root().join("Cargo.toml") {
+        progress!("  host: {}", relative_path.display());
+      }
+      writer.add_transitive_pins(&host_path, &plan.transitive_pins)?;
     }
-    writer.add_transitive_pins(&host_path, &plan.transitive_pins)?;
-  }
 
-  let msrv_warning = plan.computed_msrv.as_ref().and_then(|msrv| msrv.warning.clone());
-  if let Some(ref msrv) = plan.computed_msrv {
-    // Show warning if workspace mode has compatibility issues
-    if let Some(ref warning) = msrv.warning
-      && !json
-    {
-      crate::warn!("{}", warning);
+    if let Some(ref msrv) = plan.computed_msrv {
+      // Show warning if workspace mode has compatibility issues
+      if let Some(ref warning) = msrv.warning
+        && !json
+      {
+        crate::warn!("{}", warning);
+      }
+      if msrv_write_needed {
+        progress!(
+          "writing rust-version = \"{}.{}.{}\"...",
+          msrv.version.major,
+          msrv.version.minor,
+          msrv.version.patch
+        );
+        writer.write_workspace_msrv(&ctx.workspace_root().join("Cargo.toml"), &msrv.version)?;
+      }
     }
-    if msrv_write_needed {
-      progress!(
-        "writing rust-version = \"{}.{}.{}\"...",
-        msrv.version.major,
-        msrv.version.minor,
-        msrv.version.patch
-      );
-      writer.write_workspace_msrv(&ctx.workspace_root().join("Cargo.toml"), &msrv.version)?;
-    }
-  }
 
-  progress!("verifying planned Cargo graph...");
-  let graph_delta = match verify_applied_unify_graph(ctx, &plan) {
-    Ok(delta) => delta,
+    progress!("verifying planned Cargo graph...");
+    let graph_delta = verify_applied_unify_graph(ctx, &plan)
+      .map_err(|error| RailError::message(format!("unify graph verification failed: {error}")))?;
+    progress!(
+      "  Authorized graph delta: {} addition(s), {} removal(s), {}",
+      graph_delta.added,
+      graph_delta.removed,
+      graph_delta.fingerprint
+    );
+
+    progress!("verifying {} captured coverage views...", coverage_views.len());
+    let coverage_verification = verify_applied_coverage_views(
+      ctx,
+      &coverage_views,
+      graph_delta.post_mutation_metadata.as_ref(),
+      &graph_delta.post_mutation_lock_fingerprint,
+    )
+    .map_err(|error| RailError::message(format!("unify coverage verification failed: {error}")))?;
+    progress!(
+      "  Verified {} coverage views: {}",
+      coverage_verification.identities.len(),
+      coverage_verification.fingerprint
+    );
+
+    let repaired_members: BTreeSet<_> = plan
+      .member_edits
+      .iter()
+      .filter(|(_, edits)| {
+        edits
+          .iter()
+          .any(|edit| matches!(edit, crate::cargo::MemberEdit::AddFeatures { .. }))
+      })
+      .map(|(member, _)| member.as_ref())
+      .collect();
+    if !repaired_members.is_empty() {
+      progress!("verifying standalone feature repairs...");
+      for member in repaired_members {
+        crate::compiler::verify_standalone_member(ctx.workspace_root(), member)
+          .map_err(|error| RailError::message(format!("unify standalone verification failed: {error}")))?;
+      }
+    }
+
+    if let Some(path) = &report_output_path {
+      let revalidated = unify_report_output_path(ctx, &plan, no_report, report_path.as_deref())?;
+      if revalidated.as_ref() != Some(path) {
+        return Err(RailError::message(format!(
+          "unify report path changed after transaction capture (expected '{}', found '{}')",
+          path.display(),
+          revalidated
+            .as_deref()
+            .map_or_else(|| "disabled".to_string(), |current| current.display().to_string())
+        )));
+      }
+      UnifyReport::write_to_file(&plan, path)?;
+      progress!("report: {}", path.display());
+    }
+    // The captured fingerprint already binds existing dirt; this final check must reject only changes introduced
+    // outside the transaction. Commands that prohibit a dirty starting state do not pass this allowance.
+    let allowed_existing_paths: Vec<_> = mutation_plan
+      .pre_apply
+      .changed_paths
+      .iter()
+      .cloned()
+      .chain(plan_path.iter().cloned())
+      .collect();
+    mutation::validate_changed_paths_with_allowed_paths(ctx, &mutation_plan, &allowed_existing_paths)?;
+    Ok((graph_delta, coverage_verification, report_output_path.clone()))
+  })();
+  let (graph_delta, coverage_verification, written_report_path) = match apply_result {
+    Ok(applied) => applied,
     Err(error) => {
-      manifest_transaction.restore()?;
+      manifest_transaction.restore().map_err(|rollback| {
+        RailError::message(format!("unify apply failed: {error}; rollback also failed: {rollback}"))
+      })?;
       return Err(RailError::with_help(
-        format!("unify graph verification failed: {error}"),
-        "all modified manifests were restored; regenerate the plan after resolving the reported graph mismatch"
-          .to_string(),
+        format!("unify apply failed: {error}"),
+        "all authorized manifests, Cargo.lock, and report output were restored; resolve the failure and regenerate the plan",
       ));
     }
   };
-  progress!(
-    "  Authorized graph delta: {} addition(s), {} removal(s), {}",
-    graph_delta.added,
-    graph_delta.removed,
-    graph_delta.fingerprint
-  );
-
-  let repaired_members: BTreeSet<_> = plan
-    .member_edits
-    .iter()
-    .filter(|(_, edits)| {
-      edits
-        .iter()
-        .any(|edit| matches!(edit, crate::cargo::MemberEdit::AddFeatures { .. }))
-    })
-    .map(|(member, _)| member.as_ref())
-    .collect();
-  if !repaired_members.is_empty() {
-    progress!("verifying standalone feature repairs...");
-    for member in repaired_members {
-      if let Err(error) = crate::compiler::verify_standalone_member(ctx.workspace_root(), member) {
-        manifest_transaction.restore()?;
-        return Err(RailError::with_help(
-          format!("unify standalone verification failed: {error}"),
-          "all modified manifests were restored; the proposed feature repair did not make the member self-contained"
-            .to_string(),
-        ));
-      }
-    }
-  }
-
-  let mut written_report_path = None;
-  if !no_report {
-    let actual_report_path = report_path
-      .unwrap_or_else(|| crate::workspace::cargo_rail_state_root(ctx.workspace_root()).join("unify-report.md"));
-    UnifyReport::write_to_file(&plan, &actual_report_path)?;
-    progress!("report: {}", actual_report_path.display());
-    written_report_path = Some(actual_report_path);
-  }
 
   // Count undeclared feature fixes
   let features_fixed: usize = plan
@@ -1779,61 +2225,7 @@ pub fn run_unify_apply(
     })
     .count();
 
-  if !json {
-    println!(
-      "\nunified {} dependencies across {} members",
-      plan.workspace_deps.len(),
-      plan.member_edits.len()
-    );
-    if !plan.transitive_pins.is_empty() {
-      println!("  {} transitives pinned", plan.transitive_pins.len());
-    }
-    if !plan.duplicates_cleaned.is_empty() {
-      println!("  {} duplicates resolved", plan.duplicates_cleaned.len());
-    }
-    if !plan.pruned_features.is_empty() {
-      println!("  {} unreachable private features pruned", plan.pruned_features.len());
-    }
-    if !plan.optional_features.is_empty() {
-      println!(
-        "  {} optional features detected (user-facing, preserved)",
-        plan.optional_features.len()
-      );
-    }
-    if features_fixed > 0 {
-      println!(
-        "  {} undeclared features fixed across {} crates",
-        features_fixed, crates_fixed
-      );
-    }
-    if let Some(ref msrv) = plan.computed_msrv {
-      use crate::cargo::MsrvSourceUsed;
-      let source_desc = match msrv.source_used {
-        MsrvSourceUsed::Deps => format!(
-          "from deps: {}",
-          msrv.contributors.first().unwrap_or(&"unknown".to_string())
-        ),
-        MsrvSourceUsed::Workspace => "preserved from workspace".to_string(),
-        MsrvSourceUsed::MaxWorkspace => "from workspace (higher than deps)".to_string(),
-        MsrvSourceUsed::MaxDeps => format!(
-          "from deps: {}",
-          msrv.contributors.first().unwrap_or(&"unknown".to_string())
-        ),
-      };
-      println!(
-        "  rust-version = {}.{}.{} ({})",
-        msrv.version.major, msrv.version.minor, msrv.version.patch, source_desc
-      );
-    }
-
-    println!("\nnext: cargo check && cargo test");
-
-    if let Some(ref backup_id) = created_backup_id {
-      println!("undo: cargo rail unify undo  (backup: {})", backup_id);
-    }
-  }
-
-  let apply_receipt = mutation::write_receipt(
+  let apply_receipt_result = mutation::write_receipt(
     ctx.workspace_root(),
     "unify",
     "apply",
@@ -1844,8 +2236,16 @@ pub fn run_unify_apply(
       MutationTrace::new(
         "UNIFY_GRAPH_DELTA_VERIFIED",
         format!(
-          "authorized graph delta: {} addition(s), {} removal(s), {}",
-          graph_delta.added, graph_delta.removed, graph_delta.fingerprint
+          "authorized graph delta: {} addition(s), {} removal(s), {}; lockfile {}",
+          graph_delta.added, graph_delta.removed, graph_delta.fingerprint, graph_delta.post_mutation_lock_fingerprint
+        ),
+      ),
+      MutationTrace::new(
+        "UNIFY_COVERAGE_VIEWS_VERIFIED",
+        format!(
+          "verified {} captured coverage view(s): {}",
+          coverage_verification.identities.len(),
+          coverage_verification.fingerprint
         ),
       ),
       MutationTrace::new(
@@ -1854,8 +2254,26 @@ pub fn run_unify_apply(
       ),
       MutationTrace::new("UNIFY_APPLY_COMPLETED", "completed unify apply"),
     ],
-  )?;
+  );
+  let apply_receipt = match apply_receipt_result {
+    Ok(path) => path,
+    Err(error) => {
+      manifest_transaction.restore().map_err(|rollback| {
+        RailError::message(format!(
+          "writing the unify apply receipt failed: {error}; rollback also failed: {rollback}"
+        ))
+      })?;
+      return Err(RailError::with_help(
+        format!("writing the unify apply receipt failed: {error}"),
+        "all authorized manifests, Cargo.lock, and report output were restored; resolve the receipt storage failure and retry",
+      ));
+    }
+  };
   progress!("receipt: {}", apply_receipt.display());
+
+  if !json {
+    display_unify_apply_summary(&plan, features_fixed, crates_fixed, created_backup_id.as_deref());
+  }
 
   if json {
     let warnings = msrv_warning.into_iter().collect::<Vec<_>>();
@@ -1867,6 +2285,7 @@ pub fn run_unify_apply(
       serde_json::json!({
         "dependencies": plan.workspace_deps.len(),
         "members": plan.member_edits.len(),
+        "package_fields_inherited": plan.package_inheritance_edit_count(),
         "transitives_pinned": plan.transitive_pins.len(),
         "duplicates_resolved": plan.duplicates_cleaned.len(),
         "features_pruned": plan.pruned_features.len(),
@@ -1880,7 +2299,14 @@ pub fn run_unify_apply(
           "added_facts": graph_delta.added,
           "removed_facts": graph_delta.removed,
           "fingerprint": graph_delta.fingerprint,
+          "lockfile_fingerprint": graph_delta.post_mutation_lock_fingerprint,
           "facts": graph_delta.facts,
+        },
+        "coverage_verification": {
+          "schema_version": 1,
+          "verified_views": coverage_verification.identities.len(),
+          "identities": coverage_verification.identities,
+          "fingerprint": coverage_verification.fingerprint,
         },
         "proof_fingerprint": proof_fingerprint,
         "warnings": warnings,
@@ -1944,6 +2370,36 @@ fn display_explain(sink: &mut UnifyTextSink, plan: &crate::cargo::UnificationPla
   outln!(sink);
   outln!(sink, "=== Explanation ===");
   outln!(sink);
+
+  if !plan.package_inheritance.is_empty() {
+    outln!(sink, "Package inheritance:");
+    outln!(sink);
+    for field in &plan.package_inheritance {
+      outln!(sink, "  {}", field.field);
+      if !field.planned.is_empty() {
+        outln!(sink, "    inherit: {}", format_preview_list(&field.planned, 10));
+      }
+      if !field.local_overrides.is_empty() {
+        outln!(
+          sink,
+          "    local overrides: {}",
+          format_preview_list(&field.local_overrides, 10)
+        );
+      }
+      if !field.missing.is_empty() {
+        outln!(sink, "    missing: {}", format_preview_list(&field.missing, 10));
+      }
+      if !field.retained_equivalent.is_empty() {
+        outln!(
+          sink,
+          "    retained ({}): {}",
+          field.retention_reason.unwrap_or("domain-owned"),
+          format_preview_list(&field.retained_equivalent, 10)
+        );
+      }
+    }
+    outln!(sink);
+  }
 
   if !plan.dependency_decisions.is_empty() {
     outln!(sink, "Dependency decisions:");
@@ -2131,33 +2587,14 @@ fn display_explain(sink: &mut UnifyTextSink, plan: &crate::cargo::UnificationPla
 ///
 /// Virtual workspaces cannot have [dev-dependencies] directly in their manifest,
 /// which affects transitive dependency pinning.
-fn is_virtual_workspace(workspace_root: &std::path::Path) -> bool {
-  use std::fs;
-
-  let root_manifest = workspace_root.join("Cargo.toml");
-  let Ok(content) = fs::read_to_string(&root_manifest) else {
-    return false;
-  };
-
-  let Ok(doc) = content.parse::<toml_edit::DocumentMut>() else {
-    return false;
-  };
-
+fn is_virtual_workspace(ctx: &WorkspaceContext) -> RailResult<bool> {
+  let doc = root_manifest_document(ctx)?;
   // A virtual workspace has [workspace] but no [package]
-  doc.contains_key("workspace") && !doc.contains_key("package")
+  Ok(doc.contains_key("workspace") && !doc.contains_key("package"))
 }
 
-fn workspace_msrv_write_needed(workspace_root: &std::path::Path, msrv: &semver::Version) -> RailResult<bool> {
-  use std::fs;
-
-  let root_manifest = workspace_root.join("Cargo.toml");
-  let Ok(content) = fs::read_to_string(&root_manifest) else {
-    return Ok(true);
-  };
-  let Ok(doc) = content.parse::<toml_edit::DocumentMut>() else {
-    return Ok(true);
-  };
-
+fn workspace_msrv_write_needed(ctx: &WorkspaceContext, msrv: &semver::Version) -> RailResult<bool> {
+  let doc = root_manifest_document(ctx)?;
   let desired = format!("{}.{}.{}", msrv.major, msrv.minor, msrv.patch);
   let current = doc
     .get("workspace")
@@ -2165,7 +2602,16 @@ fn workspace_msrv_write_needed(workspace_root: &std::path::Path, msrv: &semver::
     .and_then(|pkg| pkg.get("rust-version"))
     .and_then(|v| v.as_str());
 
-  Ok(current != Some(desired.as_str()))
+  let Some(current) = current else {
+    return Ok(true);
+  };
+  let Some(current_version) = crate::cargo::multi_target_metadata::parse_rust_version(current) else {
+    return Ok(current != desired);
+  };
+  if current_version > *msrv {
+    return Ok(false);
+  }
+  Ok(current != desired)
 }
 
 fn transitive_pins_host_manifest_path(ctx: &WorkspaceContext) -> RailResult<std::path::PathBuf> {
@@ -2180,7 +2626,7 @@ fn transitive_pins_host_manifest_path(ctx: &WorkspaceContext) -> RailResult<std:
 
   // For virtual workspaces (no [package] section), we can't use the root as the transitive host
   // because virtual manifests can't have [dev-dependencies].
-  if is_root_host && is_virtual_workspace(ctx.workspace_root()) {
+  if is_root_host && is_virtual_workspace(ctx)? {
     // Auto-select first workspace member as the host
     let members = ctx.graph().workspace_members();
     if members.is_empty() {
@@ -2220,17 +2666,99 @@ fn build_unify_mutation_plan(
   report_path: Option<&std::path::PathBuf>,
 ) -> RailResult<mutation::MutationPlan> {
   let (actions, risks, trace) =
-    build_unify_mutation_parts(plan, msrv_write_needed, backup_enabled, no_report, report_path);
+    build_unify_mutation_parts(ctx, plan, msrv_write_needed, backup_enabled, no_report, report_path)?;
   mutation::build_plan(ctx, "unify", actions, risks, trace)
 }
 
+fn unify_expected_mutation(ctx: &WorkspaceContext, path: &Path) -> RailResult<ExpectedMutation> {
+  let absolute = if path.is_absolute() {
+    path.to_path_buf()
+  } else {
+    ctx.snapshot()?.cargo_current_dir().join(path)
+  };
+  let authority_root = if ctx.has_git() {
+    &ctx.git()?.git().worktree_root
+  } else {
+    ctx.workspace_root()
+  };
+  let relative = crate::utils::path_relative_to(authority_root, &absolute).map_err(|error| {
+    RailError::message(format!(
+      "unify mutation path '{}' is outside authority root '{}': {error}",
+      absolute.display(),
+      authority_root.display()
+    ))
+  })?;
+  Ok(ExpectedMutation::capture(
+    authority_root,
+    relative,
+    MutationEffect::Write,
+  ))
+}
+
+fn unify_report_output_path(
+  ctx: &WorkspaceContext,
+  plan: &crate::cargo::UnificationPlan,
+  no_report: bool,
+  requested: Option<&Path>,
+) -> RailResult<Option<PathBuf>> {
+  if no_report {
+    return Ok(None);
+  }
+  let requested = requested
+    .map(Path::to_path_buf)
+    .unwrap_or_else(|| crate::workspace::cargo_rail_state_root(ctx.workspace_root()).join("unify-report.md"));
+  let absolute = if requested.is_absolute() {
+    requested
+  } else {
+    ctx.snapshot()?.cargo_current_dir().join(requested)
+  };
+  let output = crate::utils::canonicalize_allow_missing(&absolute)
+    .map_err(|error| RailError::message(format!("resolving unify report path '{}': {error}", absolute.display())))?;
+  let authority_root = if ctx.has_git() {
+    &ctx.git()?.git().worktree_root
+  } else {
+    ctx.workspace_root()
+  };
+  crate::utils::path_relative_to(authority_root, &output).map_err(|error| {
+    RailError::message(format!(
+      "unify report path '{}' is outside authority root '{}': {error}",
+      output.display(),
+      authority_root.display()
+    ))
+  })?;
+
+  let mut protected = BTreeSet::from([
+    ctx.workspace_root().join("Cargo.toml"),
+    ctx.workspace_root().join("Cargo.lock"),
+  ]);
+  protected.extend(plan.member_paths.values().cloned());
+  if !plan.transitive_pins.is_empty() {
+    protected.insert(transitive_pins_host_manifest_path(ctx)?);
+  }
+  for path in protected {
+    let path = crate::utils::canonicalize_allow_missing(&path)
+      .map_err(|error| RailError::message(format!("resolving protected unify path '{}': {error}", path.display())))?;
+    if output == path {
+      return Err(RailError::with_help(
+        format!(
+          "unify report path '{}' aliases a graph mutation target",
+          output.display()
+        ),
+        "choose a report path that is distinct from every Cargo.toml and Cargo.lock",
+      ));
+    }
+  }
+  Ok(Some(output))
+}
+
 fn build_unify_mutation_parts(
+  ctx: &WorkspaceContext,
   plan: &crate::cargo::UnificationPlan,
   msrv_write_needed: bool,
   backup_enabled: bool,
   no_report: bool,
   report_path: Option<&std::path::PathBuf>,
-) -> (Vec<MutationAction>, Vec<MutationRisk>, Vec<MutationTrace>) {
+) -> RailResult<(Vec<MutationAction>, Vec<MutationRisk>, Vec<MutationTrace>)> {
   let mut actions = Vec::with_capacity(8); // Typically few distinct action types
   let mut risks = Vec::with_capacity(4);
   let mut trace = Vec::with_capacity(8);
@@ -2250,46 +2778,97 @@ fn build_unify_mutation_parts(
   );
 
   if !plan.workspace_deps.is_empty() {
-    actions.push(MutationAction::new(
-      "WRITE_WORKSPACE_DEPS",
-      "Cargo.toml:[workspace.dependencies]",
-      Some(format!("{} dependencies", plan.workspace_deps.len())),
-    ));
+    actions.push(
+      MutationAction::new(
+        "WRITE_WORKSPACE_DEPS",
+        "Cargo.toml:[workspace.dependencies]",
+        Some(format!("{} dependencies", plan.workspace_deps.len())),
+      )
+      .with_mutations(vec![unify_expected_mutation(
+        ctx,
+        &ctx.workspace_root().join("Cargo.toml"),
+      )?]),
+    );
   }
 
   if !plan.member_edits.is_empty() {
-    actions.push(MutationAction::new(
-      "APPLY_MEMBER_EDITS",
-      "workspace member manifests",
-      Some(format!("{} member(s)", plan.member_edits.len())),
-    ));
+    let mut members = plan
+      .member_edits
+      .keys()
+      .map(|member| {
+        let path = plan
+          .member_paths
+          .get(member)
+          .ok_or_else(|| RailError::message(format!("member path not found: {member}")))?;
+        unify_expected_mutation(ctx, path)
+      })
+      .collect::<RailResult<Vec<_>>>()?;
+    members.sort_by(|left, right| left.path.cmp(&right.path));
+    actions.push(
+      MutationAction::new(
+        "APPLY_MEMBER_EDITS",
+        "workspace member manifests",
+        Some(format!("{} member(s)", plan.member_edits.len())),
+      )
+      .with_mutations(members),
+    );
   }
 
   if !plan.transitive_pins.is_empty() {
-    actions.push(MutationAction::new(
-      "APPLY_TRANSITIVE_PINS",
-      "transitive host manifest",
-      Some(format!("{} pinned dependencies", plan.transitive_pins.len())),
-    ));
+    let mut mutations = vec![unify_expected_mutation(ctx, &ctx.workspace_root().join("Cargo.toml"))?];
+    let host = unify_expected_mutation(ctx, &transitive_pins_host_manifest_path(ctx)?)?;
+    if mutations.iter().all(|mutation| mutation.path != host.path) {
+      mutations.push(host);
+    }
+    actions.push(
+      MutationAction::new(
+        "APPLY_TRANSITIVE_PINS",
+        "transitive host manifest",
+        Some(format!("{} pinned dependencies", plan.transitive_pins.len())),
+      )
+      .with_mutations(mutations),
+    );
   }
 
   if msrv_write_needed {
-    actions.push(MutationAction::new(
-      "WRITE_WORKSPACE_MSRV",
-      "Cargo.toml:[workspace.package.rust-version]",
-      None,
-    ));
+    actions.push(
+      MutationAction::new(
+        "WRITE_WORKSPACE_MSRV",
+        "Cargo.toml:[workspace.package.rust-version]",
+        None,
+      )
+      .with_mutations(vec![unify_expected_mutation(
+        ctx,
+        &ctx.workspace_root().join("Cargo.toml"),
+      )?]),
+    );
   }
 
-  if backup_enabled {
+  if plan.has_planned_changes(msrv_write_needed) {
+    actions.push(
+      MutationAction::new(
+        "REFRESH_CARGO_LOCK",
+        "Cargo.lock",
+        Some("Cargo resolves the authorized manifest graph".to_string()),
+      )
+      .with_mutations(vec![unify_expected_mutation(
+        ctx,
+        &ctx.workspace_root().join("Cargo.lock"),
+      )?]),
+    );
+  }
+
+  if backup_enabled && plan.has_planned_changes(msrv_write_needed) {
     actions.push(MutationAction::new("CREATE_BACKUP", "target/cargo-rail/backups", None));
   }
 
-  if !no_report {
-    let target = report_path
-      .map(|p| p.display().to_string())
-      .unwrap_or_else(|| "target/cargo-rail/unify-report.md".to_string());
-    actions.push(MutationAction::new("WRITE_REPORT", target, None));
+  if !no_report && plan.has_planned_changes(msrv_write_needed) {
+    let path = unify_report_output_path(ctx, plan, false, report_path.map(PathBuf::as_path))?
+      .ok_or_else(|| RailError::message("unify report path unexpectedly disabled"))?;
+    let mutation = unify_expected_mutation(ctx, &path)?;
+    actions.push(
+      MutationAction::new("WRITE_REPORT", mutation.path.display().to_string(), None).with_mutations(vec![mutation]),
+    );
   }
 
   let error_count = plan
@@ -2348,6 +2927,16 @@ fn build_unify_mutation_parts(
       format!("planned {} feature-level member edit(s)", feature_edit_count),
     ));
   }
+  let package_inheritance_edit_count = plan.package_inheritance_edit_count();
+  if package_inheritance_edit_count > 0 {
+    trace.push(MutationTrace::new(
+      "UNIFY_PACKAGE_INHERITANCE_DECISIONS",
+      format!(
+        "planned {} equivalent package declaration(s) for workspace inheritance",
+        package_inheritance_edit_count
+      ),
+    ));
+  }
   if msrv_write_needed || plan.computed_msrv.is_some() {
     trace.push(MutationTrace::new(
       "UNIFY_MSRV_DECISIONS",
@@ -2365,7 +2954,7 @@ fn build_unify_mutation_parts(
     ));
   }
 
-  (actions, risks, trace)
+  Ok((actions, risks, trace))
 }
 
 #[cfg(test)]
@@ -2397,6 +2986,7 @@ mod tests {
       version_mismatches: Vec::new(),
       unused_deps: Vec::new(),
       undeclared_features: Vec::new(),
+      package_inheritance: Vec::new(),
       dependency_decisions: Vec::new(),
     }
   }
@@ -2439,6 +3029,32 @@ mod tests {
     assert_eq!(
       relative_path(Path::new("/checkout/workspace"), Path::new("/checkout/vendor/beta")),
       Some(PathBuf::from("../vendor/beta"))
+    );
+  }
+
+  #[test]
+  fn test_msrv_toolchain_constraint_distinguishes_identity_from_probe_evidence() {
+    let required = semver::Version::new(1, 90, 0);
+
+    assert_eq!(
+      msrv_toolchain_constraint(Some(&required), "1.90.0").0,
+      MsrvToolchainConstraintStatus::Satisfied
+    );
+    assert_eq!(
+      msrv_toolchain_constraint(Some(&required), "1.91.0-nightly").0,
+      MsrvToolchainConstraintStatus::Satisfied
+    );
+    assert_eq!(
+      msrv_toolchain_constraint(Some(&required), "1.89.0").0,
+      MsrvToolchainConstraintStatus::Unsatisfied
+    );
+    assert_eq!(
+      msrv_toolchain_constraint(Some(&required), "unknown").0,
+      MsrvToolchainConstraintStatus::Unknown
+    );
+    assert_eq!(
+      msrv_toolchain_constraint(None, "1.90.0").0,
+      MsrvToolchainConstraintStatus::NotApplicable
     );
   }
 

@@ -27,5 +27,6 @@ pub fn read_toml_file(path: &Path) -> RailResult<DocumentMut> {
 ///
 /// Returns error if file cannot be written
 pub fn write_toml_file(path: &Path, doc: &DocumentMut) -> RailResult<()> {
-  std::fs::write(path, doc.to_string()).with_context(|| format!("Failed to write {}", path.display()))
+  crate::utils::write_file_atomic(path, doc.to_string().as_bytes())
+    .with_context(|| format!("Failed to write {}", path.display()))
 }

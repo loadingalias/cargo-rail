@@ -63,6 +63,82 @@ impl FeatureSelection {
   }
 }
 
+/// One root-independent feature/target coverage view for workspace packages.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct CoverageView {
+  /// Configured platform target covered by this view.
+  pub target: PlatformTarget,
+  /// Exact Cargo feature selection shared by every package in the view.
+  pub features: FeatureSelection,
+  /// Deterministically ordered workspace package names.
+  pub packages: Vec<String>,
+}
+
+impl CoverageView {
+  pub(crate) fn new(target: PlatformTarget, features: FeatureSelection, packages: BTreeSet<String>) -> Self {
+    Self {
+      target,
+      features,
+      packages: packages.into_iter().collect(),
+    }
+  }
+
+  /// Return a root-independent identity for this exact coverage view.
+  pub fn identity(&self) -> crate::error::RailResult<String> {
+    let bytes = serde_json::to_vec(self)?;
+    Ok(format!(
+      "coverage:v1-sha256-{}",
+      crate::source::ContentDigest::sha256(&bytes)
+    ))
+  }
+
+  /// Return argv after `cargo` for a compile-only all-targets check.
+  #[must_use]
+  pub fn cargo_arguments(&self) -> Vec<String> {
+    let mut arguments = vec!["check".to_string(), "--locked".to_string(), "--all-targets".to_string()];
+    self.extend_feature_arguments(&mut arguments);
+    self.extend_package_and_target_arguments(&mut arguments);
+    arguments
+  }
+
+  /// Return argv after `cargo` for a nextest execution of this view.
+  #[must_use]
+  pub fn nextest_arguments(&self) -> Vec<String> {
+    let mut arguments = vec!["nextest".to_string(), "run".to_string(), "--locked".to_string()];
+    self.extend_feature_arguments(&mut arguments);
+    self.extend_package_and_target_arguments(&mut arguments);
+    arguments
+  }
+
+  fn extend_feature_arguments(&self, arguments: &mut Vec<String>) {
+    match &self.features {
+      FeatureSelection::Default => {}
+      FeatureSelection::NoDefaultFeatures => arguments.push("--no-default-features".to_string()),
+      FeatureSelection::AllFeatures => arguments.push("--all-features".to_string()),
+      FeatureSelection::Selected(features) => {
+        arguments.push("--no-default-features".to_string());
+        for package in &self.packages {
+          for feature in features {
+            arguments.push("--features".to_string());
+            arguments.push(format!("{package}/{feature}"));
+          }
+        }
+      }
+    }
+  }
+
+  fn extend_package_and_target_arguments(&self, arguments: &mut Vec<String>) {
+    for package in &self.packages {
+      arguments.push("--package".to_string());
+      arguments.push(package.clone());
+    }
+    if self.target.as_str() != "default" {
+      arguments.push("--target".to_string());
+      arguments.push(self.target.as_str().to_string());
+    }
+  }
+}
+
 /// Cargo target domain reported by compiler messages.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum CargoTargetKind {
