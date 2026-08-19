@@ -23,7 +23,12 @@ fn surface_schema_is_pre_context_and_matches_the_published_contract() -> Result<
   Ok(())
 }
 
+/// Complete surface analysis reads authenticated typed compiler facts, so this
+/// front-door contract only holds for a cargo-rail built with an embedded
+/// driver authority. `scripts/test-compiler-fact-protocol.sh` provisions that
+/// build; an ordinary source build has no producer authority to exercise.
 #[test]
+#[ignore = "requires the exact rustc-dev companion authority embedded by the protocol harness"]
 fn surface_check_collects_production_tests_and_doctests_once() -> Result<()> {
   let workspace = TestWorkspace::new_named("surface-complete-views")?;
   let package = workspace.add_crate("surface-app", "0.1.0", &[])?;

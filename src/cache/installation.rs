@@ -23,6 +23,7 @@ const COORDINATOR_STATE_PREFIX: &str = "remote-coordinator-v1-";
 const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
 const MAX_SESSION_MEMO_BYTES: u64 = 256 * 1024;
 const MAX_USAGE_BYTES: u64 = 64 * 1024;
+const MAX_DISTRIBUTED_PLACEMENT_HISTORY_BYTES: u64 = 64 * 1024;
 #[cfg(not(windows))]
 const WRAPPER_FILE: &str = "cargo-rail-native-rustc-wrapper";
 #[cfg(windows)]
@@ -31,11 +32,28 @@ const WRAPPER_FILE: &str = "cargo-rail-native-rustc-wrapper.exe";
 const WORKER_FILE: &str = "cargo-rail-native-rustc-worker";
 #[cfg(windows)]
 const WORKER_FILE: &str = "cargo-rail-native-rustc-worker.exe";
+#[cfg(not(windows))]
+const DISTRIBUTED_WORKER_FILE: &str = "cargo-rail-distributed-worker";
+#[cfg(windows)]
+const DISTRIBUTED_WORKER_FILE: &str = "cargo-rail-distributed-worker.exe";
+const DISTRIBUTED_AUTHORITY_FILE: &str = "distributed-authority.pem";
+const DISTRIBUTED_CLIENT_CERTIFICATE_FILE: &str = "distributed-client.pem";
+const DISTRIBUTED_CLIENT_PRIVATE_KEY_FILE: &str = "distributed-client.key";
+const DISTRIBUTED_PLACEMENT_HISTORY_FILE: &str = "distributed-placement-v1.json";
+const DISTRIBUTED_PLACEMENT_LOCK_FILE: &str = "distributed-placement-v1.lock";
 const DIRECT_LAUNCHER_ENV: &str = "CARGO_RAIL_DIRECT_CACHE_LAUNCHER";
 
 /// Requested machine policy. Omitted values preserve an existing installation.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SetupRequest {
+  pub(crate) distributed_local: bool,
+  pub(crate) distributed_endpoint: Option<String>,
+  pub(crate) distributed_server_name: Option<String>,
+  pub(crate) distributed_capability: Option<String>,
+  pub(crate) distributed_authority: Option<PathBuf>,
+  pub(crate) distributed_client_certificate: Option<PathBuf>,
+  pub(crate) distributed_client_private_key: Option<PathBuf>,
+  pub(crate) distributed_policy: Option<String>,
   pub(crate) local_dir: Option<PathBuf>,
   pub(crate) max_bytes: Option<u64>,
   pub(crate) remote_url: Option<String>,
@@ -56,7 +74,19 @@ pub(crate) struct SetupPlan {
   source_wrapper_digest: String,
   source_worker: PathBuf,
   source_worker_digest: String,
+  source_distributed_worker: Option<PathBuf>,
+  source_distributed_worker_digest: Option<String>,
+  source_distributed_identity: Option<SourceDistributedIdentity>,
   pending: bool,
+}
+
+struct SourceDistributedIdentity {
+  authority: PathBuf,
+  authority_digest: String,
+  client_certificate: PathBuf,
+  client_certificate_digest: String,
+  client_private_key: PathBuf,
+  client_private_key_digest: String,
 }
 
 /// One exact uninstall preview. The local compiler-result cache is deliberately
@@ -69,6 +99,8 @@ pub(crate) struct RemovalPlan {
   receipt: Option<InstallationReceipt>,
   wrapper_before_digest: Option<String>,
   worker_before_digest: Option<String>,
+  distributed_worker_before_digest: Option<String>,
+  distributed_identity_before_digests: Vec<Option<String>>,
 }
 
 impl RemovalPlan {
@@ -133,6 +165,23 @@ impl SetupPlan {
       .map_err(|error| RailError::message(format!("installed remote cache policy is invalid: {error}")))
   }
 
+  pub(crate) fn distributed_mode(&self) -> Option<&str> {
+    self
+      .receipt
+      .distributed
+      .as_ref()
+      .map(|distributed| distributed.mode.as_str())
+  }
+
+  pub(crate) fn distributed_policy(&self) -> Option<&'static str> {
+    self
+      .receipt
+      .distributed
+      .as_ref()
+      .and_then(|distributed| distributed.placement)
+      .map(DistributedPlacementPolicy::as_str)
+  }
+
   pub(crate) fn receipt_path(&self) -> RailResult<PathBuf> {
     Ok(self.receipt.installation_directory()?.join(RECEIPT_FILE))
   }
@@ -165,6 +214,58 @@ pub(crate) struct InstallationReceipt {
   cache: LocalCacheSelection,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   remote: Option<crate::remote_cache::InstalledRemoteCache>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  distributed: Option<InstalledDistributedQualification>,
+}
+
+/// Optional machine-owned execution authority installed beside the wrapper.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstalledDistributedQualification {
+  mode: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  placement: Option<DistributedPlacementPolicy>,
+  worker_path: PathBuf,
+  worker_digest: String,
+  worker_generation: Vec<u8>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  mutual_tls: Option<InstalledMutualTlsDirect>,
+}
+
+/// Machine-owned decision boundary for one direct mTLS worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DistributedPlacementPolicy {
+  /// Delegate only when bounded retained observations predict a material win.
+  Automatic,
+  /// Collect explicit qualification observations even when no cost history exists.
+  Qualification,
+}
+
+impl DistributedPlacementPolicy {
+  pub(crate) const fn as_str(self) -> &'static str {
+    match self {
+      Self::Automatic => "automatic",
+      Self::Qualification => "qualification",
+    }
+  }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstalledMutualTlsDirect {
+  endpoint: String,
+  server_name: String,
+  worker_capability_id: String,
+  authority_certificate: PathBuf,
+  authority_digest: String,
+  authority_generation: Vec<u8>,
+  client_certificate: PathBuf,
+  client_certificate_digest: String,
+  client_certificate_generation: Vec<u8>,
+  client_private_key: PathBuf,
+  client_private_key_digest: String,
+  client_private_key_generation: Vec<u8>,
 }
 
 pub(crate) struct InstallationSessionLock {
@@ -204,6 +305,49 @@ impl InstallationReceipt {
     self.remote.as_ref()
   }
 
+  pub(crate) fn local_distributed_worker(&self) -> Option<&Path> {
+    self
+      .distributed
+      .as_ref()
+      .filter(|distributed| distributed.mode == "local_process_qualification_v1")
+      .filter(|distributed| {
+        crate::utils::stable_file_generation(&distributed.worker_path).as_ref() == Some(&distributed.worker_generation)
+      })
+      .map(|distributed| distributed.worker_path.as_path())
+  }
+
+  pub(crate) fn mutual_tls_distributed_worker(
+    &self,
+  ) -> Option<(
+    crate::compiler::distributed::MutualTlsClientIdentity<'_>,
+    DistributedPlacementPolicy,
+  )> {
+    let distributed = self.distributed.as_ref()?;
+    let mutual_tls = distributed.mutual_tls.as_ref()?;
+    if distributed.mode != "mutual_tls_direct_v1"
+      || crate::utils::stable_file_generation(&distributed.worker_path).as_ref() != Some(&distributed.worker_generation)
+      || crate::utils::stable_file_generation(&mutual_tls.authority_certificate).as_ref()
+        != Some(&mutual_tls.authority_generation)
+      || crate::utils::stable_file_generation(&mutual_tls.client_certificate).as_ref()
+        != Some(&mutual_tls.client_certificate_generation)
+      || crate::utils::stable_file_generation(&mutual_tls.client_private_key).as_ref()
+        != Some(&mutual_tls.client_private_key_generation)
+    {
+      return None;
+    }
+    Some((
+      crate::compiler::distributed::MutualTlsClientIdentity {
+        endpoint: &mutual_tls.endpoint,
+        server_name: &mutual_tls.server_name,
+        worker_capability_id: &mutual_tls.worker_capability_id,
+        authority_certificate: &mutual_tls.authority_certificate,
+        client_certificate: &mutual_tls.client_certificate,
+        client_private_key: &mutual_tls.client_private_key,
+      },
+      distributed.placement?,
+    ))
+  }
+
   pub(crate) fn installation_directory(&self) -> RailResult<&Path> {
     self
       .wrapper_path
@@ -225,6 +369,14 @@ impl InstallationReceipt {
 
   fn usage_path(&self) -> RailResult<PathBuf> {
     Ok(self.installation_directory()?.join(USAGE_FILE))
+  }
+
+  fn distributed_placement_history_path(&self) -> RailResult<PathBuf> {
+    Ok(self.installation_directory()?.join(DISTRIBUTED_PLACEMENT_HISTORY_FILE))
+  }
+
+  fn distributed_placement_lock_path(&self) -> RailResult<PathBuf> {
+    Ok(self.installation_directory()?.join(DISTRIBUTED_PLACEMENT_LOCK_FILE))
   }
 
   fn validate(&self) -> RailResult<()> {
@@ -267,8 +419,69 @@ impl InstallationReceipt {
         .selection()
         .map_err(|error| RailError::message(format!("installed remote cache policy is invalid: {error}")))?;
     }
+    if let Some(distributed) = &self.distributed
+      && (!matches!(
+        distributed.mode.as_str(),
+        "local_process_qualification_v1" | "mutual_tls_direct_v1"
+      ) || !valid_sha256(&distributed.worker_digest)
+        || distributed.worker_generation.is_empty()
+        || distributed.worker_generation.len() > 512
+        || !distributed.worker_path.is_absolute()
+        || distributed.worker_path.parent() != self.wrapper_path.parent()
+        || distributed.worker_path.file_name() != Some(std::ffi::OsStr::new(DISTRIBUTED_WORKER_FILE))
+        || (distributed.mode == "local_process_qualification_v1" && distributed.mutual_tls.is_some())
+        || (distributed.mode == "local_process_qualification_v1" && distributed.placement.is_some())
+        || (distributed.mode == "mutual_tls_direct_v1"
+          && (distributed.placement.is_none()
+            || distributed
+              .mutual_tls
+              .as_ref()
+              .is_none_or(|mutual_tls| !valid_installed_mutual_tls(mutual_tls, &distributed.worker_path)))))
+    {
+      return Err(RailError::message(
+        "transparent compiler-cache distributed qualification receipt is invalid",
+      ));
+    }
     Ok(())
   }
+}
+
+fn valid_installed_mutual_tls(mutual_tls: &InstalledMutualTlsDirect, worker_path: &Path) -> bool {
+  let Some(directory) = worker_path.parent() else {
+    return false;
+  };
+  mutual_tls.endpoint.parse::<std::net::SocketAddr>().is_ok()
+    && rustls::pki_types::ServerName::try_from(mutual_tls.server_name.clone()).is_ok()
+    && crate::compiler::distributed::worker_capability_identity_is_valid(&mutual_tls.worker_capability_id)
+    && [
+      (
+        &mutual_tls.authority_certificate,
+        DISTRIBUTED_AUTHORITY_FILE,
+        &mutual_tls.authority_digest,
+        &mutual_tls.authority_generation,
+      ),
+      (
+        &mutual_tls.client_certificate,
+        DISTRIBUTED_CLIENT_CERTIFICATE_FILE,
+        &mutual_tls.client_certificate_digest,
+        &mutual_tls.client_certificate_generation,
+      ),
+      (
+        &mutual_tls.client_private_key,
+        DISTRIBUTED_CLIENT_PRIVATE_KEY_FILE,
+        &mutual_tls.client_private_key_digest,
+        &mutual_tls.client_private_key_generation,
+      ),
+    ]
+    .into_iter()
+    .all(|(path, file_name, digest, generation)| {
+      path.is_absolute()
+        && path.parent() == Some(directory)
+        && path.file_name() == Some(std::ffi::OsStr::new(file_name))
+        && valid_sha256(digest)
+        && !generation.is_empty()
+        && generation.len() <= 512
+    })
 }
 
 pub(crate) fn load_session_memo(receipt: &InstallationReceipt) -> RailResult<Option<Vec<u8>>> {
@@ -306,6 +519,55 @@ pub(crate) fn store_session_memo(receipt: &InstallationReceipt, bytes: &[u8]) ->
   write_private_atomic(&receipt.session_memo_path()?, bytes)
 }
 
+/// Read bounded observational placement history. It never grants result authority.
+pub(crate) fn read_distributed_placement_history(receipt: &InstallationReceipt) -> RailResult<Option<Vec<u8>>> {
+  read_optional_regular(
+    &receipt.distributed_placement_history_path()?,
+    MAX_DISTRIBUTED_PLACEMENT_HISTORY_BYTES,
+  )
+}
+
+/// Serialize one bounded placement-history update across concurrent Cargo wrappers.
+pub(crate) fn update_distributed_placement_history(
+  receipt: &InstallationReceipt,
+  update: impl FnOnce(Option<&[u8]>) -> RailResult<Vec<u8>>,
+) -> RailResult<()> {
+  if receipt
+    .distributed
+    .as_ref()
+    .is_none_or(|distributed| distributed.mutual_tls.is_none())
+  {
+    return Err(RailError::message(
+      "distributed placement history has no installed mTLS authority",
+    ));
+  }
+  let lock_path = receipt.distributed_placement_lock_path()?;
+  let lock = crate::utils::open_cache_lock_file(&lock_path, true)?;
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    lock.set_permissions(fs::Permissions::from_mode(0o600))?;
+  }
+  if !crate::utils::private_file_matches_path(&lock, &lock_path, 0)? {
+    return Err(RailError::message(
+      "distributed placement lock is not a private regular file",
+    ));
+  }
+  lock.lock()?;
+  if !crate::utils::private_file_matches_path(&lock, &lock_path, 0)? {
+    return Err(RailError::message(
+      "distributed placement lock changed while it was acquired",
+    ));
+  }
+  let current = read_distributed_placement_history(receipt)?;
+  let next = update(current.as_deref())?;
+  if next.len() as u64 > MAX_DISTRIBUTED_PLACEMENT_HISTORY_BYTES {
+    return Err(RailError::message("distributed placement history exceeds its bound"));
+  }
+  write_private_atomic(&receipt.distributed_placement_history_path()?, &next)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct InstallationStatus {
   pub(crate) state: &'static str,
@@ -318,6 +580,12 @@ pub(crate) struct InstallationStatus {
   pub(crate) cache_base: Option<String>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub(crate) max_bytes: Option<u64>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub(crate) distributed: Option<&'static str>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub(crate) distributed_policy: Option<&'static str>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub(crate) distributed_placement_history: Option<crate::compiler::distributed::PlacementHistoryStatus>,
   pub(crate) cargo_l0: &'static str,
   pub(crate) usage: InstallationUsageStatus,
   pub(crate) issues: Vec<String>,
@@ -434,11 +702,114 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
     .unwrap_or_default();
   let wrapper_path = install_directory.join(WRAPPER_FILE);
   let worker_path = install_directory.join(WORKER_FILE);
+  let distributed_worker_path = install_directory.join(DISTRIBUTED_WORKER_FILE);
+  let distributed_authority_path = install_directory.join(DISTRIBUTED_AUTHORITY_FILE);
+  let distributed_client_certificate_path = install_directory.join(DISTRIBUTED_CLIENT_CERTIFICATE_FILE);
+  let distributed_client_private_key_path = install_directory.join(DISTRIBUTED_CLIENT_PRIVATE_KEY_FILE);
   let (config_after, build_table_created) = install_wrapper_value(&original, &wrapper_path, existing.as_ref())?;
   let source_wrapper = crate::compiler::native_cache::direct_wrapper_executable()?;
   let source_wrapper_digest = installation_source_digest(&source_wrapper)?;
   let source_worker = crate::compiler::native_cache::direct_worker_executable()?;
   let source_worker_digest = installation_source_digest(&source_worker)?;
+  let requested_mutual_tls = match (
+    request.distributed_endpoint.as_deref(),
+    request.distributed_server_name.as_deref(),
+    request.distributed_capability.as_deref(),
+    request.distributed_authority.as_deref(),
+    request.distributed_client_certificate.as_deref(),
+    request.distributed_client_private_key.as_deref(),
+  ) {
+    (None, None, None, None, None, None) => None,
+    (
+      Some(endpoint),
+      Some(server_name),
+      Some(worker_capability_id),
+      Some(authority),
+      Some(client_certificate),
+      Some(client_private_key),
+    ) => {
+      if request.distributed_local {
+        return Err(RailError::message(
+          "local-process and mutually authenticated distributed modes are exclusive",
+        ));
+      }
+      let endpoint = endpoint
+        .parse::<std::net::SocketAddr>()
+        .map_err(|_| RailError::message("distributed endpoint must be an explicit socket address"))?
+        .to_string();
+      rustls::pki_types::ServerName::try_from(server_name.to_string())
+        .map_err(|_| RailError::message("distributed TLS server name is invalid"))?;
+      let authority = resolve_requested_path(current_dir, authority)?;
+      let client_certificate = resolve_requested_path(current_dir, client_certificate)?;
+      let client_private_key = resolve_requested_path(current_dir, client_private_key)?;
+      crate::compiler::distributed::validate_mutual_tls_client_identity(
+        server_name,
+        worker_capability_id,
+        &authority,
+        &client_certificate,
+        &client_private_key,
+      )?;
+      Some((
+        endpoint,
+        server_name.to_string(),
+        worker_capability_id.to_string(),
+        authority,
+        client_certificate,
+        client_private_key,
+      ))
+    }
+    _ => {
+      return Err(RailError::message(
+        "distributed mTLS setup requires endpoint, server name, worker capability, authority, client certificate, and client key",
+      ));
+    }
+  };
+  if request.distributed_local
+    && existing
+      .as_ref()
+      .and_then(|receipt| receipt.distributed.as_ref())
+      .is_some_and(|distributed| distributed.mutual_tls.is_some())
+  {
+    return Err(RailError::with_help(
+      "cannot replace an mTLS distributed installation with local qualification during setup",
+      "run `cargo rail cache remove`, then rerun setup with `--distributed-local`",
+    ));
+  }
+  let requested_placement = request
+    .distributed_policy
+    .as_deref()
+    .map(|policy| match policy {
+      "automatic" => Ok(DistributedPlacementPolicy::Automatic),
+      "qualification" => Ok(DistributedPlacementPolicy::Qualification),
+      _ => Err(RailError::message("distributed placement policy is invalid")),
+    })
+    .transpose()?;
+  let distributed_enabled = request.distributed_local
+    || requested_mutual_tls.is_some()
+    || requested_placement.is_some()
+    || existing.as_ref().is_some_and(|receipt| receipt.distributed.is_some());
+  let source_distributed_worker = distributed_enabled
+    .then(crate::compiler::native_cache::direct_distributed_worker_executable)
+    .transpose()?;
+  let source_distributed_worker_digest = source_distributed_worker
+    .as_deref()
+    .map(installation_source_digest)
+    .transpose()?;
+  let source_distributed_identity = requested_mutual_tls
+    .as_ref()
+    .map(
+      |(_, _, _, authority, client_certificate, client_private_key)| -> RailResult<SourceDistributedIdentity> {
+        Ok(SourceDistributedIdentity {
+          authority: authority.clone(),
+          authority_digest: installation_source_digest(authority)?,
+          client_certificate: client_certificate.clone(),
+          client_certificate_digest: installation_source_digest(client_certificate)?,
+          client_private_key: client_private_key.clone(),
+          client_private_key_digest: installation_source_digest(client_private_key)?,
+        })
+      },
+    )
+    .transpose()?;
   let wrapper_current = optional_file_digest(&wrapper_path)?;
   let wrapper_generation = if wrapper_current.as_deref() == Some(source_wrapper_digest.as_str()) {
     crate::utils::stable_file_generation(&wrapper_path)
@@ -452,6 +823,72 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
       .ok_or_else(|| RailError::message("installed compiler worker has no stable local file generation"))?
   } else {
     vec![0]
+  };
+  let distributed_worker_current = if distributed_enabled {
+    optional_file_digest(&distributed_worker_path)?
+  } else {
+    None
+  };
+  let distributed_worker_generation = if distributed_enabled
+    && distributed_worker_current.as_deref() == source_distributed_worker_digest.as_deref()
+  {
+    crate::utils::stable_file_generation(&distributed_worker_path)
+      .ok_or_else(|| RailError::message("installed distributed compiler worker has no stable local file generation"))?
+  } else {
+    vec![0]
+  };
+  let mutual_tls = if let (Some((endpoint, server_name, worker_capability_id, ..)), Some(source)) =
+    (requested_mutual_tls.as_ref(), source_distributed_identity.as_ref())
+  {
+    let installed_generation = |path: &Path, digest: &str| -> RailResult<Vec<u8>> {
+      if optional_file_digest(path)?.as_deref() == Some(digest) {
+        crate::utils::stable_file_generation(path)
+          .ok_or_else(|| RailError::message("installed distributed TLS identity has no stable file generation"))
+      } else {
+        Ok(vec![0])
+      }
+    };
+    Some(InstalledMutualTlsDirect {
+      endpoint: endpoint.clone(),
+      server_name: server_name.clone(),
+      worker_capability_id: worker_capability_id.clone(),
+      authority_certificate: distributed_authority_path.clone(),
+      authority_digest: source.authority_digest.clone(),
+      authority_generation: installed_generation(&distributed_authority_path, &source.authority_digest)?,
+      client_certificate: distributed_client_certificate_path.clone(),
+      client_certificate_digest: source.client_certificate_digest.clone(),
+      client_certificate_generation: installed_generation(
+        &distributed_client_certificate_path,
+        &source.client_certificate_digest,
+      )?,
+      client_private_key: distributed_client_private_key_path.clone(),
+      client_private_key_digest: source.client_private_key_digest.clone(),
+      client_private_key_generation: installed_generation(
+        &distributed_client_private_key_path,
+        &source.client_private_key_digest,
+      )?,
+    })
+  } else {
+    existing
+      .as_ref()
+      .and_then(|receipt| receipt.distributed.as_ref())
+      .and_then(|distributed| distributed.mutual_tls.clone())
+  };
+  let placement = if mutual_tls.is_some() {
+    requested_placement
+      .or_else(|| {
+        existing
+          .as_ref()
+          .and_then(|receipt| receipt.distributed.as_ref())
+          .and_then(|distributed| distributed.placement)
+      })
+      .or(Some(DistributedPlacementPolicy::Automatic))
+  } else if requested_placement.is_some() {
+    return Err(RailError::message(
+      "distributed placement policy requires an installed or requested mTLS worker",
+    ));
+  } else {
+    None
   };
   let cache_base = request
     .local_dir
@@ -505,14 +942,51 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
     worker_generation,
     cache,
     remote,
+    distributed: source_distributed_worker_digest
+      .as_ref()
+      .map(|digest| InstalledDistributedQualification {
+        mode: if mutual_tls.is_some() {
+          "mutual_tls_direct_v1".to_string()
+        } else {
+          "local_process_qualification_v1".to_string()
+        },
+        placement,
+        worker_path: distributed_worker_path,
+        worker_digest: digest.clone(),
+        worker_generation: distributed_worker_generation,
+        mutual_tls,
+      }),
   };
   receipt.validate()?;
   let encoded_receipt = encode_receipt(&receipt)?;
   let cache_ready = receipt.cache.configured_root()?.is_some();
+  let distributed_identity_current = receipt
+    .distributed
+    .as_ref()
+    .and_then(|distributed| distributed.mutual_tls.as_ref())
+    .map(|mutual_tls| -> RailResult<[Option<String>; 3]> {
+      Ok([
+        optional_file_digest(&mutual_tls.authority_certificate)?,
+        optional_file_digest(&mutual_tls.client_certificate)?,
+        optional_file_digest(&mutual_tls.client_private_key)?,
+      ])
+    })
+    .transpose()?;
   let pending = config_before.as_deref() != Some(config_after.as_bytes())
     || receipt_before.as_deref() != Some(encoded_receipt.as_slice())
     || wrapper_current.as_deref() != Some(source_wrapper_digest.as_str())
     || worker_current.as_deref() != Some(source_worker_digest.as_str())
+    || distributed_enabled && distributed_worker_current.as_deref() != source_distributed_worker_digest.as_deref()
+    || receipt
+      .distributed
+      .as_ref()
+      .and_then(|distributed| distributed.mutual_tls.as_ref())
+      .zip(distributed_identity_current.as_ref())
+      .is_some_and(|(mutual_tls, current)| {
+        current[0].as_deref() != Some(mutual_tls.authority_digest.as_str())
+          || current[1].as_deref() != Some(mutual_tls.client_certificate_digest.as_str())
+          || current[2].as_deref() != Some(mutual_tls.client_private_key_digest.as_str())
+      })
     || !cache_ready;
   Ok(SetupPlan {
     cargo_home,
@@ -525,6 +999,9 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
     source_wrapper_digest,
     source_worker,
     source_worker_digest,
+    source_distributed_worker,
+    source_distributed_worker_digest,
+    source_distributed_identity,
     pending,
   })
 }
@@ -564,6 +1041,58 @@ pub(crate) fn apply_setup(mut plan: SetupPlan) -> RailResult<()> {
       "compiler worker executable changed after setup planning",
     ));
   }
+  if let (Some(source), Some(expected_digest)) = (
+    plan.source_distributed_worker.as_deref(),
+    plan.source_distributed_worker_digest.as_deref(),
+  ) && installation_source_digest(source)? != expected_digest
+  {
+    return Err(RailError::message(
+      "distributed compiler worker executable changed after setup planning",
+    ));
+  }
+  if let Some(source) = &plan.source_distributed_identity {
+    for (path, expected) in [
+      (&source.authority, &source.authority_digest),
+      (&source.client_certificate, &source.client_certificate_digest),
+      (&source.client_private_key, &source.client_private_key_digest),
+    ] {
+      if installation_source_digest(path)? != *expected {
+        return Err(RailError::message(
+          "distributed TLS identity changed after setup planning",
+        ));
+      }
+    }
+  } else if let Some(mutual_tls) = plan
+    .receipt
+    .distributed
+    .as_ref()
+    .and_then(|distributed| distributed.mutual_tls.as_ref())
+  {
+    for (path, expected, generation) in [
+      (
+        &mutual_tls.authority_certificate,
+        &mutual_tls.authority_digest,
+        &mutual_tls.authority_generation,
+      ),
+      (
+        &mutual_tls.client_certificate,
+        &mutual_tls.client_certificate_digest,
+        &mutual_tls.client_certificate_generation,
+      ),
+      (
+        &mutual_tls.client_private_key,
+        &mutual_tls.client_private_key_digest,
+        &mutual_tls.client_private_key_generation,
+      ),
+    ] {
+      if file_digest(path)? != *expected || crate::utils::stable_file_generation(path).as_ref() != Some(generation) {
+        return Err(RailError::with_help(
+          "installed distributed TLS identity drifted",
+          "rerun cache setup with the complete distributed identity to repair it",
+        ));
+      }
+    }
+  }
   if let Some(existing) = plan.receipt_before.as_deref().map(parse_receipt).transpose()? {
     crate::remote_cache::stop_installed_coordinators(&existing);
   }
@@ -580,6 +1109,36 @@ pub(crate) fn apply_setup(mut plan: SetupPlan) -> RailResult<()> {
   LocalCas::open_selected(&plan.receipt.cache)?;
   install_executable_atomic(&plan.source_wrapper, &plan.receipt.wrapper_path)?;
   install_executable_atomic(&plan.source_worker, &plan.receipt.worker_path)?;
+  if let (Some(source), Some(distributed)) = (
+    plan.source_distributed_worker.as_deref(),
+    plan.receipt.distributed.as_ref(),
+  ) {
+    install_executable_atomic(source, &distributed.worker_path)?;
+  }
+  if let (Some(source), Some(mutual_tls)) = (
+    plan.source_distributed_identity.as_ref(),
+    plan
+      .receipt
+      .distributed
+      .as_ref()
+      .and_then(|distributed| distributed.mutual_tls.as_ref()),
+  ) {
+    install_private_file_atomic(
+      &source.authority,
+      &mutual_tls.authority_certificate,
+      &source.authority_digest,
+    )?;
+    install_private_file_atomic(
+      &source.client_certificate,
+      &mutual_tls.client_certificate,
+      &source.client_certificate_digest,
+    )?;
+    install_private_file_atomic(
+      &source.client_private_key,
+      &mutual_tls.client_private_key,
+      &source.client_private_key_digest,
+    )?;
+  }
   if file_digest(&plan.receipt.wrapper_path)? != plan.receipt.wrapper_digest {
     return Err(RailError::message(
       "installed compiler wrapper failed content verification",
@@ -594,6 +1153,46 @@ pub(crate) fn apply_setup(mut plan: SetupPlan) -> RailResult<()> {
   }
   plan.receipt.worker_generation = crate::utils::stable_file_generation(&plan.receipt.worker_path)
     .ok_or_else(|| RailError::message("installed compiler worker has no stable local file generation"))?;
+  if let Some(distributed) = plan.receipt.distributed.as_mut() {
+    if plan.source_distributed_worker_digest.as_deref() != Some(distributed.worker_digest.as_str())
+      || file_digest(&distributed.worker_path)? != distributed.worker_digest
+    {
+      return Err(RailError::message(
+        "installed distributed compiler worker failed content verification",
+      ));
+    }
+    distributed.worker_generation = crate::utils::stable_file_generation(&distributed.worker_path)
+      .ok_or_else(|| RailError::message("installed distributed compiler worker has no stable local file generation"))?;
+    if let Some(mutual_tls) = distributed.mutual_tls.as_mut() {
+      for (path, expected) in [
+        (&mutual_tls.authority_certificate, &mutual_tls.authority_digest),
+        (&mutual_tls.client_certificate, &mutual_tls.client_certificate_digest),
+        (&mutual_tls.client_private_key, &mutual_tls.client_private_key_digest),
+      ] {
+        if file_digest(path)? != *expected {
+          return Err(RailError::message(
+            "installed distributed TLS identity failed content verification",
+          ));
+        }
+      }
+      mutual_tls.authority_generation = crate::utils::stable_file_generation(&mutual_tls.authority_certificate)
+        .ok_or_else(|| RailError::message("installed distributed TLS authority has no stable file generation"))?;
+      mutual_tls.client_certificate_generation = crate::utils::stable_file_generation(&mutual_tls.client_certificate)
+        .ok_or_else(|| {
+        RailError::message("installed distributed TLS client certificate has no stable file generation")
+      })?;
+      mutual_tls.client_private_key_generation =
+        crate::utils::stable_file_generation(&mutual_tls.client_private_key)
+          .ok_or_else(|| RailError::message("installed distributed TLS client key has no stable file generation"))?;
+      crate::compiler::distributed::validate_mutual_tls_client_identity(
+        &mutual_tls.server_name,
+        &mutual_tls.worker_capability_id,
+        &mutual_tls.authority_certificate,
+        &mutual_tls.client_certificate,
+        &mutual_tls.client_private_key,
+      )?;
+    }
+  }
   write_private_atomic(&receipt_path, &encode_receipt(&plan.receipt)?)?;
   revalidate_optional(&plan.config_path, plan.config_before.as_deref(), 16 * 1024 * 1024)?;
   crate::utils::write_file_atomic(&plan.config_path, &plan.config_after)?;
@@ -618,6 +1217,8 @@ pub(crate) fn plan_removal(current_dir: &Path) -> RailResult<RemovalPlan> {
       receipt: None,
       wrapper_before_digest: None,
       worker_before_digest: None,
+      distributed_worker_before_digest: None,
+      distributed_identity_before_digests: Vec::new(),
     });
   };
   let receipt = parse_receipt(&receipt_bytes)?;
@@ -659,6 +1260,40 @@ pub(crate) fn plan_removal(current_dir: &Path) -> RailResult<RemovalPlan> {
     }
     None => None,
   };
+  let distributed_worker_before_digest = match receipt.distributed.as_ref() {
+    Some(distributed) => match optional_file_digest(&distributed.worker_path)? {
+      Some(digest) if digest == distributed.worker_digest => Some(digest),
+      Some(_) => {
+        return Err(RailError::message(
+          "installed distributed compiler worker content changed; removal refused",
+        ));
+      }
+      None => None,
+    },
+    None => None,
+  };
+  let distributed_identity_before_digests = receipt
+    .distributed
+    .as_ref()
+    .and_then(|distributed| distributed.mutual_tls.as_ref())
+    .map(|mutual_tls| {
+      [
+        (&mutual_tls.authority_certificate, &mutual_tls.authority_digest),
+        (&mutual_tls.client_certificate, &mutual_tls.client_certificate_digest),
+        (&mutual_tls.client_private_key, &mutual_tls.client_private_key_digest),
+      ]
+      .into_iter()
+      .map(|(path, expected)| match optional_file_digest(path)? {
+        Some(digest) if digest == *expected => Ok(Some(digest)),
+        Some(_) => Err(RailError::message(
+          "installed distributed TLS identity changed; removal refused",
+        )),
+        None => Ok(None),
+      })
+      .collect::<RailResult<Vec<_>>>()
+    })
+    .transpose()?
+    .unwrap_or_default();
   Ok(RemovalPlan {
     config_path,
     config_before,
@@ -667,6 +1302,8 @@ pub(crate) fn plan_removal(current_dir: &Path) -> RailResult<RemovalPlan> {
     receipt: Some(receipt),
     wrapper_before_digest,
     worker_before_digest,
+    distributed_worker_before_digest,
+    distributed_identity_before_digests,
   })
 }
 
@@ -705,6 +1342,46 @@ pub(crate) fn apply_removal(plan: RemovalPlan) -> RailResult<()> {
       ));
     }
   }
+  if let Some(distributed) = &receipt.distributed {
+    match (
+      &plan.distributed_worker_before_digest,
+      optional_file_digest(&distributed.worker_path)?,
+    ) {
+      (Some(expected), Some(current)) if expected == &current => {}
+      (None, None) => {}
+      _ => {
+        return Err(RailError::with_help(
+          "installed distributed compiler worker changed after removal planning",
+          "rerun the command after inspecting the installation drift",
+        ));
+      }
+    }
+  }
+  if let Some(mutual_tls) = receipt
+    .distributed
+    .as_ref()
+    .and_then(|distributed| distributed.mutual_tls.as_ref())
+  {
+    for ((path, _), expected) in [
+      (&mutual_tls.authority_certificate, &mutual_tls.authority_digest),
+      (&mutual_tls.client_certificate, &mutual_tls.client_certificate_digest),
+      (&mutual_tls.client_private_key, &mutual_tls.client_private_key_digest),
+    ]
+    .into_iter()
+    .zip(&plan.distributed_identity_before_digests)
+    {
+      match (expected, optional_file_digest(path)?) {
+        (Some(expected), Some(current)) if expected == &current => {}
+        (None, None) => {}
+        _ => {
+          return Err(RailError::with_help(
+            "installed distributed TLS identity changed after removal planning",
+            "rerun the command after inspecting the installation drift",
+          ));
+        }
+      }
+    }
+  }
   crate::remote_cache::stop_installed_coordinators(&receipt);
 
   match plan.config_after {
@@ -720,12 +1397,36 @@ pub(crate) fn apply_removal(plan: RemovalPlan) -> RailResult<()> {
   if plan.worker_before_digest.is_some() {
     fs::remove_file(&receipt.worker_path)?;
   }
+  if plan.distributed_worker_before_digest.is_some()
+    && let Some(distributed) = &receipt.distributed
+  {
+    fs::remove_file(&distributed.worker_path)?;
+  }
+  if let Some(mutual_tls) = receipt
+    .distributed
+    .as_ref()
+    .and_then(|distributed| distributed.mutual_tls.as_ref())
+  {
+    for (path, present) in [
+      &mutual_tls.authority_certificate,
+      &mutual_tls.client_certificate,
+      &mutual_tls.client_private_key,
+    ]
+    .into_iter()
+    .zip(&plan.distributed_identity_before_digests)
+    {
+      if present.is_some() {
+        fs::remove_file(path)?;
+      }
+    }
+  }
   if read_optional_regular(&receipt.session_memo_path()?, MAX_SESSION_MEMO_BYTES)?.is_some() {
     fs::remove_file(receipt.session_memo_path()?)?;
   }
   if read_optional_regular(&receipt.usage_path()?, MAX_USAGE_BYTES)?.is_some() {
     fs::remove_file(receipt.usage_path()?)?;
   }
+  remove_distributed_placement_state(&receipt)?;
   fs::remove_file(&receipt_path)?;
   let session_lock_path = receipt.session_lock_path()?;
   drop(session_lock);
@@ -743,6 +1444,32 @@ pub(crate) fn apply_removal(plan: RemovalPlan) -> RailResult<()> {
       Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
       Err(error) => return Err(error.into()),
     }
+  }
+  Ok(())
+}
+
+fn remove_distributed_placement_state(receipt: &InstallationReceipt) -> RailResult<()> {
+  let lock_path = receipt.distributed_placement_lock_path()?;
+  let lock = crate::utils::open_cache_lock_file(&lock_path, true)?;
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    lock.set_permissions(fs::Permissions::from_mode(0o600))?;
+  }
+  if !crate::utils::private_file_matches_path(&lock, &lock_path, 0)? {
+    return Err(RailError::message(
+      "distributed placement lock is not a private regular file",
+    ));
+  }
+  lock.lock()?;
+  let history = receipt.distributed_placement_history_path()?;
+  if read_optional_regular(&history, MAX_DISTRIBUTED_PLACEMENT_HISTORY_BYTES)?.is_some() {
+    fs::remove_file(history)?;
+  }
+  drop(lock);
+  if read_optional_regular(&lock_path, 0)?.is_some() {
+    fs::remove_file(lock_path)?;
   }
   Ok(())
 }
@@ -768,6 +1495,17 @@ pub(crate) fn load_for_wrapper(invoked: &Path) -> RailResult<InstallationReceipt
   }
   if crate::utils::stable_file_generation(&invoked).as_ref() != Some(&receipt.worker_generation)
     || crate::utils::stable_file_generation(&launcher).as_ref() != Some(&receipt.wrapper_generation)
+    || receipt.distributed.as_ref().is_some_and(|distributed| {
+      crate::utils::stable_file_generation(&distributed.worker_path).as_ref() != Some(&distributed.worker_generation)
+        || distributed.mutual_tls.as_ref().is_some_and(|mutual_tls| {
+          crate::utils::stable_file_generation(&mutual_tls.authority_certificate).as_ref()
+            != Some(&mutual_tls.authority_generation)
+            || crate::utils::stable_file_generation(&mutual_tls.client_certificate).as_ref()
+              != Some(&mutual_tls.client_certificate_generation)
+            || crate::utils::stable_file_generation(&mutual_tls.client_private_key).as_ref()
+              != Some(&mutual_tls.client_private_key_generation)
+        })
+    })
   {
     return Err(RailError::message(
       "installed compiler launcher or worker changed after verified setup",
@@ -879,6 +1617,9 @@ pub(crate) fn status(current_dir: &Path) -> RailResult<InstallationStatus> {
       wrapper_path: None,
       cache_base: None,
       max_bytes: None,
+      distributed: None,
+      distributed_policy: None,
+      distributed_placement_history: None,
       cargo_l0: "owned_by_cargo_not_observable_when_rustc_is_not_launched",
       usage: InstallationUsageStatus {
         early_bypasses: "not_recorded_before_context_acquisition",
@@ -914,6 +1655,54 @@ pub(crate) fn status(current_dir: &Path) -> RailResult<InstallationStatus> {
     Ok(_) => issues.push("installed worker content changed".to_string()),
     Err(error) => issues.push(format!("installed worker is unavailable: {error}")),
   }
+  if let Some(distributed) = &receipt.distributed {
+    match file_digest(&distributed.worker_path) {
+      Ok(digest)
+        if digest == distributed.worker_digest
+          && crate::utils::stable_file_generation(&distributed.worker_path).as_ref()
+            == Some(&distributed.worker_generation) => {}
+      Ok(_) => issues.push("installed distributed worker content changed".to_string()),
+      Err(error) => issues.push(format!("installed distributed worker is unavailable: {error}")),
+    }
+    if let Some(mutual_tls) = &distributed.mutual_tls {
+      for (role, path, expected, generation) in [
+        (
+          "authority",
+          &mutual_tls.authority_certificate,
+          &mutual_tls.authority_digest,
+          &mutual_tls.authority_generation,
+        ),
+        (
+          "client certificate",
+          &mutual_tls.client_certificate,
+          &mutual_tls.client_certificate_digest,
+          &mutual_tls.client_certificate_generation,
+        ),
+        (
+          "client key",
+          &mutual_tls.client_private_key,
+          &mutual_tls.client_private_key_digest,
+          &mutual_tls.client_private_key_generation,
+        ),
+      ] {
+        match file_digest(path) {
+          Ok(digest)
+            if digest == *expected && crate::utils::stable_file_generation(path).as_ref() == Some(generation) => {}
+          Ok(_) => issues.push(format!("installed distributed TLS {role} changed")),
+          Err(error) => issues.push(format!("installed distributed TLS {role} is unavailable: {error}")),
+        }
+      }
+      if let Err(error) = crate::compiler::distributed::validate_mutual_tls_client_identity(
+        &mutual_tls.server_name,
+        &mutual_tls.worker_capability_id,
+        &mutual_tls.authority_certificate,
+        &mutual_tls.client_certificate,
+        &mutual_tls.client_private_key,
+      ) {
+        issues.push(error.to_string());
+      }
+    }
+  }
   match receipt.cache.configured_root() {
     Ok(Some(_)) => {}
     Ok(None) => issues.push("local cache is unavailable; run cargo rail cache setup to repair it".to_string()),
@@ -932,6 +1721,21 @@ pub(crate) fn status(current_dir: &Path) -> RailResult<InstallationStatus> {
       }
     }
   };
+  let distributed_placement_history = if receipt
+    .distributed
+    .as_ref()
+    .is_some_and(|distributed| distributed.mutual_tls.is_some())
+  {
+    match crate::compiler::distributed::placement_history_status(&receipt) {
+      Ok(status) => Some(status),
+      Err(error) => {
+        issues.push(format!("distributed placement history is unavailable: {error}"));
+        None
+      }
+    }
+  } else {
+    None
+  };
   Ok(InstallationStatus {
     state: if issues.is_empty() { "installed" } else { "drifted" },
     healthy: issues.is_empty(),
@@ -940,6 +1744,20 @@ pub(crate) fn status(current_dir: &Path) -> RailResult<InstallationStatus> {
     wrapper_path: Some(receipt.wrapper_path.to_string_lossy().into_owned()),
     cache_base: Some(receipt.cache.base().to_string_lossy().into_owned()),
     max_bytes: Some(receipt.cache.max_bytes()),
+    distributed: receipt
+      .distributed
+      .as_ref()
+      .and_then(|distributed| match distributed.mode.as_str() {
+        "local_process_qualification_v1" => Some("local_process_qualification_v1"),
+        "mutual_tls_direct_v1" => Some("mutual_tls_direct_v1"),
+        _ => None,
+      }),
+    distributed_policy: receipt
+      .distributed
+      .as_ref()
+      .and_then(|distributed| distributed.placement)
+      .map(DistributedPlacementPolicy::as_str),
+    distributed_placement_history,
     cargo_l0: "owned_by_cargo_not_observable_when_rustc_is_not_launched",
     usage,
     issues,
@@ -1201,6 +2019,46 @@ fn install_executable_atomic(source: &Path, destination: &Path) -> RailResult<()
     temporary.as_file().set_permissions(fs::Permissions::from_mode(0o700))?;
   }
   temporary.as_file().sync_all()?;
+  crate::utils::persist_file_atomic(temporary, destination)?;
+  Ok(())
+}
+
+fn install_private_file_atomic(source: &Path, destination: &Path, expected_digest: &str) -> RailResult<()> {
+  let parent = destination
+    .parent()
+    .ok_or_else(|| RailError::message("installed distributed identity has no parent"))?;
+  let metadata = fs::symlink_metadata(source)?;
+  if !metadata.is_file() || crate::utils::is_symlink_or_reparse(&metadata) {
+    return Err(RailError::message(
+      "distributed identity source is not a real regular file",
+    ));
+  }
+  let mut input = File::open(source)?;
+  if !crate::utils::opened_file_matches_path(&input, source, metadata.len())? {
+    return Err(RailError::message(
+      "distributed identity source changed before it was opened",
+    ));
+  }
+  let mut builder = tempfile::Builder::new();
+  builder.prefix(".cargo-rail-distributed-identity-");
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::PermissionsExt as _;
+    builder.permissions(fs::Permissions::from_mode(0o600));
+  }
+  let mut temporary = builder.tempfile_in(parent)?;
+  std::io::copy(&mut input, &mut temporary)?;
+  if !crate::utils::opened_file_matches_path(&input, source, metadata.len())? {
+    return Err(RailError::message(
+      "distributed identity source changed while it was copied",
+    ));
+  }
+  temporary.as_file().sync_all()?;
+  if digest_regular_file(temporary.path(), false)? != expected_digest {
+    return Err(RailError::message(
+      "distributed identity source changed after setup planning",
+    ));
+  }
   crate::utils::persist_file_atomic(temporary, destination)?;
   Ok(())
 }

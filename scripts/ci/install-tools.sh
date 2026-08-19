@@ -57,8 +57,9 @@ install_release_binary() {
   local digest="$6"
   local member="$7"
   local binary="${8:-$package}"
+  local version_program="${9:-$package}"
   local destination="$cargo_bin/$binary"
-  local expected_version="$package $version"
+  local expected_version="$version_program $version"
   if [[ -x "$destination" ]] && [[ "$("$destination" --version 2>&1)" == "$expected_version" ]]; then
     echo "$package $version is already installed"
     return
@@ -200,6 +201,28 @@ install_sccache() {
   esac
   install_release_binary sccache "$SCCACHE_VERSION" mozilla/sccache "v$SCCACHE_VERSION" \
     "$asset" "$digest" "sccache-v$SCCACHE_VERSION-$archive_target/$binary" "$binary"
+}
+
+install_sccache_dist() {
+  local asset digest archive_target
+  case "$rust_host" in
+    x86_64-unknown-linux-gnu)
+      archive_target="x86_64-unknown-linux-musl"
+      asset="sccache-dist-v$SCCACHE_VERSION-$archive_target.tar.gz"
+      digest="affec995429df5f97498e93d373b10733b0048a6391554c83ccd57d9b6c23d1c"
+      ;;
+    aarch64-unknown-linux-gnu)
+      archive_target="aarch64-unknown-linux-musl"
+      asset="sccache-dist-v$SCCACHE_VERSION-$archive_target.tar.gz"
+      digest="5b84340b1e34d9c7426be3b9e4e674b6a01dc70187ad6640f83446d1ee94a0e3"
+      ;;
+    *)
+      echo "sccache-dist $SCCACHE_VERSION has no configured asset for Rust host $rust_host" >&2
+      exit 1
+      ;;
+  esac
+  install_release_binary sccache-dist "$SCCACHE_VERSION" mozilla/sccache "v$SCCACHE_VERSION" \
+    "$asset" "$digest" "sccache-dist-v$SCCACHE_VERSION-$archive_target/sccache-dist" sccache-dist sccache
 }
 
 install_cargo_nextest() {
@@ -376,6 +399,20 @@ case "$profile" in
     cargo audit --version
     hyperfine --version
     sccache --version
+    ;;
+  *-distributed-qualification)
+    # Distributed qualification compares against the exact pinned sccache
+    # client, scheduler, and server release on the same bounded topology.
+    install_cargo_nextest
+    install_cargo_deny
+    install_cargo_audit
+    install_sccache
+    install_sccache_dist
+    cargo nextest --version
+    cargo deny --version
+    cargo audit --version
+    sccache --version
+    sccache-dist --version
     ;;
   *-qualification)
     # Benchmark images stay lean. Qualification explicitly adds the tools used

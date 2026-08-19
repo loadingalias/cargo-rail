@@ -337,6 +337,13 @@ pub fn dispatch_required() -> i32 {
   }
 }
 
+/// Run the dedicated distributed compiler worker process.
+#[doc(hidden)]
+#[must_use]
+pub fn dispatch_distributed_worker() -> i32 {
+  crate::compiler::distributed::worker_main()
+}
+
 fn run_direct_cache() -> i32 {
   let cache_control = cache_control();
   if cache_control == CacheControl::Disabled {
@@ -490,12 +497,14 @@ fn run_cache_invocation(
       capture,
       base_action_key,
       cache_bytes_read,
+      distributed_placement,
     } => crate::compiler::native_cache::run_and_store(
       command,
       recorder,
       capture,
       base_action_key,
       cache_bytes_read,
+      distributed_placement,
       "cargo-rail compiler cache wrapper",
     ),
     crate::compiler::native_cache::OuterCacheAction::OperationalFailure(error) => {

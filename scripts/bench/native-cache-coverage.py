@@ -16,7 +16,7 @@ import tempfile
 from typing import Any
 
 
-EVENT_SCHEMA_VERSION = 8
+EVENT_SCHEMA_VERSION = 9
 REPORT_SCHEMA_VERSION = 7
 INVENTORY_SCHEMA_VERSION = 5
 DIRECT_WRAPPER_NAMES = {"cargo-rail-native-rustc-wrapper", "cargo-rail-native-rustc-wrapper.exe"}

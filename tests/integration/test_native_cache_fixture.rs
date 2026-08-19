@@ -417,7 +417,7 @@ fn ensure_typed_benchmark_events(directory: &Path) -> Result<()> {
   ensure!(!events.is_empty(), "benchmark compiler operation inventory is empty");
   for event in events {
     ensure!(
-      event["schema_version"] == 8,
+      event["schema_version"] == 9,
       "benchmark compiler operation has an incompatible schema: {event}"
     );
     let action = event["action"].as_object().context("benchmark compiler operation")?;

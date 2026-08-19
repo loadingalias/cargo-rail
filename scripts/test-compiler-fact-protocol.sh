@@ -30,6 +30,12 @@ CARGO_RAIL_CACHE_DIR="$fact_cache" \
   "$repository_root/scripts/with-compiler-fact-driver.sh" \
   "$repository_root/scripts/test-compiler-fact-exact-reuse.sh"
 
+# Surface analysis consumes typed facts through the cargo-rail front door, so
+# it needs an embedded driver authority rather than a runtime driver path.
+"$repository_root/scripts/with-compiler-fact-driver.sh" \
+  cargo nextest run --locked -p cargo-rail --all-features --test integration \
+    --run-ignored ignored-only surface_check_collects_production_tests_and_doctests_once
+
 if [[ "${OS:-}" != "Windows_NT" ]]; then
   CARGO_RAIL_TEST_FACT_DRIVER="$driver" \
     cargo nextest run --locked -p cargo-rail --all-features \

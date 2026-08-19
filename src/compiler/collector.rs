@@ -2425,20 +2425,35 @@ struct SysrootIdentityMemo {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn compiler_sysroot_memo_lookup(sysroot: &Path, host_target: &str) -> Option<ContentDigest> {
+  let sysroot = crate::utils::canonicalize_existing(sysroot).ok()?;
+  let mut framed = Vec::from(&b"cargo-rail-compiler-sysroot-memo-location-v1\0"[..]);
+  append_identity_frame(&mut framed, b"sysroot", sysroot.as_os_str().as_encoded_bytes());
+  append_identity_frame(&mut framed, b"host-target", host_target.as_bytes());
+  Some(ContentDigest::sha256(&framed))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn compiler_sysroot_memo_path(
   sysroot: &Path,
   host_target: &str,
   selection: Option<&LocalCacheSelection>,
 ) -> Option<PathBuf> {
-  let sysroot = crate::utils::canonicalize_existing(sysroot).ok()?;
-  let mut framed = Vec::from(&b"cargo-rail-compiler-sysroot-memo-location-v1\0"[..]);
-  append_identity_frame(&mut framed, b"sysroot", sysroot.as_os_str().as_encoded_bytes());
-  append_identity_frame(&mut framed, b"host-target", host_target.as_bytes());
-  let lookup = ContentDigest::sha256(&framed);
+  let lookup = compiler_sysroot_memo_lookup(sysroot, host_target)?;
   selection
     .map_or_else(LocalCas::open, LocalCas::open_initialized_selected)
     .ok()
     .map(|cas| cas.sysroot_identity_memo_path(&lookup))
+}
+
+/// Select the sysroot identity memo owned by one already open local cache.
+///
+/// The distributed client reaches this after the native session has already
+/// established the same fact in the same process, so reusing the caller's cache
+/// avoids opening a second one and avoids rehashing the whole sysroot.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+pub(crate) fn compiler_sysroot_memo_path_in(cas: &LocalCas, sysroot: &Path, host_target: &str) -> Option<PathBuf> {
+  compiler_sysroot_memo_lookup(sysroot, host_target).map(|lookup| cas.sysroot_identity_memo_path(&lookup))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -2450,7 +2465,12 @@ fn compiler_sysroot_memo_path(
   None
 }
 
-fn compiler_sysroot_fingerprint(
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub(crate) fn compiler_sysroot_memo_path_in(_cas: &LocalCas, _sysroot: &Path, _host_target: &str) -> Option<PathBuf> {
+  None
+}
+
+pub(crate) fn compiler_sysroot_fingerprint(
   sysroot: &Path,
   host_target: &str,
   memo_path: Option<&Path>,

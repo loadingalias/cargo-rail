@@ -74,6 +74,8 @@ pub(crate) fn run_setup(
     "cache_base": plan.cache_base(),
     "max_bytes": plan.max_bytes(),
     "remote": remote,
+    "distributed": plan.distributed_mode(),
+    "distributed_policy": plan.distributed_policy(),
   });
   if check {
     render_installation_operation("setup_check", pending, &details, format)?;
@@ -149,6 +151,12 @@ fn render_installation_operation(
     }
     if let Some(cache) = details["cache_base"].as_str() {
       println!("  local cache base: {cache}");
+    }
+    if let Some(distributed) = details["distributed"].as_str() {
+      println!("  distributed mode: {distributed}");
+    }
+    if let Some(policy) = details["distributed_policy"].as_str() {
+      println!("  distributed placement: {policy}");
     }
     if let Some(receipt) = details["receipt_path"].as_str() {
       println!("  setup receipt: {receipt}");
@@ -300,6 +308,18 @@ fn render_status(status: &CacheStatus) {
   }
   if let Some(cache) = &status.installation.cache_base {
     println!("    local cache base: {cache}");
+  }
+  if let Some(distributed) = status.installation.distributed {
+    println!("    distributed mode: {distributed}");
+  }
+  if let Some(policy) = status.installation.distributed_policy {
+    println!("    distributed placement: {policy}");
+  }
+  if let Some(history) = &status.installation.distributed_placement_history {
+    println!(
+      "    distributed history: {} classes, {} local / {} remote observations, {} active backoffs",
+      history.classes, history.local_observations, history.remote_observations, history.active_backoffs
+    );
   }
   println!("    Cargo L0: {}", status.installation.cargo_l0);
   println!(

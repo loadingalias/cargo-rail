@@ -496,7 +496,7 @@ fn setup_preview_apply_repeat_status_and_exact_remove_are_lossless() -> Result<(
   )?;
   assert!(status.status.success(), "installation status failed: {status:?}");
   let status = json(&status)?;
-  assert_eq!(status["status"]["schema_version"], 10);
+  assert_eq!(status["status"]["schema_version"], 11);
   assert_eq!(status["status"]["installation"]["state"], "installed");
   assert_eq!(status["status"]["installation"]["healthy"], true);
   let wrapper = PathBuf::from(
@@ -555,6 +555,174 @@ fn setup_preview_apply_repeat_status_and_exact_remove_are_lossless() -> Result<(
   assert!(
     cargo_home.path().join("cargo-rail/local-cas-v2").exists(),
     "removal deleted the compiler-result cache"
+  );
+  Ok(())
+}
+
+#[test]
+fn receipt_qualified_local_distribution_executes_an_ordinary_cargo_library() -> Result<()> {
+  let workspace = TestWorkspace::new_single_crate("distributed_front_door", "0.1.0")?;
+  let cargo_home = tempfile::tempdir()?;
+  let coverage = tempfile::tempdir()?;
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::set_permissions(coverage.path(), fs::Permissions::from_mode(0o700))?;
+  }
+  let coverage = fs::canonicalize(coverage.path())?;
+
+  let preview = rail(
+    &workspace.path,
+    cargo_home.path(),
+    &["rail", "cache", "setup", "--distributed-local", "--check", "-f", "json"],
+  )?;
+  assert_eq!(
+    preview.status.code(),
+    Some(1),
+    "qualification preview failed: {preview:?}"
+  );
+  assert_eq!(json(&preview)?["distributed"], "local_process_qualification_v1");
+  assert!(!cargo_home.path().join("cargo-rail/compiler-cache-v1").exists());
+
+  let setup = rail(
+    &workspace.path,
+    cargo_home.path(),
+    &["rail", "cache", "setup", "--distributed-local", "-f", "json"],
+  )?;
+  assert!(setup.status.success(), "qualification setup failed: {setup:?}");
+  assert_eq!(json(&setup)?["distributed"], "local_process_qualification_v1");
+  let installation = cargo_home.path().join("cargo-rail/compiler-cache-v1");
+  #[cfg(not(windows))]
+  let distributed_worker = installation.join("cargo-rail-distributed-worker");
+  #[cfg(windows)]
+  let distributed_worker = installation.join("cargo-rail-distributed-worker.exe");
+  assert!(
+    distributed_worker.is_file(),
+    "setup omitted the receipt-owned distributed worker"
+  );
+
+  let build = || {
+    Command::new("cargo")
+      .current_dir(&workspace.path)
+      .args(["build", "--release", "--lib", "--message-format=json"])
+      .env("CARGO_HOME", cargo_home.path())
+      .env("CARGO_INCREMENTAL", "0")
+      .env("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1")
+      .env("CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY", &coverage)
+      .env_remove("OUT_DIR")
+      .env_remove("RUSTC_WRAPPER")
+      .env_remove("RUSTC_WORKSPACE_WRAPPER")
+      .output()
+  };
+  let built = build()?;
+  assert!(
+    built.status.success(),
+    "ordinary Cargo did not seed its first-seen compiler environment\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&built.stdout),
+    String::from_utf8_lossy(&built.stderr)
+  );
+  let seeded_events = coverage_events(&coverage)?;
+  assert!(
+    seeded_events.iter().any(|event| {
+      event["status"] == "miss"
+        && event["reason"]
+          .as_str()
+          .is_some_and(|reason| reason.starts_with("environment_selector_not_found;stored_verified_result"))
+    }),
+    "ordinary Cargo did not establish local compiler-environment authority: {seeded_events:?}"
+  );
+  fs::remove_dir_all(workspace.path.join("target"))?;
+  let cache_roots = fs::read_dir(cargo_home.path().join("cargo-rail"))?
+    .filter_map(|entry| entry.ok())
+    .filter(|entry| entry.file_name().to_string_lossy().starts_with("local-cas-v2"))
+    .filter(|entry| entry.path().is_dir())
+    .collect::<Vec<_>>();
+  let [cache_root] = cache_roots.as_slice() else {
+    anyhow::bail!("local distribution test did not contain one local CAS root: {cache_roots:?}");
+  };
+  for entry in fs::read_dir(cache_root.path().join("native-actions-v2"))? {
+    fs::remove_file(entry?.path())?;
+  }
+  for entry in fs::read_dir(&coverage)? {
+    fs::remove_file(entry?.path())?;
+  }
+
+  let built = build()?;
+  assert!(
+    built.status.success(),
+    "ordinary Cargo did not complete through local distribution\nstdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&built.stdout),
+    String::from_utf8_lossy(&built.stderr)
+  );
+  let events = coverage_events(&coverage)?;
+  assert!(
+    events
+      .iter()
+      .any(|event| event["status"] == "hit" && event["reason"] == "verified_distributed_execution"),
+    "ordinary Cargo never crossed the distributed admission boundary\nstderr:\n{}\nevents: {events:?}",
+    String::from_utf8_lossy(&built.stderr)
+  );
+
+  fs::write(
+    workspace.path.join("src/lib.rs"),
+    "compile_error!(\"distributed failure proof\");\n",
+  )?;
+  fs::remove_dir_all(workspace.path.join("target"))?;
+  let failed = Command::new("cargo")
+    .current_dir(&workspace.path)
+    .args(["build", "--release", "--lib", "--message-format=json"])
+    .env("CARGO_HOME", cargo_home.path())
+    .env("CARGO_INCREMENTAL", "0")
+    .env_remove("OUT_DIR")
+    .env_remove("RUSTC_WRAPPER")
+    .env_remove("RUSTC_WORKSPACE_WRAPPER")
+    .output()?;
+  assert!(
+    !failed.status.success(),
+    "worker compiler failure unexpectedly succeeded"
+  );
+  let diagnostics = [failed.stdout.as_slice(), failed.stderr.as_slice()].concat();
+  assert!(
+    diagnostics
+      .windows(b"distributed failure proof".len())
+      .any(|window| window == b"distributed failure proof"),
+    "first-seen compiler diagnostics were not preserved: {failed:?}"
+  );
+  assert!(
+    !diagnostics
+      .windows(b"/cargo-rail/exec/v3".len())
+      .any(|window| window == b"/cargo-rail/exec/v3"),
+    "distributed virtual paths escaped into Cargo diagnostics: {failed:?}"
+  );
+
+  let status = rail(
+    &workspace.path,
+    cargo_home.path(),
+    &["rail", "cache", "status", "--scope", "local", "-f", "json"],
+  )?;
+  let status = json(&status)?;
+  assert_eq!(status["status"]["installation"]["state"], "installed");
+  assert_eq!(
+    status["status"]["installation"]["distributed"],
+    "local_process_qualification_v1"
+  );
+
+  fs::write(&distributed_worker, b"drifted")?;
+  let drifted = rail(
+    &workspace.path,
+    cargo_home.path(),
+    &["rail", "cache", "status", "--scope", "local", "-f", "json"],
+  )?;
+  assert_eq!(json(&drifted)?["status"]["installation"]["state"], "drifted");
+  let repair = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "setup"])?;
+  assert!(repair.status.success(), "qualification repair failed: {repair:?}");
+  assert_ne!(fs::read(&distributed_worker)?, b"drifted");
+
+  let remove = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "remove"])?;
+  assert!(remove.status.success(), "qualification removal failed: {remove:?}");
+  assert!(
+    !distributed_worker.exists(),
+    "removal retained the receipt-owned worker"
   );
   Ok(())
 }
@@ -623,7 +791,7 @@ fn cache_status_reports_only_redacted_machine_selected_remote_authority() -> Res
     .output()?;
   assert!(output.status.success(), "remote status failed: {output:?}");
   let value = json(&output)?;
-  assert_eq!(value["status"]["schema_version"], 10);
+  assert_eq!(value["status"]["schema_version"], 11);
   assert_eq!(value["status"]["remote"]["activation"], "direct_transport_selected");
   assert_eq!(value["status"]["remote"]["provider"], "aws-s3");
   assert_eq!(value["status"]["remote"]["mode"], "read");

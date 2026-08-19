@@ -70,6 +70,10 @@ const DIRECT_WRAPPER_NAME: &str = "cargo-rail-native-rustc-wrapper.exe";
 const DIRECT_WORKER_NAME: &str = "cargo-rail-native-rustc-worker";
 #[cfg(windows)]
 const DIRECT_WORKER_NAME: &str = "cargo-rail-native-rustc-worker.exe";
+#[cfg(not(windows))]
+const DISTRIBUTED_WORKER_NAME: &str = "cargo-rail-distributed-worker";
+#[cfg(windows)]
+const DISTRIBUTED_WORKER_NAME: &str = "cargo-rail-distributed-worker.exe";
 const DIRECT_LAUNCHER_ENV: &str = "CARGO_RAIL_DIRECT_CACHE_LAUNCHER";
 const GRADUATED_NATIVE_CACHE_CLASS: &str = "exact_rustc_result";
 const NATIVE_CACHE_CAPABILITY_SCHEMA_VERSION: u32 = 11;
@@ -261,14 +265,15 @@ impl NativeDurabilityCounters {
   }
 }
 
+/// One source-free phase counter shared by every native timing snapshot.
 #[derive(Clone, Copy, Debug, Default, Serialize)]
-struct NativePhaseMeasurement {
-  count: u64,
-  elapsed_ns: u64,
+pub(crate) struct NativePhaseMeasurement {
+  pub(crate) count: u64,
+  pub(crate) elapsed_ns: u64,
 }
 
 impl NativePhaseMeasurement {
-  fn record(&mut self, started: Instant) {
+  pub(crate) fn record(&mut self, started: Instant) {
     self.count = self.count.saturating_add(1);
     self.elapsed_ns = self.elapsed_ns.saturating_add(elapsed_nanos(started));
   }
@@ -353,6 +358,9 @@ struct NativeCacheMetrics {
   cache_bytes_read: u64,
   remote_started: Option<Instant>,
   remote_timing: NativeRemoteTimingSnapshot,
+  /// Present only for a verified distributed execution, so ordinary cache
+  /// evidence never carries an empty distributed phase block.
+  distributed_timing: Option<crate::compiler::distributed::DistributedTiming>,
 }
 
 impl NativeCacheMetrics {
@@ -4004,6 +4012,17 @@ pub(crate) fn direct_worker_executable() -> RailResult<PathBuf> {
     .ok_or_else(|| RailError::message("native compiler cache worker executable is unavailable"))
 }
 
+pub(crate) fn direct_distributed_worker_executable() -> RailResult<PathBuf> {
+  let cargo_rail_executable = std::env::current_exe()?;
+  cargo_rail_executable
+    .parent()
+    .map(|directory| directory.join(DISTRIBUTED_WORKER_NAME))
+    .filter(|candidate| {
+      fs::metadata(candidate).is_ok_and(|metadata| metadata.is_file() && executable_metadata(&metadata))
+    })
+    .ok_or_else(|| RailError::message("distributed compiler worker executable is unavailable"))
+}
+
 #[cfg(unix)]
 fn executable_metadata(metadata: &fs::Metadata) -> bool {
   use std::os::unix::fs::PermissionsExt as _;
@@ -5020,6 +5039,767 @@ fn portable_native_cache_key_inputs<'a>(
   })
 }
 
+/// Derive protocol v3 only when the captured native action is already the
+/// worker's exact portable, non-linking Rust compilation class.
+///
+/// This is deliberately stricter than native-cache eligibility. Unknown or
+/// merely harmless rustc options are not portable execution authority.
+pub(crate) fn distributed_rust_library_candidate(
+  observation: &RawCompilerInvocation,
+  capture: &NativeActionCapture,
+  output_paths: &NativeOutputPaths,
+  workspace_root: &Path,
+  workspace_root_spelling: &Path,
+) -> Result<crate::compiler::distributed::RustLibraryCandidate, &'static str> {
+  distributed_rust_library_candidate_with_remap(
+    observation,
+    capture,
+    output_paths,
+    workspace_root,
+    workspace_root_spelling,
+    true,
+  )
+}
+
+pub(crate) fn distributed_rust_library_normalization_candidate(
+  observation: &RawCompilerInvocation,
+  capture: &NativeActionCapture,
+  output_paths: &NativeOutputPaths,
+  workspace_root: &Path,
+  workspace_root_spelling: &Path,
+) -> Result<crate::compiler::distributed::RustLibraryCandidate, &'static str> {
+  distributed_rust_library_candidate_with_remap(
+    observation,
+    capture,
+    output_paths,
+    workspace_root,
+    workspace_root_spelling,
+    false,
+  )
+}
+
+fn distributed_rust_library_input_candidate(
+  observation: &RawCompilerInvocation,
+  capture: &NativeActionCapture,
+  output_paths: &NativeOutputPaths,
+  workspace_root: &Path,
+  workspace_root_spelling: &Path,
+) -> Result<crate::compiler::distributed::RustLibraryCandidate, &'static str> {
+  distributed_rust_library_candidate(
+    observation,
+    capture,
+    output_paths,
+    workspace_root,
+    workspace_root_spelling,
+  )
+  .or_else(|reason| {
+    if reason != "distributed_argument_authority_mismatch" {
+      return Err(reason);
+    }
+    distributed_rust_library_normalization_candidate(
+      observation,
+      capture,
+      output_paths,
+      workspace_root,
+      workspace_root_spelling,
+    )
+  })
+}
+
+fn distributed_rust_library_candidate_with_remap(
+  observation: &RawCompilerInvocation,
+  capture: &NativeActionCapture,
+  output_paths: &NativeOutputPaths,
+  workspace_root: &Path,
+  workspace_root_spelling: &Path,
+  workspace_remap_required: bool,
+) -> Result<crate::compiler::distributed::RustLibraryCandidate, &'static str> {
+  let authority = distributed_rust_library_authority_with_remap(
+    observation,
+    capture,
+    output_paths,
+    workspace_root,
+    workspace_remap_required,
+  )?;
+  capture
+    .revalidate_before_restore_commit(observation, workspace_root, workspace_root_spelling)
+    .map_err(|_| "distributed_action_changed_before_execution")?;
+  crate::compiler::distributed::RustLibraryCandidate::from_captured_inputs(
+    crate::compiler::distributed::RustLibraryCandidateInput {
+      crate_name: authority.crate_name,
+      crate_type: authority.crate_type,
+      dep_info_name: authority.dep_info_name,
+      edition: authority.edition,
+      emission: authority.emission,
+      metadata: authority.metadata,
+      metadata_name: authority.metadata_name,
+      extra_filename: authority.extra_filename,
+      output_relative_directory: authority.output_relative_directory,
+      source_relative_path: authority.source_relative_path,
+      test_mode: authority.test_mode,
+      toolchain_proc_macro: authority.toolchain_proc_macro,
+      rlib_name: authority.rlib_name,
+      options: authority.execution_options,
+    },
+    authority.sources,
+    authority.dependencies,
+  )
+  .map_err(|_| "distributed_source_capture_failed")
+}
+
+struct DistributedRustLibraryAuthority {
+  crate_name: String,
+  crate_type: String,
+  dependencies: Vec<crate::compiler::distributed::RustLibraryDependencyInput>,
+  dep_info_name: String,
+  edition: String,
+  emission: crate::compiler::distributed::RustLibraryEmission,
+  execution_options: crate::compiler::distributed::RustLibraryExecutionOptions,
+  extra_filename: String,
+  metadata: String,
+  metadata_name: String,
+  output_relative_directory: String,
+  rlib_name: Option<String>,
+  sources: Vec<crate::compiler::distributed::RustLibrarySourceInput>,
+  source_relative_path: String,
+  test_mode: bool,
+  toolchain_proc_macro: bool,
+}
+
+#[cfg(test)]
+fn distributed_rust_library_authority(
+  observation: &RawCompilerInvocation,
+  capture: &NativeActionCapture,
+  output_paths: &NativeOutputPaths,
+  workspace_root: &Path,
+) -> Result<DistributedRustLibraryAuthority, &'static str> {
+  distributed_rust_library_authority_with_remap(observation, capture, output_paths, workspace_root, true)
+}
+
+fn distributed_rust_library_authority_with_remap(
+  observation: &RawCompilerInvocation,
+  capture: &NativeActionCapture,
+  output_paths: &NativeOutputPaths,
+  workspace_root: &Path,
+  workspace_remap_required: bool,
+) -> Result<DistributedRustLibraryAuthority, &'static str> {
+  use crate::compiler::distributed::RustLibraryEmission;
+
+  let metadata_emits = BTreeSet::from(["dep-info".to_string(), "metadata".to_string()]);
+  let linked_emits = BTreeSet::from(["dep-info".to_string(), "link".to_string(), "metadata".to_string()]);
+  let emission = if observation.emit_modes == metadata_emits {
+    RustLibraryEmission::Metadata
+  } else if observation.emit_modes == linked_emits {
+    RustLibraryEmission::MetadataAndLink
+  } else {
+    return Err("distributed_output_contract_ineligible");
+  };
+  let mut crate_types = observation.crate_types.iter().map(String::as_str);
+  let crate_type = match (crate_types.next(), observation.test_mode) {
+    (Some(crate_type), _) => crate_type,
+    (None, true) => "bin",
+    (None, false) => return Err("distributed_crate_type_unavailable"),
+  };
+  if crate_types.next().is_some() {
+    return Err("distributed_crate_type_unavailable");
+  }
+  let portable_crate_type = matches!(
+    crate_type,
+    "bin" | "cdylib" | "dylib" | "lib" | "proc-macro" | "rlib" | "staticlib"
+  );
+  if observation.mode != CompilerMode::Rustc
+    || !portable_crate_type
+    || emission == RustLibraryEmission::MetadataAndLink && !matches!(crate_type, "lib" | "rlib")
+    || observation.target_argument.is_some()
+    || !observation.environment_reads.is_empty()
+    || !observation.bypasses.is_empty()
+    || capture.generated.is_some()
+    || !capture.native_searches.is_empty()
+    || !capture.pathless_extern_searches.is_empty()
+      && !(crate_type == "proc-macro" && pathless_extern_names(&observation.compiler_arguments) == ["proc_macro"])
+    || !capture.approved_environment.entries.is_empty()
+  {
+    return Err("distributed_action_class_ineligible");
+  }
+  let output_roles = output_paths
+    .artifacts
+    .iter()
+    .map(|artifact| artifact.role)
+    .collect::<Vec<_>>();
+  let expected_roles = match emission {
+    RustLibraryEmission::Metadata => &[NativeOutputRole::Metadata][..],
+    RustLibraryEmission::MetadataAndLink => &[NativeOutputRole::Metadata, NativeOutputRole::Rlib][..],
+  };
+  if output_roles != expected_roles {
+    return Err("distributed_output_contract_ineligible");
+  }
+  let [declared] = observation.declared_inputs.as_slice() else {
+    return Err("distributed_source_input_unavailable");
+  };
+  let ObservationPath::Repository(source_relative_path) = &declared.path else {
+    return Err("distributed_source_input_unavailable");
+  };
+  let ObservationPath::Repository(namespace_relative) = &capture.source_state.root else {
+    return Err("distributed_source_namespace_ineligible");
+  };
+  let sources = distributed_source_inputs(capture, namespace_relative, source_relative_path, declared)?;
+  let dependencies = distributed_dependency_inputs(observation, workspace_root)?;
+
+  let arguments = DistributedRustLibraryArguments::parse(&observation.compiler_arguments)?;
+  let crate_name = observation
+    .crate_name
+    .as_deref()
+    .ok_or("distributed_crate_name_unavailable")?;
+  if arguments.crate_name.as_deref() != Some(crate_name)
+    || arguments
+      .crate_type
+      .as_deref()
+      .map_or(!observation.test_mode, |argument| argument != crate_type)
+    || !arguments
+      .source
+      .as_deref()
+      .is_some_and(|source| distributed_source_argument_matches(source, &declared.path))
+    || arguments.emit_modes != observation.emit_modes
+    || arguments.out_dir.is_none()
+    || arguments.workspace_remap_seen != workspace_remap_required
+    || arguments.test_mode != observation.test_mode
+    || arguments.cfg.iter().cloned().collect::<BTreeSet<_>>() != observation.cfg
+    || arguments.externs
+      != observation
+        .dependency_artifacts
+        .iter()
+        .map(|(name, artifact)| {
+          observation_path_basename(&artifact.path)
+            .map(|artifact| (name.clone(), artifact.to_string()))
+            .ok_or("distributed_dependency_artifact_ineligible")
+        })
+        .collect::<Result<Vec<_>, _>>()?
+  {
+    return Err("distributed_argument_authority_mismatch");
+  }
+  let extra_filename = arguments
+    .extra_filename
+    .as_deref()
+    .ok_or("distributed_extra_filename_unavailable")?;
+  let dep_info_name = output_paths
+    .dep_info
+    .file_name()
+    .and_then(OsStr::to_str)
+    .filter(|name| Path::new(name).extension() == Some(OsStr::new("d")))
+    .ok_or("distributed_output_contract_ineligible")?;
+  let metadata_name = output_paths
+    .artifacts
+    .iter()
+    .find(|artifact| artifact.role == NativeOutputRole::Metadata)
+    .and_then(|artifact| artifact.path.file_name())
+    .and_then(OsStr::to_str)
+    .filter(|name| Path::new(name).extension() == Some(OsStr::new("rmeta")))
+    .ok_or("distributed_output_contract_ineligible")?;
+  let rlib_name = output_paths
+    .artifacts
+    .iter()
+    .find(|artifact| artifact.role == NativeOutputRole::Rlib)
+    .and_then(|artifact| artifact.path.file_name())
+    .and_then(OsStr::to_str)
+    .map(str::to_string);
+  let output_parent = output_paths
+    .dep_info
+    .parent()
+    .ok_or("distributed_output_contract_ineligible")?;
+  let canonical_root =
+    crate::utils::canonicalize_existing(workspace_root).map_err(|_| "distributed_output_contract_ineligible")?;
+  let canonical_output =
+    crate::utils::canonicalize_existing(output_parent).map_err(|_| "distributed_output_contract_ineligible")?;
+  let output_relative_directory = canonical_output
+    .strip_prefix(&canonical_root)
+    .map(crate::utils::path_to_git_format)
+    .map_err(|_| "distributed_output_contract_ineligible")?;
+  if crate::source::RepositoryPath::new(Path::new(&output_relative_directory)).is_err() {
+    return Err("distributed_output_contract_ineligible");
+  }
+  let execution_options = arguments.execution_options();
+  Ok(DistributedRustLibraryAuthority {
+    crate_name: crate_name.to_string(),
+    crate_type: crate_type.to_string(),
+    dep_info_name: dep_info_name.to_string(),
+    edition: arguments.edition.ok_or("distributed_edition_unavailable")?,
+    emission,
+    execution_options,
+    extra_filename: extra_filename.to_string(),
+    metadata: arguments.metadata.ok_or("distributed_metadata_unavailable")?,
+    metadata_name: metadata_name.to_string(),
+    output_relative_directory,
+    rlib_name,
+    dependencies,
+    sources,
+    source_relative_path: source_relative_path.clone(),
+    test_mode: observation.test_mode,
+    toolchain_proc_macro: arguments.toolchain_proc_macro,
+  })
+}
+
+fn distributed_source_inputs(
+  capture: &NativeActionCapture,
+  namespace_relative: &str,
+  source_relative_path: &str,
+  declared: &FileObservation,
+) -> Result<Vec<crate::compiler::distributed::RustLibrarySourceInput>, &'static str> {
+  let mut sources = Vec::new();
+  for entry in &capture.source_state.entries {
+    let NativeSourceEntryKind::RegularFile {
+      bytes, content_digest, ..
+    } = &entry.kind
+    else {
+      continue;
+    };
+    let repository_relative_path = if namespace_relative.is_empty() {
+      entry.path.clone()
+    } else if entry.path.is_empty() {
+      namespace_relative.to_string()
+    } else {
+      format!("{namespace_relative}/{}", entry.path)
+    };
+    if crate::source::RepositoryPath::new(Path::new(&repository_relative_path)).is_err() {
+      return Err("distributed_source_namespace_ineligible");
+    }
+    sources.push(crate::compiler::distributed::RustLibrarySourceInput {
+      bytes: *bytes,
+      content_digest: content_digest.clone(),
+      path: capture.source_root.join(&entry.path),
+      repository_relative_path,
+    });
+  }
+  let root = sources
+    .iter()
+    .find(|source| source.repository_relative_path == source_relative_path)
+    .ok_or("distributed_source_namespace_ineligible")?;
+  if root.content_digest != declared.content_digest || declared.executable || declared.symlink_target.is_some() {
+    return Err("distributed_source_namespace_ineligible");
+  }
+  Ok(sources)
+}
+
+fn distributed_dependency_inputs(
+  observation: &RawCompilerInvocation,
+  workspace_root: &Path,
+) -> Result<Vec<crate::compiler::distributed::RustLibraryDependencyInput>, &'static str> {
+  observation
+    .dependency_artifacts
+    .iter()
+    .map(|(extern_name, artifact)| {
+      let artifact_name = observation_path_basename(&artifact.path)
+        .filter(|name| {
+          matches!(
+            Path::new(name).extension().and_then(OsStr::to_str),
+            Some("rmeta" | "rlib")
+          )
+        })
+        .ok_or("distributed_dependency_artifact_ineligible")?;
+      if artifact.executable || artifact.symlink_target.is_some() {
+        return Err("distributed_dependency_artifact_ineligible");
+      }
+      let path = artifact.path.resolve(workspace_root);
+      let metadata = fs::symlink_metadata(&path).map_err(|_| "distributed_dependency_artifact_ineligible")?;
+      if !metadata.is_file() || crate::utils::is_symlink_or_reparse(&metadata) {
+        return Err("distributed_dependency_artifact_ineligible");
+      }
+      Ok(crate::compiler::distributed::RustLibraryDependencyInput {
+        artifact_name: artifact_name.to_string(),
+        bytes: metadata.len(),
+        content_digest: artifact.content_digest.clone(),
+        extern_name: extern_name.clone(),
+        path,
+      })
+    })
+    .collect()
+}
+
+fn distributed_source_argument_matches(argument: &str, declared: &ObservationPath) -> bool {
+  let ObservationPath::Repository(declared) = declared else {
+    return false;
+  };
+  let argument = argument.replace('\\', "/");
+  let declared = declared.replace('\\', "/");
+  argument == declared
+}
+
+#[derive(Default)]
+struct DistributedRustLibraryArguments {
+  cap_lints: Option<String>,
+  cargo_error_format_seen: bool,
+  cargo_json_seen: bool,
+  check_cfg: Vec<String>,
+  codegen: crate::compiler::distributed::RustLibraryCodegen,
+  color: Option<String>,
+  cfg: Vec<String>,
+  crate_name: Option<String>,
+  crate_type: Option<String>,
+  diagnostic_width: Option<u32>,
+  edition: Option<String>,
+  emit_modes: BTreeSet<String>,
+  externs: Vec<(String, String)>,
+  extra_filename: Option<String>,
+  lints: Vec<crate::compiler::distributed::RustLibraryLint>,
+  metadata: Option<String>,
+  out_dir: Option<String>,
+  output_dependency_search: Option<String>,
+  source: Option<String>,
+  test_mode: bool,
+  toolchain_proc_macro: bool,
+  workspace_remap_seen: bool,
+}
+
+impl DistributedRustLibraryArguments {
+  fn parse(arguments: &[String]) -> Result<Self, &'static str> {
+    let mut parsed = Self::default();
+    let mut index = 0usize;
+    while index < arguments.len() {
+      let argument = arguments[index].as_str();
+      let next = arguments.get(index + 1).map(String::as_str);
+      let mut consumed = 1usize;
+      match argument {
+        "--crate-name" => {
+          consumed = 2;
+          set_distributed_argument(&mut parsed.crate_name, next)?;
+        }
+        "--crate-type" => {
+          consumed = 2;
+          set_distributed_argument(&mut parsed.crate_type, next)?;
+        }
+        "--edition" => {
+          consumed = 2;
+          set_distributed_argument(&mut parsed.edition, next)?;
+        }
+        "--emit" => {
+          consumed = 2;
+          parsed.capture_emit(next)?;
+        }
+        "--out-dir" => {
+          consumed = 2;
+          set_distributed_argument(&mut parsed.out_dir, next)?;
+        }
+        "--error-format" => {
+          consumed = 2;
+          parsed.capture_cargo_error_format(next)?;
+        }
+        "--extern" => {
+          consumed = 2;
+          parsed.capture_extern(next)?;
+        }
+        "--test" => {
+          if parsed.test_mode {
+            return Err("distributed_argument_shape_ineligible");
+          }
+          parsed.test_mode = true;
+        }
+        "--json" => {
+          consumed = 2;
+          parsed.capture_cargo_json(next)?;
+        }
+        "--cfg" => {
+          consumed = 2;
+          parsed.capture_cfg(next)?;
+        }
+        "--check-cfg" => {
+          consumed = 2;
+          parsed.capture_check_cfg(next)?;
+        }
+        "--cap-lints" => {
+          consumed = 2;
+          parsed.capture_cap_lints(next)?;
+        }
+        "--color" => {
+          consumed = 2;
+          parsed.capture_color(next)?;
+        }
+        "--diagnostic-width" => {
+          consumed = 2;
+          parsed.capture_diagnostic_width(next)?;
+        }
+        "--allow" | "--warn" | "--deny" | "--forbid" | "-A" | "-W" | "-D" | "-F" => {
+          consumed = 2;
+          parsed.capture_lint(argument, next)?;
+        }
+        "--remap-path-prefix" => {
+          consumed = 2;
+          parsed.capture_workspace_remap(next)?;
+        }
+        "-C" => {
+          consumed = 2;
+          parsed.capture_codegen(next)?;
+        }
+        "-L" => {
+          consumed = 2;
+          parsed.capture_library_search(next)?;
+        }
+        _ if argument.starts_with("--crate-name=") => {
+          set_distributed_argument(&mut parsed.crate_name, argument.strip_prefix("--crate-name="))?;
+        }
+        _ if argument.starts_with("--crate-type=") => {
+          set_distributed_argument(&mut parsed.crate_type, argument.strip_prefix("--crate-type="))?;
+        }
+        _ if argument.starts_with("--edition=") => {
+          set_distributed_argument(&mut parsed.edition, argument.strip_prefix("--edition="))?;
+        }
+        _ if argument.starts_with("--emit=") => parsed.capture_emit(argument.strip_prefix("--emit="))?,
+        _ if argument.starts_with("--out-dir=") => {
+          set_distributed_argument(&mut parsed.out_dir, argument.strip_prefix("--out-dir="))?;
+        }
+        _ if argument.starts_with("--error-format=") => {
+          parsed.capture_cargo_error_format(argument.strip_prefix("--error-format="))?;
+        }
+        _ if argument.starts_with("--extern=") => {
+          parsed.capture_extern(argument.strip_prefix("--extern="))?;
+        }
+        _ if argument.starts_with("--json=") => parsed.capture_cargo_json(argument.strip_prefix("--json="))?,
+        _ if argument.starts_with("--cfg=") => parsed.capture_cfg(argument.strip_prefix("--cfg="))?,
+        _ if argument.starts_with("--check-cfg=") => {
+          parsed.capture_check_cfg(argument.strip_prefix("--check-cfg="))?;
+        }
+        _ if argument.starts_with("--cap-lints=") => {
+          parsed.capture_cap_lints(argument.strip_prefix("--cap-lints="))?;
+        }
+        _ if argument.starts_with("--color=") => parsed.capture_color(argument.strip_prefix("--color="))?,
+        _ if argument.starts_with("--diagnostic-width=") => {
+          parsed.capture_diagnostic_width(argument.strip_prefix("--diagnostic-width="))?;
+        }
+        _ if argument.starts_with("--allow=")
+          || argument.starts_with("--warn=")
+          || argument.starts_with("--deny=")
+          || argument.starts_with("--forbid=") =>
+        {
+          let (option, value) = argument
+            .split_once('=')
+            .ok_or("distributed_argument_shape_ineligible")?;
+          parsed.capture_lint(option, Some(value))?;
+        }
+        _ if matches!(argument.as_bytes().first(), Some(b'-'))
+          && matches!(argument.as_bytes().get(1), Some(b'A' | b'W' | b'D' | b'F'))
+          && argument.len() > 2 =>
+        {
+          parsed.capture_lint(&argument[..2], Some(&argument[2..]))?;
+        }
+        _ if argument.starts_with("--remap-path-prefix=") => {
+          parsed.capture_workspace_remap(argument.strip_prefix("--remap-path-prefix="))?;
+        }
+        _ if argument.starts_with("-C") => parsed.capture_codegen(argument.strip_prefix("-C"))?,
+        _ if argument.starts_with("-L") => parsed.capture_library_search(argument.strip_prefix("-L"))?,
+        _ if !argument.starts_with('-') && argument.ends_with(".rs") => {
+          set_distributed_argument(&mut parsed.source, Some(argument))?;
+        }
+        _ => return Err("distributed_argument_shape_ineligible"),
+      }
+      if consumed == 2 && next.is_none() {
+        return Err("distributed_argument_shape_ineligible");
+      }
+      index = index.saturating_add(consumed);
+    }
+    if parsed.cargo_error_format_seen != parsed.cargo_json_seen
+      || parsed
+        .output_dependency_search
+        .as_deref()
+        .is_some_and(|search| parsed.out_dir.as_deref() != Some(search))
+    {
+      return Err("distributed_argument_shape_ineligible");
+    }
+    Ok(parsed)
+  }
+
+  fn capture_emit(&mut self, value: Option<&str>) -> Result<(), &'static str> {
+    let value = value
+      .filter(|value| !value.is_empty())
+      .ok_or("distributed_argument_shape_ineligible")?;
+    if !self.emit_modes.is_empty() {
+      return Err("distributed_argument_shape_ineligible");
+    }
+    for mode in value.split(',') {
+      let (name, path) = mode
+        .split_once('=')
+        .map_or((mode, None), |(name, path)| (name, Some(path)));
+      if name.is_empty() || path.is_some_and(str::is_empty) || !self.emit_modes.insert(name.to_string()) {
+        return Err("distributed_argument_shape_ineligible");
+      }
+    }
+    Ok(())
+  }
+
+  fn capture_extern(&mut self, value: Option<&str>) -> Result<(), &'static str> {
+    if value == Some("proc_macro") && !self.toolchain_proc_macro {
+      self.toolchain_proc_macro = true;
+      return Ok(());
+    }
+    let (name, path) = value
+      .and_then(|value| value.split_once('='))
+      .filter(|(name, path)| !name.is_empty() && !path.is_empty())
+      .ok_or("distributed_argument_shape_ineligible")?;
+    let artifact = portable_path_basename(path).ok_or("distributed_argument_shape_ineligible")?;
+    self.externs.push((name.to_string(), artifact.to_string()));
+    Ok(())
+  }
+
+  fn capture_codegen(&mut self, value: Option<&str>) -> Result<(), &'static str> {
+    let value = value.ok_or("distributed_argument_shape_ineligible")?;
+    let (name, value) = value.split_once('=').ok_or("distributed_argument_shape_ineligible")?;
+    match name {
+      "metadata" => set_distributed_argument(&mut self.metadata, Some(value)),
+      "extra-filename" => set_distributed_argument(&mut self.extra_filename, Some(value)),
+      "codegen-units" => set_distributed_u32(&mut self.codegen.codegen_units, value),
+      "debuginfo" => set_distributed_argument(&mut self.codegen.debuginfo, Some(value)),
+      "debug-assertions" => set_distributed_bool(&mut self.codegen.debug_assertions, value),
+      "embed-bitcode" => set_distributed_bool(&mut self.codegen.embed_bitcode, value),
+      "linker-plugin-lto" => set_distributed_bool(&mut self.codegen.linker_plugin_lto, value),
+      "lto" => set_distributed_argument(&mut self.codegen.lto, Some(value)),
+      "opt-level" => set_distributed_argument(&mut self.codegen.opt_level, Some(value)),
+      "overflow-checks" => set_distributed_bool(&mut self.codegen.overflow_checks, value),
+      "panic" => set_distributed_argument(&mut self.codegen.panic, Some(value)),
+      "prefer-dynamic" => set_distributed_bool(&mut self.codegen.prefer_dynamic, value),
+      "split-debuginfo" => set_distributed_argument(&mut self.codegen.split_debuginfo, Some(value)),
+      "strip" => set_distributed_argument(&mut self.codegen.strip, Some(value)),
+      _ => Err("distributed_argument_shape_ineligible"),
+    }
+  }
+
+  fn capture_cargo_error_format(&mut self, value: Option<&str>) -> Result<(), &'static str> {
+    if self.cargo_error_format_seen || value != Some("json") {
+      return Err("distributed_argument_shape_ineligible");
+    }
+    self.cargo_error_format_seen = true;
+    Ok(())
+  }
+
+  fn capture_cargo_json(&mut self, value: Option<&str>) -> Result<(), &'static str> {
+    if self.cargo_json_seen || value != Some("diagnostic-rendered-ansi,artifacts,future-incompat") {
+      return Err("distributed_argument_shape_ineligible");
+    }
+    self.cargo_json_seen = true;
+    Ok(())
+  }
+
+  fn capture_check_cfg(&mut self, value: Option<&str>) -> Result<(), &'static str> {
+    let value = value
+      .filter(|value| !value.is_empty())
+      .ok_or("distributed_argument_shape_ineligible")?;
+    if self.check_cfg.iter().any(|existing| existing == value) {
+      return Err("distributed_argument_shape_ineligible");
+    }
+    self.check_cfg.push(value.to_string());
+    Ok(())
+  }
+
+  fn capture_cfg(&mut self, value: Option<&str>) -> Result<(), &'static str> {
+    let value = value
+      .filter(|value| !value.is_empty())
+      .ok_or("distributed_argument_shape_ineligible")?;
+    self.cfg.push(value.to_string());
+    Ok(())
+  }
+
+  fn capture_cap_lints(&mut self, value: Option<&str>) -> Result<(), &'static str> {
+    let value = value.filter(|value| matches!(*value, "allow" | "warn" | "deny" | "forbid"));
+    set_distributed_argument(&mut self.cap_lints, value)
+  }
+
+  fn capture_color(&mut self, value: Option<&str>) -> Result<(), &'static str> {
+    let value = value.filter(|value| matches!(*value, "auto" | "always" | "never"));
+    set_distributed_argument(&mut self.color, value)
+  }
+
+  fn capture_diagnostic_width(&mut self, value: Option<&str>) -> Result<(), &'static str> {
+    let value = value
+      .and_then(|value| value.parse::<u32>().ok())
+      .filter(|value| *value > 0 && *value <= 65_535)
+      .ok_or("distributed_argument_shape_ineligible")?;
+    if self.diagnostic_width.replace(value).is_some() {
+      return Err("distributed_argument_shape_ineligible");
+    }
+    Ok(())
+  }
+
+  fn capture_lint(&mut self, option: &str, value: Option<&str>) -> Result<(), &'static str> {
+    use crate::compiler::distributed::RustLibraryLintLevel;
+
+    let level = match option {
+      "--allow" | "-A" => RustLibraryLintLevel::Allow,
+      "--warn" | "-W" => RustLibraryLintLevel::Warn,
+      "--deny" | "-D" => RustLibraryLintLevel::Deny,
+      "--forbid" | "-F" => RustLibraryLintLevel::Forbid,
+      _ => return Err("distributed_argument_shape_ineligible"),
+    };
+    let name = value
+      .filter(|value| !value.is_empty())
+      .ok_or("distributed_argument_shape_ineligible")?;
+    self.lints.push(crate::compiler::distributed::RustLibraryLint {
+      level,
+      name: name.to_string(),
+    });
+    Ok(())
+  }
+
+  fn capture_library_search(&mut self, value: Option<&str>) -> Result<(), &'static str> {
+    let value = value
+      .and_then(|value| value.strip_prefix("dependency="))
+      .filter(|value| !value.is_empty())
+      .ok_or("distributed_argument_shape_ineligible")?;
+    set_distributed_argument(&mut self.output_dependency_search, Some(value))
+  }
+
+  fn execution_options(&self) -> crate::compiler::distributed::RustLibraryExecutionOptions {
+    crate::compiler::distributed::RustLibraryExecutionOptions {
+      cap_lints: self.cap_lints.clone(),
+      cargo_json_diagnostics: self.cargo_error_format_seen,
+      check_cfg: self.check_cfg.clone(),
+      codegen: self.codegen.clone(),
+      color: self.color.clone(),
+      cfg: self.cfg.clone(),
+      diagnostic_width: self.diagnostic_width,
+      lints: self.lints.clone(),
+      output_dependency_search: self.output_dependency_search.is_some(),
+    }
+  }
+
+  fn capture_workspace_remap(&mut self, value: Option<&str>) -> Result<(), &'static str> {
+    if self.workspace_remap_seen || value.is_none_or(|value| !distributed_workspace_remap(value)) {
+      return Err("distributed_argument_shape_ineligible");
+    }
+    self.workspace_remap_seen = true;
+    Ok(())
+  }
+}
+
+fn set_distributed_argument(slot: &mut Option<String>, value: Option<&str>) -> Result<(), &'static str> {
+  let value = value
+    .filter(|value| !value.is_empty())
+    .ok_or("distributed_argument_shape_ineligible")?;
+  if slot.replace(value.to_string()).is_some() {
+    return Err("distributed_argument_shape_ineligible");
+  }
+  Ok(())
+}
+
+fn set_distributed_bool(slot: &mut Option<bool>, value: &str) -> Result<(), &'static str> {
+  let value = match value {
+    "yes" => true,
+    "no" => false,
+    _ => return Err("distributed_argument_shape_ineligible"),
+  };
+  if slot.replace(value).is_some() {
+    return Err("distributed_argument_shape_ineligible");
+  }
+  Ok(())
+}
+
+fn set_distributed_u32(slot: &mut Option<u32>, value: &str) -> Result<(), &'static str> {
+  let value = value
+    .parse::<u32>()
+    .ok()
+    .filter(|value| *value > 0)
+    .ok_or("distributed_argument_shape_ineligible")?;
+  if slot.replace(value).is_some() {
+    return Err("distributed_argument_shape_ineligible");
+  }
+  Ok(())
+}
+
 fn native_cache_key_inputs(observation: &RawCompilerInvocation) -> RailResult<NativeCacheKeyInputs<'_>> {
   let dependency_artifacts = observation
     .dependency_artifacts
@@ -5400,7 +6180,7 @@ fn invocation_bypass_reason(
   if !supported_pathless_toolchain_externs(&observation.compiler_arguments, &observation.crate_types) {
     return Some("dependency_artifact_path_unavailable");
   }
-  if let Some(reason) = compiler_argument_bypass_reason(&observation.compiler_arguments) {
+  if let Some(reason) = compiler_argument_bypass_reason(&observation.compiler_arguments, None) {
     return Some(reason);
   }
   if let Some(reason) = observation.dependency_artifacts.iter().find_map(|(_, artifact)| {
@@ -5578,7 +6358,8 @@ pub(crate) fn fast_bypass_reason(program: &OsStr, arguments: &[OsString]) -> Opt
   if !output_directory {
     return Some("compiler_output_paths_unavailable");
   }
-  compiler_argument_bypass_reason(&argument_text)
+  let current_directory = std::env::current_dir().ok();
+  compiler_argument_bypass_reason(&argument_text, current_directory.as_deref())
 }
 
 fn inline_or_next<'a>(argument: &'a str, next: Option<&'a str>, option: &str) -> Option<&'a str> {
@@ -5680,7 +6461,10 @@ fn supported_pathless_toolchain_externs(arguments: &[String], crate_types: &BTre
     || crate_types == &BTreeSet::from(["proc-macro".to_string()]) && names.iter().all(|name| *name == "proc_macro")
 }
 
-fn compiler_argument_bypass_reason<T: AsRef<str>>(arguments: &[T]) -> Option<&'static str> {
+fn compiler_argument_bypass_reason<T: AsRef<str>>(
+  arguments: &[T],
+  current_directory: Option<&Path>,
+) -> Option<&'static str> {
   let mut index = 0usize;
   let mut source_inputs = 0usize;
   while index < arguments.len() {
@@ -5705,6 +6489,7 @@ fn compiler_argument_bypass_reason<T: AsRef<str>>(arguments: &[T]) -> Option<&'s
         | "--warn"
         | "--deny"
         | "--forbid"
+        | "--remap-path-prefix"
         | "--extern"
         | "-L"
         | "-l"
@@ -5722,6 +6507,10 @@ fn compiler_argument_bypass_reason<T: AsRef<str>>(arguments: &[T]) -> Option<&'s
       "--crate-name" | "--crate-type" | "--emit" | "--out-dir" | "--target" | "--edition" | "--error-format"
       | "--json" | "--cfg" | "--check-cfg" | "--cap-lints" | "--color" | "--diagnostic-width" | "--allow"
       | "--warn" | "--deny" | "--forbid" => next.is_some(),
+      "--remap-path-prefix" if next.is_some_and(|value| distributed_workspace_remap_at(value, current_directory)) => {
+        true
+      }
+      "--remap-path-prefix" => return Some("remapped_path_observation_unavailable"),
       "--extern" => next.is_some_and(|value| value.contains('=') || value == "proc_macro"),
       "-L" => next.is_some_and(supported_library_search),
       "-l" => next.is_some_and(supported_native_library),
@@ -5751,6 +6540,12 @@ fn compiler_argument_bypass_reason<T: AsRef<str>>(arguments: &[T]) -> Option<&'s
         || argument.starts_with("-W") && argument.len() > 2
         || argument.starts_with("-D") && argument.len() > 2
         || argument.starts_with("-F") && argument.len() > 2 =>
+      {
+        false
+      }
+      _ if argument
+        .strip_prefix("--remap-path-prefix=")
+        .is_some_and(|value| distributed_workspace_remap_at(value, current_directory)) =>
       {
         false
       }
@@ -5810,6 +6605,28 @@ fn compiler_argument_bypass_reason<T: AsRef<str>>(arguments: &[T]) -> Option<&'s
     index += usize::from(consumes_next) + 1;
   }
   (source_inputs != 1).then_some("compiler_source_input_observation_unavailable")
+}
+
+fn distributed_workspace_remap(value: &str) -> bool {
+  value.strip_prefix("repository:=") == Some(crate::compiler::distributed::VIRTUAL_WORKSPACE)
+}
+
+fn distributed_workspace_remap_at(value: &str, current_directory: Option<&Path>) -> bool {
+  if distributed_workspace_remap(value) {
+    return true;
+  }
+  let Some((source, destination)) = value.rsplit_once('=') else {
+    return false;
+  };
+  destination == crate::compiler::distributed::VIRTUAL_WORKSPACE
+    && current_directory.is_some_and(|current_directory| {
+      let source = Path::new(source);
+      source == current_directory
+        || crate::utils::canonicalize_existing(source)
+          .ok()
+          .zip(crate::utils::canonicalize_existing(current_directory).ok())
+          .is_some_and(|(source, current_directory)| source == current_directory)
+    })
 }
 
 fn dependency_artifact_bypass_reason(extension: Option<&str>) -> Option<&'static str> {
@@ -5911,6 +6728,7 @@ pub(crate) enum OuterCacheAction {
     capture: NativeActionCapture,
     base_action_key: String,
     cache_bytes_read: u64,
+    distributed_placement: Option<crate::compiler::distributed::PlacementObservation>,
   },
   /// A restore crossed its irreversible effect boundary and must not run rustc.
   OperationalFailure(RailError),
@@ -6003,7 +6821,7 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
       return OuterCacheAction::Execute;
     }
   };
-  let recorder = match crate::compiler::observation::begin_invocation_in(
+  let mut recorder = match crate::compiler::observation::begin_invocation_in(
     observation_directory,
     source_root,
     &original_current_dir,
@@ -6023,9 +6841,8 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
       return OuterCacheAction::Execute;
     }
   };
-  let observation = recorder.observation();
-  let initial_input_bytes = estimated_input_bytes(observation, source_root);
-  let bypass_reason = invocation_bypass_reason(observation, false, &session.class.host_target);
+  let initial_input_bytes = estimated_input_bytes(recorder.observation(), source_root);
+  let bypass_reason = invocation_bypass_reason(recorder.observation(), false, &session.class.host_target);
   if let Some(reason) = bypass_reason {
     configure_cold(
       command,
@@ -6037,13 +6854,13 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
     );
     return OuterCacheAction::Execute;
   }
-  let Some(output_paths) = recorder.native_output_paths() else {
+  let Some(mut output_paths) = recorder.native_output_paths() else {
     configure_cold(
       command,
       CompilerCacheWrapperStatus::Bypassed,
       "compiler_output_paths_unavailable",
       None,
-      estimated_input_bytes(observation, source_root),
+      estimated_input_bytes(recorder.observation(), source_root),
       diagnostic_wrapper,
     );
     return OuterCacheAction::Execute;
@@ -6054,7 +6871,7 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
       CompilerCacheWrapperStatus::Bypassed,
       "compiler_output_root_authority_unavailable",
       None,
-      estimated_input_bytes(observation, source_root),
+      estimated_input_bytes(recorder.observation(), source_root),
       diagnostic_wrapper,
     );
     return OuterCacheAction::Execute;
@@ -6067,19 +6884,11 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
   if let Err(error) = recover_restore_commit_in(&cas, &output_paths, source_root, observation_directory) {
     return OuterCacheAction::OperationalFailure(error);
   }
-  let capture = NativeActionCapture::capture(observation, source_root);
+  let capture = NativeActionCapture::capture(recorder.observation(), source_root);
   let capture_bytes = capture.as_ref().map_or(0, |capture| capture.bytes_hashed);
-  let base_action = capture
-    .as_ref()
-    .ok()
-    .and_then(|capture| base_action_key(&session.identity, &session.class, observation, capture).ok());
-  let provisional_action = capture
-    .as_ref()
-    .ok()
-    .and_then(|capture| action_key(&session.identity, &session.class, observation, capture).ok());
-  let (capture, base_action, provisional_action) = match (capture, base_action, provisional_action) {
-    (Ok(capture), Some(base_action), Some(provisional_action)) => (capture, base_action, provisional_action),
-    _ => {
+  let mut capture = match capture {
+    Ok(capture) => capture,
+    Err(_) => {
       configure_cold(
         command,
         CompilerCacheWrapperStatus::Bypassed,
@@ -6091,6 +6900,115 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
       return OuterCacheAction::Execute;
     }
   };
+  let distributed_worker = context
+    .installation
+    .as_ref()
+    .and_then(crate::cache::installation::InstallationReceipt::local_distributed_worker)
+    .map(Path::to_path_buf);
+  let distributed_remote = context
+    .installation
+    .as_ref()
+    .and_then(crate::cache::installation::InstallationReceipt::mutual_tls_distributed_worker);
+  let mut normalized_compiler_arguments = None;
+  let mut distributed_candidate = None;
+  let mut normalization_bytes = 0_u64;
+  if (distributed_worker.is_some() || distributed_remote.is_some()) && !diagnostic_wrapper {
+    let normalized = (|| -> Result<_, &'static str> {
+      let initial_candidate = distributed_rust_library_input_candidate(
+        recorder.observation(),
+        &capture,
+        &output_paths,
+        source_root,
+        source_root_spelling,
+      )?;
+      let temporary = observation_directory.join("distributed-local-tmp");
+      fs::create_dir_all(&temporary).map_err(|_| "distributed_local_temporary_unavailable")?;
+      let temporary_metadata =
+        fs::symlink_metadata(&temporary).map_err(|_| "distributed_local_temporary_unavailable")?;
+      if !temporary_metadata.is_dir() || crate::utils::is_symlink_or_reparse(&temporary_metadata) {
+        return Err("distributed_local_temporary_unavailable");
+      }
+      let normalized_command = initial_candidate
+        .normalized_local_command(rustc, source_root, &temporary)
+        .map_err(|_| "distributed_normalized_command_unavailable")?;
+      let arguments = normalized_command
+        .get_args()
+        .map(OsStr::to_os_string)
+        .collect::<Vec<_>>();
+      let normalized_recorder = crate::compiler::observation::begin_invocation_in(
+        observation_directory,
+        source_root,
+        source_root,
+        rustc,
+        &arguments,
+      )
+      .map_err(|_| "distributed_normalized_observation_unavailable")?;
+      let normalized_output_paths = normalized_recorder
+        .native_output_paths()
+        .ok_or("distributed_normalized_output_unavailable")?;
+      validated_output_parent(&normalized_output_paths, source_root)
+        .map_err(|_| "distributed_normalized_output_unavailable")?;
+      let normalized_capture = NativeActionCapture::capture(normalized_recorder.observation(), source_root)
+        .map_err(|_| "distributed_normalized_capture_unavailable")?;
+      let exact_candidate = distributed_rust_library_candidate(
+        normalized_recorder.observation(),
+        &normalized_capture,
+        &normalized_output_paths,
+        source_root,
+        source_root_spelling,
+      )?;
+      if !initial_candidate.same_normalized_operation(&exact_candidate) {
+        return Err("distributed_normalized_action_changed");
+      }
+      Ok((
+        normalized_recorder,
+        normalized_output_paths,
+        normalized_capture,
+        exact_candidate,
+        arguments,
+      ))
+    })();
+    match normalized {
+      Ok((normalized_recorder, normalized_output_paths, normalized_capture, candidate, arguments)) => {
+        normalization_bytes = initial_input_bytes.saturating_add(capture.bytes_hashed);
+        recorder = normalized_recorder;
+        output_paths = normalized_output_paths;
+        capture = normalized_capture;
+        distributed_candidate = Some(candidate);
+        normalized_compiler_arguments = Some(arguments);
+      }
+      Err(reason) if BENCH_COVERAGE_DIRECTORY.get().is_some() => {
+        eprintln!("cargo-rail native coverage: distributed normalization unavailable: {reason}");
+      }
+      Err(_) => {}
+    }
+  }
+  let compiler_arguments = normalized_compiler_arguments.as_deref().unwrap_or(compiler_arguments);
+  let observation = recorder.observation();
+  let initial_input_bytes = estimated_input_bytes(observation, source_root);
+  let base_action = base_action_key(&session.identity, &session.class, observation, &capture).ok();
+  let provisional_action = action_key(&session.identity, &session.class, observation, &capture).ok();
+  let (base_action, provisional_action) = match (base_action, provisional_action) {
+    (Some(base_action), Some(provisional_action)) => (base_action, provisional_action),
+    _ => {
+      configure_cold(
+        command,
+        CompilerCacheWrapperStatus::Bypassed,
+        "complete_action_capture_unavailable",
+        None,
+        normalization_bytes.saturating_add(initial_input_bytes.saturating_add(capture.bytes_hashed)),
+        diagnostic_wrapper,
+      );
+      return OuterCacheAction::Execute;
+    }
+  };
+  let distributed_placement = distributed_remote.as_ref().and_then(|(identity, _)| {
+    distributed_candidate.as_ref().and_then(|candidate| {
+      candidate
+        .placement_observation(identity.worker_capability_id, identity.endpoint)
+        .ok()
+    })
+  });
   if capture_test_pause("after_initial_capture", observation).is_err() {
     configure_cold(
       command,
@@ -6103,7 +7021,7 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
     return OuterCacheAction::Execute;
   }
   let mut metrics = NativeCacheMetrics {
-    bytes_hashed: initial_input_bytes.saturating_add(capture.bytes_hashed),
+    bytes_hashed: normalization_bytes.saturating_add(initial_input_bytes.saturating_add(capture.bytes_hashed)),
     ..NativeCacheMetrics::default()
   };
   let mut remote_entry = None;
@@ -6184,6 +7102,19 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
   let environment_names = match environment_names {
     Some(names) => names,
     None => {
+      if let Some(candidate) = distributed_candidate.as_ref()
+        && prepare_distributed_local_fallback(command, rustc, candidate, source_root, observation_directory).is_err()
+      {
+        configure_cold(
+          command,
+          CompilerCacheWrapperStatus::Bypassed,
+          "distributed_normalized_fallback_unavailable",
+          Some(provisional_action),
+          metrics.bytes_hashed,
+          diagnostic_wrapper,
+        );
+        return OuterCacheAction::Execute;
+      }
       let metadata = configure_cold(
         command,
         CompilerCacheWrapperStatus::Miss,
@@ -6194,23 +7125,25 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
       );
       let mut recorder = recorder;
       recorder.set_cache_wrapper(metadata);
-      prepare_observed_cold_child(
-        command,
-        rustc,
-        compiler_arguments,
-        diagnostic_wrapper,
-        recorder.observation(),
-        observation_directory,
-      );
+      if distributed_candidate.is_none() {
+        prepare_observed_cold_child(
+          command,
+          rustc,
+          compiler_arguments,
+          diagnostic_wrapper,
+          recorder.observation(),
+          observation_directory,
+        );
+      }
       return OuterCacheAction::Store {
         recorder,
         capture,
         base_action_key: base_action,
         cache_bytes_read: 0,
+        distributed_placement,
       };
     }
   };
-  let mut capture = capture;
   match capture_approved_environment(
     source_root,
     source_root_spelling,
@@ -6314,13 +7247,16 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
     {
       metrics.cache_bytes_read = metrics.cache_bytes_read.saturating_add(cached.bytes_read);
       match restore_and_publish(
+        context,
         &cas,
-        NativeRestoreSource::Materialized(&cached),
+        NativeRestoreSource::Materialized {
+          cached: &cached,
+          hit_source: NativeHitSource::Local,
+        },
         &capture,
         observation,
         &output_paths,
         &mut metrics,
-        NativeHitSource::Local,
       ) {
         Ok(()) => return OuterCacheAction::Hit(0),
         Err(RestorePublishFailure::BeforeEffect(error)) => {
@@ -6395,6 +7331,123 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
       Err(error) => miss_reason = error.cold_reason().to_string(),
     }
   }
+  if local_miss
+    && environment_names.is_empty()
+    && let Some(candidate) = distributed_candidate.as_ref()
+  {
+    let attempt = if let Some((identity, policy)) = distributed_remote.as_ref() {
+      let decision = match policy {
+        crate::cache::installation::DistributedPlacementPolicy::Qualification => {
+          crate::compiler::distributed::PlacementDecision::Delegate
+        }
+        crate::cache::installation::DistributedPlacementPolicy::Automatic => distributed_placement
+          .as_ref()
+          .zip(context.installation.as_ref())
+          .map_or(
+            crate::compiler::distributed::PlacementDecision::Local("distributed_cost_history_unavailable"),
+            |(placement, receipt)| crate::compiler::distributed::automatic_placement(receipt, placement),
+          ),
+      };
+      match decision {
+        crate::compiler::distributed::PlacementDecision::Delegate => {
+          let started = Instant::now();
+          let attempt = crate::compiler::distributed::execute_and_admit_mutual_tls_worker(
+            identity,
+            rustc,
+            context,
+            &cas,
+            &session,
+            &capture,
+            &base_action,
+            observation,
+            &output_paths,
+            candidate,
+            metrics.cache_bytes_read,
+            *policy == crate::cache::installation::DistributedPlacementPolicy::Qualification,
+          );
+          if let (Some(receipt), Some(placement)) = (context.installation.as_ref(), distributed_placement.as_ref()) {
+            match &attempt {
+              crate::compiler::distributed::LocalAttemptDecision::Completed(_) => {
+                crate::compiler::distributed::record_remote_placement(receipt, placement, started.elapsed(), true);
+              }
+              crate::compiler::distributed::LocalAttemptDecision::Fallback(_) => {
+                crate::compiler::distributed::record_remote_placement(receipt, placement, started.elapsed(), false);
+              }
+              crate::compiler::distributed::LocalAttemptDecision::CompilerFailed { .. }
+              | crate::compiler::distributed::LocalAttemptDecision::OperationalFailure(_) => {}
+            }
+          }
+          attempt
+        }
+        crate::compiler::distributed::PlacementDecision::Local(reason) => {
+          crate::compiler::distributed::LocalAttemptDecision::Fallback(reason)
+        }
+      }
+    } else if let Some(worker) = distributed_worker.as_deref() {
+      crate::compiler::distributed::execute_and_admit_local_worker(
+        worker,
+        rustc,
+        context,
+        &cas,
+        &session,
+        &capture,
+        &base_action,
+        observation,
+        &output_paths,
+        candidate,
+        metrics.cache_bytes_read,
+      )
+    } else {
+      crate::compiler::distributed::LocalAttemptDecision::Fallback("distributed_authority_unavailable")
+    };
+    match attempt {
+      crate::compiler::distributed::LocalAttemptDecision::Completed(exit_code) => {
+        return OuterCacheAction::Hit(exit_code);
+      }
+      crate::compiler::distributed::LocalAttemptDecision::CompilerFailed { termination, result } => {
+        if !result.binds_candidate(candidate) {
+          miss_reason = "distributed_compiler_failure_action_mismatch".to_string();
+        } else {
+          let exit_code = match replay_distributed_compiler_failure(*result, termination, source_root) {
+            Ok(exit_code) => exit_code,
+            Err(error) => return OuterCacheAction::OperationalFailure(error),
+          };
+          let mut raw = match recorder.complete(false) {
+            Ok(raw) => raw,
+            Err(_) => return OuterCacheAction::Hit(exit_code),
+          };
+          let _ = publish_and_record_cold_observation(
+            &mut raw,
+            "distributed_compiler_execution_failed",
+            Some(pre_link_action),
+            None,
+            metrics.bytes_hashed,
+            metrics.cache_bytes_read,
+          );
+          return OuterCacheAction::Hit(exit_code);
+        }
+      }
+      crate::compiler::distributed::LocalAttemptDecision::Fallback(reason) => {
+        miss_reason = reason.to_string();
+      }
+      crate::compiler::distributed::LocalAttemptDecision::OperationalFailure(error) => {
+        return OuterCacheAction::OperationalFailure(error);
+      }
+    }
+  }
+  if let Some(candidate) = distributed_candidate.as_ref()
+    && prepare_distributed_local_fallback(command, rustc, candidate, source_root, observation_directory).is_err()
+  {
+    configure_cold(
+      command,
+      CompilerCacheWrapperStatus::Bypassed,
+      "distributed_normalized_fallback_unavailable",
+      Some(lookup_key),
+      metrics.bytes_hashed,
+      diagnostic_wrapper,
+    );
+    return OuterCacheAction::Execute;
+  }
   let metadata = configure_cold(
     command,
     CompilerCacheWrapperStatus::Miss,
@@ -6403,22 +7456,75 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
     metrics.bytes_hashed,
     diagnostic_wrapper,
   );
-  let mut recorder = recorder;
   recorder.set_cache_wrapper(metadata);
-  prepare_observed_cold_child(
-    command,
-    rustc,
-    compiler_arguments,
-    diagnostic_wrapper,
-    recorder.observation(),
-    observation_directory,
-  );
+  if distributed_candidate.is_none() {
+    prepare_observed_cold_child(
+      command,
+      rustc,
+      compiler_arguments,
+      diagnostic_wrapper,
+      recorder.observation(),
+      observation_directory,
+    );
+  }
   OuterCacheAction::Store {
     recorder,
     capture,
     base_action_key: base_action,
     cache_bytes_read: metrics.cache_bytes_read,
+    distributed_placement,
   }
+}
+
+fn prepare_distributed_local_fallback(
+  command: &mut Command,
+  rustc: &OsStr,
+  candidate: &crate::compiler::distributed::RustLibraryCandidate,
+  source_root: &Path,
+  observation_directory: &Path,
+) -> RailResult<()> {
+  let temporary = observation_directory.join("distributed-local-tmp");
+  *command = candidate.normalized_local_command(rustc, source_root, &temporary)?;
+  suppress_nested_observation(command);
+  Ok(())
+}
+
+fn replay_distributed_compiler_failure(
+  result: crate::compiler::distributed::StagedExecutionResult,
+  termination: crate::compiler::distributed::CompilerTermination,
+  source_root: &Path,
+) -> RailResult<i32> {
+  use crate::compiler::distributed::DistributedResultSlot;
+
+  let localize = |bytes: Vec<u8>| -> RailResult<Vec<u8>> {
+    let (localized, _) = replace_bytes(
+      &bytes,
+      crate::compiler::distributed::VIRTUAL_WORKSPACE.as_bytes(),
+      &source_root_display_bytes(source_root),
+    );
+    if localized
+      .windows(crate::compiler::distributed::VIRTUAL_ROOT.len())
+      .any(|window| window == crate::compiler::distributed::VIRTUAL_ROOT.as_bytes())
+    {
+      return Err(RailError::message(
+        "distributed compiler failure retained an unbound virtual path",
+      ));
+    }
+    Ok(localized)
+  };
+  let stdout = localize(result.read_verified_frame(DistributedResultSlot::Stdout)?)?;
+  let stderr = localize(result.read_verified_frame(DistributedResultSlot::Stderr)?)?;
+  let mut stdout_writer = std::io::stdout().lock();
+  stdout_writer.write_all(&stdout)?;
+  stdout_writer.flush()?;
+  let mut stderr_writer = std::io::stderr().lock();
+  stderr_writer.write_all(&stderr)?;
+  stderr_writer.flush()?;
+  Ok(match termination {
+    crate::compiler::distributed::CompilerTermination::Exit { code } => code,
+    crate::compiler::distributed::CompilerTermination::Signal { .. }
+    | crate::compiler::distributed::CompilerTermination::Unknown => 1,
+  })
 }
 
 fn prepare_original_child(command: &mut Command, diagnostic_wrapper: bool) {
@@ -6568,17 +7674,18 @@ fn attempt_local_packed_reuse(
   }
   metrics.cache_bytes_read = metrics.cache_bytes_read.saturating_add(pack_bytes);
   match restore_and_publish(
+    context,
     cas,
     NativeRestoreSource::Packed {
       authority,
       validation: &validation,
       handoff,
+      hit_source: NativeHitSource::Local,
     },
     capture,
     observation,
     output_paths,
     metrics,
-    NativeHitSource::Local,
   ) {
     Ok(()) => PackedLocalReuse::Hit,
     Err(RestorePublishFailure::BeforeEffect(_)) => PackedLocalReuse::Cold("packed_result_materialization_failed"),
@@ -6725,27 +7832,31 @@ fn attempt_direct_remote_reuse(
     Ok(crate::cache::cas::NativeActionLookup::Packed(authority)) => {
       metrics.cache_bytes_read = metrics.cache_bytes_read.saturating_add(authority.bytes_read);
       restore_and_publish(
+        context,
         cas,
         NativeRestoreSource::Packed {
           authority: &authority,
           validation: &validation,
           handoff,
+          hit_source: NativeHitSource::Remote { base_action_key },
         },
         capture,
         observation,
         output_paths,
         metrics,
-        NativeHitSource::Remote { base_action_key },
       )
     }
     Ok(crate::cache::cas::NativeActionLookup::Hit(cached)) if cached.validation == validation => restore_and_publish(
+      context,
       cas,
-      NativeRestoreSource::Materialized(&cached),
+      NativeRestoreSource::Materialized {
+        cached: &cached,
+        hit_source: NativeHitSource::Remote { base_action_key },
+      },
       capture,
       observation,
       output_paths,
       metrics,
-      NativeHitSource::Remote { base_action_key },
     ),
     Ok(crate::cache::cas::NativeActionLookup::Hit(_) | crate::cache::cas::NativeActionLookup::Miss(_)) | Err(_) => {
       return DirectRemoteReuse::Cold("remote_pack_authority_changed");
@@ -6756,6 +7867,120 @@ fn attempt_direct_remote_reuse(
     Err(RestorePublishFailure::BeforeEffect(_)) => DirectRemoteReuse::Cold("remote_result_materialization_failed"),
     Err(RestorePublishFailure::AfterEffect(error) | RestorePublishFailure::Operational(error)) => {
       DirectRemoteReuse::Operational(error)
+    }
+  }
+}
+
+/// Bind one privately staged worker result to the current native action, admit
+/// it through L1, and publish it through the existing restore transaction.
+///
+/// Any failure before restore publication returns a cold decision; restore
+/// failures after its effect boundary fail closed. A configured L2 receives
+/// the result only after the local restore transaction commits successfully.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn admit_distributed_rust_library_result(
+  context: &NativeCacheContext,
+  cas: &LocalCas,
+  session: &NativeCompilerSession,
+  initial_capture: &NativeActionCapture,
+  expected_base_action: &str,
+  current_observation: &RawCompilerInvocation,
+  output_paths: &NativeOutputPaths,
+  candidate: &crate::compiler::distributed::RustLibraryCandidate,
+  result: crate::compiler::distributed::StagedExecutionResult,
+  cache_bytes_read: u64,
+  mut timing: crate::compiler::distributed::DistributedTiming,
+) -> crate::compiler::distributed::LocalAdmission {
+  use crate::compiler::distributed::LocalAdmission;
+
+  let admission_started = Instant::now();
+  let live_candidate = match distributed_rust_library_candidate(
+    current_observation,
+    initial_capture,
+    output_paths,
+    &context.source_root,
+    &context.source_root_spelling,
+  ) {
+    Ok(candidate) => candidate,
+    Err(_) => return LocalAdmission::RejectedBeforeEffect("distributed_action_changed_before_admission"),
+  };
+  if !result.binds_candidate(candidate) || !result.binds_candidate(&live_candidate) {
+    return LocalAdmission::RejectedBeforeEffect("distributed_result_action_mismatch");
+  }
+  let (prepared, proof) = match prepare_distributed_result(
+    session,
+    initial_capture,
+    expected_base_action,
+    current_observation,
+    output_paths,
+    result,
+    &context.source_root,
+    &context.source_root_spelling,
+  ) {
+    Ok(prepared) => prepared,
+    Err(reason) => return LocalAdmission::RejectedBeforeEffect(reason),
+  };
+  let environment_names = Vec::new();
+  let mut recapture_bytes = 0_u64;
+  let (validation, _) = match cas.store_native_revalidated(prepared, |validation| {
+    recapture_bytes = validation
+      .revalidate_publication(
+        session,
+        &context.source_root,
+        &proof,
+        context
+          .installation
+          .as_ref()
+          .map(crate::cache::installation::InstallationReceipt::authority),
+      )
+      .map_err(|failure| failure.error)?;
+    match cas.publish_native_environment_selector(expected_base_action, &environment_names)? {
+      crate::cache::cas::NativeEnvironmentSelectorPublication::Created
+      | crate::cache::cas::NativeEnvironmentSelectorPublication::Converged => Ok(()),
+      crate::cache::cas::NativeEnvironmentSelectorPublication::Diverged => Err(RailError::message(
+        "distributed native environment selector diverged before admission",
+      )),
+    }
+  }) {
+    Ok(stored) => stored,
+    Err(_) => return LocalAdmission::RejectedBeforeEffect("distributed_local_admission_failed"),
+  };
+  let cached = match cas.native_action(validation.action_key()) {
+    Ok(crate::cache::cas::NativeActionLookup::Hit(cached)) if cached.validation == validation => cached,
+    Ok(
+      crate::cache::cas::NativeActionLookup::Hit(_)
+      | crate::cache::cas::NativeActionLookup::Packed(_)
+      | crate::cache::cas::NativeActionLookup::Miss(_),
+    )
+    | Err(_) => return LocalAdmission::RejectedBeforeEffect("distributed_local_authority_changed"),
+  };
+  timing.record_admission(admission_started);
+  let mut metrics = NativeCacheMetrics {
+    bytes_hashed: recapture_bytes,
+    cache_bytes_read,
+    distributed_timing: Some(timing),
+    ..NativeCacheMetrics::default()
+  };
+  match restore_and_publish(
+    context,
+    cas,
+    NativeRestoreSource::Materialized {
+      cached: &cached,
+      hit_source: NativeHitSource::Distributed {
+        base_action_key: expected_base_action,
+      },
+    },
+    initial_capture,
+    current_observation,
+    output_paths,
+    &mut metrics,
+  ) {
+    Ok(()) => LocalAdmission::Committed(0),
+    Err(RestorePublishFailure::BeforeEffect(_)) => {
+      LocalAdmission::RejectedBeforeEffect("distributed_result_materialization_failed")
+    }
+    Err(RestorePublishFailure::AfterEffect(error) | RestorePublishFailure::Operational(error)) => {
+      LocalAdmission::FailedAfterEffect(error)
     }
   }
 }
@@ -6938,25 +8163,37 @@ fn validate_restore_environment_authority(
   Ok(base_action)
 }
 
+#[derive(Clone, Copy)]
 enum NativeHitSource<'a> {
   Local,
   Remote { base_action_key: &'a str },
+  Distributed { base_action_key: &'a str },
 }
 
 enum NativeRestoreSource<'a> {
-  Materialized(&'a crate::cache::cas::NativeActionHit<'a>),
+  Materialized {
+    cached: &'a crate::cache::cas::NativeActionHit<'a>,
+    hit_source: NativeHitSource<'a>,
+  },
   Packed {
     authority: &'a crate::cache::cas::PackedNativeActionHit<'a>,
     validation: &'a NativeCompilerValidation,
     handoff: pack::NativePackHandoff,
+    hit_source: NativeHitSource<'a>,
   },
 }
 
-impl NativeRestoreSource<'_> {
+impl<'a> NativeRestoreSource<'a> {
   fn validation(&self) -> &NativeCompilerValidation {
     match self {
-      Self::Materialized(cached) => &cached.validation,
+      Self::Materialized { cached, .. } => &cached.validation,
       Self::Packed { validation, .. } => validation,
+    }
+  }
+
+  const fn hit_source(&self) -> NativeHitSource<'a> {
+    match self {
+      Self::Materialized { hit_source, .. } | Self::Packed { hit_source, .. } => *hit_source,
     }
   }
 }
@@ -6966,30 +8203,38 @@ impl NativeHitSource<'_> {
     match self {
       Self::Local => "verified_local_result",
       Self::Remote { .. } => "verified_remote_result",
+      Self::Distributed { .. } => "verified_distributed_execution",
     }
   }
 
   const fn remote_action_key(&self) -> Option<&str> {
     match self {
       Self::Local => None,
-      Self::Remote { base_action_key } => Some(base_action_key),
+      Self::Remote { base_action_key } | Self::Distributed { base_action_key } => Some(base_action_key),
+    }
+  }
+
+  const fn distributed_base_action_key(&self) -> Option<&str> {
+    match self {
+      Self::Distributed { base_action_key } => Some(base_action_key),
+      Self::Local | Self::Remote { .. } => None,
     }
   }
 }
 
 fn restore_and_publish(
+  context: &NativeCacheContext,
   cas: &LocalCas,
   source: NativeRestoreSource<'_>,
   initial_capture: &NativeActionCapture,
   current_observation: &RawCompilerInvocation,
   output_paths: &NativeOutputPaths,
   metrics: &mut NativeCacheMetrics,
-  hit_source: NativeHitSource<'_>,
 ) -> Result<(), RestorePublishFailure> {
   let restore_started = Instant::now();
   let durability = native_durability_phase(NativeDurabilityPhase::RestoreTransaction);
   match &source {
-    NativeRestoreSource::Materialized(cached) => {
+    NativeRestoreSource::Materialized { cached, .. } => {
       validate_restore_environment_authority(cached, initial_capture, current_observation)?;
     }
     NativeRestoreSource::Packed {
@@ -7018,8 +8263,7 @@ fn restore_and_publish(
   }
   let before = RestorePublishFailure::BeforeEffect;
   let validation = source.validation().clone();
-  let context =
-    active_context().ok_or_else(|| before(RailError::message("native compiler cache context disappeared")))?;
+  let hit_source = source.hit_source();
   let source_root = &context.source_root;
   let source_root_spelling = &context.source_root_spelling;
   let observation_directory = &context.observation_directory;
@@ -7103,9 +8347,16 @@ fn restore_and_publish(
   drop(durability);
   metrics.remote_timing.output_restore.record(restore_started);
   metrics.finish_remote();
+  let reason = hit_source
+    .distributed_base_action_key()
+    .and_then(|base_action_key| publish_direct_remote_result(cas, &validation, base_action_key))
+    .map_or_else(
+      || hit_source.reason().to_string(),
+      |remote| format!("{};{remote}", hit_source.reason()),
+    );
   write_cache_event(
     CompilerCacheWrapperStatus::Hit,
-    hit_source.reason(),
+    &reason,
     Some(&validation.action_key),
     Some(&validation.result_key),
     hit_source.remote_action_key(),
@@ -7133,7 +8384,7 @@ fn prepare_registered_restore(
     .transaction_directory
     .join(RESTORE_MATERIALIZING_DIRECTORY);
   let hit = match source {
-    NativeRestoreSource::Materialized(cached) => match cached.restore_registered(&restored, &staging) {
+    NativeRestoreSource::Materialized { cached, .. } => match cached.restore_registered(&restored, &staging) {
       NativeCacheLookup::Hit(hit) => {
         metrics.cache_bytes_read = metrics.cache_bytes_read.saturating_add(hit.bytes_read);
         hit
@@ -9812,6 +11063,7 @@ pub(crate) fn run_and_store(
   mut capture: NativeActionCapture,
   base_action_key: String,
   cache_bytes_read: u64,
+  distributed_placement: Option<crate::compiler::distributed::PlacementObservation>,
   context: &str,
 ) -> i32 {
   let Some(cache_context) = active_context() else {
@@ -9821,6 +11073,7 @@ pub(crate) fn run_and_store(
   let source_root = &cache_context.source_root;
   let source_root_spelling = &cache_context.source_root_spelling;
   let output_paths = recorder.native_output_paths();
+  let compiler_started = Instant::now();
   let output = match run_compiler_with_live_streams(command) {
     Ok(output) => output,
     Err(error) => {
@@ -9828,7 +11081,14 @@ pub(crate) fn run_and_store(
       return 1;
     }
   };
+  let compiler_elapsed = compiler_started.elapsed();
   let CapturedCompilerOutput { status, stdout, stderr } = output;
+
+  if status.success()
+    && let (Some(receipt), Some(placement)) = (cache_context.installation.as_ref(), distributed_placement.as_ref())
+  {
+    crate::compiler::distributed::record_local_placement(receipt, placement, compiler_elapsed);
+  }
 
   let capture_pause_failed =
     status.success() && capture_test_pause("after_compiler_execution", recorder.observation()).is_err();
@@ -10395,6 +11655,275 @@ struct CapturedCompilerStreams<'a> {
   stderr: &'a [u8],
 }
 
+#[allow(clippy::too_many_arguments)]
+fn prepare_distributed_result(
+  session: &NativeCompilerSession,
+  initial_capture: &NativeActionCapture,
+  expected_base_action: &str,
+  current_observation: &RawCompilerInvocation,
+  output_paths: &NativeOutputPaths,
+  mut result: crate::compiler::distributed::StagedExecutionResult,
+  source_root: &Path,
+  source_root_spelling: &Path,
+) -> Result<(PreparedNativeResult, NativePublicationProof), &'static str> {
+  use crate::compiler::distributed::DistributedResultSlot;
+
+  let durable_handoff = result.requires_durable_handoff();
+  let prepared: RailResult<_> = (|| {
+    validated_output_parent(output_paths, source_root)?;
+    let bindings = native_output_bindings(output_paths);
+    let roles = bindings.iter().map(|(role, _, _)| *role).collect::<Vec<_>>();
+    if roles != ["dep_info", "metadata"] && roles != ["dep_info", "metadata", "rlib"] {
+      return Err(RailError::message(
+        "distributed result does not match the native output contract",
+      ));
+    }
+
+    let distributed_dep_info = result.read_verified_frame(DistributedResultSlot::DepInfo)?;
+    let localized_dep_info = localize_distributed_dep_info(&distributed_dep_info, source_root)?;
+    let observed_reads = distributed_dep_info_observed_reads(&localized_dep_info, result.staging_path(), source_root)?;
+    let dep_info = portable_dep_info_output_bindings(&localized_dep_info, output_paths, source_root, initial_capture)?;
+    let stdout = portable_stream_output_bindings(
+      &result.read_verified_frame(DistributedResultSlot::Stdout)?,
+      output_paths,
+      source_root,
+    )?;
+    let stderr = portable_stream_output_bindings(
+      &result.read_verified_frame(DistributedResultSlot::Stderr)?,
+      output_paths,
+      source_root,
+    )?;
+    for slot in [DistributedResultSlot::Stdout, DistributedResultSlot::Stderr] {
+      if result.verified_frame(slot)?.3 != 0 {
+        return Err(RailError::message(
+          "distributed result stream has an invalid output mode",
+        ));
+      }
+    }
+
+    let mut frame_descriptors = BTreeMap::from([("dep_info", (digest(&dep_info), dep_info.len() as u64, 0o644))]);
+    for (role, _, _) in bindings.iter().skip(1) {
+      let slot = match *role {
+        "metadata" => DistributedResultSlot::Metadata,
+        "rlib" => DistributedResultSlot::Rlib,
+        _ => return Err(RailError::message("distributed result output role is unavailable")),
+      };
+      let (_, content_digest, bytes, mode) = result.verified_frame(slot)?;
+      frame_descriptors.insert(*role, (content_digest.to_string(), bytes, mode));
+    }
+    let outputs = bindings
+      .iter()
+      .map(|(role, slot, path)| {
+        let (content_digest, bytes, mode) = frame_descriptors
+          .get(role)
+          .ok_or_else(|| RailError::message("distributed result output role is unavailable"))?;
+        if !valid_native_output_mode(role, *mode) {
+          return Err(RailError::message("distributed result output mode is invalid"));
+        }
+        Ok(NativeCompilerOutput {
+          role: (*role).to_string(),
+          slot: (*slot).to_string(),
+          file_name: path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| RailError::message("distributed result output has no UTF-8 file name"))?
+            .to_string(),
+          content_digest: content_digest.clone(),
+          bytes: *bytes,
+          mode: *mode,
+        })
+      })
+      .collect::<RailResult<Vec<_>>>()?;
+
+    let mut cache_observation = current_observation.clone();
+    cache_observation.observed_reads = observed_reads;
+    cache_observation.emitted_outputs = bindings
+      .iter()
+      .zip(&outputs)
+      .map(|((_, _, path), output)| FileObservation {
+        path: ObservationPath::capture(path, source_root, source_root),
+        content_digest: output.content_digest.clone(),
+        executable: source_mode_executable(output.mode),
+        symlink_target: None,
+      })
+      .collect();
+    cache_observation.emitted_outputs.sort();
+    cache_observation.environment_reads.clear();
+    cache_observation.success = true;
+    cache_observation.cache_wrapper = None;
+    if invocation_bypass_reason(&cache_observation, true, &session.class.host_target).is_some() {
+      return Err(RailError::message(
+        "distributed result does not complete an eligible native observation",
+      ));
+    }
+    let witness = initial_capture.witness(&cache_observation, source_root)?;
+    let selected_action = action_key(&session.identity, &session.class, &cache_observation, initial_capture)?;
+    if base_action_key(&session.identity, &session.class, &cache_observation, initial_capture)? != expected_base_action
+    {
+      return Err(RailError::message(
+        "distributed result changed the selected native base action",
+      ));
+    }
+    let validation = NativeCompilerValidation::new(
+      session,
+      cache_observation,
+      &initial_capture.approved_environment,
+      None,
+      pack::NativeResultDescriptor {
+        action_key: selected_action,
+        witness,
+        outputs,
+        stdout_digest: digest(&stdout),
+        stdout_bytes: stdout.len() as u64,
+        stderr_digest: digest(&stderr),
+        stderr_bytes: stderr.len() as u64,
+      },
+    )?;
+
+    let staged_paths = bindings
+      .iter()
+      .map(|(_, slot, _)| result.staging_path().join(slot))
+      .chain([
+        result.staging_path().join(STDOUT_SLOT),
+        result.staging_path().join(STDERR_SLOT),
+      ])
+      .collect::<Vec<_>>();
+    for directory in staged_paths.iter().filter_map(|path| path.parent()) {
+      create_native_staging_parent(result.staging_path(), directory)?;
+    }
+    write_new_file(&staged_paths[0], &dep_info, 0o644, durable_handoff)?;
+    for (((role, native_slot, _), destination), expected) in bindings
+      .iter()
+      .skip(1)
+      .zip(staged_paths.iter().skip(1))
+      .zip(validation.outputs.iter().skip(1))
+    {
+      let slot = match *role {
+        "metadata" => DistributedResultSlot::Metadata,
+        "rlib" => DistributedResultSlot::Rlib,
+        _ => return Err(RailError::message("distributed result output role is unavailable")),
+      };
+      if destination != &result.staging_path().join(native_slot) {
+        return Err(RailError::message("distributed result native staging slot changed"));
+      }
+      let (content_digest, bytes, mode) = result.move_verified_frame_to(slot, destination)?;
+      if content_digest != expected.content_digest || bytes != expected.bytes || mode != expected.mode {
+        return Err(RailError::message(
+          "distributed result changed while entering native staging",
+        ));
+      }
+      set_native_output_mode(destination, mode)?;
+      if durable_handoff {
+        let staged = OpenOptions::new().read(true).write(true).open(destination)?;
+        sync_native_before_commit(&staged)?;
+      }
+    }
+    write_new_file(
+      &result.staging_path().join(STDOUT_SLOT),
+      &stdout,
+      0o644,
+      durable_handoff,
+    )?;
+    write_new_file(
+      &result.staging_path().join(STDERR_SLOT),
+      &stderr,
+      0o644,
+      durable_handoff,
+    )?;
+    let slots = validation
+      .cas_output_bindings()
+      .chain(validation.cas_stream_bindings())
+      .collect::<Vec<_>>();
+    let manifest = crate::cache::result::manifest_from_verified_native_slots(&slots)?;
+    let staging = result.into_native_staging()?;
+    Ok((staging, manifest, validation))
+  })();
+  let (staging, manifest, validation) = prepared.map_err(|_| "distributed_result_preparation_failed")?;
+  let proof = native_publication_proof(initial_capture, source_root, source_root_spelling)?;
+  Ok((
+    PreparedNativeResult::from_verified_local_cas_staging(staging, manifest, validation),
+    proof,
+  ))
+}
+
+fn distributed_dep_info_observed_reads(
+  bytes: &[u8],
+  staging: &Path,
+  source_root: &Path,
+) -> RailResult<Vec<FileObservation>> {
+  let mut dep_info = tempfile::Builder::new()
+    .prefix("distributed-dep-info-")
+    .tempfile_in(staging)?;
+  dep_info.write_all(bytes)?;
+  dep_info.flush()?;
+  let (_, dependencies) = crate::compiler::observation::makefile_dependency_paths(dep_info.path(), source_root)?;
+  let mut observed = dependencies
+    .iter()
+    .map(|dependency| FileObservation::capture(dependency, source_root, source_root))
+    .collect::<RailResult<Vec<_>>>()?;
+  observed.sort();
+  observed.dedup();
+  if observed.is_empty() {
+    return Err(RailError::message(
+      "distributed compiler dep-info contains no observed source",
+    ));
+  }
+  Ok(observed)
+}
+
+fn localize_distributed_dep_info(bytes: &[u8], source_root: &Path) -> RailResult<Vec<u8>> {
+  let replacement = escape_dep_info_path(&source_root_display_bytes(source_root));
+  let (localized, replacements) = replace_bytes(
+    bytes,
+    crate::compiler::distributed::VIRTUAL_WORKSPACE.as_bytes(),
+    &replacement,
+  );
+  if replacements == 0
+    || localized
+      .windows(crate::compiler::distributed::VIRTUAL_ROOT.len())
+      .any(|window| window == crate::compiler::distributed::VIRTUAL_ROOT.as_bytes())
+  {
+    return Err(RailError::message(
+      "distributed dep-info contains an unmodeled virtual path",
+    ));
+  }
+  Ok(localized)
+}
+
+fn native_publication_proof(
+  initial_capture: &NativeActionCapture,
+  source_root: &Path,
+  source_root_spelling: &Path,
+) -> Result<NativePublicationProof, &'static str> {
+  let environment_names = initial_capture
+    .approved_environment
+    .entries
+    .iter()
+    .map(|entry| entry.name.clone())
+    .collect::<Vec<_>>();
+  let (approved_environment, environment_bytes_hashed) = capture_approved_environment(
+    source_root,
+    source_root_spelling,
+    initial_capture,
+    &environment_names,
+    Instant::now(),
+  )
+  .map_err(|_| "cold_final_capture_failed")?;
+  if approved_environment != initial_capture.approved_environment {
+    return Err("cold_inputs_changed_before_admission");
+  }
+  Ok(NativePublicationProof {
+    version: 4,
+    source_state: initial_capture.source_state.clone(),
+    package_binding: initial_capture.package_binding.clone(),
+    approved_environment,
+    guard_identity: initial_capture
+      .guard_identity()
+      .map_err(|_| "cold_final_capture_failed")?,
+    environment_bytes_hashed,
+  })
+}
+
 // These values are the complete semantic and physical boundaries of one cold
 // result. Grouping them into a second context object would only hide which
 // authority is consumed at admission.
@@ -10502,7 +12031,7 @@ fn prepare_cold_result(
       .filter_map(|path| path.parent())
       .chain([stdout_slot.parent(), stderr_slot.parent()].into_iter().flatten())
     {
-      fs::create_dir_all(directory)?;
+      create_native_staging_parent(staging.path(), directory)?;
     }
     for (((role, _, source), staged), expected) in bindings.iter().zip(&staged_outputs).zip(&validation.outputs) {
       let observed = observed_output(&validation.observation, source, source_root)?;
@@ -10523,33 +12052,7 @@ fn prepare_cold_result(
     Ok((staging, manifest, validation))
   })();
   let (staging, manifest, validation) = prepared.map_err(|_| "cold_result_preparation_failed")?;
-  let environment_names = initial_capture
-    .approved_environment
-    .entries
-    .iter()
-    .map(|entry| entry.name.clone())
-    .collect::<Vec<_>>();
-  let (approved_environment, environment_bytes_hashed) = capture_approved_environment(
-    source_root,
-    source_root_spelling,
-    initial_capture,
-    &environment_names,
-    Instant::now(),
-  )
-  .map_err(|_| "cold_final_capture_failed")?;
-  if approved_environment != initial_capture.approved_environment {
-    return Err("cold_inputs_changed_before_admission");
-  }
-  let proof = NativePublicationProof {
-    version: 4,
-    source_state: initial_capture.source_state.clone(),
-    package_binding: initial_capture.package_binding.clone(),
-    approved_environment,
-    guard_identity: initial_capture
-      .guard_identity()
-      .map_err(|_| "cold_final_capture_failed")?,
-    environment_bytes_hashed,
-  };
+  let proof = native_publication_proof(initial_capture, source_root, source_root_spelling)?;
   let prepared = PreparedNativeResult::from_verified_local_cas_staging(staging, manifest, validation);
   Ok((prepared, proof))
 }
@@ -10639,6 +12142,26 @@ fn write_new_file(path: &Path, bytes: &[u8], mode: u32, durable_handoff: bool) -
   set_native_output_mode(path, mode)?;
   if durable_handoff {
     sync_native_before_commit(&file)?;
+  }
+  Ok(())
+}
+
+fn create_native_staging_parent(root: &Path, parent: &Path) -> RailResult<()> {
+  if !parent.starts_with(root) {
+    return Err(RailError::message(
+      "native compiler cache slot escaped its staging root",
+    ));
+  }
+  fs::create_dir_all(parent)?;
+  #[cfg(unix)]
+  {
+    let mut current = parent;
+    while current != root {
+      set_native_output_mode(current, 0o755)?;
+      current = current
+        .parent()
+        .ok_or_else(|| RailError::message("native compiler cache slot escaped its staging root"))?;
+    }
   }
   Ok(())
 }
@@ -10746,6 +12269,8 @@ struct NativeBenchmarkCoverageEvent<'a> {
   remote_payload_bytes_written: u64,
   remote_service_elapsed_ns: u64,
   timing: NativeRemoteTimingSnapshot,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  distributed_timing: Option<crate::compiler::distributed::DistributedTiming>,
   durability: NativeDurabilitySnapshot,
   #[serde(skip_serializing_if = "Option::is_none")]
   remote_error: Option<String>,
@@ -10832,7 +12357,7 @@ fn write_benchmark_coverage_invocation(
         .map(ToString::to_string)
     });
   let encoded = serde_json::to_vec(&NativeBenchmarkCoverageEvent {
-    schema_version: 8,
+    schema_version: 9,
     lane: "cargo-rail",
     status,
     reason,
@@ -10852,6 +12377,7 @@ fn write_benchmark_coverage_invocation(
     remote_payload_bytes_written: remote.payload_bytes_written,
     remote_service_elapsed_ns: remote.service_elapsed_ns,
     timing: metrics.remote_timing,
+    distributed_timing: metrics.distributed_timing,
     durability: native_durability_snapshot(),
     remote_error,
   })?;
@@ -11421,6 +12947,577 @@ pub(crate) mod tests {
       bypasses: BTreeSet::new(),
       compiler_fact_unit: None,
     }
+  }
+
+  #[test]
+  fn distributed_candidate_requires_closed_source_dependency_and_argument_authority() -> RailResult<()> {
+    let workspace = tempfile::tempdir()?;
+    fs::write(
+      workspace.path().join("Cargo.toml"),
+      "[package]\nname='fixture'\nversion='0.0.0'\n",
+    )?;
+    fs::create_dir(workspace.path().join("src"))?;
+    fs::create_dir_all(workspace.path().join("target/debug/deps"))?;
+    let source = workspace.path().join("src/lib.rs");
+    fs::write(&source, b"pub fn value() -> u8 { 1 }\n")?;
+    let suffix = "-0123456789abcdef";
+    let output = workspace.path().join("target/debug/deps");
+    let arguments = [
+      "--crate-name".to_string(),
+      "fixture".to_string(),
+      "--crate-type=lib".to_string(),
+      "--edition".to_string(),
+      "2024".to_string(),
+      "--error-format=json".to_string(),
+      "--json=diagnostic-rendered-ansi,artifacts,future-incompat".to_string(),
+      "--emit".to_string(),
+      format!(
+        "dep-info={},metadata={},link={}",
+        output.join(format!("fixture{suffix}.d")).display(),
+        output.join(format!("libfixture{suffix}.rmeta")).display(),
+        output.join(format!("libfixture{suffix}.rlib")).display()
+      ),
+      "-Copt-level=3".to_string(),
+      "-Cembed-bitcode=no".to_string(),
+      "--check-cfg".to_string(),
+      "cfg(docsrs,test)".to_string(),
+      "--check-cfg".to_string(),
+      "cfg(feature, values())".to_string(),
+      "-Cmetadata=0123456789abcdef".to_string(),
+      format!("-Cextra-filename={suffix}"),
+      "--out-dir".to_string(),
+      output.to_string_lossy().into_owned(),
+      "-Cstrip=debuginfo".to_string(),
+      "-L".to_string(),
+      format!("dependency={}", output.display()),
+      "--remap-path-prefix".to_string(),
+      format!(
+        "{}={}",
+        workspace.path().display(),
+        crate::compiler::distributed::VIRTUAL_WORKSPACE
+      ),
+      "src/lib.rs".to_string(),
+    ]
+    .map(OsString::from);
+    let observation_directory = tempfile::tempdir()?;
+    let recorder = crate::compiler::observation::begin_invocation_in(
+      observation_directory.path(),
+      workspace.path(),
+      workspace.path(),
+      OsStr::new("rustc"),
+      &arguments,
+    )?;
+    let output_paths = recorder
+      .native_output_paths()
+      .ok_or_else(|| RailError::message("test native output paths were unavailable"))?;
+    let observation = recorder.observation().clone();
+    let capture = NativeActionCapture::capture(&observation, workspace.path())?;
+    assert!(matches!(
+      distributed_rust_library_candidate(
+        &observation,
+        &capture,
+        &output_paths,
+        workspace.path(),
+        workspace.path(),
+      ),
+      Err("distributed_action_class_ineligible")
+    ));
+
+    let mut closed = capture.clone();
+    closed.generated = None;
+    let authority = distributed_rust_library_authority(&observation, &closed, &output_paths, workspace.path())
+      .map_err(RailError::message)?;
+    assert_eq!(authority.crate_name, "fixture");
+    assert_eq!(authority.crate_type, "lib");
+    assert_eq!(authority.edition, "2024");
+    assert_eq!(
+      authority.emission,
+      crate::compiler::distributed::RustLibraryEmission::MetadataAndLink
+    );
+    assert_eq!(authority.metadata, "0123456789abcdef");
+    assert_eq!(authority.extra_filename, suffix);
+    assert!(authority.execution_options.cargo_json_diagnostics);
+    assert_eq!(
+      authority.execution_options.check_cfg,
+      ["cfg(docsrs,test)", "cfg(feature, values())"]
+    );
+    assert_eq!(authority.execution_options.codegen.opt_level.as_deref(), Some("3"));
+    assert_eq!(authority.execution_options.codegen.embed_bitcode, Some(false));
+    assert_eq!(authority.execution_options.codegen.strip.as_deref(), Some("debuginfo"));
+    assert!(authority.execution_options.output_dependency_search);
+    let canonical_source = crate::utils::canonicalize_existing(&source)?;
+    assert!(
+      authority
+        .sources
+        .iter()
+        .any(|input| input.path == canonical_source && input.repository_relative_path == "src/lib.rs")
+    );
+    assert_eq!(authority.source_relative_path, "src/lib.rs");
+    assert_eq!(authority.output_relative_directory, "target/debug/deps");
+    let mut unnormalized = observation.clone();
+    unnormalized
+      .compiler_arguments
+      .retain(|argument| argument != "--remap-path-prefix" && !distributed_workspace_remap(argument));
+    assert!(matches!(
+      distributed_rust_library_authority(&unnormalized, &closed, &output_paths, workspace.path()),
+      Err("distributed_argument_authority_mismatch")
+    ));
+    let normalization =
+      distributed_rust_library_authority_with_remap(&unnormalized, &closed, &output_paths, workspace.path(), false)
+        .map_err(RailError::message)?;
+    let DistributedRustLibraryAuthority {
+      crate_name,
+      crate_type,
+      dep_info_name,
+      edition,
+      emission,
+      execution_options,
+      extra_filename,
+      metadata,
+      metadata_name,
+      output_relative_directory,
+      rlib_name,
+      dependencies,
+      sources,
+      source_relative_path,
+      test_mode,
+      toolchain_proc_macro,
+    } = normalization;
+    let normalization = crate::compiler::distributed::RustLibraryCandidate::from_captured_inputs(
+      crate::compiler::distributed::RustLibraryCandidateInput {
+        crate_name,
+        crate_type,
+        dep_info_name,
+        edition,
+        emission,
+        metadata,
+        metadata_name,
+        extra_filename,
+        output_relative_directory,
+        source_relative_path,
+        test_mode,
+        toolchain_proc_macro,
+        rlib_name,
+        options: execution_options,
+      },
+      sources,
+      dependencies,
+    )?;
+    let temporary = tempfile::tempdir()?;
+    let command = normalization.normalized_local_command(OsStr::new("rustc"), workspace.path(), temporary.path())?;
+    let normalized_arguments = command
+      .get_args()
+      .map(|argument| argument.to_string_lossy().into_owned())
+      .collect::<Vec<_>>();
+    assert!(normalized_arguments.iter().any(|argument| argument == "src/lib.rs"));
+    assert!(
+      normalized_arguments
+        .iter()
+        .any(|argument| argument == "--remap-path-prefix")
+    );
+    assert!(normalized_arguments.iter().any(|argument| {
+      argument.as_str()
+        == format!(
+          "{}={}",
+          fs::canonicalize(workspace.path())
+            .expect("canonical workspace")
+            .display(),
+          crate::compiler::distributed::VIRTUAL_WORKSPACE
+        )
+    }));
+
+    let mut metadata_observation = observation.clone();
+    metadata_observation.emit_modes = BTreeSet::from(["dep-info".to_string(), "metadata".to_string()]);
+    let emit_value = metadata_observation
+      .compiler_arguments
+      .iter()
+      .position(|argument| argument == "--emit")
+      .and_then(|index| metadata_observation.compiler_arguments.get_mut(index + 1))
+      .ok_or_else(|| RailError::message("test compiler arguments have no emit value"))?;
+    *emit_value = format!(
+      "dep-info={},metadata={}",
+      output.join(format!("fixture{suffix}.d")).display(),
+      output.join(format!("libfixture{suffix}.rmeta")).display()
+    );
+    let metadata_output_paths = NativeOutputPaths {
+      dep_info: output_paths.dep_info.clone(),
+      artifacts: vec![crate::compiler::observation::NativeOutputArtifact {
+        role: NativeOutputRole::Metadata,
+        path: output.join(format!("libfixture{suffix}.rmeta")),
+      }],
+    };
+    let mut metadata_capture = NativeActionCapture::capture(&metadata_observation, workspace.path())?;
+    metadata_capture.generated = None;
+    let metadata_authority = distributed_rust_library_authority(
+      &metadata_observation,
+      &metadata_capture,
+      &metadata_output_paths,
+      workspace.path(),
+    )
+    .map_err(RailError::message)?;
+    assert_eq!(
+      metadata_authority.emission,
+      crate::compiler::distributed::RustLibraryEmission::Metadata
+    );
+    let DistributedRustLibraryAuthority {
+      crate_name,
+      crate_type,
+      dependencies,
+      dep_info_name,
+      edition,
+      emission,
+      execution_options,
+      extra_filename,
+      metadata,
+      metadata_name,
+      output_relative_directory,
+      rlib_name,
+      sources,
+      source_relative_path,
+      test_mode,
+      toolchain_proc_macro,
+    } = metadata_authority;
+    let metadata_candidate = crate::compiler::distributed::RustLibraryCandidate::from_captured_inputs(
+      crate::compiler::distributed::RustLibraryCandidateInput {
+        crate_name,
+        crate_type,
+        dep_info_name,
+        edition,
+        emission,
+        metadata,
+        metadata_name,
+        extra_filename,
+        output_relative_directory,
+        source_relative_path,
+        test_mode,
+        toolchain_proc_macro,
+        rlib_name,
+        options: execution_options,
+      },
+      sources,
+      dependencies,
+    )?;
+    let metadata_command =
+      metadata_candidate.normalized_local_command(OsStr::new("rustc"), workspace.path(), temporary.path())?;
+    let metadata_emit = metadata_command
+      .get_args()
+      .map(|argument| argument.to_string_lossy())
+      .find(|argument| argument.starts_with("dep-info="))
+      .ok_or_else(|| RailError::message("metadata fallback command has no emit contract"))?;
+    assert!(metadata_emit.contains(",metadata=") && !metadata_emit.contains(",link="));
+
+    let mut capped = observation.clone();
+    capped.compiler_arguments.push("--cap-lints=allow".to_string());
+    let capped = distributed_rust_library_authority(&capped, &closed, &output_paths, workspace.path())
+      .map_err(RailError::message)?;
+    assert_eq!(capped.execution_options.cap_lints.as_deref(), Some("allow"));
+
+    let mut unmodeled = observation.clone();
+    unmodeled.compiler_arguments.push("--crate-attr=custom".to_string());
+    assert!(matches!(
+      distributed_rust_library_authority(&unmodeled, &closed, &output_paths, workspace.path()),
+      Err("distributed_argument_shape_ineligible")
+    ));
+
+    fs::write(workspace.path().join("src/late.rs"), b"pub fn late() {}\n")?;
+    let mut expanded = NativeActionCapture::capture(&observation, workspace.path())?;
+    expanded.generated = None;
+    let expanded = distributed_rust_library_authority(&observation, &expanded, &output_paths, workspace.path())
+      .map_err(RailError::message)?;
+    assert!(
+      expanded
+        .sources
+        .iter()
+        .any(|input| input.repository_relative_path == "src/late.rs")
+    );
+    Ok(())
+  }
+
+  #[test]
+  fn distributed_workspace_remap_accepts_only_the_exact_current_directory() -> RailResult<()> {
+    let workspace = tempfile::tempdir()?;
+    let virtual_root = crate::compiler::distributed::VIRTUAL_WORKSPACE;
+    let physical = format!("{}={virtual_root}", workspace.path().display());
+    let sibling = format!(
+      "{}={virtual_root}",
+      workspace.path().with_extension("sibling").display()
+    );
+
+    assert!(distributed_workspace_remap_at(&physical, Some(workspace.path())));
+    assert!(!distributed_workspace_remap_at(&physical, None));
+    assert!(!distributed_workspace_remap_at(&sibling, Some(workspace.path())));
+    assert!(!distributed_workspace_remap_at(
+      &format!("{}=/different", workspace.path().display()),
+      Some(workspace.path())
+    ));
+    assert!(distributed_workspace_remap_at(
+      &format!("repository:={virtual_root}"),
+      None
+    ));
+    Ok(())
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn native_staging_parent_modes_are_independent_of_the_callers_umask() -> RailResult<()> {
+    let staging = tempfile::tempdir()?;
+    let parent = staging.path().join("target/outputs");
+    fs::create_dir_all(&parent)?;
+    set_native_output_mode(&staging.path().join("target"), 0o775)?;
+    set_native_output_mode(&parent, 0o775)?;
+
+    create_native_staging_parent(staging.path(), &parent)?;
+
+    assert_eq!(
+      native_output_mode(&fs::symlink_metadata(staging.path().join("target"))?),
+      0o755
+    );
+    assert_eq!(native_output_mode(&fs::symlink_metadata(parent)?), 0o755);
+    Ok(())
+  }
+
+  #[test]
+  fn distributed_result_requires_live_revalidation_before_l1_admission() -> RailResult<()> {
+    let workspace = tempfile::tempdir()?;
+    fs::write(
+      workspace.path().join("Cargo.toml"),
+      "[package]\nname='fixture'\nversion='0.0.0'\n",
+    )?;
+    fs::create_dir(workspace.path().join("src"))?;
+    fs::create_dir_all(workspace.path().join("target/debug/deps"))?;
+    fs::write(workspace.path().join("src/lib.rs"), b"pub fn value() -> u8 { 1 }\n")?;
+    let workspace_root = crate::utils::canonicalize_existing(workspace.path())?;
+    let suffix = "-0123456789abcdef";
+    let output = workspace_root.join("target/debug/deps");
+    let arguments = [
+      "--crate-name".to_string(),
+      "fixture".to_string(),
+      "--crate-type=lib".to_string(),
+      "--edition=2024".to_string(),
+      "--emit".to_string(),
+      format!(
+        "dep-info={},metadata={},link={}",
+        output.join(format!("fixture{suffix}.d")).display(),
+        output.join(format!("libfixture{suffix}.rmeta")).display(),
+        output.join(format!("libfixture{suffix}.rlib")).display()
+      ),
+      "-Cmetadata=0123456789abcdef".to_string(),
+      format!("-Cextra-filename={suffix}"),
+      "--out-dir".to_string(),
+      output.to_string_lossy().into_owned(),
+      "--remap-path-prefix".to_string(),
+      format!(
+        "{}={}",
+        workspace_root.display(),
+        crate::compiler::distributed::VIRTUAL_WORKSPACE
+      ),
+      "src/lib.rs".to_string(),
+    ]
+    .map(OsString::from);
+    let observations = tempfile::tempdir()?;
+    let recorder = crate::compiler::observation::begin_invocation_in(
+      observations.path(),
+      &workspace_root,
+      &workspace_root,
+      OsStr::new("rustc"),
+      &arguments,
+    )?;
+    let output_paths = recorder
+      .native_output_paths()
+      .ok_or_else(|| RailError::message("test native output paths were unavailable"))?;
+    let observation = recorder.observation().clone();
+    let capture = NativeActionCapture::capture(&observation, &workspace_root)?;
+    let declared = observation
+      .declared_inputs
+      .first()
+      .ok_or_else(|| RailError::message("test source input was unavailable"))?;
+    let ObservationPath::Repository(namespace) = &capture.source_state.root else {
+      return Err(RailError::message("test source namespace was not repository-owned"));
+    };
+    let sources = distributed_source_inputs(&capture, namespace, "src/lib.rs", declared).map_err(RailError::message)?;
+    let candidate = crate::compiler::distributed::RustLibraryCandidate::from_captured_inputs(
+      crate::compiler::distributed::RustLibraryCandidateInput {
+        crate_name: "fixture".to_string(),
+        crate_type: "lib".to_string(),
+        dep_info_name: format!("fixture{suffix}.d"),
+        edition: "2024".to_string(),
+        emission: crate::compiler::distributed::RustLibraryEmission::MetadataAndLink,
+        metadata: "0123456789abcdef".to_string(),
+        metadata_name: format!("libfixture{suffix}.rmeta"),
+        extra_filename: suffix.to_string(),
+        output_relative_directory: "target/debug/deps".to_string(),
+        source_relative_path: "src/lib.rs".to_string(),
+        test_mode: false,
+        toolchain_proc_macro: false,
+        rlib_name: Some(format!("libfixture{suffix}.rlib")),
+        options: crate::compiler::distributed::RustLibraryExecutionOptions::default(),
+      },
+      sources,
+      Vec::new(),
+    )?;
+    let dep_info = format!(
+      "{}/target/debug/deps/fixture{suffix}.d: src/lib.rs\n",
+      crate::compiler::distributed::VIRTUAL_WORKSPACE
+    );
+    let result = crate::compiler::distributed::StagedExecutionResult::from_test_frames(
+      &candidate,
+      dep_info.as_bytes(),
+      b"metadata bytes",
+      b"rlib bytes",
+      b"",
+      b"",
+    )?;
+    let session = graduated_session(path_identity(&workspace_root)?);
+    let base_action = base_action_key(&session.identity, &session.class, &observation, &capture)?;
+    let cache_root = tempfile::tempdir()?;
+    let selection = crate::cache::cas::LocalCacheSelection::new(
+      cache_root.path().to_path_buf(),
+      1024 * 1024 * 1024,
+      Some("d".repeat(64)),
+    )?;
+    let cas = LocalCas::open_selected(&selection)?;
+    let (prepared, proof) = prepare_distributed_result(
+      &session,
+      &capture,
+      &base_action,
+      &observation,
+      &output_paths,
+      result,
+      &workspace_root,
+      &workspace_root,
+    )
+    .map_err(RailError::message)?;
+    let drift_result = crate::compiler::distributed::StagedExecutionResult::from_test_frames(
+      &candidate,
+      dep_info.as_bytes(),
+      b"metadata bytes",
+      b"rlib bytes",
+      b"",
+      b"",
+    )?;
+    let (drift_prepared, drift_proof) = prepare_distributed_result(
+      &session,
+      &capture,
+      &base_action,
+      &observation,
+      &output_paths,
+      drift_result,
+      &workspace_root,
+      &workspace_root,
+    )
+    .map_err(RailError::message)?;
+    let (validation, _) = cas.store_native_revalidated(prepared, |validation| {
+      validation
+        .revalidate_publication(&session, &workspace_root, &proof, None)
+        .map(|_| ())
+        .map_err(|failure| failure.error)
+    })?;
+    assert_eq!(
+      validation.action_key(),
+      action_key(&session.identity, &session.class, &observation, &capture)?
+    );
+    assert!(matches!(
+      cas.native_action(validation.action_key())?,
+      crate::cache::cas::NativeActionLookup::Hit(_)
+    ));
+    assert!(matches!(
+      cas.publish_native_environment_selector(&base_action, &[])?,
+      crate::cache::cas::NativeEnvironmentSelectorPublication::Created
+        | crate::cache::cas::NativeEnvironmentSelectorPublication::Converged
+    ));
+    let restore_context = NativeCacheContext {
+      session: NativeCacheSession::Prepared(session.clone()),
+      source_root: workspace_root.clone(),
+      source_root_spelling: workspace_root.clone(),
+      observation_directory: observations.path().to_path_buf(),
+      local_cas: Some(cas.clone()),
+      remote: None,
+      remote_store: OnceLock::new(),
+      installation: None,
+      _runtime: None,
+    };
+    let mut metrics = NativeCacheMetrics::default();
+    match cas.native_action(validation.action_key())? {
+      crate::cache::cas::NativeActionLookup::Hit(cached) => restore_and_publish(
+        &restore_context,
+        &cas,
+        NativeRestoreSource::Materialized {
+          cached: &cached,
+          hit_source: NativeHitSource::Distributed {
+            base_action_key: &base_action,
+          },
+        },
+        &capture,
+        &observation,
+        &output_paths,
+        &mut metrics,
+      )
+      .map_err(|failure| match failure {
+        RestorePublishFailure::BeforeEffect(error)
+        | RestorePublishFailure::AfterEffect(error)
+        | RestorePublishFailure::Operational(error) => error,
+      })?,
+      crate::cache::cas::NativeActionLookup::Packed(_) | crate::cache::cas::NativeActionLookup::Miss(_) => {
+        return Err(RailError::message("distributed test L1 authority disappeared"));
+      }
+    }
+    assert_eq!(
+      fs::read(output.join(format!("libfixture{suffix}.rmeta")))?,
+      b"metadata bytes"
+    );
+    assert_eq!(
+      fs::read(output.join(format!("libfixture{suffix}.rlib")))?,
+      b"rlib bytes"
+    );
+    let restored_dep_info = fs::read(output.join(format!("fixture{suffix}.d")))?;
+    assert!(
+      restored_dep_info
+        .windows(b"src/lib.rs".len())
+        .any(|window| window == b"src/lib.rs")
+    );
+    assert!(
+      !restored_dep_info
+        .windows(crate::compiler::distributed::VIRTUAL_ROOT.len())
+        .any(|window| { window == crate::compiler::distributed::VIRTUAL_ROOT.as_bytes() })
+    );
+    fs::write(workspace_root.join("src/lib.rs"), b"pub fn changed() {}\n")?;
+    assert!(
+      cas
+        .store_native_revalidated(drift_prepared, |validation| {
+          validation
+            .revalidate_publication(&session, &workspace_root, &drift_proof, None)
+            .map(|_| ())
+            .map_err(|failure| failure.error)
+        })
+        .is_err()
+    );
+
+    let changed = crate::compiler::distributed::StagedExecutionResult::from_test_frames(
+      &candidate,
+      dep_info.as_bytes(),
+      b"metadata bytes",
+      b"rlib bytes",
+      b"",
+      b"",
+    )?;
+    let metadata = changed
+      .frame(crate::compiler::distributed::DistributedResultSlot::Metadata)
+      .ok_or_else(|| RailError::message("test metadata frame was unavailable"))?;
+    fs::write(metadata, b"changed after decode")?;
+    assert!(
+      prepare_distributed_result(
+        &session,
+        &capture,
+        &base_action,
+        &observation,
+        &output_paths,
+        changed,
+        &workspace_root,
+        &workspace_root,
+      )
+      .is_err()
+    );
+    Ok(())
   }
 
   #[test]

@@ -604,6 +604,11 @@ impl CacheScope {
 }
 
 /// Subcommands for `cargo rail cache`.
+///
+/// This enum is parsed once and immediately dispatched. Keeping setup fields
+/// inline avoids a heap allocation on every cache command solely to reduce the
+/// size difference between variants.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 pub enum CacheCommand {
   /// Install or repair transparent verified compiler reuse.
@@ -626,6 +631,47 @@ pub enum CacheCommand {
     /// Remove persisted remote activation while preserving local reuse.
     #[arg(long, conflicts_with_all = ["remote", "remote_mode", "remote_environment"])]
     local_only: bool,
+    /// Enable the same-host distributed protocol qualification path.
+    #[arg(long, conflicts_with = "distributed_endpoint")]
+    distributed_local: bool,
+    /// Mutually authenticated direct worker socket address.
+    #[arg(
+      long,
+      value_name = "IP:PORT",
+      conflicts_with = "distributed_local",
+      requires_all = [
+        "distributed_server_name",
+        "distributed_capability",
+        "distributed_authority",
+        "distributed_client_certificate",
+        "distributed_client_private_key"
+      ]
+    )]
+    distributed_endpoint: Option<String>,
+    /// TLS DNS name required from the distributed worker certificate.
+    #[arg(long, value_name = "NAME", requires = "distributed_endpoint")]
+    distributed_server_name: Option<String>,
+    /// Exact capability identity advertised by the selected worker.
+    #[arg(long, value_name = "IDENTITY", requires = "distributed_endpoint")]
+    distributed_capability: Option<String>,
+    /// PEM certificate authority for the distributed worker.
+    #[arg(long, value_name = "PATH", requires = "distributed_endpoint")]
+    distributed_authority: Option<PathBuf>,
+    /// PEM client certificate presented to the distributed worker.
+    #[arg(long, value_name = "PATH", requires = "distributed_endpoint")]
+    distributed_client_certificate: Option<PathBuf>,
+    /// Private PEM key for the distributed client certificate.
+    #[arg(long, value_name = "PATH", requires = "distributed_endpoint")]
+    distributed_client_private_key: Option<PathBuf>,
+    /// Placement policy for an mTLS worker. Qualification samples every eligible miss;
+    /// automatic placement requires retained evidence of a critical-path win.
+    #[arg(
+      long,
+      value_name = "MODE",
+      value_parser = ["automatic", "qualification"],
+      conflicts_with = "distributed_local"
+    )]
+    distributed_policy: Option<String>,
     /// Preview exact Cargo configuration and private-state changes.
     #[arg(long, short = 'c')]
     check: bool,

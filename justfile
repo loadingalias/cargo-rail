@@ -35,8 +35,8 @@ ssh-status target="":
 ssh-bootstrap target profile="":
     @if [ -n "{{ profile }}" ]; then "{{ dev_machine }}" bootstrap cargo-rail "{{ target }}" "{{ profile }}"; else "{{ dev_machine }}" bootstrap cargo-rail "{{ target }}"; fi
 
-ssh-qualification-tools target:
-    @"{{ dev_machine }}" just cargo-rail "{{ target }}" "install-qualification-tools"
+ssh-qualification-tools target variant="":
+    @"{{ dev_machine }}" just cargo-rail "{{ target }}" "install-qualification-tools" "{{ variant }}"
 
 ssh-just target *args="":
     @"{{ dev_machine }}" just cargo-rail "{{ target }}" {{ args }}
@@ -56,6 +56,9 @@ ssh-collect-bench target run_id destination:
 
 ssh-collect-compiler-facts target run_id destination:
     @"{{ dev_machine }}" collect-results cargo-rail "{{ target }}" compiler-facts "{{ run_id }}" "{{ destination }}"
+
+ssh-collect-distributed-execution target run_id destination:
+    @"{{ dev_machine }}" collect-results cargo-rail "{{ target }}" distributed-execution "{{ run_id }}" "{{ destination }}"
 
 check:
     @scripts/check/check.sh
@@ -140,8 +143,62 @@ cleanup-native-cache-r2-prefix account bucket prefix:
 cleanup-native-cache-azure-container account container run_id:
     @scripts/ci/cleanup-native-cache-azure-container.sh "{{ account }}" "{{ container }}" "{{ run_id }}"
 
-install-qualification-tools:
-    @scripts/ci/install-qualification-tools.sh
+install-qualification-tools variant="":
+    @scripts/ci/install-qualification-tools.sh {{ variant }}
+
+qualify-distributed-execution-prepare run_id:
+    @scripts/ci/qualify-distributed-execution-node.sh prepare "{{ run_id }}"
+
+qualify-distributed-execution-seal-identity run_id role:
+    @scripts/ci/qualify-distributed-execution-node.sh seal-identity "{{ run_id }}" "{{ role }}"
+
+qualify-distributed-execution-build run_id:
+    @scripts/ci/qualify-distributed-execution-node.sh build "{{ run_id }}"
+
+qualify-distributed-execution-resources run_id:
+    @scripts/ci/qualify-distributed-execution-node.sh resources "{{ run_id }}"
+
+qualify-distributed-execution-worker-start run_id port network="tailscale":
+    @scripts/ci/qualify-distributed-execution-node.sh worker-start "{{ run_id }}" "{{ port }}" "{{ network }}"
+
+qualify-distributed-execution-worker-stop run_id:
+    @scripts/ci/qualify-distributed-execution-node.sh worker-stop "{{ run_id }}"
+
+qualify-distributed-execution-sccache-scheduler-start run_id port network="tailscale":
+    @scripts/ci/qualify-distributed-execution-node.sh sccache-scheduler-start \
+      "{{ run_id }}" "{{ port }}" "{{ network }}"
+
+qualify-distributed-execution-sccache-worker-start run_id port scheduler_endpoint network="tailscale":
+    @scripts/ci/qualify-distributed-execution-node.sh sccache-worker-start \
+      "{{ run_id }}" "{{ port }}" "{{ scheduler_endpoint }}" "{{ network }}"
+
+qualify-distributed-execution-sccache-client-prepare run_id scheduler_endpoint:
+    @scripts/ci/qualify-distributed-execution-node.sh sccache-client-prepare \
+      "{{ run_id }}" "{{ scheduler_endpoint }}"
+
+qualify-distributed-execution-sccache-stop run_id role:
+    @scripts/ci/qualify-distributed-execution-node.sh sccache-stop "{{ run_id }}" "{{ role }}"
+
+qualify-distributed-execution-reset-client run_id outcome:
+    @scripts/ci/qualify-distributed-execution-node.sh reset-client "{{ run_id }}" "{{ outcome }}"
+
+qualify-distributed-execution-reset-measure run_id attempt:
+    @scripts/ci/qualify-distributed-execution-node.sh reset-measure "{{ run_id }}" "{{ attempt }}"
+
+qualify-distributed-execution-run run_id outcome endpoint remote_url capability_id:
+    @scripts/ci/qualify-distributed-execution-node.sh run \
+      "{{ run_id }}" "{{ outcome }}" "{{ endpoint }}" "{{ remote_url }}" "{{ capability_id }}"
+
+# Operator-bounded qualification; three-round p95 is the maximum observed sample.
+qualify-distributed-execution-measure run_id rounds endpoint capability_id:
+    @scripts/ci/qualify-distributed-execution-node.sh measure \
+      "{{ run_id }}" "{{ rounds }}" "{{ endpoint }}" "{{ capability_id }}"
+
+qualify-distributed-execution-report run_id:
+    @scripts/ci/qualify-distributed-execution-node.sh report "{{ run_id }}"
+
+bench-distributed-execution-archive run_id:
+    @scripts/bench/distributed-execution-archive.sh "{{ run_id }}"
 
 bench-native-cache-archive run_id:
     @scripts/bench/native-cache-archive.sh "{{ run_id }}"

@@ -62,11 +62,11 @@ impl NativeResultStaging {
     }
   }
 
-  pub(super) fn path(&self) -> &Path {
+  pub(crate) fn path(&self) -> &Path {
     self.directory.path()
   }
 
-  pub(super) fn requires_durable_handoff(&self) -> bool {
+  pub(crate) fn requires_durable_handoff(&self) -> bool {
     self.active.is_some()
   }
 
@@ -74,7 +74,7 @@ impl NativeResultStaging {
     (self.directory, self.active, self.durable_generations)
   }
 
-  fn temporary() -> RailResult<Self> {
+  pub(crate) fn temporary() -> RailResult<Self> {
     Ok(Self {
       directory: tempfile::Builder::new().prefix("native-pack-").tempdir()?,
       active: None,

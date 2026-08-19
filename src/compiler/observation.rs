@@ -2035,7 +2035,6 @@ fn parse_dep_info(
 /// Rustc dep-info and ELF linker dependency files use the same escaped path
 /// grammar. Callers must still validate the target and capture every returned
 /// path under their own authority boundary.
-#[cfg(any(target_os = "linux", test))]
 pub(crate) fn makefile_dependency_paths(path: &Path, current_dir: &Path) -> RailResult<(PathBuf, Vec<PathBuf>)> {
   let (_, target, dependencies) = makefile_dependency_rule(path, current_dir)?;
   Ok((target, dependencies))
@@ -2122,7 +2121,7 @@ fn sort_and_deduplicate_files(files: &mut Vec<FileObservation>) {
 #[cfg(test)]
 fn portable_argument(argument: &str, source_root: &Path, canonical_source_root: &Path) -> String {
   let roots = portable_argument_roots(source_root, canonical_source_root);
-  portable_argument_with_roots(argument, &roots, false)
+  portable_argument_with_roots(argument, &roots, canonical_source_root, false)
 }
 
 fn portable_compiler_arguments(arguments: &[String], source_root: &Path, canonical_source_root: &Path) -> Vec<String> {
@@ -2131,7 +2130,7 @@ fn portable_compiler_arguments(arguments: &[String], source_root: &Path, canonic
   arguments
     .iter()
     .map(|argument| {
-      let portable = portable_argument_with_roots(argument, &roots, reviewed_value);
+      let portable = portable_argument_with_roots(argument, &roots, canonical_source_root, reviewed_value);
       reviewed_value = matches!(
         argument.as_str(),
         "--emit" | "--extern" | "--out-dir" | "--remap-path-prefix" | "-L"
@@ -2152,7 +2151,15 @@ fn portable_argument_roots(source_root: &Path, canonical_source_root: &Path) -> 
   roots
 }
 
-fn portable_argument_with_roots(argument: &str, roots: &[String], reviewed_value: bool) -> String {
+fn portable_argument_with_roots(
+  argument: &str,
+  roots: &[String],
+  canonical_source_root: &Path,
+  reviewed_value: bool,
+) -> String {
+  if let Some(portable) = portable_workspace_remap(argument, canonical_source_root, reviewed_value) {
+    return portable;
+  }
   let reviewed_path = reviewed_value && roots.iter().any(|root| argument.contains(root))
     || roots.iter().any(|root| {
       argument == root
@@ -2179,6 +2186,17 @@ fn portable_argument_with_roots(argument: &str, roots: &[String], reviewed_value
       portable
     }
   })
+}
+
+fn portable_workspace_remap(argument: &str, canonical_source_root: &Path, reviewed_value: bool) -> Option<String> {
+  let (prefix, value) = if reviewed_value {
+    ("", argument)
+  } else {
+    ("--remap-path-prefix=", argument.strip_prefix("--remap-path-prefix=")?)
+  };
+  let (source, destination) = value.rsplit_once('=')?;
+  let source = crate::utils::canonicalize_existing(Path::new(source)).ok()?;
+  (source == canonical_source_root).then(|| format!("{prefix}repository:={destination}"))
 }
 
 pub(crate) fn is_secret_name(name: &str) -> bool {

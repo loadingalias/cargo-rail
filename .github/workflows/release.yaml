@@ -325,7 +325,7 @@ jobs:
         id: build
         uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6  # v1.30.2
         with:
-          bin: cargo-rail,cargo-rail-native-rustc-wrapper,cargo-rail-native-rustc-worker
+          bin: cargo-rail,cargo-rail-native-rustc-wrapper,cargo-rail-native-rustc-worker,cargo-rail-distributed-worker
           archive: cargo-rail-${{ matrix.target }}
           target: ${{ matrix.target }}
           locked: true
@@ -350,12 +350,15 @@ jobs:
           binary="$(find smoke -type f -name cargo-rail -print -quit)"
           wrapper="$(find smoke -type f -name cargo-rail-native-rustc-wrapper -print -quit)"
           worker="$(find smoke -type f -name cargo-rail-native-rustc-worker -print -quit)"
+          distributed_worker="$(find smoke -type f -name cargo-rail-distributed-worker -print -quit)"
           driver="$(find smoke -type f -name cargo-rail-fact-driver -print -quit)"
           test -n "$binary"
           test -n "$wrapper"
           test -n "$worker"
+          test -n "$distributed_worker"
           test "$(dirname "$binary")" = "$(dirname "$wrapper")"
           test "$(dirname "$binary")" = "$(dirname "$worker")"
+          test "$(dirname "$binary")" = "$(dirname "$distributed_worker")"
           if [[ "$TARGET" == *-musl ]]; then
             test -z "$driver"
           else
@@ -370,6 +373,9 @@ jobs:
           chmod +x "$binary"
           chmod +x "$wrapper"
           chmod +x "$worker"
+          chmod +x "$distributed_worker"
+          capability="$($distributed_worker capability rustc)"
+          test "$(printf '%s' "$capability" | jq -r '.protocol_version')" = "1"
           test "$("$binary" rail --version)" = "cargo-rail $VERSION"
 
       - name: Smoke-test zip archive
@@ -386,6 +392,7 @@ jobs:
           $binary = Get-ChildItem smoke -Recurse -Filter cargo-rail.exe | Select-Object -First 1
           $wrapper = Get-ChildItem smoke -Recurse -Filter cargo-rail-native-rustc-wrapper.exe | Select-Object -First 1
           $worker = Get-ChildItem smoke -Recurse -Filter cargo-rail-native-rustc-worker.exe | Select-Object -First 1
+          $distributedWorker = Get-ChildItem smoke -Recurse -Filter cargo-rail-distributed-worker.exe | Select-Object -First 1
           $driver = Get-ChildItem smoke -Recurse -Filter cargo-rail-fact-driver.exe | Select-Object -First 1
           if (-not $binary) {
             throw "cargo-rail.exe is missing from $env:ARCHIVE"
@@ -396,11 +403,18 @@ jobs:
           if (-not $worker) {
             throw "cargo-rail-native-rustc-worker.exe is missing from $env:ARCHIVE"
           }
+          if (-not $distributedWorker) {
+            throw "cargo-rail-distributed-worker.exe is missing from $env:ARCHIVE"
+          }
           if (-not $driver) {
             throw "cargo-rail-fact-driver.exe is missing from $env:ARCHIVE"
           }
-          if ($binary.DirectoryName -ne $wrapper.DirectoryName -or $binary.DirectoryName -ne $worker.DirectoryName -or $binary.DirectoryName -ne $driver.DirectoryName) {
+          if ($binary.DirectoryName -ne $wrapper.DirectoryName -or $binary.DirectoryName -ne $worker.DirectoryName -or $binary.DirectoryName -ne $distributedWorker.DirectoryName -or $binary.DirectoryName -ne $driver.DirectoryName) {
             throw "cargo-rail compiler cache binaries are not adjacent to cargo-rail.exe"
+          }
+          $capability = (& $distributedWorker.FullName capability rustc | ConvertFrom-Json)
+          if ($LASTEXITCODE -ne 0 -or $capability.protocol_version -ne 1) {
+            throw "archive distributed worker capability smoke test failed"
           }
           $sysroot = (& rustc --print sysroot).Trim()
           $compilerLibrary = Join-Path $sysroot ($env:CARGO_RAIL_FACT_DRIVER_COMPILER_LIBRARY -replace '/', '\')

@@ -1135,13 +1135,118 @@ environment names to the built-in `CARGO_PKG_NAME` and `OUT_DIR` policy. Only va
 values are never uploaded. An unapproved name bypasses L2 for that compiler unit without disabling an existing valid
 L1 result.
 
-Status schema 10 reports provider, protocol, mode, approved-name count, and a redacted authority identity as
-`direct_transport_selected`; it never prints the URL. Status and doctor remain network-free.
+Status schema 11 reports provider, protocol, mode, approved-name count, a redacted authority identity as
+`direct_transport_selected`, distributed mode and policy, and source-free placement-history aggregates. It never
+prints the URL, endpoint, or credential paths. Status and doctor remain network-free.
 
 AWS S3 and R2 use the same bounded conditional-object protocol; Azure Blob Storage implements the same cache protocol
 through its native conditional operations. Cleartext transport exists only for deterministic loopback protocol
 fixtures and is not a supported remote provider. No remote superiority claim is made until retained real-backend
 measurements satisfy the benchmark contract.
+
+## Distributed compiler execution
+
+Distributed execution is an optional miss path below ordinary Cargo. It runs only after Cargo freshness, L1, and L2
+cannot remove the work. Protocol v3 accepts bounded compiler-only Rust operations with a complete captured source
+namespace, exact `.rmeta`/`.rlib` dependencies, typed stable rustc options, metadata-only outputs, and non-linking
+`lib`/`rlib` archive outputs. Linked binaries and dynamic libraries, build scripts, generated namespaces, native or
+dynamic dependencies, unmodeled options, and observed compiler environment remain local. The first observation of
+each compiler environment also executes locally before that exact environment can be delegated. A successful remote
+result must pass the existing native-cache validation and restore transaction before Cargo sees an output, then may
+enter L1 and the configured L2. A transport, worker, lease, or pre-commit validation failure runs the same normalized
+operation locally once.
+
+The client persists one direct worker authority in private machine state. All six worker arguments are required
+together; repository configuration and compiler environment cannot select the endpoint or credentials:
+
+```bash
+cargo rail cache setup --check \\
+  --distributed-endpoint '10.0.0.20:39443' \\
+  --distributed-server-name worker.example.internal \\
+  --distributed-capability 'worker-capability-v3:sha256:CAPABILITY_DIGEST' \\
+  --distributed-authority /etc/cargo-rail/server-ca.pem \\
+  --distributed-client-certificate /etc/cargo-rail/client.pem \\
+  --distributed-client-private-key /etc/cargo-rail/client.key
+cargo rail cache setup \\
+  --distributed-endpoint '10.0.0.20:39443' \\
+  --distributed-server-name worker.example.internal \\
+  --distributed-capability 'worker-capability-v3:sha256:CAPABILITY_DIGEST' \\
+  --distributed-authority /etc/cargo-rail/server-ca.pem \\
+  --distributed-client-certificate /etc/cargo-rail/client.pem \\
+  --distributed-client-private-key /etc/cargo-rail/client.key
+cargo build --workspace --locked
+```
+
+The default `automatic` policy stays local until bounded per-operation-class history contains at least three local and
+three successful remote observations and the conservative estimate predicts a critical-path win. It also rejects the
+process-only worker runtime. Use `--distributed-policy qualification` only to collect explicit observations; it sends
+every eligible miss to the selected worker and may use the process-only transport proof. Placement history is private,
+keyed by the pinned worker capability and endpoint, bounded, expires after seven days, never authorizes a result, and
+is summarized by `cache status` without source names, paths, or contents.
+
+The qualified Linux worker mode requires cgroup v2 with delegated `cpu`, `memory`, and `pids` controllers plus a
+root-owned, non-setid, non-writable Bubblewrap 0.x executable. On Ubuntu qualification machines, the explicit
+`scripts/ci/install-qualification-tools.sh distributed` workflow installs and activates Ubuntu's packaged,
+path-specific Bubblewrap AppArmor profile after rejecting linked, writable, or locally modified profile bytes; it
+does not disable global AppArmor or the unprivileged-user-namespace restriction. Before serving, qualify the exact
+rustc, worker, Bubblewrap, sandbox, and resource policy through a delegated service. The repository's
+`just qualify-distributed-execution-resources <task10-run-id>` recipe is the canonical qualification workflow.
+
+```bash
+worker_path="$(command -v cargo-rail-distributed-worker)"
+rustc_path="$(rustup which rustc)"
+sudo systemd-run --collect --service-type=exec \\
+  --property="User=$(id -u)" \\
+  --property="Group=$(id -g)" \\
+  --property='Delegate=cpu memory pids' \\
+  --property='KillMode=mixed' \\
+  --property='TimeoutStopSec=150s' \\
+  --property='WorkingDirectory=/' \\
+  "$worker_path" serve-mtls-bubblewrap \\
+  "$rustc_path" /usr/bin/bwrap '10.0.0.20:39443' \\
+  /etc/cargo-rail/server.pem /etc/cargo-rail/server.key /etc/cargo-rail/client-ca.pem 2
+```
+
+The `worker_ready` JSON event contains `capability_id`; copy that exact value into `--distributed-capability`. Setup is
+network-free, and every connection rejects a different capability before sending source. This pins compiler,
+toolchain, platform, operation class, environment contract, and isolation policy while resetting cost history when an
+operator deliberately installs another worker capability.
+To replace an mTLS installation with the local qualification mode, run `cargo rail cache remove` first; setup refuses
+to orphan the installed private identity.
+
+The worker authenticates the client certificate before issuing a random connection-scoped, one-use lease. The lease,
+request, response, and audit event bind the leaf-certificate fingerprint as workload identity. Protocol v3 binds a
+fixed execution envelope into capability, action, request, and response authority: at most 16,384 inputs, 64 MiB per
+input and 256 MiB total input; one CPU, 2 GiB memory with swap disabled, 64 processes or threads, 512 MiB private
+tmpfs scratch, 120 seconds, 8 MiB per stream, 64 MiB per output, and 128 MiB total output. Each attempt gets its own
+exact cgroup; cleanup uses `cgroup.kill` and refuses retained members. Startup qualification requires observed CPU
+throttling, a cgroup OOM kill, a process-limit event, and an idle hierarchy after those hostile probes.
+
+Bubblewrap starts from an empty root with private user, mount, PID, IPC, UTS, cgroup, and network namespaces; drops
+all capabilities; disables nested user namespaces; clears the environment; mounts the exact toolchain, worker, and
+system runtime read-only; and provides no host-writable bind. Scratch is the bounded tmpfs and is charged to the
+cgroup memory limit. The compiler attempt inherits no cache-provider, source-control, signing, release, or operator
+credential environment.
+
+`SIGTERM` and `SIGINT` close the listener, emit `worker_draining`, reject new connections, and wait up to the
+protocol-derived 145-second bound for accepted connections before emitting `worker_stopped`. The systemd stop timeout
+must be at least 150 seconds. Start and qualify a replacement worker, update clients to its new pinned capability,
+then stop the old unit. Startup rejects another live cgroup owner and removes only named, stale attempt cgroups before
+serving, so a replacement recovers bounded residue without trusting it.
+
+Deploy this mode only on a dedicated single-tenant worker or ephemeral VM. The current direct worker is not a
+multi-tenant service, a general remote runner, or a complete distributed scheduler. Automatic placement spends a
+worker only after fresh class-specific history predicts a material critical-path win; qualification mode exists to
+collect that evidence and can be slower. At three benchmark samples, reported p95 is the maximum observed sample
+rather than an estimated population percentile.
+
+The accepted same-shape `c8i.large` qualification used a six-crate dependency DAG with three producer crates and
+three dependent consumers. Cargo-Rail completed it in 10.098 seconds p50 and 10.107 seconds worst observed, versus
+14.338 and 14.379 seconds for local Cargo and 14.191 and 14.340 seconds for pinned distributed sccache: reductions of
+29.57%/29.71% and 28.84%/29.52%, respectively. All 48 four-lane samples were accepted. Cargo-Rail delegated four of
+six actions and executed two exact local saturation fallbacks; distributed sccache delegated all six. Small, single
+large, and parallel-check workloads lost, so this is an operator-bounded dependency-DAG result, not a general speed
+claim; automatic placement retained the measured small and large classes locally.
 
 ## Compiler-evidence cache
 

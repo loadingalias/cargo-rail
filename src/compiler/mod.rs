@@ -3,6 +3,7 @@
 pub mod cfg_eval;
 pub mod collector;
 pub mod diagnostics_store;
+pub(crate) mod distributed;
 pub(crate) mod driver;
 pub(crate) mod fact_protocol;
 pub(crate) mod fact_store;

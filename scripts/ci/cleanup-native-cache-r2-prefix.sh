@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 <account-id> <bucket> <cache/cargo-rail/r2/v3/task9/run-id>" >&2
+  echo "usage: $0 <account-id> <bucket> <cache/cargo-rail/r2/v3/task{9,10}/run-id>" >&2
   exit 2
 }
 
@@ -12,7 +12,7 @@ prefix="${3:-}"
 [[ "$#" -eq 3 ]] || usage
 [[ "$account" =~ ^[0-9a-f]{32}$ ]] || usage
 [[ "$bucket" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || usage
-[[ "$prefix" =~ ^cache/cargo-rail/r2/v3/task9/[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || usage
+[[ "$prefix" =~ ^cache/cargo-rail/r2/v3/task(9|10)/[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || usage
 [[ "$prefix" != *..* ]] || usage
 
 for tool in aws jq; do

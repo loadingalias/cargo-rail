@@ -217,6 +217,32 @@ Options:
       --local-only
           Remove persisted remote activation while preserving local reuse
 
+      --distributed-local
+          Enable the same-host distributed protocol qualification path
+
+      --distributed-endpoint <IP:PORT>
+          Mutually authenticated direct worker socket address
+
+      --distributed-server-name <NAME>
+          TLS DNS name required from the distributed worker certificate
+
+      --distributed-capability <IDENTITY>
+          Exact capability identity advertised by the selected worker
+
+      --distributed-authority <PATH>
+          PEM certificate authority for the distributed worker
+
+      --distributed-client-certificate <PATH>
+          PEM client certificate presented to the distributed worker
+
+      --distributed-client-private-key <PATH>
+          Private PEM key for the distributed client certificate
+
+      --distributed-policy <MODE>
+          Placement policy for an mTLS worker. Qualification samples every eligible miss; automatic placement requires retained evidence of a critical-path win
+
+          [possible values: automatic, qualification]
+
   -c, --check
           Preview exact Cargo configuration and private-state changes
 

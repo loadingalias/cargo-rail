@@ -5,6 +5,7 @@ mod test_classification;
 mod test_clean;
 mod test_compiler_observation;
 mod test_config;
+mod test_distributed_compilation;
 mod test_error_handling;
 mod test_frontdoor_smoke;
 mod test_git_notes;

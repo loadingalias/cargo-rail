@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 <bucket> <region> <exact Task 9 Cargo-Rail or sccache prefix>" >&2
+  echo "usage: $0 <bucket> <region> <exact Task 9/10 Cargo-Rail, Task 9 sccache, or Task 10 qualification prefix>" >&2
   exit 2
 }
 
@@ -12,8 +12,9 @@ prefix="${3:-}"
 [[ "$#" -eq 3 ]] || usage
 [[ "$bucket" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || usage
 [[ "$region" =~ ^[a-z0-9-]+$ ]] || usage
-if [[ ! "$prefix" =~ ^cache/cargo-rail/s3/v3/task9/[A-Za-z0-9][A-Za-z0-9._-]*$ \
-  && ! "$prefix" =~ ^cache/cargo-rail/sccache/v3/aws/task9/[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+if [[ ! "$prefix" =~ ^cache/cargo-rail/s3/v3/task(9|10)/[A-Za-z0-9][A-Za-z0-9._-]*$ \
+  && ! "$prefix" =~ ^cache/cargo-rail/sccache/v3/aws/task9/[A-Za-z0-9][A-Za-z0-9._-]*$ \
+  && ! "$prefix" =~ ^qualification/native-v3/task10/[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
   usage
 fi
 [[ "$prefix" != *..* ]] || usage
