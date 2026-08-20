@@ -2249,16 +2249,16 @@ fn qualify_cgroup_enforcement(captured: &CapturedWorkerCapability) -> RailResult
                 Ok(Some(status)) => break status,
                 Ok(None) => {}
                 Err(error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = resource_attempt.finish();
+                    drop(child.kill());
+                    drop(child.wait());
+                    drop(resource_attempt.finish());
                     return Err(error.into());
                 }
             }
             if started.elapsed() > Duration::from_secs(10) {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = resource_attempt.finish();
+                drop(child.kill());
+                drop(child.wait());
+                drop(resource_attempt.finish());
                 return Err(RailError::message(format!(
                     "distributed {} cgroup probe exceeded its qualification deadline",
                     probe.name()
@@ -2998,7 +2998,7 @@ impl CgroupV2Root {
         let path = self.attempts.join(format!("attempt-{}", ContentDigest::sha256(&nonce)));
         fs::create_dir(&path)?;
         if let Err(error) = configure_cgroup_attempt(&path, limits) {
-            let _ = fs::remove_dir(&path);
+            drop(fs::remove_dir(&path));
             return Err(error);
         }
         Ok(CgroupV2Attempt { path, armed: true })
@@ -3053,9 +3053,9 @@ impl CgroupV2Attempt {
 impl Drop for CgroupV2Attempt {
     fn drop(&mut self) {
         if self.armed {
-            let _ = kill_cgroup(&self.path);
-            let _ = wait_for_empty_cgroup(&self.path);
-            let _ = fs::remove_dir(&self.path);
+            drop(kill_cgroup(&self.path));
+            drop(wait_for_empty_cgroup(&self.path));
+            drop(fs::remove_dir(&self.path));
         }
     }
 }
@@ -3717,7 +3717,7 @@ fn execute_sandboxed(rustc: &OsStr) -> RailResult<()> {
         .name("cargo-rail-sandbox-cancellation".to_string())
         .spawn(move || {
             let cancellation = read_cancellation(stdin, &lease);
-            let _ = cancellation_sender.send(cancellation);
+            drop(cancellation_sender.send(cancellation));
         })?;
     let attempt = Path::new(VIRTUAL_ROOT);
     let execution_started = Instant::now();
@@ -3867,7 +3867,7 @@ fn execute_bounded_bubblewrap_request(
         Err(error) => {
             terminate_bounded_sandbox(&mut child, &mut resource_attempt);
             drop(stdin);
-            let _ = response_reader.join();
+            drop(response_reader.join());
             return Err(error.into());
         }
     };
@@ -3887,7 +3887,7 @@ fn execute_bounded_bubblewrap_request(
             rejected = Some("execution_time_limit_exceeded");
         }
         if rejected.is_some() {
-            let _ = child.kill();
+            drop(child.kill());
             break child.wait()?;
         }
         match child.try_wait() {
@@ -3896,8 +3896,8 @@ fn execute_bounded_bubblewrap_request(
             Err(error) => {
                 terminate_bounded_sandbox(&mut child, &mut resource_attempt);
                 drop(stdin);
-                let _ = response_reader.join();
-                let _ = stderr_reader.join();
+                drop(response_reader.join());
+                drop(stderr_reader.join());
                 return Err(error.into());
             }
         }
@@ -3979,11 +3979,11 @@ fn decoded_execution_into_worker(decoded: DecodedExecution, attempt: &Path) -> R
 
 #[cfg(target_os = "linux")]
 fn terminate_bounded_sandbox(child: &mut Child, resource_attempt: &mut Option<CgroupV2Attempt>) {
-    let _ = child.kill();
+    drop(child.kill());
     if let Some(resource_attempt) = resource_attempt.take() {
-        let _ = resource_attempt.finish();
+        drop(resource_attempt.finish());
     }
-    let _ = child.wait();
+    drop(child.wait());
 }
 
 fn execute_request_in_process(
@@ -4470,10 +4470,10 @@ fn run_cgroup_probe(probe: &OsStr, cgroup: &Path) -> RailResult<()> {
                 }
             }
             for child in &mut children {
-                let _ = child.kill();
+                drop(child.kill());
             }
             for mut child in children {
-                let _ = child.wait();
+                drop(child.wait());
             }
             if limited {
                 Ok(())
@@ -4659,11 +4659,12 @@ fn validate_sandbox_runtime() -> RailResult<()> {
 #[cfg(target_os = "linux")]
 fn parse_tmpfs_size_option(option: &str) -> Option<u64> {
     let value = option.strip_prefix("size=")?;
-    let (number, multiplier) = match value.as_bytes().last().copied()? {
-        b'k' | b'K' => (&value[..value.len().saturating_sub(1)], 1024_u64),
-        b'm' | b'M' => (&value[..value.len().saturating_sub(1)], 1024_u64.pow(2)),
-        b'g' | b'G' => (&value[..value.len().saturating_sub(1)], 1024_u64.pow(3)),
-        byte if byte.is_ascii_digit() => (value, 1),
+    let suffix = value.chars().next_back()?;
+    let (number, multiplier) = match suffix {
+        'k' | 'K' => (value.strip_suffix(suffix)?, 1024_u64),
+        'm' | 'M' => (value.strip_suffix(suffix)?, 1024_u64.pow(2)),
+        'g' | 'G' => (value.strip_suffix(suffix)?, 1024_u64.pow(3)),
+        character if character.is_ascii_digit() => (value, 1),
         _ => return None,
     };
     number.parse::<u64>().ok()?.checked_mul(multiplier)
@@ -6380,20 +6381,19 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_resource_probes_are_small_and_falsify_each_controller() -> RailResult<()> {
+    fn linux_resource_probes_are_small_and_falsify_each_controller() {
         let cpu = CgroupProbe::Cpu.limits();
         let memory = CgroupProbe::Memory.limits();
         let processes = CgroupProbe::Processes.limits();
-        validate_limits(cpu)?;
-        validate_limits(memory)?;
-        validate_limits(processes)?;
+        validate_limits(cpu).expect("CPU probe limits must be valid");
+        validate_limits(memory).expect("memory probe limits must be valid");
+        validate_limits(processes).expect("process probe limits must be valid");
         assert_eq!(cpu.cpu_quota_micros, 1_000);
         assert_eq!(memory.memory_bytes, 64 * 1024 * 1024);
         assert_eq!(processes.max_processes, 4);
         assert!(cpu.cpu_quota_micros < worker_execution_limits().cpu_quota_micros);
         assert!(memory.memory_bytes < worker_execution_limits().memory_bytes);
         assert!(processes.max_processes < worker_execution_limits().max_processes);
-        Ok(())
     }
 
     #[test]

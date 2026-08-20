@@ -76,14 +76,12 @@ const ACTION_RESULT_PREFIX: &str = "action-result-v1-sha256-";
 const VALIDATION_PREFIX: &str = "validation-v1-sha256-";
 
 #[cfg(any(unix, windows, test))]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) struct NativeCacheHit {
     pub(crate) bytes_read: u64,
     pub(crate) bytes_restored: u64,
 }
 
 #[cfg(any(unix, windows, test))]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) struct NativeCacheMiss {
     pub(crate) reason: String,
     pub(crate) bytes_read: u64,
@@ -112,7 +110,6 @@ struct MaterializeBlobRequest<'a> {
 }
 
 #[cfg(any(unix, windows, test))]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) enum NativeCacheLookup {
     Hit(NativeCacheHit),
     Miss(NativeCacheMiss),

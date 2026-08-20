@@ -2825,10 +2825,10 @@ fn capture_exact_sysroot_evidence(inventory: &CompilerSysrootInventory) -> Optio
             metadata.mode() as u64,
             metadata.nlink(),
             metadata.size(),
-            metadata.mtime() as u64,
-            metadata.mtime_nsec() as u64,
-            metadata.ctime() as u64,
-            metadata.ctime_nsec() as u64,
+            u64::from_ne_bytes(metadata.mtime().to_ne_bytes()),
+            u64::from_ne_bytes(metadata.mtime_nsec().to_ne_bytes()),
+            u64::from_ne_bytes(metadata.ctime().to_ne_bytes()),
+            u64::from_ne_bytes(metadata.ctime_nsec().to_ne_bytes()),
         ] {
             generation_identifier.extend_from_slice(&value.to_le_bytes());
         }

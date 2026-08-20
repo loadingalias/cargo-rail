@@ -110,7 +110,7 @@ const MAX_APPLE_LINK_CERTIFICATE_LEN: usize = 8 * 1024 * 1024;
 const MAX_LINK_INPUTS: usize = 16 * 1024;
 const MAX_LINK_PATH_BYTES: usize = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
-const MAX_ELF_LINK_DEPENDENCY_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_ELF_LINK_DEPENDENCY_BYTES: usize = 8 * 1024 * 1024;
 const DEP_INFO_SLOT: &str = "target/outputs/dep-info";
 const METADATA_SLOT: &str = "target/outputs/metadata";
 const RLIB_SLOT: &str = "target/outputs/rlib";
@@ -2513,7 +2513,7 @@ fn capture_elf_linker_witness(
 
 #[cfg(target_os = "linux")]
 fn read_elf_link_driver_evidence(path: &Path) -> RailResult<ElfLinkDriverEvidence> {
-    let bytes = read_bounded(path, MAX_ELF_LINK_DEPENDENCY_BYTES as usize)?;
+    let bytes = read_bounded(path, MAX_ELF_LINK_DEPENDENCY_BYTES)?;
     let evidence: ElfLinkDriverEvidence = serde_json::from_slice(&bytes)?;
     let path_count = evidence
         .direct_inputs
@@ -10972,7 +10972,7 @@ fn elf_driver_stdout(program: &Path, arguments: &[&str], current_directory: &Pat
         .args(arguments)
         .current_dir(current_directory)
         .output()?;
-    if !output.status.success() || output.stdout.len() > MAX_ELF_LINK_DEPENDENCY_BYTES as usize {
+    if !output.status.success() || output.stdout.len() > MAX_ELF_LINK_DEPENDENCY_BYTES {
         return Err(RailError::message("ELF linker capability probe failed"));
     }
     String::from_utf8(output.stdout).map_err(|_| RailError::message("ELF linker capability probe was not UTF-8"))
