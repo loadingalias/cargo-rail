@@ -10,25 +10,28 @@ description = "Cargo-native Rust workspace engine for affected CI, verified comp
 repository = "https://github.com/loadingalias/cargo-rail"
 documentation = "https://docs.rs/cargo-rail"
 categories = [
-    "development-tools::cargo-plugins",
-    "development-tools::build-utils",
-    "development-tools::testing",
-    "command-line-utilities",
+  "development-tools::cargo-plugins",
+  "development-tools::build-utils",
+  "development-tools::testing",
+  "command-line-utilities",
 ]
 keywords = ["cargo", "workspace", "build-cache", "cicd", "release"]
 readme = "README.md"
 include = [
-    "/build.rs",
-    "/src/**/*.rs",
-    "/schemas/**",
-    "/tests/**",
-    "/Cargo.toml",
-    "/Cargo.lock",
-    "/README.md",
-    "/LICENSE",
-    "/CHANGELOG.md",
-    "!**/.DS_Store",
+  "/build.rs",
+  "/src/**/*.rs",
+  "/schemas/**",
+  "/tests/**",
+  "/Cargo.toml",
+  "/Cargo.lock",
+  "/README.md",
+  "/LICENSE",
+  "/CHANGELOG.md",
+  "!**/.DS_Store",
 ]
+
+[lints]
+workspace = true
 
 [workspace]
 members = ["."]
@@ -39,11 +42,22 @@ resolver = "3"
 rust-version = "1.97.1"
 
 [dependencies]
-aws-config = { version = "1.10.1", default-features = false, features = ["default-https-client", "rt-tokio", "sso"] }
-aws-sdk-s3 = { version = "1.141.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-config = { version = "1.10.1", default-features = false, features = [
+  "default-https-client",
+  "rt-tokio",
+  "sso",
+] }
+aws-sdk-s3 = { version = "1.141.0", default-features = false, features = [
+  "default-https-client",
+  "rt-tokio",
+] }
 aws-types = "1.5.0"
 async-trait = "0.1.92"
-azure_core = { version = "1.0.0", default-features = false, features = ["reqwest", "reqwest_rustls", "tokio"] }
+azure_core = { version = "1.0.0", default-features = false, features = [
+  "reqwest",
+  "reqwest_rustls",
+  "tokio",
+] }
 azure_identity = { version = "1.0.0", default-features = false, features = ["tokio"] }
 azure_storage_blob = { version = "1.0.0", default-features = false, features = ["tokio"] }
 clap = { version = "4.6.5", features = ["derive", "cargo"] }
@@ -64,7 +78,12 @@ futures-util = "0.3.33"
 rustc-hash = "2.1.3"
 sha2 = { version = "0.11.0", default-features = false }
 tempfile = "3.27.0"
-tokio = { version = "1.53.1", default-features = false, features = ["fs", "io-util", "rt-multi-thread", "time"] }
+tokio = { version = "1.53.1", default-features = false, features = [
+  "fs",
+  "io-util",
+  "rt-multi-thread",
+  "time",
+] }
 zstd = { version = "0.13.3", default-features = false }
 zeroize = "1.9.0"
 
@@ -84,19 +103,74 @@ anyhow = "1.0.104"
 jsonschema = { version = "0.49.2", default-features = false }
 
 [workspace.lints.rust]
-unsafe_code = "deny"
+ambiguous_negative_literals = "deny"
 dangling_pointers_from_locals = "deny"
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
 integer_to_ptr_transmutes = "deny"
+missing_docs = "deny"
+warnings = "deny"
 
 [workspace.lints.clippy]
-correctness = { level = "deny", priority = -1 }
-suspicious = { level = "deny", priority = -1 }
-perf = { level = "deny", priority = -1 }
-
-std_instead_of_core = "warn"
-std_instead_of_alloc = "warn"
-unwrap_used = "allow"
-expect_used = "allow"
+all = { level = "deny", priority = -1 }
+arc_with_non_send_sync = "deny"
+await_holding_invalid_type = "deny"
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+non_send_fields_in_send_ty = "deny"
+significant_drop_in_scrutinee = "deny"
+panic = "deny"
+panic_in_result_fn = "deny"
+string_slice = "deny"
+todo = "deny"
+unchecked_time_subtraction = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+unwrap_used = "deny"
+assertions_on_result_states = "deny"
+let_underscore_must_use = "deny"
+unused_result_ok = "deny"
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+cast_sign_loss = "deny"
+checked_conversions = "deny"
+fn_to_numeric_cast_any = "deny"
+invalid_upcast_comparisons = "deny"
+lossy_float_literal = "deny"
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+dbg_macro = "deny"
+enum_glob_use = "deny"
+expl_impl_clone_on_copy = "deny"
+iter_not_returning_iterator = "deny"
+same_functions_in_if_condition = "deny"
+negative_feature_names = "deny"
+wildcard_dependencies = "deny"
+coerce_container_to_any = "deny"
+collection_is_never_read = "deny"
+debug_assert_with_mut_call = "deny"
+literal_string_with_formatting_args = "deny"
+or_fun_call = "deny"
+path_buf_push_overwrite = "deny"
+read_zero_byte_vec = "deny"
+redundant_clone = "deny"
+suspicious_operation_groupings = "deny"
+trait_duplication_in_bounds = "deny"
+transmute_undefined_repr = "deny"
+uninhabited_references = "deny"
+volatile_composites = "deny"
+as_ptr_cast_mut = "deny"
+as_pointer_underscore = "deny"
+borrow_as_ptr = "deny"
+cast_ptr_alignment = "deny"
+mem_forget = "deny"
+missing_safety_doc = "deny"
+ptr_as_ptr = "deny"
+ptr_cast_constness = "deny"
+ref_as_ptr = "deny"
+undocumented_unsafe_blocks = "deny"
+unnecessary_safety_comment = "deny"
+unnecessary_safety_doc = "deny"
 
 [workspace.lints.rustdoc]
 broken_intra_doc_links = "deny"

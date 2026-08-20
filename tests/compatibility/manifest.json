@@ -4,6 +4,17 @@
     "fixture": "tests/compatibility/fixtures/front-door",
     "runner": "scripts/ci/run-compatibility.py"
   },
+  "repository_coupled_rust_version_files": [
+    "scripts/fixtures/generate-workspace.sh",
+    "tests/compatibility/fixtures/front-door/Cargo.toml",
+    "tests/compatibility/fixtures/thumbv7em-none-eabihf/Cargo.toml",
+    "tests/compatibility/fixtures/wasm32-unknown-unknown/Cargo.toml",
+    "tests/compatibility/fixtures/wasm32-unknown-unknown/support/Cargo.toml",
+    "tests/compatibility/fixtures/wasm32-wasip1/Cargo.toml",
+    "tests/compatibility/fixtures/wasm32v1-none/Cargo.toml",
+    "tests/fixtures/native_cache/real_world/Cargo.toml",
+    "tests/fixtures/native_cache/real_world/git-source/Cargo.toml"
+  ],
   "cross_target_corpus": [
     {
       "target": "thumbv7em-none-eabihf",
@@ -152,15 +163,11 @@
       },
       {
         "provider": "azure-blob",
-        "evidence_gates": [
-          "task9_azure_blob_correctness_evidence_unavailable"
-        ]
+        "evidence_gates": ["task9_azure_blob_correctness_evidence_unavailable"]
       },
       {
         "provider": "cloudflare-r2",
-        "evidence_gates": [
-          "task9_cloudflare_r2_correctness_evidence_unavailable"
-        ]
+        "evidence_gates": ["task9_cloudflare_r2_correctness_evidence_unavailable"]
       }
     ]
   },

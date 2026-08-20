@@ -19,13 +19,13 @@ Rust monorepos usually acquire a tool for every symptom. Each tool reconstructs 
 
 Cargo-Rail consolidates those decisions in one local, Cargo-native engine:
 
-| Fragmented workflow | Use | What changes |
-|---|---|---|
-| Dependency version, feature, unused-edge, inheritance, and MSRV analysis | `cargo rail unify` | One reviewable and reversible graph-repair plan |
-| `dorny/paths-filter`, YAML path globs, and package-selection scripts | `cargo rail plan` | Typed affected scope derived from Git and the resolved Cargo graph |
-| Persisted `target/` directories and local cache glue | Verified compiler reuse | Exact reusable results remain available after `cargo clean` and across target directories within one physical source root |
-| `release-plz`, `cargo-release`, `git-cliff`, and publish-order scripts | `cargo rail change` and `cargo rail release` | Reviewed release intent carried through exact-SHA publication and recovery |
-| Copybara or custom monorepo-to-crate scripts | `cargo rail split` and `cargo rail sync` | Cargo-aware synchronization with source history and recovery evidence |
+| Fragmented workflow                                                      | Use                                          | What changes                                                                                                              |
+| ------------------------------------------------------------------------ | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| Dependency version, feature, unused-edge, inheritance, and MSRV analysis | `cargo rail unify`                           | One reviewable and reversible graph-repair plan                                                                           |
+| `dorny/paths-filter`, YAML path globs, and package-selection scripts     | `cargo rail plan`                            | Typed affected scope derived from Git and the resolved Cargo graph                                                        |
+| Persisted `target/` directories and local cache glue                     | Verified compiler reuse                      | Exact reusable results remain available after `cargo clean` and across target directories within one physical source root |
+| `release-plz`, `cargo-release`, `git-cliff`, and publish-order scripts   | `cargo rail change` and `cargo rail release` | Reviewed release intent carried through exact-SHA publication and recovery                                                |
+| Copybara or custom monorepo-to-crate scripts                             | `cargo rail split` and `cargo rail sync`     | Cargo-aware synchronization with source history and recovery evidence                                                     |
 
 Cargo-Rail does not coordinate other tools behind the scenes. Its workflows derive decisions from the same captured
 Cargo and source authority.
@@ -65,7 +65,7 @@ if [ "$(jq -r '.surfaces.test.enabled' <<<"$PLAN_JSON")" = "true" ]; then
   while IFS= read -r argument; do
     CARGO_ARGS+=("$argument")
   done < <(jq -r '.surfaces.test.scope.cargo_args[]' <<<"$PLAN_JSON")
-  cargo nextest run "${CARGO_ARGS[@]}"
+  cargo nextest run -P commit --locked --config-file .config/nextest.toml "${CARGO_ARGS[@]}"
 fi
 ```
 
@@ -159,11 +159,11 @@ setup or repair is pending:
 cargo rail cache setup --check
 cargo rail cache setup
 
-cargo check
+cargo check --locked
 
 cargo clean
 
-cargo check
+cargo check --locked
 ```
 
 The same setup covers ordinary Cargo, nextest, Just, IDE, and CI invocations that use that Cargo home. Cargo freshness
@@ -203,7 +203,7 @@ clock, and randomness state that rustc does not certify.
 
 **Fast when proven. Normal Cargo when not.**
 
-`CARGO_RAIL_CACHE=off cargo check` disables both L1 reads and writes for that process tree. The minimal launcher
+`CARGO_RAIL_CACHE=off cargo check --locked` disables both L1 reads and writes for that process tree. The minimal launcher
 directly executes the selected compiler chain without starting the cache worker or reading installation state.
 Incremental, clippy, native proc-macro consumer, custom-target-layout, ambiguous-wrapper, custom-linker, and otherwise
 unsupported invocations bypass before session or CAS acquisition. Existing workspace wrappers are preserved and

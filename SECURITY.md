@@ -4,10 +4,10 @@
 
 Security fixes are released from the current release line. Older releases do not receive backports — please reproduce against the latest release before reporting.
 
-| Release line | Status |
-|---|---|
-| Latest | Supported |
-| Older | Unsupported |
+| Release line | Status      |
+| ------------ | ----------- |
+| Latest       | Supported   |
+| Older        | Unsupported |
 
 ## Reporting a Vulnerability
 

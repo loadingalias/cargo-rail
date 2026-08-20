@@ -25,14 +25,14 @@ pub use manifest_analyzer::{DepKey, DepKind, DepUsage, ManifestAnalyzer};
 pub use manifest_writer::ManifestWriter;
 pub use multi_target_metadata::{ComputedMsrv, FragmentedTransitive, MsrvSourceUsed, MultiTargetMetadata};
 pub use resolution::{
-  CargoConfigSnapshot, CargoConfigSource, CustomTargetSpecification, ResolutionFeatures, ResolutionPackages,
-  ResolutionRequest, ResolutionView, TargetIdentity, TargetSpecificationIdentity, ToolchainIdentity,
+    CargoConfigSnapshot, CargoConfigSource, CustomTargetSpecification, ResolutionFeatures, ResolutionPackages,
+    ResolutionRequest, ResolutionView, TargetIdentity, TargetSpecificationIdentity, ToolchainIdentity,
 };
 pub use unify_analyzer::UnifyAnalyzer;
 pub use unify_report::UnifyReport;
 pub use unify_types::{
-  DependencyProof, DuplicateCleanup, FeatureEnablingPath, IssueSeverity, MemberEdit, OptionalFeature,
-  PackageInheritanceField, PrunedFeature, ReachableFeature, TransitivePin, UndeclaredFeature, UnificationPlan,
-  UnifiedDep, UnifyDecision, UnifyDecisionCode, UnifyDecisionReason, UnifyDecisionSubject, UnifyIssue, UnusedDep,
-  UnusedReason, ValidationResult, VersionMismatch,
+    DependencyProof, DuplicateCleanup, FeatureEnablingPath, IssueSeverity, MemberEdit, OptionalFeature,
+    PackageInheritanceField, PrunedFeature, ReachableFeature, TransitivePin, UndeclaredFeature, UnificationPlan,
+    UnifiedDep, UnifyDecision, UnifyDecisionCode, UnifyDecisionReason, UnifyDecisionSubject, UnifyIssue, UnusedDep,
+    UnusedReason, ValidationResult, VersionMismatch,
 };

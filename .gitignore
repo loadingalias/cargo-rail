@@ -18,15 +18,10 @@ Thumbs.db
 .agents
 AGENTS.md
 
-# Zed
-.zed
-
 # Keys/Creds
 *.pem
 *.key
 
-# Personal - Notes, Docs, Examples, Testing, etc.
+# Personal
 notes/
-docs/marketing/
 docs/tasks/
-first-draft.md

@@ -1,32 +1,23 @@
 # Changelog
 
-
-
-
-
-
-
-
-
-
 ## [0.21.0](https://github.com/loadingalias/cargo-rail/compare/v0.20.1...v0.21.0) - 2026-08-03
 
 - Add automatic verified compiler reuse for eligible clean Cargo profiles while preserving active incremental profiles,
   explicit incremental requests, and existing wrappers. Move compiler evidence into the typed, user-wide
   content-addressed store and retain the bounded legacy file only for one-time import.
-  
+
   Content-identify each exact Cargo, rustc, rustdoc, complete sysroot, host, environment, and compiler invocation instead
   of gating native reuse through a checked-in toolchain allowlist. Structurally eligible native library units can reuse
   verified results across supported Rust releases and bundled named codegen backends; external backend paths and
   incompletely modeled units continue through the exact compiler invocation.
-  
+
   Add separately scoped workspace/local cache status, preview, and cleanup commands while keeping `clean --cache` as the
   combined compatibility alias. Coordinate restore, publication, garbage collection, status, and cleanup through one
   validated lifecycle lock; reclaim crash staging and evict least-recently-used unleased results under the configured
   byte bound. Local status and cleanup remain exact after `cargo clean` without a workspace-local pointer to user-wide
   state. Keep Windows lifecycle locks buildable on stable Rust while preserving exact file identity, hard-link rejection,
   and pathname replacement resistance.
-  
+
   Delegate the exact normal all-workspace build and distribution actions directly to unchanged Cargo when an active
   profile and its target location are statically unambiguous. This preserves Cargo and wrapper ownership while avoiding
   metadata, Git, tool hashing, action-key construction, and cache setup. For an eligible clean profile, prove the
@@ -36,20 +27,20 @@
   Default text execution reports one concise native-cache decision; `--explain` retains the full stable reason and
   per-unit evidence plus accounted verified-result bytes read and written. Stop synchronously flushing observational
   run receipts and parent-owned compiler observations because they are not recovery authority.
-  
+
   Memoize the complete Linux sysroot identity only while two exact filesystem inventories agree, and bypass to a full
   hash when generation evidence changes. Reuse non-Rust files reported by rustc dep-info, including `include!`,
   `include_str!`, and `include_bytes!` inputs. Keep timed benchmark commands free of opt-in diagnostics and validate their
   outcomes through a separate unmeasured replay. The benchmark workflow now defaults to one accepted interleaved group
   and treats that complete group as publishable bounded evidence; larger sample counts are explicit for distribution or
   tail claims.
-  
+
   Move native compiler identity from whole-workspace session state to the exact compiler unit that consumed it. The
   session no longer includes the complete Cargo configuration or `Cargo.lock`; exact rustc arguments, cfg, sources,
   dependency contents, observed filesystem reads, observed environment reads, and a narrow compiler-process environment
   remain authoritative. Output-neutral warning, job, build-directory, target-directory, network, registry, and
   unrelated lockfile changes can now reuse verified results, while unknown or unobservable behavior continues to bypass.
-  
+
   Preserve Cargo's exact rustc argv and current directory. Bind opaque Rust metadata to the physical source root instead
   of rewriting the compiler invocation and claiming unsafe cross-checkout portability. Store reversible internal path
   tokens for verified dep-info and JSON compiler streams, then late-bind the current output directory after CAS
@@ -60,22 +51,20 @@
   toolchain, preserving MSRV-native host, filesystem, cross-target, linker, and cache-correctness coverage without
   separate live stable, intermediate stable, beta, or nightly release gates. Also make the benchmark identity manifest
   valid when the repository has no untracked files.
-  
+
   Decode rustc's Makefile-escaped dep-info environment values before hashing them, so Windows `OUT_DIR` and Cargo path
   dependencies compare against the exact compiler process environment instead of producing false warm misses. Require
   every cold cache publication to become a warm hit in the real-world fixture while preserving the exact bypass count.
   Run that long fixture first and exclusively under nextest so Windows load cannot consume its bounded timeout.
-  
+
   Retain reviewed Rust 1.97.1 Linux and Windows v4 qualification corpora with 20 accepted lane samples, two complete
   groups, no rejections, and no false hits on each host. Keep large benchmark diagnostics file-backed through `jq`
   instead of passing megabyte JSON values through the process argument limit.
-
 
 ## [0.20.1](https://github.com/loadingalias/cargo-rail/compare/v0.20.0...v0.20.1) - 2026-07-31
 
 - Consolidate planning and caching documentation, correct the release-source example, and refresh Rust dependencies and
   CI action pins.
-
 
 ## [0.20.0](https://github.com/loadingalias/cargo-rail/compare/v0.19.1...v0.20.0) - 2026-07-29
 
@@ -102,11 +91,9 @@
   package metadata, and public documentation around its shared Cargo and Git decision model without renaming technical
   interfaces.
 
-
 ## [0.19.1](https://github.com/loadingalias/cargo-rail/compare/v0.19.0...v0.19.1) - 2026-07-25
 
 - Hardened exact-SHA release readiness to reject all-skipped GitHub rollups and run release commits through normal CI. `cargo rail config migrate` now removes the inert `release.require_clean` and `release.publish_delay` fields, and release previews no longer claim to delay between publishes. Added explicit cache capability and evaluation guidance.
-
 
 ## [0.19.0](https://github.com/loadingalias/cargo-rail/compare/v0.18.0...v0.19.0) - 2026-07-24
 
@@ -147,7 +134,6 @@
 
 - Make planner impact semantic and target-aware, bind run actions to exact Cargo resolution views, and add explainable dependency-unification diagnostics.
 
-
 ## [0.18.0](https://github.com/loadingalias/cargo-rail/compare/v0.17.3...v0.18.0) - 2026-07-19
 
 - Capture complete, stable source state for deterministic planning from Git worktrees or declared Cargo filesystem roots; reject concurrent Git, byte, directory, or metadata drift; keep historical ranges object-only; support nested and no-Git Cargo workspaces; and exclude resolved Cargo and cargo-rail generated state.
@@ -183,7 +169,6 @@
 - **workspace**: report directory drift deterministically ([3c99742](https://github.com/loadingalias/cargo-rail/commit/3c997426cfe87037e93735be4a3ca62952eff698))
 - **workspace**: normalize snapshot paths on Windows ([dfe18d4](https://github.com/loadingalias/cargo-rail/commit/dfe18d404684ec1d582cd72de002953b96c72a0e))
 
-
 ## [0.17.3](https://github.com/loadingalias/cargo-rail/compare/v0.17.2...v0.17.3) - 2026-07-14
 
 - Fixed crates.io publication checks so local workspace packages cannot masquerade as published versions. Release publishing now targets crates.io explicitly, requires the committed lockfile, rejects dirty package contents, and excludes Finder metadata.
@@ -192,7 +177,6 @@
 
 - **release**: verify crates.io publication explicitly ([1bd5c68](https://github.com/loadingalias/cargo-rail/commit/1bd5c68efe44ca4e9c39616bae1f568a5d11d20d))
 
-
 ## [0.17.2](https://github.com/loadingalias/cargo-rail/compare/v0.17.1...v0.17.2) - 2026-07-14
 
 - Fixed release Git operations to preserve the caller environment for hooks, expose standard cargo-rail release context, and retain complete hook diagnostics. Removed the hook-bypassing push dry run while keeping one atomic branch-and-tag push.
@@ -200,7 +184,6 @@
 ### Bug Fixes
 
 - **release**: preserve hook context and diagnostics ([61da35d](https://github.com/loadingalias/cargo-rail/commit/61da35d4da0964618d95d0de2031a6516003bf84))
-
 
 ## [0.17.1](https://github.com/loadingalias/cargo-rail/compare/v0.17.0...v0.17.1) - 2026-07-12
 
@@ -217,7 +200,6 @@
 - **release**: recover locally rejected atomic pushes ([7340378](https://github.com/loadingalias/cargo-rail/commit/73403782bdf8921097c168f6911e2b3f00947d50))
 - **workspace**: harden graph cleanup and release readiness ([3c8b7d4](https://github.com/loadingalias/cargo-rail/commit/3c8b7d410d12701c4207ee4e745578c34a5371c0))
 - **release**: recover immutable tags from lint drift ([a10f176](https://github.com/loadingalias/cargo-rail/commit/a10f1763e3d0d54f0c982880304913dcd3d24808))
-
 
 ## [0.17.0](https://github.com/loadingalias/cargo-rail/compare/v0.16.0...v0.17.0) - 2026-07-12
 
@@ -238,8 +220,6 @@
 - **unify**: normalize proof paths on Windows ([eee5446](https://github.com/loadingalias/cargo-rail/commit/eee54464d5779c0389e36680c7ce1976249456b4))
 - **release**: finish patch release housekeeping ([9c355e3](https://github.com/loadingalias/cargo-rail/commit/9c355e30bc9d73de1c244e44c780cf60d29e28be))
 - **release**: recover immutable release assets ([5608728](https://github.com/loadingalias/cargo-rail/commit/56087284d869818f6d37713ff4e6cc8e2722280d))
-
-
 
 This file records user-visible changes. Git tags and [GitHub Releases](https://github.com/loadingalias/cargo-rail/releases) retain the complete release history.
 
@@ -348,15 +328,15 @@ This file records user-visible changes. Git tags and [GitHub Releases](https://g
 
 Releases before `0.11.0` were generated from raw commit subjects. The table keeps the user-facing milestones while the linked comparisons preserve exact history.
 
-| Series | Dates | User-visible milestones |
-| --- | --- | --- |
+| Series                                                                           | Dates                    | User-visible milestones                                                                                                                                                                                |
+| -------------------------------------------------------------------------------- | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | [`0.10.x`](https://github.com/loadingalias/cargo-rail/compare/v0.9.1...v0.10.12) | 2026-02-14 to 2026-02-19 | Replaced `affected`/`test` with `plan`/`run`; added workspace-member cohort safety, compiler-backed unused-dependency detection, and multi-target fixes. `0.10.11` contained only release bookkeeping. |
-| [`0.9.x`](https://github.com/loadingalias/cargo-rail/compare/v0.8.1...v0.9.1) | 2026-02-03 to 2026-02-10 | Added binary-crate filtering, metadata-cache invalidation, check-mode output files, and release checksums. |
-| [`0.8.x`](https://github.com/loadingalias/cargo-rail/compare/v0.7.3...v0.8.1) | 2025-12-18 | Added MSRV inheritance, workspace lint integration, and optional-feature check-mode fixes. |
-| [`0.7.x`](https://github.com/loadingalias/cargo-rail/compare/v0.6.0...v0.7.3) | 2025-12-14 to 2025-12-16 | Added configurable dependency sorting and corrected CI and release behavior. |
-| [`0.6.0`](https://github.com/loadingalias/cargo-rail/compare/v0.5.3...v0.6.0) | 2025-12-14 | Hardened split/sync, removed production panics, and revised CLI and configuration output. This version had a GitHub Release but was not published to crates.io. |
-| [`0.5.x`](https://github.com/loadingalias/cargo-rail/compare/v0.4.2...v0.5.3) | 2025-12-12 | Added borrowed-feature detection and repair, removed cargo-udeps, and corrected MSRV handling. |
-| [`0.4.x`](https://github.com/loadingalias/cargo-rail/compare/v0.3.0...v0.4.2) | 2025-12-11 | Added configuration synchronization and fixed release lockfile handling and target matching. |
-| [`0.3.0`](https://github.com/loadingalias/cargo-rail/compare/v0.2.2...v0.3.0) | 2025-12-11 | Expanded target discovery, feature exclusions, MSRV analysis, and Cargo argument output. |
-| [`0.2.x`](https://github.com/loadingalias/cargo-rail/compare/v0.1.0...v0.2.2) | 2025-12-05 to 2025-12-10 | Corrected nested-workspace change detection and completed the first public CI integration. |
-| [`0.1.0`](https://github.com/loadingalias/cargo-rail/releases/tag/v0.1.0) | 2025-12-05 | First published release with dependency unification, change detection, split/sync, and initial release automation. |
+| [`0.9.x`](https://github.com/loadingalias/cargo-rail/compare/v0.8.1...v0.9.1)    | 2026-02-03 to 2026-02-10 | Added binary-crate filtering, metadata-cache invalidation, check-mode output files, and release checksums.                                                                                             |
+| [`0.8.x`](https://github.com/loadingalias/cargo-rail/compare/v0.7.3...v0.8.1)    | 2025-12-18               | Added MSRV inheritance, workspace lint integration, and optional-feature check-mode fixes.                                                                                                             |
+| [`0.7.x`](https://github.com/loadingalias/cargo-rail/compare/v0.6.0...v0.7.3)    | 2025-12-14 to 2025-12-16 | Added configurable dependency sorting and corrected CI and release behavior.                                                                                                                           |
+| [`0.6.0`](https://github.com/loadingalias/cargo-rail/compare/v0.5.3...v0.6.0)    | 2025-12-14               | Hardened split/sync, removed production panics, and revised CLI and configuration output. This version had a GitHub Release but was not published to crates.io.                                        |
+| [`0.5.x`](https://github.com/loadingalias/cargo-rail/compare/v0.4.2...v0.5.3)    | 2025-12-12               | Added borrowed-feature detection and repair, removed cargo-udeps, and corrected MSRV handling.                                                                                                         |
+| [`0.4.x`](https://github.com/loadingalias/cargo-rail/compare/v0.3.0...v0.4.2)    | 2025-12-11               | Added configuration synchronization and fixed release lockfile handling and target matching.                                                                                                           |
+| [`0.3.0`](https://github.com/loadingalias/cargo-rail/compare/v0.2.2...v0.3.0)    | 2025-12-11               | Expanded target discovery, feature exclusions, MSRV analysis, and Cargo argument output.                                                                                                               |
+| [`0.2.x`](https://github.com/loadingalias/cargo-rail/compare/v0.1.0...v0.2.2)    | 2025-12-05 to 2025-12-10 | Corrected nested-workspace change detection and completed the first public CI integration.                                                                                                             |
+| [`0.1.0`](https://github.com/loadingalias/cargo-rail/releases/tag/v0.1.0)        | 2025-12-05               | First published release with dependency unification, change detection, split/sync, and initial release automation.                                                                                     |

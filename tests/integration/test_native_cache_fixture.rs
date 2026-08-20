@@ -10,910 +10,912 @@ use sha2::{Digest as _, Sha256};
 
 #[cfg(windows)]
 fn git_bash() -> Result<PathBuf> {
-  let output = Command::new("git")
-    .arg("--exec-path")
-    .output()
-    .context("resolve Git installation for native-cache fixture")?;
-  ensure!(output.status.success(), "git --exec-path failed");
-  let exec_path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-  exec_path
-    .ancestors()
-    .map(|ancestor| ancestor.join("bin/bash.exe"))
-    .find(|candidate| candidate.is_file())
-    .with_context(|| format!("Git Bash was not found above {}", exec_path.display()))
+    let output = Command::new("git")
+        .arg("--exec-path")
+        .output()
+        .context("resolve Git installation for native-cache fixture")?;
+    ensure!(output.status.success(), "git --exec-path failed");
+    let exec_path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    exec_path
+        .ancestors()
+        .map(|ancestor| ancestor.join("bin/bash.exe"))
+        .find(|candidate| candidate.is_file())
+        .with_context(|| format!("Git Bash was not found above {}", exec_path.display()))
 }
 
 fn materialize_fixture(destination: &Path, git_source: &Path) -> Result<()> {
-  let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/fixtures/materialize-native-cache.sh");
-  #[cfg(windows)]
-  let mut command = {
-    let mut command = Command::new(git_bash()?);
-    command.arg(script);
-    command
-  };
-  #[cfg(not(windows))]
-  let mut command = Command::new(script);
-  let output = command
-    .arg(destination)
-    .arg(git_source)
-    .output()
-    .context("materialize native-cache fixture")?;
-  ensure!(
-    output.status.success(),
-    "fixture materialization failed: {}",
-    String::from_utf8_lossy(&output.stderr)
-  );
-  Ok(())
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/fixtures/materialize-native-cache.sh");
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = Command::new(git_bash()?);
+        command.arg(script);
+        command
+    };
+    #[cfg(not(windows))]
+    let mut command = Command::new(script);
+    let output = command
+        .arg(destination)
+        .arg(git_source)
+        .output()
+        .context("materialize native-cache fixture")?;
+    ensure!(
+        output.status.success(),
+        "fixture materialization failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
 }
 
 fn cargo_metadata(fixture: &Path, cargo_home: Option<&Path>) -> Result<serde_json::Value> {
-  let mut command = Command::new("cargo");
-  command
-    .current_dir(fixture)
-    .args([
-      "metadata",
-      "--locked",
-      "--offline",
-      "--all-features",
-      "--format-version=1",
-    ])
-    .env_remove("RUSTC_WRAPPER")
-    .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
-    .env_remove("RUSTC_WORKSPACE_WRAPPER")
-    .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER");
-  if let Some(cargo_home) = cargo_home {
-    command.env("CARGO_HOME", cargo_home);
-  }
-  let output = command.output()?;
-  ensure!(
-    output.status.success(),
-    "fixture metadata failed:\nstdout:\n{}\nstderr:\n{}",
-    String::from_utf8_lossy(&output.stdout),
-    String::from_utf8_lossy(&output.stderr)
-  );
-  serde_json::from_slice(&output.stdout).context("decode fixture metadata")
+    let mut command = Command::new("cargo");
+    command
+        .current_dir(fixture)
+        .args([
+            "metadata",
+            "--locked",
+            "--offline",
+            "--all-features",
+            "--format-version=1",
+        ])
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER");
+    if let Some(cargo_home) = cargo_home {
+        command.env("CARGO_HOME", cargo_home);
+    }
+    let output = command.output()?;
+    ensure!(
+        output.status.success(),
+        "fixture metadata failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).context("decode fixture metadata")
 }
 
 fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
-  let metadata = fs::symlink_metadata(source)?;
-  ensure!(metadata.is_dir(), "fixture cache source is not a directory");
-  ensure!(!destination.exists(), "fixture cache destination already exists");
-  fs::create_dir_all(destination)?;
-  let mut entries = fs::read_dir(source)?.collect::<Result<Vec<_>, _>>()?;
-  entries.sort_by_key(std::fs::DirEntry::file_name);
-  for entry in entries {
-    let source = entry.path();
-    let destination = destination.join(entry.file_name());
-    let metadata = fs::symlink_metadata(&source)?;
-    ensure!(!metadata.file_type().is_symlink(), "fixture cache contains a symlink");
-    if metadata.is_dir() {
-      copy_tree(&source, &destination)?;
-    } else {
-      ensure!(metadata.is_file(), "fixture cache source is not a regular file");
-      fs::copy(&source, &destination)?;
+    let metadata = fs::symlink_metadata(source)?;
+    ensure!(metadata.is_dir(), "fixture cache source is not a directory");
+    ensure!(!destination.exists(), "fixture cache destination already exists");
+    fs::create_dir_all(destination)?;
+    let mut entries = fs::read_dir(source)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let source = entry.path();
+        let destination = destination.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&source)?;
+        ensure!(!metadata.file_type().is_symlink(), "fixture cache contains a symlink");
+        if metadata.is_dir() {
+            copy_tree(&source, &destination)?;
+        } else {
+            ensure!(metadata.is_file(), "fixture cache source is not a regular file");
+            fs::copy(&source, &destination)?;
+        }
     }
-  }
-  fs::set_permissions(destination, metadata.permissions())?;
-  Ok(())
+    fs::set_permissions(destination, metadata.permissions())?;
+    Ok(())
 }
 
 fn copy_file(source: &Path, destination: &Path) -> Result<()> {
-  ensure!(source.is_file(), "fixture cache source is not a file");
-  if destination.exists() {
-    return Ok(());
-  }
-  fs::create_dir_all(destination.parent().context("fixture cache file parent")?)?;
-  fs::copy(source, destination)?;
-  Ok(())
+    ensure!(source.is_file(), "fixture cache source is not a file");
+    if destination.exists() {
+        return Ok(());
+    }
+    fs::create_dir_all(destination.parent().context("fixture cache file parent")?)?;
+    fs::copy(source, destination)?;
+    Ok(())
 }
 
 fn registry_index_path(crate_name: &str) -> Result<PathBuf> {
-  ensure!(crate_name.is_ascii() && !crate_name.is_empty());
-  Ok(match crate_name.len() {
-    1 => PathBuf::from("1").join(crate_name),
-    2 => PathBuf::from("2").join(crate_name),
-    3 => PathBuf::from("3").join(&crate_name[..1]).join(crate_name),
-    _ => PathBuf::from(&crate_name[..2]).join(&crate_name[2..4]).join(crate_name),
-  })
+    ensure!(crate_name.is_ascii() && !crate_name.is_empty());
+    Ok(match crate_name.len() {
+        1 => PathBuf::from("1").join(crate_name),
+        2 => PathBuf::from("2").join(crate_name),
+        3 => PathBuf::from("3")
+            .join(crate_name.get(..1).context("three-byte crate name prefix")?)
+            .join(crate_name),
+        _ => PathBuf::from(crate_name.get(..2).context("crate name index prefix")?)
+            .join(crate_name.get(2..4).context("crate name index suffix")?)
+            .join(crate_name),
+    })
 }
 
 fn seed_isolated_cargo_home(fixture: &Path, cargo_home: &Path) -> Result<()> {
-  let metadata = cargo_metadata(fixture, None)?;
-  let packages = metadata["packages"].as_array().context("fixture metadata packages")?;
-  fs::create_dir_all(cargo_home)?;
-  for package in packages {
-    let Some(source) = package["source"].as_str() else {
-      continue;
-    };
-    let manifest = PathBuf::from(package["manifest_path"].as_str().context("fixture manifest path")?);
-    if source.starts_with("registry+") {
-      let package_source = manifest.parent().context("fixture registry package root")?;
-      let index_name = package_source
-        .parent()
-        .and_then(Path::file_name)
-        .context("fixture registry source index")?;
-      let registry_root = package_source
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::parent)
-        .context("ambient Cargo registry root")?;
-      let package_name = package["name"].as_str().context("fixture registry package name")?;
-      let package_version = package["version"]
-        .as_str()
-        .context("fixture registry package version")?;
-      let cache_index = registry_root.join("cache").join(index_name);
-      let sparse_index = registry_root.join("index").join(index_name);
-      let destination_source_index = cargo_home.join("registry/src").join(index_name);
-      fs::create_dir_all(&destination_source_index)?;
-      copy_tree(
-        package_source,
-        &destination_source_index.join(package_source.file_name().context("package source")?),
-      )?;
-      copy_file(
-        &cache_index.join(format!("{package_name}-{package_version}.crate")),
-        &cargo_home
-          .join("registry/cache")
-          .join(index_name)
-          .join(format!("{package_name}-{package_version}.crate")),
-      )?;
-      copy_file(
-        &sparse_index.join("config.json"),
-        &cargo_home.join("registry/index").join(index_name).join("config.json"),
-      )?;
-      let index_path = registry_index_path(package_name)?;
-      copy_file(
-        &sparse_index.join(".cache").join(&index_path),
-        &cargo_home
-          .join("registry/index")
-          .join(index_name)
-          .join(".cache")
-          .join(index_path),
-      )?;
-    } else if source.starts_with("git+") {
-      let checkout = manifest
-        .ancestors()
-        .find(|ancestor| ancestor.join(".cargo-ok").is_file())
-        .context("ambient Cargo Git checkout root")?;
-      let repository = checkout.parent().context("ambient Cargo Git repository checkout")?;
-      let repository_name = repository.file_name().context("ambient Cargo Git repository name")?;
-      let git_root = repository
-        .parent()
-        .and_then(Path::parent)
-        .context("ambient Cargo Git root")?;
-      let destination_checkout = cargo_home.join("git/checkouts").join(repository_name);
-      if !destination_checkout.exists() {
-        copy_tree(repository, &destination_checkout)?;
-      }
-      let destination_database = cargo_home.join("git/db").join(repository_name);
-      if !destination_database.exists() {
-        copy_tree(&git_root.join("db").join(repository_name), &destination_database)?;
-      }
+    let metadata = cargo_metadata(fixture, None)?;
+    let packages = metadata["packages"].as_array().context("fixture metadata packages")?;
+    fs::create_dir_all(cargo_home)?;
+    for package in packages {
+        let Some(source) = package["source"].as_str() else {
+            continue;
+        };
+        let manifest = PathBuf::from(package["manifest_path"].as_str().context("fixture manifest path")?);
+        if source.starts_with("registry+") {
+            let package_source = manifest.parent().context("fixture registry package root")?;
+            let index_name = package_source
+                .parent()
+                .and_then(Path::file_name)
+                .context("fixture registry source index")?;
+            let registry_root = package_source
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::parent)
+                .context("ambient Cargo registry root")?;
+            let package_name = package["name"].as_str().context("fixture registry package name")?;
+            let package_version = package["version"]
+                .as_str()
+                .context("fixture registry package version")?;
+            let cache_index = registry_root.join("cache").join(index_name);
+            let sparse_index = registry_root.join("index").join(index_name);
+            let destination_source_index = cargo_home.join("registry/src").join(index_name);
+            fs::create_dir_all(&destination_source_index)?;
+            copy_tree(
+                package_source,
+                &destination_source_index.join(package_source.file_name().context("package source")?),
+            )?;
+            copy_file(
+                &cache_index.join(format!("{package_name}-{package_version}.crate")),
+                &cargo_home
+                    .join("registry/cache")
+                    .join(index_name)
+                    .join(format!("{package_name}-{package_version}.crate")),
+            )?;
+            copy_file(
+                &sparse_index.join("config.json"),
+                &cargo_home.join("registry/index").join(index_name).join("config.json"),
+            )?;
+            let index_path = registry_index_path(package_name)?;
+            copy_file(
+                &sparse_index.join(".cache").join(&index_path),
+                &cargo_home
+                    .join("registry/index")
+                    .join(index_name)
+                    .join(".cache")
+                    .join(index_path),
+            )?;
+        } else if source.starts_with("git+") {
+            let checkout = manifest
+                .ancestors()
+                .find(|ancestor| ancestor.join(".cargo-ok").is_file())
+                .context("ambient Cargo Git checkout root")?;
+            let repository = checkout.parent().context("ambient Cargo Git repository checkout")?;
+            let repository_name = repository.file_name().context("ambient Cargo Git repository name")?;
+            let git_root = repository
+                .parent()
+                .and_then(Path::parent)
+                .context("ambient Cargo Git root")?;
+            let destination_checkout = cargo_home.join("git/checkouts").join(repository_name);
+            if !destination_checkout.exists() {
+                copy_tree(repository, &destination_checkout)?;
+            }
+            let destination_database = cargo_home.join("git/db").join(repository_name);
+            if !destination_database.exists() {
+                copy_tree(&git_root.join("db").join(repository_name), &destination_database)?;
+            }
+        }
     }
-  }
-  cargo_metadata(fixture, Some(cargo_home))?;
-  Ok(())
+    cargo_metadata(fixture, Some(cargo_home))?;
+    Ok(())
 }
 
 fn setup_cache(fixture: &Path, cargo_home: &Path, cache_base: &Path) -> Result<()> {
-  let output = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
-    .current_dir(fixture)
-    .args(["rail", "cache", "setup", "--local-dir"])
-    .arg(cache_base)
-    .env("CARGO_HOME", cargo_home)
-    .env_remove("RUSTC_WRAPPER")
-    .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
-    .env_remove("RUSTC_WORKSPACE_WRAPPER")
-    .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
-    .output()?;
-  ensure!(
-    output.status.success(),
-    "transparent setup failed:\n{}",
-    String::from_utf8_lossy(&output.stderr)
-  );
-  Ok(())
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+        .current_dir(fixture)
+        .args(["rail", "cache", "setup", "--local-dir"])
+        .arg(cache_base)
+        .env("CARGO_HOME", cargo_home)
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "transparent setup failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Usage {
-  hits: u64,
-  misses: u64,
-  bypasses: u64,
-  failures: u64,
+    hits: u64,
+    misses: u64,
+    bypasses: u64,
+    failures: u64,
 }
 
 impl Usage {
-  fn difference(self, before: Self) -> Self {
-    Self {
-      hits: self.hits.saturating_sub(before.hits),
-      misses: self.misses.saturating_sub(before.misses),
-      bypasses: self.bypasses.saturating_sub(before.bypasses),
-      failures: self.failures.saturating_sub(before.failures),
+    fn difference(self, before: Self) -> Self {
+        Self {
+            hits: self.hits.saturating_sub(before.hits),
+            misses: self.misses.saturating_sub(before.misses),
+            bypasses: self.bypasses.saturating_sub(before.bypasses),
+            failures: self.failures.saturating_sub(before.failures),
+        }
     }
-  }
 }
 
 fn cache_usage(fixture: &Path, cargo_home: &Path) -> Result<Usage> {
-  let output = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
-    .current_dir(fixture)
-    .args(["rail", "cache", "status", "--scope", "local", "-f", "json"])
-    .env("CARGO_HOME", cargo_home)
-    .env_remove("RUSTC_WRAPPER")
-    .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
-    .env_remove("RUSTC_WORKSPACE_WRAPPER")
-    .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
-    .output()?;
-  ensure!(output.status.success(), "cache status failed");
-  let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-  let usage = &value["status"]["installation"]["usage"];
-  Ok(Usage {
-    hits: usage["hits"].as_u64().context("usage hits")?,
-    misses: usage["misses"].as_u64().context("usage misses")?,
-    bypasses: usage["bypasses"].as_u64().context("usage bypasses")?,
-    failures: usage["failures"].as_u64().context("usage failures")?,
-  })
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+        .current_dir(fixture)
+        .args(["rail", "cache", "status", "--scope", "local", "-f", "json"])
+        .env("CARGO_HOME", cargo_home)
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+        .output()?;
+    ensure!(output.status.success(), "cache status failed");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let usage = &value["status"]["installation"]["usage"];
+    Ok(Usage {
+        hits: usage["hits"].as_u64().context("usage hits")?,
+        misses: usage["misses"].as_u64().context("usage misses")?,
+        bypasses: usage["bypasses"].as_u64().context("usage bypasses")?,
+        failures: usage["failures"].as_u64().context("usage failures")?,
+    })
 }
 
 fn run_cargo(
-  fixture: &Path,
-  cargo_home: &Path,
-  workload: &str,
-  environment: &[(&str, &str)],
+    fixture: &Path,
+    cargo_home: &Path,
+    workload: &str,
+    environment: &[(&str, &str)],
 ) -> Result<(Output, Usage)> {
-  let before = cache_usage(fixture, cargo_home)?;
-  let mut command = Command::new("cargo");
-  command.current_dir(fixture).arg(workload);
-  if workload == "build" {
-    command.arg("--release");
-  } else if workload == "test" {
-    command.args(["--no-run", "--all-targets"]);
-  }
-  command
-    .args([
-      "--workspace",
-      "--all-features",
-      "--locked",
-      "--offline",
-      "--message-format=json-render-diagnostics",
-    ])
-    .env("CARGO_HOME", cargo_home)
-    .env("CARGO_INCREMENTAL", "0")
-    .env("CARGO_TERM_COLOR", "never")
-    .env_remove("RUSTC_WRAPPER")
-    .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
-    .env_remove("RUSTC_WORKSPACE_WRAPPER")
-    .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER");
-  for (name, value) in environment {
-    command.env(name, value);
-  }
-  let output = command.output()?;
-  ensure!(
-    output.status.success(),
-    "cargo {workload} failed:\nstdout:\n{}\nstderr:\n{}",
-    String::from_utf8_lossy(&output.stdout),
-    String::from_utf8_lossy(&output.stderr)
-  );
-  let usage = cache_usage(fixture, cargo_home)?.difference(before);
-  Ok((output, usage))
+    let before = cache_usage(fixture, cargo_home)?;
+    let mut command = Command::new("cargo");
+    command.current_dir(fixture).arg(workload);
+    if workload == "build" {
+        command.arg("--release");
+    } else if workload == "test" {
+        command.args(["--no-run", "--all-targets"]);
+    }
+    command
+        .args([
+            "--workspace",
+            "--all-features",
+            "--locked",
+            "--offline",
+            "--message-format=json-render-diagnostics",
+        ])
+        .env("CARGO_HOME", cargo_home)
+        .env("CARGO_INCREMENTAL", "0")
+        .env("CARGO_TERM_COLOR", "never")
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER");
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    let output = command.output()?;
+    ensure!(
+        output.status.success(),
+        "cargo {workload} failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let usage = cache_usage(fixture, cargo_home)?.difference(before);
+    Ok((output, usage))
 }
 
 fn add_current_root_diagnostic(fixture: &Path) -> Result<()> {
-  let path = fixture.join("crates/fixture-types/src/lib.rs");
-  let mut source = fs::read_to_string(&path)?;
-  source.push_str(
-    "\n/// Emit a stable compiler diagnostic whose source path must follow the active root.\n\
+    let path = fixture.join("crates/fixture-types/src/lib.rs");
+    let mut source = fs::read_to_string(&path)?;
+    source.push_str(
+        "\n/// Emit a stable compiler diagnostic whose source path must follow the active root.\n\
      pub fn cargo_rail_diagnostic() -> u64 {\n\
        let cargo_rail_current_root = 0_u64;\n\
        0\n\
      }\n",
-  );
-  fs::write(path, source)?;
-  Ok(())
+    );
+    fs::write(path, source)?;
+    Ok(())
 }
 
 fn current_root_diagnostic(output: &Output) -> Result<String> {
-  let stdout = String::from_utf8_lossy(&output.stdout);
-  let stderr = String::from_utf8_lossy(&output.stderr);
-  stdout
-    .lines()
-    .chain(stderr.lines())
-    .find(|line| line.contains("unused variable: `cargo_rail_current_root`"))
-    .map(str::to_string)
-    .with_context(|| format!("fixture compiler diagnostic was not emitted:\nstdout:\n{stdout}\nstderr:\n{stderr}"))
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stdout
+        .lines()
+        .chain(stderr.lines())
+        .find(|line| line.contains("unused variable: `cargo_rail_current_root`"))
+        .map(str::to_string)
+        .with_context(|| format!("fixture compiler diagnostic was not emitted:\nstdout:\n{stdout}\nstderr:\n{stderr}"))
 }
 
 fn digest_file(path: &Path) -> Result<String> {
-  let mut hasher = Sha256::new();
-  hasher.update(fs::read(path)?);
-  Ok(hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
+    let mut hasher = Sha256::new();
+    hasher.update(fs::read(path)?);
+    Ok(hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 fn reusable_outputs(target: &Path) -> Result<BTreeMap<PathBuf, String>> {
-  fn visit(target: &Path, current: &Path, outputs: &mut BTreeMap<PathBuf, String>) -> Result<()> {
-    let mut entries = fs::read_dir(current)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    for entry in entries {
-      let path = entry.path();
-      let metadata = fs::symlink_metadata(&path)?;
-      if metadata.is_dir() {
-        visit(target, &path, outputs)?;
-      } else if metadata.is_file()
-        && matches!(
-          path.extension().and_then(|value| value.to_str()),
-          Some("a" | "d" | "dll" | "dylib" | "lib" | "rlib" | "rmeta" | "so")
-        )
-      {
-        outputs.insert(path.strip_prefix(target)?.to_path_buf(), digest_file(&path)?);
-      }
+    fn visit(target: &Path, current: &Path, outputs: &mut BTreeMap<PathBuf, String>) -> Result<()> {
+        let mut entries = fs::read_dir(current)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.is_dir() {
+                visit(target, &path, outputs)?;
+            } else if metadata.is_file()
+                && matches!(
+                    path.extension().and_then(|value| value.to_str()),
+                    Some("a" | "d" | "dll" | "dylib" | "lib" | "rlib" | "rmeta" | "so")
+                )
+            {
+                outputs.insert(path.strip_prefix(target)?.to_path_buf(), digest_file(&path)?);
+            }
+        }
+        Ok(())
     }
-    Ok(())
-  }
-  let mut outputs = BTreeMap::new();
-  visit(target, target, &mut outputs)?;
-  Ok(outputs)
+    let mut outputs = BTreeMap::new();
+    visit(target, target, &mut outputs)?;
+    Ok(outputs)
 }
 
 fn native_action_keys(cache_base: &Path) -> Result<BTreeSet<String>> {
-  let directory = cache_base.join("cargo-rail/local-cas-v2/native-actions-v2");
-  let mut keys = BTreeSet::new();
-  for entry in fs::read_dir(directory)? {
-    let entry = entry?;
-    let path = entry.path();
-    if path.extension().and_then(|value| value.to_str()) == Some("json") {
-      let state: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
-      keys.insert(state["action_key"].as_str().context("native action key")?.to_string());
+    let directory = cache_base.join("cargo-rail/local-cas-v2/native-actions-v2");
+    let mut keys = BTreeSet::new();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) == Some("json") {
+            let state: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
+            keys.insert(state["action_key"].as_str().context("native action key")?.to_string());
+        }
     }
-  }
-  Ok(keys)
+    Ok(keys)
 }
 
 fn benchmark_events(directory: &Path) -> Result<Vec<serde_json::Value>> {
-  let mut paths = fs::read_dir(directory)?
-    .map(|entry| entry.map(|entry| entry.path()))
-    .collect::<Result<Vec<_>, _>>()?;
-  paths.sort();
-  paths
-    .into_iter()
-    .map(|path| serde_json::from_slice(&fs::read(path)?).map_err(Into::into))
-    .collect()
+    let mut paths = fs::read_dir(directory)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()?;
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| serde_json::from_slice(&fs::read(path)?).map_err(Into::into))
+        .collect()
 }
 
 fn benchmark_action_keys(directory: &Path, status: &str) -> Result<Vec<String>> {
-  let mut keys = Vec::new();
-  for event in benchmark_events(directory)? {
-    if event["status"] == status {
-      keys.push(
-        event["action_key"]
-          .as_str()
-          .with_context(|| format!("benchmark {status} action key"))?
-          .to_string(),
-      );
+    let mut keys = Vec::new();
+    for event in benchmark_events(directory)? {
+        if event["status"] == status {
+            keys.push(
+                event["action_key"]
+                    .as_str()
+                    .with_context(|| format!("benchmark {status} action key"))?
+                    .to_string(),
+            );
+        }
     }
-  }
-  Ok(keys)
+    Ok(keys)
 }
 
 fn benchmark_action_crates(directory: &Path, status: &str) -> Result<Vec<String>> {
-  Ok(
-    benchmark_events(directory)?
-      .into_iter()
-      .filter(|event| event["status"] == status)
-      .filter_map(|event| event["action"]["crate_name"].as_str().map(str::to_string))
-      .collect(),
-  )
+    Ok(benchmark_events(directory)?
+        .into_iter()
+        .filter(|event| event["status"] == status)
+        .filter_map(|event| event["action"]["crate_name"].as_str().map(str::to_string))
+        .collect())
 }
 
 fn benchmark_event_summary(directory: &Path) -> Result<BTreeMap<String, u64>> {
-  let mut summary = BTreeMap::new();
-  for event in benchmark_events(directory)? {
-    let status = event["status"].as_str().context("benchmark event status")?;
-    let reason = event["reason"].as_str().context("benchmark event reason")?;
-    *summary.entry(format!("{status}:{reason}")).or_default() += 1;
-  }
-  Ok(summary)
+    let mut summary = BTreeMap::new();
+    for event in benchmark_events(directory)? {
+        let status = event["status"].as_str().context("benchmark event status")?;
+        let reason = event["reason"].as_str().context("benchmark event reason")?;
+        *summary.entry(format!("{status}:{reason}")).or_default() += 1;
+    }
+    Ok(summary)
 }
 
 fn ensure_typed_benchmark_events(directory: &Path) -> Result<()> {
-  let events = benchmark_events(directory)?;
-  ensure!(!events.is_empty(), "benchmark compiler operation inventory is empty");
-  for event in events {
-    ensure!(
-      event["schema_version"] == 9,
-      "benchmark compiler operation has an incompatible schema: {event}"
-    );
-    let action = event["action"].as_object().context("benchmark compiler operation")?;
-    ensure!(
-      action.get("schema_version") == Some(&serde_json::json!(3))
-        && action.get("action_class").and_then(serde_json::Value::as_str).is_some()
-        && action.get("driver").and_then(serde_json::Value::as_str).is_some()
-        && action
-          .get("crate_types")
-          .and_then(serde_json::Value::as_array)
-          .is_some()
-        && action.get("emit").and_then(serde_json::Value::as_array).is_some(),
-      "benchmark compiler operation is incomplete: {event}"
-    );
-    let identity = event["action_id"]
-      .as_str()
-      .context("benchmark compiler operation identity")?;
-    let digest = identity
-      .strip_prefix("coverage-action-v3:sha256:")
-      .context("benchmark compiler operation identity prefix")?;
-    ensure!(
-      digest.len() == 64
-        && digest
-          .bytes()
-          .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
-      "benchmark compiler operation identity is not canonical: {identity}"
-    );
-  }
-  Ok(())
+    let events = benchmark_events(directory)?;
+    ensure!(!events.is_empty(), "benchmark compiler operation inventory is empty");
+    for event in events {
+        ensure!(
+            event["schema_version"] == 9,
+            "benchmark compiler operation has an incompatible schema: {event}"
+        );
+        let action = event["action"].as_object().context("benchmark compiler operation")?;
+        ensure!(
+            action.get("schema_version") == Some(&serde_json::json!(3))
+                && action.get("action_class").and_then(serde_json::Value::as_str).is_some()
+                && action.get("driver").and_then(serde_json::Value::as_str).is_some()
+                && action
+                    .get("crate_types")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some()
+                && action.get("emit").and_then(serde_json::Value::as_array).is_some(),
+            "benchmark compiler operation is incomplete: {event}"
+        );
+        let identity = event["action_id"]
+            .as_str()
+            .context("benchmark compiler operation identity")?;
+        let digest = identity
+            .strip_prefix("coverage-action-v3:sha256:")
+            .context("benchmark compiler operation identity prefix")?;
+        ensure!(
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+            "benchmark compiler operation identity is not canonical: {identity}"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
 fn ensure_windows_native_miss_boundary(
-  usage: Usage,
-  miss_crates: &[String],
-  summary: &BTreeMap<String, u64>,
-  phase: &str,
+    usage: Usage,
+    miss_crates: &[String],
+    summary: &BTreeMap<String, u64>,
+    phase: &str,
 ) -> Result<()> {
-  let allowed_native_misses = BTreeSet::from(["fixture_native", "fixture_native_sys", "fixture_service_b"]);
-  let observed_native_misses = miss_crates.iter().map(String::as_str).collect::<BTreeSet<_>>();
-  ensure!(
-    observed_native_misses.len() == miss_crates.len()
-      && miss_crates.len() as u64 == usage.misses
-      && observed_native_misses.is_subset(&allowed_native_misses)
-      && (observed_native_misses.is_empty()
-        || summary
-          .get("bypassed:dynamic_dependency_execution_observation_unavailable")
-          .is_some_and(|count| *count > 0)),
-    "Windows {phase} misses escaped the explicitly ungraduated native-artifact boundary: \
+    let allowed_native_misses = BTreeSet::from(["fixture_native", "fixture_native_sys", "fixture_service_b"]);
+    let observed_native_misses = miss_crates.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    ensure!(
+        observed_native_misses.len() == miss_crates.len()
+            && miss_crates.len() as u64 == usage.misses
+            && observed_native_misses.is_subset(&allowed_native_misses)
+            && (observed_native_misses.is_empty()
+                || summary
+                    .get("bypassed:dynamic_dependency_execution_observation_unavailable")
+                    .is_some_and(|count| *count > 0)),
+        "Windows {phase} misses escaped the explicitly ungraduated native-artifact boundary: \
      usage={usage:?}, misses={miss_crates:?}, events={summary:?}"
-  );
-  Ok(())
+    );
+    Ok(())
 }
 
 fn create_private_directory(path: &Path) -> Result<()> {
-  fs::create_dir(path)?;
-  #[cfg(unix)]
-  {
-    use std::os::unix::fs::PermissionsExt as _;
+    fs::create_dir(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
 
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-  }
-  Ok(())
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 fn executable(path: PathBuf) -> PathBuf {
-  if cfg!(windows) {
-    path.with_extension("exe")
-  } else {
-    path
-  }
+    if cfg!(windows) {
+        path.with_extension("exe")
+    } else {
+        path
+    }
 }
 
 fn static_archive(directory: &Path) -> PathBuf {
-  if cfg!(windows) {
-    directory.join("fixture_static.lib")
-  } else {
-    directory.join("libfixture_static.a")
-  }
+    if cfg!(windows) {
+        directory.join("fixture_static.lib")
+    } else {
+        directory.join("libfixture_static.a")
+    }
 }
 
 fn dynamic_library(directory: &Path, crate_name: &str) -> PathBuf {
-  if cfg!(windows) {
-    directory.join(format!("{crate_name}.dll"))
-  } else if cfg!(target_os = "macos") {
-    directory.join(format!("lib{crate_name}.dylib"))
-  } else {
-    directory.join(format!("lib{crate_name}.so"))
-  }
+    if cfg!(windows) {
+        directory.join(format!("{crate_name}.dll"))
+    } else if cfg!(target_os = "macos") {
+        directory.join(format!("lib{crate_name}.dylib"))
+    } else {
+        directory.join(format!("lib{crate_name}.so"))
+    }
 }
 
 #[test]
 fn real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority() -> Result<()> {
-  let root = tempfile::tempdir()?;
-  let first = root.path().join("first");
-  let second = root.path().join("second");
-  let git_source = root.path().join("git-source");
-  let first_cache = root.path().join("first-cache");
-  let second_cache = root.path().join("second-cache");
-  let first_cargo_home = root.path().join("first-cargo-home");
-  let second_cargo_home = root.path().join("second-cargo-home");
-  materialize_fixture(&first, &git_source)?;
-  materialize_fixture(&second, &git_source)?;
-  add_current_root_diagnostic(&first)?;
-  add_current_root_diagnostic(&second)?;
-  seed_isolated_cargo_home(&first, &first_cargo_home)?;
-  seed_isolated_cargo_home(&second, &second_cargo_home)?;
-  setup_cache(&first, &first_cargo_home, &first_cache)?;
-  setup_cache(&second, &second_cargo_home, &second_cache)?;
+    let root = tempfile::tempdir()?;
+    let first = root.path().join("first");
+    let second = root.path().join("second");
+    let git_source = root.path().join("git-source");
+    let first_cache = root.path().join("first-cache");
+    let second_cache = root.path().join("second-cache");
+    let first_cargo_home = root.path().join("first-cargo-home");
+    let second_cargo_home = root.path().join("second-cargo-home");
+    materialize_fixture(&first, &git_source)?;
+    materialize_fixture(&second, &git_source)?;
+    add_current_root_diagnostic(&first)?;
+    add_current_root_diagnostic(&second)?;
+    seed_isolated_cargo_home(&first, &first_cargo_home)?;
+    seed_isolated_cargo_home(&second, &second_cargo_home)?;
+    setup_cache(&first, &first_cargo_home, &first_cache)?;
+    setup_cache(&second, &second_cargo_home, &second_cache)?;
 
-  let (_, first_cold) = run_cargo(&first, &first_cargo_home, "check", &[])?;
-  let (second_cold_output, second_cold) = run_cargo(&second, &second_cargo_home, "check", &[])?;
-  ensure!(first_cold.hits == 0 && first_cold.misses >= 12, "{first_cold:?}");
-  ensure!(second_cold.hits == 0 && second_cold.misses >= 12, "{second_cold:?}");
-  ensure!(first_cold.failures == 0 && second_cold.failures == 0);
-  let first_keys = native_action_keys(&first_cache)?;
-  let second_keys = native_action_keys(&second_cache)?;
-  ensure!(!first_keys.is_empty() && !second_keys.is_empty());
-  ensure!(
-    first_keys.is_disjoint(&second_keys),
-    "exact actions crossed physical roots"
-  );
-  let second_outputs = reusable_outputs(&second.join("target"))?;
-  let second_diagnostic = current_root_diagnostic(&second_cold_output)?;
+    let (_, first_cold) = run_cargo(&first, &first_cargo_home, "check", &[])?;
+    let (second_cold_output, second_cold) = run_cargo(&second, &second_cargo_home, "check", &[])?;
+    ensure!(first_cold.hits == 0 && first_cold.misses >= 12, "{first_cold:?}");
+    ensure!(second_cold.hits == 0 && second_cold.misses >= 12, "{second_cold:?}");
+    ensure!(first_cold.failures == 0 && second_cold.failures == 0);
+    let first_keys = native_action_keys(&first_cache)?;
+    let second_keys = native_action_keys(&second_cache)?;
+    ensure!(!first_keys.is_empty() && !second_keys.is_empty());
+    ensure!(
+        first_keys.is_disjoint(&second_keys),
+        "exact actions crossed physical roots"
+    );
+    let second_outputs = reusable_outputs(&second.join("target"))?;
+    let second_diagnostic = current_root_diagnostic(&second_cold_output)?;
 
-  setup_cache(&second, &second_cargo_home, &first_cache)?;
-  fs::remove_dir_all(second.join("target"))?;
-  let root_bound_events = fs::canonicalize(root.path())?.join("root-bound-events");
-  create_private_directory(&root_bound_events)?;
-  let root_bound_events_value = root_bound_events.to_string_lossy().into_owned();
-  let (_, root_bound_cold) = run_cargo(
-    &second,
-    &second_cargo_home,
-    "check",
-    &[
-      ("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1"),
-      (
-        "CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY",
-        root_bound_events_value.as_str(),
-      ),
-    ],
-  )?;
-  let root_bound_hits = benchmark_action_keys(&root_bound_events, "hit")?;
-  let root_bound_misses = benchmark_action_keys(&root_bound_events, "miss")?;
-  ensure_typed_benchmark_events(&root_bound_events)?;
-  ensure!(
-    root_bound_hits.len() as u64 == root_bound_cold.hits,
-    "usage and action ledgers disagree: {root_bound_cold:?}, {root_bound_hits:?}"
-  );
-  ensure!(
-    root_bound_hits
-      .iter()
-      .all(|key| second_keys.contains(key) && !first_keys.contains(key)),
-    "a hit did not come from an action published for the current physical root: {root_bound_hits:?}"
-  );
-  ensure!(
-    root_bound_cold.hits.saturating_add(root_bound_cold.misses) == second_cold.misses,
-    "root-bound reconstruction changed the eligible action count: {root_bound_cold:?}"
-  );
-  let reconstructed_keys = native_action_keys(&first_cache)?;
-  ensure!(
-    root_bound_misses.len() as u64 == root_bound_cold.misses
-      && root_bound_misses.iter().all(|key| reconstructed_keys.contains(key)),
-    "root-bound reconstruction did not publish every action missed by the current execution: \
+    setup_cache(&second, &second_cargo_home, &first_cache)?;
+    fs::remove_dir_all(second.join("target"))?;
+    let root_bound_events = fs::canonicalize(root.path())?.join("root-bound-events");
+    create_private_directory(&root_bound_events)?;
+    let root_bound_events_value = root_bound_events.to_string_lossy().into_owned();
+    let (_, root_bound_cold) = run_cargo(
+        &second,
+        &second_cargo_home,
+        "check",
+        &[
+            ("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1"),
+            (
+                "CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY",
+                root_bound_events_value.as_str(),
+            ),
+        ],
+    )?;
+    let root_bound_hits = benchmark_action_keys(&root_bound_events, "hit")?;
+    let root_bound_misses = benchmark_action_keys(&root_bound_events, "miss")?;
+    ensure_typed_benchmark_events(&root_bound_events)?;
+    ensure!(
+        root_bound_hits.len() as u64 == root_bound_cold.hits,
+        "usage and action ledgers disagree: {root_bound_cold:?}, {root_bound_hits:?}"
+    );
+    ensure!(
+        root_bound_hits
+            .iter()
+            .all(|key| second_keys.contains(key) && !first_keys.contains(key)),
+        "a hit did not come from an action published for the current physical root: {root_bound_hits:?}"
+    );
+    ensure!(
+        root_bound_cold.hits.saturating_add(root_bound_cold.misses) == second_cold.misses,
+        "root-bound reconstruction changed the eligible action count: {root_bound_cold:?}"
+    );
+    let reconstructed_keys = native_action_keys(&first_cache)?;
+    ensure!(
+        root_bound_misses.len() as u64 == root_bound_cold.misses
+            && root_bound_misses.iter().all(|key| reconstructed_keys.contains(key)),
+        "root-bound reconstruction did not publish every action missed by the current execution: \
      usage={root_bound_cold:?}, reconstructed={}, misses={root_bound_misses:?}, events={:?}",
-    reconstructed_keys.len(),
-    benchmark_event_summary(&root_bound_events)?
-  );
-  ensure!(reusable_outputs(&second.join("target"))? == second_outputs);
+        reconstructed_keys.len(),
+        benchmark_event_summary(&root_bound_events)?
+    );
+    ensure!(reusable_outputs(&second.join("target"))? == second_outputs);
 
-  fs::remove_dir_all(second.join("target"))?;
-  let second_warm_events = fs::canonicalize(root.path())?.join("second-warm-events");
-  create_private_directory(&second_warm_events)?;
-  let second_warm_events_value = second_warm_events.to_string_lossy().into_owned();
-  let (second_warm_output, second_warm) = run_cargo(
-    &second,
-    &second_cargo_home,
-    "check",
-    &[
-      ("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1"),
-      (
-        "CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY",
-        second_warm_events_value.as_str(),
-      ),
-    ],
-  )?;
-  let second_warm_summary = benchmark_event_summary(&second_warm_events)?;
-  ensure_typed_benchmark_events(&second_warm_events)?;
-  let second_warm_miss_crates = benchmark_action_crates(&second_warm_events, "miss")?;
-  ensure!(
-    second_warm.hits.saturating_add(second_warm.misses) == second_keys.len() as u64,
-    "same-root warm reconstruction changed the eligible action count: expected={}, usage={second_warm:?}, \
+    fs::remove_dir_all(second.join("target"))?;
+    let second_warm_events = fs::canonicalize(root.path())?.join("second-warm-events");
+    create_private_directory(&second_warm_events)?;
+    let second_warm_events_value = second_warm_events.to_string_lossy().into_owned();
+    let (second_warm_output, second_warm) = run_cargo(
+        &second,
+        &second_cargo_home,
+        "check",
+        &[
+            ("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1"),
+            (
+                "CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY",
+                second_warm_events_value.as_str(),
+            ),
+        ],
+    )?;
+    let second_warm_summary = benchmark_event_summary(&second_warm_events)?;
+    ensure_typed_benchmark_events(&second_warm_events)?;
+    let second_warm_miss_crates = benchmark_action_crates(&second_warm_events, "miss")?;
+    ensure!(
+        second_warm.hits.saturating_add(second_warm.misses) == second_keys.len() as u64,
+        "same-root warm reconstruction changed the eligible action count: expected={}, usage={second_warm:?}, \
      misses={second_warm_miss_crates:?}, events={second_warm_summary:?}",
-    second_keys.len(),
-  );
-  #[cfg(not(windows))]
-  ensure!(
-    second_warm.hits == second_keys.len() as u64 && second_warm.misses == 0,
-    "same-root warm restore was not clean: {second_warm:?}"
-  );
-  #[cfg(windows)]
-  ensure_windows_native_miss_boundary(second_warm, &second_warm_miss_crates, &second_warm_summary, "check")?;
-  ensure!(
-    second_warm.failures == 0,
-    "same-root warm restore failed: {second_warm:?}"
-  );
-  ensure!(reusable_outputs(&second.join("target"))? == second_outputs);
-  ensure!(current_root_diagnostic(&second_warm_output)? == second_diagnostic);
+        second_keys.len(),
+    );
+    #[cfg(not(windows))]
+    ensure!(
+        second_warm.hits == second_keys.len() as u64 && second_warm.misses == 0,
+        "same-root warm restore was not clean: {second_warm:?}"
+    );
+    #[cfg(windows)]
+    ensure_windows_native_miss_boundary(second_warm, &second_warm_miss_crates, &second_warm_summary, "check")?;
+    ensure!(
+        second_warm.failures == 0,
+        "same-root warm restore failed: {second_warm:?}"
+    );
+    ensure!(reusable_outputs(&second.join("target"))? == second_outputs);
+    ensure!(current_root_diagnostic(&second_warm_output)? == second_diagnostic);
 
-  let (_, cargo_l0) = run_cargo(&second, &second_cargo_home, "check", &[])?;
-  ensure!(
-    cargo_l0 == Usage::default(),
-    "Cargo-fresh work contacted L1: {cargo_l0:?}"
-  );
+    let (_, cargo_l0) = run_cargo(&second, &second_cargo_home, "check", &[])?;
+    ensure!(
+        cargo_l0 == Usage::default(),
+        "Cargo-fresh work contacted L1: {cargo_l0:?}"
+    );
 
-  fs::remove_dir_all(second.join("target"))?;
-  let (_, sdk_changed) = run_cargo(&second, &second_cargo_home, "check", &[("SDKROOT", "/")])?;
-  ensure!(
-    sdk_changed.hits == 0 && sdk_changed.misses >= second_cold.misses,
-    "SDKROOT change did not invalidate every action: {sdk_changed:?}"
-  );
+    fs::remove_dir_all(second.join("target"))?;
+    let (_, sdk_changed) = run_cargo(&second, &second_cargo_home, "check", &[("SDKROOT", "/")])?;
+    ensure!(
+        sdk_changed.hits == 0 && sdk_changed.misses >= second_cold.misses,
+        "SDKROOT change did not invalidate every action: {sdk_changed:?}"
+    );
 
-  fs::remove_dir_all(first.join("target"))?;
-  let (_, build_cold) = run_cargo(&first, &first_cargo_home, "build", &[])?;
-  ensure!(build_cold.hits == 0 && build_cold.misses >= 8, "{build_cold:?}");
-  let build_outputs = reusable_outputs(&first.join("target/release"))?;
-  let binary = executable(first.join("target/release/fixture-cli"));
-  let dylib = dynamic_library(&first.join("target/release"), "fixture_dylib");
-  let cdylib = dynamic_library(&first.join("target/release"), "fixture_cdylib");
-  ensure!(
-    dylib.is_file() && cdylib.is_file(),
-    "dynamic library outputs are missing"
-  );
-  let cold_binary = Command::new(&binary).output()?;
-  ensure!(cold_binary.status.success());
-  ensure!(String::from_utf8_lossy(&cold_binary.stdout).trim() == "119");
+    fs::remove_dir_all(first.join("target"))?;
+    let (_, build_cold) = run_cargo(&first, &first_cargo_home, "build", &[])?;
+    ensure!(build_cold.hits == 0 && build_cold.misses >= 8, "{build_cold:?}");
+    let build_outputs = reusable_outputs(&first.join("target/release"))?;
+    let binary = executable(first.join("target/release/fixture-cli"));
+    let dylib = dynamic_library(&first.join("target/release"), "fixture_dylib");
+    let cdylib = dynamic_library(&first.join("target/release"), "fixture_cdylib");
+    ensure!(
+        dylib.is_file() && cdylib.is_file(),
+        "dynamic library outputs are missing"
+    );
+    let cold_binary = Command::new(&binary).output()?;
+    ensure!(cold_binary.status.success());
+    ensure!(String::from_utf8_lossy(&cold_binary.stdout).trim() == "119");
 
-  fs::remove_dir_all(first.join("target"))?;
-  let build_warm_events = fs::canonicalize(root.path())?.join("build-warm-events");
-  create_private_directory(&build_warm_events)?;
-  let build_warm_events_value = build_warm_events.to_string_lossy().into_owned();
-  let (build_warm_output, build_warm) = run_cargo(
-    &first,
-    &first_cargo_home,
-    "build",
-    &[
-      ("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1"),
-      (
-        "CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY",
-        build_warm_events_value.as_str(),
-      ),
-    ],
-  )?;
-  ensure!(
-    build_warm.hits.saturating_add(build_warm.misses) == build_cold.misses,
-    "warm build changed the eligible action count: cold={build_cold:?}, warm={build_warm:?}"
-  );
-  #[cfg(not(windows))]
-  ensure!(
-    build_warm.hits == build_cold.misses && build_warm.misses == 0,
-    "warm build was not clean: {build_warm:?}"
-  );
-  #[cfg(windows)]
-  ensure_windows_native_miss_boundary(
-    build_warm,
-    &benchmark_action_crates(&build_warm_events, "miss")?,
-    &benchmark_event_summary(&build_warm_events)?,
-    "build",
-  )?;
-  ensure!(build_warm.failures == 0);
-  ensure_typed_benchmark_events(&build_warm_events)?;
-  #[cfg(not(windows))]
-  {
-    let hits = benchmark_action_crates(&build_warm_events, "hit")?;
-    let dynamic_events = benchmark_events(&build_warm_events)?
-      .into_iter()
-      .filter(|event| {
-        matches!(
-          event["action"]["action_class"].as_str(),
-          Some("rust_dynamic_library" | "c_dynamic_library")
-        )
-      })
-      .map(|event| {
-        serde_json::json!({
-          "action": event["action"],
-          "reason": event["reason"],
-          "status": event["status"],
-        })
-      })
-      .collect::<Vec<_>>();
-    for crate_name in ["fixture_static", "fixture_dylib", "fixture_cdylib"] {
-      ensure!(
-        hits.iter().any(|observed| observed == crate_name),
-        "the exact {crate_name} result was not restored: hits={hits:?}, dynamic={dynamic_events:?}, stderr={}",
-        String::from_utf8_lossy(&build_warm_output.stderr)
-      );
+    fs::remove_dir_all(first.join("target"))?;
+    let build_warm_events = fs::canonicalize(root.path())?.join("build-warm-events");
+    create_private_directory(&build_warm_events)?;
+    let build_warm_events_value = build_warm_events.to_string_lossy().into_owned();
+    let (build_warm_output, build_warm) = run_cargo(
+        &first,
+        &first_cargo_home,
+        "build",
+        &[
+            ("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1"),
+            (
+                "CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY",
+                build_warm_events_value.as_str(),
+            ),
+        ],
+    )?;
+    ensure!(
+        build_warm.hits.saturating_add(build_warm.misses) == build_cold.misses,
+        "warm build changed the eligible action count: cold={build_cold:?}, warm={build_warm:?}"
+    );
+    #[cfg(not(windows))]
+    ensure!(
+        build_warm.hits == build_cold.misses && build_warm.misses == 0,
+        "warm build was not clean: {build_warm:?}"
+    );
+    #[cfg(windows)]
+    ensure_windows_native_miss_boundary(
+        build_warm,
+        &benchmark_action_crates(&build_warm_events, "miss")?,
+        &benchmark_event_summary(&build_warm_events)?,
+        "build",
+    )?;
+    ensure!(build_warm.failures == 0);
+    ensure_typed_benchmark_events(&build_warm_events)?;
+    #[cfg(not(windows))]
+    {
+        let hits = benchmark_action_crates(&build_warm_events, "hit")?;
+        let dynamic_events = benchmark_events(&build_warm_events)?
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event["action"]["action_class"].as_str(),
+                    Some("rust_dynamic_library" | "c_dynamic_library")
+                )
+            })
+            .map(|event| {
+                serde_json::json!({
+                  "action": event["action"],
+                  "reason": event["reason"],
+                  "status": event["status"],
+                })
+            })
+            .collect::<Vec<_>>();
+        for crate_name in ["fixture_static", "fixture_dylib", "fixture_cdylib"] {
+            ensure!(
+                hits.iter().any(|observed| observed == crate_name),
+                "the exact {crate_name} result was not restored: hits={hits:?}, dynamic={dynamic_events:?}, stderr={}",
+                String::from_utf8_lossy(&build_warm_output.stderr)
+            );
+        }
     }
-  }
-  ensure!(reusable_outputs(&first.join("target/release"))? == build_outputs);
-  ensure!(
-    dylib.is_file() && cdylib.is_file(),
-    "restored dynamic library outputs are missing"
-  );
-  let warm_binary = Command::new(binary).output()?;
-  ensure!(warm_binary.status.success());
-  ensure!(String::from_utf8_lossy(&warm_binary.stdout).trim() == "119");
+    ensure!(reusable_outputs(&first.join("target/release"))? == build_outputs);
+    ensure!(
+        dylib.is_file() && cdylib.is_file(),
+        "restored dynamic library outputs are missing"
+    );
+    let warm_binary = Command::new(binary).output()?;
+    ensure!(warm_binary.status.success());
+    ensure!(String::from_utf8_lossy(&warm_binary.stdout).trim() == "119");
 
-  fs::remove_dir_all(first.join("target"))?;
-  let test_cold_events = fs::canonicalize(root.path())?.join("test-cold-events");
-  create_private_directory(&test_cold_events)?;
-  let test_cold_events_value = test_cold_events.to_string_lossy().into_owned();
-  let (_, test_cold) = run_cargo(
-    &first,
-    &first_cargo_home,
-    "test",
-    &[
-      ("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1"),
-      (
-        "CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY",
-        test_cold_events_value.as_str(),
-      ),
-    ],
-  )?;
-  ensure!(
-    test_cold.failures == 0,
-    "test-target cold compile failed: {test_cold:?}"
-  );
-  ensure_typed_benchmark_events(&test_cold_events)?;
-  let new_test_targets = ["fixture_cli_bench", "fixture_cli_example", "fixture_cli_smoke"];
-  #[cfg(not(windows))]
-  {
-    let misses = benchmark_action_crates(&test_cold_events, "miss")?;
-    for target in new_test_targets {
-      ensure!(
-        misses.iter().any(|crate_name| crate_name == target),
-        "test-target cold compile did not publish {target}: {misses:?}"
-      );
+    fs::remove_dir_all(first.join("target"))?;
+    let test_cold_events = fs::canonicalize(root.path())?.join("test-cold-events");
+    create_private_directory(&test_cold_events)?;
+    let test_cold_events_value = test_cold_events.to_string_lossy().into_owned();
+    let (_, test_cold) = run_cargo(
+        &first,
+        &first_cargo_home,
+        "test",
+        &[
+            ("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1"),
+            (
+                "CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY",
+                test_cold_events_value.as_str(),
+            ),
+        ],
+    )?;
+    ensure!(
+        test_cold.failures == 0,
+        "test-target cold compile failed: {test_cold:?}"
+    );
+    ensure_typed_benchmark_events(&test_cold_events)?;
+    let new_test_targets = ["fixture_cli_bench", "fixture_cli_example", "fixture_cli_smoke"];
+    #[cfg(not(windows))]
+    {
+        let misses = benchmark_action_crates(&test_cold_events, "miss")?;
+        for target in new_test_targets {
+            ensure!(
+                misses.iter().any(|crate_name| crate_name == target),
+                "test-target cold compile did not publish {target}: {misses:?}"
+            );
+        }
     }
-  }
-  #[cfg(windows)]
-  {
-    let bypasses = benchmark_action_crates(&test_cold_events, "bypass")?;
-    for target in new_test_targets {
-      ensure!(
-        bypasses.iter().any(|crate_name| crate_name == target),
-        "COFF test-target compile did not preserve the explicit cold boundary for {target}: {bypasses:?}"
-      );
+    #[cfg(windows)]
+    {
+        let bypasses = benchmark_action_crates(&test_cold_events, "bypass")?;
+        for target in new_test_targets {
+            ensure!(
+                bypasses.iter().any(|crate_name| crate_name == target),
+                "COFF test-target compile did not preserve the explicit cold boundary for {target}: {bypasses:?}"
+            );
+        }
     }
-  }
 
-  fs::remove_dir_all(first.join("target"))?;
-  let test_warm_events = fs::canonicalize(root.path())?.join("test-warm-events");
-  create_private_directory(&test_warm_events)?;
-  let test_warm_events_value = test_warm_events.to_string_lossy().into_owned();
-  let (_, test_warm) = run_cargo(
-    &first,
-    &first_cargo_home,
-    "test",
-    &[
-      ("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1"),
-      (
-        "CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY",
-        test_warm_events_value.as_str(),
-      ),
-    ],
-  )?;
-  ensure!(
-    test_warm.failures == 0,
-    "test-target warm compile failed: {test_warm:?}"
-  );
-  ensure_typed_benchmark_events(&test_warm_events)?;
-  #[cfg(not(windows))]
-  {
-    let hits = benchmark_action_crates(&test_warm_events, "hit")?;
-    for target in new_test_targets {
-      ensure!(
-        hits.iter().any(|crate_name| crate_name == target),
-        "test-target warm compile did not restore {target}: {hits:?}"
-      );
+    fs::remove_dir_all(first.join("target"))?;
+    let test_warm_events = fs::canonicalize(root.path())?.join("test-warm-events");
+    create_private_directory(&test_warm_events)?;
+    let test_warm_events_value = test_warm_events.to_string_lossy().into_owned();
+    let (_, test_warm) = run_cargo(
+        &first,
+        &first_cargo_home,
+        "test",
+        &[
+            ("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1"),
+            (
+                "CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY",
+                test_warm_events_value.as_str(),
+            ),
+        ],
+    )?;
+    ensure!(
+        test_warm.failures == 0,
+        "test-target warm compile failed: {test_warm:?}"
+    );
+    ensure_typed_benchmark_events(&test_warm_events)?;
+    #[cfg(not(windows))]
+    {
+        let hits = benchmark_action_crates(&test_warm_events, "hit")?;
+        for target in new_test_targets {
+            ensure!(
+                hits.iter().any(|crate_name| crate_name == target),
+                "test-target warm compile did not restore {target}: {hits:?}"
+            );
+        }
     }
-  }
-  #[cfg(windows)]
-  ensure_windows_native_miss_boundary(
-    test_warm,
-    &benchmark_action_crates(&test_warm_events, "miss")?,
-    &benchmark_event_summary(&test_warm_events)?,
-    "test targets",
-  )?;
-  Ok(())
+    #[cfg(windows)]
+    ensure_windows_native_miss_boundary(
+        test_warm,
+        &benchmark_action_crates(&test_warm_events, "miss")?,
+        &benchmark_event_summary(&test_warm_events)?,
+        "test targets",
+    )?;
+    Ok(())
 }
 
 #[test]
 fn real_world_native_cache_fixture_exercises_required_compiler_classes() -> Result<()> {
-  let root = tempfile::tempdir()?;
-  let fixture = root.path().join("fixture");
-  let target = fixture.join("target");
-  materialize_fixture(&fixture, &root.path().join("git-source"))?;
+    let root = tempfile::tempdir()?;
+    let fixture = root.path().join("fixture");
+    let target = fixture.join("target");
+    materialize_fixture(&fixture, &root.path().join("git-source"))?;
 
-  let metadata = Command::new("cargo")
-    .current_dir(&fixture)
-    .args(["metadata", "--locked", "--offline", "--format-version=1"])
-    .output()?;
-  ensure!(metadata.status.success(), "fixture metadata failed");
-  let metadata: serde_json::Value = serde_json::from_slice(&metadata.stdout)?;
-  let packages = metadata["packages"].as_array().context("fixture packages")?;
-  ensure!(
-    metadata["workspace_members"]
-      .as_array()
-      .context("workspace members")?
-      .len()
-      >= 10
-  );
-  ensure!(packages.iter().any(|package| {
-    package["source"]
-      .as_str()
-      .is_some_and(|source| source.starts_with("registry+"))
-  }));
-  for required_kind in ["cdylib", "dylib", "staticlib"] {
-    ensure!(packages.iter().any(|package| {
-      package["targets"].as_array().into_iter().flatten().any(|target| {
-        target["kind"]
-          .as_array()
-          .is_some_and(|kinds| kinds.iter().any(|kind| kind == required_kind))
-      })
-    }));
-  }
-  ensure!(packages.iter().any(|package| {
-    package["source"]
-      .as_str()
-      .is_some_and(|source| source.starts_with("git+file:"))
-  }));
-  ensure!(packages.iter().any(|package| {
-    package["targets"].as_array().into_iter().flatten().any(|target| {
-      target["kind"]
-        .as_array()
-        .is_some_and(|kinds| kinds.iter().any(|kind| kind == "custom-build"))
-    })
-  }));
-  ensure!(packages.iter().any(|package| {
-    package["targets"].as_array().into_iter().flatten().any(|target| {
-      target["kind"]
-        .as_array()
-        .is_some_and(|kinds| kinds.iter().any(|kind| kind == "proc-macro"))
-    })
-  }));
-
-  let integrated_assembly = fs::read_to_string(fixture.join("crates/fixture-static/src/lib.rs"))?;
-  for required in [
-    "core::arch::asm!",
-    "core::arch::global_asm!(include_str!",
-    "core::arch::naked_asm!",
-    "target_feature(enable",
-  ] {
+    let metadata = Command::new("cargo")
+        .current_dir(&fixture)
+        .args(["metadata", "--locked", "--offline", "--format-version=1"])
+        .output()?;
+    ensure!(metadata.status.success(), "fixture metadata failed");
+    let metadata: serde_json::Value = serde_json::from_slice(&metadata.stdout)?;
+    let packages = metadata["packages"].as_array().context("fixture packages")?;
     ensure!(
-      integrated_assembly.contains(required),
-      "fixture does not exercise required integrated-assembly shape {required}"
+        metadata["workspace_members"]
+            .as_array()
+            .context("workspace members")?
+            .len()
+            >= 10
     );
-  }
-  ensure!(
-    fs::metadata(fixture.join("crates/fixture-static/src/integrated_assembly.s"))?.len() > 0,
-    "fixture included assembly text is empty"
-  );
+    ensure!(packages.iter().any(|package| {
+        package["source"]
+            .as_str()
+            .is_some_and(|source| source.starts_with("registry+"))
+    }));
+    for required_kind in ["cdylib", "dylib", "staticlib"] {
+        ensure!(packages.iter().any(|package| {
+            package["targets"].as_array().into_iter().flatten().any(|target| {
+                target["kind"]
+                    .as_array()
+                    .is_some_and(|kinds| kinds.iter().any(|kind| kind == required_kind))
+            })
+        }));
+    }
+    ensure!(packages.iter().any(|package| {
+        package["source"]
+            .as_str()
+            .is_some_and(|source| source.starts_with("git+file:"))
+    }));
+    ensure!(packages.iter().any(|package| {
+        package["targets"].as_array().into_iter().flatten().any(|target| {
+            target["kind"]
+                .as_array()
+                .is_some_and(|kinds| kinds.iter().any(|kind| kind == "custom-build"))
+        })
+    }));
+    ensure!(packages.iter().any(|package| {
+        package["targets"].as_array().into_iter().flatten().any(|target| {
+            target["kind"]
+                .as_array()
+                .is_some_and(|kinds| kinds.iter().any(|kind| kind == "proc-macro"))
+        })
+    }));
 
-  let check = Command::new("cargo")
-    .current_dir(&fixture)
-    .args([
-      "check",
-      "--workspace",
-      "--all-targets",
-      "--all-features",
-      "--locked",
-      "--offline",
-    ])
-    .output()?;
-  ensure!(check.status.success(), "fixture check failed");
-  let build = Command::new("cargo")
-    .current_dir(&fixture)
-    .args(["build", "--workspace", "--all-features", "--locked", "--offline"])
-    .output()?;
-  ensure!(build.status.success(), "fixture build failed");
-  let test = Command::new("cargo")
-    .current_dir(&fixture)
-    .args([
-      "test",
-      "--workspace",
-      "--all-targets",
-      "--all-features",
-      "--no-run",
-      "--locked",
-      "--offline",
-    ])
-    .output()?;
-  ensure!(test.status.success(), "fixture test-target compile failed");
-  ensure!(executable(target.join("debug/fixture-cli")).is_file());
-  ensure!(static_archive(&target.join("debug")).is_file());
-  ensure!(dynamic_library(&target.join("debug"), "fixture_dylib").is_file());
-  ensure!(dynamic_library(&target.join("debug"), "fixture_cdylib").is_file());
-  Ok(())
+    let integrated_assembly = fs::read_to_string(fixture.join("crates/fixture-static/src/lib.rs"))?;
+    for required in [
+        "core::arch::asm!",
+        "core::arch::global_asm!(include_str!",
+        "core::arch::naked_asm!",
+        "target_feature(enable",
+    ] {
+        ensure!(
+            integrated_assembly.contains(required),
+            "fixture does not exercise required integrated-assembly shape {required}"
+        );
+    }
+    ensure!(
+        fs::metadata(fixture.join("crates/fixture-static/src/integrated_assembly.s"))?.len() > 0,
+        "fixture included assembly text is empty"
+    );
+
+    let check = Command::new("cargo")
+        .current_dir(&fixture)
+        .args([
+            "check",
+            "--workspace",
+            "--all-targets",
+            "--all-features",
+            "--locked",
+            "--offline",
+        ])
+        .output()?;
+    ensure!(check.status.success(), "fixture check failed");
+    let build = Command::new("cargo")
+        .current_dir(&fixture)
+        .args(["build", "--workspace", "--all-features", "--locked", "--offline"])
+        .output()?;
+    ensure!(build.status.success(), "fixture build failed");
+    let test = Command::new("cargo")
+        .current_dir(&fixture)
+        .args([
+            "test",
+            "--workspace",
+            "--all-targets",
+            "--all-features",
+            "--no-run",
+            "--locked",
+            "--offline",
+        ])
+        .output()?;
+    ensure!(test.status.success(), "fixture test-target compile failed");
+    ensure!(executable(target.join("debug/fixture-cli")).is_file());
+    ensure!(static_archive(&target.join("debug")).is_file());
+    ensure!(dynamic_library(&target.join("debug"), "fixture_dylib").is_file());
+    ensure!(dynamic_library(&target.join("debug"), "fixture_cdylib").is_file());
+    Ok(())
 }

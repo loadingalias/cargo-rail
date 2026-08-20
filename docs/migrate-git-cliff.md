@@ -95,15 +95,15 @@ group_order = ["breaking", "sec", "feat", "fix", "deps", "other"]
 git-cliff uses Tera templates. Cargo-Rail intentionally does not. Use the
 fixed placeholder format instead:
 
-| git-cliff value | Cargo-Rail placeholder |
-| --- | --- |
-| commit message body/summary | `{description}` |
-| commit scope | `{scope}` |
-| short commit id | `{sha}` |
-| linked commit id | `{sha_link}` |
-| pull request references | `{prs}` |
-| conventional commit type | `{type}` |
-| breaking marker | `{breaking}` |
+| git-cliff value             | Cargo-Rail placeholder |
+| --------------------------- | ---------------------- |
+| commit message body/summary | `{description}`        |
+| commit scope                | `{scope}`              |
+| short commit id             | `{sha}`                |
+| linked commit id            | `{sha_link}`           |
+| pull request references     | `{prs}`                |
+| conventional commit type    | `{type}`               |
+| breaking marker             | `{breaking}`           |
 
 Unsupported template logic should move to change files:
 

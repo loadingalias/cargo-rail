@@ -103,7 +103,10 @@
       "additionalProperties": false,
       "required": ["path", "kind", "owners", "owner_scope"],
       "properties": {
-        "path": { "type": "string", "pattern": "^[^/\\\\](?!.*(?:^|[/\\\\])\\.\\.(?:[/\\\\]|$)).*$" },
+        "path": {
+          "type": "string",
+          "pattern": "^[^/\\\\](?!.*(?:^|[/\\\\])\\.\\.(?:[/\\\\]|$)).*$"
+        },
         "kind": { "type": "string" },
         "sub_kind": { "type": "string" },
         "custom_surfaces": { "$ref": "#/$defs/string_array" },
@@ -137,7 +140,14 @@
     "execution_scope": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["scope_contract_version", "resolved_base", "resolved_head", "mode", "crates", "cargo_args"],
+      "required": [
+        "scope_contract_version",
+        "resolved_base",
+        "resolved_head",
+        "mode",
+        "crates",
+        "cargo_args"
+      ],
       "properties": {
         "scope_contract_version": { "const": 4 },
         "resolved_base": { "type": "string" },
@@ -182,7 +192,10 @@
         "code": { "type": "string", "minLength": 1 },
         "description": { "type": "string", "minLength": 1 },
         "semantic_input": { "enum": ["manifest", "workspace_manifest", "lockfile"] },
-        "file": { "type": "string", "pattern": "^[^/\\\\](?!.*(?:^|[/\\\\])\\.\\.(?:[/\\\\]|$)).*$" },
+        "file": {
+          "type": "string",
+          "pattern": "^[^/\\\\](?!.*(?:^|[/\\\\])\\.\\.(?:[/\\\\]|$)).*$"
+        },
         "crate": { "type": "string" },
         "package_id": { "type": "string" },
         "depends_on": { "type": "string" },

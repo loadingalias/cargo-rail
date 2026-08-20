@@ -1,0 +1,12 @@
+{
+  "lsp": {
+    "rust-analyzer": {
+      "enable_lsp_tasks": false,
+      "initialization_options": {
+        "cargo": {
+          "extraArgs": ["--locked"]
+        }
+      }
+    }
+  }
+}

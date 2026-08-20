@@ -61,7 +61,9 @@
           "allOf": [
             {
               "if": { "properties": { "phase": { "const": "planned" } } },
-              "then": { "not": { "anyOf": [{ "required": ["receipt"] }, { "required": ["backup"] }] } }
+              "then": {
+                "not": { "anyOf": [{ "required": ["receipt"] }, { "required": ["backup"] }] }
+              }
             },
             {
               "if": { "properties": { "phase": { "const": "applied" } } },
@@ -151,7 +153,15 @@
     "completeness": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["complete", "fragments", "items", "edges", "entry_points", "retentions", "retention_reasons"],
+      "required": [
+        "complete",
+        "fragments",
+        "items",
+        "edges",
+        "entry_points",
+        "retentions",
+        "retention_reasons"
+      ],
       "properties": {
         "complete": { "const": true },
         "fragments": { "type": "integer", "minimum": 1 },
@@ -192,7 +202,14 @@
       "properties": {
         "identity": { "type": "string", "pattern": "^surface-finding-v1-sha256-[0-9a-f]{64}$" },
         "item_identity": { "type": "string", "pattern": "^surface-item-v1-sha256-[0-9a-f]{64}$" },
-        "kind": { "enum": ["dead-public", "unnecessary-public", "unnecessary-restricted-visibility", "unnecessary-crate-visibility"] },
+        "kind": {
+          "enum": [
+            "dead-public",
+            "unnecessary-public",
+            "unnecessary-restricted-visibility",
+            "unnecessary-crate-visibility"
+          ]
+        },
         "name": { "type": "string" },
         "item_kind": { "type": "string", "minLength": 1 },
         "packages": { "$ref": "#/$defs/string_array" },
@@ -226,21 +243,46 @@
       "additionalProperties": false,
       "required": ["kind"],
       "properties": {
-        "kind": { "enum": ["library", "binary", "test", "example", "benchmark", "documentation", "proc_macro", "build_script", "other"] },
+        "kind": {
+          "enum": [
+            "library",
+            "binary",
+            "test",
+            "example",
+            "benchmark",
+            "documentation",
+            "proc_macro",
+            "build_script",
+            "other"
+          ]
+        },
         "name": { "type": "string" }
       }
     },
     "fragment": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["identity", "unit_identity", "package", "target", "target_kind", "domain", "platform", "complete", "items", "edges"],
+      "required": [
+        "identity",
+        "unit_identity",
+        "package",
+        "target",
+        "target_kind",
+        "domain",
+        "platform",
+        "complete",
+        "items",
+        "edges"
+      ],
       "properties": {
         "identity": { "type": "string", "minLength": 1 },
         "unit_identity": { "type": "string", "minLength": 1 },
         "package": { "type": "string", "minLength": 1 },
         "target": { "type": "string", "minLength": 1 },
         "target_kind": { "$ref": "#/$defs/target_kind" },
-        "domain": { "enum": ["production", "non_production", "doctest", "build_script", "proc_macro"] },
+        "domain": {
+          "enum": ["production", "non_production", "doctest", "build_script", "proc_macro"]
+        },
         "platform": { "type": "string", "minLength": 1 },
         "complete": { "const": true },
         "items": { "type": "integer", "minimum": 0 },
@@ -388,8 +430,14 @@
         "replacement"
       ],
       "properties": {
-        "finding_identity": { "type": "string", "pattern": "^surface-finding-v1-sha256-[0-9a-f]{64}$" },
-        "declaration_identity": { "type": "string", "pattern": "^surface-item-v1-sha256-[0-9a-f]{64}$" },
+        "finding_identity": {
+          "type": "string",
+          "pattern": "^surface-finding-v1-sha256-[0-9a-f]{64}$"
+        },
+        "declaration_identity": {
+          "type": "string",
+          "pattern": "^surface-item-v1-sha256-[0-9a-f]{64}$"
+        },
         "declaration_start": { "type": "integer", "minimum": 0 },
         "declaration_end": { "type": "integer", "minimum": 1 },
         "visibility_start": { "type": "integer", "minimum": 0 },
@@ -446,7 +494,10 @@
         "config_fingerprint": { "type": "string", "minLength": 1 },
         "toolchain_fingerprint": { "type": "string", "minLength": 1 },
         "lock_fingerprint": { "type": "string", "minLength": 1 },
-        "metadata_fingerprint": { "type": "string", "pattern": "^snapshot:v[0-9]+-sha256-[0-9a-f]{64}$" },
+        "metadata_fingerprint": {
+          "type": "string",
+          "pattern": "^snapshot:v[0-9]+-sha256-[0-9a-f]{64}$"
+        },
         "worktree_fingerprint": { "type": "string", "pattern": "^git-object:[0-9a-f]+$" },
         "changed_paths": { "$ref": "#/$defs/string_array" }
       }

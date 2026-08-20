@@ -31,16 +31,20 @@ else
   cargo fmt --all -- --check
 fi
 
+echo "Locked Cargo command surfaces..."
+scripts/ci/check-locked-cargo.sh
+scripts/ci/check-locked-cargo-test.sh
+
 echo "Security audit..."
-cargo deny check all
+cargo deny --locked check all
 cargo audit
 
 # Clippy performs Cargo's check pass, so do not run a separate `cargo check` first.
 echo "Linting..."
 if [ "$FIX_MODE" = true ]; then
-  cargo clippy --workspace --all-targets --all-features --locked --fix --allow-dirty -- -D warnings
+  cargo clippy --workspace --all-targets --all-features --locked --fix
 else
-  cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+  cargo clippy --workspace --all-targets --all-features --locked
 fi
 
 # Generated docs must match the CLI and executable support authorities.

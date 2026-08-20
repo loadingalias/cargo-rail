@@ -10,121 +10,137 @@ use std::fs;
 
 /// Test plan with non-existent git ref
 #[test]
-fn test_plan_invalid_since_ref() -> Result<()> {
-  let ws = TestWorkspace::new_named("error-invalid-ref")?;
-  ws.add_crate("test-crate", "0.1.0", &[])?;
-  ws.commit("Add crate")?;
+fn test_plan_invalid_since_ref() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("error-invalid-ref")?;
+        ws.add_crate("test-crate", "0.1.0", &[])?;
+        ws.commit("Add crate")?;
 
-  // Use a non-existent ref
-  let output = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "nonexistent-branch-xyz"])?;
+        // Use a non-existent ref
+        let output = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "nonexistent-branch-xyz"])?;
 
-  // Should fail (non-zero exit code)
-  assert!(!output.status.success(), "plan with invalid ref should fail");
+        // Should fail (non-zero exit code)
+        assert!(!output.status.success(), "plan with invalid ref should fail");
 
-  Ok(())
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
 }
 
 /// Test plan with invalid SHA pair
 #[test]
-fn test_plan_invalid_sha_pair() -> Result<()> {
-  let ws = TestWorkspace::new_named("error-invalid-sha")?;
-  ws.add_crate("test-crate", "0.1.0", &[])?;
-  ws.commit("Add crate")?;
+fn test_plan_invalid_sha_pair() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("error-invalid-sha")?;
+        ws.add_crate("test-crate", "0.1.0", &[])?;
+        ws.commit("Add crate")?;
 
-  // Use invalid SHAs
-  let output = run_cargo_rail(
-    &ws.path,
-    &[
-      "rail",
-      "plan",
-      "--from",
-      "0000000000000000000000000000000000000000",
-      "--to",
-      "HEAD",
-    ],
-  )?;
+        // Use invalid SHAs
+        let output = run_cargo_rail(
+            &ws.path,
+            &[
+                "rail",
+                "plan",
+                "--from",
+                "0000000000000000000000000000000000000000",
+                "--to",
+                "HEAD",
+            ],
+        )?;
 
-  assert!(!output.status.success(), "plan with invalid SHA should fail");
+        assert!(!output.status.success(), "plan with invalid SHA should fail");
 
-  Ok(())
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
 }
 
 // Configuration Error Tests
 
 /// Test commands fail gracefully with corrupted rail.toml
 #[test]
-fn test_corrupted_config_toml() -> Result<()> {
-  let ws = TestWorkspace::new_named("error-corrupted-config")?;
-  ws.add_crate("test-crate", "0.1.0", &[])?;
-  ws.commit("Add crate")?;
+fn test_corrupted_config_toml() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("error-corrupted-config")?;
+        ws.add_crate("test-crate", "0.1.0", &[])?;
+        ws.commit("Add crate")?;
 
-  // Write invalid TOML
-  fs::write(
-    ws.path.join(".config/rail.toml"),
-    r#"[workspace
+        // Write invalid TOML
+        fs::write(
+            ws.path.join(".config/rail.toml"),
+            r#"[workspace
 this is not valid toml { } [
 "#,
-  )?;
+        )?;
 
-  // Commands that load config should fail gracefully
-  let output = run_cargo_rail(&ws.path, &["rail", "status"])?;
+        // Commands that load config should fail gracefully
+        let output = run_cargo_rail(&ws.path, &["rail", "status"])?;
 
-  // Should fail due to invalid config
-  assert!(!output.status.success(), "status with corrupted config should fail");
+        // Should fail due to invalid config
+        assert!(!output.status.success(), "status with corrupted config should fail");
 
-  Ok(())
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
 }
 
 /// Test unify with missing config falls back gracefully
 #[test]
-fn test_unify_no_config() -> Result<()> {
-  let ws = TestWorkspace::new_named("error-no-config")?;
-  ws.add_crate("test-crate", "0.1.0", &[])?;
-  ws.commit("Add crate")?;
+fn test_unify_no_config() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("error-no-config")?;
+        ws.add_crate("test-crate", "0.1.0", &[])?;
+        ws.commit("Add crate")?;
 
-  // Remove the config
-  ws.remove_config()?;
-  ws.commit("Remove config")?;
+        // Remove the config
+        ws.remove_config()?;
+        ws.commit("Remove config")?;
 
-  // Unify should still work (uses defaults)
-  let output = run_cargo_rail(&ws.path, &["rail", "unify", "--check"])?;
+        // Unify should still work (uses defaults)
+        let output = run_cargo_rail(&ws.path, &["rail", "unify", "--check"])?;
 
-  // Should succeed with default config
-  assert!(
-    output.status.success(),
-    "unify should work without config. stderr: {}",
-    String::from_utf8_lossy(&output.stderr)
-  );
+        // Should succeed with default config
+        assert!(
+            output.status.success(),
+            "unify should work without config. stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
 
-  Ok(())
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
 }
 
 /// Test release with invalid crate name
 #[test]
-fn test_release_invalid_crate_name() -> Result<()> {
-  let ws = TestWorkspace::new_named("error-invalid-crate")?;
-  ws.add_crate("real-crate", "0.1.0", &[])?;
-  ws.commit("Add crate")?;
+fn test_release_invalid_crate_name() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("error-invalid-crate")?;
+        ws.add_crate("real-crate", "0.1.0", &[])?;
+        ws.commit("Add crate")?;
 
-  // Try to release non-existent crate
-  let output = run_cargo_rail(&ws.path, &["rail", "release", "run", "--check", "does-not-exist"])?;
-  assert!(!output.status.success(), "release with invalid crate should fail");
+        // Try to release non-existent crate
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "run", "--check", "does-not-exist"])?;
+        assert!(!output.status.success(), "release with invalid crate should fail");
 
-  Ok(())
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
 }
 
 // Split/Sync Error Tests
 
 /// Test split with invalid crate name
 #[test]
-fn test_split_invalid_crate() -> Result<()> {
-  let ws = TestWorkspace::new_named("error-split-invalid")?;
-  ws.add_crate("real-crate", "0.1.0", &[])?;
+fn test_split_invalid_crate() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("error-split-invalid")?;
+        ws.add_crate("real-crate", "0.1.0", &[])?;
 
-  // Configure split for real crate using new format
-  fs::write(
-    ws.path.join(".config/rail.toml"),
-    r#"[workspace]
+        // Configure split for real crate using new format
+        fs::write(
+            ws.path.join(".config/rail.toml"),
+            r#"[workspace]
 root = "."
 
 [crates.real-crate.split]
@@ -132,185 +148,205 @@ remote = "/tmp/fake-remote"
 branch = "main"
 mode = "single"
 "#,
-  )?;
+        )?;
 
-  ws.commit("Add crate with split config")?;
+        ws.commit("Add crate with split config")?;
 
-  // Try to split non-existent crate
-  let output = run_cargo_rail(&ws.path, &["rail", "split", "run", "nonexistent-crate"])?;
-  assert!(!output.status.success(), "split with invalid crate should fail");
+        // Try to split non-existent crate
+        let output = run_cargo_rail(&ws.path, &["rail", "split", "run", "nonexistent-crate"])?;
+        assert!(!output.status.success(), "split with invalid crate should fail");
 
-  Ok(())
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
 }
 
 /// Test sync with no splits configured
 #[test]
-fn test_sync_no_splits_configured() -> Result<()> {
-  let ws = TestWorkspace::new_named("error-sync-no-splits")?;
-  ws.add_crate("test-crate", "0.1.0", &[])?;
+fn test_sync_no_splits_configured() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("error-sync-no-splits")?;
+        ws.add_crate("test-crate", "0.1.0", &[])?;
 
-  // Config without splits
-  fs::write(
-    ws.path.join(".config/rail.toml"),
-    r#"[workspace]
+        // Config without splits
+        fs::write(
+            ws.path.join(".config/rail.toml"),
+            r#"[workspace]
 root = "."
 "#,
-  )?;
+        )?;
 
-  ws.commit("Add crate without splits")?;
+        ws.commit("Add crate without splits")?;
 
-  // Try to sync
-  let output = run_cargo_rail(&ws.path, &["rail", "sync", "--all"])?;
-  assert!(!output.status.success(), "sync with no splits should fail");
+        // Try to sync
+        let output = run_cargo_rail(&ws.path, &["rail", "sync", "--all"])?;
+        assert!(!output.status.success(), "sync with no splits should fail");
 
-  Ok(())
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
 }
 
 // Workspace Error Tests
 
 /// Test running outside a cargo workspace
 #[test]
-fn test_not_a_workspace() -> Result<()> {
-  // Create a temp dir that's NOT a cargo workspace
-  let temp = tempfile::TempDir::new()?;
-  let path = temp.path();
+fn test_not_a_workspace() {
+    let result: Result<()> = (|| {
+        // Create a temp dir that's NOT a cargo workspace
+        let temp = tempfile::TempDir::new()?;
+        let path = temp.path();
 
-  // Just create an empty directory
-  fs::create_dir_all(path)?;
+        // Just create an empty directory
+        fs::create_dir_all(path)?;
 
-  // Try to run a command
-  let output = run_cargo_rail(path, &["rail", "status"])?;
-  assert!(!output.status.success(), "running outside workspace should fail");
+        // Try to run a command
+        let output = run_cargo_rail(path, &["rail", "status"])?;
+        assert!(!output.status.success(), "running outside workspace should fail");
 
-  Ok(())
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
 }
 
 /// Test running in a single crate (non-workspace)
 #[test]
-fn test_single_crate_workspace() -> Result<()> {
-  let ws = TestWorkspace::new_single_crate("single", "0.1.0")?;
+fn test_single_crate_workspace() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_single_crate("single", "0.1.0")?;
 
-  // Add a second commit so HEAD~1 exists
-  fs::write(ws.path.join("src/lib.rs"), "// modified")?;
-  super::helpers::git(&ws.path, &["add", "."])?;
-  super::helpers::git(&ws.path, &["commit", "-m", "Add modification"])?;
+        // Add a second commit so HEAD~1 exists
+        fs::write(ws.path.join("src/lib.rs"), "// modified")?;
+        super::helpers::git(&ws.path, &["add", "."])?;
+        super::helpers::git(&ws.path, &["commit", "-m", "Add modification"])?;
 
-  // Planner should work (single crate is technically a workspace)
-  let output = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD~1"])?;
+        // Planner should work (single crate is technically a workspace)
+        let output = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD~1"])?;
 
-  // This should succeed for a single crate
-  assert!(
-    output.status.success(),
-    "plan in single crate should work. stderr: {}",
-    String::from_utf8_lossy(&output.stderr)
-  );
+        // This should succeed for a single crate
+        assert!(
+            output.status.success(),
+            "plan in single crate should work. stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
 
-  Ok(())
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
 }
 
 // Init Error Tests
 
 /// Test init refuses to overwrite existing config without --force
 #[test]
-fn test_init_no_overwrite_without_force() -> Result<()> {
-  let ws = TestWorkspace::new_named("error-init-exists")?;
-  ws.add_crate("test-crate", "0.1.0", &[])?;
-  ws.commit("Add crate")?;
+fn test_init_no_overwrite_without_force() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("error-init-exists")?;
+        ws.add_crate("test-crate", "0.1.0", &[])?;
+        ws.commit("Add crate")?;
 
-  // Config already exists from TestWorkspace::new_named
+        // Config already exists from TestWorkspace::new_named
 
-  // Try to init again without --force
-  let output = run_cargo_rail(&ws.path, &["rail", "init", "--non-interactive"])?;
-  assert!(
-    !output.status.success(),
-    "init without --force should fail when config exists"
-  );
+        // Try to init again without --force
+        let output = run_cargo_rail(&ws.path, &["rail", "init", "--non-interactive"])?;
+        assert!(
+            !output.status.success(),
+            "init without --force should fail when config exists"
+        );
 
-  Ok(())
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
 }
 
 // Unify Error Tests
 
 /// Test unify undo when no backups exist
 #[test]
-fn test_unify_undo_no_backups() -> Result<()> {
-  let ws = TestWorkspace::new_named("error-undo-empty")?;
-  ws.add_crate("test-crate", "0.1.0", &[])?;
-  ws.commit("Add crate")?;
+fn test_unify_undo_no_backups() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("error-undo-empty")?;
+        ws.add_crate("test-crate", "0.1.0", &[])?;
+        ws.commit("Add crate")?;
 
-  // Make sure no backups exist
-  let backup_dir = ws.path.join("target/cargo-rail/backups");
-  if backup_dir.exists() {
-    fs::remove_dir_all(&backup_dir)?;
-  }
+        // Make sure no backups exist
+        let backup_dir = ws.path.join("target/cargo-rail/backups");
+        if backup_dir.exists() {
+            fs::remove_dir_all(&backup_dir)?;
+        }
 
-  // Try to undo when no backups exist
-  let output = run_cargo_rail(&ws.path, &["rail", "unify", "undo"])?;
-  assert!(!output.status.success(), "undo with no backups should fail");
+        // Try to undo when no backups exist
+        let output = run_cargo_rail(&ws.path, &["rail", "unify", "undo"])?;
+        assert!(!output.status.success(), "undo with no backups should fail");
 
-  Ok(())
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
 }
 
 // Path Handling Tests
 
 /// Test handling of paths with special characters
 #[test]
-fn test_path_with_spaces() -> Result<()> {
-  // Create workspace with space in path
-  let temp = tempfile::TempDir::new()?;
-  let path_with_space = temp.path().join("my workspace");
-  fs::create_dir_all(&path_with_space)?;
+fn test_path_with_spaces() {
+    let result: Result<()> = (|| {
+        // Create workspace with space in path
+        let temp = tempfile::TempDir::new()?;
+        let path_with_space = temp.path().join("my workspace");
+        fs::create_dir_all(&path_with_space)?;
 
-  // Initialize git
-  super::helpers::git(&path_with_space, &["init", "--initial-branch=main"])?;
-  super::helpers::git(&path_with_space, &["config", "user.name", "Test"])?;
-  super::helpers::git(&path_with_space, &["config", "user.email", "test@test.com"])?;
+        // Initialize git
+        super::helpers::git(&path_with_space, &["init", "--initial-branch=main"])?;
+        super::helpers::git(&path_with_space, &["config", "user.name", "Test"])?;
+        super::helpers::git(&path_with_space, &["config", "user.email", "test@test.com"])?;
 
-  // Create workspace Cargo.toml with actual member
-  fs::write(
-    path_with_space.join("Cargo.toml"),
-    r#"[workspace]
+        // Create workspace Cargo.toml with actual member
+        fs::write(
+            path_with_space.join("Cargo.toml"),
+            r#"[workspace]
 members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
 edition = "2021"
 "#,
-  )?;
+        )?;
 
-  // Create a crate so workspace has actual members
-  let crate_path = path_with_space.join("crates/test-crate");
-  fs::create_dir_all(crate_path.join("src"))?;
-  fs::write(
-    crate_path.join("Cargo.toml"),
-    r#"[package]
+        // Create a crate so workspace has actual members
+        let crate_path = path_with_space.join("crates/test-crate");
+        fs::create_dir_all(crate_path.join("src"))?;
+        fs::write(
+            crate_path.join("Cargo.toml"),
+            r#"[package]
 name = "test-crate"
 version = "0.1.0"
 edition.workspace = true
 "#,
-  )?;
-  fs::write(crate_path.join("src/lib.rs"), "// test")?;
+        )?;
+        fs::write(crate_path.join("src/lib.rs"), "// test")?;
 
-  fs::create_dir_all(path_with_space.join(".config"))?;
-  fs::write(
-    path_with_space.join(".config/rail.toml"),
-    r#"[workspace]
+        fs::create_dir_all(path_with_space.join(".config"))?;
+        fs::write(
+            path_with_space.join(".config/rail.toml"),
+            r#"[workspace]
 root = "."
 "#,
-  )?;
+        )?;
 
-  super::helpers::git(&path_with_space, &["add", "."])?;
-  super::helpers::git(&path_with_space, &["commit", "-m", "Initial"])?;
+        super::helpers::git(&path_with_space, &["add", "."])?;
+        super::helpers::git(&path_with_space, &["commit", "-m", "Initial"])?;
 
-  // Should handle paths with spaces
-  let output = run_cargo_rail(&path_with_space, &["rail", "plan", "--since", "HEAD"])?;
+        // Should handle paths with spaces
+        let output = run_cargo_rail(&path_with_space, &["rail", "plan", "--since", "HEAD"])?;
 
-  // Should succeed
-  assert!(
-    output.status.success(),
-    "Should handle paths with spaces. stderr: {}",
-    String::from_utf8_lossy(&output.stderr)
-  );
+        // Should succeed
+        assert!(
+            output.status.success(),
+            "Should handle paths with spaces. stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
 
-  Ok(())
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
 }

@@ -9,17 +9,17 @@ activation disabled: it establishes the L0/L1 baseline, not official S3 correctn
 The real-world fixture runs `cargo check`, `cargo build --release`, and `cargo test --no-run --all-targets` in
 deterministic interleaved lane order:
 
-| Lane | Target state | Cache state | Question |
-|---|---|---|---|
-| `cargo-l0` | intact | no wrapper | Native Cargo no-op authority |
-| `transparent-l0` | intact | installed L1 | Transparent no-op overhead |
-| `cargo-empty` | empty | no wrapper | Native cold-target baseline |
-| `cache-off` | empty | installed but `CARGO_RAIL_CACHE=off` | Exact opt-out overhead |
-| `transparent-cold` | empty | empty receipt-selected L1 | Cold publication overhead |
-| `transparent-warm` | empty | verified same-root L1 | Restored compiler work |
-| `sccache-server` | empty | warm pinned local sccache | Specialist server baseline |
-| `sccache-client` | empty | warm pinned client-side sccache | Specialist daemonless baseline |
-| `transparent-incremental` | empty | installed L1, incremental forced | Unsupported early bypass |
+| Lane                      | Target state | Cache state                          | Question                       |
+| ------------------------- | ------------ | ------------------------------------ | ------------------------------ |
+| `cargo-l0`                | intact       | no wrapper                           | Native Cargo no-op authority   |
+| `transparent-l0`          | intact       | installed L1                         | Transparent no-op overhead     |
+| `cargo-empty`             | empty        | no wrapper                           | Native cold-target baseline    |
+| `cache-off`               | empty        | installed but `CARGO_RAIL_CACHE=off` | Exact opt-out overhead         |
+| `transparent-cold`        | empty        | empty receipt-selected L1            | Cold publication overhead      |
+| `transparent-warm`        | empty        | verified same-root L1                | Restored compiler work         |
+| `sccache-server`          | empty        | warm pinned local sccache            | Specialist server baseline     |
+| `sccache-client`          | empty        | warm pinned client-side sccache      | Specialist daemonless baseline |
+| `transparent-incremental` | empty        | installed L1, incremental forced     | Unsupported early bypass       |
 
 Each lane has an isolated Cargo home and cache authority below the result directory. Setup is performed through
 `cargo rail cache setup`; the developer's Cargo configuration is never read or changed as installation authority.

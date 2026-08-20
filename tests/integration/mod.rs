@@ -1,3 +1,5 @@
+//! Front-door integration coverage for cargo-rail commands and workspace contracts.
+
 mod helpers;
 mod test_cache_installation;
 mod test_check;

@@ -28,7 +28,7 @@ pub use change_analyzer::ChangeImpact;
 // Re-export workspace types from context module
 pub use context::{CargoState, GitState, WorkspaceContext};
 pub use snapshot::{
-  LockedPackageIdentity, LockfileSnapshot, SnapshotFile, SnapshotId, SnapshotPackage, WorkspaceSnapshot,
+    LockedPackageIdentity, LockfileSnapshot, SnapshotFile, SnapshotId, SnapshotPackage, WorkspaceSnapshot,
 };
 
 // Re-export view types
@@ -36,5 +36,5 @@ pub use view::{CrateInfo, WorkspaceView};
 
 /// Return the workspace-owned root for generated cargo-rail state.
 pub(crate) fn cargo_rail_state_root(workspace_root: &Path) -> PathBuf {
-  workspace_root.join("target").join("cargo-rail")
+    workspace_root.join("target").join("cargo-rail")
 }

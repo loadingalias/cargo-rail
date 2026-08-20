@@ -6,7 +6,7 @@
 [crates.my-crate.split]
 remote = "git@github.com:your-org/my-crate.git"
 branch = "main"
-mode = "single"             # single | combined
+mode = "single" # single | combined
 workspace_mode = "standalone" # standalone | workspace
 # members defaults to ["my-crate"]; combined splits list package names here.
 include = []

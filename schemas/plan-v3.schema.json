@@ -89,7 +89,10 @@
       "additionalProperties": false,
       "required": ["path", "kind", "owners", "owner_scope"],
       "properties": {
-        "path": { "type": "string", "pattern": "^[^/\\\\](?!.*(?:^|[/\\\\])\\.\\.(?:[/\\\\]|$)).*$" },
+        "path": {
+          "type": "string",
+          "pattern": "^[^/\\\\](?!.*(?:^|[/\\\\])\\.\\.(?:[/\\\\]|$)).*$"
+        },
         "kind": { "type": "string" },
         "sub_kind": { "type": "string" },
         "custom_surfaces": { "$ref": "#/$defs/string_array" },
@@ -174,7 +177,10 @@
         "id": { "type": "integer", "minimum": 1 },
         "code": { "type": "string", "minLength": 1 },
         "description": { "type": "string", "minLength": 1 },
-        "file": { "type": "string", "pattern": "^[^/\\\\](?!.*(?:^|[/\\\\])\\.\\.(?:[/\\\\]|$)).*$" },
+        "file": {
+          "type": "string",
+          "pattern": "^[^/\\\\](?!.*(?:^|[/\\\\])\\.\\.(?:[/\\\\]|$)).*$"
+        },
         "crate": { "type": "string" },
         "depends_on": { "type": "string" },
         "surface": { "type": "string" }

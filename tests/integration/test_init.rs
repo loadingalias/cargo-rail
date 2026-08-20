@@ -4,239 +4,266 @@ use crate::helpers::{TestWorkspace, load_rail_config, run_cargo_rail};
 use anyhow::Result;
 
 #[test]
-fn test_init_creates_config() -> Result<()> {
-  let ws = TestWorkspace::new_named("init-basic")?;
-  ws.remove_config()?; // Remove default config for init test
+fn test_init_creates_config() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("init-basic")?;
+        ws.remove_config()?; // Remove default config for init test
 
-  // Run init command
-  let output = run_cargo_rail(&ws.path, &["rail", "init"])?;
+        // Run init command
+        let output = run_cargo_rail(&ws.path, &["rail", "init"])?;
 
-  // Verify success
-  assert!(output.status.success(), "init should succeed");
+        // Verify success
+        assert!(output.status.success(), "init should succeed");
 
-  // Verify config was created
-  let config_path = &ws.path.join(".config/rail.toml");
-  assert!(config_path.exists(), "config file should be created");
+        // Verify config was created
+        let config_path = &ws.path.join(".config/rail.toml");
+        assert!(config_path.exists(), "config file should be created");
 
-  // Init writes only detected choices that differ from coded defaults.
-  let config_content = std::fs::read_to_string(config_path)?;
-  assert!(config_content.contains("cargo-rail configuration"));
-  assert!(!config_content.contains("[unify]"));
-  assert!(!config_content.contains("[release]"));
-  assert!(!config_content.contains("[change-detection]"));
-  assert!(!config_content.contains("[run]"));
+        // Init writes only detected choices that differ from coded defaults.
+        let config_content = std::fs::read_to_string(config_path)?;
+        assert!(config_content.contains("cargo-rail configuration"));
+        assert!(!config_content.contains("[unify]"));
+        assert!(!config_content.contains("[release]"));
+        assert!(!config_content.contains("[change-detection]"));
+        assert!(!config_content.contains("[run]"));
 
-  Ok(())
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
 }
 
 #[test]
-fn test_init_respects_force_flag() -> Result<()> {
-  let ws = TestWorkspace::new_named("init-force")?;
-  ws.remove_config()?; // Remove default config for init test
+fn test_init_respects_force_flag() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("init-force")?;
+        ws.remove_config()?; // Remove default config for init test
 
-  // Create initial config
-  run_cargo_rail(&ws.path, &["rail", "init"])?;
-  let config_path = &ws.path.join(".config/rail.toml");
-  assert!(config_path.exists());
+        // Create initial config
+        run_cargo_rail(&ws.path, &["rail", "init"])?;
+        let config_path = &ws.path.join(".config/rail.toml");
+        assert!(config_path.exists());
 
-  // Try to init again without --force (should fail)
-  let output = run_cargo_rail(&ws.path, &["rail", "init"])?;
-  assert!(!output.status.success(), "init should fail when config exists");
-  assert!(
-    String::from_utf8_lossy(&output.stderr).contains("configuration exists"),
-    "error should mention config already exists"
-  );
+        // Try to init again without --force (should fail)
+        let output = run_cargo_rail(&ws.path, &["rail", "init"])?;
+        assert!(!output.status.success(), "init should fail when config exists");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("configuration exists"),
+            "error should mention config already exists"
+        );
 
-  // Try with --force (should succeed)
-  let output = run_cargo_rail(&ws.path, &["rail", "init", "--force"])?;
-  assert!(output.status.success(), "init --force should succeed");
+        // Try with --force (should succeed)
+        let output = run_cargo_rail(&ws.path, &["rail", "init", "--force"])?;
+        assert!(output.status.success(), "init --force should succeed");
 
-  Ok(())
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
 }
 
 #[test]
-fn test_init_dry_run_mode() -> Result<()> {
-  let ws = TestWorkspace::new_named("init-dry-run")?;
-  ws.remove_config()?; // Remove default config for init test
+fn test_init_dry_run_mode() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("init-dry-run")?;
+        ws.remove_config()?; // Remove default config for init test
 
-  // `--dry-run` previews execution; `--check` is reserved for read-only checks.
-  let output = run_cargo_rail(&ws.path, &["rail", "init", "--dry-run"])?;
+        // `--dry-run` previews execution; `--check` is reserved for read-only checks.
+        let output = run_cargo_rail(&ws.path, &["rail", "init", "--dry-run"])?;
 
-  // Verify success
-  assert!(output.status.success(), "dry-run mode should succeed");
+        // Verify success
+        assert!(output.status.success(), "dry-run mode should succeed");
 
-  // Verify config was NOT created
-  let config_path = &ws.path.join(".config/rail.toml");
-  assert!(
-    !config_path.exists(),
-    "config file should NOT be created in dry-run mode"
-  );
+        // Verify config was NOT created
+        let config_path = &ws.path.join(".config/rail.toml");
+        assert!(
+            !config_path.exists(),
+            "config file should NOT be created in dry-run mode"
+        );
 
-  // Verify output shows config
-  let stdout = String::from_utf8_lossy(&output.stdout);
-  assert!(stdout.contains("cargo-rail configuration"));
+        // Verify output shows config
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("cargo-rail configuration"));
 
-  Ok(())
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
 }
 
 #[test]
-fn test_init_custom_output_path() -> Result<()> {
-  let ws = TestWorkspace::new_named("init-custom-path")?;
-  ws.remove_config()?; // Remove default config for init test
+fn test_init_custom_output_path() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("init-custom-path")?;
+        ws.remove_config()?; // Remove default config for init test
 
-  // Run init with custom output
-  run_cargo_rail(&ws.path, &["rail", "init", "--output", "rail.toml"])?;
+        // Run init with custom output
+        run_cargo_rail(&ws.path, &["rail", "init", "--output", "rail.toml"])?;
 
-  // Verify config was created at custom path
-  let config_path = &ws.path.join("rail.toml");
-  assert!(config_path.exists(), "config should be created at custom path");
+        // Verify config was created at custom path
+        let config_path = &ws.path.join("rail.toml");
+        assert!(config_path.exists(), "config should be created at custom path");
 
-  // Verify default path was NOT created
-  let default_path = &ws.path.join(".config/rail.toml");
-  assert!(!default_path.exists(), "config should NOT be at default path");
+        // Verify default path was NOT created
+        let default_path = &ws.path.join(".config/rail.toml");
+        assert!(!default_path.exists(), "config should NOT be at default path");
 
-  Ok(())
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
 }
 
 #[test]
-fn test_init_creates_directory_if_needed() -> Result<()> {
-  let ws = TestWorkspace::new_named("init-mkdir")?;
-  ws.remove_config()?; // Remove default config for init test
+fn test_init_creates_directory_if_needed() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("init-mkdir")?;
+        ws.remove_config()?; // Remove default config for init test
 
-  // Remove .config directory entirely for this test
-  let config_dir = &ws.path.join(".config");
-  if config_dir.exists() {
-    std::fs::remove_dir_all(config_dir)?;
-  }
-  assert!(!config_dir.exists(), ".config should not exist initially");
+        // Remove .config directory entirely for this test
+        let config_dir = &ws.path.join(".config");
+        if config_dir.exists() {
+            std::fs::remove_dir_all(config_dir)?;
+        }
+        assert!(!config_dir.exists(), ".config should not exist initially");
 
-  // Run init
-  run_cargo_rail(&ws.path, &["rail", "init"])?;
+        // Run init
+        run_cargo_rail(&ws.path, &["rail", "init"])?;
 
-  // Verify .config was created
-  assert!(config_dir.exists(), ".config directory should be created");
-  assert!(config_dir.is_dir(), ".config should be a directory");
+        // Verify .config was created
+        assert!(config_dir.exists(), ".config directory should be created");
+        assert!(config_dir.is_dir(), ".config should be a directory");
 
-  // Verify config file exists
-  assert!(config_dir.join("rail.toml").exists());
+        // Verify config file exists
+        assert!(config_dir.join("rail.toml").exists());
 
-  Ok(())
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
 }
 
 #[test]
 fn test_init_generated_config_is_valid() -> Result<()> {
-  let ws = TestWorkspace::new_named("init-valid")?;
-  ws.remove_config()?; // Remove default config for init test
+    let ws = TestWorkspace::new_named("init-valid")?;
+    ws.remove_config()?; // Remove default config for init test
 
-  // Run init
-  run_cargo_rail(&ws.path, &["rail", "init"])?;
+    // Run init
+    run_cargo_rail(&ws.path, &["rail", "init"])?;
 
-  // Try to load the config using RailConfig
-  let config = load_rail_config(&ws.path)?;
+    // Try to load the config using RailConfig
+    let config = load_rail_config(&ws.path)?;
 
-  // Verify basic fields exist (targets should be present, possibly empty)
-  let _ = &config.targets; // Just verify it's accessible
+    // Verify basic fields exist (targets should be present, possibly empty)
+    let _ = &config.targets; // Just verify it's accessible
 
-  Ok(())
+    Ok(())
 }
 
 #[test]
-fn test_init_generated_config_passes_strict_validate() -> Result<()> {
-  let ws = TestWorkspace::new_named("init-strict-validate")?;
-  ws.remove_config()?;
+fn test_init_generated_config_passes_strict_validate() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("init-strict-validate")?;
+        ws.remove_config()?;
 
-  let init_output = run_cargo_rail(&ws.path, &["rail", "init"])?;
-  assert!(
-    init_output.status.success(),
-    "init should succeed before strict validation"
-  );
+        let init_output = run_cargo_rail(&ws.path, &["rail", "init"])?;
+        assert!(
+            init_output.status.success(),
+            "init should succeed before strict validation"
+        );
 
-  let validate_output = run_cargo_rail(&ws.path, &["rail", "config", "validate", "--strict", "-f", "json"])?;
-  assert!(
-    validate_output.status.success(),
-    "generated config must pass strict validation. stderr:\n{}",
-    String::from_utf8_lossy(&validate_output.stderr)
-  );
+        let validate_output = run_cargo_rail(&ws.path, &["rail", "config", "validate", "--strict", "-f", "json"])?;
+        assert!(
+            validate_output.status.success(),
+            "generated config must pass strict validation. stderr:\n{}",
+            String::from_utf8_lossy(&validate_output.stderr)
+        );
 
-  Ok(())
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
 }
 
 #[test]
-fn test_init_generated_config_migrate_check_is_idempotent() -> Result<()> {
-  let ws = TestWorkspace::new_named("init-migrate-idempotent")?;
-  ws.remove_config()?;
+fn test_init_generated_config_migrate_check_is_idempotent() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("init-migrate-idempotent")?;
+        ws.remove_config()?;
 
-  let init_output = run_cargo_rail(&ws.path, &["rail", "init"])?;
-  assert!(init_output.status.success(), "init should succeed");
+        let init_output = run_cargo_rail(&ws.path, &["rail", "init"])?;
+        assert!(init_output.status.success(), "init should succeed");
 
-  let migrate_check_output = run_cargo_rail(&ws.path, &["rail", "config", "migrate", "--check", "-f", "json"])?;
-  assert!(
-    migrate_check_output.status.success(),
-    "fresh init config should need no migration. stdout:\n{}\nstderr:\n{}",
-    String::from_utf8_lossy(&migrate_check_output.stdout),
-    String::from_utf8_lossy(&migrate_check_output.stderr)
-  );
+        let migrate_check_output = run_cargo_rail(&ws.path, &["rail", "config", "migrate", "--check", "-f", "json"])?;
+        assert!(
+            migrate_check_output.status.success(),
+            "fresh init config should need no migration. stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&migrate_check_output.stdout),
+            String::from_utf8_lossy(&migrate_check_output.stderr)
+        );
 
-  Ok(())
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
 }
 
 #[test]
-fn test_init_omits_default_sections_and_templates() -> Result<()> {
-  let ws = TestWorkspace::new_named("init-sparse")?;
-  ws.remove_config()?; // Remove default config for init test
+fn test_init_omits_default_sections_and_templates() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("init-sparse")?;
+        ws.remove_config()?; // Remove default config for init test
 
-  // Run init
-  run_cargo_rail(&ws.path, &["rail", "init"])?;
+        // Run init
+        run_cargo_rail(&ws.path, &["rail", "init"])?;
 
-  let config_content = std::fs::read_to_string(ws.path.join(".config/rail.toml"))?;
+        let config_content = std::fs::read_to_string(ws.path.join(".config/rail.toml"))?;
 
-  assert!(!config_content.contains("[unify]"));
-  assert!(!config_content.contains("[release]"));
-  assert!(!config_content.contains("[change-detection]"));
-  assert!(!config_content.contains("[crates.my-crate.split]"));
+        assert!(!config_content.contains("[unify]"));
+        assert!(!config_content.contains("[release]"));
+        assert!(!config_content.contains("[change-detection]"));
+        assert!(!config_content.contains("[crates.my-crate.split]"));
 
-  Ok(())
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
 }
 
 /// Test that --output to a different path works when default config exists
 #[test]
-fn test_init_output_different_path_with_existing_config() -> Result<()> {
-  let ws = TestWorkspace::new_named("init-output-diff")?;
+fn test_init_output_different_path_with_existing_config() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("init-output-diff")?;
 
-  // Create config at default location
-  let default_config = ws.path.join(".config/rail.toml");
-  std::fs::create_dir_all(ws.path.join(".config"))?;
-  std::fs::write(&default_config, "# existing config\n[unify]\n")?;
-  assert!(default_config.exists(), "default config should exist");
+        // Create config at default location
+        let default_config = ws.path.join(".config/rail.toml");
+        std::fs::create_dir_all(ws.path.join(".config"))?;
+        std::fs::write(&default_config, "# existing config\n[unify]\n")?;
+        assert!(default_config.exists(), "default config should exist");
 
-  // Run init with different output path - should succeed without --force
-  let custom_path = "custom-rail.toml";
-  let output = run_cargo_rail(&ws.path, &["rail", "init", "--output", custom_path])?;
+        // Run init with different output path - should succeed without --force
+        let custom_path = "custom-rail.toml";
+        let output = run_cargo_rail(&ws.path, &["rail", "init", "--output", custom_path])?;
 
-  assert!(
-    output.status.success(),
-    "init with different --output should succeed even with existing config"
-  );
+        assert!(
+            output.status.success(),
+            "init with different --output should succeed even with existing config"
+        );
 
-  // Verify custom config was created
-  let custom_config = ws.path.join(custom_path);
-  assert!(custom_config.exists(), "custom config should be created");
+        // Verify custom config was created
+        let custom_config = ws.path.join(custom_path);
+        assert!(custom_config.exists(), "custom config should be created");
 
-  // Verify default config still exists (unchanged)
-  assert!(default_config.exists(), "default config should still exist");
-  let default_content = std::fs::read_to_string(&default_config)?;
-  assert!(
-    default_content.contains("# existing config"),
-    "default config should be unchanged"
-  );
+        // Verify default config still exists (unchanged)
+        assert!(default_config.exists(), "default config should still exist");
+        let default_content = std::fs::read_to_string(&default_config)?;
+        assert!(
+            default_content.contains("# existing config"),
+            "default config should be unchanged"
+        );
 
-  // Verify stderr warns about existing config
-  let stderr = String::from_utf8_lossy(&output.stderr);
-  assert!(
-    stderr.contains("note:") && stderr.contains("existing config"),
-    "should warn about existing config, got: {}",
-    stderr
-  );
+        // Verify stderr warns about existing config
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("note:") && stderr.contains("existing config"),
+            "should warn about existing config, got: {}",
+            stderr
+        );
 
-  Ok(())
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
 }

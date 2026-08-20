@@ -7,13 +7,13 @@ configuration, toolchain, metadata, and graph state instead of rebuilding partia
 
 Cargo-Rail has five workflows:
 
-| Workflow | Authority | Result |
-|---|---|---|
-| `unify` | Resolved Cargo graph plus compiler evidence | A checked or applied manifest mutation plan |
-| `plan` | Changed source plus the declared dependency universe | Selected surfaces and typed package scopes |
-| caching | Exact compiler inputs and verified result bytes | Diagnostic reuse or one compiler-result restore |
+| Workflow             | Authority                                                | Result                                                         |
+| -------------------- | -------------------------------------------------------- | -------------------------------------------------------------- |
+| `unify`              | Resolved Cargo graph plus compiler evidence              | A checked or applied manifest mutation plan                    |
+| `plan`               | Changed source plus the declared dependency universe     | Selected surfaces and typed package scopes                     |
+| caching              | Exact compiler inputs and verified result bytes          | Diagnostic reuse or one compiler-result restore                |
 | `change` / `release` | Reviewed change intent plus exact Git and registry state | Versions, changelogs, publications, and durable recovery state |
-| `split` / `sync` | Captured source, Git history, and split ownership | Standalone history or mapped changes with origin evidence |
+| `split` / `sync`     | Captured source, Git history, and split ownership        | Standalone history or mapped changes with origin evidence      |
 
 These workflows share infrastructure, not hidden control flow. Running `plan` does not run `unify`; running `release`
 does not silently invoke split or sync.
@@ -79,15 +79,15 @@ belong to `cache/`; compiler sessions and evidence remain in `compiler/`.
 
 ## Module ownership
 
-| Modules | Responsibility |
-|---|---|
-| `workspace/`, `source/` | Captured authority and derived workspace views |
-| `cargo/`, `graph/`, `toml/` | Cargo resolution, graph algorithms, and lossless editing |
-| `change_detection/`, `commands/plan.rs` | File semantics, impact, surfaces, and scope |
-| `compiler/` | Pre-Clap compiler invocation, sessions, observations, diagnostics, and native-result decisions |
-| `cache/` | Shared immutable CAS primitives, retained output manifests, measurement, and reclamation |
-| `mutation/` | Plan/apply drift checks, authorized paths, and receipts |
-| `release/`, `split/`, `sync/` | Workflows that cross repository or publication boundaries |
-| `git/`, source path types, process helpers | External capabilities and containment |
+| Modules                                    | Responsibility                                                                                 |
+| ------------------------------------------ | ---------------------------------------------------------------------------------------------- |
+| `workspace/`, `source/`                    | Captured authority and derived workspace views                                                 |
+| `cargo/`, `graph/`, `toml/`                | Cargo resolution, graph algorithms, and lossless editing                                       |
+| `change_detection/`, `commands/plan.rs`    | File semantics, impact, surfaces, and scope                                                    |
+| `compiler/`                                | Pre-Clap compiler invocation, sessions, observations, diagnostics, and native-result decisions |
+| `cache/`                                   | Shared immutable CAS primitives, retained output manifests, measurement, and reclamation       |
+| `mutation/`                                | Plan/apply drift checks, authorized paths, and receipts                                        |
+| `release/`, `split/`, `sync/`              | Workflows that cross repository or publication boundaries                                      |
+| `git/`, source path types, process helpers | External capabilities and containment                                                          |
 
 `src/main.rs` remains a thin process entry point. User-visible behavior belongs in the library.

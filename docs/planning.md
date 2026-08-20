@@ -23,13 +23,13 @@ source and resolution view; they do not combine file decisions from one moment w
 
 ## Surfaces
 
-| Surface | Meaning |
-|---|---|
-| `build` | Compilation may be affected |
-| `test` | Test compilation or execution may be affected |
-| `bench` | Benchmark work changed |
-| `docs` | Documentation work changed |
-| `infra` | CI, scripts, tooling, or workspace operations changed |
+| Surface     | Meaning                                                 |
+| ----------- | ------------------------------------------------------- |
+| `build`     | Compilation may be affected                             |
+| `test`      | Test compilation or execution may be affected           |
+| `bench`     | Benchmark work changed                                  |
+| `docs`      | Documentation work changed                              |
+| `infra`     | CI, scripts, tooling, or workspace operations changed   |
 | custom name | A configured repository-specific classification matched |
 
 `infra` and custom surfaces are gates. They do not carry Cargo package arguments because their commands belong in
@@ -86,11 +86,11 @@ scope contract before executing Cargo.
 
 ## Confidence and incomplete evidence
 
-| Confidence | Behavior |
-|---|---|
-| `strict` | Expands owned changes to build/test and propagates their impact |
+| Confidence | Behavior                                                            |
+| ---------- | ------------------------------------------------------------------- |
+| `strict`   | Expands owned changes to build/test and propagates their impact     |
 | `balanced` | Uses built-in classification and the configured unknown-file policy |
-| `fast` | Avoids conservative transitive expansion |
+| `fast`     | Avoids conservative transitive expansion                            |
 
 `unknown_file_policy` controls unrecognized paths independently. See the
 [configuration reference](config.md#change-detection) for its policies and defaults.

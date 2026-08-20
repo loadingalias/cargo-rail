@@ -14,78 +14,74 @@ use crate::error::{RailError, RailResult};
 /// `FileType::is_symlink` does not classify directory junctions on Windows.
 /// Cache authority must reject every reparse point before traversing it.
 pub(crate) fn is_symlink_or_reparse(metadata: &fs::Metadata) -> bool {
-  if metadata.file_type().is_symlink() {
-    return true;
-  }
-  #[cfg(windows)]
-  {
-    use std::os::windows::fs::MetadataExt as _;
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
 
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-  }
-  #[cfg(not(windows))]
-  {
-    false
-  }
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 /// Open a cache lock without permitting pathname replacement on Windows.
 pub(crate) fn open_cache_lock_file(path: &Path, create: bool) -> io::Result<fs::File> {
-  let mut options = fs::OpenOptions::new();
-  options.read(true).write(true).create(create).truncate(false);
-  #[cfg(windows)]
-  {
-    use std::os::windows::fs::OpenOptionsExt as _;
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(create).truncate(false);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
 
-    const FILE_SHARE_READ: u32 = 0x0000_0001;
-    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
-    options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
-  }
-  options.open(path)
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+    }
+    options.open(path)
 }
 
 /// Verify that a path still names one private opened regular file.
 pub(crate) fn private_file_matches_path(opened: &fs::File, path: &Path, expected_len: u64) -> io::Result<bool> {
-  let opened_metadata = opened.metadata()?;
-  let named_metadata = fs::symlink_metadata(path)?;
-  if !opened_metadata.is_file()
-    || !named_metadata.is_file()
-    || is_symlink_or_reparse(&named_metadata)
-    || opened_metadata.len() != expected_len
-    || named_metadata.len() != expected_len
-  {
-    return Ok(false);
-  }
+    let opened_metadata = opened.metadata()?;
+    let named_metadata = fs::symlink_metadata(path)?;
+    if !opened_metadata.is_file()
+        || !named_metadata.is_file()
+        || is_symlink_or_reparse(&named_metadata)
+        || opened_metadata.len() != expected_len
+        || named_metadata.len() != expected_len
+    {
+        return Ok(false);
+    }
 
-  #[cfg(unix)]
-  {
-    use std::os::unix::fs::MetadataExt as _;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
 
-    Ok(
-      opened_metadata.dev() == named_metadata.dev()
-        && opened_metadata.ino() == named_metadata.ino()
-        && opened_metadata.nlink() == 1
-        && named_metadata.nlink() == 1,
-    )
-  }
-  #[cfg(windows)]
-  {
-    let named = crate::windows_fs::open_for_observation(path)?;
-    let opened_observation = crate::windows_fs::observe_file(opened)?;
-    let named_observation = crate::windows_fs::observe_file(&named)?;
-    crate::windows_fs::prove_local_ntfs(opened, opened_observation.volume_serial_number)?;
-    crate::windows_fs::prove_local_ntfs(&named, named_observation.volume_serial_number)?;
-    Ok(
-      opened_observation == named_observation
-        && opened_observation.number_of_links == 1
-        && opened_observation.size == expected_len,
-    )
-  }
-  #[cfg(not(any(unix, windows)))]
-  {
-    Ok(true)
-  }
+        Ok(opened_metadata.dev() == named_metadata.dev()
+            && opened_metadata.ino() == named_metadata.ino()
+            && opened_metadata.nlink() == 1
+            && named_metadata.nlink() == 1)
+    }
+    #[cfg(windows)]
+    {
+        let named = crate::windows_fs::open_for_observation(path)?;
+        let opened_observation = crate::windows_fs::observe_file(opened)?;
+        let named_observation = crate::windows_fs::observe_file(&named)?;
+        crate::windows_fs::prove_local_ntfs(opened, opened_observation.volume_serial_number)?;
+        crate::windows_fs::prove_local_ntfs(&named, named_observation.volume_serial_number)?;
+        Ok(opened_observation == named_observation
+            && opened_observation.number_of_links == 1
+            && opened_observation.size == expected_len)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Ok(true)
+    }
 }
 
 /// Ask a copy-on-write filesystem to clone one opened regular file.
@@ -95,53 +91,53 @@ pub(crate) fn private_file_matches_path(opened: &fs::File, path: &Path, expected
 /// correct fallback.
 #[cfg(target_vendor = "apple")]
 pub(crate) fn try_clone_regular_file(source: &fs::File, destination: &Path) -> Option<fs::File> {
-  let parent = fs::File::open(destination.parent()?).ok()?;
-  let name = destination.file_name()?;
-  if rustix::fs::fclonefileat(
-    source,
-    &parent,
-    name,
-    rustix::fs::CloneFlags::NOFOLLOW | rustix::fs::CloneFlags::NOOWNERCOPY,
-  )
-  .is_ok()
-  {
-    match fs::OpenOptions::new().read(true).write(true).open(destination) {
-      Ok(output) => Some(output),
-      Err(_) => {
-        let _ = fs::remove_file(destination);
+    let parent = fs::File::open(destination.parent()?).ok()?;
+    let name = destination.file_name()?;
+    if rustix::fs::fclonefileat(
+        source,
+        &parent,
+        name,
+        rustix::fs::CloneFlags::NOFOLLOW | rustix::fs::CloneFlags::NOOWNERCOPY,
+    )
+    .is_ok()
+    {
+        match fs::OpenOptions::new().read(true).write(true).open(destination) {
+            Ok(output) => Some(output),
+            Err(_) => {
+                drop(fs::remove_file(destination));
+                None
+            }
+        }
+    } else {
+        drop(fs::remove_file(destination));
         None
-      }
     }
-  } else {
-    let _ = fs::remove_file(destination);
-    None
-  }
 }
 
 #[cfg(all(target_os = "linux", not(any(target_arch = "sparc", target_arch = "sparc64"))))]
 pub(crate) fn try_clone_regular_file(source: &fs::File, destination: &Path) -> Option<fs::File> {
-  let output = fs::OpenOptions::new()
-    .read(true)
-    .write(true)
-    .create_new(true)
-    .open(destination)
-    .ok()?;
-  match rustix::fs::ioctl_ficlone(&output, source) {
-    Ok(()) => Some(output),
-    Err(_) => {
-      drop(output);
-      let _ = fs::remove_file(destination);
-      None
+    let output = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .ok()?;
+    match rustix::fs::ioctl_ficlone(&output, source) {
+        Ok(()) => Some(output),
+        Err(_) => {
+            drop(output);
+            let _ = fs::remove_file(destination);
+            None
+        }
     }
-  }
 }
 
 #[cfg(not(any(
-  target_vendor = "apple",
-  all(target_os = "linux", not(any(target_arch = "sparc", target_arch = "sparc64")))
+    target_vendor = "apple",
+    all(target_os = "linux", not(any(target_arch = "sparc", target_arch = "sparc64")))
 )))]
 pub(crate) fn try_clone_regular_file(_source: &fs::File, _destination: &Path) -> Option<fs::File> {
-  None
+    None
 }
 
 /// Capture stable local filesystem generation evidence without reading file
@@ -149,122 +145,122 @@ pub(crate) fn try_clone_regular_file(_source: &fs::File, _destination: &Path) ->
 /// evidence remains exact.
 #[cfg(target_os = "macos")]
 pub(crate) fn stable_file_generation(path: &Path) -> Option<Vec<u8>> {
-  use std::os::macos::fs::MetadataExt as _;
+    use std::os::macos::fs::MetadataExt as _;
 
-  let metadata = fs::symlink_metadata(path).ok()?;
-  if !metadata.is_file() || is_symlink_or_reparse(&metadata) {
-    return None;
-  }
-  let mut generation = Vec::from(&b"macos-file-generation-v1\0"[..]);
-  for value in [
-    metadata.st_dev(),
-    metadata.st_ino(),
-    u64::from(metadata.st_mode()),
-    metadata.st_nlink(),
-    metadata.st_size(),
-    metadata.st_mtime() as u64,
-    metadata.st_mtime_nsec() as u64,
-    metadata.st_ctime() as u64,
-    metadata.st_ctime_nsec() as u64,
-    metadata.st_birthtime() as u64,
-    metadata.st_birthtime_nsec() as u64,
-    u64::from(metadata.st_gen()),
-  ] {
-    generation.extend_from_slice(&value.to_le_bytes());
-  }
-  Some(generation)
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() || is_symlink_or_reparse(&metadata) {
+        return None;
+    }
+    let mut generation = Vec::from(&b"macos-file-generation-v1\0"[..]);
+    for value in [
+        metadata.st_dev(),
+        metadata.st_ino(),
+        u64::from(metadata.st_mode()),
+        metadata.st_nlink(),
+        metadata.st_size(),
+        u64::from_ne_bytes(metadata.st_mtime().to_ne_bytes()),
+        u64::from_ne_bytes(metadata.st_mtime_nsec().to_ne_bytes()),
+        u64::from_ne_bytes(metadata.st_ctime().to_ne_bytes()),
+        u64::from_ne_bytes(metadata.st_ctime_nsec().to_ne_bytes()),
+        u64::from_ne_bytes(metadata.st_birthtime().to_ne_bytes()),
+        u64::from_ne_bytes(metadata.st_birthtime_nsec().to_ne_bytes()),
+        u64::from(metadata.st_gen()),
+    ] {
+        generation.extend_from_slice(&value.to_le_bytes());
+    }
+    Some(generation)
 }
 
 #[cfg(target_os = "linux")]
 pub(crate) fn stable_file_generation(path: &Path) -> Option<Vec<u8>> {
-  use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::fs::MetadataExt as _;
 
-  let metadata = fs::symlink_metadata(path).ok()?;
-  if !metadata.is_file() || is_symlink_or_reparse(&metadata) {
-    return None;
-  }
-  let mut generation = Vec::from(&b"linux-file-generation-v1\0"[..]);
-  for value in [
-    metadata.dev(),
-    metadata.ino(),
-    metadata.mode() as u64,
-    metadata.nlink(),
-    metadata.size(),
-    metadata.mtime() as u64,
-    metadata.mtime_nsec() as u64,
-    metadata.ctime() as u64,
-    metadata.ctime_nsec() as u64,
-  ] {
-    generation.extend_from_slice(&value.to_le_bytes());
-  }
-  Some(generation)
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() || is_symlink_or_reparse(&metadata) {
+        return None;
+    }
+    let mut generation = Vec::from(&b"linux-file-generation-v1\0"[..]);
+    for value in [
+        metadata.dev(),
+        metadata.ino(),
+        metadata.mode() as u64,
+        metadata.nlink(),
+        metadata.size(),
+        metadata.mtime() as u64,
+        metadata.mtime_nsec() as u64,
+        metadata.ctime() as u64,
+        metadata.ctime_nsec() as u64,
+    ] {
+        generation.extend_from_slice(&value.to_le_bytes());
+    }
+    Some(generation)
 }
 
 #[cfg(windows)]
 pub(crate) fn stable_file_generation(path: &Path) -> Option<Vec<u8>> {
-  let file = crate::windows_fs::open_for_observation(path).ok()?;
-  let observation = crate::windows_fs::observe_file(&file).ok()?;
-  crate::windows_fs::prove_local_ntfs(&file, observation.volume_serial_number).ok()?;
-  let repeated = crate::windows_fs::open_for_observation(path).ok()?;
-  let repeated = crate::windows_fs::observe_file(&repeated).ok()?;
-  if observation != repeated || observation.file_attributes & 0x10 != 0 {
-    return None;
-  }
-  let mut generation = Vec::from(&b"windows-file-generation-v1\0"[..]);
-  for value in [
-    observation.volume_serial_number,
-    observation.file_id,
-    observation.creation_time,
-    observation.last_write_time,
-    observation.change_time,
-    u64::from(observation.file_attributes),
-    observation.size,
-    observation.number_of_links,
-  ] {
-    generation.extend_from_slice(&value.to_le_bytes());
-  }
-  Some(generation)
+    let file = crate::windows_fs::open_for_observation(path).ok()?;
+    let observation = crate::windows_fs::observe_file(&file).ok()?;
+    crate::windows_fs::prove_local_ntfs(&file, observation.volume_serial_number).ok()?;
+    let repeated = crate::windows_fs::open_for_observation(path).ok()?;
+    let repeated = crate::windows_fs::observe_file(&repeated).ok()?;
+    if observation != repeated || observation.file_attributes & 0x10 != 0 {
+        return None;
+    }
+    let mut generation = Vec::from(&b"windows-file-generation-v1\0"[..]);
+    for value in [
+        observation.volume_serial_number,
+        observation.file_id,
+        observation.creation_time,
+        observation.last_write_time,
+        observation.change_time,
+        u64::from(observation.file_attributes),
+        observation.size,
+        observation.number_of_links,
+    ] {
+        generation.extend_from_slice(&value.to_le_bytes());
+    }
+    Some(generation)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub(crate) fn stable_file_generation(_path: &Path) -> Option<Vec<u8>> {
-  None
+    None
 }
 
 /// Verify that a path still names the same opened regular file without
 /// rejecting benign hard links. This is the file-capture identity guard; cache
 /// authority files use the stricter single-link variant above.
 pub(crate) fn opened_file_matches_path(opened: &fs::File, path: &Path, expected_len: u64) -> io::Result<bool> {
-  let opened_metadata = opened.metadata()?;
-  let named_metadata = fs::symlink_metadata(path)?;
-  if !opened_metadata.is_file()
-    || !named_metadata.is_file()
-    || is_symlink_or_reparse(&named_metadata)
-    || opened_metadata.len() != expected_len
-    || named_metadata.len() != expected_len
-  {
-    return Ok(false);
-  }
+    let opened_metadata = opened.metadata()?;
+    let named_metadata = fs::symlink_metadata(path)?;
+    if !opened_metadata.is_file()
+        || !named_metadata.is_file()
+        || is_symlink_or_reparse(&named_metadata)
+        || opened_metadata.len() != expected_len
+        || named_metadata.len() != expected_len
+    {
+        return Ok(false);
+    }
 
-  #[cfg(unix)]
-  {
-    use std::os::unix::fs::MetadataExt as _;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
 
-    Ok(opened_metadata.dev() == named_metadata.dev() && opened_metadata.ino() == named_metadata.ino())
-  }
-  #[cfg(windows)]
-  {
-    let named = crate::windows_fs::open_for_observation(path)?;
-    let opened_observation = crate::windows_fs::observe_file(opened)?;
-    let named_observation = crate::windows_fs::observe_file(&named)?;
-    crate::windows_fs::prove_local_ntfs(opened, opened_observation.volume_serial_number)?;
-    crate::windows_fs::prove_local_ntfs(&named, named_observation.volume_serial_number)?;
-    Ok(opened_observation == named_observation && opened_observation.size == expected_len)
-  }
-  #[cfg(not(any(unix, windows)))]
-  {
-    Ok(opened_metadata.modified()? == named_metadata.modified()?)
-  }
+        Ok(opened_metadata.dev() == named_metadata.dev() && opened_metadata.ino() == named_metadata.ino())
+    }
+    #[cfg(windows)]
+    {
+        let named = crate::windows_fs::open_for_observation(path)?;
+        let opened_observation = crate::windows_fs::observe_file(opened)?;
+        let named_observation = crate::windows_fs::observe_file(&named)?;
+        crate::windows_fs::prove_local_ntfs(opened, opened_observation.volume_serial_number)?;
+        crate::windows_fs::prove_local_ntfs(&named, named_observation.volume_serial_number)?;
+        Ok(opened_observation == named_observation && opened_observation.size == expected_len)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Ok(opened_metadata.modified()? == named_metadata.modified()?)
+    }
 }
 
 // ============================================================================
@@ -277,16 +273,16 @@ pub(crate) fn opened_file_matches_path(opened: &fs::File, path: &Path, expected_
 /// Used for change detection and cache invalidation.
 #[inline]
 pub fn fnv1a64(bytes: &[u8]) -> u64 {
-  const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-  const FNV_PRIME: u64 = 0x100000001b3;
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
 
-  crate::instrumentation::record_hash(bytes.len());
-  let mut hash = FNV_OFFSET_BASIS;
-  for byte in bytes {
-    hash ^= *byte as u64;
-    hash = hash.wrapping_mul(FNV_PRIME);
-  }
-  hash
+    crate::instrumentation::record_hash(bytes.len());
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 /// Compute a fingerprint for a file's contents
@@ -294,13 +290,13 @@ pub fn fnv1a64(bytes: &[u8]) -> u64 {
 /// Produces a formatted fingerprint like `fnv1a64:0123456789abcdef`,
 /// or `"none"` when the file cannot be read.
 pub fn file_fingerprint(path: &Path) -> String {
-  match fs::read(path) {
-    Ok(bytes) => {
-      crate::instrumentation::record_hashed_file_bytes_read(bytes.len());
-      format!("fnv1a64:{:016x}", fnv1a64(&bytes))
+    match fs::read(path) {
+        Ok(bytes) => {
+            crate::instrumentation::record_hashed_file_bytes_read(bytes.len());
+            format!("fnv1a64:{:016x}", fnv1a64(&bytes))
+        }
+        Err(_) => "none".to_string(),
     }
-    Err(_) => "none".to_string(),
-  }
 }
 
 /// Compute a content fingerprint after normalizing text line endings.
@@ -309,33 +305,33 @@ pub fn file_fingerprint(path: &Path) -> String {
 /// configuration. Configuration identities must describe the parsed text, not
 /// the platform's checkout filter.
 fn text_file_fingerprint(path: &Path) -> String {
-  match fs::read(path) {
-    Ok(bytes) => {
-      crate::instrumentation::record_hashed_file_bytes_read(bytes.len());
-      let normalized = normalize_line_endings(&bytes);
-      format!("fnv1a64:{:016x}", fnv1a64(&normalized))
+    match fs::read(path) {
+        Ok(bytes) => {
+            crate::instrumentation::record_hashed_file_bytes_read(bytes.len());
+            let normalized = normalize_line_endings(&bytes);
+            format!("fnv1a64:{:016x}", fnv1a64(&normalized))
+        }
+        Err(_) => "none".to_string(),
     }
-    Err(_) => "none".to_string(),
-  }
 }
 
 pub(crate) fn normalize_line_endings(bytes: &[u8]) -> Cow<'_, [u8]> {
-  if !bytes.contains(&b'\r') {
-    return Cow::Borrowed(bytes);
-  }
-
-  let mut normalized = Vec::with_capacity(bytes.len());
-  let mut index = 0;
-  while index < bytes.len() {
-    if bytes[index] == b'\r' {
-      normalized.push(b'\n');
-      index += usize::from(bytes.get(index + 1) == Some(&b'\n'));
-    } else {
-      normalized.push(bytes[index]);
+    if !bytes.contains(&b'\r') {
+        return Cow::Borrowed(bytes);
     }
-    index += 1;
-  }
-  Cow::Owned(normalized)
+
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\r' {
+            normalized.push(b'\n');
+            index += usize::from(bytes.get(index + 1) == Some(&b'\n'));
+        } else {
+            normalized.push(bytes[index]);
+        }
+        index += 1;
+    }
+    Cow::Owned(normalized)
 }
 
 /// Atomically replace a file without following a predictable temporary path.
@@ -344,55 +340,55 @@ pub(crate) fn normalize_line_endings(bytes: &[u8]) -> Cow<'_, [u8]> {
 /// a concurrent process cannot pre-create a symlink at the chosen path and the
 /// final rename stays on the same filesystem.
 pub(crate) fn write_file_atomic(path: &Path, contents: &[u8]) -> RailResult<()> {
-  let parent = destination_parent(path);
-  let mut temporary = tempfile::Builder::new()
-    .prefix(".cargo-rail-")
-    .suffix(".tmp")
-    .tempfile_in(parent)
-    .map_err(|error| {
-      RailError::message(format!(
-        "failed to create temporary file in {}: {error}",
-        parent.display()
-      ))
-    })?;
+    let parent = destination_parent(path);
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".cargo-rail-")
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .map_err(|error| {
+            RailError::message(format!(
+                "failed to create temporary file in {}: {error}",
+                parent.display()
+            ))
+        })?;
 
-  if let Ok(metadata) = fs::symlink_metadata(path)
-    && metadata.file_type().is_file()
-  {
+    if let Ok(metadata) = fs::symlink_metadata(path)
+        && metadata.file_type().is_file()
+    {
+        temporary
+            .as_file()
+            .set_permissions(metadata.permissions())
+            .map_err(|error| {
+                RailError::message(format!(
+                    "failed to preserve permissions for {}: {error}",
+                    path.display()
+                ))
+            })?;
+    }
     temporary
-      .as_file()
-      .set_permissions(metadata.permissions())
-      .map_err(|error| {
-        RailError::message(format!(
-          "failed to preserve permissions for {}: {error}",
-          path.display()
-        ))
-      })?;
-  }
-  temporary
-    .write_all(contents)
-    .and_then(|()| temporary.as_file().sync_all())
-    .map_err(|error| {
-      RailError::message(format!(
-        "failed to write temporary file for {}: {error}",
-        path.display()
-      ))
-    })?;
-  persist_file_atomic(temporary, path)?;
-  Ok(())
+        .write_all(contents)
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|error| {
+            RailError::message(format!(
+                "failed to write temporary file for {}: {error}",
+                path.display()
+            ))
+        })?;
+    persist_file_atomic(temporary, path)?;
+    Ok(())
 }
 
 /// Atomically replace `path` with a fully prepared temporary file in the same directory.
 pub(crate) fn persist_file_atomic(temporary: tempfile::NamedTempFile, path: &Path) -> RailResult<fs::File> {
-  let parent = destination_parent(path);
-  let file = persist_regenerable_file_atomic(temporary, path)?;
-  sync_parent_directory(parent).map_err(|error| {
-    RailError::message(format!(
-      "failed to persist the atomic replacement for {}: {error}",
-      path.display()
-    ))
-  })?;
-  Ok(file)
+    let parent = destination_parent(path);
+    let file = persist_regenerable_file_atomic(temporary, path)?;
+    sync_parent_directory(parent).map_err(|error| {
+        RailError::message(format!(
+            "failed to persist the atomic replacement for {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(file)
 }
 
 /// Atomically publish a regenerable file.
@@ -401,64 +397,63 @@ pub(crate) fn persist_file_atomic(temporary: tempfile::NamedTempFile, path: &Pat
 /// replacement authoritative. Windows uses a write-through rename so a
 /// successful publication has crossed one unambiguous filesystem boundary.
 pub(crate) fn persist_regenerable_file_atomic(temporary: tempfile::NamedTempFile, path: &Path) -> RailResult<fs::File> {
-  let persisted = {
-    #[cfg(windows)]
-    {
-      persist_atomic_replacement(temporary, path)
-    }
-    #[cfg(not(windows))]
-    {
-      temporary.persist(path).map_err(|error| error.error)
-    }
-  };
-  persisted.map_err(|error| RailError::message(format!("failed to atomically replace {}: {}", path.display(), error)))
+    let persisted = {
+        #[cfg(windows)]
+        {
+            persist_atomic_replacement(temporary, path)
+        }
+        #[cfg(not(windows))]
+        {
+            temporary.persist(path).map_err(|error| error.error)
+        }
+    };
+    persisted.map_err(|error| RailError::message(format!("failed to atomically replace {}: {}", path.display(), error)))
 }
 
 #[cfg(windows)]
 fn persist_atomic_replacement(temporary: tempfile::NamedTempFile, path: &Path) -> io::Result<fs::File> {
-  const MAX_ATTEMPTS: usize = 50;
-  let (file, temporary_path) = temporary.keep().map_err(|error| error.error)?;
-  let mut attempts = 0;
-  loop {
-    match crate::windows_fs::rename_write_through(&temporary_path, path, true) {
-      Ok(()) => return Ok(file),
-      Err(error) => {
-        attempts += 1;
-        let transient_reader_conflict = matches!(error.raw_os_error(), Some(5 | 32 | 33));
-        if !transient_reader_conflict || attempts >= MAX_ATTEMPTS {
-          drop(file);
-          return match fs::remove_file(&temporary_path) {
-            Ok(()) => Err(error),
-            Err(cleanup) => Err(io::Error::new(
-              error.kind(),
-              format!(
-                "{error}; failed to remove retained temporary file '{}': {cleanup}",
-                temporary_path.display()
-              ),
-            )),
-          };
+    const MAX_ATTEMPTS: usize = 50;
+    let (file, temporary_path) = temporary.keep().map_err(|error| error.error)?;
+    let mut attempts = 0;
+    loop {
+        match crate::windows_fs::rename_write_through(&temporary_path, path, true) {
+            Ok(()) => return Ok(file),
+            Err(error) => {
+                attempts += 1;
+                let transient_reader_conflict = matches!(error.raw_os_error(), Some(5 | 32 | 33));
+                if !transient_reader_conflict || attempts >= MAX_ATTEMPTS {
+                    drop(file);
+                    return match fs::remove_file(&temporary_path) {
+                        Ok(()) => Err(error),
+                        Err(cleanup) => Err(io::Error::new(
+                            error.kind(),
+                            format!(
+                                "{error}; failed to remove retained temporary file '{}': {cleanup}",
+                                temporary_path.display()
+                            ),
+                        )),
+                    };
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
         }
-        std::thread::sleep(std::time::Duration::from_millis(1));
-      }
     }
-  }
 }
 
 fn destination_parent(path: &Path) -> &Path {
-  path
-    .parent()
-    .filter(|parent| !parent.as_os_str().is_empty())
-    .unwrap_or_else(|| Path::new("."))
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 #[cfg(unix)]
 fn sync_parent_directory(path: &Path) -> io::Result<()> {
-  fs::File::open(path)?.sync_all()
+    fs::File::open(path)?.sync_all()
 }
 
 #[cfg(not(unix))]
 fn sync_parent_directory(_path: &Path) -> io::Result<()> {
-  Ok(())
+    Ok(())
 }
 
 /// Compute a fingerprint for the rail.toml configuration file
@@ -466,9 +461,9 @@ fn sync_parent_directory(_path: &Path) -> io::Result<()> {
 /// Searches standard config locations and emits the fingerprint,
 /// or `"none"` when no config file is found.
 pub fn config_fingerprint(workspace_root: &Path) -> String {
-  RailConfig::find_config_path(workspace_root)
-    .map(|p| text_file_fingerprint(&p))
-    .unwrap_or_else(|| "none".to_string())
+    RailConfig::find_config_path(workspace_root)
+        .map(|p| text_file_fingerprint(&p))
+        .unwrap_or_else(|| "none".to_string())
 }
 
 /// Compute a fingerprint for the Rust toolchain file
@@ -476,12 +471,12 @@ pub fn config_fingerprint(workspace_root: &Path) -> String {
 /// Checks `rust-toolchain.toml` then `rust-toolchain` and emits the
 /// fingerprint of the first match, or `"none"` if neither exists.
 pub fn toolchain_fingerprint(workspace_root: &Path) -> String {
-  ["rust-toolchain.toml", "rust-toolchain"]
-    .iter()
-    .map(|name| workspace_root.join(name))
-    .find(|p| p.exists())
-    .map(|p| text_file_fingerprint(&p))
-    .unwrap_or_else(|| "none".to_string())
+    ["rust-toolchain.toml", "rust-toolchain"]
+        .iter()
+        .map(|name| workspace_root.join(name))
+        .find(|p| p.exists())
+        .map(|p| text_file_fingerprint(&p))
+        .unwrap_or_else(|| "none".to_string())
 }
 
 /// Canonicalize an existing path and return a form suitable for both Rust and
@@ -491,7 +486,7 @@ pub fn toolchain_fingerprint(workspace_root: &Path) -> String {
 /// is safe for Win32 APIs but is not accepted consistently by Git for Windows,
 /// and it does not compare lexically with ordinary absolute paths.
 pub fn canonicalize_existing(path: &Path) -> io::Result<PathBuf> {
-  fs::canonicalize(path).map(simplify_canonical_path)
+    fs::canonicalize(path).map(simplify_canonical_path)
 }
 
 /// Resolve a possibly missing path through its nearest existing ancestor.
@@ -499,108 +494,108 @@ pub fn canonicalize_existing(path: &Path) -> io::Result<PathBuf> {
 /// Existing ancestors are canonicalized, so symlink escapes remain visible;
 /// only a normalized, non-existent suffix is appended afterward.
 pub fn canonicalize_allow_missing(path: &Path) -> io::Result<PathBuf> {
-  let absolute = if path.is_absolute() {
-    path.to_path_buf()
-  } else {
-    std::env::current_dir()?.join(path)
-  };
-  let normalized = normalize_absolute_path(&absolute)?;
-  if fs::symlink_metadata(&normalized).is_ok() {
-    return canonicalize_existing(&normalized);
-  }
-
-  let mut ancestor = normalized.as_path();
-  let mut suffix = Vec::<OsString>::new();
-  loop {
-    match fs::symlink_metadata(ancestor) {
-      Ok(_) => break,
-      Err(error) if error.kind() == io::ErrorKind::NotFound => {
-        let name = ancestor.file_name().ok_or_else(|| {
-          io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("path '{}' has no existing ancestor", path.display()),
-          )
-        })?;
-        suffix.push(name.to_os_string());
-        ancestor = ancestor.parent().ok_or_else(|| {
-          io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("path '{}' has no existing ancestor", path.display()),
-          )
-        })?;
-      }
-      Err(error) => return Err(error),
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let normalized = normalize_absolute_path(&absolute)?;
+    if fs::symlink_metadata(&normalized).is_ok() {
+        return canonicalize_existing(&normalized);
     }
-  }
 
-  let mut resolved = canonicalize_existing(ancestor)?;
-  for component in suffix.iter().rev() {
-    resolved.push(component);
-  }
-  Ok(resolved)
+    let mut ancestor = normalized.as_path();
+    let mut suffix = Vec::<OsString>::new();
+    loop {
+        match fs::symlink_metadata(ancestor) {
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let name = ancestor.file_name().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("path '{}' has no existing ancestor", path.display()),
+                    )
+                })?;
+                suffix.push(name.to_os_string());
+                ancestor = ancestor.parent().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("path '{}' has no existing ancestor", path.display()),
+                    )
+                })?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    let mut resolved = canonicalize_existing(ancestor)?;
+    for component in suffix.iter().rev() {
+        resolved.push(component);
+    }
+    Ok(resolved)
 }
 
 /// Return `path` relative to `root` after resolving both representations.
 pub fn path_relative_to(root: &Path, path: &Path) -> io::Result<PathBuf> {
-  let root = canonicalize_existing(root)?;
-  let path = canonicalize_allow_missing(path)?;
-  path.strip_prefix(&root).map(Path::to_path_buf).map_err(|_| {
-    io::Error::new(
-      io::ErrorKind::InvalidInput,
-      format!("path '{}' is outside root '{}'", path.display(), root.display()),
-    )
-  })
+    let root = canonicalize_existing(root)?;
+    let path = canonicalize_allow_missing(path)?;
+    path.strip_prefix(&root).map(Path::to_path_buf).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path '{}' is outside root '{}'", path.display(), root.display()),
+        )
+    })
 }
 
 fn normalize_absolute_path(path: &Path) -> io::Result<PathBuf> {
-  let mut normalized = PathBuf::new();
-  for component in path.components() {
-    match component {
-      Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-      Component::RootDir => normalized.push(component.as_os_str()),
-      Component::CurDir => {}
-      Component::ParentDir => {
-        if !normalized.pop() {
-          return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("path '{}' escapes the filesystem root", path.display()),
-          ));
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("path '{}' escapes the filesystem root", path.display()),
+                    ));
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
         }
-      }
-      Component::Normal(part) => normalized.push(part),
     }
-  }
-  Ok(normalized)
+    Ok(normalized)
 }
 
 #[cfg(not(windows))]
 fn simplify_canonical_path(path: PathBuf) -> PathBuf {
-  path
+    path
 }
 
 #[cfg(windows)]
 fn simplify_canonical_path(path: PathBuf) -> PathBuf {
-  use std::path::Prefix;
+    use std::path::Prefix;
 
-  let mut components = path.components();
-  let Some(Component::Prefix(prefix)) = components.next() else {
-    return path;
-  };
-  let mut simplified = match prefix.kind() {
-    Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:", char::from(drive).to_ascii_uppercase())),
-    Prefix::VerbatimUNC(server, share) => {
-      let mut raw = OsString::from(r"\\");
-      raw.push(server);
-      raw.push(r"\");
-      raw.push(share);
-      PathBuf::from(raw)
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return path;
+    };
+    let mut simplified = match prefix.kind() {
+        Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:", char::from(drive).to_ascii_uppercase())),
+        Prefix::VerbatimUNC(server, share) => {
+            let mut raw = OsString::from(r"\\");
+            raw.push(server);
+            raw.push(r"\");
+            raw.push(share);
+            PathBuf::from(raw)
+        }
+        _ => return path,
+    };
+    for component in components {
+        simplified.push(component.as_os_str());
     }
-    _ => return path,
-  };
-  for component in components {
-    simplified.push(component.as_os_str());
-  }
-  simplified
+    simplified
 }
 
 // ============================================================================
@@ -619,54 +614,54 @@ fn simplify_canonical_path(path: PathBuf) -> PathBuf {
 /// - SSH URLs: `git@github.com:user/repo.git`
 /// - HTTPS URLs: `https://github.com/user/repo.git`
 pub fn is_local_path(path: &str) -> bool {
-  let p = Path::new(path);
+    let p = Path::new(path);
 
-  // Check for relative paths
-  if path.starts_with("./") || path.starts_with("../") {
-    return true;
-  }
-
-  // Check for Windows drive letter (C:\ or C:/)
-  // Must check before URL check since Windows paths contain ':'
-  if path.len() >= 3 {
-    let bytes = path.as_bytes();
-    if bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/') {
-      return true;
+    // Check for relative paths
+    if path.starts_with("./") || path.starts_with("../") {
+        return true;
     }
-  }
 
-  // Check for Windows UNC paths (\\server\share)
-  if path.starts_with("\\\\") {
-    return true;
-  }
-
-  // Check for Unix absolute paths (/path/to/repo)
-  // Important: Check this BEFORE is_absolute() because on Windows,
-  // Path::is_absolute() returns false for Unix-style paths
-  if path.starts_with('/') {
-    // Make sure it's not part of a URL pattern
-    if !path.contains("://") && !path.contains('@') {
-      return true;
+    // Check for Windows drive letter (C:\ or C:/)
+    // Must check before URL check since Windows paths contain ':'
+    if path.len() >= 3 {
+        let bytes = path.as_bytes();
+        if bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/') {
+            return true;
+        }
     }
-  }
 
-  // Check for absolute paths (fallback for platform-specific cases)
-  if p.is_absolute() {
-    return true;
-  }
+    // Check for Windows UNC paths (\\server\share)
+    if path.starts_with("\\\\") {
+        return true;
+    }
 
-  // If it contains :// it's a URL
-  if path.contains("://") {
-    return false;
-  }
+    // Check for Unix absolute paths (/path/to/repo)
+    // Important: Check this BEFORE is_absolute() because on Windows,
+    // Path::is_absolute() returns false for Unix-style paths
+    if path.starts_with('/') {
+        // Make sure it's not part of a URL pattern
+        if !path.contains("://") && !path.contains('@') {
+            return true;
+        }
+    }
 
-  // If it contains @ it's likely an SSH URL (git@github.com:user/repo.git)
-  if path.contains('@') {
-    return false;
-  }
+    // Check for absolute paths (fallback for platform-specific cases)
+    if p.is_absolute() {
+        return true;
+    }
 
-  // Default to false for safety (require preflight checks)
-  false
+    // If it contains :// it's a URL
+    if path.contains("://") {
+        return false;
+    }
+
+    // If it contains @ it's likely an SSH URL (git@github.com:user/repo.git)
+    if path.contains('@') {
+        return false;
+    }
+
+    // Default to false for safety (require preflight checks)
+    false
 }
 
 /// Prompt user for confirmation (Enter to confirm, Ctrl+C or any input to cancel)
@@ -674,42 +669,42 @@ pub fn is_local_path(path: &str) -> bool {
 /// Returns Ok(true) if user presses Enter without typing anything.
 /// Returns Ok(false) if user types anything before pressing Enter.
 pub fn prompt_for_confirmation(message: &str) -> RailResult<bool> {
-  print!("\n{}: ", message);
-  io::stdout().flush()?;
+    print!("\n{}: ", message);
+    io::stdout().flush()?;
 
-  let mut input = String::new();
-  io::stdin().read_line(&mut input)?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
 
-  // If user just presses Enter (empty line), that's a confirmation
-  Ok(input.trim().is_empty())
+    // If user just presses Enter (empty line), that's a confirmation
+    Ok(input.trim().is_empty())
 }
 
 /// Detect CHANGELOG file in a crate directory
 ///
 /// Searches for common changelog file patterns and returns the first match found.
 pub fn detect_crate_changelog(crate_dir: &cargo_metadata::camino::Utf8Path) -> Option<std::path::PathBuf> {
-  let changelog_patterns = [
-    "CHANGELOG.md",
-    "CHANGELOG.txt",
-    "CHANGELOG",
-    "Changelog.md",
-    "changelog.md",
-    "CHANGES.md",
-    "CHANGES.txt",
-    "CHANGES",
-    "Changes.md",
-    "changes.md",
-  ];
+    let changelog_patterns = [
+        "CHANGELOG.md",
+        "CHANGELOG.txt",
+        "CHANGELOG",
+        "Changelog.md",
+        "changelog.md",
+        "CHANGES.md",
+        "CHANGES.txt",
+        "CHANGES",
+        "Changes.md",
+        "changes.md",
+    ];
 
-  for pattern in &changelog_patterns {
-    let changelog = crate_dir.join(pattern);
-    if changelog.exists() {
-      // Return relative path from crate root
-      return Some(std::path::PathBuf::from(pattern));
+    for pattern in &changelog_patterns {
+        let changelog = crate_dir.join(pattern);
+        if changelog.exists() {
+            // Return relative path from crate root
+            return Some(std::path::PathBuf::from(pattern));
+        }
     }
-  }
 
-  None
+    None
 }
 
 /// Convert a path to Git format (always forward slashes)
@@ -717,303 +712,304 @@ pub fn detect_crate_changelog(crate_dir: &cargo_metadata::camino::Utf8Path) -> O
 /// Git expects paths with forward slashes, even on Windows.
 /// This function converts backslashes to forward slashes for use in Git commands.
 pub fn path_to_git_format(path: &Path) -> String {
-  path.to_string_lossy().replace('\\', "/")
+    path.to_string_lossy().replace('\\', "/")
 }
 
 #[cfg(test)]
 mod tests {
-  use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-  use std::sync::{Arc, Barrier};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
 
-  use super::*;
-  use std::path::PathBuf;
+    use super::*;
+    use std::path::PathBuf;
 
-  #[test]
-  fn test_fnv1a64_empty() {
-    assert_eq!(fnv1a64(b""), 0xcbf29ce484222325);
-  }
+    #[test]
+    fn test_fnv1a64_empty() {
+        assert_eq!(fnv1a64(b""), 0xcbf29ce484222325);
+    }
 
-  #[test]
-  fn test_fnv1a64_known_values() {
-    // FNV-1a test vectors
-    assert_eq!(fnv1a64(b"a"), 0xaf63dc4c8601ec8c);
-    assert_eq!(fnv1a64(b"foobar"), 0x85944171f73967e8);
-  }
+    #[test]
+    fn test_fnv1a64_known_values() {
+        // FNV-1a test vectors
+        assert_eq!(fnv1a64(b"a"), 0xaf63dc4c8601ec8c);
+        assert_eq!(fnv1a64(b"foobar"), 0x85944171f73967e8);
+    }
 
-  #[test]
-  fn test_fnv1a64_deterministic() {
-    let data = b"hello world";
-    assert_eq!(fnv1a64(data), fnv1a64(data));
-  }
+    #[test]
+    fn test_fnv1a64_deterministic() {
+        let data = b"hello world";
+        assert_eq!(fnv1a64(data), fnv1a64(data));
+    }
 
-  #[test]
-  fn test_file_fingerprint_missing_file() {
-    let result = file_fingerprint(Path::new("/nonexistent/path/to/file"));
-    assert_eq!(result, "none");
-  }
+    #[test]
+    fn test_file_fingerprint_missing_file() {
+        let result = file_fingerprint(Path::new("/nonexistent/path/to/file"));
+        assert_eq!(result, "none");
+    }
 
-  #[test]
-  fn atomic_writes_use_current_directory_for_bare_filenames() {
-    assert_eq!(destination_parent(Path::new("rail.toml")), Path::new("."));
-    assert_eq!(destination_parent(Path::new("config/rail.toml")), Path::new("config"));
-  }
+    #[test]
+    fn atomic_writes_use_current_directory_for_bare_filenames() {
+        assert_eq!(destination_parent(Path::new("rail.toml")), Path::new("."));
+        assert_eq!(destination_parent(Path::new("config/rail.toml")), Path::new("config"));
+    }
 
-  #[test]
-  fn atomic_replacement_never_exposes_partial_bytes_to_concurrent_readers() {
-    let directory = tempfile::tempdir().unwrap();
-    let destination = directory.path().join("state");
-    let first = Arc::new(vec![b'a'; 256 * 1024]);
-    let second = Arc::new(vec![b'b'; 256 * 1024]);
-    write_file_atomic(&destination, &first).unwrap();
+    #[test]
+    fn atomic_replacement_never_exposes_partial_bytes_to_concurrent_readers() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("state");
+        let first = Arc::new(vec![b'a'; 256 * 1024]);
+        let second = Arc::new(vec![b'b'; 256 * 1024]);
+        write_file_atomic(&destination, &first).unwrap();
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let reads = Arc::new(AtomicUsize::new(0));
-    let ready = Arc::new(Barrier::new(2));
-    std::thread::scope(|scope| {
-      let reader_stop = Arc::clone(&stop);
-      let reader_reads = Arc::clone(&reads);
-      let reader_ready = Arc::clone(&ready);
-      let reader_first = Arc::clone(&first);
-      let reader_second = Arc::clone(&second);
-      let destination = &destination;
-      let reader = scope.spawn(move || {
-        let observed = fs::read(destination).expect("the destination must remain visible");
+        let stop = Arc::new(AtomicBool::new(false));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let ready = Arc::new(Barrier::new(2));
+        std::thread::scope(|scope| {
+            let reader_stop = Arc::clone(&stop);
+            let reader_reads = Arc::clone(&reads);
+            let reader_ready = Arc::clone(&ready);
+            let reader_first = Arc::clone(&first);
+            let reader_second = Arc::clone(&second);
+            let destination = &destination;
+            let reader = scope.spawn(move || {
+                let observed = fs::read(destination).expect("the destination must remain visible");
+                assert!(
+                    observed == *reader_first || observed == *reader_second,
+                    "a reader observed a partial atomic replacement"
+                );
+                reader_reads.fetch_add(1, Ordering::Relaxed);
+                reader_ready.wait();
+                while !reader_stop.load(Ordering::Acquire) {
+                    let observed = fs::read(destination).expect("the destination must remain visible");
+                    assert!(
+                        observed == *reader_first || observed == *reader_second,
+                        "a reader observed a partial atomic replacement"
+                    );
+                    reader_reads.fetch_add(1, Ordering::Relaxed);
+                    if cfg!(windows) {
+                        // Leave the writer a gap between NTFS read handles so the bounded
+                        // replacement retry can observe a normal sharing window.
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+            });
+
+            ready.wait();
+
+            // One concurrent NTFS rename exercises the visibility boundary without
+            // turning this oracle into an EBS flush-latency test.
+            let replacements = if cfg!(windows) { 1 } else { 64 };
+            let replacement = (|| {
+                for iteration in 0..replacements {
+                    let contents = if iteration % 2 == 0 { &second } else { &first };
+                    write_file_atomic(destination, contents)?;
+                }
+                Ok::<(), RailError>(())
+            })();
+            stop.store(true, Ordering::Release);
+            reader.join().unwrap();
+            replacement.unwrap();
+        });
+        assert!(reads.load(Ordering::Relaxed) > 0, "the concurrent reader did not run");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_replacement_preserves_mode_and_replaces_symlinks_without_following_them() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("state");
+        fs::write(&destination, b"old").unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o600)).unwrap();
+        write_file_atomic(&destination, b"new").unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"new");
+        assert_eq!(fs::metadata(&destination).unwrap().permissions().mode() & 0o777, 0o600);
+
+        let victim = directory.path().join("victim");
+        fs::write(&victim, b"keep").unwrap();
+        fs::remove_file(&destination).unwrap();
+        symlink(&victim, &destination).unwrap();
+        write_file_atomic(&destination, b"replacement").unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"keep");
+        assert_eq!(fs::read(&destination).unwrap(), b"replacement");
+        assert!(!fs::symlink_metadata(&destination).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn atomic_replacement_preserves_the_old_file_when_the_filesystem_is_full() {
+        const ROOT_ENV: &str = "CARGO_RAIL_TEST_ENOSPC_ROOT";
+        const MAX_BYTES_ENV: &str = "CARGO_RAIL_TEST_ENOSPC_MAX_BYTES";
+        let (Some(root), Some(maximum)) = (std::env::var_os(ROOT_ENV), std::env::var_os(MAX_BYTES_ENV)) else {
+            return;
+        };
+        let maximum = maximum
+            .to_str()
+            .and_then(|value| value.parse::<u64>().ok())
+            .expect("the ENOSPC byte bound must be an unsigned integer");
         assert!(
-          observed == *reader_first || observed == *reader_second,
-          "a reader observed a partial atomic replacement"
+            (1024 * 1024..=512 * 1024 * 1024).contains(&maximum),
+            "the ENOSPC byte bound must be between 1 MiB and 512 MiB"
         );
-        reader_reads.fetch_add(1, Ordering::Relaxed);
-        reader_ready.wait();
-        while !reader_stop.load(Ordering::Acquire) {
-          let observed = fs::read(destination).expect("the destination must remain visible");
-          assert!(
-            observed == *reader_first || observed == *reader_second,
-            "a reader observed a partial atomic replacement"
-          );
-          reader_reads.fetch_add(1, Ordering::Relaxed);
-          if cfg!(windows) {
-            // Leave the writer a gap between NTFS read handles so the bounded
-            // replacement retry can observe a normal sharing window.
-            std::thread::sleep(std::time::Duration::from_millis(1));
-          }
+
+        let directory = tempfile::Builder::new()
+            .prefix("cargo-rail-enospc-")
+            .tempdir_in(PathBuf::from(root))
+            .expect("isolated ENOSPC test directory");
+        let destination = directory.path().join("state");
+        fs::write(&destination, b"old").expect("initial state");
+        let filler_path = directory.path().join("filler");
+        let mut filler = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&filler_path)
+            .expect("filler file");
+        let mut block = vec![0_u8; 1024 * 1024];
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for chunk in block.chunks_exact_mut(8) {
+            state ^= state << 7;
+            state ^= state >> 9;
+            state ^= state << 8;
+            chunk.copy_from_slice(&state.to_le_bytes());
         }
-      });
 
-      ready.wait();
-
-      // One concurrent NTFS rename exercises the visibility boundary without
-      // turning this oracle into an EBS flush-latency test.
-      let replacements = if cfg!(windows) { 1 } else { 64 };
-      let replacement = (|| {
-        for iteration in 0..replacements {
-          let contents = if iteration % 2 == 0 { &second } else { &first };
-          write_file_atomic(destination, contents)?;
+        let mut written = 0_u64;
+        let exhausted = loop {
+            match filler.write_all(&block).and_then(|()| filler.sync_data()) {
+                Ok(()) => {
+                    written = written.saturating_add(block.len() as u64);
+                    if written >= maximum {
+                        break None;
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::StorageFull => break Some(error),
+                Err(error) => panic!("isolated filesystem failed before ENOSPC: {error}"),
+            }
+        };
+        if exhausted.is_none() {
+            drop(filler);
+            fs::remove_file(&filler_path).expect("remove bounded filler");
+            panic!("isolated filesystem did not report ENOSPC within {maximum} bytes");
         }
-        Ok::<(), RailError>(())
-      })();
-      stop.store(true, Ordering::Release);
-      reader.join().unwrap();
-      replacement.unwrap();
-    });
-    assert!(reads.load(Ordering::Relaxed) > 0, "the concurrent reader did not run");
-  }
 
-  #[cfg(unix)]
-  #[test]
-  fn atomic_replacement_preserves_mode_and_replaces_symlinks_without_following_them() {
-    use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let replacement = vec![b'n'; 1024 * 1024];
+        let error =
+            write_file_atomic(&destination, &replacement).expect_err("replacement must fail on a full filesystem");
+        assert!(
+            error.to_string().contains("temporary file") || error.to_string().contains("atomically replace"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&destination).expect("original state"), b"old");
+        assert_eq!(
+            fs::read_dir(directory.path())
+                .expect("test directory")
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with(".cargo-rail-"))
+                .count(),
+            0,
+            "a failed atomic replacement must clean its private temporary file"
+        );
 
-    let directory = tempfile::tempdir().unwrap();
-    let destination = directory.path().join("state");
-    fs::write(&destination, b"old").unwrap();
-    fs::set_permissions(&destination, fs::Permissions::from_mode(0o600)).unwrap();
-    write_file_atomic(&destination, b"new").unwrap();
-    assert_eq!(fs::read(&destination).unwrap(), b"new");
-    assert_eq!(fs::metadata(&destination).unwrap().permissions().mode() & 0o777, 0o600);
-
-    let victim = directory.path().join("victim");
-    fs::write(&victim, b"keep").unwrap();
-    fs::remove_file(&destination).unwrap();
-    symlink(&victim, &destination).unwrap();
-    write_file_atomic(&destination, b"replacement").unwrap();
-    assert_eq!(fs::read(&victim).unwrap(), b"keep");
-    assert_eq!(fs::read(&destination).unwrap(), b"replacement");
-    assert!(!fs::symlink_metadata(&destination).unwrap().file_type().is_symlink());
-  }
-
-  #[test]
-  fn atomic_replacement_preserves_the_old_file_when_the_filesystem_is_full() {
-    const ROOT_ENV: &str = "CARGO_RAIL_TEST_ENOSPC_ROOT";
-    const MAX_BYTES_ENV: &str = "CARGO_RAIL_TEST_ENOSPC_MAX_BYTES";
-    let (Some(root), Some(maximum)) = (std::env::var_os(ROOT_ENV), std::env::var_os(MAX_BYTES_ENV)) else {
-      return;
-    };
-    let maximum = maximum
-      .to_str()
-      .and_then(|value| value.parse::<u64>().ok())
-      .expect("the ENOSPC byte bound must be an unsigned integer");
-    assert!(
-      (1024 * 1024..=512 * 1024 * 1024).contains(&maximum),
-      "the ENOSPC byte bound must be between 1 MiB and 512 MiB"
-    );
-
-    let directory = tempfile::Builder::new()
-      .prefix("cargo-rail-enospc-")
-      .tempdir_in(PathBuf::from(root))
-      .expect("isolated ENOSPC test directory");
-    let destination = directory.path().join("state");
-    fs::write(&destination, b"old").expect("initial state");
-    let filler_path = directory.path().join("filler");
-    let mut filler = fs::OpenOptions::new()
-      .write(true)
-      .create_new(true)
-      .open(&filler_path)
-      .expect("filler file");
-    let mut block = vec![0_u8; 1024 * 1024];
-    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
-    for chunk in block.chunks_exact_mut(8) {
-      state ^= state << 7;
-      state ^= state >> 9;
-      state ^= state << 8;
-      chunk.copy_from_slice(&state.to_le_bytes());
+        drop(filler);
+        fs::remove_file(&filler_path).expect("free isolated filesystem capacity");
+        write_file_atomic(&destination, b"new").expect("replacement should recover after capacity is available");
+        assert_eq!(fs::read(&destination).expect("recovered state"), b"new");
     }
 
-    let mut written = 0_u64;
-    let exhausted = loop {
-      match filler.write_all(&block).and_then(|()| filler.sync_data()) {
-        Ok(()) => {
-          written = written.saturating_add(block.len() as u64);
-          if written >= maximum {
-            break None;
-          }
-        }
-        Err(error) if error.kind() == io::ErrorKind::StorageFull => break Some(error),
-        Err(error) => panic!("isolated filesystem failed before ENOSPC: {error}"),
-      }
-    };
-    if exhausted.is_none() {
-      drop(filler);
-      fs::remove_file(&filler_path).expect("remove bounded filler");
-      panic!("isolated filesystem did not report ENOSPC within {maximum} bytes");
+    #[test]
+    fn test_text_fingerprint_ignores_checkout_line_endings() {
+        let temp = tempfile::tempdir().unwrap();
+        let lf = temp.path().join("lf.toml");
+        let crlf = temp.path().join("crlf.toml");
+        fs::write(&lf, b"[workspace]\nroot = \".\"\n").unwrap();
+        fs::write(&crlf, b"[workspace]\r\nroot = \".\"\r\n").unwrap();
+
+        assert_eq!(text_file_fingerprint(&lf), text_file_fingerprint(&crlf));
+        assert_ne!(file_fingerprint(&lf), file_fingerprint(&crlf));
     }
 
-    let replacement = vec![b'n'; 1024 * 1024];
-    let error = write_file_atomic(&destination, &replacement).expect_err("replacement must fail on a full filesystem");
-    assert!(
-      error.to_string().contains("temporary file") || error.to_string().contains("atomically replace"),
-      "{error}"
-    );
-    assert_eq!(fs::read(&destination).expect("original state"), b"old");
-    assert_eq!(
-      fs::read_dir(directory.path())
-        .expect("test directory")
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with(".cargo-rail-"))
-        .count(),
-      0,
-      "a failed atomic replacement must clean its private temporary file"
-    );
+    #[test]
+    fn test_path_relative_to_resolves_existing_and_missing_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("existing.txt"), b"content").unwrap();
 
-    drop(filler);
-    fs::remove_file(&filler_path).expect("free isolated filesystem capacity");
-    write_file_atomic(&destination, b"new").expect("replacement should recover after capacity is available");
-    assert_eq!(fs::read(&destination).expect("recovered state"), b"new");
-  }
+        assert_eq!(
+            path_relative_to(&root, &root.join("existing.txt")).unwrap(),
+            PathBuf::from("existing.txt")
+        );
+        assert_eq!(
+            path_relative_to(&root, &root.join("new/child.txt")).unwrap(),
+            PathBuf::from("new/child.txt")
+        );
+        path_relative_to(&root, temp.path()).unwrap_err();
+    }
 
-  #[test]
-  fn test_text_fingerprint_ignores_checkout_line_endings() {
-    let temp = tempfile::tempdir().unwrap();
-    let lf = temp.path().join("lf.toml");
-    let crlf = temp.path().join("crlf.toml");
-    fs::write(&lf, b"[workspace]\nroot = \".\"\n").unwrap();
-    fs::write(&crlf, b"[workspace]\r\nroot = \".\"\r\n").unwrap();
+    #[cfg(unix)]
+    #[test]
+    fn test_path_relative_to_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
 
-    assert_eq!(text_file_fingerprint(&lf), text_file_fingerprint(&crlf));
-    assert_ne!(file_fingerprint(&lf), file_fingerprint(&crlf));
-  }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("file.txt"), b"outside").unwrap();
+        symlink(&outside, root.join("escape")).unwrap();
 
-  #[test]
-  fn test_path_relative_to_resolves_existing_and_missing_paths() {
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("root");
-    fs::create_dir(&root).unwrap();
-    fs::write(root.join("existing.txt"), b"content").unwrap();
+        path_relative_to(&root, &root.join("escape/file.txt")).unwrap_err();
+    }
 
-    assert_eq!(
-      path_relative_to(&root, &root.join("existing.txt")).unwrap(),
-      PathBuf::from("existing.txt")
-    );
-    assert_eq!(
-      path_relative_to(&root, &root.join("new/child.txt")).unwrap(),
-      PathBuf::from("new/child.txt")
-    );
-    assert!(path_relative_to(&root, temp.path()).is_err());
-  }
+    #[cfg(windows)]
+    #[test]
+    fn test_canonical_paths_are_external_tool_compatible_on_windows() {
+        let temp = tempfile::tempdir().unwrap();
+        let canonical = canonicalize_existing(temp.path()).unwrap();
+        assert!(!canonical.to_string_lossy().starts_with(r"\\?\"));
+    }
 
-  #[cfg(unix)]
-  #[test]
-  fn test_path_relative_to_rejects_symlink_escape() {
-    use std::os::unix::fs::symlink;
+    #[test]
+    fn test_is_local_path_classification() {
+        // Local paths - absolute
+        assert!(is_local_path("/home/user/repo"));
+        assert!(is_local_path("C:\\Users\\test\\repo"));
+        assert!(is_local_path("C:/Users/test/repo"));
 
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().join("root");
-    let outside = temp.path().join("outside");
-    fs::create_dir(&root).unwrap();
-    fs::create_dir(&outside).unwrap();
-    fs::write(outside.join("file.txt"), b"outside").unwrap();
-    symlink(&outside, root.join("escape")).unwrap();
+        // Local paths - relative
+        assert!(is_local_path("./repo"));
+        assert!(is_local_path("../path/to/repo"));
 
-    assert!(path_relative_to(&root, &root.join("escape/file.txt")).is_err());
-  }
+        // Windows UNC paths (platform-specific)
+        #[cfg(target_os = "windows")]
+        assert!(is_local_path("\\\\server\\share\\repo"));
 
-  #[cfg(windows)]
-  #[test]
-  fn test_canonical_paths_are_external_tool_compatible_on_windows() {
-    let temp = tempfile::tempdir().unwrap();
-    let canonical = canonicalize_existing(temp.path()).unwrap();
-    assert!(!canonical.to_string_lossy().starts_with(r"\\?\"));
-  }
+        // Remote URLs - various protocols
+        assert!(!is_local_path("git@github.com:user/repo.git"));
+        assert!(!is_local_path("https://github.com/user/repo.git"));
+        assert!(!is_local_path("ssh://git@github.com/user/repo.git"));
 
-  #[test]
-  fn test_is_local_path_classification() {
-    // Local paths - absolute
-    assert!(is_local_path("/home/user/repo"));
-    assert!(is_local_path("C:\\Users\\test\\repo"));
-    assert!(is_local_path("C:/Users/test/repo"));
+        // Edge cases - ambiguous bare names
+        assert!(!is_local_path("repo"));
+        assert!(!is_local_path(""));
+    }
 
-    // Local paths - relative
-    assert!(is_local_path("./repo"));
-    assert!(is_local_path("../path/to/repo"));
+    #[test]
+    fn test_path_to_git_format_preserves_forward_slashes() {
+        let path = PathBuf::from("/home/user/repo/src/main.rs");
+        assert_eq!(path_to_git_format(&path), "/home/user/repo/src/main.rs");
 
-    // Windows UNC paths (platform-specific)
-    #[cfg(target_os = "windows")]
-    assert!(is_local_path("\\\\server\\share\\repo"));
+        let path = PathBuf::from("./relative/path.rs");
+        assert_eq!(path_to_git_format(&path), "./relative/path.rs");
+    }
 
-    // Remote URLs - various protocols
-    assert!(!is_local_path("git@github.com:user/repo.git"));
-    assert!(!is_local_path("https://github.com/user/repo.git"));
-    assert!(!is_local_path("ssh://git@github.com/user/repo.git"));
+    #[test]
+    fn test_path_to_git_format_normalizes_backslashes_on_every_host() {
+        let path = PathBuf::from("C:\\Users\\test\\repo\\src\\main.rs");
+        assert_eq!(path_to_git_format(&path), "C:/Users/test/repo/src/main.rs");
 
-    // Edge cases - ambiguous bare names
-    assert!(!is_local_path("repo"));
-    assert!(!is_local_path(""));
-  }
-
-  #[test]
-  fn test_path_to_git_format_preserves_forward_slashes() {
-    let path = PathBuf::from("/home/user/repo/src/main.rs");
-    assert_eq!(path_to_git_format(&path), "/home/user/repo/src/main.rs");
-
-    let path = PathBuf::from("./relative/path.rs");
-    assert_eq!(path_to_git_format(&path), "./relative/path.rs");
-  }
-
-  #[test]
-  fn test_path_to_git_format_normalizes_backslashes_on_every_host() {
-    let path = PathBuf::from("C:\\Users\\test\\repo\\src\\main.rs");
-    assert_eq!(path_to_git_format(&path), "C:/Users/test/repo/src/main.rs");
-
-    let path = PathBuf::from("..\\relative\\path.rs");
-    assert_eq!(path_to_git_format(&path), "../relative/path.rs");
-  }
+        let path = PathBuf::from("..\\relative\\path.rs");
+        assert_eq!(path_to_git_format(&path), "../relative/path.rs");
+    }
 }

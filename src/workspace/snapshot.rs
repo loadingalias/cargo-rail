@@ -13,8 +13,8 @@ use sha2::{Digest as _, Sha256};
 
 use crate::cargo::MultiTargetMetadata;
 use crate::cargo::resolution::{
-  CargoConfigSnapshot, ResolutionInputs, ResolutionRequest, ResolutionView, ResolutionViews, TargetIdentity,
-  ToolchainIdentity, credential_bearing_url,
+    CargoConfigSnapshot, ResolutionInputs, ResolutionRequest, ResolutionView, ResolutionViews, TargetIdentity,
+    ToolchainIdentity, credential_bearing_url,
 };
 use crate::compiler::cfg_eval::{TargetCfgSet, load_target_cfg_sets};
 use crate::config::RailConfig;
@@ -28,156 +28,156 @@ const SNAPSHOT_ID_VERSION: u32 = 1;
 /// Versioned SHA-256 identity of canonical authoritative workspace inputs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SnapshotId {
-  version: u32,
-  digest: ContentDigest,
+    version: u32,
+    digest: ContentDigest,
 }
 
 impl SnapshotId {
-  /// Return the framing schema version used for this identity.
-  pub fn version(self) -> u32 {
-    self.version
-  }
+    /// Return the framing schema version used for this identity.
+    pub fn version(self) -> u32 {
+        self.version
+    }
 
-  /// Return the raw SHA-256 digest.
-  pub fn digest(self) -> ContentDigest {
-    self.digest
-  }
+    /// Return the raw SHA-256 digest.
+    pub fn digest(self) -> ContentDigest {
+        self.digest
+    }
 }
 
 impl fmt::Display for SnapshotId {
-  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-    write!(formatter, "v{}-sha256-{}", self.version, self.digest)
-  }
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "v{}-sha256-{}", self.version, self.digest)
+    }
 }
 
 /// Exact bytes of one authoritative workspace file.
 pub struct SnapshotFile {
-  path: RepositoryPath,
-  bytes: Arc<[u8]>,
-  digest: ContentDigest,
+    path: RepositoryPath,
+    bytes: Arc<[u8]>,
+    digest: ContentDigest,
 }
 
 impl SnapshotFile {
-  /// Return the logical source-root-relative path.
-  pub fn path(&self) -> &RepositoryPath {
-    &self.path
-  }
+    /// Return the logical source-root-relative path.
+    pub fn path(&self) -> &RepositoryPath {
+        &self.path
+    }
 
-  /// Return the exact captured bytes.
-  pub fn bytes(&self) -> &[u8] {
-    &self.bytes
-  }
+    /// Return the exact captured bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
 
-  /// Return the SHA-256 identity of the exact bytes.
-  pub fn digest(&self) -> ContentDigest {
-    self.digest
-  }
+    /// Return the SHA-256 identity of the exact bytes.
+    pub fn digest(&self) -> ContentDigest {
+        self.digest
+    }
 }
 
 /// One package identity parsed from the exact Cargo lockfile.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LockedPackageIdentity {
-  name: String,
-  version: String,
-  source: Option<String>,
-  checksum: Option<String>,
+    name: String,
+    version: String,
+    source: Option<String>,
+    checksum: Option<String>,
 }
 
 impl LockedPackageIdentity {
-  /// Return the locked package name.
-  pub fn name(&self) -> &str {
-    &self.name
-  }
+    /// Return the locked package name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 
-  /// Return the locked semantic version as Cargo wrote it.
-  pub fn version(&self) -> &str {
-    &self.version
-  }
+    /// Return the locked semantic version as Cargo wrote it.
+    pub fn version(&self) -> &str {
+        &self.version
+    }
 
-  /// Return Cargo's locked source identity, when present.
-  pub fn source(&self) -> Option<&str> {
-    self.source.as_deref()
-  }
+    /// Return Cargo's locked source identity, when present.
+    pub fn source(&self) -> Option<&str> {
+        self.source.as_deref()
+    }
 
-  /// Return the registry checksum, when Cargo recorded one.
-  pub fn checksum(&self) -> Option<&str> {
-    self.checksum.as_deref()
-  }
+    /// Return the registry checksum, when Cargo recorded one.
+    pub fn checksum(&self) -> Option<&str> {
+        self.checksum.as_deref()
+    }
 }
 
 /// Exact Cargo lockfile bytes plus parsed package/source identities.
 pub struct LockfileSnapshot {
-  file: SnapshotFile,
-  packages: Vec<LockedPackageIdentity>,
+    file: SnapshotFile,
+    packages: Vec<LockedPackageIdentity>,
 }
 
 impl LockfileSnapshot {
-  /// Return the exact lockfile capture.
-  pub fn file(&self) -> &SnapshotFile {
-    &self.file
-  }
+    /// Return the exact lockfile capture.
+    pub fn file(&self) -> &SnapshotFile {
+        &self.file
+    }
 
-  /// Return locked package identities in deterministic order.
-  pub fn packages(&self) -> &[LockedPackageIdentity] {
-    &self.packages
-  }
+    /// Return locked package identities in deterministic order.
+    pub fn packages(&self) -> &[LockedPackageIdentity] {
+        &self.packages
+    }
 }
 
 /// Cargo package identity and its logical local root, when source-backed here.
 pub struct SnapshotPackage {
-  id: PackageId,
-  name: String,
-  version: String,
-  source: Option<Source>,
-  checksum: Option<String>,
-  workspace_member: bool,
-  manifest_path: Option<RepositoryPath>,
-  package_root: Option<PathBuf>,
+    id: PackageId,
+    name: String,
+    version: String,
+    source: Option<Source>,
+    checksum: Option<String>,
+    workspace_member: bool,
+    manifest_path: Option<RepositoryPath>,
+    package_root: Option<PathBuf>,
 }
 
 impl SnapshotPackage {
-  /// Return Cargo's exact package identity.
-  pub fn id(&self) -> &PackageId {
-    &self.id
-  }
+    /// Return Cargo's exact package identity.
+    pub fn id(&self) -> &PackageId {
+        &self.id
+    }
 
-  /// Return the package name.
-  pub fn name(&self) -> &str {
-    &self.name
-  }
+    /// Return the package name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 
-  /// Return the package semantic version as Cargo rendered it.
-  pub fn version(&self) -> &str {
-    &self.version
-  }
+    /// Return the package semantic version as Cargo rendered it.
+    pub fn version(&self) -> &str {
+        &self.version
+    }
 
-  /// Return Cargo's external source identity, or `None` for a local package.
-  pub fn source(&self) -> Option<&Source> {
-    self.source.as_ref()
-  }
+    /// Return Cargo's external source identity, or `None` for a local package.
+    pub fn source(&self) -> Option<&Source> {
+        self.source.as_ref()
+    }
 
-  /// Return the checksum bound by Cargo.lock, when available.
-  pub fn checksum(&self) -> Option<&str> {
-    self.checksum.as_deref()
-  }
+    /// Return the checksum bound by Cargo.lock, when available.
+    pub fn checksum(&self) -> Option<&str> {
+        self.checksum.as_deref()
+    }
 
-  /// Return whether Cargo selected this package as a workspace member.
-  pub fn is_workspace_member(&self) -> bool {
-    self.workspace_member
-  }
+    /// Return whether Cargo selected this package as a workspace member.
+    pub fn is_workspace_member(&self) -> bool {
+        self.workspace_member
+    }
 
-  /// Return the local manifest path relative to the source root.
-  pub fn manifest_path(&self) -> Option<&RepositoryPath> {
-    self.manifest_path.as_ref()
-  }
+    /// Return the local manifest path relative to the source root.
+    pub fn manifest_path(&self) -> Option<&RepositoryPath> {
+        self.manifest_path.as_ref()
+    }
 
-  /// Return the normalized local package root.
-  ///
-  /// The empty path denotes a package at the logical source root. External
-  /// registry and Git packages return `None`.
-  pub fn package_root(&self) -> Option<&Path> {
-    self.package_root.as_deref()
-  }
+    /// Return the normalized local package root.
+    ///
+    /// The empty path denotes a package at the logical source root. External
+    /// registry and Git packages return `None`.
+    pub fn package_root(&self) -> Option<&Path> {
+        self.package_root.as_deref()
+    }
 }
 
 /// One coherent immutable capture of authoritative workspace inputs.
@@ -189,185 +189,212 @@ impl SnapshotPackage {
 /// logical identities; external paths remain identity inputs when their
 /// location changes Cargo or compiler behavior.
 pub struct WorkspaceSnapshot {
-  id: SnapshotId,
-  source_root: PathBuf,
-  configuration_fingerprint: String,
-  toolchain_fingerprint: String,
-  cargo_config_identity: Arc<[u8]>,
-  toolchain_identity: Arc<[u8]>,
-  cargo: Arc<CargoState>,
-  source: Arc<SourceSnapshot>,
-  manifests: Vec<SnapshotFile>,
-  lockfile: Option<LockfileSnapshot>,
-  rail_config: Option<SnapshotFile>,
-  rail_config_path: Option<PathBuf>,
-  rail_config_discovery_root: Option<PathBuf>,
-  config: Option<Arc<RailConfig>>,
-  cargo_config: Arc<CargoConfigSnapshot>,
-  packages: Vec<SnapshotPackage>,
-  toolchain: ToolchainIdentity,
-  compilation_executable_identities: OnceLock<Result<ToolchainExecutableIdentities, String>>,
-  targets: Vec<TargetIdentity>,
-  base_resolution: Arc<ResolutionView>,
-  derived: Arc<DerivedViews>,
+    id: SnapshotId,
+    source_root: PathBuf,
+    configuration_fingerprint: String,
+    toolchain_fingerprint: String,
+    cargo_config_identity: Arc<[u8]>,
+    toolchain_identity: Arc<[u8]>,
+    cargo: Arc<CargoState>,
+    source: Arc<SourceSnapshot>,
+    manifests: Vec<SnapshotFile>,
+    lockfile: Option<LockfileSnapshot>,
+    rail_config: Option<SnapshotFile>,
+    rail_config_path: Option<PathBuf>,
+    rail_config_discovery_root: Option<PathBuf>,
+    config: Option<Arc<RailConfig>>,
+    cargo_config: Arc<CargoConfigSnapshot>,
+    packages: Vec<SnapshotPackage>,
+    toolchain: ToolchainIdentity,
+    compilation_executable_identities: OnceLock<Result<ToolchainExecutableIdentities, String>>,
+    targets: Vec<TargetIdentity>,
+    base_resolution: Arc<ResolutionView>,
+    derived: Arc<DerivedViews>,
 }
 
 pub(crate) struct DerivedViews {
-  workspace_root: PathBuf,
-  analysis_targets: Vec<String>,
-  resolutions: Arc<ResolutionViews>,
-  multi_target_metadata: OnceLock<Result<Arc<MultiTargetMetadata>, SnapshotViewError>>,
-  target_cfg_sets: OnceLock<Result<Arc<std::collections::HashMap<String, TargetCfgSet>>, SnapshotViewError>>,
+    workspace_root: PathBuf,
+    analysis_targets: Vec<String>,
+    resolutions: Arc<ResolutionViews>,
+    multi_target_metadata: OnceLock<Result<Arc<MultiTargetMetadata>, SnapshotViewError>>,
+    target_cfg_sets: OnceLock<Result<Arc<std::collections::HashMap<String, TargetCfgSet>>, SnapshotViewError>>,
 }
 
 impl DerivedViews {
-  pub(crate) fn new(workspace_root: PathBuf, analysis_targets: Vec<String>, resolutions: Arc<ResolutionViews>) -> Self {
-    Self {
-      workspace_root,
-      analysis_targets,
-      resolutions,
-      multi_target_metadata: OnceLock::new(),
-      target_cfg_sets: OnceLock::new(),
+    pub(crate) fn new(
+        workspace_root: PathBuf,
+        analysis_targets: Vec<String>,
+        resolutions: Arc<ResolutionViews>,
+    ) -> Self {
+        Self {
+            workspace_root,
+            analysis_targets,
+            resolutions,
+            multi_target_metadata: OnceLock::new(),
+            target_cfg_sets: OnceLock::new(),
+        }
     }
-  }
 
-  pub(crate) fn resolution_view(&self, request: ResolutionRequest) -> RailResult<Arc<ResolutionView>> {
-    self.resolutions.view(request)
-  }
+    pub(crate) fn resolution_view(&self, request: ResolutionRequest) -> RailResult<Arc<ResolutionView>> {
+        self.resolutions.view(request)
+    }
 
-  pub(crate) fn post_mutation_resolution_view(
-    &self,
-    request: ResolutionRequest,
-    post_mutation_metadata: &Metadata,
-  ) -> RailResult<Arc<ResolutionView>> {
-    self
-      .resolutions
-      .load_post_mutation_view(request, post_mutation_metadata)
-  }
+    pub(crate) fn post_mutation_resolution_view(
+        &self,
+        request: ResolutionRequest,
+        post_mutation_metadata: &Metadata,
+    ) -> RailResult<Arc<ResolutionView>> {
+        self.resolutions
+            .load_post_mutation_view(request, post_mutation_metadata)
+    }
 
-  pub(crate) fn cargo_current_dir(&self) -> &Path {
-    self.resolutions.cargo_current_dir()
-  }
+    pub(crate) fn cargo_current_dir(&self) -> &Path {
+        self.resolutions.cargo_current_dir()
+    }
 
-  pub(crate) fn multi_target_metadata(&self) -> RailResult<Arc<MultiTargetMetadata>> {
-    cached_snapshot_view(self.multi_target_metadata.get_or_init(|| {
-      if !self.analysis_targets.is_empty() {
-        crate::progress!("Loading metadata for {} target(s)...", self.analysis_targets.len());
-      }
-      MultiTargetMetadata::load_parallel(&self.resolutions, &self.analysis_targets)
-        .map(Arc::new)
-        .map_err(SnapshotViewError::capture)
-    }))
-  }
+    pub(crate) fn multi_target_metadata(&self) -> RailResult<Arc<MultiTargetMetadata>> {
+        cached_snapshot_view(self.multi_target_metadata.get_or_init(|| {
+            if !self.analysis_targets.is_empty() {
+                crate::progress!("Loading metadata for {} target(s)...", self.analysis_targets.len());
+            }
+            MultiTargetMetadata::load_parallel(&self.resolutions, &self.analysis_targets)
+                .map(Arc::new)
+                .map_err(SnapshotViewError::capture)
+        }))
+    }
 
-  pub(crate) fn target_cfg_sets(&self) -> RailResult<Arc<std::collections::HashMap<String, TargetCfgSet>>> {
-    cached_snapshot_view(self.target_cfg_sets.get_or_init(|| {
-      let mut targets = Vec::with_capacity(self.analysis_targets.len() + 1);
-      targets.push("default");
-      targets.extend(self.analysis_targets.iter().map(String::as_str));
-      load_target_cfg_sets(&self.workspace_root, &targets)
-        .map(Arc::new)
-        .map_err(SnapshotViewError::capture)
-    }))
-  }
+    pub(crate) fn target_cfg_sets(&self) -> RailResult<Arc<std::collections::HashMap<String, TargetCfgSet>>> {
+        cached_snapshot_view(self.target_cfg_sets.get_or_init(|| {
+            let mut targets = Vec::with_capacity(self.analysis_targets.len() + 1);
+            targets.push("default");
+            targets.extend(self.analysis_targets.iter().map(String::as_str));
+            load_target_cfg_sets(&self.workspace_root, &targets)
+                .map(Arc::new)
+                .map_err(SnapshotViewError::capture)
+        }))
+    }
 }
 
 #[derive(Clone)]
 struct SnapshotViewError {
-  message: String,
-  help: Option<String>,
+    message: String,
+    help: Option<String>,
 }
 
 impl SnapshotViewError {
-  fn capture(error: RailError) -> Self {
-    Self {
-      message: error.to_string(),
-      help: error.help_message(),
+    fn capture(error: RailError) -> Self {
+        Self {
+            message: error.to_string(),
+            help: error.help_message(),
+        }
     }
-  }
 
-  fn to_error(&self) -> RailError {
-    self.help.as_ref().map_or_else(
-      || RailError::message(self.message.clone()),
-      |help| RailError::with_help(self.message.clone(), help.clone()),
-    )
-  }
+    fn to_error(&self) -> RailError {
+        self.help.as_ref().map_or_else(
+            || RailError::message(self.message.clone()),
+            |help| RailError::with_help(self.message.clone(), help.clone()),
+        )
+    }
 }
 
 pub(crate) struct CapturedRailConfig {
-  path: PathBuf,
-  bytes: Vec<u8>,
-  config: Arc<RailConfig>,
+    path: PathBuf,
+    bytes: Vec<u8>,
+    config: Arc<RailConfig>,
 }
 
 pub(crate) struct CapturedLockfile {
-  path: PathBuf,
-  bytes: Vec<u8>,
+    path: PathBuf,
+    bytes: Vec<u8>,
+}
+
+pub(crate) struct WorkspaceSnapshotCapture<'a> {
+    pub(crate) source_root: &'a Path,
+    pub(crate) source: Arc<SourceSnapshot>,
+    pub(crate) cargo: Arc<CargoState>,
+    pub(crate) rail_config: Option<CapturedRailConfig>,
+    pub(crate) rail_config_discovery_root: Option<PathBuf>,
+    pub(crate) generated_lockfile: Option<CapturedLockfile>,
+    pub(crate) resolution_inputs: ResolutionInputs,
+    pub(crate) targets: Vec<TargetIdentity>,
+    pub(crate) derived: Arc<DerivedViews>,
+}
+
+struct SnapshotIdentityInputs<'a> {
+    source: &'a SourceSnapshot,
+    manifests: &'a [SnapshotFile],
+    lockfile: Option<&'a LockfileSnapshot>,
+    rail_config: Option<&'a SnapshotFile>,
+    cargo_config_identity: &'a [u8],
+    toolchain_identity: &'a [u8],
+    source_root: &'a Path,
+    targets: &'a [TargetIdentity],
+    excluded_paths: &'a BTreeSet<RepositoryPath>,
 }
 
 impl CapturedLockfile {
-  pub(crate) fn new(path: PathBuf, bytes: Vec<u8>) -> Self {
-    Self { path, bytes }
-  }
+    pub(crate) fn new(path: PathBuf, bytes: Vec<u8>) -> Self {
+        Self { path, bytes }
+    }
 
-  pub(crate) fn path(&self) -> &Path {
-    &self.path
-  }
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
 
-  pub(crate) fn bytes(&self) -> &[u8] {
-    &self.bytes
-  }
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 impl CapturedRailConfig {
-  pub(crate) fn new(path: PathBuf, bytes: Vec<u8>, config: Arc<RailConfig>) -> Self {
-    Self { path, bytes, config }
-  }
+    pub(crate) fn new(path: PathBuf, bytes: Vec<u8>, config: Arc<RailConfig>) -> Self {
+        Self { path, bytes, config }
+    }
 }
 
 impl WorkspaceSnapshot {
-  #[allow(clippy::too_many_arguments)]
-  pub(crate) fn capture(
-    source_root: &Path,
-    mut source: Arc<SourceSnapshot>,
-    cargo: Arc<CargoState>,
-    rail_config: Option<CapturedRailConfig>,
-    rail_config_discovery_root: Option<PathBuf>,
-    generated_lockfile: Option<CapturedLockfile>,
-    resolution_inputs: ResolutionInputs,
-    targets: Vec<TargetIdentity>,
-    derived: Arc<DerivedViews>,
-  ) -> RailResult<Self> {
-    if rail_config.is_some() == rail_config_discovery_root.is_some() {
-      return Err(RailError::message(
-        "workspace snapshot must retain exactly one present or discovered-absent cargo-rail configuration state",
-      ));
-    }
-    let metadata = cargo.metadata();
-    let source_root = crate::utils::canonicalize_existing(source_root)?;
-    let mut partitioned_source_paths = resolution_inputs
-      .cargo_config
-      .repository_config_paths(&source_root)?
-      .into_iter()
-      .collect::<BTreeSet<_>>();
-    let lockfile_path = source_root_for_lockfile(metadata)?;
-    partitioned_source_paths.insert(relative_path(&source_root, &lockfile_path)?);
-    if !partitioned_source_paths.is_empty() {
-      Arc::make_mut(&mut source).retain(|entry| !partitioned_source_paths.contains(&entry.path));
-    }
-    let root_manifest = source_root_for_workspace_manifest(source_root.as_path(), metadata)?;
-    let mut manifest_paths = BTreeMap::new();
-    manifest_paths.insert(relative_path(&source_root, &root_manifest)?, root_manifest);
+    pub(crate) fn capture(capture: WorkspaceSnapshotCapture<'_>) -> RailResult<Self> {
+        let WorkspaceSnapshotCapture {
+            source_root,
+            mut source,
+            cargo,
+            rail_config,
+            rail_config_discovery_root,
+            generated_lockfile,
+            resolution_inputs,
+            targets,
+            derived,
+        } = capture;
+        if rail_config.is_some() == rail_config_discovery_root.is_some() {
+            return Err(RailError::message(
+                "workspace snapshot must retain exactly one present or discovered-absent cargo-rail configuration state",
+            ));
+        }
+        let metadata = cargo.metadata();
+        let source_root = crate::utils::canonicalize_existing(source_root)?;
+        let mut partitioned_source_paths = resolution_inputs
+            .cargo_config
+            .repository_config_paths(&source_root)?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let lockfile_path = source_root_for_lockfile(metadata)?;
+        partitioned_source_paths.insert(relative_path(&source_root, &lockfile_path)?);
+        if !partitioned_source_paths.is_empty() {
+            Arc::make_mut(&mut source).retain(|entry| !partitioned_source_paths.contains(&entry.path));
+        }
+        let root_manifest = source_root_for_workspace_manifest(source_root.as_path(), metadata)?;
+        let mut manifest_paths = BTreeMap::new();
+        manifest_paths.insert(relative_path(&source_root, &root_manifest)?, root_manifest);
 
-    let workspace_members: BTreeSet<_> = metadata.workspace_members.iter().collect();
-    let mut package_locations = BTreeMap::new();
-    let mut local_manifest_owners = BTreeMap::new();
-    for package in &metadata.packages {
-      if package.source.is_some() {
-        continue;
-      }
-      let manifest = package.manifest_path.as_std_path();
-      let relative = relative_path(&source_root, manifest).map_err(|_| {
+        let workspace_members: BTreeSet<_> = metadata.workspace_members.iter().collect();
+        let mut package_locations = BTreeMap::new();
+        let mut local_manifest_owners = BTreeMap::new();
+        for package in &metadata.packages {
+            if package.source.is_some() {
+                continue;
+            }
+            let manifest = package.manifest_path.as_std_path();
+            let relative = relative_path(&source_root, manifest).map_err(|_| {
         RailError::with_help(
           format!(
             "Local package '{}' manifest '{}' is outside snapshot source root '{}'",
@@ -378,1071 +405,1067 @@ impl WorkspaceSnapshot {
           "place local path packages inside the captured repository/workspace boundary before creating a workspace snapshot",
         )
       })?;
-      let package_root = relative
-        .as_path()
-        .parent()
-        .unwrap_or_else(|| Path::new(""))
-        .to_path_buf();
-      if let Some(existing) = local_manifest_owners.insert(relative.clone(), package.id.clone()) {
-        let mut package_ids = [existing.to_string(), package.id.to_string()];
-        package_ids.sort_unstable();
-        return Err(RailError::message(format!(
-          "Local packages '{}' and '{}' claim the same manifest '{}'",
-          package_ids[0], package_ids[1], relative
-        )));
-      }
-      manifest_paths.insert(relative.clone(), manifest.to_path_buf());
-      package_locations.insert(package.id.clone(), (relative, package_root));
-    }
-
-    let manifests = manifest_paths
-      .into_values()
-      .map(|path| capture_required_file(&source, &source_root, &path, "Cargo manifest"))
-      .collect::<RailResult<Vec<_>>>()?;
-    let source_lockfile = capture_optional_file(&source, &source_root, &lockfile_path, "Cargo lockfile")?;
-    let lockfile = match (source_lockfile, generated_lockfile) {
-      (Some(file), None) => Some(file),
-      (None, Some(captured)) => Some(capture_generated_lockfile(&source_root, metadata, captured)?),
-      (None, None) => None,
-      (Some(file), Some(captured)) => {
-        if file.bytes() != captured.bytes {
-          return Err(RailError::with_help(
-            "Cargo-generated lockfile changed while the workspace snapshot was being captured",
-            "retry after workspace input changes have stopped",
-          ));
+            let package_root = relative
+                .as_path()
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .to_path_buf();
+            if let Some(existing) = local_manifest_owners.insert(relative.clone(), package.id.clone()) {
+                let mut package_ids = [existing.to_string(), package.id.to_string()];
+                package_ids.sort_unstable();
+                return Err(RailError::message(format!(
+                    "Local packages '{}' and '{}' claim the same manifest '{}'",
+                    package_ids[0], package_ids[1], relative
+                )));
+            }
+            manifest_paths.insert(relative.clone(), manifest.to_path_buf());
+            package_locations.insert(package.id.clone(), (relative, package_root));
         }
-        Some(file)
-      }
-    }
-    .map(LockfileSnapshot::from_file)
-    .transpose()?;
-    let (rail_config, rail_config_path, config) = rail_config
-      .map(|config| {
-        let captured = capture_rail_config(&source, &source_root, &config)?;
-        if captured.bytes() != config.bytes.as_slice() {
-          return Err(RailError::with_help(
-            format!(
-              "cargo-rail configuration '{}' changed after it was parsed",
-              captured.path()
-            ),
-            "retry after workspace configuration changes have stopped",
-          ));
+
+        let manifests = manifest_paths
+            .into_values()
+            .map(|path| capture_required_file(&source, &source_root, &path, "Cargo manifest"))
+            .collect::<RailResult<Vec<_>>>()?;
+        let source_lockfile = capture_optional_file(&source, &source_root, &lockfile_path, "Cargo lockfile")?;
+        let lockfile = match (source_lockfile, generated_lockfile) {
+            (Some(file), None) => Some(file),
+            (None, Some(captured)) => Some(capture_generated_lockfile(&source_root, metadata, captured)?),
+            (None, None) => None,
+            (Some(file), Some(captured)) => {
+                if file.bytes() != captured.bytes {
+                    return Err(RailError::with_help(
+                        "Cargo-generated lockfile changed while the workspace snapshot was being captured",
+                        "retry after workspace input changes have stopped",
+                    ));
+                }
+                Some(file)
+            }
         }
-        Ok((captured, config.path, config.config))
-      })
-      .transpose()?
-      .map_or((None, None, None), |(file, path, config)| {
-        (Some(file), Some(path), Some(config))
-      });
+        .map(LockfileSnapshot::from_file)
+        .transpose()?;
+        let (rail_config, rail_config_path, config) = rail_config
+            .map(|config| {
+                let captured = capture_rail_config(&source, &source_root, &config)?;
+                if captured.bytes() != config.bytes.as_slice() {
+                    return Err(RailError::with_help(
+                        format!(
+                            "cargo-rail configuration '{}' changed after it was parsed",
+                            captured.path()
+                        ),
+                        "retry after workspace configuration changes have stopped",
+                    ));
+                }
+                Ok((captured, config.path, config.config))
+            })
+            .transpose()?
+            .map_or((None, None, None), |(file, path, config)| {
+                (Some(file), Some(path), Some(config))
+            });
 
-    let packages = package_snapshots(metadata, &workspace_members, &package_locations, lockfile.as_ref())?;
-    let base_resolution = derived.resolution_view(ResolutionRequest::default())?;
-    let cargo_config_identity = resolution_inputs
-      .cargo_config
-      .portable_snapshot_identity(&source_root)?;
-    let toolchain_identity = resolution_inputs.toolchain.portable_snapshot_identity(&source_root)?;
-    let configuration_fingerprint = snapshot_configuration_fingerprint(rail_config.as_ref(), &cargo_config_identity);
-    let toolchain_fingerprint = format!("sha256:{}", ContentDigest::sha256(&toolchain_identity));
-    let excluded_paths = BTreeSet::new();
-    let id = compute_snapshot_id(
-      &source,
-      &manifests,
-      lockfile.as_ref(),
-      rail_config.as_ref(),
-      &cargo_config_identity,
-      &toolchain_identity,
-      &source_root,
-      &targets,
-      &excluded_paths,
-    )?;
-    Ok(Self {
-      id,
-      source_root,
-      configuration_fingerprint,
-      toolchain_fingerprint,
-      cargo_config_identity: cargo_config_identity.into(),
-      toolchain_identity: toolchain_identity.into(),
-      cargo,
-      source,
-      manifests,
-      lockfile,
-      rail_config,
-      rail_config_path,
-      rail_config_discovery_root,
-      config,
-      cargo_config: resolution_inputs.cargo_config,
-      packages,
-      toolchain: resolution_inputs.toolchain,
-      compilation_executable_identities: OnceLock::new(),
-      targets,
-      base_resolution,
-      derived,
-    })
-  }
-
-  /// Return the portable identity of this exact authoritative capture.
-  pub fn id(&self) -> SnapshotId {
-    self.id
-  }
-
-  pub(crate) fn source_root(&self) -> &Path {
-    &self.source_root
-  }
-
-  pub(crate) fn configuration_fingerprint(&self) -> &str {
-    &self.configuration_fingerprint
-  }
-
-  pub(crate) fn toolchain_fingerprint(&self) -> &str {
-    &self.toolchain_fingerprint
-  }
-
-  pub(crate) fn lockfile_fingerprint(&self) -> String {
-    self
-      .lockfile()
-      .map(|lockfile| format!("sha256:{}", lockfile.file().digest()))
-      .unwrap_or_else(|| "absent".to_string())
-  }
-
-  pub(crate) fn id_excluding_paths(&self, paths: &BTreeSet<PathBuf>) -> RailResult<SnapshotId> {
-    let paths = paths
-      .iter()
-      .map(|path| RepositoryPath::new(path))
-      .collect::<RailResult<BTreeSet<_>>>()?;
-    compute_snapshot_id(
-      &self.source,
-      &self.manifests,
-      self.lockfile.as_ref(),
-      self.rail_config.as_ref(),
-      &self.cargo_config_identity,
-      &self.toolchain_identity,
-      &self.source_root,
-      &self.targets,
-      &paths,
-    )
-  }
-
-  /// Return the backend-independent canonical source capture.
-  pub fn source(&self) -> &SourceSnapshot {
-    &self.source
-  }
-
-  /// Read one regular source file only when it still matches this capture.
-  pub(crate) fn read_source_file(&self, path: &RepositoryPath) -> RailResult<Option<Vec<u8>>> {
-    read_captured_source_file(&self.source_root, &self.source, path)
-  }
-
-  pub(crate) fn cargo(&self) -> &Arc<CargoState> {
-    &self.cargo
-  }
-
-  /// Return root and local-package manifests in logical path order.
-  pub fn manifests(&self) -> &[SnapshotFile] {
-    &self.manifests
-  }
-
-  /// Return the exact captured Cargo workspace root manifest.
-  pub(crate) fn workspace_manifest(&self) -> RailResult<&SnapshotFile> {
-    let path = relative_path(&self.source_root, &self.derived.workspace_root.join("Cargo.toml"))?;
-    self
-      .manifests
-      .iter()
-      .find(|manifest| manifest.path() == &path)
-      .ok_or_else(|| {
-        RailError::message(format!(
-          "workspace root manifest '{}' is absent from the authoritative snapshot",
-          path
-        ))
-      })
-  }
-
-  /// Return the exact lockfile and parsed identities, when present.
-  pub fn lockfile(&self) -> Option<&LockfileSnapshot> {
-    self.lockfile.as_ref()
-  }
-
-  /// Return the lossless cargo-rail configuration bytes, when present.
-  pub fn rail_config(&self) -> Option<&SnapshotFile> {
-    self.rail_config.as_ref()
-  }
-
-  pub(crate) fn rail_config_path(&self) -> Option<&Path> {
-    self.rail_config_path.as_deref()
-  }
-
-  /// Return the parsed cargo-rail configuration paired with the lossless bytes.
-  pub fn config(&self) -> Option<&RailConfig> {
-    self.config.as_deref()
-  }
-
-  pub(crate) fn shared_config(&self) -> Option<&Arc<RailConfig>> {
-    self.config.as_ref()
-  }
-
-  /// Return effective non-secret Cargo configuration inputs and provenance.
-  pub fn cargo_config(&self) -> &CargoConfigSnapshot {
-    &self.cargo_config
-  }
-
-  /// Return exact Cargo package/source identities in package-ID order.
-  pub fn packages(&self) -> &[SnapshotPackage] {
-    &self.packages
-  }
-
-  /// Return the resolved Cargo, rustc, rustdoc, and wrapper identity.
-  pub fn toolchain(&self) -> &ToolchainIdentity {
-    &self.toolchain
-  }
-
-  pub(crate) fn executable_identities(&self) -> RailResult<&ToolchainExecutableIdentities> {
-    match self.compilation_executable_identities.get_or_init(|| {
-      ToolchainExecutableIdentities::capture(&self.toolchain, &self.source_root, &self.source_root)
-        .map_err(|error| error.to_string())
-    }) {
-      Ok(identities) => Ok(identities),
-      Err(error) => Err(RailError::message(error.clone())),
+        let packages = package_snapshots(metadata, &workspace_members, &package_locations, lockfile.as_ref())?;
+        let base_resolution = derived.resolution_view(ResolutionRequest::default())?;
+        let cargo_config_identity = resolution_inputs
+            .cargo_config
+            .portable_snapshot_identity(&source_root)?;
+        let toolchain_identity = resolution_inputs.toolchain.portable_snapshot_identity(&source_root)?;
+        let configuration_fingerprint =
+            snapshot_configuration_fingerprint(rail_config.as_ref(), &cargo_config_identity);
+        let toolchain_fingerprint = format!("sha256:{}", ContentDigest::sha256(&toolchain_identity));
+        let excluded_paths = BTreeSet::new();
+        let id = compute_snapshot_id(SnapshotIdentityInputs {
+            source: &source,
+            manifests: &manifests,
+            lockfile: lockfile.as_ref(),
+            rail_config: rail_config.as_ref(),
+            cargo_config_identity: &cargo_config_identity,
+            toolchain_identity: &toolchain_identity,
+            source_root: &source_root,
+            targets: &targets,
+            excluded_paths: &excluded_paths,
+        })?;
+        Ok(Self {
+            id,
+            source_root,
+            configuration_fingerprint,
+            toolchain_fingerprint,
+            cargo_config_identity: cargo_config_identity.into(),
+            toolchain_identity: toolchain_identity.into(),
+            cargo,
+            source,
+            manifests,
+            lockfile,
+            rail_config,
+            rail_config_path,
+            rail_config_discovery_root,
+            config,
+            cargo_config: resolution_inputs.cargo_config,
+            packages,
+            toolchain: resolution_inputs.toolchain,
+            compilation_executable_identities: OnceLock::new(),
+            targets,
+            base_resolution,
+            derived,
+        })
     }
-  }
 
-  /// Return host and selected target identities in deterministic order.
-  pub fn targets(&self) -> &[TargetIdentity] {
-    &self.targets
-  }
-
-  /// Return the already-loaded canonical native/default resolution.
-  pub fn base_resolution(&self) -> &ResolutionView {
-    &self.base_resolution
-  }
-
-  pub(crate) fn resolution_view(&self, request: ResolutionRequest) -> RailResult<Arc<ResolutionView>> {
-    self.derived.resolution_view(request)
-  }
-
-  pub(crate) fn post_mutation_resolution_view(
-    &self,
-    request: ResolutionRequest,
-    post_mutation_metadata: &Metadata,
-  ) -> RailResult<Arc<ResolutionView>> {
-    self
-      .derived
-      .post_mutation_resolution_view(request, post_mutation_metadata)
-  }
-
-  pub(crate) fn cargo_current_dir(&self) -> &Path {
-    self.derived.cargo_current_dir()
-  }
-
-  pub(crate) fn multi_target_metadata(&self) -> RailResult<Arc<MultiTargetMetadata>> {
-    self.derived.multi_target_metadata()
-  }
-
-  pub(crate) fn target_cfg_sets(&self) -> RailResult<Arc<std::collections::HashMap<String, TargetCfgSet>>> {
-    self.derived.target_cfg_sets()
-  }
-
-  pub(crate) fn validate_external_targets_unchanged(&self) -> RailResult<()> {
-    self
-      .targets
-      .iter()
-      .try_for_each(TargetIdentity::validate_custom_specification_unchanged)
-  }
-
-  pub(crate) fn validate_live_authoritative_inputs(&self) -> RailResult<()> {
-    self.validate_resolution_environment_unchanged()?;
-    self.validate_authoritative_files_unchanged()?;
-    self.validate_external_targets_unchanged()
-  }
-
-  /// Revalidate every captured resolution input that an authorized manifest
-  /// mutation does not own.
-  pub(crate) fn validate_post_mutation_resolution_inputs_unchanged(&self) -> RailResult<()> {
-    self.validate_post_mutation_environment_unchanged()?;
-    if let Some(lockfile) = &self.lockfile {
-      let path = self.source_root.join(lockfile.file().path().as_path());
-      validate_authoritative_file_unchanged(lockfile.file(), &path)?;
+    /// Return the portable identity of this exact authoritative capture.
+    pub fn id(&self) -> SnapshotId {
+        self.id
     }
-    Ok(())
-  }
 
-  /// Revalidate captured resolution inputs other than the lockfile and the
-  /// manifests owned by the active mutation.
-  pub(crate) fn validate_post_mutation_environment_unchanged(&self) -> RailResult<()> {
-    self.validate_resolution_environment_unchanged()?;
-    if let (Some(file), Some(path)) = (&self.rail_config, &self.rail_config_path) {
-      validate_authoritative_file_unchanged(file, path)?;
+    pub(crate) fn source_root(&self) -> &Path {
+        &self.source_root
     }
-    if let Some(root) = &self.rail_config_discovery_root {
-      validate_discovered_rail_config_absence(root)?;
-    }
-    self.validate_external_targets_unchanged()
-  }
 
-  pub(crate) fn validate_authoritative_files_unchanged(&self) -> RailResult<()> {
-    for file in self
-      .manifests
-      .iter()
-      .chain(self.lockfile.iter().map(LockfileSnapshot::file))
-    {
-      let path = self.source_root.join(file.path().as_path());
-      validate_authoritative_file_unchanged(file, &path)?;
+    pub(crate) fn configuration_fingerprint(&self) -> &str {
+        &self.configuration_fingerprint
     }
-    if let (Some(file), Some(path)) = (&self.rail_config, &self.rail_config_path) {
-      validate_authoritative_file_unchanged(file, path)?;
-    }
-    if let Some(root) = &self.rail_config_discovery_root {
-      validate_discovered_rail_config_absence(root)?;
-    }
-    Ok(())
-  }
 
-  pub(crate) fn validate_resolution_environment_unchanged(&self) -> RailResult<()> {
-    let current = ResolutionViews::capture_inputs(self.derived.cargo_current_dir())?;
-    if current.cargo_config != self.cargo_config || current.toolchain != self.toolchain {
-      return Err(RailError::with_help(
-        "Cargo configuration or toolchain identity changed after workspace snapshot capture",
-        "retry after workspace inputs and toolchain updates have stopped",
-      ));
+    pub(crate) fn toolchain_fingerprint(&self) -> &str {
+        &self.toolchain_fingerprint
     }
-    Ok(())
-  }
+
+    pub(crate) fn lockfile_fingerprint(&self) -> String {
+        self.lockfile()
+            .map(|lockfile| format!("sha256:{}", lockfile.file().digest()))
+            .unwrap_or_else(|| "absent".to_string())
+    }
+
+    pub(crate) fn id_excluding_paths(&self, paths: &BTreeSet<PathBuf>) -> RailResult<SnapshotId> {
+        let paths = paths
+            .iter()
+            .map(|path| RepositoryPath::new(path))
+            .collect::<RailResult<BTreeSet<_>>>()?;
+        compute_snapshot_id(SnapshotIdentityInputs {
+            source: &self.source,
+            manifests: &self.manifests,
+            lockfile: self.lockfile.as_ref(),
+            rail_config: self.rail_config.as_ref(),
+            cargo_config_identity: &self.cargo_config_identity,
+            toolchain_identity: &self.toolchain_identity,
+            source_root: &self.source_root,
+            targets: &self.targets,
+            excluded_paths: &paths,
+        })
+    }
+
+    /// Return the backend-independent canonical source capture.
+    pub fn source(&self) -> &SourceSnapshot {
+        &self.source
+    }
+
+    /// Read one regular source file only when it still matches this capture.
+    pub(crate) fn read_source_file(&self, path: &RepositoryPath) -> RailResult<Option<Vec<u8>>> {
+        read_captured_source_file(&self.source_root, &self.source, path)
+    }
+
+    pub(crate) fn cargo(&self) -> &Arc<CargoState> {
+        &self.cargo
+    }
+
+    /// Return root and local-package manifests in logical path order.
+    pub fn manifests(&self) -> &[SnapshotFile] {
+        &self.manifests
+    }
+
+    /// Return the exact captured Cargo workspace root manifest.
+    pub(crate) fn workspace_manifest(&self) -> RailResult<&SnapshotFile> {
+        let path = relative_path(&self.source_root, &self.derived.workspace_root.join("Cargo.toml"))?;
+        self.manifests
+            .iter()
+            .find(|manifest| manifest.path() == &path)
+            .ok_or_else(|| {
+                RailError::message(format!(
+                    "workspace root manifest '{}' is absent from the authoritative snapshot",
+                    path
+                ))
+            })
+    }
+
+    /// Return the exact lockfile and parsed identities, when present.
+    pub fn lockfile(&self) -> Option<&LockfileSnapshot> {
+        self.lockfile.as_ref()
+    }
+
+    /// Return the lossless cargo-rail configuration bytes, when present.
+    pub fn rail_config(&self) -> Option<&SnapshotFile> {
+        self.rail_config.as_ref()
+    }
+
+    pub(crate) fn rail_config_path(&self) -> Option<&Path> {
+        self.rail_config_path.as_deref()
+    }
+
+    /// Return the parsed cargo-rail configuration paired with the lossless bytes.
+    pub fn config(&self) -> Option<&RailConfig> {
+        self.config.as_deref()
+    }
+
+    pub(crate) fn shared_config(&self) -> Option<&Arc<RailConfig>> {
+        self.config.as_ref()
+    }
+
+    /// Return effective non-secret Cargo configuration inputs and provenance.
+    pub fn cargo_config(&self) -> &CargoConfigSnapshot {
+        &self.cargo_config
+    }
+
+    /// Return exact Cargo package/source identities in package-ID order.
+    pub fn packages(&self) -> &[SnapshotPackage] {
+        &self.packages
+    }
+
+    /// Return the resolved Cargo, rustc, rustdoc, and wrapper identity.
+    pub fn toolchain(&self) -> &ToolchainIdentity {
+        &self.toolchain
+    }
+
+    pub(crate) fn executable_identities(&self) -> RailResult<&ToolchainExecutableIdentities> {
+        match self.compilation_executable_identities.get_or_init(|| {
+            ToolchainExecutableIdentities::capture(&self.toolchain, &self.source_root, &self.source_root)
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(identities) => Ok(identities),
+            Err(error) => Err(RailError::message(error.clone())),
+        }
+    }
+
+    /// Return host and selected target identities in deterministic order.
+    pub fn targets(&self) -> &[TargetIdentity] {
+        &self.targets
+    }
+
+    /// Return the already-loaded canonical native/default resolution.
+    pub fn base_resolution(&self) -> &ResolutionView {
+        &self.base_resolution
+    }
+
+    pub(crate) fn resolution_view(&self, request: ResolutionRequest) -> RailResult<Arc<ResolutionView>> {
+        self.derived.resolution_view(request)
+    }
+
+    pub(crate) fn post_mutation_resolution_view(
+        &self,
+        request: ResolutionRequest,
+        post_mutation_metadata: &Metadata,
+    ) -> RailResult<Arc<ResolutionView>> {
+        self.derived
+            .post_mutation_resolution_view(request, post_mutation_metadata)
+    }
+
+    pub(crate) fn cargo_current_dir(&self) -> &Path {
+        self.derived.cargo_current_dir()
+    }
+
+    pub(crate) fn multi_target_metadata(&self) -> RailResult<Arc<MultiTargetMetadata>> {
+        self.derived.multi_target_metadata()
+    }
+
+    pub(crate) fn target_cfg_sets(&self) -> RailResult<Arc<std::collections::HashMap<String, TargetCfgSet>>> {
+        self.derived.target_cfg_sets()
+    }
+
+    pub(crate) fn validate_external_targets_unchanged(&self) -> RailResult<()> {
+        self.targets
+            .iter()
+            .try_for_each(TargetIdentity::validate_custom_specification_unchanged)
+    }
+
+    pub(crate) fn validate_live_authoritative_inputs(&self) -> RailResult<()> {
+        self.validate_resolution_environment_unchanged()?;
+        self.validate_authoritative_files_unchanged()?;
+        self.validate_external_targets_unchanged()
+    }
+
+    /// Revalidate every captured resolution input that an authorized manifest
+    /// mutation does not own.
+    pub(crate) fn validate_post_mutation_resolution_inputs_unchanged(&self) -> RailResult<()> {
+        self.validate_post_mutation_environment_unchanged()?;
+        if let Some(lockfile) = &self.lockfile {
+            let path = self.source_root.join(lockfile.file().path().as_path());
+            validate_authoritative_file_unchanged(lockfile.file(), &path)?;
+        }
+        Ok(())
+    }
+
+    /// Revalidate captured resolution inputs other than the lockfile and the
+    /// manifests owned by the active mutation.
+    pub(crate) fn validate_post_mutation_environment_unchanged(&self) -> RailResult<()> {
+        self.validate_resolution_environment_unchanged()?;
+        if let (Some(file), Some(path)) = (&self.rail_config, &self.rail_config_path) {
+            validate_authoritative_file_unchanged(file, path)?;
+        }
+        if let Some(root) = &self.rail_config_discovery_root {
+            validate_discovered_rail_config_absence(root)?;
+        }
+        self.validate_external_targets_unchanged()
+    }
+
+    pub(crate) fn validate_authoritative_files_unchanged(&self) -> RailResult<()> {
+        for file in self
+            .manifests
+            .iter()
+            .chain(self.lockfile.iter().map(LockfileSnapshot::file))
+        {
+            let path = self.source_root.join(file.path().as_path());
+            validate_authoritative_file_unchanged(file, &path)?;
+        }
+        if let (Some(file), Some(path)) = (&self.rail_config, &self.rail_config_path) {
+            validate_authoritative_file_unchanged(file, path)?;
+        }
+        if let Some(root) = &self.rail_config_discovery_root {
+            validate_discovered_rail_config_absence(root)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_resolution_environment_unchanged(&self) -> RailResult<()> {
+        let current = ResolutionViews::capture_inputs(self.derived.cargo_current_dir())?;
+        if current.cargo_config != self.cargo_config || current.toolchain != self.toolchain {
+            return Err(RailError::with_help(
+                "Cargo configuration or toolchain identity changed after workspace snapshot capture",
+                "retry after workspace inputs and toolchain updates have stopped",
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn validate_discovered_rail_config_absence(discovery_root: &Path) -> RailResult<()> {
-  let Some(path) = RailConfig::find_config_path(discovery_root) else {
-    return Ok(());
-  };
-  Err(RailError::with_help(
-    format!(
-      "cargo-rail configuration '{}' appeared after workspace snapshot capture",
-      path.display()
-    ),
-    "retry after workspace configuration changes have stopped",
-  ))
+    let Some(path) = RailConfig::find_config_path(discovery_root) else {
+        return Ok(());
+    };
+    Err(RailError::with_help(
+        format!(
+            "cargo-rail configuration '{}' appeared after workspace snapshot capture",
+            path.display()
+        ),
+        "retry after workspace configuration changes have stopped",
+    ))
 }
 
 fn validate_authoritative_file_unchanged(file: &SnapshotFile, path: &Path) -> RailResult<()> {
-  let metadata = fs::symlink_metadata(path).map_err(|error| {
-    RailError::message(format!(
-      "failed to revalidate authoritative snapshot file '{}': {error}",
-      path.display()
-    ))
-  })?;
-  if !metadata.file_type().is_file() {
-    return Err(RailError::with_help(
-      format!(
-        "authoritative snapshot file '{}' is no longer a regular file",
-        path.display()
-      ),
-      "retry after workspace input changes have stopped",
-    ));
-  }
-  let bytes = fs::read(path).map_err(|error| {
-    RailError::message(format!(
-      "failed to revalidate authoritative snapshot file '{}': {error}",
-      path.display()
-    ))
-  })?;
-  if ContentDigest::sha256(&bytes) != file.digest() {
-    return Err(RailError::with_help(
-      format!("authoritative snapshot file '{}' changed after capture", path.display()),
-      "retry after workspace input changes have stopped",
-    ));
-  }
-  Ok(())
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        RailError::message(format!(
+            "failed to revalidate authoritative snapshot file '{}': {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(RailError::with_help(
+            format!(
+                "authoritative snapshot file '{}' is no longer a regular file",
+                path.display()
+            ),
+            "retry after workspace input changes have stopped",
+        ));
+    }
+    let bytes = fs::read(path).map_err(|error| {
+        RailError::message(format!(
+            "failed to revalidate authoritative snapshot file '{}': {error}",
+            path.display()
+        ))
+    })?;
+    if ContentDigest::sha256(&bytes) != file.digest() {
+        return Err(RailError::with_help(
+            format!("authoritative snapshot file '{}' changed after capture", path.display()),
+            "retry after workspace input changes have stopped",
+        ));
+    }
+    Ok(())
 }
 
 fn read_captured_source_file(
-  source_root: &Path,
-  source: &SourceSnapshot,
-  path: &RepositoryPath,
+    source_root: &Path,
+    source: &SourceSnapshot,
+    path: &RepositoryPath,
 ) -> RailResult<Option<Vec<u8>>> {
-  let entries = source.tree().entries();
-  let Ok(index) = entries.binary_search_by(|entry| entry.path.cmp(path)) else {
-    return Ok(None);
-  };
-  let expected_digest = match entries[index].kind {
-    SourceEntryKind::RegularFile { digest, .. } => digest,
-    SourceEntryKind::Symlink { .. } => {
-      return Err(RailError::with_help(
-        format!("captured source '{}' is a symbolic link", path),
-        "replace analysis source symlinks with regular files before collecting compiler facts",
-      ));
-    }
-    SourceEntryKind::Deleted => {
-      return Err(RailError::message(format!(
-        "captured source '{}' has an invalid deleted final-tree entry",
-        path
-      )));
-    }
-  };
+    let entries = source.tree().entries();
+    let Ok(index) = entries.binary_search_by(|entry| entry.path.cmp(path)) else {
+        return Ok(None);
+    };
+    let expected_digest = match entries[index].kind {
+        SourceEntryKind::RegularFile { digest, .. } => digest,
+        SourceEntryKind::Symlink { .. } => {
+            return Err(RailError::with_help(
+                format!("captured source '{}' is a symbolic link", path),
+                "replace analysis source symlinks with regular files before collecting compiler facts",
+            ));
+        }
+        SourceEntryKind::Deleted => {
+            return Err(RailError::message(format!(
+                "captured source '{}' has an invalid deleted final-tree entry",
+                path
+            )));
+        }
+    };
 
-  let absolute = source_root.join(path.as_path());
-  let metadata = fs::symlink_metadata(&absolute).map_err(|error| {
-    RailError::with_help(
-      format!("captured source '{}' cannot be inspected: {error}", path),
-      "retry after workspace source changes have stopped",
-    )
-  })?;
-  if !metadata.file_type().is_file() || crate::utils::is_symlink_or_reparse(&metadata) {
-    return Err(RailError::with_help(
-      format!("captured source '{}' is no longer a regular file", path),
-      "retry after workspace source changes have stopped",
-    ));
-  }
-  let mut opened = fs::File::open(&absolute).map_err(|error| {
-    RailError::with_help(
-      format!("captured source '{}' cannot be opened: {error}", path),
-      "retry after workspace source changes have stopped",
-    )
-  })?;
-  if !crate::utils::opened_file_matches_path(&opened, &absolute, metadata.len()).map_err(|error| {
-    RailError::with_help(
-      format!(
-        "captured source '{}' cannot be revalidated after opening: {error}",
-        path
-      ),
-      "retry after workspace source changes have stopped",
-    )
-  })? {
-    return Err(RailError::with_help(
-      format!("captured source '{}' changed before it was read", path),
-      "retry after workspace source changes have stopped",
-    ));
-  }
-  let capacity = usize::try_from(metadata.len()).map_err(|_| {
-    RailError::with_help(
-      format!("captured source '{}' is too large to read on this platform", path),
-      "reduce the source file size before collecting compiler facts",
-    )
-  })?;
-  let mut bytes = Vec::with_capacity(capacity);
-  (&mut opened)
-    .take(metadata.len().saturating_add(1))
-    .read_to_end(&mut bytes)
-    .map_err(|error| {
-      RailError::with_help(
-        format!("captured source '{}' cannot be read: {error}", path),
-        "retry after workspace source changes have stopped",
-      )
+    let absolute = source_root.join(path.as_path());
+    let metadata = fs::symlink_metadata(&absolute).map_err(|error| {
+        RailError::with_help(
+            format!("captured source '{}' cannot be inspected: {error}", path),
+            "retry after workspace source changes have stopped",
+        )
     })?;
-  if bytes.len() as u64 != metadata.len()
-    || !crate::utils::opened_file_matches_path(&opened, &absolute, metadata.len()).map_err(|error| {
-      RailError::with_help(
-        format!(
-          "captured source '{}' cannot be revalidated after reading: {error}",
-          path
-        ),
-        "retry after workspace source changes have stopped",
-      )
-    })?
-  {
-    return Err(RailError::with_help(
-      format!("captured source '{}' changed while it was read", path),
-      "retry after workspace source changes have stopped",
-    ));
-  }
-  if ContentDigest::sha256(&bytes) != expected_digest {
-    return Err(RailError::with_help(
-      format!("captured source '{}' changed after workspace capture", path),
-      "retry after workspace source changes have stopped",
-    ));
-  }
-  Ok(Some(bytes))
+    if !metadata.file_type().is_file() || crate::utils::is_symlink_or_reparse(&metadata) {
+        return Err(RailError::with_help(
+            format!("captured source '{}' is no longer a regular file", path),
+            "retry after workspace source changes have stopped",
+        ));
+    }
+    let mut opened = fs::File::open(&absolute).map_err(|error| {
+        RailError::with_help(
+            format!("captured source '{}' cannot be opened: {error}", path),
+            "retry after workspace source changes have stopped",
+        )
+    })?;
+    if !crate::utils::opened_file_matches_path(&opened, &absolute, metadata.len()).map_err(|error| {
+        RailError::with_help(
+            format!(
+                "captured source '{}' cannot be revalidated after opening: {error}",
+                path
+            ),
+            "retry after workspace source changes have stopped",
+        )
+    })? {
+        return Err(RailError::with_help(
+            format!("captured source '{}' changed before it was read", path),
+            "retry after workspace source changes have stopped",
+        ));
+    }
+    let capacity = usize::try_from(metadata.len()).map_err(|_| {
+        RailError::with_help(
+            format!("captured source '{}' is too large to read on this platform", path),
+            "reduce the source file size before collecting compiler facts",
+        )
+    })?;
+    let mut bytes = Vec::with_capacity(capacity);
+    (&mut opened)
+        .take(metadata.len().saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            RailError::with_help(
+                format!("captured source '{}' cannot be read: {error}", path),
+                "retry after workspace source changes have stopped",
+            )
+        })?;
+    if bytes.len() as u64 != metadata.len()
+        || !crate::utils::opened_file_matches_path(&opened, &absolute, metadata.len()).map_err(|error| {
+            RailError::with_help(
+                format!(
+                    "captured source '{}' cannot be revalidated after reading: {error}",
+                    path
+                ),
+                "retry after workspace source changes have stopped",
+            )
+        })?
+    {
+        return Err(RailError::with_help(
+            format!("captured source '{}' changed while it was read", path),
+            "retry after workspace source changes have stopped",
+        ));
+    }
+    if ContentDigest::sha256(&bytes) != expected_digest {
+        return Err(RailError::with_help(
+            format!("captured source '{}' changed after workspace capture", path),
+            "retry after workspace source changes have stopped",
+        ));
+    }
+    Ok(Some(bytes))
 }
 
 fn capture_rail_config(
-  source: &SourceSnapshot,
-  source_root: &Path,
-  config: &CapturedRailConfig,
+    source: &SourceSnapshot,
+    source_root: &Path,
+    config: &CapturedRailConfig,
 ) -> RailResult<SnapshotFile> {
-  if relative_path(source_root, &config.path).is_ok() {
-    return capture_required_file(source, source_root, &config.path, "cargo-rail configuration");
-  }
+    if relative_path(source_root, &config.path).is_ok() {
+        return capture_required_file(source, source_root, &config.path, "cargo-rail configuration");
+    }
 
-  let logical_path = RepositoryPath::new(Path::new(".cargo-rail/external-config.toml"))?;
-  capture_declared_file_outside_tree(logical_path, &config.path, "cargo-rail configuration")?.ok_or_else(|| {
-    RailError::message(format!(
-      "cargo-rail configuration '{}' disappeared during snapshot capture",
-      config.path.display()
-    ))
-  })
+    let logical_path = RepositoryPath::new(Path::new(".cargo-rail/external-config.toml"))?;
+    capture_declared_file_outside_tree(logical_path, &config.path, "cargo-rail configuration")?.ok_or_else(|| {
+        RailError::message(format!(
+            "cargo-rail configuration '{}' disappeared during snapshot capture",
+            config.path.display()
+        ))
+    })
 }
 
 fn capture_generated_lockfile(
-  source_root: &Path,
-  metadata: &Metadata,
-  captured: CapturedLockfile,
+    source_root: &Path,
+    metadata: &Metadata,
+    captured: CapturedLockfile,
 ) -> RailResult<SnapshotFile> {
-  let expected = source_root_for_lockfile(metadata)?;
-  let file_type = fs::symlink_metadata(&captured.path)
-    .map_err(|error| {
-      RailError::message(format!(
-        "failed to inspect generated Cargo lockfile '{}': {error}",
-        captured.path.display()
-      ))
-    })?
-    .file_type();
-  if !file_type.is_file() {
-    return Err(RailError::with_help(
-      format!(
-        "generated Cargo lockfile '{}' is not a regular file",
-        captured.path.display()
-      ),
-      "replace the lockfile symlink or special entry with a regular file and retry",
-    ));
-  }
-  let path = crate::utils::canonicalize_existing(&captured.path)?;
-  if path != crate::utils::canonicalize_existing(&expected)? {
-    return Err(RailError::message(format!(
-      "generated Cargo lockfile '{}' does not match workspace lockfile '{}'",
-      path.display(),
-      expected.display()
-    )));
-  }
-  let current = fs::read(&path).map_err(|error| {
-    RailError::message(format!(
-      "failed to revalidate generated Cargo lockfile '{}': {error}",
-      path.display()
-    ))
-  })?;
-  if current != captured.bytes {
-    return Err(RailError::with_help(
-      "Cargo-generated lockfile changed while the workspace snapshot was being captured",
-      "retry after workspace input changes have stopped",
-    ));
-  }
-  Ok(SnapshotFile {
-    path: relative_path(source_root, &path)?,
-    digest: ContentDigest::sha256(&captured.bytes),
-    bytes: captured.bytes.into(),
-  })
+    let expected = source_root_for_lockfile(metadata)?;
+    let file_type = fs::symlink_metadata(&captured.path)
+        .map_err(|error| {
+            RailError::message(format!(
+                "failed to inspect generated Cargo lockfile '{}': {error}",
+                captured.path.display()
+            ))
+        })?
+        .file_type();
+    if !file_type.is_file() {
+        return Err(RailError::with_help(
+            format!(
+                "generated Cargo lockfile '{}' is not a regular file",
+                captured.path.display()
+            ),
+            "replace the lockfile symlink or special entry with a regular file and retry",
+        ));
+    }
+    let path = crate::utils::canonicalize_existing(&captured.path)?;
+    if path != crate::utils::canonicalize_existing(&expected)? {
+        return Err(RailError::message(format!(
+            "generated Cargo lockfile '{}' does not match workspace lockfile '{}'",
+            path.display(),
+            expected.display()
+        )));
+    }
+    let current = fs::read(&path).map_err(|error| {
+        RailError::message(format!(
+            "failed to revalidate generated Cargo lockfile '{}': {error}",
+            path.display()
+        ))
+    })?;
+    if current != captured.bytes {
+        return Err(RailError::with_help(
+            "Cargo-generated lockfile changed while the workspace snapshot was being captured",
+            "retry after workspace input changes have stopped",
+        ));
+    }
+    Ok(SnapshotFile {
+        path: relative_path(source_root, &path)?,
+        digest: ContentDigest::sha256(&captured.bytes),
+        bytes: captured.bytes.into(),
+    })
 }
 
 fn cached_snapshot_view<T>(value: &Result<Arc<T>, SnapshotViewError>) -> RailResult<Arc<T>> {
-  value.as_ref().map(Arc::clone).map_err(SnapshotViewError::to_error)
+    value.as_ref().map(Arc::clone).map_err(SnapshotViewError::to_error)
 }
+fn compute_snapshot_id(inputs: SnapshotIdentityInputs<'_>) -> RailResult<SnapshotId> {
+    let SnapshotIdentityInputs {
+        source,
+        manifests,
+        lockfile,
+        rail_config,
+        cargo_config_identity,
+        toolchain_identity,
+        source_root,
+        targets,
+        excluded_paths,
+    } = inputs;
+    let mut identity = SnapshotIdentityHasher::new(b"cargo-rail-workspace-snapshot\0");
+    identity.frame(b"version", &SNAPSHOT_ID_VERSION.to_le_bytes());
 
-#[allow(clippy::too_many_arguments)]
-fn compute_snapshot_id(
-  source: &SourceSnapshot,
-  manifests: &[SnapshotFile],
-  lockfile: Option<&LockfileSnapshot>,
-  rail_config: Option<&SnapshotFile>,
-  cargo_config_identity: &[u8],
-  toolchain_identity: &[u8],
-  source_root: &Path,
-  targets: &[TargetIdentity],
-  excluded_paths: &BTreeSet<RepositoryPath>,
-) -> RailResult<SnapshotId> {
-  let mut identity = SnapshotIdentityHasher::new(b"cargo-rail-workspace-snapshot\0");
-  identity.frame(b"version", &SNAPSHOT_ID_VERSION.to_le_bytes());
-
-  for entry in source.tree().entries() {
-    if excluded_paths.contains(&entry.path) {
-      continue;
+    for entry in source.tree().entries() {
+        if excluded_paths.contains(&entry.path) {
+            continue;
+        }
+        let mut framed = Vec::new();
+        append_identity_frame(&mut framed, b"path", entry.path.as_str().as_bytes());
+        match &entry.kind {
+            SourceEntryKind::RegularFile { digest, executable } => {
+                append_identity_frame(&mut framed, b"kind", b"regular-file");
+                append_identity_frame(&mut framed, b"content", digest.as_bytes());
+                append_identity_frame(&mut framed, b"executable", &[u8::from(*executable)]);
+            }
+            SourceEntryKind::Symlink { target } => {
+                append_identity_frame(&mut framed, b"kind", b"symlink");
+                append_identity_frame(&mut framed, b"target", target.as_bytes());
+            }
+            SourceEntryKind::Deleted => {
+                return Err(RailError::message(format!(
+                    "workspace snapshot source tree contains deleted entry '{}'",
+                    entry.path
+                )));
+            }
+        }
+        identity.frame(b"source-entry", &framed);
     }
-    let mut framed = Vec::new();
-    append_identity_frame(&mut framed, b"path", entry.path.as_str().as_bytes());
-    match &entry.kind {
-      SourceEntryKind::RegularFile { digest, executable } => {
-        append_identity_frame(&mut framed, b"kind", b"regular-file");
-        append_identity_frame(&mut framed, b"content", digest.as_bytes());
-        append_identity_frame(&mut framed, b"executable", &[u8::from(*executable)]);
-      }
-      SourceEntryKind::Symlink { target } => {
-        append_identity_frame(&mut framed, b"kind", b"symlink");
-        append_identity_frame(&mut framed, b"target", target.as_bytes());
-      }
-      SourceEntryKind::Deleted => {
-        return Err(RailError::message(format!(
-          "workspace snapshot source tree contains deleted entry '{}'",
-          entry.path
-        )));
-      }
+
+    for manifest in manifests {
+        identity.snapshot_file(b"manifest", manifest);
     }
-    identity.frame(b"source-entry", &framed);
-  }
+    match lockfile {
+        Some(lockfile) => identity.snapshot_file(b"lockfile", lockfile.file()),
+        None => identity.frame(b"lockfile", b"absent"),
+    }
+    match rail_config {
+        Some(config) => identity.snapshot_file(b"rail-config", config),
+        None => identity.frame(b"rail-config", b"absent"),
+    }
 
-  for manifest in manifests {
-    identity.snapshot_file(b"manifest", manifest);
-  }
-  match lockfile {
-    Some(lockfile) => identity.snapshot_file(b"lockfile", lockfile.file()),
-    None => identity.frame(b"lockfile", b"absent"),
-  }
-  match rail_config {
-    Some(config) => identity.snapshot_file(b"rail-config", config),
-    None => identity.frame(b"rail-config", b"absent"),
-  }
+    identity.frame(b"cargo-config", cargo_config_identity);
+    identity.frame(b"toolchain", toolchain_identity);
+    for target in targets {
+        identity.frame(b"target", &target.portable_snapshot_identity(source_root)?);
+    }
 
-  identity.frame(b"cargo-config", cargo_config_identity);
-  identity.frame(b"toolchain", toolchain_identity);
-  for target in targets {
-    identity.frame(b"target", &target.portable_snapshot_identity(source_root)?);
-  }
-
-  Ok(SnapshotId {
-    version: SNAPSHOT_ID_VERSION,
-    digest: identity.finish(),
-  })
+    Ok(SnapshotId {
+        version: SNAPSHOT_ID_VERSION,
+        digest: identity.finish(),
+    })
 }
 
 struct SnapshotIdentityHasher {
-  hasher: Sha256,
-  input_bytes: usize,
+    hasher: Sha256,
+    input_bytes: usize,
 }
 
 impl SnapshotIdentityHasher {
-  fn new(domain: &[u8]) -> Self {
-    let mut identity = Self {
-      hasher: Sha256::new(),
-      input_bytes: 0,
-    };
-    identity.update(domain);
-    identity
-  }
+    fn new(domain: &[u8]) -> Self {
+        let mut identity = Self {
+            hasher: Sha256::new(),
+            input_bytes: 0,
+        };
+        identity.update(domain);
+        identity
+    }
 
-  fn frame(&mut self, tag: &[u8], value: &[u8]) {
-    self.update(&(tag.len() as u64).to_le_bytes());
-    self.update(tag);
-    self.update(&(value.len() as u64).to_le_bytes());
-    self.update(value);
-  }
+    fn frame(&mut self, tag: &[u8], value: &[u8]) {
+        self.update(&(tag.len() as u64).to_le_bytes());
+        self.update(tag);
+        self.update(&(value.len() as u64).to_le_bytes());
+        self.update(value);
+    }
 
-  fn snapshot_file(&mut self, tag: &[u8], file: &SnapshotFile) {
-    let mut framed = Vec::new();
-    append_identity_frame(&mut framed, b"path", file.path().as_str().as_bytes());
-    append_identity_frame(&mut framed, b"content", file.digest().as_bytes());
-    self.frame(tag, &framed);
-  }
+    fn snapshot_file(&mut self, tag: &[u8], file: &SnapshotFile) {
+        let mut framed = Vec::new();
+        append_identity_frame(&mut framed, b"path", file.path().as_str().as_bytes());
+        append_identity_frame(&mut framed, b"content", file.digest().as_bytes());
+        self.frame(tag, &framed);
+    }
 
-  fn update(&mut self, bytes: &[u8]) {
-    self.hasher.update(bytes);
-    self.input_bytes = self.input_bytes.saturating_add(bytes.len());
-  }
+    fn update(&mut self, bytes: &[u8]) {
+        self.hasher.update(bytes);
+        self.input_bytes = self.input_bytes.saturating_add(bytes.len());
+    }
 
-  fn finish(self) -> ContentDigest {
-    crate::instrumentation::record_hash_operation();
-    crate::instrumentation::record_hash_input_bytes(self.input_bytes);
-    ContentDigest::from_sha256_bytes(self.hasher.finalize().into())
-  }
+    fn finish(self) -> ContentDigest {
+        crate::instrumentation::record_hash_operation();
+        crate::instrumentation::record_hash_input_bytes(self.input_bytes);
+        ContentDigest::from_sha256_bytes(self.hasher.finalize().into())
+    }
 }
 
 fn snapshot_configuration_fingerprint(rail_config: Option<&SnapshotFile>, cargo_config_identity: &[u8]) -> String {
-  let mut identity = Vec::from(&b"cargo-rail-snapshot-configuration-v1\0"[..]);
-  match rail_config {
-    Some(config) => {
-      let mut framed = Vec::new();
-      let normalized = crate::utils::normalize_line_endings(config.bytes());
-      let digest = ContentDigest::sha256(&normalized);
-      append_identity_frame(&mut framed, b"path", config.path().as_str().as_bytes());
-      append_identity_frame(&mut framed, b"content", digest.as_bytes());
-      append_identity_frame(&mut identity, b"rail-config", &framed);
+    let mut identity = Vec::from(&b"cargo-rail-snapshot-configuration-v1\0"[..]);
+    match rail_config {
+        Some(config) => {
+            let mut framed = Vec::new();
+            let normalized = crate::utils::normalize_line_endings(config.bytes());
+            let digest = ContentDigest::sha256(&normalized);
+            append_identity_frame(&mut framed, b"path", config.path().as_str().as_bytes());
+            append_identity_frame(&mut framed, b"content", digest.as_bytes());
+            append_identity_frame(&mut identity, b"rail-config", &framed);
+        }
+        None => append_identity_frame(&mut identity, b"rail-config", b"absent"),
     }
-    None => append_identity_frame(&mut identity, b"rail-config", b"absent"),
-  }
-  append_identity_frame(&mut identity, b"cargo-config", cargo_config_identity);
-  format!("sha256:{}", ContentDigest::sha256(&identity))
+    append_identity_frame(&mut identity, b"cargo-config", cargo_config_identity);
+    format!("sha256:{}", ContentDigest::sha256(&identity))
 }
 
 fn append_identity_frame(output: &mut Vec<u8>, tag: &[u8], value: &[u8]) {
-  output.extend_from_slice(&(tag.len() as u64).to_le_bytes());
-  output.extend_from_slice(tag);
-  output.extend_from_slice(&(value.len() as u64).to_le_bytes());
-  output.extend_from_slice(value);
+    output.extend_from_slice(&(tag.len() as u64).to_le_bytes());
+    output.extend_from_slice(tag);
+    output.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    output.extend_from_slice(value);
 }
 
 impl LockfileSnapshot {
-  fn from_file(file: SnapshotFile) -> RailResult<Self> {
-    #[derive(Deserialize)]
-    struct Document {
-      #[serde(default)]
-      package: Vec<Package>,
-    }
-    #[derive(Deserialize)]
-    struct Package {
-      name: String,
-      version: String,
-      source: Option<String>,
-      checksum: Option<String>,
-    }
+    fn from_file(file: SnapshotFile) -> RailResult<Self> {
+        #[derive(Deserialize)]
+        struct Document {
+            #[serde(default)]
+            package: Vec<Package>,
+        }
+        #[derive(Deserialize)]
+        struct Package {
+            name: String,
+            version: String,
+            source: Option<String>,
+            checksum: Option<String>,
+        }
 
-    let text = std::str::from_utf8(file.bytes())
-      .map_err(|_| RailError::message(format!("Cargo lockfile '{}' is not valid UTF-8", file.path())))?;
-    let document: Document = toml_edit::de::from_str(text).map_err(|_| {
-      RailError::with_help(
-        format!("failed to parse Cargo lockfile '{}'", file.path()),
-        "fix Cargo.lock syntax; raw parser context is suppressed because source URLs may contain credentials",
-      )
-    })?;
-    let mut packages = document
-      .package
-      .into_iter()
-      .map(|package| LockedPackageIdentity {
-        name: package.name,
-        version: package.version,
-        source: package.source,
-        checksum: package.checksum,
-      })
-      .collect::<Vec<_>>();
-    if let Some(package) = packages
-      .iter()
-      .find(|package| package.source.as_deref().is_some_and(credential_bearing_url))
-    {
-      return Err(RailError::with_help(
-        format!(
-          "Cargo lockfile package '{} {}' contains a credential-bearing source URL",
-          package.name, package.version
-        ),
-        "move credentials to Cargo's credential provider and regenerate Cargo.lock with a secret-free source URL",
-      ));
+        let text = std::str::from_utf8(file.bytes())
+            .map_err(|_| RailError::message(format!("Cargo lockfile '{}' is not valid UTF-8", file.path())))?;
+        let document: Document = toml_edit::de::from_str(text).map_err(|_| {
+            RailError::with_help(
+                format!("failed to parse Cargo lockfile '{}'", file.path()),
+                "fix Cargo.lock syntax; raw parser context is suppressed because source URLs may contain credentials",
+            )
+        })?;
+        let mut packages = document
+            .package
+            .into_iter()
+            .map(|package| LockedPackageIdentity {
+                name: package.name,
+                version: package.version,
+                source: package.source,
+                checksum: package.checksum,
+            })
+            .collect::<Vec<_>>();
+        if let Some(package) = packages
+            .iter()
+            .find(|package| package.source.as_deref().is_some_and(credential_bearing_url))
+        {
+            return Err(RailError::with_help(
+                format!(
+                    "Cargo lockfile package '{} {}' contains a credential-bearing source URL",
+                    package.name, package.version
+                ),
+                "move credentials to Cargo's credential provider and regenerate Cargo.lock with a secret-free source URL",
+            ));
+        }
+        packages.sort_unstable();
+        if let Some(duplicate) = packages.windows(2).find(|pair| {
+            pair[0].name == pair[1].name && pair[0].version == pair[1].version && pair[0].source == pair[1].source
+        }) {
+            return Err(RailError::message(format!(
+                "Cargo lockfile contains duplicate package identity '{} {}'",
+                duplicate[0].name, duplicate[0].version
+            )));
+        }
+        Ok(Self { file, packages })
     }
-    packages.sort_unstable();
-    if let Some(duplicate) = packages.windows(2).find(|pair| {
-      pair[0].name == pair[1].name && pair[0].version == pair[1].version && pair[0].source == pair[1].source
-    }) {
-      return Err(RailError::message(format!(
-        "Cargo lockfile contains duplicate package identity '{} {}'",
-        duplicate[0].name, duplicate[0].version
-      )));
-    }
-    Ok(Self { file, packages })
-  }
 }
 
 fn package_snapshots(
-  metadata: &Metadata,
-  workspace_members: &BTreeSet<&PackageId>,
-  locations: &BTreeMap<PackageId, (RepositoryPath, PathBuf)>,
-  lockfile: Option<&LockfileSnapshot>,
+    metadata: &Metadata,
+    workspace_members: &BTreeSet<&PackageId>,
+    locations: &BTreeMap<PackageId, (RepositoryPath, PathBuf)>,
+    lockfile: Option<&LockfileSnapshot>,
 ) -> RailResult<Vec<SnapshotPackage>> {
-  let checksums = lockfile
-    .map(|lockfile| {
-      lockfile
+    let checksums = lockfile
+        .map(|lockfile| {
+            lockfile
+                .packages
+                .iter()
+                .map(|locked| {
+                    (
+                        (locked.name.clone(), locked.version.clone(), locked.source.clone()),
+                        locked.checksum.clone(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let mut packages = metadata
         .packages
         .iter()
-        .map(|locked| {
-          (
-            (locked.name.clone(), locked.version.clone(), locked.source.clone()),
-            locked.checksum.clone(),
-          )
+        .map(|package| {
+            if package
+                .source
+                .as_ref()
+                .is_some_and(|source| credential_bearing_url(&source.repr))
+            {
+                return Err(RailError::with_help(
+                    format!(
+                        "Package '{} {}' contains a credential-bearing Cargo source URL",
+                        package.name, package.version
+                    ),
+                    "move credentials to Cargo's credential provider and keep dependency source URLs secret-free",
+                ));
+            }
+            let location = locations.get(&package.id);
+            let name = package.name.to_string();
+            let version = package.version.to_string();
+            let source = package.source.clone();
+            let checksum = checksums
+                .get(&(
+                    name.clone(),
+                    version.clone(),
+                    source.as_ref().map(|source| source.repr.clone()),
+                ))
+                .cloned()
+                .flatten();
+            Ok(SnapshotPackage {
+                id: package.id.clone(),
+                name,
+                version,
+                source,
+                checksum,
+                workspace_member: workspace_members.contains(&package.id),
+                manifest_path: location.map(|(manifest, _)| manifest.clone()),
+                package_root: location.map(|(_, root)| root.clone()),
+            })
         })
-        .collect::<BTreeMap<_, _>>()
-    })
-    .unwrap_or_default();
-  let mut packages = metadata
-    .packages
-    .iter()
-    .map(|package| {
-      if package
-        .source
-        .as_ref()
-        .is_some_and(|source| credential_bearing_url(&source.repr))
-      {
-        return Err(RailError::with_help(
-          format!(
-            "Package '{} {}' contains a credential-bearing Cargo source URL",
-            package.name, package.version
-          ),
-          "move credentials to Cargo's credential provider and keep dependency source URLs secret-free",
-        ));
-      }
-      let location = locations.get(&package.id);
-      let name = package.name.to_string();
-      let version = package.version.to_string();
-      let source = package.source.clone();
-      let checksum = checksums
-        .get(&(
-          name.clone(),
-          version.clone(),
-          source.as_ref().map(|source| source.repr.clone()),
-        ))
-        .cloned()
-        .flatten();
-      Ok(SnapshotPackage {
-        id: package.id.clone(),
-        name,
-        version,
-        source,
-        checksum,
-        workspace_member: workspace_members.contains(&package.id),
-        manifest_path: location.map(|(manifest, _)| manifest.clone()),
-        package_root: location.map(|(_, root)| root.clone()),
-      })
-    })
-    .collect::<RailResult<Vec<_>>>()?;
-  packages.sort_unstable_by(|left, right| left.id.repr.cmp(&right.id.repr));
-  Ok(packages)
+        .collect::<RailResult<Vec<_>>>()?;
+    packages.sort_unstable_by(|left, right| left.id.repr.cmp(&right.id.repr));
+    Ok(packages)
 }
 
 fn source_root_for_workspace_manifest(source_root: &Path, metadata: &Metadata) -> RailResult<PathBuf> {
-  let workspace_root = metadata.workspace_root.as_std_path();
-  let manifest = workspace_root.join("Cargo.toml");
-  relative_path(source_root, &manifest)?;
-  Ok(manifest)
+    let workspace_root = metadata.workspace_root.as_std_path();
+    let manifest = workspace_root.join("Cargo.toml");
+    relative_path(source_root, &manifest)?;
+    Ok(manifest)
 }
 
 fn source_root_for_lockfile(metadata: &Metadata) -> RailResult<PathBuf> {
-  let workspace_root = metadata.workspace_root.as_std_path();
-  if !workspace_root.is_absolute() {
-    return Err(RailError::message(format!(
-      "Cargo workspace root '{}' is not absolute",
-      workspace_root.display()
-    )));
-  }
-  Ok(workspace_root.join("Cargo.lock"))
+    let workspace_root = metadata.workspace_root.as_std_path();
+    if !workspace_root.is_absolute() {
+        return Err(RailError::message(format!(
+            "Cargo workspace root '{}' is not absolute",
+            workspace_root.display()
+        )));
+    }
+    Ok(workspace_root.join("Cargo.lock"))
 }
 
 fn relative_path(source_root: &Path, path: &Path) -> RailResult<RepositoryPath> {
-  if let Ok(relative) = path.strip_prefix(source_root) {
-    return RepositoryPath::new(relative);
-  }
-  let relative = crate::utils::path_relative_to(source_root, path).map_err(|_| {
-    RailError::message(format!(
-      "authoritative workspace path '{}' is outside snapshot source root '{}'",
-      path.display(),
-      source_root.display()
-    ))
-  })?;
-  RepositoryPath::new(&relative)
+    if let Ok(relative) = path.strip_prefix(source_root) {
+        return RepositoryPath::new(relative);
+    }
+    let relative = crate::utils::path_relative_to(source_root, path).map_err(|_| {
+        RailError::message(format!(
+            "authoritative workspace path '{}' is outside snapshot source root '{}'",
+            path.display(),
+            source_root.display()
+        ))
+    })?;
+    RepositoryPath::new(&relative)
 }
 
 fn capture_required_file(
-  source: &SourceSnapshot,
-  source_root: &Path,
-  path: &Path,
-  description: &str,
+    source: &SourceSnapshot,
+    source_root: &Path,
+    path: &Path,
+    description: &str,
 ) -> RailResult<SnapshotFile> {
-  capture_file(source, source_root, path, description)?.ok_or_else(|| {
-    RailError::message(format!(
-      "{description} '{}' is absent from the canonical source tree",
-      path.display()
-    ))
-  })
+    capture_file(source, source_root, path, description)?.ok_or_else(|| {
+        RailError::message(format!(
+            "{description} '{}' is absent from the canonical source tree",
+            path.display()
+        ))
+    })
 }
 
 fn capture_optional_file(
-  source: &SourceSnapshot,
-  source_root: &Path,
-  path: &Path,
-  description: &str,
+    source: &SourceSnapshot,
+    source_root: &Path,
+    path: &Path,
+    description: &str,
 ) -> RailResult<Option<SnapshotFile>> {
-  capture_file(source, source_root, path, description)
+    capture_file(source, source_root, path, description)
 }
 
 fn capture_file(
-  source: &SourceSnapshot,
-  source_root: &Path,
-  path: &Path,
-  description: &str,
+    source: &SourceSnapshot,
+    source_root: &Path,
+    path: &Path,
+    description: &str,
 ) -> RailResult<Option<SnapshotFile>> {
-  if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
-    return Err(RailError::with_help(
-      format!("{description} '{}' is a symbolic link", path.display()),
-      "replace the authoritative file symlink with a regular file before snapshot capture",
-    ));
-  }
-  let relative = relative_path(source_root, path)?;
-  let Some(entry) = source
-    .tree()
-    .entries()
-    .binary_search_by(|entry| entry.path.cmp(&relative))
-    .ok()
-    .map(|index| &source.tree().entries()[index])
-  else {
-    return capture_declared_file_outside_tree(relative, path, description);
-  };
-  let SourceEntryKind::RegularFile { digest, .. } = entry.kind else {
-    return Err(RailError::with_help(
-      format!("{description} '{}' is not a regular file", path.display()),
-      "replace the authoritative file symlink or special entry with a regular file before snapshot capture",
-    ));
-  };
-  let bytes = fs::read(path)
-    .map_err(|error| RailError::message(format!("failed to read {description} '{}': {error}", path.display())))?;
-  let current_digest = ContentDigest::sha256(&bytes);
-  if current_digest != digest {
-    return Err(RailError::with_help(
-      format!(
-        "{description} '{}' changed after canonical source capture",
-        path.display()
-      ),
-      "retry after workspace source changes have stopped",
-    ));
-  }
-  Ok(Some(SnapshotFile {
-    path: relative,
-    bytes: bytes.into(),
-    digest,
-  }))
+    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(RailError::with_help(
+            format!("{description} '{}' is a symbolic link", path.display()),
+            "replace the authoritative file symlink with a regular file before snapshot capture",
+        ));
+    }
+    let relative = relative_path(source_root, path)?;
+    let Some(entry) = source
+        .tree()
+        .entries()
+        .binary_search_by(|entry| entry.path.cmp(&relative))
+        .ok()
+        .map(|index| &source.tree().entries()[index])
+    else {
+        return capture_declared_file_outside_tree(relative, path, description);
+    };
+    let SourceEntryKind::RegularFile { digest, .. } = entry.kind else {
+        return Err(RailError::with_help(
+            format!("{description} '{}' is not a regular file", path.display()),
+            "replace the authoritative file symlink or special entry with a regular file before snapshot capture",
+        ));
+    };
+    let bytes = fs::read(path)
+        .map_err(|error| RailError::message(format!("failed to read {description} '{}': {error}", path.display())))?;
+    let current_digest = ContentDigest::sha256(&bytes);
+    if current_digest != digest {
+        return Err(RailError::with_help(
+            format!(
+                "{description} '{}' changed after canonical source capture",
+                path.display()
+            ),
+            "retry after workspace source changes have stopped",
+        ));
+    }
+    Ok(Some(SnapshotFile {
+        path: relative,
+        bytes: bytes.into(),
+        digest,
+    }))
 }
 
 fn capture_declared_file_outside_tree(
-  relative: RepositoryPath,
-  path: &Path,
-  description: &str,
+    relative: RepositoryPath,
+    path: &Path,
+    description: &str,
 ) -> RailResult<Option<SnapshotFile>> {
-  let before = match fs::symlink_metadata(path) {
-    Ok(metadata) => metadata,
-    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-    Err(error) => {
-      return Err(RailError::message(format!(
-        "failed to inspect {description} '{}': {error}",
-        path.display()
-      )));
+    let before = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(RailError::message(format!(
+                "failed to inspect {description} '{}': {error}",
+                path.display()
+            )));
+        }
+    };
+    if !before.file_type().is_file() {
+        return Err(RailError::with_help(
+            format!("{description} '{}' is not a regular file", path.display()),
+            "replace the authoritative file symlink or special entry with a regular file before snapshot capture",
+        ));
     }
-  };
-  if !before.file_type().is_file() {
-    return Err(RailError::with_help(
-      format!("{description} '{}' is not a regular file", path.display()),
-      "replace the authoritative file symlink or special entry with a regular file before snapshot capture",
-    ));
-  }
-  let bytes = fs::read(path)
-    .map_err(|error| RailError::message(format!("failed to read {description} '{}': {error}", path.display())))?;
-  let after = fs::symlink_metadata(path).map_err(|error| {
-    RailError::message(format!(
-      "failed to reinspect {description} '{}': {error}",
-      path.display()
-    ))
-  })?;
-  let repeated = fs::read(path)
-    .map_err(|error| RailError::message(format!("failed to reread {description} '{}': {error}", path.display())))?;
-  let repeated_metadata = fs::symlink_metadata(path).map_err(|error| {
-    RailError::message(format!(
-      "failed to reinspect {description} '{}' after reread: {error}",
-      path.display()
-    ))
-  })?;
-  let metadata_changed = |left: &fs::Metadata, right: &fs::Metadata| {
-    left.file_type() != right.file_type()
-      || left.len() != right.len()
-      || left.modified().ok() != right.modified().ok()
-      || left.permissions().readonly() != right.permissions().readonly()
-  };
-  if bytes != repeated || metadata_changed(&before, &after) || metadata_changed(&after, &repeated_metadata) {
-    return Err(RailError::with_help(
-      format!("{description} '{}' changed during snapshot capture", path.display()),
-      "retry after workspace source changes have stopped",
-    ));
-  }
-  let digest = ContentDigest::sha256(&bytes);
-  Ok(Some(SnapshotFile {
-    path: relative,
-    bytes: bytes.into(),
-    digest,
-  }))
+    let bytes = fs::read(path)
+        .map_err(|error| RailError::message(format!("failed to read {description} '{}': {error}", path.display())))?;
+    let after = fs::symlink_metadata(path).map_err(|error| {
+        RailError::message(format!(
+            "failed to reinspect {description} '{}': {error}",
+            path.display()
+        ))
+    })?;
+    let repeated = fs::read(path)
+        .map_err(|error| RailError::message(format!("failed to reread {description} '{}': {error}", path.display())))?;
+    let repeated_metadata = fs::symlink_metadata(path).map_err(|error| {
+        RailError::message(format!(
+            "failed to reinspect {description} '{}' after reread: {error}",
+            path.display()
+        ))
+    })?;
+    let metadata_changed = |left: &fs::Metadata, right: &fs::Metadata| {
+        left.file_type() != right.file_type()
+            || left.len() != right.len()
+            || left.modified().ok() != right.modified().ok()
+            || left.permissions().readonly() != right.permissions().readonly()
+    };
+    if bytes != repeated || metadata_changed(&before, &after) || metadata_changed(&after, &repeated_metadata) {
+        return Err(RailError::with_help(
+            format!("{description} '{}' changed during snapshot capture", path.display()),
+            "retry after workspace source changes have stopped",
+        ));
+    }
+    let digest = ContentDigest::sha256(&bytes);
+    Ok(Some(SnapshotFile {
+        path: relative,
+        bytes: bytes.into(),
+        digest,
+    }))
 }
 
 #[cfg(test)]
 mod tests {
-  use super::*;
+    use super::*;
 
-  fn lockfile(bytes: &[u8]) -> SnapshotFile {
-    SnapshotFile {
-      path: RepositoryPath::new(Path::new("Cargo.lock")).expect("lockfile path should be valid"),
-      bytes: Arc::from(bytes),
-      digest: ContentDigest::sha256(bytes),
+    fn lockfile(bytes: &[u8]) -> SnapshotFile {
+        SnapshotFile {
+            path: RepositoryPath::new(Path::new("Cargo.lock")).expect("lockfile path should be valid"),
+            bytes: Arc::from(bytes),
+            digest: ContentDigest::sha256(bytes),
+        }
     }
-  }
 
-  #[test]
-  fn lockfile_snapshot_preserves_source_and_checksum_identity() {
-    let snapshot = LockfileSnapshot::from_file(lockfile(
+    #[test]
+    fn lockfile_snapshot_preserves_source_and_checksum_identity() {
+        let snapshot = LockfileSnapshot::from_file(lockfile(
       b"version = 4\n\n[[package]]\nname = \"dep\"\nversion = \"1.2.3\"\nsource = \"registry+https://example.invalid/index\"\nchecksum = \"abc123\"\n",
     ))
     .expect("valid lockfile should parse");
 
-    assert_eq!(snapshot.packages().len(), 1);
-    assert_eq!(snapshot.packages()[0].name(), "dep");
-    assert_eq!(snapshot.packages()[0].version(), "1.2.3");
-    assert_eq!(
-      snapshot.packages()[0].source(),
-      Some("registry+https://example.invalid/index")
-    );
-    assert_eq!(snapshot.packages()[0].checksum(), Some("abc123"));
-  }
+        assert_eq!(snapshot.packages().len(), 1);
+        assert_eq!(snapshot.packages()[0].name(), "dep");
+        assert_eq!(snapshot.packages()[0].version(), "1.2.3");
+        assert_eq!(
+            snapshot.packages()[0].source(),
+            Some("registry+https://example.invalid/index")
+        );
+        assert_eq!(snapshot.packages()[0].checksum(), Some("abc123"));
+    }
 
-  #[test]
-  fn lockfile_snapshot_rejects_duplicate_identity_with_conflicting_checksum() {
-    let error = LockfileSnapshot::from_file(lockfile(
+    #[test]
+    fn lockfile_snapshot_rejects_duplicate_identity_with_conflicting_checksum() {
+        let error = LockfileSnapshot::from_file(lockfile(
       b"version = 4\n\n[[package]]\nname = \"dep\"\nversion = \"1.2.3\"\nsource = \"registry+https://example.invalid/index\"\nchecksum = \"abc123\"\n\n[[package]]\nname = \"dep\"\nversion = \"1.2.3\"\nsource = \"registry+https://example.invalid/index\"\nchecksum = \"def456\"\n",
     ))
     .err()
     .expect("duplicate locked identities must fail closed");
-    assert!(error.to_string().contains("duplicate package identity"), "{error}");
-  }
+        assert!(error.to_string().contains("duplicate package identity"), "{error}");
+    }
 
-  #[test]
-  fn lockfile_snapshot_rejects_credential_bearing_source_urls() {
-    let error = LockfileSnapshot::from_file(lockfile(
+    #[test]
+    fn lockfile_snapshot_rejects_credential_bearing_source_urls() {
+        let error = LockfileSnapshot::from_file(lockfile(
       b"version = 4\n\n[[package]]\nname = \"dep\"\nversion = \"1.2.3\"\nsource = \"registry+https://user:password@example.invalid/index\"\nchecksum = \"abc123\"\n",
     ))
     .err()
     .expect("credential-bearing locked source must fail closed");
-    assert!(error.to_string().contains("credential-bearing source URL"), "{error}");
-  }
+        assert!(error.to_string().contains("credential-bearing source URL"), "{error}");
+    }
 
-  #[test]
-  fn discovered_config_absence_rejects_a_later_configuration() {
-    let workspace = tempfile::tempdir().expect("workspace");
-    validate_discovered_rail_config_absence(workspace.path()).expect("configuration remains absent");
+    #[test]
+    fn discovered_config_absence_rejects_a_later_configuration() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        validate_discovered_rail_config_absence(workspace.path()).expect("configuration remains absent");
 
-    let configuration_directory = workspace.path().join(".config");
-    fs::create_dir(&configuration_directory).expect("configuration directory");
-    let configuration = configuration_directory.join("rail.toml");
-    fs::write(&configuration, "[unify]\ninclude_paths = false\n").expect("configuration");
+        let configuration_directory = workspace.path().join(".config");
+        fs::create_dir(&configuration_directory).expect("configuration directory");
+        let configuration = configuration_directory.join("rail.toml");
+        fs::write(&configuration, "[unify]\ninclude_paths = false\n").expect("configuration");
 
-    let error = validate_discovered_rail_config_absence(workspace.path())
-      .expect_err("a newly discovered configuration must invalidate captured absence");
-    assert!(
-      error.to_string().contains(&configuration.display().to_string())
-        && error.to_string().contains("appeared after workspace snapshot capture"),
-      "{error}"
-    );
-  }
+        let error = validate_discovered_rail_config_absence(workspace.path())
+            .expect_err("a newly discovered configuration must invalidate captured absence");
+        assert!(
+            error.to_string().contains(&configuration.display().to_string())
+                && error.to_string().contains("appeared after workspace snapshot capture"),
+            "{error}"
+        );
+    }
 
-  #[test]
-  fn captured_source_read_rejects_post_capture_content_drift() {
-    let workspace = tempfile::tempdir().expect("workspace");
-    let source_directory = workspace.path().join("src");
-    fs::create_dir(&source_directory).expect("source directory");
-    let source_path = source_directory.join("lib.rs");
-    fs::write(&source_path, b"pub const VALUE: u8 = 1;\n").expect("initial source");
-    let source = SourceSnapshot::capture_filesystem(workspace.path(), &[]).expect("source capture");
-    let relative = RepositoryPath::new(Path::new("src/lib.rs")).expect("source path");
+    #[test]
+    fn captured_source_read_rejects_post_capture_content_drift() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let source_directory = workspace.path().join("src");
+        fs::create_dir(&source_directory).expect("source directory");
+        let source_path = source_directory.join("lib.rs");
+        fs::write(&source_path, b"pub const VALUE: u8 = 1;\n").expect("initial source");
+        let source = SourceSnapshot::capture_filesystem(workspace.path(), &[]).expect("source capture");
+        let relative = RepositoryPath::new(Path::new("src/lib.rs")).expect("source path");
 
-    assert_eq!(
-      read_captured_source_file(workspace.path(), &source, &relative).expect("matching source"),
-      Some(b"pub const VALUE: u8 = 1;\n".to_vec())
-    );
+        assert_eq!(
+            read_captured_source_file(workspace.path(), &source, &relative).expect("matching source"),
+            Some(b"pub const VALUE: u8 = 1;\n".to_vec())
+        );
 
-    fs::write(&source_path, b"pub const VALUE: u8 = 2;\n").expect("changed source");
-    let error = read_captured_source_file(workspace.path(), &source, &relative)
-      .expect_err("changed source must not satisfy the capture");
-    assert!(error.to_string().contains("changed after workspace capture"), "{error}");
-  }
+        fs::write(&source_path, b"pub const VALUE: u8 = 2;\n").expect("changed source");
+        let error = read_captured_source_file(workspace.path(), &source, &relative)
+            .expect_err("changed source must not satisfy the capture");
+        assert!(error.to_string().contains("changed after workspace capture"), "{error}");
+    }
 
-  #[cfg(unix)]
-  #[test]
-  fn captured_source_read_rejects_post_capture_symlink_replacement() {
-    use std::os::unix::fs::symlink;
+    #[cfg(unix)]
+    #[test]
+    fn captured_source_read_rejects_post_capture_symlink_replacement() {
+        use std::os::unix::fs::symlink;
 
-    let workspace = tempfile::tempdir().expect("workspace");
-    let source_directory = workspace.path().join("src");
-    fs::create_dir(&source_directory).expect("source directory");
-    let source_path = source_directory.join("lib.rs");
-    fs::write(&source_path, b"pub const VALUE: u8 = 1;\n").expect("initial source");
-    let source = SourceSnapshot::capture_filesystem(workspace.path(), &[]).expect("source capture");
-    let relative = RepositoryPath::new(Path::new("src/lib.rs")).expect("source path");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let source_directory = workspace.path().join("src");
+        fs::create_dir(&source_directory).expect("source directory");
+        let source_path = source_directory.join("lib.rs");
+        fs::write(&source_path, b"pub const VALUE: u8 = 1;\n").expect("initial source");
+        let source = SourceSnapshot::capture_filesystem(workspace.path(), &[]).expect("source capture");
+        let relative = RepositoryPath::new(Path::new("src/lib.rs")).expect("source path");
 
-    let replacement = workspace.path().join("replacement.rs");
-    fs::write(&replacement, b"pub const VALUE: u8 = 1;\n").expect("replacement source");
-    fs::remove_file(&source_path).expect("remove captured source");
-    symlink(&replacement, &source_path).expect("replacement symlink");
+        let replacement = workspace.path().join("replacement.rs");
+        fs::write(&replacement, b"pub const VALUE: u8 = 1;\n").expect("replacement source");
+        fs::remove_file(&source_path).expect("remove captured source");
+        symlink(&replacement, &source_path).expect("replacement symlink");
 
-    let error = read_captured_source_file(workspace.path(), &source, &relative)
-      .expect_err("a symlink must not satisfy a captured regular file");
-    assert!(error.to_string().contains("no longer a regular file"), "{error}");
-  }
+        let error = read_captured_source_file(workspace.path(), &source, &relative)
+            .expect_err("a symlink must not satisfy a captured regular file");
+        assert!(error.to_string().contains("no longer a regular file"), "{error}");
+    }
 }

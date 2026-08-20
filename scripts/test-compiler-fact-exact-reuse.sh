@@ -12,5 +12,5 @@ if [[ "${OS:-}" == Windows_NT ]]; then
   observation_wrapper="$observation_wrapper.exe"
 fi
 CARGO_RAIL_TEST_OBSERVATION_WRAPPER="$observation_wrapper" \
-  cargo nextest run --locked -p cargo-rail --all-features --no-capture \
+  cargo nextest run --locked -p cargo-rail --all-features --no-capture --config-file .config/nextest.toml \
     --run-ignored ignored-only exact_compiler_fact_cas_reuse_eliminates_independent_acquisitions

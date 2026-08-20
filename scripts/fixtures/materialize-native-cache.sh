@@ -76,6 +76,7 @@ prefetch_rendered="$destination/git-prefetch/Cargo.toml.rendered"
 sed -e "s|__FIXTURE_GIT_URL__|$git_url|" -e "s|__FIXTURE_GIT_REV__|$git_commit|" \
   "$prefetch_manifest" >"$prefetch_rendered"
 mv "$prefetch_rendered" "$prefetch_manifest"
+# cargo-rail: allow-unlocked-cargo: resolves the rendered Git dependency before offline fixture lockfile generation.
 cargo metadata --manifest-path "$prefetch_manifest" --format-version=1 >/dev/null
 rm -r -- "$destination/git-prefetch"
 

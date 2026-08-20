@@ -12,7 +12,7 @@ trap 'rm -rf "$fixture"' EXIT
 for tool in hyperfine jq cargo git; do
   command -v "$tool" >/dev/null || { echo "missing required benchmark tool: $tool" >&2; exit 2; }
 done
-[[ -x "$binary" ]] || { echo "build the release binary first: cargo build --release" >&2; exit 2; }
+[[ -x "$binary" ]] || { echo "build the release binary first: cargo build --release --locked" >&2; exit 2; }
 mkdir -p "$results"
 results="$(cd "$(dirname "$results")" && pwd)/$(basename "$results")"
 

@@ -53,6 +53,78 @@ def load_toml(path: Path) -> dict[str, Any]:
         ) from error
 
 
+def read_optional_nextest_version() -> str:
+    config = load_toml(REPOSITORY_ROOT / ".config/nextest.toml")
+    nextest_version = config.get("nextest-version")
+    if isinstance(nextest_version, str):
+        return require_string(nextest_version, ".config/nextest.toml nextest-version")
+    require(isinstance(nextest_version, dict), "nextest.toml nextest-version must be a string or table")
+    require(
+        set(nextest_version) == {"required", "recommended"},
+        "nextest.toml nextest-version must contain required and recommended",
+    )
+    required = require_string(
+        nextest_version.get("required"), "nextest.toml nextest-version.required"
+    )
+    recommended = require_string(
+        nextest_version.get("recommended"), "nextest.toml nextest-version.recommended"
+    )
+    require(
+        required == recommended,
+        "nextest.toml nextest-version required and recommended must match",
+    )
+    return required
+
+
+def load_ci_tool_archives() -> tuple["CiToolArchive", ...]:
+    path = REPOSITORY_ROOT / ".config/ci-tool-archives.tsv"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    entries: list[CiToolArchive] = []
+    keys: list[str] = []
+    for index, line in enumerate(lines, start=1):
+        trimmed = line.strip()
+        if not trimmed or trimmed.startswith("#"):
+            continue
+        values = line.split("\t")
+        require(
+            len(values) == 7,
+            f"ci-tool-archives.tsv line {index} must contain 7 tab columns",
+        )
+        tool = require_string(values[0], f"ci-tool-archives.tsv:{index}:tool")
+        version = require_string(values[1], f"ci-tool-archives.tsv:{index}:version")
+        os_name = require_string(values[2], f"ci-tool-archives.tsv:{index}:os")
+        arch = require_string(values[3], f"ci-tool-archives.tsv:{index}:arch")
+        filename = require_string(values[4], f"ci-tool-archives.tsv:{index}:filename")
+        url = require_string(values[5], f"ci-tool-archives.tsv:{index}:url")
+        digest = require_string(values[6], f"ci-tool-archives.tsv:{index}:sha256")
+        require(
+            re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) is not None,
+            f"ci-tool-archives.tsv:{index}:version must be semver",
+        )
+        require(re.fullmatch(r"[0-9a-f]{64}", digest) is not None, f"ci-tool-archives.tsv:{index}:sha256 must be a hex digest")
+        require(
+            url.startswith("https://"),
+            f"ci-tool-archives.tsv:{index}:url must be https",
+        )
+        key = f"{tool}\t{version}\t{os_name}\t{arch}"
+        keys.append(key)
+        entries.append(
+            CiToolArchive(
+                tool=tool,
+                version=version,
+                os=os_name,
+                arch=arch,
+                filename=filename,
+                url=url,
+                sha256=digest,
+            )
+        )
+    require(entries, "ci-tool-archives.tsv must contain at least one archive")
+    require_unique_sorted(keys, "ci-tool-archives.tsv keys")
+    require(len(keys) == len(set(keys)), "ci-tool-archives.tsv contains duplicate rows")
+    return tuple(entries)
+
+
 def require_string(value: Any, path: str) -> str:
     require(
         isinstance(value, str) and bool(value), f"{path} must be a non-empty string"
@@ -116,6 +188,7 @@ class CompatibilityManifest:
     schema_version: int
     corpus_fixture: str
     corpus_runner: str
+    repository_coupled_rust_version_files: tuple[str, ...]
     cross_target_fixtures: tuple[CrossTargetFixture, ...]
     native_hosts: tuple[NativeHost, ...]
     filesystem_profiles: tuple[FilesystemProfile, ...]
@@ -135,6 +208,7 @@ def load_compatibility_manifest() -> CompatibilityManifest:
         {
             "schema_version",
             "front_door_corpus",
+            "repository_coupled_rust_version_files",
             "cross_target_corpus",
             "native_hosts",
             "filesystem_profiles",
@@ -160,6 +234,60 @@ def load_compatibility_manifest() -> CompatibilityManifest:
     require(
         (REPOSITORY_ROOT / corpus_runner).is_file(),
         f"front-door runner does not exist: {corpus_runner}",
+    )
+
+    repository_msrv = workspace_msrv()
+    repository_coupled_rust_version_files: list[str] = []
+    require(
+        isinstance(raw["repository_coupled_rust_version_files"], list)
+        and raw["repository_coupled_rust_version_files"],
+        "repository_coupled_rust_version_files must be a non-empty array",
+    )
+    for index, value in enumerate(raw["repository_coupled_rust_version_files"]):
+        path = require_string(
+            value,
+            f"repository_coupled_rust_version_files[{index}]",
+        )
+        repository_file = REPOSITORY_ROOT / path
+        require(repository_file.is_file(), f"{path} must be a file")
+        if repository_file.suffix == ".toml":
+            fixture_manifest = load_toml(repository_file)
+            if isinstance(fixture_manifest.get("package"), dict):
+                rust_version = fixture_manifest["package"].get("rust-version")
+            else:
+                rust_version = None
+            if rust_version is None:
+                workspace_package = (
+                    fixture_manifest.get("workspace", {})
+                    .get("package", {})
+                )
+                rust_version = workspace_package.get("rust-version")
+            require(
+                isinstance(rust_version, str),
+                f"{path} must declare rust-version",
+            )
+            require(
+                rust_version == repository_msrv,
+                f"{path} rust-version must equal workspace MSRV {repository_msrv}",
+            )
+        else:
+            source = repository_file.read_text(encoding="utf-8")
+            require(
+                re.search(
+                    r"rust-version",
+                    source,
+                )
+                is not None,
+                f"{path} must contain a rust-version declaration",
+            )
+            require(
+                f"rust-version = \"{repository_msrv}\"" in source,
+                f"{path} must declare rust-version {repository_msrv}",
+            )
+        repository_coupled_rust_version_files.append(path)
+    require_unique_sorted(
+        repository_coupled_rust_version_files,
+        "repository_coupled_rust_version_files",
     )
 
     cross_target_fixtures: list[CrossTargetFixture] = []
@@ -361,7 +489,9 @@ def load_compatibility_manifest() -> CompatibilityManifest:
     )
     for host in deferred_hosts:
         require(
-            re.fullmatch(r"native_[a-z0-9]+_hardware_access_unavailable", host.evidence_gate)
+            re.fullmatch(
+                r"native_[a-z0-9]+_hardware_access_unavailable", host.evidence_gate
+            )
             is not None,
             f"deferred host {host.target} has an invalid hardware-access gate",
         )
@@ -385,7 +515,8 @@ def load_compatibility_manifest() -> CompatibilityManifest:
         task9_native_gates.append(
             Task9NativeGate(
                 target=require_string(
-                    gate["target"], f"task9_open_evidence_gates.native_hosts[{index}].target"
+                    gate["target"],
+                    f"task9_open_evidence_gates.native_hosts[{index}].target",
                 ),
                 evidence_gate=require_string(
                     gate["evidence_gate"],
@@ -560,6 +691,7 @@ def load_compatibility_manifest() -> CompatibilityManifest:
         schema_version=raw["schema_version"],
         corpus_fixture=corpus_fixture,
         corpus_runner=corpus_runner,
+        repository_coupled_rust_version_files=tuple(repository_coupled_rust_version_files),
         cross_target_fixtures=tuple(cross_target_fixtures),
         native_hosts=tuple(native_hosts),
         filesystem_profiles=tuple(filesystem_profiles),
@@ -577,6 +709,17 @@ class NativeCacheContract:
     schema_version: int
     cache_class: str
     execution_contract: str
+
+
+@dataclass(frozen=True)
+class CiToolArchive:
+    tool: str
+    version: str
+    os: str
+    arch: str
+    filename: str
+    url: str
+    sha256: str
 
 
 def required_source_value(source: str, pattern: str, name: str) -> str:
@@ -614,9 +757,11 @@ def load_native_cache_contract() -> NativeCacheContract:
         and "incremental_work_product_observation_unavailable" in source,
         "transparent native cache must retain direct activation and the incremental bypass",
     )
-    bypass_source = source + (REPOSITORY_ROOT / "src/compiler/collector.rs").read_text(
-        encoding="utf-8"
-    ) + (REPOSITORY_ROOT / "src/compiler/invocation.rs").read_text(encoding="utf-8")
+    bypass_source = (
+        source
+        + (REPOSITORY_ROOT / "src/compiler/collector.rs").read_text(encoding="utf-8")
+        + (REPOSITORY_ROOT / "src/compiler/invocation.rs").read_text(encoding="utf-8")
+    )
     for reason in (
         "alternate_compiler_program_identity_unavailable",
         "clippy_diagnostic_result_authority_unavailable",
@@ -735,6 +880,85 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         ".config/rail.toml is missing advertised native or required release cross targets",
     )
 
+    ci_tool_archives = load_ci_tool_archives()
+    ci_tool_map = {(entry.tool, entry.version, entry.os, entry.arch): entry for entry in ci_tool_archives}
+    install_tools = (REPOSITORY_ROOT / "scripts/ci/install-tools.sh").read_text(
+        encoding="utf-8"
+    )
+    config_nextest_version = read_optional_nextest_version()
+    require(
+        "CI_TOOL_ARCHIVES" in install_tools
+        and "ci_tool_archive cargo-nextest" in install_tools
+        and "ci_tool_archive just" in install_tools,
+        "scripts/ci/install-tools.sh must install cargo-nextest and just from ci-tool-archives.tsv",
+    )
+    require(
+        re.search(r"readonly\s+(?:CARGO_NEXTEST_VERSION|JUST_VERSION)=", install_tools) is None,
+        "scripts/ci/install-tools.sh must not duplicate cargo-nextest or just versions",
+    )
+
+    nextest_required_pairs = {
+        (entry.os, entry.arch)
+        for entry in ci_tool_archives
+        if entry.tool == "cargo-nextest"
+    }
+    require(
+        bool(nextest_required_pairs),
+        "ci-tool-archives.tsv must define cargo-nextest pins",
+    )
+    nextest_versions = {
+        entry.version
+        for entry in ci_tool_archives
+        if entry.tool == "cargo-nextest"
+    }
+    require(len(nextest_versions) == 1, "ci-tool-archives.tsv must select one cargo-nextest version")
+    nextest_version = next(iter(nextest_versions))
+    require(
+        nextest_version == config_nextest_version,
+        "ci-tool-archives.tsv cargo-nextest version must match .config/nextest.toml",
+    )
+    expected_nextest_targets = {
+        ("unknown-linux-gnu", "x86_64"),
+        ("unknown-linux-gnu", "aarch64"),
+        ("pc-windows-msvc", "x86_64"),
+        ("pc-windows-msvc", "aarch64"),
+    }
+    require(nextest_required_pairs == expected_nextest_targets, "ci-tool-archives.tsv cargo-nextest targets are incomplete")
+    for os_name, arch in sorted(expected_nextest_targets):
+        entry = ci_tool_map[("cargo-nextest", nextest_version, os_name, arch)]
+        target = f"{arch}-{os_name}"
+        expected_filename = f"cargo-nextest-{nextest_version}-{target}.tar.gz"
+        expected_url = (
+            f"https://github.com/nextest-rs/nextest/releases/download/"
+            f"cargo-nextest-{nextest_version}/{expected_filename}"
+        )
+        require(entry.filename == expected_filename and entry.url == expected_url, f"invalid cargo-nextest archive row for {target}")
+
+    just_required_pairs = {
+        (entry.os, entry.arch) for entry in ci_tool_archives if entry.tool == "just"
+    }
+    require(
+        bool(just_required_pairs),
+        "ci-tool-archives.tsv must define just pins",
+    )
+    just_versions = {entry.version for entry in ci_tool_archives if entry.tool == "just"}
+    require(len(just_versions) == 1, "ci-tool-archives.tsv must select one just version")
+    just_version = next(iter(just_versions))
+    expected_just_targets = {
+        ("unknown-linux-musl", "x86_64"),
+        ("unknown-linux-musl", "aarch64"),
+        ("pc-windows-msvc", "x86_64"),
+        ("pc-windows-msvc", "aarch64"),
+    }
+    require(just_required_pairs == expected_just_targets, "ci-tool-archives.tsv just targets are incomplete")
+    for os_name, arch in sorted(expected_just_targets):
+        entry = ci_tool_map[("just", just_version, os_name, arch)]
+        target = f"{arch}-{os_name}"
+        suffix = "zip" if os_name == "pc-windows-msvc" else "tar.gz"
+        expected_filename = f"just-{just_version}-{target}.{suffix}"
+        expected_url = f"https://github.com/casey/just/releases/download/{just_version}/{expected_filename}"
+        require(entry.filename == expected_filename and entry.url == expected_url, f"invalid just archive row for {target}")
+
     corpus_runner = (REPOSITORY_ROOT / manifest.corpus_runner).read_text(
         encoding="utf-8"
     )
@@ -765,6 +989,35 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
             "uses: ./.github/workflows/compatibility.yaml" in source,
             f"{caller} does not call the compatibility workflow",
         )
+
+    deny_graph = load_toml(REPOSITORY_ROOT / "deny.toml").get("graph")
+    deny_graph = require_object(
+        deny_graph,
+        "deny.toml [graph]",
+        {"targets"},
+    )
+    deny_targets = deny_graph["targets"]
+    require(
+        isinstance(deny_targets, list)
+        and deny_targets
+        and all(isinstance(target, str) and target for target in deny_targets),
+        "deny.toml [graph].targets must be a non-empty string array",
+    )
+    require_unique_sorted(deny_targets, "deny.toml [graph].targets")
+
+    expected_deny_targets = sorted(
+        {host.target for host in manifest.native_hosts}
+        | {target for target in manifest.release_cross_targets}
+        | {
+            gate.target
+            for gate in manifest.task9_native_gates
+            if gate.target.endswith("-apple-darwin")
+        }
+    )
+    require(
+        set(deny_targets) == set(expected_deny_targets),
+        "deny.toml graph targets must match supported native hosts, release cross targets, and macOS Task 9 targets",
+    )
 
 
 def github_matrix(manifest: CompatibilityManifest) -> str:
@@ -881,9 +1134,7 @@ def render_markdown(
                 + linked_class
                 + "; exact compiler identity is part of every key"
             )
-        rows.append(
-            f"| `{target}` | {execution} | {cross} | {release} | {cache} |"
-        )
+        rows.append(f"| `{target}` | {execution} | {cross} | {release} | {cache} |")
 
     deferred_rows = [
         (

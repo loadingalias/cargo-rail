@@ -10,13 +10,45 @@ case "$profile" in
     ;;
 esac
 
-readonly CARGO_NEXTEST_VERSION=0.9.140
 readonly CARGO_DENY_VERSION=0.20.2
 readonly CARGO_AUDIT_VERSION=0.22.2
 readonly HYPERFINE_VERSION=1.20.0
-readonly JUST_VERSION=1.57.0
 readonly SCCACHE_VERSION=0.17.0
 readonly JQ_VERSION=1.8.2
+
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly REPOSITORY_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+readonly CI_TOOL_ARCHIVES="$REPOSITORY_ROOT/.config/ci-tool-archives.tsv"
+
+ci_tool_version() {
+  local tool="$1"
+  awk -F '\t' -v tool="$tool" '
+    $0 !~ /^#/ && $1 == tool { versions[$2] = 1 }
+    END {
+      for (version in versions) {
+        count += 1
+        selected = version
+      }
+      if (count != 1) exit 1
+      print selected
+    }
+  ' "$CI_TOOL_ARCHIVES"
+}
+
+ci_tool_archive() {
+  local tool="$1"
+  local archive_target="$2"
+  local architecture="${archive_target%%-*}"
+  local os="${archive_target#*-}"
+  awk -F '\t' -v tool="$tool" -v os="$os" -v architecture="$architecture" '
+    BEGIN { OFS = FS }
+    $0 !~ /^#/ && $1 == tool && $3 == os && $4 == architecture {
+      print $2, $5, $6, $7
+      matches += 1
+    }
+    END { if (matches != 1) exit 1 }
+  ' "$CI_TOOL_ARCHIVES"
+}
 
 cargo_bin="$HOME/.cargo/bin"
 mkdir -p "$cargo_bin"
@@ -58,6 +90,7 @@ install_release_binary() {
   local member="$7"
   local binary="${8:-$package}"
   local version_program="${9:-$package}"
+  local source_url="${10:-https://github.com/$repository/releases/download/$tag/$asset}"
   local destination="$cargo_bin/$binary"
   local expected_version="$version_program $version"
   if [[ -x "$destination" ]] && [[ "$("$destination" --version 2>&1)" == "$expected_version" ]]; then
@@ -71,7 +104,7 @@ install_release_binary() {
   trap 'rm -rf -- "$temporary"; rm -f -- "$staged"' RETURN
   archive="$temporary/$asset"
   curl --proto '=https' --tlsv1.2 -fsSL \
-    "https://github.com/$repository/releases/download/$tag/$asset" \
+    "$source_url" \
     -o "$archive"
   printf '%s  %s\n' "$digest" "$archive" | sha256sum --check --status
   case "$asset" in
@@ -103,34 +136,36 @@ PY
 }
 
 install_just() {
-  local asset digest binary
+  local archive_target asset binary digest record source_url version
   case "$rust_host" in
     x86_64-unknown-linux-gnu)
-      asset="just-$JUST_VERSION-x86_64-unknown-linux-musl.tar.gz"
-      digest="45b548094283cb9739af8f13273b8cddeee869f5b4ef2bb631b1f311cb566155"
+      archive_target=x86_64-unknown-linux-musl
       binary=just
       ;;
     aarch64-unknown-linux-gnu)
-      asset="just-$JUST_VERSION-aarch64-unknown-linux-musl.tar.gz"
-      digest="f225044a81adea6e0b3a8b9370aaf374e6af76c8735ae263ac993df55fd137ec"
+      archive_target=aarch64-unknown-linux-musl
       binary=just
       ;;
     x86_64-pc-windows-msvc)
-      asset="just-$JUST_VERSION-x86_64-pc-windows-msvc.zip"
-      digest="4c7391d17cb1d17b758b52004ee6411372b8a13ff37c3c9b9031625cb6026e09"
+      archive_target=x86_64-pc-windows-msvc
       binary=just.exe
       ;;
     aarch64-pc-windows-msvc)
-      asset="just-$JUST_VERSION-aarch64-pc-windows-msvc.zip"
-      digest="14ff33bbac8d2f07deda30cd3bafe7be083213cdb1c4dae7a55567d375cc17f1"
+      archive_target=aarch64-pc-windows-msvc
       binary=just.exe
       ;;
     *)
-      echo "just $JUST_VERSION has no configured asset for Rust host $rust_host" >&2
+      echo "just has no configured asset for Rust host $rust_host" >&2
       exit 1
       ;;
   esac
-  install_release_binary just "$JUST_VERSION" casey/just "$JUST_VERSION" "$asset" "$digest" "$binary" "$binary"
+  record="$(ci_tool_archive just "$archive_target")" || {
+    echo "just has no unique archive pin for $archive_target" >&2
+    exit 1
+  }
+  IFS=$'\t' read -r version asset source_url digest <<<"$record"
+  install_release_binary just "$version" casey/just "$version" "$asset" "$digest" "$binary" "$binary" just \
+    "$source_url"
 }
 
 install_hyperfine() {
@@ -226,48 +261,43 @@ install_sccache_dist() {
 }
 
 install_cargo_nextest() {
-  local asset binary digest path temporary
+  local archive_target asset binary digest path record source_url temporary version
   binary=cargo-nextest
   [[ "$rust_host" == *-pc-windows-msvc ]] && binary=cargo-nextest.exe
-  path="$cargo_bin/$binary"
-  if [[ -x "$path" ]] && "$path" --version 2>&1 | grep -Fq "$CARGO_NEXTEST_VERSION"; then
-    echo "cargo-nextest $CARGO_NEXTEST_VERSION is already installed"
-    return
-  fi
 
   case "$rust_host" in
-    x86_64-unknown-linux-gnu)
-      asset="cargo-nextest-$CARGO_NEXTEST_VERSION-x86_64-unknown-linux-gnu.tar.gz"
-      digest="4ee9aaa0d0171a985a5d0eb735b87355894c1c455972e9674fb9fdbd1387c9a3"
-      ;;
-    aarch64-unknown-linux-gnu)
-      asset="cargo-nextest-$CARGO_NEXTEST_VERSION-aarch64-unknown-linux-gnu.tar.gz"
-      digest="8b3f4d4560b6b0f83774fecc6be07e47716dbad0eb0bb6c3890f478f4affe4b6"
-      ;;
-    x86_64-pc-windows-msvc)
-      asset="cargo-nextest-$CARGO_NEXTEST_VERSION-x86_64-pc-windows-msvc.tar.gz"
-      digest="b75c287b89df1fbfe033a98df058a94cd1f5119dab6ff56e4916e5a1597c7ac9"
-      ;;
-    aarch64-pc-windows-msvc)
-      asset="cargo-nextest-$CARGO_NEXTEST_VERSION-aarch64-pc-windows-msvc.tar.gz"
-      digest="c1d88ca5dfa07367399e64be499ad867f62f29958156b356d54bef05581bfc1b"
+    x86_64-unknown-linux-gnu | aarch64-unknown-linux-gnu | x86_64-pc-windows-msvc | aarch64-pc-windows-msvc)
+      archive_target="$rust_host"
       ;;
     *)
-      install_cargo_tool cargo-nextest "$CARGO_NEXTEST_VERSION" cargo-nextest
+      version="$(ci_tool_version cargo-nextest)" || {
+        echo "cargo-nextest does not have one configured version" >&2
+        exit 1
+      }
+      install_cargo_tool cargo-nextest "$version" cargo-nextest
       return
       ;;
   esac
 
+  record="$(ci_tool_archive cargo-nextest "$archive_target")" || {
+    echo "cargo-nextest has no unique archive pin for $archive_target" >&2
+    exit 1
+  }
+  IFS=$'\t' read -r version asset source_url digest <<<"$record"
+  path="$cargo_bin/$binary"
+  if [[ -x "$path" ]] && "$path" --version 2>&1 | grep -Fq "$version"; then
+    echo "cargo-nextest $version is already installed"
+    return
+  fi
+
   temporary="$(mktemp "${TMPDIR:-/tmp}/cargo-nextest.XXXXXX")"
   trap 'rm -f -- "$temporary"' RETURN
-  curl --proto '=https' --tlsv1.2 -fsSL \
-    "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$CARGO_NEXTEST_VERSION/$asset" \
-    -o "$temporary"
+  curl --proto '=https' --tlsv1.2 -fsSL "$source_url" -o "$temporary"
   printf '%s  %s\n' "$digest" "$temporary" | sha256sum --check --status
   tar -xzf "$temporary" -C "$cargo_bin" "$binary"
   chmod +x "$path"
-  "$path" --version 2>&1 | grep -Fq "$CARGO_NEXTEST_VERSION" || {
-    echo "cargo-nextest archive did not install version $CARGO_NEXTEST_VERSION" >&2
+  "$path" --version 2>&1 | grep -Fq "$version" || {
+    echo "cargo-nextest archive did not install version $version" >&2
     exit 1
   }
   rm -f -- "$temporary"
