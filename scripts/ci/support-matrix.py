@@ -917,6 +917,24 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         nextest_version == config_nextest_version,
         "ci-tool-archives.tsv cargo-nextest version must match .config/nextest.toml",
     )
+    nextest_action_paths = [
+        REPOSITORY_ROOT / ".github/actions/setup/action.yaml",
+        *sorted((REPOSITORY_ROOT / ".github/workflows").glob("*.yaml")),
+    ]
+    nextest_action_pattern = re.compile(
+        r"^[ \t]+tool:[ \t]+['\"]?cargo-nextest(?:@([^'\"\s]+))?['\"]?[ \t]*$",
+        re.MULTILINE,
+    )
+    nextest_action_installs = [
+        (path, match.group(1))
+        for path in nextest_action_paths
+        for match in nextest_action_pattern.finditer(path.read_text(encoding="utf-8"))
+    ]
+    require(nextest_action_installs, "GitHub Actions must install cargo-nextest")
+    require(
+        all(version == nextest_version for _, version in nextest_action_installs),
+        f"GitHub Actions cargo-nextest installs must pin cargo-nextest@{nextest_version}",
+    )
     expected_nextest_targets = {
         ("unknown-linux-gnu", "x86_64"),
         ("unknown-linux-gnu", "aarch64"),

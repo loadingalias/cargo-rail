@@ -25,7 +25,7 @@ runs:
       if: inputs.install-nextest == 'true'
       uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2.85.5
       with:
-        tool: cargo-nextest
+        tool: cargo-nextest@0.9.143
 
     - name: Install repository Rust toolchain
       uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
