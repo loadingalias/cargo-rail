@@ -2688,6 +2688,7 @@ fn unify_expected_mutation(ctx: &WorkspaceContext, path: &Path) -> RailResult<Ex
             authority_root.display()
         ))
     })?;
+    let relative = PathBuf::from(crate::utils::path_to_git_format(&relative));
     Ok(ExpectedMutation::capture(
         authority_root,
         relative,

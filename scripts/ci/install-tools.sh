@@ -416,7 +416,11 @@ jq --version
 case "$profile" in
   *-ci)
     install_cargo_nextest
+    install_cargo_deny
+    install_cargo_audit
     cargo nextest --version
+    cargo deny --version
+    cargo audit --version
     ;;
   native-cache-qualification)
     install_cargo_nextest

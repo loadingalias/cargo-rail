@@ -160,6 +160,8 @@ pub(crate) fn prove_local_ntfs(file: &File, expected_volume_serial_number: u64) 
 
     let mut serial = 0_u32;
     let mut file_system_name = [0_u16; FILE_SYSTEM_NAME_CAPACITY];
+    let file_system_name_capacity = u32::try_from(file_system_name.len())
+        .map_err(|_| invalid_data("Windows filesystem-name capacity exceeds 32 bits"))?;
     // SAFETY: `file` owns a live handle. The optional output pointers are null;
     // `serial` and `file_system_name` are valid writable outputs of the sizes
     // passed, and Windows retains none of these arguments.
@@ -172,7 +174,7 @@ pub(crate) fn prove_local_ntfs(file: &File, expected_volume_serial_number: u64) 
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             file_system_name.as_mut_ptr(),
-            FILE_SYSTEM_NAME_CAPACITY as u32,
+            file_system_name_capacity,
         )
     };
     if succeeded == 0 {
@@ -345,6 +347,8 @@ const fn fold_ascii_case(unit: u16) -> u16 {
 
 fn query_basic_information(file: &File) -> io::Result<BasicObservation> {
     let mut information = FILE_BASIC_INFO::default();
+    let information_size = u32::try_from(size_of::<FILE_BASIC_INFO>())
+        .map_err(|_| invalid_data("Windows basic file information size exceeds 32 bits"))?;
     // SAFETY: `file` owns a live handle for this call. `information` is a
     // correctly aligned writable `FILE_BASIC_INFO`, its exact size is passed,
     // and Windows does not retain either the handle or output pointer.
@@ -353,7 +357,7 @@ fn query_basic_information(file: &File) -> io::Result<BasicObservation> {
             raw_handle(file),
             FileBasicInfo,
             (&raw mut information).cast(),
-            size_of::<FILE_BASIC_INFO>() as u32,
+            information_size,
         )
     };
     if succeeded == 0 {
@@ -429,6 +433,10 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fallible Windows setup precedes the test assertions"
+    )]
     fn observation_handle_excludes_x_y_x_byte_races() -> io::Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("input.rs");
@@ -456,6 +464,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fallible Windows setup precedes the test assertions"
+    )]
     fn file_id_is_stable_across_write_through_rename() -> io::Result<()> {
         let directory = tempfile::tempdir()?;
         let before_path = directory.path().join("before.rmeta");
@@ -494,6 +506,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fallible Windows setup precedes the test assertions"
+    )]
     fn directories_have_handle_bound_change_time_and_volume_proof() -> io::Result<()> {
         let directory = tempfile::tempdir()?;
         let before_file = open_for_observation(directory.path())?;
@@ -525,6 +541,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fallible Windows setup precedes the test assertions"
+    )]
     fn write_through_rename_preserves_or_replaces_destination_as_requested() -> io::Result<()> {
         let directory = tempfile::tempdir()?;
         let source = directory.path().join("source");

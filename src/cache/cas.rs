@@ -5338,7 +5338,7 @@ fn write_file_atomic_committed(path: &Path, contents: &[u8]) -> RailResult<()> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
+        .unwrap_or_else(|| Path::new("."));
     let mut temporary = tempfile::Builder::new()
         .prefix(".cargo-rail-")
         .suffix(".tmp")

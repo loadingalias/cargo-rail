@@ -115,6 +115,7 @@ while IFS= read -r listed; do
     path="$ROOT/$listed"
   fi
   case "$relative" in
+    */__pycache__/* | *.pyc) continue ;;
     justfile | README.md) ;;
     scripts/*.sh | scripts/**/*.sh | scripts/*.py | scripts/**/*.py | scripts/*.json | scripts/**/*.json)
       [[ "$relative" == *-test.sh ]] && continue
@@ -136,7 +137,16 @@ while IFS= read -r listed; do
 done < <("${inventory_command[@]}" | LC_ALL=C sort -u)
 
 if [[ -d "$ROOT/src" ]]; then
-  if ! python3 - "$ROOT" <<'PY'
+  python_command=python3
+  if ! command -v "$python_command" >/dev/null 2>&1; then
+    python_command=python
+  fi
+  if ! command -v "$python_command" >/dev/null 2>&1; then
+    echo "Python 3 is required to validate the locked Cargo command surface" >&2
+    exit 2
+  fi
+
+  if ! "$python_command" - "$ROOT" <<'PY'
 import pathlib
 import re
 import sys

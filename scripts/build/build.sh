@@ -36,9 +36,9 @@ if [ "$(jq -r '.surfaces.build.enabled' <<<"$PLAN_JSON")" != "true" ]; then
 fi
 
 CARGO_ARGS=()
-while IFS= read -r argument; do
+while IFS= read -r -d '' argument; do
   CARGO_ARGS+=("$argument")
-done < <(jq -r '.surfaces.build.scope.cargo_args[]' <<<"$PLAN_JSON")
+done < <(jq -rj '.surfaces.build.scope.cargo_args[] | "\(.)\u0000"' <<<"$PLAN_JSON")
 
 echo "Building affected packages..."
 cargo build "${CARGO_ARGS[@]}" --all-targets --all-features --locked

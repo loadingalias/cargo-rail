@@ -1,5 +1,5 @@
 [windows]
-set shell := ["bash", "-lc"]
+set shell := ["bash", "--noprofile", "--norc", "scripts/ci/windows-recipe-shell.sh"]
 
 # Remote development. Provider mechanics and credentials stay in ~/dev-machines.
 

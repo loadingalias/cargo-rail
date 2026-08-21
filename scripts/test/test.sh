@@ -81,8 +81,8 @@ if [ "$(jq -r '.surfaces.test.enabled' <<<"$PLAN_JSON")" != "true" ]; then
 fi
 
 CARGO_ARGS=()
-while IFS= read -r argument; do
+while IFS= read -r -d '' argument; do
   CARGO_ARGS+=("$argument")
-done < <(jq -r '.surfaces.test.scope.cargo_args[]' <<<"$PLAN_JSON")
+done < <(jq -rj '.surfaces.test.scope.cargo_args[] | "\(.)\u0000"' <<<"$PLAN_JSON")
 
 cargo nextest run "${CARGO_ARGS[@]}" -P "$NEXTEST_PROFILE" --all-features --locked --config-file .config/nextest.toml

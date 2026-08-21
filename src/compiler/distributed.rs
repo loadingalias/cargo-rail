@@ -4139,11 +4139,7 @@ fn elapsed_nanos_between(started: Instant, finished: Instant) -> u64 {
 }
 
 fn rebind_compiler_stream(stream: &mut Vec<u8>, workspace: &Path, attempt: &Path) -> RailResult<()> {
-    *stream = replace_bytes(
-        stream,
-        workspace.as_os_str().as_encoded_bytes(),
-        VIRTUAL_WORKSPACE.as_bytes(),
-    );
+    *stream = rebind_path_spellings(stream, workspace, VIRTUAL_WORKSPACE);
     if physical_worker_root_remains(stream, attempt) {
         return Err(RailError::message(
             "distributed compiler stream retained its worker root",
@@ -4874,11 +4870,8 @@ fn validate_and_rebind_dep_info(
         ));
     }
     let before = fs::read(dep_info)?;
-    let portable = if attempt == Path::new(VIRTUAL_ROOT) {
-        before
-    } else {
-        replace_bytes(&before, attempt.as_os_str().as_encoded_bytes(), VIRTUAL_ROOT.as_bytes())
-    };
+    let portable = rebind_path_spellings(&before, current_directory, VIRTUAL_WORKSPACE);
+    let portable = rebind_path_spellings(&portable, attempt, VIRTUAL_ROOT);
     if physical_worker_root_remains(&portable, attempt) {
         return Err(RailError::message(
             "distributed compiler dep-info retained its worker root",
@@ -4906,10 +4899,58 @@ fn copy_staged_input(source: &Path, destination: &Path, frame: &InputFrame) -> R
 }
 
 fn physical_worker_root_remains(bytes: &[u8], attempt: &Path) -> bool {
-    let attempt = attempt.as_os_str().as_encoded_bytes();
-    !attempt.is_empty()
-        && attempt != VIRTUAL_ROOT.as_bytes()
-        && bytes.windows(attempt.len()).any(|window| window == attempt)
+    attempt != Path::new(VIRTUAL_ROOT)
+        && path_spellings(attempt)
+            .iter()
+            .any(|spelling| bytes.windows(spelling.len()).any(|window| window == spelling))
+}
+
+fn rebind_path_spellings(bytes: &[u8], path: &Path, replacement: &str) -> Vec<u8> {
+    path_spellings(path).iter().fold(bytes.to_vec(), |current, spelling| {
+        replace_bytes(&current, spelling, replacement.as_bytes())
+    })
+}
+
+fn path_spellings(path: &Path) -> Vec<Vec<u8>> {
+    let mut literals = vec![path.as_os_str().as_encoded_bytes().to_vec()];
+    if let Some(path) = path.to_str() {
+        let forward = path.replace('\\', "/");
+        literals.push(forward.as_bytes().to_vec());
+        literals.push(forward.replace('/', "\\").into_bytes());
+    }
+    literals.retain(|spelling| !spelling.is_empty());
+    literals.sort();
+    literals.dedup();
+
+    let mut spellings = literals.clone();
+    for literal in literals {
+        spellings.push(json_string_contents(&literal));
+        spellings.push(escape_dep_info_path(&literal));
+    }
+    spellings.sort_unstable_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+    spellings.dedup();
+    spellings
+}
+
+fn json_string_contents(value: &[u8]) -> Vec<u8> {
+    let Ok(value) = std::str::from_utf8(value) else {
+        return value.to_vec();
+    };
+    match serde_json::to_vec(value) {
+        Ok(encoded) if encoded.len() >= 2 => encoded[1..encoded.len() - 1].to_vec(),
+        _ => value.as_bytes().to_vec(),
+    }
+}
+
+fn escape_dep_info_path(path: &[u8]) -> Vec<u8> {
+    let mut escaped = Vec::with_capacity(path.len());
+    for byte in path {
+        if byte.is_ascii_whitespace() || matches!(byte, b'\\' | b'#' | b':') {
+            escaped.push(b'\\');
+        }
+        escaped.push(*byte);
+    }
+    escaped
 }
 
 fn replace_bytes(input: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
@@ -6319,6 +6360,21 @@ mod tests {
             b"diagnostic at /cargo-rail/exec/v3/workspace/src/lib.rs",
             Path::new("/private/attempt")
         ));
+    }
+
+    #[test]
+    fn compiler_stream_rebinding_handles_json_escaped_windows_paths() {
+        let attempt = Path::new(r"C:\Users\runner\attempt");
+        let workspace = Path::new(r"C:\Users\runner\attempt\workspace");
+        let mut stream = br#"{"artifact":"C:\\Users\\runner\\attempt\\workspace\\target/release/lib.rlib"}"#.to_vec();
+
+        rebind_compiler_stream(&mut stream, workspace, attempt).expect("stream rebinding");
+
+        assert_eq!(
+            stream,
+            br#"{"artifact":"/cargo-rail/exec/v3/workspace\\target/release/lib.rlib"}"#
+        );
+        assert!(!physical_worker_root_remains(&stream, attempt));
     }
 
     #[test]

@@ -2312,7 +2312,9 @@ fn capture_elf_linker_witness(
             dependencies.display()
         ))
     })?;
-    if dependency_metadata.len() > MAX_ELF_LINK_DEPENDENCY_BYTES {
+    let dependency_len = usize::try_from(dependency_metadata.len())
+        .map_err(|_| RailError::message("ELF linker dependency file exceeds its byte bound"))?;
+    if dependency_len > MAX_ELF_LINK_DEPENDENCY_BYTES {
         return Err(RailError::message("ELF linker dependency file exceeds its byte bound"));
     }
     let evidence = read_elf_link_driver_evidence(driver_inputs).map_err(|error| {
@@ -13278,7 +13280,7 @@ pub(crate) mod tests {
                 argument.as_str()
                     == format!(
                         "{}={}",
-                        fs::canonicalize(workspace.path())
+                        crate::utils::canonicalize_existing(workspace.path())
                             .expect("canonical workspace")
                             .display(),
                         crate::compiler::distributed::VIRTUAL_WORKSPACE

@@ -27,9 +27,10 @@ fn normalize_git_path(path: &str) -> PathBuf {
         let bytes = path.as_bytes();
         if bytes.len() >= 3 && bytes[0] == b'/' && bytes[2] == b'/' && bytes[1].is_ascii_alphabetic() {
             let drive = (bytes[1] as char).to_ascii_uppercase();
-            let rest = &path[2..]; // includes leading /
-            let windows_path = format!("{}:{}", drive, rest.replace('/', "\\"));
-            return PathBuf::from(windows_path);
+            if let Ok(rest) = std::str::from_utf8(&bytes[2..]) {
+                let windows_path = format!("{}:{}", drive, rest.replace('/', "\\"));
+                return PathBuf::from(windows_path);
+            }
         }
     }
 

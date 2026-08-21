@@ -47,7 +47,7 @@ pub mod toml;
 /// Shared utilities.
 pub mod utils;
 /// Audited Win32 primitives unavailable through stable `std`.
-#[allow(unsafe_code)]
+#[expect(unsafe_code, reason = "this audited module is the sole Win32 FFI boundary")]
 #[cfg(windows)]
 pub(crate) mod windows_fs;
 /// Unified workspace context.

@@ -1,8 +1,12 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead as _, BufReader, Read, Write};
+#[cfg(unix)]
+use std::io::{BufRead as _, BufReader};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+#[cfg(unix)]
+use std::process::Child;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
 use cargo_rail::source::ContentDigest;
@@ -14,7 +18,9 @@ const RESPONSE_MAGIC: &[u8; 8] = b"CRXRES3\0";
 const RESPONSE_TRAILER: &[u8; 8] = b"CRXDONE3";
 const CANCEL_MAGIC: &[u8; 8] = b"CRXCAN3\0";
 const CANCEL_TRAILER: &[u8; 8] = b"CRXCEND3";
+#[cfg(unix)]
 const CAPABILITY_MAGIC: &[u8; 8] = b"CRXCAP3\0";
+#[cfg(unix)]
 const CAPABILITY_TRAILER: &[u8; 8] = b"CRXCPEN3";
 const VIRTUAL_ROOT: &str = "/cargo-rail/exec/v3";
 const VIRTUAL_WORKSPACE: &str = "/cargo-rail/exec/v3/workspace";
@@ -1423,6 +1429,7 @@ fn assert_distributed_phase_timing(event: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn generate_mutual_tls_identity() -> Result<MutualTlsIdentity> {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -1799,7 +1806,7 @@ fn compile_locally(
     source_bytes: &[u8],
 ) -> Result<BTreeMap<String, Vec<u8>>> {
     let root = tempfile::tempdir()?;
-    let root_path = fs::canonicalize(root.path())?;
+    let root_path = cargo_rail::utils::canonicalize_existing(root.path())?;
     let workspace_directory = root_path.join("workspace");
     let output_directory = workspace_directory.join(&operation.output_relative_directory);
     let temporary_directory = root.path().join("tmp");
@@ -1884,16 +1891,14 @@ fn compile_locally(
         root_path.as_os_str().as_encoded_bytes(),
         VIRTUAL_ROOT.as_bytes(),
     );
-    let stdout = replace_bytes(
-        &output.stdout,
-        root_path.as_os_str().as_encoded_bytes(),
-        VIRTUAL_ROOT.as_bytes(),
+    #[cfg(windows)]
+    let dep_info_bytes = replace_bytes(
+        &dep_info_bytes,
+        format!(r"{VIRTUAL_ROOT}\workspace").as_bytes(),
+        VIRTUAL_WORKSPACE.as_bytes(),
     );
-    let stderr = replace_bytes(
-        &output.stderr,
-        root_path.as_os_str().as_encoded_bytes(),
-        VIRTUAL_ROOT.as_bytes(),
-    );
+    let stdout = rebind_stream_path(&output.stdout, &workspace_directory);
+    let stderr = rebind_stream_path(&output.stderr, &workspace_directory);
     let mut outputs = BTreeMap::from([
         ("dep_info".to_string(), dep_info_bytes),
         ("metadata".to_string(), fs::read(metadata)?),
@@ -1906,7 +1911,24 @@ fn compile_locally(
     Ok(outputs)
 }
 
+fn rebind_stream_path(stream: &[u8], path: &Path) -> Vec<u8> {
+    let raw = path.as_os_str().as_encoded_bytes();
+    let encoded = path
+        .to_str()
+        .and_then(|path| serde_json::to_vec(path).ok())
+        .filter(|encoded| encoded.len() >= 2)
+        .map(|encoded| encoded[1..encoded.len() - 1].to_vec());
+    let stream = encoded.as_deref().map_or_else(
+        || stream.to_vec(),
+        |encoded| replace_bytes(stream, encoded, VIRTUAL_WORKSPACE.as_bytes()),
+    );
+    replace_bytes(&stream, raw, VIRTUAL_WORKSPACE.as_bytes())
+}
+
 fn replace_bytes(input: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
+    if needle.is_empty() {
+        return input.to_vec();
+    }
     let mut output = Vec::with_capacity(input.len());
     let mut remaining = input;
     while let Some(index) = remaining.windows(needle.len()).position(|window| window == needle) {

@@ -458,7 +458,16 @@ fn ensure_windows_native_miss_boundary(
     summary: &BTreeMap<String, u64>,
     phase: &str,
 ) -> Result<()> {
-    let allowed_native_misses = BTreeSet::from(["fixture_native", "fixture_native_sys", "fixture_service_b"]);
+    // COFF linker observation deliberately bypasses this native producer. Its
+    // rebuilt artifact changes the exact inputs of every downstream action, so
+    // the safe miss boundary is the full dependent closure, including binaries.
+    let allowed_native_misses = BTreeSet::from([
+        "fixture_native",
+        "fixture_native_sys",
+        "fixture_service_b",
+        "fixture_cli",
+        "fixture_worker",
+    ]);
     let observed_native_misses = miss_crates.iter().map(String::as_str).collect::<BTreeSet<_>>();
     ensure!(
         observed_native_misses.len() == miss_crates.len()
@@ -470,6 +479,33 @@ fn ensure_windows_native_miss_boundary(
                     .is_some_and(|count| *count > 0)),
         "Windows {phase} misses escaped the explicitly ungraduated native-artifact boundary: \
      usage={usage:?}, misses={miss_crates:?}, events={summary:?}"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+fn ensure_windows_hit_outputs_are_exact(
+    cold: &BTreeMap<PathBuf, String>,
+    warm: &BTreeMap<PathBuf, String>,
+    uncached_crates: &[String],
+    phase: &str,
+) -> Result<()> {
+    ensure!(
+        cold.keys().eq(warm.keys()),
+        "Windows {phase} changed the reusable output inventory"
+    );
+    let changed = cold
+        .iter()
+        .filter(|(path, digest)| warm.get(*path) != Some(*digest))
+        .map(|(path, _)| path)
+        .collect::<Vec<_>>();
+    ensure!(
+        changed.iter().all(|path| {
+            let normalized = path.to_string_lossy().replace('-', "_");
+            uncached_crates.iter().any(|crate_name| normalized.contains(crate_name))
+        }),
+        "Windows {phase} changed output bytes outside its reported non-hit closure: \
+     uncached={uncached_crates:?}, changed={changed:?}"
     );
     Ok(())
 }
@@ -588,7 +624,22 @@ fn real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority() ->
         reconstructed_keys.len(),
         benchmark_event_summary(&root_bound_events)?
     );
-    ensure!(reusable_outputs(&second.join("target"))? == second_outputs);
+    let root_bound_outputs = reusable_outputs(&second.join("target"))?;
+    #[cfg(not(windows))]
+    ensure!(
+        root_bound_outputs == second_outputs,
+        "root-bound output reconstruction changed reusable outputs"
+    );
+    // Correct root-bound misses perform a second cold compilation. Windows
+    // PE/COFF images and native archives can embed build-time data, so that
+    // compilation must reproduce the output inventory, not identical bytes.
+    // The same-root warm phase below remains byte-exact outside its explicitly
+    // reported native miss closure.
+    #[cfg(windows)]
+    ensure!(
+        root_bound_outputs.keys().eq(second_outputs.keys()),
+        "root-bound output reconstruction changed the reusable output inventory"
+    );
 
     fs::remove_dir_all(second.join("target"))?;
     let second_warm_events = fs::canonicalize(root.path())?.join("second-warm-events");
@@ -621,12 +672,32 @@ fn real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority() ->
         "same-root warm restore was not clean: {second_warm:?}"
     );
     #[cfg(windows)]
+    let second_warm_uncached_crates = {
+        let mut crates = second_warm_miss_crates.clone();
+        crates.extend(benchmark_action_crates(&second_warm_events, "bypassed")?);
+        crates.sort();
+        crates.dedup();
+        crates
+    };
+    #[cfg(windows)]
     ensure_windows_native_miss_boundary(second_warm, &second_warm_miss_crates, &second_warm_summary, "check")?;
     ensure!(
         second_warm.failures == 0,
         "same-root warm restore failed: {second_warm:?}"
     );
-    ensure!(reusable_outputs(&second.join("target"))? == second_outputs);
+    let second_warm_outputs = reusable_outputs(&second.join("target"))?;
+    #[cfg(not(windows))]
+    ensure!(
+        second_warm_outputs == root_bound_outputs,
+        "same-root warm restore changed the outputs published by its cold producer"
+    );
+    #[cfg(windows)]
+    ensure_windows_hit_outputs_are_exact(
+        &root_bound_outputs,
+        &second_warm_outputs,
+        &second_warm_uncached_crates,
+        "check",
+    )?;
     ensure!(current_root_diagnostic(&second_warm_output)? == second_diagnostic);
 
     let (_, cargo_l0) = run_cargo(&second, &second_cargo_home, "check", &[])?;
@@ -661,7 +732,7 @@ fn real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority() ->
     let build_warm_events = fs::canonicalize(root.path())?.join("build-warm-events");
     create_private_directory(&build_warm_events)?;
     let build_warm_events_value = build_warm_events.to_string_lossy().into_owned();
-    let (build_warm_output, build_warm) = run_cargo(
+    let (_build_warm_output, build_warm) = run_cargo(
         &first,
         &first_cargo_home,
         "build",
@@ -683,9 +754,19 @@ fn real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority() ->
         "warm build was not clean: {build_warm:?}"
     );
     #[cfg(windows)]
+    let build_warm_miss_crates = benchmark_action_crates(&build_warm_events, "miss")?;
+    #[cfg(windows)]
+    let build_warm_uncached_crates = {
+        let mut crates = build_warm_miss_crates.clone();
+        crates.extend(benchmark_action_crates(&build_warm_events, "bypassed")?);
+        crates.sort();
+        crates.dedup();
+        crates
+    };
+    #[cfg(windows)]
     ensure_windows_native_miss_boundary(
         build_warm,
-        &benchmark_action_crates(&build_warm_events, "miss")?,
+        &build_warm_miss_crates,
         &benchmark_event_summary(&build_warm_events)?,
         "build",
     )?;
@@ -714,11 +795,20 @@ fn real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority() ->
             ensure!(
                 hits.iter().any(|observed| observed == crate_name),
                 "the exact {crate_name} result was not restored: hits={hits:?}, dynamic={dynamic_events:?}, stderr={}",
-                String::from_utf8_lossy(&build_warm_output.stderr)
+                String::from_utf8_lossy(&_build_warm_output.stderr)
             );
         }
     }
-    ensure!(reusable_outputs(&first.join("target/release"))? == build_outputs);
+    let build_warm_outputs = reusable_outputs(&first.join("target/release"))?;
+    #[cfg(not(windows))]
+    ensure!(build_warm_outputs == build_outputs);
+    #[cfg(windows)]
+    ensure_windows_hit_outputs_are_exact(
+        &build_outputs,
+        &build_warm_outputs,
+        &build_warm_uncached_crates,
+        "build",
+    )?;
     ensure!(
         dylib.is_file() && cdylib.is_file(),
         "restored dynamic library outputs are missing"
@@ -761,7 +851,7 @@ fn real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority() ->
     }
     #[cfg(windows)]
     {
-        let bypasses = benchmark_action_crates(&test_cold_events, "bypass")?;
+        let bypasses = benchmark_action_crates(&test_cold_events, "bypassed")?;
         for target in new_test_targets {
             ensure!(
                 bypasses.iter().any(|crate_name| crate_name == target),
