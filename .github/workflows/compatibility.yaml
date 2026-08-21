@@ -224,8 +224,12 @@ jobs:
           key: ${{ inputs.cache-prefix }}-${{ matrix.filesystem.name }}
           cache-on-failure: true
 
-      - name: Build cargo-rail outside the qualified volume
-        run: cargo build --locked --bins
+      - name: Build cargo-rail and filesystem tests outside the qualified volume
+        shell: bash
+        run: |
+          cargo build --locked --bins
+          cargo nextest run -p cargo-rail -P commit --all-features --lib --locked \
+            --config-file .config/nextest.toml --no-run
 
       - name: Strip Linux native wrapper debug sections
         if: runner.os == 'Linux'

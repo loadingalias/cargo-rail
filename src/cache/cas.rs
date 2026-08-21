@@ -6067,7 +6067,18 @@ mod tests {
             bytes: bytes.len() as u64,
         };
         let identity = blob_id(&content_digest, bytes.len() as u64).expect("blob identity");
-        fs::write(&source, b"tampered").expect("same-length mutation");
+        let started = std::time::Instant::now();
+        loop {
+            fs::write(&source, b"tampered").expect("same-length mutation");
+            if crate::utils::stable_file_generation(&source).as_ref() != Some(&generation) {
+                break;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(1),
+                "the filesystem generation must advance after a same-length mutation"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
 
         let error = move_blob_verified(&blob, &identity, &destination, Some(&generation))
             .expect_err("changed generation must be rejected");

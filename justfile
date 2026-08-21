@@ -3,7 +3,8 @@ set shell := ["bash", "--noprofile", "--norc", "scripts/ci/windows-recipe-shell.
 
 # Remote development. Provider mechanics and credentials stay in ~/dev-machines.
 
-dev_machine := env_var_or_default("DEV_MACHINE_BIN", env_var("HOME") + "/dev-machines/dev-machine")
+operator_home := env_var_or_default("HOME", env_var_or_default("USERPROFILE", "."))
+dev_machine := env_var_or_default("DEV_MACHINE_BIN", operator_home + "/dev-machines/dev-machine")
 
 ssh-list:
     @"{{ dev_machine }}" list
