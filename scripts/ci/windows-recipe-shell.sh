@@ -9,12 +9,17 @@ if [ "$#" -ne 1 ]; then
   exit 2
 fi
 
-case "${RUNNER_ARCH:-${PROCESSOR_ARCHITEW6432:-${PROCESSOR_ARCHITECTURE:-}}}" in
-  ARM64 | arm64)
+rust_host=$(rustc -vV | sed -n 's/^host: //p')
+case "$rust_host" in
+  aarch64-pc-windows-msvc)
     target_arch=arm64
     ;;
-  *)
+  x86_64-pc-windows-msvc)
     target_arch=x64
+    ;;
+  *)
+    echo "unsupported native Windows Rust host: ${rust_host:-unknown}" >&2
+    exit 2
     ;;
 esac
 

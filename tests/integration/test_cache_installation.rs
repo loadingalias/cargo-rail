@@ -255,6 +255,8 @@ fn serve_s3_request(
     state: &Arc<Mutex<LoopbackS3State>>,
     available: bool,
 ) -> std::io::Result<()> {
+    // Windows accepted sockets can inherit the listener's nonblocking mode.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let mut request = Vec::new();

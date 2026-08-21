@@ -2886,9 +2886,14 @@ fn capture_relevant_environment(
             }
             continue;
         };
-        if !is_relevant_environment(name) && !configured_environment.contains(name) {
+        let configured_name = configured_environment
+            .iter()
+            .copied()
+            .find(|configured| environment_names_equal(configured, name));
+        if !is_relevant_environment(name) && configured_name.is_none() {
             continue;
         }
+        let name = configured_name.unwrap_or(name);
         if is_secret_name(name) {
             environment.insert(
                 name.to_string(),
@@ -2911,6 +2916,14 @@ fn capture_relevant_environment(
     }
     append_frame(framed, b"environment", &serde_json::to_vec(&environment)?);
     Ok(environment)
+}
+
+fn environment_names_equal(left: &str, right: &str) -> bool {
+    if cfg!(windows) {
+        left.eq_ignore_ascii_case(right)
+    } else {
+        left == right
+    }
 }
 
 fn known_credential_capability(value: &JsonValue, path: &str) -> RailResult<Option<JsonValue>> {

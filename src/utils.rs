@@ -206,13 +206,19 @@ pub(crate) fn stable_file_generation(path: &Path) -> Option<Vec<u8>> {
     if observation != repeated || observation.file_attributes & 0x10 != 0 {
         return None;
     }
-    let mut generation = Vec::from(&b"windows-file-generation-v1\0"[..]);
+    windows_file_generation(observation)
+}
+
+#[cfg(windows)]
+fn windows_file_generation(observation: crate::windows_fs::FileObservation) -> Option<Vec<u8>> {
+    // NTFS ChangeTime can advance when Windows persists benign access or inspection metadata after setup. Keep it in
+    // the handle-bound observation race check above, but do not make it part of the durable byte-generation claim.
+    let mut generation = Vec::from(&b"windows-file-generation-v2\0"[..]);
     for value in [
         observation.volume_serial_number,
         observation.file_id,
         observation.creation_time,
         observation.last_write_time,
-        observation.change_time,
         u64::from(observation.file_attributes),
         observation.size,
         observation.number_of_links,
@@ -717,11 +723,33 @@ pub fn path_to_git_format(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
 
     use super::*;
-    use std::path::PathBuf;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_generation_ignores_benign_change_time_but_binds_byte_writes() {
+        let observation = crate::windows_fs::FileObservation {
+            volume_serial_number: 1,
+            file_id: 2,
+            creation_time: 3,
+            last_write_time: 4,
+            change_time: 5,
+            file_attributes: 6,
+            size: 7,
+            number_of_links: 1,
+        };
+        let mut accessed = observation;
+        accessed.change_time = 8;
+        assert_eq!(windows_file_generation(observation), windows_file_generation(accessed));
+
+        let mut written = observation;
+        written.last_write_time = 9;
+        assert_ne!(windows_file_generation(observation), windows_file_generation(written));
+    }
 
     #[test]
     fn test_fnv1a64_empty() {

@@ -58,6 +58,11 @@ if [[ -z "$rust_host" ]]; then
   echo "rustc did not report its native host target" >&2
   exit 1
 fi
+if [[ "$rust_host" == *-pc-windows-msvc && "${CARGO_RAIL_WINDOWS_RECIPE_SHELL_ACTIVE:-}" != 1 ]]; then
+  export CARGO_RAIL_WINDOWS_RECIPE_SHELL_ACTIVE=1
+  printf -v native_command '%q ' bash "$0" "$@"
+  exec "$SCRIPT_DIR/windows-recipe-shell.sh" "$native_command"
+fi
 
 # dev-machines installs the remote cache environment before this script. The
 # wrapper binary does not exist until sccache is installed below.
