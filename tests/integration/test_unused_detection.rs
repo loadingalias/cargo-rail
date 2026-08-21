@@ -467,7 +467,11 @@ log = "0.4"
         let output = run_cargo_rail_with_env(
             &workspace.path,
             &["rail", "unify", "--check", "--explain"],
-            &[("TMPDIR", invalid_temp.to_str().unwrap())],
+            &[
+                ("TMPDIR", invalid_temp.to_str().unwrap()),
+                ("TMP", invalid_temp.to_str().unwrap()),
+                ("TEMP", invalid_temp.to_str().unwrap()),
+            ],
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
