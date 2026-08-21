@@ -242,7 +242,7 @@ jobs:
           set -euo pipefail
           mount="$RUNNER_TEMP/cargo-rail-tmpfs"
           mkdir -p "$mount"
-          sudo mount -t tmpfs -o size=256m,mode=0700 cargo-rail-tmpfs "$mount"
+          sudo mount -t tmpfs -o size=512m,mode=0700 cargo-rail-tmpfs "$mount"
           sudo chown "$(id -u):$(id -g)" "$mount"
           mkdir "$mount/tmp"
           {
