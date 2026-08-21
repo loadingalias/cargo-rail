@@ -78,6 +78,12 @@ pub(crate) struct DependencyUniverse {
 impl DependencyUniverse {
     /// Build the declared universe from the metadata already owned by the workspace capture.
     pub(crate) fn from_metadata(metadata: &Metadata, source_root: &Path) -> RailResult<Self> {
+        let source_root = crate::utils::canonicalize_existing(source_root).map_err(|error| {
+            RailError::message(format!(
+                "failed to resolve dependency universe source root '{}': {error}",
+                source_root.display()
+            ))
+        })?;
         let workspace_ids = metadata.workspace_members.iter().cloned().collect::<HashSet<_>>();
         let packages: FxHashMap<PackageId, PackageFacts> = metadata
             .packages
@@ -99,7 +105,7 @@ impl DependencyUniverse {
         let portable_package_ids = metadata
             .packages
             .iter()
-            .map(|package| (package.id.clone(), portable_package_id(package, source_root)))
+            .map(|package| (package.id.clone(), portable_package_id(package, &source_root)))
             .collect::<FxHashMap<_, _>>();
         let mut portable_packages = metadata
             .packages
@@ -125,7 +131,7 @@ impl DependencyUniverse {
                 portable_declarations.push(PortableDeclaration {
                     dependent: portable_package_ids[&dependent.id].clone(),
                     dependency_name: declaration.name.clone(),
-                    dependency_source: portable_dependency_source(declaration, source_root),
+                    dependency_source: portable_dependency_source(declaration, &source_root),
                     requirement: declaration.req.to_string(),
                     alias: cargo_alias(declaration.rename.as_deref().unwrap_or(&declaration.name)),
                     kind: dependency_kind_rank(declaration.kind),
@@ -305,19 +311,14 @@ fn portable_package_id(package: &Package, source_root: &Path) -> String {
     }
     let package_root = package.manifest_path.parent().map(|path| path.as_std_path());
     let relative = package_root
-        .and_then(|path| path.strip_prefix(source_root).ok())
-        .map(normalized_path)
+        .and_then(|path| portable_relative_path(path, source_root))
         .unwrap_or_else(|| "<outside-source-root>".to_string());
     format!("{}@{}#path:{relative}", package.name, package.version)
 }
 
 fn portable_dependency_source(dependency: &Dependency, source_root: &Path) -> String {
     if let Some(path) = &dependency.path {
-        let relative = path
-            .as_std_path()
-            .strip_prefix(source_root)
-            .ok()
-            .map(normalized_path)
+        let relative = portable_relative_path(path.as_std_path(), source_root)
             .unwrap_or_else(|| "<outside-source-root>".to_string());
         return format!("path:{relative}");
     }
@@ -325,6 +326,14 @@ fn portable_dependency_source(dependency: &Dependency, source_root: &Path) -> St
         .source
         .as_ref()
         .map_or_else(|| "registry:default".to_string(), |source| source.repr.clone())
+}
+
+fn portable_relative_path(path: &Path, source_root: &Path) -> Option<String> {
+    crate::utils::canonicalize_existing(path)
+        .ok()?
+        .strip_prefix(source_root)
+        .ok()
+        .map(normalized_path)
 }
 
 fn normalized_path(path: &Path) -> String {
@@ -361,5 +370,26 @@ const fn dependency_kind_rank(kind: DependencyKind) -> u8 {
         DependencyKind::Development => 1,
         DependencyKind::Build => 2,
         DependencyKind::Unknown => 3,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    #[test]
+    fn portable_paths_resolve_equivalent_platform_spellings() {
+        let root = tempfile::tempdir().expect("source root");
+        let package = root.path().join("crates/example");
+        fs::create_dir_all(&package).expect("package directory");
+        let source_root = crate::utils::canonicalize_existing(root.path()).expect("canonical source root");
+        let platform_spelling = fs::canonicalize(&package).expect("platform package spelling");
+
+        assert_eq!(
+            portable_relative_path(&platform_spelling, &source_root).as_deref(),
+            Some("crates/example")
+        );
     }
 }

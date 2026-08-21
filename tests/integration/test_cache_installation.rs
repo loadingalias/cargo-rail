@@ -860,12 +860,12 @@ fn setup_owned_remote_is_automatic_coordinated_and_removable() {
         assert!(seed.status.success(), "automatic remote seed failed: {seed:?}");
         let seed_events = coverage_events(seed_coverage.path())?;
         assert_setup_owned_remote_transport(&seed_events, "seed");
+        let seed_requests = remote.requests();
         assert!(
-            remote
-                .requests()
+            seed_requests
                 .iter()
                 .any(|(method, path)| method == "PUT" && path.contains("/entries/")),
-            "automatic remote seed did not publish an entry"
+            "automatic remote seed did not publish an entry: requests={seed_requests:?}, events={seed_events:?}"
         );
 
         fs::remove_dir_all(workspace.path.join("target"))?;

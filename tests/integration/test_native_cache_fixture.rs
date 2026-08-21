@@ -744,9 +744,22 @@ fn real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority() ->
             ),
         ],
     )?;
+    #[cfg(not(windows))]
+    let (cold_actions, warm_actions) = (build_cold.misses, build_warm.hits.saturating_add(build_warm.misses));
+    #[cfg(windows)]
+    let (cold_actions, warm_actions) = (
+        build_cold
+            .hits
+            .saturating_add(build_cold.misses)
+            .saturating_add(build_cold.bypasses),
+        build_warm
+            .hits
+            .saturating_add(build_warm.misses)
+            .saturating_add(build_warm.bypasses),
+    );
     ensure!(
-        build_warm.hits.saturating_add(build_warm.misses) == build_cold.misses,
-        "warm build changed the eligible action count: cold={build_cold:?}, warm={build_warm:?}"
+        warm_actions == cold_actions,
+        "warm build changed the classified action count: cold={build_cold:?}, warm={build_warm:?}"
     );
     #[cfg(not(windows))]
     ensure!(

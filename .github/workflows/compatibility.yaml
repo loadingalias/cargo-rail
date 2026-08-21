@@ -144,10 +144,16 @@ jobs:
         run: just build-all
 
       - name: Run full endpoint suite
-        if: matrix.compatibility.full-suite
+        if: matrix.compatibility.full-suite && runner.os != 'Windows'
         env:
           RUSTUP_TOOLCHAIN: ${{ matrix.compatibility.toolchain }}
         run: just test-all
+
+      - name: Run full Windows endpoint suite
+        if: matrix.compatibility.full-suite && runner.os == 'Windows'
+        env:
+          RUSTUP_TOOLCHAIN: ${{ matrix.compatibility.toolchain }}
+        run: cargo nextest run --workspace -P commit --all-features --locked --config-file .config/nextest.toml
 
       - name: Qualify exact compiler fact driver
         if: matrix.compatibility.full-suite

@@ -996,6 +996,7 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         "scripts/ci/run-filesystem-compatibility.py",
         "just build-all",
         "just test-all",
+        "cargo nextest run --workspace -P commit --all-features --locked --config-file .config/nextest.toml",
     ):
         require(
             fragment in compatibility_workflow,
