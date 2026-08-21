@@ -6,4 +6,5 @@ infra=false
 surface=true
 base_ref=origin/main
 cargo_args=--workspace
+surfaces_json={"bench":true,"build":true,"docs":false,"infra":false,"surface":true,"test":true}
 scope_json={"cargo_args":["--workspace"],"crates":[],"mode":"workspace","resolved_base":"origin/main","resolved_head":"WORKTREE","scope_contract_version":4}

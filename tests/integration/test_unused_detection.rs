@@ -445,6 +445,58 @@ log = "0.4"
 }
 
 #[test]
+fn test_unused_detection_fails_when_compiler_observation_storage_is_unavailable() {
+    let result: Result<()> = (|| {
+        let workspace = create_workspace_with_unused_detection()?;
+        add_crate_with_manifest(
+            &workspace,
+            "test-crate",
+            r#"[package]
+name = "test-crate"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+log = "0.4"
+"#,
+        )?;
+        workspace.commit("Add source-level dependency candidate")?;
+
+        let invalid_temp = workspace.path.join("not-a-directory");
+        fs::write(&invalid_temp, "compiler observations cannot be created below a file")?;
+        let output = run_cargo_rail_with_env(
+            &workspace.path,
+            &["rail", "unify", "--check", "--explain"],
+            &[("TMPDIR", invalid_temp.to_str().unwrap())],
+        )?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "compiler evidence acquisition is an operational authority, not a semantic check result\nstdout:\n{}\nstderr:\n{}",
+            stdout,
+            stderr
+        );
+        assert!(
+            stderr.contains("cargo-rail-compiler-observations-"),
+            "the original compiler-observation failure must identify the failed evidence storage\nstderr:\n{}",
+            stderr
+        );
+        assert!(
+            !stderr.contains("falling back") && !stdout.contains("Unification Plan"),
+            "an indeterminate compiler observation must not produce a fallback semantic verdict\nstdout:\n{}\nstderr:\n{}",
+            stdout,
+            stderr
+        );
+
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
 fn test_unused_detection_single_crate_issue_11_repro() {
     let result: Result<()> = (|| {
         // Repro from GH issue #11:

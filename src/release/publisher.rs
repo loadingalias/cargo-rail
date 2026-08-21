@@ -582,86 +582,37 @@ impl<'a> ReleasePublisher<'a> {
 
     fn reconcile_finalize_commit(&self, state: &mut ReleaseState, state_path: &std::path::Path) -> RailResult<()> {
         let git = self.ctx.git()?.git();
-        let expected_subject = format!("chore(release): finalize {}", state.transaction_id);
         let head = git.head_commit()?;
-        let message = git.run_git_stdout(&["log", "-1", "--format=%B"])?;
-        let trailer = format!("Rail-Release: {}", state.transaction_id);
-        let has_transaction = message.lines().any(|line| line.trim() == trailer);
-        let is_finalize = message.lines().any(|line| line.trim() == "Rail-Release-Mode: finalize");
-        if has_transaction && is_finalize {
-            for crate_state in &mut state.crates {
-                crate_state.commit.status = StepStatus::Complete;
-                crate_state.commit.object = Some(head.clone());
-            }
-            state.release_commit = Some(head);
-            state.save(state_path, "finalize_commit_observed")?;
-            return Ok(());
-        }
-
-        let first = state
-            .crates
-            .first()
-            .ok_or_else(|| RailError::message("finalize release plan has no crates"))?;
-        if first.commit.status == StepStatus::InProgress {
-            let expected_parent = first
-                .commit
-                .object
-                .as_deref()
-                .ok_or_else(|| RailError::message("in-progress finalize commit has no recorded parent"))?;
-            if head != expected_parent {
-                let parent = git.run_git_stdout(&["rev-parse", "HEAD^"]).unwrap_or_default();
-                let subject = git.run_git_stdout(&["log", "-1", "--format=%s"])?;
-                if parent != expected_parent || subject != expected_subject {
-                    return Err(RailError::with_help(
-                        "HEAD changed while the finalize transaction commit was in progress",
-                        "inspect the release status and Git history; do not create tags for an ambiguous release commit",
-                    ));
+        if head != state.initial_head {
+            let message = git.run_git_stdout(&["log", "-1", "--format=%B"])?;
+            let transaction = format!("Rail-Release: {}", state.transaction_id);
+            if message.lines().any(|line| line.trim() == transaction)
+                && message.lines().any(|line| line.trim() == "Rail-Release-Mode: finalize")
+            {
+                for crate_state in &mut state.crates {
+                    crate_state.commit.status = StepStatus::Complete;
+                    crate_state.commit.object = Some(head.clone());
                 }
+                state.release_commit = Some(head);
+                return state.save(state_path, "legacy_finalize_commit_observed");
             }
+            return Err(RailError::with_help(
+                format!(
+                    "release finalize started at {}, but the checkout is now at {}",
+                    state.initial_head, head
+                ),
+                format!(
+                    "restore the merged release commit {}; if an older cargo-rail created an empty finalize commit, abort this local transaction before retrying",
+                    state.initial_head
+                ),
+            ));
         }
-
-        if !state.crates.iter().all(|crate_state| crate_state.commit.is_complete()) {
-            let parent = git.head_commit()?;
-            for crate_state in &mut state.crates {
-                crate_state.commit.status = StepStatus::InProgress;
-                crate_state.commit.object = Some(parent.clone());
-            }
-            state.save(state_path, "finalize_commit_intent")?;
-            fault_before("commit", "finalize")?;
-            let mut message = format!(
-                "{}\n\n{}\nRail-Release-Mode: finalize\nRail-Release-Publish: {}\nRail-Release-Tag: {}\nRail-Release-Remote: {}",
-                expected_subject,
-                trailer,
-                !state.skip_publish,
-                !state.skip_tag,
-                self.release_config.remote_effects.as_str()
-            );
-            for crate_plan in &state.plan.crates {
-                message.push_str(&format!(
-                    "\nRail-Release-Crate: {}@{}",
-                    crate_plan.name, crate_plan.new_version
-                ));
-                message.push_str(&format!(
-                    "\nRail-Release-Tag-Name: {}={}",
-                    crate_plan.name, crate_plan.tag_name
-                ));
-                message.push_str(&format!(
-                    "\nRail-Release-Crate-Publish: {}={}",
-                    crate_plan.name,
-                    !state.skip_publish && crate_plan.publish
-                ));
-            }
-            git.run_git_observable_with_env(&["commit", "--allow-empty", "-m", &message], RELEASE_OPERATION_ENV)?;
-            let commit = git.head_commit()?;
-            fault_after("commit", "finalize")?;
-            for crate_state in &mut state.crates {
-                crate_state.commit.status = StepStatus::Complete;
-                crate_state.commit.object = Some(commit.clone());
-            }
-            state.release_commit = Some(commit);
-            state.save(state_path, "finalize_commit_observed")?;
+        for crate_state in &mut state.crates {
+            crate_state.commit.status = StepStatus::Complete;
+            crate_state.commit.object = Some(head.clone());
         }
-        Ok(())
+        state.release_commit = Some(head);
+        state.save(state_path, "finalize_commit_observed")
     }
 
     fn reconcile_local_tags(&self, state: &mut ReleaseState, state_path: &std::path::Path) -> RailResult<()> {

@@ -1671,6 +1671,12 @@ verify = ["verify/**"]
 
         assert!(gh_stdout.contains("build="), "github output must include build key");
         assert!(gh_stdout.contains("test="), "github output must include test key");
+        let surfaces_json = gh_stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("surfaces_json="))
+            .ok_or_else(|| anyhow!("github output must include surfaces_json"))?;
+        let surfaces: Value = serde_json::from_str(surfaces_json)?;
+        assert_eq!(surfaces["custom:verify"], true);
         assert!(
             gh_stdout.contains("scope_json="),
             "github output must include scope_json key"
@@ -2507,6 +2513,7 @@ fn test_plan_github_projections() {
             "surface",
             "base_ref",
             "cargo_args",
+            "surfaces_json",
             "scope_json",
         ];
         for key in expected_keys {
@@ -2515,6 +2522,9 @@ fn test_plan_github_projections() {
 
         assert_eq!(kv["base_ref"], "origin/main");
         assert_eq!(kv["cargo_args"], "--workspace");
+        let surfaces_json: Value = serde_json::from_str(&kv["surfaces_json"])?;
+        assert_eq!(surfaces_json["build"], true);
+        assert_eq!(surfaces_json["test"], true);
 
         let scope_json: Value = serde_json::from_str(&kv["scope_json"])?;
         assert_eq!(scope_json["mode"], serde_json::json!("workspace"));
@@ -2619,6 +2629,7 @@ fn normalize_plan_github_output(stdout: &str) -> Result<String> {
         "surface",
         "base_ref",
         "cargo_args",
+        "surfaces_json",
         "scope_json",
     ];
 
@@ -2626,6 +2637,13 @@ fn normalize_plan_github_output(stdout: &str) -> Result<String> {
     for key in ordered_keys {
         match key {
             "scope_json" => lines.push(format!("{}={}", key, serde_json::to_string(&scope_json)?)),
+            "surfaces_json" => {
+                let surfaces_json: Value = serde_json::from_str(
+                    kv.get(key)
+                        .ok_or_else(|| anyhow!("missing {} key in github-debug output", key))?,
+                )?;
+                lines.push(format!("{}={}", key, serde_json::to_string(&surfaces_json)?));
+            }
             _ => {
                 let value = kv
                     .get(key)
@@ -2670,6 +2688,7 @@ fn normalize_plan_github_debug_output(stdout: &str) -> Result<String> {
         "surface",
         "base_ref",
         "cargo_args",
+        "surfaces_json",
         "scope_json",
         "plan_json",
     ];
@@ -2678,6 +2697,13 @@ fn normalize_plan_github_debug_output(stdout: &str) -> Result<String> {
     for key in ordered_keys {
         match key {
             "scope_json" => lines.push(format!("{}={}", key, serde_json::to_string(&scope_json)?)),
+            "surfaces_json" => {
+                let surfaces_json: Value = serde_json::from_str(
+                    kv.get(key)
+                        .ok_or_else(|| anyhow!("missing {} key in github-debug output", key))?,
+                )?;
+                lines.push(format!("{}={}", key, serde_json::to_string(&surfaces_json)?));
+            }
             "plan_json" => lines.push(format!("{}={}", key, serde_json::to_string(&plan_json)?)),
             _ => {
                 let value = kv

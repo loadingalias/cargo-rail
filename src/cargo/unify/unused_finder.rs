@@ -13,6 +13,7 @@ use crate::compiler::{
     CompilerCacheIdentity, CompilerCandidate, CompilerDiagnosticsCollector, DependencyEvidenceState,
     DependencyIdentity, FeatureSelection, MemberEvidence,
 };
+use crate::error::RailResult;
 use crate::progress;
 use cargo_metadata::PackageId;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -27,7 +28,7 @@ pub struct UnusedDepFinder<'a> {
     target_cfg_sets: &'a HashMap<String, TargetCfgSet>,
     unreachable_features: HashMap<String, BTreeSet<String>>,
     workspace_is_consumer_scope: bool,
-    compiler_cache_identity: Option<&'a CompilerCacheIdentity>,
+    compiler_cache_identity: &'a CompilerCacheIdentity,
 }
 
 struct DependencyDeclaration<'a> {
@@ -45,7 +46,7 @@ impl<'a> UnusedDepFinder<'a> {
         target_cfg_sets: &'a HashMap<String, TargetCfgSet>,
         pruned_features: &[crate::cargo::unify_types::PrunedFeature],
         workspace_is_consumer_scope: bool,
-        compiler_cache_identity: Option<&'a CompilerCacheIdentity>,
+        compiler_cache_identity: &'a CompilerCacheIdentity,
     ) -> Self {
         let mut unreachable_features: HashMap<String, BTreeSet<String>> = HashMap::new();
         for feature in pruned_features {
@@ -66,11 +67,11 @@ impl<'a> UnusedDepFinder<'a> {
     }
 
     /// Detect unused dependencies in workspace members.
-    pub fn find(&self) -> Vec<UnusedDep> {
+    pub fn find(&self) -> RailResult<Vec<UnusedDep>> {
         let mut unused = Vec::new();
         let declarations = self.dependency_declarations();
         let configured_targets: Vec<&str> = self.metadata.targets();
-        let source_unused = self.detect_source_unused_deps(&declarations, &configured_targets, self.target_cfg_sets);
+        let source_unused = self.detect_source_unused_deps(&declarations, &configured_targets, self.target_cfg_sets)?;
 
         for declaration in declarations {
             if let Some(resolved) = declaration.resolved {
@@ -196,7 +197,7 @@ impl<'a> UnusedDepFinder<'a> {
             progress!("  Found {} potentially unused dependencies", unused.len());
         }
 
-        unused
+        Ok(unused)
     }
 
     /// Explain dependency domains intentionally preserved without complete evidence.
@@ -365,33 +366,20 @@ impl<'a> UnusedDepFinder<'a> {
         declarations: &[DependencyDeclaration<'_>],
         configured_targets: &[&str],
         cfg_sets: &HashMap<String, TargetCfgSet>,
-    ) -> HashMap<PackageId, MemberEvidence> {
+    ) -> RailResult<HashMap<PackageId, MemberEvidence>> {
         let candidates = self.compiler_candidates(declarations, configured_targets, cfg_sets);
         if candidates.is_empty() {
-            return HashMap::new();
+            return Ok(HashMap::new());
         }
 
         let targets = self.metadata.targets();
-        let Some(compiler_cache_identity) = self.compiler_cache_identity else {
-            return HashMap::new();
-        };
         let collector = CompilerDiagnosticsCollector::with_identity(
             self.workspace_root,
             self.manifests,
             targets,
-            compiler_cache_identity,
+            self.compiler_cache_identity,
         );
-
-        match collector.collect_for_candidates(&candidates) {
-            Ok(map) => map,
-            Err(error) => {
-                crate::warn!(
-                    "source-level unused dependency detection failed; falling back to graph-only detection: {}",
-                    error
-                );
-                HashMap::new()
-            }
-        }
+        collector.collect_for_candidates(&candidates)
     }
 
     fn compiler_candidates(

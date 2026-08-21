@@ -105,9 +105,11 @@ Readiness and registry propagation are explicit wait boundaries: Cargo-Rail exit
 provider settles. GitHub readiness requires at least one successful context, complete reported counts, and no pending
 or failed context.
 
-Release commit trailers retain the transaction and effect authorization. From the exact release commit in a fresh
-checkout, `release status` can report reconstructable state and
-`cargo rail release resume release-<transaction-id>` can rebuild a missing local journal.
+Direct release commit trailers retain the transaction and effect authorization. From the exact release commit in a
+fresh checkout, `release status` can report reconstructable state and
+`cargo rail release resume release-<transaction-id>` can rebuild a missing local journal. PR preparation trailers
+retain the transaction plan, but finalization does not rewrite the merged commit. Its journal remains the final-effect
+authority until tags, publication, and forge state are reconciled.
 
 Abort only while no external side effect may exist:
 

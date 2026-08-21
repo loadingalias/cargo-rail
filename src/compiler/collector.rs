@@ -2388,6 +2388,8 @@ const SYSROOT_MEMO_VERSION: u32 = 3;
 const MAX_SYSROOT_MEMO_BYTES: u64 = 4 * 1024 * 1024;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 const MAX_GENERATION_IDENTIFIER_BYTES: usize = 256;
+#[cfg(any(windows, test))]
+const WINDOWS_SYSROOT_CAPTURE_ATTEMPTS: usize = 3;
 const MAX_SYSROOT_FILES: usize = 4096;
 const MAX_SYSROOT_BYTES: u64 = 1024 * 1024 * 1024;
 
@@ -2527,6 +2529,7 @@ pub(crate) fn compiler_sysroot_fingerprint(
     let before = memo_path.and_then(|_| capture_exact_sysroot_evidence(&inventory));
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     let _ = memo_path;
+    #[cfg(not(windows))]
     let fingerprint = hash_compiler_sysroot(&inventory)?;
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -2541,23 +2544,47 @@ pub(crate) fn compiler_sysroot_fingerprint(
 
     #[cfg(windows)]
     {
-        let after_inventory = compiler_sysroot_inventory(sysroot, host_target)?;
-        if inventory.files != after_inventory.files {
-            return Err(RailError::message(
-                "compiler sysroot inventory changed during identity capture",
-            ));
-        }
-        let after = capture_exact_sysroot_evidence(&after_inventory)
-            .ok_or_else(|| RailError::message("native cache cannot prove a stable local NTFS compiler sysroot"))?;
-        if windows_before != after {
-            return Err(RailError::message("compiler sysroot changed during identity capture"));
-        }
+        // NTFS may finish a benign metadata update while the freshly installed sysroot is first inspected. Rehash the
+        // whole inventory after drift; accepting only one fully bracketed attempt preserves the exact-byte claim.
+        let mut retry_inventory = inventory;
+        let mut retry_before = windows_before;
+        let (fingerprint, stable_inventory, stable_evidence) = retry_unstable_windows_sysroot_capture(|| {
+            let fingerprint = hash_compiler_sysroot(&retry_inventory)?;
+            let after_inventory = compiler_sysroot_inventory(sysroot, host_target)?;
+            let Some(after) = capture_exact_sysroot_evidence(&after_inventory) else {
+                return Ok(None);
+            };
+            if retry_inventory.files != after_inventory.files || retry_before != after {
+                retry_inventory = after_inventory;
+                retry_before = after;
+                return Ok(None);
+            }
+            Ok(Some((fingerprint, after_inventory, after)))
+        })?;
         if let Some(memo_path) = memo_path {
-            publish_sysroot_identity_memo(memo_path, &after_inventory, host_target, &fingerprint.0, after);
+            publish_sysroot_identity_memo(
+                memo_path,
+                &stable_inventory,
+                host_target,
+                &fingerprint.0,
+                stable_evidence,
+            );
         }
+        return Ok(fingerprint);
     }
 
+    #[cfg(not(windows))]
     Ok(fingerprint)
+}
+
+#[cfg(any(windows, test))]
+fn retry_unstable_windows_sysroot_capture<T>(mut capture: impl FnMut() -> RailResult<Option<T>>) -> RailResult<T> {
+    for _ in 0..WINDOWS_SYSROOT_CAPTURE_ATTEMPTS {
+        if let Some(captured) = capture()? {
+            return Ok(captured);
+        }
+    }
+    Err(RailError::message("compiler sysroot changed during identity capture"))
 }
 
 fn compiler_sysroot_inventory(sysroot: &Path, host_target: &str) -> RailResult<CompilerSysrootInventory> {
@@ -4644,6 +4671,32 @@ edition = "2024"
         let changed_hit =
             compiler_sysroot_fingerprint(sysroot.path(), "test-host", Some(&memo)).expect("changed memo hit");
         assert_eq!(changed_hit, (changed.0, 0));
+    }
+
+    #[test]
+    fn windows_sysroot_capture_retries_transient_generation_drift() {
+        let mut attempts = 0;
+        let captured = retry_unstable_windows_sysroot_capture(|| {
+            attempts += 1;
+            Ok((attempts == 2).then_some("stable"))
+        })
+        .expect("second bracketed capture");
+
+        assert_eq!(captured, "stable");
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn windows_sysroot_capture_rejects_persistent_generation_drift() {
+        let mut attempts = 0;
+        let error = retry_unstable_windows_sysroot_capture::<()>(|| {
+            attempts += 1;
+            Ok(None)
+        })
+        .expect_err("persistent drift");
+
+        assert_eq!(attempts, WINDOWS_SYSROOT_CAPTURE_ATTEMPTS);
+        assert_eq!(error.to_string(), "compiler sysroot changed during identity capture");
     }
 
     fn test_evidence(unused: &[&str]) -> TargetEvidence {

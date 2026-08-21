@@ -98,7 +98,8 @@ reason = "fixture product"
         assert_eq!(
             output.status.code(),
             Some(1),
-            "{}",
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(

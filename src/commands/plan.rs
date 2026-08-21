@@ -1465,8 +1465,16 @@ fn format_text(output: &PlanOutput, explain: bool) -> String {
 
 fn format_github(output: &PlanOutput, debug: bool) -> RailResult<String> {
     let scope_json = to_json(&output.scope)?;
+    let surfaces_json = to_json(
+        &output
+            .surfaces
+            .iter()
+            .map(|(name, decision)| (name, decision.enabled))
+            .collect::<BTreeMap<_, _>>(),
+    )?;
     let plan_json = if debug { Some(to_json(output)?) } else { None };
-    let mut out = String::with_capacity(160 + scope_json.len() + plan_json.as_ref().map_or(0, String::len));
+    let mut out =
+        String::with_capacity(180 + scope_json.len() + surfaces_json.len() + plan_json.as_ref().map_or(0, String::len));
     for (key, enabled) in [
         ("build", surface_enabled(output, "build")),
         ("test", surface_enabled(output, "test")),
@@ -1484,6 +1492,8 @@ fn format_github(output: &PlanOutput, debug: bool) -> RailResult<String> {
     out.push_str(&output.inputs.refs.resolved_base);
     out.push_str("\ncargo_args=");
     out.push_str(&output.scope.cargo_args.join(" "));
+    out.push_str("\nsurfaces_json=");
+    out.push_str(&surfaces_json);
     out.push_str("\nscope_json=");
     out.push_str(&scope_json);
     out.push('\n');

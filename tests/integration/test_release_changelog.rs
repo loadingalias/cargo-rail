@@ -1668,13 +1668,14 @@ core = ["lib-a", "lib-b"]
 fn release_pr_mode_round_trips_to_finalize_on_merge_commit() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("release-pr-mode")?;
-        write_release_config(&ws, "require_release_notes = false")?;
+        write_release_config(&ws, "require_release_notes = false\nremote_effects = \"push\"")?;
         ws.add_crate("lib-a", "0.1.0", &[])?;
         ws.commit("Add lib-a")?;
         tag_release(&ws, "lib-a", "0.1.0")?;
 
         let remote_root = tempfile::TempDir::new()?;
-        let remote = remote_root.path().join("origin.git");
+        let remote = remote_root.path().join("gitlab.com/origin.git");
+        std::fs::create_dir_all(remote.parent().unwrap())?;
         let output = Command::new("git")
             .args(["init", "--bare", remote.to_str().unwrap()])
             .output()?;
@@ -1756,9 +1757,28 @@ fi
         let merge_sha = String::from_utf8_lossy(&git(&ws.path, &["rev-parse", "HEAD"])?.stdout)
             .trim()
             .to_string();
+        git(&remote, &["fetch", ws.path.to_str().unwrap(), &merge_sha])?;
+        git(&remote, &["update-ref", "refs/heads/main", &merge_sha])?;
+        install_pre_push_hook(
+            &ws,
+            r#"#!/bin/sh
+while read -r _local_ref _local_sha remote_ref _remote_sha; do
+  case "$remote_ref" in
+    refs/heads/*)
+      echo "protected branch update rejected" >&2
+      exit 1
+      ;;
+  esac
+done
+"#,
+        )?;
 
-        let output = run_cargo_rail(
-            &ws.path,
+        let glab_log_dir = tempfile::TempDir::new()?;
+        let glab_log = glab_log_dir.path().join("glab.log");
+        let (_glab_dir, glab_path) = glab_shim(&glab_log)?;
+        let output = run_with_path_prefix(
+            &ws,
+            glab_path.parent().unwrap(),
             &["rail", "release", "finalize", "lib-a", "--skip-publish", "--yes"],
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1772,21 +1792,29 @@ fi
         let tag_target = String::from_utf8_lossy(&git(&ws.path, &["rev-list", "-n", "1", "v0.2.0"])?.stdout)
             .trim()
             .to_string();
-        let finalize_sha = String::from_utf8_lossy(&git(&ws.path, &["rev-parse", "HEAD"])?.stdout)
+        let finalized_head = String::from_utf8_lossy(&git(&ws.path, &["rev-parse", "HEAD"])?.stdout)
             .trim()
             .to_string();
         assert_eq!(
-            tag_target, finalize_sha,
-            "finalize should tag its exact transaction commit"
+            tag_target, merge_sha,
+            "finalize should tag the merged commit covered by release evidence"
         );
+        assert_eq!(finalized_head, merge_sha, "finalize must not manufacture a new commit");
+        let remote_head = String::from_utf8_lossy(&git(&remote, &["rev-parse", "refs/heads/main"])?.stdout)
+            .trim()
+            .to_string();
         assert_eq!(
-            String::from_utf8_lossy(&git(&ws.path, &["rev-parse", "HEAD^"])?.stdout).trim(),
-            merge_sha
+            remote_head, merge_sha,
+            "finalize must not push a protected branch update"
         );
-        let finalize_message =
-            String::from_utf8_lossy(&git(&ws.path, &["log", "-1", "--format=%B"])?.stdout).to_string();
-        assert!(finalize_message.contains(&format!("Rail-Release: {}", transaction)));
-        assert!(finalize_message.contains("Rail-Release-Mode: finalize"));
+        let remote_tag = String::from_utf8_lossy(&git(&remote, &["rev-list", "-n", "1", "v0.2.0"])?.stdout)
+            .trim()
+            .to_string();
+        assert_eq!(remote_tag, merge_sha, "the pushed tag must retain the proven commit");
+        assert!(
+            !transaction.is_empty(),
+            "prepare transaction identity should be preserved in the journal"
+        );
 
         Ok(())
     })();

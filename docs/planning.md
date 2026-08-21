@@ -135,31 +135,31 @@ authorizes result reuse.
 
 [`loadingalias/cargo-rail-action`](https://github.com/loadingalias/cargo-rail-action) installs Cargo-Rail, runs the
 planner once, validates planner and scope versions, and exports their projections. Action major v6 consumes planner v6
-and scope v4, so it cannot consume this release's planner v7 contract. Use the direct planner command until an action
-major that declares planner v7 support is available; the action's `version` input independently selects Cargo-Rail.
+and scope v4. Action major v7 consumes planner v7 and scope v4; the action's `version` input independently selects a
+compatible Cargo-Rail release.
 
 ```yaml
-- uses: loadingalias/cargo-rail-action@v6
+- uses: loadingalias/cargo-rail-action@v7
   id: rail
-  with:
-    mode: debug
 
 - name: Test selected packages
   if: steps.rail.outputs.test == 'true'
   shell: bash
   env:
-    PLAN_JSON: ${{ steps.rail.outputs.plan-json }}
+    SCOPE_JSON: ${{ steps.rail.outputs.scope-json }}
   run: |
     CARGO_ARGS=()
     while IFS= read -r argument; do
       CARGO_ARGS+=("$argument")
-    done < <(jq -r '.surfaces.test.scope.cargo_args[]' <<<"$PLAN_JSON")
+    done < <(jq -r '.cargo_args[]' <<<"$SCOPE_JSON")
     cargo nextest run "${CARGO_ARGS[@]}" --locked
 ```
 
 Minimal mode exports built-in surface booleans, `surfaces-json`, `scope-json`, `cargo-args`, and `base-ref`. Debug mode
-also exports the full `plan-json`. Pin the action to a full commit SHA when immutable third-party action execution is
-required.
+also exports a same-job `plan-file`. Use `surfaces-json` for routing and `scope-json` for execution. The full,
+workspace-sized plan is deliberately not a GitHub output because one environment entry can exceed the operating
+system's process-launch limit on a large diff. Read `plan-file` in the same job or transfer it as an artifact. Pin the
+action to a full commit SHA when immutable third-party action execution is required.
 
 Transparent local reuse remains independent of planning. Run `cargo rail cache setup` once on an execution machine;
 ordinary Cargo and nextest processes using that Cargo home can then use verified L1. See
