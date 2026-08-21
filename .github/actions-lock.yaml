@@ -68,9 +68,9 @@ dtolnay/rust-toolchain:
   updated: "2026-07-25T14:41:49Z"
   notes: "Rust toolchain installation for stable, MSRV, and release builds"
 taiki-e/install-action:
-  ref: v2.85.5
-  sha: "6a1bd70eaac3c8bdf093356838d7ee09fda951cf"
-  updated: "2026-07-31T19:03:57Z"
+  ref: v2.85.9
+  sha: "91ddec75689c4c78665b598d188dc821c5a43e5c"
+  updated: "2026-08-06T13:14:11Z"
   notes: "Install cargo tools (nextest, just, deny, audit)"
 Swatinem/rust-cache:
   ref: v2.9.1
