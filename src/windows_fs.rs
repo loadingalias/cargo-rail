@@ -3,25 +3,47 @@
 //! This is the only production module allowed to use `unsafe`. Its crate-private
 //! API keeps Win32 pointer and handle contracts out of the rest of Cargo-Rail.
 
-use std::fs::{File, OpenOptions};
+use std::ffi::c_void;
+use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::mem::size_of;
+use std::mem::{MaybeUninit, size_of};
 use std::os::windows::ffi::OsStrExt as _;
 use std::os::windows::fs::OpenOptionsExt as _;
 use std::os::windows::io::AsRawHandle as _;
 use std::path::Path;
 
-use windows_sys::Win32::Foundation::{FILETIME, HANDLE};
+use windows_sys::Win32::Foundation::{ERROR_NOT_SAME_DEVICE, FILETIME, HANDLE};
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FileBasicInfo, GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
-    GetVolumeInformationByHandleW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, VOLUME_NAME_GUID,
+    BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TEMPORARY, FILE_BASIC_INFO,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_POSIX_SEMANTICS, FILE_FLAG_SEQUENTIAL_SCAN,
+    FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileBasicInfo,
+    GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
+    MAXIMUM_REPARSE_DATA_BUFFER_SIZE, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, VOLUME_NAME_GUID,
 };
+use windows_sys::Win32::System::IO::DeviceIoControl;
+use windows_sys::Win32::System::Ioctl::{FSCTL_GET_REPARSE_POINT, FSCTL_SET_REPARSE_POINT};
+use windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_MOUNT_POINT;
 
 const FILE_SYSTEM_NAME_CAPACITY: usize = 32;
 const MAX_FINAL_PATH_UNITS: u32 = 32_768;
 const MAX_PATH_ARGUMENT_UNITS: usize = 32_766;
+const MOUNT_POINT_PATH_UNITS: usize = MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize / size_of::<u16>();
+
+#[repr(C)]
+#[expect(
+    non_snake_case,
+    reason = "the layout and field names match the Win32 mount-point reparse buffer contract"
+)]
+struct MountPointBuffer {
+    ReparseTag: u32,
+    ReparseDataLength: u16,
+    Reserved: u16,
+    SubstituteNameOffset: u16,
+    SubstituteNameLength: u16,
+    PrintNameOffset: u16,
+    PrintNameLength: u16,
+    PathBuffer: [MaybeUninit<u16>; MOUNT_POINT_PATH_UNITS],
+}
 
 /// One stable, handle-bound observation of a Windows filesystem entry.
 ///
@@ -96,6 +118,207 @@ pub(crate) fn open_for_execution_guard(path: &Path) -> io::Result<File> {
         .share_mode(FILE_SHARE_READ)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     options.open(path)
+}
+
+/// Open one execution-path guard while following the final reparse point.
+///
+/// This is used only to prove that a private directory junction still resolves
+/// to the already-guarded target directory. The retained handle excludes byte
+/// writes, deletion, and namespace replacement on that target.
+pub(crate) fn open_for_execution_guard_following_reparse(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    options.open(path)
+}
+
+/// Create one private file whose bytes remain writable only through the
+/// returned handle and readable by a later Windows image loader.
+pub(crate) fn create_for_execution_copy(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .share_mode(FILE_SHARE_READ)
+        .attributes(FILE_ATTRIBUTE_TEMPORARY)
+        .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN);
+    options.open(path)
+}
+
+/// Return whether a hard-link failure is precisely Windows' cross-volume
+/// boundary. Other errors must remain failures rather than becoming copies.
+pub(crate) fn is_cross_volume_error(error: &io::Error) -> bool {
+    error
+        .raw_os_error()
+        .and_then(|code| u32::try_from(code).ok())
+        .is_some_and(|code| code == ERROR_NOT_SAME_DEVICE)
+}
+
+/// Create and retain an exact NTFS directory junction.
+///
+/// `target` must already be canonical and qualified as local NTFS by the
+/// caller. The returned handle opens the reparse point itself, prevents its
+/// replacement, and supports later target revalidation without a close/reopen
+/// race.
+pub(crate) fn create_directory_junction(target: &Path, link: &Path) -> io::Result<File> {
+    let substitute_name = nt_junction_target(target)?;
+    let substitute_bytes = substitute_name
+        .len()
+        .checked_mul(size_of::<u16>())
+        .ok_or_else(|| invalid_data("Windows junction target length overflowed"))?;
+    let reparse_data_length = 12_usize
+        .checked_add(substitute_bytes)
+        .ok_or_else(|| invalid_data("Windows junction reparse length overflowed"))?;
+    let input_length = reparse_data_length
+        .checked_add(8)
+        .ok_or_else(|| invalid_data("Windows junction input length overflowed"))?;
+    if substitute_name.len().saturating_add(2) > MOUNT_POINT_PATH_UNITS
+        || input_length > MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Windows junction target exceeds the supported reparse-point bound",
+        ));
+    }
+
+    let substitute_name_length =
+        u16::try_from(substitute_bytes).map_err(|_| invalid_data("Windows junction target length exceeds 16 bits"))?;
+    let print_name_offset = u16::try_from(substitute_bytes + size_of::<u16>())
+        .map_err(|_| invalid_data("Windows junction print-name offset exceeds 16 bits"))?;
+    let mut buffer = Box::new(MountPointBuffer {
+        ReparseTag: IO_REPARSE_TAG_MOUNT_POINT,
+        ReparseDataLength: u16::try_from(reparse_data_length)
+            .map_err(|_| invalid_data("Windows junction data length exceeds 16 bits"))?,
+        Reserved: 0,
+        SubstituteNameOffset: 0,
+        SubstituteNameLength: substitute_name_length,
+        PrintNameOffset: print_name_offset,
+        PrintNameLength: 0,
+        PathBuffer: [MaybeUninit::uninit(); MOUNT_POINT_PATH_UNITS],
+    });
+    for (destination, unit) in buffer.PathBuffer.iter_mut().zip(substitute_name.iter().copied()) {
+        destination.write(unit);
+    }
+    buffer.PathBuffer[substitute_name.len()].write(0);
+    buffer.PathBuffer[substitute_name.len() + 1].write(0);
+
+    fs::create_dir(link)?;
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_POSIX_SEMANTICS);
+    let junction = match options.open(link) {
+        Ok(junction) => junction,
+        Err(error) => {
+            drop(fs::remove_dir(link));
+            return Err(error);
+        }
+    };
+    let input_length =
+        u32::try_from(input_length).map_err(|_| invalid_data("Windows junction input length exceeds 32 bits"))?;
+    let mut bytes_returned = 0_u32;
+    // SAFETY: `junction` owns the newly created directory handle. `buffer` is
+    // an aligned initialized mount-point header followed by the exact number
+    // of initialized UTF-16 units declared by `input_length`; Windows retains
+    // neither pointer and the operation has no output buffer.
+    let succeeded = unsafe {
+        DeviceIoControl(
+            raw_handle(&junction),
+            FSCTL_SET_REPARSE_POINT,
+            (&raw const *buffer).cast::<c_void>(),
+            input_length,
+            std::ptr::null_mut(),
+            0,
+            &raw mut bytes_returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if succeeded == 0 {
+        let error = io::Error::last_os_error();
+        drop(junction);
+        drop(fs::remove_dir(link));
+        return Err(error);
+    }
+    match directory_junction_targets(&junction, target) {
+        Ok(true) => Ok(junction),
+        Ok(false) => {
+            drop(junction);
+            drop(fs::remove_dir(link));
+            Err(invalid_data(
+                "Windows returned a directory junction with a different target",
+            ))
+        }
+        Err(error) => {
+            drop(junction);
+            drop(fs::remove_dir(link));
+            Err(error)
+        }
+    }
+}
+
+/// Prove that one retained mount-point handle still targets `target` exactly.
+pub(crate) fn directory_junction_targets(junction: &File, target: &Path) -> io::Result<bool> {
+    let expected = nt_junction_target(target)?;
+    let mut buffer = Box::new(MountPointBuffer {
+        ReparseTag: 0,
+        ReparseDataLength: 0,
+        Reserved: 0,
+        SubstituteNameOffset: 0,
+        SubstituteNameLength: 0,
+        PrintNameOffset: 0,
+        PrintNameLength: 0,
+        PathBuffer: [MaybeUninit::uninit(); MOUNT_POINT_PATH_UNITS],
+    });
+    let mut bytes_returned = 0_u32;
+    // SAFETY: `junction` owns a live reparse-point handle. `buffer` is aligned
+    // writable storage of at least `MAXIMUM_REPARSE_DATA_BUFFER_SIZE` bytes;
+    // the returned byte count is validated before any output field or path
+    // unit is read, and Windows retains no pointer.
+    let succeeded = unsafe {
+        DeviceIoControl(
+            raw_handle(junction),
+            FSCTL_GET_REPARSE_POINT,
+            std::ptr::null(),
+            0,
+            (&raw mut *buffer).cast::<c_void>(),
+            MAXIMUM_REPARSE_DATA_BUFFER_SIZE,
+            &raw mut bytes_returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if succeeded == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if bytes_returned < 16
+        || buffer.ReparseTag != IO_REPARSE_TAG_MOUNT_POINT
+        || usize::from(buffer.ReparseDataLength).saturating_add(8)
+            > usize::try_from(bytes_returned)
+                .map_err(|_| invalid_data("Windows junction returned byte count exceeds usize"))?
+        || !buffer.SubstituteNameOffset.is_multiple_of(2)
+        || !buffer.SubstituteNameLength.is_multiple_of(2)
+    {
+        return Err(invalid_data("Windows junction returned malformed reparse data"));
+    }
+    let start = usize::from(buffer.SubstituteNameOffset) / size_of::<u16>();
+    let length = usize::from(buffer.SubstituteNameLength) / size_of::<u16>();
+    let end = start
+        .checked_add(length)
+        .ok_or_else(|| invalid_data("Windows junction target range overflowed"))?;
+    let path_bytes = usize::from(buffer.ReparseDataLength)
+        .checked_sub(8)
+        .ok_or_else(|| invalid_data("Windows junction path data is truncated"))?;
+    if end > path_bytes / size_of::<u16>() || end > MOUNT_POINT_PATH_UNITS {
+        return Err(invalid_data("Windows junction target exceeds returned reparse data"));
+    }
+    // SAFETY: the validated returned byte count covers every selected UTF-16
+    // unit, and each unit lies within the aligned `PathBuffer` allocation.
+    let actual = unsafe { std::slice::from_raw_parts(buffer.PathBuffer.as_ptr().cast::<u16>().add(start), length) };
+    Ok(actual == expected)
 }
 
 /// Observe identity, topology, size, attributes, and mutation times through
@@ -230,6 +453,52 @@ pub(crate) fn rename_write_through(from: &Path, to: &Path, replace: bool) -> io:
     } else {
         Ok(())
     }
+}
+
+fn nt_junction_target(target: &Path) -> io::Result<Vec<u16>> {
+    let absolute = std::path::absolute(target)?;
+    let path = absolute.as_os_str().encode_wide().collect::<Vec<_>>();
+    if path.is_empty() || path.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Windows junction target is empty or contains a NUL code unit",
+        ));
+    }
+
+    const DOS_DEVICE_PREFIX: &[u16] = &[b'\\' as u16, b'?' as u16, b'?' as u16, b'\\' as u16];
+    const VERBATIM_PREFIX: &[u16] = &[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    const DEVICE_PREFIX: &[u16] = &[b'\\' as u16, b'\\' as u16, b'.' as u16, b'\\' as u16];
+    const UNC_PREFIX: &[u16] = &[
+        b'\\' as u16,
+        b'?' as u16,
+        b'?' as u16,
+        b'\\' as u16,
+        b'U' as u16,
+        b'N' as u16,
+        b'C' as u16,
+        b'\\' as u16,
+    ];
+
+    let mut target = Vec::with_capacity(path.len().saturating_add(UNC_PREFIX.len()));
+    if path.starts_with(VERBATIM_PREFIX) || path.starts_with(DOS_DEVICE_PREFIX) {
+        target.extend_from_slice(DOS_DEVICE_PREFIX);
+        target.extend_from_slice(&path[VERBATIM_PREFIX.len()..]);
+    } else if path.starts_with(DEVICE_PREFIX) {
+        target.extend_from_slice(DOS_DEVICE_PREFIX);
+        target.extend_from_slice(&path[DEVICE_PREFIX.len()..]);
+    } else if path.len() > 2 && path[1] == b':' as u16 && path[2] == b'\\' as u16 {
+        target.extend_from_slice(DOS_DEVICE_PREFIX);
+        target.extend_from_slice(&path);
+    } else if path.starts_with(&[b'\\' as u16, b'\\' as u16]) {
+        target.extend_from_slice(UNC_PREFIX);
+        target.extend_from_slice(&path[2..]);
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Windows junction target is not an absolute drive or UNC path",
+        ));
+    }
+    Ok(target)
 }
 
 fn encode_path(path: &Path) -> io::Result<Vec<u16>> {
@@ -426,7 +695,9 @@ fn unsupported_with_source(message: &str, source: io::Error) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        observe_file, open_for_observation, open_for_stable_byte_observation, prove_local_ntfs, rename_write_through,
+        create_directory_junction, directory_junction_targets, observe_file, open_for_execution_guard,
+        open_for_execution_guard_following_reparse, open_for_observation, open_for_stable_byte_observation,
+        prove_local_ntfs, rename_write_through,
     };
     use std::fs::{self, File};
     use std::io;
@@ -561,6 +832,46 @@ mod tests {
         rename_write_through(&source, &destination, true)?;
         assert!(!source.exists());
         assert_eq!(fs::read(&destination)?, b"new");
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fallible Windows setup precedes the test assertions"
+    )]
+    fn directory_junction_retains_one_exact_guarded_target() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let target = directory.path().join("target");
+        let alternate = directory.path().join("alternate");
+        let junction = directory.path().join("junction");
+        fs::create_dir(&target)?;
+        fs::create_dir(&alternate)?;
+        fs::write(target.join("entry"), b"target")?;
+
+        let target_guard = open_for_execution_guard(&target)?;
+        let target_observation = observe_file(&target_guard)?;
+        if !local_ntfs_or_explicitly_unsupported(&target_guard, target_observation.volume_serial_number)? {
+            return Ok(());
+        }
+
+        let junction_guard = create_directory_junction(&target, &junction)?;
+        assert!(directory_junction_targets(&junction_guard, &target)?);
+        assert!(!directory_junction_targets(&junction_guard, &alternate)?);
+        assert_eq!(fs::read(junction.join("entry"))?, b"target");
+        let followed_guard = open_for_execution_guard_following_reparse(&junction)?;
+        assert_eq!(observe_file(&followed_guard)?, target_observation);
+
+        let error = fs::remove_dir(&junction).expect_err("the retained junction handle must exclude replacement");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(32),
+            "junction replacement must receive ERROR_SHARING_VIOLATION"
+        );
+        drop(followed_guard);
+        drop(junction_guard);
+        fs::remove_dir(&junction)?;
+        assert!(target.is_dir(), "removing the junction must preserve its target");
         Ok(())
     }
 

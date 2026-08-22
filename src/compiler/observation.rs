@@ -365,6 +365,14 @@ impl CompilerWrapperIdentity {
     pub(crate) fn new(role: CompilerWrapperRole, executable: ExecutableIdentity) -> Self {
         Self { role, executable }
     }
+
+    pub(crate) const fn role(&self) -> CompilerWrapperRole {
+        self.role
+    }
+
+    pub(crate) fn executable(&self) -> &ExecutableIdentity {
+        &self.executable
+    }
 }
 
 /// Whether the cargo-rail native compiler cache ran for this observation.

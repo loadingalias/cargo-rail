@@ -154,6 +154,10 @@ impl ToolchainExecutableIdentities {
         &self.rustc
     }
 
+    pub(crate) fn rustdoc(&self) -> Option<&ExecutableIdentity> {
+        self.rustdoc.as_ref()
+    }
+
     pub(crate) fn rustc_wrapper(&self) -> Option<&ExecutableIdentity> {
         self.rustc_wrapper.as_ref()
     }

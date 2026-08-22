@@ -23,6 +23,8 @@ use crate::workspace::WorkspaceSnapshot;
 
 const MAX_FACT_DRIVER_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_COMPILER_LIBRARY_BYTES: u64 = 1024 * 1024 * 1024;
+#[cfg(windows)]
+const MAX_DOCTEST_EXECUTABLE_BYTES: u64 = 1024 * 1024 * 1024;
 const COMPILED_TARGET: &str = env!("CARGO_RAIL_COMPILED_TARGET");
 
 const FACT_DRIVER_FILE: Option<&str> = option_env!("CARGO_RAIL_FACT_DRIVER_FILE");
@@ -87,13 +89,11 @@ pub(crate) struct CompilerFactDoctestSysroot {
     rustc_target: PathBuf,
     #[cfg(unix)]
     rustdoc_target: PathBuf,
-    #[cfg(unix)]
     library_target: PathBuf,
     runtime_library: PathBuf,
     #[cfg(unix)]
     runtime_library_generation: Option<Vec<u8>>,
     _runtime_library_file: File,
-    _directory: tempfile::TempDir,
     #[cfg(windows)]
     _root_guard: File,
     #[cfg(windows)]
@@ -102,6 +102,11 @@ pub(crate) struct CompilerFactDoctestSysroot {
     _rustc_guard: File,
     #[cfg(windows)]
     _rustdoc_guard: File,
+    #[cfg(windows)]
+    _library_junction_guard: File,
+    #[cfg(windows)]
+    _library_target_guard: File,
+    _directory: tempfile::TempDir,
 }
 
 impl CompilerFactDriverAuthority {
@@ -429,12 +434,16 @@ impl PreparedCompilerFactDriver {
         &self,
         snapshot: &WorkspaceSnapshot,
         wrapper: &Path,
+        wrapper_digest: &str,
         rustdoc: &Path,
+        rustdoc_digest: &str,
     ) -> RailResult<CompilerFactDoctestSysroot> {
         CompilerFactDoctestSysroot::stage(
             snapshot.toolchain().rustc_sysroot(),
             wrapper,
+            wrapper_digest,
             rustdoc,
+            rustdoc_digest,
             &self.compiler_library_path,
             &self.compiler_library_digest,
         )
@@ -446,7 +455,9 @@ impl CompilerFactDoctestSysroot {
     fn stage(
         toolchain_sysroot: &Path,
         wrapper: &Path,
+        _wrapper_digest: &str,
         rustdoc: &Path,
+        _rustdoc_digest: &str,
         compiler_library: &Path,
         compiler_library_digest: &str,
     ) -> RailResult<Self> {
@@ -500,13 +511,16 @@ impl CompilerFactDoctestSysroot {
     fn stage(
         toolchain_sysroot: &Path,
         wrapper: &Path,
+        wrapper_digest: &str,
         rustdoc: &Path,
+        rustdoc_digest: &str,
         compiler_library: &Path,
         compiler_library_digest: &str,
     ) -> RailResult<Self> {
         let toolchain_sysroot = crate::utils::canonicalize_existing(toolchain_sysroot)?;
         let wrapper = crate::utils::canonicalize_existing(wrapper)?;
         let rustdoc = crate::utils::canonicalize_existing(rustdoc)?;
+        let compiler_library = crate::utils::canonicalize_existing(compiler_library)?;
         let directory = tempfile::Builder::new()
             .prefix("cargo-rail-doctest-sysroot-")
             .tempdir()?;
@@ -514,47 +528,91 @@ impl CompilerFactDoctestSysroot {
         let bin = root.join("bin");
         let library = root.join("lib");
         fs::create_dir(&bin)?;
-        mirror_directory_with_hard_links(&toolchain_sysroot.join("lib"), &library)?;
+        let library_target = toolchain_sysroot.join("lib");
+        let library_target_guard = crate::windows_fs::open_for_execution_guard(&library_target)?;
+        let library_target_observation = crate::windows_fs::observe_file(&library_target_guard)?;
+        crate::windows_fs::prove_local_ntfs(&library_target_guard, library_target_observation.volume_serial_number)?;
+        let library_junction_guard =
+            crate::windows_fs::create_directory_junction(&library_target, &library).map_err(|error| {
+                RailError::message(format!(
+                    "failed to retain the compiler sysroot library as a private directory junction: {error}"
+                ))
+            })?;
+        let followed_library_guard = crate::windows_fs::open_for_execution_guard_following_reparse(&library)?;
+        if crate::windows_fs::observe_file(&followed_library_guard)? != library_target_observation {
+            return Err(RailError::message(
+                "private doctest compiler library junction resolved to a different directory",
+            ));
+        }
+        drop(followed_library_guard);
         let rustc = bin.join("rustc.exe");
-        fs::hard_link(&wrapper, &rustc).map_err(|error| {
-            RailError::message(format!(
-                "failed to retain cargo-rail as the private doctest compiler on the selected volume: {error}"
-            ))
-        })?;
+        let rustc_guard = stage_windows_execution_file(
+            &wrapper,
+            &rustc,
+            wrapper_digest,
+            MAX_DOCTEST_EXECUTABLE_BYTES,
+            "cargo-rail typed-doctest compiler wrapper",
+        )?;
         let staged_rustdoc = bin.join("rustdoc.exe");
-        fs::hard_link(&rustdoc, &staged_rustdoc).map_err(|error| {
-            RailError::message(format!(
-                "failed to retain rustdoc in the private doctest sysroot on the selected volume: {error}"
-            ))
-        })?;
-        let rustc_guard = crate::windows_fs::open_for_execution_guard(&rustc)?;
-        let rustdoc_guard = crate::windows_fs::open_for_execution_guard(&staged_rustdoc)?;
+        let rustdoc_guard = stage_windows_execution_file(
+            &rustdoc,
+            &staged_rustdoc,
+            rustdoc_digest,
+            MAX_DOCTEST_EXECUTABLE_BYTES,
+            "selected rustdoc executable",
+        )?;
         let runtime_library = root.join(
             compiler_library
                 .strip_prefix(&toolchain_sysroot)
                 .map_err(|_| RailError::message("compiler fact runtime library is outside the selected sysroot"))?,
         );
-        if !runtime_library.exists() {
-            fs::create_dir_all(
-                runtime_library
-                    .parent()
-                    .ok_or_else(|| RailError::message("compiler fact runtime library has no parent"))?,
-            )?;
-            fs::copy(compiler_library, &runtime_library)?;
-        }
-        authenticate_compiler_library(&runtime_library, compiler_library_digest)?;
-        let runtime_library_file = crate::windows_fs::open_for_execution_guard(&runtime_library)?;
+        let runtime_parent = runtime_library
+            .parent()
+            .ok_or_else(|| RailError::message("compiler fact runtime library has no parent"))?;
+        let runtime_library_file = match fs::symlink_metadata(&runtime_library) {
+            Ok(_) => authenticate_windows_execution_file(
+                &runtime_library,
+                compiler_library_digest,
+                MAX_COMPILER_LIBRARY_BYTES,
+                "compiler fact runtime library",
+            )?,
+            Err(error) if error.kind() == ErrorKind::NotFound && runtime_parent == bin => stage_windows_execution_file(
+                &compiler_library,
+                &runtime_library,
+                compiler_library_digest,
+                MAX_COMPILER_LIBRARY_BYTES,
+                "compiler fact runtime library",
+            )?,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Err(RailError::message(
+                    "compiler fact runtime library is absent from the retained sysroot library and private bin",
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        };
         let bin_guard = crate::windows_fs::open_for_execution_guard(&bin)?;
         let root_guard = crate::windows_fs::open_for_execution_guard(&root)?;
+        let bin_observation = crate::windows_fs::observe_file(&bin_guard)?;
+        let root_observation = crate::windows_fs::observe_file(&root_guard)?;
+        crate::windows_fs::prove_local_ntfs(&bin_guard, bin_observation.volume_serial_number)?;
+        crate::windows_fs::prove_local_ntfs(&root_guard, root_observation.volume_serial_number)?;
+        if bin_observation.volume_serial_number != root_observation.volume_serial_number {
+            return Err(RailError::message(
+                "private doctest sysroot and compiler bin directory are on different volumes",
+            ));
+        }
         let capability = Self {
             root,
+            library_target,
             runtime_library,
             _runtime_library_file: runtime_library_file,
-            _directory: directory,
             _root_guard: root_guard,
             _bin_guard: bin_guard,
             _rustc_guard: rustc_guard,
             _rustdoc_guard: rustdoc_guard,
+            _library_junction_guard: library_junction_guard,
+            _library_target_guard: library_target_guard,
+            _directory: directory,
         };
         capability.revalidate()?;
         Ok(capability)
@@ -564,7 +622,9 @@ impl CompilerFactDoctestSysroot {
     fn stage(
         _toolchain_sysroot: &Path,
         _wrapper: &Path,
+        _wrapper_digest: &str,
         _rustdoc: &Path,
+        _rustdoc_digest: &str,
         _compiler_library: &Path,
         _compiler_library_digest: &str,
     ) -> RailResult<Self> {
@@ -600,7 +660,11 @@ impl CompilerFactDoctestSysroot {
                     != crate::windows_fs::observe_file(&File::open(rustdoc)?)?
                 || crate::windows_fs::observe_file(&self._runtime_library_file)?
                     != crate::windows_fs::observe_file(&File::open(&self.runtime_library)?)?
-                || !self.root.join("lib").is_dir()
+                || !crate::windows_fs::directory_junction_targets(&self._library_junction_guard, &self.library_target)?
+                || crate::windows_fs::observe_file(&self._library_target_guard)?
+                    != crate::windows_fs::observe_file(&crate::windows_fs::open_for_execution_guard_following_reparse(
+                        &self.root.join("lib"),
+                    )?)?
             {
                 return Err(RailError::message(
                     "private doctest compiler sysroot changed during acquisition",
@@ -642,34 +706,183 @@ fn clone_or_copy_runtime_library(source: &Path, destination: &Path) -> RailResul
 }
 
 #[cfg(windows)]
-fn mirror_directory_with_hard_links(source: &Path, destination: &Path) -> RailResult<()> {
-    const MAX_ENTRIES: usize = 16_384;
+fn stage_windows_execution_file(
+    source: &Path,
+    destination: &Path,
+    expected_digest: &str,
+    maximum_bytes: u64,
+    description: &str,
+) -> RailResult<File> {
+    let mut source_file = crate::windows_fs::open_for_stable_byte_observation(source)
+        .map_err(|error| RailError::message(format!("failed to retain {description} source bytes: {error}")))?;
+    let source_before = crate::windows_fs::observe_file(&source_file)?;
+    crate::windows_fs::prove_local_ntfs(&source_file, source_before.volume_serial_number)?;
+    validate_windows_execution_file_observation(&source_before, maximum_bytes, description)?;
 
-    fs::create_dir(destination)?;
-    let mut pending = vec![(source.to_path_buf(), destination.to_path_buf())];
-    let mut entries = 0usize;
-    while let Some((source, destination)) = pending.pop() {
-        for entry in fs::read_dir(source)? {
-            let entry = entry?;
-            entries = entries
-                .checked_add(1)
-                .ok_or_else(|| RailError::message("doctest sysroot mirror entry count overflow"))?;
-            if entries > MAX_ENTRIES {
-                return Err(RailError::message("doctest sysroot mirror exceeds its entry bound"));
+    match fs::hard_link(source, destination) {
+        Ok(()) => {
+            let mut destination_file = crate::windows_fs::open_for_execution_guard(destination)?;
+            let source_after = crate::windows_fs::observe_file(&source_file)?;
+            let destination_before = crate::windows_fs::observe_file(&destination_file)?;
+            crate::windows_fs::prove_local_ntfs(&destination_file, destination_before.volume_serial_number)?;
+            if source_after != destination_before {
+                return Err(RailError::message(format!(
+                    "staged {description} hard link does not retain the selected source file"
+                )));
             }
-            let metadata = entry.metadata()?;
-            let target = destination.join(entry.file_name());
-            if metadata.is_dir() && !crate::utils::is_symlink_or_reparse(&metadata) {
-                fs::create_dir(&target)?;
-                pending.push((entry.path(), target));
-            } else if metadata.is_file() && !crate::utils::is_symlink_or_reparse(&metadata) {
-                fs::hard_link(entry.path(), target)?;
-            } else {
-                return Err(RailError::message(
-                    "doctest sysroot mirror contains an unsupported file kind",
-                ));
+            authenticate_windows_open_file(
+                &mut destination_file,
+                destination_before,
+                expected_digest,
+                maximum_bytes,
+                description,
+            )?;
+            if crate::windows_fs::observe_file(&source_file)? != crate::windows_fs::observe_file(&destination_file)? {
+                return Err(RailError::message(format!(
+                    "staged {description} hard link changed while it was authenticated"
+                )));
             }
+            Ok(destination_file)
         }
+        Err(error) if crate::windows_fs::is_cross_volume_error(&error) => {
+            let mut destination_file = crate::windows_fs::create_for_execution_copy(destination)
+                .map_err(|error| RailError::message(format!("failed to create private {description} copy: {error}")))?;
+            transfer_windows_execution_file(
+                &mut source_file,
+                &mut destination_file,
+                source_before,
+                expected_digest,
+                maximum_bytes,
+                description,
+            )?;
+            destination_file.flush()?;
+            let destination_observation = crate::windows_fs::observe_file(&destination_file)?;
+            crate::windows_fs::prove_local_ntfs(&destination_file, destination_observation.volume_serial_number)?;
+            if destination_observation.size != source_before.size || destination_observation.number_of_links != 1 {
+                return Err(RailError::message(format!(
+                    "private {description} copy does not have exact single-file ownership"
+                )));
+            }
+            drop(destination_file);
+            let path_file = crate::windows_fs::open_for_execution_guard(destination)?;
+            if crate::windows_fs::observe_file(&path_file)? != destination_observation {
+                return Err(RailError::message(format!(
+                    "private {description} copy changed before its path was retained"
+                )));
+            }
+            Ok(path_file)
+        }
+        Err(error) => Err(RailError::message(format!(
+            "failed to retain {description} in the private doctest sysroot: {error}"
+        ))),
+    }
+}
+
+#[cfg(windows)]
+fn authenticate_windows_execution_file(
+    path: &Path,
+    expected_digest: &str,
+    maximum_bytes: u64,
+    description: &str,
+) -> RailResult<File> {
+    let mut file = crate::windows_fs::open_for_execution_guard(path)?;
+    let observation = crate::windows_fs::observe_file(&file)?;
+    crate::windows_fs::prove_local_ntfs(&file, observation.volume_serial_number)?;
+    authenticate_windows_open_file(&mut file, observation, expected_digest, maximum_bytes, description)?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn authenticate_windows_open_file(
+    file: &mut File,
+    observation: crate::windows_fs::FileObservation,
+    expected_digest: &str,
+    maximum_bytes: u64,
+    description: &str,
+) -> RailResult<u64> {
+    validate_windows_execution_file_observation(&observation, maximum_bytes, description)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut bytes = 0_u64;
+    loop {
+        let read = match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
+        bytes = bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| RailError::message(format!("{description} byte count overflow")))?;
+        hasher.update(&buffer[..read]);
+    }
+    finish_windows_execution_authentication(file, observation, bytes, hasher, expected_digest, description)
+}
+
+#[cfg(windows)]
+fn transfer_windows_execution_file(
+    source: &mut File,
+    destination: &mut File,
+    observation: crate::windows_fs::FileObservation,
+    expected_digest: &str,
+    maximum_bytes: u64,
+    description: &str,
+) -> RailResult<u64> {
+    validate_windows_execution_file_observation(&observation, maximum_bytes, description)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut bytes = 0_u64;
+    loop {
+        let read = match source.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
+        bytes = bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| RailError::message(format!("{description} byte count overflow")))?;
+        hasher.update(&buffer[..read]);
+        destination.write_all(&buffer[..read])?;
+    }
+    finish_windows_execution_authentication(source, observation, bytes, hasher, expected_digest, description)
+}
+
+#[cfg(windows)]
+fn finish_windows_execution_authentication(
+    file: &File,
+    observation: crate::windows_fs::FileObservation,
+    bytes: u64,
+    hasher: Sha256,
+    expected_digest: &str,
+    description: &str,
+) -> RailResult<u64> {
+    if bytes != observation.size || crate::windows_fs::observe_file(file)? != observation {
+        return Err(RailError::message(format!(
+            "{description} changed while its bytes were authenticated"
+        )));
+    }
+    crate::instrumentation::record_hash(usize::try_from(bytes).unwrap_or(usize::MAX));
+    crate::instrumentation::record_hashed_file_bytes_read(usize::try_from(bytes).unwrap_or(usize::MAX));
+    let actual = format!("sha256:{}", ContentDigest::from_sha256_bytes(hasher.finalize().into()));
+    if actual != expected_digest {
+        return Err(RailError::message(format!(
+            "{description} bytes do not match the captured workspace authority"
+        )));
+    }
+    Ok(bytes)
+}
+
+#[cfg(windows)]
+fn validate_windows_execution_file_observation(
+    observation: &crate::windows_fs::FileObservation,
+    maximum_bytes: u64,
+    description: &str,
+) -> RailResult<()> {
+    if observation.size == 0 || observation.size > maximum_bytes {
+        return Err(RailError::message(format!(
+            "{description} is not a bounded nonempty file"
+        )));
     }
     Ok(())
 }
@@ -1279,6 +1492,82 @@ mod tests {
         let error = fs::rename(directory_path, directory_path.with_extension("replacement"))
             .expect_err("the retained directory handle must exclude replacement");
         assert_eq!(error.raw_os_error(), Some(32));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_windows_doctest_sysroot_is_exact_guarded_and_removed_on_drop() {
+        let fixture = tempfile::tempdir().expect("temporary fixture");
+        let sysroot = fixture.path().join("sysroot");
+        let sysroot_bin = sysroot.join("bin");
+        fs::create_dir_all(sysroot.join("lib/rustlib")).expect("sysroot library");
+        fs::create_dir(&sysroot_bin).expect("sysroot bin");
+        let wrapper = fixture.path().join("cargo-rail.exe");
+        let rustdoc = fixture.path().join("rustdoc.exe");
+        let compiler_library = sysroot_bin.join("rustc_driver-test.dll");
+        write_executable(&wrapper, b"wrapper");
+        write_executable(&rustdoc, b"rustdoc");
+        fs::write(&compiler_library, b"compiler library").expect("compiler library");
+
+        let capability = CompilerFactDoctestSysroot::stage(
+            &sysroot,
+            &wrapper,
+            &digest(b"wrapper"),
+            &rustdoc,
+            &digest(b"rustdoc"),
+            &compiler_library,
+            &digest(b"compiler library"),
+        )
+        .expect("private doctest sysroot");
+        let private_root = capability.path().to_path_buf();
+        assert_eq!(
+            fs::read(private_root.join("bin/rustc.exe")).expect("wrapper"),
+            b"wrapper"
+        );
+        assert_eq!(
+            fs::read(private_root.join("bin/rustdoc.exe")).expect("rustdoc"),
+            b"rustdoc"
+        );
+        assert!(private_root.join("lib/rustlib").is_dir());
+        capability.revalidate().expect("stable private doctest sysroot");
+
+        drop(capability);
+        assert!(
+            !private_root.exists(),
+            "guard handles must close before the private sysroot is removed"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_windows_doctest_sysroot_rejects_digest_drift() {
+        let fixture = tempfile::tempdir().expect("temporary fixture");
+        let sysroot = fixture.path().join("sysroot");
+        let sysroot_bin = sysroot.join("bin");
+        fs::create_dir_all(sysroot.join("lib/rustlib")).expect("sysroot library");
+        fs::create_dir(&sysroot_bin).expect("sysroot bin");
+        let wrapper = fixture.path().join("cargo-rail.exe");
+        let rustdoc = fixture.path().join("rustdoc.exe");
+        let compiler_library = sysroot_bin.join("rustc_driver-test.dll");
+        write_executable(&wrapper, b"wrapper");
+        write_executable(&rustdoc, b"rustdoc");
+        fs::write(&compiler_library, b"compiler library").expect("compiler library");
+
+        let error = CompilerFactDoctestSysroot::stage(
+            &sysroot,
+            &wrapper,
+            &digest(b"different wrapper"),
+            &rustdoc,
+            &digest(b"rustdoc"),
+            &compiler_library,
+            &digest(b"compiler library"),
+        )
+        .err()
+        .expect("captured wrapper digest drift must fail closed");
+        assert!(
+            error.to_string().contains("captured workspace authority"),
+            "unexpected error: {error}"
+        );
     }
 
     #[cfg(unix)]

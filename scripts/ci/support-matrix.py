@@ -1183,7 +1183,11 @@ def render_markdown(
         (
             f"| {profile.name} | `{profile.runner}` | `{profile.filesystem}` | "
             f"{'Sensitive' if profile.case_sensitive else 'Insensitive'} | "
-            "Front-door corpus, CAS/atomicity suite, ENOSPC, and cleanup |"
+            + (
+                "Front-door corpus, CAS/atomicity suite, cross-volume compiler staging, ENOSPC, and cleanup |"
+                if profile.name == "windows-ntfs-vhd"
+                else "Front-door corpus, CAS/atomicity suite, ENOSPC, and cleanup |"
+            )
         )
         for profile in manifest.filesystem_profiles
     )

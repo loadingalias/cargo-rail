@@ -271,7 +271,7 @@ jobs:
             throw 'No drive letter is available for the NTFS qualification VHD'
           }
           @"
-          create vdisk file="$vhd" maximum=256 type=fixed
+          create vdisk file="$vhd" maximum=512 type=fixed
           select vdisk file="$vhd"
           attach vdisk
           create partition primary
@@ -327,6 +327,13 @@ jobs:
         run: |
           cargo nextest run -p cargo-rail -P commit --all-features --lib --locked --config-file .config/nextest.toml \
             -E 'test(~cache::cas::tests) | test(~utils::tests)'
+
+      - name: Qualify cross-volume exact compiler staging
+        if: matrix.filesystem.setup == 'windows-ntfs-vhd'
+        shell: bash
+        run: |
+          rustup component add rustc-dev
+          scripts/test-compiler-fact-protocol.sh
 
       - name: Run front-door corpus on the qualified filesystem
         shell: bash

@@ -309,6 +309,22 @@ impl CompilerCacheIdentity {
             cache_bypass_reason,
         })
     }
+
+    fn diagnostic_wrapper_executable(&self) -> RailResult<&ExecutableIdentity> {
+        let mut wrappers = self
+            .wrapper_chain
+            .iter()
+            .filter(|wrapper| wrapper.role() == CompilerWrapperRole::Diagnostic);
+        let wrapper = wrappers
+            .next()
+            .ok_or_else(|| RailError::message("compiler cache identity has no diagnostic wrapper authority"))?;
+        if wrappers.next().is_some() {
+            return Err(RailError::message(
+                "compiler cache identity repeats the diagnostic wrapper authority",
+            ));
+        }
+        Ok(wrapper.executable())
+    }
 }
 
 /// Capture the retained exact v10 session from the compiler Cargo selected for
@@ -789,13 +805,19 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                     snapshot.toolchain().rustdoc_program(),
                     snapshot.cargo_current_dir(),
                 )?;
+                let wrapper_digest = self.identity.diagnostic_wrapper_executable()?.content_digest();
+                let rustdoc_digest = snapshot
+                    .executable_identities()?
+                    .rustdoc()
+                    .ok_or_else(|| RailError::message("selected toolchain has no captured rustdoc authority"))?
+                    .content_digest();
                 prepared_doctest_sysroot = Some(
                     prepared_driver
                         .as_ref()
                         .ok_or_else(|| {
                             RailError::message("typed compiler fact driver disappeared before doctest staging")
                         })?
-                        .stage_doctest_sysroot(snapshot, &wrapper, &rustdoc)
+                        .stage_doctest_sysroot(snapshot, &wrapper, wrapper_digest, &rustdoc, rustdoc_digest)
                         .map_err(|error| {
                             RailError::message(format!(
                                 "failed to stage the private typed-doctest compiler sysroot: {error}"
@@ -2570,7 +2592,7 @@ pub(crate) fn compiler_sysroot_fingerprint(
                 stable_evidence,
             );
         }
-        return Ok(fingerprint);
+        Ok(fingerprint)
     }
 
     #[cfg(not(windows))]
