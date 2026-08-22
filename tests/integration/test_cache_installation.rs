@@ -14,6 +14,28 @@ use std::time::Duration;
 
 use crate::helpers::TestWorkspace;
 
+#[cfg(unix)]
+fn file_identity(path: &Path) -> Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = fs::metadata(path).with_context(|| format!("read identity for {}", path.display()))?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(windows)]
+fn file_identity(path: &Path) -> Result<(u32, u64, u64)> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    let metadata = fs::metadata(path).with_context(|| format!("read identity for {}", path.display()))?;
+    Ok((
+        metadata
+            .volume_serial_number()
+            .context("file has no volume serial number")?,
+        metadata.file_index().context("file has no index")?,
+        metadata.creation_time(),
+    ))
+}
+
 fn rail(workspace: &Path, cargo_home: &Path, arguments: &[&str]) -> Result<Output> {
     Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
         .current_dir(workspace)
@@ -1866,6 +1888,21 @@ fn local_cleanup_uses_the_receipt_selected_custom_cache_and_is_repairable() {
         let cold = cargo_check(&workspace.path, cargo_home.path(), None, None)?;
         assert!(cold.status.success(), "custom cache seed failed: {cold:?}");
         let custom_root = cache_base.path().join("cargo-rail/local-cas-v2");
+        let installation = cargo_home.path().join("cargo-rail/compiler-cache-v1");
+        #[cfg(not(windows))]
+        let wrapper = installation.join("cargo-rail-native-rustc-wrapper");
+        #[cfg(windows)]
+        let wrapper = installation.join("cargo-rail-native-rustc-wrapper.exe");
+        #[cfg(not(windows))]
+        let worker = installation.join("cargo-rail-native-rustc-worker");
+        #[cfg(windows)]
+        let worker = installation.join("cargo-rail-native-rustc-worker.exe");
+        let receipt = installation.join("setup.json");
+        let config = cargo_home.path().join("config.toml");
+        let wrapper_identity = file_identity(&wrapper)?;
+        let worker_identity = file_identity(&worker)?;
+        let receipt_identity = file_identity(&receipt)?;
+        let config_identity = file_identity(&config)?;
         assert!(custom_root.is_dir());
         assert!(!cargo_home.path().join("cargo-rail/local-cas-v2").exists());
 
@@ -1890,6 +1927,26 @@ fn local_cleanup_uses_the_receipt_selected_custom_cache_and_is_repairable() {
         assert!(
             custom_root.is_dir(),
             "repair changed or ignored the receipt-selected cache"
+        );
+        assert_eq!(
+            file_identity(&wrapper)?,
+            wrapper_identity,
+            "cache-only repair replaced the installed compiler wrapper"
+        );
+        assert_eq!(
+            file_identity(&worker)?,
+            worker_identity,
+            "cache-only repair replaced the installed compiler worker"
+        );
+        assert_eq!(
+            file_identity(&receipt)?,
+            receipt_identity,
+            "cache-only repair replaced the unchanged installation receipt"
+        );
+        assert_eq!(
+            file_identity(&config)?,
+            config_identity,
+            "cache-only repair replaced the unchanged Cargo configuration"
         );
         Ok(())
     })();

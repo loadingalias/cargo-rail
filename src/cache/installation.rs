@@ -70,14 +70,38 @@ pub(crate) struct SetupPlan {
     config_after: Vec<u8>,
     receipt_before: Option<Vec<u8>>,
     receipt: InstallationReceipt,
-    source_wrapper: PathBuf,
-    source_wrapper_digest: String,
-    source_worker: PathBuf,
-    source_worker_digest: String,
-    source_distributed_worker: Option<PathBuf>,
-    source_distributed_worker_digest: Option<String>,
+    wrapper: ExecutableSetup,
+    worker: ExecutableSetup,
+    distributed_worker: Option<ExecutableSetup>,
     source_distributed_identity: Option<SourceDistributedIdentity>,
     pending: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstalledExecutable {
+    digest: String,
+    generation: Vec<u8>,
+}
+
+struct ExecutableSetup {
+    source: PathBuf,
+    source_digest: String,
+    before: Option<InstalledExecutable>,
+}
+
+impl ExecutableSetup {
+    fn requires_installation(&self) -> bool {
+        self.before
+            .as_ref()
+            .is_none_or(|before| before.digest != self.source_digest)
+    }
+
+    fn preserved_generation(&self) -> Option<&[u8]> {
+        match &self.before {
+            Some(before) if before.digest == self.source_digest => Some(&before.generation),
+            _ => None,
+        }
+    }
 }
 
 struct SourceDistributedIdentity {
@@ -701,10 +725,16 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
     let distributed_client_certificate_path = install_directory.join(DISTRIBUTED_CLIENT_CERTIFICATE_FILE);
     let distributed_client_private_key_path = install_directory.join(DISTRIBUTED_CLIENT_PRIVATE_KEY_FILE);
     let (config_after, build_table_created) = install_wrapper_value(&original, &wrapper_path, existing.as_ref())?;
-    let source_wrapper = crate::compiler::native_cache::direct_wrapper_executable()?;
-    let source_wrapper_digest = installation_source_digest(&source_wrapper)?;
-    let source_worker = crate::compiler::native_cache::direct_worker_executable()?;
-    let source_worker_digest = installation_source_digest(&source_worker)?;
+    let wrapper = plan_executable_setup(
+        crate::compiler::native_cache::direct_wrapper_executable()?,
+        &wrapper_path,
+        "installed compiler wrapper",
+    )?;
+    let worker = plan_executable_setup(
+        crate::compiler::native_cache::direct_worker_executable()?,
+        &worker_path,
+        "installed compiler worker",
+    )?;
     let requested_mutual_tls = match (
         request.distributed_endpoint.as_deref(),
         request.distributed_server_name.as_deref(),
@@ -782,12 +812,14 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
         || requested_mutual_tls.is_some()
         || requested_placement.is_some()
         || existing.as_ref().is_some_and(|receipt| receipt.distributed.is_some());
-    let source_distributed_worker = distributed_enabled
-        .then(crate::compiler::native_cache::direct_distributed_worker_executable)
-        .transpose()?;
-    let source_distributed_worker_digest = source_distributed_worker
-        .as_deref()
-        .map(installation_source_digest)
+    let distributed_worker = distributed_enabled
+        .then(|| {
+            plan_executable_setup(
+                crate::compiler::native_cache::direct_distributed_worker_executable()?,
+                &distributed_worker_path,
+                "installed distributed compiler worker",
+            )
+        })
         .transpose()?;
     let source_distributed_identity = requested_mutual_tls
         .as_ref()
@@ -804,34 +836,12 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
             },
         )
         .transpose()?;
-    let wrapper_current = optional_file_digest(&wrapper_path)?;
-    let wrapper_generation = if wrapper_current.as_deref() == Some(source_wrapper_digest.as_str()) {
-        crate::utils::stable_file_generation(&wrapper_path)
-            .ok_or_else(|| RailError::message("installed compiler wrapper has no stable local file generation"))?
-    } else {
-        vec![0]
-    };
-    let worker_current = optional_file_digest(&worker_path)?;
-    let worker_generation = if worker_current.as_deref() == Some(source_worker_digest.as_str()) {
-        crate::utils::stable_file_generation(&worker_path)
-            .ok_or_else(|| RailError::message("installed compiler worker has no stable local file generation"))?
-    } else {
-        vec![0]
-    };
-    let distributed_worker_current = if distributed_enabled {
-        optional_file_digest(&distributed_worker_path)?
-    } else {
-        None
-    };
-    let distributed_worker_generation = if distributed_enabled
-        && distributed_worker_current.as_deref() == source_distributed_worker_digest.as_deref()
-    {
-        crate::utils::stable_file_generation(&distributed_worker_path).ok_or_else(|| {
-            RailError::message("installed distributed compiler worker has no stable local file generation")
-        })?
-    } else {
-        vec![0]
-    };
+    let wrapper_generation = wrapper.preserved_generation().map_or_else(|| vec![0], <[u8]>::to_vec);
+    let worker_generation = worker.preserved_generation().map_or_else(|| vec![0], <[u8]>::to_vec);
+    let distributed_worker_generation = distributed_worker
+        .as_ref()
+        .and_then(ExecutableSetup::preserved_generation)
+        .map_or_else(|| vec![0], <[u8]>::to_vec);
     let mutual_tls = if let (Some((endpoint, server_name, worker_capability_id, ..)), Some(source)) =
         (requested_mutual_tls.as_ref(), source_distributed_identity.as_ref())
     {
@@ -931,16 +941,16 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
             .as_ref()
             .map_or(build_table_created, |receipt| receipt.build_table_created),
         wrapper_path,
-        wrapper_digest: source_wrapper_digest.clone(),
+        wrapper_digest: wrapper.source_digest.clone(),
         wrapper_generation,
         worker_path,
-        worker_digest: source_worker_digest.clone(),
+        worker_digest: worker.source_digest.clone(),
         worker_generation,
         cache,
         remote,
-        distributed: source_distributed_worker_digest
+        distributed: distributed_worker
             .as_ref()
-            .map(|digest| InstalledDistributedQualification {
+            .map(|worker| InstalledDistributedQualification {
                 mode: if mutual_tls.is_some() {
                     "mutual_tls_direct_v1".to_string()
                 } else {
@@ -948,7 +958,7 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
                 },
                 placement,
                 worker_path: distributed_worker_path,
-                worker_digest: digest.clone(),
+                worker_digest: worker.source_digest.clone(),
                 worker_generation: distributed_worker_generation,
                 mutual_tls,
             }),
@@ -970,9 +980,11 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
         .transpose()?;
     let pending = config_before.as_deref() != Some(config_after.as_bytes())
         || receipt_before.as_deref() != Some(encoded_receipt.as_slice())
-        || wrapper_current.as_deref() != Some(source_wrapper_digest.as_str())
-        || worker_current.as_deref() != Some(source_worker_digest.as_str())
-        || distributed_enabled && distributed_worker_current.as_deref() != source_distributed_worker_digest.as_deref()
+        || wrapper.requires_installation()
+        || worker.requires_installation()
+        || distributed_worker
+            .as_ref()
+            .is_some_and(ExecutableSetup::requires_installation)
         || receipt
             .distributed
             .as_ref()
@@ -991,12 +1003,9 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
         config_after: config_after.into_bytes(),
         receipt_before,
         receipt,
-        source_wrapper,
-        source_wrapper_digest,
-        source_worker,
-        source_worker_digest,
-        source_distributed_worker,
-        source_distributed_worker_digest,
+        wrapper,
+        worker,
+        distributed_worker,
         source_distributed_identity,
         pending,
     })
@@ -1027,20 +1036,18 @@ pub(crate) fn apply_setup(mut plan: SetupPlan) -> RailResult<()> {
         .ok_or_else(|| RailError::message("installed compiler wrapper has no parent"))?
         .join(RECEIPT_FILE);
     revalidate_optional(&receipt_path, plan.receipt_before.as_deref(), MAX_RECEIPT_BYTES)?;
-    if installation_source_digest(&plan.source_wrapper)? != plan.source_wrapper_digest {
+    if installation_source_digest(&plan.wrapper.source)? != plan.wrapper.source_digest {
         return Err(RailError::message(
             "compiler wrapper executable changed after setup planning",
         ));
     }
-    if installation_source_digest(&plan.source_worker)? != plan.source_worker_digest {
+    if installation_source_digest(&plan.worker.source)? != plan.worker.source_digest {
         return Err(RailError::message(
             "compiler worker executable changed after setup planning",
         ));
     }
-    if let (Some(source), Some(expected_digest)) = (
-        plan.source_distributed_worker.as_deref(),
-        plan.source_distributed_worker_digest.as_deref(),
-    ) && installation_source_digest(source)? != expected_digest
+    if let Some(distributed_worker) = &plan.distributed_worker
+        && installation_source_digest(&distributed_worker.source)? != distributed_worker.source_digest
     {
         return Err(RailError::message(
             "distributed compiler worker executable changed after setup planning",
@@ -1101,17 +1108,19 @@ pub(crate) fn apply_setup(mut plan: SetupPlan) -> RailResult<()> {
     let install_directory = owner.join(INSTALLATION_DIRECTORY);
     create_private_directory(&install_directory)?;
     let _session_lock = lock_session(&plan.receipt)?;
+    revalidate_executable_setup(&plan.receipt.wrapper_path, &plan.wrapper, "installed compiler wrapper")?;
+    revalidate_executable_setup(&plan.receipt.worker_path, &plan.worker, "installed compiler worker")?;
+    if let (Some(setup), Some(distributed)) = (&plan.distributed_worker, &plan.receipt.distributed) {
+        revalidate_executable_setup(&distributed.worker_path, setup, "installed distributed compiler worker")?;
+    }
     if read_optional_regular(&plan.receipt.session_memo_path()?, MAX_SESSION_MEMO_BYTES)?.is_some() {
         fs::remove_file(plan.receipt.session_memo_path()?)?;
     }
     LocalCas::open_selected(&plan.receipt.cache)?;
-    install_executable_atomic(&plan.source_wrapper, &plan.receipt.wrapper_path)?;
-    install_executable_atomic(&plan.source_worker, &plan.receipt.worker_path)?;
-    if let (Some(source), Some(distributed)) = (
-        plan.source_distributed_worker.as_deref(),
-        plan.receipt.distributed.as_ref(),
-    ) {
-        install_executable_atomic(source, &distributed.worker_path)?;
+    install_planned_executable(&plan.wrapper, &plan.receipt.wrapper_path)?;
+    install_planned_executable(&plan.worker, &plan.receipt.worker_path)?;
+    if let (Some(setup), Some(distributed)) = (&plan.distributed_worker, &plan.receipt.distributed) {
+        install_planned_executable(setup, &distributed.worker_path)?;
     }
     if let (Some(source), Some(mutual_tls)) = (
         plan.source_distributed_identity.as_ref(),
@@ -1151,7 +1160,11 @@ pub(crate) fn apply_setup(mut plan: SetupPlan) -> RailResult<()> {
     plan.receipt.worker_generation = crate::utils::stable_file_generation(&plan.receipt.worker_path)
         .ok_or_else(|| RailError::message("installed compiler worker has no stable local file generation"))?;
     if let Some(distributed) = plan.receipt.distributed.as_mut() {
-        if plan.source_distributed_worker_digest.as_deref() != Some(distributed.worker_digest.as_str())
+        if plan
+            .distributed_worker
+            .as_ref()
+            .map(|setup| setup.source_digest.as_str())
+            != Some(distributed.worker_digest.as_str())
             || file_digest(&distributed.worker_path)? != distributed.worker_digest
         {
             return Err(RailError::message(
@@ -1195,9 +1208,14 @@ pub(crate) fn apply_setup(mut plan: SetupPlan) -> RailResult<()> {
             )?;
         }
     }
-    write_private_atomic(&receipt_path, &encode_receipt(&plan.receipt)?)?;
+    let encoded_receipt = encode_receipt(&plan.receipt)?;
+    if plan.receipt_before.as_deref() != Some(encoded_receipt.as_slice()) {
+        write_private_atomic(&receipt_path, &encoded_receipt)?;
+    }
     revalidate_optional(&plan.config_path, plan.config_before.as_deref(), 16 * 1024 * 1024)?;
-    crate::utils::write_file_atomic(&plan.config_path, &plan.config_after)?;
+    if plan.config_before.as_deref() != Some(plan.config_after.as_slice()) {
+        crate::utils::write_file_atomic(&plan.config_path, &plan.config_after)?;
+    }
     Ok(())
 }
 
@@ -1999,6 +2017,53 @@ fn ensure_real_directory(path: &Path) -> RailResult<()> {
             "Cargo home '{}' is not a real directory",
             path.display()
         )));
+    }
+    Ok(())
+}
+
+fn plan_executable_setup(source: PathBuf, destination: &Path, description: &str) -> RailResult<ExecutableSetup> {
+    Ok(ExecutableSetup {
+        source_digest: installation_source_digest(&source)?,
+        source,
+        before: observe_installed_executable(destination, description)?,
+    })
+}
+
+fn observe_installed_executable(path: &Path, description: &str) -> RailResult<Option<InstalledExecutable>> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            let generation_before = crate::utils::stable_file_generation(path)
+                .ok_or_else(|| RailError::message(format!("{description} has no stable local file generation")))?;
+            let digest = file_digest(path)?;
+            let generation = crate::utils::stable_file_generation(path)
+                .ok_or_else(|| RailError::message(format!("{description} has no stable local file generation")))?;
+            if generation != generation_before {
+                return Err(RailError::with_help(
+                    format!("{description} changed while setup was planned"),
+                    "rerun the command to build a new exact mutation plan",
+                ));
+            }
+            Ok(Some(InstalledExecutable { digest, generation }))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn revalidate_executable_setup(path: &Path, setup: &ExecutableSetup, description: &str) -> RailResult<()> {
+    if observe_installed_executable(path, description)?.as_ref() == setup.before.as_ref() {
+        Ok(())
+    } else {
+        Err(RailError::with_help(
+            format!("{description} changed after setup planning"),
+            "rerun the command to build a new exact mutation plan",
+        ))
+    }
+}
+
+fn install_planned_executable(setup: &ExecutableSetup, destination: &Path) -> RailResult<()> {
+    if setup.requires_installation() {
+        install_executable_atomic(&setup.source, destination)?;
     }
     Ok(())
 }
