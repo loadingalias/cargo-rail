@@ -459,10 +459,12 @@ struct ExecutionResponse {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkerPhaseTiming {
+    /// Connection acceptance through the start of the worker execution interval.
     queue_ns: u64,
     input_ns: u64,
     compiler_ns: u64,
     result_encode_ns: u64,
+    /// Worker-owned execution interval containing input, compiler, and result encoding.
     elapsed_ns: u64,
     source_bytes: u64,
     result_bytes: u64,
@@ -1342,7 +1344,7 @@ pub(crate) struct DistributedTiming {
     lease: NativePhaseMeasurement,
     /// Execution request header and source frame write.
     source_transfer: NativePhaseMeasurement,
-    /// Queue plus remote compilation, ending at the decoded response header.
+    /// Client response wait ending at the decoded response header.
     remote_execution: NativePhaseMeasurement,
     /// Digest-verified result frames written into private staging.
     result_transfer: NativePhaseMeasurement,

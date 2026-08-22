@@ -1345,7 +1345,7 @@ fn mutually_authenticated_idle_connection(
 
 #[cfg(unix)]
 /// Prove the committed distributed hit retained a complete, source-free phase
-/// breakdown whose measured sub-phases decompose the client critical path.
+/// breakdown whose measured sub-phases decompose their owning intervals.
 fn assert_distributed_phase_timing(event: &serde_json::Value) -> Result<()> {
     const CRITICAL_PATH: [&str; 9] = [
         "capability_capture",
@@ -1396,12 +1396,16 @@ fn assert_distributed_phase_timing(event: &serde_json::Value) -> Result<()> {
             .with_context(|| format!("distributed worker timing lost {name}: {event}"))
     };
     let worker_elapsed = worker_phase("elapsed_ns")?;
+    worker_phase("queue_ns")?;
     let worker_measured = worker_phase("input_ns")?
         .saturating_add(worker_phase("compiler_ns")?)
         .saturating_add(worker_phase("result_encode_ns")?);
+    // The client response wait and worker execution are measured in separate
+    // processes. Their starts can overlap the request write, so neither
+    // duration is a valid upper bound for the other.
     anyhow::ensure!(
-        worker_elapsed >= worker_measured && phase("remote_execution")?.1 >= worker_elapsed,
-        "distributed worker phases do not decompose the remote execution interval: {event}"
+        worker_elapsed >= worker_measured,
+        "distributed worker phases do not decompose the worker execution interval: {event}"
     );
     anyhow::ensure!(
         timing["source_bytes"].as_u64().is_some_and(|bytes| bytes > 0)
