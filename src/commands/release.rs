@@ -10,7 +10,10 @@ use crate::release::planner::{DependentPolicy, ReleasePlanner};
 use crate::release::publisher::{
     CheckReadiness, ReleasePublisher, observe_github_exact_sha_readiness, observe_gitlab_exact_sha_readiness,
 };
-use crate::release::state::{ReleaseState, ReleaseStatus, StepStatus, state_dir, validate_state_path};
+use crate::release::remote::{RemoteRepository, release_repository};
+use crate::release::state::{
+    ReconstructedRelease, ReleaseState, ReleaseStatus, StepStatus, state_dir, validate_state_path,
+};
 use crate::release::validator::ReleaseValidator;
 use crate::release::version::BumpRequest;
 use crate::utils;
@@ -42,6 +45,7 @@ struct GitReleaseTransaction {
     publish: Option<bool>,
     tag: Option<bool>,
     remote: Option<String>,
+    remote_repository: Option<RemoteRepository>,
     crates: BTreeMap<String, String>,
     tags: BTreeMap<String, String>,
     crate_publish: BTreeMap<String, bool>,
@@ -1066,6 +1070,23 @@ fn reconstructed_release_is_terminal(
     let Some(remote) = transaction.remote.as_deref() else {
         return false;
     };
+    let remote_repository = if remote == "none" {
+        None
+    } else {
+        let Some(expected) = transaction.remote_repository.as_ref() else {
+            observations.push("remote_repository:ambiguous=missing_transaction_identity".to_string());
+            return false;
+        };
+        let Ok(actual) = release_repository(workspace_root) else {
+            observations.push("remote_repository:ambiguous=unresolvable".to_string());
+            return false;
+        };
+        if &actual != expected {
+            observations.push("remote_repository:ambiguous=changed".to_string());
+            return false;
+        }
+        Some(expected)
+    };
     let tags_complete = match transaction.tag {
         Some(true) => {
             if transaction.tags.len() != transaction.crates.len() {
@@ -1104,7 +1125,7 @@ fn reconstructed_release_is_terminal(
 
     let readiness_required = remote != "none" && (transaction.tag == Some(true) || transaction.publish == Some(true));
     if readiness_required {
-        let Some(provider) = exact_sha_readiness_provider(workspace_root, remote) else {
+        let Some(provider) = exact_sha_readiness_provider(remote_repository, remote) else {
             observations.push("readiness:ambiguous=unsupported_provider".to_string());
             return false;
         };
@@ -1174,15 +1195,10 @@ fn reconstructed_release_is_terminal(
 
     let forge = match remote {
         "github" | "gitlab" => Some(remote),
-        "auto" => git_stdout(workspace_root, &["config", "--get", "remote.origin.url"]).and_then(|url| {
-            let url = url.to_ascii_lowercase();
-            if url.contains("github") {
-                Some("github")
-            } else if url.contains("gitlab") {
-                Some("gitlab")
-            } else {
-                None
-            }
+        "auto" => remote_repository.and_then(|repository| match repository.host() {
+            Some("github.com") => Some("github"),
+            Some("gitlab.com") => Some("gitlab"),
+            _ => None,
         }),
         "none" | "push" => return true,
         _ => None,
@@ -1191,9 +1207,10 @@ fn reconstructed_release_is_terminal(
         return false;
     };
     transaction.tags.values().all(|tag| {
+        let selector = remote_repository.map(RemoteRepository::selector).unwrap_or_default();
         let complete = match forge {
-            "github" => command_succeeds(workspace_root, "gh", &["release", "view", tag]),
-            "gitlab" => command_succeeds(workspace_root, "glab", &["release", "view", tag]),
+            "github" => command_succeeds(workspace_root, "gh", &["release", "view", tag, "--repo", &selector]),
+            "gitlab" => command_succeeds(workspace_root, "glab", &["release", "view", tag, "--repo", &selector]),
             _ => false,
         };
         if complete {
@@ -1203,19 +1220,14 @@ fn reconstructed_release_is_terminal(
     })
 }
 
-fn exact_sha_readiness_provider(workspace_root: &Path, remote: &str) -> Option<&'static str> {
+fn exact_sha_readiness_provider(repository: Option<&RemoteRepository>, remote: &str) -> Option<&'static str> {
     match remote {
         "github" => Some("github"),
         "gitlab" => Some("gitlab"),
-        "auto" | "push" => git_stdout(workspace_root, &["config", "--get", "remote.origin.url"]).and_then(|url| {
-            let url = url.to_ascii_lowercase();
-            if url.contains("github.com") {
-                Some("github")
-            } else if url.contains("gitlab.com") {
-                Some("gitlab")
-            } else {
-                None
-            }
+        "auto" | "push" => repository.and_then(|repository| match repository.host() {
+            Some("github.com") => Some("github"),
+            Some("gitlab.com") => Some("gitlab"),
+            _ => None,
         }),
         _ => None,
     }
@@ -1290,6 +1302,8 @@ fn git_release_transactions(workspace_root: &Path) -> RailResult<Vec<GitReleaseT
                 publish: parse_bool_trailer(&message, "Rail-Release-Publish"),
                 tag: parse_bool_trailer(&message, "Rail-Release-Tag"),
                 remote: trailer_value(&message, "Rail-Release-Remote"),
+                remote_repository: trailer_value(&message, "Rail-Release-Repository")
+                    .and_then(|value| RemoteRepository::from_trailer(&value).ok()),
                 crates: BTreeMap::new(),
                 tags: BTreeMap::new(),
                 crate_publish: BTreeMap::new(),
@@ -1304,6 +1318,8 @@ fn git_release_transactions(workspace_root: &Path) -> RailResult<Vec<GitReleaseT
             transaction.publish = parse_bool_trailer(&message, "Rail-Release-Publish");
             transaction.tag = parse_bool_trailer(&message, "Rail-Release-Tag");
             transaction.remote = trailer_value(&message, "Rail-Release-Remote");
+            transaction.remote_repository = trailer_value(&message, "Rail-Release-Repository")
+                .and_then(|value| RemoteRepository::from_trailer(&value).ok());
         }
         for value in trailer_values(&message, "Rail-Release-Crate") {
             let Some((name, version)) = value.rsplit_once('@') else {
@@ -1427,6 +1443,19 @@ pub fn run_release_resume(ctx: &WorkspaceContext, state: &std::path::Path) -> Ra
             "restore the release configuration from the exact release commit",
         ));
     }
+    let remote_repository = if remote == "none" {
+        None
+    } else {
+        Some(transaction.remote_repository.clone().ok_or_else(|| {
+            RailError::with_help(
+                format!(
+                    "release transaction '{}' predates exact repository identity",
+                    transaction_id
+                ),
+                "recover the original local journal; cargo-rail will not guess an irreversible remote target",
+            )
+        })?)
+    };
     let head = ctx.git()?.git().head_commit()?;
     if head != transaction.exact_sha {
         return Err(RailError::with_help(
@@ -1496,8 +1525,11 @@ pub fn run_release_resume(ctx: &WorkspaceContext, state: &std::path::Path) -> Ra
         &plan,
         !publish,
         !tag,
-        transaction.exact_sha,
-        transaction.commit_targets,
+        ReconstructedRelease {
+            release_commit: transaction.exact_sha,
+            commit_targets: transaction.commit_targets,
+            remote_repository,
+        },
     )
 }
 

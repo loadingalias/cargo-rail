@@ -990,6 +990,13 @@ fi
 if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
   exit 0
 fi
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  exit 0
+fi
+if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
+  echo '{{"data":{{"repository":{{"object":{{"statusCheckRollup":{{"contexts":{{"totalCount":1,"checkRunCount":1,"checkRunCountsByState":[{{"state":"SUCCESS","count":1}}],"statusContextCount":0,"statusContextCountsByState":[]}}}}}}}}}}}}'
+  exit 0
+fi
 echo "unexpected gh args: $@" >&2
 exit 1
 "#,
@@ -1674,13 +1681,35 @@ fn release_pr_mode_round_trips_to_finalize_on_merge_commit() {
         tag_release(&ws, "lib-a", "0.1.0")?;
 
         let remote_root = tempfile::TempDir::new()?;
-        let remote = remote_root.path().join("gitlab.com/origin.git");
+        let remote = remote_root.path().join("origin.git");
         std::fs::create_dir_all(remote.parent().unwrap())?;
         let output = Command::new("git")
             .args(["init", "--bare", remote.to_str().unwrap()])
             .output()?;
         assert!(output.status.success(), "bare remote init failed");
-        ws.set_remote(remote.to_str().unwrap())?;
+        let ssh = remote_root.path().join("ssh");
+        std::fs::write(
+            &ssh,
+            format!(
+                r#"#!/bin/sh
+case "$*" in
+  *git-receive-pack*) exec git-receive-pack "{}" ;;
+  *git-upload-pack*) exec git-upload-pack "{}" ;;
+esac
+exit 1
+"#,
+                remote.display(),
+                remote.display()
+            ),
+        )?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&ssh)?.permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&ssh, permissions)?;
+        }
+        ws.set_remote("git@github.com:org/repo.git")?;
+        git(&ws.path, &["config", "core.sshCommand", ssh.to_str().unwrap()])?;
         git(&ws.path, &["push", "-u", "origin", "main"])?;
         install_pre_push_hook(
             &ws,
@@ -1738,7 +1767,8 @@ fi
         );
         assert!(!ws.path.join(".changes").exists() || std::fs::read_dir(ws.path.join(".changes"))?.next().is_none());
         assert!(std::fs::read_to_string(ws.path.join("crates/lib-a/Cargo.toml"))?.contains("version = \"0.2.0\""));
-        assert!(std::fs::read_to_string(&gh_log)?.contains("pr create"));
+        let gh_commands = std::fs::read_to_string(&gh_log)?;
+        assert!(gh_commands.contains("pr create") && gh_commands.contains("--repo org/repo"));
         assert_eq!(
             std::fs::read_to_string(ws.path.join(".git/release-pr-hook-context"))?,
             "1:release\n",
@@ -1773,12 +1803,9 @@ done
 "#,
         )?;
 
-        let glab_log_dir = tempfile::TempDir::new()?;
-        let glab_log = glab_log_dir.path().join("glab.log");
-        let (_glab_dir, glab_path) = glab_shim(&glab_log)?;
         let output = run_with_path_prefix(
             &ws,
-            glab_path.parent().unwrap(),
+            gh_path.parent().unwrap(),
             &["rail", "release", "finalize", "lib-a", "--skip-publish", "--yes"],
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1811,6 +1838,12 @@ done
             .trim()
             .to_string();
         assert_eq!(remote_tag, merge_sha, "the pushed tag must retain the proven commit");
+        let gh_commands = std::fs::read_to_string(&gh_log)?;
+        assert!(
+            gh_commands.contains("api graphql --hostname github.com"),
+            "GitHub readiness must target the bound host\n{}",
+            gh_commands
+        );
         assert!(
             !transaction.is_empty(),
             "prepare transaction identity should be preserved in the journal"
@@ -3005,6 +3038,11 @@ remote_effects = "gitlab"
             "glab release create args should include the title and notes file\n{}",
             glab_log
         );
+        assert!(
+            glab_log.contains("--repo "),
+            "glab commands must target the bound repository\n{}",
+            glab_log
+        );
 
         Ok(())
     })();
@@ -3192,6 +3230,94 @@ echo "release hook context accepted"
             trace
         );
 
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_release_rejects_a_different_origin_push_repository_before_mutation() {
+    let result: Result<()> = (|| {
+        let (ws, _fetch_remote) = push_release_workspace("divergent-push")?;
+        let push_remote = tempfile::TempDir::new()?;
+        git(push_remote.path(), &["init", "--bare", "--initial-branch=main"])?;
+        git(
+            &ws.path,
+            &["config", "remote.origin.pushurl", push_remote.path().to_str().unwrap()],
+        )?;
+        let head_before = git(&ws.path, &["rev-parse", "HEAD"])?.stdout;
+
+        let output = run_cargo_rail(
+            &ws.path,
+            &[
+                "rail",
+                "release",
+                "run",
+                "--all",
+                "--bump",
+                "patch",
+                "--skip-publish",
+                "--skip-tag",
+                "--yes",
+            ],
+        )?;
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.status.code(), Some(2), "{combined}");
+        assert!(
+            combined.contains("origin fetches from") && combined.contains("but pushes to"),
+            "{combined}"
+        );
+        assert_eq!(git(&ws.path, &["rev-parse", "HEAD"])?.stdout, head_before);
+        assert!(!ws.path.join("target/cargo-rail/releases").exists());
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_release_rejects_multiple_origin_push_repositories() {
+    let result: Result<()> = (|| {
+        let (ws, _fetch_remote) = push_release_workspace("multiple-pushes")?;
+        let first = tempfile::TempDir::new()?;
+        let second = tempfile::TempDir::new()?;
+        for remote in [&first, &second] {
+            git(remote.path(), &["init", "--bare", "--initial-branch=main"])?;
+            git(
+                &ws.path,
+                &[
+                    "config",
+                    "--add",
+                    "remote.origin.pushurl",
+                    remote.path().to_str().unwrap(),
+                ],
+            )?;
+        }
+
+        let output = run_cargo_rail(
+            &ws.path,
+            &[
+                "rail",
+                "release",
+                "run",
+                "--all",
+                "--bump",
+                "patch",
+                "--skip-publish",
+                "--skip-tag",
+                "--yes",
+            ],
+        )?;
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.status.code(), Some(2), "{combined}");
+        assert!(combined.contains("2 effective push URLs"), "{combined}");
         Ok(())
     })();
     super::helpers::finish_test(result);
@@ -3448,6 +3574,92 @@ remote_effects = "push"
         );
         let state: serde_json::Value = serde_json::from_slice(&std::fs::read(state_path)?)?;
         assert_eq!(state["status"], "complete");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_release_resume_rejects_remote_repository_drift() {
+    let result: Result<()> = (|| {
+        let (ws, _original_remote) = push_release_workspace("push-target-drift")?;
+        let interrupted = run_release_with_fault(
+            &ws.path,
+            &[
+                "rail",
+                "release",
+                "run",
+                "--all",
+                "--bump",
+                "patch",
+                "--skip-publish",
+                "--skip-tag",
+                "--yes",
+            ],
+            "push",
+        )?;
+        assert!(!interrupted.status.success());
+        let state_path = only_release_state(&ws.path)?;
+        let replacement = tempfile::TempDir::new()?;
+        git(replacement.path(), &["init", "--bare", "--initial-branch=main"])?;
+        git(
+            &ws.path,
+            &["remote", "set-url", "origin", replacement.path().to_str().unwrap()],
+        )?;
+
+        let resumed = run_cargo_rail(&ws.path, &["rail", "release", "resume", state_path.to_str().unwrap()])?;
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&resumed.stdout),
+            String::from_utf8_lossy(&resumed.stderr)
+        );
+        assert_eq!(resumed.status.code(), Some(2), "{combined}");
+        assert!(combined.contains("release repository changed from"), "{combined}");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_release_abort_remains_local_before_a_push_after_origin_drift() {
+    let result: Result<()> = (|| {
+        let (ws, _original_remote) = push_release_workspace("abort-before-push-drift")?;
+        let initial_head = git(&ws.path, &["rev-parse", "HEAD"])?.stdout;
+        let interrupted = run_release_with_fault(
+            &ws.path,
+            &[
+                "rail",
+                "release",
+                "run",
+                "--all",
+                "--bump",
+                "patch",
+                "--skip-publish",
+                "--skip-tag",
+                "--yes",
+            ],
+            "commit:abort-before-push-drift",
+        )?;
+        assert!(!interrupted.status.success());
+        let state_path = only_release_state(&ws.path)?;
+        let replacement = tempfile::TempDir::new()?;
+        git(replacement.path(), &["init", "--bare", "--initial-branch=main"])?;
+        git(
+            &ws.path,
+            &["remote", "set-url", "origin", replacement.path().to_str().unwrap()],
+        )?;
+
+        let aborted = run_cargo_rail(
+            &ws.path,
+            &["rail", "release", "abort", state_path.to_str().unwrap(), "--yes"],
+        )?;
+        assert!(
+            aborted.status.success(),
+            "purely local abort must not depend on the current origin\n{}\n{}",
+            String::from_utf8_lossy(&aborted.stdout),
+            String::from_utf8_lossy(&aborted.stderr)
+        );
+        assert_eq!(git(&ws.path, &["rev-parse", "HEAD"])?.stdout, initial_head);
         Ok(())
     })();
     super::helpers::finish_test(result);

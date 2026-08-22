@@ -429,34 +429,22 @@ pub fn resolve_links(
 
 /// Detect GitHub repository from the git remote
 pub fn detect_github_repo(workspace_root: &Path) -> Option<(String, String)> {
-    let output =
-        crate::release::process::run("git", &["config", "--get", "remote.origin.url"], Some(workspace_root)).ok()?;
-
-    if !output.status.success() {
+    let repository = crate::release::remote::fetch_repository(workspace_root).ok()?;
+    if repository.host() != Some("github.com") {
         return None;
     }
-
-    let url = String::from_utf8_lossy(&output.stdout);
-    parse_github_remote(&url)
+    let (owner, name) = repository.github_owner_repo()?;
+    Some((owner.to_string(), name.to_string()))
 }
 
-/// Parse a GitHub remote URL into (org, repo)
-fn parse_github_remote(url: &str) -> Option<(String, String)> {
-    let trimmed = url.trim().trim_end_matches(".git").trim_end_matches('/');
-
-    let repo_part = if let Some(ssh) = trimmed.strip_prefix("git@github.com:") {
-        ssh
-    } else if let Some(ssh) = trimmed.strip_prefix("ssh://git@github.com/") {
-        ssh
-    } else {
-        trimmed.strip_prefix("https://github.com/")?
-    };
-
-    let mut parts = repo_part.split('/');
-    let org = parts.next()?;
-    let repo = parts.next()?;
-
-    Some((org.to_string(), repo.to_string()))
+#[cfg(test)]
+fn parse_github_remote(value: &str) -> Option<(String, String)> {
+    let repository = crate::release::remote::RemoteRepository::parse(value)?;
+    if repository.host() != Some("github.com") {
+        return None;
+    }
+    let (owner, name) = repository.github_owner_repo()?;
+    Some((owner.to_string(), name.to_string()))
 }
 
 fn to_boxed_set(values: &[String]) -> FxHashSet<Box<str>> {
@@ -723,6 +711,19 @@ mod tests {
             Some(("org".to_string(), "repo".to_string()))
         );
         assert_eq!(parse_github_remote("git@gitlab.com:org/repo.git"), None);
+        assert_eq!(
+            parse_github_remote("https://github.com/org/repo.git/"),
+            Some(("org".to_string(), "repo".to_string()))
+        );
+        for invalid in [
+            "https://github.com/org/repo/extra",
+            "https://github.com/org/repo.git?ref=main",
+            "https://github.com/org/repo#readme",
+            "https://github.com//repo",
+            "https://github.com/org/",
+        ] {
+            assert_eq!(parse_github_remote(invalid), None, "{invalid}");
+        }
     }
 
     #[test]

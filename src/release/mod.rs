@@ -6,6 +6,7 @@ pub mod changelog;
 pub mod planner;
 mod process;
 pub mod publisher;
+pub(crate) mod remote;
 pub(crate) mod semver_checks;
 pub(crate) mod state;
 pub mod validator;

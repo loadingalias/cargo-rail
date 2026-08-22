@@ -4,6 +4,7 @@ use crate::config::ReleaseConfig;
 use crate::error::{RailError, RailResult};
 use crate::git::SystemGit;
 use crate::release::planner::ReleasePlan;
+use crate::release::remote::RemoteRepository;
 use crate::utils::canonicalize_existing;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -20,6 +21,8 @@ pub(crate) struct ReleaseState {
     pub mode: ReleaseMode,
     pub plan: ReleasePlan,
     pub release_config: ReleaseConfig,
+    #[serde(default)]
+    pub remote_repository: Option<RemoteRepository>,
     pub skip_publish: bool,
     pub skip_tag: bool,
     pub initial_head: String,
@@ -47,6 +50,7 @@ pub(crate) struct ReleaseStateCreate<'a> {
     pub(crate) mode: ReleaseMode,
     pub(crate) plan: ReleasePlan,
     pub(crate) release_config: ReleaseConfig,
+    pub(crate) remote_repository: Option<RemoteRepository>,
     pub(crate) skip_publish: bool,
     pub(crate) skip_tag: bool,
     pub(crate) initial_head: String,
@@ -75,6 +79,7 @@ pub(crate) enum BackupRestorePolicy {
 pub(crate) struct ReconstructedRelease {
     pub release_commit: String,
     pub commit_targets: BTreeMap<String, String>,
+    pub remote_repository: Option<RemoteRepository>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,6 +162,7 @@ impl ReleaseState {
             mode,
             plan,
             release_config,
+            remote_repository,
             skip_publish,
             skip_tag,
             initial_head,
@@ -213,7 +219,7 @@ impl ReleaseState {
             })
             .collect();
         let state = Self {
-            schema_version: 2,
+            schema_version: 3,
             transaction_id: transaction_id.clone(),
             status: ReleaseStatus::Active,
             phase: if reconstructed.is_some() {
@@ -224,6 +230,7 @@ impl ReleaseState {
             mode,
             plan,
             release_config,
+            remote_repository,
             skip_publish,
             skip_tag,
             initial_head,
@@ -281,7 +288,10 @@ impl ReleaseState {
         if state.schema_version == 1 {
             state.migrate_v1();
         }
-        if state.schema_version != 2 {
+        if state.schema_version == 2 {
+            state.schema_version = 3;
+        }
+        if state.schema_version != 3 {
             return Err(RailError::message(format!(
                 "unsupported release state version {}",
                 state.schema_version
@@ -361,7 +371,7 @@ impl ReleaseState {
                 self.tag_push = complete_step(self.commit_push.object.clone());
             }
         }
-        self.schema_version = 2;
+        self.schema_version = 3;
     }
 }
 
