@@ -15,25 +15,63 @@ use std::time::Duration;
 use crate::helpers::TestWorkspace;
 
 #[cfg(unix)]
-fn file_identity(path: &Path) -> Result<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    let metadata = fs::metadata(path).with_context(|| format!("read identity for {}", path.display()))?;
-    Ok((metadata.dev(), metadata.ino()))
+struct UnchangedFileEvidence {
+    device: u64,
+    inode: u64,
 }
 
 #[cfg(windows)]
-fn file_identity(path: &Path) -> Result<(u32, u64, u64)> {
-    use std::os::windows::fs::MetadataExt as _;
+struct UnchangedFileEvidence {
+    _deny_write_and_delete: fs::File,
+}
+
+#[cfg(unix)]
+fn capture_unchanged_file(path: &Path) -> Result<UnchangedFileEvidence> {
+    use std::os::unix::fs::MetadataExt as _;
 
     let metadata = fs::metadata(path).with_context(|| format!("read identity for {}", path.display()))?;
-    Ok((
-        metadata
-            .volume_serial_number()
-            .context("file has no volume serial number")?,
-        metadata.file_index().context("file has no index")?,
-        metadata.creation_time(),
-    ))
+    Ok(UnchangedFileEvidence {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn capture_unchanged_file(path: &Path) -> Result<UnchangedFileEvidence> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+    // The retained handle permits the reads required by setup while denying
+    // writes and deletes. An in-place rewrite or atomic replacement therefore
+    // fails with a sharing violation instead of passing through a weak timestamp
+    // comparison.
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(path)
+        .with_context(|| format!("protect unchanged file {}", path.display()))?;
+    Ok(UnchangedFileEvidence {
+        _deny_write_and_delete: file,
+    })
+}
+
+#[cfg(unix)]
+fn assert_unchanged_file(path: &Path, expected: &UnchangedFileEvidence, description: &str) -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = fs::metadata(path).with_context(|| format!("read identity for {}", path.display()))?;
+    anyhow::ensure!(
+        (metadata.dev(), metadata.ino()) == (expected.device, expected.inode),
+        "{description} was replaced"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+fn assert_unchanged_file(path: &Path, _expected: &UnchangedFileEvidence, description: &str) -> Result<()> {
+    let metadata = fs::metadata(path).with_context(|| format!("read protected file {}", path.display()))?;
+    anyhow::ensure!(metadata.is_file(), "{description} is no longer a regular file");
+    Ok(())
 }
 
 fn rail(workspace: &Path, cargo_home: &Path, arguments: &[&str]) -> Result<Output> {
@@ -1899,10 +1937,10 @@ fn local_cleanup_uses_the_receipt_selected_custom_cache_and_is_repairable() {
         let worker = installation.join("cargo-rail-native-rustc-worker.exe");
         let receipt = installation.join("setup.json");
         let config = cargo_home.path().join("config.toml");
-        let wrapper_identity = file_identity(&wrapper)?;
-        let worker_identity = file_identity(&worker)?;
-        let receipt_identity = file_identity(&receipt)?;
-        let config_identity = file_identity(&config)?;
+        let wrapper_evidence = capture_unchanged_file(&wrapper)?;
+        let worker_evidence = capture_unchanged_file(&worker)?;
+        let receipt_evidence = capture_unchanged_file(&receipt)?;
+        let config_evidence = capture_unchanged_file(&config)?;
         assert!(custom_root.is_dir());
         assert!(!cargo_home.path().join("cargo-rail/local-cas-v2").exists());
 
@@ -1928,26 +1966,10 @@ fn local_cleanup_uses_the_receipt_selected_custom_cache_and_is_repairable() {
             custom_root.is_dir(),
             "repair changed or ignored the receipt-selected cache"
         );
-        assert_eq!(
-            file_identity(&wrapper)?,
-            wrapper_identity,
-            "cache-only repair replaced the installed compiler wrapper"
-        );
-        assert_eq!(
-            file_identity(&worker)?,
-            worker_identity,
-            "cache-only repair replaced the installed compiler worker"
-        );
-        assert_eq!(
-            file_identity(&receipt)?,
-            receipt_identity,
-            "cache-only repair replaced the unchanged installation receipt"
-        );
-        assert_eq!(
-            file_identity(&config)?,
-            config_identity,
-            "cache-only repair replaced the unchanged Cargo configuration"
-        );
+        assert_unchanged_file(&wrapper, &wrapper_evidence, "installed compiler wrapper")?;
+        assert_unchanged_file(&worker, &worker_evidence, "installed compiler worker")?;
+        assert_unchanged_file(&receipt, &receipt_evidence, "installation receipt")?;
+        assert_unchanged_file(&config, &config_evidence, "Cargo configuration")?;
         Ok(())
     })();
     super::helpers::finish_test(result);
