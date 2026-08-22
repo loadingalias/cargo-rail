@@ -111,7 +111,7 @@ Examples:
 
 const SPLIT_HELP: &str = "\
 This is an advanced feature for extracting crates to standalone repositories
-while preserving git history. Most teams should start with 'plan', 'run',
+while preserving git history. Most teams should start with 'plan', 'cache',
 and 'unify' before using split/sync.
 
 Examples:
@@ -138,7 +138,7 @@ Examples:
   cargo rail release init my-crate              # Configure release for my-crate
   cargo rail release init my-crate --dry-run    # Preview generated config
   cargo rail release check my-crate             # Validate release readiness
-  cargo rail release check my-crate --extended  # Run extended checks (dry-run, MSRV)
+  cargo rail release check my-crate --extended  # Run publish, MSRV, and semver checks
   cargo rail release run my-crate --check       # Check for a pending release (exit 1)
   cargo rail release run my-crate               # Release from reviewed change intent
   cargo rail release run my-crate --include-dependents  # Release selected crate plus dependent closure
@@ -176,7 +176,7 @@ Examples:
 
 const CLEAN_HELP: &str = "\
 Examples:
-  cargo rail clean                      # Clean all artifacts
+  cargo rail clean                      # Clean all Cargo-Rail artifacts
   cargo rail clean --cache              # Clean validated local and workspace cache state
   cargo rail clean --backups            # Prune old backups
   cargo rail clean --reports            # Clean generated reports
@@ -323,7 +323,7 @@ pub enum Commands {
         /// Subcommand (doctor or undo)
         #[command(subcommand)]
         command: Option<UnifyCommand>,
-        /// Check for pending changes without modifying files (exit 1 when pending)
+        /// Check for pending manifest changes without modifying manifests (exit 1 when pending)
         #[arg(long, short = 'c')]
         check: bool,
         /// Apply from a previously generated mutation plan file
@@ -930,7 +930,7 @@ pub enum ReleaseCommand {
         /// Check all workspace crates (mutually exclusive with crate names)
         #[arg(short, long)]
         all: bool,
-        /// Run extended validation (cargo publish --dry-run, MSRV check)
+        /// Run extended validation (publish dry-run, MSRV, optional semver checks)
         #[arg(long, short = 'e')]
         extended: bool,
         /// Expand explicit crate selection to include the full dependent closure

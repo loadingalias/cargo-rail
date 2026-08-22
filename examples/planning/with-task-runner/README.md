@@ -22,17 +22,18 @@ fi
 ## CI example
 
 ```yaml
-- uses: loadingalias/cargo-rail-action@v6
+- uses: loadingalias/cargo-rail-action@8362d141189a75e7a9513217bfeb16accfb3d58d
   id: rail
   with:
     mode: debug
+    version: 0.22.0
 
 - name: Run targeted tests
   if: steps.rail.outputs.test == 'true'
   env:
-    PLAN_JSON: ${{ steps.rail.outputs.plan-json }}
+    PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
   run: |
-    TEST_SCOPE=$(echo "$PLAN_JSON" | jq -c '.surfaces.test.scope')
+    TEST_SCOPE=$(jq -c '.surfaces.test.scope' "$PLAN_FILE")
     MODE=$(echo "$TEST_SCOPE" | jq -r '.mode')
     if [ "$MODE" = "workspace" ]; then
       cargo xtask test --workspace

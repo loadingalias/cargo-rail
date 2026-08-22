@@ -134,13 +134,14 @@ authorizes result reuse.
 ## GitHub Actions
 
 [`loadingalias/cargo-rail-action`](https://github.com/loadingalias/cargo-rail-action) installs Cargo-Rail, runs the
-planner once, validates planner and scope versions, and exports their projections. Action major v6 consumes planner v6
-and scope v4. Action major v7 consumes planner v7 and scope v4; the action's `version` input independently selects a
-compatible Cargo-Rail release.
+planner once, validates planner and scope versions, and exports their projections. The pinned revision below consumes
+planner v7 and scope v4; the action's `version` input independently selects a compatible Cargo-Rail release.
 
 ```yaml
-- uses: loadingalias/cargo-rail-action@v7
+- uses: loadingalias/cargo-rail-action@8362d141189a75e7a9513217bfeb16accfb3d58d
   id: rail
+  with:
+    version: 0.22.0
 
 - name: Test selected packages
   if: steps.rail.outputs.test == 'true'

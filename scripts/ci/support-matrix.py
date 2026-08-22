@@ -1352,7 +1352,8 @@ cargo rail cache setup --remote \\
 cargo build --workspace --all-features --locked
 ```
 
-`loadingalias/cargo-rail-action/cache@v6` accepts the same URL as `url`, runs setup once, and leaves later ordinary
+`loadingalias/cargo-rail-action/cache@8362d141189a75e7a9513217bfeb16accfb3d58d` accepts the same URL as `url`, runs
+setup once, and leaves later ordinary
 Cargo commands in that GitHub Actions job on the installed cache path. Configure provider credentials before Cargo
 runs and invoke the cache Action separately in each execution job because hosted jobs do not share a machine or Cargo
 home.
@@ -1405,7 +1406,8 @@ credential environment from every compiler child it launches. Prefer a machine/c
 preconfigured profile; keep exported credentials job-scoped and least-privilege when a provider requires them.
 
 `CARGO_RAIL_CACHE_REMOTE_ENVIRONMENT` may add a sorted comma-separated set of reviewed, non-secret compiler
-environment names to the built-in `CARGO_PKG_NAME` and `OUT_DIR` policy. Only value digests enter action identity; raw
+environment names to the built-in `CARGO_PKG_NAME`, `CARGO_PKG_VERSION_PATCH`, and `OUT_DIR` policy. Only value digests
+enter action identity; raw
 values are never uploaded. An unapproved name bypasses L2 for that compiler unit without disabling an existing valid
 L1 result.
 

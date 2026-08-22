@@ -617,7 +617,7 @@ Options:
           Output as JSON where supported; rejected otherwise (shorthand for -f json)
 
   -c, --check
-          Check for pending changes without modifying files (exit 1 when pending)
+          Check for pending manifest changes without modifying manifests (exit 1 when pending)
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -810,7 +810,7 @@ Options:
           Print version
 
 This is an advanced feature for extracting crates to standalone repositories
-while preserving git history. Most teams should start with 'plan', 'run',
+while preserving git history. Most teams should start with 'plan', 'cache',
 and 'unify' before using split/sync.
 
 Examples:
@@ -1038,7 +1038,7 @@ Examples:
   cargo rail release init my-crate              # Configure release for my-crate
   cargo rail release init my-crate --dry-run    # Preview generated config
   cargo rail release check my-crate             # Validate release readiness
-  cargo rail release check my-crate --extended  # Run extended checks (dry-run, MSRV)
+  cargo rail release check my-crate --extended  # Run publish, MSRV, and semver checks
   cargo rail release run my-crate --check       # Check for a pending release (exit 1)
   cargo rail release run my-crate               # Release from reviewed change intent
   cargo rail release run my-crate --include-dependents  # Release selected crate plus dependent closure
@@ -1167,7 +1167,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
   -e, --extended
-          Run extended validation (cargo publish --dry-run, MSRV check)
+          Run extended validation (publish dry-run, MSRV, optional semver checks)
 
       --json
           Output as JSON where supported; rejected otherwise (shorthand for -f json)
@@ -1580,7 +1580,7 @@ Options:
           Print version
 
 Examples:
-  cargo rail clean                      # Clean all artifacts
+  cargo rail clean                      # Clean all Cargo-Rail artifacts
   cargo rail clean --cache              # Clean validated local and workspace cache state
   cargo rail clean --backups            # Prune old backups
   cargo rail clean --reports            # Clean generated reports

@@ -87,9 +87,10 @@ In GitHub Actions, the same contract is one input. Configure provider credential
 that job uses the installed receipt:
 
 ```yaml
-- uses: actions/checkout@v7
-- uses: loadingalias/cargo-rail-action/cache@v6
+- uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+- uses: loadingalias/cargo-rail-action/cache@8362d141189a75e7a9513217bfeb16accfb3d58d
   with:
+    version: 0.22.0
     url: ${{ vars.CARGO_RAIL_CACHE_URL }}
     mode: read
 - run: cargo check --workspace --all-features --locked
@@ -132,8 +133,9 @@ enter action identity; raw
 values are never uploaded. An unapproved name bypasses L2 for that compiler unit without disabling an existing valid
 L1 result.
 
-Status schema 10 reports provider, protocol, mode, approved-name count, and a redacted authority identity as
-`direct_transport_selected`; it never prints the URL. Status and doctor remain network-free.
+Status schema 11 reports provider, protocol, mode, approved-name count, distributed mode and policy, retained-history
+state, and a redacted authority identity as `direct_transport_selected`; it never prints the URL. Status and doctor
+remain network-free.
 
 ## Grant only object access
 

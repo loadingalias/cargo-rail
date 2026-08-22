@@ -65,7 +65,7 @@ if [ "$(jq -r '.surfaces.test.enabled' <<<"$PLAN_JSON")" = "true" ]; then
   while IFS= read -r argument; do
     CARGO_ARGS+=("$argument")
   done < <(jq -r '.surfaces.test.scope.cargo_args[]' <<<"$PLAN_JSON")
-  cargo nextest run -P commit --locked --config-file .config/nextest.toml "${CARGO_ARGS[@]}"
+  cargo nextest run "${CARGO_ARGS[@]}" --all-features --locked
 fi
 ```
 

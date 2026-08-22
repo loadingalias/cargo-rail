@@ -19,31 +19,32 @@ fi
 ## CI example
 
 ```yaml
-- uses: loadingalias/cargo-rail-action@v6
+- uses: loadingalias/cargo-rail-action@8362d141189a75e7a9513217bfeb16accfb3d58d
   id: rail
   with:
     mode: debug
+    version: 0.22.0
 
 - name: Test selected packages
   if: steps.rail.outputs.test == 'true'
   env:
-    PLAN_JSON: ${{ steps.rail.outputs.plan-json }}
+    PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
   run: |
     CARGO_ARGS=()
     while IFS= read -r argument; do
       CARGO_ARGS+=("$argument")
-    done < <(jq -r '.surfaces.test.scope.cargo_args[]' <<<"$PLAN_JSON")
+    done < <(jq -r '.surfaces.test.scope.cargo_args[]' "$PLAN_FILE")
     cargo nextest run "${CARGO_ARGS[@]}"
 
 - name: Build selected packages
   if: steps.rail.outputs.build == 'true'
   env:
-    PLAN_JSON: ${{ steps.rail.outputs.plan-json }}
+    PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
   run: |
     CARGO_ARGS=()
     while IFS= read -r argument; do
       CARGO_ARGS+=("$argument")
-    done < <(jq -r '.surfaces.build.scope.cargo_args[]' <<<"$PLAN_JSON")
+    done < <(jq -r '.surfaces.build.scope.cargo_args[]' "$PLAN_FILE")
     cargo build "${CARGO_ARGS[@]}"
 ```
 
