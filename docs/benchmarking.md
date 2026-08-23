@@ -10,10 +10,10 @@ hit against a cold Hawk target directory as an implementation-speed result.
 The acquisition model predicts subprocess work before measurement. For one feature/target view, let `P` be the number
 of configured production products and `D` the number of selected doctest package passes:
 
-| Tool       | Ordinary target passes | Doctest passes | Total Cargo acquisition views |
-| ---------- | ---------------------: | -------------: | ----------------------------: |
-| Cargo-Rail |                      1 |            `D` |                       `1 + D` |
-| Reference analyzer |       `P + 1` |            `D` |                   `P + 1 + D` |
+| Tool               | Ordinary target passes | Doctest passes | Total Cargo acquisition views |
+| ------------------ | ---------------------: | -------------: | ----------------------------: |
+| Cargo-Rail         |                      1 |            `D` |                       `1 + D` |
+| Reference analyzer |                `P + 1` |            `D` |                   `P + 1 + D` |
 
 Cargo-Rail classifies production and non-production units from one all-targets compiler acquisition instead of
 rebuilding the shared dependency graph once per product. This guarantees fewer Cargo acquisition views when `P > 0`,
@@ -35,12 +35,12 @@ scripts/ci/qualify-surface-reference.py \
 
 The harness performs a separate conformance smoke and then interleaves 20 accepted samples in each lane:
 
-| Lane | Target and cache authority |
-| --- | --- |
-| `cold-target` | Fresh reference target, fresh Cargo-Rail analysis target, and fresh fact cache |
-| `cargo-fresh` | Reused reference Cargo target; Cargo-Rail conservatively bypasses facts because the fixture gains a build script |
-| `fact-cache-hit` | Repeated unchanged workspace with a required complete Cargo-Rail fact hit |
-| `cache-bypass` | Fresh target with the build-script observation boundary forcing a named fact-cache bypass |
+| Lane             | Target and cache authority                                                                                       |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `cold-target`    | Fresh reference target, fresh Cargo-Rail analysis target, and fresh fact cache                                   |
+| `cargo-fresh`    | Reused reference Cargo target; Cargo-Rail conservatively bypasses facts because the fixture gains a build script |
+| `fact-cache-hit` | Repeated unchanged workspace with a required complete Cargo-Rail fact hit                                        |
+| `cache-bypass`   | Fresh target with the build-script observation boundary forcing a named fact-cache bypass                        |
 
 Every accepted pair must retain equivalent normalized findings after exact allowlist application. Each raw sample
 keeps stdout, stderr, the timer record, normalized findings, exact argv, wall and CPU time, peak RSS, Cargo view count,

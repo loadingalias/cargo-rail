@@ -11,8 +11,8 @@ and exit behavior.
 2. **Interpret Cargo inputs.** Manifest and lockfile changes are compared semantically. Formatting and package metadata
    changes can select no package work. Unknown resolver, membership, source, parse, or removed-resolution changes
    widen to the workspace.
-3. **Classify files.** Built-in rules select build, test, benchmark, documentation, or infrastructure surfaces.
-   Configured globs add infrastructure and custom surfaces.
+3. **Classify files.** Built-in rules select build, test, benchmark, documentation, infrastructure, and configured
+   source-surface analysis. Configured globs add infrastructure and custom surfaces.
 4. **Resolve ownership and impact.** Cargo metadata maps files to packages. One declared-dependency universe keeps
    build-transitive and development-only impact separate while accounting for optional and target-gated edges.
 5. **Build surface scope.** Each package-scoped surface receives `empty`, `crates`, or `workspace` scope and the exact
@@ -30,10 +30,12 @@ source and resolution view; they do not combine file decisions from one moment w
 | `bench`     | Benchmark work changed                                  |
 | `docs`      | Documentation work changed                              |
 | `infra`     | CI, scripts, tooling, or workspace operations changed   |
+| `surface`   | Rust source or Surface policy may require analysis      |
 | custom name | A configured repository-specific classification matched |
 
-`infra` and custom surfaces are gates. They do not carry Cargo package arguments because their commands belong in
-Just, CI, or a purpose-built domain tool.
+`infra`, `surface`, and custom surfaces are gates. They do not carry Cargo package arguments because their commands
+belong in Just, CI, or a purpose-built domain tool. The native `surface` gate is selected only when
+`[surface] enabled = true` and a relevant change requires whole-workspace analysis.
 
 ```toml
 [change-detection]
@@ -60,7 +62,7 @@ cargo rail plan --merge-base -f json
 Use planner fields according to their ownership:
 
 - `surfaces.NAME.enabled` and `.reasons` decide one surface.
-- `surfaces.NAME.scope` is that surface's exact package handoff.
+- `surfaces.NAME.scope` is the exact package handoff for package-scoped surfaces and empty for gate-only surfaces.
 - `scope` is the compatibility union of active package-scoped surfaces.
 - `resolution_universe` identifies the dependency semantics used by every surface.
 - `trace` is the stable reason chain.
@@ -80,6 +82,17 @@ if [ "$(jq -r '.surfaces.test.enabled' <<<"$PLAN_JSON")" = "true" ]; then
   cargo nextest run "${CARGO_ARGS[@]}" --all-features --locked
 fi
 ```
+
+Route the whole-workspace Surface gate from its planner decision instead of recreating file rules in CI:
+
+```bash
+if [ "$(jq -r '.surfaces.surface.enabled' <<<"$PLAN_JSON")" = "true" ]; then
+  cargo rail surface --check
+fi
+```
+
+The execution machine must have a supported native release archive and its adjacent compiler-fact driver. See
+[Configuration](config.md#surface) for the closed-world and lint policy.
 
 The consumer must validate the contract versions it supports. This repository's scripts reject an unknown planner or
 scope contract before executing Cargo.

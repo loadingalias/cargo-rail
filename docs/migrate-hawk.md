@@ -43,20 +43,20 @@ matrix.
 Map an existing `hawk.toml` manually; the table is small and this keeps one analyzer's schema out of Cargo Rail's
 product API:
 
-| Hawk 0.1.13 | Cargo-Rail |
-| --- | --- |
-| omitted feature profiles | Cargo Rail's automatic feature coverage; use one explicit `all-features` profile only for an exact comparison |
-| omitted doctest entries | `doctest_coverage = "automatic"` |
-| `[[production]]` | `[[surface.product]]`, including `bin`/`lib`, `target`, and `reason` |
-| `[[feature-profile]]` | `[[surface.feature-profile]]` with the same Cargo flags |
-| `[[doctest]]` | `[[surface.doctest]]`; any entries replace automatic package selection |
-| `preserve-uniform-field-visibility` | `surface.preserve_uniform_fields` |
-| `[[override]]` | `[[surface.override]]`, preserving Rust `crate`, item, mapped kind, target, level, and reason |
-| `[[exclude]]` | `[[surface.exclude]]`, preserving Rust `crate`, module/file, target, level, and reason |
-| `hawk::dead_public` | `dead-public` |
-| `hawk::unnecessary_public` | `unnecessary-public` |
-| `hawk::unnecessary_restricted_visibility` | `unnecessary-restricted-visibility` |
-| `hawk::unnecessary_crate_visibility` | `unnecessary-crate-visibility` |
+| Hawk 0.1.13                               | Cargo-Rail                                                                                                    |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| omitted feature profiles                  | Cargo Rail's automatic feature coverage; use one explicit `all-features` profile only for an exact comparison |
+| omitted doctest entries                   | `doctest_coverage = "automatic"`                                                                              |
+| `[[production]]`                          | `[[surface.product]]`, including `bin`/`lib`, `target`, and `reason`                                          |
+| `[[feature-profile]]`                     | `[[surface.feature-profile]]` with the same Cargo flags                                                       |
+| `[[doctest]]`                             | `[[surface.doctest]]`; any entries replace automatic package selection                                        |
+| `preserve-uniform-field-visibility`       | `surface.preserve_uniform_fields`                                                                             |
+| `[[override]]`                            | `[[surface.override]]`, preserving Rust `crate`, item, mapped kind, target, level, and reason                 |
+| `[[exclude]]`                             | `[[surface.exclude]]`, preserving Rust `crate`, module/file, target, level, and reason                        |
+| `hawk::dead_public`                       | `dead-public`                                                                                                 |
+| `hawk::unnecessary_public`                | `unnecessary-public`                                                                                          |
+| `hawk::unnecessary_restricted_visibility` | `unnecessary-restricted-visibility`                                                                           |
+| `hawk::unnecessary_crate_visibility`      | `unnecessary-crate-visibility`                                                                                |
 
 Hawk's `--exclude-crate NAME` is command-line state, so record the boundary explicitly:
 

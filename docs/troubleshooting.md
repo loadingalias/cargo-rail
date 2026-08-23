@@ -35,6 +35,31 @@ cargo rail config validate --strict
 `locate` shows the discovered file. `explain` shows effective values and their sources. A CLI `--config` override
 bypasses the normal search order.
 
+## Surface analysis is unavailable or unexpected
+
+If analysis reports that Surface is unavailable, the CLI came from a source installation, `cargo binstall`, or an
+unsupported native archive. `surface --schema` remains available, but analysis requires a supported release archive
+with `cargo-rail-fact-driver` beside the CLI. Use the checksum-verifying installer documented in
+[Installation](../README.md#installation).
+
+For an unexpected gate or finding, inspect the planner, effective policy, and report authority separately:
+
+```bash
+cargo rail plan --merge-base -f json | jq '.surfaces.surface'
+cargo rail config explain -f json | jq '.fields[] | select(.path | startswith("surface."))'
+cargo rail surface --check -f json
+```
+
+In the report, verify `authority.audited_targets`, `authority.open_targets`, `products`, `targets`, `features`, and
+`completeness.complete` before changing policy. A declaration observed in any open compiler crate is preserved. Use
+`consumer_scope = "workspace"` only when the workspace contains every consumer of its non-publishable internal
+compiler crates.
+
+Warm analysis exposes `metrics.acquisition`: an unchanged exact hit has zero Cargo views and compiler invocations.
+A miss or bypass names its reason and runs the required compiler acquisition instead of trusting incomplete facts.
+Plain `cargo rail surface` reports findings with exit 0; `--check` uses exit 1 for deny findings or configuration
+diagnostics, and operational failures use exit 2.
+
 ## Cache reuse did not happen
 
 Use the doctor for the cache boundary you are testing:

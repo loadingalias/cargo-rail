@@ -134,21 +134,24 @@ or configuration diagnostics; `warn` findings remain visible with exit 0. `--fix
 plan. `--fix` revalidates the captured snapshot, edits only planned visibility spans, recompiles every configured view,
 and writes a receipt after successful verification. Dead-public findings are report-only.
 
-| Field                     |      Default | Behavior                                                                                                                                                 |
-| ------------------------- | -----------: | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `enabled`                 |      `false` | Include the whole-workspace `surface` gate in planner and CI decisions. Direct `cargo rail surface` inspection remains available when disabled.          |
-| `consumer_scope`          |     `"open"` | `"workspace"` permits closed-world conclusions at the compiler-crate boundary described below.                                                          |
-| `targets`                 |   `["host"]` | Compiler target views to merge. Use `"host"` or target triples already captured by the top-level `targets` policy.                                       |
-| `crate_visibility`        | `"preserve"` | `"allow"` enables the otherwise allow-by-default `unnecessary-crate-visibility` class.                                                                  |
-| `preserve_uniform_fields` |      `false` | Preserve one intentional field-visibility level across a struct or union instead of reducing fields independently.                                       |
-| `lint`                    |         `[]` | Ordered global `{ selector, level }` directives. Later matching directives win; `selector` is `warnings` or one exact lint.                              |
-| `product`                 |         `[]` | Complete shipped binary/library roots. When empty, every workspace binary is implicit; an explicit list replaces that inference.                         |
-| `feature-profile`         |         `[]` | Exact Cargo feature profiles. Empty uses automatic coverage; an explicit list replaces it.                                                               |
-| `doctest`                 |         `[]` | Exact doctest package set. Empty follows `doctest_coverage`.                                                                                              |
-| `doctest_coverage`        |  `"automatic"` | `"automatic"` covers every doctest-enabled workspace package; `"disabled"` covers none and cannot accompany explicit doctests.                        |
-| `external`                |         `[]` | Exact compiler crates deliberately kept outside closed-world authority, each with a reason.                                                              |
-| `override`                |         `[]` | Item-specific policy. `allow` suppresses, `expect` suppresses but fails when stale, and `warn`/`deny` retain a finding.                                  |
-| `exclude`                 |         `[]` | Module- or repository-file-scoped policy with the same `allow`, `expect`, `warn`, and `deny` levels.                                                     |
+Analysis requires a supported native release archive with its matching compiler-fact driver. Source installations and
+`cargo binstall` retain `surface --schema`, but reject analysis before workspace acquisition with installation guidance.
+
+| Field                     |       Default | Behavior                                                                                                                                        |
+| ------------------------- | ------------: | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`                 |       `false` | Include the whole-workspace `surface` gate in planner and CI decisions. Direct `cargo rail surface` inspection remains available when disabled. |
+| `consumer_scope`          |      `"open"` | `"workspace"` permits closed-world conclusions at the compiler-crate boundary described below.                                                  |
+| `targets`                 |    `["host"]` | Compiler target views to merge. Use `"host"` or target triples already captured by the top-level `targets` policy.                              |
+| `crate_visibility`        |  `"preserve"` | `"allow"` enables the otherwise allow-by-default `unnecessary-crate-visibility` class.                                                          |
+| `preserve_uniform_fields` |       `false` | Preserve one intentional field-visibility level across a struct or union instead of reducing fields independently.                              |
+| `lint`                    |          `[]` | Ordered global `{ selector, level }` directives. Later matching directives win; `selector` is `warnings` or one exact lint.                     |
+| `product`                 |          `[]` | Complete shipped binary/library roots. When empty, every workspace binary is implicit; an explicit list replaces that inference.                |
+| `feature-profile`         |          `[]` | Exact Cargo feature profiles. Empty uses automatic coverage; an explicit list replaces it.                                                      |
+| `doctest`                 |          `[]` | Exact doctest package set. Empty follows `doctest_coverage`.                                                                                    |
+| `doctest_coverage`        | `"automatic"` | `"automatic"` covers every doctest-enabled workspace package; `"disabled"` covers none and cannot accompany explicit doctests.                  |
+| `external`                |          `[]` | Exact compiler crates deliberately kept outside closed-world authority, each with a reason.                                                     |
+| `override`                |          `[]` | Item-specific policy. `allow` suppresses, `expect` suppresses but fails when stale, and `warn`/`deny` retain a finding.                         |
+| `exclude`                 |          `[]` | Module- or repository-file-scoped policy with the same `allow`, `expect`, `warn`, and `deny` levels.                                            |
 
 The four lint names are `dead-public`, `unnecessary-public`, `unnecessary-restricted-visibility`, and
 `unnecessary-crate-visibility`. Core findings deny by default; crate-visibility reductions allow by default. The

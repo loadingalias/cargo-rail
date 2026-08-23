@@ -25,7 +25,7 @@ Cargo-Rail consolidates those decisions in one local, Cargo-native engine:
 | ------------------------------------------------------------------------ | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
 | Dependency version, feature, unused-edge, inheritance, and MSRV analysis | `cargo rail unify`                           | One reviewable and reversible graph-repair plan                                                                           |
 | `dorny/paths-filter`, YAML path globs, and package-selection scripts     | `cargo rail plan`                            | Typed affected scope derived from Git and the resolved Cargo graph                                                        |
-| Rust source-visibility analysis                                           | `cargo rail surface`                         | Compiler-derived production, non-production, and required-public reachability with drift-safe visibility fixes           |
+| Rust source-visibility analysis                                          | `cargo rail surface`                         | Compiler-derived production, non-production, and required-public reachability with drift-safe visibility fixes            |
 | Persisted `target/` directories and local cache glue                     | Verified compiler reuse                      | Exact reusable results remain available after `cargo clean` and across target directories within one physical source root |
 | `release-plz`, `cargo-release`, `git-cliff`, and publish-order scripts   | `cargo rail change` and `cargo rail release` | Reviewed release intent carried through exact-SHA publication and recovery                                                |
 | Copybara or custom monorepo-to-crate scripts                             | `cargo rail split` and `cargo rail sync`     | Cargo-aware synchronization with source history and recovery evidence                                                     |
@@ -146,6 +146,10 @@ There is only one implementation of “affected.”
 same captured source, Cargo views, compiler-fact protocol, configuration, planner, output, and mutation authority as
 the rest of Cargo Rail.
 
+Surface analysis requires a supported native release archive because its compiler-fact driver must match the release
+toolchain. A source `cargo install` still provides `surface --schema`, but analysis stops with installation guidance.
+See [Installation](#installation).
+
 Enable automatic planner and CI enforcement in `rail.toml`:
 
 ```toml
@@ -181,9 +185,9 @@ receipt. Dead-public findings remain report-only because deleting a declaration 
 
 Cargo-Rail also removes Cargo acquisition passes structurally. For one feature/target view it collects all ordinary
 production and non-production targets in one Cargo pass; a per-product analyzer needs an additional pass for every
-shipped binary or library. Doctest acquisition remains separate. That is a bounded work reduction, not a universal wall-time
-multiplier: compare the same source, compiler, feature/target coverage, doctest scope, and cold or warm state before
-publishing a speed claim. See [Migrate from Hawk](docs/migrate-hawk.md) for the exact mapping and
+shipped binary or library. Doctest acquisition remains separate. That is a bounded work reduction, not a universal
+wall-time multiplier: compare the same source, compiler, feature/target coverage, doctest scope, and cold or warm state
+before publishing a speed claim. See [Migrate from Hawk](docs/migrate-hawk.md) for the exact mapping and
 [Benchmarking](docs/benchmarking.md#source-surface-analysis) for the measurement contract.
 
 ## Compiler reuse that survives `cargo clean`

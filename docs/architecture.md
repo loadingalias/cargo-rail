@@ -7,14 +7,14 @@ configuration, toolchain, metadata, and graph state instead of rebuilding partia
 
 Cargo-Rail has six workflows:
 
-| Workflow             | Authority                                                | Result                                                         |
-| -------------------- | -------------------------------------------------------- | -------------------------------------------------------------- |
-| `unify`              | Resolved Cargo graph plus compiler evidence              | A checked or applied manifest mutation plan                    |
-| `plan`               | Changed source plus the declared dependency universe     | Selected surfaces and typed package scopes                     |
-| `surface`            | Authenticated compiler facts plus exact compiler-crate authority | Reachability findings or exact visibility mutations     |
-| caching              | Exact compiler inputs and verified result bytes          | Diagnostic reuse or one compiler-result restore                |
-| `change` / `release` | Reviewed change intent plus exact Git and registry state | Versions, changelogs, publications, and durable recovery state |
-| `split` / `sync`     | Captured source, Git history, and split ownership        | Standalone history or mapped changes with origin evidence      |
+| Workflow             | Authority                                                        | Result                                                         |
+| -------------------- | ---------------------------------------------------------------- | -------------------------------------------------------------- |
+| `unify`              | Resolved Cargo graph plus compiler evidence                      | A checked or applied manifest mutation plan                    |
+| `plan`               | Changed source plus the declared dependency universe             | Selected surfaces and typed package scopes                     |
+| `surface`            | Authenticated compiler facts plus exact compiler-crate authority | Reachability findings or exact visibility mutations            |
+| caching              | Exact compiler inputs and verified result bytes                  | Diagnostic reuse or one compiler-result restore                |
+| `change` / `release` | Reviewed change intent plus exact Git and registry state         | Versions, changelogs, publications, and durable recovery state |
+| `split` / `sync`     | Captured source, Git history, and split ownership                | Standalone history or mapped changes with origin evidence      |
 
 These workflows share infrastructure, not hidden control flow. Running `plan` does not run `unify`; running `release`
 does not silently invoke split or sync.
@@ -75,11 +75,11 @@ library or configured external crate remains open. When one physical declaration
 observations, the open observation wins. Selected internal libraries seed production reachability only from their
 actual cross-crate production consumers.
 
-Every inspection, check, and mutation projection uses surface contract v2. It records audited and open compiler targets, selected
-products and target selectors, exact feature/target views, completeness, policy levels, configuration diagnostics,
-cache observations, acquisition metrics, and the exact mutation plan. Inspection is read-only and non-failing;
-`--check` turns configuration errors and deny-level findings into exit 1. Operational failures exit 2. Machine output
-is one schema-owned stdout value.
+Every inspection, check, and mutation projection uses surface contract v2. It records audited and open compiler
+targets, selected products and target selectors, exact feature/target views, completeness, policy levels,
+configuration diagnostics, cache observations, acquisition metrics, and the exact mutation plan. Inspection is
+read-only and non-failing; `--check` turns configuration errors and deny-level findings into exit 1. Operational
+failures exit 2. Machine output is one schema-owned stdout value.
 
 Source-built installations deliberately have no compiler-analysis authority. Schema output remains pre-context, but
 analysis rejects the installation before Cargo metadata or workspace acquisition. Supported native release archives
