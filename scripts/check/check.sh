@@ -35,9 +35,8 @@ echo "Locked Cargo command surfaces..."
 scripts/ci/check-locked-cargo.sh
 scripts/ci/check-locked-cargo-test.sh
 
-echo "Security audit..."
-cargo deny --locked check all
-cargo audit
+echo "Dependency and security policy..."
+cargo deny --locked check -D warnings all
 
 # Clippy performs Cargo's check pass, so do not run a separate `cargo check` first.
 echo "Linting..."

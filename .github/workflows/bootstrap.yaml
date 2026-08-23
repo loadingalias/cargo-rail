@@ -52,11 +52,6 @@ jobs:
         with:
           tool: cargo-deny
 
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9
-        with:
-          tool: cargo-audit
-
       - name: Quality checks
         run: just check-ci
 

@@ -12,7 +12,12 @@ targets = [
 
 [advisories]
 yanked = "deny"
-ignore = []
+unsound = "all"
+ignore = [
+  # aws-sdk-s3 constrains lru to ^0.16.3. Its affected LruCache key is a
+  # String wrapper with non-panicking Drop, so RUSTSEC-2026-0253 is unreachable.
+  { id = "RUSTSEC-2026-0253", reason = "aws-sdk-s3's cache key cannot panic during Drop" },
+]
 
 [licenses]
 # Only allow licenses we actually encounter
@@ -30,16 +35,26 @@ allow = [
 confidence-threshold = 0.93
 
 [bans]
-multiple-versions = "warn"
+multiple-versions = "deny"
 wildcards = "deny"
 highlight = "all"
 
 skip = [
-  # petgraph 0.8.3 requires hashbrown 0.15; current indexmap and tooling use
-  # hashbrown 0.17. Both lines are required until petgraph publishes its
-  # hashbrown 0.16 update.
+  # The AWS SDK currently spans the RustCrypto 0.10 and 0.11 dependency lines.
+  "block-buffer@0.10.4",
+  "cpufeatures@0.2.17",
+  "crypto-common@0.1.7",
+  "digest@0.10.7",
+  "sha1@0.10.7",
+  # The AWS SDK deliberately supports both HTTP 0.2 and 1.x.
+  "http@0.2.12",
+  "http-body@0.4.6",
+  # petgraph, the AWS SDK's LRU cache, and indexmap use successive hashbrown lines.
   "hashbrown@0.15.5",
+  "hashbrown@0.16.1",
   "foldhash@0.1.5",
+  # Proc-macro dependencies are still split between Syn 2 and 3.
+  "syn@2.0.119",
 ]
 
 [sources]
