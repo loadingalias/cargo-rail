@@ -62,7 +62,17 @@ jobs:
           SURFACES_JSON: ${{ steps.plan.outputs.surfaces-json }}
         run: |
           set -euo pipefail
-          surface="$(python3 -c 'import json,os; print(str(json.loads(os.environ["SURFACES_JSON"])["surface"]).lower())')"
+          # Planner 0.20.1 predates the native gate. Missing must broaden to true until
+          # the action pin advances; a legacy plan must never skip Surface enforcement.
+          surface="$(
+            python3 <<'PY'
+          import json
+          import os
+
+          surfaces = json.loads(os.environ["SURFACES_JSON"])
+          print(str(surfaces.get("surface", True)).lower())
+          PY
+          )"
           echo "surface=$surface" >> "$GITHUB_OUTPUT"
 
   quality:
