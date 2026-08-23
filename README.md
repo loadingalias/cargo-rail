@@ -396,7 +396,8 @@ verified reuse
   → removes compiler invocations from the work that remains
 ```
 
-These optimizations compound because they derive from the same captured source tree and resolved Cargo graph. The context is passed around... it's not re-computed.
+These optimizations compound because they derive from the same captured source tree and resolved Cargo graph. The
+context is shared instead of recaptured.
 
 Independent tools cannot compound as effectively: each optimization is bounded by its own approximation of the workspace.
 
@@ -437,8 +438,10 @@ remains available; any surface analysis fails before workspace acquisition with 
 For `surface`, install a native release archive and its adjacent driver with the checksum-verifying installer:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/loadingalias/cargo-rail/main/scripts/install.sh \
-  | sh -s -- X.Y.Z
+version=X.Y.Z
+curl --proto '=https' --tlsv1.2 -sSf \
+  "https://raw.githubusercontent.com/loadingalias/cargo-rail/v${version}/scripts/install.sh" \
+  | sh -s -- "$version"
 ```
 
 Pre-built archives, SHA-256 checksums, and signed provenance are published with

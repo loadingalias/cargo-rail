@@ -2,7 +2,7 @@
 
 > Auto-generated from executable CI/release registries and native-cache production gates. Do not edit manually.
 >
-> Regenerate with: `./scripts/docs/generate.sh`. Support manifest schema: `7`;
+> Regenerate with: `./scripts/docs/generate.sh`. Support manifest schema: `8`;
 > native-cache compiler-identity schema: `11`.
 
 Planning removes jobs that do not need to run. Caching removes compiler or analysis work only when Cargo-Rail can
@@ -396,26 +396,6 @@ Alternate profiles use bounded temporary volumes and detach them after success o
 
 IBM Power, IBM Z, and RISC-V need native hardware before Cargo-Rail can claim tested execution. Each row retains the
 exact hardware-access gate; none is excluded by a runtime platform allowlist.
-
-### Open Task 9 evidence gates
-
-| Scope | Target or provider | Required evidence gate |
-|---|---|---|
-| Native host | `aarch64-apple-darwin` | `task9_aarch64_apple_darwin_cache_off_performance_incomplete` |
-| Native host | `aarch64-pc-windows-msvc` | `task9_aarch64_pc_windows_msvc_native_evidence_unavailable` |
-| Native host | `aarch64-unknown-linux-gnu` | `task9_aarch64_unknown_linux_gnu_native_evidence_unavailable` |
-| Native host | `powerpc64le-unknown-linux-gnu` | `native_powerpc64le_hardware_access_unavailable` |
-| Native host | `riscv64gc-unknown-linux-gnu` | `native_riscv64gc_hardware_access_unavailable` |
-| Native host | `s390x-unknown-linux-gnu` | `native_s390x_hardware_access_unavailable` |
-| Native host | `x86_64-apple-darwin` | `task9_x86_64_apple_darwin_native_evidence_unavailable` |
-| Native host | `x86_64-pc-windows-msvc` | `task9_x86_64_pc_windows_msvc_native_evidence_unavailable` |
-| Native host | `x86_64-unknown-linux-gnu` | `task9_x86_64_unknown_linux_gnu_native_evidence_unavailable` |
-| Remote provider | `aws-s3` | `task9_aws_s3_correctness_evidence_unavailable`, `task9_aws_s3_performance_evidence_unavailable` |
-| Remote provider | `azure-blob` | `task9_azure_blob_correctness_evidence_unavailable` |
-| Remote provider | `cloudflare-r2` | `task9_cloudflare_r2_correctness_evidence_unavailable` |
-
-These rows are explicit completion blockers, not unsupported-target declarations. Remove a gate only after retaining
-the exact native or real-provider corpus required by the Task 9 contract.
 
 ### Linkers and codegen backends
 

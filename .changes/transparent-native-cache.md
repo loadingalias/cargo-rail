@@ -10,8 +10,8 @@ preserves the disabled compiler contract without starting the receipt-authentica
 including metadata-only proc-macro producers, exact native-static consumers, and certified Apple build-script
 executables, proc-macro producer dylibs, and final linked artifacts use one action/witness/result pack with verified
 atomic L1 restore. Native proc-macro consumers remain cold.
-Removed runner-owned native cache activation and remote transfer rather than maintaining a second cache protocol;
-retained remote targets are configuration-only until a later release transports this exact compiler-owned pack.
+Removed runner-owned cache activation and transfer rather than maintaining a second cache protocol. Optional
+machine-owned remote authorities transport the same exact compiler-owned result pack used by the local cache.
 On the canonical five-sample local fixture, verified warm L1 was strictly faster than pinned sccache at p50 and p95 for
 both check and release workloads while safely reusing more compiler actions and rejecting unsafe native proc-macro
 consumer hits.

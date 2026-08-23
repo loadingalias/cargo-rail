@@ -21,8 +21,8 @@ against the pinned sccache lane, records the separate 15% target, and cannot be 
 Real-provider correctness now covers check, release build, and all-target test compilation and requires a retained
 producer/consumer pair report proving exact root-independent action multisets, output bytes, read-only import, and
 offline L1 behavior.
-Provider fault qualification now shares one AWS S3, Azure Blob, and Cloudflare R2 harness with exact Task 9
-namespaces. Each backend must reject a corrupt object, fall back when that object is absent, and build through a
+Provider fault qualification now shares one AWS S3, Azure Blob, and Cloudflare R2 harness with dedicated
+run namespaces. Each backend must reject a corrupt object, fall back when that object is absent, and build through a
 network-denied outage without changing exact outputs or writing remotely. Cleanup rejects broader authorities; Azure
 qualification requires and removes one dedicated run container.
 Native host qualification now binds the exact host and filesystem to the compatibility corpus, authenticated full

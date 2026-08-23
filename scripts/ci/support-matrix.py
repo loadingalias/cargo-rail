@@ -172,18 +172,6 @@ class DeferredHost:
 
 
 @dataclass(frozen=True)
-class Task9NativeGate:
-    target: str
-    evidence_gate: str
-
-
-@dataclass(frozen=True)
-class Task9RemoteGate:
-    provider: str
-    evidence_gates: tuple[str, ...]
-
-
-@dataclass(frozen=True)
 class CompatibilityManifest:
     schema_version: int
     corpus_fixture: str
@@ -194,8 +182,6 @@ class CompatibilityManifest:
     filesystem_profiles: tuple[FilesystemProfile, ...]
     release_cross_targets: tuple[str, ...]
     deferred_hosts: tuple[DeferredHost, ...]
-    task9_native_gates: tuple[Task9NativeGate, ...]
-    task9_remote_gates: tuple[Task9RemoteGate, ...]
     alternate_linkers: tuple[dict[str, Any], ...]
     alternate_codegen_backends: tuple[dict[str, Any], ...]
 
@@ -214,13 +200,12 @@ def load_compatibility_manifest() -> CompatibilityManifest:
             "filesystem_profiles",
             "required_release_cross_targets",
             "deferred_native_hosts",
-            "task9_open_evidence_gates",
             "advertised_non_default_linkers",
             "advertised_non_default_codegen_backends",
         },
     )
     require(
-        raw["schema_version"] == 7, "compatibility manifest schema_version must be 7"
+        raw["schema_version"] == 8, "compatibility manifest schema_version must be 8"
     )
     corpus = require_object(
         raw["front_door_corpus"], "front_door_corpus", {"fixture", "runner"}
@@ -496,102 +481,6 @@ def load_compatibility_manifest() -> CompatibilityManifest:
             f"deferred host {host.target} has an invalid hardware-access gate",
         )
 
-    task9 = require_object(
-        raw["task9_open_evidence_gates"],
-        "task9_open_evidence_gates",
-        {"native_hosts", "remote_providers"},
-    )
-    task9_native_gates: list[Task9NativeGate] = []
-    require(
-        isinstance(task9["native_hosts"], list) and task9["native_hosts"],
-        "task9_open_evidence_gates.native_hosts must be a non-empty array",
-    )
-    for index, value in enumerate(task9["native_hosts"]):
-        gate = require_object(
-            value,
-            f"task9_open_evidence_gates.native_hosts[{index}]",
-            {"target", "evidence_gate"},
-        )
-        task9_native_gates.append(
-            Task9NativeGate(
-                target=require_string(
-                    gate["target"],
-                    f"task9_open_evidence_gates.native_hosts[{index}].target",
-                ),
-                evidence_gate=require_string(
-                    gate["evidence_gate"],
-                    f"task9_open_evidence_gates.native_hosts[{index}].evidence_gate",
-                ),
-            )
-        )
-    require_unique_sorted(
-        [gate.target for gate in task9_native_gates],
-        "task9_open_evidence_gates.native_hosts targets",
-    )
-    expected_task9_native_targets = (
-        {host.target for host in native_hosts}
-        | {host.target for host in deferred_hosts}
-        | {"aarch64-apple-darwin", "x86_64-apple-darwin"}
-    )
-    require(
-        {gate.target for gate in task9_native_gates} == expected_task9_native_targets,
-        "Task 9 native evidence registry must cover macOS plus every advertised or deferred native host",
-    )
-
-    task9_remote_gates: list[Task9RemoteGate] = []
-    require(
-        isinstance(task9["remote_providers"], list) and task9["remote_providers"],
-        "task9_open_evidence_gates.remote_providers must be a non-empty array",
-    )
-    for index, value in enumerate(task9["remote_providers"]):
-        gate = require_object(
-            value,
-            f"task9_open_evidence_gates.remote_providers[{index}]",
-            {"provider", "evidence_gates"},
-        )
-        evidence_gates = gate["evidence_gates"]
-        require(
-            isinstance(evidence_gates, list)
-            and bool(evidence_gates)
-            and all(isinstance(item, str) and item for item in evidence_gates),
-            f"task9_open_evidence_gates.remote_providers[{index}].evidence_gates "
-            "must be a non-empty string array",
-        )
-        require_unique_sorted(
-            evidence_gates,
-            f"task9_open_evidence_gates.remote_providers[{index}].evidence_gates",
-        )
-        task9_remote_gates.append(
-            Task9RemoteGate(
-                provider=require_string(
-                    gate["provider"],
-                    f"task9_open_evidence_gates.remote_providers[{index}].provider",
-                ),
-                evidence_gates=tuple(evidence_gates),
-            )
-        )
-    require_unique_sorted(
-        [gate.provider for gate in task9_remote_gates],
-        "task9_open_evidence_gates.remote_providers providers",
-    )
-    require(
-        {gate.provider for gate in task9_remote_gates}
-        == {"aws-s3", "azure-blob", "cloudflare-r2"},
-        "Task 9 remote evidence registry must cover AWS S3, Azure Blob, and Cloudflare R2",
-    )
-    task9_gate_ids = [gate.evidence_gate for gate in task9_native_gates] + [
-        gate_id for gate in task9_remote_gates for gate_id in gate.evidence_gates
-    ]
-    require(
-        len(task9_gate_ids) == len(set(task9_gate_ids)),
-        "Task 9 evidence gate IDs must be unique",
-    )
-    for gate_id in task9_gate_ids:
-        require(
-            re.fullmatch(r"[a-z0-9]+(?:_[a-z0-9]+)*", gate_id) is not None,
-            f"Task 9 evidence gate has an invalid ID: {gate_id}",
-        )
-
     alternate_linkers = raw["advertised_non_default_linkers"]
     alternate_backends = raw["advertised_non_default_codegen_backends"]
     require(
@@ -697,8 +586,6 @@ def load_compatibility_manifest() -> CompatibilityManifest:
         filesystem_profiles=tuple(filesystem_profiles),
         release_cross_targets=tuple(release_cross_targets),
         deferred_hosts=tuple(deferred_hosts),
-        task9_native_gates=tuple(task9_native_gates),
-        task9_remote_gates=tuple(task9_remote_gates),
         alternate_linkers=tuple(alternate_linkers),
         alternate_codegen_backends=tuple(alternate_backends),
     )
@@ -1031,15 +918,10 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
     expected_deny_targets = sorted(
         {host.target for host in manifest.native_hosts}
         | {target for target in manifest.release_cross_targets}
-        | {
-            gate.target
-            for gate in manifest.task9_native_gates
-            if gate.target.endswith("-apple-darwin")
-        }
     )
     require(
         set(deny_targets) == set(expected_deny_targets),
-        "deny.toml graph targets must match supported native hosts, release cross targets, and macOS Task 9 targets",
+        "deny.toml graph targets must match supported native hosts and release cross targets",
     )
 
 
@@ -1166,15 +1048,6 @@ def render_markdown(
         )
         for host in manifest.deferred_hosts
     ]
-
-    task9_gate_rows = [
-        f"| Native host | `{gate.target}` | `{gate.evidence_gate}` |"
-        for gate in manifest.task9_native_gates
-    ]
-    task9_gate_rows.extend(
-        f"| Remote provider | `{gate.provider}` | {formatted_list(gate.evidence_gates)} |"
-        for gate in manifest.task9_remote_gates
-    )
 
     filesystem_rows = [
         (
@@ -1595,15 +1468,6 @@ Alternate profiles use bounded temporary volumes and detach them after success o
 
 IBM Power, IBM Z, and RISC-V need native hardware before Cargo-Rail can claim tested execution. Each row retains the
 exact hardware-access gate; none is excluded by a runtime platform allowlist.
-
-### Open Task 9 evidence gates
-
-| Scope | Target or provider | Required evidence gate |
-|---|---|---|
-{chr(10).join(task9_gate_rows)}
-
-These rows are explicit completion blockers, not unsupported-target declarations. Remove a gate only after retaining
-the exact native or real-provider corpus required by the Task 9 contract.
 
 ### Linkers and codegen backends
 
