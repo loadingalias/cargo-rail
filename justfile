@@ -67,6 +67,10 @@ check:
 check-compiler-fact-driver:
     @scripts/check-compiler-fact-driver.sh
 
+check-windows-targets:
+    cargo xwin check --workspace --all-targets --all-features --locked --target x86_64-pc-windows-msvc
+    cargo xwin check --workspace --all-targets --all-features --locked --target aarch64-pc-windows-msvc
+
 fix:
     @scripts/check/check.sh --fix
 

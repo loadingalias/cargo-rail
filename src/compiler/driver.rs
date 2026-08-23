@@ -1622,6 +1622,9 @@ mod tests {
         write_executable(&wrapper, b"wrapper");
         write_executable(&rustdoc, b"rustdoc");
         fs::write(&compiler_library, b"compiler library").expect("compiler library");
+        let compiler_library_digest = digest(b"compiler library");
+        let compiler_library = authenticate_compiler_library(&compiler_library, &compiler_library_digest)
+            .expect("authenticated compiler library");
 
         let capability = CompilerFactDoctestSysroot::stage(
             &sysroot,
@@ -1630,7 +1633,7 @@ mod tests {
             &rustdoc,
             &digest(b"rustdoc"),
             &compiler_library,
-            &digest(b"compiler library"),
+            &compiler_library_digest,
         )
         .expect("private doctest sysroot");
         let private_root = capability.path().to_path_buf();
@@ -1666,6 +1669,9 @@ mod tests {
         write_executable(&wrapper, b"wrapper");
         write_executable(&rustdoc, b"rustdoc");
         fs::write(&compiler_library, b"compiler library").expect("compiler library");
+        let compiler_library_digest = digest(b"compiler library");
+        let compiler_library = authenticate_compiler_library(&compiler_library, &compiler_library_digest)
+            .expect("authenticated compiler library");
 
         let error = CompilerFactDoctestSysroot::stage(
             &sysroot,
@@ -1674,7 +1680,7 @@ mod tests {
             &rustdoc,
             &digest(b"rustdoc"),
             &compiler_library,
-            &digest(b"compiler library"),
+            &compiler_library_digest,
         )
         .err()
         .expect("captured wrapper digest drift must fail closed");
