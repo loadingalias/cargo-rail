@@ -329,6 +329,7 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
         crate::change_detection::semantic::analyze(ctx, &changed_files, refs.resolved_base(), semantic_head)?;
     let confidence = resolve_confidence_profile(ctx, opts)?;
     let change_detection_config = ctx.config().map(|config| &config.change_detection);
+    let surface_analysis_enabled = ctx.config().is_some_and(|config| config.surface.enabled);
     let infrastructure_patterns = compile_infrastructure_patterns(change_detection_config);
     let custom_patterns = compile_custom_patterns(change_detection_config);
     let configured_custom_surfaces = custom_surface_names(&custom_patterns);
@@ -407,6 +408,9 @@ pub(crate) fn build_plan_output(ctx: &WorkspaceContext, opts: &PlanOptions) -> R
             .map(|surface| (*surface).to_string())
             .collect();
         apply_semantic_surface_policy(semantic_change, &mut kind_surfaces);
+        if !surface_analysis_enabled {
+            kind_surfaces.retain(|surface| surface != "surface");
+        }
         let has_builtin_infra_surface = kind_surfaces.iter().any(|surface| surface == "infra");
         let extra_infra_surface =
             !has_builtin_infra_surface && matches_infrastructure_patterns(path, &infrastructure_patterns);

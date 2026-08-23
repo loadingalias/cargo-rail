@@ -40,9 +40,11 @@ pub(crate) fn publish(invocation: &CompilerFactInvocation, object: CompilerFactO
     let mut temporary = options
         .open(&temporary_path)
         .map_err(|error| format!("create compiler fact sidecar: {error}"))?;
+    // Cargo joins this compiler before the parent reads the regenerable
+    // content-addressed sidecar. Atomic publication is required; crash
+    // durability is not.
     temporary
         .write_all(&bytes)
-        .and_then(|()| temporary.sync_all())
         .map_err(|error| format!("write compiler fact sidecar: {error}"))?;
     drop(temporary);
     match fs::rename(&temporary_path, &final_path) {

@@ -144,6 +144,14 @@ impl AnalysisView {
         };
         match &self.features {
             FeatureSelection::Default => {}
+            FeatureSelection::DefaultWith(features) => {
+                for member in &selected {
+                    for feature in features {
+                        arguments.push("--features".into());
+                        arguments.push(format!("{member}/{feature}").into());
+                    }
+                }
+            }
             FeatureSelection::NoDefaultFeatures => arguments.push("--no-default-features".into()),
             FeatureSelection::AllFeatures => arguments.push("--all-features".into()),
             FeatureSelection::Selected(features) => {
@@ -191,6 +199,7 @@ impl AnalysisSchedule {
     /// `typed_packages` names captured workspace packages that need ordinary
     /// target facts. `doctest_packages` is its exact subset whose library
     /// targets enable doctests in Cargo metadata.
+    #[cfg(test)]
     pub(crate) fn for_combined(
         manifests: &[ParsedManifest],
         targets: &[&str],
@@ -198,6 +207,21 @@ impl AnalysisSchedule {
         typed_packages: &BTreeSet<String>,
         doctest_packages: &BTreeSet<String>,
     ) -> RailResult<Self> {
+        Self::for_combined_with_features(manifests, targets, candidates, typed_packages, doctest_packages, None)
+    }
+
+    /// Derive combined acquisitions with an optional exact feature-profile matrix.
+    pub(crate) fn for_combined_with_features(
+        manifests: &[ParsedManifest],
+        targets: &[&str],
+        candidates: &[CompilerCandidate],
+        typed_packages: &BTreeSet<String>,
+        doctest_packages: &BTreeSet<String>,
+        explicit_features: Option<&[FeatureSelection]>,
+    ) -> RailResult<Self> {
+        if explicit_features.is_some_and(<[FeatureSelection]>::is_empty) {
+            return Err(RailError::message("explicit compiler feature profile set is empty"));
+        }
         let configured_targets = targets.iter().copied().collect::<BTreeSet<_>>();
         let mut manifests_by_name = BTreeMap::new();
         for manifest in manifests {
@@ -246,7 +270,7 @@ impl AnalysisSchedule {
                     candidate.member, target
                 )));
             }
-            let selections = planned_feature_selections(manifest);
+            let selections = scheduled_feature_selections(manifest, explicit_features);
             if let Some(required) = &candidate.required_features
                 && !candidate.applicable_targets.is_empty()
                 && !selections.contains(required)
@@ -274,7 +298,7 @@ impl AnalysisSchedule {
             BTreeMap::<(AnalysisAcquisition, PlatformTarget, FeatureSelection, Option<String>), ViewAccumulator>::new();
         for (member_name, member_candidates) in candidates_by_member {
             let manifest = manifests_by_name[member_name];
-            for features in planned_feature_selections(manifest) {
+            for features in scheduled_feature_selections(manifest, explicit_features) {
                 for target in &configured_targets {
                     let applicable = member_candidates.iter().filter(|candidate| {
                         candidate.applicable_targets.contains(*target)
@@ -306,7 +330,7 @@ impl AnalysisSchedule {
 
         for package in typed_packages {
             let manifest = manifests_by_name[package.as_str()];
-            for features in planned_feature_selections(manifest) {
+            for features in scheduled_feature_selections(manifest, explicit_features) {
                 for target in &configured_targets {
                     let view = normalized
                         .entry((
@@ -366,6 +390,47 @@ impl AnalysisSchedule {
     pub(crate) fn views(&self) -> &[AnalysisView] {
         &self.views
     }
+}
+
+fn scheduled_feature_selections(
+    manifest: &ParsedManifest,
+    explicit: Option<&[FeatureSelection]>,
+) -> Vec<FeatureSelection> {
+    let Some(explicit) = explicit else {
+        return planned_feature_selections(manifest);
+    };
+    explicit
+        .iter()
+        .map(|selection| match selection {
+            FeatureSelection::Selected(features) => {
+                let features = features
+                    .iter()
+                    .filter(|feature| manifest.declared_features.contains(*feature))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if features.is_empty() {
+                    FeatureSelection::NoDefaultFeatures
+                } else {
+                    FeatureSelection::Selected(features)
+                }
+            }
+            FeatureSelection::DefaultWith(features) => {
+                let features = features
+                    .iter()
+                    .filter(|feature| manifest.declared_features.contains(*feature))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if features.is_empty() {
+                    FeatureSelection::Default
+                } else {
+                    FeatureSelection::DefaultWith(features)
+                }
+            }
+            other => other.clone(),
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn dependency_domain(kind: DepKind) -> CompilerFactDomain {
@@ -724,6 +789,52 @@ mod tests {
             &BTreeSet::from(["app".to_string()]),
         )
         .unwrap_err();
+    }
+
+    #[test]
+    fn explicit_feature_profiles_replace_automatic_views_without_losing_default_semantics() {
+        let manifests = [manifest("app", "app"), manifest("worker", "worker")];
+        let typed = BTreeSet::from(["app".to_string(), "worker".to_string()]);
+        let profiles = [
+            FeatureSelection::DefaultWith(vec!["backend".to_string()]),
+            FeatureSelection::Selected(vec!["example".to_string()]),
+            FeatureSelection::AllFeatures,
+        ];
+        let schedule = AnalysisSchedule::for_combined_with_features(
+            &manifests,
+            &["default"],
+            &[],
+            &typed,
+            &BTreeSet::from(["app".to_string()]),
+            Some(&profiles),
+        )
+        .expect("explicit feature schedule");
+
+        assert_eq!(schedule.views().len(), 6);
+        assert_eq!(
+            schedule
+                .views()
+                .iter()
+                .filter(|view| view.acquisition == AnalysisAcquisition::CheckAllTargets)
+                .map(|view| view.features().clone())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(profiles)
+        );
+        let default_with = schedule
+            .views()
+            .iter()
+            .find(|view| view.features() == &FeatureSelection::DefaultWith(vec!["backend".to_string()]))
+            .expect("default-plus-selected view");
+        let arguments = default_with
+            .cargo_arguments(&["app", "worker"])
+            .expect("default-plus-selected argv");
+        assert!(!arguments.contains(&OsString::from("--no-default-features")));
+        assert!(arguments.windows(2).any(|pair| pair == ["--features", "app/backend"]));
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--features", "worker/backend"])
+        );
     }
 
     #[test]

@@ -10,12 +10,11 @@ use serde::Serialize;
 use crate::backup::{BackupManager, BackupMetadata};
 use crate::cargo::{ManifestAnalyzer, TargetSpecificationIdentity};
 use crate::commands::common::SurfaceOutputFormat;
-use crate::compiler::facts::{
-    CompilerFactDomain, CompilerFactPackage, CompilerFactTargetKind, ValidatedCompilerFactObject,
-};
-use crate::compiler::{CompilerAnalysisMetrics, CompilerCacheIdentity, CompilerDiagnosticsCollector};
+use crate::compiler::facts::{CompilerFactDomain, CompilerFactTargetKind, ValidatedCompilerFactObject};
+use crate::compiler::{CompilerAnalysisMetrics, CompilerCacheIdentity, CompilerDiagnosticsCollector, FeatureSelection};
 use crate::config::{
-    SurfaceConfig, SurfaceConsumerScope, SurfaceCrateVisibility, SurfaceExclude, SurfaceLintLevel, SurfaceOverride,
+    SurfaceConfig, SurfaceConsumerScope, SurfaceCrateVisibility, SurfaceDoctestCoverage, SurfaceExclude,
+    SurfaceLintLevel, SurfaceOverride,
 };
 use crate::error::{RailError, RailResult};
 use crate::mutation::{
@@ -24,13 +23,14 @@ use crate::mutation::{
 };
 use crate::source::{ContentDigest, RepositoryPath};
 use crate::surface::{
-    SurfaceAnalysis, SurfaceFinding, SurfaceFindingKind, SurfaceGraph, SurfaceGraphMetrics, SurfaceItemAnalysis,
-    SurfacePolicy, SurfaceProductKind, SurfaceProductRoot, retention_reason_code,
+    SurfaceAnalysis, SurfaceCompilerCrate, SurfaceFinding, SurfaceFindingKind, SurfaceGraph, SurfaceGraphMetrics,
+    SurfaceItemAnalysis, SurfacePolicy, SurfaceProductKind, SurfaceProductRoot, SurfaceProductSelection,
+    retention_reason_code, target_selector_matches,
 };
 use crate::workspace::{CargoState, WorkspaceContext, WorkspaceSnapshot};
 
-const SURFACE_CONTRACT_VERSION: u32 = 1;
-const SURFACE_SCHEMA_JSON: &str = include_str!("../../schemas/surface-v1.schema.json");
+const SURFACE_CONTRACT_VERSION: u32 = 2;
+const SURFACE_SCHEMA_JSON: &str = include_str!("../../schemas/surface-v2.schema.json");
 
 /// Options for the `surface` domain command.
 #[derive(Debug)]
@@ -49,6 +49,8 @@ pub struct SurfaceOptions {
     pub output: Option<PathBuf>,
     /// Include reason chains in human output.
     pub explain: bool,
+    /// Exact enabled finding classes to retain; empty retains every class.
+    pub only: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -57,11 +59,13 @@ struct SurfaceReport {
     snapshot: SurfaceSnapshotReport,
     config: SurfaceConfigReport,
     toolchain: SurfaceToolchainReport,
+    authority: SurfaceAuthorityReport,
     products: Vec<SurfaceProductReport>,
     targets: Vec<String>,
     features: Vec<SurfaceFeatureView>,
     completeness: SurfaceCompleteness,
     findings: Vec<SurfaceReportFinding>,
+    configuration_diagnostics: Vec<SurfaceConfigurationDiagnostic>,
     reasons: Vec<SurfaceReason>,
     fragments: Vec<SurfaceFragmentReport>,
     cache: SurfaceCacheReport,
@@ -78,9 +82,11 @@ struct SurfaceSnapshotReport {
 #[derive(Debug, Serialize)]
 struct SurfaceConfigReport {
     identity: String,
+    enabled: bool,
     consumer_scope: SurfaceConsumerScope,
     crate_visibility: SurfaceCrateVisibility,
     preserve_uniform_fields: bool,
+    only: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -97,6 +103,14 @@ struct SurfaceProductReport {
     kind: SurfaceProductKind,
     implicit: bool,
     reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_selector: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SurfaceAuthorityReport {
+    audited_targets: Vec<SurfaceCompilerCrate>,
+    open_targets: Vec<SurfaceCompilerCrate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -125,6 +139,14 @@ struct SurfaceReportFinding {
     level: SurfaceLintLevel,
     #[serde(skip_serializing_if = "Option::is_none")]
     policy_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct SurfaceConfigurationDiagnostic {
+    code: &'static str,
+    location: String,
+    message: String,
+    reason: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -195,6 +217,8 @@ struct SurfaceRun {
     targets: Vec<String>,
     facts: Vec<ValidatedCompilerFactObject>,
     findings: Vec<SurfaceReportFinding>,
+    configuration_diagnostics: Vec<SurfaceConfigurationDiagnostic>,
+    authority: SurfaceAuthorityReport,
     metrics: SurfaceRunMetrics,
 }
 
@@ -238,39 +262,35 @@ pub fn run_surface(ctx: &WorkspaceContext, options: SurfaceOptions) -> RailResul
     if options.format.is_json_like() {
         crate::output::set_json_mode(true);
     }
-    if options.check == options.fix || options.check && (options.dry_run || options.backup) {
+    if options.check && options.fix || !options.fix && (options.dry_run || options.backup) {
         return Err(RailError::with_help(
-            "surface requires exactly one operation",
-            "use '--check' for read-only analysis or '--fix' for exact visibility repair",
+            "surface received incompatible operation flags",
+            "run without an operation flag to inspect, use '--check' for CI, or use '--fix' for exact visibility repair",
         ));
     }
 
     let config = ctx.config().map(|config| config.surface.clone()).unwrap_or_default();
     config.validate().map_err(RailError::Config)?;
-    let initial = analyze_surface(ctx, &config)?;
+    let mut initial = analyze_surface(ctx, &config)?;
+    filter_findings(&mut initial.findings, &options.only);
 
-    if options.check {
-        let report = build_report(
-            ctx.snapshot()?,
-            &config,
-            &initial.targets,
-            &initial.facts,
-            &initial.metrics,
-            initial.findings,
-            None,
-        )?;
-        return emit_report(report, &options, "check");
+    if !options.fix {
+        let report = build_report(ctx.snapshot()?, &config, &options.only, initial, None)?;
+        return emit_report(
+            report,
+            &options,
+            if options.check { "check" } else { "inspect" },
+            options.check,
+        );
     }
 
     let (plan, updates) = plan_visibility_mutation(ctx, &initial.findings)?;
-    if options.dry_run {
+    if options.dry_run || !initial.configuration_diagnostics.is_empty() {
         let report = build_report(
             ctx.snapshot()?,
             &config,
-            &initial.targets,
-            &initial.facts,
-            &initial.metrics,
-            initial.findings,
+            &options.only,
+            initial,
             Some(SurfaceMutationReport {
                 phase: "planned",
                 plan,
@@ -278,11 +298,17 @@ pub fn run_surface(ctx: &WorkspaceContext, options: SurfaceOptions) -> RailResul
                 backup: None,
             }),
         )?;
-        return emit_report(report, &options, "fix_dry_run");
+        return emit_report(
+            report,
+            &options,
+            if options.dry_run { "fix_dry_run" } else { "fix" },
+            true,
+        );
     }
 
     let applied = apply_visibility_mutation(ctx, plan, &updates, options.backup)?;
     let verification = (|| {
+        surface_test_fault("recompilation")?;
         let verified_context = ctx.recapture_after_mutation()?;
         let verified_config = verified_context
             .config()
@@ -293,7 +319,8 @@ pub fn run_surface(ctx: &WorkspaceContext, options: SurfaceOptions) -> RailResul
                 "surface configuration changed across post-mutation verification",
             ));
         }
-        let verified = analyze_surface(&verified_context, &verified_config)?;
+        let mut verified = analyze_surface(&verified_context, &verified_config)?;
+        filter_findings(&mut verified.findings, &options.only);
         verified_context.validate_snapshot_unchanged()?;
         verify_surface_updates(&ctx.git()?.git().worktree_root, &updates)?;
         Ok((verified_context, verified_config, verified))
@@ -306,13 +333,18 @@ pub fn run_surface(ctx: &WorkspaceContext, options: SurfaceOptions) -> RailResul
     let report = build_report(
         verified_context.snapshot()?,
         &verified_config,
-        &verified.targets,
-        &verified.facts,
-        &verified.metrics,
-        verified.findings,
+        &options.only,
+        verified,
         Some(mutation),
     )?;
-    emit_report(report, &options, "fix")
+    emit_report(report, &options, "fix", true)
+}
+
+fn filter_findings(findings: &mut Vec<SurfaceReportFinding>, only: &[String]) {
+    if !only.is_empty() {
+        let selected = only.iter().map(String::as_str).collect::<BTreeSet<_>>();
+        findings.retain(|finding| selected.contains(finding.finding.kind.as_str()));
+    }
 }
 
 fn analyze_surface(ctx: &WorkspaceContext, config: &SurfaceConfig) -> RailResult<SurfaceRun> {
@@ -327,14 +359,35 @@ fn analyze_surface(ctx: &WorkspaceContext, config: &SurfaceConfig) -> RailResult
         .iter()
         .map(|package| package.name.to_string())
         .collect::<BTreeSet<_>>();
-    let doctest_packages = workspace_packages
-        .iter()
-        .filter(|package| package.targets.iter().any(|target| target.doctest))
-        .map(|package| package.name.to_string())
-        .collect::<BTreeSet<_>>();
+    let doctest_packages = if !config.doctest.is_empty() {
+        config
+            .doctest
+            .iter()
+            .map(|entry| entry.package.clone())
+            .collect::<BTreeSet<_>>()
+    } else if config.doctest_coverage == SurfaceDoctestCoverage::Automatic {
+        workspace_packages
+            .iter()
+            .filter(|package| package.targets.iter().any(|target| target.doctest))
+            .map(|package| package.name.to_string())
+            .collect::<BTreeSet<_>>()
+    } else {
+        BTreeSet::new()
+    };
     let collector =
         CompilerDiagnosticsCollector::with_identity(ctx.workspace_root(), &manifests, target_refs, &cache_identity);
-    let evidence = collector.collect_with_typed_items(snapshot, &[], &typed_packages, &doctest_packages)?;
+    let feature_profiles = configured_feature_profiles(config);
+    let evidence = if feature_profiles.is_empty() {
+        collector.collect_with_typed_items(snapshot, &[], &typed_packages, &doctest_packages)?
+    } else {
+        collector.collect_with_typed_items_and_features(
+            snapshot,
+            &[],
+            &typed_packages,
+            &doctest_packages,
+            &feature_profiles,
+        )?
+    };
     if evidence.compiler_facts.is_empty() {
         return Err(RailError::message(
             "surface analysis produced no authenticated compiler facts",
@@ -342,20 +395,31 @@ fn analyze_surface(ctx: &WorkspaceContext, config: &SurfaceConfig) -> RailResult
     }
 
     let graph = SurfaceGraph::from_compiler_facts(&evidence.compiler_facts)?;
-    let closed_world_packages = closed_world_packages(&workspace_packages, config.consumer_scope);
+    let closed_world_crates = closed_world_crates(&workspace_packages, &evidence.compiler_facts, config)?;
+    let all_compiler_crates = evidence
+        .compiler_facts
+        .iter()
+        .map(|fact| SurfaceCompilerCrate::from(fact.object()))
+        .collect::<BTreeSet<_>>();
+    let authority = SurfaceAuthorityReport {
+        audited_targets: closed_world_crates.iter().cloned().collect(),
+        open_targets: all_compiler_crates.difference(&closed_world_crates).cloned().collect(),
+    };
     let products = configured_product_roots(config);
     let policy = SurfacePolicy::new(
-        closed_world_packages,
+        closed_world_crates,
         config.crate_visibility == SurfaceCrateVisibility::Allow,
     )
     .with_products(products)
     .preserving_uniform_fields(config.preserve_uniform_fields);
     let analysis = graph.analyze(&policy)?;
-    let findings = apply_diagnostic_policy(&analysis, config)?;
+    let policy_result = apply_diagnostic_policy(&analysis, config)?;
     Ok(SurfaceRun {
         targets,
         facts: evidence.compiler_facts,
-        findings,
+        findings: policy_result.findings,
+        configuration_diagnostics: policy_result.configuration_diagnostics,
+        authority,
         metrics: SurfaceRunMetrics {
             acquisition: evidence.metrics,
             graph: analysis.metrics,
@@ -363,8 +427,38 @@ fn analyze_surface(ctx: &WorkspaceContext, config: &SurfaceConfig) -> RailResult
     })
 }
 
-fn emit_report(report: SurfaceReport, options: &SurfaceOptions, mode: &'static str) -> RailResult<()> {
-    let exit_code = i32::from(!report.findings.is_empty());
+fn configured_feature_profiles(config: &SurfaceConfig) -> Vec<FeatureSelection> {
+    config
+        .feature_profile
+        .iter()
+        .map(|profile| {
+            if profile.all_features {
+                FeatureSelection::AllFeatures
+            } else if profile.no_default_features && profile.features.is_empty() {
+                FeatureSelection::NoDefaultFeatures
+            } else if profile.no_default_features {
+                FeatureSelection::Selected(profile.features.clone())
+            } else if profile.features.is_empty() {
+                FeatureSelection::Default
+            } else {
+                FeatureSelection::DefaultWith(profile.features.clone())
+            }
+        })
+        .collect()
+}
+
+fn emit_report(
+    report: SurfaceReport,
+    options: &SurfaceOptions,
+    mode: &'static str,
+    fail_on_findings: bool,
+) -> RailResult<()> {
+    let has_denied_findings = report
+        .findings
+        .iter()
+        .any(|finding| finding.level == SurfaceLintLevel::Deny)
+        || !report.configuration_diagnostics.is_empty();
+    let exit_code = i32::from(fail_on_findings && has_denied_findings);
     let rendered = render_report(&report, options.format, options.explain, mode, exit_code)?;
     write_output(&rendered, options.output.as_deref())?;
 
@@ -462,14 +556,26 @@ fn apply_visibility_edits(
     let mut edits = findings
         .iter()
         .map(|finding| {
-            let start = usize::try_from(finding.visibility_start)
+            let visibility_start = finding.visibility_start.ok_or_else(|| {
+                RailError::message(format!(
+                    "surface finding '{}' has no writable visibility span",
+                    finding.identity
+                ))
+            })?;
+            let visibility_end = finding.visibility_end.ok_or_else(|| {
+                RailError::message(format!(
+                    "surface finding '{}' has no writable visibility span",
+                    finding.identity
+                ))
+            })?;
+            let start = usize::try_from(visibility_start)
                 .map_err(|_| RailError::message("surface visibility start exceeds this platform"))?;
-            let end = usize::try_from(finding.visibility_end)
+            let end = usize::try_from(visibility_end)
                 .map_err(|_| RailError::message("surface visibility end exceeds this platform"))?;
             if start >= end
                 || end > before.len()
-                || finding.visibility_start < finding.declaration_start
-                || finding.visibility_end > finding.declaration_end
+                || visibility_start < finding.declaration_start
+                || visibility_end > finding.declaration_end
             {
                 return Err(RailError::message(format!(
                     "surface finding '{}' has an invalid visibility byte range",
@@ -496,7 +602,7 @@ fn apply_visibility_edits(
                 (SurfaceFindingKind::UnnecessaryPublic, Some("pub(super)")) if compact == "pub" => "pub(super)",
                 (SurfaceFindingKind::UnnecessaryPublic, Some("private")) if compact == "pub" => "",
                 (SurfaceFindingKind::UnnecessaryRestrictedVisibility, Some("private"))
-                    if restricted_visibility(&compact) =>
+                    if restricted_visibility(&compact) || compact == "pub(crate)" =>
                 {
                     ""
                 }
@@ -507,7 +613,7 @@ fn apply_visibility_edits(
                 _ => {
                     return Err(RailError::message(format!(
                         "surface finding '{}' expected a different original visibility at {}..{}",
-                        finding.identity, finding.visibility_start, finding.visibility_end
+                        finding.identity, visibility_start, visibility_end
                     )));
                 }
             };
@@ -524,9 +630,9 @@ fn apply_visibility_edits(
                 declaration_identity: finding.item_identity.clone(),
                 declaration_start: finding.declaration_start,
                 declaration_end: finding.declaration_end,
-                visibility_start: finding.visibility_start,
-                visibility_end: finding.visibility_end,
-                edit_start: finding.visibility_start,
+                visibility_start,
+                visibility_end,
+                edit_start: visibility_start,
                 edit_end: u64::try_from(edit_end).map_err(|_| RailError::message("surface edit end exceeds u64"))?,
                 original_visibility: original.to_string(),
                 replacement: replacement.to_string(),
@@ -595,7 +701,26 @@ fn apply_visibility_mutation(
     revalidate_surface_updates(git_root, updates)?;
     for (index, update) in updates.iter().enumerate() {
         let absolute = git_root.join(update.path.as_path());
-        if let Err(error) = crate::utils::write_file_atomic(&absolute, &update.after) {
+        let fault_point = if index == 0 { "first-write" } else { "write" };
+        let write =
+            surface_test_fault(fault_point).and_then(|()| crate::utils::write_file_atomic(&absolute, &update.after));
+        if let Err(error) = write {
+            let rollback_error = rollback_surface_updates(git_root, &updates[..=index]);
+            return match rollback_error {
+                Ok(()) => Err(error.context("surface visibility application failed; applied files were restored")),
+                Err(rollback) => Err(RailError::with_help(
+                    format!("surface visibility application failed: {error}; automatic recovery failed: {rollback}"),
+                    backup.as_ref().map_or_else(
+                        || "restore the affected files from version control".to_string(),
+                        |backup| format!("restore backup '{backup}' before retrying"),
+                    ),
+                )),
+            };
+        }
+        if index == 0
+            && updates.len() > 1
+            && let Err(error) = surface_test_fault("partial-write")
+        {
             let rollback_error = rollback_surface_updates(git_root, &updates[..=index]);
             return match rollback_error {
                 Ok(()) => Err(error.context("surface visibility application failed; applied files were restored")),
@@ -610,7 +735,8 @@ fn apply_visibility_mutation(
         }
     }
 
-    if let Err(error) = verify_surface_updates(git_root, updates)
+    if let Err(error) = surface_test_fault("post-write-validation")
+        .and_then(|()| verify_surface_updates(git_root, updates))
         .and_then(|()| validate_changed_paths_with_allowed_paths(ctx, &plan, &plan.pre_apply.changed_paths))
     {
         let rollback = rollback_surface_updates(git_root, updates);
@@ -634,20 +760,22 @@ fn finalize_surface_mutation(
     applied: AppliedSurfaceMutation,
     updates: &[SurfaceFileUpdate],
 ) -> RailResult<SurfaceMutationReport> {
-    let receipt = write_receipt(
-        ctx.workspace_root(),
-        "surface",
-        "apply",
-        "applied",
-        applied.plan.clone(),
-        vec![MutationTrace::new(
-            "SURFACE_VISIBILITY_VERIFIED",
-            format!(
-                "applied {} authorized source file mutation(s) and revalidated every configured compiler view",
-                updates.len()
-            ),
-        )],
-    );
+    let receipt = surface_test_fault("receipt-write").and_then(|()| {
+        write_receipt(
+            ctx.workspace_root(),
+            "surface",
+            "apply",
+            "applied",
+            applied.plan.clone(),
+            vec![MutationTrace::new(
+                "SURFACE_VISIBILITY_VERIFIED",
+                format!(
+                    "applied {} authorized source file mutation(s) and revalidated every configured compiler view",
+                    updates.len()
+                ),
+            )],
+        )
+    });
     let receipt = match receipt {
         Ok(receipt) => receipt,
         Err(error) => {
@@ -670,6 +798,14 @@ fn finalize_surface_mutation(
         receipt: Some(display_repository_path(&ctx.git()?.git().worktree_root, &receipt)),
         backup: applied.backup,
     })
+}
+
+fn surface_test_fault(point: &str) -> RailResult<()> {
+    if std::env::var("CARGO_RAIL_SURFACE_FAIL_AT").as_deref() == Ok(point) {
+        Err(RailError::message(format!("injected surface failure at {point}")))
+    } else {
+        Ok(())
+    }
 }
 
 fn recover_failed_verification(
@@ -803,18 +939,61 @@ fn validate_workspace_policy(
             config
                 .r#override
                 .iter()
-                .map(|policy| ("surface.override", policy.package.as_str())),
+                .filter_map(|policy| policy.package.as_deref().map(|package| ("surface.override", package))),
         )
         .chain(
             config
                 .exclude
                 .iter()
-                .map(|policy| ("surface.exclude", policy.package.as_str())),
+                .filter_map(|policy| policy.package.as_deref().map(|package| ("surface.exclude", package))),
+        )
+        .chain(
+            config
+                .doctest
+                .iter()
+                .map(|entry| ("surface.doctest", entry.package.as_str())),
         )
     {
         if !names.contains(package) {
             return Err(RailError::message(format!(
                 "{field} names unknown workspace package '{package}'"
+            )));
+        }
+    }
+
+    let library_crates = packages
+        .iter()
+        .flat_map(|package| {
+            package
+                .targets
+                .iter()
+                .filter(|target| target.kind.iter().any(is_library_target))
+                .map(|target| (package.name.as_str(), target.name.as_str()))
+        })
+        .collect::<Vec<_>>();
+    for boundary in &config.external {
+        let matches = library_crates
+            .iter()
+            .filter(|(_, crate_name)| *crate_name == boundary.crate_name)
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(RailError::message(format!(
+                "surface external crate '{}' identifies {} workspace library targets",
+                boundary.crate_name,
+                matches.len()
+            )));
+        }
+    }
+
+    for doctest in &config.doctest {
+        let package = ctx
+            .cargo()
+            .get_package(&doctest.package)
+            .ok_or_else(|| RailError::message(format!("surface doctest package '{}' disappeared", doctest.package)))?;
+        if !package.targets.iter().any(|target| target.doctest) {
+            return Err(RailError::message(format!(
+                "surface doctest package '{}' has no doctest-enabled Cargo target",
+                doctest.package
             )));
         }
     }
@@ -900,22 +1079,78 @@ fn selected_target_views(config: &SurfaceConfig) -> Vec<String> {
         .collect()
 }
 
-fn closed_world_packages(packages: &[&Package], scope: SurfaceConsumerScope) -> BTreeSet<CompilerFactPackage> {
-    if scope != SurfaceConsumerScope::Workspace {
-        return BTreeSet::new();
-    }
-    packages
+fn closed_world_crates(
+    packages: &[&Package],
+    facts: &[ValidatedCompilerFactObject],
+    config: &SurfaceConfig,
+) -> RailResult<BTreeSet<SurfaceCompilerCrate>> {
+    let publishable = packages
         .iter()
-        .filter(|package| !CargoState::is_package_publishable(package))
-        .map(|package| CompilerFactPackage {
-            name: package.name.to_string(),
-            version: package.version.to_string(),
-            source: package.source.as_ref().map(|source| source.repr.clone()),
-        })
-        .collect()
+        .map(|package| (package.name.as_str(), CargoState::is_package_publishable(package)))
+        .collect::<BTreeMap<_, _>>();
+    let products = configured_product_roots(config);
+    let library_products_only = !products.is_empty()
+        && products
+            .iter()
+            .all(|selection| selection.root.kind == SurfaceProductKind::Library);
+    let selected_libraries = products
+        .iter()
+        .filter(|selection| selection.root.kind == SurfaceProductKind::Library)
+        .map(|selection| (selection.root.package.as_str(), selection.root.target.as_str()))
+        .collect::<BTreeSet<_>>();
+    let selected_binaries = products
+        .iter()
+        .filter(|selection| selection.root.kind == SurfaceProductKind::Binary)
+        .map(|selection| (selection.root.package.as_str(), selection.root.target.as_str()))
+        .collect::<BTreeSet<_>>();
+    let external = config
+        .external
+        .iter()
+        .map(|boundary| boundary.crate_name.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut closed = BTreeSet::new();
+    for fact in facts {
+        let object = fact.object();
+        let Some(package_publishable) = publishable.get(object.unit.package.name.as_str()).copied() else {
+            continue;
+        };
+        let compiler_crate = SurfaceCompilerCrate::from(object);
+        if external.contains(compiler_crate.crate_name.as_str()) {
+            continue;
+        }
+        let product = (
+            compiler_crate.package.name.as_str(),
+            compiler_crate.cargo_target.as_str(),
+        );
+        let authorized = if compiler_crate.target_kind == CompilerFactTargetKind::Binary {
+            if products.is_empty() {
+                true
+            } else {
+                selected_binaries.contains(&product)
+            }
+        } else if config.consumer_scope != SurfaceConsumerScope::Workspace {
+            false
+        } else if library_products_only {
+            !package_publishable
+                && compiler_crate.target_kind == CompilerFactTargetKind::Library
+                && selected_libraries.contains(&product)
+        } else {
+            !package_publishable
+                && matches!(
+                    compiler_crate.target_kind,
+                    CompilerFactTargetKind::Library
+                        | CompilerFactTargetKind::ProcMacro
+                        | CompilerFactTargetKind::BuildScript
+                )
+        };
+        if authorized {
+            closed.insert(compiler_crate);
+        }
+    }
+    Ok(closed)
 }
 
-fn configured_product_roots(config: &SurfaceConfig) -> BTreeSet<SurfaceProductRoot> {
+fn configured_product_roots(config: &SurfaceConfig) -> Vec<SurfaceProductSelection> {
     config
         .product
         .iter()
@@ -925,79 +1160,140 @@ fn configured_product_roots(config: &SurfaceConfig) -> BTreeSet<SurfaceProductRo
                 .as_ref()
                 .map(|target| (target, SurfaceProductKind::Binary))
                 .or_else(|| product.lib.as_ref().map(|target| (target, SurfaceProductKind::Library)))
-                .map(|(target, kind)| SurfaceProductRoot {
-                    package: product.package.clone(),
-                    target: target.clone(),
-                    kind,
+                .map(|(target, kind)| SurfaceProductSelection {
+                    root: SurfaceProductRoot {
+                        package: product.package.clone(),
+                        target: target.clone(),
+                        kind,
+                    },
+                    target: product.target.clone(),
                 })
         })
         .collect()
 }
 
-fn apply_diagnostic_policy(
-    analysis: &SurfaceAnalysis,
-    config: &SurfaceConfig,
-) -> RailResult<Vec<SurfaceReportFinding>> {
-    for policy in config
-        .r#override
-        .iter()
-        .filter(|policy| policy.level == SurfaceLintLevel::Expect)
-    {
-        if !analysis
-            .findings
-            .iter()
-            .any(|finding| override_matches(finding, policy))
-        {
-            return Err(RailError::message(format!(
-                "expected surface finding '{}:{}:{}:{}' disappeared",
-                policy.lint, policy.package, policy.item, policy.kind
-            )));
+struct SurfacePolicyResult {
+    findings: Vec<SurfaceReportFinding>,
+    configuration_diagnostics: Vec<SurfaceConfigurationDiagnostic>,
+}
+
+fn apply_diagnostic_policy(analysis: &SurfaceAnalysis, config: &SurfaceConfig) -> RailResult<SurfacePolicyResult> {
+    let mut configuration_diagnostics = Vec::new();
+    let mut active_overrides = Vec::new();
+    for (index, policy) in config.r#override.iter().enumerate() {
+        let mut matching_items = BTreeSet::new();
+        for item in &analysis.items {
+            if override_identifies_item(item, policy)? {
+                matching_items.insert(item.identity.as_str());
+            }
+        }
+        let location = format!("surface.override[{index}]");
+        if matching_items.is_empty() {
+            configuration_diagnostics.push(SurfaceConfigurationDiagnostic {
+                code: "unknown-item",
+                location,
+                message: format!(
+                    "surface override does not identify a compiled item '{}':{}",
+                    policy.item, policy.lint
+                ),
+                reason: policy.reason.clone(),
+            });
+            continue;
+        }
+        if matching_items.len() > 1 {
+            configuration_diagnostics.push(SurfaceConfigurationDiagnostic {
+                code: "ambiguous-item",
+                location,
+                message: format!(
+                    "surface override identifies {} compiled items; add an exact declaration kind",
+                    matching_items.len()
+                ),
+                reason: policy.reason.clone(),
+            });
+            continue;
+        }
+        active_overrides.push((index, policy));
+        if policy.level == SurfaceLintLevel::Expect {
+            let mut fulfilled = false;
+            for finding in &analysis.findings {
+                if override_matches(finding, policy)? {
+                    fulfilled = true;
+                    break;
+                }
+            }
+            if !fulfilled {
+                configuration_diagnostics.push(SurfaceConfigurationDiagnostic {
+                    code: "unfulfilled-expectation",
+                    location,
+                    message: format!(
+                        "expected surface finding '{}:{}' no longer exists",
+                        policy.lint, policy.item
+                    ),
+                    reason: policy.reason.clone(),
+                });
+            }
         }
     }
-    for policy in config
-        .exclude
-        .iter()
-        .filter(|policy| policy.level == SurfaceLintLevel::Expect)
-    {
-        if !analysis.items.iter().any(|item| exclusion_matches_item(item, policy)) {
-            return Err(RailError::message(format!(
-                "expected surface exclusion scope for package '{}' disappeared",
-                policy.package
-            )));
+
+    for (index, policy) in config.exclude.iter().enumerate() {
+        if policy.level != SurfaceLintLevel::Expect {
+            continue;
+        }
+        let mut suppressed = false;
+        for finding in &analysis.findings {
+            if exclusion_matches_finding(finding, policy)? {
+                suppressed = true;
+                break;
+            }
+        }
+        if !suppressed {
+            configuration_diagnostics.push(SurfaceConfigurationDiagnostic {
+                code: "unfulfilled-expectation",
+                location: format!("surface.exclude[{index}]"),
+                message: "expected surface exclusion no longer suppresses a finding".to_string(),
+                reason: policy.reason.clone(),
+            });
         }
     }
 
     let mut enabled = Vec::new();
     for finding in &analysis.findings {
-        let exact = config
-            .r#override
-            .iter()
-            .filter(|policy| override_matches(finding, policy))
-            .collect::<Vec<_>>();
-        if exact.len() > 1 {
-            return Err(RailError::message(format!(
-                "surface finding '{}' matches multiple item overrides",
-                finding.identity
-            )));
+        let mut exact = Vec::new();
+        for (index, policy) in &active_overrides {
+            if override_matches(finding, policy)? {
+                exact.push((*index, *policy));
+            }
         }
-        let (level, reason) = if let Some(policy) = exact.first() {
+        if exact.len() > 1 {
+            configuration_diagnostics.push(SurfaceConfigurationDiagnostic {
+                code: "ambiguous-policy",
+                location: exact
+                    .iter()
+                    .map(|(index, _)| format!("surface.override[{index}]"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                message: format!("surface finding '{}' matches multiple item overrides", finding.identity),
+                reason: exact
+                    .iter()
+                    .map(|(_, policy)| policy.reason.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            });
+            continue;
+        }
+        let (level, reason) = if let Some((_, policy)) = exact.first() {
             (policy.level, Some(policy.reason.clone()))
         } else {
-            let matches = config
-                .exclude
-                .iter()
-                .filter(|policy| exclusion_matches_finding(finding, policy))
-                .collect::<Vec<_>>();
-            let levels = matches.iter().map(|policy| policy.level).collect::<BTreeSet<_>>();
-            if levels.len() > 1 {
-                return Err(RailError::message(format!(
-                    "surface finding '{}' matches exclusions with conflicting levels",
-                    finding.identity
-                )));
+            let mut matched_exclusion = None;
+            for policy in &config.exclude {
+                if exclusion_matches_finding(finding, policy)? {
+                    matched_exclusion = Some(policy);
+                }
             }
-            matches.first().map_or((SurfaceLintLevel::Warn, None), |policy| {
-                (policy.level, Some(policy.reason.clone()))
-            })
+            matched_exclusion.map_or_else(
+                || (default_lint_level(finding.kind, config), None),
+                |policy| (policy.level, Some(policy.reason.clone())),
+            )
         };
         if matches!(level, SurfaceLintLevel::Warn | SurfaceLintLevel::Deny) {
             enabled.push(SurfaceReportFinding {
@@ -1007,27 +1303,92 @@ fn apply_diagnostic_policy(
             });
         }
     }
-    Ok(enabled)
+    Ok(SurfacePolicyResult {
+        findings: enabled,
+        configuration_diagnostics,
+    })
 }
 
-fn override_matches(finding: &SurfaceFinding, policy: &SurfaceOverride) -> bool {
-    finding.kind.as_str() == policy.lint
-        && finding.packages.iter().any(|package| package == &policy.package)
-        && finding.item_kind == policy.kind
+fn default_lint_level(kind: SurfaceFindingKind, config: &SurfaceConfig) -> SurfaceLintLevel {
+    let mut level = if kind == SurfaceFindingKind::UnnecessaryCrateVisibility {
+        SurfaceLintLevel::Allow
+    } else {
+        SurfaceLintLevel::Deny
+    };
+    for directive in &config.lint {
+        let selected = directive.selector == kind.as_str()
+            || directive.selector == "warnings" && kind != SurfaceFindingKind::UnnecessaryCrateVisibility;
+        if selected {
+            level = directive.level;
+        }
+    }
+    level
+}
+
+fn override_identifies_item(item: &SurfaceItemAnalysis, policy: &SurfaceOverride) -> RailResult<bool> {
+    Ok(policy_owner_matches(
+        &item.packages,
+        &item.compiler_crates,
+        policy.package.as_deref(),
+        policy.crate_name.as_deref(),
+    ) && policy.kind.as_deref().is_none_or(|kind| item.item_kind == kind)
+        && item
+            .diagnostic_paths
+            .iter()
+            .any(|path| exact_diagnostic_path(path, &policy.item))
+        && target_observations_match(policy.target.as_deref(), &item.target_observations)?)
+}
+
+fn override_matches(finding: &SurfaceFinding, policy: &SurfaceOverride) -> RailResult<bool> {
+    Ok(finding.kind.as_str() == policy.lint
+        && policy_owner_matches(
+            &finding.packages,
+            &finding.compiler_crates,
+            policy.package.as_deref(),
+            policy.crate_name.as_deref(),
+        )
+        && policy.kind.as_deref().is_none_or(|kind| finding.item_kind == kind)
         && finding
             .diagnostic_paths
             .iter()
             .any(|path| exact_diagnostic_path(path, &policy.item))
+        && target_observations_match(policy.target.as_deref(), &finding.target_observations)?)
 }
 
-fn exclusion_matches_finding(finding: &SurfaceFinding, policy: &SurfaceExclude) -> bool {
-    finding.packages.iter().any(|package| package == &policy.package)
-        && exclusion_matches(&finding.source, &finding.diagnostic_paths, policy)
+fn exclusion_matches_finding(finding: &SurfaceFinding, policy: &SurfaceExclude) -> RailResult<bool> {
+    Ok(policy_owner_matches(
+        &finding.packages,
+        &finding.compiler_crates,
+        policy.package.as_deref(),
+        policy.crate_name.as_deref(),
+    ) && exclusion_matches(&finding.source, &finding.diagnostic_paths, policy)
+        && target_observations_match(policy.target.as_deref(), &finding.target_observations)?)
 }
 
-fn exclusion_matches_item(item: &SurfaceItemAnalysis, policy: &SurfaceExclude) -> bool {
-    item.packages.iter().any(|package| package == &policy.package)
-        && exclusion_matches(&item.source, &item.diagnostic_paths, policy)
+fn policy_owner_matches(
+    packages: &[String],
+    compiler_crates: &[SurfaceCompilerCrate],
+    package: Option<&str>,
+    crate_name: Option<&str>,
+) -> bool {
+    package.is_some_and(|expected| packages.iter().any(|package| package == expected))
+        || crate_name.is_some_and(|expected| {
+            compiler_crates
+                .iter()
+                .any(|compiler_crate| compiler_crate.crate_name == expected)
+        })
+}
+
+fn target_observations_match(
+    selector: Option<&str>,
+    observations: &[crate::surface::SurfaceTargetObservation],
+) -> RailResult<bool> {
+    for observation in observations {
+        if target_selector_matches(selector, observation)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn exclusion_matches(source: &str, diagnostic_paths: &[String], policy: &SurfaceExclude) -> bool {
@@ -1054,12 +1415,18 @@ fn diagnostic_module_contains(path: &str, module: &str) -> bool {
 fn build_report(
     snapshot: &WorkspaceSnapshot,
     config: &SurfaceConfig,
-    targets: &[String],
-    facts: &[ValidatedCompilerFactObject],
-    metrics: &SurfaceRunMetrics,
-    findings: Vec<SurfaceReportFinding>,
+    only: &[String],
+    run: SurfaceRun,
     mutation: Option<SurfaceMutationReport>,
 ) -> RailResult<SurfaceReport> {
+    let SurfaceRun {
+        targets,
+        facts,
+        findings,
+        configuration_diagnostics,
+        authority,
+        metrics,
+    } = run;
     let mut fragments = facts
         .iter()
         .map(|fact| {
@@ -1095,7 +1462,7 @@ fn build_report(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let products = report_products(config, facts);
+    let products = report_products(config, &facts);
     let config_bytes = serde_json::to_vec(config)?;
     let reasons = used_reasons(&findings);
 
@@ -1107,20 +1474,24 @@ fn build_report(
         },
         config: SurfaceConfigReport {
             identity: format!("sha256:{}", ContentDigest::sha256(&config_bytes)),
+            enabled: config.enabled,
             consumer_scope: config.consumer_scope,
             crate_visibility: config.crate_visibility,
             preserve_uniform_fields: config.preserve_uniform_fields,
+            only: only.iter().cloned().collect::<BTreeSet<_>>().into_iter().collect(),
         },
         toolchain: SurfaceToolchainReport {
             fingerprint: snapshot.toolchain_fingerprint().to_string(),
             rustc: snapshot.toolchain().rustc_verbose_version().to_string(),
             host: snapshot.toolchain().host_target().to_string(),
         },
+        authority,
         products,
-        targets: targets.to_vec(),
+        targets,
         features,
-        completeness: completeness(facts)?,
+        completeness: completeness(&facts)?,
         findings,
+        configuration_diagnostics,
         reasons,
         fragments,
         cache: SurfaceCacheReport {
@@ -1168,6 +1539,7 @@ fn report_products(config: &SurfaceConfig, facts: &[ValidatedCompilerFactObject]
                         kind,
                         implicit: false,
                         reason: product.reason.clone(),
+                        target_selector: product.target.clone(),
                     })
             })
             .collect();
@@ -1184,6 +1556,7 @@ fn report_products(config: &SurfaceConfig, facts: &[ValidatedCompilerFactObject]
                     kind: SurfaceProductKind::Binary,
                     implicit: true,
                     reason: "workspace binary implicit root".to_string(),
+                    target_selector: None,
                 })
         })
         .collect::<BTreeSet<_>>()
@@ -1275,19 +1648,28 @@ fn render_report(
         SurfaceOutputFormat::Text => Ok(render_text(report, explain)),
         SurfaceOutputFormat::Json => {
             let payload = serde_json::to_value(report)?;
-            let result = if exit_code == 0 { "clean" } else { "findings" };
+            let result = if report.findings.is_empty() && report.configuration_diagnostics.is_empty() {
+                "clean"
+            } else {
+                "findings"
+            };
             let envelope = crate::output::machine_json_envelope("surface", mode, result, exit_code, payload);
             serde_json::to_string_pretty(&envelope).map_err(Into::into)
         }
         SurfaceOutputFormat::GitHub => {
             let payload = serde_json::to_value(report)?;
-            let result = if exit_code == 0 { "clean" } else { "findings" };
+            let result = if report.findings.is_empty() && report.configuration_diagnostics.is_empty() {
+                "clean"
+            } else {
+                "findings"
+            };
             let envelope = crate::output::machine_json_envelope("surface", mode, result, exit_code, payload);
             let report_json = serde_json::to_string(&envelope)?;
             Ok(format!(
-                "surface={}\nfinding_count={}\nsurface_report_json={}\n",
-                exit_code != 0,
+                "surface={}\nfinding_count={}\nconfiguration_diagnostic_count={}\nsurface_report_json={}\n",
+                result == "findings",
                 report.findings.len(),
+                report.configuration_diagnostics.len(),
                 report_json
             ))
         }
@@ -1296,12 +1678,14 @@ fn render_report(
 
 fn render_text(report: &SurfaceReport, explain: bool) -> String {
     let mut output = String::new();
-    if report.findings.is_empty() {
+    if report.findings.is_empty() && report.configuration_diagnostics.is_empty() {
         output.push_str("surface: clean\n");
     } else {
         output.push_str("surface: ");
         output.push_str(&report.findings.len().to_string());
-        output.push_str(" finding(s)\n");
+        output.push_str(" finding(s), ");
+        output.push_str(&report.configuration_diagnostics.len().to_string());
+        output.push_str(" configuration diagnostic(s)\n");
     }
     output.push_str("snapshot: ");
     output.push_str(&report.snapshot.identity);
@@ -1338,7 +1722,11 @@ fn render_text(report: &SurfaceReport, explain: bool) -> String {
         output.push_str(" at ");
         output.push_str(&finding.source);
         output.push(':');
-        output.push_str(&finding.visibility_start.to_string());
+        output.push_str(
+            &finding
+                .visibility_start
+                .map_or_else(|| "implicit".to_string(), |offset| offset.to_string()),
+        );
         output.push('\n');
         if explain {
             output.push_str("  reasons: ");
@@ -1349,6 +1737,20 @@ fn render_text(report: &SurfaceReport, explain: bool) -> String {
                 output.push_str(reason);
                 output.push('\n');
             }
+        }
+    }
+    for diagnostic in &report.configuration_diagnostics {
+        output.push_str("configuration ");
+        output.push_str(diagnostic.code);
+        output.push_str(" at ");
+        output.push_str(&diagnostic.location);
+        output.push_str(": ");
+        output.push_str(&diagnostic.message);
+        output.push('\n');
+        if explain {
+            output.push_str("  reason: ");
+            output.push_str(&diagnostic.reason);
+            output.push('\n');
         }
     }
     output
@@ -1384,7 +1786,29 @@ fn write_output(content: &str, output: Option<&Path>) -> RailResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::surface::SurfaceFindingKind;
+    use crate::compiler::facts::{CompilerFactPackage, CompilerFactRole};
+    use crate::surface::{SurfaceFindingKind, SurfaceTargetObservation};
+
+    fn compiler_crate() -> SurfaceCompilerCrate {
+        SurfaceCompilerCrate {
+            package: CompilerFactPackage {
+                name: "app-core".to_string(),
+                version: "1.0.0".to_string(),
+                source: None,
+            },
+            cargo_target: "app_core".to_string(),
+            crate_name: "app_core".to_string(),
+            target_kind: CompilerFactTargetKind::Library,
+            role: CompilerFactRole::Target,
+        }
+    }
+
+    fn target_observation() -> SurfaceTargetObservation {
+        SurfaceTargetObservation {
+            platform: "aarch64-apple-darwin".to_string(),
+            cfg: vec!["target_os=\"macos\"".to_string()],
+        }
+    }
 
     fn finding() -> SurfaceFinding {
         SurfaceFinding {
@@ -1394,13 +1818,15 @@ mod tests {
             name: "legacy_entry".to_string(),
             item_kind: "function",
             packages: vec!["app-core".to_string()],
+            compiler_crates: vec![compiler_crate()],
+            target_observations: vec![target_observation()],
             diagnostic_paths: vec!["app_core::migration::legacy_entry".to_string()],
             source: "crates/app-core/src/migration.rs".to_string(),
             source_generated: false,
             declaration_start: 20,
             declaration_end: 50,
-            visibility_start: 20,
-            visibility_end: 23,
+            visibility_start: Some(20),
+            visibility_end: Some(23),
             replacement: Some("pub(crate)"),
             production_live: true,
             non_production_live: false,
@@ -1415,6 +1841,8 @@ mod tests {
                 identity: "surface-item-v1-sha256-test".to_string(),
                 item_kind: "function",
                 packages: vec!["app-core".to_string()],
+                compiler_crates: vec![compiler_crate()],
+                target_observations: vec![target_observation()],
                 diagnostic_paths: vec!["app_core::migration::legacy_entry".to_string()],
                 source: "crates/app-core/src/migration.rs".to_string(),
                 source_generated: false,
@@ -1433,25 +1861,21 @@ mod tests {
         let mut config = SurfaceConfig::default();
         config.r#override.push(SurfaceOverride {
             lint: "unnecessary-public".to_string(),
-            package: "app-core".to_string(),
+            package: Some("app-core".to_string()),
+            crate_name: None,
             item: "migration::legacy_entry".to_string(),
-            kind: "function".to_string(),
+            kind: Some("function".to_string()),
+            target: None,
             level: SurfaceLintLevel::Expect,
             reason: "migration compatibility".to_string(),
         });
-        assert!(
-            apply_diagnostic_policy(&analysis(), &config)
-                .expect("policy should apply")
-                .is_empty()
-        );
+        let result = apply_diagnostic_policy(&analysis(), &config).expect("policy should apply");
+        assert!(result.findings.is_empty());
+        assert!(result.configuration_diagnostics.is_empty());
 
         config.r#override[0].item = "migration::gone".to_string();
-        assert!(
-            apply_diagnostic_policy(&analysis(), &config)
-                .expect_err("missing expected finding should fail")
-                .to_string()
-                .contains("disappeared")
-        );
+        let result = apply_diagnostic_policy(&analysis(), &config).expect("stale policy should be diagnosed");
+        assert_eq!(result.configuration_diagnostics[0].code, "unknown-item");
     }
 
     #[test]
@@ -1460,44 +1884,82 @@ mod tests {
         for item in ["app_core::migration::legacy_entry", "migration::legacy_entry"] {
             config.r#override.push(SurfaceOverride {
                 lint: "unnecessary-public".to_string(),
-                package: "app-core".to_string(),
+                package: Some("app-core".to_string()),
+                crate_name: None,
                 item: item.to_string(),
-                kind: "function".to_string(),
+                kind: Some("function".to_string()),
+                target: None,
                 level: SurfaceLintLevel::Allow,
                 reason: "one exact policy must own the finding".to_string(),
             });
         }
 
+        let result = apply_diagnostic_policy(&analysis(), &config).expect("overlap should be diagnosed");
         assert!(
-            apply_diagnostic_policy(&analysis(), &config)
-                .expect_err("overlapping overrides are ambiguous")
-                .to_string()
-                .contains("multiple item overrides")
+            result
+                .configuration_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "ambiguous-policy")
         );
     }
 
     #[test]
-    fn expected_exclusion_tracks_scope_not_only_current_findings() {
+    fn expected_exclusion_requires_a_suppressed_finding() {
         let mut config = SurfaceConfig::default();
         config.exclude.push(SurfaceExclude {
-            package: "app-core".to_string(),
+            package: Some("app-core".to_string()),
+            crate_name: None,
             module: Some("migration".to_string()),
             file: None,
+            target: None,
             level: SurfaceLintLevel::Expect,
             reason: "generated migration surface".to_string(),
         });
-        assert!(
-            apply_diagnostic_policy(&analysis(), &config)
-                .expect("scope should exist")
-                .is_empty()
-        );
+        let result = apply_diagnostic_policy(&analysis(), &config).expect("finding should satisfy exclusion");
+        assert!(result.findings.is_empty());
+        assert!(result.configuration_diagnostics.is_empty());
 
         let mut no_findings = analysis();
         no_findings.findings.clear();
-        assert!(
-            apply_diagnostic_policy(&no_findings, &config)
-                .expect("the excluded scope still exists")
-                .is_empty()
+        let result = apply_diagnostic_policy(&no_findings, &config).expect("stale exclusion should be diagnosed");
+        assert_eq!(result.configuration_diagnostics[0].code, "unfulfilled-expectation");
+    }
+
+    #[test]
+    fn ordered_lint_levels_keep_warning_runs_successful_and_crate_visibility_allowed_by_default() {
+        let mut config = SurfaceConfig::default();
+        config.lint.extend([
+            crate::config::SurfaceLintDirective {
+                selector: "warnings".to_string(),
+                level: SurfaceLintLevel::Warn,
+            },
+            crate::config::SurfaceLintDirective {
+                selector: "unnecessary-public".to_string(),
+                level: SurfaceLintLevel::Deny,
+            },
+            crate::config::SurfaceLintDirective {
+                selector: "warnings".to_string(),
+                level: SurfaceLintLevel::Warn,
+            },
+        ]);
+        let result = apply_diagnostic_policy(&analysis(), &config).expect("ordered policy");
+        assert_eq!(result.findings[0].level, SurfaceLintLevel::Warn);
+
+        let mut crate_visibility = analysis();
+        crate_visibility.findings[0].kind = SurfaceFindingKind::UnnecessaryCrateVisibility;
+        let default =
+            apply_diagnostic_policy(&crate_visibility, &SurfaceConfig::default()).expect("crate visibility default");
+        assert!(default.findings.is_empty());
+        config.lint.push(crate::config::SurfaceLintDirective {
+            selector: "unnecessary-crate-visibility".to_string(),
+            level: SurfaceLintLevel::Deny,
+        });
+        assert_eq!(
+            apply_diagnostic_policy(&crate_visibility, &config)
+                .expect("explicit crate visibility")
+                .findings[0]
+                .level,
+            SurfaceLintLevel::Deny
         );
     }
 
@@ -1509,8 +1971,8 @@ mod tests {
         first.item_identity = "first-item".to_string();
         first.declaration_start = 0;
         first.declaration_end = 17;
-        first.visibility_start = 0;
-        first.visibility_end = 3;
+        first.visibility_start = Some(0);
+        first.visibility_end = Some(3);
 
         let second_start = source
             .windows(b"pub(crate)".len())
@@ -1522,8 +1984,8 @@ mod tests {
         second.kind = SurfaceFindingKind::UnnecessaryCrateVisibility;
         second.declaration_start = second_start as u64;
         second.declaration_end = source.len() as u64;
-        second.visibility_start = second_start as u64;
-        second.visibility_end = (second_start + b"pub(crate)".len()) as u64;
+        second.visibility_start = Some(second_start as u64);
+        second.visibility_end = Some((second_start + b"pub(crate)".len()) as u64);
         second.replacement = Some("pub(super)");
 
         let (updated, edits) = apply_visibility_edits(source, &[&first, &second]).expect("edits should be exact");
@@ -1541,8 +2003,8 @@ mod tests {
         first.identity = "first".to_string();
         first.declaration_start = 0;
         first.declaration_end = source.len() as u64;
-        first.visibility_start = 0;
-        first.visibility_end = 3;
+        first.visibility_start = Some(0);
+        first.visibility_end = Some(3);
         let mut second = first.clone();
         second.identity = "second".to_string();
         assert!(
@@ -1552,7 +2014,7 @@ mod tests {
                 .contains("overlap")
         );
 
-        first.visibility_end = 6;
+        first.visibility_end = Some(6);
         assert!(
             apply_visibility_edits(source, &[&first])
                 .expect_err("unexpected original visibility must fail")
@@ -1572,8 +2034,8 @@ mod tests {
         item.kind = SurfaceFindingKind::UnnecessaryRestrictedVisibility;
         item.declaration_start = visibility_start as u64;
         item.declaration_end = source.len() as u64;
-        item.visibility_start = visibility_start as u64;
-        item.visibility_end = (visibility_start + b"pub ( super )".len()) as u64;
+        item.visibility_start = Some(visibility_start as u64);
+        item.visibility_end = Some((visibility_start + b"pub ( super )".len()) as u64);
         item.replacement = Some("private");
 
         let (updated, edits) = apply_visibility_edits(source, &[&item]).expect("private edit should be exact");

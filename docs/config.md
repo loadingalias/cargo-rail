@@ -53,6 +53,11 @@ targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 include_renamed = true
 major_version_conflict = "bump"
 
+[surface]
+enabled = true
+# Only when every compiler crate closed by policy has no external consumers.
+consumer_scope = "workspace"
+
 [release]
 remote_effects = "auto"
 
@@ -66,6 +71,7 @@ verification = ["verification/**"]
 | ------------------ | -------: | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | `targets`          |     `[]` | Additional target triples used for target-aware resolution and compiler evidence. `init` can detect these from repository configuration. |
 | `unify`            | defaults | Dependency and manifest policy.                                                                                                          |
+| `surface`          | defaults | Rust declaration reachability, diagnostic, and visibility-repair policy.                                                                 |
 | `release`          | defaults | Release, changelog, and remote-effect policy.                                                                                            |
 | `change-detection` | defaults | Planner classification policy.                                                                                                           |
 | `crates`           |     `{}` | Per-crate split, release, and changelog policy.                                                                                          |
@@ -118,6 +124,101 @@ msrv_policy = { mode = "compute", source = "workspace", inherit = true }
 consumer_scope = "workspace"
 preserve_features = ["unstable-*", "bench*"]
 ```
+
+## `[surface]`
+
+`cargo rail surface` merges authenticated compiler facts from production, non-production, build-script, proc-macro,
+doctest, feature, and configured target views into one physical declaration graph. With no operation flag it prints a
+read-only report and exits 0 even when findings exist. `--check` uses the same analysis but exits 1 for `deny` findings
+or configuration diagnostics; `warn` findings remain visible with exit 0. `--fix --dry-run` emits the exact mutation
+plan. `--fix` revalidates the captured snapshot, edits only planned visibility spans, recompiles every configured view,
+and writes a receipt after successful verification. Dead-public findings are report-only.
+
+| Field                     |      Default | Behavior                                                                                                                                                 |
+| ------------------------- | -----------: | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`                 |      `false` | Include the whole-workspace `surface` gate in planner and CI decisions. Direct `cargo rail surface` inspection remains available when disabled.          |
+| `consumer_scope`          |     `"open"` | `"workspace"` permits closed-world conclusions at the compiler-crate boundary described below.                                                          |
+| `targets`                 |   `["host"]` | Compiler target views to merge. Use `"host"` or target triples already captured by the top-level `targets` policy.                                       |
+| `crate_visibility`        | `"preserve"` | `"allow"` enables the otherwise allow-by-default `unnecessary-crate-visibility` class.                                                                  |
+| `preserve_uniform_fields` |      `false` | Preserve one intentional field-visibility level across a struct or union instead of reducing fields independently.                                       |
+| `lint`                    |         `[]` | Ordered global `{ selector, level }` directives. Later matching directives win; `selector` is `warnings` or one exact lint.                              |
+| `product`                 |         `[]` | Complete shipped binary/library roots. When empty, every workspace binary is implicit; an explicit list replaces that inference.                         |
+| `feature-profile`         |         `[]` | Exact Cargo feature profiles. Empty uses automatic coverage; an explicit list replaces it.                                                               |
+| `doctest`                 |         `[]` | Exact doctest package set. Empty follows `doctest_coverage`.                                                                                              |
+| `doctest_coverage`        |  `"automatic"` | `"automatic"` covers every doctest-enabled workspace package; `"disabled"` covers none and cannot accompany explicit doctests.                        |
+| `external`                |         `[]` | Exact compiler crates deliberately kept outside closed-world authority, each with a reason.                                                              |
+| `override`                |         `[]` | Item-specific policy. `allow` suppresses, `expect` suppresses but fails when stale, and `warn`/`deny` retain a finding.                                  |
+| `exclude`                 |         `[]` | Module- or repository-file-scoped policy with the same `allow`, `expect`, `warn`, and `deny` levels.                                                     |
+
+The four lint names are `dead-public`, `unnecessary-public`, `unnecessary-restricted-visibility`, and
+`unnecessary-crate-visibility`. Core findings deny by default; crate-visibility reductions allow by default. The
+ordered `warnings` selector applies to the three core classes. `--only` filters
+finding classes after policy evaluation and never hides unknown, ambiguous, overlapping, or stale policy diagnostics.
+
+Closed-world authority is exact per compiler crate, not per package. Selected binary products are closed even in a
+publishable package. With `consumer_scope = "workspace"`, non-publishable library, proc-macro, and build-script targets
+are also closed; publishable libraries stay open. A physical declaration observed in any open compiler crate is
+preserved even when another observation is closed. `[[surface.external]]` opens a named compiler crate explicitly.
+
+```toml
+[surface]
+enabled = true
+consumer_scope = "workspace"
+targets = ["host", "x86_64-unknown-linux-gnu"]
+crate_visibility = "allow"
+preserve_uniform_fields = true
+
+[[surface.product]]
+package = "app"
+bin = "app"
+target = "cfg(unix)"
+reason = "shipped application"
+
+[[surface.feature-profile]]
+name = "server"
+no-default-features = true
+features = ["tls", "metrics"]
+
+[[surface.doctest]]
+package = "app-core"
+
+[[surface.external]]
+crate = "app_ffi"
+reason = "loaded by consumers outside this workspace"
+
+[[surface.lint]]
+selector = "warnings"
+level = "warn"
+
+[[surface.lint]]
+selector = "dead-public"
+level = "deny"
+
+[[surface.override]]
+lint = "dead-public"
+crate = "app_core"
+item = "migration::legacy_entry"
+kind = "function"
+target = "cfg(unix)"
+level = "expect"
+reason = "removed after downstream migration"
+
+[[surface.exclude]]
+package = "app-core"
+module = "generated"
+level = "expect"
+reason = "generated protocol bindings"
+```
+
+Each product or policy entry can use an optional Cargo target triple or `cfg(...)` selector. An override and exclusion
+requires exactly one owner selector, `package` or Rust compiler `crate`; exclusions require exactly one of `module` or
+`file`. Missing and ambiguous item selectors are configuration failures instead of broad matches.
+
+`surface.targets` selects only target views declared by the repository's top-level target policy. With no explicit
+feature profiles, Cargo-Rail derives default, no-default, all-features, and applicable selected-feature views from
+manifests and cfg expressions. Explicit profiles replace that matrix exactly.
+
+See [Migrate from Hawk](migrate-hawk.md) for configuration and command mappings.
 
 ## `[release]`
 

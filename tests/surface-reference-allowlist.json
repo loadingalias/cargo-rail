@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "differences": [
+    {
+      "tool": "cargo-rail",
+      "finding": {
+        "package": "surface-conformance-app",
+        "crate": "surface_conformance_app",
+        "item": "live_binary_surface",
+        "item_kind": "function",
+        "source": "app/src/main.rs",
+        "declaration_start": 138,
+        "finding": "dead-public",
+        "replacement": null
+      },
+      "reason": "Cargo-Rail audits source declarations compiled into the selected closed binary; the reference analyzer audits workspace library declarations only.",
+      "owner": "surface compiler-crate authority"
+    },
+    {
+      "tool": "cargo-rail",
+      "finding": {
+        "package": "surface-conformance-app",
+        "crate": "surface_conformance_app",
+        "item": "dead_binary_surface",
+        "item_kind": "function",
+        "source": "app/src/main.rs",
+        "declaration_start": 171,
+        "finding": "dead-public",
+        "replacement": null
+      },
+      "reason": "Cargo-Rail audits source declarations compiled into the selected closed binary; the reference analyzer audits workspace library declarations only.",
+      "owner": "surface compiler-crate authority"
+    },
+    {
+      "tool": "cargo-rail",
+      "finding": {
+        "package": "surface-conformance-app",
+        "crate": "surface_conformance_app",
+        "item": "test_support",
+        "item_kind": "function",
+        "source": "app/src/main.rs",
+        "declaration_start": 316,
+        "finding": "unnecessary-public",
+        "replacement": ""
+      },
+      "reason": "Cargo-Rail audits source declarations compiled into the selected closed binary; the reference analyzer audits workspace library declarations only.",
+      "owner": "surface compiler-crate authority"
+    }
+  ]
+}

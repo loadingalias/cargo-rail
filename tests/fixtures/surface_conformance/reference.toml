@@ -1,0 +1,18 @@
+preserve-uniform-field-visibility = true
+
+[[production]]
+package = "surface-conformance-app"
+bin = "surface-conformance-app"
+reason = "shipped conformance binary"
+
+[[production]]
+package = "surface-conformance-tool"
+bin = "surface-conformance-tool"
+reason = "second shipped conformance binary"
+
+[[feature-profile]]
+name = "all-features"
+all-features = true
+
+[[doctest]]
+package = "surface-conformance-core"

@@ -806,13 +806,17 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
     release_targets: list[str] = []
     for index, value in enumerate(release_entries):
         entry = require_object(
-            value, f"release-targets[{index}]", {"target", "os", "archive"}
+            value, f"release-targets[{index}]", {"target", "os", "archive", "surface"}
         )
         target = require_string(entry["target"], f"release-targets[{index}].target")
         require_string(entry["os"], f"release-targets[{index}].os")
         require(
             entry["archive"] in {"tar", "zip"},
             f"release-targets[{index}].archive is invalid",
+        )
+        require(
+            isinstance(entry["surface"], bool),
+            f"release-targets[{index}].surface must be a boolean",
         )
         release_targets.append(target)
     require_unique_sorted(release_targets, "release target registry")

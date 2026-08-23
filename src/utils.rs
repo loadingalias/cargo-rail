@@ -145,12 +145,17 @@ pub(crate) fn try_clone_regular_file(_source: &fs::File, _destination: &Path) ->
 /// evidence remains exact.
 #[cfg(target_os = "macos")]
 pub(crate) fn stable_file_generation(path: &Path) -> Option<Vec<u8>> {
-    use std::os::macos::fs::MetadataExt as _;
-
     let metadata = fs::symlink_metadata(path).ok()?;
     if !metadata.is_file() || is_symlink_or_reparse(&metadata) {
         return None;
     }
+    macos_file_generation(&metadata)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_file_generation(metadata: &fs::Metadata) -> Option<Vec<u8>> {
+    use std::os::macos::fs::MetadataExt as _;
+
     let mut generation = Vec::from(&b"macos-file-generation-v1\0"[..]);
     for value in [
         metadata.st_dev(),
@@ -171,14 +176,27 @@ pub(crate) fn stable_file_generation(path: &Path) -> Option<Vec<u8>> {
     Some(generation)
 }
 
+/// Capture stable generation evidence from an already-open regular file.
+#[cfg(target_os = "macos")]
+pub(crate) fn stable_open_file_generation(file: &fs::File) -> Option<Vec<u8>> {
+    let metadata = file.metadata().ok()?;
+    metadata.is_file().then_some(())?;
+    macos_file_generation(&metadata)
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn stable_file_generation(path: &Path) -> Option<Vec<u8>> {
-    use std::os::unix::fs::MetadataExt as _;
-
     let metadata = fs::symlink_metadata(path).ok()?;
     if !metadata.is_file() || is_symlink_or_reparse(&metadata) {
         return None;
     }
+    linux_file_generation(&metadata)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_file_generation(metadata: &fs::Metadata) -> Option<Vec<u8>> {
+    use std::os::unix::fs::MetadataExt as _;
+
     let mut generation = Vec::from(&b"linux-file-generation-v1\0"[..]);
     for value in [
         metadata.dev(),
@@ -194,6 +212,14 @@ pub(crate) fn stable_file_generation(path: &Path) -> Option<Vec<u8>> {
         generation.extend_from_slice(&value.to_le_bytes());
     }
     Some(generation)
+}
+
+/// Capture stable generation evidence from an already-open regular file.
+#[cfg(target_os = "linux")]
+pub(crate) fn stable_open_file_generation(file: &fs::File) -> Option<Vec<u8>> {
+    let metadata = file.metadata().ok()?;
+    metadata.is_file().then_some(())?;
+    linux_file_generation(&metadata)
 }
 
 #[cfg(windows)]
@@ -228,8 +254,22 @@ fn windows_file_generation(observation: crate::windows_fs::FileObservation) -> O
     Some(generation)
 }
 
+/// Capture stable generation evidence from an already-open regular file.
+#[cfg(windows)]
+pub(crate) fn stable_open_file_generation(file: &fs::File) -> Option<Vec<u8>> {
+    let observation = crate::windows_fs::observe_file(file).ok()?;
+    crate::windows_fs::prove_local_ntfs(file, observation.volume_serial_number).ok()?;
+    windows_file_generation(observation)
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub(crate) fn stable_file_generation(_path: &Path) -> Option<Vec<u8>> {
+    None
+}
+
+/// Stable opened-file generations are unavailable on this host.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub(crate) fn stable_open_file_generation(_file: &fs::File) -> Option<Vec<u8>> {
     None
 }
 

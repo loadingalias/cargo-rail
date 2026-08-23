@@ -6,8 +6,9 @@ readonly repository_root
 
 : "${CARGO_RAIL_TEST_FACT_DRIVER:?compiler fact driver authority is required}"
 
-cargo build --locked -p cargo-rail --all-features --bin cargo-rail
-observation_wrapper="$repository_root/target/debug/cargo-rail"
+cargo build --locked -p cargo-rail --all-features \
+  --bin cargo-rail --bin cargo-rail-compiler-observation
+observation_wrapper="$repository_root/target/debug/cargo-rail-compiler-observation"
 if [[ "${OS:-}" == Windows_NT ]]; then
   observation_wrapper="$observation_wrapper.exe"
 fi

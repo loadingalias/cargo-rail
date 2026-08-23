@@ -7,7 +7,7 @@
 
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::{ErrorKind, Read as _, Write as _};
+use std::io::{ErrorKind, Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -55,6 +55,15 @@ pub(crate) struct CompilerFactDriverComponent {
     authority: CompilerFactDriverAuthority,
     path: PathBuf,
     compiler_library_directory: PathBuf,
+    compiler_library_path: PathBuf,
+}
+
+/// Runtime-library bytes authenticated once and retained through doctest staging.
+struct AuthenticatedCompilerLibrary {
+    path: PathBuf,
+    file: File,
+    generation: Vec<u8>,
+    bytes: u64,
 }
 
 /// Handle-bound executable bytes retained for the lifetime of a compiler run.
@@ -78,7 +87,7 @@ pub(crate) struct PreparedCompilerFactDriver {
     execution: CompilerFactDriverExecutionCapability,
     producer_authority: CompilerFactProducerAuthority,
     compiler_library_directory: PathBuf,
-    compiler_library_path: PathBuf,
+    compiler_library: AuthenticatedCompilerLibrary,
     compiler_library_digest: String,
 }
 
@@ -93,6 +102,8 @@ pub(crate) struct CompilerFactDoctestSysroot {
     runtime_library: PathBuf,
     #[cfg(unix)]
     runtime_library_generation: Option<Vec<u8>>,
+    #[cfg(unix)]
+    runtime_library_bytes: u64,
     _runtime_library_file: File,
     #[cfg(windows)]
     _root_guard: File,
@@ -110,6 +121,19 @@ pub(crate) struct CompilerFactDoctestSysroot {
 }
 
 impl CompilerFactDriverAuthority {
+    /// Fail before workspace acquisition when an installed surface command
+    /// cannot authenticate its companion producer.
+    pub(crate) fn require_surface_installation() -> RailResult<()> {
+        if Self::embedded()?.is_some() {
+            Ok(())
+        } else {
+            Err(RailError::with_help(
+                "surface is unavailable in this source-built cargo-rail installation",
+                "install a supported native cargo-rail archive with its adjacent authenticated compiler-fact driver; cargo install does not provide surface",
+            ))
+        }
+    }
+
     fn embedded() -> RailResult<Option<Self>> {
         Self::from_fields([
             FACT_DRIVER_FILE,
@@ -198,7 +222,6 @@ impl CompilerFactDriverAuthority {
     fn validate_toolchain(&self, toolchain: &ToolchainIdentity) -> RailResult<PathBuf> {
         self.validate_toolchain_identity(toolchain)?;
         let library = toolchain.rustc_sysroot().join(&self.compiler_library);
-        authenticate_compiler_library(&library, &self.compiler_library_digest)?;
         library
             .parent()
             .map(Path::to_path_buf)
@@ -315,10 +338,16 @@ impl CompilerFactDriverComponent {
         })?;
         let path = directory.join(&authority.file_name);
         authenticate_component_file(&path, &authority.content_digest)?;
+        let compiler_library_path = compiler_library_directory.join(
+            Path::new(&authority.compiler_library)
+                .file_name()
+                .ok_or_else(|| RailError::message("compiler fact runtime library has no file name"))?,
+        );
         Ok(Self {
             authority: authority.clone(),
             path,
             compiler_library_directory,
+            compiler_library_path,
         })
     }
 
@@ -389,12 +418,9 @@ impl PreparedCompilerFactDriver {
             ));
         }
         let compiler_library_directory = component.compiler_library_directory().to_path_buf();
-        let compiler_library_path = compiler_library_directory.join(
-            Path::new(&component.authority.compiler_library)
-                .file_name()
-                .ok_or_else(|| RailError::message("compiler fact runtime library has no file name"))?,
-        );
         let compiler_library_digest = component.authority.compiler_library_digest.clone();
+        let compiler_library =
+            authenticate_compiler_library(&component.compiler_library_path, &compiler_library_digest)?;
         let execution = component.stage()?;
         let producer_authority = CompilerFactProducerAuthority {
             compiler_identity: expected_producer.compiler_identity.clone(),
@@ -409,7 +435,7 @@ impl PreparedCompilerFactDriver {
             execution,
             producer_authority,
             compiler_library_directory,
-            compiler_library_path,
+            compiler_library,
             compiler_library_digest,
         })
     }
@@ -444,7 +470,7 @@ impl PreparedCompilerFactDriver {
             wrapper_digest,
             rustdoc,
             rustdoc_digest,
-            &self.compiler_library_path,
+            &self.compiler_library,
             &self.compiler_library_digest,
         )
     }
@@ -458,8 +484,8 @@ impl CompilerFactDoctestSysroot {
         _wrapper_digest: &str,
         rustdoc: &Path,
         _rustdoc_digest: &str,
-        compiler_library: &Path,
-        compiler_library_digest: &str,
+        compiler_library: &AuthenticatedCompilerLibrary,
+        _compiler_library_digest: &str,
     ) -> RailResult<Self> {
         use std::os::unix::fs::{PermissionsExt as _, symlink};
 
@@ -479,17 +505,21 @@ impl CompilerFactDoctestSysroot {
         symlink(toolchain_sysroot.join("lib/rustlib"), library.join("rustlib"))?;
         let runtime_library = library.join(
             compiler_library
+                .path
                 .file_name()
                 .ok_or_else(|| RailError::message("compiler fact runtime library has no file name"))?,
         );
-        clone_or_copy_runtime_library(compiler_library, &runtime_library)?;
-        authenticate_compiler_library(&runtime_library, compiler_library_digest)?;
-        fs::set_permissions(&runtime_library, fs::Permissions::from_mode(0o400))?;
-        let runtime_library_file = File::open(&runtime_library)?;
-        let runtime_library_generation =
-            Some(crate::utils::stable_file_generation(&runtime_library).ok_or_else(|| {
-                RailError::message("private doctest runtime library has no stable filesystem generation")
-            })?);
+        let runtime_library_file = clone_or_copy_runtime_library(compiler_library, &runtime_library)?;
+        runtime_library_file.set_permissions(fs::Permissions::from_mode(0o400))?;
+        let runtime_library_generation = crate::utils::stable_open_file_generation(&runtime_library_file)
+            .ok_or_else(|| RailError::message("private doctest runtime library has no stable filesystem generation"))?;
+        if crate::utils::stable_file_generation(&runtime_library).as_ref() != Some(&runtime_library_generation)
+            || !crate::utils::opened_file_matches_path(&runtime_library_file, &runtime_library, compiler_library.bytes)?
+        {
+            return Err(RailError::message(
+                "private doctest runtime library changed while it was retained",
+            ));
+        }
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o500))?;
         fs::set_permissions(&library, fs::Permissions::from_mode(0o500))?;
         fs::set_permissions(&root, fs::Permissions::from_mode(0o500))?;
@@ -499,7 +529,8 @@ impl CompilerFactDoctestSysroot {
             rustdoc_target: rustdoc,
             library_target: toolchain_sysroot.join("lib/rustlib"),
             runtime_library,
-            runtime_library_generation,
+            runtime_library_generation: Some(runtime_library_generation),
+            runtime_library_bytes: compiler_library.bytes,
             _runtime_library_file: runtime_library_file,
             _directory: directory,
         };
@@ -514,13 +545,13 @@ impl CompilerFactDoctestSysroot {
         wrapper_digest: &str,
         rustdoc: &Path,
         rustdoc_digest: &str,
-        compiler_library: &Path,
+        compiler_library: &AuthenticatedCompilerLibrary,
         compiler_library_digest: &str,
     ) -> RailResult<Self> {
         let toolchain_sysroot = crate::utils::canonicalize_existing(toolchain_sysroot)?;
         let wrapper = crate::utils::canonicalize_existing(wrapper)?;
         let rustdoc = crate::utils::canonicalize_existing(rustdoc)?;
-        let compiler_library = crate::utils::canonicalize_existing(compiler_library)?;
+        let compiler_library = crate::utils::canonicalize_existing(&compiler_library.path)?;
         let directory = tempfile::Builder::new()
             .prefix("cargo-rail-doctest-sysroot-")
             .tempdir()?;
@@ -625,7 +656,7 @@ impl CompilerFactDoctestSysroot {
         _wrapper_digest: &str,
         _rustdoc: &Path,
         _rustdoc_digest: &str,
-        _compiler_library: &Path,
+        _compiler_library: &AuthenticatedCompilerLibrary,
         _compiler_library_digest: &str,
     ) -> RailResult<Self> {
         Err(RailError::message(
@@ -644,6 +675,11 @@ impl CompilerFactDoctestSysroot {
                 || fs::read_link(self.root.join("bin/rustdoc"))? != self.rustdoc_target
                 || fs::read_link(self.root.join("lib/rustlib"))? != self.library_target
                 || self.runtime_library_generation != crate::utils::stable_file_generation(&self.runtime_library)
+                || !crate::utils::opened_file_matches_path(
+                    &self._runtime_library_file,
+                    &self.runtime_library,
+                    self.runtime_library_bytes,
+                )?
             {
                 return Err(RailError::message(
                     "private doctest compiler sysroot changed during acquisition",
@@ -695,14 +731,41 @@ impl Drop for CompilerFactDoctestSysroot {
 }
 
 #[cfg(unix)]
-fn clone_or_copy_runtime_library(source: &Path, destination: &Path) -> RailResult<()> {
-    let source_file = File::open(source)?;
-    if let Some(clone) = crate::utils::try_clone_regular_file(&source_file, destination) {
-        drop(clone);
-        return Ok(());
+fn clone_or_copy_runtime_library(source: &AuthenticatedCompilerLibrary, destination: &Path) -> RailResult<File> {
+    if crate::utils::stable_open_file_generation(&source.file).as_ref() != Some(&source.generation)
+        || !crate::utils::opened_file_matches_path(&source.file, &source.path, source.bytes)?
+    {
+        return Err(RailError::message(
+            "authenticated compiler fact runtime library changed before doctest staging",
+        ));
     }
-    fs::copy(source, destination)?;
-    Ok(())
+    let output = if let Some(clone) = crate::utils::try_clone_regular_file(&source.file, destination) {
+        clone
+    } else {
+        let mut input = source.file.try_clone()?;
+        input.seek(std::io::SeekFrom::Start(0))?;
+        let mut output = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(destination)?;
+        let copied = std::io::copy(&mut input.take(source.bytes.saturating_add(1)), &mut output)?;
+        if copied != source.bytes {
+            return Err(RailError::message(
+                "authenticated compiler fact runtime library changed while it was copied",
+            ));
+        }
+        output
+    };
+    if crate::utils::stable_open_file_generation(&source.file).as_ref() != Some(&source.generation)
+        || !crate::utils::opened_file_matches_path(&source.file, &source.path, source.bytes)?
+        || !crate::utils::opened_file_matches_path(&output, destination, source.bytes)?
+    {
+        return Err(RailError::message(
+            "authenticated compiler fact runtime library changed during doctest staging",
+        ));
+    }
+    Ok(output)
 }
 
 #[cfg(windows)]
@@ -932,7 +995,7 @@ fn authenticate_component_file(path: &Path, expected_digest: &str) -> RailResult
     transfer_authenticated_component(path, expected_digest, None)
 }
 
-fn authenticate_compiler_library(path: &Path, expected_digest: &str) -> RailResult<u64> {
+fn authenticate_compiler_library(path: &Path, expected_digest: &str) -> RailResult<AuthenticatedCompilerLibrary> {
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         RailError::message(format!(
             "failed to inspect compiler fact runtime library '{}': {error}",
@@ -983,7 +1046,19 @@ fn authenticate_compiler_library(path: &Path, expected_digest: &str) -> RailResu
             "install the exact rustc-dev component for the selected toolchain",
         ));
     }
-    Ok(bytes)
+    let generation = crate::utils::stable_open_file_generation(&file)
+        .ok_or_else(|| RailError::message("compiler fact runtime library has no stable filesystem generation"))?;
+    if !crate::utils::opened_file_matches_path(&file, path, metadata.len())? {
+        return Err(RailError::message(
+            "compiler fact runtime library changed while its generation was retained",
+        ));
+    }
+    Ok(AuthenticatedCompilerLibrary {
+        path: path.to_path_buf(),
+        file,
+        generation,
+        bytes,
+    })
 }
 
 fn transfer_authenticated_component(
@@ -1250,6 +1325,33 @@ mod tests {
             file.set_permissions(fs::Permissions::from_mode(0o700))
                 .expect("make component executable");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctest_runtime_clone_reuses_only_retained_authenticated_bytes() {
+        let directory = tempfile::tempdir().expect("runtime directory");
+        let source = directory.path().join("librustc_driver-test");
+        let destination = directory.path().join("private-runtime");
+        let bytes = b"authenticated compiler runtime";
+        fs::write(&source, bytes).expect("runtime bytes");
+        let authenticated = authenticate_compiler_library(&source, &digest(bytes)).expect("authenticated runtime");
+
+        let cloned = clone_or_copy_runtime_library(&authenticated, &destination).expect("retained runtime clone");
+        assert!(
+            crate::utils::opened_file_matches_path(
+                &cloned,
+                &destination,
+                u64::try_from(bytes.len()).expect("runtime length")
+            )
+            .expect("destination identity")
+        );
+        assert_eq!(fs::read(&destination).expect("cloned bytes"), bytes);
+
+        fs::write(&source, b"changed compiler runtime").expect("change runtime bytes");
+        let rejected = directory.path().join("rejected-runtime");
+        clone_or_copy_runtime_library(&authenticated, &rejected).unwrap_err();
+        assert!(!rejected.exists());
     }
 
     #[test]

@@ -65,6 +65,12 @@ jobs:
           rustup component add rustc-dev
           just check-compiler-fact-driver
 
+      - name: Enforce Rust surface
+        run: |
+          scripts/with-compiler-fact-driver.sh cargo build --locked \
+            --bin cargo-rail --bin cargo-rail-compiler-observation
+          target/debug/cargo-rail rail surface --check --format github
+
   compatibility:
     name: Compatibility
     needs: quality

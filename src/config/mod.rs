@@ -15,7 +15,8 @@ pub use release::{
 };
 pub use split::{CratePath, CrateSplitConfig, SplitConfig, SplitMode, WorkspaceMode};
 pub use surface::{
-    SurfaceConfig, SurfaceConsumerScope, SurfaceCrateVisibility, SurfaceExclude, SurfaceLintLevel, SurfaceOverride,
+    SurfaceConfig, SurfaceConsumerScope, SurfaceCrateVisibility, SurfaceDoctest, SurfaceDoctestCoverage,
+    SurfaceExclude, SurfaceExternal, SurfaceFeatureProfile, SurfaceLintDirective, SurfaceLintLevel, SurfaceOverride,
     SurfaceProduct,
 };
 pub use unify::{

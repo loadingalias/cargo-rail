@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "reference": {
+    "version": "0.1.13",
+    "commit": "a3b75f193b931d11cf8883c44bda3f9a79c8f19a",
+    "archive_sha256": "489f22d7df7e819273fa15c9558128e3a10f206672fb75c8544117e390dc095f",
+    "rust": "1.98.0"
+  },
+  "fixture": "tests/fixtures/surface_conformance",
+  "cases": [
+    {
+      "name": "binary-products",
+      "reference_config": "reference.toml",
+      "rail_config": ".config/rail.toml",
+      "allowlist": "tests/surface-reference-allowlist.json"
+    },
+    {
+      "name": "internal-library",
+      "reference_config": "reference-library.toml",
+      "rail_config": ".config/rail-library.toml",
+      "allowlist": "tests/surface-reference-library-allowlist.json"
+    }
+  ],
+  "performance_case": "binary-products",
+  "target": "host",
+  "feature_profiles": ["all-features"],
+  "doctest_packages": ["surface-conformance-core"]
+}

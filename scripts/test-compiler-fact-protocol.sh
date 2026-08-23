@@ -34,7 +34,7 @@ CARGO_RAIL_CACHE_DIR="$fact_cache" \
 # it needs an embedded driver authority rather than a runtime driver path.
 "$repository_root/scripts/with-compiler-fact-driver.sh" \
   cargo nextest run --locked -p cargo-rail --all-features --test integration --config-file .config/nextest.toml \
-    --run-ignored ignored-only surface_check_collects_production_tests_and_doctests_once
+    --run-ignored ignored-only --filterset 'test(/^test_surface::surface_/)'
 
 if [[ "${OS:-}" != "Windows_NT" ]]; then
   CARGO_RAIL_TEST_FACT_DRIVER="$driver" \

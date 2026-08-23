@@ -39,6 +39,14 @@
   ],
   "native_hosts": [
     {
+      "target": "aarch64-apple-darwin",
+      "runner": "macos-14",
+      "cache_key": "macos-arm64",
+      "full_suite": true,
+      "filesystem": "apfs",
+      "case_sensitive": false
+    },
+    {
       "target": "aarch64-pc-windows-msvc",
       "runner": "windows-11-arm",
       "cache_key": "windows-arm64",
@@ -53,6 +61,14 @@
       "full_suite": true,
       "filesystem": "ext4",
       "case_sensitive": true
+    },
+    {
+      "target": "x86_64-apple-darwin",
+      "runner": "macos-15-intel",
+      "cache_key": "macos-x64",
+      "full_suite": true,
+      "filesystem": "apfs",
+      "case_sensitive": false
     },
     {
       "target": "x86_64-pc-windows-msvc",

@@ -48,13 +48,20 @@ struct SurfaceItemKey {
 }
 
 /// One Rust privacy domain, normalized across feature and platform views.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct SurfaceCrateIdentity {
-    package: CompilerFactPackage,
-    cargo_target: String,
-    crate_name: String,
-    target_kind: CompilerFactTargetKind,
-    role: CompilerFactRole,
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub(crate) struct SurfaceCompilerCrate {
+    pub(crate) package: CompilerFactPackage,
+    pub(crate) cargo_target: String,
+    pub(crate) crate_name: String,
+    pub(crate) target_kind: CompilerFactTargetKind,
+    pub(crate) role: CompilerFactRole,
+}
+
+/// One exact target/cfg observation for a physical declaration.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub(crate) struct SurfaceTargetObservation {
+    pub(crate) platform: String,
+    pub(crate) cfg: Vec<String>,
 }
 
 /// Cargo product kind used to select complete production roots.
@@ -73,7 +80,20 @@ pub(crate) struct SurfaceProductRoot {
     pub(crate) kind: SurfaceProductKind,
 }
 
-impl From<&CompilerFactObject> for SurfaceCrateIdentity {
+/// One configured product and its optional Cargo target selector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SurfaceProductSelection {
+    pub(crate) root: SurfaceProductRoot,
+    pub(crate) target: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SurfaceProductObservation {
+    root: SurfaceProductRoot,
+    target: SurfaceTargetObservation,
+}
+
+impl From<&CompilerFactObject> for SurfaceCompilerCrate {
     fn from(object: &CompilerFactObject) -> Self {
         Self {
             package: object.unit.package.clone(),
@@ -81,6 +101,15 @@ impl From<&CompilerFactObject> for SurfaceCrateIdentity {
             crate_name: object.unit.crate_name.clone(),
             target_kind: object.unit.target_kind.clone(),
             role: object.unit.role,
+        }
+    }
+}
+
+impl From<&CompilerFactObject> for SurfaceTargetObservation {
+    fn from(object: &CompilerFactObject) -> Self {
+        Self {
+            platform: object.unit.platform.clone(),
+            cfg: object.unit.cfg.clone(),
         }
     }
 }
@@ -154,9 +183,11 @@ struct SurfaceItem {
     names: BTreeSet<String>,
     diagnostic_paths: BTreeSet<String>,
     packages: BTreeSet<CompilerFactPackage>,
-    compiler_crates: BTreeSet<SurfaceCrateIdentity>,
+    compiler_crates: BTreeSet<SurfaceCompilerCrate>,
+    target_observations: BTreeSet<SurfaceTargetObservation>,
     parent_observations: BTreeSet<Option<SurfaceItemKey>>,
     written_visibilities: BTreeSet<SurfaceVisibility>,
+    effective_visibilities: BTreeSet<SurfaceVisibility>,
     visibility_spans: BTreeSet<Option<SurfaceSpan>>,
     macro_provenance: BTreeSet<SurfaceMacroProvenance>,
     retentions: BTreeSet<String>,
@@ -170,8 +201,10 @@ impl SurfaceItem {
             diagnostic_paths: BTreeSet::new(),
             packages: BTreeSet::new(),
             compiler_crates: BTreeSet::new(),
+            target_observations: BTreeSet::new(),
             parent_observations: BTreeSet::new(),
             written_visibilities: BTreeSet::new(),
+            effective_visibilities: BTreeSet::new(),
             visibility_spans: BTreeSet::new(),
             macro_provenance: BTreeSet::new(),
             retentions: BTreeSet::new(),
@@ -181,15 +214,21 @@ impl SurfaceItem {
     fn classification_is_supported(&self) -> bool {
         self.retentions.is_empty()
             && self.names.len() == 1
-            && self.written_visibilities.len() == 1
-            && self.visibility_spans.len() == 1
-            && self.visibility_spans.first().is_some_and(Option::is_some)
+            && self.effective_visibilities.len() == 1
             && self.macro_provenance == BTreeSet::from([SurfaceMacroProvenance::Written])
     }
 
     fn written_visibility(&self) -> Option<SurfaceVisibility> {
-        (self.written_visibilities.len() == 1)
-            .then(|| self.written_visibilities.first().copied())
+        (self.written_visibilities.len() == 1
+            && self.visibility_spans.len() == 1
+            && self.visibility_spans.first().is_some_and(Option::is_some))
+        .then(|| self.written_visibilities.first().copied())
+        .flatten()
+    }
+
+    fn effective_visibility(&self) -> Option<SurfaceVisibility> {
+        (self.effective_visibilities.len() == 1)
+            .then(|| self.effective_visibilities.first().copied())
             .flatten()
     }
 }
@@ -204,26 +243,23 @@ struct SurfaceEdge {
 /// Closed-world authority supplied by the policy layer.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SurfacePolicy {
-    closed_world_packages: BTreeSet<CompilerFactPackage>,
+    closed_world_crates: BTreeSet<SurfaceCompilerCrate>,
     unnecessary_crate_visibility: bool,
     preserve_uniform_fields: bool,
-    products: BTreeSet<SurfaceProductRoot>,
+    products: Vec<SurfaceProductSelection>,
 }
 
 impl SurfacePolicy {
-    pub(crate) fn new(
-        closed_world_packages: BTreeSet<CompilerFactPackage>,
-        unnecessary_crate_visibility: bool,
-    ) -> Self {
+    pub(crate) fn new(closed_world_crates: BTreeSet<SurfaceCompilerCrate>, unnecessary_crate_visibility: bool) -> Self {
         Self {
-            closed_world_packages,
+            closed_world_crates,
             unnecessary_crate_visibility,
             preserve_uniform_fields: false,
-            products: BTreeSet::new(),
+            products: Vec::new(),
         }
     }
 
-    pub(crate) fn with_products(mut self, products: BTreeSet<SurfaceProductRoot>) -> Self {
+    pub(crate) fn with_products(mut self, products: Vec<SurfaceProductSelection>) -> Self {
         self.products = products;
         self
     }
@@ -288,13 +324,15 @@ pub(crate) struct SurfaceFinding {
     pub(crate) name: String,
     pub(crate) item_kind: &'static str,
     pub(crate) packages: Vec<String>,
+    pub(crate) compiler_crates: Vec<SurfaceCompilerCrate>,
+    pub(crate) target_observations: Vec<SurfaceTargetObservation>,
     pub(crate) diagnostic_paths: Vec<String>,
     pub(crate) source: String,
     pub(crate) source_generated: bool,
     pub(crate) declaration_start: u64,
     pub(crate) declaration_end: u64,
-    pub(crate) visibility_start: u64,
-    pub(crate) visibility_end: u64,
+    pub(crate) visibility_start: Option<u64>,
+    pub(crate) visibility_end: Option<u64>,
     pub(crate) replacement: Option<&'static str>,
     pub(crate) production_live: bool,
     pub(crate) non_production_live: bool,
@@ -308,6 +346,8 @@ pub(crate) struct SurfaceItemAnalysis {
     pub(crate) identity: String,
     pub(crate) item_kind: &'static str,
     pub(crate) packages: Vec<String>,
+    pub(crate) compiler_crates: Vec<SurfaceCompilerCrate>,
+    pub(crate) target_observations: Vec<SurfaceTargetObservation>,
     pub(crate) diagnostic_paths: Vec<String>,
     pub(crate) source: String,
     pub(crate) source_generated: bool,
@@ -339,7 +379,8 @@ pub(crate) struct SurfaceGraph {
     items: BTreeMap<SurfaceItemKey, SurfaceItem>,
     adjacency: BTreeMap<SurfaceItemKey, BTreeSet<(CompilerFactEdgeKind, SurfaceItemKey)>>,
     incoming: BTreeMap<SurfaceItemKey, BTreeSet<SurfaceItemKey>>,
-    product_roots: BTreeMap<SurfaceProductRoot, BTreeSet<SurfaceItemKey>>,
+    product_roots: BTreeMap<SurfaceProductObservation, BTreeSet<SurfaceItemKey>>,
+    workspace_library_roots: BTreeSet<SurfaceItemKey>,
     production_retention_roots: BTreeSet<SurfaceItemKey>,
     non_production_roots: BTreeSet<SurfaceItemKey>,
     required_public_roots: BTreeSet<SurfaceItemKey>,
@@ -403,10 +444,16 @@ impl SurfaceGraph {
                     .diagnostic_paths
                     .insert(object.strings[item.diagnostic_path.0 as usize].clone());
                 merged.packages.insert(object.unit.package.clone());
-                merged.compiler_crates.insert(SurfaceCrateIdentity::from(*object));
+                merged.compiler_crates.insert(SurfaceCompilerCrate::from(*object));
+                merged
+                    .target_observations
+                    .insert(SurfaceTargetObservation::from(*object));
                 merged
                     .written_visibilities
                     .insert(SurfaceVisibility::from(&item.written_visibility));
+                merged
+                    .effective_visibilities
+                    .insert(SurfaceVisibility::from(&item.effective_visibility));
                 merged.visibility_spans.insert(
                     item.visibility_span
                         .map(|span| surface_span(object, span))
@@ -420,24 +467,19 @@ impl SurfaceGraph {
         }
 
         let mut edges = BTreeSet::new();
-        let mut product_roots = BTreeMap::<SurfaceProductRoot, BTreeSet<SurfaceItemKey>>::new();
+        let mut product_roots = BTreeMap::<SurfaceProductObservation, BTreeSet<SurfaceItemKey>>::new();
+        let mut workspace_library_roots = BTreeSet::new();
         let mut production_retention_roots = BTreeSet::new();
         let mut non_production_roots = BTreeSet::new();
         let mut required_public_roots = BTreeSet::new();
         for (object_index, object) in objects.iter().enumerate() {
             let local = &local_items[object_index];
-            let product = surface_product(object);
+            let product = surface_product(object).map(|root| SurfaceProductObservation {
+                root,
+                target: SurfaceTargetObservation::from(*object),
+            });
             if let Some(product) = &product {
-                let roots = product_roots.entry(product.clone()).or_default();
-                if product.kind == SurfaceProductKind::Library {
-                    roots.extend(
-                        object
-                            .items
-                            .iter()
-                            .filter(|item| item.effective_visibility == CompilerFactVisibility::Public)
-                            .map(|item| local[&item.id].clone()),
-                    );
-                }
+                product_roots.entry(product.clone()).or_default();
             }
             for item in &object.items {
                 let key = &local[&item.id];
@@ -485,6 +527,9 @@ impl SurfaceGraph {
                         kind: edge.kind,
                     });
                     if edge.source.0[0] != edge.target.0[0] {
+                        if object.unit.domain == CompilerFactDomain::Production {
+                            workspace_library_roots.insert(target.clone());
+                        }
                         required_public_roots.insert(target);
                     }
                 }
@@ -505,6 +550,7 @@ impl SurfaceGraph {
             adjacency,
             incoming,
             product_roots,
+            workspace_library_roots,
             production_retention_roots,
             non_production_roots,
             required_public_roots,
@@ -514,24 +560,48 @@ impl SurfaceGraph {
     /// Compute the three closures and classify only declarations under explicit closed-world authority.
     pub(crate) fn analyze(&self, policy: &SurfacePolicy) -> RailResult<SurfaceAnalysis> {
         let mut production_roots = self.production_retention_roots.clone();
-        let mut required_public_roots = self.required_public_roots.clone();
+        let required_public_roots = self.required_public_roots.clone();
         if policy.products.is_empty() {
             for (product, roots) in &self.product_roots {
-                if product.kind == SurfaceProductKind::Binary {
+                if product.root.kind == SurfaceProductKind::Binary {
                     production_roots.extend(roots.iter().cloned());
                 }
             }
         } else {
-            for product in &policy.products {
-                let roots = self.product_roots.get(product).ok_or_else(|| {
-                    RailError::message(format!(
-                        "configured surface product '{}:{}' was not compiled",
-                        product.package, product.target
-                    ))
-                })?;
-                production_roots.extend(roots.iter().cloned());
-                if product.kind == SurfaceProductKind::Library {
-                    required_public_roots.extend(roots.iter().cloned());
+            for selection in &policy.products {
+                let mut matching = Vec::new();
+                for (product, roots) in &self.product_roots {
+                    if product.root == selection.root
+                        && target_selector_matches(selection.target.as_deref(), &product.target)?
+                    {
+                        matching.push((product, roots));
+                    }
+                }
+                if matching.is_empty() {
+                    return Err(RailError::message(format!(
+                        "configured surface product '{}:{}' was not compiled for its target selector",
+                        selection.root.package, selection.root.target
+                    )));
+                }
+                if selection.root.kind == SurfaceProductKind::Binary {
+                    for (_, roots) in matching {
+                        production_roots.extend(roots.iter().cloned());
+                    }
+                } else {
+                    production_roots.extend(
+                        self.workspace_library_roots
+                            .iter()
+                            .filter(|root| {
+                                self.items.get(*root).is_some_and(|item| {
+                                    item.compiler_crates.iter().any(|compiler_crate| {
+                                        compiler_crate.package.name == selection.root.package
+                                            && compiler_crate.cargo_target == selection.root.target
+                                            && compiler_crate.target_kind == CompilerFactTargetKind::Library
+                                    })
+                                })
+                            })
+                            .cloned(),
+                    );
                 }
             }
         }
@@ -557,6 +627,8 @@ impl SurfaceGraph {
                 identity: item.identity.clone(),
                 item_kind: item_kind_name(key.kind),
                 packages: item.packages.iter().map(|package| package.name.clone()).collect(),
+                compiler_crates: item.compiler_crates.iter().cloned().collect(),
+                target_observations: item.target_observations.iter().cloned().collect(),
                 diagnostic_paths: item.diagnostic_paths.iter().cloned().collect(),
                 source: source.clone(),
                 source_generated,
@@ -570,11 +642,7 @@ impl SurfaceGraph {
                 && let Some(kind) = self.classify_item(key, item, &state, policy)
             {
                 let identity = finding_identity(key, kind)?;
-                let visibility_span = item
-                    .visibility_spans
-                    .first()
-                    .and_then(Option::as_ref)
-                    .ok_or_else(|| RailError::message("classified surface item has no exact visibility span"))?;
+                let visibility_span = item.visibility_spans.first().and_then(Option::as_ref);
                 findings.push(SurfaceFinding {
                     identity,
                     item_identity: item.identity.clone(),
@@ -582,13 +650,15 @@ impl SurfaceGraph {
                     name: item.names.first().cloned().unwrap_or_default(),
                     item_kind: item_kind_name(key.kind),
                     packages: item.packages.iter().map(|package| package.name.clone()).collect(),
+                    compiler_crates: item.compiler_crates.iter().cloned().collect(),
+                    target_observations: item.target_observations.iter().cloned().collect(),
                     diagnostic_paths: item.diagnostic_paths.iter().cloned().collect(),
                     source,
                     source_generated,
                     declaration_start: key.span.start,
                     declaration_end: key.span.end,
-                    visibility_start: visibility_span.start,
-                    visibility_end: visibility_span.end,
+                    visibility_start: visibility_span.map(|span| span.start),
+                    visibility_end: visibility_span.map(|span| span.end),
                     replacement: self.replacement(key, kind, policy),
                     production_live: state.production_live,
                     non_production_live: state.non_production_live,
@@ -638,9 +708,9 @@ impl SurfaceGraph {
     fn item_has_closed_world_authority(&self, item: &SurfaceItem, policy: &SurfacePolicy) -> bool {
         !item.packages.is_empty()
             && item
-                .packages
+                .compiler_crates
                 .iter()
-                .all(|package| policy.closed_world_packages.contains(package))
+                .all(|compiler_crate| policy.closed_world_crates.contains(compiler_crate))
     }
 
     fn preserve_uniform_field_findings(&self, findings: &mut Vec<SurfaceFinding>) {
@@ -679,7 +749,13 @@ impl SurfaceGraph {
         state: &SurfaceItemAnalysis,
         policy: &SurfacePolicy,
     ) -> Option<SurfaceFindingKind> {
-        let visibility = item.written_visibility()?;
+        let Some(visibility) = item.written_visibility() else {
+            return (item.effective_visibility() == Some(SurfaceVisibility::Public)
+                && !state.required_public
+                && !state.production_live
+                && !state.non_production_live)
+                .then_some(SurfaceFindingKind::DeadPublic);
+        };
         match visibility {
             SurfaceVisibility::Public if state.required_public => None,
             SurfaceVisibility::Public if !state.production_live && !state.non_production_live => {
@@ -694,11 +770,17 @@ impl SurfaceGraph {
             {
                 Some(SurfaceFindingKind::UnnecessaryRestrictedVisibility)
             }
-            SurfaceVisibility::Crate if !state.required_public && policy.unnecessary_crate_visibility => {
-                let parent = self.defining_scope(key).and_then(|scope| self.parent_scope(&scope));
-                parent
-                    .filter(|scope| self.all_uses_fit(key, scope))
-                    .map(|_| SurfaceFindingKind::UnnecessaryCrateVisibility)
+            SurfaceVisibility::Crate if !state.required_public => {
+                let defining = self.defining_scope(key)?;
+                if self.all_uses_fit(key, &defining) {
+                    Some(SurfaceFindingKind::UnnecessaryRestrictedVisibility)
+                } else if policy.unnecessary_crate_visibility {
+                    self.parent_scope(&defining)
+                        .filter(|scope| self.all_uses_fit(key, scope))
+                        .map(|_| SurfaceFindingKind::UnnecessaryCrateVisibility)
+                } else {
+                    None
+                }
             }
             SurfaceVisibility::Private | SurfaceVisibility::Restricted | SurfaceVisibility::Crate => None,
         }
@@ -820,16 +902,39 @@ fn finding_reasons(kind: SurfaceFindingKind, state: &SurfaceItemAnalysis) -> Vec
 
 #[derive(Debug)]
 enum SurfaceScope {
-    Crate(SurfaceCrateIdentity),
-    Module(SurfaceItemKey, SurfaceCrateIdentity),
+    Crate(SurfaceCompilerCrate),
+    Module(SurfaceItemKey, SurfaceCompilerCrate),
 }
 
 impl SurfaceScope {
-    fn compiler_crate(&self) -> &SurfaceCrateIdentity {
+    fn compiler_crate(&self) -> &SurfaceCompilerCrate {
         match self {
             Self::Crate(compiler_crate) | Self::Module(_, compiler_crate) => compiler_crate,
         }
     }
+}
+
+/// Evaluate one Cargo target name or `cfg(...)` expression against authenticated compiler facts.
+pub(crate) fn target_selector_matches(
+    selector: Option<&str>,
+    observation: &SurfaceTargetObservation,
+) -> RailResult<bool> {
+    let Some(selector) = selector else {
+        return Ok(true);
+    };
+    let platform = selector
+        .parse::<cargo_platform::Platform>()
+        .map_err(|error| RailError::message(format!("invalid surface target selector '{selector}': {error}")))?;
+    let cfg = observation
+        .cfg
+        .iter()
+        .map(|value| {
+            value
+                .parse::<cargo_platform::Cfg>()
+                .map_err(|error| RailError::message(format!("compiler fact contains invalid cfg '{value}': {error}")))
+        })
+        .collect::<RailResult<Vec<_>>>()?;
+    Ok(platform.matches(&observation.platform, &cfg))
 }
 
 fn exactly_one<T: Clone + Ord>(values: &BTreeSet<T>) -> Option<T> {
@@ -1024,7 +1129,21 @@ mod tests {
     }
 
     fn policy(packages: &[&str], crate_visibility: bool) -> SurfacePolicy {
-        SurfacePolicy::new(packages.iter().map(|name| package(name)).collect(), crate_visibility)
+        let crates = packages
+            .iter()
+            .flat_map(|name| {
+                [CompilerFactTargetKind::Library, CompilerFactTargetKind::Binary].map(|target_kind| {
+                    SurfaceCompilerCrate {
+                        package: package(name),
+                        cargo_target: (*name).to_string(),
+                        crate_name: name.replace('-', "_"),
+                        target_kind,
+                        role: CompilerFactRole::Target,
+                    }
+                })
+            })
+            .collect();
+        SurfacePolicy::new(crates, crate_visibility)
     }
 
     #[test]
@@ -1325,6 +1444,72 @@ mod tests {
     }
 
     #[test]
+    fn unused_crate_visibility_reduces_to_private_as_restricted_visibility() {
+        let crate_visible = item(
+            (CRATE_A, 1),
+            (10, 30),
+            CompilerFactItemKind::Function,
+            CompilerFactVisibility::Crate,
+        );
+        let facts = object(
+            "app",
+            CompilerFactDomain::Production,
+            vec![crate_visible],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let findings = SurfaceGraph::from_objects(&[&facts])
+            .expect("merge graph")
+            .analyze(&policy(&["app"], false))
+            .expect("analyze graph")
+            .findings;
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].kind, SurfaceFindingKind::UnnecessaryRestrictedVisibility);
+        assert_eq!(findings[0].replacement, Some("private"));
+    }
+
+    #[test]
+    fn implicit_public_enum_variant_remains_a_report_only_dead_finding() {
+        let enumeration = item(
+            (CRATE_A, 1),
+            (10, 50),
+            CompilerFactItemKind::Enum,
+            CompilerFactVisibility::Public,
+        );
+        let mut variant = item(
+            (CRATE_A, 2),
+            (30, 40),
+            CompilerFactItemKind::Variant,
+            CompilerFactVisibility::Private,
+        );
+        variant.parent = Some(enumeration.id);
+        variant.visibility_span = None;
+        variant.effective_visibility = CompilerFactVisibility::Public;
+        let facts = object(
+            "app",
+            CompilerFactDomain::Production,
+            vec![enumeration, variant],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let findings = SurfaceGraph::from_objects(&[&facts])
+            .expect("merge graph")
+            .analyze(&policy(&["app"], false))
+            .expect("analyze graph")
+            .findings;
+        let variant = findings
+            .iter()
+            .find(|finding| finding.item_kind == "variant")
+            .expect("dead variant finding");
+        assert_eq!(variant.kind, SurfaceFindingKind::DeadPublic);
+        assert_eq!(variant.replacement, None);
+        assert_eq!(variant.visibility_start, None);
+        assert_eq!(variant.visibility_end, None);
+    }
+
+    #[test]
     fn public_fix_reaches_the_narrowest_enabled_visibility_in_one_plan() {
         let root = item(
             (CRATE_A, 1),
@@ -1495,16 +1680,169 @@ mod tests {
                 .all(|finding| finding.kind == SurfaceFindingKind::UnnecessaryPublic)
         );
 
-        let selected = policy(&["first", "second"], false).with_products(BTreeSet::from([SurfaceProductRoot {
-            package: "first".to_string(),
-            target: "first".to_string(),
-            kind: SurfaceProductKind::Binary,
-        }]));
+        let selected = policy(&["first", "second"], false).with_products(vec![SurfaceProductSelection {
+            root: SurfaceProductRoot {
+                package: "first".to_string(),
+                target: "first".to_string(),
+                kind: SurfaceProductKind::Binary,
+            },
+            target: None,
+        }]);
         let selected = graph.analyze(&selected).expect("analyze selected product");
         assert_eq!(
             selected.findings.iter().map(|finding| finding.kind).collect::<Vec<_>>(),
             vec![SurfaceFindingKind::UnnecessaryPublic, SurfaceFindingKind::DeadPublic]
         );
+    }
+
+    #[test]
+    fn selected_internal_library_is_seeded_by_real_workspace_consumers() {
+        let used = item(
+            (CRATE_A, 1),
+            (0, 10),
+            CompilerFactItemKind::Function,
+            CompilerFactVisibility::Public,
+        );
+        let dead = item(
+            (CRATE_A, 2),
+            (20, 30),
+            CompilerFactItemKind::Function,
+            CompilerFactVisibility::Public,
+        );
+        let mut provider = object(
+            "provider",
+            CompilerFactDomain::Production,
+            vec![used, dead],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        provider.unit.cargo_target = "provider_lib".to_string();
+        provider.unit.crate_name = "provider_lib".to_string();
+        let consumer_root = item(
+            (CRATE_B, 1),
+            (0, 10),
+            CompilerFactItemKind::Function,
+            CompilerFactVisibility::Private,
+        );
+        let consumer = object(
+            "consumer",
+            CompilerFactDomain::Production,
+            vec![consumer_root.clone()],
+            vec![body((CRATE_B, 1), (CRATE_A, 1))],
+            vec![consumer_root.id],
+            Vec::new(),
+        );
+        let closed = BTreeSet::from([SurfaceCompilerCrate::from(&provider)]);
+        let policy = SurfacePolicy::new(closed, false).with_products(vec![SurfaceProductSelection {
+            root: SurfaceProductRoot {
+                package: "provider".to_string(),
+                target: "provider_lib".to_string(),
+                kind: SurfaceProductKind::Library,
+            },
+            target: None,
+        }]);
+
+        let analysis = SurfaceGraph::from_objects(&[&provider, &consumer])
+            .expect("merge library consumers")
+            .analyze(&policy)
+            .expect("analyze selected library");
+        assert_eq!(analysis.findings.len(), 1);
+        assert_eq!(analysis.findings[0].kind, SurfaceFindingKind::DeadPublic);
+        assert_eq!(analysis.findings[0].declaration_start, 20);
+        assert!(
+            analysis
+                .items
+                .iter()
+                .any(|item| item.production_live && item.required_public),
+            "the compiled production consumer must seed and protect its provider declaration"
+        );
+    }
+
+    #[test]
+    fn selected_internal_library_without_consumers_reports_public_items_dead() {
+        let public = item(
+            (CRATE_A, 1),
+            (0, 10),
+            CompilerFactItemKind::Function,
+            CompilerFactVisibility::Public,
+        );
+        let mut provider = object(
+            "provider",
+            CompilerFactDomain::Production,
+            vec![public],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        provider.unit.cargo_target = "provider_lib".to_string();
+        provider.unit.crate_name = "provider_lib".to_string();
+        let policy =
+            SurfacePolicy::new(BTreeSet::from([SurfaceCompilerCrate::from(&provider)]), false).with_products(vec![
+                SurfaceProductSelection {
+                    root: SurfaceProductRoot {
+                        package: "provider".to_string(),
+                        target: "provider_lib".to_string(),
+                        kind: SurfaceProductKind::Library,
+                    },
+                    target: None,
+                },
+            ]);
+
+        let analysis = SurfaceGraph::from_objects(&[&provider])
+            .expect("merge library")
+            .analyze(&policy)
+            .expect("analyze selected library");
+        assert_eq!(analysis.findings.len(), 1);
+        assert_eq!(analysis.findings[0].kind, SurfaceFindingKind::DeadPublic);
+    }
+
+    #[test]
+    fn one_open_compiler_crate_observation_preserves_a_shared_declaration() {
+        let declaration = item(
+            (CRATE_A, 1),
+            (0, 10),
+            CompilerFactItemKind::Function,
+            CompilerFactVisibility::Public,
+        );
+        let mut library = object(
+            "mixed",
+            CompilerFactDomain::Production,
+            vec![declaration.clone()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        library.unit.cargo_target = "mixed_lib".to_string();
+        library.unit.crate_name = "mixed_lib".to_string();
+        let mut binary = object(
+            "mixed",
+            CompilerFactDomain::Production,
+            vec![declaration.clone()],
+            Vec::new(),
+            vec![declaration.id],
+            Vec::new(),
+        );
+        binary.unit.cargo_target = "mixed_bin".to_string();
+        binary.unit.crate_name = "mixed_bin".to_string();
+        let policy =
+            SurfacePolicy::new(BTreeSet::from([SurfaceCompilerCrate::from(&binary)]), false).with_products(vec![
+                SurfaceProductSelection {
+                    root: SurfaceProductRoot {
+                        package: "mixed".to_string(),
+                        target: "mixed_bin".to_string(),
+                        kind: SurfaceProductKind::Binary,
+                    },
+                    target: None,
+                },
+            ]);
+
+        let analysis = SurfaceGraph::from_objects(&[&library, &binary])
+            .expect("merge mixed package observations")
+            .analyze(&policy)
+            .expect("analyze mixed package");
+        assert!(analysis.findings.is_empty());
+        assert_eq!(analysis.items[0].compiler_crates.len(), 2);
     }
 
     #[test]

@@ -826,6 +826,7 @@ dependencies = [
  "azure_core",
  "azure_identity",
  "azure_storage_blob",
+ "cargo-platform",
  "cargo_metadata",
  "chrono",
  "clap",

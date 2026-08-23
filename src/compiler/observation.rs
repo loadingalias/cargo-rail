@@ -19,6 +19,7 @@ pub(crate) const COMPILATION_OBSERVATION_VERSION: u32 = 6;
 const COMPILER_CACHE_WRAPPER_METADATA_VERSION: u32 = 2;
 const COMPILATION_UNIT_VERSION: u32 = 2;
 const RAW_INVOCATION_VERSION: u32 = 6;
+const MAX_RESPONSE_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Typed Cargo target domain for one compiler or rustdoc invocation.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -537,6 +538,7 @@ pub(crate) struct InvocationRecorder {
     metadata_paths: Vec<PathBuf>,
     rlib_paths: Vec<PathBuf>,
     output_paths: Vec<PathBuf>,
+    execution_arguments: Vec<String>,
 }
 
 pub(crate) struct NativeOutputPaths {
@@ -1332,7 +1334,8 @@ fn begin_compiler_invocation(
             })
         })
         .collect::<RailResult<Vec<_>>>()?;
-    let parsed = ParsedArguments::parse(&argument_text, &current_dir, mode, &mut bypasses);
+    let execution_arguments = expand_response_files(&argument_text, physical_current_dir, &mut bypasses);
+    let parsed = ParsedArguments::parse(&execution_arguments, &current_dir, mode, &mut bypasses);
     if mode == CompilerMode::Rustdoc {
         if !parsed.emit_modes.contains("dep-info") {
             bypasses.insert("rustdoc_dep_info_unavailable".to_string());
@@ -1378,7 +1381,7 @@ fn begin_compiler_invocation(
             cfg: parsed.cfg,
             emit_modes: parsed.emit_modes,
             test_mode: parsed.test_mode,
-            compiler_arguments: portable_compiler_arguments(&argument_text, source_root, &canonical_source_root),
+            compiler_arguments: portable_compiler_arguments(&execution_arguments, source_root, &canonical_source_root),
             declared_inputs,
             observed_reads: Vec::new(),
             dependency_artifacts,
@@ -1391,12 +1394,18 @@ fn begin_compiler_invocation(
             bypasses,
             compiler_fact_unit: None,
         },
+        execution_arguments,
     })
 }
 
 impl InvocationRecorder {
     pub(crate) fn observation(&self) -> &RawCompilerInvocation {
         &self.raw
+    }
+
+    /// Exact argv to execute after one rustc-compatible ordinary response-file expansion.
+    pub(crate) fn execution_arguments(&self) -> &[String] {
+        &self.execution_arguments
     }
 
     pub(crate) fn native_output_paths(&self) -> Option<NativeOutputPaths> {
@@ -1499,6 +1508,80 @@ impl InvocationRecorder {
         sort_and_deduplicate_files(&mut self.raw.observed_reads);
         sort_and_deduplicate_files(&mut self.raw.emitted_outputs);
         Ok(self.raw)
+    }
+}
+
+/// Expand rustc's stable newline-delimited argument-file grammar once.
+///
+/// The selected compiler owns shell-style parsing behind `-Zshell-argfiles`.
+/// Nested argument files also cannot be forwarded as already-expanded argv
+/// without changing rustc's one-level semantics, so both forms retain the raw
+/// argv and conservatively bypass reusable observations.
+fn expand_response_files(arguments: &[String], current_dir: &Path, bypasses: &mut BTreeSet<String>) -> Vec<String> {
+    let mut expander = ResponseFileExpander::default();
+    for argument in arguments {
+        if let Err(reason) = expander.push(argument, current_dir) {
+            bypasses.insert(reason.to_string());
+            return arguments.to_vec();
+        }
+    }
+    expander.expanded
+}
+
+#[derive(Default)]
+struct ResponseFileExpander {
+    shell_argfiles: bool,
+    next_is_unstable_option: bool,
+    expanded: Vec<String>,
+}
+
+impl ResponseFileExpander {
+    fn push(&mut self, argument: &str, current_dir: &Path) -> Result<(), &'static str> {
+        let Some(argument_file) = argument.strip_prefix('@') else {
+            self.push_expanded(argument.to_string());
+            return Ok(());
+        };
+        let path = match argument_file.split_once(':') {
+            Some(("shell", _)) if self.shell_argfiles => {
+                return Err("response_file_expansion_unavailable");
+            }
+            _ => argument_file,
+        };
+        let path = resolve_argument_path(path, current_dir);
+        let metadata = fs::metadata(&path).map_err(|_| "response_file_expansion_unavailable")?;
+        if !metadata.is_file() || metadata.len() > MAX_RESPONSE_FILE_BYTES {
+            return Err("response_file_expansion_unavailable");
+        }
+        let contents = fs::read_to_string(path).map_err(|_| "response_file_expansion_unavailable")?;
+        if u64::try_from(contents.len()).unwrap_or(u64::MAX) != metadata.len()
+            || contents.lines().any(|line| line.starts_with('@'))
+        {
+            return Err("response_file_expansion_unavailable");
+        }
+        for line in contents.lines() {
+            self.push_expanded(line.to_string());
+        }
+        Ok(())
+    }
+
+    fn push_expanded(&mut self, argument: String) {
+        if self.next_is_unstable_option {
+            self.inspect_unstable_option(&argument);
+            self.next_is_unstable_option = false;
+        } else if let Some(option) = argument.strip_prefix("-Z") {
+            if option.is_empty() {
+                self.next_is_unstable_option = true;
+            } else {
+                self.inspect_unstable_option(option);
+            }
+        }
+        self.expanded.push(argument);
+    }
+
+    fn inspect_unstable_option(&mut self, option: &str) {
+        if option == "shell-argfiles" {
+            self.shell_argfiles = true;
+        }
     }
 }
 
@@ -2244,6 +2327,70 @@ fn is_executable(_metadata: &fs::Metadata) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_response_file_is_the_observed_and_executed_argument_stream() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let source = workspace.path().join("src/lib.rs");
+        fs::create_dir_all(source.parent().expect("source parent")).expect("source parent");
+        fs::write(&source, "pub fn answer() -> u8 { 42 }\n").expect("source");
+        let response = workspace.path().join("rustc.args");
+        let arguments = [
+            "--crate-name",
+            "fixture",
+            "--crate-type",
+            "lib",
+            "--cfg",
+            "feature=\"extra\"",
+            "src/lib.rs",
+        ];
+        fs::write(&response, format!("{}\n", arguments.join("\n"))).expect("response file");
+
+        let recorder = begin_compiler_invocation(
+            workspace.path(),
+            workspace.path(),
+            workspace.path(),
+            &[format!("@{}", response.display()).into()],
+            CompilerMode::Rustc,
+        )
+        .expect("response-file invocation");
+
+        assert_eq!(recorder.execution_arguments(), arguments);
+        assert_eq!(recorder.observation().compiler_arguments, arguments);
+        assert_eq!(recorder.observation().crate_name.as_deref(), Some("fixture"));
+        assert_eq!(recorder.observation().crate_types, BTreeSet::from(["lib".to_string()]));
+        assert_eq!(
+            recorder.observation().cfg,
+            BTreeSet::from(["feature=\"extra\"".to_string()])
+        );
+        assert_eq!(recorder.observation().declared_inputs.len(), 1);
+        assert!(recorder.observation().bypasses.is_empty());
+    }
+
+    #[test]
+    fn response_file_forms_that_cannot_be_forwarded_exactly_remain_raw() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let nested = workspace.path().join("nested.args");
+        fs::write(&nested, "--crate-name\nfixture\n").expect("nested response file");
+        let outer = workspace.path().join("outer.args");
+        fs::write(&outer, format!("@{}\n", nested.display())).expect("outer response file");
+        let raw = vec![format!("@{}", outer.display())];
+        let mut bypasses = BTreeSet::new();
+
+        assert_eq!(expand_response_files(&raw, workspace.path(), &mut bypasses), raw);
+        assert_eq!(
+            bypasses,
+            BTreeSet::from(["response_file_expansion_unavailable".to_string()])
+        );
+
+        let shell = vec!["-Zshell-argfiles".to_string(), "@shell:arguments.txt".to_string()];
+        bypasses.clear();
+        assert_eq!(expand_response_files(&shell, workspace.path(), &mut bypasses), shell);
+        assert_eq!(
+            bypasses,
+            BTreeSet::from(["response_file_expansion_unavailable".to_string()])
+        );
+    }
 
     #[cfg(unix)]
     #[test]

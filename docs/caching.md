@@ -356,6 +356,7 @@ structural and exact-toolchain-keyed.
 
 | Target | Native execution | Cross-target compilation | Release artifact | Native compiler-result cache |
 |---|---|---|---|---|
+| `aarch64-apple-darwin` | Advertised; full-suite CI required (`macos-14`) | — | Native artifact required | Active for structurally eligible `exact_rustc_result` units; exact compiler identity is part of every key |
 | `aarch64-pc-windows-msvc` | Advertised; full-suite CI required (`windows-11-arm`) | — | Native artifact required | Active for structurally eligible `exact_rustc_result` units; exact compiler identity is part of every key |
 | `aarch64-unknown-linux-gnu` | Advertised; full-suite CI required (`ubuntu-24.04-arm`) | — | Native artifact required | Active for structurally eligible `exact_rustc_result` units and certified default-ELF-linker producers/final artifacts; exact compiler identity is part of every key |
 | `aarch64-unknown-linux-musl` | Not a native host | Required compatibility build | Cross-built artifact required | Bypass: `cross_target_toolchain_evidence_unavailable` |
@@ -363,6 +364,7 @@ structural and exact-toolchain-keyed.
 | `wasm32-unknown-unknown` | Not a native host | Required compatibility build | Fixture artifact required | Bypass: `cross_target_toolchain_evidence_unavailable` |
 | `wasm32-wasip1` | Not a native host | Required compatibility build | Fixture artifact required | Bypass: `cross_target_toolchain_evidence_unavailable` |
 | `wasm32v1-none` | Not a native host | Required compatibility build | Fixture artifact required | Bypass: `cross_target_toolchain_evidence_unavailable` |
+| `x86_64-apple-darwin` | Advertised; full-suite CI required (`macos-15-intel`) | — | Native artifact required | Active for structurally eligible `exact_rustc_result` units; exact compiler identity is part of every key |
 | `x86_64-pc-windows-msvc` | Advertised; full-suite CI required (`windows-2022`) | — | Native artifact required | Active for structurally eligible `exact_rustc_result` units; exact compiler identity is part of every key |
 | `x86_64-unknown-linux-gnu` | Advertised; full-suite CI required (`ubuntu-24.04`) | — | Native artifact required | Active for structurally eligible `exact_rustc_result` units and certified default-ELF-linker producers/final artifacts; exact compiler identity is part of every key |
 | `x86_64-unknown-linux-musl` | Not a native host | Required compatibility build | Cross-built artifact required | Bypass: `cross_target_toolchain_evidence_unavailable` |
@@ -373,8 +375,10 @@ Linux musl rows are release cross-builds, not native Linux host evidence.
 
 | Profile | Runner | Filesystem | Case behavior | Required evidence |
 |---|---|---|---|---|
+| Default `aarch64-apple-darwin` | `macos-14` | `apfs` | Insensitive | Full endpoint suite and native probe |
 | Default `aarch64-pc-windows-msvc` | `windows-11-arm` | `ntfs` | Insensitive | Full endpoint suite and native probe |
 | Default `aarch64-unknown-linux-gnu` | `ubuntu-24.04-arm` | `ext4` | Sensitive | Full endpoint suite and native probe |
+| Default `x86_64-apple-darwin` | `macos-15-intel` | `apfs` | Insensitive | Full endpoint suite and native probe |
 | Default `x86_64-pc-windows-msvc` | `windows-2022` | `ntfs` | Insensitive | Full endpoint suite and native probe |
 | Default `x86_64-unknown-linux-gnu` | `ubuntu-24.04` | `ext4` | Sensitive | Full endpoint suite and native probe |
 | linux-tmpfs | `ubuntu-24.04` | `tmpfs` | Sensitive | Front-door corpus, CAS/atomicity suite, ENOSPC, and cleanup |

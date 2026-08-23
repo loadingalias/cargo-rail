@@ -30,6 +30,43 @@ fn test_plan_schema_command_matches_published_schema() {
 }
 
 #[test]
+fn test_plan_surface_gate_requires_explicit_enablement() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("plan-surface-opt-in")?;
+        ws.add_crate("surface-opt-in", "0.1.0", &[])?;
+        ws.commit("add crate")?;
+        git(&ws.path, &["branch", "origin/main"])?;
+        ws.modify_file("surface-opt-in", "src/lib.rs", "pub fn changed() {}")?;
+
+        let disabled = run_cargo_rail(
+            &ws.path,
+            &["rail", "plan", "--since", "origin/main", "--format", "json"],
+        )?;
+        assert!(disabled.status.success());
+        let disabled: Value = serde_json::from_slice(&disabled.stdout)?;
+        assert_eq!(disabled["surfaces"]["surface"]["enabled"], false);
+
+        std::fs::create_dir_all(ws.path.join(".config"))?;
+        std::fs::write(ws.path.join(".config/rail.toml"), "[surface]\nenabled = true\n")?;
+        let enabled = run_cargo_rail(
+            &ws.path,
+            &["rail", "plan", "--since", "origin/main", "--format", "json"],
+        )?;
+        assert!(enabled.status.success());
+        let enabled: Value = serde_json::from_slice(&enabled.stdout)?;
+        assert_eq!(enabled["surfaces"]["surface"]["enabled"], true);
+        assert!(
+            enabled["surfaces"]["surface"]["reasons"]
+                .as_array()
+                .is_some_and(|reasons| !reasons.is_empty())
+        );
+
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
 fn test_plan_json_validates_against_published_schema() {
     let result: Result<()> = (|| {
         let ws = setup_golden_workspace("plan-schema-validation")?;
@@ -2546,6 +2583,8 @@ fn setup_golden_workspace(name: &str) -> Result<TestWorkspace> {
     let ws = TestWorkspace::new_named(name)?;
     ws.add_crate("lib-a", "0.1.0", &[])?;
     ws.add_crate("lib-b", "0.1.0", &[("lib-a", r#"{ path = "../lib-a" }"#)])?;
+    std::fs::create_dir_all(ws.path.join(".config"))?;
+    std::fs::write(ws.path.join(".config/rail.toml"), "[surface]\nenabled = true\n")?;
     ws.commit("add crates")?;
 
     git(&ws.path, &["branch", "origin/main"])?;

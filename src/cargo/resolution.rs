@@ -377,6 +377,20 @@ impl TargetIdentity {
         self.host_artifact_rustdocflags.as_deref()
     }
 
+    /// Return whether Cargo can pass a user-selected response file to rustc or rustdoc.
+    pub(crate) fn uses_response_file_argument(&self) -> bool {
+        [
+            Some(self.rustflags.as_slice()),
+            Some(self.rustdocflags.as_slice()),
+            self.host_artifact_rustflags.as_deref(),
+            self.host_artifact_rustdocflags.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|argument| argument.starts_with('@'))
+    }
+
     pub(crate) fn validate_custom_specification_unchanged(&self) -> RailResult<()> {
         match &self.specification {
             TargetSpecificationIdentity::BuiltIn(_) => Ok(()),
@@ -1252,6 +1266,11 @@ pub(crate) fn coverage_resolution_request(view: &CoverageView, metadata: &Metada
 
     let features = match &view.features {
         FeatureSelection::Default => ResolutionFeatures::Default,
+        FeatureSelection::DefaultWith(_) => {
+            return Err(RailError::message(
+                "default-plus-selected feature profiles are not coverage views",
+            ));
+        }
         FeatureSelection::NoDefaultFeatures => ResolutionFeatures::NoDefaultFeatures,
         FeatureSelection::AllFeatures => ResolutionFeatures::AllFeatures,
         FeatureSelection::Selected(selected) => ResolutionFeatures::Selected(
@@ -3174,6 +3193,33 @@ fn append_frame(output: &mut Vec<u8>, tag: &[u8], value: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn target_identity_names_user_selected_response_files() {
+        let mut target = TargetIdentity {
+            specification: TargetSpecificationIdentity::BuiltIn("test-target".to_string()),
+            host: true,
+            build_target: true,
+            analysis_target: true,
+            cfg: Vec::new(),
+            runner: None,
+            linker: None,
+            rustflags: Vec::new(),
+            rustdocflags: Vec::new(),
+            host_artifact_rustflags: Some(Vec::new()),
+            host_artifact_rustdocflags: Some(Vec::new()),
+        };
+        assert!(!target.uses_response_file_argument());
+
+        target.rustflags.push("@rustc.args".to_string());
+        assert!(target.uses_response_file_argument());
+        target.rustflags.clear();
+        target
+            .host_artifact_rustdocflags
+            .get_or_insert_default()
+            .push("@rustdoc.args".to_string());
+        assert!(target.uses_response_file_argument());
+    }
 
     const CARGO_TOOL_ENVIRONMENT: &[&str] = &[
         "CARGO_BUILD_RUSTC",

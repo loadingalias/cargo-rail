@@ -38,6 +38,7 @@ jobs:
       test: ${{ steps.plan.outputs.test }}
       docs: ${{ steps.plan.outputs.docs }}
       infra: ${{ steps.plan.outputs.infra }}
+      surface: ${{ steps.surface.outputs.surface }}
       base-ref: ${{ steps.plan.outputs.base-ref }}
     steps:
       - name: Checkout
@@ -54,10 +55,20 @@ jobs:
           since: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
           args: "--explain"
 
+      - name: Export surface gate
+        id: surface
+        shell: bash
+        env:
+          SURFACES_JSON: ${{ steps.plan.outputs.surfaces-json }}
+        run: |
+          set -euo pipefail
+          surface="$(python3 -c 'import json,os; print(str(json.loads(os.environ["SURFACES_JSON"])["surface"]).lower())')"
+          echo "surface=$surface" >> "$GITHUB_OUTPUT"
+
   quality:
     name: Quality and Security
     needs: plan
-    if: needs.plan.outputs.build == 'true' || needs.plan.outputs.test == 'true' || needs.plan.outputs.docs == 'true' || needs.plan.outputs.infra == 'true'
+    if: needs.plan.outputs.build == 'true' || needs.plan.outputs.test == 'true' || needs.plan.outputs.docs == 'true' || needs.plan.outputs.infra == 'true' || needs.plan.outputs.surface == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -94,8 +105,33 @@ jobs:
   compatibility:
     name: Compatibility
     needs: [quality, plan]
-    if: needs.plan.outputs.build == 'true' || needs.plan.outputs.test == 'true' || needs.plan.outputs.infra == 'true'
+    if: needs.plan.outputs.build == 'true' || needs.plan.outputs.test == 'true' || needs.plan.outputs.infra == 'true' || needs.plan.outputs.surface == 'true'
     uses: ./.github/workflows/compatibility.yaml
     with:
       ref: ${{ github.sha }}
       cache-prefix: commit
+
+  surface:
+    name: Rust Surface
+    needs: [quality, plan]
+    if: needs.plan.outputs.surface == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup
+        uses: ./.github/actions/setup
+        with:
+          cache-key: commit-surface
+
+      - name: Enforce planner-selected surface
+        run: |
+          rustup component add rustc-dev
+          scripts/with-compiler-fact-driver.sh cargo build --locked \
+            --bin cargo-rail --bin cargo-rail-compiler-observation
+          target/debug/cargo-rail rail surface --check --format github

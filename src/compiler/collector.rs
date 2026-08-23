@@ -183,6 +183,7 @@ enum CargoBuildScriptOutput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompilerCacheBypass {
     CargoConfiguration,
+    ResponseFileConfiguration,
     BuildScriptObservations,
     ProcMacroObservations,
     ExternalSourceDigest,
@@ -192,6 +193,7 @@ impl CompilerCacheBypass {
     const fn as_str(self) -> &'static str {
         match self {
             Self::CargoConfiguration => "cargo_configuration_unmodeled",
+            Self::ResponseFileConfiguration => "response_file_configuration_unmodeled",
             Self::BuildScriptObservations => "build_script_observations_unavailable",
             Self::ProcMacroObservations => "proc_macro_observations_unavailable",
             Self::ExternalSourceDigest => "external_source_digest_unavailable",
@@ -199,13 +201,52 @@ impl CompilerCacheBypass {
     }
 }
 
+static COMPILER_OBSERVATION_PROCESS: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
 fn compiler_observation_wrapper() -> RailResult<PathBuf> {
     #[cfg(test)]
     if let Some(path) = std::env::var_os("CARGO_RAIL_TEST_OBSERVATION_WRAPPER") {
         return crate::utils::canonicalize_existing(Path::new(&path))
             .with_context(|| "locating the explicitly provisioned compiler-observation test wrapper".to_string());
     }
-    std::env::current_exe().with_context(|| "locating cargo-rail compiler-observation wrapper".to_string())
+    if let Some(process) = COMPILER_OBSERVATION_PROCESS.get() {
+        return Ok(process.clone());
+    }
+    let executable = std::env::current_exe()
+        .with_context(|| "locating cargo-rail while selecting its compiler-observation process".to_string())?;
+    let observation = executable.with_file_name(format!(
+        "cargo-rail-compiler-observation{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    let process = if observation.is_file() && compatible_observation_process(&observation) {
+        crate::utils::canonicalize_existing(&observation).with_context(|| {
+            format!(
+                "locating cargo-rail compiler-observation process '{}'",
+                observation.display()
+            )
+        })?
+    } else {
+        executable
+    };
+    if COMPILER_OBSERVATION_PROCESS.set(process.clone()).is_err()
+        && let Some(selected) = COMPILER_OBSERVATION_PROCESS.get()
+    {
+        return Ok(selected.clone());
+    }
+    Ok(process)
+}
+
+fn compatible_observation_process(path: &Path) -> bool {
+    Command::new(path)
+        .arg(crate::compiler::invocation::OBSERVATION_PROTOCOL_ARGUMENT)
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && output.stderr.is_empty()
+                && String::from_utf8(output.stdout).is_ok_and(|version| {
+                    version.trim().parse::<u32>() == Ok(crate::compiler::invocation::OBSERVATION_PROTOCOL_VERSION)
+                })
+        })
 }
 
 impl CompilerCacheIdentity {
@@ -547,7 +588,7 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
         candidates: &[CompilerCandidate],
     ) -> RailResult<HashMap<PackageId, MemberEvidence>> {
         Ok(self
-            .collect_requirements(candidates, &BTreeSet::new(), &BTreeSet::new(), None)?
+            .collect_requirements(candidates, &BTreeSet::new(), &BTreeSet::new(), None, None)?
             .diagnostics)
     }
 
@@ -559,7 +600,25 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
         typed_packages: &BTreeSet<String>,
         doctest_packages: &BTreeSet<String>,
     ) -> RailResult<CompilerAnalysisEvidence> {
-        self.collect_requirements(candidates, typed_packages, doctest_packages, Some(snapshot))
+        self.collect_requirements(candidates, typed_packages, doctest_packages, None, Some(snapshot))
+    }
+
+    /// Collect typed items through an exact, explicitly configured feature matrix.
+    pub(crate) fn collect_with_typed_items_and_features(
+        &self,
+        snapshot: &WorkspaceSnapshot,
+        candidates: &[CompilerCandidate],
+        typed_packages: &BTreeSet<String>,
+        doctest_packages: &BTreeSet<String>,
+        features: &[FeatureSelection],
+    ) -> RailResult<CompilerAnalysisEvidence> {
+        self.collect_requirements(
+            candidates,
+            typed_packages,
+            doctest_packages,
+            Some(features),
+            Some(snapshot),
+        )
     }
 
     fn collect_requirements(
@@ -567,14 +626,16 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
         candidates: &[CompilerCandidate],
         typed_packages: &BTreeSet<String>,
         doctest_packages: &BTreeSet<String>,
+        features: Option<&[FeatureSelection]>,
         snapshot: Option<&WorkspaceSnapshot>,
     ) -> RailResult<CompilerAnalysisEvidence> {
-        let schedule = AnalysisSchedule::for_combined(
+        let schedule = AnalysisSchedule::for_combined_with_features(
             &self.manifests.members,
             &self.targets,
             candidates,
             typed_packages,
             doctest_packages,
+            features,
         )?;
         let mut metrics = CompilerAnalysisMetrics {
             analysis_views: schedule.views().len(),
@@ -1335,9 +1396,10 @@ fn run_workspace_check(
     } else {
         BTreeSet::from([crate::compiler::scheduler::CompilerFactFamily::StableDiagnostics])
     };
+    let source_root = typed.map_or(workspace_root, |typed| typed.snapshot.source_root());
     let fact_session = CompilerFactSession::write_with_typed(
         observation_directory.path(),
-        workspace_root,
+        source_root,
         &fact_families,
         typed_session.clone(),
     )?;
@@ -1352,7 +1414,7 @@ fn run_workspace_check(
         .env("RUSTC_WORKSPACE_WRAPPER", &workspace_wrapper)
         .env(WRAPPER_MARKER, "1")
         .env(OBSERVATION_DIRECTORY_ENV, observation_directory.path())
-        .env(OBSERVATION_SOURCE_ROOT_ENV, workspace_root)
+        .env(OBSERVATION_SOURCE_ROOT_ENV, source_root)
         .env(FACT_SESSION_ENV, fact_session)
         .env_remove(CACHE_WRAPPER_MARKER)
         .args(&args);
@@ -1409,7 +1471,7 @@ fn run_workspace_check(
     || Ok(Vec::new()),
     |typed| {
       let expected_artifacts =
-        selected_typed_artifact_count(&String::from_utf8_lossy(&output.stdout), workspace_root, typed)?;
+        selected_typed_artifact_count(&String::from_utf8_lossy(&output.stdout), source_root, typed)?;
       let fragments = load_compiler_fact_fragments(
         &String::from_utf8_lossy(&output.stdout),
         observation_directory.path(),
@@ -3254,6 +3316,13 @@ fn target_fingerprints(snapshot: &WorkspaceSnapshot) -> RailResult<HashMap<Strin
 fn compiler_cache_bypass_reason(snapshot: &WorkspaceSnapshot) -> Option<CompilerCacheBypass> {
     if !snapshot.cargo_config().unmodeled_settings().is_empty() {
         return Some(CompilerCacheBypass::CargoConfiguration);
+    }
+    if snapshot
+        .targets()
+        .iter()
+        .any(crate::cargo::resolution::TargetIdentity::uses_response_file_argument)
+    {
+        return Some(CompilerCacheBypass::ResponseFileConfiguration);
     }
     for package in &snapshot.base_resolution().metadata().packages {
         if package

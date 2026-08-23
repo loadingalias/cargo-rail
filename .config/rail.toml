@@ -1,9 +1,11 @@
 # Repository policy. Omitted fields use cargo-rail's coded defaults.
 
 targets = [
+  "aarch64-apple-darwin",
   "aarch64-pc-windows-msvc",
   "aarch64-unknown-linux-gnu",
   "aarch64-unknown-linux-musl",
+  "x86_64-apple-darwin",
   "x86_64-pc-windows-msvc",
   "x86_64-unknown-linux-gnu",
   "x86_64-unknown-linux-musl",
@@ -14,6 +16,9 @@ include_renamed = true
 major_version_conflict = "bump"
 max_backups = 2
 msrv_policy = { mode = "compute", source = "workspace" }
+
+[surface]
+enabled = true
 
 [release]
 tag_format = "{prefix}{version}"

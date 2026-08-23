@@ -39,6 +39,8 @@ impl From<&str> for PlatformTarget {
 pub enum FeatureSelection {
     /// Cargo's ordinary default-feature behavior.
     Default,
+    /// Keep default features and enable an explicit named set.
+    DefaultWith(Vec<String>),
     /// A condition-derived set enabled without default features.
     Selected(Vec<String>),
     /// Disable default features for selected workspace packages.
@@ -56,6 +58,7 @@ impl FeatureSelection {
     pub fn label(&self) -> String {
         match self {
             Self::Default => "default-features".to_string(),
+            Self::DefaultWith(features) => format!("default-features+selected:{}", features.join(",")),
             Self::NoDefaultFeatures => "no-default-features".to_string(),
             Self::AllFeatures => "all-features".to_string(),
             Self::Selected(features) => format!("selected:{}", features.join(",")),
@@ -113,6 +116,14 @@ impl CoverageView {
     fn extend_feature_arguments(&self, arguments: &mut Vec<String>) {
         match &self.features {
             FeatureSelection::Default => {}
+            FeatureSelection::DefaultWith(features) => {
+                for package in &self.packages {
+                    for feature in features {
+                        arguments.push("--features".to_string());
+                        arguments.push(format!("{package}/{feature}"));
+                    }
+                }
+            }
             FeatureSelection::NoDefaultFeatures => arguments.push("--no-default-features".to_string()),
             FeatureSelection::AllFeatures => arguments.push("--all-features".to_string()),
             FeatureSelection::Selected(features) => {

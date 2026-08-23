@@ -75,6 +75,7 @@ fn test_plan_classification_corpus() {
         for (index, case) in corpus_cases().into_iter().enumerate() {
             let ws = TestWorkspace::new_named(&format!("plan-classification-corpus-{index}"))?;
             ws.add_crate("lib-a", "0.1.0", &[])?;
+            std::fs::write(ws.path.join("rail.toml"), "[surface]\nenabled = true\n")?;
             ws.commit("add crate")?;
 
             git(&ws.path, &["branch", "origin/main"])?;

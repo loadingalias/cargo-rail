@@ -361,6 +361,10 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
         "Selects the repository's default planner safety profile.",
     ),
     policy(
+        "surface.enabled",
+        "Chooses whether the planner selects source-surface analysis for relevant repository changes.",
+    ),
+    policy(
         "surface.consumer_scope",
         "Declares whether the workspace is the complete consumer universe for internal source visibility.",
     ),
@@ -393,8 +397,65 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
         "Selects one shipped Cargo library target as a public production root.",
     ),
     policy(
+        "surface.product.<index>.target",
+        "Restricts a production root to one Cargo target selector.",
+    ),
+    policy(
         "surface.product.<index>.reason",
         "Records why the selected target belongs to the complete production root set.",
+    ),
+    policy("surface.lint", "Defines ordered workspace-wide surface lint levels."),
+    policy(
+        "surface.lint.<index>.selector",
+        "Selects one exact surface lint or the warnings group.",
+    ),
+    policy(
+        "surface.lint.<index>.level",
+        "Sets the ordered disposition for the selected lint group.",
+    ),
+    policy(
+        "surface.feature-profile",
+        "Defines the exact Cargo feature views included in source-surface analysis.",
+    ),
+    policy(
+        "surface.feature-profile.<index>.name",
+        "Names one stable source-surface feature view.",
+    ),
+    policy(
+        "surface.feature-profile.<index>.all-features",
+        "Selects every declared Cargo feature for one source-surface view.",
+    ),
+    policy(
+        "surface.feature-profile.<index>.no-default-features",
+        "Disables Cargo default features for one source-surface view.",
+    ),
+    policy(
+        "surface.feature-profile.<index>.features",
+        "Selects exact Cargo features for one source-surface view.",
+    ),
+    policy(
+        "surface.doctest",
+        "Defines the exact workspace packages whose doctests are compiled.",
+    ),
+    policy(
+        "surface.doctest.<index>.package",
+        "Selects one doctest-enabled workspace package.",
+    ),
+    policy(
+        "surface.doctest_coverage",
+        "Chooses automatic or disabled doctest coverage when no exact package list exists.",
+    ),
+    policy(
+        "surface.external",
+        "Keeps explicitly external compiler crates outside closed-world authority.",
+    ),
+    policy(
+        "surface.external.<index>.crate",
+        "Selects one exact Rust compiler crate with external consumers.",
+    ),
+    policy(
+        "surface.external.<index>.reason",
+        "Records why the compiler crate remains open to external consumers.",
     ),
     policy("surface.override", "Defines item-specific surface diagnostic policy."),
     policy(
@@ -406,12 +467,20 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
         "Selects the exact workspace package owning the overridden declaration.",
     ),
     policy(
+        "surface.override.<index>.crate",
+        "Selects the exact Rust compiler crate owning the overridden declaration.",
+    ),
+    policy(
         "surface.override.<index>.item",
         "Selects the declaration by its compiler diagnostic path.",
     ),
     policy(
         "surface.override.<index>.kind",
         "Disambiguates the selected declaration by its exact Rust item kind.",
+    ),
+    policy(
+        "surface.override.<index>.target",
+        "Restricts an item override to one Cargo target selector.",
     ),
     policy(
         "surface.override.<index>.level",
@@ -430,12 +499,20 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
         "Selects the exact workspace package owning the excluded scope.",
     ),
     policy(
+        "surface.exclude.<index>.crate",
+        "Selects the exact Rust compiler crate owning the excluded scope.",
+    ),
+    policy(
         "surface.exclude.<index>.module",
         "Selects an excluded compiler diagnostic module path.",
     ),
     policy(
         "surface.exclude.<index>.file",
         "Selects an excluded repository-relative source file.",
+    ),
+    policy(
+        "surface.exclude.<index>.target",
+        "Restricts an excluded scope to one Cargo target selector.",
     ),
     policy(
         "surface.exclude.<index>.level",

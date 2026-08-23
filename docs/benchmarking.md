@@ -1,5 +1,57 @@
 # Benchmarking
 
+## Source-surface analysis
+
+`cargo rail surface` and Hawk both instrument rustc and merge declaration graphs, so a useful comparison must bind the
+same source commit, compiler identity, production products, feature profiles, target, doctest packages, lint policy,
+output sink, and cache state. Compare cold with cold and repeated with repeated; do not present a compiler-fact cache
+hit against a cold Hawk target directory as an implementation-speed result.
+
+The acquisition model predicts subprocess work before measurement. For one feature/target view, let `P` be the number
+of configured production products and `D` the number of selected doctest package passes:
+
+| Tool       | Ordinary target passes | Doctest passes | Total Cargo acquisition views |
+| ---------- | ---------------------: | -------------: | ----------------------------: |
+| Cargo-Rail |                      1 |            `D` |                       `1 + D` |
+| Reference analyzer |       `P + 1` |            `D` |                   `P + 1 + D` |
+
+Cargo-Rail classifies production and non-production units from one all-targets compiler acquisition instead of
+rebuilding the shared dependency graph once per product. This guarantees fewer Cargo acquisition views when `P > 0`,
+but it does not guarantee a wall-time ratio: dependency freshness, linker work, doctest count, compiler-fact cache
+eligibility, process scheduling, and output volume can dominate.
+
+The checked-in qualification authority is `tests/surface-reference.json`. It binds Hawk 0.1.13 as the reference by commit and archive
+digest, Rust 1.98.0, the host target, two shipped products, the all-features profile, the doctest package set, lint
+policy, focused binary and internal-library cases, and exact difference allowlists. Run it against an extracted native
+Cargo-Rail archive so the adjacent compiler-fact driver is part of the measurement:
+
+```bash
+scripts/ci/qualify-surface-reference.py \
+  --cargo-rail /path/to/extracted/cargo-rail \
+  --reference-archive /path/to/hawk-a3b75f193b931d11cf8883c44bda3f9a79c8f19a.tar.gz \
+  --output benchmark_results/surface-reference-$(date +%Y%m%d) \
+  --runs 20
+```
+
+The harness performs a separate conformance smoke and then interleaves 20 accepted samples in each lane:
+
+| Lane | Target and cache authority |
+| --- | --- |
+| `cold-target` | Fresh reference target, fresh Cargo-Rail analysis target, and fresh fact cache |
+| `cargo-fresh` | Reused reference Cargo target; Cargo-Rail conservatively bypasses facts because the fixture gains a build script |
+| `fact-cache-hit` | Repeated unchanged workspace with a required complete Cargo-Rail fact hit |
+| `cache-bypass` | Fresh target with the build-script observation boundary forcing a named fact-cache bypass |
+
+Every accepted pair must retain equivalent normalized findings after exact allowlist application. Each raw sample
+keeps stdout, stderr, the timer record, normalized findings, exact argv, wall and CPU time, peak RSS, Cargo view count,
+compiler invocation count, fact-cache outcome, and exit code. `identity.json` binds the source commit, worktree patch,
+fixture tree, tool and driver bytes, compiler, Cargo, host, target, profiles, doctests, and output sink. `summary.json`
+reports p50/p95 without deleting a slow, noisy, or failed corpus.
+
+Do not compare Hawk's Cargo-fresh measurement with a Cargo-Rail fact hit as an implementation-speed result. A public
+“2x faster” claim additionally requires equivalent cold Cargo-Rail p50 and p95 at or below 50% of Hawk on the retained
+corpus. If that bound does not pass, report the measured result plainly or publish no speed claim.
+
 The native-cache workflow measures transparent local activation under direct Cargo. Runner-owned cache lanes are
 retired because they are not part of the compiler-cache architecture. The harness deliberately leaves remote cache
 activation disabled: it establishes the L0/L1 baseline, not official S3 correctness or performance.

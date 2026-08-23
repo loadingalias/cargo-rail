@@ -6,7 +6,7 @@ edition = "2024"
 rust-version = { workspace = true }
 license = "MIT"
 authors = ["loadingalias"]
-description = "Cargo-native Rust workspace engine for affected CI, verified compiler reuse, dependency coherence, exact-SHA releases, and crate split/sync"
+description = "Cargo-native Rust workspace engine for affected CI, Rust source-surface analysis, compiler reuse, dependency coherence, exact-SHA releases, and split/sync"
 repository = "https://github.com/loadingalias/cargo-rail"
 documentation = "https://docs.rs/cargo-rail"
 categories = [
@@ -63,6 +63,7 @@ azure_storage_blob = { version = "1.0.0", default-features = false, features = [
 clap = { version = "4.6.5", features = ["derive", "cargo"] }
 clap_complete = "4.6.8"
 cargo_metadata = "0.23.1"
+cargo-platform = "0.3.3"
 petgraph = { version = "0.8.3", default-features = false }
 toml_edit = { version = "0.25.13", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }

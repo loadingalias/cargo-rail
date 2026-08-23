@@ -16,12 +16,13 @@ state in separate tools.
 ```
 The Rust workspace engine.
 
-Cargo-Rail turns Cargo's resolved workspace model and an exact source snapshot into affected CI, verified compiler reuse,
-dependency coherence, exact-SHA releases, and crate synchronization.
+Cargo-Rail turns Cargo's resolved workspace model and an exact source snapshot into affected CI, source-surface analysis,
+verified compiler reuse, dependency coherence, exact-SHA releases, and crate synchronization.
 
 Quick start:
   cargo rail plan --merge-base --explain          # Inspect affected work and reasoning
   cargo rail plan --merge-base -f github           # Export typed CI scope
+  cargo rail surface --explain                     # Inspect Rust reachability and visibility
   cargo rail cache setup                           # Enable transparent compiler reuse
   cargo rail unify --check --explain              # Inspect dependency changes (exit 1 when pending)
 
@@ -33,7 +34,7 @@ Commands:
   doctor       Inspect native compiler-cache capability
   cache        Inspect or reclaim explicitly scoped cache state
   plan         Build a deterministic file-first change plan
-  surface      Analyze complete Rust declaration reachability and visibility
+  surface      Analyze and repair complete Rust declaration reachability and visibility
   unify        Analyze and repair workspace dependency coherence
   init         Initialize configuration (rail.toml)
   split        (Advanced) Split a crate to a standalone repository with git history
@@ -533,13 +534,13 @@ Examples:
 ## cargo rail surface
 
 ```
-Analyze complete Rust declaration reachability and visibility
+Analyze and repair complete Rust declaration reachability and visibility
 
 Usage: cargo rail surface [OPTIONS]
 
 Options:
       --check
-          Check for enabled findings without modifying source (exit 1 when found)
+          Fail on denied findings without modifying source (for CI)
 
   -q, --quiet
           Suppress progress messages (for CI/automation)
@@ -578,6 +579,11 @@ Options:
       --explain
           Show the reason chain for every finding
 
+      --only <LINT>
+          Restrict reported findings to one or more exact lint classes
+
+          [possible values: dead-public, unnecessary-public, unnecessary-restricted-visibility, unnecessary-crate-visibility]
+
       --schema
           Print the versioned surface JSON Schema and exit
 
@@ -587,7 +593,12 @@ Options:
   -V, --version
           Print version
 
+Set `[surface] enabled = true` to include this gate in planner-selected CI.
+Set `[surface] consumer_scope = "workspace"` only when each closed compiler
+crate has no consumers outside the captured workspace.
+
 Examples:
+  cargo rail surface                        # Inspect and report without modifying source
   cargo rail surface --check --explain      # Inspect complete Rust reachability
   cargo rail surface --check -f json        # Emit the versioned machine contract
   cargo rail surface --fix --dry-run --explain  # Preview exact visibility edits

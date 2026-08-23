@@ -2,10 +2,25 @@
 
 use std::fs;
 
-use crate::helpers::{TestWorkspace, run_cargo_rail};
+use crate::helpers::{NestedWorkspace, TestWorkspace, run_cargo_rail, run_cargo_rail_with_env};
 use anyhow::{Result, anyhow};
 
-const SURFACE_V1_SCHEMA: &str = include_str!("../../schemas/surface-v1.schema.json");
+const SURFACE_V2_SCHEMA: &str = include_str!("../../schemas/surface-v2.schema.json");
+
+#[test]
+fn compiler_observation_process_reports_its_private_protocol() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cargo-rail-compiler-observation"))
+        .arg(cargo_rail::compiler::invocation::OBSERVATION_PROTOCOL_ARGUMENT)
+        .output()
+        .expect("run compiler observation protocol probe");
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 protocol version").trim(),
+        cargo_rail::compiler::invocation::OBSERVATION_PROTOCOL_VERSION.to_string()
+    );
+}
 
 #[test]
 fn surface_schema_is_pre_context_and_matches_the_published_contract() {
@@ -17,10 +32,80 @@ fn surface_schema_is_pre_context_and_matches_the_published_contract() {
             output.status.success(),
             "surface --schema should not load workspace state"
         );
-        assert_eq!(String::from_utf8_lossy(&output.stdout), SURFACE_V1_SCHEMA);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), SURFACE_V2_SCHEMA);
         assert!(output.stderr.is_empty(), "schema output must keep stderr empty");
-        let schema: serde_json::Value = serde_json::from_str(SURFACE_V1_SCHEMA)?;
+        let schema: serde_json::Value = serde_json::from_str(SURFACE_V2_SCHEMA)?;
         jsonschema::validator_for(&schema).map_err(|error| anyhow::anyhow!("invalid surface schema: {error}"))?;
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn source_built_surface_fails_before_workspace_acquisition() {
+    let result: Result<()> = (|| {
+        let workspace = TestWorkspace::new_named("surface-source-installation")?;
+        fs::write(workspace.path.join("Cargo.toml"), "this is not Cargo metadata")?;
+
+        let output = run_cargo_rail(&workspace.path, &["rail", "surface", "--check"])?;
+
+        assert_eq!(output.status.code(), Some(2));
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(stderr.contains("surface is unavailable in this source-built cargo-rail installation"));
+        assert!(stderr.contains("cargo install does not provide surface"));
+        assert!(
+            !stderr.contains("metadata"),
+            "workspace acquisition must not run: {stderr}"
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+/// Typed target authority and wrapper observations must share the captured Git
+/// source root even when Cargo owns a workspace below it.
+#[test]
+#[ignore = "requires the exact rustc-dev companion authority embedded by the protocol harness"]
+fn surface_inspects_a_workspace_nested_below_its_git_root() {
+    let result: Result<()> = (|| {
+        let workspace = NestedWorkspace::new("rust")?;
+        let package = workspace.add_crate("nested-surface-app", "0.1.0")?;
+        fs::write(
+            package.join("src/main.rs"),
+            r#"fn main() {
+  live();
+}
+
+pub fn live() {}
+pub fn dead_public() {}
+"#,
+        )?;
+        fs::write(
+            workspace.workspace_root.join(".config/rail.toml"),
+            "[surface]\nenabled = true\n",
+        )?;
+        fs::write(
+            workspace.workspace_root.join("rust-toolchain.toml"),
+            include_str!("../../rust-toolchain.toml"),
+        )?;
+        workspace.commit("Add nested surface fixture")?;
+
+        let output = run_cargo_rail(&workspace.workspace_root, &["rail", "surface", "--format", "json"])?;
+        assert!(
+            output.status.success(),
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(report["mode"], "inspect");
+        assert_eq!(report["config"]["enabled"], true);
+        assert!(
+            report["metrics"]["acquisition"]["compiler_invocations"]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "nested workspace analysis must acquire typed compiler facts"
+        );
         Ok(())
     })();
     super::helpers::finish_test(result);
@@ -108,7 +193,7 @@ reason = "fixture product"
         );
 
         let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-        let schema: serde_json::Value = serde_json::from_str(SURFACE_V1_SCHEMA)?;
+        let schema: serde_json::Value = serde_json::from_str(SURFACE_V2_SCHEMA)?;
         let validator =
             jsonschema::validator_for(&schema).map_err(|error| anyhow!("invalid surface schema: {error}"))?;
         let errors = validator
@@ -145,6 +230,21 @@ reason = "fixture product"
         assert!(
             finding("exported").is_none(),
             "cross-crate product API must remain public"
+        );
+
+        let inspected = run_cargo_rail(&workspace.path, &["rail", "surface", "--format", "json"])?;
+        assert!(
+            inspected.status.success(),
+            "inspection must report findings without turning them into a failing gate"
+        );
+        let inspected_report: serde_json::Value = serde_json::from_slice(&inspected.stdout)?;
+        assert_eq!(inspected_report["mode"], "inspect");
+        assert_eq!(inspected_report["result"], "findings");
+        assert_eq!(inspected_report["exit_code"], 0);
+        assert!(
+            inspected_report["findings"]
+                .as_array()
+                .is_some_and(|findings| !findings.is_empty())
         );
 
         let fixed = run_cargo_rail(
@@ -217,22 +317,21 @@ reason = "fixture product"
             "one successful fix must leave no further visibility mutation"
         );
         let repeated_acquisition = &repeated_report["metrics"]["acquisition"];
-        let cargo_views = repeated_acquisition["cargo_views_executed"]
-            .as_u64()
-            .ok_or_else(|| anyhow!("cargo view metric is not an integer"))?;
-        let fact_hits = repeated_acquisition["fact_cache_hits"]
-            .as_u64()
-            .ok_or_else(|| anyhow!("fact hit metric is not an integer"))?;
-        assert_eq!(cargo_views + fact_hits, 2, "every warm view must hit or execute");
-        assert!(fact_hits >= 1, "the warm run should reuse at least one complete view");
-        if cargo_views > 0 {
-            assert!(
-                repeated_acquisition["fact_cache_bypass_reasons"]
-                    .as_object()
-                    .is_some_and(|reasons| !reasons.is_empty()),
-                "an uncacheable warm view must name its conservative bypass: {repeated_acquisition}"
-            );
-        }
+        assert_eq!(
+            repeated_acquisition["cargo_views_executed"], 0,
+            "an unchanged warm run must not invoke Cargo: {repeated_acquisition}"
+        );
+        assert_eq!(
+            repeated_acquisition["compiler_invocations"], 0,
+            "an unchanged warm run must not invoke a compiler: {repeated_acquisition}"
+        );
+        assert_eq!(
+            repeated_acquisition["fact_cache_hits"], 2,
+            "both unchanged analysis views must reuse complete facts: {repeated_acquisition}"
+        );
+        assert_eq!(repeated_acquisition["fact_cache_misses"], 0);
+        assert_eq!(repeated_acquisition["fact_cache_store_failures"], 0);
+        assert_eq!(repeated_acquisition["fact_cache_bypass_reasons"], serde_json::json!({}));
 
         let github = run_cargo_rail(&workspace.path, &["rail", "surface", "--check", "--format", "github"])?;
         assert_eq!(github.status.code(), Some(1));
@@ -252,6 +351,131 @@ reason = "fixture product"
             embedded_errors.is_empty(),
             "GitHub surface contract failed its schema: {embedded_errors:#?}"
         );
+
+        let response_file = workspace.path.join("rustc.args");
+        fs::write(&response_file, "--cfg\ncargo_rail_response_file\n")?;
+        fs::create_dir_all(workspace.path.join(".cargo"))?;
+        fs::write(
+            workspace.path.join(".cargo/config.toml"),
+            format!("[build]\nrustflags = ['@{}']\n", response_file.display()),
+        )?;
+        let configured_response = run_cargo_rail(&workspace.path, &["rail", "surface", "--check", "--format", "json"])?;
+        assert_eq!(configured_response.status.code(), Some(1));
+        let configured_report: serde_json::Value = serde_json::from_slice(&configured_response.stdout)?;
+        let configured_acquisition = &configured_report["metrics"]["acquisition"];
+        assert_eq!(configured_acquisition["cargo_views_executed"], 2);
+        assert_eq!(configured_acquisition["fact_cache_hits"], 0);
+        assert_eq!(
+            configured_acquisition["fact_cache_bypass_reasons"]["response_file_configuration_unmodeled"], 2,
+            "user-selected response-file bytes must remain fail-closed: {configured_acquisition}"
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+#[ignore = "requires the exact rustc-dev companion authority embedded by the protocol harness"]
+fn surface_fix_failure_matrix_restores_every_written_source() {
+    let result: Result<()> = (|| {
+        let workspace = TestWorkspace::new_named("surface-failure-matrix")?;
+        let package = workspace.add_crate("surface-fault-app", "0.1.0", &[])?;
+        let manifest = fs::read_to_string(package.join("Cargo.toml"))?.replace(
+            "authors.workspace = true\n",
+            "authors.workspace = true\npublish = false\n",
+        );
+        fs::write(package.join("Cargo.toml"), manifest)?;
+        fs::remove_file(package.join("src/lib.rs"))?;
+        let main_source = r#"mod support;
+
+fn main() {
+  first();
+  support::second();
+}
+
+pub fn first() {}
+"#;
+        let support_source = "pub fn second() {}\n";
+        fs::write(package.join("src/main.rs"), main_source)?;
+        fs::write(package.join("src/support.rs"), support_source)?;
+        fs::write(
+            workspace.path.join(".config/rail.toml"),
+            r#"[surface]
+consumer_scope = "workspace"
+
+[[surface.product]]
+package = "surface-fault-app"
+bin = "surface-fault-app"
+reason = "failure-matrix product"
+"#,
+        )?;
+        fs::write(
+            workspace.path.join("rust-toolchain.toml"),
+            include_str!("../../rust-toolchain.toml"),
+        )?;
+        workspace.commit("Add surface failure fixture")?;
+
+        for point in [
+            "first-write",
+            "partial-write",
+            "post-write-validation",
+            "recompilation",
+            "receipt-write",
+        ] {
+            let output = run_cargo_rail_with_env(
+                &workspace.path,
+                &["rail", "surface", "--fix"],
+                &[("CARGO_RAIL_SURFACE_FAIL_AT", point)],
+            )?;
+            assert_eq!(
+                output.status.code(),
+                Some(2),
+                "{point}: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stderr).contains(&format!("injected surface failure at {point}")));
+            assert_eq!(fs::read_to_string(package.join("src/main.rs"))?, main_source, "{point}");
+            assert_eq!(
+                fs::read_to_string(package.join("src/support.rs"))?,
+                support_source,
+                "{point}"
+            );
+        }
+
+        fs::write(
+            workspace.path.join(".config/rail.toml"),
+            r#"[surface]
+consumer_scope = "workspace"
+
+[[surface.product]]
+package = "surface-fault-app"
+bin = "surface-fault-app"
+reason = "failure-matrix product"
+
+[[surface.override]]
+lint = "unnecessary-public"
+package = "surface-fault-app"
+item = "missing_item"
+kind = "function"
+level = "deny"
+reason = "the configured item must exist"
+"#,
+        )?;
+        let blocked = run_cargo_rail(&workspace.path, &["rail", "surface", "--fix", "--format", "json"])?;
+        assert_eq!(blocked.status.code(), Some(1));
+        let blocked_report: serde_json::Value = serde_json::from_slice(&blocked.stdout)?;
+        assert_eq!(blocked_report["mutation"]["phase"], "planned");
+        assert_eq!(blocked_report["configuration_diagnostics"][0]["code"], "unknown-item");
+        assert_eq!(fs::read_to_string(package.join("src/main.rs"))?, main_source);
+        assert_eq!(fs::read_to_string(package.join("src/support.rs"))?, support_source);
+
+        let explained = run_cargo_rail(&workspace.path, &["rail", "surface", "--check", "--explain"])?;
+        assert_eq!(explained.status.code(), Some(1));
+        let explained = String::from_utf8(explained.stdout)?;
+        assert!(explained.contains("1 configuration diagnostic(s)"));
+        assert!(explained.contains("configuration unknown-item at surface.override[0]"));
+        assert!(explained.contains("reason: the configured item must exist"));
         Ok(())
     })();
     super::helpers::finish_test(result);

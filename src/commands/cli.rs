@@ -17,12 +17,13 @@ use std::path::PathBuf;
 const MAIN_HELP: &str = "\
 The Rust workspace engine.
 
-Cargo-Rail turns Cargo's resolved workspace model and an exact source snapshot into affected CI, verified compiler reuse,
-dependency coherence, exact-SHA releases, and crate synchronization.
+Cargo-Rail turns Cargo's resolved workspace model and an exact source snapshot into affected CI, source-surface analysis,
+verified compiler reuse, dependency coherence, exact-SHA releases, and crate synchronization.
 
 Quick start:
   cargo rail plan --merge-base --explain          # Inspect affected work and reasoning
   cargo rail plan --merge-base -f github           # Export typed CI scope
+  cargo rail surface --explain                     # Inspect Rust reachability and visibility
   cargo rail cache setup                           # Enable transparent compiler reuse
   cargo rail unify --check --explain              # Inspect dependency changes (exit 1 when pending)
 
@@ -91,7 +92,12 @@ Examples:
   cargo rail plan -f github-debug           # GitHub Actions output plus plan_json";
 
 const SURFACE_HELP: &str = "\
+Set `[surface] enabled = true` to include this gate in planner-selected CI.
+Set `[surface] consumer_scope = \"workspace\"` only when each closed compiler
+crate has no consumers outside the captured workspace.
+
 Examples:
+  cargo rail surface                        # Inspect and report without modifying source
   cargo rail surface --check --explain      # Inspect complete Rust reachability
   cargo rail surface --check -f json        # Emit the versioned machine contract
   cargo rail surface --fix --dry-run --explain  # Preview exact visibility edits
@@ -288,10 +294,10 @@ pub enum Commands {
         schema: bool,
     },
 
-    /// Analyze complete Rust declaration reachability and visibility
+    /// Analyze and repair complete Rust declaration reachability and visibility
     #[command(after_long_help = SURFACE_HELP)]
     Surface {
-        /// Check for enabled findings without modifying source (exit 1 when found)
+        /// Fail on denied findings without modifying source (for CI)
         #[arg(long, conflicts_with = "fix")]
         check: bool,
         /// Apply exact visibility reductions
@@ -312,8 +318,21 @@ pub enum Commands {
         /// Show the reason chain for every finding
         #[arg(long)]
         explain: bool,
+        /// Restrict reported findings to one or more exact lint classes
+        #[arg(
+            long,
+            value_name = "LINT",
+            value_delimiter = ',',
+            value_parser = [
+                "dead-public",
+                "unnecessary-public",
+                "unnecessary-restricted-visibility",
+                "unnecessary-crate-visibility"
+            ]
+        )]
+        only: Vec<String>,
         /// Print the versioned surface JSON Schema and exit
-        #[arg(long, conflicts_with_all = ["check", "fix", "dry_run", "backup", "output", "explain"])]
+        #[arg(long, conflicts_with_all = ["check", "fix", "dry_run", "backup", "output", "explain", "only"])]
         schema: bool,
     },
 

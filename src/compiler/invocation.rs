@@ -50,6 +50,14 @@ pub(crate) const FACT_DOCTEST_BUILDER_ENV: &str = "CARGO_RAIL_COMPILER_FACT_DOCT
 /// Marker for cargo-rail's compile-only doctest runtool boundary.
 pub(crate) const FACT_DOCTEST_RUNNER_ENV: &str = "CARGO_RAIL_COMPILER_FACT_DOCTEST_RUNNER";
 
+/// Private compatibility probe understood by the dedicated observer.
+#[doc(hidden)]
+pub const OBSERVATION_PROTOCOL_ARGUMENT: &str = "--cargo-rail-observation-protocol-version";
+
+/// Compiler-observation process contract implemented by this build.
+#[doc(hidden)]
+pub const OBSERVATION_PROTOCOL_VERSION: u32 = 1;
+
 /// Result of classifying the process before Clap or workspace acquisition.
 #[doc(hidden)]
 pub enum PreClapDispatch {
@@ -263,14 +271,19 @@ pub fn dispatch() -> PreClapDispatch {
 }
 
 fn rustc_wrapper_argument_shape() -> bool {
+    rustc_program_argument_shape()
+        || std::env::args_os().nth(1).is_some_and(|program| {
+            crate::compiler::native_cache::NativeCacheContext::is_direct_invocation()
+                && program.as_encoded_bytes().first() != Some(&b'-')
+        })
+}
+
+fn rustc_program_argument_shape() -> bool {
     std::env::args_os().nth(1).is_some_and(|program| {
-        let rustc = Path::new(&program)
+        Path::new(&program)
             .file_stem()
             .and_then(std::ffi::OsStr::to_str)
-            .is_some_and(|name| name.eq_ignore_ascii_case("rustc"));
-        rustc
-            || crate::compiler::native_cache::NativeCacheContext::is_direct_invocation()
-                && program.as_encoded_bytes().first() != Some(&b'-')
+            .is_some_and(|name| name.eq_ignore_ascii_case("rustc"))
     })
 }
 
@@ -331,6 +344,47 @@ pub fn dispatch_required() -> i32 {
         PreClapDispatch::Exit(exit_code) => exit_code,
         PreClapDispatch::Cli => {
             eprintln!("cargo-rail compiler cache wrapper: missing private invocation context");
+            2
+        }
+    }
+}
+
+/// Run only the compiler-observation roles used by surface acquisition.
+///
+/// Keeping this entry point separate from [`dispatch_required`] lets the
+/// dedicated observation executable omit native-cache, distributed, and CLI
+/// paths from its linked image.
+#[must_use]
+pub fn dispatch_observation_required() -> i32 {
+    let signals = InvocationSignals {
+        link_adapter: std::env::var_os("CARGO_RAIL_APPLE_LINK_ADAPTER").is_some()
+            || std::env::var_os("CARGO_RAIL_ELF_LINK_ADAPTER").is_some(),
+        marked_cache: std::env::var_os(CACHE_WRAPPER_MARKER).is_some(),
+        rustc_observation: std::env::var_os(WRAPPER_MARKER).is_some(),
+        rustdoc_observation: std::env::var_os(RUSTDOC_WRAPPER_MARKER).is_some(),
+        rustc_wrapper_argv: rustc_program_argument_shape(),
+        doctest_builder: std::env::var_os(FACT_DOCTEST_BUILDER_ENV).is_some() && direct_rustc_argument_shape(),
+        doctest_runner: std::env::var_os(FACT_DOCTEST_RUNNER_ENV).is_some(),
+        ..InvocationSignals::default()
+    };
+    let role = match signals.classify() {
+        Ok(Some(role)) => role,
+        Ok(None) => {
+            eprintln!("cargo-rail compiler observation: missing private invocation context");
+            return 2;
+        }
+        Err(error) => {
+            eprintln!("cargo-rail compiler observation: {error}");
+            return 2;
+        }
+    };
+    match role {
+        InvocationRole::RustcObservation => run_rustc(),
+        InvocationRole::RustdocObservation => run_rustdoc(),
+        InvocationRole::DoctestBuilder => run_doctest_builder(),
+        InvocationRole::DoctestRunner => run_doctest_runner(),
+        InvocationRole::LinkAdapter | InvocationRole::DirectCache | InvocationRole::MarkedCache => {
+            eprintln!("cargo-rail compiler observation: incompatible private invocation context");
             2
         }
     }
@@ -609,6 +663,15 @@ fn run_doctest_builder() -> i32 {
     run_rustc_with_session(invocation, None, fact_session, Some(input))
 }
 
+fn is_merged_doctest_probe(arguments: &[OsString]) -> bool {
+    arguments.iter().any(|argument| {
+        Path::new(argument)
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name.starts_with("doctest_bundle_") && name.ends_with(".rs"))
+    })
+}
+
 struct CapturedDoctestInput {
     file: fs::File,
     identity: String,
@@ -634,15 +697,6 @@ fn capture_doctest_input_from(mut source: impl std::io::Read) -> crate::error::R
     Ok(CapturedDoctestInput {
         file,
         identity: format!("sha256:{}", ContentDigest::from_sha256_bytes(hasher.finalize().into())),
-    })
-}
-
-fn is_merged_doctest_probe(arguments: &[OsString]) -> bool {
-    arguments.iter().any(|argument| {
-        Path::new(argument)
-            .file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .is_some_and(|name| name.starts_with("doctest_bundle_") && name.ends_with(".rs"))
     })
 }
 
@@ -706,7 +760,7 @@ fn run_rustc_with_session(
             .map(|typed| std::ffi::OsStr::new(&typed.driver_program))
             .or(inner_wrapper),
     );
-    command.args(&invocation.arguments);
+    command.args(recorder.execution_arguments());
     if let Some(input) = doctest_input {
         command.stdin(Stdio::from(input.file));
     }
@@ -841,7 +895,8 @@ fn run_rustdoc() -> i32 {
             return 2;
         }
     };
-    let mut command = invocation.command();
+    let mut command = Command::new(&invocation.program);
+    command.args(recorder.execution_arguments());
     #[cfg(unix)]
     if fact_session.typed().is_some_and(|typed| typed.doctest) {
         use std::os::unix::process::CommandExt as _;
@@ -1049,8 +1104,10 @@ fn write_compiler_fact_invocation(
         builder.permissions(fs::Permissions::from_mode(0o600));
     }
     let mut capability = builder.tempfile_in(directory)?;
+    // The parent retains this private file until the child has exited. It is a
+    // one-run capability, not durable state, so visibility requires close and
+    // ordered process creation rather than a storage flush.
     capability.write_all(&encoded)?;
-    capability.as_file_mut().sync_all()?;
     #[cfg(unix)]
     capability
         .as_file()

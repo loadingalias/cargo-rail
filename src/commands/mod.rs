@@ -142,6 +142,14 @@ pub fn try_dispatch_pre_context(
             Ok(PreContextDispatch::Handled)
         }
 
+        command @ Commands::Surface { .. } => {
+            crate::compiler::driver::CompilerFactDriverAuthority::require_surface_installation()?;
+            Ok(PreContextDispatch::NeedsContext(PreparedContext::new(
+                command,
+                config_override,
+            )?))
+        }
+
         Commands::Init { output, force, dry_run } => {
             init::run_init_standalone(workspace_root, &output, force, dry_run, json)?;
             Ok(PreContextDispatch::Handled)
@@ -347,6 +355,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
             format,
             output,
             explain,
+            only,
             schema: _,
         } => run_surface(
             ctx,
@@ -358,6 +367,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
                 format,
                 output,
                 explain,
+                only,
             },
         ),
 

@@ -1,0 +1,30 @@
+[surface]
+enabled = true
+consumer_scope = "workspace"
+crate_visibility = "allow"
+preserve_uniform_fields = true
+
+[[surface.lint]]
+selector = "warnings"
+level = "deny"
+
+[[surface.lint]]
+selector = "unnecessary-crate-visibility"
+level = "deny"
+
+[[surface.product]]
+package = "surface-conformance-app"
+bin = "surface-conformance-app"
+reason = "shipped conformance binary"
+
+[[surface.product]]
+package = "surface-conformance-tool"
+bin = "surface-conformance-tool"
+reason = "second shipped conformance binary"
+
+[[surface.feature-profile]]
+name = "all-features"
+all-features = true
+
+[[surface.doctest]]
+package = "surface-conformance-core"

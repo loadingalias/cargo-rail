@@ -1,0 +1,585 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/loadingalias/cargo-rail/main/schemas/surface-v2.schema.json",
+  "title": "cargo-rail surface report contract v2",
+  "description": "Machine envelope emitted by cargo rail surface --format json.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "command",
+    "mode",
+    "result",
+    "exit_code",
+    "surface_contract_version",
+    "snapshot",
+    "config",
+    "toolchain",
+    "authority",
+    "products",
+    "targets",
+    "features",
+    "completeness",
+    "findings",
+    "configuration_diagnostics",
+    "reasons",
+    "fragments",
+    "cache",
+    "metrics",
+    "mutation"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "command": { "const": "surface" },
+    "mode": { "enum": ["inspect", "check", "fix_dry_run", "fix"] },
+    "result": { "enum": ["clean", "findings"] },
+    "exit_code": { "enum": [0, 1] },
+    "surface_contract_version": { "const": 2 },
+    "snapshot": { "$ref": "#/$defs/snapshot" },
+    "config": { "$ref": "#/$defs/config" },
+    "toolchain": { "$ref": "#/$defs/toolchain" },
+    "authority": { "$ref": "#/$defs/authority" },
+    "products": { "type": "array", "items": { "$ref": "#/$defs/product" } },
+    "targets": { "$ref": "#/$defs/string_array" },
+    "features": { "type": "array", "items": { "$ref": "#/$defs/feature_view" } },
+    "completeness": { "$ref": "#/$defs/completeness" },
+    "findings": { "type": "array", "items": { "$ref": "#/$defs/finding" } },
+    "configuration_diagnostics": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/configuration_diagnostic" }
+    },
+    "reasons": { "type": "array", "items": { "$ref": "#/$defs/reason" } },
+    "fragments": { "type": "array", "items": { "$ref": "#/$defs/fragment" } },
+    "cache": { "$ref": "#/$defs/cache" },
+    "metrics": { "$ref": "#/$defs/metrics" },
+    "mutation": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["phase", "plan"],
+          "properties": {
+            "phase": { "enum": ["planned", "applied"] },
+            "plan": { "$ref": "#/$defs/mutation_plan" },
+            "receipt": { "type": "string", "minLength": 1 },
+            "backup": { "type": "string", "minLength": 1 }
+          },
+          "allOf": [
+            {
+              "if": { "properties": { "phase": { "const": "planned" } } },
+              "then": {
+                "not": { "anyOf": [{ "required": ["receipt"] }, { "required": ["backup"] }] }
+              }
+            },
+            {
+              "if": { "properties": { "phase": { "const": "applied" } } },
+              "then": { "required": ["receipt"] }
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "exit_code": { "const": 1 } } },
+      "then": { "properties": { "result": { "const": "findings" } } }
+    },
+    {
+      "if": { "properties": { "mode": { "enum": ["inspect", "check"] } } },
+      "then": { "properties": { "mutation": { "type": "null" } } }
+    },
+    {
+      "if": { "properties": { "mode": { "enum": ["fix_dry_run", "fix"] } } },
+      "then": { "properties": { "mutation": { "type": "object" } } }
+    }
+  ],
+  "$defs": {
+    "string_array": { "type": "array", "items": { "type": "string" } },
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["identity", "configuration_fingerprint"],
+      "properties": {
+        "identity": { "type": "string", "pattern": "^v[0-9]+-sha256-[0-9a-f]{64}$" },
+        "configuration_fingerprint": { "type": "string", "minLength": 1 }
+      }
+    },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "identity",
+        "enabled",
+        "consumer_scope",
+        "crate_visibility",
+        "preserve_uniform_fields",
+        "only"
+      ],
+      "properties": {
+        "identity": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "enabled": { "type": "boolean" },
+        "consumer_scope": { "enum": ["open", "workspace"] },
+        "crate_visibility": { "enum": ["preserve", "allow"] },
+        "preserve_uniform_fields": { "type": "boolean" },
+        "only": { "$ref": "#/$defs/finding_kind_array" }
+      }
+    },
+    "toolchain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fingerprint", "rustc", "host"],
+      "properties": {
+        "fingerprint": { "type": "string", "minLength": 1 },
+        "rustc": { "type": "string", "minLength": 1 },
+        "host": { "type": "string", "minLength": 1 }
+      }
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["audited_targets", "open_targets"],
+      "properties": {
+        "audited_targets": { "type": "array", "items": { "$ref": "#/$defs/compiler_crate" } },
+        "open_targets": { "type": "array", "items": { "$ref": "#/$defs/compiler_crate" } }
+      }
+    },
+    "compiler_crate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["package", "cargo_target", "crate_name", "target_kind", "role"],
+      "properties": {
+        "package": { "$ref": "#/$defs/package" },
+        "cargo_target": { "type": "string", "minLength": 1 },
+        "crate_name": { "type": "string", "minLength": 1 },
+        "target_kind": { "$ref": "#/$defs/target_kind" },
+        "role": { "enum": ["host", "target"] }
+      }
+    },
+    "package": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "source"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "minLength": 1 },
+        "source": { "type": ["string", "null"] }
+      }
+    },
+    "product": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["package", "target", "kind", "implicit", "reason"],
+      "properties": {
+        "package": { "type": "string", "minLength": 1 },
+        "target": { "type": "string", "minLength": 1 },
+        "kind": { "enum": ["binary", "library"] },
+        "implicit": { "type": "boolean" },
+        "reason": { "type": "string", "minLength": 1 },
+        "target_selector": { "type": "string", "minLength": 1 }
+      }
+    },
+    "feature_view": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["package", "target", "platform", "features"],
+      "properties": {
+        "package": { "type": "string", "minLength": 1 },
+        "target": { "type": "string", "minLength": 1 },
+        "platform": { "type": "string", "minLength": 1 },
+        "features": { "$ref": "#/$defs/string_array" }
+      }
+    },
+    "completeness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "complete",
+        "fragments",
+        "items",
+        "edges",
+        "entry_points",
+        "retentions",
+        "retention_reasons"
+      ],
+      "properties": {
+        "complete": { "const": true },
+        "fragments": { "type": "integer", "minimum": 1 },
+        "items": { "type": "integer", "minimum": 0 },
+        "edges": { "type": "integer", "minimum": 0 },
+        "entry_points": { "type": "integer", "minimum": 0 },
+        "retentions": { "type": "integer", "minimum": 0 },
+        "retention_reasons": {
+          "type": "object",
+          "additionalProperties": { "type": "integer", "minimum": 1 }
+        }
+      }
+    },
+    "finding_kind": {
+      "enum": [
+        "dead-public",
+        "unnecessary-public",
+        "unnecessary-restricted-visibility",
+        "unnecessary-crate-visibility"
+      ]
+    },
+    "finding_kind_array": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/finding_kind" },
+      "uniqueItems": true
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "identity",
+        "item_identity",
+        "kind",
+        "name",
+        "item_kind",
+        "packages",
+        "compiler_crates",
+        "target_observations",
+        "diagnostic_paths",
+        "source",
+        "source_generated",
+        "declaration_start",
+        "declaration_end",
+        "visibility_start",
+        "visibility_end",
+        "replacement",
+        "production_live",
+        "non_production_live",
+        "required_public",
+        "reasons",
+        "level"
+      ],
+      "properties": {
+        "identity": { "type": "string", "pattern": "^surface-finding-v1-sha256-[0-9a-f]{64}$" },
+        "item_identity": { "type": "string", "pattern": "^surface-item-v1-sha256-[0-9a-f]{64}$" },
+        "kind": { "$ref": "#/$defs/finding_kind" },
+        "name": { "type": "string" },
+        "item_kind": { "type": "string", "minLength": 1 },
+        "packages": { "$ref": "#/$defs/string_array" },
+        "compiler_crates": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/compiler_crate" },
+          "minItems": 1
+        },
+        "target_observations": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/target_observation" },
+          "minItems": 1
+        },
+        "diagnostic_paths": { "$ref": "#/$defs/string_array" },
+        "source": { "type": "string", "minLength": 1 },
+        "source_generated": { "type": "boolean" },
+        "declaration_start": { "type": "integer", "minimum": 0 },
+        "declaration_end": { "type": "integer", "minimum": 0 },
+        "visibility_start": { "type": ["integer", "null"], "minimum": 0 },
+        "visibility_end": { "type": ["integer", "null"], "minimum": 0 },
+        "replacement": { "type": ["string", "null"] },
+        "production_live": { "type": "boolean" },
+        "non_production_live": { "type": "boolean" },
+        "required_public": { "type": "boolean" },
+        "reasons": { "$ref": "#/$defs/string_array" },
+        "level": { "enum": ["warn", "deny"] },
+        "policy_reason": { "type": "string", "minLength": 1 }
+      }
+    },
+    "target_observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["platform", "cfg"],
+      "properties": {
+        "platform": { "type": "string", "minLength": 1 },
+        "cfg": { "$ref": "#/$defs/string_array" }
+      }
+    },
+    "configuration_diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "location", "message", "reason"],
+      "properties": {
+        "code": {
+          "enum": ["unknown-item", "ambiguous-item", "ambiguous-policy", "unfulfilled-expectation"]
+        },
+        "location": { "type": "string", "minLength": 1 },
+        "message": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string", "minLength": 1 }
+      }
+    },
+    "reason": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "description"],
+      "properties": {
+        "code": { "type": "string", "minLength": 1 },
+        "description": { "type": "string", "minLength": 1 }
+      }
+    },
+    "target_kind": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "library",
+            "binary",
+            "test",
+            "example",
+            "benchmark",
+            "documentation",
+            "proc_macro",
+            "build_script",
+            "other"
+          ]
+        },
+        "name": { "type": "string" }
+      }
+    },
+    "fragment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "identity",
+        "unit_identity",
+        "package",
+        "target",
+        "target_kind",
+        "domain",
+        "platform",
+        "complete",
+        "items",
+        "edges"
+      ],
+      "properties": {
+        "identity": { "type": "string", "minLength": 1 },
+        "unit_identity": { "type": "string", "minLength": 1 },
+        "package": { "type": "string", "minLength": 1 },
+        "target": { "type": "string", "minLength": 1 },
+        "target_kind": { "$ref": "#/$defs/target_kind" },
+        "domain": {
+          "enum": ["production", "non_production", "doctest", "build_script", "proc_macro"]
+        },
+        "platform": { "type": "string", "minLength": 1 },
+        "complete": { "const": true },
+        "items": { "type": "integer", "minimum": 0 },
+        "edges": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "cache": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["compiler_fact_objects"],
+      "properties": { "compiler_fact_objects": { "$ref": "#/$defs/string_array" } }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["acquisition", "graph"],
+      "properties": {
+        "acquisition": { "$ref": "#/$defs/acquisition_metrics" },
+        "graph": { "$ref": "#/$defs/graph_metrics" }
+      }
+    },
+    "acquisition_metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "analysis_views",
+        "cargo_views_executed",
+        "compiler_invocations",
+        "diagnostic_cache_hits",
+        "diagnostic_cache_misses",
+        "fact_cache_hits",
+        "fact_cache_misses",
+        "fact_cache_store_failures",
+        "fact_cache_bypass_reasons",
+        "fresh_fragment_bytes",
+        "retained_fact_object_bytes"
+      ],
+      "properties": {
+        "analysis_views": { "type": "integer", "minimum": 1 },
+        "cargo_views_executed": { "type": "integer", "minimum": 0 },
+        "compiler_invocations": { "type": "integer", "minimum": 0 },
+        "diagnostic_cache_hits": { "type": "integer", "minimum": 0 },
+        "diagnostic_cache_misses": { "type": "integer", "minimum": 0 },
+        "fact_cache_hits": { "type": "integer", "minimum": 0 },
+        "fact_cache_misses": { "type": "integer", "minimum": 0 },
+        "fact_cache_store_failures": { "type": "integer", "minimum": 0 },
+        "fact_cache_bypass_reasons": {
+          "type": "object",
+          "additionalProperties": { "type": "integer", "minimum": 1 }
+        },
+        "fresh_fragment_bytes": { "type": "integer", "minimum": 0 },
+        "retained_fact_object_bytes": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "graph_metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["nodes", "edges", "traversals", "edge_visits"],
+      "properties": {
+        "nodes": { "type": "integer", "minimum": 0 },
+        "edges": { "type": "integer", "minimum": 0 },
+        "traversals": { "const": 3 },
+        "edge_visits": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "mutation_plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version",
+        "operation",
+        "operation_id",
+        "inputs_fingerprint",
+        "resolved_refs",
+        "actions",
+        "risks",
+        "trace",
+        "pre_apply"
+      ],
+      "properties": {
+        "contract_version": { "const": 2 },
+        "operation": { "const": "surface" },
+        "operation_id": { "type": "string", "pattern": "^surface-[0-9a-f]{12}$" },
+        "inputs_fingerprint": { "type": "string", "pattern": "^git-object:[0-9a-f]+$" },
+        "resolved_refs": { "$ref": "#/$defs/mutation_resolved_refs" },
+        "actions": { "type": "array", "items": { "$ref": "#/$defs/mutation_action" } },
+        "declared_inputs": { "type": "array", "maxItems": 0 },
+        "risks": { "type": "array", "items": { "$ref": "#/$defs/mutation_risk" } },
+        "trace": { "type": "array", "items": { "$ref": "#/$defs/mutation_trace" } },
+        "pre_apply": { "$ref": "#/$defs/mutation_pre_apply" }
+      }
+    },
+    "mutation_resolved_refs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["git_head", "git_branch"],
+      "properties": {
+        "git_head": { "type": "string", "pattern": "^[0-9a-f]+$" },
+        "git_branch": { "type": "string", "minLength": 1 }
+      }
+    },
+    "mutation_action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "target", "detail", "payload", "expected_mutations"],
+      "properties": {
+        "code": { "const": "SURFACE_REDUCE_VISIBILITY" },
+        "target": { "type": "string", "minLength": 1 },
+        "detail": { "type": "string", "minLength": 1 },
+        "payload": { "$ref": "#/$defs/surface_action_payload" },
+        "expected_mutations": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": { "$ref": "#/$defs/expected_mutation" }
+        }
+      }
+    },
+    "surface_action_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "before_digest", "after_digest", "edits"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "before_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "after_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "edits": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/visibility_edit" } }
+      }
+    },
+    "visibility_edit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "finding_identity",
+        "declaration_identity",
+        "declaration_start",
+        "declaration_end",
+        "visibility_start",
+        "visibility_end",
+        "edit_start",
+        "edit_end",
+        "original_visibility",
+        "replacement"
+      ],
+      "properties": {
+        "finding_identity": {
+          "type": "string",
+          "pattern": "^surface-finding-v1-sha256-[0-9a-f]{64}$"
+        },
+        "declaration_identity": {
+          "type": "string",
+          "pattern": "^surface-item-v1-sha256-[0-9a-f]{64}$"
+        },
+        "declaration_start": { "type": "integer", "minimum": 0 },
+        "declaration_end": { "type": "integer", "minimum": 1 },
+        "visibility_start": { "type": "integer", "minimum": 0 },
+        "visibility_end": { "type": "integer", "minimum": 1 },
+        "edit_start": { "type": "integer", "minimum": 0 },
+        "edit_end": { "type": "integer", "minimum": 1 },
+        "original_visibility": { "type": "string", "pattern": "^pub" },
+        "replacement": { "enum": ["", "pub(crate)", "pub(super)"] }
+      }
+    },
+    "expected_mutation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "effect", "before_fingerprint"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "effect": { "const": "write" },
+        "before_fingerprint": { "type": "string", "pattern": "^(fnv1a64:[0-9a-f]{16}|none)$" }
+      }
+    },
+    "mutation_risk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "severity", "message"],
+      "properties": {
+        "code": { "const": "SOURCE_VISIBILITY_REWRITE" },
+        "severity": { "const": "medium" },
+        "message": { "type": "string", "minLength": 1 }
+      }
+    },
+    "mutation_trace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "const": "SURFACE_EXACT_VISIBILITY_SPANS" },
+        "message": { "type": "string", "minLength": 1 }
+      }
+    },
+    "mutation_pre_apply": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "git_head",
+        "config_fingerprint",
+        "toolchain_fingerprint",
+        "lock_fingerprint",
+        "metadata_fingerprint",
+        "worktree_fingerprint",
+        "changed_paths"
+      ],
+      "properties": {
+        "git_head": { "type": "string", "pattern": "^[0-9a-f]+$" },
+        "config_fingerprint": { "type": "string", "minLength": 1 },
+        "toolchain_fingerprint": { "type": "string", "minLength": 1 },
+        "lock_fingerprint": { "type": "string", "minLength": 1 },
+        "metadata_fingerprint": {
+          "type": "string",
+          "pattern": "^snapshot:v[0-9]+-sha256-[0-9a-f]{64}$"
+        },
+        "worktree_fingerprint": { "type": "string", "pattern": "^git-object:[0-9a-f]+$" },
+        "changed_paths": { "$ref": "#/$defs/string_array" }
+      }
+    }
+  }
+}

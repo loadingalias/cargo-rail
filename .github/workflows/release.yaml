@@ -104,7 +104,7 @@ jobs:
           python3 scripts/ci/support-matrix.py --github-matrix >/dev/null
           jq -e '
             length > 0
-            and all(.[]; .target and .os and (.archive == "tar" or .archive == "zip"))
+            and all(.[]; .target and .os and (.archive == "tar" or .archive == "zip") and (.surface | type == "boolean"))
             and ((map(.target) | length) == (map(.target) | unique | length))
           ' \
             distribution/release-targets.json >/dev/null
@@ -225,7 +225,7 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          if [[ "$TARGET" == *-musl ]]; then
+          if [[ "${{ matrix.surface }}" != "true" ]]; then
             echo "include=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -277,6 +277,7 @@ jobs:
           fi
           compiler_libraries="$(find "$sysroot/lib" "$sysroot/bin" -maxdepth 1 -type f \( \
             -name 'librustc_driver-*.so' -o \
+            -name 'librustc_driver-*.dylib' -o \
             -name 'rustc_driver-*.dll' \
           \) 2>/dev/null || true)"
           test "$(printf '%s\n' "$compiler_libraries" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
@@ -325,7 +326,7 @@ jobs:
         id: build
         uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1.30.2
         with:
-          bin: cargo-rail,cargo-rail-native-rustc-wrapper,cargo-rail-native-rustc-worker,cargo-rail-distributed-worker
+          bin: cargo-rail,cargo-rail-compiler-observation,cargo-rail-native-rustc-wrapper,cargo-rail-native-rustc-worker,cargo-rail-distributed-worker
           archive: cargo-rail-${{ matrix.target }}
           target: ${{ matrix.target }}
           locked: true
@@ -348,27 +349,42 @@ jobs:
           mkdir smoke
           tar -xzf "$ARCHIVE" -C smoke
           binary="$(find smoke -type f -name cargo-rail -print -quit)"
+          observation="$(find smoke -type f -name cargo-rail-compiler-observation -print -quit)"
           wrapper="$(find smoke -type f -name cargo-rail-native-rustc-wrapper -print -quit)"
           worker="$(find smoke -type f -name cargo-rail-native-rustc-worker -print -quit)"
           distributed_worker="$(find smoke -type f -name cargo-rail-distributed-worker -print -quit)"
           driver="$(find smoke -type f -name cargo-rail-fact-driver -print -quit)"
           test -n "$binary"
+          test -n "$observation"
           test -n "$wrapper"
           test -n "$worker"
           test -n "$distributed_worker"
           test "$(dirname "$binary")" = "$(dirname "$wrapper")"
+          test "$(dirname "$binary")" = "$(dirname "$observation")"
           test "$(dirname "$binary")" = "$(dirname "$worker")"
           test "$(dirname "$binary")" = "$(dirname "$distributed_worker")"
-          if [[ "$TARGET" == *-musl ]]; then
+          test "$("$observation" --cargo-rail-observation-protocol-version)" = "1"
+          if [[ "${{ matrix.surface }}" != "true" ]]; then
             test -z "$driver"
+            surface_stderr="$(mktemp)"
+            if (cd "$(mktemp -d)" && "$binary" rail surface --check 2>"$surface_stderr"); then
+              echo "surface unexpectedly succeeded for unavailable artifact" >&2
+              exit 1
+            fi
+            grep -F "surface is unavailable" "$surface_stderr"
           else
             test -n "$driver"
             test "$(dirname "$binary")" = "$(dirname "$driver")"
             chmod +x "$driver"
             compiler_library="$(rustc --print sysroot)/$CARGO_RAIL_FACT_DRIVER_COMPILER_LIBRARY"
             compiler_library_directory="$(dirname "$compiler_library")"
-            protocol="$(LD_LIBRARY_PATH="$compiler_library_directory" "$driver" --cargo-rail-fact-protocol-version)"
+            protocol="$(LD_LIBRARY_PATH="$compiler_library_directory" DYLD_LIBRARY_PATH="$compiler_library_directory" "$driver" --cargo-rail-fact-protocol-version)"
             [[ "$protocol" =~ ^[1-9][0-9]*$ ]]
+            binary="$(cd "$(dirname "$binary")" && pwd)/$(basename "$binary")"
+            surface_report="$(cd tests/fixtures/surface_release && "$binary" rail surface --check -f json || test $? = 1)"
+            test "$(printf '%s' "$surface_report" | jq -r '.surface_contract_version')" = "2"
+            test "$(printf '%s' "$surface_report" | jq -r '.authority.audited_targets | length > 0')" = "true"
+            test "$(printf '%s' "$surface_report" | jq -r '.findings | any(.name == "dead_public")')" = "true"
           fi
           chmod +x "$binary"
           chmod +x "$wrapper"
@@ -390,12 +406,16 @@ jobs:
           }
           Expand-Archive -Path $env:ARCHIVE -DestinationPath smoke
           $binary = Get-ChildItem smoke -Recurse -Filter cargo-rail.exe | Select-Object -First 1
+          $observation = Get-ChildItem smoke -Recurse -Filter cargo-rail-compiler-observation.exe | Select-Object -First 1
           $wrapper = Get-ChildItem smoke -Recurse -Filter cargo-rail-native-rustc-wrapper.exe | Select-Object -First 1
           $worker = Get-ChildItem smoke -Recurse -Filter cargo-rail-native-rustc-worker.exe | Select-Object -First 1
           $distributedWorker = Get-ChildItem smoke -Recurse -Filter cargo-rail-distributed-worker.exe | Select-Object -First 1
           $driver = Get-ChildItem smoke -Recurse -Filter cargo-rail-fact-driver.exe | Select-Object -First 1
           if (-not $binary) {
             throw "cargo-rail.exe is missing from $env:ARCHIVE"
+          }
+          if (-not $observation) {
+            throw "cargo-rail-compiler-observation.exe is missing from $env:ARCHIVE"
           }
           if (-not $wrapper) {
             throw "cargo-rail-native-rustc-wrapper.exe is missing from $env:ARCHIVE"
@@ -409,8 +429,12 @@ jobs:
           if (-not $driver) {
             throw "cargo-rail-fact-driver.exe is missing from $env:ARCHIVE"
           }
-          if ($binary.DirectoryName -ne $wrapper.DirectoryName -or $binary.DirectoryName -ne $worker.DirectoryName -or $binary.DirectoryName -ne $distributedWorker.DirectoryName -or $binary.DirectoryName -ne $driver.DirectoryName) {
+          if ($binary.DirectoryName -ne $observation.DirectoryName -or $binary.DirectoryName -ne $wrapper.DirectoryName -or $binary.DirectoryName -ne $worker.DirectoryName -or $binary.DirectoryName -ne $distributedWorker.DirectoryName -or $binary.DirectoryName -ne $driver.DirectoryName) {
             throw "cargo-rail compiler cache binaries are not adjacent to cargo-rail.exe"
+          }
+          $observationProtocol = (& $observation.FullName --cargo-rail-observation-protocol-version).Trim()
+          if ($LASTEXITCODE -ne 0 -or $observationProtocol -ne '1') {
+            throw "archive compiler observation protocol smoke test failed"
           }
           $capability = (& $distributedWorker.FullName capability rustc | ConvertFrom-Json)
           if ($LASTEXITCODE -ne 0 -or $capability.protocol_version -ne 1) {
@@ -422,6 +446,21 @@ jobs:
           $protocol = (& $driver.FullName --cargo-rail-fact-protocol-version).Trim()
           if ($LASTEXITCODE -ne 0 -or $protocol -notmatch '^[1-9][0-9]*$') {
             throw "archive compiler fact driver failed to load: $protocol"
+          }
+          Push-Location tests/fixtures/surface_release
+          $PSNativeCommandUseErrorActionPreference = $false
+          $surfaceJson = & $binary.FullName rail surface --check -f json
+          $surfaceExit = $LASTEXITCODE
+          $surfaceReport = $surfaceJson | Out-String | ConvertFrom-Json
+          Pop-Location
+          if ($surfaceExit -ne 1 -or $surfaceReport.surface_contract_version -ne 2) {
+            throw "archive surface fixture did not report its versioned findings"
+          }
+          if ($surfaceReport.authority.audited_targets.Count -eq 0) {
+            throw "archive surface fixture did not audit a closed compiler target"
+          }
+          if (-not ($surfaceReport.findings | Where-Object { $_.name -eq "dead_public" })) {
+            throw "archive surface fixture did not report dead_public"
           }
           $actual = (& $binary.FullName rail --version).Trim()
           if ($LASTEXITCODE -ne 0 -or $actual -ne "cargo-rail $env:VERSION") {

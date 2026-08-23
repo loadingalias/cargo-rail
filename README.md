@@ -4,8 +4,10 @@
 
 Cargo-Rail turns Cargo's resolved graph into one monorepo engine. `unify` produces one dependency-coherence report and
 mutation plan. `plan` emits typed affected scope for Cargo, nextest, Just, and CI. Verified compiler reuse survives
-`cargo clean`. `change` and `release` turn reviewed changesets into version bumps, changelogs, dep-ordered publication,
-and resumable exact-SHA releases. `split` and `sync` keep standalone crates tied to monorepo source and history.
+`cargo clean`. `surface` provides Rust source-visibility analysis from compiler-derived reachability and
+snapshot-bound fixes. `change` and `release` turn reviewed changesets into version bumps, changelogs, dep-ordered
+publication, and resumable exact-SHA releases. `split` and `sync` keep standalone crates tied to monorepo source and
+history.
 
 **One captured workspace. Explicit authority.**
 
@@ -23,6 +25,7 @@ Cargo-Rail consolidates those decisions in one local, Cargo-native engine:
 | ------------------------------------------------------------------------ | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
 | Dependency version, feature, unused-edge, inheritance, and MSRV analysis | `cargo rail unify`                           | One reviewable and reversible graph-repair plan                                                                           |
 | `dorny/paths-filter`, YAML path globs, and package-selection scripts     | `cargo rail plan`                            | Typed affected scope derived from Git and the resolved Cargo graph                                                        |
+| Rust source-visibility analysis                                           | `cargo rail surface`                         | Compiler-derived production, non-production, and required-public reachability with drift-safe visibility fixes           |
 | Persisted `target/` directories and local cache glue                     | Verified compiler reuse                      | Exact reusable results remain available after `cargo clean` and across target directories within one physical source root |
 | `release-plz`, `cargo-release`, `git-cliff`, and publish-order scripts   | `cargo rail change` and `cargo rail release` | Reviewed release intent carried through exact-SHA publication and recovery                                                |
 | Copybara or custom monorepo-to-crate scripts                             | `cargo rail split` and `cargo rail sync`     | Cargo-aware synchronization with source history and recovery evidence                                                     |
@@ -36,6 +39,7 @@ flowchart TB
 
     rail --> unify["unify<br/>coherent dependencies"]
     rail --> plan["plan<br/>affected scope"]
+    rail --> surface["surface<br/>Rust visibility"]
     rail --> cache["verified reuse<br/>compiler results"]
     rail --> release["change / release<br/>exact-SHA publication"]
     rail --> sync["split / sync<br/>crate repositories"]
@@ -135,6 +139,52 @@ The same versioned plan drives:
 - typed Cargo package arguments.
 
 There is only one implementation of “affected.”
+
+## Rust visibility from the captured workspace
+
+`cargo rail surface` finds public declarations that are dead or broader than their real consumers require. It uses the
+same captured source, Cargo views, compiler-fact protocol, configuration, planner, output, and mutation authority as
+the rest of Cargo Rail.
+
+Enable automatic planner and CI enforcement in `rail.toml`:
+
+```toml
+[surface]
+enabled = true
+```
+
+That is sufficient for normal binary workspaces: every workspace binary is an implicit product and binary compiler
+crates are closed independently of package publishability. Set `consumer_scope = "workspace"` only to authorize
+closed-world conclusions for non-publishable library, proc-macro, and build-script crates. Publishable libraries
+remain open. If a source declaration is compiled into both open and closed crates, the open observation preserves it.
+Advanced product, target, feature, lint, and exception policy is optional.
+
+Inspect the configured production, test, example, benchmark, doctest, build-script, proc-macro, feature, and target
+views:
+
+```bash
+cargo rail surface                   # Report findings; always read-only and non-failing
+cargo rail surface --check --explain
+cargo rail surface --check -f json
+```
+
+Preview or apply exact visibility reductions:
+
+```bash
+cargo rail surface --fix --dry-run --explain
+cargo rail surface --fix --backup
+```
+
+The fix path does not delegate mutation to `cargo fix`. It binds byte spans to the captured snapshot, rejects drift,
+writes only planned source files, recompiles every configured view, rolls back failed verification, and records a
+receipt. Dead-public findings remain report-only because deleting a declaration is a different mutation authority.
+
+Cargo-Rail also removes Cargo acquisition passes structurally. For one feature/target view it collects all ordinary
+production and non-production targets in one Cargo pass; a per-product analyzer needs an additional pass for every
+shipped binary or library. Doctest acquisition remains separate. That is a bounded work reduction, not a universal wall-time
+multiplier: compare the same source, compiler, feature/target coverage, doctest scope, and cold or warm state before
+publishing a speed claim. See [Migrate from Hawk](docs/migrate-hawk.md) for the exact mapping and
+[Benchmarking](docs/benchmarking.md#source-surface-analysis) for the measurement contract.
 
 ## Compiler reuse that survives `cargo clean`
 
@@ -335,6 +385,9 @@ plan
 package scope
   → removes unaffected crates inside selected jobs
 
+surface
+  → reports dead declarations; narrows visibility only under explicit --fix
+
 verified reuse
   → removes compiler invocations from the work that remains
 ```
@@ -374,18 +427,22 @@ Adopt a workflow when it deletes a second source of truth. Do not adopt it merel
 cargo install cargo-rail --locked
 ```
 
-Or install a pre-built binary:
+Source installs provide the general CLI but cannot provide the release-built compiler-fact driver. `surface --schema`
+remains available; any surface analysis fails before workspace acquisition with installation guidance.
+
+For `surface`, install a native release archive and its adjacent driver with the checksum-verifying installer:
 
 ```bash
-cargo binstall cargo-rail
+curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/loadingalias/cargo-rail/main/scripts/install.sh \
+  | sh -s -- X.Y.Z
 ```
 
 Pre-built archives, SHA-256 checksums, and signed provenance are published with
 [GitHub Releases](https://github.com/loadingalias/cargo-rail/releases).
 
-Release archives place Cargo-Rail's private compiler shim beside the CLI. Keep both files together when moving a
-manual installation; Cargo-Rail remains correct without the shim but falls back to the larger CLI executable for
-compiler-wrapper processes.
+Release archives place the native compiler helpers and, on supported native targets, `cargo-rail-fact-driver` beside
+the CLI. Keep the files together. GNU Linux, macOS, and Windows archives support `surface`; musl archives deliberately
+do not. `cargo binstall cargo-rail` installs the general CLI but does not establish the companion-driver contract.
 
 The current MSRV is published in
 [`Cargo.toml`](https://github.com/loadingalias/cargo-rail/blob/main/Cargo.toml).
@@ -400,6 +457,7 @@ The current MSRV is published in
 - [Share local compiler reuse across workspaces](docs/cache-sharing.md)
 - [Benchmarking](docs/benchmarking.md)
 - [Troubleshooting and recovery](docs/troubleshooting.md)
+- [Migrate from Hawk](docs/migrate-hawk.md)
 - [Migrate from cargo-hakari](docs/migrate-hakari.md)
 - [Migrate from git-cliff or release-plz](docs/migrate-git-cliff.md)
 - [Examples](examples/)

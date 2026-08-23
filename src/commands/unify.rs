@@ -537,6 +537,7 @@ fn coverage_views_to_json(coverage_views: &[crate::compiler::CoverageView]) -> R
         .map(|view| {
             let (mode, selected) = match &view.features {
                 crate::compiler::FeatureSelection::Default => ("default", Vec::new()),
+                crate::compiler::FeatureSelection::DefaultWith(features) => ("default_with_selected", features.clone()),
                 crate::compiler::FeatureSelection::NoDefaultFeatures => ("no_default_features", Vec::new()),
                 crate::compiler::FeatureSelection::AllFeatures => ("all_features", Vec::new()),
                 crate::compiler::FeatureSelection::Selected(features) => ("selected", features.clone()),

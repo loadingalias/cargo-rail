@@ -184,14 +184,29 @@ def authoritative_environment(setup: Path) -> tuple[dict[str, str], dict[str, An
     environment.update(authority)
 
     run_command(
-        ["cargo", "build", "--locked", "--release", "--package", "cargo-rail", "--all-features", "--bin", "cargo-rail"],
+        [
+            "cargo",
+            "build",
+            "--locked",
+            "--release",
+            "--package",
+            "cargo-rail",
+            "--all-features",
+            "--bin",
+            "cargo-rail",
+            "--bin",
+            "cargo-rail-compiler-observation",
+        ],
         env=environment,
         stdout=setup / "cargo-rail-build.stdout",
         stderr=setup / "cargo-rail-build.stderr",
     )
     cargo_rail = REPOSITORY_ROOT / f"target/release/cargo-rail{executable_suffix}"
+    observation = REPOSITORY_ROOT / f"target/release/cargo-rail-compiler-observation{executable_suffix}"
     if not cargo_rail.is_file():
         raise QualificationError(f"cargo-rail release build omitted {cargo_rail}")
+    if not observation.is_file():
+        raise QualificationError(f"cargo-rail release build omitted {observation}")
 
     listing = run_command(
         [
@@ -229,7 +244,7 @@ def authoritative_environment(setup: Path) -> tuple[dict[str, str], dict[str, An
     environment.update(
         {
             "CARGO_RAIL_TEST_FACT_DRIVER": str(driver.resolve()),
-            "CARGO_RAIL_TEST_OBSERVATION_WRAPPER": str(cargo_rail.resolve()),
+            "CARGO_RAIL_TEST_OBSERVATION_WRAPPER": str(observation.resolve()),
         }
     )
     metadata = {
@@ -243,6 +258,8 @@ def authoritative_environment(setup: Path) -> tuple[dict[str, str], dict[str, An
         "compiler_library_sha256": sha256_file(runtime),
         "cargo_rail": str(cargo_rail.resolve()),
         "cargo_rail_sha256": sha256_file(cargo_rail),
+        "observation": str(observation.resolve()),
+        "observation_sha256": sha256_file(observation),
         "cargo_rail_bytes": cargo_rail.stat().st_size,
         "test_binary": str(test_binary),
         "test_binary_sha256": sha256_file(test_binary),
