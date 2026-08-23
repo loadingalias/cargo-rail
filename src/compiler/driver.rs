@@ -7,7 +7,9 @@
 
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::{ErrorKind, Read as _, Seek as _, Write as _};
+#[cfg(unix)]
+use std::io::Seek as _;
+use std::io::{ErrorKind, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -61,8 +63,11 @@ pub(crate) struct CompilerFactDriverComponent {
 /// Runtime-library bytes authenticated once and retained through doctest staging.
 struct AuthenticatedCompilerLibrary {
     path: PathBuf,
+    #[cfg(unix)]
     file: File,
+    #[cfg(unix)]
     generation: Vec<u8>,
+    #[cfg(unix)]
     bytes: u64,
 }
 
@@ -1046,17 +1051,24 @@ fn authenticate_compiler_library(path: &Path, expected_digest: &str) -> RailResu
             "install the exact rustc-dev component for the selected toolchain",
         ));
     }
-    let generation = crate::utils::stable_open_file_generation(&file)
-        .ok_or_else(|| RailError::message("compiler fact runtime library has no stable filesystem generation"))?;
-    if !crate::utils::opened_file_matches_path(&file, path, metadata.len())? {
-        return Err(RailError::message(
-            "compiler fact runtime library changed while its generation was retained",
-        ));
-    }
+    #[cfg(unix)]
+    let generation = {
+        let generation = crate::utils::stable_open_file_generation(&file)
+            .ok_or_else(|| RailError::message("compiler fact runtime library has no stable filesystem generation"))?;
+        if !crate::utils::opened_file_matches_path(&file, path, metadata.len())? {
+            return Err(RailError::message(
+                "compiler fact runtime library changed while its generation was retained",
+            ));
+        }
+        generation
+    };
     Ok(AuthenticatedCompilerLibrary {
         path: path.to_path_buf(),
+        #[cfg(unix)]
         file,
+        #[cfg(unix)]
         generation,
+        #[cfg(unix)]
         bytes,
     })
 }
