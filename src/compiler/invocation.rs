@@ -415,6 +415,9 @@ fn run_direct_cache() -> i32 {
     };
     if cache_control == CacheControl::BenchmarkCoverage {
         crate::compiler::native_cache::activate_benchmark_coverage();
+        if let Some(exit_code) = benchmark_coverage_failure("cargo-rail compiler cache wrapper") {
+            return exit_code;
+        }
     }
     if crate::compiler::native_cache::NativeCacheContext::is_direct_wrapper_program(&invocation.program) {
         eprintln!("cargo-rail compiler cache wrapper: recursive transparent wrapper configuration");
@@ -433,6 +436,9 @@ fn run_direct_cache() -> i32 {
             &invocation.arguments,
             reason,
         );
+        if let Some(exit_code) = benchmark_coverage_failure("cargo-rail compiler cache wrapper") {
+            return exit_code;
+        }
         let mut command = invocation.command();
         if cache_control == CacheControl::BenchmarkCoverage {
             crate::compiler::native_cache::remove_cache_environment(&mut command);
@@ -451,6 +457,9 @@ fn run_direct_cache() -> i32 {
                 &invocation.arguments,
                 reason,
             );
+            if let Some(exit_code) = benchmark_coverage_failure("cargo-rail compiler cache wrapper") {
+                return exit_code;
+            }
             let mut command = invocation.command();
             if cache_control == CacheControl::BenchmarkCoverage {
                 crate::compiler::native_cache::remove_cache_environment(&mut command);
@@ -529,6 +538,12 @@ fn cache_control() -> CacheControl {
     }
 }
 
+fn benchmark_coverage_failure(context: &str) -> Option<i32> {
+    let error = crate::compiler::native_cache::benchmark_coverage_failure()?;
+    eprintln!("{context}: failed to record benchmark compiler coverage: {error}");
+    Some(2)
+}
+
 fn run_cache_bypass(invocation: CompilerInvocation) -> i32 {
     let mut command = invocation.command();
     crate::compiler::native_cache::remove_cache_environment(&mut command);
@@ -547,7 +562,12 @@ fn run_cache_invocation(
     }
     let mut command = invocation.command();
     command.env_remove(CACHE_WRAPPER_MARKER).env_remove(CACHE_CONTROL_ENV);
-    match crate::compiler::native_cache::configure_outer(&invocation.program, &invocation.arguments, &mut command) {
+    let action =
+        crate::compiler::native_cache::configure_outer(&invocation.program, &invocation.arguments, &mut command);
+    if let Some(exit_code) = benchmark_coverage_failure("cargo-rail compiler cache wrapper") {
+        return exit_code;
+    }
+    match action {
         crate::compiler::native_cache::OuterCacheAction::Hit(exit_code) => exit_code,
         crate::compiler::native_cache::OuterCacheAction::Store(store) => {
             let crate::compiler::native_cache::OuterCacheStore {
@@ -557,7 +577,7 @@ fn run_cache_invocation(
                 cache_bytes_read,
                 distributed_placement,
             } = *store;
-            crate::compiler::native_cache::run_and_store(
+            let exit_code = crate::compiler::native_cache::run_and_store(
                 command,
                 recorder,
                 capture,
@@ -565,7 +585,8 @@ fn run_cache_invocation(
                 cache_bytes_read,
                 distributed_placement,
                 "cargo-rail compiler cache wrapper",
-            )
+            );
+            benchmark_coverage_failure("cargo-rail compiler cache wrapper").unwrap_or(exit_code)
         }
         crate::compiler::native_cache::OuterCacheAction::OperationalFailure(error) => {
             crate::compiler::native_cache::record_active_failure();
@@ -830,6 +851,9 @@ fn run_rustdoc() -> i32 {
     let benchmark_coverage = cache_control() == CacheControl::BenchmarkCoverage;
     if benchmark_coverage {
         crate::compiler::native_cache::activate_benchmark_coverage();
+        if let Some(exit_code) = benchmark_coverage_failure("cargo-rail rustdoc proxy") {
+            return exit_code;
+        }
     }
     if is_rustdoc_information_request(&original_arguments) {
         if benchmark_coverage {
@@ -838,6 +862,9 @@ fn run_rustdoc() -> i32 {
                 &original_arguments,
                 "compiler_information_request",
             );
+            if let Some(exit_code) = benchmark_coverage_failure("cargo-rail rustdoc proxy") {
+                return exit_code;
+            }
         }
         return run_rustdoc_bypass(CompilerInvocation::selected(rustdoc, original_arguments));
     }
@@ -850,6 +877,9 @@ fn run_rustdoc() -> i32 {
                     &original_arguments,
                     rustdoc_cache_bypass_reason(&original_arguments),
                 );
+                if let Some(exit_code) = benchmark_coverage_failure("cargo-rail rustdoc proxy") {
+                    return exit_code;
+                }
             }
             return run_rustdoc_bypass(CompilerInvocation::selected(rustdoc, original_arguments));
         }

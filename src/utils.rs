@@ -254,21 +254,13 @@ fn windows_file_generation(observation: crate::windows_fs::FileObservation) -> O
     Some(generation)
 }
 
-/// Capture stable generation evidence from an already-open regular file.
-#[cfg(windows)]
-pub(crate) fn stable_open_file_generation(file: &fs::File) -> Option<Vec<u8>> {
-    let observation = crate::windows_fs::observe_file(file).ok()?;
-    crate::windows_fs::prove_local_ntfs(file, observation.volume_serial_number).ok()?;
-    windows_file_generation(observation)
-}
-
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub(crate) fn stable_file_generation(_path: &Path) -> Option<Vec<u8>> {
     None
 }
 
-/// Stable opened-file generations are unavailable on this host.
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+/// Stable opened-file generations are unavailable on this Unix host.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 pub(crate) fn stable_open_file_generation(_file: &fs::File) -> Option<Vec<u8>> {
     None
 }

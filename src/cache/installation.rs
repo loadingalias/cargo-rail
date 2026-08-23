@@ -609,40 +609,36 @@ pub(crate) struct InstallationStatus {
     pub(crate) issues: Vec<String>,
 }
 
-/// Record one post-context transparent wrapper outcome in a bounded private log.
+/// Record one post-context wrapper outcome in a bounded private log.
 ///
-/// This deliberately ignores failures: cache reuse and the compiler process
-/// must never depend on observational status accounting.
-pub(crate) fn record_usage(receipt: &InstallationReceipt, outcome: u8) {
+/// Ordinary cache execution deliberately discards this result. Explicit
+/// benchmark coverage instead surfaces it so its usage and action ledgers
+/// cannot silently diverge.
+pub(crate) fn record_usage(receipt: &InstallationReceipt, outcome: u8) -> RailResult<()> {
     if !matches!(outcome, b'H' | b'M' | b'B' | b'F') {
-        return;
+        return Err(RailError::message("compiler-cache usage outcome is invalid"));
     }
-    let Ok(path) = receipt.usage_path() else {
-        return;
-    };
-    let Ok(mut file) = crate::utils::open_cache_lock_file(&path, true) else {
-        return;
-    };
+    let path = receipt.usage_path()?;
+    let mut file = crate::utils::open_cache_lock_file(&path, true)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        if file.set_permissions(fs::Permissions::from_mode(0o600)).is_err() {
-            return;
-        }
+
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
-    if file.lock().is_err() {
-        return;
+    file.lock()?;
+    let metadata = file.metadata()?;
+    if metadata.len() >= MAX_USAGE_BYTES {
+        return Err(RailError::message("compiler-cache usage log reached its size bound"));
     }
-    let Ok(metadata) = file.metadata() else {
-        return;
-    };
-    if metadata.len() >= MAX_USAGE_BYTES
-        || !crate::utils::private_file_matches_path(&file, &path, metadata.len()).unwrap_or(false)
-        || file.seek(std::io::SeekFrom::End(0)).is_err()
-    {
-        return;
+    if !crate::utils::private_file_matches_path(&file, &path, metadata.len())? {
+        return Err(RailError::message(
+            "compiler-cache usage log is not the retained bounded private file",
+        ));
     }
-    drop(file.write_all(&[outcome]));
+    file.seek(std::io::SeekFrom::End(0))?;
+    file.write_all(&[outcome])?;
+    Ok(())
 }
 
 fn usage_status(receipt: &InstallationReceipt) -> RailResult<InstallationUsageStatus> {

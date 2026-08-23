@@ -824,7 +824,7 @@ fn benchmark_coverage_records_compiler_mode_cold_boundaries() {
 
 #[cfg(unix)]
 #[test]
-fn benchmark_coverage_rejects_a_symlink_without_changing_compiler_behavior() {
+fn benchmark_coverage_rejects_a_symlink_before_compiler_execution() {
     let result: Result<()> = (|| {
         use std::os::unix::fs::symlink;
 
@@ -832,15 +832,19 @@ fn benchmark_coverage_rejects_a_symlink_without_changing_compiler_behavior() {
         let state_root = fs::canonicalize(state.path())?;
         let real = state_root.join("real-coverage");
         let selected = state_root.join("selected-coverage");
+        let compiler = state_root.join("rustc");
+        let compiler_marker = state_root.join("compiler-ran");
         fs::create_dir(&real)?;
         {
             use std::os::unix::fs::PermissionsExt as _;
             fs::set_permissions(&real, fs::Permissions::from_mode(0o700))?;
         }
         symlink(&real, &selected)?;
+        write_executable(&compiler, "#!/bin/sh\nprintf executed > \"$1\"\n")?;
 
         let output = Command::new(env!("CARGO_BIN_EXE_cargo-rail-native-rustc-wrapper"))
-            .args(["rustc", "--version"])
+            .arg(&compiler)
+            .arg(&compiler_marker)
             .env(CACHE_CONTROL_ENV, BENCH_COVERAGE_CONTROL)
             .env(BENCH_COVERAGE_DIRECTORY_ENV, &selected)
             .env_remove(CACHE_WRAPPER_MARKER)
@@ -848,9 +852,17 @@ fn benchmark_coverage_rejects_a_symlink_without_changing_compiler_behavior() {
             .env_remove("CARGO_RAIL_RUSTDOC_WRAPPER")
             .output()?;
 
+        assert_eq!(output.status.code(), Some(2), "hostile benchmark path was ignored");
         assert!(
-            output.status.success(),
-            "hostile benchmark path changed compiler behavior"
+            String::from_utf8_lossy(&output.stderr).contains(
+                "cargo-rail compiler cache wrapper: failed to record benchmark compiler coverage: coverage \
+                 directory: benchmark compiler coverage directory is not one real canonical directory"
+            ),
+            "hostile benchmark path did not report its exact cause: {output:?}"
+        );
+        assert!(
+            !compiler_marker.exists(),
+            "compiler ran after evidence validation failed"
         );
         assert!(
             fs::read_dir(real)?.next().is_none(),

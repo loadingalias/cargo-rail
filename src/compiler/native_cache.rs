@@ -60,6 +60,8 @@ const CAPTURE_PAUSE_PHASE_ENV: &str = "CARGO_RAIL_TEST_NATIVE_CAPTURE_PAUSE_PHAS
 const CAPTURE_PAUSE_CRATE_ENV: &str = "CARGO_RAIL_TEST_NATIVE_CAPTURE_PAUSE_CRATE";
 #[cfg(debug_assertions)]
 const CAPTURE_PAUSE_DIRECTORY_ENV: &str = "CARGO_RAIL_TEST_NATIVE_CAPTURE_PAUSE_DIRECTORY";
+#[cfg(debug_assertions)]
+const BENCH_COVERAGE_FAULT_ENV: &str = "CARGO_RAIL_TEST_BENCH_COVERAGE_FAULT";
 pub(crate) const DIAGNOSTIC_EXECUTION_CONTRACT: &str = "diagnostic-workspace-wrapper-v13";
 pub(crate) const DIRECT_EXECUTION_CONTRACT: &str = "direct-global-wrapper-v14";
 #[cfg(not(windows))]
@@ -213,6 +215,7 @@ impl NativeCacheSession {
 
 static ACTIVE_CONTEXT: OnceLock<NativeCacheContext> = OnceLock::new();
 static BENCH_COVERAGE_DIRECTORY: OnceLock<PathBuf> = OnceLock::new();
+static BENCH_COVERAGE_FAILURE: OnceLock<String> = OnceLock::new();
 static BENCH_DURABILITY_COUNTERS: OnceLock<NativeDurabilityCounters> = OnceLock::new();
 
 const NATIVE_DURABILITY_PHASE_COUNT: usize = 8;
@@ -3991,6 +3994,7 @@ fn private_test_compiler_environment(name: &OsStr) -> bool {
                 | CAPTURE_PAUSE_PHASE_ENV
                 | CAPTURE_PAUSE_CRATE_ENV
                 | CAPTURE_PAUSE_DIRECTORY_ENV
+                | BENCH_COVERAGE_FAULT_ENV
         )
     )
 }
@@ -10608,7 +10612,8 @@ pub(crate) fn remove_cache_environment(command: &mut Command) {
         .env_remove(TEST_CAPTURE_LIMIT_ENV)
         .env_remove(CAPTURE_PAUSE_PHASE_ENV)
         .env_remove(CAPTURE_PAUSE_CRATE_ENV)
-        .env_remove(CAPTURE_PAUSE_DIRECTORY_ENV);
+        .env_remove(CAPTURE_PAUSE_DIRECTORY_ENV)
+        .env_remove(BENCH_COVERAGE_FAULT_ENV);
     command
         .env_remove(SESSION_ENV)
         .env_remove(DISPOSITION_ENV)
@@ -12370,15 +12375,17 @@ fn write_cache_event(
         CompilerCacheWrapperStatus::Miss => b'M',
         CompilerCacheWrapperStatus::Bypassed | CompilerCacheWrapperStatus::Disabled => b'B',
     };
-    crate::cache::installation::record_usage(receipt, outcome);
-    drop(write_benchmark_coverage_event(
-        status,
-        reason,
-        action_key,
-        result_key,
-        remote_base_action_key,
-        metrics,
-    ));
+    let usage = crate::cache::installation::record_usage(receipt, outcome);
+    let coverage =
+        write_benchmark_coverage_event(status, reason, action_key, result_key, remote_base_action_key, metrics);
+    if BENCH_COVERAGE_DIRECTORY.get().is_some() {
+        if let Err(error) = usage {
+            retain_benchmark_coverage_failure(format!("usage log: {error}"));
+        }
+        if let Err(error) = coverage {
+            retain_benchmark_coverage_failure(format!("coverage event: {error}"));
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -12471,6 +12478,7 @@ fn write_benchmark_coverage_invocation(invocation: BenchmarkCoverageInvocation<'
         compiler,
         arguments,
     } = invocation;
+    benchmark_coverage_test_fault(status)?;
     let compiler = compiler
         .to_str()
         .ok_or_else(|| RailError::message("benchmark compiler coverage has a non-UTF-8 compiler argument"))?
@@ -12558,15 +12566,18 @@ fn write_benchmark_coverage_invocation(invocation: BenchmarkCoverageInvocation<'
 
 /// Activate benchmark-only evidence after the existing cache-control read selected it.
 ///
-/// Invalid or hostile evidence paths disable evidence without changing compiler behavior.
+/// Invalid or hostile evidence paths fail only the explicitly selected evidence run.
 pub(crate) fn activate_benchmark_coverage() {
     let Some(directory) = std::env::var_os(BENCH_COVERAGE_DIRECTORY_ENV).map(PathBuf::from) else {
+        retain_benchmark_coverage_failure("coverage directory is not configured".to_string());
         return;
     };
-    if validate_benchmark_coverage_directory(&directory).is_ok() {
-        BENCH_COVERAGE_DIRECTORY.get_or_init(|| directory);
-        BENCH_DURABILITY_COUNTERS.get_or_init(NativeDurabilityCounters::new);
+    if let Err(error) = validate_benchmark_coverage_directory(&directory) {
+        retain_benchmark_coverage_failure(format!("coverage directory: {error}"));
+        return;
     }
+    BENCH_COVERAGE_DIRECTORY.get_or_init(|| directory);
+    BENCH_DURABILITY_COUNTERS.get_or_init(NativeDurabilityCounters::new);
 }
 
 /// Record one acquisition-free direct-wrapper bypass for the explicit benchmark census.
@@ -12574,7 +12585,7 @@ pub(crate) fn record_benchmark_coverage_bypass(program: &OsStr, arguments: &[OsS
     let Some(directory) = BENCH_COVERAGE_DIRECTORY.get() else {
         return;
     };
-    drop(write_benchmark_coverage_invocation(BenchmarkCoverageInvocation {
+    if let Err(error) = write_benchmark_coverage_invocation(BenchmarkCoverageInvocation {
         directory,
         status: CompilerCacheWrapperStatus::Bypassed,
         reason,
@@ -12584,7 +12595,45 @@ pub(crate) fn record_benchmark_coverage_bypass(program: &OsStr, arguments: &[OsS
         metrics: NativeCacheMetrics::default(),
         compiler: program,
         arguments,
-    }));
+    }) {
+        retain_benchmark_coverage_failure(format!("coverage event: {error}"));
+    }
+}
+
+/// Return the first benchmark-only evidence failure retained by this process.
+pub(crate) fn benchmark_coverage_failure() -> Option<&'static str> {
+    BENCH_COVERAGE_FAILURE.get().map(String::as_str)
+}
+
+fn retain_benchmark_coverage_failure(error: String) {
+    BENCH_COVERAGE_FAILURE.get_or_init(|| error);
+}
+
+#[cfg(debug_assertions)]
+fn benchmark_coverage_test_fault(status: CompilerCacheWrapperStatus) -> RailResult<()> {
+    let Some(selected) = std::env::var_os(BENCH_COVERAGE_FAULT_ENV) else {
+        return Ok(());
+    };
+    let selected = selected
+        .to_str()
+        .ok_or_else(|| RailError::message(format!("{BENCH_COVERAGE_FAULT_ENV} is not valid UTF-8")))?;
+    let status = match status {
+        CompilerCacheWrapperStatus::Hit => "hit",
+        CompilerCacheWrapperStatus::Miss => "miss",
+        CompilerCacheWrapperStatus::Disabled => "disabled",
+        CompilerCacheWrapperStatus::Bypassed => "bypassed",
+    };
+    if selected == status {
+        return Err(RailError::message(format!(
+            "injected benchmark compiler coverage {status} event failure"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn benchmark_coverage_test_fault(_status: CompilerCacheWrapperStatus) -> RailResult<()> {
+    Ok(())
 }
 
 fn validate_benchmark_coverage_directory(directory: &Path) -> RailResult<()> {
@@ -12616,7 +12665,7 @@ fn validate_benchmark_coverage_directory(directory: &Path) -> RailResult<()> {
 /// Record an operational wrapper failure after an installed context was authenticated.
 pub(crate) fn record_active_failure() {
     if let Some(receipt) = active_context().and_then(|context| context.installation.as_ref()) {
-        crate::cache::installation::record_usage(receipt, b'F');
+        drop(crate::cache::installation::record_usage(receipt, b'F'));
     }
 }
 
@@ -15037,7 +15086,7 @@ pub(crate) mod tests {
 
     #[cfg(debug_assertions)]
     #[test]
-    fn capture_pause_controls_are_private_compiler_capabilities() {
+    fn test_controls_are_private_compiler_capabilities() {
         let controls = [
             RESTORE_FAULT_ENV,
             RESTORE_ABORT_ENV,
@@ -15047,6 +15096,7 @@ pub(crate) mod tests {
             CAPTURE_PAUSE_PHASE_ENV,
             CAPTURE_PAUSE_CRATE_ENV,
             CAPTURE_PAUSE_DIRECTORY_ENV,
+            BENCH_COVERAGE_FAULT_ENV,
         ];
         for control in controls {
             assert!(private_compiler_environment(OsStr::new(control)));

@@ -264,6 +264,22 @@ fn run_cargo(
     environment: &[(&str, &str)],
 ) -> Result<(Output, Usage)> {
     let before = cache_usage(fixture, cargo_home)?;
+    let mut command = cargo_command(fixture, cargo_home, workload);
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    let output = command.output()?;
+    ensure!(
+        output.status.success(),
+        "cargo {workload} failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let usage = cache_usage(fixture, cargo_home)?.difference(before);
+    Ok((output, usage))
+}
+
+fn cargo_command(fixture: &Path, cargo_home: &Path, workload: &str) -> Command {
     let mut command = Command::new("cargo");
     command.current_dir(fixture).arg(workload);
     if workload == "build" {
@@ -286,18 +302,7 @@ fn run_cargo(
         .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER");
-    for (name, value) in environment {
-        command.env(name, value);
-    }
-    let output = command.output()?;
-    ensure!(
-        output.status.success(),
-        "cargo {workload} failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let usage = cache_usage(fixture, cargo_home)?.difference(before);
-    Ok((output, usage))
+    command
 }
 
 fn add_current_root_diagnostic(fixture: &Path) -> Result<()> {
@@ -545,6 +550,48 @@ fn dynamic_library(directory: &Path, crate_name: &str) -> PathBuf {
     } else {
         directory.join(format!("lib{crate_name}.so"))
     }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn benchmark_coverage_event_failure_is_explicit() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let fixture = root.path().join("fixture");
+    let git_source = root.path().join("git-source");
+    let cache = root.path().join("cache");
+    let cargo_home = root.path().join("cargo-home");
+    let events = root.path().join("events");
+    materialize_fixture(&fixture, &git_source)?;
+    seed_isolated_cargo_home(&fixture, &cargo_home)?;
+    setup_cache(&fixture, &cargo_home, &cache)?;
+    create_private_directory(&events)?;
+    let events = fs::canonicalize(events)?;
+
+    let before = cache_usage(&fixture, &cargo_home)?;
+    let output = cargo_command(&fixture, &cargo_home, "check")
+        .env("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1")
+        .env("CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY", &events)
+        .env("CARGO_RAIL_TEST_BENCH_COVERAGE_FAULT", "miss")
+        .output()?;
+    let usage = cache_usage(&fixture, &cargo_home)?.difference(before);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    ensure!(!output.status.success(), "injected coverage failure was ignored");
+    ensure!(
+        stderr.contains(
+            "cargo-rail compiler cache wrapper: failed to record benchmark compiler coverage: coverage event: \
+             injected benchmark compiler coverage miss event failure"
+        ),
+        "wrapper did not report the benchmark evidence failure:\n{stderr}"
+    );
+    ensure!(
+        usage.misses > 0,
+        "injected failure did not cross a recorded miss: {usage:?}\n{stderr}"
+    );
+    ensure!(
+        !benchmark_events(&events)?.iter().any(|event| event["status"] == "miss"),
+        "faulted miss unexpectedly published benchmark evidence"
+    );
+    Ok(())
 }
 
 #[test]
