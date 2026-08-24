@@ -8,7 +8,7 @@ if [ -z "$version" ]; then
   exit 2
 fi
 case "$version" in
-  *[!0-9.]*|.*|*.) echo "version must be an exact numeric release such as 0.22.0" >&2; exit 2 ;;
+  *[!0-9.]*|.*|*.) echo "version must be an exact numeric release such as 0.22.1" >&2; exit 2 ;;
 esac
 
 machine="$(uname -m)"

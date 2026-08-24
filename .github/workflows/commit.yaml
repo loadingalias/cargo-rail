@@ -49,9 +49,9 @@ jobs:
 
       - name: Build Plan
         id: plan
-        uses: loadingalias/cargo-rail-action@ebc8ef2740efefe2cd5c42826344a8f1213113ae # v6.1.2
+        uses: loadingalias/cargo-rail-action@47e86bde928ce420b85efa5f8d3b5feb96fd0ffc # v7.0.0
         with:
-          version: 0.20.1
+          version: 0.22.1
           since: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
           args: "--explain"
 
@@ -62,8 +62,7 @@ jobs:
           SURFACES_JSON: ${{ steps.plan.outputs.surfaces-json }}
         run: |
           set -euo pipefail
-          # Planner 0.20.1 predates the native gate. Missing must broaden to true until
-          # the action pin advances; a legacy plan must never skip Surface enforcement.
+          # Missing must broaden to true; contract drift must never skip Surface enforcement.
           surface="$(
             python3 <<'PY'
           import json

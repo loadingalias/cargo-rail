@@ -151,10 +151,10 @@ planner once, validates planner and scope versions, and exports their projection
 planner v7 and scope v4; the action's `version` input independently selects a compatible Cargo-Rail release.
 
 ```yaml
-- uses: loadingalias/cargo-rail-action@8362d141189a75e7a9513217bfeb16accfb3d58d
+- uses: loadingalias/cargo-rail-action@47e86bde928ce420b85efa5f8d3b5feb96fd0ffc # v7.0.0
   id: rail
   with:
-    version: 0.22.0
+    version: 0.22.1
 
 - name: Test selected packages
   if: steps.rail.outputs.test == 'true'

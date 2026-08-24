@@ -206,7 +206,7 @@ rewrite_workflows() {
       fi
 
       # Pattern: uses: actions/checkout@v4
-      # Replace with: uses: actions/checkout@abc123...  # v4
+      # Replace with: uses: actions/checkout@abc123... # v4
 
       # Check if action exists in file
       if ! grep -q "uses: $action@" "$temp_file"; then
@@ -215,8 +215,8 @@ rewrite_workflows() {
 
       # Perform replacement using sed
       # Match: uses: actions/checkout@<anything>
-      # Replace: uses: actions/checkout@<sha>  # <ref>
-      sed -i.bak -E "s|(uses: $action)@[a-zA-Z0-9._-]+( *#.*)?$|\1@$sha  # $ref|g" "$temp_file"
+      # Replace: uses: actions/checkout@<sha> # <ref>
+      sed -i.bak -E "s|(uses: $action)@[a-zA-Z0-9._-]+( *#.*)?$|\1@$sha # $ref|g" "$temp_file"
 
       modified=true
       echo "  ✅ Pinned $action@$ref → $sha"

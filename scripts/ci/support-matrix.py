@@ -1265,7 +1265,7 @@ cargo rail cache setup --remote \\
 cargo build --workspace --all-features --locked
 ```
 
-`loadingalias/cargo-rail-action/cache@8362d141189a75e7a9513217bfeb16accfb3d58d` accepts the same URL as `url`, runs
+`loadingalias/cargo-rail-action/cache@47e86bde928ce420b85efa5f8d3b5feb96fd0ffc` accepts the same URL as `url`, runs
 setup once, and leaves later ordinary
 Cargo commands in that GitHub Actions job on the installed cache path. Configure provider credentials before Cargo
 runs and invoke the cache Action separately in each execution job because hosted jobs do not share a machine or Cargo

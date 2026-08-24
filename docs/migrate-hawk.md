@@ -15,7 +15,7 @@ The checked-in conformance reference is pinned to Hawk 0.1.13 at commit
 remains available.
 
 ```bash
-version=X.Y.Z
+version=0.22.1
 curl --proto '=https' --tlsv1.2 -sSf \
   "https://raw.githubusercontent.com/loadingalias/cargo-rail/v${version}/scripts/install.sh" \
   | sh -s -- "$version"

@@ -88,9 +88,9 @@ that job uses the installed receipt:
 
 ```yaml
 - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-- uses: loadingalias/cargo-rail-action/cache@8362d141189a75e7a9513217bfeb16accfb3d58d
+- uses: loadingalias/cargo-rail-action/cache@47e86bde928ce420b85efa5f8d3b5feb96fd0ffc # v7.0.0
   with:
-    version: 0.22.0
+    version: 0.22.1
     url: ${{ vars.CARGO_RAIL_CACHE_URL }}
     mode: read
 - run: cargo check --workspace --all-features --locked

@@ -45,7 +45,7 @@ compiler-fact driver from a native release archive. On GNU Linux and macOS, inst
 installer:
 
 ```bash
-version=X.Y.Z
+version=0.22.1
 curl --proto '=https' --tlsv1.2 -sSf \
   "https://raw.githubusercontent.com/loadingalias/cargo-rail/v${version}/scripts/install.sh" \
   | sh -s -- "$version"
