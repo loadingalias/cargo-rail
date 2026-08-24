@@ -1,5 +1,19 @@
 # Changelog
 
+
+## [0.22.1](https://github.com/loadingalias/cargo-rail/compare/v0.22.0...v0.22.1) - 2026-08-24
+
+- Shorten the README around the product decision, safe evaluation, installation, and adoption. Remove stale
+  version-pinned launch copy and move deep operational detail behind maintained references.
+
+- Preserve Rustup proxy selection while binding distributed execution to the exact sysroot compiler, derive archive
+  protocol checks from the worker itself, and require the same eight-target archive build and smoke-test gate before a
+  release commit can become publishable.
+
+- Resolve release-archive executables from an absolute extraction root so smoke tests remain valid after changing their
+  working directory, and preserve the failing diagnostic when an archive violates its Surface capability contract.
+
+
 ## [0.22.0](https://github.com/loadingalias/cargo-rail/compare/v0.21.0...v0.22.0) - 2026-08-23
 
 - Make compiler-cache compatibility validation fail explicitly when benchmark evidence cannot be recorded, and restore
