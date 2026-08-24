@@ -1,6 +1,16 @@
 # Changelog
 
 
+
+## [0.22.2](https://github.com/loadingalias/cargo-rail/compare/v0.22.1...v0.22.2) - 2026-08-24
+
+- Update Cargo-Rail's public GitHub Actions examples and dogfood workflow to use cargo-rail-action v7 with Cargo-Rail
+  0.22.1.
+
+- Preserve every benchmark compiler-coverage event when parallel rustc wrappers select the same initial event filename
+  instead of failing the compilation with an `EEXIST` error.
+
+
 ## [0.22.1](https://github.com/loadingalias/cargo-rail/compare/v0.22.0...v0.22.1) - 2026-08-24
 
 - Shorten the README around the product decision, safe evaluation, installation, and adoption. Remove stale
