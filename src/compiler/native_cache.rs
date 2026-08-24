@@ -12556,12 +12556,31 @@ fn write_benchmark_coverage_invocation(invocation: BenchmarkCoverageInvocation<'
     }
     temporary.write_all(&encoded)?;
     temporary.write_all(b"\n")?;
+    persist_benchmark_coverage_event(temporary, directory)
+}
+
+fn persist_benchmark_coverage_event(mut temporary: tempfile::NamedTempFile, directory: &Path) -> RailResult<()> {
+    // Coverage is a lossless event stream, not a content-addressed set. A temporary filename can be reused after an
+    // earlier process renames it, so retain the prepared event and atomically claim the next free collision slot.
     let temporary_identity = ContentDigest::sha256(temporary.path().as_os_str().as_encoded_bytes());
-    let destination = directory.join(format!("event-{temporary_identity}.json"));
-    temporary
-        .persist_noclobber(destination)
-        .map_err(|error| RailError::from(error.error))?;
-    Ok(())
+    for collision in 0..=u64::MAX {
+        let suffix = if collision == 0 {
+            String::new()
+        } else {
+            format!("-{collision}")
+        };
+        let destination = directory.join(format!("event-{temporary_identity}{suffix}.json"));
+        match temporary.persist_noclobber(&destination) {
+            Ok(_) => return Ok(()),
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                temporary = error.file;
+            }
+            Err(error) => return Err(RailError::from(error.error)),
+        }
+    }
+    Err(RailError::message(
+        "benchmark compiler coverage event namespace is exhausted",
+    ))
 }
 
 /// Activate benchmark-only evidence after the existing cache-control read selected it.
@@ -12710,6 +12729,30 @@ fn append_frame(output: &mut Vec<u8>, tag: &[u8], value: &[u8]) {
 pub(crate) mod tests {
     use super::*;
     use crate::compiler::observation::EnvironmentObservation;
+
+    #[test]
+    fn benchmark_coverage_publication_preserves_events_after_a_name_collision() {
+        let directory = tempfile::tempdir().expect("coverage directory");
+        let mut temporary = tempfile::Builder::new()
+            .prefix(".cargo-rail-native-coverage-")
+            .suffix(".tmp")
+            .tempfile_in(directory.path())
+            .expect("coverage temporary");
+        temporary.write_all(b"new event\n").expect("new event");
+        let identity = ContentDigest::sha256(temporary.path().as_os_str().as_encoded_bytes());
+        let occupied = directory.path().join(format!("event-{identity}.json"));
+        fs::write(&occupied, b"existing event\n").expect("occupied event slot");
+
+        persist_benchmark_coverage_event(temporary, directory.path()).expect("publish after collision");
+
+        assert_eq!(fs::read(&occupied).expect("existing event"), b"existing event\n");
+        let mut events = fs::read_dir(directory.path())
+            .expect("coverage events")
+            .map(|entry| fs::read(entry.expect("coverage entry").path()).expect("coverage event"))
+            .collect::<Vec<_>>();
+        events.sort();
+        assert_eq!(events, [b"existing event\n".to_vec(), b"new event\n".to_vec()]);
+    }
 
     fn metadata_output_paths(dep_info: PathBuf, metadata: PathBuf) -> NativeOutputPaths {
         NativeOutputPaths {
