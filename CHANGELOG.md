@@ -1,6 +1,5 @@
 # Changelog
 
-
 ## [0.22.0](https://github.com/loadingalias/cargo-rail/compare/v0.21.0...v0.22.0) - 2026-08-23
 
 - Make compiler-cache compatibility validation fail explicitly when benchmark evidence cannot be recorded, and restore
@@ -12,7 +11,7 @@
   linker witness; COFF, explicit linkers, cross targets, incremental work products, alternate compilers, external
   backends, Clippy diagnostics, rustdoc output, doctest execution, proc-macro consumers, and build-script execution keep
   specific acquisition-free cold boundaries when complete authority is unavailable.
-  
+
   Added a root-independent operation inventory for Rust compilation, build-script execution, native compilation,
   compiler-owned `asm!`, `global_asm!`, `naked_asm!`, included and target-feature-sensitive assembly results,
   Rust-required external assembly, preprocessing, archives, probes, generated outputs, and downstream artifact edges.
@@ -64,20 +63,20 @@
   a versioned typed protocol with canonical source namespaces, exact Rust dependency inputs, fixed compiler options, and
   metadata or library outputs. Unsupported inputs, native or dynamic dependencies, linking, incomplete environment
   evidence, and unknown compiler shapes stay local.
-  
+
   `cache setup` can pin one mutually authenticated worker and its exact compiler, sysroot, platform, endpoint, trust
   root, client identity, and execution policy. The qualified Linux policy runs each attempt in an empty-root Bubblewrap
   sandbox with private namespaces and an exact cgroup-v2 envelope for CPU, memory, processes, scratch space, time,
   streams, and outputs. Startup probes require observed CPU throttling, an OOM kill, process-limit enforcement, and an
   idle hierarchy before the worker accepts normal work. The direct worker remains for dedicated single-tenant or
   ephemeral machines; it is not a multi-tenant service or general remote runner.
-  
+
   Distribution runs only after local L1 and remote L2 miss. Transport, protocol, capability, lease, and pre-effect worker
   failures fall back to the exact local compiler command. Compiler failures retain their exit state and bounded
   diagnostics without returning partial artifacts. Successful responses enter private staging and must pass the same
   live recapture, action/result verification, and atomic restore transaction as local cache results before any output is
   published. Workers never receive cache-provider credentials or cache write authority.
-  
+
   Automatic placement uses bounded, expiring, source-free cost history and delegates only when at least three local and
   remote observations predict a critical-path win. In the retained same-shape `c8i.large` qualification, a six-crate
   dependency DAG completed in 10.098 seconds p50: 29.57% below local Cargo and 28.84% below pinned distributed sccache.
@@ -95,13 +94,13 @@
   dependencies, source feature evidence, conservative documentation references, and MSRV policy now come from the same
   snapshot. Existing inherited declarations participate in unused-dependency proof without producing no-op edits, and
   renamed dependencies retain their exact Cargo alias and package identity through planning and application.
-  
+
   Captured `[workspace.package]` policy now produces explicit inheritance decisions. Unify rewrites only member values
   that are semantically equal and safe to inherit, reports missing and divergent declarations without changing them, and
   retains version- and workspace-relative path fields for their owning release or path policy. JSON, explanations,
   Markdown reports, proof certificates, mutation traces, previews, receipts, and deterministic apply order share the same
   decision set.
-  
+
   Added root-independent, versioned feature/target coverage views with direct Cargo and nextest argument arrays. Removed
   the former target-load result that was presented as validation despite proving only that already-required metadata
   existed. Each target now carries only feature selections whose captured cfg predicates can apply to that target.
@@ -134,13 +133,13 @@
   explicit read or read-write AWS S3, Azure Blob Storage, and Cloudflare R2 destinations, can return to local-only mode,
   and reports only redacted authority. A new network-free normalization command validates provider URLs before
   credentials or storage are consulted. Existing repository `[cache]` configuration is rejected with migration guidance.
-  
+
   Added transparent result sharing through one conditional object protocol and a private bounded coordinator that reuses
   provider credentials, clients, and connections without retaining build results in memory. Verified local packed results
   remain authoritative and network-free; absence, conflict, corruption, credential failure, coordinator failure, or
   provider outage falls back to exact cold compilation. Qualified Linux ELF linker evidence also expands safe reuse to
   linked build-script, proc-macro, and final executable outputs.
-  
+
   On the retained Linux x64 corpus, local L1 was 77.55–89.25% faster than pinned sccache at p95 while restoring more
   compiler actions. The empty-L1 AWS S3 corpus was 43.58% faster for check and 73.27% faster for release build at p95.
   Azure Blob and R2 passed independent live producer/consumer, read-only, offline-L1, corruption/outage, and cleanup
@@ -155,22 +154,22 @@
   separates production, non-production, and required-public reachability across configured targets and reports dead or
   unnecessarily broad visibility only for closed compiler crates while preserving every open target observation.
   Versioned text, JSON, GitHub, schema, reason, fragment, and cache evidence share one deterministic report.
-  
+
   Added exact visibility repair with snapshot-bound byte spans, deterministic mutation plans, drift rejection, bounded
   backups, atomic file replacement, rollback, receipts, and post-write recompilation of every configured view. Public
   declaration deletion remains report-only. Planner contract v7 adds a whole-workspace `surface` decision without
   claiming package-scoped Cargo arguments.
-  
+
   `[surface] enabled = true` opts the planner and CI into that gate. `cargo rail surface` without an operation flag is a
   read-only, non-failing report; only explicit `--fix` grants source-write authority.
-  
+
   Documented native `[surface]` adoption, closed-world limits, planner routing, and a reproducible benchmarking contract
   without claiming an unsupported universal wall-time multiplier.
 
 - Made Surface analysis installable and CI-native through `[surface] enabled`, planner-selected commit gating, native
   release companions, and archive smoke tests. Supported release archives now execute a versioned Surface report, while
   unsupported targets fail with an explicit availability diagnostic.
-  
+
   Exact warm compiler-fact reuse now avoids Cargo and rustc on an unchanged workspace, expands ordinary response files
   into the observed and executed argument stream, and bypasses forms it cannot model exactly. Compiler-target evidence
   and retained runtime generations keep cache hits, findings, and visibility repairs fail-closed on incomplete authority.
@@ -198,7 +197,6 @@
 
 - Retry Windows compiler-sysroot fingerprinting after transient NTFS metadata drift while requiring one complete stable
   rehash before cache reuse.
-
 
 ## [0.21.0](https://github.com/loadingalias/cargo-rail/compare/v0.20.1...v0.21.0) - 2026-08-03
 

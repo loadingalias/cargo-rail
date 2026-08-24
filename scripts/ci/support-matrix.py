@@ -916,6 +916,7 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         "workflow_call:",
         "distribution/release-targets.json",
         worker_verifier,
+        'smoke="$(pwd)/smoke"',
         "if: inputs.stage",
         "actions/attest@",
         "actions/upload-artifact@",

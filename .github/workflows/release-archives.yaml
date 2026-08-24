@@ -219,14 +219,15 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$ARCHIVE" && test -f "$ARCHIVE"
-          mkdir smoke
-          tar -xzf "$ARCHIVE" -C smoke
-          binary="$(find smoke -type f -name cargo-rail -print -quit)"
-          observation="$(find smoke -type f -name cargo-rail-compiler-observation -print -quit)"
-          wrapper="$(find smoke -type f -name cargo-rail-native-rustc-wrapper -print -quit)"
-          worker="$(find smoke -type f -name cargo-rail-native-rustc-worker -print -quit)"
-          distributed_worker="$(find smoke -type f -name cargo-rail-distributed-worker -print -quit)"
-          driver="$(find smoke -type f -name cargo-rail-fact-driver -print -quit)"
+          smoke="$(pwd)/smoke"
+          mkdir "$smoke"
+          tar -xzf "$ARCHIVE" -C "$smoke"
+          binary="$(find "$smoke" -type f -name cargo-rail -print -quit)"
+          observation="$(find "$smoke" -type f -name cargo-rail-compiler-observation -print -quit)"
+          wrapper="$(find "$smoke" -type f -name cargo-rail-native-rustc-wrapper -print -quit)"
+          worker="$(find "$smoke" -type f -name cargo-rail-native-rustc-worker -print -quit)"
+          distributed_worker="$(find "$smoke" -type f -name cargo-rail-distributed-worker -print -quit)"
+          driver="$(find "$smoke" -type f -name cargo-rail-fact-driver -print -quit)"
           test -n "$binary"
           test -n "$observation"
           test -n "$wrapper"
@@ -244,7 +245,11 @@ jobs:
               echo "surface unexpectedly succeeded for unavailable artifact" >&2
               exit 1
             fi
-            grep -F "surface is unavailable" "$surface_stderr"
+            if ! grep -Fq "surface is unavailable" "$surface_stderr"; then
+              echo "surface did not report the expected unavailable-artifact diagnostic" >&2
+              sed -n '1,120p' "$surface_stderr" >&2
+              exit 1
+            fi
           else
             test -n "$driver"
             test "$(dirname "$binary")" = "$(dirname "$driver")"
