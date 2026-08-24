@@ -116,6 +116,17 @@ jobs:
       ref: ${{ github.sha }}
       cache-prefix: commit
 
+  release-archives:
+    name: Release Archive Gate
+    needs: [quality, plan]
+    if: needs.plan.outputs.infra == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/release-archives.yaml
+    with:
+      ref: ${{ github.sha }}
+      stage: false
+
   surface:
     name: Rust Surface
     needs: [quality, plan]

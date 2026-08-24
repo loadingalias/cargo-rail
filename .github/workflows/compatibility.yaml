@@ -97,6 +97,21 @@ jobs:
           RUSTUP_TOOLCHAIN: ${{ matrix.compatibility.toolchain }}
         run: cargo build --locked --bins
 
+      - name: Verify distributed worker front door
+        shell: bash
+        env:
+          RUSTUP_TOOLCHAIN: ${{ matrix.compatibility.toolchain }}
+        run: |
+          worker="target/debug/cargo-rail-distributed-worker"
+          python_command=python3
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            worker="${worker}.exe"
+          fi
+          if ! command -v "$python_command" >/dev/null 2>&1; then
+            python_command=python
+          fi
+          "$python_command" scripts/ci/verify-distributed-worker.py --worker "$worker" --rustc rustc
+
       - name: Verify default native filesystem
         if: matrix.compatibility.selection-probes
         shell: bash

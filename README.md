@@ -326,7 +326,17 @@ code + reviewed .changes/*.md
        durable recovery state
 ```
 
-Prepare a release pull request containing version and changelog updates:
+Release directly from the current branch:
+
+```bash
+cargo rail release run --all --bump auto --yes
+```
+
+The command creates and pushes the exact release commit, then stops if its checks are still running. Wait for that SHA
+to become green and run the exact `cargo rail release resume <STATE>` command it prints. Do not start a second release
+transaction. Readiness must include the repository's release-archive gate before publication; tags remain last.
+
+To review the version and changelog update in a pull request instead, prepare a release PR:
 
 ```bash
 cargo rail release run --all --bump auto --pr

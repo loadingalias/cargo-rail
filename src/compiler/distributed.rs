@@ -3394,8 +3394,31 @@ fn capture_worker_capability_for_runtime(
     cache: Option<&crate::cache::cas::LocalCas>,
 ) -> RailResult<CapturedWorkerCapability> {
     let current = std::env::current_dir()?;
-    let rustc = crate::executable::resolve_executable_path(rustc, &current)?;
-    let rustc = crate::utils::canonicalize_existing(&rustc)?;
+    let rustc_selection = rustc;
+    let selected_rustc = crate::executable::resolve_executable_selection(rustc_selection, &current)?;
+    let selected_implementation = crate::utils::canonicalize_existing(&selected_rustc)?;
+    let verbose = exact_command_output(&selected_rustc, &["-vV"], "rustc verbose identity")?;
+    let selected_sysroot = exact_command_output(&selected_rustc, &["--print=sysroot"], "rustc sysroot")?;
+    let selected_sysroot = String::from_utf8(selected_sysroot)
+        .map_err(|_| RailError::message("distributed worker sysroot is not UTF-8"))?;
+    let sysroot = crate::utils::canonicalize_existing(Path::new(selected_sysroot.trim()))?;
+    let rustc = crate::utils::canonicalize_existing(&crate::executable::sysroot_program(&sysroot, "rustc"))?;
+    let implementation_verbose = exact_command_output(&rustc, &["-vV"], "sysroot rustc verbose identity")?;
+    let implementation_sysroot = exact_command_output(&rustc, &["--print=sysroot"], "sysroot rustc sysroot")?;
+    let implementation_sysroot = String::from_utf8(implementation_sysroot)
+        .map_err(|_| RailError::message("distributed worker implementation sysroot is not UTF-8"))?;
+    let implementation_sysroot = crate::utils::canonicalize_existing(Path::new(implementation_sysroot.trim()))?;
+    let current_selection = crate::executable::resolve_executable_selection(rustc_selection, &current)?;
+    let current_selection = crate::utils::canonicalize_existing(&current_selection)?;
+    if verbose != implementation_verbose
+        || sysroot != implementation_sysroot
+        || crate::utils::canonicalize_existing(&selected_rustc)? != selected_implementation
+        || current_selection != selected_implementation
+    {
+        return Err(RailError::message(
+            "distributed worker rustc selection does not match its exact sysroot implementation",
+        ));
+    }
     let rustc_metadata = fs::symlink_metadata(&rustc)?;
     if !rustc_metadata.is_file() || crate::utils::is_symlink_or_reparse(&rustc_metadata) {
         return Err(RailError::message(
@@ -3404,19 +3427,14 @@ fn capture_worker_capability_for_runtime(
     }
     let rustc_generation = crate::utils::stable_file_generation(&rustc)
         .ok_or_else(|| RailError::message("distributed worker rustc has no stable file generation"))?;
-    let verbose = exact_command_output(&rustc, &["-vV"], "rustc verbose identity")?;
-    let verbose =
-        String::from_utf8(verbose).map_err(|_| RailError::message("distributed worker rustc identity is not UTF-8"))?;
+    let verbose = String::from_utf8(implementation_verbose)
+        .map_err(|_| RailError::message("distributed worker rustc identity is not UTF-8"))?;
     let host_target = verbose
         .lines()
         .find_map(|line| line.strip_prefix("host: "))
         .filter(|target| !target.is_empty())
         .ok_or_else(|| RailError::message("distributed worker rustc identity has no host target"))?
         .to_string();
-    let sysroot = exact_command_output(&rustc, &["--print=sysroot"], "rustc sysroot")?;
-    let sysroot =
-        String::from_utf8(sysroot).map_err(|_| RailError::message("distributed worker sysroot is not UTF-8"))?;
-    let sysroot = crate::utils::canonicalize_existing(Path::new(sysroot.trim()))?;
     let memo = cache
         .and_then(|cache| crate::compiler::collector::compiler_sysroot_memo_path_in(cache, &sysroot, &host_target));
     let (sysroot_identity, _) =

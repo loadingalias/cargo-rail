@@ -900,6 +900,41 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
             f"{caller} does not call the compatibility workflow",
         )
 
+    worker_verifier = "scripts/ci/verify-distributed-worker.py"
+    require(
+        (REPOSITORY_ROOT / worker_verifier).is_file(),
+        "distributed worker shipment verifier is missing",
+    )
+    require(
+        worker_verifier in compatibility_workflow,
+        "compatibility workflow does not verify the distributed worker front door",
+    )
+    archive_workflow = (
+        REPOSITORY_ROOT / ".github/workflows/release-archives.yaml"
+    ).read_text(encoding="utf-8")
+    for fragment in (
+        "workflow_call:",
+        "distribution/release-targets.json",
+        worker_verifier,
+        "if: inputs.stage",
+        "actions/attest@",
+        "actions/upload-artifact@",
+    ):
+        require(
+            fragment in archive_workflow,
+            f"release archive workflow is missing {fragment}",
+        )
+    for caller, stage in (
+        (".github/workflows/commit.yaml", "stage: false"),
+        (".github/workflows/release.yaml", "stage: true"),
+    ):
+        source = (REPOSITORY_ROOT / caller).read_text(encoding="utf-8")
+        require(
+            "uses: ./.github/workflows/release-archives.yaml" in source
+            and stage in source,
+            f"{caller} does not call the release archive workflow with {stage}",
+        )
+
     deny_graph = load_toml(REPOSITORY_ROOT / "deny.toml").get("graph")
     deny_graph = require_object(
         deny_graph,

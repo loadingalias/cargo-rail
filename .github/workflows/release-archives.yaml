@@ -1,0 +1,360 @@
+name: Release Archives
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact source commit to package
+        required: true
+        type: string
+      stage:
+        description: Attest and stage verified archives for release publication
+        required: false
+        default: false
+        type: boolean
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  prepare:
+    name: Prepare Release Archive Matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.targets.outputs.matrix }}
+      version: ${{ steps.package.outputs.version }}
+      msrv: ${{ steps.package.outputs.msrv }}
+      release_sha: ${{ steps.package.outputs.release_sha }}
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref }}
+
+      - name: Bind package identity
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "release_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import pathlib
+          import tomllib
+
+          manifest = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
+          print(f"version={manifest['package']['version']}")
+          print(f"msrv={manifest['workspace']['package']['rust-version']}")
+          PY
+
+      - name: Load supported release targets
+        id: targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/support-matrix.py --github-matrix >/dev/null
+          jq -e '
+            length > 0
+            and all(.[]; .target and .os and (.archive == "tar" or .archive == "zip") and (.surface | type == "boolean"))
+            and ((map(.target) | length) == (map(.target) | unique | length))
+          ' distribution/release-targets.json >/dev/null
+          echo "matrix=$(jq -c '{include: .}' distribution/release-targets.json)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build and Verify (${{ matrix.target }})
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Checkout verified commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.release_sha }}
+
+      - name: Verify checkout identity
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ needs.prepare.outputs.release_sha }}
+        run: test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: ${{ needs.prepare.outputs.msrv }}
+
+      - name: Manufacture exact compiler fact driver
+        id: fact-driver
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.surface }}" != "true" ]]; then
+            echo "include=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          sha256_file() {
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$1" | awk '{print $1}'
+            else
+              shasum -a 256 "$1" | awk '{print $1}'
+            fi
+          }
+
+          sha256_stream() {
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum | awk '{print $1}'
+            else
+              shasum -a 256 | awk '{print $1}'
+            fi
+          }
+
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          test "$host" = "$TARGET"
+          rustup component add rustc-dev
+          scripts/build-compiler-fact-driver.sh
+
+          suffix=""
+          if [[ "$TARGET" == *-windows-* ]]; then
+            suffix=".exe"
+          fi
+          source="tools/compiler-fact-driver/target/release/cargo-rail-fact-driver${suffix}"
+          component="cargo-rail-fact-driver${suffix}"
+          cp "$source" "$component"
+          digest="$(sha256_file "$component")"
+          provenance="$({
+            for file in \
+              tools/compiler-fact-driver/Cargo.lock \
+              tools/compiler-fact-driver/Cargo.toml \
+              tools/compiler-fact-driver/build.rs \
+              tools/compiler-fact-driver/src/*.rs \
+              src/compiler/fact_protocol.rs; do
+              printf '%s  %s\n' "$(sha256_file "$file")" "$file"
+            done
+          } | sha256_stream)"
+          release="$(rustc -vV | sed -n 's/^release: //p')"
+          commit="$(rustc -vV | sed -n 's/^commit-hash: //p')"
+          sysroot="$(rustc --print sysroot)"
+          if command -v cygpath >/dev/null 2>&1; then
+            sysroot="$(cygpath -u "$sysroot")"
+          fi
+          compiler_libraries="$(find "$sysroot/lib" "$sysroot/bin" -maxdepth 1 -type f \( \
+            -name 'librustc_driver-*.so' -o \
+            -name 'librustc_driver-*.dylib' -o \
+            -name 'rustc_driver-*.dll' \
+          \) 2>/dev/null || true)"
+          test "$(printf '%s\n' "$compiler_libraries" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
+          compiler_library="$compiler_libraries"
+          compiler_library_relative="${compiler_library#"$sysroot"/}"
+          test "$compiler_library_relative" != "$compiler_library"
+          compiler_library_digest="$(sha256_file "$compiler_library")"
+
+          {
+            echo "CARGO_RAIL_FACT_DRIVER_FILE=$component"
+            echo "CARGO_RAIL_FACT_DRIVER_SHA256=sha256:$digest"
+            echo "CARGO_RAIL_FACT_DRIVER_PROVENANCE=sha256:$provenance"
+            echo "CARGO_RAIL_FACT_DRIVER_RUSTC_RELEASE=$release"
+            echo "CARGO_RAIL_FACT_DRIVER_RUSTC_COMMIT=$commit"
+            echo "CARGO_RAIL_FACT_DRIVER_RUSTC_HOST=$host"
+            echo "CARGO_RAIL_FACT_DRIVER_COMPILER_LIBRARY=$compiler_library_relative"
+            echo "CARGO_RAIL_FACT_DRIVER_COMPILER_LIBRARY_SHA256=sha256:$compiler_library_digest"
+          } >> "$GITHUB_ENV"
+          echo "include=$component" >> "$GITHUB_OUTPUT"
+
+      - name: Configure path remapping
+        shell: bash
+        run: |
+          flags="--remap-path-prefix=${GITHUB_WORKSPACE}=/workspace --remap-path-scope=object"
+          if [ -n "${RUSTFLAGS:-}" ]; then
+            flags="${RUSTFLAGS} ${flags}"
+          fi
+          echo "RUSTFLAGS=$flags" >> "$GITHUB_ENV"
+
+      - name: Setup target toolchain
+        uses: taiki-e/setup-cross-toolchain-action@12b7ad4acfa95a1476779d6c06699b96ec1691f8 # v1.42.0
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Configure static linking (musl)
+        if: contains(matrix.target, '-linux-musl')
+        shell: bash
+        run: echo "RUSTFLAGS=${RUSTFLAGS} -C target-feature=+crt-static -C link-self-contained=yes" >> "$GITHUB_ENV"
+
+      - name: Configure static linking (Windows)
+        if: contains(matrix.target, '-windows-msvc')
+        shell: bash
+        run: echo "RUSTFLAGS=${RUSTFLAGS} -C target-feature=+crt-static" >> "$GITHUB_ENV"
+
+      - name: Build archive
+        id: build
+        uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1.30.2
+        with:
+          bin: cargo-rail,cargo-rail-compiler-observation,cargo-rail-native-rustc-wrapper,cargo-rail-native-rustc-worker,cargo-rail-distributed-worker
+          archive: cargo-rail-${{ matrix.target }}
+          target: ${{ matrix.target }}
+          locked: true
+          tar: unix
+          zip: windows
+          dry-run: true
+          dry-run-intended: true
+          include: ${{ steps.fact-driver.outputs.include }}
+
+      - name: Smoke-test tar archive
+        if: matrix.archive == 'tar'
+        shell: bash
+        env:
+          ARCHIVE: ${{ steps.build.outputs.tar }}
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          test -n "$ARCHIVE" && test -f "$ARCHIVE"
+          mkdir smoke
+          tar -xzf "$ARCHIVE" -C smoke
+          binary="$(find smoke -type f -name cargo-rail -print -quit)"
+          observation="$(find smoke -type f -name cargo-rail-compiler-observation -print -quit)"
+          wrapper="$(find smoke -type f -name cargo-rail-native-rustc-wrapper -print -quit)"
+          worker="$(find smoke -type f -name cargo-rail-native-rustc-worker -print -quit)"
+          distributed_worker="$(find smoke -type f -name cargo-rail-distributed-worker -print -quit)"
+          driver="$(find smoke -type f -name cargo-rail-fact-driver -print -quit)"
+          test -n "$binary"
+          test -n "$observation"
+          test -n "$wrapper"
+          test -n "$worker"
+          test -n "$distributed_worker"
+          test "$(dirname "$binary")" = "$(dirname "$wrapper")"
+          test "$(dirname "$binary")" = "$(dirname "$observation")"
+          test "$(dirname "$binary")" = "$(dirname "$worker")"
+          test "$(dirname "$binary")" = "$(dirname "$distributed_worker")"
+          test "$("$observation" --cargo-rail-observation-protocol-version)" = "1"
+          if [[ "${{ matrix.surface }}" != "true" ]]; then
+            test -z "$driver"
+            surface_stderr="$(mktemp)"
+            if (cd "$(mktemp -d)" && "$binary" rail surface --check 2>"$surface_stderr"); then
+              echo "surface unexpectedly succeeded for unavailable artifact" >&2
+              exit 1
+            fi
+            grep -F "surface is unavailable" "$surface_stderr"
+          else
+            test -n "$driver"
+            test "$(dirname "$binary")" = "$(dirname "$driver")"
+            chmod +x "$driver"
+            compiler_library="$(rustc --print sysroot)/$CARGO_RAIL_FACT_DRIVER_COMPILER_LIBRARY"
+            compiler_library_directory="$(dirname "$compiler_library")"
+            protocol="$(LD_LIBRARY_PATH="$compiler_library_directory" DYLD_LIBRARY_PATH="$compiler_library_directory" "$driver" --cargo-rail-fact-protocol-version)"
+            [[ "$protocol" =~ ^[1-9][0-9]*$ ]]
+            binary="$(cd "$(dirname "$binary")" && pwd)/$(basename "$binary")"
+            set +e
+            surface_report="$(cd tests/fixtures/surface_release && "$binary" rail surface --check -f json)"
+            surface_status=$?
+            set -e
+            test "$surface_status" = 1
+            test "$(printf '%s' "$surface_report" | jq -r '.surface_contract_version')" = "2"
+            test "$(printf '%s' "$surface_report" | jq -r '.authority.audited_targets | length > 0')" = "true"
+            test "$(printf '%s' "$surface_report" | jq -r '.findings | any(.name == "dead_public")')" = "true"
+          fi
+          chmod +x "$binary"
+          chmod +x "$wrapper"
+          chmod +x "$worker"
+          chmod +x "$distributed_worker"
+          python3 scripts/ci/verify-distributed-worker.py --worker "$distributed_worker" --rustc rustc
+          test "$("$binary" rail --version)" = "cargo-rail $VERSION"
+
+      - name: Smoke-test zip archive
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        env:
+          ARCHIVE: ${{ steps.build.outputs.zip }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          if (-not $env:ARCHIVE -or -not (Test-Path $env:ARCHIVE)) {
+            throw "release archive was not produced"
+          }
+          Expand-Archive -Path $env:ARCHIVE -DestinationPath smoke
+          $binary = Get-ChildItem smoke -Recurse -Filter cargo-rail.exe | Select-Object -First 1
+          $observation = Get-ChildItem smoke -Recurse -Filter cargo-rail-compiler-observation.exe | Select-Object -First 1
+          $wrapper = Get-ChildItem smoke -Recurse -Filter cargo-rail-native-rustc-wrapper.exe | Select-Object -First 1
+          $worker = Get-ChildItem smoke -Recurse -Filter cargo-rail-native-rustc-worker.exe | Select-Object -First 1
+          $distributedWorker = Get-ChildItem smoke -Recurse -Filter cargo-rail-distributed-worker.exe | Select-Object -First 1
+          $driver = Get-ChildItem smoke -Recurse -Filter cargo-rail-fact-driver.exe | Select-Object -First 1
+          if (-not $binary) {
+            throw "cargo-rail.exe is missing from $env:ARCHIVE"
+          }
+          if (-not $observation) {
+            throw "cargo-rail-compiler-observation.exe is missing from $env:ARCHIVE"
+          }
+          if (-not $wrapper) {
+            throw "cargo-rail-native-rustc-wrapper.exe is missing from $env:ARCHIVE"
+          }
+          if (-not $worker) {
+            throw "cargo-rail-native-rustc-worker.exe is missing from $env:ARCHIVE"
+          }
+          if (-not $distributedWorker) {
+            throw "cargo-rail-distributed-worker.exe is missing from $env:ARCHIVE"
+          }
+          if (-not $driver) {
+            throw "cargo-rail-fact-driver.exe is missing from $env:ARCHIVE"
+          }
+          if ($binary.DirectoryName -ne $observation.DirectoryName -or $binary.DirectoryName -ne $wrapper.DirectoryName -or $binary.DirectoryName -ne $worker.DirectoryName -or $binary.DirectoryName -ne $distributedWorker.DirectoryName -or $binary.DirectoryName -ne $driver.DirectoryName) {
+            throw "cargo-rail compiler cache binaries are not adjacent to cargo-rail.exe"
+          }
+          $observationProtocol = (& $observation.FullName --cargo-rail-observation-protocol-version).Trim()
+          if ($LASTEXITCODE -ne 0 -or $observationProtocol -ne '1') {
+            throw "archive compiler observation protocol smoke test failed"
+          }
+          python scripts/ci/verify-distributed-worker.py --worker $distributedWorker.FullName --rustc rustc
+          if ($LASTEXITCODE -ne 0) {
+            throw "archive distributed worker capability smoke test failed"
+          }
+          $sysroot = (& rustc --print sysroot).Trim()
+          $compilerLibrary = Join-Path $sysroot ($env:CARGO_RAIL_FACT_DRIVER_COMPILER_LIBRARY -replace '/', '\')
+          $env:PATH = "$(Split-Path $compilerLibrary);$env:PATH"
+          $protocol = (& $driver.FullName --cargo-rail-fact-protocol-version).Trim()
+          if ($LASTEXITCODE -ne 0 -or $protocol -notmatch '^[1-9][0-9]*$') {
+            throw "archive compiler fact driver failed to load: $protocol"
+          }
+          Push-Location tests/fixtures/surface_release
+          $PSNativeCommandUseErrorActionPreference = $false
+          $surfaceJson = & $binary.FullName rail surface --check -f json
+          $surfaceExit = $LASTEXITCODE
+          $surfaceReport = $surfaceJson | Out-String | ConvertFrom-Json
+          Pop-Location
+          if ($surfaceExit -ne 1 -or $surfaceReport.surface_contract_version -ne 2) {
+            throw "archive surface fixture did not report its versioned findings"
+          }
+          if ($surfaceReport.authority.audited_targets.Count -eq 0) {
+            throw "archive surface fixture did not audit a closed compiler target"
+          }
+          if (-not ($surfaceReport.findings | Where-Object { $_.name -eq "dead_public" })) {
+            throw "archive surface fixture did not report dead_public"
+          }
+          $actual = (& $binary.FullName rail --version).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actual -ne "cargo-rail $env:VERSION") {
+            throw "archive smoke test failed: $actual"
+          }
+
+      - name: Attest archive provenance
+        if: inputs.stage
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: ${{ matrix.archive == 'zip' && steps.build.outputs.zip || steps.build.outputs.tar }}
+
+      - name: Stage verified archive
+        if: inputs.stage
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.target }}
+          path: ${{ matrix.archive == 'zip' && steps.build.outputs.zip || steps.build.outputs.tar }}
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1

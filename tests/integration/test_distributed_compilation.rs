@@ -25,7 +25,7 @@ const CAPABILITY_TRAILER: &[u8; 8] = b"CRXCPEN3";
 const VIRTUAL_ROOT: &str = "/cargo-rail/exec/v3";
 const VIRTUAL_WORKSPACE: &str = "/cargo-rail/exec/v3/workspace";
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkerCapability {
     architecture: String,
@@ -197,6 +197,16 @@ fn one_shot_worker_matches_local_rustc_and_honors_cancellation() -> Result<()> {
     );
     let capability: WorkerCapability = serde_json::from_slice(&capability_output.stdout)?;
     anyhow::ensure!(capability.protocol_version == 3, "unexpected capability protocol");
+    let proxy_capability_output = Command::new(worker).args(["capability", "rustc"]).output()?;
+    anyhow::ensure!(
+        proxy_capability_output.status.success(),
+        "Rustup proxy capability query failed: {proxy_capability_output:?}"
+    );
+    let proxy_capability: WorkerCapability = serde_json::from_slice(&proxy_capability_output.stdout)?;
+    anyhow::ensure!(
+        proxy_capability == capability,
+        "Rustup proxy and exact rustc path produced different capabilities"
+    );
     anyhow::ensure!(
         capability.resource_limits
             == ExecutionLimits {

@@ -86,7 +86,22 @@ Use `just bench-native-cache 10` only when the decision requires distribution or
   pipeline.
 - Published version tags and release assets are immutable.
 
-Before opening a release PR:
+For a direct maintainer release from `main`, use the current checkout's binary rather than an older globally installed
+Cargo-Rail:
+
+```bash
+cargo build --locked --bin cargo-rail
+release_cli="$PWD/target/debug/cargo-rail"
+"$release_cli" rail release run --all --bump auto --check
+"$release_cli" rail release run --all --bump auto --yes
+```
+
+The check command exits `1` when it finds a pending release. That is the expected preview result. The apply command
+pushes one exact release commit and exits while GitHub checks, including all release archives, are pending. After they
+pass, run the exact `"$release_cli" rail release resume <STATE>` command printed by the tool. Do not rerun `release
+run`, move a published tag, or replace an existing release asset.
+
+Before opening a release PR instead:
 
 ```bash
 cargo rail change status

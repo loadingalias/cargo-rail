@@ -66,11 +66,19 @@ impl ExecutableIdentity {
     }
 }
 
-/// Resolve the executable one direct `Command` would launch without reading
-/// its contents. Callers must bind separate change evidence before trusting a
-/// memoized content identity.
+/// Resolve the selected command path without following its final symlink.
+///
+/// Preserving the selected path matters for multicall executables such as the
+/// Rustup proxies: the basename controls which tool the executable dispatches.
+pub(crate) fn resolve_executable_selection(selection: &OsStr, current_dir: &Path) -> RailResult<PathBuf> {
+    resolve_program(selection, current_dir)
+}
+
+/// Resolve the canonical executable bytes behind one command selection.
+/// Callers must preserve the selected path separately when its basename can
+/// affect process behavior.
 pub(crate) fn resolve_executable_path(selection: &OsStr, current_dir: &Path) -> RailResult<PathBuf> {
-    resolve_program(selection, current_dir)?
+    resolve_executable_selection(selection, current_dir)?
         .canonicalize()
         .map_err(Into::into)
 }
@@ -190,7 +198,7 @@ impl ToolchainExecutableIdentities {
     }
 }
 
-fn sysroot_program(sysroot: &Path, name: &str) -> PathBuf {
+pub(crate) fn sysroot_program(sysroot: &Path, name: &str) -> PathBuf {
     #[cfg(windows)]
     let name = format!("{name}.exe");
     sysroot.join("bin").join(name)
