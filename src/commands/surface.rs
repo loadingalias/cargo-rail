@@ -1879,6 +1879,7 @@ fn write_output(content: &str, output: Option<&Path>) -> RailResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compiler::fact_protocol::DRIVER_IDENTITY_PREFIX;
     use crate::compiler::facts::{CompilerFactPackage, CompilerFactRole};
     use crate::surface::{SurfaceFindingKind, SurfaceTargetObservation};
 
@@ -1896,7 +1897,7 @@ mod tests {
             },
             driver: SurfaceDriverReadinessReport {
                 protocol: 3,
-                identity: "cargo-rail-fact-driver-v1-sha256:driver".to_string(),
+                identity: format!("{DRIVER_IDENTITY_PREFIX}{}", "d".repeat(64)),
                 content_digest: "sha256:driver".to_string(),
                 compiler_library_digest: "sha256:library".to_string(),
                 rustc_release: "1.99.0-nightly".to_string(),

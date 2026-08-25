@@ -1764,8 +1764,14 @@ fn run_workspace_check(
     })
 }
 
-const COMPILER_ARTIFACT_FREE_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_COMPILER_ARTIFACT_FREE_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const COMPILER_ARTIFACT_FREE_RESERVE_DIVISOR: u64 = 10;
 const COMPILER_ARTIFACT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Preserve ten percent on small volumes without reserving more than two GiB on normal workspace storage.
+fn compiler_artifact_free_reserve_bytes(total_space: u64) -> u64 {
+    (total_space / COMPILER_ARTIFACT_FREE_RESERVE_DIVISOR).min(MAX_COMPILER_ARTIFACT_FREE_RESERVE_BYTES)
+}
 
 #[derive(Debug)]
 struct ArtifactBoundedCommandOutput {
@@ -1787,13 +1793,20 @@ fn run_artifact_bounded_command(
             artifact_root.display()
         )
     })?;
-    let capacity_limit = initial_available.saturating_sub(COMPILER_ARTIFACT_FREE_RESERVE_BYTES);
+    let total_space = fs2::total_space(artifact_root).with_context(|| {
+        format!(
+            "measuring filesystem size for compiler artifact root '{}'",
+            artifact_root.display()
+        )
+    })?;
+    let free_reserve = compiler_artifact_free_reserve_bytes(total_space);
+    let capacity_limit = initial_available.saturating_sub(free_reserve);
     let effective_hard_limit = budget.hard_limit_bytes.min(capacity_limit);
     if effective_hard_limit == 0 {
         return Err(RailError::with_help(
             format!(
                 "compiler artifact preflight found {initial_available} available bytes, which cannot preserve the {}-byte free-space reserve",
-                COMPILER_ARTIFACT_FREE_RESERVE_BYTES
+                free_reserve
             ),
             "free workspace storage or configure the operation on a filesystem with more available capacity",
         ));
@@ -1801,7 +1814,7 @@ fn run_artifact_bounded_command(
     let effective_soft_limit = budget.soft_limit_bytes.min(effective_hard_limit);
     progress!(
         "    Compiler artifact preflight: {initial_available} bytes available; {effective_soft_limit} bytes soft; {effective_hard_limit} bytes hard; {} bytes reserved",
-        COMPILER_ARTIFACT_FREE_RESERVE_BYTES
+        free_reserve
     );
 
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -4930,12 +4943,12 @@ edition = "2024"
             transparent_native_environment_value(
                 "DYLD_FALLBACK_LIBRARY_PATH",
                 &first_value,
-                &fs::canonicalize(first.path()).expect("first canonical root"),
+                &crate::utils::canonicalize_existing(first.path()).expect("first canonical root"),
             ),
             transparent_native_environment_value(
                 "DYLD_FALLBACK_LIBRARY_PATH",
                 &second_value,
-                &fs::canonicalize(second.path()).expect("second canonical root"),
+                &crate::utils::canonicalize_existing(second.path()).expect("second canonical root"),
             ),
         );
         assert_ne!(
@@ -5056,6 +5069,18 @@ edition = "2024"
         assert!(
             started.elapsed() < Duration::from_secs(8),
             "budget monitor did not terminate the active view"
+        );
+    }
+
+    #[test]
+    fn compiler_artifact_free_reserve_scales_to_the_physical_volume() {
+        assert_eq!(
+            compiler_artifact_free_reserve_bytes(512 * 1024 * 1024),
+            512 * 1024 * 1024 / COMPILER_ARTIFACT_FREE_RESERVE_DIVISOR
+        );
+        assert_eq!(
+            compiler_artifact_free_reserve_bytes(64 * 1024 * 1024 * 1024),
+            MAX_COMPILER_ARTIFACT_FREE_RESERVE_BYTES
         );
     }
 

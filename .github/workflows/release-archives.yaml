@@ -307,7 +307,7 @@ jobs:
             test "$(printf '%s' "$surface_preparation" | jq -r '.mode')" = "prepare"
             test "$(printf '%s' "$surface_preparation" | jq -r '.result')" = "ready"
             test "$(printf '%s' "$surface_preparation" | jq -r '.surface_preparation_contract_version')" = "1"
-            test "$(printf '%s' "$surface_preparation" | jq -r '.driver.identity | startswith("cargo-rail-fact-driver-v1-sha256:")')" = "true"
+            test "$(printf '%s' "$surface_preparation" | jq -r '.driver.identity | test("^compiler-fact-driver-v1-sha256-[0-9a-f]{64}$")')" = "true"
             rustup component list --installed | grep -Eq '^rustc-dev(-|$)'
             set +e
             surface_report="$(cd tests/fixtures/surface_release && "$binary" rail surface --check -f json)"
@@ -414,7 +414,7 @@ jobs:
           }
           $preparation = $preparationJson | Out-String | ConvertFrom-Json
           Pop-Location
-          if ($preparation.mode -ne 'prepare' -or $preparation.result -ne 'ready' -or $preparation.surface_preparation_contract_version -ne 1 -or $preparation.driver.identity -notmatch '^cargo-rail-fact-driver-v1-sha256:') {
+          if ($preparation.mode -ne 'prepare' -or $preparation.result -ne 'ready' -or $preparation.surface_preparation_contract_version -ne 1 -or $preparation.driver.identity -notmatch '^compiler-fact-driver-v1-sha256-[0-9a-f]{64}$') {
             throw "archive Surface preparation contract is invalid"
           }
           $selectedComponents = rustup component list --installed

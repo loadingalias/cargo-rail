@@ -13232,9 +13232,12 @@ pub(crate) mod tests {
         );
         assert_eq!(
             target_root,
-            fs::canonicalize(workspace.path().join("target")).expect("target root")
+            crate::utils::canonicalize_existing(&workspace.path().join("target")).expect("target root")
         );
-        assert_eq!(output_parent, fs::canonicalize(&output).expect("output parent"));
+        assert_eq!(
+            output_parent,
+            crate::utils::canonicalize_existing(&output).expect("output parent")
+        );
 
         let custom_target = tempfile::tempdir().expect("custom target root");
         let custom_output = custom_target.path().join("debug/deps");
@@ -13243,12 +13246,18 @@ pub(crate) mod tests {
         let (_, root, target_root, output_parent) =
             direct_compilation_root(&custom, workspace.path(), Some(custom_target.path().as_os_str()))
                 .expect("validated custom Cargo target root");
-        assert_eq!(root, fs::canonicalize(workspace.path()).expect("workspace root"));
+        assert_eq!(
+            root,
+            crate::utils::canonicalize_existing(workspace.path()).expect("workspace root")
+        );
         assert_eq!(
             target_root,
-            fs::canonicalize(custom_target.path()).expect("custom target root")
+            crate::utils::canonicalize_existing(custom_target.path()).expect("custom target root")
         );
-        assert_eq!(output_parent, fs::canonicalize(&custom_output).expect("custom output"));
+        assert_eq!(
+            output_parent,
+            crate::utils::canonicalize_existing(&custom_output).expect("custom output")
+        );
 
         let escaped = tempfile::tempdir().expect("escaped output root");
         fs::create_dir_all(escaped.path().join("debug/deps")).expect("escaped output directory");

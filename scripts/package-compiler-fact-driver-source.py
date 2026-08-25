@@ -38,14 +38,15 @@ def main() -> None:
       root / "src" / "compiler" / "fact_protocol.rs",
     )
     # Start from the checked lockfile so Cargo preserves every selected runtime
-    # version while pruning the removed development graph. This avoids a TOML
-    # parser dependency in the release environment and keeps the source
-    # component below its authenticated size bound.
+    # version while pruning the removed development graph. Manufacture may
+    # acquire an exact locked package that the preceding host build did not
+    # need; the emitted source replacement makes consumer builds frozen and
+    # offline. This also avoids a TOML parser dependency in the release
+    # environment and keeps the component below its authenticated size bound.
     subprocess.run(
       [
         "cargo",
         "metadata",
-        "--offline",
         "--format-version",
         "1",
         "--manifest-path",
@@ -55,9 +56,8 @@ def main() -> None:
       check=True,
       stdout=subprocess.DEVNULL,
     )
-    # `cargo vendor` may acquire a locked package that the preceding host build
-    # did not need (for example `libc` on Windows); the emitted source
-    # replacement makes every later build frozen and offline.
+    # Vendor the pruned, locked runtime graph so every later build is frozen
+    # and offline.
     subprocess.run(
       [
         "cargo",

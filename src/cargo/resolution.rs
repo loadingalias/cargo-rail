@@ -3559,7 +3559,7 @@ mod tests {
             "include = [\"base.toml\"]\n[build]\nrustflags = [\"--cfg\", \"workspace\"]\n",
         )
         .expect("workspace config should be written");
-        let cargo_dir = fs::canonicalize(cargo_dir).expect("Cargo config directory should resolve");
+        let cargo_dir = crate::utils::canonicalize_existing(&cargo_dir).expect("Cargo config directory should resolve");
 
         let captured = CargoConfigSnapshot::capture(workspace.path()).expect("Cargo config capture should succeed");
         let local_sources = captured

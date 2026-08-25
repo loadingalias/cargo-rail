@@ -25,18 +25,19 @@ pub fn finish_test(result: Result<()>) {
     assert_eq!(result.map_err(|error| format!("{error:#}")), Ok(()));
 }
 
-fn null_device() -> &'static str {
-    if cfg!(windows) { "NUL" } else { "/dev/null" }
+fn isolated_git_config() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/isolated.gitconfig")
 }
 
 /// Build a cargo-rail command isolated from the developer's Cargo and Git configuration.
 pub fn cargo_rail_command(cwd: &Path) -> Result<Command> {
+    let git_config = isolated_git_config();
     let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-rail"));
     command
         .current_dir(cwd)
         .env("CARGO_RAIL_CACHE_DIR", cwd.join("target/cargo-rail-test-cache"))
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", null_device())
+        .env("GIT_CONFIG_GLOBAL", git_config)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CONFIG_COUNT", "2")
         .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
@@ -422,10 +423,11 @@ edition.workspace = true
 
 /// Run git command in a directory
 pub fn git(cwd: &Path, args: &[&str]) -> Result<Output> {
+    let git_config = isolated_git_config();
     let output = Command::new("git")
         .current_dir(cwd)
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", null_device())
+        .env("GIT_CONFIG_GLOBAL", git_config)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CONFIG_COUNT", "2")
         .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
