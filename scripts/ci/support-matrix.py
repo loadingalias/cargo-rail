@@ -989,6 +989,9 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         "distribution/release-targets.json",
         worker_verifier,
         'smoke="$(pwd)/smoke"',
+        "--cargo-rail-fact-protocol-version",
+        "surface --prepare",
+        "surface --check",
         "if: inputs.stage",
         "actions/attest@",
         "actions/upload-artifact@",
@@ -997,6 +1000,10 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
             fragment in archive_workflow,
             f"release archive workflow is missing {fragment}",
         )
+    require(
+        "rustup component list" not in archive_workflow,
+        "release archive workflow must prove Surface capability instead of Rustup component inventory",
+    )
     for caller, stage in (
         (".github/workflows/commit.yaml", "stage: false"),
         (".github/workflows/release.yaml", "stage: true"),

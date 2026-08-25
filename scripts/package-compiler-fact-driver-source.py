@@ -28,7 +28,9 @@ def main() -> None:
 
     manifest = (companion / "Cargo.toml").read_text(encoding="utf-8")
     manifest = manifest.split("\n[dev-dependencies]\n", maxsplit=1)[0].rstrip() + "\n"
-    (package / "Cargo.toml").write_text(manifest, encoding="utf-8")
+    # Emit generated text as bytes so the authenticated component is identical
+    # on hosts whose text writers translate newlines.
+    (package / "Cargo.toml").write_bytes(manifest.encode("utf-8"))
     shutil.copyfile(companion / "Cargo.lock", package / "Cargo.lock")
     shutil.copyfile(companion / "build.rs", package / "build.rs")
     for source in sorted((companion / "src").glob("*.rs")):
@@ -72,10 +74,9 @@ def main() -> None:
       check=True,
       stdout=subprocess.DEVNULL,
     )
-    (root / ".cargo" / "config.toml").write_text(
-      '[source.crates-io]\nreplace-with = "vendored-sources"\n\n'
-      '[source.vendored-sources]\ndirectory = "vendor"\n',
-      encoding="utf-8",
+    (root / ".cargo" / "config.toml").write_bytes(
+      b'[source.crates-io]\nreplace-with = "vendored-sources"\n\n'
+      b'[source.vendored-sources]\ndirectory = "vendor"\n',
     )
 
     files: list[dict[str, str]] = []

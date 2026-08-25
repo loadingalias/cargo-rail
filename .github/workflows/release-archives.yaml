@@ -308,7 +308,8 @@ jobs:
             test "$(printf '%s' "$surface_preparation" | jq -r '.result')" = "ready"
             test "$(printf '%s' "$surface_preparation" | jq -r '.surface_preparation_contract_version')" = "1"
             test "$(printf '%s' "$surface_preparation" | jq -r '.driver.identity | test("^compiler-fact-driver-v1-sha256-[0-9a-f]{64}$")')" = "true"
-            rustup component list --installed | grep -Eq '^rustc-dev(-|$)'
+            # Readiness and the following analysis prove the compiler capability. The required
+            # library may be supplied by rustc itself or by the rustc-dev component.
             set +e
             surface_report="$(cd tests/fixtures/surface_release && "$binary" rail surface --check -f json)"
             surface_status=$?
@@ -332,7 +333,6 @@ jobs:
             test "$(printf '%s' "$nightly_report" | jq -r '.surface_contract_version')" = "2"
             test "$(printf '%s' "$nightly_report" | jq -r '.toolchain.rustc | contains("1.99.0-nightly")')" = "true"
             test "$(printf '%s' "$nightly_report" | jq -r '.authority.audited_targets | length > 0')" = "true"
-            rustup component list --toolchain nightly-2026-08-12 --installed | grep -Eq '^rustc-dev(-|$)'
           fi
           chmod +x "$binary"
           chmod +x "$wrapper"
@@ -417,10 +417,8 @@ jobs:
           if ($preparation.mode -ne 'prepare' -or $preparation.result -ne 'ready' -or $preparation.surface_preparation_contract_version -ne 1 -or $preparation.driver.identity -notmatch '^compiler-fact-driver-v1-sha256-[0-9a-f]{64}$') {
             throw "archive Surface preparation contract is invalid"
           }
-          $selectedComponents = rustup component list --installed
-          if ($LASTEXITCODE -ne 0 -or -not ($selectedComponents | Where-Object { $_ -match '^rustc-dev(?:-|$)' })) {
-            throw "Surface preparation did not install rustc-dev for the selected toolchain"
-          }
+          # Readiness and the following analysis prove the compiler capability. The required
+          # library may be supplied by rustc itself or by the rustc-dev component.
           Push-Location tests/fixtures/surface_release
           $PSNativeCommandUseErrorActionPreference = $false
           $surfaceJson = & $binary.FullName rail surface --check -f json
@@ -463,10 +461,6 @@ jobs:
           Remove-Item Env:RUSTUP_TOOLCHAIN
           if ($nightlyExit -ne 1 -or $nightlyReport.surface_contract_version -ne 2 -or $nightlyReport.toolchain.rustc -notmatch '1\.99\.0-nightly' -or $nightlyReport.authority.audited_targets.Count -eq 0) {
             throw "archive dated-nightly Surface qualification failed"
-          }
-          $installedComponents = rustup component list --toolchain nightly-2026-08-12 --installed
-          if ($LASTEXITCODE -ne 0 -or -not ($installedComponents | Where-Object { $_ -match '^rustc-dev(?:-|$)' })) {
-            throw "Surface did not install rustc-dev for the exact selected toolchain"
           }
           $actual = (& $binary.FullName rail --version).Trim()
           if ($LASTEXITCODE -ne 0 -or $actual -ne "cargo-rail $env:VERSION") {

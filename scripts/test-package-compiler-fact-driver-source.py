@@ -30,6 +30,10 @@ class SourcePackagerTests(unittest.TestCase):
     packager = load_packager()
     commands: list[list[str]] = []
 
+    def windows_write_text(path: pathlib.Path, data: str, encoding: str | None = None, **_kwargs: object) -> int:
+      translated = data.replace("\r\n", "\n").replace("\n", "\r\n")
+      return path.write_bytes(translated.encode(encoding or "utf-8"))
+
     def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
       commands.append(command)
       if command[1] == "vendor":
@@ -40,9 +44,10 @@ class SourcePackagerTests(unittest.TestCase):
 
     with tempfile.TemporaryDirectory(prefix="cargo-rail-source-packager-test-") as temporary_text:
       output = pathlib.Path(temporary_text) / "source.json"
-      with mock.patch.object(packager.subprocess, "run", side_effect=run):
-        with mock.patch.object(sys, "argv", [str(SCRIPT), str(output)]):
-          packager.main()
+      with mock.patch.object(pathlib.Path, "write_text", new=windows_write_text):
+        with mock.patch.object(packager.subprocess, "run", side_effect=run):
+          with mock.patch.object(sys, "argv", [str(SCRIPT), str(output)]):
+            packager.main()
       payload = json.loads(output.read_text(encoding="ascii"))
 
     metadata, vendor = commands
@@ -58,7 +63,9 @@ class SourcePackagerTests(unittest.TestCase):
       b'[source.vendored-sources]\ndirectory = "vendor"\n',
     )
     self.assertIn("tools/compiler-fact-driver/Cargo.lock", files)
-    self.assertNotIn(b"[dev-dependencies]", files["tools/compiler-fact-driver/Cargo.toml"])
+    manifest = files["tools/compiler-fact-driver/Cargo.toml"]
+    self.assertNotIn(b"\r\n", manifest)
+    self.assertNotIn(b"[dev-dependencies]", manifest)
     self.assertIn("vendor/fixture-0.0.0/.cargo-checksum.json", files)
 
 

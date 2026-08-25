@@ -143,9 +143,9 @@ and writes a receipt after successful verification. Dead-public findings are rep
 
 The complete installer in the [README](../README.md#installation) includes authenticated prebuilt and offline-source
 driver authority. `cargo rail surface --prepare` resolves the workspace's exact Cargo-selected compiler, installs its
-`rustc-dev` component through `rustup` when absent, builds a toolchain-matched driver when the prebuilt one differs,
-and authenticates both before analysis. It does not change the user default toolchain. Source installs and
-`cargo binstall` keep `surface --schema`, but cannot prepare or analyze code.
+`rustc-dev` component through `rustup` when the required compiler library is absent, builds a toolchain-matched driver
+when the prebuilt one differs, and authenticates both before analysis. It does not change the user default toolchain.
+Source installs and `cargo binstall` keep `surface --schema`, but cannot prepare or analyze code.
 
 | Field                     |       Default | Behavior                                                                                                                                        |
 | ------------------------- | ------------: | ----------------------------------------------------------------------------------------------------------------------------------------------- |

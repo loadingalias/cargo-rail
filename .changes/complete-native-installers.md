@@ -9,4 +9,6 @@ reclaims completed targets, scales its free-space reserve to the physical volume
 failure. Native caching now supports deterministic policy flags and qualified target roots, records early bypass
 reasons, cleans process state, and safely quarantines markerless local stores. Release planning defaults registry
 publication off, preserves Cargo registry restrictions, reconciles completed prepare transactions, and keeps generic
-workspace cleanup away from the shared compiler cache. Effective configuration now prints as strict round-trip input.
+workspace cleanup away from the shared compiler cache. Native archives manufacture byte-identical offline driver source
+across host newline conventions and qualify the executable compiler capability instead of Rustup package inventory.
+Effective configuration now prints as strict round-trip input.

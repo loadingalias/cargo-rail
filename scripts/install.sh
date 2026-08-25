@@ -141,7 +141,7 @@ actual_version="$("$install_directory/cargo-rail" rail --version)"
 
 echo "Installed Cargo-Rail $version in $install_directory."
 if [ "$surface" = true ]; then
-  echo "Surface source authority is installed; rustc-dev is prepared for the exact selected toolchain on first use."
+  echo "Surface source authority is installed; exact-toolchain compiler support is prepared on first use."
 else
   echo "Surface analysis is unavailable for $target."
 fi

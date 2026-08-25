@@ -81,9 +81,10 @@ value.
 Source-built installations have no compiler-analysis authority. Schema output remains pre-context, but preparation
 and analysis reject the installation before Cargo metadata or workspace acquisition. Complete native installers place
 authenticated prebuilt and offline-source driver authority beside the CLI. `surface --prepare` resolves Cargo's exact
-selected compiler, installs its `rustc-dev` component through `rustup` when absent, manufactures a toolchain-matched
-driver from the authenticated source when needed, and authenticates the staged driver and compiler library. The driver
-protocol verifies that authority and the captured workspace capability before accepting compiler facts.
+selected compiler, installs its `rustc-dev` component through `rustup` when the required compiler library is absent,
+manufactures a toolchain-matched driver from the authenticated source when needed, and authenticates the staged driver
+and compiler library. The driver protocol verifies that authority and the captured workspace capability before
+accepting compiler facts.
 
 ## Compiler process boundary
 

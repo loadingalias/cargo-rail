@@ -20,8 +20,9 @@ Before comparing results, prepare the producer for the exact Cargo-selected work
 cargo rail surface --prepare -f json
 ```
 
-The preflight installs that rustup toolchain's `rustc-dev` component when absent, builds a matching driver from the
-authenticated offline source component when needed, and verifies readiness without analyzing the workspace.
+When the required compiler library is absent, the preflight installs that rustup toolchain's `rustc-dev` component. It
+builds a matching driver from the authenticated offline source component when needed and verifies readiness without
+analyzing the workspace.
 
 Source installs and `cargo binstall` can print `surface --schema`, but cannot prepare or analyze code. Contributors
 changing the compiler integration can use the source-build steps in

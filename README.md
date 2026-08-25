@@ -43,9 +43,9 @@ irm https://github.com/loadingalias/cargo-rail/releases/latest/download/cargo-ra
 
 The installer selects the native archive, verifies its SHA-256 digest, and places every authenticated component in
 Cargo's binary directory. Run `cargo rail surface --prepare` to authenticate and prepare the producer for the
-workspace's exact Cargo-selected toolchain before analysis. The preflight installs that toolchain's `rustc-dev`
-component through `rustup` when absent and never changes the user default. Surface analysis is unavailable only in the
-musl archive.
+workspace's exact Cargo-selected toolchain before analysis. When the required compiler library is absent, the preflight
+installs that toolchain's `rustc-dev` component through `rustup`; it never changes the user default. Surface analysis is
+unavailable only in the musl archive.
 
 For a core-only source build, use `cargo install cargo-rail --locked` or `cargo binstall cargo-rail`. These builds keep
 all commands except Surface analysis; `surface --schema` still works. This is an alternative install path, not a

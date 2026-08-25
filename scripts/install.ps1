@@ -137,7 +137,7 @@ try {
   }
 
   Write-Host "Installed Cargo-Rail $Version in $installDirectory."
-  Write-Host "Surface source authority is installed; rustc-dev is prepared for the exact selected toolchain on first use."
+  Write-Host "Surface source authority is installed; exact-toolchain compiler support is prepared on first use."
 } finally {
   Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $temporary
 }
