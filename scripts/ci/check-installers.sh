@@ -3,6 +3,7 @@ set -euo pipefail
 
 sh -n scripts/install.sh
 scripts/ci/test-install.sh
+python3 scripts/ci/http-fixture-server.py --help >/dev/null
 
 for placeholder in '@CARGO_RAIL_VERSION@'; do
   for installer in scripts/install.sh scripts/install.ps1; do

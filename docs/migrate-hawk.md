@@ -11,8 +11,8 @@ The checked-in conformance reference is pinned to Hawk 0.1.13 at commit
 ## Install Cargo-Rail
 
 Use the complete one-command installer in the [README](../README.md#installation). It includes the CLI and
-authenticated Surface producer authority on macOS, GNU Linux, and Windows. Musl builds provide the core CLI without
-Surface analysis.
+authenticated Surface producer authority on Apple Silicon macOS, GNU Linux, and Windows. Musl builds provide the core
+CLI without Surface analysis.
 
 Before comparing results, prepare the producer for the exact Cargo-selected workspace toolchain:
 

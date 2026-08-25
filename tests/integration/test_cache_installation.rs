@@ -1928,6 +1928,7 @@ fn custom_target_and_deterministic_flags_reuse_without_runtime_residue() {
     super::helpers::finish_test(result);
 }
 
+#[cfg(unix)]
 fn assert_no_native_runtime_residue(directory: &Path) -> Result<()> {
     let residue = fs::read_dir(directory)?
         .collect::<Result<Vec<_>, _>>()?
@@ -1939,8 +1940,10 @@ fn assert_no_native_runtime_residue(directory: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 type NativeCoverageSummary = (Option<String>, String, Option<String>, Option<String>);
 
+#[cfg(unix)]
 fn native_coverage_summary(directory: &Path) -> Result<Vec<NativeCoverageSummary>> {
     let mut summary = fs::read_dir(directory)?
         .collect::<Result<Vec<_>, _>>()?

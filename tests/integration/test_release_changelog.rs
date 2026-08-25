@@ -6,7 +6,9 @@
 //! - Commit/PR links and breaking markers
 //! - per-crate changelog skip and require_changelog_entries flags
 
-use crate::helpers::{TestWorkspace, cargo_rail_command, git, isolated_cargo_rail_command, run_cargo_rail};
+#[cfg(unix)]
+use crate::helpers::isolated_cargo_rail_command;
+use crate::helpers::{TestWorkspace, cargo_rail_command, git, run_cargo_rail};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::process::Command;

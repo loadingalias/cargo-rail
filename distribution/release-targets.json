@@ -3,48 +3,49 @@
     "target": "aarch64-apple-darwin",
     "os": "macos-14",
     "archive": "tar",
-    "surface": true
+    "surface": true,
+    "commit_ci": false
   },
   {
     "target": "aarch64-pc-windows-msvc",
     "os": "windows-11-arm",
     "archive": "zip",
-    "surface": true
+    "surface": true,
+    "commit_ci": true
   },
   {
     "target": "aarch64-unknown-linux-gnu",
     "os": "ubuntu-24.04-arm",
     "archive": "tar",
-    "surface": true
+    "surface": true,
+    "commit_ci": true
   },
   {
     "target": "aarch64-unknown-linux-musl",
     "os": "ubuntu-24.04-arm",
     "archive": "tar",
-    "surface": false
-  },
-  {
-    "target": "x86_64-apple-darwin",
-    "os": "macos-15-intel",
-    "archive": "tar",
-    "surface": true
+    "surface": false,
+    "commit_ci": true
   },
   {
     "target": "x86_64-pc-windows-msvc",
     "os": "windows-2022",
     "archive": "zip",
-    "surface": true
+    "surface": true,
+    "commit_ci": true
   },
   {
     "target": "x86_64-unknown-linux-gnu",
     "os": "ubuntu-22.04",
     "archive": "tar",
-    "surface": true
+    "surface": true,
+    "commit_ci": true
   },
   {
     "target": "x86_64-unknown-linux-musl",
     "os": "ubuntu-22.04",
     "archive": "tar",
-    "surface": false
+    "surface": false,
+    "commit_ci": true
   }
 ]

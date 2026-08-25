@@ -104,7 +104,14 @@ jobs:
           python3 scripts/ci/support-matrix.py --github-matrix >/dev/null
           jq -e '
             length > 0
-            and all(.[]; .target and .os and (.archive == "tar" or .archive == "zip") and (.surface | type == "boolean"))
+            and all(
+              .[];
+              .target
+              and .os
+              and (.archive == "tar" or .archive == "zip")
+              and (.surface | type == "boolean")
+              and (.commit_ci | type == "boolean")
+            )
             and ((map(.target) | length) == (map(.target) | unique | length))
           ' \
             distribution/release-targets.json >/dev/null

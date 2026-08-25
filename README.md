@@ -28,7 +28,7 @@ source snapshot. Cargo-Rail derives their decisions from the same workspace view
 
 Install complete Cargo-Rail, including Surface analysis and compiler-cache helpers.
 
-macOS and Linux:
+Apple Silicon macOS and Linux:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSL \

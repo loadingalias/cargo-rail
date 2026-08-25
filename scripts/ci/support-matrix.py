@@ -157,8 +157,9 @@ def require_action_tool_version(paths: list[Path], tool: str, version: str) -> N
 @dataclass(frozen=True)
 class NativeHost:
     target: str
-    runner: str
-    cache_key: str
+    qualification: str
+    runner: str | None
+    cache_key: str | None
     full_suite: bool
     filesystem: str
     case_sensitive: bool
@@ -222,7 +223,7 @@ def load_compatibility_manifest() -> CompatibilityManifest:
         },
     )
     require(
-        raw["schema_version"] == 8, "compatibility manifest schema_version must be 8"
+        raw["schema_version"] == 9, "compatibility manifest schema_version must be 9"
     )
     corpus = require_object(
         raw["front_door_corpus"], "front_door_corpus", {"fixture", "runner"}
@@ -337,17 +338,29 @@ def load_compatibility_manifest() -> CompatibilityManifest:
         "native_hosts must be a non-empty array",
     )
     for index, value in enumerate(raw["native_hosts"]):
+        require(
+            isinstance(value, dict), f"native_hosts[{index}] must be an object"
+        )
+        qualification = require_string(
+            value.get("qualification"), f"native_hosts[{index}].qualification"
+        )
+        require(
+            qualification in {"ci", "local"},
+            f"native_hosts[{index}].qualification must be ci or local",
+        )
+        expected_fields = {
+            "target",
+            "qualification",
+            "full_suite",
+            "filesystem",
+            "case_sensitive",
+        }
+        if qualification == "ci":
+            expected_fields.update({"runner", "cache_key"})
         host = require_object(
             value,
             f"native_hosts[{index}]",
-            {
-                "target",
-                "runner",
-                "cache_key",
-                "full_suite",
-                "filesystem",
-                "case_sensitive",
-            },
+            expected_fields,
         )
         require(
             host["full_suite"] is True, f"native_hosts[{index}].full_suite must be true"
@@ -359,9 +372,18 @@ def load_compatibility_manifest() -> CompatibilityManifest:
         native_hosts.append(
             NativeHost(
                 target=require_string(host["target"], f"native_hosts[{index}].target"),
-                runner=require_string(host["runner"], f"native_hosts[{index}].runner"),
-                cache_key=require_string(
-                    host["cache_key"], f"native_hosts[{index}].cache_key"
+                qualification=qualification,
+                runner=(
+                    require_string(host["runner"], f"native_hosts[{index}].runner")
+                    if qualification == "ci"
+                    else None
+                ),
+                cache_key=(
+                    require_string(
+                        host["cache_key"], f"native_hosts[{index}].cache_key"
+                    )
+                    if qualification == "ci"
+                    else None
                 ),
                 full_suite=True,
                 filesystem=require_string(
@@ -373,13 +395,14 @@ def load_compatibility_manifest() -> CompatibilityManifest:
     require_unique_sorted(
         [host.target for host in native_hosts], "native_hosts targets"
     )
+    ci_hosts = [host for host in native_hosts if host.qualification == "ci"]
     require(
-        len({host.runner for host in native_hosts}) == len(native_hosts),
-        "native_hosts runners must be unique",
+        len({host.runner for host in ci_hosts}) == len(ci_hosts),
+        "CI-native host runners must be unique",
     )
     require(
-        len({host.cache_key for host in native_hosts}) == len(native_hosts),
-        "native_hosts cache keys must be unique",
+        len({host.cache_key for host in ci_hosts}) == len(ci_hosts),
+        "CI-native host cache keys must be unique",
     )
     filesystem_profiles: list[FilesystemProfile] = []
     require(
@@ -405,8 +428,8 @@ def load_compatibility_manifest() -> CompatibilityManifest:
             f"filesystem_profiles[{index}] target is not an advertised native host",
         )
         require(
-            native.runner == runner,
-            f"filesystem_profiles[{index}] must use the native host's runner",
+            native.qualification == "ci" and native.runner == runner,
+            f"filesystem_profiles[{index}] must use a CI-native host's runner",
         )
         require(
             isinstance(profile["case_sensitive"], bool),
@@ -709,7 +732,9 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
     release_targets: list[str] = []
     for index, value in enumerate(release_entries):
         entry = require_object(
-            value, f"release-targets[{index}]", {"target", "os", "archive", "surface"}
+            value,
+            f"release-targets[{index}]",
+            {"target", "os", "archive", "surface", "commit_ci"},
         )
         target = require_string(entry["target"], f"release-targets[{index}].target")
         require_string(entry["os"], f"release-targets[{index}].os")
@@ -720,6 +745,18 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         require(
             isinstance(entry["surface"], bool),
             f"release-targets[{index}].surface must be a boolean",
+        )
+        require(
+            isinstance(entry["commit_ci"], bool),
+            f"release-targets[{index}].commit_ci must be a boolean",
+        )
+        native_host = next(
+            (host for host in manifest.native_hosts if host.target == target), None
+        )
+        require(
+            entry["commit_ci"]
+            == (native_host is None or native_host.qualification != "local"),
+            f"release-targets[{index}].commit_ci must exclude exactly locally qualified native hosts",
         )
         release_targets.append(target)
     require_unique_sorted(release_targets, "release target registry")
@@ -1007,6 +1044,7 @@ def github_matrix(manifest: CompatibilityManifest) -> str:
             }
         }
         for host in manifest.native_hosts
+        if host.qualification == "ci"
     ]
     return json.dumps({"include": include}, separators=(",", ":"))
 
@@ -1045,6 +1083,7 @@ def compatibility_matrix(manifest: CompatibilityManifest) -> str:
             }
         }
         for host in manifest.native_hosts
+        if host.qualification == "ci"
     ]
     return json.dumps({"include": include}, separators=(",", ":"))
 
@@ -1097,7 +1136,11 @@ def render_markdown(
             )
             cache = "Bypass: `cross_target_toolchain_evidence_unavailable`"
         else:
-            execution = f"Advertised; full-suite CI required (`{host.runner}`)"
+            execution = (
+                f"Advertised; full-suite CI required (`{host.runner}`)"
+                if host.qualification == "ci"
+                else "Advertised; local full-suite qualification required"
+            )
             cross = "—"
             release = "Native artifact required"
             linked_class = ""
@@ -1120,13 +1163,22 @@ def render_markdown(
         for host in manifest.deferred_hosts
     ]
 
-    filesystem_rows = [
-        (
-            f"| Default `{host.target}` | `{host.runner}` | `{host.filesystem}` | "
-            f"{'Sensitive' if host.case_sensitive else 'Insensitive'} | Full endpoint suite and native probe |"
+    filesystem_rows = []
+    for host in manifest.native_hosts:
+        qualification = (
+            f"`{host.runner}`"
+            if host.qualification == "ci"
+            else "Local native host"
         )
-        for host in manifest.native_hosts
-    ]
+        evidence = (
+            "Full endpoint suite and native probe"
+            if host.qualification == "ci"
+            else "Local full endpoint suite, native probe, and benchmarks"
+        )
+        filesystem_rows.append(
+            f"| Default `{host.target}` | {qualification} | `{host.filesystem}` | "
+            f"{'Sensitive' if host.case_sensitive else 'Insensitive'} | {evidence} |"
+        )
     filesystem_rows.extend(
         (
             f"| {profile.name} | `{profile.runner}` | `{profile.filesystem}` | "

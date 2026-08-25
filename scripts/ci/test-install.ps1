@@ -49,16 +49,20 @@ try {
   $python = if (Get-Command python3 -ErrorAction SilentlyContinue) { "python3" } else { "python" }
   $serverOutput = Join-Path $temporary "server.stdout"
   $serverError = Join-Path $temporary "server.stderr"
+  $serverPort = Join-Path $temporary "server.port"
   $server = Start-Process $python -ArgumentList @(
-    "-u", "-m", "http.server", "0", "--bind", "127.0.0.1", "--directory", (Join-Path $temporary "repository")
+    "-u", "scripts/ci/http-fixture-server.py",
+    "--directory", (Join-Path $temporary "repository"),
+    "--port-file", $serverPort
   ) -RedirectStandardOutput $serverOutput -RedirectStandardError $serverError -PassThru -NoNewWindow
 
   $port = $null
   for ($attempt = 0; $attempt -lt 100; $attempt++) {
-    if (Test-Path $serverError) {
-      $message = Get-Content $serverError -Raw
-      if ($message -match 'port ([0-9]+)') {
-        $port = $Matches[1]
+    if (Test-Path $serverPort) {
+      $reportedPort = (Get-Content $serverPort -Raw).Trim()
+      $parsedPort = 0
+      if ([int]::TryParse($reportedPort, [ref]$parsedPort) -and $parsedPort -ge 1 -and $parsedPort -le 65535) {
+        $port = $parsedPort
         break
       }
     }
@@ -68,7 +72,8 @@ try {
     Start-Sleep -Milliseconds 100
   }
   if (-not $port) {
-    throw "local installer fixture server did not report its port"
+    $diagnostic = if (Test-Path $serverError) { (Get-Content $serverError -Raw).Trim() } else { "no server stderr" }
+    throw "local installer fixture server did not report a valid port: $diagnostic"
   }
 
   $installer = Join-Path $temporary "install.ps1"

@@ -55,15 +55,29 @@ jobs:
       - name: Load supported release targets
         id: targets
         shell: bash
+        env:
+          STAGE: ${{ inputs.stage }}
         run: |
           set -euo pipefail
           python3 scripts/ci/support-matrix.py --github-matrix >/dev/null
           jq -e '
             length > 0
-            and all(.[]; .target and .os and (.archive == "tar" or .archive == "zip") and (.surface | type == "boolean"))
+            and all(
+              .[];
+              .target
+              and .os
+              and (.archive == "tar" or .archive == "zip")
+              and (.surface | type == "boolean")
+              and (.commit_ci | type == "boolean")
+            )
             and ((map(.target) | length) == (map(.target) | unique | length))
           ' distribution/release-targets.json >/dev/null
-          echo "matrix=$(jq -c '{include: .}' distribution/release-targets.json)" >> "$GITHUB_OUTPUT"
+          matrix="$(
+            jq -c --arg stage "$STAGE" \
+              '{include: (if $stage == "true" then . else map(select(.commit_ci)) end)}' \
+              distribution/release-targets.json
+          )"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build and Verify (${{ matrix.target }})
@@ -316,7 +330,7 @@ jobs:
             set -e
             test "$nightly_status" = 1
             test "$(printf '%s' "$nightly_report" | jq -r '.surface_contract_version')" = "2"
-            test "$(printf '%s' "$nightly_report" | jq -r '.toolchain.rustc | contains("1.99.0-nightly"))" = "true"
+            test "$(printf '%s' "$nightly_report" | jq -r '.toolchain.rustc | contains("1.99.0-nightly")')" = "true"
             test "$(printf '%s' "$nightly_report" | jq -r '.authority.audited_targets | length > 0')" = "true"
             rustup component list --toolchain nightly-2026-08-12 --installed | grep -Eq '^rustc-dev(-|$)'
           fi

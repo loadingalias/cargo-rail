@@ -10,7 +10,6 @@ mkdir -p "$release" "$temporary/payload"
 
 targets=(
   "Darwin arm64 native aarch64-apple-darwin true"
-  "Darwin x86_64 native x86_64-apple-darwin true"
   "Linux aarch64 gnu aarch64-unknown-linux-gnu true"
   "Linux aarch64 musl aarch64-unknown-linux-musl false"
   "Linux x86_64 gnu x86_64-unknown-linux-gnu true"
@@ -88,6 +87,15 @@ for specification in "${targets[@]}"; do
     PATH="$temporary/bin:$PATH" CARGO_HOME="$cargo_home" "$installer" "$version" > /dev/null
   cmp scripts/ci/fixtures/fake-cargo-rail-installer-binary.sh "$cargo_home/bin/cargo-rail-native-rustc-worker"
 done
+
+if INSTALLER_TEST_SYSTEM=Darwin INSTALLER_TEST_MACHINE=x86_64 INSTALLER_TEST_LIBC=native \
+  PATH="$temporary/bin:$PATH" CARGO_HOME="$temporary/unsupported-macos-home" \
+  "$installer" "$version" > /dev/null 2> "$temporary/unsupported-macos-stderr"; then
+  echo "installer accepted unsupported Intel macOS" >&2
+  exit 1
+fi
+grep -Fq "no supported Cargo-Rail archive for Darwin x86_64" "$temporary/unsupported-macos-stderr"
+test ! -e "$temporary/unsupported-macos-home/bin/cargo-rail"
 
 bad_archive="cargo-rail-x86_64-unknown-linux-gnu.tar.gz"
 printf '%064d  %s\n' 0 "$bad_archive" > "$release/SHA256SUMS"

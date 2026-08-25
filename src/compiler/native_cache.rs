@@ -15869,7 +15869,7 @@ pub(crate) mod tests {
 
         for (platform, host_target, release) in [
             ("unix-linux-aarch64", "aarch64-unknown-linux-gnu", "1.91.0"),
-            ("unix-macos-x86_64", "x86_64-apple-darwin", "1.97.1"),
+            ("unix-macos-aarch64", "aarch64-apple-darwin", "1.97.1"),
             ("windows-windows-x86_64", "x86_64-pc-windows-msvc", "1.98.0-nightly"),
             ("unix-freebsd-x86_64", "x86_64-unknown-freebsd", "custom"),
         ] {

@@ -9,7 +9,6 @@ import pathlib
 import shutil
 import subprocess
 import tempfile
-import tomllib
 
 
 def main() -> None:
@@ -30,6 +29,7 @@ def main() -> None:
     manifest = (companion / "Cargo.toml").read_text(encoding="utf-8")
     manifest = manifest.split("\n[dev-dependencies]\n", maxsplit=1)[0].rstrip() + "\n"
     (package / "Cargo.toml").write_text(manifest, encoding="utf-8")
+    shutil.copyfile(companion / "Cargo.lock", package / "Cargo.lock")
     shutil.copyfile(companion / "build.rs", package / "build.rs")
     for source in sorted((companion / "src").glob("*.rs")):
       shutil.copyfile(source, package / "src" / source.name)
@@ -37,60 +37,31 @@ def main() -> None:
       repository / "src" / "compiler" / "fact_protocol.rs",
       root / "src" / "compiler" / "fact_protocol.rs",
     )
+    # Start from the checked lockfile so Cargo preserves every selected runtime
+    # version while pruning the removed development graph. This avoids a TOML
+    # parser dependency in the release environment and keeps the source
+    # component below its authenticated size bound.
     subprocess.run(
       [
         "cargo",
-        "generate-lockfile",
+        "metadata",
         "--offline",
+        "--format-version",
+        "1",
         "--manifest-path",
         str(package / "Cargo.toml"),
       ],
       cwd=root,
       check=True,
+      stdout=subprocess.DEVNULL,
     )
-    checked_lock = tomllib.loads((companion / "Cargo.lock").read_text(encoding="utf-8"))
-    checked_packages = {
-      (entry["name"], entry["version"], entry.get("source"), entry.get("checksum"))
-      for entry in checked_lock["package"]
-    }
-    checked_versions: dict[str, set[str]] = {}
-    for entry in checked_lock["package"]:
-      checked_versions.setdefault(entry["name"], set()).add(entry["version"])
-    for _ in range(len(checked_packages)):
-      runtime_lock = tomllib.loads((package / "Cargo.lock").read_text(encoding="utf-8"))
-      runtime_packages = {
-        (entry["name"], entry["version"], entry.get("source"), entry.get("checksum"))
-        for entry in runtime_lock["package"]
-      }
-      drift = sorted(runtime_packages - checked_packages)
-      if not drift:
-        break
-      name = drift[0][0]
-      versions = checked_versions.get(name, set())
-      if len(versions) != 1:
-        raise RuntimeError(f"runtime driver dependency resolution drifted ambiguously: {drift}")
-      subprocess.run(
-        [
-          "cargo",
-          "update",
-          "--offline",
-          "--manifest-path",
-          str(package / "Cargo.toml"),
-          "-p",
-          name,
-          "--precise",
-          next(iter(versions)),
-        ],
-        cwd=root,
-        check=True,
-      )
-    else:
-      raise RuntimeError("runtime driver dependency resolution did not converge on its checked Cargo.lock")
+    # `cargo vendor` may acquire a locked package that the preceding host build
+    # did not need (for example `libc` on Windows); the emitted source
+    # replacement makes every later build frozen and offline.
     subprocess.run(
       [
         "cargo",
         "vendor",
-        "--offline",
         "--locked",
         "--versioned-dirs",
         "--manifest-path",

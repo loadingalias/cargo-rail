@@ -679,7 +679,7 @@ fn test_unused_detection_multi_target_union() {
         let workspace = create_workspace_with_unused_detection()?;
 
         // Config with multiple targets
-        let config = r#"targets = ["x86_64-unknown-linux-gnu", "x86_64-apple-darwin"]
+        let config = r#"targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
 "#;
         fs::write(workspace.path.join(".config/rail.toml"), config)?;
 

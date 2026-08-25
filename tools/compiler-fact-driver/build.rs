@@ -13,10 +13,14 @@ fn main() {
         println!("cargo::rustc-cfg=cargo_rail_rustc_local_mod_id");
     }
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if target_os == "linux" {
+    if matches!(target_os.as_str(), "linux" | "macos") {
         let library = selected_rustc_sysroot().join("lib");
         println!("cargo::rustc-link-search=native={}", library.display());
+    }
+    if target_os == "linux" {
         println!("cargo::rustc-link-arg-bin=cargo-rail-fact-driver=-Wl,-rpath,$ORIGIN/../lib");
+    } else if target_os == "macos" {
+        println!("cargo::rustc-link-arg-bin=cargo-rail-fact-driver=-Wl,-rpath,@loader_path/../lib");
     }
 }
 
