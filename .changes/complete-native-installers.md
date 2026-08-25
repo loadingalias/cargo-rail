@@ -12,4 +12,6 @@ publication off, preserves Cargo registry restrictions, reconciles completed pre
 workspace cleanup away from the shared compiler cache. Native archives manufacture byte-identical offline driver source
 across host newline conventions and qualify the executable compiler capability instead of Rustup package inventory.
 Runtime driver preparation distinguishes residual compiler runtime libraries from the development metadata required to
-build against a selected toolchain. Effective configuration now prints as strict round-trip input.
+build against a selected toolchain. Runtime driver capture accepts Cargo's hard-linked build output before restaging it
+as private cache authority. Windows archive qualification binds dated-nightly Surface checks to exact compiler tools
+instead of ambient `PATH` selection. Effective configuration now prints as strict round-trip input.

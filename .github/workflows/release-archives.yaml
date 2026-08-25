@@ -318,10 +318,11 @@ jobs:
             test "$(printf '%s' "$surface_report" | jq -r '.surface_contract_version')" = "2"
             test "$(printf '%s' "$surface_report" | jq -r '.authority.audited_targets | length > 0')" = "true"
             test "$(printf '%s' "$surface_report" | jq -r '.findings | any(.name == "dead_public")')" = "true"
-            rustup toolchain install nightly-2026-08-12 --profile minimal
-            rustup component remove rustc-dev --toolchain nightly-2026-08-12 || true
+            nightly_toolchain="nightly-2026-08-12"
+            rustup toolchain install "$nightly_toolchain" --profile minimal
+            rustup component remove rustc-dev --toolchain "$nightly_toolchain" || true
             set +e
-            nightly_preparation="$(cd tests/fixtures/surface_release && RUSTUP_TOOLCHAIN=nightly-2026-08-12 "$binary" rail surface --prepare -f json)"
+            nightly_preparation="$(cd tests/fixtures/surface_release && RUSTUP_TOOLCHAIN="$nightly_toolchain" "$binary" rail surface --prepare -f json)"
             nightly_preparation_status=$?
             set -e
             if [[ "$nightly_preparation_status" != 0 ]]; then
@@ -333,7 +334,7 @@ jobs:
             test "$(printf '%s' "$nightly_preparation" | jq -r '.surface_preparation_contract_version')" = "1"
             test "$(printf '%s' "$nightly_preparation" | jq -r '.toolchain.rustc | contains("1.99.0-nightly")')" = "true"
             set +e
-            nightly_report="$(cd tests/fixtures/surface_release && RUSTUP_TOOLCHAIN=nightly-2026-08-12 "$binary" rail surface --check -f json)"
+            nightly_report="$(cd tests/fixtures/surface_release && RUSTUP_TOOLCHAIN="$nightly_toolchain" "$binary" rail surface --check -f json)"
             nightly_status=$?
             set -e
             test "$nightly_status" = 1
@@ -441,15 +442,19 @@ jobs:
           if (-not ($surfaceReport.findings | Where-Object { $_.name -eq "dead_public" })) {
             throw "archive surface fixture did not report dead_public"
           }
-          rustup toolchain install nightly-2026-08-12 --profile minimal
+          $nightlyToolchain = "nightly-2026-08-12"
+          rustup toolchain install $nightlyToolchain --profile minimal
           if ($LASTEXITCODE -ne 0) {
             throw "dated nightly toolchain installation failed"
           }
-          rustup component remove rustc-dev --toolchain nightly-2026-08-12 2>$null
+          rustup component remove rustc-dev --toolchain $nightlyToolchain 2>$null
           if ($LASTEXITCODE -ne 0) {
             Write-Host "dated nightly rustc-dev was already absent"
           }
-          $env:RUSTUP_TOOLCHAIN = "nightly-2026-08-12"
+          $env:RUSTUP_TOOLCHAIN = $nightlyToolchain
+          $env:CARGO = (rustup which cargo --toolchain $nightlyToolchain).Trim()
+          $env:RUSTC = (rustup which rustc --toolchain $nightlyToolchain).Trim()
+          $env:RUSTDOC = (rustup which rustdoc --toolchain $nightlyToolchain).Trim()
           Push-Location tests/fixtures/surface_release
           $nightlyPreparationJson = & $binary.FullName rail surface --prepare -f json
           $nightlyPreparationExit = $LASTEXITCODE
@@ -466,7 +471,7 @@ jobs:
           $nightlyExit = $LASTEXITCODE
           $nightlyReport = $nightlyJson | Out-String | ConvertFrom-Json
           Pop-Location
-          Remove-Item Env:RUSTUP_TOOLCHAIN
+          Remove-Item Env:RUSTUP_TOOLCHAIN, Env:CARGO, Env:RUSTC, Env:RUSTDOC
           if ($nightlyExit -ne 1 -or $nightlyReport.surface_contract_version -ne 2 -or $nightlyReport.toolchain.rustc -notmatch '1\.99\.0-nightly' -or $nightlyReport.authority.audited_targets.Count -eq 0) {
             throw "archive dated-nightly Surface qualification failed"
           }

@@ -10,7 +10,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File};
 #[cfg(unix)]
 use std::io::Seek as _;
-use std::io::{ErrorKind, Read as _, Write as _};
+use std::io::{self, ErrorKind, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -645,7 +645,8 @@ fn runtime_compiler_fact_driver(
         .join(selected.host)
         .join("release")
         .join(expected_driver_file_name());
-    let content_digest = digest_regular_file(&built, MAX_FACT_DRIVER_BYTES)?;
+    let built_bytes = read_bounded_build_output(&built, MAX_FACT_DRIVER_BYTES)?;
+    let content_digest = format!("sha256:{}", ContentDigest::sha256(&built_bytes));
     let authority = CompilerFactDriverAuthority {
         file_name: expected_driver_file_name().to_string(),
         content_digest,
@@ -672,7 +673,7 @@ fn runtime_compiler_fact_driver(
         .prefix(".cargo-rail-fact-driver-entry-")
         .tempdir_in(&cache)?;
     let staged_driver = staged.path().join(expected_driver_file_name());
-    fs::copy(&built, &staged_driver)?;
+    fs::write(&staged_driver, built_bytes)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -705,6 +706,32 @@ fn read_authenticated_component(path: &Path, expected_digest: &str, maximum_byte
 }
 
 fn read_bounded_regular_file(path: &Path, maximum_bytes: u64) -> RailResult<Vec<u8>> {
+    read_bounded_regular_file_with_identity(
+        path,
+        maximum_bytes,
+        crate::utils::private_file_matches_path,
+        "changed before it was opened or has multiple links",
+        "changed while its bytes were read",
+    )
+}
+
+fn read_bounded_build_output(path: &Path, maximum_bytes: u64) -> RailResult<Vec<u8>> {
+    read_bounded_regular_file_with_identity(
+        path,
+        maximum_bytes,
+        crate::utils::opened_file_matches_path,
+        "changed before it was opened",
+        "changed while its bytes were read",
+    )
+}
+
+fn read_bounded_regular_file_with_identity(
+    path: &Path,
+    maximum_bytes: u64,
+    matches_path: fn(&File, &Path, u64) -> io::Result<bool>,
+    opening_failure: &str,
+    reading_failure: &str,
+) -> RailResult<Vec<u8>> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_file()
         || crate::utils::is_symlink_or_reparse(&metadata)
@@ -717,10 +744,10 @@ fn read_bounded_regular_file(path: &Path, maximum_bytes: u64) -> RailResult<Vec<
         )));
     }
     let mut file = File::open(path)?;
-    if !crate::utils::private_file_matches_path(&file, path, metadata.len())? {
+    if !matches_path(&file, path, metadata.len())? {
         return Err(RailError::message(format!(
-            "component '{}' changed before it was opened or has multiple links",
-            path.display()
+            "component '{}' {opening_failure}",
+            path.display(),
         )));
     }
     let capacity = usize::try_from(metadata.len())
@@ -729,10 +756,10 @@ fn read_bounded_regular_file(path: &Path, maximum_bytes: u64) -> RailResult<Vec<
     (&mut file)
         .take(maximum_bytes.saturating_add(1))
         .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 != metadata.len() || !crate::utils::private_file_matches_path(&file, path, metadata.len())? {
+    if bytes.len() as u64 != metadata.len() || !matches_path(&file, path, metadata.len())? {
         return Err(RailError::message(format!(
-            "component '{}' changed while its bytes were read",
-            path.display()
+            "component '{}' {reading_failure}",
+            path.display(),
         )));
     }
     crate::instrumentation::record_hash(bytes.len());
@@ -2142,6 +2169,24 @@ mod tests {
             b"authenticated source"
         );
         read_authenticated_component(&path, &digest(b"different source"), 1024).unwrap_err();
+    }
+
+    #[test]
+    fn runtime_build_output_accepts_cargo_hard_links_before_private_staging() {
+        let directory = tempfile::tempdir().expect("build output directory");
+        let cargo_output = directory.path().join(expected_driver_file_name());
+        let cargo_cache = directory.path().join("cargo-cache-driver");
+        write_executable(&cargo_cache, b"cargo-produced driver");
+        fs::hard_link(&cargo_cache, &cargo_output).expect("hard-link Cargo output");
+
+        assert_eq!(
+            read_bounded_build_output(&cargo_output, 1024).expect("capture Cargo output"),
+            b"cargo-produced driver"
+        );
+        assert!(
+            read_bounded_regular_file(&cargo_output, 1024).is_err(),
+            "cache authority must continue to reject multiple links"
+        );
     }
 
     #[test]
