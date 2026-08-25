@@ -46,17 +46,10 @@ fn materialize_fixture(destination: &Path, git_source: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cargo_metadata(fixture: &Path, cargo_home: Option<&Path>) -> Result<serde_json::Value> {
+fn cargo_process(fixture: &Path, cargo_home: Option<&Path>) -> Command {
     let mut command = Command::new("cargo");
     command
         .current_dir(fixture)
-        .args([
-            "metadata",
-            "--locked",
-            "--offline",
-            "--all-features",
-            "--format-version=1",
-        ])
         .env_remove("RUSTC_WRAPPER")
         .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
@@ -64,6 +57,18 @@ fn cargo_metadata(fixture: &Path, cargo_home: Option<&Path>) -> Result<serde_jso
     if let Some(cargo_home) = cargo_home {
         command.env("CARGO_HOME", cargo_home);
     }
+    command
+}
+
+fn cargo_metadata(fixture: &Path, cargo_home: Option<&Path>) -> Result<serde_json::Value> {
+    let mut command = cargo_process(fixture, cargo_home);
+    command.args([
+        "metadata",
+        "--locked",
+        "--offline",
+        "--all-features",
+        "--format-version=1",
+    ]);
     let output = command.output()?;
     ensure!(
         output.status.success(),
@@ -280,8 +285,8 @@ fn run_cargo(
 }
 
 fn cargo_command(fixture: &Path, cargo_home: &Path, workload: &str) -> Command {
-    let mut command = Command::new("cargo");
-    command.current_dir(fixture).arg(workload);
+    let mut command = cargo_process(fixture, Some(cargo_home));
+    command.arg(workload);
     if workload == "build" {
         command.arg("--release");
     } else if workload == "test" {
@@ -295,13 +300,8 @@ fn cargo_command(fixture: &Path, cargo_home: &Path, workload: &str) -> Command {
             "--offline",
             "--message-format=json-render-diagnostics",
         ])
-        .env("CARGO_HOME", cargo_home)
         .env("CARGO_INCREMENTAL", "0")
-        .env("CARGO_TERM_COLOR", "never")
-        .env_remove("RUSTC_WRAPPER")
-        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
-        .env_remove("RUSTC_WORKSPACE_WRAPPER")
-        .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER");
+        .env("CARGO_TERM_COLOR", "never");
     command
 }
 
@@ -966,14 +966,11 @@ fn real_world_native_cache_fixture_exercises_required_compiler_classes() -> Resu
     let root = tempfile::tempdir()?;
     let fixture = root.path().join("fixture");
     let target = fixture.join("target");
+    let cargo_home = root.path().join("cargo-home");
     materialize_fixture(&fixture, &root.path().join("git-source"))?;
+    seed_isolated_cargo_home(&fixture, &cargo_home)?;
 
-    let metadata = Command::new("cargo")
-        .current_dir(&fixture)
-        .args(["metadata", "--locked", "--offline", "--format-version=1"])
-        .output()?;
-    ensure!(metadata.status.success(), "fixture metadata failed");
-    let metadata: serde_json::Value = serde_json::from_slice(&metadata.stdout)?;
+    let metadata = cargo_metadata(&fixture, Some(&cargo_home))?;
     let packages = metadata["packages"].as_array().context("fixture packages")?;
     ensure!(
         metadata["workspace_members"]
@@ -1033,8 +1030,7 @@ fn real_world_native_cache_fixture_exercises_required_compiler_classes() -> Resu
         "fixture included assembly text is empty"
     );
 
-    let check = Command::new("cargo")
-        .current_dir(&fixture)
+    let check = cargo_process(&fixture, Some(&cargo_home))
         .args([
             "check",
             "--workspace",
@@ -1045,13 +1041,11 @@ fn real_world_native_cache_fixture_exercises_required_compiler_classes() -> Resu
         ])
         .output()?;
     ensure!(check.status.success(), "fixture check failed");
-    let build = Command::new("cargo")
-        .current_dir(&fixture)
+    let build = cargo_process(&fixture, Some(&cargo_home))
         .args(["build", "--workspace", "--all-features", "--locked", "--offline"])
         .output()?;
     ensure!(build.status.success(), "fixture build failed");
-    let test = Command::new("cargo")
-        .current_dir(&fixture)
+    let test = cargo_process(&fixture, Some(&cargo_home))
         .args([
             "test",
             "--workspace",
