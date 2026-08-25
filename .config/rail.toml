@@ -25,6 +25,7 @@ remote_effects = "auto"
 sign_tags = true
 require_changelog_entries = true
 require_change_files = true
+semver_check = "off"
 unconventional_commits = "deny"
 
 [release.changelog]

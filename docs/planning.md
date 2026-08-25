@@ -152,7 +152,7 @@ planner v7 and scope v4; the action's `version` input independently selects a co
 - uses: loadingalias/cargo-rail-action@47e86bde928ce420b85efa5f8d3b5feb96fd0ffc # v7.0.0
   id: rail
   with:
-    version: 0.22.3
+    version: 0.23.0
 
 - name: Test selected packages
   if: steps.rail.outputs.test == 'true'

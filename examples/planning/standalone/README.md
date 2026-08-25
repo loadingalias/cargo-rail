@@ -27,7 +27,7 @@ fi
   id: rail
   with:
     mode: debug
-    version: 0.22.3
+    version: 0.23.0
 
 - name: Test selected packages
   if: steps.rail.outputs.test == 'true'
