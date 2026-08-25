@@ -560,9 +560,9 @@ fn runtime_compiler_fact_driver(
         read_authenticated_component(&source_path, &source.content_digest, MAX_FACT_DRIVER_SOURCE_BYTES)?;
     let bundle: CompilerFactDriverSourceBundle = serde_json::from_slice(&source_bytes)?;
     validate_source_bundle(&bundle)?;
-    let compiler_library = selected_compiler_library(snapshot)?;
-    let compiler_library_path = compiler_library.path.clone();
     let selected = RustcVerboseIdentity::parse(snapshot.toolchain().direct_rustc_verbose_version())?;
+    let compiler_library = selected_compiler_library(snapshot, selected.host)?;
+    let compiler_library_path = compiler_library.path.clone();
     let cache_key = ContentDigest::sha256(
         format!(
             "cargo-rail-runtime-fact-driver-v1\0{}\0{}\0{}\0{}",
@@ -864,13 +864,21 @@ fn create_private_real_directory(parent: &Path, name: &str) -> RailResult<PathBu
     crate::utils::canonicalize_existing(&path).map_err(Into::into)
 }
 
-fn selected_compiler_library(snapshot: &WorkspaceSnapshot) -> RailResult<SelectedCompilerLibrary> {
+fn selected_compiler_library(snapshot: &WorkspaceSnapshot, rustc_host: &str) -> RailResult<SelectedCompilerLibrary> {
     let sysroot = crate::utils::canonicalize_existing(snapshot.toolchain().direct_rustc_sysroot())?;
     let rustup_toolchain = rustup_toolchain_for_sysroot(snapshot, &sysroot)?;
     let mut libraries = compiler_libraries(&sysroot)?;
-    if libraries.is_empty() {
+    let mut development_support = compiler_development_support_present(&sysroot, rustc_host)?;
+    if libraries.is_empty() || !development_support {
         install_selected_rustc_dev(snapshot, &sysroot, rustup_toolchain.as_deref())?;
         libraries = compiler_libraries(&sysroot)?;
+        development_support = compiler_development_support_present(&sysroot, rustc_host)?;
+    }
+    if !development_support {
+        return Err(RailError::message(format!(
+            "selected rustc sysroot '{}' has no compiler development metadata after rustc-dev preparation",
+            sysroot.display()
+        )));
     }
     if libraries.len() != 1 {
         return Err(RailError::message(format!(
@@ -899,6 +907,36 @@ fn selected_compiler_library(snapshot: &WorkspaceSnapshot) -> RailResult<Selecte
         content_digest,
         rustup_toolchain,
     })
+}
+
+fn compiler_development_support_present(sysroot: &Path, rustc_host: &str) -> RailResult<bool> {
+    // Current rustc distributions can retain the loadable rustc_driver library after rustc-dev is removed.
+    // rustc_hir metadata is a direct build input of the bundled driver and therefore proves the distinct
+    // compiler-development capability that a runtime source build needs.
+    let directory = sysroot.join("lib").join("rustlib").join(rustc_host).join("lib");
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("librustc_hir-") || !(name.ends_with(".rmeta") || name.ends_with(".rlib")) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.is_file() || crate::utils::is_symlink_or_reparse(&metadata) {
+            return Err(RailError::message(
+                "selected rustc-dev compiler metadata is not a real file",
+            ));
+        }
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn ensure_authority_compiler_library(
@@ -2104,6 +2142,22 @@ mod tests {
             b"authenticated source"
         );
         read_authenticated_component(&path, &digest(b"different source"), 1024).unwrap_err();
+    }
+
+    #[test]
+    fn runtime_library_does_not_claim_compiler_development_support() {
+        let sysroot = tempfile::tempdir().expect("temporary sysroot");
+        let host = "test-host";
+        fs::create_dir_all(sysroot.path().join("lib")).expect("runtime library directory");
+        fs::write(sysroot.path().join("lib/librustc_driver-residual.so"), b"runtime")
+            .expect("residual runtime library");
+
+        assert!(!compiler_development_support_present(sysroot.path(), host).expect("development support inspection"));
+
+        let development = sysroot.path().join("lib/rustlib").join(host).join("lib");
+        fs::create_dir_all(&development).expect("development library directory");
+        fs::write(development.join("librustc_hir-test.rmeta"), b"metadata").expect("compiler metadata");
+        assert!(compiler_development_support_present(sysroot.path(), host).expect("development support inspection"));
     }
 
     #[test]

@@ -320,7 +320,14 @@ jobs:
             test "$(printf '%s' "$surface_report" | jq -r '.findings | any(.name == "dead_public")')" = "true"
             rustup toolchain install nightly-2026-08-12 --profile minimal
             rustup component remove rustc-dev --toolchain nightly-2026-08-12 || true
+            set +e
             nightly_preparation="$(cd tests/fixtures/surface_release && RUSTUP_TOOLCHAIN=nightly-2026-08-12 "$binary" rail surface --prepare -f json)"
+            nightly_preparation_status=$?
+            set -e
+            if [[ "$nightly_preparation_status" != 0 ]]; then
+              printf '%s\n' "$nightly_preparation" >&2
+              exit "$nightly_preparation_status"
+            fi
             test "$(printf '%s' "$nightly_preparation" | jq -r '.mode')" = "prepare"
             test "$(printf '%s' "$nightly_preparation" | jq -r '.result')" = "ready"
             test "$(printf '%s' "$nightly_preparation" | jq -r '.surface_preparation_contract_version')" = "1"
@@ -445,13 +452,14 @@ jobs:
           $env:RUSTUP_TOOLCHAIN = "nightly-2026-08-12"
           Push-Location tests/fixtures/surface_release
           $nightlyPreparationJson = & $binary.FullName rail surface --prepare -f json
-          if ($LASTEXITCODE -ne 0) {
-            throw "archive dated-nightly Surface preparation failed"
-          }
+          $nightlyPreparationExit = $LASTEXITCODE
           $nightlyPreparation = $nightlyPreparationJson | Out-String | ConvertFrom-Json
           Pop-Location
+          if ($nightlyPreparationExit -ne 0) {
+            throw "archive dated-nightly Surface preparation failed: $($nightlyPreparationJson | Out-String)"
+          }
           if ($nightlyPreparation.mode -ne 'prepare' -or $nightlyPreparation.result -ne 'ready' -or $nightlyPreparation.surface_preparation_contract_version -ne 1 -or $nightlyPreparation.toolchain.rustc -notmatch '1\.99\.0-nightly') {
-            throw "archive dated-nightly Surface preparation contract is invalid"
+            throw "archive dated-nightly Surface preparation contract is invalid: $($nightlyPreparationJson | Out-String)"
           }
           Push-Location tests/fixtures/surface_release
           $nightlyJson = & $binary.FullName rail surface --check -f json

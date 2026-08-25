@@ -20,7 +20,7 @@ Before comparing results, prepare the producer for the exact Cargo-selected work
 cargo rail surface --prepare -f json
 ```
 
-When the required compiler library is absent, the preflight installs that rustup toolchain's `rustc-dev` component. It
+When compiler development metadata is absent, the preflight installs that rustup toolchain's `rustc-dev` component. It
 builds a matching driver from the authenticated offline source component when needed and verifies readiness without
 analyzing the workspace.
 

@@ -11,4 +11,5 @@ reasons, cleans process state, and safely quarantines markerless local stores. R
 publication off, preserves Cargo registry restrictions, reconciles completed prepare transactions, and keeps generic
 workspace cleanup away from the shared compiler cache. Native archives manufacture byte-identical offline driver source
 across host newline conventions and qualify the executable compiler capability instead of Rustup package inventory.
-Effective configuration now prints as strict round-trip input.
+Runtime driver preparation distinguishes residual compiler runtime libraries from the development metadata required to
+build against a selected toolchain. Effective configuration now prints as strict round-trip input.

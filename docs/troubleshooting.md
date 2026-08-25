@@ -47,7 +47,7 @@ Prepare the exact workspace-selected toolchain before analysis:
 cargo rail surface --prepare -f json
 ```
 
-When the required compiler library is absent, the preflight installs the selected rustup toolchain's `rustc-dev`
+When compiler development metadata is absent, the preflight installs the selected rustup toolchain's `rustc-dev`
 component. It resolves either the exact prebuilt producer or a deterministic driver built from authenticated offline
 source, stages and reauthenticates its bytes, and emits readiness contract v1. It never changes the user default
 toolchain. An operational failure names the missing toolchain/component or failed authority boundary and exits 2
