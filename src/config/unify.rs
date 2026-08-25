@@ -61,6 +61,14 @@ pub struct UnifyConfig {
     #[serde(default = "default_max_backups")]
     pub max_backups: usize,
 
+    /// Byte count at which compiler-artifact acquisition reports storage pressure.
+    #[serde(default = "default_compiler_artifact_soft_limit_bytes")]
+    pub compiler_artifact_soft_limit_bytes: u64,
+
+    /// Maximum filesystem consumption authorized for the command-owned compiler working set.
+    #[serde(default = "default_compiler_artifact_hard_limit_bytes")]
+    pub compiler_artifact_hard_limit_bytes: u64,
+
     /// MSRV computation and inheritance policy.
     #[serde(default)]
     pub msrv_policy: MsrvPolicy,
@@ -115,6 +123,8 @@ impl Default for UnifyConfig {
             exclude: Vec::new(),
             include: Vec::new(),
             max_backups: default_max_backups(),
+            compiler_artifact_soft_limit_bytes: default_compiler_artifact_soft_limit_bytes(),
+            compiler_artifact_hard_limit_bytes: default_compiler_artifact_hard_limit_bytes(),
             msrv_policy: MsrvPolicy::default(),
             consumer_scope: ConsumerScope::default(),
             preserve_features: Vec::new(),
@@ -179,6 +189,19 @@ impl UnifyConfig {
     pub fn validate(&self, workspace_root: &std::path::Path) -> Result<(), crate::error::ConfigError> {
         validate_glob_patterns("unify.preserve_features", &self.preserve_features)?;
         validate_glob_patterns("unify.skip_undeclared_patterns", &self.skip_undeclared_patterns)?;
+
+        if self.compiler_artifact_soft_limit_bytes == 0 {
+            return Err(crate::error::ConfigError::InvalidValue {
+                field: "unify.compiler_artifact_soft_limit_bytes".to_string(),
+                message: "must be greater than zero".to_string(),
+            });
+        }
+        if self.compiler_artifact_hard_limit_bytes < self.compiler_artifact_soft_limit_bytes {
+            return Err(crate::error::ConfigError::InvalidValue {
+                field: "unify.compiler_artifact_hard_limit_bytes".to_string(),
+                message: "must be greater than or equal to compiler_artifact_soft_limit_bytes".to_string(),
+            });
+        }
 
         if let Some(TransitivePinning {
             host: TransitiveFeatureHost::Path(p),
@@ -404,6 +427,8 @@ struct UnifyConfigInput {
     exclude: Vec<String>,
     include: Vec<String>,
     max_backups: usize,
+    compiler_artifact_soft_limit_bytes: u64,
+    compiler_artifact_hard_limit_bytes: u64,
     msrv_policy: Option<MsrvPolicy>,
     msrv: Option<bool>,
     enforce_msrv_inheritance: Option<bool>,
@@ -428,6 +453,8 @@ impl Default for UnifyConfigInput {
             exclude: config.exclude,
             include: config.include,
             max_backups: config.max_backups,
+            compiler_artifact_soft_limit_bytes: config.compiler_artifact_soft_limit_bytes,
+            compiler_artifact_hard_limit_bytes: config.compiler_artifact_hard_limit_bytes,
             msrv_policy: None,
             msrv: None,
             enforce_msrv_inheritance: None,
@@ -494,6 +521,8 @@ impl<'de> Deserialize<'de> for UnifyConfig {
             exclude: input.exclude,
             include: input.include,
             max_backups: input.max_backups,
+            compiler_artifact_soft_limit_bytes: input.compiler_artifact_soft_limit_bytes,
+            compiler_artifact_hard_limit_bytes: input.compiler_artifact_hard_limit_bytes,
             msrv_policy,
             consumer_scope: input.consumer_scope,
             preserve_features: input.preserve_features,
@@ -509,6 +538,14 @@ impl<'de> Deserialize<'de> for UnifyConfig {
 
 fn default_max_backups() -> usize {
     3
+}
+
+const fn default_compiler_artifact_soft_limit_bytes() -> u64 {
+    32 * 1024 * 1024 * 1024
+}
+
+const fn default_compiler_artifact_hard_limit_bytes() -> u64 {
+    64 * 1024 * 1024 * 1024
 }
 
 fn default_include_paths() -> bool {
@@ -540,6 +577,36 @@ mod tests {
         assert!(config.include.is_empty());
         assert_eq!(config.msrv_policy.source(), Some(MsrvSource::Max));
         assert_eq!(config.consumer_scope, ConsumerScope::Open);
+        assert_eq!(config.compiler_artifact_soft_limit_bytes, 32 * 1024 * 1024 * 1024);
+        assert_eq!(config.compiler_artifact_hard_limit_bytes, 64 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn compiler_artifact_budget_rejects_zero_or_reversed_limits() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let zero = UnifyConfig {
+            compiler_artifact_soft_limit_bytes: 0,
+            ..UnifyConfig::default()
+        };
+        assert!(
+            zero.validate(workspace.path())
+                .expect_err("zero soft limit")
+                .to_string()
+                .contains("soft_limit_bytes")
+        );
+
+        let reversed = UnifyConfig {
+            compiler_artifact_soft_limit_bytes: 2048,
+            compiler_artifact_hard_limit_bytes: 1024,
+            ..UnifyConfig::default()
+        };
+        assert!(
+            reversed
+                .validate(workspace.path())
+                .expect_err("reversed limits")
+                .to_string()
+                .contains("hard_limit_bytes")
+        );
     }
 
     #[test]

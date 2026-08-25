@@ -1,44 +1,48 @@
-# cargo-rail configuration
-# Release-focused example: change files, auto bumps, and a shaped changelog.
-
-# targets = []  # optional: set for multi-target validation
+# Complete release policy. Remote effects stay disabled until you opt in.
 
 [release]
+source = "changes" # changes | commits | both
 tag_prefix = "v"
-tag_format = "{crate}-{prefix}{version}" # e.g. my-crate-v1.0.0 (with tag_prefix = "v")
+tag_format = "{prefix}{version}"
+remote_effects = "none" # none | push | auto | github | gitlab
+registry_publication = "none" # none | crates-io
 sign_tags = false
 require_changelog_entries = false
 require_release_notes = true
+release_notes_dir = "release-notes"
+change_dir = ".changes"
+pre_1_breaking_bump = "minor" # minor | major
+unconventional_commits = "warn" # allow | warn | deny
+semver_check = "warn" # off | warn | deny
+require_change_files = false
 
-# --bump auto policies
-pre_1_breaking_bump = "minor" # breaking change on 0.x: "minor" or "major"
-unconventional_commits = "warn" # commits that fail conventional parsing: "allow", "warn", "deny"
-semver_check = "warn" # cargo-semver-checks (external binary): "off", "warn", "deny"
-change_dir = ".changes" # pending release intent files; use "changes" for a visible dir
-require_change_files = false # true, false, or ["crate-a", "crate-b"]
-
-# Lockstep groups: every member releases at the max bump any member earned
+# Lockstep groups require at least two real workspace package names.
 # [release.version_groups]
-# core = ["rail-core", "rail-graph", "rail-git"]
+# core = ["core-api", "core-runtime"]
 
 [release.changelog]
 path = "CHANGELOG.md"
-relative_to = "crate" # "crate" = one changelog per crate, "workspace" = shared file
+relative_to = "workspace" # crate | workspace
 entry_format = "- {scope}{breaking}{description}{prs} ({sha_link})"
-emoji = true
+emoji = false
 group_order = ["breaking", "feat", "fix", "perf", "docs", "deps", "other"]
-fallback = "other" # unlisted commit types land here; "skip" drops them
+fallback = "other" # a group name | skip
+commit_url = "https://github.com/your-org/your-repo/commit/{sha}"
+pr_url = "https://github.com/your-org/your-repo/pull/{pr}"
+
+[[release.changelog.groups]]
+types = ["sec", "security"]
+title = "Security"
+emoji = "🔒"
 
 [release.changelog.filters]
-skip_types = ["chore", "ci"] # breaking commits always render, even for skipped types
-skip_scopes = []
+skip_types = ["chore", "ci"]
+skip_scopes = ["internal"]
+include_paths = []
+exclude_paths = ["fixtures/**"]
 
-# Custom section: map extra commit types to a shared heading
-# [[release.changelog.groups]]
-# types = ["sec", "security"]
-# title = "Security"
+[crates.cargo-rail.release]
+publish = true
 
-# Per-crate overrides inherit anything they don't set
-# [crates.my-crate.changelog]
-# path = "HISTORY.md"
-# emoji = false
+[crates.cargo-rail.changelog]
+skip = false

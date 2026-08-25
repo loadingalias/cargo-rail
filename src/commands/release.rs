@@ -6,7 +6,7 @@ use crate::error::{RailError, RailResult};
 use crate::mutation::{
     self, ExpectedMutation, MutationAction, MutationEffect, MutationInput, MutationObject, MutationRisk, MutationTrace,
 };
-use crate::release::planner::{DependentPolicy, ReleasePlanner};
+use crate::release::planner::{DependentPolicy, RELEASE_REGISTRY, ReleasePlanner};
 use crate::release::publisher::{
     CheckReadiness, ReleasePublisher, observe_github_exact_sha_readiness, observe_gitlab_exact_sha_readiness,
 };
@@ -18,7 +18,7 @@ use crate::release::validator::ReleaseValidator;
 use crate::release::version::BumpRequest;
 use crate::utils;
 use crate::workspace::WorkspaceContext;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -43,6 +43,7 @@ struct GitReleaseTransaction {
     exact_sha: String,
     mode: String,
     publish: Option<bool>,
+    publish_registry: Option<String>,
     tag: Option<bool>,
     remote: Option<String>,
     remote_repository: Option<RemoteRepository>,
@@ -52,14 +53,21 @@ struct GitReleaseTransaction {
     commit_targets: BTreeMap<String, String>,
 }
 
+enum PrepareReconciliation {
+    Incomplete,
+    Terminal(Box<GitReleaseTransaction>),
+    Ambiguous,
+}
+
 /// Inputs that select and authorize an already-merged release finalization.
+#[derive(Debug)]
 pub struct ReleaseFinalizeOptions {
     /// Explicit crate names to finalize when `all` is false.
     pub crate_names: Option<Vec<String>>,
     /// Finalize every crate selected by the release plan.
     pub all: bool,
-    /// Complete the release without publishing crates to the registry.
-    pub skip_publish: bool,
+    /// Positively authorize irreversible crates.io publication.
+    pub publish: bool,
     /// Complete the release without creating or pushing release tags.
     pub skip_tag: bool,
     /// Include crates that depend on the explicitly selected crates.
@@ -75,7 +83,7 @@ pub fn run_release_plan(
     ctx: &WorkspaceContext,
     crate_names: Option<Vec<String>>,
     bump: String,
-    skip_publish: bool,
+    publish: bool,
     skip_tag: bool,
     include_dependents: bool,
     format: TextJsonOutputFormat,
@@ -98,6 +106,7 @@ pub fn run_release_plan(
     let config = ctx.config().map(|c| &c.release);
     let release_config =
         config.ok_or_else(|| RailError::with_help("no release configuration", "run 'cargo rail init' first"))?;
+    let skip_publish = registry_publication_skipped(publish, release_config)?;
 
     // Validate release config (tag format, changelog shape, release policies)
     let warnings = release_config.validate(workspace_members).map_err(RailError::Config)?;
@@ -170,6 +179,7 @@ pub fn run_release_plan(
 }
 
 /// Arguments for release execution.
+#[derive(Debug)]
 pub struct ReleasePublishArgs {
     /// Explicit crate names to release; ignored when `all` is true.
     pub crate_names: Option<Vec<String>>,
@@ -177,8 +187,8 @@ pub struct ReleasePublishArgs {
     pub all: bool,
     /// Version bump strategy.
     pub bump: String,
-    /// Skip publishing crates to the registry.
-    pub skip_publish: bool,
+    /// Positively authorize irreversible crates.io publication.
+    pub publish: bool,
     /// Skip creating git tags.
     pub skip_tag: bool,
     /// Prepare a release PR branch without tags or publish.
@@ -204,6 +214,7 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
     let config = ctx.config().map(|c| &c.release);
     let release_config =
         config.ok_or_else(|| RailError::with_help("no release configuration", "run 'cargo rail init' first"))?;
+    let skip_publish = registry_publication_skipped(args.publish, release_config)?;
 
     let workspace_members = ctx.graph().workspace_members();
     let mut warnings = release_config.validate(workspace_members).map_err(RailError::Config)?;
@@ -242,7 +253,7 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
         } else {
             println!(
                 "{}",
-                plan.format_summary_with_flags(args.skip_publish || args.pr, args.skip_tag || args.pr)
+                plan.format_summary_with_flags(skip_publish || args.pr, args.skip_tag || args.pr)
             );
             println!("\nNo release-worthy changes detected.");
         }
@@ -250,7 +261,7 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
     }
 
     let target_crates = plan.canonical_crate_order.clone();
-    let effective_skip_publish = args.skip_publish || args.pr;
+    let effective_skip_publish = skip_publish || args.pr;
     let effective_skip_tag = args.skip_tag || args.pr;
     validator.validate(&target_crates, false)?;
 
@@ -366,7 +377,7 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
         publisher.execute(
             &transaction_id,
             &plan,
-            args.skip_publish,
+            skip_publish,
             args.skip_tag,
             &planned_paths,
             &allowed_unstaged_paths,
@@ -700,7 +711,7 @@ pub fn run_release_finalize(ctx: &WorkspaceContext, options: ReleaseFinalizeOpti
     let ReleaseFinalizeOptions {
         crate_names,
         all,
-        skip_publish,
+        publish,
         skip_tag,
         include_dependents,
         yes,
@@ -717,6 +728,7 @@ pub fn run_release_finalize(ctx: &WorkspaceContext, options: ReleaseFinalizeOpti
         .as_ref()
         .map(|config| &config.release)
         .ok_or_else(|| RailError::with_help("no release configuration", "run 'cargo rail init' first"))?;
+    let skip_publish = registry_publication_skipped(publish, release_config)?;
 
     let workspace_members = ctx.graph().workspace_members();
     let mut warnings = release_config.validate(workspace_members).map_err(RailError::Config)?;
@@ -782,10 +794,34 @@ fn prepared_release_transaction_id(
         .iter()
         .map(|crate_plan| (crate_plan.name.clone(), crate_plan.new_version.to_string()))
         .collect::<BTreeMap<_, _>>();
-    Ok(git_release_transactions(ctx.workspace_root())?
+    let mut candidates = Vec::new();
+    for transaction in git_release_transactions(ctx.workspace_root())?
         .into_iter()
-        .find(|transaction| transaction.mode == "prepare" && transaction.crates == expected)
-        .map(|transaction| transaction.transaction_id))
+        .filter(|transaction| transaction.mode == "prepare" && transaction.crates == expected)
+    {
+        let mut observations = Vec::new();
+        match reconcile_prepare_transaction(ctx.workspace_root(), &transaction, &mut observations) {
+            PrepareReconciliation::Incomplete => candidates.push(transaction.transaction_id),
+            PrepareReconciliation::Terminal(_) => {}
+            PrepareReconciliation::Ambiguous => {
+                return Err(RailError::with_help(
+                    format!(
+                        "prepared release transaction '{}' has ambiguous or partial external effects: {}",
+                        transaction.transaction_id,
+                        observations.join(", ")
+                    ),
+                    "inspect `cargo rail release status --format json` and select an explicit recovery transaction",
+                ));
+            }
+        }
+    }
+    if candidates.len() > 1 {
+        return Err(RailError::with_help(
+            "multiple incomplete prepare transactions match the finalize plan",
+            "inspect `cargo rail release status --format json` and remove superseded terminal state before finalizing",
+        ));
+    }
+    Ok(candidates.pop())
 }
 
 fn dependent_policy(include_dependents: bool) -> DependentPolicy {
@@ -794,6 +830,30 @@ fn dependent_policy(include_dependents: bool) -> DependentPolicy {
     } else {
         DependentPolicy::RejectPartialClosure
     }
+}
+
+fn registry_publication_skipped(publish: bool, release_config: &crate::config::ReleaseConfig) -> RailResult<bool> {
+    if !publish {
+        return Ok(true);
+    }
+    if release_config.remote_effects == ReleaseRemoteEffects::None {
+        return Err(RailError::with_help(
+            "--publish cannot be combined with release.remote_effects = \"none\"",
+            "select an explicit remote effect authority before authorizing irreversible crates.io publication",
+        ));
+    }
+    let registry = release_config.registry_publication.registry().ok_or_else(|| {
+        RailError::with_help(
+            "--publish requires release.registry_publication = \"crates-io\"",
+            "authorize the exact registry in rail.toml as well as at invocation time",
+        )
+    })?;
+    if registry != RELEASE_REGISTRY {
+        return Err(RailError::message(format!(
+            "release configuration selected unsupported registry '{registry}'"
+        )));
+    }
+    Ok(false)
 }
 
 /// Show durable release transactions without loading Cargo metadata.
@@ -1012,14 +1072,27 @@ fn reconstructed_status_report(workspace_root: &Path, transaction: GitReleaseTra
         .map(|(name, version)| format!("git:complete={}@{}", name, version))
         .chain(std::iter::once(format!("git:complete={}", transaction.exact_sha)))
         .collect::<Vec<_>>();
-    let terminal = !prepare && reconstructed_release_is_terminal(workspace_root, &transaction, &mut observations);
+    let prepare_reconciliation =
+        prepare.then(|| reconcile_prepare_transaction(workspace_root, &transaction, &mut observations));
+    let (terminal, ambiguous, effective_transaction) = match prepare_reconciliation {
+        Some(PrepareReconciliation::Terminal(normalized)) => (true, false, *normalized),
+        Some(PrepareReconciliation::Incomplete) => (false, false, transaction.clone()),
+        Some(PrepareReconciliation::Ambiguous) => (false, true, transaction.clone()),
+        None => (
+            reconstructed_release_is_terminal(workspace_root, &transaction, &mut observations),
+            false,
+            transaction.clone(),
+        ),
+    };
     let safe_operator_command = if terminal {
         "cargo rail clean".to_string()
-    } else if prepare {
+    } else if prepare && !ambiguous {
         format!(
             "cargo rail release finalize {} --yes",
             transaction.crates.keys().cloned().collect::<Vec<_>>().join(" ")
         )
+    } else if prepare {
+        format!("cargo rail release status {} --format json", transaction.transaction_id)
     } else {
         format!("cargo rail release resume {}", transaction.transaction_id)
     };
@@ -1032,7 +1105,7 @@ fn reconstructed_status_report(workspace_root: &Path, transaction: GitReleaseTra
         } else {
             "reconstructed:active".to_string()
         },
-        exact_sha: Some(transaction.exact_sha.clone()),
+        exact_sha: Some(effective_transaction.exact_sha),
         completed_effect: Some(if terminal {
             "release".to_string()
         } else {
@@ -1048,17 +1121,151 @@ fn reconstructed_status_report(workspace_root: &Path, transaction: GitReleaseTra
             })
         },
         observations,
-        ambiguity: !prepare && !terminal,
+        ambiguity: ambiguous || !prepare && !terminal,
         recoverability: if terminal {
             "terminal"
-        } else if prepare {
+        } else if prepare && !ambiguous {
             "finalizable"
+        } else if prepare {
+            "reconcile"
         } else {
             "reconstructable"
         }
         .to_string(),
         safe_operator_command,
         journal: None,
+    }
+}
+
+fn reconcile_prepare_transaction(
+    workspace_root: &Path,
+    transaction: &GitReleaseTransaction,
+    observations: &mut Vec<String>,
+) -> PrepareReconciliation {
+    if transaction.tags.len() != transaction.crates.len() || transaction.tags.is_empty() {
+        observations.push("prepare:ambiguous=incomplete_tag_identity".to_string());
+        return PrepareReconciliation::Ambiguous;
+    }
+    let remote = match transaction.remote.as_deref() {
+        Some(remote) => remote,
+        None => {
+            observations.push("prepare:ambiguous=missing_remote_intent".to_string());
+            return PrepareReconciliation::Ambiguous;
+        }
+    };
+    let mut missing = 0usize;
+    let mut targets = BTreeSet::new();
+    for tag in transaction.tags.values() {
+        match prepared_tag_target(workspace_root, remote, tag) {
+            Ok(Some(target)) => {
+                observations.push(format!("tag:observed={tag}@{target}"));
+                targets.insert(target);
+            }
+            Ok(None) => {
+                observations.push(format!("tag:missing={tag}"));
+                missing = missing.saturating_add(1);
+            }
+            Err(()) => {
+                observations.push(format!("tag:ambiguous={tag}"));
+                return PrepareReconciliation::Ambiguous;
+            }
+        }
+    }
+    if missing == transaction.tags.len() {
+        return PrepareReconciliation::Incomplete;
+    }
+    if remote != "none" {
+        let Some(expected) = transaction.remote_repository.as_ref() else {
+            observations.push("remote_repository:ambiguous=missing_transaction_identity".to_string());
+            return PrepareReconciliation::Ambiguous;
+        };
+        match release_repository(workspace_root) {
+            Ok(actual) if &actual == expected => {}
+            Ok(_) | Err(_) => {
+                observations.push("remote_repository:ambiguous=changed_or_unresolvable".to_string());
+                return PrepareReconciliation::Ambiguous;
+            }
+        }
+    }
+    if missing != 0 || targets.len() != 1 {
+        observations.push("prepare:ambiguous=partial_or_divergent_tags".to_string());
+        return PrepareReconciliation::Ambiguous;
+    }
+    let release_target = targets.into_iter().next().unwrap_or_default();
+    if release_target.is_empty()
+        || !command_succeeds(
+            workspace_root,
+            "git",
+            &["merge-base", "--is-ancestor", &transaction.exact_sha, &release_target],
+        )
+        || !command_succeeds(
+            workspace_root,
+            "git",
+            &["merge-base", "--is-ancestor", &release_target, "HEAD"],
+        )
+    {
+        observations.push("prepare:ambiguous=tag_target_not_merged_descendant".to_string());
+        return PrepareReconciliation::Ambiguous;
+    }
+    observations.push(format!("prepare:merged_target={release_target}"));
+    let mut normalized = transaction.clone();
+    normalized.exact_sha = release_target.clone();
+    normalized.tag = Some(true);
+    if normalized.publish.is_none() {
+        normalized.publish = Some(normalized.crate_publish.values().any(|publish| *publish));
+    }
+    normalized.commit_targets = normalized
+        .crates
+        .keys()
+        .map(|name| (name.clone(), release_target.clone()))
+        .collect();
+    if reconstructed_release_is_terminal(workspace_root, &normalized, observations) {
+        PrepareReconciliation::Terminal(Box::new(normalized))
+    } else {
+        observations.push("prepare:ambiguous=external_effects_incomplete_or_unavailable".to_string());
+        PrepareReconciliation::Ambiguous
+    }
+}
+
+fn prepared_tag_target(workspace_root: &Path, remote: &str, tag: &str) -> Result<Option<String>, ()> {
+    if remote == "none" {
+        let output = Command::new("git")
+            .current_dir(workspace_root)
+            .args(["rev-parse", "--verify", &format!("refs/tags/{tag}^{{commit}}")])
+            .output()
+            .map_err(|_| ())?;
+        if output.status.success() {
+            let target = String::from_utf8(output.stdout).map_err(|_| ())?.trim().to_string();
+            return if target.is_empty() { Err(()) } else { Ok(Some(target)) };
+        }
+        return Ok(None);
+    }
+    let output = Command::new("git")
+        .current_dir(workspace_root)
+        .args([
+            "ls-remote",
+            "origin",
+            &format!("refs/tags/{tag}"),
+            &format!("refs/tags/{tag}^{{}}"),
+        ])
+        .output()
+        .map_err(|_| ())?;
+    if !output.status.success() {
+        return Err(());
+    }
+    let stdout = String::from_utf8(output.stdout).map_err(|_| ())?;
+    let peeled = format!("refs/tags/{tag}^{{}}");
+    if let Some(target) = stdout.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let target = fields.next()?;
+        let reference = fields.next()?;
+        (reference == peeled).then(|| target.to_string())
+    }) {
+        Ok(Some(target))
+    } else if stdout.trim().is_empty() {
+        Ok(None)
+    } else {
+        Err(())
     }
 }
 
@@ -1300,6 +1507,7 @@ fn git_release_transactions(workspace_root: &Path) -> RailResult<Vec<GitReleaseT
                 exact_sha: sha.clone(),
                 mode: mode.clone(),
                 publish: parse_bool_trailer(&message, "Rail-Release-Publish"),
+                publish_registry: trailer_value(&message, "Rail-Release-Publish-Registry"),
                 tag: parse_bool_trailer(&message, "Rail-Release-Tag"),
                 remote: trailer_value(&message, "Rail-Release-Remote"),
                 remote_repository: trailer_value(&message, "Rail-Release-Repository")
@@ -1316,6 +1524,7 @@ fn git_release_transactions(workspace_root: &Path) -> RailResult<Vec<GitReleaseT
             transaction.mode = mode;
             transaction.exact_sha = sha.clone();
             transaction.publish = parse_bool_trailer(&message, "Rail-Release-Publish");
+            transaction.publish_registry = trailer_value(&message, "Rail-Release-Publish-Registry");
             transaction.tag = parse_bool_trailer(&message, "Rail-Release-Tag");
             transaction.remote = trailer_value(&message, "Rail-Release-Remote");
             transaction.remote_repository = trailer_value(&message, "Rail-Release-Repository")
@@ -1415,6 +1624,27 @@ pub fn run_release_resume(ctx: &WorkspaceContext, state: &std::path::Path) -> Ra
             "recover the original local journal; legacy trailers do not authorize irreversible effects",
         )
     })?;
+    if publish {
+        let registry = transaction.publish_registry.as_deref().ok_or_else(|| {
+            RailError::with_help(
+                format!(
+                    "release transaction '{}' predates reconstructable registry authority",
+                    transaction_id
+                ),
+                "recover the original local journal; cargo-rail will not guess an irreversible registry target",
+            )
+        })?;
+        if release_config.registry_publication.registry() != Some(registry) {
+            return Err(RailError::with_help(
+                format!(
+                    "transaction authorizes registry '{}', but release.registry_publication resolves to '{}'",
+                    registry,
+                    release_config.registry_publication.registry().unwrap_or("none")
+                ),
+                "restore the release configuration from the exact release commit",
+            ));
+        }
+    }
     let tag = transaction.tag.ok_or_else(|| {
         RailError::with_help(
             format!(
@@ -1552,6 +1782,13 @@ fn build_release_mutation_plan(
     pr: bool,
     release_config: &crate::config::ReleaseConfig,
 ) -> RailResult<mutation::MutationPlan> {
+    let publish_registry = if skip_publish {
+        None
+    } else {
+        Some(release_config.registry_publication.registry().ok_or_else(|| {
+            RailError::message("release mutation plan has no configured registry publication authority")
+        })?)
+    };
     let mut actions = Vec::with_capacity(
         plan.crates.len() * 7 + plan.change_files_to_delete.len() + plan.change_files_to_update.len() + 3,
     );
@@ -1694,11 +1931,11 @@ fn build_release_mutation_plan(
                 );
             }
         }
-        if !skip_publish {
+        if let Some(registry) = publish_registry {
             for crate_plan in plan.crates.iter().filter(|crate_plan| crate_plan.publish) {
                 actions.push(
                     MutationAction::new("PUBLISH_CRATE", crate_plan.name.clone(), None)
-                        .with_payload(serde_json::json!({ "crate": crate_plan.name, "registry": "crates-io" })),
+                        .with_payload(serde_json::json!({ "crate": crate_plan.name, "registry": registry })),
                 );
             }
         }
@@ -1770,8 +2007,11 @@ fn build_release_mutation_plan(
     let trace = vec![MutationTrace::new(
         "RELEASE_PLAN_RESOLVED",
         format!(
-            "resolved {} crate(s), {} publish candidate(s), skip_tag={}, skip_publish={}",
-            plan.summary.total_crates, plan.summary.crates_to_publish, skip_tag, skip_publish
+            "resolved {} crate(s), {} publish candidate(s), skip_tag={}, publish_registry={}",
+            plan.summary.total_crates,
+            plan.summary.crates_to_publish,
+            skip_tag,
+            publish_registry.unwrap_or("none")
         ),
     )];
 

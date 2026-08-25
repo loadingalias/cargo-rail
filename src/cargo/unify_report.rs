@@ -7,6 +7,7 @@ use crate::cargo::unify_types::{IssueSeverity, MemberEdit, UnificationPlan, Unus
 use crate::error::RailResult;
 
 /// Generate a markdown report from the unification plan
+#[derive(Debug)]
 pub struct UnifyReport;
 
 impl UnifyReport {

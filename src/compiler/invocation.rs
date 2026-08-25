@@ -59,6 +59,7 @@ pub const OBSERVATION_PROTOCOL_ARGUMENT: &str = "--cargo-rail-observation-protoc
 pub const OBSERVATION_PROTOCOL_VERSION: u32 = 1;
 
 /// Result of classifying the process before Clap or workspace acquisition.
+#[derive(Debug)]
 #[doc(hidden)]
 pub enum PreClapDispatch {
     /// No compiler role was requested; continue with the ordinary CLI.
@@ -431,6 +432,7 @@ fn run_direct_cache() -> i32 {
         configured_workspace_wrapper.as_deref(),
     );
     if let Some(reason) = cache_fast_bypass_reason(&invocation, observation_wrapper) {
+        record_early_cache_bypass(reason);
         crate::compiler::native_cache::record_benchmark_coverage_bypass(
             &invocation.program,
             &invocation.arguments,
@@ -452,6 +454,7 @@ fn run_direct_cache() -> i32 {
     match context {
         Ok(context) => run_cache_invocation(invocation, Some(context)),
         Err(reason) => {
+            record_early_cache_bypass(reason);
             crate::compiler::native_cache::record_benchmark_coverage_bypass(
                 &invocation.program,
                 &invocation.arguments,
@@ -466,6 +469,19 @@ fn run_direct_cache() -> i32 {
             }
             run_transparently(command, "cargo-rail compiler cache wrapper")
         }
+    }
+}
+
+fn record_early_cache_bypass(reason: &'static str) {
+    let trace = std::env::var_os("CARGO_RAIL_CACHE_TRACE").as_deref() == Some(std::ffi::OsStr::new("1"));
+    match crate::cache::installation::record_early_bypass(reason) {
+        Ok(()) if trace => eprintln!(
+            "cargo-rail native cache trace: bypass class {reason}; inspect `cargo rail cache status --scope local`"
+        ),
+        Err(error) if trace => {
+            eprintln!("cargo-rail native cache trace: failed to record bypass class {reason}: {error}");
+        }
+        Ok(()) | Err(_) => {}
     }
 }
 
@@ -554,12 +570,17 @@ fn run_cache_invocation(
     invocation: CompilerInvocation,
     context: Option<crate::compiler::native_cache::NativeCacheContext>,
 ) -> i32 {
-    if let Some(context) = context
-        && let Err(error) = context.activate()
-    {
-        eprintln!("cargo-rail compiler cache wrapper: {error}");
-        return 2;
-    }
+    let runtime = if let Some(context) = context {
+        match context.activate() {
+            Ok(runtime) => Some(runtime),
+            Err(error) => {
+                eprintln!("cargo-rail compiler cache wrapper: {error}");
+                return 2;
+            }
+        }
+    } else {
+        None
+    };
     let mut command = invocation.command();
     command.env_remove(CACHE_WRAPPER_MARKER).env_remove(CACHE_CONTROL_ENV);
     let action =
@@ -594,6 +615,12 @@ fn run_cache_invocation(
             2
         }
         crate::compiler::native_cache::OuterCacheAction::Execute => {
+            if let Some(runtime) = runtime
+                && let Err(error) = runtime.close()
+            {
+                eprintln!("cargo-rail compiler cache wrapper: failed to remove private runtime: {error}");
+                return 2;
+            }
             run_transparently(command, "cargo-rail compiler cache wrapper")
         }
     }

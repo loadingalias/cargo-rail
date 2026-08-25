@@ -32,7 +32,7 @@ Docs: https://github.com/loadingalias/cargo-rail";
 /// Root CLI wrapper for cargo subcommand integration
 ///
 /// This wrapper allows cargo-rail to be invoked as `cargo rail <subcommand>`.
-#[derive(Parser)]
+#[derive(Debug, Parser)]
 #[command(name = "cargo")]
 #[command(bin_name = "cargo")]
 #[command(styles = get_styles())]
@@ -45,7 +45,7 @@ pub enum CargoCli {
 /// Main CLI structure for cargo-rail
 ///
 /// Contains global options and the subcommand to execute.
-#[derive(Parser)]
+#[derive(Debug, Parser)]
 #[command(name = "rail")]
 #[command(version)]
 #[command(about = "The Rust workspace engine")]
@@ -98,6 +98,7 @@ crate has no consumers outside the captured workspace.
 
 Examples:
   cargo rail surface                        # Inspect and report without modifying source
+  cargo rail surface --prepare              # Prove exact-toolchain producer readiness
   cargo rail surface --check --explain      # Inspect complete Rust reachability
   cargo rail surface --check -f json        # Emit the versioned machine contract
   cargo rail surface --fix --dry-run --explain  # Preview exact visibility edits
@@ -146,17 +147,17 @@ Examples:
   cargo rail release check my-crate             # Validate release readiness
   cargo rail release check my-crate --extended  # Run publish, MSRV, and semver checks
   cargo rail release run my-crate --check       # Check for a pending release (exit 1)
-  cargo rail release run my-crate               # Release from reviewed change intent
+  cargo rail release run my-crate               # Prepare a local release without registry publication
+  cargo rail release run my-crate --publish     # Match configured crates.io authority at invocation
   cargo rail release run my-crate --include-dependents  # Release selected crate plus dependent closure
   cargo rail release run my-crate --yes         # Non-interactive apply confirmation
   cargo rail release run my-crate --bump auto   # Infer each bump from the configured release source
   cargo rail release run --all --bump auto --pr # Open a release PR with bumps/changelogs only
-  cargo rail release finalize --all             # Tag/publish after the release PR merges
+  cargo rail release finalize --all --publish   # Match configured crates.io authority after PR merge
   cargo rail release run my-crate --bump minor
   cargo rail release run my-crate --bump prerelease  # 1.0.0 -> 1.0.0-rc.1
   cargo rail release run my-crate --bump release     # 1.0.0-rc.2 -> 1.0.0
-  cargo rail release run --all --bump patch     # Release all crates
-  cargo rail release run my-crate --skip-publish  # Tag only, no crates.io";
+  cargo rail release run --all --bump patch     # Release all crates";
 
 const CHANGE_HELP: &str = "\
 Examples:
@@ -182,8 +183,8 @@ Examples:
 
 const CLEAN_HELP: &str = "\
 Examples:
-  cargo rail clean                      # Clean all Cargo-Rail artifacts
-  cargo rail clean --cache              # Clean validated local and workspace cache state
+  cargo rail clean                      # Clean all current-workspace Cargo-Rail artifacts
+  cargo rail clean --cache              # Clean current-workspace cache state
   cargo rail clean --backups            # Prune old backups
   cargo rail clean --reports            # Clean generated reports
   cargo rail clean --check              # Check for pending cleanup (exit 1)";
@@ -194,6 +195,8 @@ Examples:
   cargo rail cache setup                          # Install or repair the Cargo wrapper
   cargo rail cache status                         # Inspect workspace and shared local cache state
   cargo rail cache status --scope local -f json  # Inspect the shared local CAS only
+  cargo rail cache recover --check                # Preview byte-preserving markerless CAS recovery
+  cargo rail cache recover                        # Quarantine the old tree and create a fresh CAS
   cargo rail cache clean --scope workspace --check  # Preview workspace cache reclamation
   cargo rail cache clean --scope local            # Remove the validated cross-workspace CAS
   cargo rail cache remove --check                 # Preview exact setup-state removal
@@ -245,7 +248,7 @@ Installation:
   cargo rail completions powershell | Out-String | Invoke-Expression";
 
 /// Available subcommands
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 pub enum Commands {
     /// Inspect native compiler-cache capability
     Doctor {
@@ -297,6 +300,12 @@ pub enum Commands {
     /// Analyze and repair complete Rust declaration reachability and visibility
     #[command(after_long_help = SURFACE_HELP)]
     Surface {
+        /// Prepare and authenticate the exact-toolchain Surface producer without analysis
+        #[arg(
+            long,
+            conflicts_with_all = ["check", "fix", "dry_run", "backup", "explain", "only", "schema"]
+        )]
+        prepare: bool,
         /// Fail on denied findings without modifying source (for CI)
         #[arg(long, conflicts_with = "fix")]
         check: bool,
@@ -332,7 +341,10 @@ pub enum Commands {
         )]
         only: Vec<String>,
         /// Print the versioned surface JSON Schema and exit
-        #[arg(long, conflicts_with_all = ["check", "fix", "dry_run", "backup", "output", "explain", "only"])]
+        #[arg(
+            long,
+            conflicts_with_all = ["prepare", "check", "fix", "dry_run", "backup", "output", "explain", "only"]
+        )]
         schema: bool,
     },
 
@@ -454,10 +466,10 @@ pub enum Commands {
         command: ChangeCommand,
     },
 
-    /// Clean generated artifacts (cache, backups, reports)
+    /// Clean generated artifacts owned by the current workspace
     #[command(after_long_help = CLEAN_HELP)]
     Clean {
-        /// Clean validated local and workspace cache state
+        /// Clean cache state owned by this workspace
         #[arg(long)]
         cache: bool,
         /// Prune old backups
@@ -584,7 +596,7 @@ impl Commands {
 }
 
 /// Subcommands for `cargo rail doctor`.
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 pub enum DoctorCommand {
     /// Inspect the exact native-cache compiler identity
     NativeCache {
@@ -624,7 +636,7 @@ impl CacheScope {
 }
 
 /// Arguments that install or repair transparent verified compiler reuse.
-#[derive(Args)]
+#[derive(Debug, Args)]
 pub struct CacheSetupArgs {
     /// Local cache base directory (defaults to Cargo home).
     #[arg(long, value_name = "PATH")]
@@ -694,7 +706,7 @@ pub struct CacheSetupArgs {
 }
 
 /// Subcommands for `cargo rail cache`.
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 pub enum CacheCommand {
     /// Install or repair transparent verified compiler reuse.
     Setup(Box<CacheSetupArgs>),
@@ -718,6 +730,15 @@ pub enum CacheCommand {
         /// Cache scope to inspect.
         #[arg(long, value_enum, default_value = "all")]
         scope: CacheScope,
+        /// Report format.
+        #[arg(long, short = 'f', default_value_t, value_enum)]
+        format: TextJsonOutputFormat,
+    },
+    /// Quarantine a selected markerless CAS and create a fresh owned authority.
+    Recover {
+        /// Preview the exact quarantine move without modifying cache state.
+        #[arg(long, short = 'c')]
+        check: bool,
         /// Report format.
         #[arg(long, short = 'f', default_value_t, value_enum)]
         format: TextJsonOutputFormat,
@@ -775,7 +796,7 @@ fn parse_cache_size(value: &str) -> Result<u64, String> {
 }
 
 /// Subcommands for `cargo rail config`
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 pub enum ConfigCommand {
     /// Print the path to the active config file
     ///
@@ -786,11 +807,11 @@ pub enum ConfigCommand {
         #[arg(long, short = 'f', default_value_t, value_enum)]
         format: TextJsonOutputFormat,
     },
-    /// Print the effective configuration with defaults
+    /// Print canonical effective configuration with defaults
     ///
-    /// Shows the merged configuration: user settings plus defaults for
-    /// any unset fields. Useful for debugging and understanding what
-    /// cargo-rail will actually use.
+    /// Shows the merged repository policy: user settings plus defaults for
+    /// any unset fields. Text output is reusable `rail.toml` input and omits
+    /// deprecated compatibility-only fields.
     Print {
         /// Output format
         #[arg(long, short = 'f', default_value_t, value_enum)]
@@ -833,7 +854,7 @@ pub enum ConfigCommand {
 }
 
 /// Subcommands for `cargo rail unify`
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 pub enum UnifyCommand {
     /// Inspect Cargo resolution semantics without changing files
     Doctor {
@@ -853,7 +874,7 @@ pub enum UnifyCommand {
 }
 
 /// Subcommands for `cargo rail split`
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 pub enum SplitCommand {
     /// Configure split for crate(s)
     Init {
@@ -894,7 +915,7 @@ pub enum SplitCommand {
 }
 
 /// Subcommands for `cargo rail release`
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 pub enum ReleaseCommand {
     /// Configure release settings
     Init {
@@ -922,8 +943,12 @@ pub enum ReleaseCommand {
         /// Apply from a previously generated mutation plan file
         #[arg(long, value_name = "PATH", conflicts_with = "check")]
         plan: Option<PathBuf>,
-        /// Skip publishing to crates.io
+        /// Positively authorize irreversible publication to crates.io
+        #[arg(long, conflicts_with_all = ["skip_publish", "pr"])]
+        publish: bool,
+        /// Deprecated compatibility spelling; publication is default-deny
         #[arg(long)]
+        #[arg(hide = true, conflicts_with = "publish")]
         skip_publish: bool,
         /// Skip git tag creation
         #[arg(long)]
@@ -967,8 +992,12 @@ pub enum ReleaseCommand {
         /// Finalize all workspace crates with release notes for their current versions
         #[arg(short, long)]
         all: bool,
-        /// Skip publishing to crates.io
+        /// Positively authorize irreversible publication to crates.io
+        #[arg(long, conflicts_with = "skip_publish")]
+        publish: bool,
+        /// Deprecated compatibility spelling; publication is default-deny
         #[arg(long)]
+        #[arg(hide = true, conflicts_with = "publish")]
         skip_publish: bool,
         /// Skip git tag creation
         #[arg(long)]
@@ -1010,7 +1039,7 @@ pub enum ReleaseCommand {
 }
 
 /// Subcommands for `cargo rail change`
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 pub enum ChangeCommand {
     /// Create a pending change file
     Add {
@@ -1074,6 +1103,7 @@ impl Commands {
                 CacheCommand::Setup(setup) => setup.format.is_json_like(),
                 CacheCommand::Normalize { format, .. }
                 | CacheCommand::Status { format, .. }
+                | CacheCommand::Recover { format, .. }
                 | CacheCommand::Clean { format, .. }
                 | CacheCommand::Remove { format, .. } => format.is_json_like(),
             },
@@ -1155,6 +1185,7 @@ impl Commands {
                 CacheCommand::Setup(setup) => setup.format = TextJsonOutputFormat::Json,
                 CacheCommand::Normalize { format, .. }
                 | CacheCommand::Status { format, .. }
+                | CacheCommand::Recover { format, .. }
                 | CacheCommand::Clean { format, .. }
                 | CacheCommand::Remove { format, .. } => {
                     *format = TextJsonOutputFormat::Json;

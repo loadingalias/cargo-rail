@@ -1,8 +1,7 @@
 # Configuration Reference
 
-`rail.toml` supplies repository policy to Cargo-Rail's captured workspace view; it does not mirror Cargo-Rail's internal defaults.
-An empty file is valid. Omitted fields use coded defaults, and upgrades do not require copying new fields into the
-repository.
+`rail.toml` supplies repository policy. It does not copy Cargo-Rail's internal defaults. An empty file is valid, and
+omitted fields use coded defaults.
 
 ## File discovery
 
@@ -32,9 +31,14 @@ cargo rail config migrate --check    # Read-only; exit 1 when migration is pendi
 cargo rail config migrate            # Apply explicit semantic migrations
 ```
 
-`config migrate` is deliberately not a synchronization command. It preserves unrelated TOML and never materializes coded defaults. Deprecated inputs warn while they remain accepted.
+Text `config print` output is canonical reusable `rail.toml`: it contains effective repository policy and coded
+defaults, omits compatibility-only inputs, passes `config validate --strict`, and has no pending migration. JSON
+contains the same effective public policy under `config`. Reprinting the generated TOML preserves that policy.
 
-`config explain -f json` and text output are built from the same field records. Each record contains the configured value, effective value, default, source, classification, behavioral reason, and any deprecation guidance.
+`config migrate` preserves unrelated TOML and does not write coded defaults. Deprecated inputs warn while accepted.
+
+Text and JSON explanations use the same field records. Each record contains the configured value, effective value,
+default, source, classification, reason, and deprecation guidance.
 
 ## Minimal configuration
 
@@ -83,37 +87,40 @@ project policy. `cargo rail config migrate` removes the old table without materi
 
 ## `[unify]`
 
-`cargo rail unify --check` always performs safe diagnostics without mutating manifests. It may update compiler-evidence
-cache and report files under `target/cargo-rail/`, and it exits 1 when proven manifest edits are pending. Running without
-`--check` applies the plan. `cargo rail unify doctor` is a cheaper read-only resolution diagnostic: it reports the
-selected Cargo/channel, resolver, feature mode, source and policy overrides, target domains, ambiguous aliases, and a
-recommended next action. Compiler evidence caching and deterministic ordering are internal responsibilities and cannot
-be disabled.
+`cargo rail unify --check` diagnoses without mutating manifests. It may update compiler-evidence cache and reports
+under `target/cargo-rail/`. It exits 1 when proven edits are pending. Running without `--check` applies the plan.
+`cargo rail unify doctor` is a cheaper resolution diagnostic. It reports the selected Cargo channel, resolver, feature
+mode, source and policy overrides, target domains, ambiguous aliases, and a recommended action. Compiler evidence
+caching and deterministic ordering cannot be disabled.
 
 `unify --check --explain` keeps feature evidence separated by exact manifest declaration. Each feature rule names the
 member, Cargo.toml alias, normal/development/build domain, target predicate, explicit features, default-feature state,
 and optional state. Renamed aliases do not share feature-provider evidence unless `include_renamed = true` explicitly
 selects package-level union behavior.
-When dependency domains disagree on default features, the workspace baseline disables them and declarations that need
+When dependency domains disagree on default features, the workspace baseline disables them. Declarations that need
 them opt back in through the explicit `default` feature. This preserves narrow target, development, and build domains.
 
-Unused dependencies are removed only with complete declaration-kind, target, feature, and compilation evidence. Dormant features and optional dependencies are deleted only when `consumer_scope = "workspace"` proves the private workspace is the complete consumer universe; published packages remain open-world.
+Unused dependencies require complete declaration-kind, target, feature, and compilation evidence. Dormant features and
+optional dependencies are deleted only when `consumer_scope = "workspace"` proves the private workspace is the
+complete consumer universe. Published packages remain open-world.
 
-| Field                      |                     Default | Behavior                                                                                                                                         |
-| -------------------------- | --------------------------: | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `include_paths`            |                      `true` | Include path dependency declarations in unification.                                                                                             |
-| `include_renamed`          |                     `false` | Include renamed declarations such as `alias = { package = "real", ... }`.                                                                        |
-| `exclude`                  |                        `[]` | Dependency names excluded from unification. Workspace-member cohorts remain atomic.                                                              |
-| `include`                  |                        `[]` | Dependency names force-included in unification.                                                                                                  |
-| `strict_version_compat`    |                      `true` | Treat incompatible existing workspace requirements as blocking.                                                                                  |
-| `exact_pin_handling`       |                    `"warn"` | Handle exact pins with `"skip"`, `"preserve"`, or `"warn"`.                                                                                      |
-| `major_version_conflict`   |                    `"warn"` | `"warn"` keeps incompatible majors split; `"bump"` explicitly accepts unification to the highest resolved major.                                 |
-| `transitive_pinning`       |                       unset | Enable host-owned pins for fragmented transitive features and select `host = "root"` or a member path. Virtual workspaces require a member path. |
-| `msrv_policy`              |  compute/max/no inheritance | Disabled, or compute with source `"deps"`, `"workspace"`, or `"max"` and boolean inheritance.                                                    |
-| `consumer_scope`           |                    `"open"` | Use `"workspace"` only for a closed private consumer graph.                                                                                      |
-| `preserve_features`        |                        `[]` | Glob patterns for dormant features that must survive closed-world pruning.                                                                       |
-| `skip_undeclared_patterns` | common implementation names | Glob patterns for borrowed feature names intentionally excluded from diagnostics.                                                                |
-| `max_backups`              |                         `3` | Number of recovery backups retained after mutation.                                                                                              |
+| Field                                |                     Default | Behavior                                                                                                                                         |
+| ------------------------------------ | --------------------------: | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `include_paths`                      |                      `true` | Include path dependency declarations in unification.                                                                                             |
+| `include_renamed`                    |                     `false` | Include renamed declarations such as `alias = { package = "real", ... }`.                                                                        |
+| `exclude`                            |                        `[]` | Dependency names excluded from unification. Workspace-member cohorts remain atomic.                                                              |
+| `include`                            |                        `[]` | Dependency names force-included in unification.                                                                                                  |
+| `strict_version_compat`              |                      `true` | Treat incompatible existing workspace requirements as blocking.                                                                                  |
+| `exact_pin_handling`                 |                    `"warn"` | Handle exact pins with `"skip"`, `"preserve"`, or `"warn"`.                                                                                      |
+| `major_version_conflict`             |                    `"warn"` | `"warn"` keeps incompatible majors split; `"bump"` explicitly accepts unification to the highest resolved major.                                 |
+| `transitive_pinning`                 |                       unset | Enable host-owned pins for fragmented transitive features and select `host = "root"` or a member path. Virtual workspaces require a member path. |
+| `msrv_policy`                        |  compute/max/no inheritance | Disabled, or compute with source `"deps"`, `"workspace"`, or `"max"` and boolean inheritance.                                                    |
+| `consumer_scope`                     |                    `"open"` | Use `"workspace"` only for a closed private consumer graph.                                                                                      |
+| `preserve_features`                  |                        `[]` | Glob patterns for dormant features that must survive closed-world pruning.                                                                       |
+| `skip_undeclared_patterns`           | common implementation names | Glob patterns for borrowed feature names intentionally excluded from diagnostics.                                                                |
+| `max_backups`                        |                         `3` | Number of recovery backups retained after mutation.                                                                                              |
+| `compiler_artifact_soft_limit_bytes` |               `34359738368` | Report storage pressure when the command-owned compiler working set reaches 32 GiB.                                                              |
+| `compiler_artifact_hard_limit_bytes` |               `68719476736` | Stop compiler acquisition when that working set reaches 64 GiB.                                                                                  |
 
 Example policy:
 
@@ -134,8 +141,11 @@ or configuration diagnostics; `warn` findings remain visible with exit 0. `--fix
 plan. `--fix` revalidates the captured snapshot, edits only planned visibility spans, recompiles every configured view,
 and writes a receipt after successful verification. Dead-public findings are report-only.
 
-Analysis requires a supported native release archive with its matching compiler-fact driver. Source installations and
-`cargo binstall` retain `surface --schema`, but reject analysis before workspace acquisition with installation guidance.
+The complete installer in the [README](../README.md#installation) includes authenticated prebuilt and offline-source
+driver authority. `cargo rail surface --prepare` resolves the workspace's exact Cargo-selected compiler, installs its
+`rustc-dev` component through `rustup` when absent, builds a toolchain-matched driver when the prebuilt one differs,
+and authenticates both before analysis. It does not change the user default toolchain. Source installs and
+`cargo binstall` keep `surface --schema`, but cannot prepare or analyze code.
 
 | Field                     |       Default | Behavior                                                                                                                                        |
 | ------------------------- | ------------: | ----------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -225,18 +235,18 @@ See [Migrate from Hawk](migrate-hawk.md) for configuration and command mappings.
 
 ## `[release]`
 
-Reviewed `.changes/*.md` files are the default authority for bump selection and release prose. Commit-derived modes
-exist for migration. Remote release modes bind the prepared commit, wait for readiness on that exact SHA, publish in
-dependency order, observe registry state, and create tags last.
+Reviewed `.changes/*.md` files are the default authority for bumps and release prose. Commit-derived modes support
+migration. Remote release modes bind the prepared commit and wait for readiness on its exact SHA. Registry publication
+is a separate default-deny authority and requires both `registry_publication = "crates-io"` and `--publish`; when
+authorized, it runs in dependency order, observes crates.io state, and creates tags last.
 
 | Field                       |                       Default | Behavior                                                                                                                                                                                                                                                                                                                                                                 |
 | --------------------------- | ----------------------------: | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `source`                    |                   `"changes"` | `"changes"` uses reviewed intent only. `"commits"` and `"both"` are explicit compatibility modes.                                                                                                                                                                                                                                                                        |
 | `tag_prefix`                |                         `"v"` | Value rendered by `{prefix}`.                                                                                                                                                                                                                                                                                                                                            |
 | `tag_format`                | `"{crate}-{prefix}{version}"` | Tag namespace. Multi-crate formats should include `{crate}`.                                                                                                                                                                                                                                                                                                             |
-| `require_clean`             |                        `true` | Deprecated compatibility input. Preview permits dirt and apply always rejects paths outside the bound plan. Remove it with `cargo rail config migrate`.                                                                                                                                                                                                                  |
-| `publish_delay`             |                           `5` | Deprecated compatibility input with no effect. Cargo-Rail never sleeps for registry convergence. Remove it with `cargo rail config migrate`.                                                                                                                                                                                                                             |
 | `remote_effects`            |                      `"none"` | `"none"` stays local. Other modes push the exact release commit, then exit until GitHub reports complete counts with at least one successful non-skipped context and no pending/failed context, or GitLab reports a successful exact-SHA pipeline. Publication follows readiness; tags are pushed last. `"auto"`, `"github"`, and `"gitlab"` also create forge releases. |
+| `registry_publication`      |                      `"none"` | Registry authority independent from Git/forge effects. `"crates-io"` permits publication only when the invocation also passes `--publish`; Cargo manifest registry restrictions remain the upper bound.                                                                                                                                                      |
 | `sign_tags`                 |                       `false` | Sign release tags with the configured Git signing mechanism.                                                                                                                                                                                                                                                                                                             |
 | `require_changelog_entries` |                       `false` | Fail when a released crate has no generated changelog entries.                                                                                                                                                                                                                                                                                                           |
 | `require_release_notes`     |                        `true` | Require reviewed notes before tag, publish, or forge effects.                                                                                                                                                                                                                                                                                                            |
@@ -253,13 +263,18 @@ dependency order, observe registry state, and create tags last.
 source = "changes"
 tag_format = "{prefix}{version}"
 remote_effects = "auto"
+registry_publication = "crates-io"
 sign_tags = true
 
 [release.version_groups]
 core = ["rail-core", "rail-graph", "rail-git"]
 ```
 
-`cargo rail release run` defaults to `--bump auto`. In changes mode, only release-worthy entries (`patch`, `minor`, or `major`) select a crate; `none` records explicit reviewed no-release intent and satisfies coverage without adding changelog prose. Release-worthy entries in one shared file are consumed atomically, while `none` entries for crates outside the release plan are retained by an exact frontmatter rewrite. Dependency-only releases receive a synthesized patch entry. Use `source = "commits"` or `source = "both"` only while migrating an older commit-driven workflow.
+`cargo rail release run` defaults to `--bump auto`. In changes mode, only `patch`, `minor`, or `major` entries select a
+crate. `none` records reviewed no-release intent and satisfies coverage without adding changelog prose. Release-worthy
+entries in one file are consumed atomically. `none` entries outside the release plan are retained by an exact
+frontmatter rewrite. Dependency-only releases receive a synthesized patch entry. Use `source = "commits"` or
+`source = "both"` only during migration from a commit-driven workflow.
 
 ### `[release.changelog]`
 
@@ -305,7 +320,8 @@ and custom repository surfaces; they do not replace crate ownership with hand-ma
 | `unknown_file_policy` |             `"strict"` | `"docs"`, `"owned_build_test"`, `"workspace_infra"`, or `"strict"`. |
 | `confidence_profile`  |           `"balanced"` | Repository default: `"strict"`, `"balanced"`, or `"fast"`.          |
 
-Provider identity does not change planner policy. CI can override the repository profile explicitly on the CLI, but bot authorship is not a policy input.
+Provider identity does not change planner policy. CI can override the repository profile on the CLI; bot authorship
+is not a policy input.
 
 ```toml
 [change-detection]
@@ -352,7 +368,10 @@ Included assets retain their workspace-relative paths; ambiguous single-split ma
 
 ### Release and changelog overrides
 
-`[crates.NAME.release]` supports `publish`, defaulting to `true`. `[crates.NAME.changelog]` can override `path`, `relative_to`, `skip`, `entry_format`, `emoji`, `group_order`, `fallback`, `groups`, `filters`, `commit_url`, and `pr_url`. Absent values inherit `[release.changelog]`.
+`[crates.NAME.release]` supports `publish`, which defaults to `true` but can only narrow the registries authorized by
+Cargo.toml. `[crates.NAME.changelog]` can override `path`,
+`relative_to`, `skip`, `entry_format`, `emoji`, `group_order`, `fallback`, `groups`, `filters`, `commit_url`, and
+`pr_url`. Absent values inherit `[release.changelog]`.
 
 ```toml
 [crates.internal.release]
@@ -365,7 +384,8 @@ emoji = false
 
 ## Deprecated inputs and migrations
 
-Deprecated fields remain parseable for a bounded compatibility window, emit actionable warnings, and have one explicit `config migrate` action.
+Deprecated fields remain parseable for a bounded compatibility window. They emit warnings and have one
+`config migrate` action.
 
 | Deprecated input                                                    | Migration                                                                                                       |
 | ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
@@ -400,7 +420,8 @@ cargo rail config validate --strict
 
 ## Environment
 
-`config validate` enables strict mode automatically when `CI`, `GITHUB_ACTIONS`, `GITLAB_CI`, or `CIRCLECI` is present. Use `--no-strict` only when warnings are intentionally non-blocking.
+`config validate` enables strict mode when `CI`, `GITHUB_ACTIONS`, `GITLAB_CI`, or `CIRCLECI` is present. Use
+`--no-strict` only when warnings are intentionally non-blocking.
 
 ## See also
 

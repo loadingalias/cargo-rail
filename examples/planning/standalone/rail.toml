@@ -15,6 +15,5 @@ infrastructure = [
 confidence_profile = "balanced"
 unknown_file_policy = "strict"
 
-# Custom gating surfaces (optional)
-# [change-detection.custom]
-# stress_test = ["stress-test/**"]
+[change-detection.custom]
+stress_test = ["stress-test/**"]

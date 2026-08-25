@@ -1115,7 +1115,9 @@ fn parse_name_status_records(records: &[&[u8]]) -> RailResult<Vec<(PathBuf, char
         ));
     }
     records
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let status_record = pair[0].strip_prefix(b"\n").unwrap_or(pair[0]);
             let status = status_record

@@ -212,6 +212,7 @@ impl Drop for DiagnosticPhaseGuard {
 }
 
 /// Active diagnostic session for one cargo-rail process.
+#[derive(Debug)]
 #[doc(hidden)]
 pub struct DiagnosticSession {
     output: Option<(PathBuf, File)>,

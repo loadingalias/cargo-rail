@@ -80,6 +80,9 @@ if [[ "$compiler_library_relative" == "$compiler_library" ]]; then
   exit 1
 fi
 compiler_library_digest="$(sha256_file "$compiler_library")"
+source_bundle="$repository_root/target/$profile/cargo-rail-fact-driver-source-v1.json"
+"$repository_root/scripts/package-compiler-fact-driver-source.py" "$source_bundle"
+source_bundle_digest="$(sha256_file "$source_bundle")"
 
 # Reproduce release archive topology: the embedded authority selects exactly
 # one authenticated component beside the cargo-rail executable.
@@ -88,6 +91,14 @@ staged_driver="$repository_root/target/$profile/$driver_file"
 cp "$driver" "$staged_driver"
 if [[ "$(sha256_file "$staged_driver")" != "$driver_digest" ]]; then
   echo "staged compiler fact driver does not match its manufactured bytes" >&2
+  exit 1
+fi
+staged_source="$repository_root/target/$profile/cargo-rail-fact-driver-source-v1.json"
+if [[ "$source_bundle" != "$staged_source" ]]; then
+  cp "$source_bundle" "$staged_source"
+fi
+if [[ "$(sha256_file "$staged_source")" != "$source_bundle_digest" ]]; then
+  echo "staged compiler fact driver source does not match its manufactured bytes" >&2
   exit 1
 fi
 
@@ -101,5 +112,8 @@ export CARGO_RAIL_FACT_DRIVER_RUSTC_COMMIT="$rustc_commit"
 export CARGO_RAIL_FACT_DRIVER_RUSTC_HOST="$rustc_host"
 export CARGO_RAIL_FACT_DRIVER_COMPILER_LIBRARY="$compiler_library_relative"
 export CARGO_RAIL_FACT_DRIVER_COMPILER_LIBRARY_SHA256="sha256:$compiler_library_digest"
+export CARGO_RAIL_FACT_DRIVER_SOURCE_FILE="cargo-rail-fact-driver-source-v1.json"
+export CARGO_RAIL_FACT_DRIVER_SOURCE_SHA256="sha256:$source_bundle_digest"
+export CARGO_RAIL_FACT_DRIVER_SOURCE_PROVENANCE="sha256:$provenance"
 
 exec "$@"

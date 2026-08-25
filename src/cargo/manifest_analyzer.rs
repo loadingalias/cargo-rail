@@ -259,6 +259,7 @@ struct ParseContext<'a> {
 // Main Analyzer
 
 /// Analyzes all workspace manifests for dependency usage patterns
+#[derive(Debug)]
 pub struct ManifestAnalyzer {
     /// All parsed manifests
     pub members: Vec<ParsedManifest>,

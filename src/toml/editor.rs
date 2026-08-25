@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use toml_edit::{DocumentMut, Item, Table, Value};
 
 /// Safe TOML file editor with validation and atomic writes
+#[derive(Debug)]
 pub struct TomlEditor {
     path: PathBuf,
     doc: DocumentMut,
@@ -247,7 +248,7 @@ impl TomlEditor {
 }
 
 /// Batch edit multiple TOML files atomically
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct TomlBatchEditor {
     editors: Vec<TomlEditor>,
 }

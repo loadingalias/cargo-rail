@@ -10,6 +10,7 @@ use serde::Serialize;
 use crate::backup::{BackupManager, BackupMetadata};
 use crate::cargo::{ManifestAnalyzer, TargetSpecificationIdentity};
 use crate::commands::common::SurfaceOutputFormat;
+use crate::compiler::driver::{CompilerFactDriverAuthority, CompilerFactDriverReadiness};
 use crate::compiler::facts::{CompilerFactDomain, CompilerFactTargetKind, ValidatedCompilerFactObject};
 use crate::compiler::{CompilerAnalysisMetrics, CompilerCacheIdentity, CompilerDiagnosticsCollector, FeatureSelection};
 use crate::config::{
@@ -30,11 +31,14 @@ use crate::surface::{
 use crate::workspace::{CargoState, WorkspaceContext, WorkspaceSnapshot};
 
 const SURFACE_CONTRACT_VERSION: u32 = 2;
+const SURFACE_PREPARATION_CONTRACT_VERSION: u32 = 1;
 const SURFACE_SCHEMA_JSON: &str = include_str!("../../schemas/surface-v2.schema.json");
 
 /// Options for the `surface` domain command.
 #[derive(Debug)]
 pub struct SurfaceOptions {
+    /// Prepare the exact-toolchain producer without analysis.
+    pub prepare: bool,
     /// Run read-only analysis.
     pub check: bool,
     /// Apply exact visibility reductions.
@@ -51,6 +55,25 @@ pub struct SurfaceOptions {
     pub explain: bool,
     /// Exact enabled finding classes to retain; empty retains every class.
     pub only: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SurfacePreparationReport {
+    surface_preparation_contract_version: u32,
+    snapshot: SurfaceSnapshotReport,
+    toolchain: SurfaceToolchainReport,
+    driver: SurfaceDriverReadinessReport,
+}
+
+#[derive(Debug, Serialize)]
+struct SurfaceDriverReadinessReport {
+    protocol: u32,
+    identity: String,
+    content_digest: String,
+    compiler_library_digest: String,
+    rustc_release: String,
+    rustc_commit: String,
+    rustc_host: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -262,11 +285,22 @@ pub fn run_surface(ctx: &WorkspaceContext, options: SurfaceOptions) -> RailResul
     if options.format.is_json_like() {
         crate::output::set_json_mode(true);
     }
-    if options.check && options.fix || !options.fix && (options.dry_run || options.backup) {
+    let preparation_conflicts = options.prepare
+        && (options.check
+            || options.fix
+            || options.dry_run
+            || options.backup
+            || options.explain
+            || !options.only.is_empty());
+    if preparation_conflicts || options.check && options.fix || !options.fix && (options.dry_run || options.backup) {
         return Err(RailError::with_help(
             "surface received incompatible operation flags",
-            "run without an operation flag to inspect, use '--check' for CI, or use '--fix' for exact visibility repair",
+            "use '--prepare' alone to prove readiness, '--check' for CI, or '--fix' for exact visibility repair",
         ));
+    }
+
+    if options.prepare {
+        return prepare_surface(ctx, &options);
     }
 
     let config = ctx.config().map(|config| config.surface.clone()).unwrap_or_default();
@@ -338,6 +372,65 @@ pub fn run_surface(ctx: &WorkspaceContext, options: SurfaceOptions) -> RailResul
         Some(mutation),
     )?;
     emit_report(report, &options, "fix", true)
+}
+
+fn prepare_surface(ctx: &WorkspaceContext, options: &SurfaceOptions) -> RailResult<()> {
+    let snapshot = ctx.snapshot()?;
+    let readiness = CompilerFactDriverAuthority::prepare_surface(snapshot)?;
+    ctx.validate_snapshot_unchanged()?;
+    let report = SurfacePreparationReport {
+        surface_preparation_contract_version: SURFACE_PREPARATION_CONTRACT_VERSION,
+        snapshot: SurfaceSnapshotReport {
+            identity: snapshot.id().to_string(),
+            configuration_fingerprint: snapshot.configuration_fingerprint().to_string(),
+        },
+        toolchain: SurfaceToolchainReport {
+            fingerprint: snapshot.toolchain_fingerprint().to_string(),
+            rustc: snapshot.toolchain().direct_rustc_verbose_version().to_string(),
+            host: snapshot.toolchain().host_target().to_string(),
+        },
+        driver: surface_driver_readiness_report(readiness),
+    };
+    let rendered = render_preparation_report(&report, options.format)?;
+    write_output(&rendered, options.output.as_deref())
+}
+
+fn surface_driver_readiness_report(readiness: CompilerFactDriverReadiness) -> SurfaceDriverReadinessReport {
+    SurfaceDriverReadinessReport {
+        protocol: readiness.protocol,
+        identity: readiness.driver_identity,
+        content_digest: readiness.driver_digest,
+        compiler_library_digest: readiness.compiler_library_digest,
+        rustc_release: readiness.rustc_release,
+        rustc_commit: readiness.rustc_commit,
+        rustc_host: readiness.rustc_host,
+    }
+}
+
+fn render_preparation_report(report: &SurfacePreparationReport, format: SurfaceOutputFormat) -> RailResult<String> {
+    match format {
+        SurfaceOutputFormat::Text => Ok(format!(
+            "surface: ready\nrustc: {} ({}, {})\ndriver: {}\nprotocol: {}",
+            report.driver.rustc_release,
+            report.driver.rustc_commit,
+            report.driver.rustc_host,
+            report.driver.identity,
+            report.driver.protocol,
+        )),
+        SurfaceOutputFormat::Json => {
+            let envelope =
+                crate::output::machine_json_envelope("surface", "prepare", "ready", 0, serde_json::to_value(report)?);
+            serde_json::to_string_pretty(&envelope).map_err(Into::into)
+        }
+        SurfaceOutputFormat::GitHub => {
+            let envelope =
+                crate::output::machine_json_envelope("surface", "prepare", "ready", 0, serde_json::to_value(report)?);
+            Ok(format!(
+                "surface_ready=true\nsurface_preparation_json={}\n",
+                serde_json::to_string(&envelope)?,
+            ))
+        }
+    }
 }
 
 fn filter_findings(findings: &mut Vec<SurfaceReportFinding>, only: &[String]) {
@@ -1788,6 +1881,52 @@ mod tests {
     use super::*;
     use crate::compiler::facts::{CompilerFactPackage, CompilerFactRole};
     use crate::surface::{SurfaceFindingKind, SurfaceTargetObservation};
+
+    fn preparation_report() -> SurfacePreparationReport {
+        SurfacePreparationReport {
+            surface_preparation_contract_version: SURFACE_PREPARATION_CONTRACT_VERSION,
+            snapshot: SurfaceSnapshotReport {
+                identity: "workspace-snapshot-v2-sha256:test".to_string(),
+                configuration_fingerprint: "sha256:config".to_string(),
+            },
+            toolchain: SurfaceToolchainReport {
+                fingerprint: "sha256:toolchain".to_string(),
+                rustc: "rustc 1.99.0-nightly\ncommit-hash: 1111111111111111111111111111111111111111\nhost: aarch64-apple-darwin\nrelease: 1.99.0-nightly".to_string(),
+                host: "aarch64-apple-darwin".to_string(),
+            },
+            driver: SurfaceDriverReadinessReport {
+                protocol: 3,
+                identity: "cargo-rail-fact-driver-v1-sha256:driver".to_string(),
+                content_digest: "sha256:driver".to_string(),
+                compiler_library_digest: "sha256:library".to_string(),
+                rustc_release: "1.99.0-nightly".to_string(),
+                rustc_commit: "1111111111111111111111111111111111111111".to_string(),
+                rustc_host: "aarch64-apple-darwin".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn preparation_projection_is_versioned_and_machine_safe() {
+        let report = preparation_report();
+        let json = render_preparation_report(&report, SurfaceOutputFormat::Json).expect("JSON preparation");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("preparation JSON");
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["command"], "surface");
+        assert_eq!(value["mode"], "prepare");
+        assert_eq!(value["result"], "ready");
+        assert_eq!(value["exit_code"], 0);
+        assert_eq!(value["surface_preparation_contract_version"], 1);
+        assert_eq!(value["driver"]["protocol"], 3);
+        assert_eq!(value["driver"]["rustc_release"], "1.99.0-nightly");
+
+        let github = render_preparation_report(&report, SurfaceOutputFormat::GitHub).expect("GitHub preparation");
+        assert!(github.starts_with("surface_ready=true\nsurface_preparation_json={"));
+        assert!(
+            !github.contains("\ncommit-hash:"),
+            "embedded JSON must stay on one line"
+        );
+    }
 
     fn compiler_crate() -> SurfaceCompilerCrate {
         SurfaceCompilerCrate {

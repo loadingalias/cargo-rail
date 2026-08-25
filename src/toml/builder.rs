@@ -4,6 +4,7 @@ use super::format::{TomlFormatter, TomlValue};
 use crate::error::RailResult;
 
 /// Builder for a deterministic `[workspace.dependencies]` section.
+#[derive(Debug)]
 pub struct WorkspaceDepsBuilder {
     formatter: TomlFormatter,
     deps: Vec<(String, String, Option<String>)>,

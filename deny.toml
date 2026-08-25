@@ -16,6 +16,7 @@ unsound = "all"
 ignore = [
   # aws-sdk-s3 constrains lru to ^0.16.3. Its affected LruCache key is a
   # String wrapper with non-panicking Drop, so RUSTSEC-2026-0253 is unreachable.
+  # Remove this ignore when aws-sdk-s3 permits an lru release that fixes the advisory.
   { id = "RUSTSEC-2026-0253", reason = "aws-sdk-s3's cache key cannot panic during Drop" },
 ]
 
@@ -40,22 +41,30 @@ wildcards = "deny"
 highlight = "all"
 
 skip = [
-  # The AWS SDK currently spans the RustCrypto 0.10 and 0.11 dependency lines.
+  # The AWS SDK currently spans the RustCrypto 0.10 and 0.11 dependency lines;
+  # remove these skips when its graph converges on one compatible line.
   "block-buffer@0.10.4",
   "cpufeatures@0.2.17",
   "crypto-common@0.1.7",
   "digest@0.10.7",
   "sha1@0.10.7",
-  # The AWS SDK deliberately supports both HTTP 0.2 and 1.x.
+  # The AWS SDK deliberately supports both HTTP 0.2 and 1.x; remove these skips
+  # when its compatibility surface no longer requires HTTP 0.2.
   "http@0.2.12",
   "http-body@0.4.6",
-  # petgraph, the AWS SDK's LRU cache, and indexmap use successive hashbrown lines.
+  # petgraph, the AWS SDK's LRU cache, and indexmap use successive hashbrown
+  # lines; remove these skips when those constraints converge.
   "hashbrown@0.15.5",
   "hashbrown@0.16.1",
   "foldhash@0.1.5",
-  # Proc-macro dependencies are still split between Syn 2 and 3.
+  # Proc-macro dependencies are still split between Syn 2 and 3; remove this
+  # skip when all selected proc macros accept one Syn line.
   "syn@2.0.119",
 ]
+
+[bans.std-replacements]
+scope = "workspace"
+level = "warn"
 
 [sources]
 unknown-registry = "deny"

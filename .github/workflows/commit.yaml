@@ -51,7 +51,7 @@ jobs:
         id: plan
         uses: loadingalias/cargo-rail-action@47e86bde928ce420b85efa5f8d3b5feb96fd0ffc # v7.0.0
         with:
-          version: 0.22.1
+          version: 0.22.2
           since: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
           args: "--explain"
 
@@ -96,10 +96,10 @@ jobs:
       - name: Install cargo-deny
         uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9
         with:
-          tool: cargo-deny
+          tool: cargo-deny@0.20.2
 
       - name: Quality checks
-        run: just check-ci
+        run: just check
 
       - name: Exact compiler fact driver
         run: |

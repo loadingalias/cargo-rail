@@ -51,6 +51,7 @@ pub enum MergeResult {
 }
 
 /// Conflict resolver using Git's 3-way merge
+#[derive(Debug)]
 pub struct ConflictResolver {
     strategy: ConflictStrategy,
     /// Working directory for temporary files

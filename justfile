@@ -241,11 +241,6 @@ bench-compiler-facts-remote target runs="20":
 gen-fixture members output:
     @scripts/fixtures/generate-workspace.sh "{{ members }}" "{{ output }}"
 
-# CI Commands (for GitHub Actions)
-
-check-ci:
-    @scripts/check/check.sh
-
 # Explainability
 
 plan:

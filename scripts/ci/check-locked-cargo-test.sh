@@ -11,7 +11,7 @@ fail() {
   exit 1
 }
 
-mkdir -p "$TMP_ROOT/scripts/ci" "$TMP_ROOT/.zed" "$TMP_ROOT/src"
+mkdir -p "$TMP_ROOT/scripts/ci" "$TMP_ROOT/.zed" "$TMP_ROOT/docs" "$TMP_ROOT/examples" "$TMP_ROOT/src"
 printf '%s\n' 'build:' '    cargo build --locked --workspace' >"$TMP_ROOT/justfile"
 "$CHECKER" --root "$TMP_ROOT" || fail "locked command was rejected"
 
@@ -25,6 +25,14 @@ printf '%s\n' '#!/usr/bin/env bash' 'cargo test \' '  --locked \' '  --workspace
 
 printf '%s\n' '#!/usr/bin/env bash' '# cargo check --workspace' >"$TMP_ROOT/scripts/ci/example.sh"
 "$CHECKER" --root "$TMP_ROOT" || fail "comment was treated as a command"
+
+printf '%s\n' 'cargo test `' '  --workspace' >"$TMP_ROOT/scripts/ci/example.ps1"
+if "$CHECKER" --root "$TMP_ROOT" >/dev/null 2>&1; then
+  fail "unlocked PowerShell command was accepted"
+fi
+
+printf '%s\n' 'cargo test `' '  --locked `' '  --workspace' >"$TMP_ROOT/scripts/ci/example.ps1"
+"$CHECKER" --root "$TMP_ROOT" || fail "multiline locked PowerShell command was rejected"
 
 printf '%s\n' \
   '# cargo-rail: allow-unlocked-cargo: fixture resolution deliberately creates its lockfile.' \
@@ -46,6 +54,17 @@ fi
 
 printf '%s\n' 'fn run() {' '  process::run("cargo", &["check", "--locked"], None);' '}' >"$TMP_ROOT/src/example.rs"
 "$CHECKER" --root "$TMP_ROOT" || fail "locked Rust Cargo subprocess was rejected"
+
+printf '%s\n' 'Use cargo package to inspect the distributable source.' >"$TMP_ROOT/CONTRIBUTING.md"
+"$CHECKER" --root "$TMP_ROOT" || fail "Markdown prose was treated as a command"
+
+printf '%s\n' '```sh' 'cargo package' '```' >"$TMP_ROOT/examples/package.md"
+if "$CHECKER" --root "$TMP_ROOT" >/dev/null 2>&1; then
+  fail "unlocked Markdown Cargo command was accepted"
+fi
+
+printf '%s\n' '```console' '$ cargo package --locked' 'Packaging cargo-rail' '```' >"$TMP_ROOT/examples/package.md"
+"$CHECKER" --root "$TMP_ROOT" || fail "locked Markdown Cargo command was rejected"
 
 : >"$TMP_ROOT/scripts/ci/unknown.rb"
 if "$CHECKER" --root "$TMP_ROOT" >/dev/null 2>&1; then

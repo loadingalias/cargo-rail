@@ -10,9 +10,10 @@ use crate::cargo::unify_types::{
 use crate::compiler::cfg_eval::{TargetCfgSet, target_constraint_matches_target};
 use crate::compiler::scheduler::planned_feature_selections;
 use crate::compiler::{
-    CompilerCacheIdentity, CompilerCandidate, CompilerDiagnosticsCollector, DependencyEvidenceState,
-    DependencyIdentity, FeatureSelection, MemberEvidence,
+    CompilerArtifactBudget, CompilerCacheIdentity, CompilerCandidate, CompilerDiagnosticsCollector,
+    DependencyEvidenceState, DependencyIdentity, FeatureSelection, MemberEvidence,
 };
+use crate::config::{ConsumerScope, UnifyConfig};
 use crate::error::RailResult;
 use crate::progress;
 use cargo_metadata::PackageId;
@@ -29,6 +30,7 @@ pub struct UnusedDepFinder<'a> {
     unreachable_features: HashMap<String, BTreeSet<String>>,
     workspace_is_consumer_scope: bool,
     compiler_cache_identity: &'a CompilerCacheIdentity,
+    compiler_artifact_budget: CompilerArtifactBudget,
 }
 
 struct DependencyDeclaration<'a> {
@@ -45,7 +47,7 @@ impl<'a> UnusedDepFinder<'a> {
         manifests: &'a ManifestAnalyzer,
         target_cfg_sets: &'a HashMap<String, TargetCfgSet>,
         pruned_features: &[crate::cargo::unify_types::PrunedFeature],
-        workspace_is_consumer_scope: bool,
+        config: &UnifyConfig,
         compiler_cache_identity: &'a CompilerCacheIdentity,
     ) -> Self {
         let mut unreachable_features: HashMap<String, BTreeSet<String>> = HashMap::new();
@@ -61,8 +63,12 @@ impl<'a> UnusedDepFinder<'a> {
             manifests,
             target_cfg_sets,
             unreachable_features,
-            workspace_is_consumer_scope,
+            workspace_is_consumer_scope: config.consumer_scope == ConsumerScope::Workspace,
             compiler_cache_identity,
+            compiler_artifact_budget: CompilerArtifactBudget::new(
+                config.compiler_artifact_soft_limit_bytes,
+                config.compiler_artifact_hard_limit_bytes,
+            ),
         }
     }
 
@@ -87,11 +93,7 @@ impl<'a> UnusedDepFinder<'a> {
                     if required_targets.is_empty() {
                         continue;
                     }
-                    if resolved
-                        .crate_names
-                        .iter()
-                        .any(|crate_name| declaration.member.retention_identifiers.contains(crate_name))
-                    {
+                    if declaration_has_retention_evidence(declaration.member, &resolved) {
                         continue;
                     }
                     let Some(member_evidence) = source_unused.get(&declaration.member.package_id) else {
@@ -378,7 +380,8 @@ impl<'a> UnusedDepFinder<'a> {
             self.manifests,
             targets,
             self.compiler_cache_identity,
-        );
+        )
+        .with_artifact_budget(self.compiler_artifact_budget);
         collector.collect_for_candidates(&candidates)
     }
 
@@ -390,6 +393,16 @@ impl<'a> UnusedDepFinder<'a> {
     ) -> Vec<CompilerCandidate> {
         let mut candidates = BTreeSet::new();
         for declaration in declarations {
+            if declaration
+                .resolved
+                .as_ref()
+                .is_some_and(|resolved| declaration_has_retention_evidence(declaration.member, resolved))
+            {
+                // `find` cannot remove this declaration regardless of compiler
+                // output. Do not schedule an exhaustive target/feature matrix
+                // whose result is guaranteed to be discarded.
+                continue;
+            }
             for usage in declaration.usages {
                 if declaration.resolved.is_none() {
                     if usage.kind != DepKind::Normal
@@ -459,6 +472,13 @@ impl<'a> UnusedDepFinder<'a> {
 
         edits
     }
+}
+
+fn declaration_has_retention_evidence(member: &ParsedManifest, resolved: &ResolvedDependency) -> bool {
+    resolved
+        .crate_names
+        .iter()
+        .any(|crate_name| member.retention_identifiers.contains(crate_name))
 }
 
 fn usage_required_targets<'a>(

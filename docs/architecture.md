@@ -1,7 +1,7 @@
 # Architecture
 
-Cargo-Rail is one library-backed workspace engine around Cargo's resolved model. Commands share captured source,
-configuration, toolchain, metadata, and graph state instead of rebuilding partial views of the workspace.
+Cargo-Rail is a library-backed workspace engine built on Cargo's resolved model. Commands share captured source,
+configuration, toolchain, metadata, and graph state.
 
 ## Mental model
 
@@ -16,8 +16,7 @@ Cargo-Rail has six workflows:
 | `change` / `release` | Reviewed change intent plus exact Git and registry state         | Versions, changelogs, publications, and durable recovery state |
 | `split` / `sync`     | Captured source, Git history, and split ownership                | Standalone history or mapped changes with origin evidence      |
 
-These workflows share infrastructure, not hidden control flow. Running `plan` does not run `unify`; running `release`
-does not silently invoke split or sync.
+The workflows share infrastructure but do not invoke one another implicitly.
 
 ## One captured workspace view
 
@@ -30,9 +29,8 @@ selected command. Depending on the command, that context owns:
 - captured source, manifests, lockfile, Cargo configuration, toolchain, and target identities; and
 - lazy feature/target resolution views derived from those inputs.
 
-Source capture happens before metadata can create generated state. Snapshot-bound commands revalidate live inputs
-before mutation. Commands derive narrower views from the context; they do not reload an independent workspace model
-for convenience.
+Source capture precedes metadata operations that may create generated state. Snapshot-bound commands revalidate live
+inputs before mutation. Commands derive narrower views from the context instead of reloading workspace state.
 
 ## Planning and direct consumption
 
@@ -52,17 +50,16 @@ Filesystem mutation follows check, plan, revalidate, apply:
 3. Revalidate the captured assumptions immediately before writing.
 4. Apply only the planned changes and record a receipt or backup where recovery requires one.
 
-Release, split, and sync add Git, forge, remote, or registry effects. They persist enough identity and progress before
-crossing those boundaries to make retry or reconciliation explicit. They do not claim that an external publication can
-be rolled back.
+Release, split, and sync add Git, forge, remote, or registry effects. Before crossing those boundaries, they persist
+the identity and progress needed for retry or reconciliation. External publication cannot be rolled back.
 
 Paths are validated capabilities, not unchecked strings. Manifest and configuration edits preserve TOML data outside
 the operation's ownership.
 
 ## Cache authority
 
-A cache lookup is never proof by itself. Cargo-Rail revalidates the inputs, action/result binding, and stored bytes
-owned by that cache layer before reuse. Unsupported or incomplete evidence bypasses reuse and executes the normal tool.
+A cache lookup is not proof. Cargo-Rail revalidates the inputs, action/result binding, and stored bytes owned by that
+cache layer before reuse. Unsupported or incomplete evidence bypasses reuse and executes the normal tool.
 The compiler-evidence and native compiler-result layers are documented in [Caching](caching.md). `surface` consumes
 complete authenticated typed facts from that compiler boundary; it does not reconstruct a second source graph.
 
@@ -76,15 +73,17 @@ observations, the open observation wins. Selected internal libraries seed produc
 actual cross-crate production consumers.
 
 Every inspection, check, and mutation projection uses surface contract v2. It records audited and open compiler
-targets, selected products and target selectors, exact feature/target views, completeness, policy levels,
-configuration diagnostics, cache observations, acquisition metrics, and the exact mutation plan. Inspection is
-read-only and non-failing; `--check` turns configuration errors and deny-level findings into exit 1. Operational
-failures exit 2. Machine output is one schema-owned stdout value.
+targets, selected products, exact feature and target views, completeness, policy, diagnostics, cache observations,
+acquisition metrics, and the mutation plan. Inspection is read-only and non-failing. `--check` exits 1 for
+configuration errors or deny-level findings. Operational failures exit 2. Machine output is one schema-owned stdout
+value.
 
-Source-built installations deliberately have no compiler-analysis authority. Schema output remains pre-context, but
-analysis rejects the installation before Cargo metadata or workspace acquisition. Supported native release archives
-carry the matching driver beside the CLI; the driver protocol verifies binary identity and captured workspace
-capability before accepting compiler facts.
+Source-built installations have no compiler-analysis authority. Schema output remains pre-context, but preparation
+and analysis reject the installation before Cargo metadata or workspace acquisition. Complete native installers place
+authenticated prebuilt and offline-source driver authority beside the CLI. `surface --prepare` resolves Cargo's exact
+selected compiler, installs its `rustc-dev` component through `rustup` when absent, manufactures a toolchain-matched
+driver from the authenticated source when needed, and authenticates the staged driver and compiler library. The driver
+protocol verifies that authority and the captured workspace capability before accepting compiler facts.
 
 ## Compiler process boundary
 

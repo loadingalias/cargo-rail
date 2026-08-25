@@ -117,6 +117,14 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
         "Bounds retained recovery copies after manifest mutation.",
     ),
     policy(
+        "unify.compiler_artifact_soft_limit_bytes",
+        "Reports storage pressure when the command-owned compiler working set reaches this many bytes.",
+    ),
+    policy(
+        "unify.compiler_artifact_hard_limit_bytes",
+        "Stops compiler acquisition before its command-owned artifact working set can grow without bound.",
+    ),
+    policy(
         "unify.msrv_policy.mode",
         "Enables or disables workspace MSRV computation.",
     ),
@@ -222,6 +230,10 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
     policy(
         "release.remote_effects",
         "Selects one valid remote-effect boundary: none, push, auto, GitHub, or GitLab.",
+    ),
+    policy(
+        "release.registry_publication",
+        "Selects an exact package-registry publication boundary independently from Git and forge effects.",
     ),
     compatibility(
         "release.create_github_release",

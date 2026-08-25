@@ -132,6 +132,9 @@ jobs:
           component="cargo-rail-fact-driver${suffix}"
           cp "$source" "$component"
           digest="$(sha256_file "$component")"
+          source_bundle="cargo-rail-fact-driver-source-v1.json"
+          scripts/package-compiler-fact-driver-source.py "$source_bundle"
+          source_bundle_digest="$(sha256_file "$source_bundle")"
           provenance="$({
             for file in \
               tools/compiler-fact-driver/Cargo.lock \
@@ -168,8 +171,11 @@ jobs:
             echo "CARGO_RAIL_FACT_DRIVER_RUSTC_HOST=$host"
             echo "CARGO_RAIL_FACT_DRIVER_COMPILER_LIBRARY=$compiler_library_relative"
             echo "CARGO_RAIL_FACT_DRIVER_COMPILER_LIBRARY_SHA256=sha256:$compiler_library_digest"
+            echo "CARGO_RAIL_FACT_DRIVER_SOURCE_FILE=$source_bundle"
+            echo "CARGO_RAIL_FACT_DRIVER_SOURCE_SHA256=sha256:$source_bundle_digest"
+            echo "CARGO_RAIL_FACT_DRIVER_SOURCE_PROVENANCE=sha256:$provenance"
           } >> "$GITHUB_ENV"
-          echo "include=$component" >> "$GITHUB_OUTPUT"
+          echo "include=$component,$source_bundle" >> "$GITHUB_OUTPUT"
 
       - name: Configure path remapping
         shell: bash
@@ -209,6 +215,19 @@ jobs:
           dry-run-intended: true
           include: ${{ steps.fact-driver.outputs.include }}
 
+      - name: Bind archive component inventory
+        shell: bash
+        env:
+          ARCHIVE: ${{ matrix.archive == 'zip' && steps.build.outputs.zip || steps.build.outputs.tar }}
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          scripts/package-release-archive.py "$ARCHIVE" \
+            --target "$TARGET" \
+            --version "$VERSION" \
+            --surface "${{ matrix.surface }}"
+
       - name: Smoke-test tar archive
         if: matrix.archive == 'tar'
         shell: bash
@@ -228,18 +247,26 @@ jobs:
           worker="$(find "$smoke" -type f -name cargo-rail-native-rustc-worker -print -quit)"
           distributed_worker="$(find "$smoke" -type f -name cargo-rail-distributed-worker -print -quit)"
           driver="$(find "$smoke" -type f -name cargo-rail-fact-driver -print -quit)"
+          driver_source="$(find "$smoke" -type f -name cargo-rail-fact-driver-source-v1.json -print -quit)"
+          component_manifest="$(find "$smoke" -type f -name cargo-rail-components-v1.tsv -print -quit)"
           test -n "$binary"
           test -n "$observation"
           test -n "$wrapper"
           test -n "$worker"
           test -n "$distributed_worker"
+          test -n "$component_manifest"
           test "$(dirname "$binary")" = "$(dirname "$wrapper")"
           test "$(dirname "$binary")" = "$(dirname "$observation")"
           test "$(dirname "$binary")" = "$(dirname "$worker")"
           test "$(dirname "$binary")" = "$(dirname "$distributed_worker")"
+          scripts/ci/verify-release-components.py "$(dirname "$binary")" \
+            --target "$TARGET" \
+            --version "$VERSION" \
+            --surface "${{ matrix.surface }}"
           test "$("$observation" --cargo-rail-observation-protocol-version)" = "1"
           if [[ "${{ matrix.surface }}" != "true" ]]; then
             test -z "$driver"
+            test -z "$driver_source"
             surface_stderr="$(mktemp)"
             if (cd "$(mktemp -d)" && "$binary" rail surface --check 2>"$surface_stderr"); then
               echo "surface unexpectedly succeeded for unavailable artifact" >&2
@@ -252,13 +279,22 @@ jobs:
             fi
           else
             test -n "$driver"
+            test -n "$driver_source"
             test "$(dirname "$binary")" = "$(dirname "$driver")"
+            test "$(dirname "$binary")" = "$(dirname "$driver_source")"
             chmod +x "$driver"
             compiler_library="$(rustc --print sysroot)/$CARGO_RAIL_FACT_DRIVER_COMPILER_LIBRARY"
             compiler_library_directory="$(dirname "$compiler_library")"
             protocol="$(LD_LIBRARY_PATH="$compiler_library_directory" DYLD_LIBRARY_PATH="$compiler_library_directory" "$driver" --cargo-rail-fact-protocol-version)"
             [[ "$protocol" =~ ^[1-9][0-9]*$ ]]
             binary="$(cd "$(dirname "$binary")" && pwd)/$(basename "$binary")"
+            rustup component remove rustc-dev || true
+            surface_preparation="$(cd tests/fixtures/surface_release && "$binary" rail surface --prepare -f json)"
+            test "$(printf '%s' "$surface_preparation" | jq -r '.mode')" = "prepare"
+            test "$(printf '%s' "$surface_preparation" | jq -r '.result')" = "ready"
+            test "$(printf '%s' "$surface_preparation" | jq -r '.surface_preparation_contract_version')" = "1"
+            test "$(printf '%s' "$surface_preparation" | jq -r '.driver.identity | startswith("cargo-rail-fact-driver-v1-sha256:")')" = "true"
+            rustup component list --installed | grep -Eq '^rustc-dev(-|$)'
             set +e
             surface_report="$(cd tests/fixtures/surface_release && "$binary" rail surface --check -f json)"
             surface_status=$?
@@ -267,6 +303,22 @@ jobs:
             test "$(printf '%s' "$surface_report" | jq -r '.surface_contract_version')" = "2"
             test "$(printf '%s' "$surface_report" | jq -r '.authority.audited_targets | length > 0')" = "true"
             test "$(printf '%s' "$surface_report" | jq -r '.findings | any(.name == "dead_public")')" = "true"
+            rustup toolchain install nightly-2026-08-12 --profile minimal
+            rustup component remove rustc-dev --toolchain nightly-2026-08-12 || true
+            nightly_preparation="$(cd tests/fixtures/surface_release && RUSTUP_TOOLCHAIN=nightly-2026-08-12 "$binary" rail surface --prepare -f json)"
+            test "$(printf '%s' "$nightly_preparation" | jq -r '.mode')" = "prepare"
+            test "$(printf '%s' "$nightly_preparation" | jq -r '.result')" = "ready"
+            test "$(printf '%s' "$nightly_preparation" | jq -r '.surface_preparation_contract_version')" = "1"
+            test "$(printf '%s' "$nightly_preparation" | jq -r '.toolchain.rustc | contains("1.99.0-nightly")')" = "true"
+            set +e
+            nightly_report="$(cd tests/fixtures/surface_release && RUSTUP_TOOLCHAIN=nightly-2026-08-12 "$binary" rail surface --check -f json)"
+            nightly_status=$?
+            set -e
+            test "$nightly_status" = 1
+            test "$(printf '%s' "$nightly_report" | jq -r '.surface_contract_version')" = "2"
+            test "$(printf '%s' "$nightly_report" | jq -r '.toolchain.rustc | contains("1.99.0-nightly"))" = "true"
+            test "$(printf '%s' "$nightly_report" | jq -r '.authority.audited_targets | length > 0')" = "true"
+            rustup component list --toolchain nightly-2026-08-12 --installed | grep -Eq '^rustc-dev(-|$)'
           fi
           chmod +x "$binary"
           chmod +x "$wrapper"
@@ -292,6 +344,8 @@ jobs:
           $worker = Get-ChildItem smoke -Recurse -Filter cargo-rail-native-rustc-worker.exe | Select-Object -First 1
           $distributedWorker = Get-ChildItem smoke -Recurse -Filter cargo-rail-distributed-worker.exe | Select-Object -First 1
           $driver = Get-ChildItem smoke -Recurse -Filter cargo-rail-fact-driver.exe | Select-Object -First 1
+          $driverSource = Get-ChildItem smoke -Recurse -Filter cargo-rail-fact-driver-source-v1.json | Select-Object -First 1
+          $componentManifest = Get-ChildItem smoke -Recurse -Filter cargo-rail-components-v1.tsv | Select-Object -First 1
           if (-not $binary) {
             throw "cargo-rail.exe is missing from $env:ARCHIVE"
           }
@@ -310,8 +364,15 @@ jobs:
           if (-not $driver) {
             throw "cargo-rail-fact-driver.exe is missing from $env:ARCHIVE"
           }
-          if ($binary.DirectoryName -ne $observation.DirectoryName -or $binary.DirectoryName -ne $wrapper.DirectoryName -or $binary.DirectoryName -ne $worker.DirectoryName -or $binary.DirectoryName -ne $distributedWorker.DirectoryName -or $binary.DirectoryName -ne $driver.DirectoryName) {
+          if (-not $driverSource -or -not $componentManifest) {
+            throw "Surface source authority or component manifest is missing from $env:ARCHIVE"
+          }
+          if ($binary.DirectoryName -ne $observation.DirectoryName -or $binary.DirectoryName -ne $wrapper.DirectoryName -or $binary.DirectoryName -ne $worker.DirectoryName -or $binary.DirectoryName -ne $distributedWorker.DirectoryName -or $binary.DirectoryName -ne $driver.DirectoryName -or $binary.DirectoryName -ne $driverSource.DirectoryName -or $binary.DirectoryName -ne $componentManifest.DirectoryName) {
             throw "cargo-rail compiler cache binaries are not adjacent to cargo-rail.exe"
+          }
+          python scripts/ci/verify-release-components.py $binary.DirectoryName --target "${{ matrix.target }}" --version $env:VERSION --surface "true"
+          if ($LASTEXITCODE -ne 0) {
+            throw "archive component authority verification failed"
           }
           $observationProtocol = (& $observation.FullName --cargo-rail-observation-protocol-version).Trim()
           if ($LASTEXITCODE -ne 0 -or $observationProtocol -ne '1') {
@@ -328,6 +389,24 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or $protocol -notmatch '^[1-9][0-9]*$') {
             throw "archive compiler fact driver failed to load: $protocol"
           }
+          rustup component remove rustc-dev
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "selected rustc-dev was already absent"
+          }
+          Push-Location tests/fixtures/surface_release
+          $preparationJson = & $binary.FullName rail surface --prepare -f json
+          if ($LASTEXITCODE -ne 0) {
+            throw "archive Surface preparation failed"
+          }
+          $preparation = $preparationJson | Out-String | ConvertFrom-Json
+          Pop-Location
+          if ($preparation.mode -ne 'prepare' -or $preparation.result -ne 'ready' -or $preparation.surface_preparation_contract_version -ne 1 -or $preparation.driver.identity -notmatch '^cargo-rail-fact-driver-v1-sha256:') {
+            throw "archive Surface preparation contract is invalid"
+          }
+          $selectedComponents = rustup component list --installed
+          if ($LASTEXITCODE -ne 0 -or -not ($selectedComponents | Where-Object { $_ -match '^rustc-dev(?:-|$)' })) {
+            throw "Surface preparation did not install rustc-dev for the selected toolchain"
+          }
           Push-Location tests/fixtures/surface_release
           $PSNativeCommandUseErrorActionPreference = $false
           $surfaceJson = & $binary.FullName rail surface --check -f json
@@ -342,6 +421,38 @@ jobs:
           }
           if (-not ($surfaceReport.findings | Where-Object { $_.name -eq "dead_public" })) {
             throw "archive surface fixture did not report dead_public"
+          }
+          rustup toolchain install nightly-2026-08-12 --profile minimal
+          if ($LASTEXITCODE -ne 0) {
+            throw "dated nightly toolchain installation failed"
+          }
+          rustup component remove rustc-dev --toolchain nightly-2026-08-12 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "dated nightly rustc-dev was already absent"
+          }
+          $env:RUSTUP_TOOLCHAIN = "nightly-2026-08-12"
+          Push-Location tests/fixtures/surface_release
+          $nightlyPreparationJson = & $binary.FullName rail surface --prepare -f json
+          if ($LASTEXITCODE -ne 0) {
+            throw "archive dated-nightly Surface preparation failed"
+          }
+          $nightlyPreparation = $nightlyPreparationJson | Out-String | ConvertFrom-Json
+          Pop-Location
+          if ($nightlyPreparation.mode -ne 'prepare' -or $nightlyPreparation.result -ne 'ready' -or $nightlyPreparation.surface_preparation_contract_version -ne 1 -or $nightlyPreparation.toolchain.rustc -notmatch '1\.99\.0-nightly') {
+            throw "archive dated-nightly Surface preparation contract is invalid"
+          }
+          Push-Location tests/fixtures/surface_release
+          $nightlyJson = & $binary.FullName rail surface --check -f json
+          $nightlyExit = $LASTEXITCODE
+          $nightlyReport = $nightlyJson | Out-String | ConvertFrom-Json
+          Pop-Location
+          Remove-Item Env:RUSTUP_TOOLCHAIN
+          if ($nightlyExit -ne 1 -or $nightlyReport.surface_contract_version -ne 2 -or $nightlyReport.toolchain.rustc -notmatch '1\.99\.0-nightly' -or $nightlyReport.authority.audited_targets.Count -eq 0) {
+            throw "archive dated-nightly Surface qualification failed"
+          }
+          $installedComponents = rustup component list --toolchain nightly-2026-08-12 --installed
+          if ($LASTEXITCODE -ne 0 -or -not ($installedComponents | Where-Object { $_ -match '^rustc-dev(?:-|$)' })) {
+            throw "Surface did not install rustc-dev for the exact selected toolchain"
           }
           $actual = (& $binary.FullName rail --version).Trim()
           if ($LASTEXITCODE -ne 0 -or $actual -ne "cargo-rail $env:VERSION") {

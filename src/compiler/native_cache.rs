@@ -191,12 +191,31 @@ pub(crate) struct NativeCacheContext {
     session: NativeCacheSession,
     source_root: PathBuf,
     source_root_spelling: PathBuf,
+    output_parent_authority: Option<PathBuf>,
     observation_directory: PathBuf,
     local_cas: Option<LocalCas>,
     remote: Option<crate::remote_cache::RemoteCacheSelection>,
     remote_store: OnceLock<Result<crate::remote_cache::RemoteStore, crate::remote_cache::RemoteStoreError>>,
     installation: Option<crate::cache::installation::InstallationReceipt>,
-    _runtime: Option<tempfile::TempDir>,
+    runtime: Option<tempfile::TempDir>,
+}
+
+/// Process-local scratch ownership that must not enter the global cache context.
+///
+/// Rustc wrappers may replace themselves with the compiler on Unix. Keeping a
+/// `TempDir` in `ACTIVE_CONTEXT` would therefore leak it both at normal process
+/// exit and across `exec`. The command frame owns and closes this guard instead.
+pub(crate) struct NativeCacheRuntime {
+    directory: Option<tempfile::TempDir>,
+}
+
+impl NativeCacheRuntime {
+    pub(crate) fn close(mut self) -> RailResult<()> {
+        if let Some(directory) = self.directory.take() {
+            directory.close()?;
+        }
+        Ok(())
+    }
 }
 
 enum NativeCacheSession {
@@ -4050,10 +4069,14 @@ fn executable_metadata(_metadata: &fs::Metadata) -> bool {
 }
 
 impl NativeCacheContext {
-    pub(crate) fn activate(self) -> RailResult<()> {
+    pub(crate) fn activate(mut self) -> RailResult<NativeCacheRuntime> {
+        let runtime = NativeCacheRuntime {
+            directory: self.runtime.take(),
+        };
         ACTIVE_CONTEXT
             .set(self)
-            .map_err(|_| RailError::message("native compiler cache context was activated twice"))
+            .map_err(|_| RailError::message("native compiler cache context was activated twice"))?;
+        Ok(runtime)
     }
 
     pub(crate) fn from_environment() -> Option<Self> {
@@ -4063,6 +4086,7 @@ impl NativeCacheContext {
             session: NativeCacheSession::Persisted(std::env::var_os(SESSION_ENV).map(PathBuf::from)?),
             source_root_spelling: source_root.clone(),
             source_root,
+            output_parent_authority: None,
             observation_directory: std::env::var_os(crate::compiler::invocation::OBSERVATION_DIRECTORY_ENV)
                 .map(PathBuf::from)?,
             local_cas: None,
@@ -4071,7 +4095,7 @@ impl NativeCacheContext {
                 .flatten(),
             remote_store: OnceLock::new(),
             installation: None,
-            _runtime: None,
+            runtime: None,
         })
     }
 
@@ -4106,12 +4130,15 @@ impl NativeCacheContext {
         rustc_program: &OsStr,
         rustc_arguments: &[OsString],
     ) -> Result<Self, &'static str> {
-        let (source_root_spelling, source_root) =
-            direct_compilation_root(rustc_arguments).map_err(|_| "compiler_output_root_unavailable")?;
+        let current_directory = std::env::current_dir().map_err(|_| "compiler_working_directory_unavailable")?;
+        let target_directory = std::env::var_os("CARGO_TARGET_DIR");
+        let (source_root_spelling, source_root, target_root_authority, output_parent_authority) =
+            direct_compilation_root(rustc_arguments, &current_directory, target_directory.as_deref())
+                .map_err(|_| "compiler_output_root_unavailable")?;
         let receipt = crate::cache::installation::load_for_wrapper(invoked)
             .map_err(|_| "native_cache_installation_unavailable")?;
         let local_cas = LocalCas::open_initialized_selected(receipt.cache()).map_err(|_| "local_cache_unavailable")?;
-        let session = installed_native_session(&receipt, &source_root, rustc_program)
+        let session = installed_native_session(&receipt, &source_root, &target_root_authority, rustc_program)
             .map_err(|_| "native_cache_session_unavailable")?;
         let runtime = private_command_directory().map_err(|_| "native_cache_runtime_unavailable")?;
         let remote = crate::remote_cache::RemoteCacheSelection::from_environment_or_installed(receipt.remote())
@@ -4121,18 +4148,23 @@ impl NativeCacheContext {
             session: NativeCacheSession::Prepared(session),
             source_root,
             source_root_spelling,
+            output_parent_authority: Some(output_parent_authority),
             observation_directory: runtime.path().to_path_buf(),
             local_cas: Some(local_cas),
             remote,
             remote_store: OnceLock::new(),
             installation: Some(receipt),
-            _runtime: Some(runtime),
+            runtime: Some(runtime),
         })
     }
 }
 
-/// Derive Cargo's physical compilation root from the standard target layout.
-fn direct_compilation_root(arguments: &[OsString]) -> RailResult<(PathBuf, PathBuf)> {
+/// Derive Cargo's source authority and validate the selected physical output root.
+fn direct_compilation_root(
+    arguments: &[OsString],
+    current_directory: &Path,
+    target_directory: Option<&OsStr>,
+) -> RailResult<(PathBuf, PathBuf, PathBuf, PathBuf)> {
     let mut selected = None;
     let mut index = 0usize;
     while index < arguments.len() {
@@ -4153,21 +4185,38 @@ fn direct_compilation_root(arguments: &[OsString]) -> RailResult<(PathBuf, PathB
     let output = if output.is_absolute() {
         output
     } else {
-        std::env::current_dir()?.join(output)
+        current_directory.join(output)
     };
-    let target = output
-        .ancestors()
-        .find(|ancestor| ancestor.file_name() == Some(OsStr::new("target")))
-        .ok_or_else(|| RailError::message("transparent compiler output does not use Cargo's standard target layout"))?;
-    let spelling = target
-        .parent()
-        .ok_or_else(|| RailError::message("transparent compiler target directory has no compilation root"))?
-        .to_path_buf();
-    let canonical = crate::utils::canonicalize_existing(&spelling)?;
     let canonical_output = crate::utils::canonicalize_existing(&output)?;
-    if !canonical_output.starts_with(canonical.join("target")) {
+
+    let standard_target = output
+        .ancestors()
+        .find(|ancestor| ancestor.file_name() == Some(OsStr::new("target")));
+    let (spelling, canonical, canonical_target) = if let Some(target_directory) = target_directory {
+        let target = PathBuf::from(target_directory);
+        let target = if target.is_absolute() {
+            target
+        } else {
+            current_directory.join(target)
+        };
+        let canonical_target = crate::utils::canonicalize_existing(&target)?;
+        let (spelling, canonical) = direct_source_root(current_directory)?;
+        (spelling, canonical, canonical_target)
+    } else if let Some(target) = standard_target {
+        let spelling = target
+            .parent()
+            .ok_or_else(|| RailError::message("transparent compiler target directory has no compilation root"))?
+            .to_path_buf();
+        let canonical = crate::utils::canonicalize_existing(&spelling)?;
+        let canonical_target = canonical.join("target");
+        (spelling, canonical, canonical_target)
+    } else {
+        let (spelling, canonical) = direct_source_root(current_directory)?;
+        (spelling, canonical, canonical_output.clone())
+    };
+    if !canonical_output.starts_with(&canonical_target) {
         return Err(RailError::message(
-            "transparent compiler output escaped Cargo's standard target root",
+            "transparent compiler output escaped Cargo's selected target root",
         ));
     }
     let manifest = canonical.join("Cargo.toml");
@@ -4178,17 +4227,47 @@ fn direct_compilation_root(arguments: &[OsString]) -> RailResult<(PathBuf, PathB
             "transparent compiler target root has no real Cargo workspace manifest",
         ));
     }
-    Ok((spelling, canonical))
+    Ok((spelling, canonical, canonical_target, canonical_output))
+}
+
+fn direct_source_root(current_directory: &Path) -> RailResult<(PathBuf, PathBuf)> {
+    let current_directory = crate::utils::canonicalize_existing(current_directory)?;
+    let mut package_root = None;
+    for candidate in current_directory.ancestors() {
+        let manifest = candidate.join("Cargo.toml");
+        let Ok(metadata) = fs::symlink_metadata(&manifest) else {
+            continue;
+        };
+        if !metadata.is_file() || crate::utils::is_symlink_or_reparse(&metadata) {
+            continue;
+        }
+        let Ok(contents) = fs::read_to_string(&manifest) else {
+            continue;
+        };
+        let Ok(document) = contents.parse::<toml_edit::DocumentMut>() else {
+            continue;
+        };
+        package_root.get_or_insert_with(|| candidate.to_path_buf());
+        if document.get("workspace").is_some() {
+            return Ok((candidate.to_path_buf(), candidate.to_path_buf()));
+        }
+    }
+    let root = package_root.ok_or_else(|| {
+        RailError::message("transparent compiler working directory has no real Cargo package manifest")
+    })?;
+    Ok((root.clone(), root))
 }
 
 fn installed_native_session(
     receipt: &crate::cache::installation::InstallationReceipt,
     source_root: &Path,
+    target_root: &Path,
     rustc_program: &OsStr,
 ) -> RailResult<NativeCompilerSession> {
     fn load(
         receipt: &crate::cache::installation::InstallationReceipt,
         source_root: &Path,
+        target_root: &Path,
         rustc_program: &OsStr,
     ) -> RailResult<Option<NativeCompilerSession>> {
         let Some(bytes) = crate::cache::installation::load_session_memo(receipt)? else {
@@ -4198,18 +4277,22 @@ fn installed_native_session(
             Ok(memo) => memo,
             Err(_) => return Ok(None),
         };
-        crate::compiler::collector::reuse_transparent_native_session(&memo, source_root, rustc_program)
+        crate::compiler::collector::reuse_transparent_native_session(&memo, source_root, target_root, rustc_program)
     }
 
-    if let Some(session) = load(receipt, source_root, rustc_program)? {
+    if let Some(session) = load(receipt, source_root, target_root, rustc_program)? {
         return Ok(session);
     }
     let _lock = crate::cache::installation::lock_session(receipt)?;
-    if let Some(session) = load(receipt, source_root, rustc_program)? {
+    if let Some(session) = load(receipt, source_root, target_root, rustc_program)? {
         return Ok(session);
     }
-    let (session, _, memo) =
-        crate::compiler::collector::capture_transparent_native_session(source_root, rustc_program, receipt.cache())?;
+    let (session, _, memo) = crate::compiler::collector::capture_transparent_native_session(
+        source_root,
+        target_root,
+        rustc_program,
+        receipt.cache(),
+    )?;
     crate::cache::installation::store_session_memo(receipt, &memo.encode()?)?;
     Ok(session)
 }
@@ -6274,9 +6357,6 @@ fn invocation_bypass_reason(
 /// recognizes shapes that cannot enter the graduated class, so it can never
 /// turn an eligible invocation into a cache hit or store under a second rule.
 pub(crate) fn fast_bypass_reason(program: &OsStr, arguments: &[OsString]) -> Option<&'static str> {
-    if std::env::var_os("CARGO_TARGET_DIR").is_some() {
-        return Some("custom_target_directory_authority_unavailable");
-    }
     if Path::new(program)
         .file_stem()
         .and_then(OsStr::to_str)
@@ -6703,6 +6783,9 @@ fn supported_native_library(value: &str) -> bool {
 }
 
 fn supported_unstable_option(option: &str) -> bool {
+    if let Some(attribute) = option.strip_prefix("crate-attr=") {
+        return !attribute.is_empty() && !attribute.as_bytes().contains(&0);
+    }
     let Some(("codegen-backend", backend)) = option.split_once('=') else {
         return false;
     };
@@ -6717,6 +6800,9 @@ fn supported_unstable_option(option: &str) -> bool {
 }
 
 fn supported_codegen_option(option: &str) -> bool {
+    if let Some(features) = option.strip_prefix("target-feature=") {
+        return !features.is_empty() && !features.as_bytes().contains(&0);
+    }
     matches!(
         option.split_once('=').map_or(option, |(name, _)| name),
         "metadata"
@@ -9991,7 +10077,12 @@ fn validated_output_parent(outputs: &NativeOutputPaths, source_root: &Path) -> R
     }
     let canonical_parent = crate::utils::canonicalize_existing(output_parent)?;
     let canonical_root = crate::utils::canonicalize_existing(source_root)?;
-    if !canonical_parent.starts_with(canonical_root.join("target"))
+    let direct_authority = active_context().and_then(|context| context.output_parent_authority.as_ref());
+    let authorized = direct_authority.map_or_else(
+        || canonical_parent.starts_with(canonical_root.join("target")),
+        |authority| &canonical_parent == authority,
+    );
+    if !authorized
         || bindings
             .iter()
             .any(|(role, _, output)| !output_role_path_matches(role, output))
@@ -10338,14 +10429,13 @@ fn output_binding_paths(output: &Path, source_root: &Path) -> RailResult<Vec<(&'
         .ok_or_else(|| RailError::message("native compiler output has no file name"))?;
     let canonical_root = crate::utils::canonicalize_existing(source_root)?;
     let canonical_output = crate::utils::canonicalize_existing(output_parent)?.join(file_name);
-    let relative = canonical_output
-        .strip_prefix(&canonical_root)
-        .map_err(|_| RailError::message("native compiler output is outside the source root"))?;
     let mut paths = vec![
         ("selected", crate::utils::path_to_git_format(output)),
         ("canonical", crate::utils::path_to_git_format(&canonical_output)),
-        ("relative", crate::utils::path_to_git_format(relative)),
     ];
+    if let Ok(relative) = canonical_output.strip_prefix(&canonical_root) {
+        paths.push(("relative", crate::utils::path_to_git_format(relative)));
+    }
     let mut seen = BTreeSet::new();
     paths.retain(|(_, path)| seen.insert(path.clone()));
     Ok(paths)
@@ -10362,16 +10452,14 @@ fn output_parent_spellings(
         .ok_or_else(|| RailError::message("native compiler output has no parent"))?;
     let canonical_root = crate::utils::canonicalize_existing(source_root)?;
     let canonical_parent = crate::utils::canonicalize_existing(output_parent)?;
-    let relative_parent = canonical_parent
-        .strip_prefix(&canonical_root)
-        .map_err(|_| RailError::message("native compiler output parent is outside the source root"))?;
-    let paths = [
+    let mut paths = vec![
         crate::utils::path_to_git_format(output_parent),
         crate::utils::path_to_git_format(&canonical_parent),
-        crate::utils::path_to_git_format(relative_parent),
-    ]
-    .into_iter()
-    .collect::<BTreeSet<_>>();
+    ];
+    if let Ok(relative_parent) = canonical_parent.strip_prefix(&canonical_root) {
+        paths.push(crate::utils::path_to_git_format(relative_parent));
+    }
+    let paths = paths.into_iter().collect::<BTreeSet<_>>();
     let mut spellings = Vec::new();
     for path in paths {
         for (_, path) in output_path_forms(&path) {
@@ -13115,10 +13203,18 @@ pub(crate) mod tests {
         ] {
             assert!(!supported_unstable_option(option), "accepted {option}");
         }
+        for option in ["crate-attr=feature(portable_simd)", "crate-attr=cfg(cargo_rail)"] {
+            assert!(supported_unstable_option(option), "rejected {option}");
+        }
+        assert!(!supported_unstable_option("crate-attr="));
+        for option in ["target-feature=+aes,+sse2", "target-feature=-crt-static"] {
+            assert!(supported_codegen_option(option), "rejected {option}");
+        }
+        assert!(!supported_codegen_option("target-feature="));
     }
 
     #[test]
-    fn transparent_compilation_root_comes_from_the_standard_cargo_output_layout() {
+    fn transparent_compilation_root_validates_standard_and_custom_cargo_output_layouts() {
         let workspace = tempfile::tempdir().expect("workspace");
         fs::write(workspace.path().join("Cargo.toml"), "[workspace]\n").expect("workspace manifest");
         let output = workspace.path().join("target/debug/deps");
@@ -13128,16 +13224,44 @@ pub(crate) mod tests {
             output.as_os_str().to_owned(),
             OsString::from("--crate-type=lib"),
         ];
-        let (_, root) = direct_compilation_root(&arguments).expect("standard Cargo target root");
+        let (_, root, target_root, output_parent) =
+            direct_compilation_root(&arguments, workspace.path(), None).expect("standard Cargo target root");
         assert_eq!(
             root,
             crate::utils::canonicalize_existing(workspace.path()).expect("canonical workspace")
         );
+        assert_eq!(
+            target_root,
+            fs::canonicalize(workspace.path().join("target")).expect("target root")
+        );
+        assert_eq!(output_parent, fs::canonicalize(&output).expect("output parent"));
 
-        let custom = workspace.path().join("custom/debug/deps");
-        fs::create_dir_all(&custom).expect("custom output directory");
-        let unsupported = vec![OsString::from(format!("--out-dir={}", custom.display()))];
-        direct_compilation_root(&unsupported).unwrap_err();
+        let custom_target = tempfile::tempdir().expect("custom target root");
+        let custom_output = custom_target.path().join("debug/deps");
+        fs::create_dir_all(&custom_output).expect("custom output directory");
+        let custom = vec![OsString::from(format!("--out-dir={}", custom_output.display()))];
+        let (_, root, target_root, output_parent) =
+            direct_compilation_root(&custom, workspace.path(), Some(custom_target.path().as_os_str()))
+                .expect("validated custom Cargo target root");
+        assert_eq!(root, fs::canonicalize(workspace.path()).expect("workspace root"));
+        assert_eq!(
+            target_root,
+            fs::canonicalize(custom_target.path()).expect("custom target root")
+        );
+        assert_eq!(output_parent, fs::canonicalize(&custom_output).expect("custom output"));
+
+        let escaped = tempfile::tempdir().expect("escaped output root");
+        fs::create_dir_all(escaped.path().join("debug/deps")).expect("escaped output directory");
+        let escaped_arguments = vec![OsString::from(format!(
+            "--out-dir={}",
+            escaped.path().join("debug/deps").display()
+        ))];
+        direct_compilation_root(
+            &escaped_arguments,
+            workspace.path(),
+            Some(custom_target.path().as_os_str()),
+        )
+        .expect_err("output outside the selected custom target must be rejected");
     }
 
     fn observed_file(path: &str, bytes: &[u8]) -> FileObservation {
@@ -13682,12 +13806,13 @@ pub(crate) mod tests {
                 session: NativeCacheSession::Prepared(session.clone()),
                 source_root: workspace_root.clone(),
                 source_root_spelling: workspace_root.clone(),
+                output_parent_authority: None,
                 observation_directory: observations.path().to_path_buf(),
                 local_cas: Some(cas.clone()),
                 remote: None,
                 remote_store: OnceLock::new(),
                 installation: None,
-                _runtime: None,
+                runtime: None,
             };
             let mut metrics = NativeCacheMetrics::default();
             match cas.native_action(validation.action_key())? {
@@ -13788,6 +13913,19 @@ pub(crate) mod tests {
             supported.push(dependency[0].into());
             if !dependency[1].is_empty() {
                 supported.push(dependency[1].into());
+            }
+            assert_eq!(fast_bypass_reason(OsStr::new("rustc"), &supported), None);
+        }
+        for flags in [
+            ["-Zcrate-attr=feature(portable_simd)", ""],
+            ["-Z", "crate-attr=cfg(cargo_rail)"],
+            ["-Ctarget-feature=+aes,+sse2", ""],
+            ["-C", "target-feature=-crt-static"],
+        ] {
+            let mut supported = eligible.to_vec();
+            supported.push(flags[0].into());
+            if !flags[1].is_empty() {
+                supported.push(flags[1].into());
             }
             assert_eq!(fast_bypass_reason(OsStr::new("rustc"), &supported), None);
         }
@@ -16002,6 +16140,16 @@ pub(crate) mod tests {
             .compiler_arguments
             .extend(["-C".to_string(), "opt-level=3".to_string()]);
         assert_changed(profile, "profile/codegen");
+        let mut target_features = baseline.clone();
+        target_features
+            .compiler_arguments
+            .push("-Ctarget-feature=+aes".to_string());
+        assert_changed(target_features, "target features");
+        let mut crate_attribute = baseline.clone();
+        crate_attribute
+            .compiler_arguments
+            .push("-Zcrate-attr=cfg(cargo_rail)".to_string());
+        assert_changed(crate_attribute, "crate attribute");
         let mut flags = baseline;
         flags
             .compiler_arguments

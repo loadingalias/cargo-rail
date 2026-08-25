@@ -7,6 +7,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 /// Manages backups for a workspace
+#[derive(Debug)]
 pub struct BackupManager {
     workspace_root: PathBuf,
     backup_root: PathBuf,

@@ -50,10 +50,10 @@ jobs:
       - name: Install cargo-deny
         uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9
         with:
-          tool: cargo-deny
+          tool: cargo-deny@0.20.2
 
       - name: Quality checks
-        run: just check-ci
+        run: just check
 
       - name: Exact compiler fact driver
         run: |

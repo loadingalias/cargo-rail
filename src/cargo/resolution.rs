@@ -160,6 +160,7 @@ impl Default for ResolutionRequest {
 }
 
 /// Immutable Cargo metadata and exact dependency graph for one resolution.
+#[derive(Debug)]
 pub struct ResolutionView {
     request: ResolutionRequest,
     metadata: Arc<Metadata>,
@@ -202,12 +203,14 @@ pub struct ToolchainIdentity {
     cargo_verbose_version: String,
     rustc_program: OsString,
     rustc_verbose_version: String,
+    direct_rustc_verbose_version: String,
     rustdoc_program: OsString,
     rustdoc_verbose_version: String,
     rustc_wrapper_program: Option<OsString>,
     rustc_workspace_wrapper_program: Option<OsString>,
     host_target: String,
     rustc_sysroot: PathBuf,
+    direct_rustc_sysroot: PathBuf,
 }
 
 impl ToolchainIdentity {
@@ -229,6 +232,12 @@ impl ToolchainIdentity {
     /// Return the complete normalized output of `rustc -vV`.
     pub fn rustc_verbose_version(&self) -> &str {
         &self.rustc_verbose_version
+    }
+
+    /// Return the exact unwrapped compiler identity used when a command owns
+    /// the complete compiler-wrapper chain.
+    pub(crate) fn direct_rustc_verbose_version(&self) -> &str {
+        &self.direct_rustc_verbose_version
     }
 
     /// Return the selected rustdoc program.
@@ -259,6 +268,11 @@ impl ToolchainIdentity {
     /// Return the stable sysroot selected by the effective rustc wrapper chain.
     pub(crate) fn rustc_sysroot(&self) -> &Path {
         &self.rustc_sysroot
+    }
+
+    /// Return the unwrapped compiler sysroot captured beside the Cargo view.
+    pub(crate) fn direct_rustc_sysroot(&self) -> &Path {
+        &self.direct_rustc_sysroot
     }
 }
 
@@ -740,6 +754,11 @@ impl ToolchainIdentity {
             "rustc program",
         )?;
         append_frame(&mut identity, b"rustc-version", self.rustc_verbose_version().as_bytes());
+        append_frame(
+            &mut identity,
+            b"direct-rustc-version",
+            self.direct_rustc_verbose_version().as_bytes(),
+        );
         append_os_frame(
             &mut identity,
             b"rustdoc-program",
@@ -952,6 +971,7 @@ type CachedView = Result<Arc<ResolutionView>, CachedResolutionError>;
 type ViewCell = OnceLock<CachedView>;
 
 /// Context-local lazy cache of exact Cargo resolution views.
+#[derive(Debug)]
 pub(crate) struct ResolutionViews {
     workspace_root: PathBuf,
     cargo_current_dir: PathBuf,
@@ -1422,8 +1442,19 @@ impl ToolchainIdentity {
             workspace_root: cargo_current_dir,
             cargo_config,
         };
+        let direct_rustc = WrappedRustcQuery {
+            cargo_program: &cargo_program,
+            rustc_program: &rustc_program,
+            rustc_wrapper_program: None,
+            rustc_workspace_wrapper_program: None,
+            workspace_root: cargo_current_dir,
+            cargo_config,
+        };
         let rustc_verbose_version = wrapped_rustc_identity(&wrapped_rustc)?;
         let rustc_sysroot = PathBuf::from(wrapped_rustc.run("--print=sysroot", "wrapped 'rustc --print=sysroot'")?);
+        let direct_rustc_verbose_version = wrapped_rustc_identity(&direct_rustc)?;
+        let direct_rustc_sysroot =
+            PathBuf::from(direct_rustc.run("--print=sysroot", "unwrapped 'rustc --print=sysroot'")?);
         let host_target = parse_rustc_host(&rustc_verbose_version)?;
         Ok(Self {
             cargo_verbose_version: command_identity(&cargo_program, "-Vv", cargo_current_dir, None)?,
@@ -1431,11 +1462,13 @@ impl ToolchainIdentity {
             cargo_program,
             rustc_program,
             rustc_verbose_version,
+            direct_rustc_verbose_version,
             rustdoc_program,
             rustc_wrapper_program,
             rustc_workspace_wrapper_program,
             host_target,
             rustc_sysroot,
+            direct_rustc_sysroot,
         })
     }
 }
@@ -3526,11 +3559,13 @@ mod tests {
             "include = [\"base.toml\"]\n[build]\nrustflags = [\"--cfg\", \"workspace\"]\n",
         )
         .expect("workspace config should be written");
+        let cargo_dir = fs::canonicalize(cargo_dir).expect("Cargo config directory should resolve");
 
         let captured = CargoConfigSnapshot::capture(workspace.path()).expect("Cargo config capture should succeed");
         let local_sources = captured
             .provenance()
             .iter()
+            .filter(|source| source.path().starts_with(&cargo_dir))
             .filter_map(|source| source.path().file_name().and_then(OsStr::to_str))
             .filter(|name| matches!(*name, "base.toml" | "config.toml"))
             .collect::<Vec<_>>();
@@ -4226,6 +4261,8 @@ CARGO_RAIL_WRAPPER_LOG = { value = "wrapper.log", relative = true, force = true 
             ToolchainIdentity::capture(workspace.path(), &cargo_config).expect("wrapped rustc identity should resolve");
 
         assert!(toolchain.rustc_verbose_version().starts_with("rustc "));
+        assert!(toolchain.direct_rustc_verbose_version().starts_with("rustc "));
+        assert!(toolchain.direct_rustc_sysroot().is_absolute());
         let log = fs::read_to_string(workspace.path().join("wrapper.log")).expect("wrapper log should be readable");
         assert_eq!(
             log.lines().collect::<Vec<_>>(),
@@ -4430,12 +4467,14 @@ CARGO_RAIL_WRAPPER_LOG = { value = "wrapper.log", relative = true, force = true 
             cargo_verbose_version: "cargo 1.95.0".to_string(),
             rustc_program: "selected-rustc".into(),
             rustc_verbose_version: "rustc 1.95.0\nhost: x86_64-unknown-linux-gnu".to_string(),
+            direct_rustc_verbose_version: "rustc 1.95.0\nhost: x86_64-unknown-linux-gnu".to_string(),
             rustdoc_program: "rustdoc".into(),
             rustdoc_verbose_version: "rustdoc 1.95.0".to_string(),
             rustc_wrapper_program: Some("sccache".into()),
             rustc_workspace_wrapper_program: Some("workspace-wrapper".into()),
             host_target: "x86_64-unknown-linux-gnu".to_string(),
             rustc_sysroot: PathBuf::from("/toolchain"),
+            direct_rustc_sysroot: PathBuf::from("/toolchain"),
         };
         let command = rustc_command(&toolchain);
         assert_eq!(command.get_program(), OsStr::new("sccache"));
@@ -4480,12 +4519,14 @@ CARGO_RAIL_WRAPPER_LOG = { value = "wrapper.log", relative = true, force = true 
                 cargo_verbose_version: "cargo 1.95.0".to_string(),
                 rustc_program: "rustc".into(),
                 rustc_verbose_version: "rustc 1.95.0".to_string(),
+                direct_rustc_verbose_version: "rustc 1.95.0".to_string(),
                 rustdoc_program: "rustdoc".into(),
                 rustdoc_verbose_version: "rustdoc 1.95.0".to_string(),
                 rustc_wrapper_program: None,
                 rustc_workspace_wrapper_program: None,
                 host_target: "x86_64-unknown-linux-gnu".to_string(),
                 rustc_sysroot: PathBuf::from("/toolchain"),
+                direct_rustc_sysroot: PathBuf::from("/toolchain"),
             },
             cargo_config: ContentDigest::sha256(b"config-a"),
             credential_sensitive: false,

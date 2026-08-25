@@ -3,7 +3,7 @@
 use crate::config::{ChangelogRelativeTo, ReleaseConfig, SemverCheckPolicy};
 use crate::error::{RailError, RailResult};
 use crate::release::change_files::PendingChangeSet;
-use crate::release::planner::ReleasePlan;
+use crate::release::planner::{RELEASE_REGISTRY, ReleasePlan};
 use crate::release::process;
 use crate::release::semver_checks;
 use crate::workspace::WorkspaceContext;
@@ -59,6 +59,7 @@ impl ValidationResult {
 }
 
 /// Pre-release validator
+#[derive(Debug)]
 pub struct ReleaseValidator<'a> {
     /// Workspace context
     ctx: &'a WorkspaceContext,
@@ -157,11 +158,10 @@ impl<'a> ReleaseValidator<'a> {
             .get_package(crate_name)
             .ok_or_else(|| RailError::message(format!("Crate '{}' not found", crate_name)))?;
 
-        // Check if publish = false in Cargo.toml
-        if !crate::workspace::CargoState::is_package_publishable(package) {
+        if !crate::workspace::CargoState::package_allows_registry(package, RELEASE_REGISTRY) {
             return Err(RailError::with_help(
-                format!("Crate '{}' has publish = false in Cargo.toml", crate_name),
-                "Remove 'publish = false' or exclude this crate from the release",
+                format!("Crate '{}' cannot publish to crates-io under Cargo.toml", crate_name),
+                "authorize crates-io in package.publish or exclude this crate from registry publication",
             ));
         }
 
@@ -340,20 +340,15 @@ impl<'a> ReleaseValidator<'a> {
 
     /// Check if a crate is publishable (combined Cargo.toml + rail.toml check)
     ///
-    /// A crate is considered publishable if:
-    /// 1. Cargo.toml does not have `publish = false`, AND
-    /// 2. rail.toml does not have `[crates.NAME.release] publish = false`
-    ///
-    /// rail.toml takes precedence: if it explicitly sets `publish = true`,
-    /// that overrides Cargo.toml's `publish = false`.
+    /// Cargo.toml must permit crates.io and rail.toml must not disable it.
+    /// Repository policy can narrow Cargo authority but never widen it.
     pub fn is_publishable(&self, crate_name: &str) -> bool {
         let package = match self.ctx.cargo().get_package(crate_name) {
             Some(pkg) => pkg,
             None => return false,
         };
 
-        // Check Cargo.toml
-        let publish_from_cargo = crate::workspace::CargoState::is_package_publishable(package);
+        let publish_from_cargo = crate::workspace::CargoState::package_allows_registry(package, RELEASE_REGISTRY);
 
         // Check rail.toml - takes precedence if set
         let publish_from_config = self
@@ -364,8 +359,7 @@ impl<'a> ReleaseValidator<'a> {
             .and_then(|c| c.release.as_ref())
             .map(|r| r.publish);
 
-        // rail.toml takes precedence if explicitly set
-        publish_from_config.unwrap_or(publish_from_cargo)
+        publish_from_cargo && publish_from_config.unwrap_or(true)
     }
 
     /// Get the reason why a crate is not publishable
@@ -377,23 +371,21 @@ impl<'a> ReleaseValidator<'a> {
             None => return Some(format!("crate '{}' not found", crate_name)),
         };
 
-        // Check rail.toml first (takes precedence)
+        if !crate::workspace::CargoState::package_allows_registry(package, RELEASE_REGISTRY) {
+            return Some(match package.publish.as_deref() {
+                Some([]) => "publish = false in Cargo.toml".to_string(),
+                _ => "Cargo.toml publish allowlist does not authorize the crates-io registry".to_string(),
+            });
+        }
+
         if let Some(config) = self.ctx.config()
             && let Some(crate_config) = config.crates.get(crate_name)
             && let Some(release_config) = &crate_config.release
         {
-            // If rail.toml explicitly sets publish, use that
             if !release_config.publish {
                 return Some("publish = false in rail.toml".to_string());
             }
-            // If rail.toml explicitly sets publish = true, it's publishable
-            // (overrides Cargo.toml)
             return None;
-        }
-
-        // Fall back to Cargo.toml check
-        if !crate::workspace::CargoState::is_package_publishable(package) {
-            return Some("publish = false in Cargo.toml".to_string());
         }
 
         None

@@ -46,6 +46,7 @@ if [ "$ARG" = "--all" ]; then
   echo "Full workspace test (--all)"
   echo ""
   cargo nextest run --workspace -P "$NEXTEST_PROFILE" --all-features --locked --config-file .config/nextest.toml
+  cargo test --doc -p cargo-rail --all-features --locked
   exit 0
 fi
 

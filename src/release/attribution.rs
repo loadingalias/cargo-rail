@@ -81,6 +81,7 @@ impl AttributedHistory {
 }
 
 /// Resolver-backed commit attributor
+#[derive(Debug)]
 pub struct CommitAttributor<'a> {
     ctx: &'a WorkspaceContext,
     members: HashSet<&'a str>,

@@ -47,16 +47,18 @@ fn source_built_surface_fails_before_workspace_acquisition() {
         let workspace = TestWorkspace::new_named("surface-source-installation")?;
         fs::write(workspace.path.join("Cargo.toml"), "this is not Cargo metadata")?;
 
-        let output = run_cargo_rail(&workspace.path, &["rail", "surface", "--check"])?;
+        for operation in ["--check", "--prepare"] {
+            let output = run_cargo_rail(&workspace.path, &["rail", "surface", operation])?;
 
-        assert_eq!(output.status.code(), Some(2));
-        let stderr = String::from_utf8(output.stderr)?;
-        assert!(stderr.contains("surface is unavailable in this source-built cargo-rail installation"));
-        assert!(stderr.contains("cargo install does not provide surface"));
-        assert!(
-            !stderr.contains("metadata"),
-            "workspace acquisition must not run: {stderr}"
-        );
+            assert_eq!(output.status.code(), Some(2));
+            let stderr = String::from_utf8(output.stderr)?;
+            assert!(stderr.contains("surface is unavailable in this source-built cargo-rail installation"));
+            assert!(stderr.contains("cargo install does not provide surface"));
+            assert!(
+                !stderr.contains("metadata"),
+                "workspace acquisition must not run for {operation}: {stderr}"
+            );
+        }
         Ok(())
     })();
     super::helpers::finish_test(result);

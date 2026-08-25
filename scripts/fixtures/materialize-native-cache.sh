@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export LC_ALL=C
+export TZ=UTC
+umask 022
+
 usage() {
   echo "usage: $0 <destination> [shared-git-source]" >&2
   exit 2

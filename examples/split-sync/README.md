@@ -1,19 +1,18 @@
-# Split / Sync Example
+# Split and Sync
 
-`split` filters crate history and rewrites workspace-relative paths for a standalone repository. `sync` maps later commits in either direction and uses a three-way merge for concurrent edits.
+[`rail.toml`](rail.toml) shows every `[crates.NAME.split]` field for one crate. `include` adds non-Cargo files;
+`exclude` can only narrow that list. Cargo-owned package files come from workspace ownership automatically.
 
-## Quick Start
+From the repository root:
 
 ```bash
-cargo rail split init my-crate
-cargo rail split run my-crate --check
-cargo rail split run my-crate
-cargo rail sync my-crate --to-remote
+cargo rail --config examples/split-sync/rail.toml config validate --strict
+cargo rail --config examples/split-sync/rail.toml split run cargo-rail --check
 ```
 
-`sync --from-remote` creates a review branch in the monorepo. Manual conflicts leave files and a receipt for `cargo rail sync --resume <receipt>`.
+Review the check result before running `split run` without `--check`. Later, use `sync --to-remote` or
+`sync --from-remote`. A conflicted sync prints the receipt required by `sync --resume`.
 
-## Reference
+For a combined split, set `mode = "combined"` and list at least two package names in `members`.
 
-- [Configuration Reference](../../docs/config.md)
-- [Architecture](../../docs/architecture.md)
+See the [configuration reference](../../docs/config.md#split-and-sync) for ownership and path rules.

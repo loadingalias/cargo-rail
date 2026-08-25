@@ -26,19 +26,23 @@ pub struct ReleaseConfig {
     ///
     /// Release previews allow dirt. Apply binds planned inputs and rejects every
     /// unrelated path immediately before the first write.
-    #[serde(default = "default_true")]
+    #[serde(skip_serializing)]
     pub require_clean: bool,
 
     /// Deprecated registry-convergence polling interval.
     ///
     /// Cargo-rail never sleeps for convergence; it stops and reconciles on the
     /// next invocation.
-    #[serde(default = "default_publish_delay")]
+    #[serde(skip_serializing)]
     pub publish_delay: u64,
 
     /// Authorized remote effects after local release preparation.
     #[serde(default)]
     pub remote_effects: ReleaseRemoteEffects,
+
+    /// Registry publication authority, separate from Git and forge effects.
+    #[serde(default)]
+    pub registry_publication: ReleaseRegistryPublication,
 
     /// Sign git tags with GPG/SSH (default: false)
     #[serde(default)]
@@ -127,6 +131,7 @@ impl Default for ReleaseConfig {
             require_clean: true,
             publish_delay: default_publish_delay(),
             remote_effects: ReleaseRemoteEffects::default(),
+            registry_publication: ReleaseRegistryPublication::default(),
             sign_tags: false,
             require_changelog_entries: false,
             require_release_notes: true,
@@ -320,6 +325,27 @@ pub enum ReleaseRemoteEffects {
     Gitlab,
 }
 
+/// Registry publication authority for release execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReleaseRegistryPublication {
+    /// Do not authorize publication to any package registry.
+    #[default]
+    None,
+    /// Permit a matching `--publish` invocation to publish to crates.io.
+    CratesIo,
+}
+
+impl ReleaseRegistryPublication {
+    /// Exact registry identity authorized by this policy.
+    pub const fn registry(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::CratesIo => Some("crates-io"),
+        }
+    }
+}
+
 impl ReleaseRemoteEffects {
     /// Stable configuration spelling used in durable release trailers.
     pub const fn as_str(self) -> &'static str {
@@ -352,6 +378,7 @@ struct ReleaseConfigInput {
     require_clean: bool,
     publish_delay: u64,
     remote_effects: Option<ReleaseRemoteEffects>,
+    registry_publication: ReleaseRegistryPublication,
     create_github_release: Option<bool>,
     forge: Option<LegacyReleaseForge>,
     push: Option<bool>,
@@ -378,6 +405,7 @@ impl Default for ReleaseConfigInput {
             require_clean: config.require_clean,
             publish_delay: config.publish_delay,
             remote_effects: None,
+            registry_publication: config.registry_publication,
             create_github_release: None,
             forge: None,
             push: None,
@@ -448,6 +476,7 @@ impl<'de> Deserialize<'de> for ReleaseConfig {
             require_clean: input.require_clean,
             publish_delay: input.publish_delay,
             remote_effects,
+            registry_publication: input.registry_publication,
             sign_tags: input.sign_tags,
             require_changelog_entries: input.require_changelog_entries,
             require_release_notes: input.require_release_notes,
@@ -619,7 +648,7 @@ impl ChangelogFilters {
 /// Release configuration for a crate
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrateReleaseConfig {
-    /// Enable/disable publishing for this crate (overrides Cargo.toml)
+    /// Enable or disable publishing for this crate within Cargo's manifest authority.
     #[serde(default = "default_true")]
     pub publish: bool,
 }
@@ -791,6 +820,7 @@ mod tests {
         assert_eq!(config.unconventional_commits, CommitPolicy::Warn);
         assert_eq!(config.semver_check, SemverCheckPolicy::Warn);
         assert_eq!(config.remote_effects, ReleaseRemoteEffects::None);
+        assert_eq!(config.registry_publication, ReleaseRegistryPublication::None);
         assert_eq!(config.change_dir, ".changes");
         assert!(!config.require_change_files.is_enabled());
         assert!(config.requires_change_file("any-crate"));
@@ -807,6 +837,7 @@ mod tests {
       semver_check = "off"
       change_dir = "changes"
       remote_effects = "gitlab"
+      registry_publication = "crates-io"
     "#;
         let config: ReleaseConfig = toml_edit::de::from_str(toml).unwrap();
         assert_eq!(config.pre_1_breaking_bump, Pre1BreakingBump::Major);
@@ -815,6 +846,7 @@ mod tests {
         assert_eq!(config.semver_check, SemverCheckPolicy::Off);
         assert_eq!(config.change_dir, "changes");
         assert_eq!(config.remote_effects, ReleaseRemoteEffects::Gitlab);
+        assert_eq!(config.registry_publication, ReleaseRegistryPublication::CratesIo);
     }
 
     #[test]

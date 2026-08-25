@@ -544,6 +544,14 @@ fn test_unify_major_version_conflict_warns_and_skips() {
             "0.1.0",
             &[("serde", r#"{ version = "0.8", features = ["alloc"] }"#)],
         )?;
+        std::fs::write(
+            workspace.path.join("crates/crate-a/src/lib.rs"),
+            "use serde as _;\npub fn a() {}\n",
+        )?;
+        std::fs::write(
+            workspace.path.join("crates/crate-b/src/lib.rs"),
+            "use serde as _;\npub fn b() {}\n",
+        )?;
 
         workspace.commit("Add crates with major version conflict")?;
 
@@ -563,8 +571,10 @@ root = "."
 
         assert!(
             analyze_stdout.contains("Multiple major versions") || analyze_stdout.contains("skipping"),
-            "Should detect major version conflict.\nOutput:\n{}",
-            analyze_stdout
+            "Should detect major version conflict.\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            analyze_output.status,
+            analyze_stdout,
+            String::from_utf8_lossy(&analyze_output.stderr)
         );
 
         // Run apply - should SUCCEED but skip the conflicting dependency
@@ -1058,9 +1068,10 @@ cc = "1.0"
 "#,
         )?;
 
+        std::fs::write(crate_a_path.join("src/lib.rs"), "pub fn a() {}\n")?;
         std::fs::write(
-            crate_a_path.join("src/lib.rs"),
-            "use serde as _;\nuse anyhow as _;\npub fn a() {}",
+            crate_a_path.join("build.rs"),
+            "fn main() { let _ = cc::Build::new(); }\n",
         )?;
 
         // Create crate-b with same build-dependency
@@ -1080,7 +1091,11 @@ cc = "1.0"
 "#,
         )?;
 
-        std::fs::write(crate_b_path.join("src/lib.rs"), "use serde as _;\npub fn b() {}")?;
+        std::fs::write(crate_b_path.join("src/lib.rs"), "pub fn b() {}\n")?;
+        std::fs::write(
+            crate_b_path.join("build.rs"),
+            "fn main() { let _ = cc::Build::new(); }\n",
+        )?;
 
         workspace.commit("Add crates with build-dependencies")?;
 
@@ -1088,8 +1103,10 @@ cc = "1.0"
         let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
         assert!(
             output.status.success(),
-            "Unify should succeed.\nOutput:\n{}",
-            String::from_utf8_lossy(&output.stdout)
+            "Unify should succeed.\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
 
         // Verify workspace has cc

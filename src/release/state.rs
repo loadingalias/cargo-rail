@@ -3,7 +3,7 @@
 use crate::config::ReleaseConfig;
 use crate::error::{RailError, RailResult};
 use crate::git::SystemGit;
-use crate::release::planner::ReleasePlan;
+use crate::release::planner::{RELEASE_REGISTRY, ReleasePlan};
 use crate::release::remote::RemoteRepository;
 use crate::utils::canonicalize_existing;
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,8 @@ pub(crate) struct ReleaseState {
     pub release_config: ReleaseConfig,
     #[serde(default)]
     pub remote_repository: Option<RemoteRepository>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_registry: Option<String>,
     pub skip_publish: bool,
     pub skip_tag: bool,
     pub initial_head: String,
@@ -172,6 +174,20 @@ impl ReleaseState {
             reconstructed,
         } = request;
         let git = SystemGit::open(root)?;
+        let publish_registry = if skip_publish {
+            None
+        } else {
+            let registry = release_config
+                .registry_publication
+                .registry()
+                .ok_or_else(|| RailError::message("release state has no configured registry publication authority"))?;
+            if registry != RELEASE_REGISTRY {
+                return Err(RailError::message(format!(
+                    "release state selected unsupported registry '{registry}'"
+                )));
+            }
+            Some(registry.to_string())
+        };
         let mut local_input_paths = plan
             .change_files_to_delete
             .iter()
@@ -219,7 +235,7 @@ impl ReleaseState {
             })
             .collect();
         let state = Self {
-            schema_version: 3,
+            schema_version: 4,
             transaction_id: transaction_id.clone(),
             status: ReleaseStatus::Active,
             phase: if reconstructed.is_some() {
@@ -231,6 +247,7 @@ impl ReleaseState {
             plan,
             release_config,
             remote_repository,
+            publish_registry,
             skip_publish,
             skip_tag,
             initial_head,
@@ -291,11 +308,25 @@ impl ReleaseState {
         if state.schema_version == 2 {
             state.schema_version = 3;
         }
-        if state.schema_version != 3 {
+        if state.schema_version == 3 {
+            state.publish_registry = (!state.skip_publish).then(|| RELEASE_REGISTRY.to_string());
+            state.schema_version = 4;
+        }
+        if state.schema_version != 4 {
             return Err(RailError::message(format!(
                 "unsupported release state version {}",
                 state.schema_version
             )));
+        }
+        if state.skip_publish != state.publish_registry.is_none()
+            || state
+                .publish_registry
+                .as_deref()
+                .is_some_and(|registry| registry != RELEASE_REGISTRY)
+        {
+            return Err(RailError::message(
+                "release state contains inconsistent or unsupported registry publication authority",
+            ));
         }
         Ok(state)
     }

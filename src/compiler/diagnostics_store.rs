@@ -681,6 +681,7 @@ fn validate_identity(value: &str, prefix: &str) -> RailResult<()> {
 }
 
 /// Persistent compiler diagnostics store.
+#[derive(Debug)]
 pub struct CompilerDiagnosticsStore {
     path: PathBuf,
     cache: CompilerDiagCacheFile,

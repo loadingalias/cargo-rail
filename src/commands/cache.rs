@@ -194,6 +194,49 @@ pub(crate) fn run_status(workspace_root: &Path, scope: CacheScope, format: TextJ
     Ok(())
 }
 
+/// Preview or apply byte-preserving recovery of one selected markerless CAS.
+pub(crate) fn run_recover(workspace_root: &Path, check: bool, format: TextJsonOutputFormat) -> RailResult<()> {
+    if format.is_json() {
+        crate::output::set_json_mode(true);
+    }
+    let plan = if check {
+        crate::cache::installation::plan_local_cache_recovery(workspace_root)?
+    } else {
+        crate::cache::installation::recover_local_cache(workspace_root)?
+    };
+    let pending = plan.is_some();
+    if format.is_json() {
+        let output = crate::output::machine_json_envelope(
+            "cache",
+            if check { "recover_check" } else { "recover" },
+            if check && pending { "pending_changes" } else { "success" },
+            if check && pending { 1 } else { 0 },
+            serde_json::json!({
+              "pending": pending,
+              "recovery": plan,
+            }),
+        );
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else if let Some(plan) = &plan {
+        if check {
+            println!("local CAS recovery pending");
+        } else {
+            println!("local CAS recovered");
+        }
+        println!("  selected root: {}", plan.selected_root);
+        println!("  quarantine: {}", plan.quarantine_root);
+        println!("  retained bytes: {}", plan.bytes);
+        println!("  receipt: {}", plan.receipt_path);
+    } else {
+        println!("local CAS recovery not required");
+    }
+    if check && pending {
+        Err(RailError::CheckHasPendingChanges)
+    } else {
+        Ok(())
+    }
+}
+
 /// Preview or apply explicitly scoped cache reclamation.
 pub(crate) fn run_clean(
     workspace_root: &Path,
@@ -330,11 +373,18 @@ fn render_status(status: &CacheStatus) {
         status.installation.usage.failures
     );
     println!(
-        "    usage ledger: {} events (full: {}; early bypasses: {})",
-        status.installation.usage.recorded_events,
-        status.installation.usage.ledger_full,
-        status.installation.usage.early_bypasses
+        "    usage ledger: {} events (full: {})",
+        status.installation.usage.recorded_events, status.installation.usage.ledger_full
     );
+    println!(
+        "    early bypass ledger: {} events (full: {}; incomplete tail: {})",
+        status.installation.usage.early_bypasses,
+        status.installation.usage.early_bypass_ledger_full,
+        status.installation.usage.early_bypass_incomplete_tail
+    );
+    for (reason, count) in &status.installation.usage.early_bypass_reasons {
+        println!("      {reason}: {count}");
+    }
     for issue in &status.installation.issues {
         println!("    issue: {issue}");
     }

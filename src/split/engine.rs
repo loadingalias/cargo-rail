@@ -45,6 +45,7 @@ pub struct SplitOwnership {
 ///
 /// Distinct from `config::SplitConfig` which is the deserialized config schema.
 /// This struct holds computed/resolved values needed to execute the split.
+#[derive(Debug)]
 pub struct SplitParams {
     /// Name of the crate being split
     pub crate_name: String,
@@ -114,6 +115,7 @@ struct CommitParams<'a> {
 ///
 /// Deterministic git splitting: same input = same commit SHAs
 /// Uses WorkspaceContext for git and cargo operations - no duplicate loads.
+#[derive(Debug)]
 pub struct SplitEngine<'a> {
     ctx: &'a WorkspaceContext,
     transform: CargoTransform,

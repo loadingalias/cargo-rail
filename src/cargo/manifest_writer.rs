@@ -10,6 +10,7 @@ use crate::toml::format::TomlFormatter;
 use std::path::Path;
 
 /// Writes changes to Cargo.toml files
+#[derive(Debug)]
 pub struct ManifestWriter {
     formatter: TomlFormatter,
 }

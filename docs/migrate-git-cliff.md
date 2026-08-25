@@ -1,13 +1,11 @@
 # Migrate from git-cliff or release-plz
 
-Cargo-Rail combines bump selection, graph-attributed changelogs, dependency-ordered publishing, tags, forge releases, and
-reviewed change files in one release engine. It uses fixed changelog placeholders and groups instead of git-cliff's
-Tera templates.
+Cargo-Rail combines bump selection, graph-attributed changelogs, dependency-ordered publishing, tags, forge releases,
+and reviewed change files. It uses fixed placeholders and groups instead of git-cliff's Tera templates.
 
-The mappings below start in commit-driven compatibility mode (`source = "commits"`) so the existing
-conventional-commit workflow continues to select bumps and prose. Move to the default reviewed-changes mode after the
-generated plan matches the current release. Commit mode reconstructs intent from history; changes mode records intent
-in `.changes/*.md` while the code is reviewed.
+Start in commit-driven compatibility mode (`source = "commits"`) so conventional commits continue to select bumps and
+prose. Move to reviewed changes after Cargo-Rail's plan matches the current release. Commit mode reconstructs intent
+from history; changes mode records intent in `.changes/*.md` during review.
 
 ## Migration path
 
@@ -92,8 +90,7 @@ group_order = ["breaking", "sec", "feat", "fix", "deps", "other"]
 
 ## Templates
 
-git-cliff uses Tera templates. Cargo-Rail intentionally does not. Use the
-fixed placeholder format instead:
+Cargo-Rail does not run Tera templates. Use fixed placeholders:
 
 | git-cliff value             | Cargo-Rail placeholder |
 | --------------------------- | ---------------------- |
@@ -113,8 +110,7 @@ cargo rail change add rail-core --bump minor --message "Added graph-aware releas
 
 ## Paths
 
-Do not migrate git-cliff monorepo path globs directly as the primary model.
-Cargo-Rail attributes commits through the workspace graph:
+Do not make git-cliff path globs the primary model. Cargo-Rail attributes commits through the workspace graph:
 
 1. changed file resolves to its owning crate,
 2. a conventional-commit scope matching a crate name narrows attribution,
@@ -128,8 +124,7 @@ include_paths = ["crates/*/src/**"]
 exclude_paths = ["crates/*/benches/**"]
 ```
 
-Filters are authoritative: a commit scope can claim an otherwise
-unattributed commit, but never one whose files the filters excluded.
+Filters are authoritative. A commit scope can claim an unattributed commit, but not one excluded by path filters.
 
 ## release-plz mapping
 
@@ -162,8 +157,6 @@ cargo rail release check --all --extended
 In commit mode, `--bump auto --all` releases only crates with release-worthy changes. Everything else is listed under
 `Skipped:` with the reason and the tag range it was measured against.
 
-`release check --extended` uses an installed `cargo-semver-checks` binary when
-available. It is never added as a cargo-rail dependency. An inconclusive run
-(for example a first release with no published baseline) reports as skipped.
-A confirmed breaking change validates the selected bump and blocks when the
-declared signal is insufficient; it never silently escalates a release.
+`release check --extended` uses an installed `cargo-semver-checks` binary when available; Cargo-Rail does not depend
+on it. An inconclusive run, such as a first release without a published baseline, reports as skipped. A confirmed
+breaking change validates the selected bump and blocks an insufficient bump. It does not escalate the release.

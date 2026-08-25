@@ -23,6 +23,7 @@ use std::path::PathBuf;
 /// - Crate metadata (path, proc-macro status)
 /// - Dependency information from the graph
 /// - File-to-crate mapping
+#[derive(Debug)]
 pub struct WorkspaceView<'a> {
     ctx: &'a WorkspaceContext,
 }

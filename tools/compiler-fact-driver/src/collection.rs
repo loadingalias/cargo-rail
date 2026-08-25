@@ -756,7 +756,7 @@ fn written_visibility(
         "pub(crate)" => (CompilerFactVisibility::Crate, true),
         visibility if visibility.starts_with("pub(") && visibility.ends_with(')') => match tcx.local_visibility(def_id)
         {
-            ty::Visibility::Restricted(scope) if scope == CRATE_DEF_ID => {
+            ty::Visibility::Restricted(scope) if is_crate_scope(scope) => {
                 (CompilerFactVisibility::RestrictedCrateRoot, true)
             }
             ty::Visibility::Restricted(scope) => (
@@ -772,9 +772,19 @@ fn written_visibility(
 fn fact_visibility(tcx: TyCtxt<'_>, visibility: ty::Visibility) -> CompilerFactVisibility {
     match visibility {
         ty::Visibility::Public => CompilerFactVisibility::Public,
-        ty::Visibility::Restricted(scope) if scope == CRATE_DEF_ID => CompilerFactVisibility::Crate,
+        ty::Visibility::Restricted(scope) if is_crate_scope(scope) => CompilerFactVisibility::Crate,
         ty::Visibility::Restricted(scope) => CompilerFactVisibility::Restricted(item_id(tcx, scope.to_def_id())),
     }
+}
+
+#[cfg(not(cargo_rail_rustc_local_mod_id))]
+fn is_crate_scope(scope: LocalDefId) -> bool {
+    scope == CRATE_DEF_ID
+}
+
+#[cfg(cargo_rail_rustc_local_mod_id)]
+fn is_crate_scope(scope: rustc_hir::def_id::LocalModId) -> bool {
+    LocalDefId::from(scope) == CRATE_DEF_ID
 }
 
 fn entry_point_kind(invocation: &CompilerFactInvocation) -> CompilerFactEntryPointKind {

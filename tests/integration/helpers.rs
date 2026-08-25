@@ -25,6 +25,36 @@ pub fn finish_test(result: Result<()>) {
     assert_eq!(result.map_err(|error| format!("{error:#}")), Ok(()));
 }
 
+fn null_device() -> &'static str {
+    if cfg!(windows) { "NUL" } else { "/dev/null" }
+}
+
+/// Build a cargo-rail command isolated from the developer's Cargo and Git configuration.
+pub fn cargo_rail_command(cwd: &Path) -> Result<Command> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-rail"));
+    command
+        .current_dir(cwd)
+        .env("CARGO_RAIL_CACHE_DIR", cwd.join("target/cargo-rail-test-cache"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", null_device())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
+        .env("GIT_CONFIG_VALUE_0", "false")
+        .env("GIT_CONFIG_KEY_1", "tag.gpgsign")
+        .env("GIT_CONFIG_VALUE_1", "false");
+    Ok(command)
+}
+
+/// Isolate cache-management commands from a real cargo-rail installation receipt.
+pub fn isolated_cargo_rail_command(cwd: &Path) -> Result<Command> {
+    let cargo_home = cwd.join("target/cargo-rail-test-cargo-home");
+    std::fs::create_dir_all(&cargo_home)?;
+    let mut command = cargo_rail_command(cwd)?;
+    command.env("CARGO_HOME", cargo_home);
+    Ok(command)
+}
+
 /// A test workspace with git history
 pub struct TestWorkspace {
     _root: TempDir,
@@ -394,6 +424,9 @@ edition.workspace = true
 pub fn git(cwd: &Path, args: &[&str]) -> Result<Output> {
     let output = Command::new("git")
         .current_dir(cwd)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", null_device())
+        .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CONFIG_COUNT", "2")
         .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
         .env("GIT_CONFIG_VALUE_0", "false")
@@ -419,18 +452,12 @@ pub fn run_cargo_rail(cwd: &Path, args: &[&str]) -> Result<Output> {
 
 /// Run cargo-rail with explicit environment overrides.
 pub fn run_cargo_rail_with_env(cwd: &Path, args: &[&str], environment: &[(&str, &str)]) -> Result<Output> {
-    let cargo_rail_bin = env!("CARGO_BIN_EXE_cargo-rail");
-
-    let mut command = Command::new(cargo_rail_bin);
-    command
-        .current_dir(cwd)
-        .env("GIT_CONFIG_COUNT", "2")
-        .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
-        .env("GIT_CONFIG_VALUE_0", "false")
-        .env("GIT_CONFIG_KEY_1", "tag.gpgsign")
-        .env("GIT_CONFIG_VALUE_1", "false")
-        .env("CARGO_RAIL_CACHE_DIR", cwd.join("target/cargo-rail-test-cache"))
-        .args(args);
+    let mut command = if matches!(args.get(1), Some(&"cache" | &"clean")) {
+        isolated_cargo_rail_command(cwd)?
+    } else {
+        cargo_rail_command(cwd)?
+    };
+    command.args(args);
     for (name, value) in environment {
         command.env(name, value);
     }

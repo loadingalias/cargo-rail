@@ -11,7 +11,6 @@ case "$profile" in
 esac
 
 readonly CARGO_DENY_VERSION=0.20.2
-readonly CARGO_AUDIT_VERSION=0.22.2
 readonly HYPERFINE_VERSION=1.20.0
 readonly SCCACHE_VERSION=0.17.0
 readonly JQ_VERSION=1.8.2
@@ -337,36 +336,6 @@ install_cargo_deny() {
     "$asset" "$digest" "cargo-deny-$CARGO_DENY_VERSION-$archive_target/$binary" "$binary"
 }
 
-install_cargo_audit() {
-  local archive_target asset binary digest
-  case "$rust_host" in
-    x86_64-unknown-linux-gnu)
-      archive_target=x86_64-unknown-linux-gnu
-      asset="cargo-audit-$archive_target-v$CARGO_AUDIT_VERSION.tgz"
-      binary=cargo-audit
-      digest="ab28a1bdb54db4d5d8ad5981cf1f959410370b3d28250dbd35f6a44248620e39"
-      ;;
-    aarch64-unknown-linux-gnu)
-      archive_target=aarch64-unknown-linux-gnu
-      asset="cargo-audit-$archive_target-v$CARGO_AUDIT_VERSION.tgz"
-      binary=cargo-audit
-      digest="c6603814ddaa45e51263dafd31c0ac98808f688d26f7395804f9670b0fd599dd"
-      ;;
-    x86_64-pc-windows-msvc)
-      archive_target=x86_64-pc-windows-msvc
-      asset="cargo-audit-$archive_target-v$CARGO_AUDIT_VERSION.zip"
-      binary=cargo-audit.exe
-      digest="0a7316540862c13d954f648917ceacca593747baed6eec180fafa590be2710ab"
-      ;;
-    *)
-      install_cargo_tool cargo-audit "$CARGO_AUDIT_VERSION" cargo-audit
-      return
-      ;;
-  esac
-  install_release_binary cargo-audit "$CARGO_AUDIT_VERSION" RustSec/rustsec "cargo-audit/v$CARGO_AUDIT_VERSION" \
-    "$asset" "$digest" "cargo-audit-$archive_target-v$CARGO_AUDIT_VERSION/$binary" "$binary"
-}
-
 install_jq() {
   if command -v jq >/dev/null 2>&1 && [[ "$(jq --version)" == "jq-$JQ_VERSION" ]]; then
     echo "jq $JQ_VERSION is already installed"
@@ -422,20 +391,16 @@ case "$profile" in
   *-ci)
     install_cargo_nextest
     install_cargo_deny
-    install_cargo_audit
     cargo nextest --version
     cargo deny --version
-    cargo audit --version
     ;;
   native-cache-qualification)
     install_cargo_nextest
     install_cargo_deny
-    install_cargo_audit
     install_hyperfine
     install_sccache
     cargo nextest --version
     cargo deny --version
-    cargo audit --version
     hyperfine --version
     sccache --version
     ;;
@@ -444,12 +409,10 @@ case "$profile" in
     # client, scheduler, and server release on the same bounded topology.
     install_cargo_nextest
     install_cargo_deny
-    install_cargo_audit
     install_sccache
     install_sccache_dist
     cargo nextest --version
     cargo deny --version
-    cargo audit --version
     sccache --version
     sccache-dist --version
     ;;
@@ -458,10 +421,8 @@ case "$profile" in
     # by `just check` and `just test-all` before measurements are retained.
     install_cargo_nextest
     install_cargo_deny
-    install_cargo_audit
     cargo nextest --version
     cargo deny --version
-    cargo audit --version
     ;;
   bench | *-bench)
     install_hyperfine
@@ -472,11 +433,9 @@ case "$profile" in
   *)
     install_cargo_nextest
     install_cargo_deny
-    install_cargo_audit
     install_hyperfine
     install_sccache
     cargo deny --version
-    cargo audit --version
     cargo nextest --version
     hyperfine --version
     sccache --version

@@ -26,7 +26,7 @@ use std::sync::Arc;
 ///
 /// Provides cargo metadata and workspace information.
 /// This is built once and shared across all commands via WorkspaceContext.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct CargoState {
     /// Underlying cargo metadata
     metadata: Arc<Metadata>,
@@ -268,6 +268,17 @@ impl CargoState {
         package.publish.as_ref().map(|p| !p.is_empty()).unwrap_or(true)
     }
 
+    /// Return whether Cargo permits publishing this package to `registry`.
+    ///
+    /// An omitted `package.publish` permits every registry. An explicit list
+    /// is a hard upper bound; repository policy cannot widen it.
+    pub fn package_allows_registry(package: &Package, registry: &str) -> bool {
+        package
+            .publish
+            .as_ref()
+            .is_none_or(|registries| registries.iter().any(|candidate| candidate == registry))
+    }
+
     /// Check if a workspace member is binary-only (has `[[bin]]` targets but no library target).
     ///
     /// This is used by planner/executor flows to optionally skip crates
@@ -407,7 +418,7 @@ fn compute_workspace_hash_with_members(workspace_root: &Path, metadata: &Metadat
 ///
 /// Provides git operations scoped to the workspace repository.
 /// This is built once and shared across all commands via WorkspaceContext.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct GitState {
     /// Underlying git backend
     git: SystemGit,
@@ -467,6 +478,7 @@ impl GitState {
 ///
 /// Uses Arc for efficient sharing across threads and parallel operations.
 /// Cloning is extremely cheap (just increments Arc refcounts).
+#[derive(Debug)]
 pub struct WorkspaceContext {
     /// Cargo workspace root (`Cargo.toml` location).
     ///

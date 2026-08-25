@@ -82,6 +82,7 @@ use crate::workspace::WorkspaceContext;
 use std::path::{Path, PathBuf};
 
 /// Result of attempting to dispatch a command without building WorkspaceContext.
+#[derive(Debug)]
 #[doc(hidden)]
 pub enum PreContextDispatch {
     /// The command ran and the process should exit.
@@ -91,6 +92,7 @@ pub enum PreContextDispatch {
 }
 
 /// A command paired with the context-construction contract it requires.
+#[derive(Debug)]
 #[doc(hidden)]
 pub struct PreparedContext {
     command: Box<Commands>,
@@ -265,6 +267,9 @@ pub fn try_dispatch_pre_context(
                     format,
                 } => cache::run_normalize(&url, mode.as_deref(), environment, format)?,
                 cli::CacheCommand::Status { scope, format } => cache::run_status(workspace_root, scope, format)?,
+                cli::CacheCommand::Recover { check, format } => {
+                    cache::run_recover(workspace_root, check, format)?;
+                }
                 cli::CacheCommand::Clean { scope, check, format } => {
                     cache::run_clean(workspace_root, scope, check, format)?;
                 }
@@ -348,6 +353,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
         ),
 
         Commands::Surface {
+            prepare,
             check,
             fix,
             dry_run,
@@ -360,6 +366,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
         } => run_surface(
             ctx,
             SurfaceOptions {
+                prepare,
                 check,
                 fix,
                 dry_run,
@@ -516,6 +523,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
                 bump,
                 check,
                 plan,
+                publish,
                 skip_publish,
                 skip_tag,
                 pr,
@@ -529,8 +537,9 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
                     Some(crate_names)
                 };
 
+                let publish = publish && !skip_publish;
                 if check {
-                    run_release_plan(ctx, names, bump, skip_publish, skip_tag, include_dependents, format)
+                    run_release_plan(ctx, names, bump, publish, skip_tag, include_dependents, format)
                 } else {
                     run_release_publish(
                         ctx,
@@ -538,7 +547,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
                             crate_names: names,
                             all,
                             bump,
-                            skip_publish,
+                            publish,
                             skip_tag,
                             pr,
                             include_dependents,
@@ -566,6 +575,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
             cli::ReleaseCommand::Finalize {
                 crate_names,
                 all,
+                publish,
                 skip_publish,
                 skip_tag,
                 include_dependents,
@@ -582,7 +592,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
                     release::ReleaseFinalizeOptions {
                         crate_names: names,
                         all,
-                        skip_publish,
+                        publish: publish && !skip_publish,
                         skip_tag,
                         include_dependents,
                         yes,

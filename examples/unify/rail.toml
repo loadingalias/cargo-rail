@@ -1,16 +1,18 @@
-# Unify policy: every entry differs from cargo-rail's coded defaults.
+# Complete dependency policy. Remove fields your workspace does not need.
 
 [unify]
+include_paths = true
 include_renamed = true
-major_version_conflict = "bump"
-msrv_policy = { mode = "compute", source = "workspace", inherit = true }
-
-# Enable only when this private workspace is the complete consumer graph.
-consumer_scope = "workspace"
-preserve_features = ["unstable-*", "bench*"]
-
-# Fragmented transitive feature pins require an explicit host.
-transitive_pinning = { host = "root" }
-
-# Workspace-member cohorts remain atomic when these safety hatches are used.
+include = ["serde"]
 exclude = ["platform-specific-dep"]
+strict_version_compat = true
+exact_pin_handling = "warn" # skip | preserve | warn
+major_version_conflict = "warn" # warn | bump
+transitive_pinning = { host = "root" }
+msrv_policy = { mode = "compute", source = "workspace", inherit = true }
+consumer_scope = "open" # use workspace only for a closed private consumer graph
+preserve_features = ["unstable-*", "bench*"]
+skip_undeclared_patterns = ["default", "std", "alloc", "*_backend", "*_impl"]
+max_backups = 3
+compiler_artifact_soft_limit_bytes = 34359738368
+compiler_artifact_hard_limit_bytes = 68719476736

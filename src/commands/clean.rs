@@ -62,7 +62,7 @@ pub fn run_clean(
     let delete_all_backups = clean_all;
 
     let cache_status = (check && clean_cache)
-        .then(|| crate::cache::status(ctx.workspace_root(), true, true))
+        .then(|| crate::cache::status(ctx.workspace_root(), true, false))
         .transpose()?;
 
     // Collect artifacts to clean
@@ -82,9 +82,7 @@ pub fn run_clean(
     if clean_all {
         collect_release_journal_artifacts(ctx, &mut artifacts)?;
     }
-    // Combined apply preserves the historical local+workspace behavior. Validate
-    // the entire workspace scope before deleting the shared CAS so a hostile
-    // workspace path cannot produce an avoidable partial cleanup.
+    // Validate the complete workspace-owned cache scope before deleting any of it.
     if !check && clean_cache {
         crate::cache::status(ctx.workspace_root(), true, false)?;
     }
@@ -121,13 +119,7 @@ pub fn run_clean(
             }
             if let Some(status) = &cache_status {
                 let workspace_bytes = status.workspace.as_ref().map_or(0, |workspace| workspace.bytes);
-                let local_bytes = status
-                    .local
-                    .as_ref()
-                    .and_then(|local| local.cache.as_ref())
-                    .map_or(0, |cache| cache.bytes);
                 println!("\n  workspace cache bytes: {workspace_bytes}");
-                println!("  shared local CAS bytes: {local_bytes} (affects other workspaces)");
             }
             for path in &artifacts.report_files {
                 println!("  {}", path);
@@ -202,9 +194,6 @@ fn collect_cache_artifacts(status: &crate::cache::CacheStatus, artifacts: &mut C
                 .filter(|artifact| artifact.kind != "workspace_cache_lock")
                 .map(|artifact| artifact.path.clone()),
         );
-    }
-    if let Some(local) = status.local.as_ref().and_then(|local| local.cache.as_ref()) {
-        artifacts.cache_files.push(local.root.clone());
     }
 }
 
@@ -313,8 +302,7 @@ fn clean_release_journals(paths: &[String]) -> RailResult<Vec<String>> {
 
 fn clean_cache_files(ctx: &WorkspaceContext) -> RailResult<Vec<String>> {
     progress!("removing validated cache state...");
-    let mut removal = crate::cache::remove_local(ctx.workspace_root())?;
-    removal.extend(crate::cache::remove_workspace(ctx.workspace_root())?)?;
+    let removal = crate::cache::remove_workspace(ctx.workspace_root())?;
     Ok(removal.paths)
 }
 

@@ -935,6 +935,7 @@ pub fn run_unify_doctor(ctx: &WorkspaceContext, format: UnifyOutputFormat) -> Ra
 }
 
 /// Prepared options for dependency-coherence check mode.
+#[derive(Debug)]
 #[doc(hidden)]
 pub struct UnifyAnalyzeOptions<'a> {
     pub(crate) show_diff: bool,

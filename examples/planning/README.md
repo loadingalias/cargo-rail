@@ -1,37 +1,26 @@
-# Planner Scope Examples
+# Affected CI
 
 Choose the direct consumer:
 
 - [`with-task-runner/`](with-task-runner/) for `just`, `make`, `xtask`, or scripts
 - [`standalone/`](standalone/) for Cargo and cargo-nextest
 
-## Quick start
+Inspect scope without running work:
 
 ```bash
 cargo rail plan --merge-base --explain
-cargo nextest run --workspace
 ```
 
-`scope` contains the Cargo package selection. `impact` explains how changed crates and dependents produced that selection.
+`scope` contains the Cargo package selection. `impact` explains how changed crates and dependents produced it.
 
-## Config shape
-
-```toml
-[change-detection]
-confidence_profile = "balanced"
-
-[change-detection.custom]
-benchmarks = ["benches/**", "perf/**"]
-```
-
-## Validate
+Validate both policy files from the repository root:
 
 ```bash
-cargo rail config validate --strict
-cargo rail plan --merge-base --explain
+cargo rail --config examples/planning/standalone/rail.toml config validate --strict
+cargo rail --config examples/planning/with-task-runner/rail.toml config validate --strict
 ```
 
 ## See also
 
-- [Configuration Reference](../../docs/config.md)
-- [Planning Guide](../../docs/planning.md)
+- [Configuration reference](../../docs/config.md#change-detection)
+- [Planning guide](../../docs/planning.md)

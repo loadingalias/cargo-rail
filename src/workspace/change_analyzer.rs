@@ -110,6 +110,7 @@ impl ImpactReport {
 }
 
 /// Graph-aware change impact analyzer
+#[derive(Debug)]
 pub struct ChangeImpact<'a> {
     ctx: &'a WorkspaceContext,
 }

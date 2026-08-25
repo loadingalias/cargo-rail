@@ -28,7 +28,7 @@ pub(crate) struct ExecutableIdentity {
 }
 
 /// Executables captured once for one immutable workspace snapshot.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct ToolchainExecutableIdentities {
     cargo: ExecutableIdentity,
     rustc: ExecutableIdentity,

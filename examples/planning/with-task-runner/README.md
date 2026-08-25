@@ -1,13 +1,16 @@
 # Planning and Execution: With Task Runner
 
-Use this pattern when your repo already has `just`, `make`, `xtask`, or scripts.
+Use this pattern when your repository already has `just`, `make`, `xtask`, or scripts. Cargo-Rail emits surface scope;
+the task runner maps it to repository-specific commands.
 
-Cargo-Rail emits crate and surface scope. The task runner maps that scope to repository-specific commands.
+```bash
+cargo rail --config examples/planning/with-task-runner/rail.toml config validate --strict
+```
 
 ## Local example
 
 ```bash
-PLAN=$(cargo rail plan --merge-base -f json)
+PLAN=$(cargo rail --config examples/planning/with-task-runner/rail.toml plan --merge-base -f json)
 TEST_SCOPE=$(echo "$PLAN" | jq -c '.surfaces.test.scope')
 
 if echo "$PLAN" | jq -e '.surfaces.test.enabled' > /dev/null; then
@@ -26,7 +29,7 @@ fi
   id: rail
   with:
     mode: debug
-    version: 0.22.1
+    version: 0.22.3
 
 - name: Run targeted tests
   if: steps.rail.outputs.test == 'true'
@@ -42,4 +45,4 @@ fi
     fi
 ```
 
-Use the selected surface's `scope` for execution. Do not rebuild execution scope from `impact`.
+Execute the selected surface's `scope`. Do not reconstruct it from `impact`.

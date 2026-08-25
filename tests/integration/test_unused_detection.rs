@@ -96,6 +96,10 @@ pub fn hello() -> u8 {
             stdout,
             stderr
         );
+        assert!(
+            !stderr.contains("Compiler evidence plan:"),
+            "source-retained declarations must not schedule compiler work whose result cannot affect Unify\nstderr:\n{stderr}"
+        );
 
         Ok(())
     })();
@@ -501,6 +505,56 @@ log = "0.4"
 }
 
 #[test]
+fn test_unused_detection_stops_on_failed_required_cargo_view() {
+    let result: Result<()> = (|| {
+        let workspace = create_workspace_with_unused_detection()?;
+        add_crate_with_manifest(
+            &workspace,
+            "test-crate",
+            r#"[package]
+name = "test-crate"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+log = "0.4"
+"#,
+        )?;
+        fs::write(
+            workspace.path.join("crates/test-crate/src/lib.rs"),
+            "pub fn broken( {\n",
+        )?;
+        workspace.commit("Add uncompilable dependency candidate")?;
+
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--explain"])?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "a failed required Cargo view must be an operational error\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("compiler-evidence Cargo acquisition failed"),
+            "the exact failed authority was not reported:\n{stderr}"
+        );
+        assert_eq!(
+            stderr.matches("Collecting compiler evidence for target").count(),
+            1,
+            "Unify continued after its proof was already impossible:\n{stderr}"
+        );
+        assert!(
+            !stdout.contains("Unification Plan") && !stdout.contains("Remove log"),
+            "failed compiler evidence escaped as a semantic result:\n{stdout}"
+        );
+
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
 fn test_unused_detection_single_crate_issue_11_repro() {
     let result: Result<()> = (|| {
         // Repro from GH issue #11:
@@ -654,12 +708,25 @@ pub fn hello() {}
 
         let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
 
         // log is a real dep present on both targets - should NOT be flagged
         assert!(
             !stdout.contains("log") || !stdout.contains("Unused"),
             "log should NOT be flagged (present in resolved graph)\nOutput:\n{}",
             stdout
+        );
+        assert!(
+            !workspace.path.join("target/cargo-rail/compiler-artifacts-v1").exists(),
+            "multi-target Unify retained a Cargo working set"
+        );
+        assert!(
+            !workspace.path.join("target/debug").exists(),
+            "compiler evidence escaped into the workspace Cargo target directory"
+        );
+        assert!(
+            !stderr.contains("Compiler evidence plan:"),
+            "source-retained multi-target declarations scheduled compiler work whose result cannot affect Unify:\n{stderr}"
         );
 
         Ok(())
@@ -1034,17 +1101,16 @@ required-features = ["example-gate"]
         workspace.commit("Use dependency from a required-features example")?;
 
         let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--explain"])?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             !String::from_utf8_lossy(&output.stdout).contains("Remove log"),
             "required-features Cargo targets must contribute usage evidence\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        let cache = compiler_evidence_cache(&workspace.path)?;
-        let encoded_cache = serde_json::to_string(&cache)?;
         assert!(
-            encoded_cache.contains("example-gate"),
-            "the evidence cache should retain the required feature configuration\n{encoded_cache}"
+            !stderr.contains("Compiler evidence plan:"),
+            "captured source retention made the compiler result irrelevant, but Unify still scheduled it:\n{stderr}"
         );
 
         Ok(())

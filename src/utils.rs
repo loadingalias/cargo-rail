@@ -926,7 +926,7 @@ mod tests {
             .expect("filler file");
         let mut block = vec![0_u8; 1024 * 1024];
         let mut state = 0x9e37_79b9_7f4a_7c15_u64;
-        for chunk in block.chunks_exact_mut(8) {
+        for chunk in block.as_chunks_mut::<8>().0 {
             state ^= state << 7;
             state ^= state >> 9;
             state ^= state << 8;

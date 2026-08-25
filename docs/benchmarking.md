@@ -2,10 +2,9 @@
 
 ## Source-surface analysis
 
-`cargo rail surface` and Hawk both instrument rustc and merge declaration graphs, so a useful comparison must bind the
-same source commit, compiler identity, production products, feature profiles, target, doctest packages, lint policy,
-output sink, and cache state. Compare cold with cold and repeated with repeated; do not present a compiler-fact cache
-hit against a cold Hawk target directory as an implementation-speed result.
+Compare `cargo rail surface` and Hawk with the same source commit, compiler identity, production products, feature
+profiles, target, doctest packages, lint policy, output sink, and cache state. Compare cold with cold and repeated with
+repeated. A Cargo-Rail fact hit against a cold Hawk target is not an implementation-speed result.
 
 The acquisition model predicts subprocess work before measurement. For one feature/target view, let `P` be the number
 of configured production products and `D` the number of selected doctest package passes:
@@ -15,15 +14,14 @@ of configured production products and `D` the number of selected doctest package
 | Cargo-Rail         |                      1 |            `D` |                       `1 + D` |
 | Reference analyzer |                `P + 1` |            `D` |                   `P + 1 + D` |
 
-Cargo-Rail classifies production and non-production units from one all-targets compiler acquisition instead of
-rebuilding the shared dependency graph once per product. This guarantees fewer Cargo acquisition views when `P > 0`,
-but it does not guarantee a wall-time ratio: dependency freshness, linker work, doctest count, compiler-fact cache
-eligibility, process scheduling, and output volume can dominate.
+Cargo-Rail classifies production and non-production units from one all-targets compiler acquisition. It uses fewer
+Cargo acquisition views when `P > 0`, but this does not guarantee a wall-time ratio. Dependency freshness, linking,
+doctests, cache eligibility, scheduling, and output volume can dominate.
 
-The checked-in qualification authority is `tests/surface-reference.json`. It binds Hawk 0.1.13 as the reference by commit and archive
-digest, Rust 1.98.0, the host target, two shipped products, the all-features profile, the doctest package set, lint
-policy, focused binary and internal-library cases, and exact difference allowlists. Run it against an extracted native
-Cargo-Rail archive so the adjacent compiler-fact driver is part of the measurement:
+`tests/surface-reference.json` is the qualification authority. It binds Hawk 0.1.13 by commit and archive digest, Rust
+1.98.0, the host target, two shipped products, all features, doctest packages, lint policy, focused cases, and exact
+difference allowlists. Run it against an extracted native Cargo-Rail archive so the measurement includes the adjacent
+compiler-fact driver:
 
 ```bash
 scripts/ci/qualify-surface-reference.py \
@@ -48,15 +46,13 @@ compiler invocation count, fact-cache outcome, and exit code. `identity.json` bi
 fixture tree, tool and driver bytes, compiler, Cargo, host, target, profiles, doctests, and output sink. `summary.json`
 reports p50/p95 without deleting a slow, noisy, or failed corpus.
 
-Do not compare Hawk's Cargo-fresh measurement with a Cargo-Rail fact hit as an implementation-speed result. A public
-“2x faster” claim additionally requires equivalent cold Cargo-Rail p50 and p95 at or below 50% of Hawk on the retained
-corpus. If that bound does not pass, report the measured result plainly or publish no speed claim.
+A “2x faster” claim requires equivalent cold Cargo-Rail p50 and p95 at or below 50% of Hawk on the retained corpus. If
+the bound fails, report the measured result without the speed claim.
 
-The native-cache workflow measures transparent local activation under direct Cargo. Runner-owned cache lanes are
-retired because they are not part of the compiler-cache architecture. The harness deliberately leaves remote cache
-activation disabled: it establishes the L0/L1 baseline, not official S3 correctness or performance.
+The native-cache workflow measures transparent local activation under direct Cargo. It excludes retired runner-owned
+lanes and remote activation. This establishes the L0/L1 baseline, not S3 correctness or performance.
 
-## Questions measured separately
+## Native cache lanes
 
 The real-world fixture runs `cargo check`, `cargo build --release`, and `cargo test --no-run --all-targets` in
 deterministic interleaved lane order:
@@ -73,20 +69,19 @@ deterministic interleaved lane order:
 | `sccache-client`          | empty        | warm pinned client-side sccache      | Specialist daemonless baseline |
 | `transparent-incremental` | empty        | installed L1, incremental forced     | Unsupported early bypass       |
 
-Each lane has an isolated Cargo home and cache authority below the result directory. Setup is performed through
-`cargo rail cache setup`; the developer's Cargo configuration is never read or changed as installation authority.
-Registry and Git dependency stores may be linked read-only from the invoking Cargo home on platforms that support
-links, but configuration, receipt, wrapper, sessions, ledgers, CAS, target directories, and sccache data remain
-isolated.
+Each lane has an isolated Cargo home and cache authority below the result directory. Setup uses
+`cargo rail cache setup`; the developer's Cargo configuration is not installation authority. Supported platforms may
+link registry and Git dependency stores read-only from the invoking Cargo home. Configuration, receipts, wrappers,
+sessions, ledgers, CAS, target directories, and sccache data remain isolated.
 
-## Run the 20-sample local qualification corpus
+## Local qualification
 
 ```bash
 just bench-native-cache-smoke
 ```
 
-One accepted sample per lane checks orchestration, exact lane-local authoritative output bytes, expected cache outcomes,
-zero false hits, and reporting. It is not performance qualification.
+One accepted sample per lane checks orchestration, output bytes, expected cache outcomes, zero false hits, and
+reporting. It does not qualify performance.
 
 Run the canonical interleaved qualification corpus next:
 
@@ -99,21 +94,20 @@ just bench-native-cache 20
   is 15%); and
 - every accepted sample has exact outputs, an explicit cache outcome, and zero ambiguity or false hits.
 
-Twenty accepted samples per lane are the canonical qualification unit. A reviewed anomaly may use at most 30, but a
-failed corpus remains useful evidence: retain it, profile the failing lane when further optimization is justified, and
-make no superiority claim. Do not expand the sample count merely to average away a missed bound.
+Twenty accepted samples per lane form one qualification corpus. A reviewed anomaly may use at most 30. Retain a
+failed corpus, profile its failing lane if justified, and make no superiority claim. Do not increase the sample count
+to average away a missed bound.
 
-## Qualify remote providers separately
+## Remote provider qualification
 
-Remote correctness qualification uses a disposable real provider authority and independent roots with empty local
-caches. AWS S3, Azure Blob Storage, and Cloudflare R2 must each prove producer/consumer import, conditional
-publication, read-only operation, a subsequent valid L1 hit with no remote request, exact outputs, and cold fallback
-for absence, corruption, and outage. Provider credentials stay outside retained evidence, and cleanup must verify the
-exact disposable prefix, multipart uploads, and provider resources are absent.
+Remote correctness uses a disposable provider authority and independent roots with empty local caches. AWS S3, Azure
+Blob Storage, and Cloudflare R2 must each prove producer/consumer import, conditional publication, read-only operation,
+a subsequent L1 hit without a remote request, exact outputs, and cold fallback for absence, corruption, and outage.
+Retained evidence excludes credentials. Cleanup verifies the disposable prefix, multipart uploads, and provider
+resources are absent.
 
-The retained direct-provider harness has a historical S3 name but accepts normalized AWS S3, Azure Blob, and R2 URLs.
-One guarded fault harness preserves each provider's CLI, endpoint, and credential authority; cleanup remains
-provider-specific:
+The direct-provider harness retains a historical S3 name but accepts normalized AWS S3, Azure Blob, and R2 URLs. One
+fault harness preserves each provider's CLI, endpoint, and credential authority. Cleanup remains provider-specific:
 
 ```bash
 just qualify-native-cache-s3 <producer|consumer> <run-id> <remote-url>
@@ -144,18 +138,17 @@ interrupted outage assertion without repeating the destructive corruption and ab
 exact Task 9 Cargo-Rail or comparison-sccache namespace, and R2 cleanup accepts only the exact Task 9 Cargo-Rail
 namespace.
 
-### Qualify official S3 performance separately
+### S3 performance
 
 Remote performance qualification uses a disposable real AWS S3 authority and independent machines with empty local
 caches.
 
-Do not treat this local harness, a loopback protocol test, or an SDK mock as remote performance evidence. A remote
-comparison must interleave empty-L1 S3 import with the accepted pinned remote sccache lane and retain 20–30 accepted
-samples for each workload and lane. Twenty rounds produce 120 accepted samples across the three workloads and two
-lanes; the harness permits at most 30 rounds only for a reviewed anomaly. The target is at least 15% faster at both
-p50 and p95. At least 10% at both percentiles is an accepted win; below 10% is an availability result, not superiority.
-Every accepted claim also requires zero false hits, strict containment of sccache's safe Rust hits, and reported
-bytes, requests, CPU, memory, eligibility, conflicts, and operational requirements.
+A local harness, loopback test, or SDK mock is not remote performance evidence. Interleave empty-L1 S3 import with the
+pinned remote sccache lane and retain 20–30 samples per workload and lane. Twenty rounds produce 120 samples across
+three workloads and two lanes; use at most 30 rounds for a reviewed anomaly. The target is 15% faster at p50 and p95.
+At least 10% at both percentiles is an accepted win; below 10% proves availability, not superiority. Claims also
+require zero false hits, strict containment of sccache's safe Rust hits, and reported bytes, requests, CPU, memory,
+eligibility, conflicts, and operational requirements.
 
 ## Evidence layout
 
@@ -206,9 +199,9 @@ just bench-native-cache-resume target/benchmarks/native-cache/<run>
 Resume refuses a changed repository commit or worktree diff. Start a new result after changing source, harness,
 binary, toolchain, host, policy, or cache protocol.
 
-## Correctness is independent
+## Platform qualification
 
-Timing acceptance does not prove compiler-cache correctness. The integration fixture separately proves exact `.d`,
+Timing does not prove compiler-cache correctness. The integration fixture separately proves exact `.d`,
 `.rmeta`, `.rlib`, compiler-owned static archives, Rust and C dynamic libraries, build-script executables, proc-macro
 producers, and linked binary, test, example, and benchmark bytes; diagnostic replay; root isolation; environment and
 linker-input invalidation; L0 no-op behavior; L1 outage fallback; compiler-class boundaries; and same-root
@@ -227,14 +220,14 @@ just qualify-native-cache-native-smoke <target> --execute
 just qualify-native-cache-native <target> 20 --execute
 ```
 
-## Qualification claims
+## Claim requirements
 
-Earlier pre-linked and runner-owned L2 measurements describe different architectures and are not evidence for this
-contract. Publish a scoped local shared-hit superiority claim only from one accepted 20-sample corpus whose summary
-reports `superiority_qualified: true`; `target_qualified` records the 15% target. The broader local performance claim
-also requires `performance_qualified: true`, which includes the L0 and cache-off overhead bounds. Publish a scoped
-remote claim only from the separate real-backend corpus above. Retain a failed corpus as the canonical result for that
-exact worktree and host; do not replace it with a larger population or combine it with another run.
+Pre-linked and runner-owned L2 measurements describe different architectures and do not support this contract. A
+local shared-hit superiority claim requires one accepted 20-sample corpus with `superiority_qualified: true`;
+`target_qualified` records the 15% target. A broader local performance claim also requires
+`performance_qualified: true`, including the L0 and cache-off overhead bounds. A remote claim requires the separate
+real-backend corpus. Retain a failed corpus for its exact worktree and host. Do not replace it with a larger population
+or combine it with another run.
 
 Do not compare absolute timings across hosts or combine distinct commits, worktrees, toolchains, target-state policies,
 physical roots, cache protocols, or machines into one population.

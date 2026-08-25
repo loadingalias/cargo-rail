@@ -1,7 +1,7 @@
 # Troubleshooting
 
-Cargo-Rail records why it selected, skipped, widened, or refused work. Start at the boundary that made the decision;
-do not infer it from the final Cargo command.
+Cargo-Rail records why it selected, skipped, widened, or refused work. Start with that decision, not the final Cargo
+command.
 
 ## Planning selected the wrong work
 
@@ -18,8 +18,8 @@ Read these fields in order:
 4. `surfaces.NAME` — was the relevant surface enabled, and with which reason IDs?
 5. `surfaces.NAME.scope` — which packages belong to that surface?
 
-Use `scope` for combined execution and `surfaces.NAME.scope` for one surface. `impact` is explanation, not an execution
-handoff. Historical `--from/--to` plans widen package work because Cargo cannot resolve an unchecked-out tree.
+Use `scope` for combined execution and `surfaces.NAME.scope` for one surface. `impact` explains the decision; it is not
+execution scope. Historical `--from/--to` plans widen package work because Cargo cannot resolve an unchecked-out tree.
 
 If the plan is right but execution is wrong, inspect the Cargo or nextest command that consumed
 `surfaces.NAME.scope.cargo_args`. Command-specific flags belong to that tool. See [Planning](planning.md).
@@ -37,16 +37,27 @@ bypasses the normal search order.
 
 ## Surface analysis is unavailable or unexpected
 
-If analysis reports that Surface is unavailable, the CLI came from a source installation, `cargo binstall`, or an
-unsupported native archive. `surface --schema` remains available, but analysis requires a supported release archive
-with `cargo-rail-fact-driver` beside the CLI. Use the checksum-verifying installer documented in
-[Installation](../README.md#installation).
+If Surface is unavailable, the CLI came from a core-only source installation, `cargo binstall`, or the musl archive.
+`surface --schema` remains available. Use the complete native install in
+[Installation](../README.md#installation) to install authenticated Surface components.
+
+Prepare the exact workspace-selected toolchain before analysis:
+
+```bash
+cargo rail surface --prepare -f json
+```
+
+The preflight installs the selected rustup toolchain's `rustc-dev` component when absent, resolves either the exact
+prebuilt producer or a deterministic driver built from authenticated offline source, stages and reauthenticates its
+bytes, and emits readiness contract v1. It never changes the user default toolchain. An operational failure names the
+missing toolchain/component or failed authority boundary and exits 2 without starting analysis.
 
 For an unexpected gate or finding, inspect the planner, effective policy, and report authority separately:
 
 ```bash
 cargo rail plan --merge-base -f json | jq '.surfaces.surface'
 cargo rail config explain -f json | jq '.fields[] | select(.path | startswith("surface."))'
+cargo rail surface --prepare -f json
 cargo rail surface --check -f json
 ```
 
@@ -55,10 +66,9 @@ In the report, verify `authority.audited_targets`, `authority.open_targets`, `pr
 `consumer_scope = "workspace"` only when the workspace contains every consumer of its non-publishable internal
 compiler crates.
 
-Warm analysis exposes `metrics.acquisition`: an unchanged exact hit has zero Cargo views and compiler invocations.
-A miss or bypass names its reason and runs the required compiler acquisition instead of trusting incomplete facts.
-Plain `cargo rail surface` reports findings with exit 0; `--check` uses exit 1 for deny findings or configuration
-diagnostics, and operational failures use exit 2.
+Warm analysis reports `metrics.acquisition`. An unchanged exact hit has zero Cargo views and compiler invocations. A
+miss or bypass names its reason and acquires new compiler evidence. Plain `cargo rail surface` reports findings with
+exit 0. `--check` exits 1 for deny findings or configuration diagnostics. Operational failures exit 2.
 
 ## Cache reuse did not happen
 
@@ -80,14 +90,14 @@ cargo rail cache status --scope local --format json
 cargo rail doctor native-cache --format json
 ```
 
-Clearly unsupported shapes execute before session, ledger, or CAS acquisition, so early-bypass totals are not a census
-of rustc. Failure to capture the exact compiler identity, incremental compilation, an ambiguous wrapper, a nonstandard
-target layout, an unsupported compiler class, or incomplete observed input executes normally; it is not a false cache
-hit. A different physical source root has different action authority and compiles its own exact variant.
+Unsupported shapes execute before session, ledger, or CAS acquisition, so early-bypass totals do not count every rustc
+invocation. Missing compiler identity, incremental compilation, an ambiguous wrapper, a nonstandard target layout, an
+unsupported compiler class, or incomplete input evidence executes normally. A different physical source root has
+different action authority and compiles its own variant.
 
-If an installed wrapper must be disabled for one process tree, set `CARGO_RAIL_CACHE=off`. The minimal launcher
-executes the selected compiler chain without starting the cache worker or reading installation context, session state,
-or CAS data and preserves the environment control for the compiler.
+Set `CARGO_RAIL_CACHE=off` to disable an installed wrapper for one process tree. The launcher executes the selected
+compiler chain without starting the cache worker or reading installation context, session state, or CAS data. It
+preserves the environment control for the compiler.
 
 For `unify`, `evidence_cache` reports diagnostic-observation reuse. That cache never restores Cargo build artifacts.
 
@@ -108,8 +118,8 @@ cargo rail cache remove --check
 cargo rail cache remove                   # preserve CAS data
 ```
 
-Setup refuses persistent environment/workspace shadowing and unowned global wrappers. Removal refuses a changed Cargo
-field, launcher, worker, or receipt; resolve the ownership drift instead of deleting configuration by hand.
+Setup refuses persistent environment or workspace shadowing and unowned global wrappers. Removal refuses a changed
+Cargo field, launcher, worker, or receipt. Resolve the ownership drift instead of deleting configuration by hand.
 
 ## Release stopped
 
@@ -126,12 +136,11 @@ cargo rail release resume target/cargo-rail/releases/release-<id>.json
 recoverability, and a safe command. `resume` reconciles local Git, remote refs, readiness checks, registry versions,
 tags, and forge state before advancing. It does not replan from already-mutated manifests.
 
-Readiness and registry propagation are explicit wait boundaries: Cargo-Rail exits instead of polling. Resume after the
-provider settles. GitHub readiness requires at least one successful context, complete reported counts, and no pending
-or failed context.
+Cargo-Rail exits at readiness and registry-propagation boundaries. Resume after the provider settles. GitHub readiness
+requires at least one successful context, complete reported counts, and no pending or failed context.
 
-Direct release commit trailers retain the transaction and effect authorization. From the exact release commit in a
-fresh checkout, `release status` can report reconstructable state and
+Direct release commit trailers retain transaction and effect authorization. From the exact release commit in a fresh
+checkout, `release status` can report reconstructable state and
 `cargo rail release resume release-<transaction-id>` can rebuild a missing local journal. PR preparation trailers
 retain the transaction plan, but finalization does not rewrite the merged commit. Its journal remains the final-effect
 authority until tags, publication, and forge state are reconciled.

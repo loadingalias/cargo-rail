@@ -121,6 +121,13 @@ fn test_config_locate_with_config_flag() {
 
 // Config Print Tests
 
+fn config_print_body(output: &str) -> &str {
+    output
+        .split_once("\n\n")
+        .map(|(_, body)| body)
+        .expect("text config output must separate its provenance header from canonical TOML")
+}
+
 #[test]
 fn test_config_print_shows_defaults() {
     let result: Result<()> = (|| {
@@ -179,6 +186,177 @@ fn test_config_print_json_output() {
         );
         assert!(json["config"].is_object());
         assert!(json["config"]["unify"].is_object());
+
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_config_print_emits_canonical_strictly_valid_configuration() {
+    let result: Result<()> = (|| {
+        let fixtures = [
+            ("empty", ""),
+            ("minimal", "targets = [\"x86_64-unknown-linux-gnu\"]\n"),
+            (
+                "customized",
+                r#"targets = ["x86_64-unknown-linux-gnu"]
+
+[unify]
+include_paths = false
+include_renamed = true
+transitive_pinning = { host = "root" }
+exclude = ["platform-only"]
+include = ["serde"]
+max_backups = 7
+compiler_artifact_soft_limit_bytes = 1024
+compiler_artifact_hard_limit_bytes = 2048
+msrv_policy = { mode = "compute", source = "workspace", inherit = true }
+consumer_scope = "workspace"
+preserve_features = ["unstable-*"]
+strict_version_compat = false
+exact_pin_handling = "preserve"
+major_version_conflict = "bump"
+skip_undeclared_patterns = ["default"]
+
+[surface]
+enabled = true
+consumer_scope = "workspace"
+targets = ["host", "x86_64-unknown-linux-gnu"]
+crate_visibility = "allow"
+preserve_uniform_fields = true
+doctest_coverage = "disabled"
+
+[[surface.lint]]
+selector = "warnings"
+level = "warn"
+
+[release]
+source = "both"
+tag_prefix = "release-"
+tag_format = "{crate}-{version}"
+remote_effects = "push"
+sign_tags = true
+require_changelog_entries = true
+require_release_notes = false
+release_notes_dir = "notes"
+change_dir = ".release-intent"
+pre_1_breaking_bump = "major"
+unconventional_commits = "deny"
+semver_check = "deny"
+require_change_files = ["test-crate"]
+version_groups = { core = ["test-crate"] }
+
+[change-detection]
+infrastructure = ["ci/**"]
+unknown_file_policy = "owned_build_test"
+confidence_profile = "strict"
+
+[change-detection.custom]
+verification = ["verify/**"]
+"#,
+            ),
+            (
+                "deprecated",
+                r#"[unify]
+compiler_diag_cache = false
+sort_dependencies = false
+pin_transitives = true
+transitive_host = "root"
+msrv = true
+msrv_source = "workspace"
+enforce_msrv_inheritance = true
+
+[release]
+require_clean = false
+publish_delay = 17
+require_release_notes = false
+"#,
+            ),
+            (
+                "optional",
+                r#"[unify]
+transitive_pinning = { host = "root" }
+
+[release.changelog]
+commit_url = "https://example.invalid/commit/{sha}"
+pr_url = "https://example.invalid/pull/{pr}"
+
+[crates.test-crate.release]
+publish = false
+
+[crates.test-crate.changelog]
+path = "HISTORY.md"
+emoji = false
+"#,
+            ),
+        ];
+
+        for (name, input) in fixtures {
+            let ws = TestWorkspace::new_named(&format!("config-print-canonical-{name}"))?;
+            ws.add_crate("test-crate", "0.1.0", &[])?;
+            ws.commit("Add test crate")?;
+            fs::write(ws.path.join(".config/rail.toml"), input)?;
+
+            let printed = run_cargo_rail(&ws.path, &["rail", "config", "print"])?;
+            assert!(printed.status.success(), "{name}: config print failed: {printed:?}");
+            let printed_text = String::from_utf8(printed.stdout)?;
+            for deprecated in [
+                "compiler_diag_cache",
+                "sort_dependencies",
+                "require_clean",
+                "publish_delay",
+            ] {
+                assert!(
+                    !printed_text.contains(deprecated),
+                    "{name}: emitted {deprecated}: {printed_text}"
+                );
+            }
+
+            let original_json = run_cargo_rail(&ws.path, &["rail", "config", "print", "-f", "json"])?;
+            assert!(original_json.status.success(), "{name}: JSON config print failed");
+            let original_json: serde_json::Value = serde_json::from_slice(&original_json.stdout)?;
+
+            let canonical_name = format!("canonical-{name}.toml");
+            fs::write(ws.path.join(&canonical_name), &printed_text)?;
+            let validated = run_cargo_rail(
+                &ws.path,
+                &["rail", "--config", &canonical_name, "config", "validate", "--strict"],
+            )?;
+            assert!(
+                validated.status.success(),
+                "{name}: printed config failed strict validation: {validated:?}"
+            );
+
+            let migrated = run_cargo_rail(
+                &ws.path,
+                &["rail", "--config", &canonical_name, "config", "migrate", "--check"],
+            )?;
+            assert!(
+                migrated.status.success(),
+                "{name}: printed config has a pending migration: {migrated:?}"
+            );
+
+            let canonical_json = run_cargo_rail(
+                &ws.path,
+                &["rail", "--config", &canonical_name, "config", "print", "-f", "json"],
+            )?;
+            assert!(canonical_json.status.success(), "{name}: canonical JSON print failed");
+            let canonical_json: serde_json::Value = serde_json::from_slice(&canonical_json.stdout)?;
+            assert_eq!(
+                original_json["config"], canonical_json["config"],
+                "{name}: TOML and JSON projections changed effective public policy"
+            );
+
+            let repeated = run_cargo_rail(&ws.path, &["rail", "--config", &canonical_name, "config", "print"])?;
+            assert!(repeated.status.success(), "{name}: repeated config print failed");
+            let repeated_text = String::from_utf8(repeated.stdout)?;
+            assert_eq!(
+                config_print_body(&printed_text),
+                config_print_body(&repeated_text),
+                "{name}: repeated print changed canonical policy"
+            );
+        }
 
         Ok(())
     })();

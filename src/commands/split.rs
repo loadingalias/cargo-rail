@@ -14,6 +14,7 @@ use crate::workspace::WorkspaceContext;
 use rayon::prelude::*;
 
 /// Arguments for the split run command
+#[derive(Debug)]
 pub struct SplitRunArgs {
     /// Crate name to split (mutually exclusive with `all`)
     pub crate_name: Option<String>,

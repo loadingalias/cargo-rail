@@ -136,7 +136,7 @@ jobs:
       - name: Install just
         uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9
         with:
-          tool: just
+          tool: just@1.58.0
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9
@@ -146,12 +146,7 @@ jobs:
       - name: Install cargo-deny
         uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9
         with:
-          tool: cargo-deny
-
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9
-        with:
-          tool: cargo-audit
+          tool: cargo-deny@0.20.2
 
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -177,6 +172,9 @@ jobs:
       - name: Verify tests
         run: cargo +${{ steps.release.outputs.msrv }} nextest run --workspace --all-features --locked --config-file .config/nextest.toml -P commit
 
+      - name: Verify doctests
+        run: cargo +${{ steps.release.outputs.msrv }} test --doc -p cargo-rail --all-features --locked
+
       - name: Verify documentation
         env:
           RUSTDOCFLAGS: -D warnings
@@ -184,9 +182,6 @@ jobs:
 
       - name: Verify dependency policy
         run: cargo deny --locked check all
-
-      - name: Verify security advisories
-        run: cargo audit
 
   upload-assets:
     name: Build and Verify Release Archives
@@ -208,6 +203,12 @@ jobs:
       contents: write
       attestations: read
     steps:
+      - name: Checkout exact release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.verify-release.outputs.release_sha }}
+
       - name: Collect verified archives
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -228,6 +229,53 @@ jobs:
             exit 1
           fi
 
+      - name: Prepare versioned installers
+        env:
+          VERSION: ${{ needs.verify-release.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import pathlib
+
+          replacements = {
+              "@CARGO_RAIL_VERSION@": os.environ["VERSION"],
+          }
+          installers = {
+              pathlib.Path("scripts/install.sh"): pathlib.Path("cargo-rail-installer.sh"),
+              pathlib.Path("scripts/install.ps1"): pathlib.Path("cargo-rail-installer.ps1"),
+          }
+          for source, destination in installers.items():
+              content = source.read_text()
+              for placeholder, value in replacements.items():
+                  if content.count(placeholder) != 1:
+                      raise SystemExit(f"{source} must contain exactly one {placeholder} placeholder")
+                  content = content.replace(placeholder, value)
+              destination.write_text(content)
+          PY
+          chmod 755 cargo-rail-installer.sh
+          sh -n cargo-rail-installer.sh
+          if grep -Fq '@CARGO_RAIL_VERSION@' cargo-rail-installer.sh cargo-rail-installer.ps1; then
+            echo "release installer still contains a version placeholder" >&2
+            exit 1
+          fi
+
+      - name: Verify PowerShell installer
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path "cargo-rail-installer.ps1"),
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { [Console]::Error.WriteLine($_) }
+            exit 1
+          }
+
       - name: Generate checksum manifests
         env:
           RELEASE_SHA: ${{ needs.verify-release.outputs.release_sha }}
@@ -235,7 +283,7 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          files=(cargo-rail-*.tar.* cargo-rail-*.zip)
+          files=(cargo-rail-*.tar.* cargo-rail-*.zip cargo-rail-installer.sh cargo-rail-installer.ps1)
           sha256sum "${files[@]}" | sort -k2 > SHA256SUMS
           sha256sum --check SHA256SUMS
 
@@ -280,7 +328,7 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           files=(cargo-rail-*.tar.* cargo-rail-*.zip)
-          files+=(SHA256SUMS SHA256SUMS.json)
+          files+=(cargo-rail-installer.sh cargo-rail-installer.ps1 SHA256SUMS SHA256SUMS.json)
           remote_assets="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
           download_dir="$(mktemp -d)"
           trap 'rm -rf "$download_dir"' EXIT

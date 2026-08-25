@@ -48,8 +48,8 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
 static QUALIFICATION_CARGO_VIEWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -62,6 +62,29 @@ pub(crate) struct CompilerDiagnosticsCollector<'a> {
     manifests: &'a ManifestAnalyzer,
     targets: Vec<&'a str>,
     identity: CompilerCacheIdentity,
+    artifact_budget: CompilerArtifactBudget,
+}
+
+/// Storage authority for the command-owned Cargo working set shared across evidence views.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CompilerArtifactBudget {
+    soft_limit_bytes: u64,
+    hard_limit_bytes: u64,
+}
+
+impl CompilerArtifactBudget {
+    pub(crate) const fn new(soft_limit_bytes: u64, hard_limit_bytes: u64) -> Self {
+        Self {
+            soft_limit_bytes,
+            hard_limit_bytes,
+        }
+    }
+}
+
+impl Default for CompilerArtifactBudget {
+    fn default() -> Self {
+        Self::new(32 * 1024 * 1024 * 1024, 64 * 1024 * 1024 * 1024)
+    }
 }
 
 /// Independently validated products from one shared set of Cargo acquisitions.
@@ -85,10 +108,187 @@ pub(crate) struct CompilerAnalysisMetrics {
     pub(crate) fact_cache_bypass_reasons: BTreeMap<String, usize>,
     pub(crate) fresh_fragment_bytes: u64,
     pub(crate) retained_fact_object_bytes: u64,
+    pub(crate) artifact_high_water_bytes: u64,
+    pub(crate) artifact_views_reclaimed: usize,
+}
+
+struct CompilerArtifactAuthority {
+    root: PathBuf,
+    budget: CompilerArtifactBudget,
+    _workspace_lock: crate::cache::WorkspaceCacheLock,
+}
+
+const CARGO_CACHE_DIRECTORY_TAG: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55\n\
+# This file is a cache directory tag created by cargo.\n\
+# For information about cache directory tags see https://bford.info/cachedir/\n";
+
+fn ensure_compiler_artifact_root(root: &Path) -> RailResult<()> {
+    match fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.is_dir() && !crate::utils::is_symlink_or_reparse(&metadata) => {}
+        Ok(_) => {
+            return Err(RailError::with_help(
+                format!("compiler artifact root '{}' is not a real directory", root.display()),
+                "remove the hostile path; cargo-rail will not follow compiler artifact links",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir(root)?,
+        Err(error) => return Err(error.into()),
+    }
+    fs::write(root.join("CACHEDIR.TAG"), CARGO_CACHE_DIRECTORY_TAG)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+impl CompilerArtifactAuthority {
+    fn prepare(workspace_root: &Path, budget: CompilerArtifactBudget, planned_views: usize) -> RailResult<Self> {
+        let workspace_lock = crate::cache::lock_workspace(workspace_root)?;
+        let state_root = crate::workspace::cargo_rail_state_root(workspace_root);
+        let state_root = crate::utils::canonicalize_existing(&state_root)?;
+        let root = state_root.join("compiler-artifacts-v1");
+        match fs::symlink_metadata(&root) {
+            Ok(metadata) if metadata.is_dir() && !crate::utils::is_symlink_or_reparse(&metadata) => {
+                fs::remove_dir_all(&root)?;
+            }
+            Ok(_) => {
+                return Err(RailError::with_help(
+                    format!("compiler artifact root '{}' is not a real directory", root.display()),
+                    "remove the hostile path; cargo-rail will not follow compiler artifact links",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        ensure_compiler_artifact_root(&root)?;
+        progress!(
+            "  Compiler artifact working set: {} ({} planned views; reused across feature views; 0 bytes current; {} bytes soft; {} bytes hard; target artifacts reclaimed after authenticated evidence)",
+            root.display(),
+            planned_views,
+            budget.soft_limit_bytes,
+            budget.hard_limit_bytes,
+        );
+        Ok(Self {
+            root,
+            budget,
+            _workspace_lock: workspace_lock,
+        })
+    }
+
+    fn target_dir(&self) -> &Path {
+        &self.root
+    }
+}
+
+impl Drop for CompilerArtifactAuthority {
+    fn drop(&mut self) {
+        drop(fs::remove_dir_all(&self.root));
+    }
+}
+
+fn reclaim_compiler_artifact_target(
+    metrics: &mut CompilerAnalysisMetrics,
+    workspace_root: &Path,
+    cargo_program: &OsStr,
+    authority: &CompilerArtifactAuthority,
+    target: &str,
+) -> RailResult<()> {
+    let before = compiler_artifact_bytes(authority.target_dir())?;
+    metrics.artifact_high_water_bytes = metrics.artifact_high_water_bytes.max(before);
+    if before > authority.budget.hard_limit_bytes {
+        return Err(RailError::with_help(
+            format!(
+                "compiler artifact working set reached {before} bytes and exceeded its {}-byte hard limit",
+                authority.budget.hard_limit_bytes
+            ),
+            "increase unify.compiler_artifact_hard_limit_bytes only after verifying the workspace's required target working set",
+        ));
+    }
+
+    if target == "default" {
+        progress!(
+            "    Compiler artifacts: {before} bytes retained for the default target; {} bytes high-water",
+            metrics.artifact_high_water_bytes
+        );
+        return Ok(());
+    }
+
+    let mut command = Command::new(cargo_program);
+    command
+        .current_dir(workspace_root)
+        .arg("clean")
+        .arg("--target")
+        .arg(target)
+        .arg("--target-dir")
+        .arg(authority.target_dir())
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("RUSTDOC");
+    crate::remote_cache::scrub_child_environment(&mut command);
+    let output = command
+        .output()
+        .with_context(|| format!("reclaiming compiler artifacts for target '{target}'"))?;
+    if !output.status.success() {
+        return Err(RailError::message(format!(
+            "failed to reclaim compiler artifacts for target '{target}' with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+
+    // Cargo may remove an otherwise empty target directory after cleaning its
+    // final recognized slice. Re-establish the command-owned root and marker
+    // before measuring or advancing to the next target.
+    ensure_compiler_artifact_root(authority.target_dir())?;
+    let after = compiler_artifact_bytes(authority.target_dir())?;
+    if after > authority.budget.hard_limit_bytes {
+        return Err(RailError::with_help(
+            format!(
+                "compiler artifact working set retained {after} bytes after cleaning target '{target}' and exceeded its {}-byte hard limit",
+                authority.budget.hard_limit_bytes
+            ),
+            "increase unify.compiler_artifact_hard_limit_bytes only after verifying the workspace's required shared host working set",
+        ));
+    }
+    metrics.artifact_views_reclaimed = metrics.artifact_views_reclaimed.saturating_add(1);
+    progress!(
+        "    Compiler artifacts: {} bytes reclaimed for target '{target}'; {} bytes retained; {} bytes high-water",
+        before.saturating_sub(after),
+        after,
+        metrics.artifact_high_water_bytes,
+    );
+    Ok(())
+}
+
+fn compiler_artifact_bytes(root: &Path) -> RailResult<u64> {
+    let mut bytes = 0_u64;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.is_dir() && !crate::utils::is_symlink_or_reparse(&metadata) {
+            for entry in fs::read_dir(&path)? {
+                pending.push(entry?.path());
+            }
+        } else if metadata.is_file() && !crate::utils::is_symlink_or_reparse(&metadata) {
+            bytes = bytes
+                .checked_add(metadata.len())
+                .ok_or_else(|| RailError::message("compiler artifact byte count overflow"))?;
+        } else {
+            return Err(RailError::message(format!(
+                "compiler artifact view contains unsupported path '{}'",
+                path.display()
+            )));
+        }
+    }
+    Ok(bytes)
 }
 
 /// Exact snapshot-derived inputs shared by every compiler-evidence key.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct CompilerCacheIdentity {
     rustc_version: String,
     cargo_version: String,
@@ -99,6 +299,7 @@ pub(crate) struct CompilerCacheIdentity {
     compiler_env_fingerprint: String,
     cargo_config_fingerprint: String,
     cargo_program: OsString,
+    rustc_program: OsString,
     rustdoc_program: OsString,
     rustc_workspace_wrapper: Option<OsString>,
     manifest_fingerprints: HashMap<PackageId, String>,
@@ -115,7 +316,7 @@ pub(crate) struct CompilerCacheIdentity {
     cache_bypass_reason: Option<CompilerCacheBypass>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct BuildScriptPackageContext {
     package_id: PackageId,
     working_directory: String,
@@ -150,7 +351,7 @@ impl NativeToolchainCapability {
     }
 }
 
-const TRANSPARENT_SESSION_MEMO_VERSION: u32 = 1;
+const TRANSPARENT_SESSION_MEMO_VERSION: u32 = 2;
 
 /// Regenerable, receipt-private proof that a direct compiler session remains
 /// exact without launching two identity probes for every rustc unit.
@@ -270,6 +471,7 @@ impl CompilerCacheIdentity {
         let compiler_env_fingerprint = compiler_env_fingerprint(snapshot.cargo_config())?;
         let cargo_config_fingerprint = cargo_config_fingerprint(snapshot.cargo_config(), snapshot.source_root())?;
         let cargo_program = snapshot.toolchain().cargo_program().to_owned();
+        let rustc_program = snapshot.toolchain().rustc_program().to_owned();
         let rustdoc_program = snapshot.toolchain().rustdoc_program().to_owned();
         let rustc_workspace_wrapper = snapshot
             .toolchain()
@@ -334,6 +536,7 @@ impl CompilerCacheIdentity {
             compiler_env_fingerprint,
             cargo_config_fingerprint,
             cargo_program,
+            rustc_program,
             rustdoc_program,
             rustc_workspace_wrapper,
             manifest_fingerprints,
@@ -374,6 +577,7 @@ impl CompilerCacheIdentity {
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub(crate) fn capture_transparent_native_session(
     source_root: &Path,
+    target_root: &Path,
     rustc_program: &OsStr,
     cache: &LocalCacheSelection,
 ) -> RailResult<(NativeCompilerSession, u64, TransparentNativeSessionMemo)> {
@@ -423,7 +627,7 @@ pub(crate) fn capture_transparent_native_session(
     append_identity_frame(&mut framed, b"rustc-content", rustc_content_digest.as_bytes());
     append_identity_frame(&mut framed, b"compiler-sysroot", sysroot_identity.as_bytes());
     let capability_identity = format!("sha256:{}", ContentDigest::sha256(&framed));
-    let compiler_environment = transparent_native_compiler_process_env_fingerprint()?;
+    let compiler_environment = transparent_native_compiler_process_env_fingerprint(target_root)?;
     let session = NativeCompilerSession::capture(
         &source_root,
         &rustc_verbose_version,
@@ -463,6 +667,7 @@ pub(crate) fn capture_transparent_native_session(
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub(crate) fn capture_transparent_native_session(
     _source_root: &Path,
+    _target_root: &Path,
     _rustc_program: &OsStr,
     _cache: &LocalCacheSelection,
 ) -> RailResult<(NativeCompilerSession, u64, TransparentNativeSessionMemo)> {
@@ -475,13 +680,14 @@ pub(crate) fn capture_transparent_native_session(
 pub(crate) fn reuse_transparent_native_session(
     memo: &TransparentNativeSessionMemo,
     source_root: &Path,
+    target_root: &Path,
     rustc_program: &OsStr,
 ) -> RailResult<Option<NativeCompilerSession>> {
     let source_root = crate::utils::canonicalize_existing(source_root)?;
     if memo.version != TRANSPARENT_SESSION_MEMO_VERSION
         || memo.digest != transparent_session_memo_digest(memo)?
         || memo.source_root != source_root.to_string_lossy()
-        || memo.compiler_environment_identity != transparent_native_compiler_process_env_fingerprint()?
+        || memo.compiler_environment_identity != transparent_native_compiler_process_env_fingerprint(target_root)?
     {
         return Ok(None);
     }
@@ -506,6 +712,7 @@ pub(crate) fn reuse_transparent_native_session(
 pub(crate) fn reuse_transparent_native_session(
     _memo: &TransparentNativeSessionMemo,
     _source_root: &Path,
+    _target_root: &Path,
     _rustc_program: &OsStr,
 ) -> RailResult<Option<NativeCompilerSession>> {
     Ok(None)
@@ -579,7 +786,13 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
             manifests,
             targets,
             identity: identity.clone(),
+            artifact_budget: CompilerArtifactBudget::default(),
         }
+    }
+
+    pub(crate) fn with_artifact_budget(mut self, budget: CompilerArtifactBudget) -> Self {
+        self.artifact_budget = budget;
+        self
     }
 
     /// Collect diagnostics for selected workspace members.
@@ -658,20 +871,11 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
         };
         let producer_authority = typed_snapshot
             .map(|snapshot| {
-                CompilerFactDriverAuthority::producer_authority(
-                    snapshot.toolchain(),
-                    &self.identity.toolchain_fingerprint,
-                )
+                CompilerFactDriverAuthority::producer_authority(snapshot, &self.identity.toolchain_fingerprint)
             })
             .transpose()?;
-        let typed_cargo_target = typed_snapshot
-            .map(|_| {
-                tempfile::Builder::new()
-                    .prefix("cargo-rail-compiler-target-")
-                    .tempdir()
-                    .with_context(|| "creating shared compiler-analysis target directory".to_string())
-            })
-            .transpose()?;
+        let artifact_authority =
+            CompilerArtifactAuthority::prepare(self.workspace_root, self.artifact_budget, schedule.views().len())?;
         let mut prepared_driver = None;
         let mut prepared_doctest_sysroot = None;
 
@@ -764,10 +968,38 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
             }
         }
 
+        progress!(
+            "  Compiler evidence plan: {} views; up to {} Cargo acquisitions; {} diagnostic cache hits; {} diagnostic cache misses",
+            metrics.analysis_views,
+            stale_by_configuration.len(),
+            metrics.diagnostic_cache_hits,
+            metrics.diagnostic_cache_misses
+        );
+
+        let mut stale_configurations = stale_by_configuration.into_iter().collect::<Vec<_>>();
+        stale_configurations.sort_by(|(left, _), (right, _)| analysis_view_execution_order(left, right));
+
         let mut skipped_member_targets = 0usize;
-        for (view, stale_members) in stale_by_configuration {
+        let mut active_artifact_target = None::<String>;
+        let mut active_artifact_target_dirty = false;
+        for (view, stale_members) in stale_configurations {
             let target = view.platform().as_str();
             let features = view.features();
+            if active_artifact_target.as_deref() != Some(target) {
+                if active_artifact_target_dirty {
+                    reclaim_compiler_artifact_target(
+                        &mut metrics,
+                        self.workspace_root,
+                        &self.identity.cargo_program,
+                        &artifact_authority,
+                        active_artifact_target.as_deref().ok_or_else(|| {
+                            RailError::message("active compiler artifact target disappeared before reclamation")
+                        })?,
+                    )?;
+                }
+                active_artifact_target = Some(target.to_string());
+                active_artifact_target_dirty = false;
+            }
             let diagnostic_members: Vec<&str> = stale_members
                 .iter()
                 .copied()
@@ -894,10 +1126,6 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                         .as_ref()
                         .ok_or_else(|| RailError::message("typed compiler fact driver disappeared"))?,
                     doctest_sysroot: prepared_doctest_sysroot.as_ref(),
-                    cargo_target: typed_cargo_target
-                        .as_ref()
-                        .ok_or_else(|| RailError::message("typed compiler target directory disappeared"))?
-                        .path(),
                     packages: &typed_members,
                 })
             } else {
@@ -908,7 +1136,9 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                 &self.identity,
                 &view,
                 &active_members,
+                artifact_authority.target_dir(),
                 typed_context.as_ref(),
+                artifact_authority.budget,
             )
             .with_context(|| {
                 format!(
@@ -917,8 +1147,10 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                     view.features().label()
                 )
             })?;
+            active_artifact_target_dirty = true;
             metrics.cargo_views_executed += 1;
             metrics.compiler_invocations += run.invocations.len();
+            metrics.artifact_high_water_bytes = metrics.artifact_high_water_bytes.max(run.artifact_high_water_bytes);
             if collect_typed {
                 metrics.fresh_fragment_bytes =
                     run.compiler_facts
@@ -932,9 +1164,7 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                     .into_iter()
                     .map(ValidatedCompilerFactFragment::into_object)
                     .collect::<Vec<_>>();
-                if run.success
-                    && let Some(key) = &fact_cache_key
-                {
+                if let Some(key) = &fact_cache_key {
                     let bypasses = fact_invocation_cache_bypasses(&run.invocations);
                     let complete_empty_view = fresh_facts.is_empty()
                         && bypasses == BTreeSet::from(["no_typed_compiler_invocation".to_string()]);
@@ -960,9 +1190,6 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                 format_args!("{} / {}", target, features.label()),
                 started.elapsed().as_secs_f64()
             );
-            if !run.success && !run.stderr.trim().is_empty() {
-                progress!("    Cargo analysis failed:\n{}", run.stderr.trim_end());
-            }
             if !view
                 .fact_families()
                 .contains(&crate::compiler::scheduler::CompilerFactFamily::StableDiagnostics)
@@ -980,11 +1207,7 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
             let mut compilation_observations =
                 parse_compilation_observations(&run.stdout, invocations, &self.identity, target)?;
             reconcile_exact_artifact_observations(&mut compilation_observations, &mut retained_observations);
-            let completeness = if run.success {
-                DiagnosticsCompleteness::Complete
-            } else {
-                DiagnosticsCompleteness::Incomplete
-            };
+            let completeness = DiagnosticsCompleteness::Complete;
 
             for member in diagnostic_members {
                 let manifests_member = self
@@ -1067,6 +1290,17 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                 record_target_evidence(&mut result, &manifests_member.package_id, &entry.evidence);
                 store.put(entry);
             }
+        }
+        if active_artifact_target_dirty {
+            reclaim_compiler_artifact_target(
+                &mut metrics,
+                self.workspace_root,
+                &self.identity.cargo_program,
+                &artifact_authority,
+                active_artifact_target.as_deref().ok_or_else(|| {
+                    RailError::message("active compiler artifact target disappeared before final reclamation")
+                })?,
+            )?;
         }
 
         store.flush()?;
@@ -1268,6 +1502,27 @@ type CandidateId = (
     Option<FeatureSelection>,
 );
 
+fn analysis_view_execution_order(left: &AnalysisView, right: &AnalysisView) -> std::cmp::Ordering {
+    left.platform()
+        .cmp(right.platform())
+        .then_with(|| left.compiles_doctests().cmp(&right.compiles_doctests()))
+        .then_with(|| feature_execution_priority(left.features()).cmp(&feature_execution_priority(right.features())))
+        .then_with(|| left.features().cmp(right.features()))
+}
+
+fn feature_execution_priority(features: &FeatureSelection) -> u8 {
+    match features {
+        // The default graph is ordinarily the smallest representative view.
+        // Acquire it first so an uncompilable workspace fails at the cheapest
+        // required boundary instead of materializing a maximal feature graph.
+        FeatureSelection::Default => 0,
+        FeatureSelection::NoDefaultFeatures => 1,
+        FeatureSelection::DefaultWith(_) => 2,
+        FeatureSelection::Selected(_) => 3,
+        FeatureSelection::AllFeatures => 4,
+    }
+}
+
 fn build_candidate_target_index(
     candidates: &[CompilerCandidate],
 ) -> HashMap<String, BTreeMap<CandidateId, BTreeSet<String>>> {
@@ -1312,9 +1567,6 @@ fn update_candidate_survivors(
     target: &str,
     evidence: &TargetEvidence,
 ) {
-    if evidence.completeness != DiagnosticsCompleteness::Complete || evidence.compiled_units.is_empty() {
-        return;
-    }
     let Some(targets_by_candidate) = candidate_targets.get(member) else {
         return;
     };
@@ -1329,23 +1581,29 @@ fn update_candidate_survivors(
                 .2
                 .as_ref()
                 .is_none_or(|required| required == &evidence.features);
-        !applicable || evidence.dependency_state_for_kind(&candidate.1, candidate.0) != DependencyEvidenceState::Used
+        if !applicable {
+            return true;
+        }
+        // One missing required configuration permanently prevents an unused
+        // proof for this declaration. Continuing to compile its remaining
+        // target/feature matrix cannot change the removal decision.
+        evidence.completeness == DiagnosticsCompleteness::Complete
+            && !evidence.compiled_units.is_empty()
+            && evidence.dependency_state_for_kind(&candidate.1, candidate.0) != DependencyEvidenceState::Used
     });
 }
 
 struct WorkspaceCheckOutput {
     stdout: String,
-    stderr: String,
-    success: bool,
     invocations: Vec<crate::compiler::observation::RawCompilerInvocation>,
     compiler_facts: Vec<ValidatedCompilerFactFragment>,
+    artifact_high_water_bytes: u64,
 }
 
 struct TypedAcquisitionContext<'a> {
     snapshot: &'a WorkspaceSnapshot,
     driver: &'a PreparedCompilerFactDriver,
     doctest_sysroot: Option<&'a CompilerFactDoctestSysroot>,
-    cargo_target: &'a Path,
     packages: &'a BTreeSet<String>,
 }
 
@@ -1354,7 +1612,9 @@ fn run_workspace_check(
     identity: &CompilerCacheIdentity,
     view: &AnalysisView,
     members: &[&str],
+    cargo_target: &Path,
     typed: Option<&TypedAcquisitionContext<'_>>,
+    artifact_budget: CompilerArtifactBudget,
 ) -> RailResult<WorkspaceCheckOutput> {
     let wrapper = compiler_observation_wrapper()?;
     let existing_workspace_wrapper = identity.rustc_workspace_wrapper.as_deref();
@@ -1367,7 +1627,6 @@ fn run_workspace_check(
     } else {
         wrapper.clone()
     };
-    let typed_cargo_target = typed.map(|typed| typed.cargo_target);
     let doctest_sysroot = if view.compiles_doctests() {
         let typed =
             typed.ok_or_else(|| RailError::message("compile-only doctest view has no typed compiler authority"))?;
@@ -1386,7 +1645,7 @@ fn run_workspace_check(
                 view,
                 members,
                 observation_directory.path(),
-                typed_cargo_target.ok_or_else(|| RailError::message("typed Cargo output authority disappeared"))?,
+                cargo_target,
                 doctest_sysroot,
             )
         })
@@ -1416,10 +1675,14 @@ fn run_workspace_check(
         .env(OBSERVATION_DIRECTORY_ENV, observation_directory.path())
         .env(OBSERVATION_SOURCE_ROOT_ENV, source_root)
         .env(FACT_SESSION_ENV, fact_session)
+        .env("CARGO_TARGET_DIR", cargo_target)
         .env_remove(CACHE_WRAPPER_MARKER)
         .args(&args);
-    if let Some(target) = &typed_cargo_target {
-        command.env("CARGO_TARGET_DIR", target);
+    if typed.is_some() {
+        command
+            .env("RUSTC", &identity.rustc_program)
+            .env("RUSTC_WRAPPER", "")
+            .env("CARGO_BUILD_RUSTC_WRAPPER", "");
     }
     if view.compiles_doctests() {
         command
@@ -1427,12 +1690,8 @@ fn run_workspace_check(
             .env(INNER_RUSTDOC_ENV, &identity.rustdoc_program)
             .env(RUSTDOC_WRAPPER_MARKER, "1");
     }
-    if typed.is_some() && existing_workspace_wrapper.is_some() {
-        return Err(RailError::message(
-            "typed compiler fact acquisition cannot compose with a configured workspace wrapper",
-        ));
-    }
-    if let Some(inner_wrapper) = existing_workspace_wrapper
+    if typed.is_none()
+        && let Some(inner_wrapper) = existing_workspace_wrapper
         && inner_wrapper != wrapper.as_os_str()
     {
         command.env(INNER_WRAPPER_ENV, inner_wrapper);
@@ -1440,19 +1699,29 @@ fn run_workspace_check(
 
     #[cfg(test)]
     QUALIFICATION_CARGO_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let output = command.output().with_context(|| {
+    let bounded = run_artifact_bounded_command(&mut command, cargo_target, artifact_budget).with_context(|| {
         format!(
             "running cargo check for target '{target}' in {}",
             workspace_root.display(),
             target = view.platform().as_str()
         )
     })?;
-    if typed_session.is_some() && !output.status.success() {
+    let output = bounded.output;
+    if !output.status.success() {
         let diagnostics = cargo_failure_diagnostics(&output.stdout);
+        let stderr = if diagnostics.is_empty() {
+            bounded_cargo_failure_stderr(&output.stderr)
+        } else {
+            String::new()
+        };
         return Err(RailError::message(format!(
-            "typed Cargo acquisition failed with status {}: {}{}",
+            "compiler-evidence Cargo acquisition failed with status {}{}{}",
             output.status,
-            String::from_utf8_lossy(&output.stderr).trim(),
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            },
             if diagnostics.is_empty() {
                 String::new()
             } else {
@@ -1489,10 +1758,165 @@ fn run_workspace_check(
   )?;
     Ok(WorkspaceCheckOutput {
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        success: output.status.success(),
         invocations,
         compiler_facts,
+        artifact_high_water_bytes: bounded.high_water_bytes,
+    })
+}
+
+const COMPILER_ARTIFACT_FREE_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const COMPILER_ARTIFACT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+#[derive(Debug)]
+struct ArtifactBoundedCommandOutput {
+    output: Output,
+    high_water_bytes: u64,
+}
+
+fn run_artifact_bounded_command(
+    command: &mut Command,
+    artifact_root: &Path,
+    budget: CompilerArtifactBudget,
+) -> RailResult<ArtifactBoundedCommandOutput> {
+    if budget.soft_limit_bytes == 0 || budget.hard_limit_bytes < budget.soft_limit_bytes {
+        return Err(RailError::message("compiler artifact storage budget is invalid"));
+    }
+    let initial_available = fs2::available_space(artifact_root).with_context(|| {
+        format!(
+            "measuring filesystem capacity for compiler artifact root '{}'",
+            artifact_root.display()
+        )
+    })?;
+    let capacity_limit = initial_available.saturating_sub(COMPILER_ARTIFACT_FREE_RESERVE_BYTES);
+    let effective_hard_limit = budget.hard_limit_bytes.min(capacity_limit);
+    if effective_hard_limit == 0 {
+        return Err(RailError::with_help(
+            format!(
+                "compiler artifact preflight found {initial_available} available bytes, which cannot preserve the {}-byte free-space reserve",
+                COMPILER_ARTIFACT_FREE_RESERVE_BYTES
+            ),
+            "free workspace storage or configure the operation on a filesystem with more available capacity",
+        ));
+    }
+    let effective_soft_limit = budget.soft_limit_bytes.min(effective_hard_limit);
+    progress!(
+        "    Compiler artifact preflight: {initial_available} bytes available; {effective_soft_limit} bytes soft; {effective_hard_limit} bytes hard; {} bytes reserved",
+        COMPILER_ARTIFACT_FREE_RESERVE_BYTES
+    );
+
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| RailError::message("Cargo compiler acquisition has no stdout pipe"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| RailError::message("Cargo compiler acquisition has no stderr pipe"))?;
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).map(|_| bytes)
+    });
+
+    let probe_stride_bytes = (effective_hard_limit / 8).clamp(1024 * 1024, 8 * 1024 * 1024 * 1024);
+    let mut next_probe_bytes = effective_soft_limit;
+    let mut high_water_bytes = 0_u64;
+    let mut soft_reported = false;
+    let mut budget_breach = None;
+    let mut monitor_error = None;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                monitor_error = Some(error);
+                if let Err(error) = child.kill() {
+                    monitor_error = Some(error);
+                }
+                break child.wait()?;
+            }
+        }
+        match fs2::available_space(artifact_root) {
+            Ok(available) => {
+                let filesystem_delta = initial_available.saturating_sub(available);
+                if filesystem_delta >= next_probe_bytes {
+                    match compiler_artifact_bytes(artifact_root) {
+                        Ok(current_bytes) => {
+                            high_water_bytes = high_water_bytes.max(current_bytes);
+                            if !soft_reported && current_bytes >= effective_soft_limit {
+                                soft_reported = true;
+                                progress!(
+                                    "    Compiler artifacts: {current_bytes} bytes current; {high_water_bytes} bytes high-water; soft limit reached"
+                                );
+                            }
+                            if current_bytes > effective_hard_limit {
+                                budget_breach = Some(current_bytes);
+                                if let Err(error) = child.kill() {
+                                    monitor_error = Some(error);
+                                }
+                                break child.wait()?;
+                            }
+                        }
+                        Err(error) => {
+                            monitor_error = Some(std::io::Error::other(error.to_string()));
+                            if let Err(error) = child.kill() {
+                                monitor_error = Some(error);
+                            }
+                            break child.wait()?;
+                        }
+                    }
+                    next_probe_bytes = filesystem_delta.saturating_add(probe_stride_bytes);
+                }
+            }
+            Err(error) => {
+                monitor_error = Some(error);
+                if let Err(error) = child.kill() {
+                    monitor_error = Some(error);
+                }
+                break child.wait()?;
+            }
+        }
+        std::thread::sleep(COMPILER_ARTIFACT_POLL_INTERVAL);
+    };
+
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| RailError::message("Cargo compiler acquisition stdout reader panicked"))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| RailError::message("Cargo compiler acquisition stderr reader panicked"))??;
+    if let Some(error) = monitor_error {
+        return Err(RailError::message(format!(
+            "compiler artifact storage monitor failed: {error}"
+        )));
+    }
+    if let Some(current_bytes) = budget_breach {
+        return Err(RailError::with_help(
+            format!(
+                "compiler artifact working set reached {current_bytes} bytes and exceeded its {effective_hard_limit}-byte hard limit"
+            ),
+            "increase unify.compiler_artifact_hard_limit_bytes only after verifying the workspace's required single-view working set",
+        ));
+    }
+
+    let final_bytes = compiler_artifact_bytes(artifact_root)?;
+    high_water_bytes = high_water_bytes.max(final_bytes);
+    if final_bytes > effective_hard_limit {
+        return Err(RailError::with_help(
+            format!(
+                "compiler artifact working set finished at {final_bytes} bytes and exceeded its {effective_hard_limit}-byte hard limit"
+            ),
+            "increase unify.compiler_artifact_hard_limit_bytes only after verifying the workspace's required single-view working set",
+        ));
+    }
+    Ok(ArtifactBoundedCommandOutput {
+        output: Output { status, stdout, stderr },
+        high_water_bytes,
     })
 }
 
@@ -1532,6 +1956,12 @@ fn cargo_failure_diagnostics(stdout: &[u8]) -> String {
         diagnostics.push('\n');
     }
     diagnostics
+}
+
+fn bounded_cargo_failure_stderr(stderr: &[u8]) -> String {
+    const MAX_STDERR_BYTES: usize = 16 * 1024;
+    let start = stderr.len().saturating_sub(MAX_STDERR_BYTES);
+    String::from_utf8_lossy(&stderr[start..]).trim().to_string()
 }
 
 fn fact_invocation_cache_bypasses(
@@ -3655,14 +4085,18 @@ fn compiler_env_fingerprint(cargo_config: &CargoConfigSnapshot) -> RailResult<St
     Ok(format!("sha256:{}", ContentDigest::sha256(&framed)))
 }
 
-fn transparent_native_compiler_process_env_fingerprint() -> RailResult<String> {
+fn transparent_native_compiler_process_env_fingerprint(target_root: &Path) -> RailResult<String> {
+    let target_root = crate::utils::canonicalize_existing(target_root)?;
     let runtime = std::env::vars_os()
         .filter_map(|(name, value)| {
             let name = name.into_string().ok()?;
             native_compiler_process_environment(&name).then(|| {
                 (
-                    name,
-                    Some(format!("sha256:{}", ContentDigest::sha256(value.as_encoded_bytes()))),
+                    name.clone(),
+                    Some(format!(
+                        "sha256:{}",
+                        ContentDigest::sha256(&transparent_native_environment_value(&name, &value, &target_root,)),
+                    )),
                 )
             })
         })
@@ -3671,7 +4105,7 @@ fn transparent_native_compiler_process_env_fingerprint() -> RailResult<String> {
     let default_regular_file_mode = transparent_default_regular_file_creation_mode();
     #[cfg(not(unix))]
     let default_regular_file_mode = 0o644_u32;
-    let mut framed = Vec::from(&b"cargo-rail-native-compiler-process-environment-v2\0"[..]);
+    let mut framed = Vec::from(&b"cargo-rail-native-compiler-process-environment-v3\0"[..]);
     append_identity_frame(&mut framed, b"runtime", &serde_json::to_vec(&runtime)?);
     append_identity_frame(
         &mut framed,
@@ -3679,6 +4113,39 @@ fn transparent_native_compiler_process_env_fingerprint() -> RailResult<String> {
         &default_regular_file_mode.to_le_bytes(),
     );
     Ok(format!("sha256:{}", ContentDigest::sha256(&framed)))
+}
+
+fn transparent_native_environment_value(name: &str, value: &OsStr, target_root: &Path) -> Vec<u8> {
+    if !matches!(
+        name,
+        "DYLD_FALLBACK_LIBRARY_PATH"
+            | "DYLD_LIBRARY_PATH"
+            | "LD_LIBRARY_PATH"
+            | "LD_RUN_PATH"
+            | "LIBRARY_PATH"
+            | "LPATH"
+    ) {
+        return value.as_encoded_bytes().to_vec();
+    }
+
+    let mut framed = Vec::from(&b"cargo-rail-native-search-path-v1\0"[..]);
+    for component in std::env::split_paths(value) {
+        let relative = component
+            .strip_prefix(target_root)
+            .ok()
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                crate::utils::canonicalize_existing(&component)
+                    .ok()
+                    .and_then(|canonical| canonical.strip_prefix(target_root).ok().map(Path::to_path_buf))
+            });
+        if let Some(relative) = relative {
+            append_identity_frame(&mut framed, b"selected-target", relative.as_os_str().as_encoded_bytes());
+        } else {
+            append_identity_frame(&mut framed, b"external", component.as_os_str().as_encoded_bytes());
+        }
+    }
+    framed
 }
 
 #[cfg(unix)]
@@ -4448,6 +4915,171 @@ edition = "2024"
     }
 
     #[test]
+    fn native_session_search_paths_abstract_only_the_selected_target_root() {
+        let first = tempfile::tempdir().expect("first target root");
+        let second = tempfile::tempdir().expect("second target root");
+        let external = tempfile::tempdir().expect("external search root");
+        let first_deps = first.path().join("debug/deps");
+        let second_deps = second.path().join("debug/deps");
+        fs::create_dir_all(&first_deps).expect("first deps");
+        fs::create_dir_all(&second_deps).expect("second deps");
+        let first_value = std::env::join_paths([first_deps.as_path(), external.path()]).expect("first path list");
+        let second_value = std::env::join_paths([second_deps.as_path(), external.path()]).expect("second path list");
+
+        assert_eq!(
+            transparent_native_environment_value(
+                "DYLD_FALLBACK_LIBRARY_PATH",
+                &first_value,
+                &fs::canonicalize(first.path()).expect("first canonical root"),
+            ),
+            transparent_native_environment_value(
+                "DYLD_FALLBACK_LIBRARY_PATH",
+                &second_value,
+                &fs::canonicalize(second.path()).expect("second canonical root"),
+            ),
+        );
+        assert_ne!(
+            transparent_native_environment_value("LD_LIBRARY_PATH", &first_value, first.path()),
+            transparent_native_environment_value(
+                "LD_LIBRARY_PATH",
+                &std::env::join_paths([first_deps.as_path(), second.path()]).expect("changed external path list"),
+                first.path(),
+            ),
+            "external search namespaces must remain exact",
+        );
+        assert_ne!(
+            transparent_native_environment_value("LD_PRELOAD", first.path().as_os_str(), first.path()),
+            transparent_native_environment_value("LD_PRELOAD", second.path().as_os_str(), second.path()),
+            "injected libraries are exact files, not selected-root search namespaces",
+        );
+    }
+
+    #[test]
+    fn compiler_artifact_authority_reclaims_interrupted_graphs_and_serializes_disk_owners() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let stale = workspace
+            .path()
+            .join("target/cargo-rail/compiler-artifacts-v1/interrupted/debug/deps");
+        fs::create_dir_all(&stale).expect("stale artifact tree");
+        fs::write(stale.join("artifact"), b"reconstructible").expect("stale artifact");
+
+        let authority = CompilerArtifactAuthority::prepare(workspace.path(), CompilerArtifactBudget::default(), 2)
+            .expect("artifact authority");
+        assert!(!stale.exists(), "interrupted artifact graph survived restart cleanup");
+        fs::write(authority.target_dir().join("artifact"), b"active").expect("active artifact");
+        let workspace_root = workspace.path().to_path_buf();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let next = CompilerArtifactAuthority::prepare(&workspace_root, CompilerArtifactBudget::default(), 1)
+                    .expect("next authority");
+                drop(next);
+                finished_tx.send(()).expect("completion");
+            });
+            assert!(
+                finished_rx.recv_timeout(std::time::Duration::from_millis(100)).is_err(),
+                "a second compiler acquisition crossed the workspace disk authority"
+            );
+            drop(authority);
+            finished_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("next authority should proceed after cleanup");
+        });
+        assert!(
+            !workspace
+                .path()
+                .join("target/cargo-rail/compiler-artifacts-v1")
+                .exists(),
+            "artifact authority left an empty working root"
+        );
+    }
+
+    #[test]
+    fn compiler_artifact_authority_uses_cargo_target_reclamation() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::create_dir(workspace.path().join("src")).expect("source directory");
+        fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[package]\nname = \"artifact-clean\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("manifest");
+        fs::write(workspace.path().join("src/lib.rs"), "pub fn value() {}\n").expect("source");
+        let authority = CompilerArtifactAuthority::prepare(workspace.path(), CompilerArtifactBudget::default(), 1)
+            .expect("artifact authority");
+        let target_artifact = authority
+            .target_dir()
+            .join("aarch64-apple-darwin/debug/deps/target-artifact");
+        let host_artifact = authority.target_dir().join("debug/deps/host-artifact");
+        fs::create_dir_all(target_artifact.parent().expect("target artifact parent")).expect("target artifacts");
+        fs::create_dir_all(host_artifact.parent().expect("host artifact parent")).expect("host artifacts");
+        fs::write(&target_artifact, b"target").expect("target artifact");
+        fs::write(&host_artifact, b"host").expect("host artifact");
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+        let mut metrics = CompilerAnalysisMetrics::default();
+
+        reclaim_compiler_artifact_target(
+            &mut metrics,
+            workspace.path(),
+            &cargo,
+            &authority,
+            "aarch64-apple-darwin",
+        )
+        .expect("target reclamation");
+
+        assert!(!target_artifact.exists(), "Cargo left the completed target slice");
+        assert!(
+            authority.target_dir().join("CACHEDIR.TAG").is_file(),
+            "Cargo Rail did not restore the owned target root after Cargo removed it"
+        );
+        assert_eq!(metrics.artifact_views_reclaimed, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compiler_artifact_hard_limit_terminates_an_active_view() {
+        let root = tempfile::tempdir().expect("artifact root");
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("dd if=/dev/urandom of=\"$1/artifact\" bs=1048576 count=8 2>/dev/null; sync; exec sleep 10")
+            .arg("cargo-rail-artifact-budget-test")
+            .arg(root.path());
+        let started = Instant::now();
+        let error = run_artifact_bounded_command(
+            &mut command,
+            root.path(),
+            CompilerArtifactBudget::new(512 * 1024, 1024 * 1024),
+        )
+        .expect_err("artifact growth must exceed the hard limit");
+
+        assert!(error.to_string().contains("hard limit"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "budget monitor did not terminate the active view"
+        );
+    }
+
+    #[test]
+    fn compiler_artifact_hard_limit_checks_exact_final_bytes() {
+        let root = tempfile::tempdir().expect("artifact root");
+        fs::write(root.path().join("artifact"), vec![7_u8; 2048]).expect("artifact");
+        let mut command = if cfg!(windows) {
+            let mut command = Command::new("cmd");
+            command.args(["/c", "exit", "0"]);
+            command
+        } else {
+            let mut command = Command::new("sh");
+            command.args(["-c", "exit 0"]);
+            command
+        };
+        let error = run_artifact_bounded_command(&mut command, root.path(), CompilerArtifactBudget::new(512, 1024))
+            .expect_err("final logical bytes must remain bounded");
+
+        assert!(error.to_string().contains("2048 bytes"), "{error}");
+        assert!(error.to_string().contains("hard limit"), "{error}");
+    }
+
+    #[test]
     fn build_script_executable_comes_from_cargo_filenames() {
         let unix = FileObservation {
             path: ObservationPath::Repository("target/debug/build/unit/build-script-build".to_string()),
@@ -4628,6 +5260,56 @@ edition = "2024"
         update_candidate_survivors(&mut survivors, &targets, "member", "linux", &test_evidence(&[]));
 
         assert!(survivors["member"].is_empty());
+    }
+
+    #[test]
+    fn test_candidate_scheduler_stops_after_incomplete_required_view() {
+        let candidates = vec![CompilerCandidate {
+            member: "member".to_string(),
+            crate_name: "alpha".to_string(),
+            kind: crate::cargo::manifest_analyzer::DepKind::Normal,
+            applicable_targets: BTreeSet::from(["linux".to_string()]),
+            required_features: None,
+        }];
+        let targets = build_candidate_target_index(&candidates);
+        let mut survivors = HashMap::from([(
+            "member".to_string(),
+            BTreeSet::from([(
+                crate::cargo::manifest_analyzer::DepKind::Normal,
+                "alpha".to_string(),
+                None,
+            )]),
+        )]);
+        let mut evidence = test_evidence(&["alpha"]);
+        evidence.completeness = DiagnosticsCompleteness::Incomplete;
+
+        update_candidate_survivors(&mut survivors, &targets, "member", "linux", &evidence);
+
+        assert!(
+            survivors["member"].is_empty(),
+            "one incomplete required view already makes an unused proof impossible"
+        );
+    }
+
+    #[test]
+    fn compiler_evidence_executes_cheapest_feature_view_first() {
+        let mut features = vec![
+            FeatureSelection::Selected(vec!["feature".to_string()]),
+            FeatureSelection::NoDefaultFeatures,
+            FeatureSelection::AllFeatures,
+            FeatureSelection::Default,
+        ];
+        features.sort_by_key(feature_execution_priority);
+
+        assert_eq!(
+            features,
+            vec![
+                FeatureSelection::Default,
+                FeatureSelection::NoDefaultFeatures,
+                FeatureSelection::Selected(vec!["feature".to_string()]),
+                FeatureSelection::AllFeatures,
+            ]
+        );
     }
 
     #[test]

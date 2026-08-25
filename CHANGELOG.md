@@ -1,7 +1,5 @@
 # Changelog
 
-
-
 ## [0.22.2](https://github.com/loadingalias/cargo-rail/compare/v0.22.1...v0.22.2) - 2026-08-24
 
 - Update Cargo-Rail's public GitHub Actions examples and dogfood workflow to use cargo-rail-action v7 with Cargo-Rail
@@ -9,7 +7,6 @@
 
 - Preserve every benchmark compiler-coverage event when parallel rustc wrappers select the same initial event filename
   instead of failing the compilation with an `EEXIST` error.
-
 
 ## [0.22.1](https://github.com/loadingalias/cargo-rail/compare/v0.22.0...v0.22.1) - 2026-08-24
 
@@ -22,7 +19,6 @@
 
 - Resolve release-archive executables from an absolute extraction root so smoke tests remain valid after changing their
   working directory, and preserve the failing diagnostic when an archive violates its Surface capability contract.
-
 
 ## [0.22.0](https://github.com/loadingalias/cargo-rail/compare/v0.21.0...v0.22.0) - 2026-08-23
 

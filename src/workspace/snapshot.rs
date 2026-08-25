@@ -51,6 +51,7 @@ impl fmt::Display for SnapshotId {
 }
 
 /// Exact bytes of one authoritative workspace file.
+#[derive(Debug)]
 pub struct SnapshotFile {
     path: RepositoryPath,
     bytes: Arc<[u8]>,
@@ -106,6 +107,7 @@ impl LockedPackageIdentity {
 }
 
 /// Exact Cargo lockfile bytes plus parsed package/source identities.
+#[derive(Debug)]
 pub struct LockfileSnapshot {
     file: SnapshotFile,
     packages: Vec<LockedPackageIdentity>,
@@ -124,6 +126,7 @@ impl LockfileSnapshot {
 }
 
 /// Cargo package identity and its logical local root, when source-backed here.
+#[derive(Debug)]
 pub struct SnapshotPackage {
     id: PackageId,
     name: String,
@@ -188,6 +191,7 @@ impl SnapshotPackage {
 /// view already loaded for the owning context. Repository-owned paths use
 /// logical identities; external paths remain identity inputs when their
 /// location changes Cargo or compiler behavior.
+#[derive(Debug)]
 pub struct WorkspaceSnapshot {
     id: SnapshotId,
     source_root: PathBuf,
@@ -212,6 +216,7 @@ pub struct WorkspaceSnapshot {
     derived: Arc<DerivedViews>,
 }
 
+#[derive(Debug)]
 pub(crate) struct DerivedViews {
     workspace_root: PathBuf,
     analysis_targets: Vec<String>,
@@ -275,7 +280,7 @@ impl DerivedViews {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct SnapshotViewError {
     message: String,
     help: Option<String>,
@@ -1391,8 +1396,7 @@ mod tests {
         let error = LockfileSnapshot::from_file(lockfile(
       b"version = 4\n\n[[package]]\nname = \"dep\"\nversion = \"1.2.3\"\nsource = \"registry+https://example.invalid/index\"\nchecksum = \"abc123\"\n\n[[package]]\nname = \"dep\"\nversion = \"1.2.3\"\nsource = \"registry+https://example.invalid/index\"\nchecksum = \"def456\"\n",
     ))
-    .err()
-    .expect("duplicate locked identities must fail closed");
+    .expect_err("duplicate locked identities must fail closed");
         assert!(error.to_string().contains("duplicate package identity"), "{error}");
     }
 
@@ -1401,8 +1405,7 @@ mod tests {
         let error = LockfileSnapshot::from_file(lockfile(
       b"version = 4\n\n[[package]]\nname = \"dep\"\nversion = \"1.2.3\"\nsource = \"registry+https://user:password@example.invalid/index\"\nchecksum = \"abc123\"\n",
     ))
-    .err()
-    .expect("credential-bearing locked source must fail closed");
+    .expect_err("credential-bearing locked source must fail closed");
         assert!(error.to_string().contains("credential-bearing source URL"), "{error}");
     }
 

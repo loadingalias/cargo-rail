@@ -255,6 +255,7 @@ pub struct FeatureReachability {
 }
 
 /// Analyzes workspace features using resolved cargo metadata
+#[derive(Debug)]
 pub struct FeatureScanner;
 
 impl FeatureScanner {

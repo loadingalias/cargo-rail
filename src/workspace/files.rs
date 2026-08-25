@@ -9,6 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Handler for auxiliary files (rust-toolchain.toml, rustfmt.toml, .cargo/config.toml)
+#[derive(Debug)]
 pub struct AuxiliaryFiles {
     files: Vec<AuxiliaryFile>,
 }
@@ -22,6 +23,7 @@ struct AuxiliaryFile {
 }
 
 /// Handler for project files (README, LICENSE) with crate-first, workspace-fallback logic
+#[derive(Debug)]
 pub struct ProjectFiles {
     files: Vec<AuxiliaryFile>,
 }

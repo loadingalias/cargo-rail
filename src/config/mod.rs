@@ -10,8 +10,8 @@ mod unify;
 pub use change_detection::{ChangeDetectionConfig, ConfidenceProfile, UnknownFilePolicy};
 pub use release::{
     ChangelogConfig, ChangelogFilters, ChangelogRelativeTo, ChangelogShape, CommitPolicy, CrateReleaseConfig,
-    GroupSpec, Pre1BreakingBump, ReleaseConfig, ReleaseRemoteEffects, ReleaseSource, RequireChangeFiles,
-    SemverCheckPolicy,
+    GroupSpec, Pre1BreakingBump, ReleaseConfig, ReleaseRegistryPublication, ReleaseRemoteEffects, ReleaseSource,
+    RequireChangeFiles, SemverCheckPolicy,
 };
 pub use split::{CratePath, CrateSplitConfig, SplitConfig, SplitMode, WorkspaceMode};
 pub use surface::{
@@ -82,6 +82,7 @@ pub struct CrateConfig {
 }
 
 /// Result of attempting to load configuration
+#[derive(Debug)]
 pub enum ConfigLoadResult {
     /// Config loaded successfully
     Loaded(Box<RailConfig>),

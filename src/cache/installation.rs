@@ -19,10 +19,13 @@ const RECEIPT_FILE: &str = "setup.json";
 const SESSION_MEMO_FILE: &str = "session.json";
 const SESSION_LOCK_FILE: &str = "session.lock";
 const USAGE_FILE: &str = "usage-v1.log";
+const EARLY_BYPASS_FILE: &str = "early-bypass-v1.log";
 const COORDINATOR_STATE_PREFIX: &str = "remote-coordinator-v1-";
 const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
 const MAX_SESSION_MEMO_BYTES: u64 = 256 * 1024;
 const MAX_USAGE_BYTES: u64 = 64 * 1024;
+const MAX_EARLY_BYPASS_BYTES: u64 = 64 * 1024;
+const MAX_EARLY_BYPASS_REASON_BYTES: usize = 96;
 const MAX_DISTRIBUTED_PLACEMENT_HISTORY_BYTES: u64 = 64 * 1024;
 #[cfg(not(windows))]
 const WRAPPER_FILE: &str = "cargo-rail-native-rustc-wrapper";
@@ -301,7 +304,10 @@ pub(crate) struct InstallationUsageStatus {
     pub(crate) bypasses: u64,
     pub(crate) failures: u64,
     pub(crate) ledger_full: bool,
-    pub(crate) early_bypasses: &'static str,
+    pub(crate) early_bypasses: u64,
+    pub(crate) early_bypass_reasons: std::collections::BTreeMap<String, u64>,
+    pub(crate) early_bypass_ledger_full: bool,
+    pub(crate) early_bypass_incomplete_tail: bool,
 }
 
 impl InstallationReceipt {
@@ -389,6 +395,10 @@ impl InstallationReceipt {
 
     fn usage_path(&self) -> RailResult<PathBuf> {
         Ok(self.installation_directory()?.join(USAGE_FILE))
+    }
+
+    fn early_bypass_path(&self) -> RailResult<PathBuf> {
+        Ok(self.installation_directory()?.join(EARLY_BYPASS_FILE))
     }
 
     fn distributed_placement_history_path(&self) -> RailResult<PathBuf> {
@@ -641,48 +651,148 @@ pub(crate) fn record_usage(receipt: &InstallationReceipt, outcome: u8) -> RailRe
     Ok(())
 }
 
-fn usage_status(receipt: &InstallationReceipt) -> RailResult<InstallationUsageStatus> {
-    let path = receipt.usage_path()?;
-    let mut file = match crate::utils::open_cache_lock_file(&path, false) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(InstallationUsageStatus {
-                early_bypasses: "not_recorded_before_context_acquisition",
-                ..InstallationUsageStatus::default()
-            });
+/// Record an acquisition-free wrapper bypass beside the validated installed binaries.
+///
+/// This path deliberately does not load the installation receipt, compiler
+/// session, or CAS. The reason is a classifier-owned constant and never
+/// contains compiler arguments or environment values.
+pub(crate) fn record_early_bypass(reason: &'static str) -> RailResult<()> {
+    if reason.is_empty()
+        || reason.len() > MAX_EARLY_BYPASS_REASON_BYTES
+        || !reason
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return Err(RailError::message("compiler-cache early bypass reason is invalid"));
+    }
+    let executable = std::env::current_exe()?;
+    let directory = executable
+        .parent()
+        .ok_or_else(|| RailError::message("installed compiler wrapper has no parent"))?;
+    let executable_name = executable.file_name();
+    if !matches!(
+        executable_name,
+        Some(name) if name == std::ffi::OsStr::new(WRAPPER_FILE) || name == std::ffi::OsStr::new(WORKER_FILE)
+    ) {
+        return Err(RailError::message(
+            "compiler-cache early bypass did not originate from an installed wrapper",
+        ));
+    }
+    let session_lock_path = directory.join(SESSION_LOCK_FILE);
+    let session_lock = crate::utils::open_cache_lock_file(&session_lock_path, false)?;
+    if !crate::utils::private_file_matches_path(&session_lock, &session_lock_path, 0)? {
+        return Err(RailError::message(
+            "transparent compiler session lock is not a private regular file",
+        ));
+    }
+    session_lock.lock()?;
+    if !crate::utils::private_file_matches_path(&session_lock, &session_lock_path, 0)? {
+        return Err(RailError::message(
+            "transparent compiler session lock changed while recording an early bypass",
+        ));
+    }
+    for name in [WRAPPER_FILE, WORKER_FILE] {
+        let path = directory.join(name);
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_file() || crate::utils::is_symlink_or_reparse(&metadata) {
+            return Err(RailError::message(
+                "compiler-cache early bypass installation binaries are invalid",
+            ));
         }
+    }
+
+    let path = directory.join(EARLY_BYPASS_FILE);
+    let mut file = crate::utils::open_cache_lock_file(&path, true)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    file.lock()?;
+    let metadata = file.metadata()?;
+    let record_len = u64::try_from(reason.len().saturating_add(1)).unwrap_or(u64::MAX);
+    if metadata.len().saturating_add(record_len) > MAX_EARLY_BYPASS_BYTES {
+        return Err(RailError::message(
+            "compiler-cache early bypass log reached its size bound",
+        ));
+    }
+    if !crate::utils::private_file_matches_path(&file, &path, metadata.len())? {
+        return Err(RailError::message(
+            "compiler-cache early bypass log is not the retained bounded private file",
+        ));
+    }
+    file.seek(std::io::SeekFrom::End(0))?;
+    file.write_all(&[u8::try_from(reason.len())
+        .map_err(|_| RailError::message("compiler-cache early bypass reason exceeded its encoded bound"))?])?;
+    file.write_all(reason.as_bytes())?;
+    drop(session_lock);
+    Ok(())
+}
+
+fn usage_status(receipt: &InstallationReceipt) -> RailResult<InstallationUsageStatus> {
+    let mut usage = InstallationUsageStatus::default();
+    if let Some(bytes) = read_bounded_private_log(&receipt.usage_path()?, MAX_USAGE_BYTES)? {
+        usage.recorded_events = bytes.len() as u64;
+        usage.ledger_full = bytes.len() as u64 == MAX_USAGE_BYTES;
+        for byte in bytes {
+            match byte {
+                b'H' => usage.hits = usage.hits.saturating_add(1),
+                b'M' => usage.misses = usage.misses.saturating_add(1),
+                b'B' => usage.bypasses = usage.bypasses.saturating_add(1),
+                b'F' => usage.failures = usage.failures.saturating_add(1),
+                _ => return Err(RailError::message("transparent compiler-cache usage log is malformed")),
+            }
+        }
+    }
+    if let Some(bytes) = read_bounded_private_log(&receipt.early_bypass_path()?, MAX_EARLY_BYPASS_BYTES)? {
+        usage.early_bypass_ledger_full = bytes.len() as u64 == MAX_EARLY_BYPASS_BYTES;
+        let mut remaining = bytes.as_slice();
+        while let Some((&length, tail)) = remaining.split_first() {
+            let length = usize::from(length);
+            if length == 0 || length > MAX_EARLY_BYPASS_REASON_BYTES || tail.len() < length {
+                usage.early_bypass_incomplete_tail = true;
+                break;
+            }
+            let reason = std::str::from_utf8(&tail[..length])?;
+            if !reason
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+            {
+                return Err(RailError::message(
+                    "transparent compiler-cache early bypass log is malformed",
+                ));
+            }
+            usage.early_bypasses = usage.early_bypasses.saturating_add(1);
+            let count = usage.early_bypass_reasons.entry(reason.to_string()).or_default();
+            *count = count.saturating_add(1);
+            remaining = &tail[length..];
+        }
+    }
+    Ok(usage)
+}
+
+fn read_bounded_private_log(path: &Path, maximum: u64) -> RailResult<Option<Vec<u8>>> {
+    let mut file = match crate::utils::open_cache_lock_file(path, false) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
     file.lock()?;
     let metadata = file.metadata()?;
-    if metadata.len() > MAX_USAGE_BYTES || !crate::utils::private_file_matches_path(&file, &path, metadata.len())? {
+    if metadata.len() > maximum || !crate::utils::private_file_matches_path(&file, path, metadata.len())? {
         return Err(RailError::message(
-            "transparent compiler-cache usage log is not a bounded private regular file",
+            "transparent compiler-cache observational log is not a bounded private regular file",
         ));
     }
     let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
     file.read_to_end(&mut bytes)?;
     if bytes.len() as u64 != metadata.len() {
         return Err(RailError::message(
-            "transparent compiler-cache usage log changed while it was read",
+            "transparent compiler-cache observational log changed while it was read",
         ));
     }
-    let mut usage = InstallationUsageStatus {
-        recorded_events: bytes.len() as u64,
-        ledger_full: bytes.len() as u64 == MAX_USAGE_BYTES,
-        early_bypasses: "not_recorded_before_context_acquisition",
-        ..InstallationUsageStatus::default()
-    };
-    for byte in bytes {
-        match byte {
-            b'H' => usage.hits = usage.hits.saturating_add(1),
-            b'M' => usage.misses = usage.misses.saturating_add(1),
-            b'B' => usage.bypasses = usage.bypasses.saturating_add(1),
-            b'F' => usage.failures = usage.failures.saturating_add(1),
-            _ => return Err(RailError::message("transparent compiler-cache usage log is malformed")),
-        }
-    }
-    Ok(usage)
+    Ok(Some(bytes))
 }
 
 /// Build a no-write setup plan from Cargo's current hierarchy and machine state.
@@ -1442,6 +1552,9 @@ pub(crate) fn apply_removal(plan: RemovalPlan) -> RailResult<()> {
     if read_optional_regular(&receipt.usage_path()?, MAX_USAGE_BYTES)?.is_some() {
         fs::remove_file(receipt.usage_path()?)?;
     }
+    if read_bounded_private_log(&receipt.early_bypass_path()?, MAX_EARLY_BYPASS_BYTES)?.is_some() {
+        fs::remove_file(receipt.early_bypass_path()?)?;
+    }
     remove_distributed_placement_state(&receipt)?;
     fs::remove_file(&receipt_path)?;
     let session_lock_path = receipt.session_lock_path()?;
@@ -1637,10 +1750,7 @@ pub(crate) fn status(current_dir: &Path) -> RailResult<InstallationStatus> {
             distributed_policy: None,
             distributed_placement_history: None,
             cargo_l0: "owned_by_cargo_not_observable_when_rustc_is_not_launched",
-            usage: InstallationUsageStatus {
-                early_bypasses: "not_recorded_before_context_acquisition",
-                ..InstallationUsageStatus::default()
-            },
+            usage: InstallationUsageStatus::default(),
             issues: Vec::new(),
         });
     };
@@ -1732,10 +1842,7 @@ pub(crate) fn status(current_dir: &Path) -> RailResult<InstallationStatus> {
         Ok(usage) => usage,
         Err(error) => {
             issues.push(error.to_string());
-            InstallationUsageStatus {
-                early_bypasses: "not_recorded_before_context_acquisition",
-                ..InstallationUsageStatus::default()
-            }
+            InstallationUsageStatus::default()
         }
     };
     let distributed_placement_history = if receipt
@@ -1796,6 +1903,41 @@ pub(crate) fn local_cache_status(current_dir: &Path) -> RailResult<Option<crate:
         return Ok(None);
     };
     crate::cache::cas::status_at_with_max(&root, receipt.cache.max_bytes())
+}
+
+/// Preview recovery using only the exact cache authority in the setup receipt.
+pub(crate) fn plan_local_cache_recovery(
+    current_dir: &Path,
+) -> RailResult<Option<crate::cache::cas::LocalCasRecoveryPlan>> {
+    let selection = recovery_cache_selection(current_dir)?;
+    crate::cache::cas::plan_markerless_recovery(&selection)
+}
+
+/// Quarantine one selected markerless CAS and create a fresh owned authority.
+pub(crate) fn recover_local_cache(current_dir: &Path) -> RailResult<Option<crate::cache::cas::LocalCasRecoveryPlan>> {
+    let selection = recovery_cache_selection(current_dir)?;
+    crate::cache::cas::recover_markerless_selected(&selection)
+}
+
+fn recovery_cache_selection(current_dir: &Path) -> RailResult<LocalCacheSelection> {
+    let cargo_home = resolve_cargo_home(current_dir)?;
+    let receipt_path = cargo_home
+        .join("cargo-rail")
+        .join(INSTALLATION_DIRECTORY)
+        .join(RECEIPT_FILE);
+    let bytes = read_optional_regular(&receipt_path, MAX_RECEIPT_BYTES)?.ok_or_else(|| {
+        RailError::with_help(
+            "transparent compiler-cache setup receipt is unavailable",
+            "run `cargo rail cache setup --check` before attempting local CAS recovery",
+        )
+    })?;
+    let receipt = parse_receipt(&bytes)?;
+    if receipt.cargo_home != cargo_home || receipt.config_path != selected_user_config(&cargo_home) {
+        return Err(RailError::message(
+            "transparent compiler-cache recovery authority does not match the selected Cargo home",
+        ));
+    }
+    Ok(receipt.cache)
 }
 
 /// Remove only the CAS selected by an installation receipt, when one exists.

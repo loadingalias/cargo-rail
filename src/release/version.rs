@@ -219,6 +219,7 @@ pub fn commit_bump_level(parsed: &ParsedSubject<'_>) -> Option<BumpLevel> {
 }
 
 /// Version bumper for Cargo.toml files
+#[derive(Debug)]
 pub struct VersionBumper;
 
 impl VersionBumper {

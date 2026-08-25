@@ -1,13 +1,10 @@
-# cargo-rail configuration
-# Split/Sync-focused example with full [crates.<name>.split] section.
+# Complete single-crate split policy.
 
-# targets = []  # optional: set for multi-target validation
-
-[crates.my-crate.split]
-remote = "git@github.com:your-org/my-crate.git"
+[crates.cargo-rail.split]
+remote = "git@github.com:your-org/cargo-rail-split.git"
 branch = "main"
 mode = "single" # single | combined
 workspace_mode = "standalone" # standalone | workspace
-# members defaults to ["my-crate"]; combined splits list package names here.
-include = []
-exclude = []
+members = ["cargo-rail"]
+include = ["LICENSE", "README.md"]
+exclude = ["README.md"]

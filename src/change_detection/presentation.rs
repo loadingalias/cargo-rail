@@ -52,6 +52,7 @@ impl ChangeClassification {
 /// Classifier for presentation-layer change detection
 ///
 /// Applies configuration rules to classify changes for display/CI integration.
+#[derive(Debug)]
 pub struct ChangeClassifier {
     /// Compiled infrastructure patterns
     infra_patterns: Vec<glob::Pattern>,

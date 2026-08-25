@@ -22,6 +22,7 @@ use crate::compiler::native_cache::{
     NativeCompilerValidation, NativeDurabilityPhase, PreparedNativeParts, PreparedNativeResult, native_durability_phase,
 };
 use crate::error::{RailError, RailResult};
+use crate::source::ContentDigest;
 
 const CAS_VERSION: u32 = 2;
 const CAS_ROOT_NAME: &str = "local-cas-v2";
@@ -233,6 +234,24 @@ impl LocalCacheSelection {
     pub(crate) fn configured_root(&self) -> RailResult<Option<PathBuf>> {
         configured_root_for(self)
     }
+
+    fn selected_root_without_owner_validation(&self) -> RailResult<Option<(PathBuf, SelectedCacheAuthority)>> {
+        let base = match fs::canonicalize(&self.base) {
+            Ok(base) => base,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        validate_real_directory(&base, "local cache base")?;
+        let owner = base.join("cargo-rail");
+        match fs::symlink_metadata(&owner) {
+            Ok(_) => validate_real_directory(&owner, "local CAS owner")?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+        let owner = fs::canonicalize(owner)?;
+        let authority = selected_cache_authority(&owner, false, self.trust_domain())?;
+        Ok(Some((owner.join(&authority.root_name), authority)))
+    }
 }
 
 struct SelectedCacheAuthority {
@@ -270,6 +289,16 @@ pub(crate) struct LocalCasStatus {
     pub(crate) oldest_used_unix_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) newest_used_unix_ms: Option<u64>,
+}
+
+/// Exact recoverable move for one selected markerless CAS root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct LocalCasRecoveryPlan {
+    pub(crate) schema_version: u32,
+    pub(crate) selected_root: String,
+    pub(crate) quarantine_root: String,
+    pub(crate) receipt_path: String,
+    pub(crate) bytes: u64,
 }
 
 /// Exclusive authority over one shared CAS lifecycle mutation or snapshot.
@@ -1321,36 +1350,7 @@ impl LocalCas {
         let lifecycle_lock = cargo_rail.join(format!("{}.lock", authority.root_name));
         let _lock = lock_local_cas(&lifecycle_lock, true, LockMode::Exclusive)?
             .ok_or_else(|| RailError::message("local CAS lifecycle lock was not created"))?;
-        let root = create_real_directory(&cargo_rail, &authority.root_name)?;
-        prove_local_cache_volume(&root)?;
-        ensure_owner_marker(&root, &authority.trust_domain)?;
-        create_real_directory(&root, "staging")?;
-        for name in [
-            "results",
-            "pins",
-            "leases",
-            NATIVE_ACTION_STATE_DIRECTORY,
-            NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY,
-            NATIVE_LINK_CANDIDATE_DIRECTORY,
-            EVIDENCE_CANDIDATE_INDEX_DIRECTORY,
-        ] {
-            create_real_directory(&root, name)?;
-        }
-        validate_optional_real_directory(
-            &root.join(LEGACY_NATIVE_ACTION_STATE_DIRECTORY),
-            "legacy local CAS native action state",
-        )?;
-        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-        create_real_directory(&root, SYSROOT_IDENTITY_MEMO_DIRECTORY)?;
-        validate_root_entries(&root)?;
-        clear_staging(&root.join("staging"))?;
-        reconcile_capacity_state(&root)?;
-        reconcile_native_ledger(&root)?;
-        Ok(Self {
-            root,
-            lifecycle_lock,
-            max_bytes: selection.max_bytes(),
-        })
+        initialize_selected_root(&cargo_rail, &authority, lifecycle_lock, selection.max_bytes())
     }
 
     /// Open the CAS prepared by this Cargo session without repeating lifecycle mutation.
@@ -2140,6 +2140,44 @@ fn cache_base() -> RailResult<PathBuf> {
     Ok(PathBuf::from(home).join(".cargo"))
 }
 
+fn initialize_selected_root(
+    cargo_rail: &Path,
+    authority: &SelectedCacheAuthority,
+    lifecycle_lock: PathBuf,
+    max_bytes: u64,
+) -> RailResult<LocalCas> {
+    let root = create_real_directory(cargo_rail, &authority.root_name)?;
+    prove_local_cache_volume(&root)?;
+    ensure_owner_marker(&root, &authority.trust_domain)?;
+    create_real_directory(&root, "staging")?;
+    for name in [
+        "results",
+        "pins",
+        "leases",
+        NATIVE_ACTION_STATE_DIRECTORY,
+        NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY,
+        NATIVE_LINK_CANDIDATE_DIRECTORY,
+        EVIDENCE_CANDIDATE_INDEX_DIRECTORY,
+    ] {
+        create_real_directory(&root, name)?;
+    }
+    validate_optional_real_directory(
+        &root.join(LEGACY_NATIVE_ACTION_STATE_DIRECTORY),
+        "legacy local CAS native action state",
+    )?;
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    create_real_directory(&root, SYSROOT_IDENTITY_MEMO_DIRECTORY)?;
+    validate_root_entries(&root)?;
+    clear_staging(&root.join("staging"))?;
+    reconcile_capacity_state(&root)?;
+    reconcile_native_ledger(&root)?;
+    Ok(LocalCas {
+        root,
+        lifecycle_lock,
+        max_bytes,
+    })
+}
+
 fn selected_cache_authority(
     owner: &Path,
     create_default: bool,
@@ -2413,7 +2451,7 @@ fn ensure_owner_marker(root: &Path, trust_domain: &str) -> RailResult<()> {
                 "local CAS root '{}' is nonempty but has no cargo-rail ownership marker",
                 root.display()
             ),
-            "choose an empty cache directory or remove the hostile pre-positioned path",
+            "run `cargo rail cache recover --check` to preview a byte-preserving quarantine, or choose an empty cache directory",
         ));
     }
     let parent = root
@@ -5919,6 +5957,154 @@ pub(crate) fn remove_owned_root_at(root: &Path) -> RailResult<Option<(PathBuf, u
     Ok(Some((root, bytes)))
 }
 
+#[derive(Serialize)]
+struct LocalCasRecoveryReceipt<'a> {
+    schema_version: u32,
+    state: &'a str,
+    selected_root: &'a str,
+    quarantine_root: &'a str,
+    bytes: u64,
+}
+
+/// Preview recovery of the exact selected markerless CAS without adopting it.
+pub(crate) fn plan_markerless_recovery(selection: &LocalCacheSelection) -> RailResult<Option<LocalCasRecoveryPlan>> {
+    let Some((root, authority)) = selection.selected_root_without_owner_validation()? else {
+        return Ok(None);
+    };
+    let lifecycle_lock = lifecycle_lock_path(&root)?;
+    let _lock = lock_local_cas(&lifecycle_lock, true, LockMode::Exclusive)?
+        .ok_or_else(|| RailError::message("local CAS lifecycle lock was not created"))?;
+    markerless_recovery_plan_locked(&root, &authority)
+}
+
+/// Quarantine the selected markerless root and initialize a fresh authority.
+pub(crate) fn recover_markerless_selected(selection: &LocalCacheSelection) -> RailResult<Option<LocalCasRecoveryPlan>> {
+    let Some((root, authority)) = selection.selected_root_without_owner_validation()? else {
+        return Ok(None);
+    };
+    let lifecycle_lock = lifecycle_lock_path(&root)?;
+    let _lock = lock_local_cas(&lifecycle_lock, true, LockMode::Exclusive)?
+        .ok_or_else(|| RailError::message("local CAS lifecycle lock was not created"))?;
+    let Some(plan) = markerless_recovery_plan_locked(&root, &authority)? else {
+        return Ok(None);
+    };
+    let selected_root = Path::new(&plan.selected_root);
+    let quarantine_root = Path::new(&plan.quarantine_root);
+    let receipt_path = Path::new(&plan.receipt_path);
+    let planned = LocalCasRecoveryReceipt {
+        schema_version: 1,
+        state: "planned",
+        selected_root: &plan.selected_root,
+        quarantine_root: &plan.quarantine_root,
+        bytes: plan.bytes,
+    };
+    write_file_atomic_committed(receipt_path, &canonical_json(&planned)?)?;
+    fs::rename(selected_root, quarantine_root).map_err(|error| {
+        RailError::message(format!(
+            "failed to quarantine markerless local CAS '{}' as '{}': {error}",
+            selected_root.display(),
+            quarantine_root.display()
+        ))
+    })?;
+    sync_directory_before_commit(
+        selected_root
+            .parent()
+            .ok_or_else(|| RailError::message("selected local CAS root has no parent"))?,
+    )?;
+    validate_real_directory(quarantine_root, "quarantined local CAS")?;
+    if removable_tree_bytes(quarantine_root)? != plan.bytes {
+        return Err(RailError::with_help(
+            "quarantined local CAS byte count changed across its atomic move",
+            format!(
+                "all retained bytes remain at '{}'; inspect them before rerunning cache setup",
+                quarantine_root.display()
+            ),
+        ));
+    }
+    let cargo_rail = selected_root
+        .parent()
+        .ok_or_else(|| RailError::message("selected local CAS root has no owner directory"))?;
+    drop(initialize_selected_root(
+        cargo_rail,
+        &authority,
+        lifecycle_lock,
+        selection.max_bytes(),
+    )?);
+    let completed = LocalCasRecoveryReceipt {
+        state: "completed",
+        ..planned
+    };
+    write_file_atomic_committed(receipt_path, &canonical_json(&completed)?)?;
+    Ok(Some(plan))
+}
+
+fn markerless_recovery_plan_locked(
+    root: &Path,
+    authority: &SelectedCacheAuthority,
+) -> RailResult<Option<LocalCasRecoveryPlan>> {
+    let metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_dir() || is_link_or_reparse(&metadata) || fs::canonicalize(root)? != root {
+        return Err(RailError::message(format!(
+            "selected local CAS root '{}' is not a canonical real directory",
+            root.display()
+        )));
+    }
+    match fs::symlink_metadata(root.join("OWNER")) {
+        Ok(_) => {
+            ensure_owner_marker_existing(root, Some(&authority.trust_domain)).map_err(|_| {
+                RailError::with_help(
+                    format!(
+                        "selected local CAS root '{}' has an owner marker with ambiguous authority",
+                        root.display()
+                    ),
+                    "recovery only quarantines a markerless root; inspect the owner marker and select the matching trust domain",
+                )
+            })?;
+            return Ok(None);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    if fs::read_dir(root)?.next().transpose()?.is_none() {
+        return Ok(None);
+    }
+    let bytes = removable_tree_bytes(root)?;
+    let mut identity = Sha256::new();
+    identity.update(b"cargo-rail-local-cas-recovery-v1\0");
+    identity.update(root.as_os_str().as_encoded_bytes());
+    identity.update(bytes.to_le_bytes());
+    identity.update(crate::utils::stable_file_generation(root).unwrap_or_default());
+    let identity = ContentDigest::from_sha256_bytes(identity.finalize().into()).to_string();
+    let root_name = root
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| RailError::message("selected local CAS root name is invalid"))?;
+    let parent = root
+        .parent()
+        .ok_or_else(|| RailError::message("selected local CAS root has no parent"))?;
+    let quarantine = parent.join(format!("{root_name}.quarantine-{identity}"));
+    let receipt = parent.join(format!("local-cas-recovery-{identity}.json"));
+    for path in [&quarantine, &receipt] {
+        if fs::symlink_metadata(path).is_ok() {
+            return Err(RailError::with_help(
+                format!("local CAS recovery destination '{}' already exists", path.display()),
+                "inspect the retained recovery receipt and quarantine before attempting another recovery",
+            ));
+        }
+    }
+    Ok(Some(LocalCasRecoveryPlan {
+        schema_version: 1,
+        selected_root: root.to_string_lossy().into_owned(),
+        quarantine_root: quarantine.to_string_lossy().into_owned(),
+        receipt_path: receipt.to_string_lossy().into_owned(),
+        bytes,
+    }))
+}
+
 /// Measure an owned tree without following links so cleanup can still recover
 /// a cache containing a hostile nested link.
 fn removable_tree_bytes(root: &Path) -> RailResult<u64> {
@@ -5971,10 +6157,17 @@ fn owner_marker_bytes(trust_domain: &str) -> RailResult<Vec<u8>> {
 fn ensure_owner_marker_existing(root: &Path, expected_trust_domain: Option<&str>) -> RailResult<()> {
     let marker = root.join("OWNER");
     let metadata = fs::symlink_metadata(&marker).map_err(|error| {
-        RailError::message(format!(
-            "local CAS root '{}' has no ownership marker: {error}",
-            root.display()
-        ))
+        if error.kind() == std::io::ErrorKind::NotFound {
+            RailError::with_help(
+                format!("local CAS root '{}' has no ownership marker", root.display()),
+                "run `cargo rail cache recover --check` to preview a byte-preserving quarantine",
+            )
+        } else {
+            RailError::message(format!(
+                "failed to inspect local CAS ownership marker '{}': {error}",
+                marker.display()
+            ))
+        }
     })?;
     let bytes = if metadata.is_file()
         && !is_link_or_reparse(&metadata)

@@ -704,14 +704,14 @@ pub(crate) struct CargoArtifactObservation {
 }
 
 /// Snapshot-derived target facts required to interpret wrapper argv without rediscovery.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct CompilationObservationContext {
     pub(crate) source_root: PathBuf,
     host_target: String,
     targets: Vec<ObservedTargetIdentity>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct ObservedTargetIdentity {
     selectors: BTreeSet<String>,
     platform: String,

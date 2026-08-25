@@ -155,6 +155,7 @@ fn dependency_path_matches(dependency: &Dependency, package: &PackageNode) -> bo
         .is_some_and(|package_root| package_root == path)
 }
 
+#[derive(Debug)]
 struct OwnershipIndex {
     workspace_root: PathBuf,
     workspace_roots: FxHashMap<PathBuf, NodeIndex>,
@@ -311,6 +312,7 @@ impl OwnershipIndex {
 /// Workspace dependency graph.
 ///
 /// Built from cargo_metadata, using petgraph for efficient traversals.
+#[derive(Debug)]
 pub struct WorkspaceGraph {
     /// The dependency graph (petgraph DiGraph)
     /// Nodes: PackageNode
@@ -1195,9 +1197,7 @@ mod tests {
         metadata.workspace_members.push(duplicate.id.clone());
         metadata.packages.push(duplicate);
 
-        let error = WorkspaceGraph::from_metadata(&metadata)
-            .err()
-            .expect("two exact packages cannot own the same root");
+        let error = WorkspaceGraph::from_metadata(&metadata).expect_err("two exact packages cannot own the same root");
         assert!(error.to_string().contains("same workspace package root"), "{error}");
     }
 

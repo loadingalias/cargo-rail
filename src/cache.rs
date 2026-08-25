@@ -136,7 +136,7 @@ pub(crate) fn status(workspace_root: &Path, workspace: bool, local: bool) -> Rai
         None
     };
     Ok(CacheStatus {
-        schema_version: 11,
+        schema_version: 12,
         installation,
         workspace: workspace.then(|| workspace_status(workspace_root)).transpose()?,
         local: local
@@ -168,6 +168,7 @@ pub(crate) fn remove_workspace(workspace_root: &Path) -> RailResult<CacheRemoval
     let root = crate::workspace::cargo_rail_state_root(workspace_root);
     let metadata = root.join("metadata.json");
     let legacy = root.join("cache");
+    let compiler_artifacts = root.join("compiler-artifacts-v1");
 
     // Validate and measure the complete owned scope before deleting any part of it.
     // The lifecycle lock keeps current cargo-rail processes from changing the view.
@@ -188,6 +189,9 @@ pub(crate) fn remove_workspace(workspace_root: &Path) -> RailResult<CacheRemoval
     }
     if remove_owned_tree(&legacy)? {
         paths.push(legacy.to_string_lossy().into_owned());
+    }
+    if remove_owned_tree(&compiler_artifacts)? {
+        paths.push(compiler_artifacts.to_string_lossy().into_owned());
     }
     Ok(CacheRemoval { paths, bytes })
 }
@@ -232,6 +236,7 @@ fn workspace_status(workspace_root: &Path) -> RailResult<WorkspaceCacheStatus> {
             root.join("cache"),
             Some(crate::compiler::diagnostics_store::MAX_CACHE_BYTES as u64),
         ),
+        ("compiler_artifacts", root.join("compiler-artifacts-v1"), None),
         (
             "workspace_cache_lock",
             root.join("cache.lock"),

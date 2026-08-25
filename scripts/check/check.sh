@@ -35,6 +35,9 @@ echo "Locked Cargo command surfaces..."
 scripts/ci/check-locked-cargo.sh
 scripts/ci/check-locked-cargo-test.sh
 
+echo "Installers..."
+scripts/ci/check-installers.sh
+
 echo "Dependency and security policy..."
 cargo deny --locked check -D warnings all
 

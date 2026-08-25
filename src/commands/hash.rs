@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 const PLAN_IDENTITY_CONTRACT_VERSION: u32 = 1;
 
 /// Options for `cargo rail hash`.
+#[derive(Debug)]
 pub struct HashOptions {
     /// Git ref to compare against.
     pub since: Option<String>,

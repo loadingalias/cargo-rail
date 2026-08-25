@@ -137,6 +137,23 @@ def require_unique_sorted(values: list[str], path: str) -> None:
     require(values == sorted(values), f"{path} must be sorted")
 
 
+def require_action_tool_version(paths: list[Path], tool: str, version: str) -> None:
+    pattern = re.compile(
+        rf"^[ \t]+tool:[ \t]+['\"]?{re.escape(tool)}(?:@([^'\"\s]+))?['\"]?[ \t]*$",
+        re.MULTILINE,
+    )
+    installs = [
+        (path, match.group(1))
+        for path in paths
+        for match in pattern.finditer(path.read_text(encoding="utf-8"))
+    ]
+    require(installs, f"GitHub Actions must install {tool}")
+    require(
+        all(installed_version == version for _, installed_version in installs),
+        f"GitHub Actions {tool} installs must pin {tool}@{version}",
+    )
+
+
 @dataclass(frozen=True)
 class NativeHost:
     target: str
@@ -656,7 +673,6 @@ def load_native_cache_contract() -> NativeCacheContract:
         "compiler_diagnostic_replay_unavailable",
         "compiler_output_root_authority_unavailable",
         "cross_target_toolchain_evidence_unavailable",
-        "custom_target_directory_authority_unavailable",
         "dynamic_dependency_execution_observation_unavailable",
         "doctest_execution_result_authority_unavailable",
         "explicit_link_argument_evidence_unavailable",
@@ -787,6 +803,14 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         re.search(r"readonly\s+(?:CARGO_NEXTEST_VERSION|JUST_VERSION)=", install_tools) is None,
         "scripts/ci/install-tools.sh must not duplicate cargo-nextest or just versions",
     )
+    require(
+        "cargo-audit" not in install_tools,
+        "scripts/ci/install-tools.sh must keep cargo-deny as the single dependency policy gate",
+    )
+    action_tool_paths = [
+        REPOSITORY_ROOT / ".github/actions/setup/action.yaml",
+        *sorted((REPOSITORY_ROOT / ".github/workflows").glob("*.yaml")),
+    ]
 
     nextest_required_pairs = {
         (entry.os, entry.arch)
@@ -808,24 +832,7 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         nextest_version == config_nextest_version,
         "ci-tool-archives.tsv cargo-nextest version must match .config/nextest.toml",
     )
-    nextest_action_paths = [
-        REPOSITORY_ROOT / ".github/actions/setup/action.yaml",
-        *sorted((REPOSITORY_ROOT / ".github/workflows").glob("*.yaml")),
-    ]
-    nextest_action_pattern = re.compile(
-        r"^[ \t]+tool:[ \t]+['\"]?cargo-nextest(?:@([^'\"\s]+))?['\"]?[ \t]*$",
-        re.MULTILINE,
-    )
-    nextest_action_installs = [
-        (path, match.group(1))
-        for path in nextest_action_paths
-        for match in nextest_action_pattern.finditer(path.read_text(encoding="utf-8"))
-    ]
-    require(nextest_action_installs, "GitHub Actions must install cargo-nextest")
-    require(
-        all(version == nextest_version for _, version in nextest_action_installs),
-        f"GitHub Actions cargo-nextest installs must pin cargo-nextest@{nextest_version}",
-    )
+    require_action_tool_version(action_tool_paths, "cargo-nextest", nextest_version)
     expected_nextest_targets = {
         ("unknown-linux-gnu", "x86_64"),
         ("unknown-linux-gnu", "aarch64"),
@@ -853,6 +860,21 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
     just_versions = {entry.version for entry in ci_tool_archives if entry.tool == "just"}
     require(len(just_versions) == 1, "ci-tool-archives.tsv must select one just version")
     just_version = next(iter(just_versions))
+    require_action_tool_version(action_tool_paths, "just", just_version)
+    cargo_deny_match = re.search(
+        r"^readonly CARGO_DENY_VERSION=([0-9]+\.[0-9]+\.[0-9]+)$",
+        install_tools,
+        re.MULTILINE,
+    )
+    require(
+        cargo_deny_match is not None,
+        "scripts/ci/install-tools.sh must define one exact CARGO_DENY_VERSION",
+    )
+    require_action_tool_version(
+        action_tool_paths,
+        "cargo-deny",
+        cargo_deny_match.group(1),
+    )
     expected_just_targets = {
         ("unknown-linux-musl", "x86_64"),
         ("unknown-linux-musl", "aarch64"),
@@ -888,6 +910,7 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         "just build-all",
         "just test-all",
         "cargo nextest run --workspace -P commit --all-features --locked --config-file .config/nextest.toml",
+        "cargo test --doc -p cargo-rail --all-features --locked",
     ):
         require(
             fragment in compatibility_workflow,
@@ -899,6 +922,18 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
             "uses: ./.github/workflows/compatibility.yaml" in source,
             f"{caller} does not call the compatibility workflow",
         )
+
+    release_workflow = (REPOSITORY_ROOT / ".github/workflows/release.yaml").read_text(
+        encoding="utf-8"
+    )
+    require(
+        "test --doc -p cargo-rail --all-features --locked" in release_workflow,
+        "release workflow must run doctests",
+    )
+    require(
+        "cargo-audit" not in release_workflow,
+        "release workflow must keep cargo-deny as the single dependency policy gate",
+    )
 
     worker_verifier = "scripts/ci/verify-distributed-worker.py"
     require(
@@ -1472,8 +1507,9 @@ installed receipt authority, validates its owner marker, waits for in-flight rea
 CAS. Removing active L1 leaves setup drift that the next cold compiler invocation bypasses safely; `cache setup`
 repairs the same root. `cache remove` losslessly removes only the receipt-owned Cargo field, wrapper, session state, and
 receipt; it preserves CAS data. It refuses changed or unowned state. A legacy `local-cas-v1` is reclaim-only and never
-becomes v2 authority. Use `--scope all` only when both cache-cleanup effects are intended. `cargo rail clean --cache`
-remains a combined compatibility alias. Do not remove individual CAS objects or Cargo fingerprints by hand.
+becomes v2 authority. Use `--scope all` only when both cache-cleanup effects are intended. Bare `cargo rail clean` and
+its `--cache` compatibility option remain bounded to current-workspace state; neither removes the shared local CAS.
+Do not remove individual CAS objects or Cargo fingerprints by hand.
 
 ## Execution and reuse support
 

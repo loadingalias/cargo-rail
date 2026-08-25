@@ -3,7 +3,7 @@
 use crate::config::{ReleaseConfig, ReleaseRemoteEffects};
 use crate::error::{RailError, RailResult};
 use crate::release::changelog::detect_github_repo;
-use crate::release::planner::{CrateReleasePlan, ReleasePlan};
+use crate::release::planner::{CrateReleasePlan, RELEASE_REGISTRY, ReleasePlan};
 use crate::release::process;
 use crate::release::remote::{RemoteRepository, release_repository};
 use crate::release::state::{
@@ -58,6 +58,7 @@ impl ReleaseForge {
 }
 
 /// Release publisher
+#[derive(Debug)]
 pub struct ReleasePublisher<'a> {
     /// Workspace context
     ctx: &'a WorkspaceContext,
@@ -81,6 +82,13 @@ impl<'a> ReleasePublisher<'a> {
     fn preflight(&self, plan: &ReleasePlan, skip_publish: bool, skip_tag: bool) -> RailResult<ReleasePreflight> {
         let mut warnings = Vec::new();
         let git = self.ctx.git()?.git();
+
+        if !skip_publish && self.release_config.registry_publication.registry() != Some(RELEASE_REGISTRY) {
+            return Err(RailError::with_help(
+                "registry publication is not authorized by the persisted release configuration",
+                "set release.registry_publication = \"crates-io\" and pass --publish only after reviewing the exact plan",
+            ));
+        }
 
         if !skip_tag {
             let mut tags = BTreeSet::new();
@@ -867,21 +875,29 @@ impl<'a> ReleasePublisher<'a> {
                 }
                 continue;
             }
+            let registry = state.publish_registry.clone().ok_or_else(|| {
+                RailError::message(format!(
+                    "release state has no registry authority for pending publication of '{}'",
+                    crate_plan.name
+                ))
+            })?;
             if self.registry_version_exists(&crate_plan) {
                 state.crates[index].publication.status = StepStatus::Complete;
-                state.crates[index].publication.object = Some(crate_plan.new_version.to_string());
+                state.crates[index].publication.object =
+                    Some(format!("{registry}:{}@{}", crate_plan.name, crate_plan.new_version));
                 state.save(state_path, &format!("publish_observed:{}", crate_plan.name))?;
                 continue;
             }
             if state.crates[index].publication.status == StepStatus::Pending {
                 state.crates[index].publication.status = StepStatus::InProgress;
-                state.crates[index].publication.object = Some(crate_plan.new_version.to_string());
+                state.crates[index].publication.object =
+                    Some(format!("{registry}:{}@{}", crate_plan.name, crate_plan.new_version));
                 state.save(state_path, &format!("publish_intent:{}", crate_plan.name))?;
             }
             progress!("  publishing {}...", crate_plan.name);
             self.validate_publish_checkout(state)?;
             fault_before("publish", &crate_plan.name)?;
-            let publish = self.publish_crate(&crate_plan);
+            let publish = self.publish_crate(&crate_plan, &registry);
             fault_after("publish", &crate_plan.name)?;
             let observable = self.registry_version_exists(&crate_plan);
             if let Err(error) = publish
@@ -896,7 +912,8 @@ impl<'a> ReleasePublisher<'a> {
                 return Err(registry_wait_error(&crate_plan));
             }
             state.crates[index].publication.status = StepStatus::Complete;
-            state.crates[index].publication.object = Some(crate_plan.new_version.to_string());
+            state.crates[index].publication.object =
+                Some(format!("{registry}:{}@{}", crate_plan.name, crate_plan.new_version));
             state.save(state_path, &format!("publish_observed:{}", crate_plan.name))?;
         }
         Ok(())
@@ -1116,11 +1133,12 @@ impl<'a> ReleasePublisher<'a> {
     /// Commit version bump and changelog
     fn commit_version_bump(&self, state: &ReleaseState, plan: &CrateReleasePlan) -> RailResult<()> {
         let mut message = format!(
-            "chore(release): {} v{}\n\nRail-Release: {}\nRail-Release-Mode: run\nRail-Release-Publish: {}\nRail-Release-Tag: {}\nRail-Release-Remote: {}\nRail-Release-Crate: {}@{}\nRail-Release-Tag-Name: {}={}\nRail-Release-Crate-Publish: {}={}",
+            "chore(release): {} v{}\n\nRail-Release: {}\nRail-Release-Mode: run\nRail-Release-Publish: {}\nRail-Release-Publish-Registry: {}\nRail-Release-Tag: {}\nRail-Release-Remote: {}\nRail-Release-Crate: {}@{}\nRail-Release-Tag-Name: {}={}\nRail-Release-Crate-Publish: {}={}",
             plan.name,
             plan.new_version,
             state.transaction_id,
             !state.skip_publish,
+            state.publish_registry.as_deref().unwrap_or("none"),
             !state.skip_tag,
             self.release_config.remote_effects.as_str(),
             plan.name,
@@ -1217,10 +1235,15 @@ impl<'a> ReleasePublisher<'a> {
     }
 
     /// Publish crate to crates.io
-    fn publish_crate(&self, plan: &CrateReleasePlan) -> RailResult<()> {
+    fn publish_crate(&self, plan: &CrateReleasePlan, registry: &str) -> RailResult<()> {
+        if registry != RELEASE_REGISTRY {
+            return Err(RailError::message(format!(
+                "release state authorizes unsupported registry '{registry}'"
+            )));
+        }
         let output = process::run(
             "cargo",
-            &["publish", "-p", &plan.name, "--locked", "--registry", "crates-io"],
+            &["publish", "-p", &plan.name, "--locked", "--registry", registry],
             Some(self.ctx.workspace_root()),
         )?;
 
@@ -1391,7 +1414,7 @@ impl<'a> ReleasePublisher<'a> {
     fn unsupported_readiness_error(&self) -> RailError {
         RailError::with_help(
             "origin does not expose a supported exact-SHA readiness provider",
-            "use a GitHub or GitLab origin, or pass both --skip-publish and --skip-tag for a commit-only push",
+            "use a GitHub or GitLab origin, or omit --publish and pass --skip-tag for a commit-only push",
         )
     }
 

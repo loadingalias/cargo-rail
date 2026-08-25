@@ -19,7 +19,7 @@ runs:
     - name: Install just
       uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9
       with:
-        tool: just
+        tool: just@1.58.0
 
     - name: Install cargo-nextest
       if: inputs.install-nextest == 'true'
@@ -30,7 +30,7 @@ runs:
     - name: Install repository Rust toolchain
       uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
       with:
-        toolchain: 1.97.1
+        toolchain: 1.98.0
         components: clippy, rustfmt
 
     - name: Setup Rust Cache

@@ -21,6 +21,8 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+pub(crate) const RELEASE_REGISTRY: &str = "crates-io";
+
 /// A plan for releasing one or more crates
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleasePlan {
@@ -205,6 +207,7 @@ pub enum DependentPolicy {
 }
 
 /// Release planner
+#[derive(Debug)]
 pub struct ReleasePlanner<'a> {
     /// Workspace context
     ctx: &'a WorkspaceContext,
@@ -504,11 +507,12 @@ impl<'a> ReleasePlanner<'a> {
                 ));
             }
 
-            let publish_from_cargo = crate::workspace::CargoState::is_package_publishable(package);
-            let publish = crate_config
-                .and_then(|config| config.release.as_ref())
-                .map(|release| release.publish)
-                .unwrap_or(publish_from_cargo);
+            let publish_from_cargo = crate::workspace::CargoState::package_allows_registry(package, RELEASE_REGISTRY);
+            let publish = publish_from_cargo
+                && crate_config
+                    .and_then(|config| config.release.as_ref())
+                    .map(|release| release.publish)
+                    .unwrap_or(true);
             let tag_name = self.format_tag(crate_name, &current_version);
             crate_plans.push(CrateReleasePlan {
                 name: crate_name.clone(),
@@ -626,12 +630,14 @@ impl<'a> ReleasePlanner<'a> {
             .filter_map(|entry| entry.bump.release_level())
             .max();
 
-        // Check if should publish - per-crate config takes priority, then Cargo.toml
-        let publish_from_cargo = crate::workspace::CargoState::is_package_publishable(package);
-        let publish = crate_config
-            .and_then(|c| c.release.as_ref())
-            .map(|r| r.publish)
-            .unwrap_or(publish_from_cargo);
+        // Cargo's registry allowlist is the hard ceiling. Repository policy
+        // may narrow that authority but can never widen it.
+        let publish_from_cargo = crate::workspace::CargoState::package_allows_registry(package, RELEASE_REGISTRY);
+        let publish = publish_from_cargo
+            && crate_config
+                .and_then(|c| c.release.as_ref())
+                .map(|r| r.publish)
+                .unwrap_or(true);
 
         let explicit_signal = [change_bump, inferred_bump].into_iter().flatten().max();
         let natural_level = explicit_signal.or_else(|| (!dependency_updates.is_empty()).then_some(BumpLevel::Patch));
@@ -1258,7 +1264,7 @@ impl ReleasePlan {
 
             // Show publish status
             let publish_status = if skip_publish {
-                "✗ (--skip-publish)".to_string()
+                "✗ (not authorized; pass --publish)".to_string()
             } else if crate_plan.publish {
                 "✓".to_string()
             } else {

@@ -3,7 +3,6 @@ use cargo_rail::backup::{BackupManager, BackupMetadata};
 use cargo_rail::commands::{TextJsonOutputFormat, run_clean};
 use cargo_rail::workspace::WorkspaceContext;
 use std::fs;
-use std::process::Command;
 use tempfile::TempDir;
 
 fn create_test_workspace() -> Result<TempDir> {
@@ -70,8 +69,9 @@ fn create_test_workspace() -> Result<TempDir> {
 }
 
 fn run_cache_command(workspace: &TempDir, cache: &TempDir, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
-        .current_dir(workspace.path())
+    let mut command =
+        super::helpers::isolated_cargo_rail_command(workspace.path()).expect("test command should be isolated");
+    command
         .env("CARGO_RAIL_CACHE_DIR", cache.path())
         .args(args)
         .output()
@@ -187,23 +187,25 @@ fn apply_cleanup_migrates_an_owned_pre_lifecycle_local_cas() {
 }
 
 #[test]
-fn compatibility_cleanup_migrates_an_owned_pre_lifecycle_local_cas() {
+fn compatibility_cleanup_never_removes_the_shared_local_cas() {
     let result: Result<()> = (|| {
-        let workspace = create_test_workspace()?;
-        let cache = TempDir::new().unwrap();
-        let root = create_empty_local_cas(&cache)?;
-        let lock = cache.path().join("cargo-rail/local-cas-v2.lock");
-        fs::remove_file(&lock).unwrap();
+        for arguments in [&["rail", "clean"][..], &["rail", "clean", "--cache"][..]] {
+            let workspace = create_test_workspace()?;
+            let cache = TempDir::new().unwrap();
+            let root = create_empty_local_cas(&cache)?;
+            let lock = cache.path().join("cargo-rail/local-cas-v2.lock");
+            let shared_result = root.join("results/shared-result");
+            fs::write(&shared_result, b"shared across workspaces")?;
 
-        let cleaned = run_cache_command(&workspace, &cache, &["rail", "clean", "--cache"]);
+            let cleaned = run_cache_command(&workspace, &cache, arguments);
 
-        assert!(cleaned.status.success(), "compatibility cleanup failed: {cleaned:?}");
-        assert!(!root.exists());
-        assert!(
-            lock.is_file(),
-            "compatibility apply must establish the persistent lifecycle authority"
-        );
-        assert_eq!(fs::metadata(lock).unwrap().len(), 0);
+            assert!(cleaned.status.success(), "compatibility cleanup failed: {cleaned:?}");
+            assert_eq!(fs::read(&shared_result)?, b"shared across workspaces");
+            assert!(lock.is_file());
+            assert_eq!(fs::metadata(lock).unwrap().len(), 0);
+            assert!(!workspace.path().join("target/cargo-rail/metadata.json").exists());
+            assert!(!workspace.path().join("target/cargo-rail/cache").exists());
+        }
         Ok(())
     })();
     super::helpers::finish_test(result);

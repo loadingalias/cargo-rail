@@ -319,6 +319,7 @@ fn parse_field<'a>(field: Option<&'a str>, name: &str) -> RailResult<&'a str> {
 }
 
 /// One-to-one source/target mapping recovered from history and legacy notes.
+#[derive(Debug)]
 pub struct MappingStore {
     owner: String,
     mappings: FxHashMap<String, String>,
@@ -670,7 +671,9 @@ fn decode_hex(value: &str) -> RailResult<String> {
     }
     let bytes = value
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let pair = std::str::from_utf8(pair).map_err(|_| RailError::message("Rail-Origin owner is not UTF-8"))?;
             u8::from_str_radix(pair, 16).map_err(|_| RailError::message("Rail-Origin owner has invalid hex"))

@@ -31,7 +31,7 @@ check_statement() {
     return
   fi
 
-  if [[ "$statement" =~ (^|[[:space:]\`\"\'])cargo[[:space:]]+(build|check|clippy|test|bench|rustc|run|doc|miri|metadata|publish)($|[[:space:]\`\"\']) ]] \
+  if [[ "$statement" =~ (^|[[:space:]\`\"\'])cargo[[:space:]]+(build|check|clippy|test|bench|rustc|run|doc|miri|metadata|package|publish)($|[[:space:]\`\"\']) ]] \
     && [[ "$statement" != *"--locked"* ]]; then
     echo "$file:$line_number: routine Cargo command must use --locked" >&2
     echo "  $statement" >&2
@@ -60,8 +60,40 @@ scan_text_file() {
   local statement_line=0
   local line_number=0
   local allow_unlocked=false
+  local in_markdown_shell_fence=false
+  local markdown_console=false
+  local trimmed_line=""
   while IFS= read -r line || [[ -n "$line" ]]; do
     line_number=$((line_number + 1))
+    if [[ "$relative" == *.md ]]; then
+      trimmed_line=${line#"${line%%[![:space:]]*}"}
+      trimmed_line=${trimmed_line%"${trimmed_line##*[![:space:]]}"}
+      if [[ "$in_markdown_shell_fence" == false ]]; then
+        case "$trimmed_line" in
+          '```bash' | '```sh' | '```shell')
+            in_markdown_shell_fence=true
+            markdown_console=false
+            ;;
+          '```console')
+            in_markdown_shell_fence=true
+            markdown_console=true
+            ;;
+        esac
+        continue
+      fi
+      if [[ "$trimmed_line" == '```' ]]; then
+        in_markdown_shell_fence=false
+        markdown_console=false
+        continue
+      fi
+      if [[ "$markdown_console" == true ]]; then
+        if [[ "$line" =~ ^[[:space:]]*[\$\>][[:space:]] ]]; then
+          line=${line#*[\$\>]}
+        else
+          continue
+        fi
+      fi
+    fi
     if [[ -z "$statement" ]]; then
       if [[ "$line" =~ ^[[:space:]]*(#|//) ]]; then
         if [[ "$line" =~ cargo-rail:[[:space:]]+allow-unlocked-cargo:[[:space:]]+.+ ]]; then
@@ -70,6 +102,10 @@ scan_text_file() {
         continue
       fi
       statement_line=$line_number
+    fi
+    if [[ "$relative" == *.ps1 && "$line" == *\` ]]; then
+      statement+=" ${line%\`}"
+      continue
     fi
     statement+=" ${line%\\}"
     if [[ "$line" == *\\ ]]; then
@@ -100,7 +136,7 @@ scan_zed_tasks() {
 }
 
 if git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  inventory_command=(git -C "$ROOT" ls-files --cached --others --exclude-standard -- justfile README.md scripts .github .zed)
+  inventory_command=(git -C "$ROOT" ls-files --cached --others --exclude-standard -- justfile README.md CONTRIBUTING.md docs examples scripts .github .zed)
 else
   inventory_command=(find "$ROOT" -type f)
 fi
@@ -114,10 +150,11 @@ while IFS= read -r listed; do
     relative=$listed
     path="$ROOT/$listed"
   fi
+  [[ -f "$path" ]] || continue
   case "$relative" in
     */__pycache__/* | *.pyc) continue ;;
-    justfile | README.md) ;;
-    scripts/*.sh | scripts/**/*.sh | scripts/*.py | scripts/**/*.py | scripts/*.json | scripts/**/*.json)
+    justfile | README.md | CONTRIBUTING.md | docs/*.md | docs/**/*.md | examples/*.md | examples/**/*.md) ;;
+    scripts/*.sh | scripts/**/*.sh | scripts/*.ps1 | scripts/**/*.ps1 | scripts/*.py | scripts/**/*.py | scripts/*.json | scripts/**/*.json)
       [[ "$relative" == *-test.sh ]] && continue
       ;;
     .github/*.yaml | .github/**/*.yaml | .github/*.yml | .github/**/*.yml) ;;
@@ -131,6 +168,7 @@ while IFS= read -r listed; do
       status=1
       continue
       ;;
+    docs/* | examples/*) continue ;;
     *) continue ;;
   esac
   scan_text_file "$path" "$relative"
@@ -156,7 +194,7 @@ patterns = (
     re.compile(r'process::run\(\s*"cargo"\s*,\s*&\[(.*?)\]\s*,', re.DOTALL),
     re.compile(r'Command::new\(\s*"cargo"\s*\)(.*?);', re.DOTALL),
 )
-routine = re.compile(r'"(?:build|check|clippy|test|bench|rustc|run|doc|miri|metadata|publish|nextest)"')
+routine = re.compile(r'"(?:build|check|clippy|test|bench|rustc|run|doc|miri|metadata|package|publish|nextest)"')
 failed = False
 for path in sorted((root / "src").rglob("*.rs")):
     source = path.read_text(encoding="utf-8")

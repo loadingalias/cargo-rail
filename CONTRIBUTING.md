@@ -9,7 +9,6 @@ You need:
 - `just`
 - `cargo-nextest`
 - `cargo-deny`
-- `cargo-audit`
 
 Then run the same checks used during development:
 
@@ -19,7 +18,7 @@ just test
 ```
 
 `just check` is workspace-wide and read-only. Use `just fix` only when you intend to format files and apply Clippy's
-automatic fixes; CI runs the same read-only checks through `just check-ci`.
+automatic fixes. CI runs `just check` too.
 
 After changing features, dependency resolution, or target-specific behavior, run the full suite:
 
@@ -27,15 +26,30 @@ After changing features, dependency resolution, or target-specific behavior, run
 just test-all
 ```
 
-## What every change needs
+## Surface development
+
+End users get authenticated Surface driver authority from the complete native installer; `surface --prepare` installs
+and verifies the exact selected toolchain component. Contributors need `rustc-dev` only when changing or validating
+Surface's compiler integration:
+
+```bash
+rustup component add rustc-dev
+just check-compiler-fact-driver
+scripts/with-compiler-fact-driver.sh cargo build --locked --bin cargo-rail
+```
+
+The driver is separate because it uses compiler internals tied to one exact Rust toolchain. General CLI,
+documentation, planner, release, and dependency work does not require it.
+
+## Change requirements
 
 - Keep the patch scoped to one problem.
 - Put production behavior in the library; `main.rs` stays limited to argument handling and error reporting.
-- Add or update tests for changed behavior. Tests run through `cargo-nextest` — this repository does not use
+- Add or update tests for changed behavior. Tests run through `cargo-nextest`; this repository does not use
   `cargo test` for the normal suite.
 - Update user documentation when commands, configuration, output, side effects, or exit codes change.
 - Add a `.changes/*.md` file for any user-visible change — CLI, configuration, documentation, performance, safety,
-  or release behavior. A few sentences aimed at users is enough; these files become the changelog.
+  or release behavior. A few sentences aimed at users is enough; these files become the changelog/release-notes.
 - Run `just check && just test` before opening a pull request.
 
 ## Generated documentation
@@ -50,17 +64,16 @@ just gen-docs
 
 ## Performance changes
 
-A performance claim needs evidence someone else can check. Identify the workload, host, toolchain, exact commands,
-sample count, and before/after values. Report point measurements for one sample; report p50 or p95 only when the run
-contains enough samples to support a distribution claim. Compare cache implementations on one host. Preserve the raw
-results, and report failed correctness checks alongside the numbers.
+A performance claim must identify the workload, host, toolchain, commands, sample count, and before/after values. Use
+point measurements for one sample and p50 or p95 only for a sufficient sample set. Compare cache implementations on
+one host. Preserve raw results and report failed correctness checks.
 
 Native compiler-cache changes must run the checked-in same-root output-directory and independent-root fixture. When a
 change can affect those lanes, measure native Cargo, Cargo-Rail disabled, Cargo-Rail cold, Cargo-Rail warm, and the
 pinned sccache comparator. Report hits, misses, bypasses, reasons, bytes hashed and restored, and exact output-byte
 equivalence.
 
-The repository benchmarks accept package and run counts:
+The benchmark recipes accept package and run counts:
 
 ```bash
 just bench-unify 25 10
@@ -100,14 +113,6 @@ The check command exits `1` when it finds a pending release. That is the expecte
 pushes one exact release commit and exits while GitHub checks, including all release archives, are pending. After they
 pass, run the exact `"$release_cli" rail release resume <STATE>` command printed by the tool. Do not rerun `release
 run`, move a published tag, or replace an existing release asset.
-
-Before opening a release PR instead:
-
-```bash
-cargo rail change status
-cargo rail release check --all --extended
-cargo rail release run --all --bump auto --pr --check
-```
 
 ## Security
 

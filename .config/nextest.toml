@@ -4,7 +4,7 @@ nextest-version = { required = "0.9.143", recommended = "0.9.143" }
 status-level = "pass"
 success-output = "never"
 failure-output = "immediate-final"
-fail-fast = false
+fail-fast = true
 test-threads = "num-cpus"
 slow-timeout = { period = "30s", terminate-after = 4 }
 leak-timeout = { period = "2s", result = "fail" }

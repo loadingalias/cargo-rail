@@ -1,12 +1,12 @@
 # Migrate from cargo-hakari
 
 cargo-hakari stabilizes feature unification by generating a `workspace-hack` crate that every member depends on.
-`cargo rail unify` can plan explicit transitive pins in the workspace root or a selected member, but it does not detect,
-remove, or prove equivalence with a generated workspace-hack crate. Treat this as a manual migration experiment until
-your workspace build, test, and performance evidence establishes parity.
+`cargo rail unify` can plan transitive pins in the workspace root or a selected member, but it cannot detect, remove,
+or prove equivalence with a generated workspace-hack crate. Treat the migration as experimental until build, test,
+and performance evidence establishes parity.
 
-The goal is not to reproduce the workspace-hack topology in another format. Remove that topology, then let Cargo-Rail keep
-only the dependency and feature edges the resolved workspace requires.
+Remove the workspace-hack topology, then let Cargo-Rail retain only the dependency and feature edges required by the
+resolved workspace.
 
 ## Migration
 

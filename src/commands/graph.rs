@@ -10,6 +10,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 
 /// Options for the `graph` command.
+#[derive(Debug)]
 pub struct GraphOptions {
     /// Git ref to compare against.
     pub since: Option<String>,

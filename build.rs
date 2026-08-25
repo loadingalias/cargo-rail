@@ -19,6 +19,9 @@ fn main() {
         "CARGO_RAIL_FACT_DRIVER_RUSTC_HOST",
         "CARGO_RAIL_FACT_DRIVER_COMPILER_LIBRARY",
         "CARGO_RAIL_FACT_DRIVER_COMPILER_LIBRARY_SHA256",
+        "CARGO_RAIL_FACT_DRIVER_SOURCE_FILE",
+        "CARGO_RAIL_FACT_DRIVER_SOURCE_SHA256",
+        "CARGO_RAIL_FACT_DRIVER_SOURCE_PROVENANCE",
     ] {
         println!("cargo::rerun-if-env-changed={name}");
         if let Ok(value) = std::env::var(name) {

@@ -41,7 +41,7 @@ Commands:
   sync         (Advanced) Sync changes between monorepo and split repos
   release      Publish releases (version bump, changelog, tag, publish)
   change       Manage pending release intent files
-  clean        Clean generated artifacts (cache, backups, reports)
+  clean        Clean generated artifacts owned by the current workspace
   config       Configuration management
   hash         Compute a portable planner identity (not a cache key)
   diff-hash    Explain why two portable planner identities differ
@@ -142,6 +142,7 @@ Commands:
   setup      Install or repair transparent verified compiler reuse
   normalize  Validate and normalize one machine-owned remote cache URL without network access
   status     Report exact bytes, counts, bounds, leases, and ownership scope
+  recover    Quarantine a selected markerless CAS and create a fresh owned authority
   clean      Reclaim one explicitly selected cache scope
   remove     Remove only transparent compiler-cache state owned by the setup receipt
   help       Print this message or the help of the given subcommand(s)
@@ -170,6 +171,8 @@ Examples:
   cargo rail cache setup                          # Install or repair the Cargo wrapper
   cargo rail cache status                         # Inspect workspace and shared local cache state
   cargo rail cache status --scope local -f json  # Inspect the shared local CAS only
+  cargo rail cache recover --check                # Preview byte-preserving markerless CAS recovery
+  cargo rail cache recover                        # Quarantine the old tree and create a fresh CAS
   cargo rail cache clean --scope workspace --check  # Preview workspace cache reclamation
   cargo rail cache clean --scope local            # Remove the validated cross-workspace CAS
   cargo rail cache remove --check                 # Preview exact setup-state removal
@@ -335,6 +338,47 @@ Options:
           - all:       Both workspace state and the shared local CAS
 
           [default: all]
+
+  -f, --format <FORMAT>
+          Report format
+
+          Possible values:
+          - text: Human-readable text output (default)
+          - json: Machine-readable JSON output
+
+          [default: text]
+
+      --json
+          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+```
+
+---
+
+### cargo rail cache recover
+
+```
+Quarantine a selected markerless CAS and create a fresh owned authority
+
+Usage: cargo rail cache recover [OPTIONS]
+
+Options:
+  -c, --check
+          Preview the exact quarantine move without modifying cache state
+
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
 
   -f, --format <FORMAT>
           Report format
@@ -539,14 +583,14 @@ Analyze and repair complete Rust declaration reachability and visibility
 Usage: cargo rail surface [OPTIONS]
 
 Options:
-      --check
-          Fail on denied findings without modifying source (for CI)
+      --prepare
+          Prepare and authenticate the exact-toolchain Surface producer without analysis
 
   -q, --quiet
           Suppress progress messages (for CI/automation)
 
-      --fix
-          Apply exact visibility reductions
+      --check
+          Fail on denied findings without modifying source (for CI)
 
       --json
           Output as JSON where supported; rejected otherwise (shorthand for -f json)
@@ -554,14 +598,17 @@ Options:
       --config <PATH>
           Path to rail.toml config file (bypass search order)
 
+      --fix
+          Apply exact visibility reductions
+
       --dry-run
           Render the exact mutation plan without writing
 
-      --backup
-          Create a bounded backup before applying visibility edits
-
       --workspace-root <PATH>
           Workspace root directory (default: current directory)
+
+      --backup
+          Create a bounded backup before applying visibility edits
 
   -f, --format <FORMAT>
           Output format
@@ -599,6 +646,7 @@ crate has no consumers outside the captured workspace.
 
 Examples:
   cargo rail surface                        # Inspect and report without modifying source
+  cargo rail surface --prepare              # Prove exact-toolchain producer readiness
   cargo rail surface --check --explain      # Inspect complete Rust reachability
   cargo rail surface --check -f json        # Emit the versioned machine contract
   cargo rail surface --fix --dry-run --explain  # Preview exact visibility edits
@@ -1051,17 +1099,17 @@ Examples:
   cargo rail release check my-crate             # Validate release readiness
   cargo rail release check my-crate --extended  # Run publish, MSRV, and semver checks
   cargo rail release run my-crate --check       # Check for a pending release (exit 1)
-  cargo rail release run my-crate               # Release from reviewed change intent
+  cargo rail release run my-crate               # Prepare a local release without registry publication
+  cargo rail release run my-crate --publish     # Match configured crates.io authority at invocation
   cargo rail release run my-crate --include-dependents  # Release selected crate plus dependent closure
   cargo rail release run my-crate --yes         # Non-interactive apply confirmation
   cargo rail release run my-crate --bump auto   # Infer each bump from the configured release source
   cargo rail release run --all --bump auto --pr # Open a release PR with bumps/changelogs only
-  cargo rail release finalize --all             # Tag/publish after the release PR merges
+  cargo rail release finalize --all --publish   # Match configured crates.io authority after PR merge
   cargo rail release run my-crate --bump minor
   cargo rail release run my-crate --bump prerelease  # 1.0.0 -> 1.0.0-rc.1
   cargo rail release run my-crate --bump release     # 1.0.0-rc.2 -> 1.0.0
   cargo rail release run --all --bump patch     # Release all crates
-  cargo rail release run my-crate --skip-publish  # Tag only, no crates.io
 ```
 
 ---
@@ -1126,8 +1174,8 @@ Options:
       --workspace-root <PATH>
           Workspace root directory (default: current directory)
 
-      --skip-publish
-          Skip publishing to crates.io
+      --publish
+          Positively authorize irreversible publication to crates.io
 
       --skip-tag
           Skip git tag creation
@@ -1231,8 +1279,8 @@ Options:
       --json
           Output as JSON where supported; rejected otherwise (shorthand for -f json)
 
-      --skip-publish
-          Skip publishing to crates.io
+      --publish
+          Positively authorize irreversible publication to crates.io
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -1240,11 +1288,11 @@ Options:
       --skip-tag
           Skip git tag creation
 
-      --include-dependents
-          Expand explicit crate selection to include the full dependent closure and version groups
-
       --workspace-root <PATH>
           Workspace root directory (default: current directory)
+
+      --include-dependents
+          Expand explicit crate selection to include the full dependent closure and version groups
 
   -y, --yes
           Skip confirmation prompts and allow non-default branch
@@ -1546,13 +1594,13 @@ Options:
 ## cargo rail clean
 
 ```
-Clean generated artifacts (cache, backups, reports)
+Clean generated artifacts owned by the current workspace
 
 Usage: cargo rail clean [OPTIONS]
 
 Options:
       --cache
-          Clean validated local and workspace cache state
+          Clean cache state owned by this workspace
 
   -q, --quiet
           Suppress progress messages (for CI/automation)
@@ -1591,8 +1639,8 @@ Options:
           Print version
 
 Examples:
-  cargo rail clean                      # Clean all Cargo-Rail artifacts
-  cargo rail clean --cache              # Clean validated local and workspace cache state
+  cargo rail clean                      # Clean all current-workspace Cargo-Rail artifacts
+  cargo rail clean --cache              # Clean current-workspace cache state
   cargo rail clean --backups            # Prune old backups
   cargo rail clean --reports            # Clean generated reports
   cargo rail clean --check              # Check for pending cleanup (exit 1)
@@ -1609,7 +1657,7 @@ Usage: cargo rail config [OPTIONS] <COMMAND>
 
 Commands:
   locate    Print the path to the active config file
-  print     Print the effective configuration with defaults
+  print     Print canonical effective configuration with defaults
   validate  Validate the configuration file
   explain   Explain effective values, defaults, sources, and deprecations
   migrate   Apply explicit semantic configuration migrations
@@ -1689,9 +1737,9 @@ Options:
 ### cargo rail config print
 
 ```
-Print the effective configuration with defaults
+Print canonical effective configuration with defaults
 
-Shows the merged configuration: user settings plus defaults for any unset fields. Useful for debugging and understanding what cargo-rail will actually use.
+Shows the merged repository policy: user settings plus defaults for any unset fields. Text output is reusable `rail.toml` input and omits deprecated compatibility-only fields.
 
 Usage: cargo rail config print [OPTIONS]
 

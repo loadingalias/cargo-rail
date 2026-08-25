@@ -1,52 +1,23 @@
-# Release Example
+# Releases
 
-`change` records reviewed bump intent. `release` turns that intent into manifest updates, changelogs, tags, forge releases, and dependency-ordered publishes.
+[`rail.toml`](rail.toml) shows every workspace release field, changelog field, filter, custom group, and per-crate
+publish switch. It keeps `remote_effects = "none"`, so copying it cannot push or publish.
 
-## Quick Start
-
-```bash
-cargo rail change add my-crate --bump minor --message "Added the new capability."
-cargo rail change status
-cargo rail release check my-crate --extended
-cargo rail release run my-crate --bump auto --check
-cargo rail release run my-crate --bump auto --yes
-```
-
-`--bump auto` reads the configured release source. The default `source = "changes"` uses reviewed change files only;
-conventional commits participate only with `source = "commits"` or `source = "both"`. Change files are consumed in
-the release commit; consumption is all-or-nothing, so a plan covering only some of a file's crates is rejected.
-
-With `remote_effects = "push"`, `release run` pushes its verified release commit and tags. Use `"auto"`, `"github"`, or `"gitlab"` to push and create a forge release. Do not add a second push step.
-
-## Release PR
-
-PR mode separates repository mutations from external release side effects:
+From the repository root:
 
 ```bash
-cargo rail release run my-crate --bump auto --pr --yes
-# merge the release PR, then run from the updated main branch:
-cargo rail release finalize my-crate --yes
+cargo rail --config examples/release/rail.toml config validate --strict
+# Writes one reviewed file under .changes/.
+cargo rail --config examples/release/rail.toml change add cargo-rail --bump patch \
+  --message "Describe the user-visible change."
+cargo rail --config examples/release/rail.toml release run --all --bump auto --check
 ```
 
-`release run --pr` only writes the version, lockfile, changelog, and consumed
-change files to a release branch. `release finalize` tags, pushes, publishes,
-and creates configured forge releases from the merged commit.
+`--check` previews the exact version, files, tag, and external effects. Change `remote_effects` only after the local
+plan is correct. Registry publication additionally requires `registry_publication = "crates-io"` in this file and
+`--publish` on the exact invocation; neither authority implies the other. With remote effects enabled, `release run`
+pushes the exact release commit and stops while its checks run. Resume the state file printed by the command after that
+SHA is green.
 
-## Lockstep Crates
-
-Use `[release.version_groups]` when crates must ship together:
-
-```toml
-[release.version_groups]
-core = ["rail-core", "rail-graph", "rail-git"]
-```
-
-With `--bump auto`, the group releases at the highest bump any member earned.
-Explicit partial group releases are rejected unless `--include-dependents`
-expands the selection to the whole group.
-
-## Reference
-
-- [Configuration Reference](../../docs/config.md)
-- [Migrate from git-cliff / release-plz](../../docs/migrate-git-cliff.md)
-- [Architecture](../../docs/architecture.md)
+See the [configuration reference](../../docs/config.md#release) for every value and the
+[contributor release runbook](../../CONTRIBUTING.md#release-policy) for this repository's direct-main flow.

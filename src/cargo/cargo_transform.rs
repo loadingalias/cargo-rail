@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use toml_edit::{DocumentMut, Item, Table};
 
 /// Context for Cargo.toml transformations
+#[derive(Debug)]
 pub struct TransformContext {
     /// Name of the crate being transformed
     pub crate_name: String,
@@ -27,6 +28,7 @@ pub struct TransformContext {
 ///
 /// Caches the workspace document to avoid repeated I/O when transforming multiple manifests.
 /// Uses interior mutability (`RefCell`) so the public API remains `&self`.
+#[derive(Debug)]
 pub struct CargoTransform {
     metadata: Metadata,
     /// Cached workspace document (loaded lazily via RefCell for interior mutability)

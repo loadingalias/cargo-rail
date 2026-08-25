@@ -21,6 +21,7 @@ struct CrateSyncResult {
 }
 
 /// Arguments for the sync command
+#[derive(Debug)]
 pub struct SyncArgs {
     /// Crate name to sync (mutually exclusive with `all`)
     pub crate_name: Option<String>,

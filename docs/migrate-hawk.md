@@ -1,6 +1,6 @@
 # Migrate from Hawk
 
-`cargo rail surface` is Cargo Rail's native source-visibility workflow. It uses Cargo Rail's captured workspace,
+`cargo rail surface` is Cargo-Rail's native source-visibility workflow. It uses Cargo-Rail's captured workspace,
 compiler-fact protocol, planner, report, and mutation boundaries; it is not a Hawk compatibility wrapper. Qualify both
 tools against the same compiler views before removing Hawk.
 
@@ -8,46 +8,46 @@ The checked-in conformance reference is pinned to Hawk 0.1.13 at commit
 `a3b75f193b931d11cf8883c44bda3f9a79c8f19a`; its source archive SHA-256 is
 `489f22d7df7e819273fa15c9558128e3a10f206672fb75c8544117e390dc095f`.
 
-## Install the compiler-fact driver
+## Install Cargo-Rail
 
-`surface` requires a native release artifact with its matching compiler-fact driver. A source installation or
-`cargo binstall` provides the general CLI, but surface analysis rejects it before workspace acquisition. Schema output
-remains available.
+Use the complete one-command installer in the [README](../README.md#installation). It includes the CLI and
+authenticated Surface producer authority on macOS, GNU Linux, and Windows. Musl builds provide the core CLI without
+Surface analysis.
+
+Before comparing results, prepare the producer for the exact Cargo-selected workspace toolchain:
 
 ```bash
-version=0.22.1
-curl --proto '=https' --tlsv1.2 -sSf \
-  "https://raw.githubusercontent.com/loadingalias/cargo-rail/v${version}/scripts/install.sh" \
-  | sh -s -- "$version"
-cargo rail surface --schema >/dev/null
+cargo rail surface --prepare -f json
 ```
 
-The checksum-verifying installer supports GNU Linux and macOS release archives. Windows users should verify the
-published `SHA256SUMS`, extract the matching `.zip`, and keep `cargo-rail.exe`, the native compiler helpers, and
-`cargo-rail-fact-driver.exe` together. Native musl archives deliberately omit the driver and do not support
-surface analysis.
+The preflight installs that rustup toolchain's `rustc-dev` component when absent, builds a matching driver from the
+authenticated offline source component when needed, and verifies readiness without analyzing the workspace.
+
+Source installs and `cargo binstall` can print `surface --schema`, but cannot prepare or analyze code. Contributors
+changing the compiler integration can use the source-build steps in
+[CONTRIBUTING.md](../CONTRIBUTING.md#surface-development).
 
 ## Configure the native workflow
 
-Cargo Rail does not carry a Hawk-specific configuration parser in its runtime. Start with the native opt-in:
+Cargo-Rail does not include a Hawk-specific configuration parser. Enable the native workflow:
 
 ```toml
 [surface]
 enabled = true
 ```
 
-That is the complete configuration for a normal binary workspace. Cargo Rail discovers workspace binaries, compiler
+That is the complete configuration for a normal binary workspace. Cargo-Rail discovers workspace binaries, compiler
 targets, feature coverage, and doctest-enabled packages from the captured Cargo model. Add
 `consumer_scope = "workspace"` only when non-publishable library, proc-macro, and build-script crates have no consumers
 outside the workspace. Add the remaining fields only when the repository needs an exception or an exact compatibility
 matrix.
 
-Map an existing `hawk.toml` manually; the table is small and this keeps one analyzer's schema out of Cargo Rail's
+Map an existing `hawk.toml` manually. This keeps Hawk's schema out of Cargo-Rail's
 product API:
 
 | Hawk 0.1.13                               | Cargo-Rail                                                                                                    |
 | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| omitted feature profiles                  | Cargo Rail's automatic feature coverage; use one explicit `all-features` profile only for an exact comparison |
+| omitted feature profiles                  | Cargo-Rail's automatic feature coverage; use one explicit `all-features` profile only for an exact comparison |
 | omitted doctest entries                   | `doctest_coverage = "automatic"`                                                                              |
 | `[[production]]`                          | `[[surface.product]]`, including `bin`/`lib`, `target`, and `reason`                                          |
 | `[[feature-profile]]`                     | `[[surface.feature-profile]]` with the same Cargo flags                                                       |

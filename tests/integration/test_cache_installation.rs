@@ -564,7 +564,7 @@ fn setup_preview_apply_repeat_status_and_exact_remove_are_lossless() {
         )?;
         assert!(status.status.success(), "installation status failed: {status:?}");
         let status = json(&status)?;
-        assert_eq!(status["status"]["schema_version"], 11);
+        assert_eq!(status["status"]["schema_version"], 12);
         assert_eq!(status["status"]["installation"]["state"], "installed");
         assert_eq!(status["status"]["installation"]["healthy"], true);
         let wrapper = PathBuf::from(
@@ -623,6 +623,101 @@ fn setup_preview_apply_repeat_status_and_exact_remove_are_lossless() {
         assert!(
             cargo_home.path().join("cargo-rail/local-cas-v2").exists(),
             "removal deleted the compiler-result cache"
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn markerless_local_cas_recovery_quarantines_every_byte_before_reinitializing() {
+    let result: Result<()> = (|| {
+        let workspace = TestWorkspace::new_single_crate("transparent-recovery", "0.1.0")?;
+        let cargo_home = tempfile::tempdir()?;
+        let setup = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "setup"])?;
+        assert!(setup.status.success(), "setup failed: {setup:?}");
+        let seeded = cargo_check(&workspace.path, cargo_home.path(), None, None)?;
+        assert!(seeded.status.success(), "cache seed failed: {seeded:?}");
+
+        let root = fs::canonicalize(cargo_home.path().join("cargo-rail/local-cas-v2"))?;
+        fs::remove_file(root.join("OWNER"))?;
+        fs::remove_file(root.join("CAPACITY.json"))?;
+        fs::remove_file(root.join("NATIVE_LEDGER.json"))?;
+        let retained = directory_snapshot(&root)?;
+        assert!(!retained.is_empty(), "partial CAS fixture retained no cache bytes");
+
+        let preview = rail(
+            &workspace.path,
+            cargo_home.path(),
+            &["rail", "cache", "recover", "--check", "-f", "json"],
+        )?;
+        assert_eq!(
+            preview.status.code(),
+            Some(1),
+            "recovery preview did not report pending work"
+        );
+        let preview = json(&preview)?;
+        assert_eq!(preview["pending"], true);
+        assert_eq!(preview["recovery"]["selected_root"], root.to_string_lossy().as_ref());
+        let quarantine = PathBuf::from(
+            preview["recovery"]["quarantine_root"]
+                .as_str()
+                .context("quarantine path")?,
+        );
+        let receipt = PathBuf::from(
+            preview["recovery"]["receipt_path"]
+                .as_str()
+                .context("recovery receipt path")?,
+        );
+        assert!(root.is_dir());
+        assert!(!quarantine.exists());
+        assert!(!receipt.exists());
+
+        let applied = rail(
+            &workspace.path,
+            cargo_home.path(),
+            &["rail", "cache", "recover", "-f", "json"],
+        )?;
+        assert!(applied.status.success(), "recovery failed: {applied:?}");
+        let applied = json(&applied)?;
+        assert_eq!(
+            applied["recovery"]["quarantine_root"],
+            quarantine.to_string_lossy().as_ref()
+        );
+        assert_eq!(directory_snapshot(&quarantine)?, retained);
+        assert!(root.join("OWNER").is_file());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(&receipt)?)?["state"],
+            "completed"
+        );
+
+        let repeated = rail(
+            &workspace.path,
+            cargo_home.path(),
+            &["rail", "cache", "recover", "--check", "-f", "json"],
+        )?;
+        assert!(
+            repeated.status.success(),
+            "repeated recovery was not clean: {repeated:?}"
+        );
+        assert_eq!(json(&repeated)?["pending"], false);
+
+        fs::remove_dir_all(workspace.path.join("target"))?;
+        let cold = cargo_check(&workspace.path, cargo_home.path(), None, None)?;
+        assert!(cold.status.success(), "fresh CAS did not populate: {cold:?}");
+        fs::remove_dir_all(workspace.path.join("target"))?;
+        let reused = cargo_check(&workspace.path, cargo_home.path(), None, None)?;
+        assert!(reused.status.success(), "fresh CAS did not restore: {reused:?}");
+        let status = rail(
+            &workspace.path,
+            cargo_home.path(),
+            &["rail", "cache", "status", "--scope", "local", "-f", "json"],
+        )?;
+        assert!(
+            json(&status)?["status"]["installation"]["usage"]["hits"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1
         );
         Ok(())
     })();
@@ -868,7 +963,7 @@ fn cache_status_reports_only_redacted_machine_selected_remote_authority() {
             .output()?;
         assert!(output.status.success(), "remote status failed: {output:?}");
         let value = json(&output)?;
-        assert_eq!(value["status"]["schema_version"], 11);
+        assert_eq!(value["status"]["schema_version"], 12);
         assert_eq!(value["status"]["remote"]["activation"], "direct_transport_selected");
         assert_eq!(value["status"]["remote"]["provider"], "aws-s3");
         assert_eq!(value["status"]["remote"]["mode"], "read");
@@ -1597,10 +1692,25 @@ fn unsupported_shapes_bypass_before_acquisition_while_proc_macro_producers_remai
         );
         assert!(!installation.join("session.json").exists());
         assert!(!installation.join("usage-v1.log").exists());
+        assert!(installation.join("early-bypass-v1.log").is_file());
         assert_eq!(
             directory_snapshot(&cache_root)?,
             before,
             "incremental bypass touched L1"
+        );
+        let early_status = rail(
+            &workspace.path,
+            cargo_home.path(),
+            &["rail", "cache", "status", "--scope", "local", "-f", "json"],
+        )?;
+        let early_usage = &json(&early_status)?["status"]["installation"]["usage"];
+        assert!(early_usage["early_bypasses"].as_u64().unwrap_or_default() >= 1);
+        assert!(
+            early_usage["early_bypass_reasons"]["incremental_work_product_observation_unavailable"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1,
+            "incremental bypass class was not observable: {early_usage}"
         );
 
         let clippy = Command::new("cargo")
@@ -1615,28 +1725,8 @@ fn unsupported_shapes_bypass_before_acquisition_while_proc_macro_producers_remai
         assert!(clippy.status.success(), "clippy bypass failed: {clippy:?}");
         assert!(!installation.join("session.json").exists());
         assert!(!installation.join("usage-v1.log").exists());
+        assert!(installation.join("early-bypass-v1.log").is_file());
         assert_eq!(directory_snapshot(&cache_root)?, before, "clippy bypass touched L1");
-
-        let custom_target = Command::new("cargo")
-            .current_dir(&workspace.path)
-            .args(["check", "--quiet"])
-            .env("CARGO_HOME", cargo_home.path())
-            .env("CARGO_INCREMENTAL", "0")
-            .env("CARGO_TARGET_DIR", workspace.path.join("custom-target"))
-            .env_remove("RUSTC_WRAPPER")
-            .env_remove("RUSTC_WORKSPACE_WRAPPER")
-            .output()?;
-        assert!(
-            custom_target.status.success(),
-            "custom target-dir bypass failed: {custom_target:?}"
-        );
-        assert!(!installation.join("session.json").exists());
-        assert!(!installation.join("usage-v1.log").exists());
-        assert_eq!(
-            directory_snapshot(&cache_root)?,
-            before,
-            "custom target-dir bypass touched L1"
-        );
 
         fs::create_dir_all(workspace.path.join("fixture-macros/src"))?;
         fs::write(
@@ -1753,6 +1843,120 @@ resolver = "3"
         Ok(())
     })();
     super::helpers::finish_test(result);
+}
+
+#[cfg(unix)]
+#[test]
+fn custom_target_and_deterministic_flags_reuse_without_runtime_residue() {
+    let result: Result<()> = (|| {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let workspace = TestWorkspace::new_single_crate("transparent-custom-target", "0.1.0")?;
+        let cargo_home = tempfile::tempdir()?;
+        let setup = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "setup"])?;
+        assert!(setup.status.success(), "setup failed: {setup:?}");
+
+        let coverage = tempfile::tempdir()?;
+        fs::set_permissions(coverage.path(), fs::Permissions::from_mode(0o700))?;
+        let coverage_path = fs::canonicalize(coverage.path())?;
+        let first_target = tempfile::tempdir()?;
+        let first_runtime = tempfile::tempdir()?;
+        let seed = Command::new("cargo")
+            .current_dir(&workspace.path)
+            .args(["check", "--quiet"])
+            .env("CARGO_HOME", cargo_home.path())
+            .env("CARGO_INCREMENTAL", "0")
+            .env("CARGO_TARGET_DIR", first_target.path())
+            .env("TMPDIR", first_runtime.path())
+            .env("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1")
+            .env("CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY", &coverage_path)
+            .env(
+                "RUSTFLAGS",
+                "-Zcrate-attr=allow(unexpected_cfgs) -Ctarget-feature=+crt-static",
+            )
+            .env("RUSTC_BOOTSTRAP", "1")
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
+            .output()?;
+        assert!(seed.status.success(), "custom-target cache seed failed: {seed:?}");
+        assert_no_native_runtime_residue(first_runtime.path())?;
+
+        let second_target = tempfile::tempdir()?;
+        let reused = Command::new("cargo")
+            .current_dir(&workspace.path)
+            .args(["check", "--quiet"])
+            .env("CARGO_HOME", cargo_home.path())
+            .env("CARGO_INCREMENTAL", "0")
+            .env("CARGO_TARGET_DIR", second_target.path())
+            .env("TMPDIR", first_runtime.path())
+            .env("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1")
+            .env("CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY", &coverage_path)
+            .env(
+                "RUSTFLAGS",
+                "-Zcrate-attr=allow(unexpected_cfgs) -Ctarget-feature=+crt-static",
+            )
+            .env("RUSTC_BOOTSTRAP", "1")
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
+            .output()?;
+        assert!(
+            reused.status.success(),
+            "the second physical target root did not reuse the verified action: {reused:?}; coverage: {:?}",
+            native_coverage_summary(coverage.path())?
+        );
+        assert_no_native_runtime_residue(first_runtime.path())?;
+
+        let status = rail(
+            &workspace.path,
+            cargo_home.path(),
+            &["rail", "cache", "status", "--scope", "local", "-f", "json"],
+        )?;
+        assert!(
+            json(&status)?["status"]["installation"]["usage"]["hits"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1,
+            "custom-target compilation did not record a native cache hit: {:?}",
+            (
+                native_coverage_summary(coverage.path())?,
+                String::from_utf8_lossy(&seed.stderr),
+                String::from_utf8_lossy(&reused.stderr),
+            )
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+fn assert_no_native_runtime_residue(directory: &Path) -> Result<()> {
+    let residue = fs::read_dir(directory)?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|entry| entry.file_name())
+        .filter(|name| name.to_string_lossy().starts_with("cargo-rail-native-cargo-"))
+        .collect::<Vec<_>>();
+    anyhow::ensure!(residue.is_empty(), "native wrapper runtime residue: {residue:?}");
+    Ok(())
+}
+
+type NativeCoverageSummary = (Option<String>, String, Option<String>, Option<String>);
+
+fn native_coverage_summary(directory: &Path) -> Result<Vec<NativeCoverageSummary>> {
+    let mut summary = fs::read_dir(directory)?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|entry| -> Result<_> {
+            let event: serde_json::Value = serde_json::from_slice(&fs::read(entry.path())?)?;
+            Ok((
+                event["action"]["crate_name"].as_str().map(str::to_string),
+                event["status"].as_str().unwrap_or("missing").to_string(),
+                event["reason"].as_str().map(str::to_string),
+                event["action_key"].as_str().map(str::to_string),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    summary.sort();
+    Ok(summary)
 }
 
 #[cfg(unix)]

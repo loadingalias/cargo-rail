@@ -213,6 +213,7 @@ impl PlanOutputFormat {
 /// Centralizes the logic for selecting crates (by name, --all, etc.)
 /// and building engine-specific configs. Eliminates duplication between
 /// split.rs and sync.rs command handlers.
+#[derive(Debug)]
 pub struct SplitSyncConfigBuilder<'a> {
     ctx: &'a WorkspaceContext,
     config: &'a RailConfig,

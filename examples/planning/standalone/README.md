@@ -1,18 +1,22 @@
 # Planner Scope: Direct Cargo
 
-Use this pattern when CI should pass planner-selected package arguments directly to Cargo without a repository-specific task runner.
+Use this pattern to pass planner-selected package arguments directly to Cargo.
+
+```bash
+cargo rail --config examples/planning/standalone/rail.toml config validate --strict
+```
 
 ## Local example
 
 ```bash
-cargo rail plan --merge-base --explain
-PLAN_JSON=$(cargo rail plan --merge-base -f json)
+cargo rail --config examples/planning/standalone/rail.toml plan --merge-base --explain
+PLAN_JSON=$(cargo rail --config examples/planning/standalone/rail.toml plan --merge-base -f json)
 if [ "$(jq -r '.surfaces.test.enabled' <<<"$PLAN_JSON")" = "true" ]; then
   CARGO_ARGS=()
   while IFS= read -r argument; do
     CARGO_ARGS+=("$argument")
   done < <(jq -r '.surfaces.test.scope.cargo_args[]' <<<"$PLAN_JSON")
-  cargo nextest run "${CARGO_ARGS[@]}"
+  cargo nextest run "${CARGO_ARGS[@]}" --locked
 fi
 ```
 
@@ -23,7 +27,7 @@ fi
   id: rail
   with:
     mode: debug
-    version: 0.22.1
+    version: 0.22.3
 
 - name: Test selected packages
   if: steps.rail.outputs.test == 'true'
@@ -34,7 +38,7 @@ fi
     while IFS= read -r argument; do
       CARGO_ARGS+=("$argument")
     done < <(jq -r '.surfaces.test.scope.cargo_args[]' "$PLAN_FILE")
-    cargo nextest run "${CARGO_ARGS[@]}"
+    cargo nextest run "${CARGO_ARGS[@]}" --locked
 
 - name: Build selected packages
   if: steps.rail.outputs.build == 'true'
@@ -48,4 +52,5 @@ fi
     cargo build "${CARGO_ARGS[@]}"
 ```
 
-Cargo-Rail decides scope. Cargo, cargo-nextest, and CI retain command semantics and exit behavior.
+Cargo-Rail decides scope. Cargo, cargo-nextest, and CI retain command semantics and exit behavior. Consume
+`surfaces.NAME.scope`; `impact` explains the decision but is not execution input.

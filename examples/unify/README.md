@@ -1,35 +1,22 @@
-# Unify Example
+# Dependency Unification
 
-`unify` plans manifest changes from the resolved dependency graph. It can centralize shared declarations, remove unused edges, prune dead features, repair borrowed features, derive MSRV, and pin fragmented transitive features.
+[`rail.toml`](rail.toml) shows every current `[unify]` field. Start with the defaults, then keep only the policy your
+workspace needs.
 
-## Quick Start
+From the repository root:
 
 ```bash
-cargo rail init
-cargo rail config migrate --check
-cargo rail unify --check
-cargo rail unify --check --explain
-cargo rail unify
+cargo rail --config examples/unify/rail.toml config validate --strict
+cargo rail --config examples/unify/rail.toml unify --check --explain
 ```
 
-## Common Options
+`--check` does not edit manifests. It exits `1` when changes are pending. Review the explanation, then apply:
 
-```toml
-[unify]
-consumer_scope = "open"
-msrv_policy = { mode = "compute", source = "workspace" }
+```bash
+cargo rail --config examples/unify/rail.toml unify
 ```
 
-Omit `transitive_pinning` unless the workspace deliberately needs host-owned transitive feature pins. Cargo-Rail does
-not detect or remove generated workspace-hack crates. Keep `consumer_scope = "open"` for libraries or
-private packages with consumers outside the workspace; set it to `"workspace"` only when the workspace is the complete
-consumer graph. Diagnostics are unconditional. `--check` does not mutate manifests, may update compiler-evidence cache
-under `target/cargo-rail/`, and exits 1 for pending edits; running without `--check` applies proven edits.
-Review `--check --explain` output before apply; `cargo rail unify undo` restores the latest manifest and lockfile backup.
+Use `consumer_scope = "workspace"` only when no external consumer can activate private package features. Use
+`cargo rail unify undo` to restore the latest manifest and lockfile backup.
 
-Compiler evidence caching and deterministic manifest ordering are internal correctness mechanisms, not configuration.
-
-## Reference
-
-- [Configuration Reference](../../docs/config.md)
-- [Migration from cargo-hakari](../../docs/migrate-hakari.md)
+See the [configuration reference](../../docs/config.md#unify) for every value and safety boundary.

@@ -1,8 +1,7 @@
 # Planning
 
 `cargo rail plan` turns Git changes and Cargo's resolved graph into typed surface and package scope. Cargo,
-cargo-nextest, Just, and CI consume that scope directly. They retain command semantics, argument ownership, output,
-and exit behavior.
+cargo-nextest, Just, and CI consume that scope while retaining their command semantics and exit behavior.
 
 ## How a plan is built
 
@@ -18,8 +17,7 @@ and exit behavior.
 5. **Build surface scope.** Each package-scoped surface receives `empty`, `crates`, or `workspace` scope and the exact
    matching Cargo argument vector.
 
-Generated source roots and Cargo-Rail state are excluded from change collection. Worktree plans use one captured
-source and resolution view; they do not combine file decisions from one moment with Cargo decisions from another.
+Generated source roots and Cargo-Rail state are excluded. Worktree plans use one captured source and resolution view.
 
 ## Surfaces
 
@@ -47,7 +45,7 @@ unknown_file_policy = "strict"
 benchmarks = ["benches/**", "perf/**"]
 ```
 
-Cargo ownership always comes from the resolved graph. Globs classify repository surfaces; they do not replace package
+Cargo ownership comes from the resolved graph. Globs classify repository surfaces; they do not define package
 ownership.
 
 ## Consume typed scope
@@ -68,7 +66,7 @@ Use planner fields according to their ownership:
 - `trace` is the stable reason chain.
 - `impact` explains graph propagation; it is not execution scope.
 
-Pass `surfaces.NAME.scope.cargo_args` as an argument array. Do not join it into a shell command or rebuild it from
+Pass `surfaces.NAME.scope.cargo_args` as an argument array. Do not join it into a shell command or reconstruct it from
 `impact`:
 
 ```bash
@@ -83,7 +81,7 @@ if [ "$(jq -r '.surfaces.test.enabled' <<<"$PLAN_JSON")" = "true" ]; then
 fi
 ```
 
-Route the whole-workspace Surface gate from its planner decision instead of recreating file rules in CI:
+Route the whole-workspace Surface gate from its planner decision:
 
 ```bash
 if [ "$(jq -r '.surfaces.surface.enabled' <<<"$PLAN_JSON")" = "true" ]; then
@@ -94,8 +92,8 @@ fi
 The execution machine must have a supported native release archive and its adjacent compiler-fact driver. See
 [Configuration](config.md#surface) for the closed-world and lint policy.
 
-The consumer must validate the contract versions it supports. This repository's scripts reject an unknown planner or
-scope contract before executing Cargo.
+Consumers must validate supported contract versions. This repository rejects unknown planner or scope contracts
+before executing Cargo.
 
 ## Confidence and incomplete evidence
 
@@ -113,7 +111,7 @@ widens it to workspace scope and records `historical_resolution_unavailable`. Cu
 explanation, but they do not narrow historical scope.
 
 Worktree plans derive one command-independent universe from captured declarations. Optional and target-gated edges
-can propagate impact regardless of default features or the host target.
+can propagate impact regardless of default features or host target.
 
 ## Machine contract
 
@@ -137,8 +135,8 @@ Compatibility rules:
 - `trace.code` is stable machine data. `description` is human text.
 - Successful structured output is one stdout value with no progress contamination.
 
-Exit code `0` means success, and `2` means an operational or argument error. Commands with an explicit check contract
-use `1` for changes required.
+Exit code `0` means success. Exit code `2` means an argument or operational error. Commands with a check contract use
+`1` for required changes.
 
 `cargo rail hash` emits a root-independent `plan-v1:sha256:<digest>` over the planning decision. It excludes local
 diagnostics such as the absolute workspace root. The digest compares decisions; it is not a cache key and never
@@ -154,7 +152,7 @@ planner v7 and scope v4; the action's `version` input independently selects a co
 - uses: loadingalias/cargo-rail-action@47e86bde928ce420b85efa5f8d3b5feb96fd0ffc # v7.0.0
   id: rail
   with:
-    version: 0.22.1
+    version: 0.22.3
 
 - name: Test selected packages
   if: steps.rail.outputs.test == 'true'
@@ -170,13 +168,12 @@ planner v7 and scope v4; the action's `version` input independently selects a co
 ```
 
 Minimal mode exports built-in surface booleans, `surfaces-json`, `scope-json`, `cargo-args`, and `base-ref`. Debug mode
-also exports a same-job `plan-file`. Use `surfaces-json` for routing and `scope-json` for execution. The full,
-workspace-sized plan is deliberately not a GitHub output because one environment entry can exceed the operating
-system's process-launch limit on a large diff. Read `plan-file` in the same job or transfer it as an artifact. Pin the
-action to a full commit SHA when immutable third-party action execution is required.
+also exports a same-job `plan-file`. Use `surfaces-json` for routing and `scope-json` for execution. The full plan is
+not a GitHub output because a large diff can exceed the operating system's environment-size limit. Read `plan-file`
+in the same job or transfer it as an artifact. Pin the action to a full commit SHA for immutable execution.
 
-Transparent local reuse remains independent of planning. Run `cargo rail cache setup` once on an execution machine;
-ordinary Cargo and nextest processes using that Cargo home can then use verified L1. See
+Compiler reuse is independent of planning. Run `cargo rail cache setup` once on an execution machine. Cargo and
+nextest processes using that Cargo home can then use verified L1. See
 [Share local compiler reuse across workspaces](cache-sharing.md).
 
 ## Diagnose

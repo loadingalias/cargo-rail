@@ -18,7 +18,7 @@ use crate::cargo::{
 };
 use crate::compiler::CompilerCacheIdentity;
 use crate::compiler::cfg_eval::{TargetCfgSet, target_constraint_matches_target};
-use crate::config::{ConsumerScope, ExactPinHandling, MajorVersionConflict, UnifyConfig};
+use crate::config::{ExactPinHandling, MajorVersionConflict, UnifyConfig};
 use crate::error::RailResult;
 use crate::progress;
 use crate::workspace::WorkspaceContext;
@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Analyzes workspace for dependency unifications
+#[derive(Debug)]
 pub struct UnifyAnalyzer {
     /// Multi-target metadata (Arc for cheap sharing - avoids expensive clone)
     metadata: Arc<MultiTargetMetadata>,
@@ -1027,7 +1028,7 @@ impl UnifyAnalyzer {
             &self.manifests,
             &self.target_cfg_sets,
             &pruned_features,
-            self.config.consumer_scope == ConsumerScope::Workspace,
+            &self.config,
             &self.compiler_cache_identity,
         );
         progress!("Detecting unused dependencies...");

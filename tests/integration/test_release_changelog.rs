@@ -6,7 +6,7 @@
 //! - Commit/PR links and breaking markers
 //! - per-crate changelog skip and require_changelog_entries flags
 
-use crate::helpers::{TestWorkspace, git, run_cargo_rail};
+use crate::helpers::{TestWorkspace, cargo_rail_command, git, isolated_cargo_rail_command, run_cargo_rail};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -69,16 +69,7 @@ fn run_release_with_before_fault(cwd: &Path, args: &[&str], fault: &str) -> Resu
 }
 
 fn run_release_with_fault_env(cwd: &Path, args: &[&str], variable: &str, fault: &str) -> Result<std::process::Output> {
-    Ok(Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
-        .current_dir(cwd)
-        .env("GIT_CONFIG_COUNT", "2")
-        .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
-        .env("GIT_CONFIG_VALUE_0", "false")
-        .env("GIT_CONFIG_KEY_1", "tag.gpgsign")
-        .env("GIT_CONFIG_VALUE_1", "false")
-        .env(variable, fault)
-        .args(args)
-        .output()?)
+    Ok(cargo_rail_command(cwd)?.env(variable, fault).args(args).output()?)
 }
 
 fn only_release_state(workspace: &Path) -> Result<PathBuf> {
@@ -727,22 +718,12 @@ exec "{}" "$@"
     perms.set_mode(0o755);
     std::fs::set_permissions(&shim, perms)?;
 
-    let cargo_rail_bin = env!("CARGO_BIN_EXE_cargo-rail");
     let path = format!(
         "{}:{}",
         shim_dir.path().display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let output = Command::new(cargo_rail_bin)
-        .current_dir(&ws.path)
-        .env("PATH", path)
-        .env("GIT_CONFIG_COUNT", "2")
-        .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
-        .env("GIT_CONFIG_VALUE_0", "false")
-        .env("GIT_CONFIG_KEY_1", "tag.gpgsign")
-        .env("GIT_CONFIG_VALUE_1", "false")
-        .args(args)
-        .output()?;
+    let output = cargo_rail_command(&ws.path)?.env("PATH", path).args(args).output()?;
     Ok(output)
 }
 
@@ -759,20 +740,13 @@ fn run_with_gh_shim(ws: &TestWorkspace, gh_script: &Path, args: &[&str]) -> Resu
 
 #[cfg(unix)]
 fn run_with_path_prefix(ws: &TestWorkspace, prefix: &Path, args: &[&str]) -> Result<std::process::Output> {
-    let cargo_rail_bin = env!("CARGO_BIN_EXE_cargo-rail");
     let path = format!("{}:{}", prefix.display(), std::env::var("PATH").unwrap_or_default());
-    Command::new(cargo_rail_bin)
-        .current_dir(&ws.path)
-        .env("PATH", path)
-        .env("CARGO_RAIL_CACHE_DIR", ws.path.join("target/cargo-rail-test-cache"))
-        .env("GIT_CONFIG_COUNT", "2")
-        .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
-        .env("GIT_CONFIG_VALUE_0", "false")
-        .env("GIT_CONFIG_KEY_1", "tag.gpgsign")
-        .env("GIT_CONFIG_VALUE_1", "false")
-        .args(args)
-        .output()
-        .map_err(Into::into)
+    let mut command = if matches!(args.get(1), Some(&"cache" | &"clean")) {
+        isolated_cargo_rail_command(&ws.path)?
+    } else {
+        cargo_rail_command(&ws.path)?
+    };
+    command.env("PATH", path).args(args).output().map_err(Into::into)
 }
 
 #[cfg(unix)]
@@ -781,6 +755,8 @@ fn registry_shadow_cargo_shim(log_path: &Path, published_path: &Path) -> Result<
 
     let real_cargo = Command::new("sh").args(["-c", "command -v cargo"]).output()?;
     let real_cargo = String::from_utf8_lossy(&real_cargo.stdout).trim().to_string();
+    let real_git = Command::new("sh").args(["-c", "command -v git"]).output()?;
+    let real_git = String::from_utf8_lossy(&real_git.stdout).trim().to_string();
     let dir = tempfile::TempDir::new()?;
     let path = dir.path().join("cargo");
     std::fs::write(
@@ -855,6 +831,76 @@ exec "{}" "$@"
     let mut perms = std::fs::metadata(&path)?.permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&path, perms)?;
+
+    let git_path = dir.path().join("git");
+    let remote_head = dir.path().join("remote-head");
+    let remote_tags = dir.path().join("remote-tags");
+    std::fs::write(
+        &git_path,
+        format!(
+            r#"#!/bin/sh
+case " $* " in
+  *" remote get-url "*)
+    echo "https://github.com/loadingalias/registry-shadow.git"
+    exit 0
+    ;;
+  *" ls-remote "*)
+    ref=""
+    for argument in "$@"; do ref="$argument"; done
+    case "$ref" in
+      refs/heads/*)
+        [ -f "{}" ] && printf '%s\t%s\n' "$(cat "{}")" "$ref"
+        ;;
+      refs/tags/*)
+        [ -f "{}" ] && printf '%s\t%s\n' "$(cat "{}")" "$ref"
+        ;;
+    esac
+    exit 0
+    ;;
+  *" push "*)
+    repository=.
+    previous=""
+    for argument in "$@"; do
+      [ "$previous" = "-C" ] && repository="$argument"
+      previous="$argument"
+    done
+    head=$("{}" -C "$repository" rev-parse HEAD)
+    case " $* " in
+      *" refs/tags/"*) printf '%s\n' "$head" > "{}" ;;
+      *) printf '%s\n' "$head" > "{}" ;;
+    esac
+    exit 0
+    ;;
+esac
+exec "{}" "$@"
+"#,
+            remote_head.display(),
+            remote_head.display(),
+            remote_tags.display(),
+            remote_tags.display(),
+            real_git,
+            remote_tags.display(),
+            remote_head.display(),
+            real_git,
+        ),
+    )?;
+    let mut perms = std::fs::metadata(&git_path)?.permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&git_path, perms)?;
+
+    let gh_path = dir.path().join("gh");
+    std::fs::write(
+        &gh_path,
+        r#"#!/bin/sh
+if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
+  printf '%s\n' '{"data":{"repository":{"object":{"statusCheckRollup":{"contexts":{"totalCount":1,"checkRunCount":1,"checkRunCountsByState":[{"state":"SUCCESS","count":1}],"statusContextCount":0,"statusContextCountsByState":[]}}}}}}'
+fi
+exit 0
+"#,
+    )?;
+    let mut perms = std::fs::metadata(&gh_path)?.permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&gh_path, perms)?;
     Ok(dir)
 }
 
@@ -871,8 +917,11 @@ require_release_notes = false
 semver_check = "off"
 sign_tags = false
 publish_delay = 1
+remote_effects = "push"
+registry_publication = "crates-io"
 "#,
         )?;
+        ws.set_remote("https://github.com/loadingalias/registry-shadow.git")?;
         ws.commit("Configure releases")?;
         ws.tag("v0.1.0", "Release registry-shadow 0.1.0")?;
 
@@ -885,24 +934,33 @@ publish_delay = 1
             shim.path().display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        let interrupted = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
-            .current_dir(&ws.path)
+        let interrupted = cargo_rail_command(&ws.path)?
             .env("PATH", &path)
-            .env("GIT_CONFIG_COUNT", "2")
-            .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
-            .env("GIT_CONFIG_VALUE_0", "false")
-            .env("GIT_CONFIG_KEY_1", "tag.gpgsign")
-            .env("GIT_CONFIG_VALUE_1", "false")
             .env(
                 "CARGO_RAIL_RELEASE_FAIL_AFTER",
                 "journal:publish_intent:registry-shadow",
             )
-            .args(["rail", "release", "run", "registry-shadow", "--bump", "patch", "--yes"])
+            .args([
+                "rail",
+                "release",
+                "run",
+                "registry-shadow",
+                "--bump",
+                "patch",
+                "--publish",
+                "--yes",
+            ])
             .output()?;
         assert!(!interrupted.status.success());
         assert!(
             !published_path.exists(),
             "journal failure precedes the publication effect"
+        );
+        anyhow::ensure!(
+            ws.path.join("target/cargo-rail/releases").is_dir(),
+            "release failed before journal creation\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&interrupted.stdout),
+            String::from_utf8_lossy(&interrupted.stderr)
         );
         let state_path = only_release_state(&ws.path)?;
         let output = run_with_path_prefix(
@@ -937,6 +995,14 @@ publish_delay = 1
             log
         );
         assert!(published_path.exists(), "the registry shim should record a publication");
+        let state: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
+        assert_eq!(state["schema_version"], 4);
+        assert_eq!(state["publish_registry"], "crates-io");
+        assert_eq!(state["release_config"]["registry_publication"], "crates-io");
+        assert_eq!(
+            state["crates"][0]["publication"]["object"],
+            "crates-io:registry-shadow@0.1.1"
+        );
 
         let cleaned = run_with_path_prefix(&ws, shim.path(), &["rail", "clean"])?;
         assert!(cleaned.status.success(), "{}", String::from_utf8_lossy(&cleaned.stderr));
@@ -1078,17 +1144,10 @@ fn run_with_minimal_path_without_forge(ws: &TestWorkspace, args: &[&str]) -> Res
         symlink(real, dir.path().join(binary))?;
     }
 
-    let cargo_rail_bin = env!("CARGO_BIN_EXE_cargo-rail");
-    Command::new(cargo_rail_bin)
-        .current_dir(&ws.path)
+    cargo_rail_command(&ws.path)?
         .env("PATH", dir.path())
         .env_remove("RUSTC_WRAPPER")
         .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
-        .env("GIT_CONFIG_COUNT", "2")
-        .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
-        .env("GIT_CONFIG_VALUE_0", "false")
-        .env("GIT_CONFIG_KEY_1", "tag.gpgsign")
-        .env("GIT_CONFIG_VALUE_1", "false")
         .args(args)
         .output()
         .map_err(Into::into)
@@ -1379,12 +1438,22 @@ tag_format = "v{version}"
 require_clean = false
 require_release_notes = false
 remote_effects = "gitlab"
+registry_publication = "crates-io"
 "#,
         )?;
         let output = run_cargo_rail(
             &ws.path,
             &[
-                "rail", "release", "run", "--all", "--bump", "patch", "--check", "--format", "json",
+                "rail",
+                "release",
+                "run",
+                "--all",
+                "--bump",
+                "patch",
+                "--check",
+                "--publish",
+                "--format",
+                "json",
             ],
         )?;
         assert_eq!(output.status.code(), Some(1));
@@ -1402,6 +1471,13 @@ remote_effects = "gitlab"
         assert!(position("PUBLISH_CRATE") < position("CREATE_TAG"));
         assert!(position("CREATE_TAG") < position("PUSH_RELEASE_TAGS"));
         assert!(position("PUSH_RELEASE_TAGS") < position("CREATE_FORGE_RELEASE"));
+        let publication = json["mutation_plan"]["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|action| action["code"] == "PUBLISH_CRATE")
+            .unwrap();
+        assert_eq!(publication["payload"]["registry"], "crates-io");
         Ok(())
     })();
     super::helpers::finish_test(result);
@@ -3148,8 +3224,7 @@ echo "release hook context accepted"
 
         let trace_dir = tempfile::TempDir::new()?;
         let trace_path = trace_dir.path().join("git-trace.log");
-        let output = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
-            .current_dir(&ws.path)
+        let output = cargo_rail_command(&ws.path)?
             .env(
                 "PATH",
                 format!(
@@ -3395,14 +3470,8 @@ remote_effects = "gitlab"
             green_glab.parent().unwrap().display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        let resumed = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
-            .current_dir(&clone)
+        let resumed = cargo_rail_command(&clone)?
             .env("PATH", path)
-            .env("GIT_CONFIG_COUNT", "2")
-            .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
-            .env("GIT_CONFIG_VALUE_0", "false")
-            .env("GIT_CONFIG_KEY_1", "tag.gpgsign")
-            .env("GIT_CONFIG_VALUE_1", "false")
             .args(["rail", "release", "resume", transaction])
             .output()?;
         assert!(
@@ -3847,20 +3916,16 @@ fn test_release_skip_tag_flag() {
     super::helpers::finish_test(result);
 }
 
-/// Test release --skip-publish flag reflects in plan
+/// Registry publication is absent unless the operator authorizes it positively.
 #[test]
-fn test_release_skip_publish_in_plan() {
+fn test_release_publication_is_default_deny() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_single_crate("skip-pub-crate", "0.1.0")?;
 
         // Configure release
         ws.write_release_config("require_clean = false\n")?;
 
-        // Run release plan with --skip-publish
-        let output = run_cargo_rail(
-            &ws.path,
-            &["rail", "release", "run", "--check", "--skip-publish", "--bump", "patch"],
-        )?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "run", "--check", "--bump", "patch"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         // Exit code 1 = check found pending changes (correct behavior)
@@ -3869,10 +3934,119 @@ fn test_release_skip_publish_in_plan() {
             "release --check should exit 1 when release pending"
         );
         assert!(
-            stdout.contains("--skip-publish") || stdout.contains("0 to publish"),
-            "Should reflect skip-publish in plan.\nOutput:\n{}",
+            stdout.contains("not authorized; pass --publish") && stdout.contains("0 to publish"),
+            "release preview must show that publication lacks positive authorization.\nOutput:\n{}",
             stdout
         );
+
+        ws.write_release_config("require_clean = false\nremote_effects = \"push\"\n")?;
+        let missing_config_authority = run_cargo_rail(
+            &ws.path,
+            &["rail", "release", "run", "--check", "--bump", "patch", "--publish"],
+        )?;
+        assert_eq!(missing_config_authority.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&missing_config_authority.stderr)
+                .contains("--publish requires release.registry_publication = \"crates-io\"")
+        );
+
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn release_local_effects_never_plan_registry_or_remote_actions() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_single_crate("local-release-authority", "0.1.0")?;
+        ws.write_release_config("require_clean = false\nremote_effects = \"none\"\n")?;
+
+        let output = run_cargo_rail(
+            &ws.path,
+            &[
+                "rail", "release", "run", "--check", "--bump", "patch", "--format", "json",
+            ],
+        )?;
+        assert_eq!(output.status.code(), Some(1));
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let codes = json["mutation_plan"]["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|action| action["code"].as_str())
+            .collect::<Vec<_>>();
+        for external in [
+            "PUBLISH_CRATE",
+            "PUSH_RELEASE_COMMIT",
+            "AWAIT_EXACT_SHA_CHECKS",
+            "PUSH_RELEASE_TAGS",
+            "CREATE_FORGE_RELEASE",
+            "PUBLISH_FORGE_RELEASE",
+        ] {
+            assert!(
+                !codes.contains(&external),
+                "local-only plan contains {external}: {codes:?}"
+            );
+        }
+
+        let rejected = run_cargo_rail(
+            &ws.path,
+            &["rail", "release", "run", "--check", "--bump", "patch", "--publish"],
+        )?;
+        assert_eq!(rejected.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr)
+                .contains("--publish cannot be combined with release.remote_effects = \"none\"")
+        );
+
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn cargo_publish_authority_cannot_be_widened_by_rail_config() {
+    let result: Result<()> = (|| {
+        for (name, publish_line) in [
+            ("manifest-private", "publish = false"),
+            ("registry-private", "publish = [\"private\"]"),
+        ] {
+            let ws = TestWorkspace::new_single_crate(name, "0.1.0")?;
+            let manifest_path = ws.path.join("Cargo.toml");
+            let manifest = std::fs::read_to_string(&manifest_path)?;
+            let manifest = manifest.replacen("edition = \"2021\"", &format!("edition = \"2021\"\n{publish_line}"), 1);
+            anyhow::ensure!(manifest.contains(publish_line));
+            std::fs::write(&manifest_path, manifest)?;
+            ws.write_release_config(&format!(
+                "require_clean = false\nremote_effects = \"push\"\nregistry_publication = \"crates-io\"\n\n[crates.{name}.release]\npublish = true\n"
+            ))?;
+
+            let output = run_cargo_rail(
+                &ws.path,
+                &[
+                    "rail",
+                    "release",
+                    "run",
+                    name,
+                    "--check",
+                    "--bump",
+                    "patch",
+                    "--publish",
+                    "--format",
+                    "json",
+                ],
+            )?;
+            assert_eq!(output.status.code(), Some(1));
+            let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+            let publishes = json["mutation_plan"]["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|action| action["code"] == "PUBLISH_CRATE")
+                .count();
+            assert_eq!(publishes, 0, "Cargo registry authority was widened for {name}");
+            assert_eq!(json["release_plan"]["crates"][0]["publish"], false);
+        }
 
         Ok(())
     })();
@@ -4748,6 +4922,50 @@ require_release_notes = false
         let reconstructed: serde_json::Value = serde_json::from_slice(&reconstructed.stdout)?;
         assert_eq!(reconstructed["transactions"][0]["state"], "released:git");
         assert_eq!(reconstructed["transactions"][0]["recoverability"], "terminal");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn historical_prepare_with_merged_descendant_tag_is_terminal_not_finalizable() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_single_crate("historical-prepare", "0.1.0")?;
+        let manifest = std::fs::read_to_string(ws.path.join("Cargo.toml"))?.replace("0.1.0", "0.1.1");
+        std::fs::write(ws.path.join("Cargo.toml"), manifest)?;
+        let transaction = "release-historical-prepare";
+        let prepare_sha = ws.commit(&format!(
+            "chore(release): prepare\n\nRail-Release: {transaction}\nRail-Release-Mode: prepare\nRail-Release-Publish: false\nRail-Release-Tag: true\nRail-Release-Remote: none\nRail-Release-Crate: historical-prepare@0.1.1\nRail-Release-Tag-Name: historical-prepare=v0.1.1\nRail-Release-Crate-Publish: historical-prepare=false"
+        ))?;
+        std::fs::write(ws.path.join("merged-release-evidence"), "merged\n")?;
+        let merged_sha = ws.commit("Merge prepared release")?;
+        git(&ws.path, &["tag", "-a", "v0.1.1", "-m", "Release v0.1.1", &merged_sha])?;
+
+        let status = run_cargo_rail(&ws.path, &["rail", "release", "status", "--format", "json"])?;
+        assert!(status.status.success(), "{}", String::from_utf8_lossy(&status.stderr));
+        let status: serde_json::Value = serde_json::from_slice(&status.stdout)?;
+        let reconstructed = status["transactions"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("release transactions are unavailable"))?
+            .iter()
+            .find(|entry| entry["transaction_id"] == transaction)
+            .ok_or_else(|| anyhow::anyhow!("historical prepare transaction is unavailable"))?;
+        assert_eq!(reconstructed["state"], "released:git");
+        assert_eq!(reconstructed["recoverability"], "terminal");
+        assert_eq!(reconstructed["ambiguity"], false);
+        assert_eq!(reconstructed["exact_sha"], merged_sha);
+        assert_eq!(reconstructed["safe_operator_command"], "cargo rail clean");
+        assert_ne!(prepare_sha, merged_sha);
+        assert!(
+            reconstructed["observations"]
+                .as_array()
+                .is_some_and(|observations| observations.iter().any(|value| {
+                    value
+                        .as_str()
+                        .is_some_and(|value| value == format!("prepare:merged_target={merged_sha}"))
+                })),
+            "merged release target was not retained in status: {reconstructed}"
+        );
         Ok(())
     })();
     super::helpers::finish_test(result);

@@ -13,7 +13,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct TargetMetadataEntry {
     metadata: Arc<Metadata>,
     package_id_index: FxHashMap<PackageId, usize>,
@@ -72,7 +72,7 @@ impl TargetMetadataEntry {
 /// Loads metadata for each target in parallel WITHOUT --all-features.
 /// This gives us accurate version resolution per target while avoiding
 /// the maximal feature set problem.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct MultiTargetMetadata {
     /// Canonical workspace metadata loaded once by [`crate::workspace::WorkspaceContext`].
     workspace_metadata: Arc<Metadata>,

@@ -344,8 +344,9 @@ installed receipt authority, validates its owner marker, waits for in-flight rea
 CAS. Removing active L1 leaves setup drift that the next cold compiler invocation bypasses safely; `cache setup`
 repairs the same root. `cache remove` losslessly removes only the receipt-owned Cargo field, wrapper, session state, and
 receipt; it preserves CAS data. It refuses changed or unowned state. A legacy `local-cas-v1` is reclaim-only and never
-becomes v2 authority. Use `--scope all` only when both cache-cleanup effects are intended. `cargo rail clean --cache`
-remains a combined compatibility alias. Do not remove individual CAS objects or Cargo fingerprints by hand.
+becomes v2 authority. Use `--scope all` only when both cache-cleanup effects are intended. Bare `cargo rail clean` and
+its `--cache` compatibility option remain bounded to current-workspace state; neither removes the shared local CAS.
+Do not remove individual CAS objects or Cargo fingerprints by hand.
 
 ## Execution and reuse support
 

@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Configuration for sync operation
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct SyncConfig {
     /// Name of the crate being synced
     pub crate_name: String,
@@ -44,6 +44,7 @@ pub struct SyncConfig {
 }
 
 /// Result of a sync operation
+#[derive(Debug)]
 pub struct SyncResult {
     /// Number of commits synced
     pub commits_synced: usize,
@@ -90,6 +91,7 @@ pub enum SyncDirection {
 
 /// Result of conflict resolution containing both conflict info and changed files
 /// Changed files are cached for reuse in the apply step to avoid redundant git calls
+#[derive(Debug)]
 pub struct ConflictResolutionResult {
     /// Conflict information for files that had merge conflicts
     pub conflicts: Vec<ConflictInfo>,
@@ -137,6 +139,7 @@ impl SyncConflictReceipt {
 }
 
 /// Bidirectional sync engine
+#[derive(Debug)]
 pub struct SyncEngine<'a> {
     /// Workspace context
     ctx: &'a WorkspaceContext,
