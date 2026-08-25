@@ -29,7 +29,26 @@ fn isolated_git_config() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/isolated.gitconfig")
 }
 
-/// Build a cargo-rail command isolated from the developer's Cargo and Git configuration.
+fn disable_ambient_cargo_wrappers(command: &mut Command) {
+    for name in [
+        "RUSTC_WRAPPER",
+        "CARGO_BUILD_RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+    ] {
+        command.env(name, "");
+    }
+}
+
+/// Build a Cargo command isolated from ambient compiler wrappers.
+pub fn cargo_command(cwd: &Path) -> Command {
+    let mut command = Command::new("cargo");
+    command.current_dir(cwd);
+    disable_ambient_cargo_wrappers(&mut command);
+    command
+}
+
+/// Build a cargo-rail command isolated from developer compiler wrappers and Git configuration.
 pub fn cargo_rail_command(cwd: &Path) -> Result<Command> {
     let git_config = isolated_git_config();
     let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-rail"));
@@ -44,6 +63,7 @@ pub fn cargo_rail_command(cwd: &Path) -> Result<Command> {
         .env("GIT_CONFIG_VALUE_0", "false")
         .env("GIT_CONFIG_KEY_1", "tag.gpgsign")
         .env("GIT_CONFIG_VALUE_1", "false");
+    disable_ambient_cargo_wrappers(&mut command);
     Ok(command)
 }
 

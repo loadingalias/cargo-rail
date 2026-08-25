@@ -6,7 +6,7 @@
 //! 3. Uses skip_undeclared_patterns correctly
 //! 4. Plans fixes for undeclared features at the normal apply boundary
 
-use crate::helpers::{TestWorkspace, run_cargo_rail};
+use crate::helpers::{TestWorkspace, cargo_command, run_cargo_rail};
 use anyhow::Result;
 use serde_json::Value;
 use std::fs;
@@ -86,8 +86,7 @@ serde = "1.0"
         )?;
         workspace.commit("Add crates with feature borrowing")?;
 
-        let standalone = std::process::Command::new("cargo")
-            .current_dir(&workspace.path)
+        let standalone = cargo_command(&workspace.path)
             .args(["check", "-p", "crate-b"])
             .output()?;
         assert!(
@@ -591,8 +590,7 @@ serde = "1"
         )?;
         workspace.commit("Add target-specific borrowed derive feature")?;
 
-        let before = std::process::Command::new("cargo")
-            .current_dir(&workspace.path)
+        let before = cargo_command(&workspace.path)
             .args(["check", "-p", "crate-b"])
             .output()?;
         assert!(
@@ -621,8 +619,7 @@ serde = "1"
             "repair must not widen a target-specific feature to an unconditional dependency\n{manifest}"
         );
 
-        let after = std::process::Command::new("cargo")
-            .current_dir(&workspace.path)
+        let after = cargo_command(&workspace.path)
             .args(["check", "-p", "crate-b"])
             .output()?;
         assert!(
