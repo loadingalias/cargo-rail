@@ -32,16 +32,6 @@ fn test_unsupported_output_formats_fail_during_cli_parsing() {
                 "[possible values: text, json]",
             ),
             (
-                "hash",
-                &["rail", "hash", "--format", "github-matrix"],
-                "[possible values: text, json]",
-            ),
-            (
-                "diff-hash",
-                &["rail", "diff-hash", "a.json", "b.json", "--format", "jsonl"],
-                "[possible values: text, json]",
-            ),
-            (
                 "split",
                 &["rail", "split", "run", "lib-a", "--format", "github"],
                 "[possible values: text, json, names-only, jsonl]",
@@ -55,11 +45,6 @@ fn test_unsupported_output_formats_fail_during_cli_parsing() {
                 "unify",
                 &["rail", "unify", "--check", "--format", "names-only"],
                 "[possible values: text, json]",
-            ),
-            (
-                "plan",
-                &["rail", "plan", "--format", "jsonl"],
-                "[possible values: text, json, github, github-debug]",
             ),
         ];
 
@@ -92,7 +77,6 @@ fn test_global_json_rejects_commands_without_structured_contracts() {
             ("release init", &["rail", "--json", "release", "init"]),
             ("release resume", &["rail", "--json", "release", "resume", "state.json"]),
             ("release abort", &["rail", "--json", "release", "abort", "state.json"]),
-            ("graph --dot", &["rail", "--json", "graph", "--dot"]),
             ("completions", &["rail", "--json", "completions", "bash"]),
         ];
 
@@ -147,7 +131,7 @@ fn test_clean_check_json_has_stable_stream_and_exit_contract() {
         std::fs::create_dir_all(artifact.parent().expect("artifact has parent"))?;
         std::fs::write(&artifact, "{}")?;
 
-        let output = run_cargo_rail(&ws.path, &["rail", "clean", "--cache", "--check", "--format", "json"])?;
+        let output = run_cargo_rail(&ws.path, &["rail", "clean", "--cache", "--check", "--json"])?;
         assert_eq!(output.status.code(), Some(1));
         assert!(output.stderr.is_empty(), "JSON check output must keep stderr empty");
 

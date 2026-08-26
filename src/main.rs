@@ -87,13 +87,13 @@ fn run(cli: RailCli, cli_preparation_started: Instant) -> RailResult<()> {
     let workspace_capture_started = Instant::now();
     let context = prepared.build(&workspace_root);
     cargo_rail::instrumentation::record_workspace_capture_cargo_metadata(workspace_capture_started);
-    let (command, ctx) = context?;
-    if let Some(snapshot_id) = ctx.snapshot_id() {
-        cargo_rail::instrumentation::record_snapshot_id(snapshot_id.to_string());
+    let (command, ctx, prepared_plan) = context?;
+    if let Some(snapshot_id) = ctx.captured_authority_id() {
+        cargo_rail::instrumentation::record_snapshot_id(snapshot_id);
     }
 
     // Dispatch to command handler
-    commands::dispatch(command, &ctx)
+    commands::dispatch(command, &ctx, prepared_plan)
 }
 
 fn exit_with_error(err: RailError) -> ! {

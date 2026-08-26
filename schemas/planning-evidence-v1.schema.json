@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/loadingalias/cargo-rail/main/schemas/planning-evidence-v1.schema.json",
+  "title": "cargo-rail portable planning evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "planning_evidence_version",
+    "identity",
+    "provider",
+    "source_base",
+    "cargo_identity",
+    "cargo_configuration_identity",
+    "toolchain_identity",
+    "target_identity",
+    "platform",
+    "environment",
+    "base_model",
+    "work"
+  ],
+  "properties": {
+    "planning_evidence_version": { "const": 1 },
+    "identity": { "type": "string", "pattern": "^planning-evidence-v1:sha256:[0-9a-f]{64}$" },
+    "provider": { "$ref": "#/$defs/provider" },
+    "source_base": { "type": "string", "minLength": 1 },
+    "cargo_identity": { "type": "string", "pattern": "^resolution-universe-v[0-9]+:sha256:[0-9a-f]{64}$" },
+    "cargo_configuration_identity": { "type": "string", "pattern": "^cargo-configuration-v1:sha256:[0-9a-f]{64}$" },
+    "toolchain_identity": { "type": "string", "minLength": 1 },
+    "target_identity": { "type": "string", "pattern": "^planning-target-v1:sha256:[0-9a-f]{64}$" },
+    "platform": { "type": "string", "minLength": 1 },
+    "environment": { "$ref": "#/$defs/string_array" },
+    "base_model": { "$ref": "#/$defs/base_model" },
+    "work": {
+      "type": "object",
+      "maxProperties": 256,
+      "propertyNames": { "pattern": "^cargo\\.[a-z][a-z0-9.-]*$" },
+      "additionalProperties": { "$ref": "#/$defs/work" }
+    }
+  },
+  "$defs": {
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["identity", "capabilities"],
+      "properties": {
+        "identity": { "type": "string", "minLength": 1 },
+        "capabilities": { "$ref": "#/$defs/string_array" }
+      }
+    },
+    "string_array": {
+      "type": "array",
+      "maxItems": 4096,
+      "items": { "type": "string" },
+      "uniqueItems": true
+    },
+    "base_model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["packages", "edges"],
+      "properties": {
+        "packages": {
+          "type": "array",
+          "maxItems": 10000,
+          "items": { "$ref": "#/$defs/base_package" }
+        },
+        "edges": {
+          "type": "array",
+          "maxItems": 100000,
+          "items": { "$ref": "#/$defs/base_edge" }
+        }
+      }
+    },
+    "base_package": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "name", "root", "targets"],
+      "properties": {
+        "key": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "root": { "type": "string" },
+        "targets": {
+          "type": "array",
+          "maxItems": 100000,
+          "items": { "$ref": "#/$defs/base_target" }
+        }
+      }
+    },
+    "base_target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "kind", "src_path"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "kind": { "$ref": "#/$defs/nonempty_string_array" },
+        "src_path": { "type": "string", "minLength": 1 }
+      }
+    },
+    "base_edge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dependency", "dependent", "domain"],
+      "properties": {
+        "dependency": { "type": "string", "minLength": 1 },
+        "dependent": { "type": "string", "minLength": 1 },
+        "domain": { "enum": ["build", "development"] }
+      }
+    },
+    "nonempty_string_array": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 4096,
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "work": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["complete", "bypasses", "inputs"],
+      "properties": {
+        "complete": { "type": "boolean" },
+        "bypasses": { "$ref": "#/$defs/string_array" },
+        "inputs": {
+          "type": "array",
+          "maxItems": 100000,
+          "items": { "$ref": "#/$defs/input" }
+        }
+      }
+    },
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "identity", "package", "target"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "identity": { "type": "string", "pattern": "^(git:[0-9]+:[0-9a-f]{40,64}|sha256:[0-9a-f]{64})$" },
+        "package": { "type": ["string", "null"] },
+        "target": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

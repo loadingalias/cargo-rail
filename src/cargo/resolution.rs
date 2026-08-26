@@ -1001,6 +1001,18 @@ impl ResolutionViews {
         Self::new_inner(workspace_root, cargo_current_dir, metadata, graph, Some(inputs))
     }
 
+    pub(crate) fn new_with_cargo_config(
+        workspace_root: PathBuf,
+        cargo_current_dir: PathBuf,
+        metadata: Arc<Metadata>,
+        graph: Arc<WorkspaceGraph>,
+        cargo_config: Arc<CargoConfigSnapshot>,
+    ) -> Self {
+        let mut views = Self::new_inner(workspace_root, cargo_current_dir, metadata, graph, None);
+        views.cargo_config = OnceLock::from(Ok(cargo_config));
+        views
+    }
+
     fn new_inner(
         workspace_root: PathBuf,
         cargo_current_dir: PathBuf,
@@ -1037,11 +1049,7 @@ impl ResolutionViews {
     }
 
     pub(crate) fn inputs(&self) -> RailResult<ResolutionInputs> {
-        let cargo_config = cached_value(self.cargo_config.get_or_init(|| {
-            CargoConfigSnapshot::capture(&self.cargo_current_dir)
-                .map(Arc::new)
-                .map_err(CachedResolutionError::from_error)
-        }))?;
+        let cargo_config = self.cargo_config()?;
         let toolchain = cached_value(self.toolchain.get_or_init(|| {
             ToolchainIdentity::capture(&self.cargo_current_dir, &cargo_config)
                 .map_err(CachedResolutionError::from_error)
@@ -1050,6 +1058,14 @@ impl ResolutionViews {
             cargo_config,
             toolchain,
         })
+    }
+
+    pub(crate) fn cargo_config(&self) -> RailResult<Arc<CargoConfigSnapshot>> {
+        cached_value(self.cargo_config.get_or_init(|| {
+            CargoConfigSnapshot::capture(&self.cargo_current_dir)
+                .map(Arc::new)
+                .map_err(CachedResolutionError::from_error)
+        }))
     }
 
     pub(crate) fn cargo_current_dir(&self) -> &Path {

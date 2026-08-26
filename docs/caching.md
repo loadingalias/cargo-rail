@@ -158,11 +158,10 @@ search namespaces, and any output class outside the reviewed Rust metadata/libra
 with a named reason and execute normally. Standardize canonical checkout roots and retain physical mode when a
 workload cannot qualify.
 
-`loadingalias/cargo-rail-action/cache@47e86bde928ce420b85efa5f8d3b5feb96fd0ffc` accepts the same URL as `url`, runs
-setup once, and leaves later ordinary
-Cargo commands in that GitHub Actions job on the installed cache path. Configure provider credentials before Cargo
-runs and invoke the cache Action separately in each execution job because hosted jobs do not share a machine or Cargo
-home.
+`loadingalias/cargo-rail-action/cache@v8` accepts the same URL as `url`, requires an explicit `read` or `read-write`
+mode, runs setup once, and verifies local status without contacting the provider. Later Cargo commands in that job use
+the installed cache path. Configure provider credentials before Cargo runs. Invoke the Action in each execution job
+because GitHub-hosted jobs do not share a machine or Cargo home.
 
 Validate or canonicalize a URL without resolving credentials or contacting storage:
 

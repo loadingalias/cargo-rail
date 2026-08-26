@@ -134,19 +134,19 @@ Inspect `authority.audited_targets`, `authority.open_targets`, `products`, `feat
 
 ## Route the gate through the planner
 
-Set `[surface] enabled = true` to let Rust source, surface policy, compiler driver, schema, and relevant workflow
-changes select the planner's whole-workspace `surface` gate. Consume the planner value directly:
+Set `[surface] enabled = true` to let Rust source, Surface policy, compiler driver, schema, and relevant workflow
+changes select the named `surface` work item. Consume that decision directly:
 
 ```bash
-PLAN_JSON=$(cargo rail plan --merge-base -f json)
-if [ "$(jq -r '.surfaces.surface.enabled' <<<"$PLAN_JSON")" = "true" ]; then
+cargo rail plan --json > target/plan-v8.json
+if [ "$(scripts/plan/read.py is-required target/plan-v8.json surface)" = "true" ]; then
   cargo rail surface --check
 fi
 ```
 
-The official action exports the same versioned `surfaces-json`; consume that value instead of recreating path rules in
-workflow YAML. Surface execution still needs the release driver or the repository's exact source-built embedded
-driver used by its bootstrap job.
+Transfer the exact v8 plan to the Surface job instead of recreating path rules in workflow YAML. Verify checkout
+`HEAD` against `inputs.head_commit` before execution. Surface still needs the release driver or the repository's exact
+source-built embedded driver used by its bootstrap job.
 
 ## Compare before removing Hawk
 

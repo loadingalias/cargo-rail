@@ -2,7 +2,8 @@
 
 use crate::cargo::multi_target_metadata::MultiTargetMetadata;
 use crate::cargo::resolution::{
-    ResolutionInputs, ResolutionRequest, ResolutionView, ResolutionViews, capture_target_identities,
+    CargoConfigSnapshot, ResolutionInputs, ResolutionRequest, ResolutionView, ResolutionViews,
+    capture_target_identities,
 };
 use crate::compiler::cfg_eval::TargetCfgSet;
 use crate::config::RailConfig;
@@ -10,7 +11,8 @@ use crate::error::{GitError, RailError, RailResult};
 use crate::git::SystemGit;
 use crate::graph::WorkspaceGraph;
 use crate::source::{
-    ContentDigest, GitWorktreeCapture, RepositoryPath, SourceEntryKind, SourceExclusions, SourceSnapshot,
+    ChangeSet, ContentDigest, GitWorktreeCapture, PlanningSourceCapture, RepositoryPath, SourceEntryKind,
+    SourceExclusions, SourceSnapshot, changes_between_objects,
 };
 use crate::workspace::snapshot::{CapturedLockfile, CapturedRailConfig, DerivedViews, WorkspaceSnapshot};
 use cargo_metadata::{Metadata, MetadataCommand, Package};
@@ -173,6 +175,17 @@ impl CargoState {
         error.into()
       }
     })?;
+        Ok(Self::from_metadata(Arc::new(metadata)))
+    }
+
+    fn load_planning(workspace_root: &Path) -> RailResult<Self> {
+        crate::instrumentation::record_cargo_metadata_load(false);
+        let mut command = MetadataCommand::new();
+        command.manifest_path(workspace_root.join("Cargo.toml"));
+        if workspace_root.join("Cargo.lock").is_file() {
+            command.other_options(vec!["--locked".to_string()]);
+        }
+        let metadata = command.exec()?;
         Ok(Self::from_metadata(Arc::new(metadata)))
     }
 
@@ -501,6 +514,9 @@ pub struct WorkspaceContext {
     /// Immutable source captured before Cargo metadata can create generated state.
     source_capture: Option<Arc<GitWorktreeCapture>>,
 
+    /// Sparse source/index authority used only by non-mutating planning flows.
+    planning_source_capture: Option<Arc<PlanningSourceCapture>>,
+
     /// Dependency graph (built from cargo metadata)
     /// Wrapped in Arc for efficient sharing across threads/commands
     graph: Arc<WorkspaceGraph>,
@@ -515,6 +531,9 @@ pub struct WorkspaceContext {
     /// Optional because not all commands require configuration
     /// Wrapped in Arc for efficient sharing
     config: Option<Arc<RailConfig>>,
+
+    /// Exact discovered configuration path for planning deltas.
+    config_path: Option<PathBuf>,
 }
 
 impl WorkspaceContext {
@@ -558,6 +577,13 @@ impl WorkspaceContext {
             ContextCapture::None
         };
         Self::build_inner(workspace_root, capture, config_override)
+    }
+
+    pub(crate) fn build_with_planning_capture_and_config(
+        workspace_root: &Path,
+        config_override: Option<&Path>,
+    ) -> RailResult<Self> {
+        Self::build_inner(workspace_root, ContextCapture::Planning, config_override)
     }
 
     /// Build a context with one complete immutable workspace snapshot.
@@ -607,10 +633,23 @@ impl WorkspaceContext {
         };
 
         let initial_generated_roots = [super::cargo_rail_state_root(workspace_root)];
-        let mut source_capture = if capture != ContextCapture::None {
+        let mut source_capture = if matches!(capture, ContextCapture::Worktree | ContextCapture::Snapshot) {
             git.as_ref()
                 .map(|state| GitWorktreeCapture::capture_excluding(state.git(), &initial_generated_roots))
                 .transpose()?
+        } else {
+            None
+        };
+        let mut planning_source_capture = if capture == ContextCapture::Planning {
+            git.as_ref()
+                .map(|state| PlanningSourceCapture::capture_excluding(state.git(), &initial_generated_roots))
+                .transpose()?
+        } else {
+            None
+        };
+
+        let planning_cargo_config = if capture == ContextCapture::Planning {
+            Some(Arc::new(CargoConfigSnapshot::capture(&cargo_current_dir)?))
         } else {
             None
         };
@@ -634,6 +673,8 @@ impl WorkspaceContext {
                 inputs.toolchain.cargo_program(),
                 inputs.cargo_config.has_credential_capability(),
             )?
+        } else if capture == ContextCapture::Planning {
+            CargoState::load_planning(workspace_root)?
         } else {
             CargoState::load(workspace_root)?
         });
@@ -670,6 +711,14 @@ impl WorkspaceContext {
         } else {
             None
         };
+        let planning_generated_lockfile =
+            if let (Some(capture), Some(git)) = (planning_source_capture.as_mut(), git.as_ref()) {
+                let generated_roots = validated_generated_source_roots(git.repo_root(), &workspace_root, &cargo)?;
+                capture.exclude_generated_roots(git.git(), &generated_roots)?;
+                stabilize_planning_generated_lockfile(capture, git, &workspace_root)?
+            } else {
+                None
+            };
 
         // Build the dependency graph from the metadata already loaded above.
         let graph = Arc::new(WorkspaceGraph::from_metadata(cargo.metadata())?);
@@ -681,6 +730,14 @@ impl WorkspaceContext {
                 cargo.shared_metadata(),
                 Arc::clone(&graph),
                 inputs,
+            )
+        } else if let Some(cargo_config) = planning_cargo_config.clone() {
+            ResolutionViews::new_with_cargo_config(
+                workspace_root.clone(),
+                cargo_current_dir,
+                cargo.shared_metadata(),
+                Arc::clone(&graph),
+                cargo_config,
             )
         } else {
             ResolutionViews::new(
@@ -702,17 +759,18 @@ impl WorkspaceContext {
                 })
             },
         );
-        let (config, rail_config, rail_config_discovery_root) = match config_path {
+        let (config, rail_config, rail_config_discovery_root, captured_config_path) = match config_path {
             Some(path) => {
                 let (parsed, bytes) = RailConfig::load_path_with_bytes(&path)?;
                 let parsed = Arc::new(parsed);
                 (
                     Some(Arc::clone(&parsed)),
-                    Some(CapturedRailConfig::new(path, bytes, parsed)),
+                    Some(CapturedRailConfig::new(path.clone(), bytes, parsed)),
                     None,
+                    Some(path),
                 )
             }
-            None => (None, None, Some(workspace_root.clone())),
+            None => (None, None, Some(workspace_root.clone()), None),
         };
 
         // Validate configured targets against rustc's canonical target list
@@ -725,8 +783,8 @@ impl WorkspaceContext {
 
         // Validate config settings that require workspace context
         if let Some(ref cfg) = config {
-            // Validate change-detection glob patterns
-            cfg.change_detection.validate().map_err(RailError::Config)?;
+            // Validate input-only planner work declarations before evaluation.
+            cfg.plan.validate().map_err(RailError::Config)?;
 
             // Validate source-surface policy before any compiler acquisition.
             cfg.surface.validate().map_err(RailError::Config)?;
@@ -794,16 +852,38 @@ impl WorkspaceContext {
             None
         };
 
+        if let (Some(capture), Some(git)) = (&planning_source_capture, &git) {
+            capture.validate_unchanged(git.git())?;
+        }
+        if let Some(initial) = planning_cargo_config {
+            let current = CargoConfigSnapshot::capture(resolution_views.cargo_current_dir())?;
+            if current != *initial {
+                return Err(RailError::with_help(
+                    "Cargo configuration changed while constructing the planning context",
+                    "retry after Cargo configuration and environment changes have stopped",
+                ));
+            }
+        }
+        if let Some(lockfile) = planning_generated_lockfile {
+            write_generated_lock_marker(
+                &workspace_root,
+                lockfile.path(),
+                ContentDigest::sha256(lockfile.bytes()),
+            )?;
+        }
+
         Ok(Self {
             workspace_root,
             git,
             cargo,
             workspace_prefix,
             source_capture: source_capture.map(Arc::new),
+            planning_source_capture: planning_source_capture.map(Arc::new),
             graph,
             derived_views,
             snapshot,
             config,
+            config_path: captured_config_path,
         })
     }
 
@@ -825,6 +905,10 @@ impl WorkspaceContext {
             .as_ref()
             .and_then(WorkspaceSnapshot::shared_config)
             .or(self.config.as_ref())
+    }
+
+    pub(crate) fn config_path(&self) -> Option<&Path> {
+        self.config_path.as_deref()
     }
 
     /// Return Cargo state paired with the authoritative snapshot metadata.
@@ -863,6 +947,60 @@ impl WorkspaceContext {
     /// workspace-owned cargo-rail state are absent from this capture.
     pub fn source_capture(&self) -> Option<&GitWorktreeCapture> {
         self.source_capture.as_deref()
+    }
+
+    pub(crate) fn planning_source_capture(&self) -> Option<&PlanningSourceCapture> {
+        self.planning_source_capture.as_deref()
+    }
+
+    pub(crate) fn planning_snapshot_id(&self) -> Option<String> {
+        self.planning_source_capture
+            .as_ref()
+            .map(|capture| format!("v1-sha256-{}", capture.identity()))
+    }
+
+    pub(crate) fn planning_head_commit(&self) -> Option<&str> {
+        self.planning_source_capture().map(PlanningSourceCapture::head_commit)
+    }
+
+    pub(crate) fn planning_cargo_configuration_identity(&self) -> RailResult<String> {
+        let source_root = self
+            .git
+            .as_ref()
+            .map_or(self.workspace_root.as_path(), |git| git.repo_root());
+        let identity = self
+            .derived_views
+            .cargo_config()?
+            .portable_snapshot_identity(source_root)?;
+        Ok(format!(
+            "cargo-configuration-v1:sha256:{}",
+            ContentDigest::sha256(&identity)
+        ))
+    }
+
+    /// Return the versioned identity for the complete or sparse authority captured by this context.
+    #[doc(hidden)]
+    pub fn captured_authority_id(&self) -> Option<String> {
+        self.snapshot_id()
+            .map(|snapshot| snapshot.to_string())
+            .or_else(|| self.planning_snapshot_id())
+    }
+
+    pub(crate) fn read_planning_current_files(&self, paths: &[String]) -> RailResult<Vec<Vec<u8>>> {
+        let capture = self
+            .planning_source_capture()
+            .ok_or_else(|| RailError::message("workspace context was built without sparse planning source capture"))?;
+        let repository_paths = paths
+            .iter()
+            .map(|path| {
+                let path = self
+                    .workspace_prefix
+                    .as_ref()
+                    .map_or_else(|| PathBuf::from(path), |prefix| prefix.join(path));
+                RepositoryPath::new(&path)
+            })
+            .collect::<RailResult<Vec<_>>>()?;
+        capture.read_current_files(self.git()?.git(), &repository_paths)
     }
 
     pub(crate) fn capture_worktree_source(&self) -> RailResult<GitWorktreeCapture> {
@@ -939,18 +1077,12 @@ impl WorkspaceContext {
         }
     }
 
-    pub(crate) fn exclude_generated_source_paths(&self, paths: Vec<PathBuf>) -> RailResult<Vec<PathBuf>> {
+    /// Capture one rich source change set between exact Git objects.
+    pub(crate) fn object_source_changes(&self, base: &str, head: &str) -> RailResult<ChangeSet> {
         let git = self.git()?;
         let generated_roots = validated_generated_source_roots(git.repo_root(), &self.workspace_root, &self.cargo)?;
         let exclusions = SourceExclusions::from_absolute_roots(git.git(), &generated_roots)?;
-        paths
-            .into_iter()
-            .filter_map(|path| match exclusions.contains_path(&path) {
-                Ok(true) => None,
-                Ok(false) => Some(Ok(path)),
-                Err(error) => Some(Err(error)),
-            })
-            .collect()
+        changes_between_objects(git.git(), base, head, &exclusions)
     }
 
     /// Get multi-target metadata, loading lazily on first access.
@@ -1072,6 +1204,7 @@ impl WorkspaceContext {
 enum ContextCapture {
     None,
     Worktree,
+    Planning,
     Snapshot,
 }
 
@@ -1177,12 +1310,37 @@ fn stabilize_cargo_generated_lockfile(
         ));
     }
     initial.exclude_generated_roots(git.git(), std::slice::from_ref(&lockfile))?;
-    initial.validate_unchanged(git.git()).map_err(|_| {
-        RailError::with_help(
-            "workspace source changed while Cargo generated a missing lockfile",
-            "retry after source changes have stopped; Cargo.lock may be retained as the resolved workspace lock",
-        )
-    })?;
+    Ok(Some(CapturedLockfile::new(lockfile, bytes)))
+}
+
+fn stabilize_planning_generated_lockfile(
+    initial: &mut PlanningSourceCapture,
+    git: &GitState,
+    workspace_root: &Path,
+) -> RailResult<Option<CapturedLockfile>> {
+    let lockfile = workspace_root.join("Cargo.lock");
+    let metadata = match fs::symlink_metadata(&lockfile) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_file() {
+        return Ok(None);
+    }
+
+    let relative = crate::utils::path_relative_to(git.repo_root(), &lockfile)?;
+    let relative = RepositoryPath::new(&relative)?;
+    if initial.is_indexed(&relative) {
+        return Ok(None);
+    }
+
+    let bytes = fs::read(&lockfile)?;
+    let digest = ContentDigest::sha256(&bytes);
+    if initial.is_untracked(&relative) && !generated_lock_marker_matches(workspace_root, digest)? {
+        return Ok(None);
+    }
+
+    initial.exclude_generated_roots(git.git(), std::slice::from_ref(&lockfile))?;
     Ok(Some(CapturedLockfile::new(lockfile, bytes)))
 }
 

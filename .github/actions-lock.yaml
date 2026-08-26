@@ -44,14 +44,6 @@ actions/attest:
   updated: "2026-07-31T19:03:57Z"
   notes: "Generate signed SLSA provenance for release archives"
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# cargo-rail Ecosystem
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-loadingalias/cargo-rail-action:
-  ref: v7.0.0
-  sha: "47e86bde928ce420b85efa5f8d3b5feb96fd0ffc"
-  updated: "2026-08-24T15:07:57Z"
-  notes: "Planner-first CI transport for cargo rail plan surfaces"
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Testing & Reporting
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 mikepenz/action-junit-report:

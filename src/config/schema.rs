@@ -36,6 +36,8 @@ pub struct FieldSpec {
     pub why: &'static str,
     /// Deprecation and migration guidance, when applicable.
     pub deprecation: Option<&'static str>,
+    /// Built-in work that consumes this exact effective field.
+    pub consumers: &'static [&'static str],
 }
 
 const fn policy(path: &'static str, why: &'static str) -> FieldSpec {
@@ -44,6 +46,17 @@ const fn policy(path: &'static str, why: &'static str) -> FieldSpec {
         classification: FieldClassification::ProjectPolicy,
         why,
         deprecation: None,
+        consumers: &[],
+    }
+}
+
+const fn subscribed_policy(path: &'static str, why: &'static str, consumers: &'static [&'static str]) -> FieldSpec {
+    FieldSpec {
+        path,
+        classification: FieldClassification::ProjectPolicy,
+        why,
+        deprecation: None,
+        consumers,
     }
 }
 
@@ -53,6 +66,7 @@ const fn compatibility(path: &'static str, why: &'static str, deprecation: &'sta
         classification: FieldClassification::CompatibilityInput,
         why,
         deprecation: Some(deprecation),
+        consumers: &[],
     }
 }
 
@@ -62,14 +76,9 @@ const fn implementation(path: &'static str, deprecation: &'static str) -> FieldS
         classification: FieldClassification::ImplementationDetail,
         why: "Correctness and deterministic output are cargo-rail responsibilities, not repository policy.",
         deprecation: Some(deprecation),
+        consumers: &[],
     }
 }
-
-const LEGACY_UNKNOWN_FILE_POLICY_BOOL: FieldSpec = compatibility(
-    "change-detection.unknown_file_policy",
-    "Preserves the legacy boolean value until it is explicitly migrated.",
-    "Deprecated: boolean unknown-file policy values must be migrated to `docs` or `owned_build_test` with `cargo rail config migrate`.",
-);
 
 /// Complete leaf-field inventory for `rail.toml`.
 ///
@@ -275,9 +284,10 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
         "release.unconventional_commits",
         "Defines compatibility handling for commit messages outside the reviewed intent model.",
     ),
-    policy(
+    subscribed_policy(
         "release.semver_check",
         "Selects how cargo-semver-checks evidence gates a release.",
+        &["release.semver"],
     ),
     policy(
         "release.require_change_files",
@@ -351,26 +361,6 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
     policy(
         "release.changelog.pr_url",
         "Overrides the derived pull-request-link format.",
-    ),
-    policy(
-        "change-detection.infrastructure",
-        "Defines repository paths that invalidate workspace-wide infrastructure.",
-    ),
-    policy(
-        "change-detection.custom",
-        "Defines project-specific planner output categories.",
-    ),
-    policy(
-        "change-detection.custom.<name>",
-        "Defines a project-specific planner output category.",
-    ),
-    policy(
-        "change-detection.unknown_file_policy",
-        "Defines conservative impact for otherwise unclassified paths.",
-    ),
-    policy(
-        "change-detection.confidence_profile",
-        "Selects the repository's default planner safety profile.",
     ),
     policy(
         "surface.enabled",
@@ -534,15 +524,26 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
         "surface.exclude.<index>.reason",
         "Records why the excluded source scope exists.",
     ),
-    compatibility(
-        "change-detection.conservative_unclassified_owner_fallback",
-        "Preserves the old boolean spelling until it is explicitly migrated.",
-        "Deprecated: migrate to `change-detection.unknown_file_policy` with `cargo rail config migrate`.",
+    policy("plan.work", "Declares input-only repository work."),
+    policy(
+        "plan.work.<name>.scope",
+        "Selects the typed scope emitted for declared work.",
     ),
-    compatibility(
-        "change-detection.bot_pr_confidence_profile",
-        "Preserves an old provider-specific planner override during its compatibility window.",
-        "Deprecated: provider identity no longer changes planner policy. Run `cargo rail config migrate` to remove it.",
+    policy(
+        "plan.work.<name>.paths",
+        "Declares positive repository-relative path inputs.",
+    ),
+    policy(
+        "plan.work.<name>.config",
+        "Declares exact effective configuration inputs.",
+    ),
+    policy(
+        "plan.work.<name>.cargo",
+        "Subscribes declared work to code-owned Cargo work.",
+    ),
+    policy(
+        "plan.work.<name>.variant_catalog",
+        "Selects a checked-in declarative variant catalog.",
     ),
     policy("crates", "Defines per-crate policy overrides."),
     policy(
@@ -658,6 +659,32 @@ pub fn field_spec(path: &str) -> Option<&'static FieldSpec> {
     FIELD_SPECS.iter().find(|spec| path_matches(spec.path, path))
 }
 
+/// Return built-in work consumers for one exact effective field.
+pub fn field_consumers(path: &str) -> &'static [&'static str] {
+    const CARGO_TARGET_CONSUMERS: &[&str] = &[
+        "cargo.build",
+        "cargo.clippy",
+        "cargo.doc",
+        "cargo.doctest",
+        "cargo.package",
+        "cargo.test",
+        "surface",
+    ];
+    const SURFACE_CONSUMERS: &[&str] = &["surface"];
+    let Some(spec) = field_spec(path) else {
+        return &[];
+    };
+    if !spec.consumers.is_empty() {
+        spec.consumers
+    } else if spec.path == "targets" {
+        CARGO_TARGET_CONSUMERS
+    } else if spec.path.starts_with("surface.") {
+        SURFACE_CONSUMERS
+    } else {
+        &[]
+    }
+}
+
 /// Whether a concrete path is a classified field or a container leading to one.
 pub fn is_known_path(path: &str) -> bool {
     field_spec(path).is_some() || FIELD_SPECS.iter().any(|spec| path_prefix_matches(spec.path, path))
@@ -703,18 +730,6 @@ pub fn present_deprecations(doc: &toml_edit::DocumentMut) -> Vec<PresentDeprecat
             spec.deprecation.map(|_| PresentDeprecation { path, spec })
         })
         .collect();
-    if doc
-        .get("change-detection")
-        .and_then(toml_edit::Item::as_table)
-        .and_then(|table| table.get("unknown_file_policy"))
-        .and_then(toml_edit::Item::as_bool)
-        .is_some()
-    {
-        deprecations.push(PresentDeprecation {
-            path: LEGACY_UNKNOWN_FILE_POLICY_BOOL.path.to_string(),
-            spec: &LEGACY_UNKNOWN_FILE_POLICY_BOOL,
-        });
-    }
     deprecations.sort_unstable_by(|left, right| left.path.cmp(&right.path));
     deprecations
 }
@@ -752,6 +767,13 @@ mod tests {
             field_spec("release.changelog.groups.0.title").map(|field| field.path),
             Some("release.changelog.groups.<index>.title")
         );
+    }
+
+    #[test]
+    fn field_consumers_are_owned_by_the_schema_inventory() {
+        assert_eq!(field_consumers("release.semver_check"), &["release.semver"]);
+        assert_eq!(field_consumers("surface.enabled"), &["surface"]);
+        assert!(field_consumers("release.tag_format").is_empty());
     }
 
     #[test]
@@ -805,20 +827,6 @@ compiler_diag_cache = false
         assert_eq!(
             paths,
             vec!["crates.demo.sync".to_string(), "unify.compiler_diag_cache".to_string()]
-        );
-    }
-
-    #[test]
-    fn legacy_boolean_unknown_file_policy_is_value_deprecated() {
-        let doc: toml_edit::DocumentMut = "[change-detection]\nunknown_file_policy = true\n"
-            .parse()
-            .expect("valid config");
-        let deprecations = present_deprecations(&doc);
-        assert_eq!(deprecations.len(), 1);
-        assert_eq!(deprecations[0].path, "change-detection.unknown_file_policy");
-        assert_eq!(
-            deprecations[0].spec.classification,
-            FieldClassification::CompatibilityInput
         );
     }
 }

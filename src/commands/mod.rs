@@ -32,10 +32,6 @@ pub mod common;
 pub mod config;
 /// Read-only workspace and toolchain diagnostics
 pub mod doctor;
-/// Planner reasoning graph command
-pub mod graph;
-/// Planner hash and diff introspection commands
-pub mod hash;
 /// Initialize cargo-rail configuration
 pub mod init;
 /// Deterministic file-first change planner
@@ -64,8 +60,6 @@ pub use config::{
     run_config_validate_standalone,
 };
 pub use doctor::run_native_cache_doctor;
-pub use graph::run_graph;
-pub use hash::{run_diff_hash, run_hash};
 pub use init::{run_init, run_init_standalone};
 pub use plan::{PlanOptions, run_plan};
 pub use release::{
@@ -97,6 +91,7 @@ pub enum PreContextDispatch {
 pub struct PreparedContext {
     command: Box<Commands>,
     config_override: Option<PathBuf>,
+    plan_options: Option<PlanOptions>,
 }
 
 impl PreparedContext {
@@ -104,14 +99,25 @@ impl PreparedContext {
         Ok(Self {
             command: Box::new(command),
             config_override: config_override.map(Path::to_path_buf),
+            plan_options: None,
         })
+    }
+
+    fn new_plan(command: Commands, config_override: Option<&Path>, plan_options: PlanOptions) -> Self {
+        Self {
+            command: Box::new(command),
+            config_override: config_override.map(Path::to_path_buf),
+            plan_options: Some(plan_options),
+        }
     }
 
     /// Build the exact workspace context required by this command.
     #[doc(hidden)]
-    pub fn build(self, workspace_root: &Path) -> RailResult<(Commands, WorkspaceContext)> {
+    pub fn build(self, workspace_root: &Path) -> RailResult<(Commands, WorkspaceContext, Option<PlanOptions>)> {
         let context = if self.command.requires_workspace_snapshot() {
             WorkspaceContext::build_with_snapshot_and_config(workspace_root, self.config_override.as_deref())
+        } else if self.command.requires_planning_source_capture() {
+            WorkspaceContext::build_with_planning_capture_and_config(workspace_root, self.config_override.as_deref())
         } else {
             WorkspaceContext::build_with_source_capture_and_config(
                 workspace_root,
@@ -119,7 +125,7 @@ impl PreparedContext {
                 self.config_override.as_deref(),
             )
         };
-        Ok((*self.command, context?))
+        Ok((*self.command, context?, self.plan_options))
     }
 }
 
@@ -137,6 +143,42 @@ pub fn try_dispatch_pre_context(
         Commands::Plan { schema: true, .. } => {
             plan::print_plan_schema();
             Ok(PreContextDispatch::Handled)
+        }
+
+        Commands::Plan {
+            since,
+            from,
+            to,
+            merge_base,
+            json,
+            explain,
+            all,
+            evidence,
+            schema: false,
+        } => {
+            let comparison = plan::PlanComparison::from_cli(&since, &from, &to, merge_base)?;
+            let command = Commands::Plan {
+                since,
+                from,
+                to,
+                merge_base,
+                json,
+                explain,
+                all,
+                evidence: evidence.clone(),
+                schema: false,
+            };
+            Ok(PreContextDispatch::NeedsContext(PreparedContext::new_plan(
+                command,
+                config_override,
+                PlanOptions {
+                    comparison,
+                    json,
+                    explain,
+                    all,
+                    evidence,
+                },
+            )))
         }
 
         Commands::Surface { schema: true, .. } => {
@@ -324,34 +366,15 @@ pub fn try_dispatch_pre_context(
 ///
 /// This is the main command routing logic. It takes a parsed `Commands` enum
 /// and the workspace context, then calls the appropriate handler.
-pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
+pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext, prepared_plan: Option<PlanOptions>) -> RailResult<()> {
     match cmd {
         Commands::Doctor {
             command: cli::DoctorCommand::NativeCache { format },
         } => run_native_cache_doctor(ctx, format),
 
-        Commands::Plan {
-            since,
-            from,
-            to,
-            merge_base,
-            format,
-            output,
-            explain,
-            confidence_profile,
-            schema: _,
-        } => run_plan(
+        Commands::Plan { .. } => run_plan(
             ctx,
-            PlanOptions {
-                since,
-                from,
-                to,
-                merge_base,
-                format,
-                output,
-                explain,
-                confidence_profile,
-            },
+            prepared_plan.ok_or_else(|| crate::error::RailError::message("plan comparison was not prepared"))?,
         ),
 
         Commands::Surface {
@@ -649,48 +672,6 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
                 "config migrate reached workspace dispatch",
             )),
         },
-
-        Commands::Hash {
-            since,
-            from,
-            to,
-            merge_base,
-            confidence_profile,
-            format,
-        } => run_hash(
-            ctx,
-            hash::HashOptions {
-                since,
-                from,
-                to,
-                merge_base,
-                confidence_profile,
-                format,
-            },
-        ),
-
-        Commands::DiffHash { a, b, format } => run_diff_hash(a, b, format),
-
-        Commands::Graph {
-            since,
-            from,
-            to,
-            merge_base,
-            confidence_profile,
-            dot,
-            output,
-        } => run_graph(
-            ctx,
-            graph::GraphOptions {
-                since,
-                from,
-                to,
-                merge_base,
-                confidence_profile,
-                dot,
-                output,
-            },
-        ),
 
         // Completions is handled before WorkspaceContext is built
         Commands::Completions { .. } => Err(crate::error::RailError::message(

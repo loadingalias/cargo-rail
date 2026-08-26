@@ -6,8 +6,7 @@
 //! **Note:** This is not part of the stable public API.
 
 use super::common::{
-    ChangeOutputFormat, PlanOutputFormat, SplitOutputFormat, SurfaceOutputFormat, TextJsonOutputFormat,
-    UnifyOutputFormat,
+    ChangeOutputFormat, SplitOutputFormat, SurfaceOutputFormat, TextJsonOutputFormat, UnifyOutputFormat,
 };
 use crate::sync::ConflictStrategy;
 use clap::{Args, CommandFactory, Parser, Subcommand, error::ErrorKind};
@@ -21,8 +20,8 @@ Cargo-Rail turns Cargo's resolved workspace model and an exact source snapshot i
 verified compiler reuse, dependency coherence, exact-SHA releases, and crate synchronization.
 
 Quick start:
-  cargo rail plan --merge-base --explain          # Inspect affected work and reasoning
-  cargo rail plan --merge-base -f github           # Export typed CI scope
+  cargo rail plan --explain                       # Inspect required named work and evidence
+  cargo rail plan --json                          # Export the versioned work plan
   cargo rail surface --explain                     # Inspect Rust reachability and visibility
   cargo rail cache setup                           # Enable transparent compiler reuse
   cargo rail unify --check --explain              # Inspect dependency changes (exit 1 when pending)
@@ -57,7 +56,7 @@ pub struct RailCli {
     #[arg(long, short, global = true)]
     pub quiet: bool,
 
-    /// Output as JSON where supported; rejected otherwise (shorthand for -f json)
+    /// Output as JSON where supported; rejected otherwise
     #[arg(long, global = true)]
     pub json: bool,
 
@@ -80,16 +79,15 @@ pub struct RailCli {
 
 const PLAN_HELP: &str = "\
 Examples:
-  cargo rail plan                           # Changes since default branch
-  cargo rail plan --merge-base              # Changes since branch point (CI recommended)
-  cargo rail plan --confidence-profile strict  # Conservative planner profile
+  cargo rail plan                           # Changes since the default-branch merge base
+  cargo rail plan --json                    # Full machine-readable work contract
   cargo rail plan --since HEAD~5            # Changes in last 5 commits
   cargo rail plan --from abc --to def       # Changes between two SHAs
   cargo rail plan --explain                 # Show concise proof chain
+  cargo rail plan --all                     # Safely require every registered work item
+  cargo rail plan --evidence inputs.json    # Use compatible observed-input evidence
   cargo rail plan --schema                  # Print the versioned JSON Schema
-  cargo rail plan -f json                   # Full machine-readable contract
-  cargo rail plan -f github                 # Compact GitHub Actions key=value output
-  cargo rail plan -f github-debug           # GitHub Actions output plus plan_json";
+  cargo rail plan --json > plan.json        # Redirect the exact plan to a file";
 
 const SURFACE_HELP: &str = "\
 Set `[surface] enabled = true` to include this gate in planner-selected CI.
@@ -215,21 +213,6 @@ Examples:
   cargo rail config migrate --check     # Check for pending semantic migrations
   cargo rail config migrate             # Apply explicit semantic migrations";
 
-const HASH_HELP: &str = "\
-Examples:
-  cargo rail hash                          # Portable identity of the current plan
-  cargo rail hash --merge-base             # Identity for the merge-base comparison
-  cargo rail hash -f json                  # Structured identity metadata
-  cargo rail diff-hash plan-a.json plan-b.json
-  cargo rail diff-hash plan-a.json plan-b.json -f json";
-
-const GRAPH_HELP: &str = "\
-Examples:
-  cargo rail graph                             # Planner reasoning graph (json)
-  cargo rail graph --merge-base                # Graph against merge-base comparison
-  cargo rail graph --dot                       # GraphViz DOT output
-  cargo rail graph --since HEAD~3 -o graph.dot # Write graph output to file";
-
 const COMPLETIONS_HELP: &str = "\
 Examples:
   cargo rail completions bash           # Output bash completions
@@ -268,7 +251,7 @@ pub enum Commands {
         command: CacheCommand,
     },
 
-    /// Build a deterministic file-first change plan
+    /// Build an evidence-backed named-work plan
     #[command(after_long_help = PLAN_HELP)]
     Plan {
         /// Git ref to compare against (auto-detects default branch)
@@ -280,23 +263,23 @@ pub enum Commands {
         /// End ref (for SHA pair mode)
         #[arg(long, requires = "from")]
         to: Option<String>,
-        /// Use merge-base with default branch (better for feature branches)
-        #[arg(long, conflicts_with_all = ["since", "from", "to"])]
+        /// Compatibility alias for the default merge-base comparison
+        #[arg(long, conflicts_with_all = ["since", "from", "to"], hide = true)]
         merge_base: bool,
-        /// Output format
-        #[arg(long, short = 'f', default_value_t, value_enum)]
-        format: PlanOutputFormat,
-        /// Write output to file (overwrites existing content)
-        #[arg(long, short = 'o', value_name = "PATH")]
-        output: Option<PathBuf>,
+        /// Machine output selected by the global --json flag
+        #[arg(skip)]
+        json: bool,
         /// Show concise human reasoning chain
         #[arg(long)]
         explain: bool,
-        /// Planner confidence profile override (strict|balanced|fast)
-        #[arg(long, value_name = "PROFILE", value_parser = ["strict", "balanced", "fast"])]
-        confidence_profile: Option<String>,
+        /// Require every registered work item with full valid scope
+        #[arg(long)]
+        all: bool,
+        /// Load portable compatible observed-input evidence
+        #[arg(long, value_name = "PATH")]
+        evidence: Option<PathBuf>,
         /// Print the versioned planner JSON Schema and exit
-        #[arg(long, conflicts_with_all = ["since", "from", "to", "merge_base", "output", "explain", "confidence_profile"])]
+        #[arg(long, conflicts_with_all = ["since", "from", "to", "merge_base", "explain", "all", "evidence"])]
         schema: bool,
     },
 
@@ -505,67 +488,6 @@ pub enum Commands {
         command: ConfigCommand,
     },
 
-    /// Compute a portable planner identity (not a cache key)
-    #[command(after_long_help = HASH_HELP)]
-    Hash {
-        /// Git ref to compare against (auto-detects default branch)
-        #[arg(long)]
-        since: Option<String>,
-        /// Start ref (for SHA pair mode)
-        #[arg(long, conflicts_with = "since", requires = "to")]
-        from: Option<String>,
-        /// End ref (for SHA pair mode)
-        #[arg(long, requires = "from")]
-        to: Option<String>,
-        /// Use merge-base with default branch (better for feature branches)
-        #[arg(long, conflicts_with_all = ["since", "from", "to"])]
-        merge_base: bool,
-        /// Planner confidence profile override (strict|balanced|fast)
-        #[arg(long, value_name = "PROFILE", value_parser = ["strict", "balanced", "fast"])]
-        confidence_profile: Option<String>,
-        /// Output format
-        #[arg(long, short = 'f', default_value_t, value_enum)]
-        format: TextJsonOutputFormat,
-    },
-
-    /// Explain why two portable planner identities differ
-    #[command(after_long_help = HASH_HELP)]
-    DiffHash {
-        /// First planner JSON path
-        a: PathBuf,
-        /// Second planner JSON path
-        b: PathBuf,
-        /// Output format
-        #[arg(long, short = 'f', default_value_t, value_enum)]
-        format: TextJsonOutputFormat,
-    },
-
-    /// Planner reasoning graph for explainability
-    #[command(after_long_help = GRAPH_HELP)]
-    Graph {
-        /// Git ref to compare against (auto-detects default branch)
-        #[arg(long)]
-        since: Option<String>,
-        /// Start ref (for SHA pair mode)
-        #[arg(long, conflicts_with = "since", requires = "to")]
-        from: Option<String>,
-        /// End ref (for SHA pair mode)
-        #[arg(long, requires = "from")]
-        to: Option<String>,
-        /// Use merge-base with default branch (better for feature branches)
-        #[arg(long, conflicts_with_all = ["since", "from", "to"])]
-        merge_base: bool,
-        /// Planner confidence profile override (strict|balanced|fast)
-        #[arg(long, value_name = "PROFILE", value_parser = ["strict", "balanced", "fast"])]
-        confidence_profile: Option<String>,
-        /// Output GraphViz DOT instead of JSON
-        #[arg(long)]
-        dot: bool,
-        /// Write output to file (overwrites existing content)
-        #[arg(long, short = 'o', value_name = "PATH")]
-        output: Option<PathBuf>,
-    },
-
     /// Generate shell completions
     #[command(after_long_help = COMPLETIONS_HELP)]
     Completions {
@@ -587,8 +509,16 @@ impl Commands {
             | Self::Surface { schema: false, .. }
             | Self::Release { .. }
             | Self::Change { .. } => true,
+            Self::Plan { .. } => false,
+            _ => false,
+        }
+    }
+
+    /// Return whether dispatch needs sparse planning state captured before metadata loading.
+    #[doc(hidden)]
+    pub fn requires_planning_source_capture(&self) -> bool {
+        match self {
             Self::Plan { from, to, schema, .. } => !(*schema || from.is_some() && to.is_some()),
-            Self::Hash { from, to, .. } | Self::Graph { from, to, .. } => !(from.is_some() && to.is_some()),
             _ => false,
         }
     }
@@ -598,8 +528,6 @@ impl Commands {
     pub fn requires_worktree_source_capture(&self) -> bool {
         match self {
             Self::Doctor { .. } | Self::Surface { .. } => false,
-            Self::Plan { from, to, schema, .. } => !(*schema || from.is_some() && to.is_some()),
-            Self::Hash { from, to, .. } | Self::Graph { from, to, .. } => !(from.is_some() && to.is_some()),
             _ => false,
         }
     }
@@ -1130,7 +1058,7 @@ impl Commands {
                 | CacheCommand::Remove { format, .. } => format.is_json_like(),
             },
             Commands::Sync { format, .. } | Commands::Clean { format, .. } => format.is_json_like(),
-            Commands::Plan { format, schema, .. } => *schema || format.is_json_like(),
+            Commands::Plan { json, schema, .. } => *schema || *json,
             Commands::Unify {
                 command: Some(UnifyCommand::Doctor { format }),
                 ..
@@ -1160,8 +1088,6 @@ impl Commands {
                 | ConfigCommand::Validate { format, .. }
                 | ConfigCommand::Migrate { format, .. } => format.is_json_like(),
             },
-            Commands::Hash { format, .. } | Commands::DiffHash { format, .. } => format.is_json_like(),
-            Commands::Graph { dot, .. } => !dot,
             _ => false,
         }
     }
@@ -1188,7 +1114,6 @@ impl Commands {
             Commands::Release {
                 command: ReleaseCommand::Abort { .. },
             } => Some("release abort"),
-            Commands::Graph { dot: true, .. } => Some("graph --dot"),
             Commands::Completions { .. } => Some("completions"),
             _ => None,
         };
@@ -1214,7 +1139,7 @@ impl Commands {
                 }
             },
             Commands::Sync { format, .. } | Commands::Clean { format, .. } => *format = TextJsonOutputFormat::Json,
-            Commands::Plan { format, .. } => *format = PlanOutputFormat::Json,
+            Commands::Plan { json, .. } => *json = true,
             Commands::Surface { format, .. } => *format = SurfaceOutputFormat::Json,
             Commands::Unify {
                 command: Some(UnifyCommand::Doctor { format }),
@@ -1246,8 +1171,6 @@ impl Commands {
                 | ConfigCommand::Validate { format, .. }
                 | ConfigCommand::Migrate { format, .. } => *format = TextJsonOutputFormat::Json,
             },
-            Commands::Hash { format, .. } | Commands::DiffHash { format, .. } => *format = TextJsonOutputFormat::Json,
-            Commands::Graph { .. } => {}
             _ => {}
         }
 

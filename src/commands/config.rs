@@ -373,9 +373,6 @@ pub fn run_config_explain(
 fn has_compatibility_source(path: &str, configured: &BTreeMap<String, serde_json::Value>) -> bool {
     let contains_any = |paths: &[&str]| paths.iter().any(|path| configured.contains_key(*path));
     match path {
-        "change-detection.unknown_file_policy" => {
-            configured.contains_key("change-detection.conservative_unclassified_owner_fallback")
-        }
         "release.remote_effects" => contains_any(&["release.push", "release.create_github_release", "release.forge"]),
         path if path.starts_with("unify.transitive_pinning.") => {
             contains_any(&["unify.pin_transitives", "unify.transitive_host"])
@@ -524,10 +521,6 @@ pub fn run_config_validate_standalone(
         .map_err(|error| RailError::message(format!("failed to parse {}: {error}", config_path.display())));
     match parsed_config {
         Ok(config) => {
-            // Validate change detection config
-            if let Err(e) = config.change_detection.validate() {
-                errors.push(ValidationIssue::new("change_detection", e.to_string()));
-            }
             if let Err(e) = config.unify.validate(workspace_root) {
                 errors.push(ValidationIssue::new("unify", e.to_string()));
             }
@@ -749,6 +742,12 @@ pub fn run_config_migrate(
         "cache",
         "Remote cache selection moved from repository aliases to machine-owned CARGO_RAIL_CACHE_REMOTE authority.",
     );
+    migrate_removed_field(
+        &mut editor,
+        &mut changes,
+        "change-detection",
+        "Path categories and global confidence policy no longer select work; translate any still-owned positive globs into explicit [plan.work.NAME] inputs.",
+    );
     crate::config::reject_removed_configuration(editor.doc()).map_err(RailError::message)?;
 
     migrate_removed_field(
@@ -826,7 +825,6 @@ pub fn run_config_migrate(
         "toolchain",
         "The reserved toolchain table had no behavior.",
     );
-    migrate_unknown_file_policy(&mut editor, &mut changes)?;
     migrate_reserved_sync_tables(&mut editor, &mut changes);
 
     let migrated = editor.doc().to_string();
@@ -998,43 +996,6 @@ fn migrate_split_member_paths(
             path: old,
             replacement: Some(new),
             message: "Split ownership is now resolved from Cargo member names and the workspace snapshot.",
-        });
-    }
-    Ok(())
-}
-
-fn migrate_unknown_file_policy(editor: &mut TomlEditor, changes: &mut Vec<MigrationChange>) -> RailResult<()> {
-    const OLD: &str = "change-detection.conservative_unclassified_owner_fallback";
-    const NEW: &str = "change-detection.unknown_file_policy";
-    if let Some(item) = editor.get(OLD) {
-        let enabled = item
-            .as_bool()
-            .ok_or_else(|| RailError::message(format!("{OLD} must be a boolean before it can be migrated")))?;
-        let mapped = if enabled { "owned_build_test" } else { "docs" };
-        let replacement = match editor.get(NEW) {
-            Some(item) => display_toml_item(item),
-            None => {
-                editor.set(NEW, mapped)?;
-                format!("\"{mapped}\"")
-            }
-        };
-        editor.remove(OLD);
-        changes.push(MigrationChange {
-            kind: "rename",
-            path: OLD.to_string(),
-            replacement: Some(format!("{NEW} = {replacement}")),
-            message: "The legacy alias was removed; an existing explicit policy takes precedence.",
-        });
-    }
-
-    if let Some(enabled) = editor.get(NEW).and_then(toml_edit::Item::as_bool) {
-        let replacement = if enabled { "owned_build_test" } else { "docs" };
-        editor.set(NEW, replacement)?;
-        changes.push(MigrationChange {
-            kind: "replace",
-            path: NEW.to_string(),
-            replacement: Some(format!("{NEW} = \"{replacement}\"")),
-            message: "The legacy boolean is now an explicit unknown-file policy.",
         });
     }
     Ok(())

@@ -545,10 +545,7 @@ mode = "single"
         )?;
 
         // Run split with --check and --json
-        let output = run_cargo_rail(
-            &ws.path,
-            &["rail", "split", "run", "json-lib", "--check", "--format", "json"],
-        )?;
+        let output = run_cargo_rail(&ws.path, &["rail", "split", "run", "json-lib", "--check", "--json"])?;
         assert_eq!(
             output.status.code(),
             Some(1),
@@ -568,10 +565,7 @@ mode = "single"
             &["rail", "split", "run", "json-lib", "--yes", "--allow-dirty"],
         )?;
         assert!(applied.status.success());
-        let clean = run_cargo_rail(
-            &ws.path,
-            &["rail", "split", "run", "json-lib", "--check", "--format", "json"],
-        )?;
+        let clean = run_cargo_rail(&ws.path, &["rail", "split", "run", "json-lib", "--check", "--json"])?;
         assert_eq!(clean.status.code(), Some(0));
         let clean_json: serde_json::Value = serde_json::from_slice(&clean.stdout)?;
         assert_eq!(clean_json["result"], "clean");
@@ -584,7 +578,7 @@ mode = "single"
 }
 
 #[test]
-fn test_split_ownership_uses_the_planner_snapshot_and_cargo_graph() {
+fn test_split_ownership_uses_its_captured_snapshot_and_cargo_graph() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("split-shared-snapshot")?;
         ws.add_crate("owned-dependency", "0.1.0", &[])?;
@@ -613,9 +607,6 @@ mode = "single"
             ),
         )?;
 
-        let plan = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--format", "json"])?;
-        assert!(plan.status.success());
-        let plan: serde_json::Value = serde_json::from_slice(&plan.stdout)?;
         let split = run_cargo_rail(
             &ws.path,
             &[
@@ -624,15 +615,18 @@ mode = "single"
                 "run",
                 "owned-root",
                 "--check",
-                "--format",
-                "json",
+                "--json",
                 "--allow-dirty",
             ],
         )?;
         assert_eq!(split.status.code(), Some(1));
         let split: serde_json::Value = serde_json::from_slice(&split.stdout)?;
         let ownership = &split["planning"]["targets"][0]["ownership"];
-        assert_eq!(ownership["snapshot_id"], plan["inputs"]["snapshot_id"]);
+        assert!(
+            ownership["snapshot_id"]
+                .as_str()
+                .is_some_and(|identity| identity.starts_with("v1-sha256-"))
+        );
         assert_eq!(
             split["mutation_plan"]["pre_apply"]["metadata_fingerprint"],
             format!("snapshot:{}", ownership["snapshot_id"].as_str().unwrap())

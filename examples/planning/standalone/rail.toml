@@ -3,8 +3,9 @@
 #
 # Strategy: cargo-rail owns scope; Cargo and CI own execution.
 
-[change-detection]
-infrastructure = [
+[plan.work.repository-validation]
+scope = "repository"
+paths = [
   ".github/**",
   "scripts/**",
   "deny.toml",
@@ -12,8 +13,7 @@ infrastructure = [
   "Cargo.toml",
   "Cargo.lock",
 ]
-confidence_profile = "balanced"
-unknown_file_policy = "strict"
 
-[change-detection.custom]
-stress_test = ["stress-test/**"]
+[plan.work.stress-test]
+scope = "repository"
+paths = ["stress-test/**"]

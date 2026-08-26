@@ -1,56 +1,36 @@
 # Planner Scope: Direct Cargo
 
-Use this pattern to pass planner-selected package arguments directly to Cargo.
+Use this pattern to pass one named work decision directly to Cargo or cargo-nextest.
 
 ```bash
 cargo rail --config examples/planning/standalone/rail.toml config validate --strict
+cargo rail --config examples/planning/standalone/rail.toml plan --explain
 ```
 
 ## Local example
 
 ```bash
-cargo rail --config examples/planning/standalone/rail.toml plan --merge-base --explain
-PLAN_JSON=$(cargo rail --config examples/planning/standalone/rail.toml plan --merge-base -f json)
-if [ "$(jq -r '.surfaces.test.enabled' <<<"$PLAN_JSON")" = "true" ]; then
+cargo rail --config examples/planning/standalone/rail.toml plan --json > target/plan-v8.json
+
+if [ "$(scripts/plan/read.py is-required target/plan-v8.json cargo.test)" = "true" ]; then
   CARGO_ARGS=()
-  while IFS= read -r argument; do
+  while IFS= read -r -d '' argument; do
     CARGO_ARGS+=("$argument")
-  done < <(jq -r '.surfaces.test.scope.cargo_args[]' <<<"$PLAN_JSON")
+  done < <(scripts/plan/read.py cargo-args target/plan-v8.json cargo.test)
   cargo nextest run "${CARGO_ARGS[@]}" --locked
 fi
 ```
 
-## CI example
+## CI boundary
 
-```yaml
-- uses: loadingalias/cargo-rail-action@47e86bde928ce420b85efa5f8d3b5feb96fd0ffc # v7.0.0
-  id: rail
-  with:
-    mode: debug
-    version: 0.23.0
+Create the plan once, transfer it as an artifact, and verify `inputs.head_commit` against checkout `HEAD` before
+execution. Gate a job with `required`, then read only that work item's scope. Reject an unknown contract or malformed
+selector before starting Cargo.
 
-- name: Test selected packages
-  if: steps.rail.outputs.test == 'true'
-  env:
-    PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
-  run: |
-    CARGO_ARGS=()
-    while IFS= read -r argument; do
-      CARGO_ARGS+=("$argument")
-    done < <(jq -r '.surfaces.test.scope.cargo_args[]' "$PLAN_FILE")
-    cargo nextest run "${CARGO_ARGS[@]}" --locked
-
-- name: Build selected packages
-  if: steps.rail.outputs.build == 'true'
-  env:
-    PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
-  run: |
-    CARGO_ARGS=()
-    while IFS= read -r argument; do
-      CARGO_ARGS+=("$argument")
-    done < <(jq -r '.surfaces.build.scope.cargo_args[]' "$PLAN_FILE")
-    cargo build "${CARGO_ARGS[@]}"
+```bash
+scripts/plan/read.py validate target/plan-v8.json
+scripts/plan/read.py verify-checkout target/plan-v8.json
 ```
 
-Cargo-Rail decides scope. Cargo, cargo-nextest, and CI retain command semantics and exit behavior. Consume
-`surfaces.NAME.scope`; `impact` explains the decision but is not execution input.
+Cargo-Rail decides work and scope. Cargo, cargo-nextest, and CI retain command semantics and exit behavior. Evidence
+records explain decisions but are not executable input.

@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/loadingalias/cargo-rail/main/schemas/plan-variants-v1.schema.json",
+  "title": "cargo-rail declarative planner variants v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["variant_catalog_version", "work", "variants"],
+  "properties": {
+    "variant_catalog_version": { "const": 1 },
+    "work": { "$ref": "#/$defs/id" },
+    "variants": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/variant" }
+    }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[a-z][a-z0-9.-]*$" },
+    "string_array": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "variant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "dimensions", "paths", "config", "cargo"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "dimensions": {
+          "type": "object",
+          "additionalProperties": { "type": ["string", "integer", "boolean"] }
+        },
+        "paths": { "$ref": "#/$defs/string_array" },
+        "config": { "$ref": "#/$defs/string_array" },
+        "cargo": { "$ref": "#/$defs/string_array" }
+      },
+      "anyOf": [
+        { "properties": { "paths": { "minItems": 1 } } },
+        { "properties": { "config": { "minItems": 1 } } },
+        { "properties": { "cargo": { "minItems": 1 } } }
+      ]
+    }
+  }
+}

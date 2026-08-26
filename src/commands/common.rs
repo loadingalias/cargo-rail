@@ -152,25 +152,6 @@ impl UnifyOutputFormat {
     }
 }
 
-/// Output format for `cargo rail plan`.
-///
-/// `plan` is the primary planning surface and intentionally supports a minimal
-/// format set: human text, full JSON contract, and GitHub Actions key/value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
-pub enum PlanOutputFormat {
-    /// Human-readable text output (default)
-    #[default]
-    Text,
-    /// Machine-readable JSON output
-    Json,
-    /// GitHub Actions output format for $GITHUB_OUTPUT
-    #[value(name = "github")]
-    GitHub,
-    /// GitHub Actions output with embedded planner contract for debugging
-    #[value(name = "github-debug")]
-    GitHubDebug,
-}
-
 /// Output format for `cargo rail surface`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum SurfaceOutputFormat {
@@ -193,18 +174,6 @@ impl SurfaceOutputFormat {
     /// Check if this format is structured output.
     pub fn is_json_like(&self) -> bool {
         matches!(self, Self::Json | Self::GitHub)
-    }
-}
-
-impl PlanOutputFormat {
-    /// Check if this format is JSON.
-    pub fn is_json(&self) -> bool {
-        matches!(self, Self::Json)
-    }
-
-    /// Check if this format is a JSON-like structured format.
-    pub fn is_json_like(&self) -> bool {
-        matches!(self, Self::Json | Self::GitHub | Self::GitHubDebug)
     }
 }
 

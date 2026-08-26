@@ -8,8 +8,7 @@ pub(crate) mod build_script;
 pub(crate) mod cache;
 /// Cargo workspace metadata and manifest operations.
 pub mod cargo;
-/// Git-based change classification.
-pub mod change_detection;
+pub(crate) mod change_detection;
 /// CLI command implementations.
 pub mod commands;
 /// Compiler diagnostics collection and caching.
@@ -30,6 +29,7 @@ pub mod instrumentation;
 pub mod mutation;
 /// Centralized output control (quiet mode, progress messages).
 pub mod output;
+pub(crate) mod planning;
 /// Release planning and publishing.
 pub mod release;
 pub(crate) mod remote_cache;

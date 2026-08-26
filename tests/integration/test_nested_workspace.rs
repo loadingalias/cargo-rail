@@ -24,7 +24,7 @@ fn test_plan_from_nested_workspace_strips_workspace_prefix() {
         // Run from cargo workspace root (nested under git root).
         let output = run_cargo_rail(
             &ws.workspace_root,
-            &["rail", "plan", "--since", "origin/main", "--format", "json"],
+            &["rail", "plan", "--since", "origin/main", "--json"],
         )?;
         assert!(output.status.success(), "plan should succeed in nested workspace");
         assert!(
@@ -34,7 +34,7 @@ fn test_plan_from_nested_workspace_strips_workspace_prefix() {
         );
 
         let json: Value = serde_json::from_slice(&output.stdout)?;
-        let files = json["files"]
+        let files = json["changes"]["files"]
             .as_array()
             .ok_or_else(|| anyhow!("files should be an array"))?;
 
@@ -49,8 +49,8 @@ fn test_plan_from_nested_workspace_strips_workspace_prefix() {
             Value::String("crates/lib-a/src/lib.rs".to_string()),
             "planner should emit workspace-relative path without nested prefix"
         );
-        assert_eq!(json["surfaces"]["build"]["enabled"], Value::Bool(true));
-        assert_eq!(json["surfaces"]["test"]["enabled"], Value::Bool(true));
+        assert_eq!(json["work"]["cargo.build"]["state"], "required");
+        assert_eq!(json["work"]["cargo.test"]["state"], "required");
 
         Ok(())
     })();
@@ -148,10 +148,7 @@ fn test_nested_workspace_rejects_a_cargo_target_root_that_contains_source() {
         )?;
         ws.commit("configure an unsafe Cargo target root")?;
 
-        let output = run_cargo_rail(
-            &ws.workspace_root,
-            &["rail", "plan", "--since", "HEAD", "--format", "json"],
-        )?;
+        let output = run_cargo_rail(&ws.workspace_root, &["rail", "plan", "--since", "HEAD", "--json"])?;
         assert_eq!(output.status.code(), Some(2));
         assert!(output.stderr.is_empty(), "JSON errors must keep stderr empty");
         let error: Value = serde_json::from_slice(&output.stdout)?;
@@ -194,7 +191,7 @@ fn test_workspace_outside_git_worktree_is_rejected() {
         git(&repository_root, &["add", "."])?;
         git(&repository_root, &["commit", "-m", "add inner repository"])?;
 
-        let output = run_cargo_rail(&crate_root, &["rail", "plan", "--since", "HEAD", "--format", "json"])?;
+        let output = run_cargo_rail(&crate_root, &["rail", "plan", "--since", "HEAD", "--json"])?;
         assert_eq!(output.status.code(), Some(2));
         assert!(output.stderr.is_empty(), "JSON errors must keep stderr empty");
         let error: Value = serde_json::from_slice(&output.stdout)?;

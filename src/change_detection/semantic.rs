@@ -11,7 +11,7 @@ use crate::error::RailResult;
 use crate::workspace::WorkspaceContext;
 
 /// Localized semantic impact for one changed Cargo input.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct SemanticFileChange {
     pub(crate) scope: SemanticScope,
     pub(crate) input: &'static str,
@@ -19,11 +19,18 @@ pub(crate) struct SemanticFileChange {
 }
 
 /// Packages authorized by a semantic diff, or a conservative workspace fallback.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum SemanticScope {
     None,
     Packages(BTreeSet<PackageId>),
     Workspace,
+}
+
+#[derive(Debug)]
+struct MemberManifestInput {
+    package: PackageId,
+    before: Vec<u8>,
+    after: Vec<u8>,
 }
 
 pub(crate) fn analyze(
@@ -60,6 +67,9 @@ pub(crate) fn analyze(
             .map(|path| (head_ref, path.as_path()))
             .collect::<Vec<_>>();
         ctx.git()?.git().read_files_bulk(&head_items)?
+    } else if ctx.planning_source_capture().is_some() {
+        let paths = semantic_paths.iter().map(|path| (*path).clone()).collect::<Vec<_>>();
+        ctx.read_planning_current_files(&paths)?
     } else {
         absolute_paths
             .iter()
@@ -70,14 +80,21 @@ pub(crate) fn analyze(
             })
             .collect::<Result<Vec<_>, _>>()?
     };
+    let member_manifests = semantic_paths
+        .iter()
+        .any(|path| classify_path(std::path::Path::new(path)) == FileProfile::TomlWorkspace)
+        .then(|| member_manifest_inputs(ctx, base_ref, head_ref))
+        .transpose()?;
 
     semantic_paths
         .into_iter()
         .zip(base)
         .zip(head)
         .map(|((path, before), after)| {
-            let mut change = match classify_path(std::path::Path::new(path)) {
-                FileProfile::TomlWorkspace => workspace_manifest_change(ctx, &before, &after),
+            let change = match classify_path(std::path::Path::new(path)) {
+                FileProfile::TomlWorkspace => {
+                    workspace_manifest_change(ctx, &before, &after, member_manifests.as_deref().unwrap_or_default())
+                }
                 FileProfile::TomlManifest => package_manifest_change(ctx, path, &before, &after),
                 FileProfile::CargoLock => lockfile_change(ctx, &before, &after),
                 _ => {
@@ -86,12 +103,61 @@ pub(crate) fn analyze(
                     )));
                 }
             };
-            if head_ref.is_some() && !matches!(change.scope, SemanticScope::None) {
-                change = fallback(change.input, "historical_resolution_unavailable");
-            }
             Ok((path.clone(), change))
         })
         .collect()
+}
+
+fn member_manifest_inputs(
+    ctx: &WorkspaceContext,
+    base_ref: &str,
+    head_ref: Option<&str>,
+) -> RailResult<Vec<MemberManifestInput>> {
+    let packages = ctx.cargo().metadata().workspace_packages();
+    let absolute_paths = packages
+        .iter()
+        .map(|package| package.manifest_path.as_std_path())
+        .collect::<Vec<_>>();
+    let base_items = absolute_paths.iter().map(|path| (base_ref, *path)).collect::<Vec<_>>();
+    let before = ctx.git()?.git().read_files_bulk(&base_items)?;
+    let after = if let Some(head_ref) = head_ref {
+        let head_items = absolute_paths.iter().map(|path| (head_ref, *path)).collect::<Vec<_>>();
+        ctx.git()?.git().read_files_bulk(&head_items)?
+    } else if ctx.planning_source_capture().is_some() {
+        let paths = absolute_paths
+            .iter()
+            .map(|path| {
+                path.strip_prefix(ctx.workspace_root())
+                    .map(crate::utils::path_to_git_format)
+                    .map_err(|_| {
+                        crate::error::RailError::message(format!(
+                            "workspace member manifest '{}' is outside the captured Cargo workspace",
+                            path.display()
+                        ))
+                    })
+            })
+            .collect::<RailResult<Vec<_>>>()?;
+        ctx.read_planning_current_files(&paths)?
+    } else {
+        absolute_paths
+            .iter()
+            .map(|path| match fs::read(path) {
+                Ok(bytes) => Ok(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+                Err(error) => Err(error),
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    Ok(packages
+        .into_iter()
+        .zip(before)
+        .zip(after)
+        .map(|((package, before), after)| MemberManifestInput {
+            package: package.id.clone(),
+            before,
+            after,
+        })
+        .collect())
 }
 
 fn package_manifest_change(ctx: &WorkspaceContext, path: &str, before: &[u8], after: &[u8]) -> SemanticFileChange {
@@ -123,7 +189,12 @@ fn package_manifest_change(ctx: &WorkspaceContext, path: &str, before: &[u8], af
     }
 }
 
-fn workspace_manifest_change(ctx: &WorkspaceContext, before: &[u8], after: &[u8]) -> SemanticFileChange {
+fn workspace_manifest_change(
+    ctx: &WorkspaceContext,
+    before: &[u8],
+    after: &[u8],
+    member_manifests: &[MemberManifestInput],
+) -> SemanticFileChange {
     let (Some(before), Some(after)) = (parse_toml(before), parse_toml(after)) else {
         return fallback("workspace_manifest", "manifest_parse_unknown");
     };
@@ -202,18 +273,17 @@ fn workspace_manifest_change(ctx: &WorkspaceContext, before: &[u8], after: &[u8]
         };
         packages.insert(package.id.clone());
     }
-    for package in ctx.cargo().metadata().workspace_packages() {
-        let Ok(document) = fs::read(package.manifest_path.as_std_path()) else {
-            return fallback("workspace_manifest", "member_manifest_read_unknown");
-        };
-        let Some(document) = parse_toml(&document) else {
+    for member in member_manifests {
+        let (Some(before_document), Some(after_document)) = (parse_toml(&member.before), parse_toml(&member.after))
+        else {
             return fallback("workspace_manifest", "member_manifest_parse_unknown");
         };
-        if consumes_workspace_dependency(&document, &dependency_keys)
-            || inherits_workspace_package_key(&document, &package_keys)
-            || (lints_changed && inherits_workspace_lints(&document))
-        {
-            packages.insert(package.id.clone());
+        if [before_document, after_document].iter().any(|document| {
+            consumes_workspace_dependency(document, &dependency_keys)
+                || inherits_workspace_package_key(document, &package_keys)
+                || (lints_changed && inherits_workspace_lints(document))
+        }) {
+            packages.insert(member.package.clone());
         }
     }
 

@@ -1,38 +1,8 @@
-//! Integration tests for plan/apply flows and graph introspection.
+//! Integration tests for plan/apply flows.
 
 use crate::helpers::{TestWorkspace, git, run_cargo_rail};
 use anyhow::Result;
 use tempfile::TempDir;
-
-#[test]
-fn test_graph_outputs_json_and_dot() {
-    let result: Result<()> = (|| {
-        let ws = TestWorkspace::new_named("graph-output")?;
-        ws.add_crate("lib-a", "0.1.0", &[])?;
-        ws.commit("Add lib-a")?;
-        ws.modify_file("lib-a", "src/lib.rs", "pub fn changed() {}")?;
-        ws.commit("Change lib-a")?;
-
-        let json_out = run_cargo_rail(&ws.path, &["rail", "graph", "--since", "HEAD~1"])?;
-        assert!(json_out.status.success(), "graph json should succeed");
-        let json: serde_json::Value = serde_json::from_slice(&json_out.stdout)?;
-        assert_eq!(json["schema_version"], serde_json::json!(1));
-        assert_eq!(json["command"], serde_json::json!("graph"));
-        assert_eq!(json["mode"], serde_json::json!("inspect"));
-        assert_eq!(json["result"], serde_json::json!("success"));
-        assert_eq!(json["exit_code"], serde_json::json!(0));
-        assert!(json["nodes"].is_array());
-        assert!(json["edges"].is_array());
-
-        let dot_out = run_cargo_rail(&ws.path, &["rail", "graph", "--since", "HEAD~1", "--dot"])?;
-        assert!(dot_out.status.success(), "graph dot should succeed");
-        let dot = String::from_utf8_lossy(&dot_out.stdout);
-        assert!(dot.contains("digraph rail_plan"));
-
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
 
 #[test]
 fn test_split_apply_from_plan_file() {

@@ -11,8 +11,6 @@
 
 use std::path::{Path, PathBuf};
 
-/// Change impact analysis
-pub mod change_analyzer;
 /// Unified workspace context (includes optional GitState and CargoState)
 pub mod context;
 /// File path utilities
@@ -21,9 +19,6 @@ pub mod files;
 pub mod snapshot;
 /// High-level façade for crate information queries
 pub mod view;
-
-// Re-export change analysis types
-pub use change_analyzer::ChangeImpact;
 
 // Re-export workspace types from context module
 pub use context::{CargoState, GitState, WorkspaceContext};

@@ -4,33 +4,25 @@ set -euo pipefail
 # Build the planner-selected Cargo packages directly. Cargo-Rail owns scope;
 # Cargo owns execution and exit behavior.
 
-if ! command -v jq >/dev/null 2>&1; then
-  echo "error: smart builds require jq to read 'cargo rail plan -f json'" >&2
-  exit 2
-fi
-
-RAIL_BOOTSTRAP_TARGET_DIR="${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}"
-RAIL_CMD=(cargo run --quiet --locked --target-dir "$RAIL_BOOTSTRAP_TARGET_DIR" -- rail)
-
-if [ -n "${RAIL_SINCE:-}" ]; then
-  PLAN_ARGS=(--since "$RAIL_SINCE")
+PLAN_READER="scripts/plan/read.py"
+PLAN_FILE="${CARGO_RAIL_PLAN_FILE:-}"
+OWN_PLAN=false
+if [ -z "$PLAN_FILE" ]; then
+  PLAN_FILE="$(mktemp "${TMPDIR:-/tmp}/cargo-rail-plan-v8.XXXXXX")"
+  OWN_PLAN=true
+  "$PLAN_READER" create "$PLAN_FILE"
 else
-  PLAN_ARGS=(--merge-base)
+  "$PLAN_READER" validate "$PLAN_FILE"
 fi
+"$PLAN_READER" verify-checkout "$PLAN_FILE"
+cleanup() {
+  if [ "$OWN_PLAN" = true ]; then
+    rm -f -- "$PLAN_FILE"
+  fi
+}
+trap cleanup EXIT
 
-PLAN_JSON="$("${RAIL_CMD[@]}" plan "${PLAN_ARGS[@]}" -f json)"
-if ! jq -e '
-  .plan_contract_version == 7 and
-  .scope.scope_contract_version == 4 and
-  (.surfaces.build.enabled | type == "boolean") and
-  (.surfaces.build.scope.cargo_args | type == "array") and
-  all(.surfaces.build.scope.cargo_args[]; type == "string")
-' <<<"$PLAN_JSON" >/dev/null; then
-  echo "error: cargo-rail returned an unsupported build scope contract" >&2
-  exit 2
-fi
-
-if [ "$(jq -r '.surfaces.build.enabled' <<<"$PLAN_JSON")" != "true" ]; then
+if [ "$("$PLAN_READER" is-required "$PLAN_FILE" cargo.build)" != "true" ]; then
   echo "No affected build targets."
   exit 0
 fi
@@ -38,7 +30,7 @@ fi
 CARGO_ARGS=()
 while IFS= read -r -d '' argument; do
   CARGO_ARGS+=("$argument")
-done < <(jq -rj '.surfaces.build.scope.cargo_args[] | "\(.)\u0000"' <<<"$PLAN_JSON")
+done < <("$PLAN_READER" cargo-args "$PLAN_FILE" cargo.build)
 
 echo "Building affected packages..."
 cargo build "${CARGO_ARGS[@]}" --all-targets --all-features --locked

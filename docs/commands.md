@@ -4,8 +4,8 @@
 >
 > Regenerate with: `./scripts/docs/generate.sh`
 
-This is the exhaustive CLI surface. Start with `cargo rail plan --merge-base --explain` to inspect affected work,
-then pass each selected surface's typed Cargo arguments to Cargo, cargo-nextest, Just, or CI. Adopt dependency,
+This is the exhaustive CLI surface. Start with `cargo rail plan --explain` to inspect required named work,
+then pass each selected work item's typed Cargo arguments to Cargo, cargo-nextest, Just, or CI. Adopt dependency,
 release, and split/sync workflows independently; they share one captured workspace view rather than rebuilding Cargo
 state in separate tools.
 
@@ -20,8 +20,8 @@ Cargo-Rail turns Cargo's resolved workspace model and an exact source snapshot i
 verified compiler reuse, dependency coherence, exact-SHA releases, and crate synchronization.
 
 Quick start:
-  cargo rail plan --merge-base --explain          # Inspect affected work and reasoning
-  cargo rail plan --merge-base -f github           # Export typed CI scope
+  cargo rail plan --explain                       # Inspect required named work and evidence
+  cargo rail plan --json                          # Export the versioned work plan
   cargo rail surface --explain                     # Inspect Rust reachability and visibility
   cargo rail cache setup                           # Enable transparent compiler reuse
   cargo rail unify --check --explain              # Inspect dependency changes (exit 1 when pending)
@@ -33,7 +33,7 @@ Usage: cargo rail [OPTIONS] <COMMAND>
 Commands:
   doctor       Inspect native compiler-cache capability
   cache        Inspect or reclaim explicitly scoped cache state
-  plan         Build a deterministic file-first change plan
+  plan         Build an evidence-backed named-work plan
   surface      Analyze and repair complete Rust declaration reachability and visibility
   unify        Analyze and repair workspace dependency coherence
   init         Initialize configuration (rail.toml)
@@ -43,9 +43,6 @@ Commands:
   change       Manage pending release intent files
   clean        Clean generated artifacts owned by the current workspace
   config       Configuration management
-  hash         Compute a portable planner identity (not a cache key)
-  diff-hash    Explain why two portable planner identities differ
-  graph        Planner reasoning graph for explainability
   completions  Generate shell completions
   help         Print this message or the help of the given subcommand(s)
 
@@ -54,7 +51,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -84,7 +81,7 @@ Commands:
 
 Options:
   -q, --quiet                  Suppress progress messages (for CI/automation)
-      --json                   Output as JSON where supported; rejected otherwise (shorthand for -f json)
+      --json                   Output as JSON where supported; rejected otherwise
       --config <PATH>          Path to rail.toml config file (bypass search order)
       --workspace-root <PATH>  Workspace root directory (default: current directory)
   -h, --help                   Print help
@@ -114,7 +111,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -152,7 +149,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -197,7 +194,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
       --max-size <SIZE>
           Positive binary byte size such as 10GiB
@@ -298,7 +295,7 @@ Options:
           Additional reviewed compiler environment name admitted to L2 identity
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -355,7 +352,7 @@ Options:
           [default: text]
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -396,7 +393,7 @@ Options:
           [default: text]
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -436,7 +433,7 @@ Options:
           Preview exact bytes and paths without deleting them
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -486,7 +483,7 @@ Options:
           [default: text]
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -506,7 +503,7 @@ Options:
 ## cargo rail plan
 
 ```
-Build a deterministic file-first change plan
+Build an evidence-backed named-work plan
 
 Usage: cargo rail plan [OPTIONS]
 
@@ -521,7 +518,7 @@ Options:
           Start ref (for SHA pair mode)
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -529,33 +526,17 @@ Options:
       --to <TO>
           End ref (for SHA pair mode)
 
-      --merge-base
-          Use merge-base with default branch (better for feature branches)
-
       --workspace-root <PATH>
           Workspace root directory (default: current directory)
-
-  -f, --format <FORMAT>
-          Output format
-
-          Possible values:
-          - text:         Human-readable text output (default)
-          - json:         Machine-readable JSON output
-          - github:       GitHub Actions output format for $GITHUB_OUTPUT
-          - github-debug: GitHub Actions output with embedded planner contract for debugging
-
-          [default: text]
-
-  -o, --output <PATH>
-          Write output to file (overwrites existing content)
 
       --explain
           Show concise human reasoning chain
 
-      --confidence-profile <PROFILE>
-          Planner confidence profile override (strict|balanced|fast)
+      --all
+          Require every registered work item with full valid scope
 
-          [possible values: strict, balanced, fast]
+      --evidence <PATH>
+          Load portable compatible observed-input evidence
 
       --schema
           Print the versioned planner JSON Schema and exit
@@ -567,16 +548,15 @@ Options:
           Print version
 
 Examples:
-  cargo rail plan                           # Changes since default branch
-  cargo rail plan --merge-base              # Changes since branch point (CI recommended)
-  cargo rail plan --confidence-profile strict  # Conservative planner profile
+  cargo rail plan                           # Changes since the default-branch merge base
+  cargo rail plan --json                    # Full machine-readable work contract
   cargo rail plan --since HEAD~5            # Changes in last 5 commits
   cargo rail plan --from abc --to def       # Changes between two SHAs
   cargo rail plan --explain                 # Show concise proof chain
+  cargo rail plan --all                     # Safely require every registered work item
+  cargo rail plan --evidence inputs.json    # Use compatible observed-input evidence
   cargo rail plan --schema                  # Print the versioned JSON Schema
-  cargo rail plan -f json                   # Full machine-readable contract
-  cargo rail plan -f github                 # Compact GitHub Actions key=value output
-  cargo rail plan -f github-debug           # GitHub Actions output plus plan_json
+  cargo rail plan --json > plan.json        # Redirect the exact plan to a file
 ```
 
 ---
@@ -599,7 +579,7 @@ Options:
           Fail on denied findings without modifying source (for CI)
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -683,7 +663,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
   -c, --check
           Check for pending manifest changes without modifying manifests (exit 1 when pending)
@@ -764,7 +744,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -792,7 +772,7 @@ Options:
       --list                   List available backups instead of restoring
   -q, --quiet                  Suppress progress messages (for CI/automation)
       --backup-id <BACKUP_ID>  Specific backup ID to restore (defaults to most recent)
-      --json                   Output as JSON where supported; rejected otherwise (shorthand for -f json)
+      --json                   Output as JSON where supported; rejected otherwise
       --config <PATH>          Path to rail.toml config file (bypass search order)
       --workspace-root <PATH>  Workspace root directory (default: current directory)
   -h, --help                   Print help
@@ -821,7 +801,7 @@ Options:
           Overwrite existing configuration
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -864,7 +844,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -906,7 +886,7 @@ Arguments:
 Options:
       --dry-run                Preview generated config without writing
   -q, --quiet                  Suppress progress messages (for CI/automation)
-      --json                   Output as JSON where supported; rejected otherwise (shorthand for -f json)
+      --json                   Output as JSON where supported; rejected otherwise
       --config <PATH>          Path to rail.toml config file (bypass search order)
       --workspace-root <PATH>  Workspace root directory (default: current directory)
   -h, --help                   Print help
@@ -934,7 +914,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
       --remote <REMOTE>
           Override remote repository
@@ -996,7 +976,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
       --remote <REMOTE>
           Override remote repository
@@ -1089,7 +1069,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -1138,7 +1118,7 @@ Arguments:
 Options:
       --dry-run                Preview generated config without writing
   -q, --quiet                  Suppress progress messages (for CI/automation)
-      --json                   Output as JSON where supported; rejected otherwise (shorthand for -f json)
+      --json                   Output as JSON where supported; rejected otherwise
       --config <PATH>          Path to rail.toml config file (bypass search order)
       --workspace-root <PATH>  Workspace root directory (default: current directory)
   -h, --help                   Print help
@@ -1171,7 +1151,7 @@ Options:
           [default: auto]
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
   -c, --check
           Check for a pending release plan (exit 1 when pending)
@@ -1242,7 +1222,7 @@ Options:
           [default: auto]
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -1299,7 +1279,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
       --publish
           Positively authorize irreversible publication to crates.io
@@ -1349,7 +1329,7 @@ Arguments:
 
 Options:
   -q, --quiet                  Suppress progress messages (for CI/automation)
-      --json                   Output as JSON where supported; rejected otherwise (shorthand for -f json)
+      --json                   Output as JSON where supported; rejected otherwise
       --config <PATH>          Path to rail.toml config file (bypass search order)
       --workspace-root <PATH>  Workspace root directory (default: current directory)
   -h, --help                   Print help
@@ -1383,7 +1363,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -1413,7 +1393,7 @@ Arguments:
 Options:
   -q, --quiet                  Suppress progress messages (for CI/automation)
   -y, --yes                    Confirm restoration of the pre-release local state
-      --json                   Output as JSON where supported; rejected otherwise (shorthand for -f json)
+      --json                   Output as JSON where supported; rejected otherwise
       --config <PATH>          Path to rail.toml config file (bypass search order)
       --workspace-root <PATH>  Workspace root directory (default: current directory)
   -h, --help                   Print help
@@ -1440,7 +1420,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -1490,7 +1470,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
   -m, --message <MESSAGE>
           User-facing changelog entry body (omit in a terminal to open $VISUAL/$EDITOR)
@@ -1545,7 +1525,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -1577,7 +1557,7 @@ Options:
           Compare against this git ref
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
       --merge-base
           Compare from the merge-base with the default branch
@@ -1631,7 +1611,7 @@ Options:
           Prune old backups
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -1690,7 +1670,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -1739,7 +1719,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -1779,7 +1759,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -1819,7 +1799,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
       --strict
           Treat warnings as errors (auto-enabled in CI)
@@ -1863,7 +1843,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -1906,7 +1886,7 @@ Options:
           [default: text]
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
@@ -1919,178 +1899,6 @@ Options:
 
   -V, --version
           Print version
-```
-
----
-
-## cargo rail hash
-
-```
-Compute a portable planner identity (not a cache key)
-
-Usage: cargo rail hash [OPTIONS]
-
-Options:
-  -q, --quiet
-          Suppress progress messages (for CI/automation)
-
-      --since <SINCE>
-          Git ref to compare against (auto-detects default branch)
-
-      --from <FROM>
-          Start ref (for SHA pair mode)
-
-      --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
-
-      --config <PATH>
-          Path to rail.toml config file (bypass search order)
-
-      --to <TO>
-          End ref (for SHA pair mode)
-
-      --merge-base
-          Use merge-base with default branch (better for feature branches)
-
-      --workspace-root <PATH>
-          Workspace root directory (default: current directory)
-
-      --confidence-profile <PROFILE>
-          Planner confidence profile override (strict|balanced|fast)
-
-          [possible values: strict, balanced, fast]
-
-  -f, --format <FORMAT>
-          Output format
-
-          Possible values:
-          - text: Human-readable text output (default)
-          - json: Machine-readable JSON output
-
-          [default: text]
-
-  -h, --help
-          Print help (see a summary with '-h')
-
-  -V, --version
-          Print version
-
-Examples:
-  cargo rail hash                          # Portable identity of the current plan
-  cargo rail hash --merge-base             # Identity for the merge-base comparison
-  cargo rail hash -f json                  # Structured identity metadata
-  cargo rail diff-hash plan-a.json plan-b.json
-  cargo rail diff-hash plan-a.json plan-b.json -f json
-```
-
----
-
-## cargo rail diff-hash
-
-```
-Explain why two portable planner identities differ
-
-Usage: cargo rail diff-hash [OPTIONS] <A> <B>
-
-Arguments:
-  <A>
-          First planner JSON path
-
-  <B>
-          Second planner JSON path
-
-Options:
-  -f, --format <FORMAT>
-          Output format
-
-          Possible values:
-          - text: Human-readable text output (default)
-          - json: Machine-readable JSON output
-
-          [default: text]
-
-  -q, --quiet
-          Suppress progress messages (for CI/automation)
-
-      --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
-
-      --config <PATH>
-          Path to rail.toml config file (bypass search order)
-
-      --workspace-root <PATH>
-          Workspace root directory (default: current directory)
-
-  -h, --help
-          Print help (see a summary with '-h')
-
-  -V, --version
-          Print version
-
-Examples:
-  cargo rail hash                          # Portable identity of the current plan
-  cargo rail hash --merge-base             # Identity for the merge-base comparison
-  cargo rail hash -f json                  # Structured identity metadata
-  cargo rail diff-hash plan-a.json plan-b.json
-  cargo rail diff-hash plan-a.json plan-b.json -f json
-```
-
----
-
-## cargo rail graph
-
-```
-Planner reasoning graph for explainability
-
-Usage: cargo rail graph [OPTIONS]
-
-Options:
-  -q, --quiet
-          Suppress progress messages (for CI/automation)
-
-      --since <SINCE>
-          Git ref to compare against (auto-detects default branch)
-
-      --from <FROM>
-          Start ref (for SHA pair mode)
-
-      --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
-
-      --config <PATH>
-          Path to rail.toml config file (bypass search order)
-
-      --to <TO>
-          End ref (for SHA pair mode)
-
-      --merge-base
-          Use merge-base with default branch (better for feature branches)
-
-      --workspace-root <PATH>
-          Workspace root directory (default: current directory)
-
-      --confidence-profile <PROFILE>
-          Planner confidence profile override (strict|balanced|fast)
-
-          [possible values: strict, balanced, fast]
-
-      --dot
-          Output GraphViz DOT instead of JSON
-
-  -o, --output <PATH>
-          Write output to file (overwrites existing content)
-
-  -h, --help
-          Print help (see a summary with '-h')
-
-  -V, --version
-          Print version
-
-Examples:
-  cargo rail graph                             # Planner reasoning graph (json)
-  cargo rail graph --merge-base                # Graph against merge-base comparison
-  cargo rail graph --dot                       # GraphViz DOT output
-  cargo rail graph --since HEAD~3 -o graph.dot # Write graph output to file
 ```
 
 ---
@@ -2113,7 +1921,7 @@ Options:
           Suppress progress messages (for CI/automation)
 
       --json
-          Output as JSON where supported; rejected otherwise (shorthand for -f json)
+          Output as JSON where supported; rejected otherwise
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)

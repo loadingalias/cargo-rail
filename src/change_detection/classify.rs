@@ -1,104 +1,6 @@
-//! Canonical file taxonomy and planning-oriented classification helpers.
-//!
-//! This module is the single source of truth for path-based change detection.
-//! The planner's `kind` / `sub_kind` taxonomy is derived from [`FileProfile`],
-//! and every other layer should consume the same profile instead of
-//! re-implementing path heuristics.
+//! Path classification used by semantic Cargo diffs and release attribution.
 
-use crate::config::ChangeDetectionConfig;
-use glob::Pattern;
 use std::path::Path;
-
-/// Trace code for planner-classified Rust source files.
-pub const RC_FILE_KIND_RUST_SRC: &str = "FILE_KIND_RUST_SRC";
-/// Trace code for planner-classified Rust test files.
-pub const RC_FILE_KIND_RUST_TEST: &str = "FILE_KIND_RUST_TEST";
-/// Trace code for planner-classified Rust bench files.
-pub const RC_FILE_KIND_RUST_BENCH: &str = "FILE_KIND_RUST_BENCH";
-/// Trace code for planner-classified Rust example files.
-pub const RC_FILE_KIND_RUST_EXAMPLE: &str = "FILE_KIND_RUST_EXAMPLE";
-/// Trace code for planner-classified Cargo build scripts.
-pub const RC_FILE_KIND_RUST_BUILD_SCRIPT: &str = "FILE_KIND_RUST_BUILD_SCRIPT";
-/// Trace code for planner-classified crate manifests.
-pub const RC_FILE_KIND_TOML_MANIFEST: &str = "FILE_KIND_TOML_MANIFEST";
-/// Trace code for planner-classified workspace manifests.
-pub const RC_FILE_KIND_TOML_WORKSPACE: &str = "FILE_KIND_TOML_WORKSPACE";
-/// Trace code for planner-classified tooling TOML files.
-pub const RC_FILE_KIND_TOML_TOOLING: &str = "FILE_KIND_TOML_TOOLING";
-/// Trace code for planner-classified Cargo.lock files.
-pub const RC_FILE_KIND_TOML_LOCKFILE: &str = "FILE_KIND_TOML_LOCKFILE";
-/// Trace code for planner-classified CI files.
-pub const RC_FILE_KIND_CI: &str = "FILE_KIND_CI";
-/// Trace code for planner-classified script files.
-pub const RC_FILE_KIND_SCRIPT: &str = "FILE_KIND_SCRIPT";
-/// Trace code for planner-classified documentation files.
-pub const RC_FILE_KIND_DOCS: &str = "FILE_KIND_DOCS";
-/// Trace code for planner-classified repository config files.
-pub const RC_FILE_KIND_REPO_CONFIG: &str = "FILE_KIND_REPO_CONFIG";
-/// Trace code emitted when configured infrastructure patterns match a path.
-pub const RC_FILE_KIND_INFRA_PATTERN: &str = "FILE_KIND_INFRA_PATTERN";
-/// Trace code emitted when configured custom surfaces match a path.
-pub const RC_FILE_KIND_CUSTOM: &str = "FILE_KIND_CUSTOM";
-/// Trace code for planner-classified unknown files.
-pub const RC_FILE_KIND_UNCLASSIFIED: &str = "FILE_KIND_UNCLASSIFIED";
-
-const BUILD_TEST_SURFACE: &[&str] = &["build", "test", "surface"];
-const TEST_SURFACE: &[&str] = &["test", "surface"];
-const BENCH_SURFACE: &[&str] = &["bench", "surface"];
-const INFRA_BUILD_TEST_SURFACE: &[&str] = &["infra", "build", "test", "surface"];
-const INFRA_ONLY_SURFACES: &[&str] = &["infra"];
-const DOCS_ONLY_SURFACES: &[&str] = &["docs"];
-const NO_SURFACES: &[&str] = &[];
-
-/// Coarse legacy classification retained for compatibility.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChangeKind {
-    /// Source code that affects compilation.
-    Source {
-        /// Whether this is a procedural macro crate.
-        is_proc_macro: bool,
-    },
-    /// Test code.
-    Test {
-        /// Type of test.
-        kind: TestKind,
-    },
-    /// Example code.
-    Example,
-    /// Build script.
-    BuildScript,
-    /// Configuration files.
-    Config {
-        /// Type of configuration file.
-        kind: ConfigKind,
-    },
-    /// Documentation only.
-    Documentation,
-    /// Other files.
-    Other,
-}
-
-/// Types of test files.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TestKind {
-    /// Integration tests in `tests/`.
-    Integration,
-    /// Benchmarks in `benches/`.
-    Bench,
-}
-
-/// Types of configuration files.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConfigKind {
-    /// `Cargo.toml`.
-    CargoToml,
-    /// `Cargo.lock`.
-    CargoLock,
-    /// `.cargo/config.toml` or `.cargo/config`.
-    CargoConfig,
-    /// `rust-toolchain.toml` or `rust-toolchain`.
-    RustToolchain,
-}
 
 /// Detailed canonical path profile.
 ///
@@ -106,7 +8,7 @@ pub enum ConfigKind {
 /// examples, lockfiles) while still projecting the planner's canonical
 /// `kind` / `sub_kind` taxonomy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileProfile {
+pub(crate) enum FileProfile {
     /// Regular Rust source file.
     RustSrc,
     /// Rust test file under `tests/`.
@@ -142,81 +44,8 @@ pub enum FileProfile {
 }
 
 impl FileProfile {
-    /// Planner-visible file kind.
-    pub fn planned_kind(self) -> &'static str {
-        match self {
-            Self::RustSrc | Self::RustTest | Self::RustBench | Self::RustExample | Self::RustBuildScript => "rust",
-            Self::TomlManifest
-            | Self::TomlWorkspace
-            | Self::TomlCargoConfig
-            | Self::TomlRustToolchain
-            | Self::TomlTooling
-            | Self::CargoLock => "toml",
-            Self::Ci => "ci",
-            Self::Script => "script",
-            Self::Docs => "docs",
-            Self::RepoConfig => "config",
-            Self::Unknown => "unknown",
-        }
-    }
-
-    /// Planner-visible file sub kind.
-    pub fn planned_sub_kind(self) -> Option<&'static str> {
-        match self {
-            Self::RustSrc => Some("src"),
-            Self::RustTest => Some("test"),
-            Self::RustBench => Some("bench"),
-            Self::RustExample => Some("example"),
-            Self::RustBuildScript => Some("build_script"),
-            Self::TomlManifest => Some("manifest"),
-            Self::TomlWorkspace => Some("workspace"),
-            Self::TomlCargoConfig | Self::TomlRustToolchain | Self::TomlTooling => Some("tooling"),
-            Self::CargoLock => Some("lock"),
-            Self::RepoConfig => Some("repo"),
-            Self::Ci | Self::Script | Self::Docs | Self::Unknown => None,
-        }
-    }
-
-    /// Planner trace reason for the builtin classification.
-    pub fn reason_code(self) -> &'static str {
-        match self {
-            Self::RustSrc => RC_FILE_KIND_RUST_SRC,
-            Self::RustTest => RC_FILE_KIND_RUST_TEST,
-            Self::RustBench => RC_FILE_KIND_RUST_BENCH,
-            Self::RustExample => RC_FILE_KIND_RUST_EXAMPLE,
-            Self::RustBuildScript => RC_FILE_KIND_RUST_BUILD_SCRIPT,
-            Self::TomlManifest => RC_FILE_KIND_TOML_MANIFEST,
-            Self::TomlWorkspace => RC_FILE_KIND_TOML_WORKSPACE,
-            Self::TomlCargoConfig | Self::TomlRustToolchain | Self::TomlTooling => RC_FILE_KIND_TOML_TOOLING,
-            Self::CargoLock => RC_FILE_KIND_TOML_LOCKFILE,
-            Self::Ci => RC_FILE_KIND_CI,
-            Self::Script => RC_FILE_KIND_SCRIPT,
-            Self::Docs => RC_FILE_KIND_DOCS,
-            Self::RepoConfig => RC_FILE_KIND_REPO_CONFIG,
-            Self::Unknown => RC_FILE_KIND_UNCLASSIFIED,
-        }
-    }
-
-    /// Builtin planner surfaces implied by this profile.
-    pub fn default_surfaces(self) -> &'static [&'static str] {
-        match self {
-            Self::RustSrc | Self::RustBuildScript | Self::TomlManifest => BUILD_TEST_SURFACE,
-            Self::RustTest => TEST_SURFACE,
-            Self::RustBench => BENCH_SURFACE,
-            Self::RustExample => TEST_SURFACE,
-            Self::TomlWorkspace
-            | Self::TomlCargoConfig
-            | Self::TomlRustToolchain
-            | Self::TomlTooling
-            | Self::CargoLock => INFRA_BUILD_TEST_SURFACE,
-            Self::Ci | Self::Script => INFRA_ONLY_SURFACES,
-            Self::Docs | Self::RepoConfig => DOCS_ONLY_SURFACES,
-            Self::Unknown => NO_SURFACES,
-        }
-    }
-
-    /// Whether this profile seeds transitive build/test impact in planner mode.
-    pub fn seeds_build_test_transitive(self) -> bool {
+    /// Whether this profile seeds transitive build/test release attribution.
+    pub(crate) fn seeds_build_test_transitive(self) -> bool {
         matches!(
             self,
             Self::RustSrc
@@ -229,43 +58,10 @@ impl FileProfile {
                 | Self::CargoLock
         )
     }
-
-    /// Whether this profile should count as docs-only by default.
-    pub fn is_docs_only(self) -> bool {
-        matches!(self, Self::Docs | Self::RepoConfig)
-    }
-
-    /// Compatibility projection to the legacy change kind enum.
-    pub fn legacy_change_kind(self) -> ChangeKind {
-        match self {
-            Self::RustSrc => ChangeKind::Source { is_proc_macro: false },
-            Self::RustTest => ChangeKind::Test {
-                kind: TestKind::Integration,
-            },
-            Self::RustBench => ChangeKind::Test { kind: TestKind::Bench },
-            Self::RustExample => ChangeKind::Example,
-            Self::RustBuildScript => ChangeKind::BuildScript,
-            Self::TomlManifest | Self::TomlWorkspace => ChangeKind::Config {
-                kind: ConfigKind::CargoToml,
-            },
-            Self::TomlCargoConfig => ChangeKind::Config {
-                kind: ConfigKind::CargoConfig,
-            },
-            Self::TomlRustToolchain => ChangeKind::Config {
-                kind: ConfigKind::RustToolchain,
-            },
-            Self::TomlTooling => ChangeKind::Other,
-            Self::CargoLock => ChangeKind::Config {
-                kind: ConfigKind::CargoLock,
-            },
-            Self::Ci | Self::Script | Self::Unknown => ChangeKind::Other,
-            Self::Docs | Self::RepoConfig => ChangeKind::Documentation,
-        }
-    }
 }
 
-/// Classify a file by path using the canonical planner taxonomy.
-pub fn classify_path(path: &Path) -> FileProfile {
+/// Classify a file for semantic Cargo analysis and release attribution.
+pub(crate) fn classify_path(path: &Path) -> FileProfile {
     let path_str = path.to_string_lossy();
 
     if path_str.ends_with("build.rs") {
@@ -317,83 +113,6 @@ pub fn classify_path(path: &Path) -> FileProfile {
     }
 
     FileProfile::Unknown
-}
-
-/// Backward-compatible file classification wrapper.
-pub fn classify_file(path: &Path) -> ChangeKind {
-    classify_path(path).legacy_change_kind()
-}
-
-/// Compile configured infrastructure patterns, using defaults when config is absent.
-pub fn compile_infrastructure_patterns(config: Option<&ChangeDetectionConfig>) -> Vec<Pattern> {
-    let patterns = config
-        .map(|cfg| cfg.infrastructure.clone())
-        .unwrap_or_else(|| ChangeDetectionConfig::default().infrastructure);
-
-    patterns
-        .into_iter()
-        .filter_map(|pattern| Pattern::new(&pattern).ok())
-        .collect()
-}
-
-/// Compile configured custom patterns sorted by category name.
-pub fn compile_custom_patterns(config: Option<&ChangeDetectionConfig>) -> Vec<(String, Pattern)> {
-    let Some(config) = config else {
-        return Vec::new();
-    };
-
-    let mut names: Vec<String> = config.custom.keys().cloned().collect();
-    names.sort();
-
-    let mut patterns = Vec::new();
-    for name in names {
-        let Some(globs) = config.custom.get(&name) else {
-            continue;
-        };
-
-        for glob in globs {
-            if let Ok(pattern) = Pattern::new(glob) {
-                patterns.push((name.clone(), pattern));
-            }
-        }
-    }
-
-    patterns
-}
-
-/// Return sorted, deduplicated custom surface names.
-pub fn custom_surface_names(custom_patterns: &[(String, Pattern)]) -> Vec<String> {
-    let mut names = Vec::new();
-
-    for (name, _) in custom_patterns {
-        let surface = format!("custom:{}", name);
-        if !names.iter().any(|existing| existing == &surface) {
-            names.push(surface);
-        }
-    }
-
-    names
-}
-
-/// Match custom surfaces for a path.
-pub fn custom_surfaces_for_path(path: &str, custom_patterns: &[(String, Pattern)]) -> Vec<String> {
-    let mut surfaces = Vec::new();
-
-    for (name, pattern) in custom_patterns {
-        if pattern.matches(path) {
-            let surface = format!("custom:{}", name);
-            if !surfaces.iter().any(|existing| existing == &surface) {
-                surfaces.push(surface);
-            }
-        }
-    }
-
-    surfaces
-}
-
-/// Whether a path matches configured infrastructure patterns.
-pub fn matches_infrastructure_patterns(path: &str, infrastructure_patterns: &[Pattern]) -> bool {
-    infrastructure_patterns.iter().any(|pattern| pattern.matches(path))
 }
 
 fn classify_rust_file(path_str: &str) -> FileProfile {
@@ -466,117 +185,18 @@ fn is_repo_config(path_str: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        FileProfile, classify_file, classify_path, compile_infrastructure_patterns, custom_surface_names,
-        custom_surfaces_for_path, matches_infrastructure_patterns,
-    };
-    use serde::Deserialize;
+    use super::{FileProfile, classify_path};
     use std::path::Path;
 
-    const CLASSIFICATION_CORPUS: &str = include_str!("../../tests/fixtures/change_detection/path_corpus.json");
-
-    #[derive(Debug, Deserialize)]
-    struct CorpusCase {
-        path: String,
-        kind: String,
-        #[serde(default)]
-        sub_kind: Option<String>,
-        #[serde(default)]
-        default_surfaces: Option<Vec<String>>,
-        surfaces: Vec<String>,
-    }
-
-    fn corpus_cases() -> Vec<CorpusCase> {
-        serde_json::from_str(CLASSIFICATION_CORPUS).expect("classification corpus should parse")
-    }
-
     #[test]
-    fn test_classification_corpus_matches_canonical_profile() {
-        for case in corpus_cases() {
-            let profile = classify_path(Path::new(&case.path));
-            assert_eq!(profile.planned_kind(), case.kind, "kind mismatch for {}", case.path);
-            assert_eq!(
-                profile.planned_sub_kind().map(str::to_string),
-                case.sub_kind,
-                "sub kind mismatch for {}",
-                case.path
-            );
-            assert_eq!(
-                profile
-                    .default_surfaces()
-                    .iter()
-                    .map(|surface| (*surface).to_string())
-                    .collect::<Vec<_>>(),
-                case.default_surfaces.clone().unwrap_or_else(|| case.surfaces.clone()),
-                "surface mismatch for {}",
-                case.path
-            );
-        }
-    }
-
-    #[test]
-    fn test_classify_file_preserves_legacy_examples_build_scripts_and_lockfiles() {
-        assert!(matches!(
-            classify_file(Path::new("examples/demo.rs")),
-            super::ChangeKind::Example
-        ));
-        assert!(matches!(
-            classify_file(Path::new("build.rs")),
-            super::ChangeKind::BuildScript
-        ));
-        assert!(matches!(
-            classify_file(Path::new("Cargo.lock")),
-            super::ChangeKind::Config {
-                kind: super::ConfigKind::CargoLock
-            }
-        ));
-        assert!(matches!(
-            classify_file(Path::new("rust-toolchain.toml")),
-            super::ChangeKind::Config {
-                kind: super::ConfigKind::RustToolchain
-            }
-        ));
-    }
-
-    #[test]
-    fn test_configured_pattern_helpers() {
-        let patterns = compile_infrastructure_patterns(None);
-        assert!(matches_infrastructure_patterns(".github/workflows/ci.yml", &patterns));
-
-        let custom_patterns = vec![
-            (
-                "verify".to_string(),
-                glob::Pattern::new("verify/**").expect("glob should compile"),
-            ),
-            (
-                "verify".to_string(),
-                glob::Pattern::new("models/**").expect("glob should compile"),
-            ),
-            (
-                "docs_pipeline".to_string(),
-                glob::Pattern::new("docs/**").expect("glob should compile"),
-            ),
-        ];
-
+    fn classifies_inputs_that_change_release_attribution() {
+        assert_eq!(classify_path(Path::new("Cargo.lock")), FileProfile::CargoLock);
+        assert_eq!(classify_path(Path::new("Cargo.toml")), FileProfile::TomlWorkspace);
         assert_eq!(
-            custom_surface_names(&custom_patterns),
-            vec!["custom:verify".to_string(), "custom:docs_pipeline".to_string()]
+            classify_path(Path::new("crates/demo/Cargo.toml")),
+            FileProfile::TomlManifest
         );
-        assert_eq!(
-            custom_surfaces_for_path("verify/state.rs", &custom_patterns),
-            vec!["custom:verify".to_string()]
-        );
-        assert_eq!(
-            custom_surfaces_for_path("docs/guide.md", &custom_patterns),
-            vec!["custom:docs_pipeline".to_string()]
-        );
-    }
-
-    #[test]
-    fn test_cargo_lock_projects_to_lock_sub_kind() {
-        let profile = classify_path(Path::new("Cargo.lock"));
-        assert_eq!(profile, FileProfile::CargoLock);
-        assert_eq!(profile.planned_kind(), "toml");
-        assert_eq!(profile.planned_sub_kind(), Some("lock"));
+        assert!(classify_path(Path::new("crates/demo/src/lib.rs")).seeds_build_test_transitive());
+        assert!(!classify_path(Path::new("crates/demo/tests/api.rs")).seeds_build_test_transitive());
     }
 }

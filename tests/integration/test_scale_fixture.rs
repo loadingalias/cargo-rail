@@ -49,6 +49,20 @@ fn commit_all(path: &Path, message: &str) -> Result<()> {
     Ok(())
 }
 
+fn selected_packages(plan: &serde_json::Value, work: &str) -> Result<Vec<String>> {
+    plan["work"][work]["scope"]["selection"]["packages"]
+        .as_array()
+        .with_context(|| format!("{work} package selectors missing"))?
+        .iter()
+        .map(|selector| {
+            selector["name"]
+                .as_str()
+                .map(str::to_owned)
+                .with_context(|| format!("{work} package selector has no name"))
+        })
+        .collect()
+}
+
 fn configure_development_chain(path: &Path, member_count: usize) -> Result<()> {
     for index in 0..member_count {
         let member = format!("member-{index:04}");
@@ -146,7 +160,7 @@ fn scale_fixtures_are_deterministic_and_cargo_valid() {
                 }
             }
 
-            let output = run_cargo_rail(&first, &["rail", "plan", "--since", "HEAD~1", "--format", "json"])?;
+            let output = run_cargo_rail(&first, &["rail", "plan", "--since", "HEAD~1", "--json"])?;
             ensure!(
                 output.status.success(),
                 "cargo-rail rejected the {member_count}-member fixture: {}",
@@ -158,13 +172,8 @@ fn scale_fixtures_are_deterministic_and_cargo_valid() {
                 String::from_utf8_lossy(&output.stderr)
             );
             let plan: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-            let expected_transitive: Vec<_> = (1..member_count).map(|index| format!("member-{index:04}")).collect();
-            assert_eq!(plan["impact"]["direct_crates"], serde_json::json!(["member-0000"]));
-            assert_eq!(
-                plan["impact"]["build_transitive_crates"],
-                serde_json::json!(expected_transitive)
-            );
-            assert_eq!(plan["impact"]["development_transitive_crates"], serde_json::json!([]));
+            let expected: Vec<_> = (0..member_count).map(|index| format!("member-{index:04}")).collect();
+            assert_eq!(selected_packages(&plan, "cargo.build")?, expected);
         }
 
         let ten_member = root.path().join("first-10");
@@ -210,25 +219,15 @@ fn semantic_impact_narrows_100_and_1000_member_mutations_without_missing_the_wit
             generate_fixture(member_count, &fixture)?;
             configure_development_chain(&fixture, member_count)?;
 
-            let output = run_cargo_rail(&fixture, &["rail", "plan", "--since", "HEAD~1", "--format", "json"])?;
+            let output = run_cargo_rail(&fixture, &["rail", "plan", "--since", "HEAD~1", "--json"])?;
             ensure!(
                 output.status.success(),
                 "semantic plan failed for {member_count} members: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
             let plan: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-            assert_eq!(
-                plan["surfaces"]["build"]["scope"]["crates"],
-                serde_json::json!(["member-0000"])
-            );
-            assert_eq!(
-                plan["surfaces"]["test"]["scope"]["crates"],
-                serde_json::json!(["member-0000", "member-0001"])
-            );
-            assert_eq!(
-                plan["surfaces"]["bench"]["scope"]["crates"],
-                serde_json::json!(["member-0001"])
-            );
+            assert_eq!(selected_packages(&plan, "cargo.build")?, ["member-0000"]);
+            assert_eq!(selected_packages(&plan, "cargo.test")?, ["member-0000", "member-0001"]);
 
             let witness = Command::new("cargo")
                 .args([

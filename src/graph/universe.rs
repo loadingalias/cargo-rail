@@ -11,7 +11,6 @@ use super::{ImpactDomain, ImpactFallback, ImpactPropagation, ImpactStep};
 use crate::error::{RailError, RailResult};
 use crate::source::ContentDigest;
 
-pub(crate) const DEPENDENCY_UNIVERSE_MODE: &str = "declared_dependencies";
 const DEPENDENCY_UNIVERSE_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

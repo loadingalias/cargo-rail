@@ -25,24 +25,21 @@ fn test_documented_frontdoor_commands_smoke() {
             "just build-release should produce the complete release artifact set"
         );
         assert!(justfile.contains("@scripts/build/build.sh"));
-        assert!(justfile.contains("rail plan --merge-base -f json"));
+        assert!(justfile.contains("rail plan --json"));
         assert!(!justfile.contains("rail run"));
-        for (script, surface, executor) in [
-            (&build_script, "build", "cargo build"),
-            (&test_script, "test", "cargo nextest run"),
+        for (script, work, executor) in [
+            (&build_script, "cargo.build", "cargo build"),
+            (&test_script, "cargo.test", "cargo nextest run"),
         ] {
-            assert!(script.contains("rail)"));
-            assert!(script.contains(&format!(".surfaces.{surface}.scope.cargo_args[]")));
+            assert!(script.contains("scripts/plan/read.py"));
+            assert!(script.contains(&format!("is-required \"$PLAN_FILE\" {work}")));
+            assert!(script.contains(&format!("cargo-args \"$PLAN_FILE\" {work}")));
             assert!(script.contains(executor));
             assert!(!script.contains(" rail run"));
         }
 
         let cases: &[(&str, &[&str], &str)] = &[
-            (
-                "README plan",
-                &["rail", "plan", "--merge-base"],
-                "cargo rail plan --merge-base",
-            ),
+            ("README plan", &["rail", "plan"], "cargo rail plan"),
             (
                 "README unify",
                 &["rail", "unify", "--check"],

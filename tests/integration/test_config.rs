@@ -247,13 +247,6 @@ semver_check = "deny"
 require_change_files = ["test-crate"]
 version_groups = { core = ["test-crate"] }
 
-[change-detection]
-infrastructure = ["ci/**"]
-unknown_file_policy = "owned_build_test"
-confidence_profile = "strict"
-
-[change-detection.custom]
-verification = ["verify/**"]
 "#,
             ),
             (
@@ -438,6 +431,27 @@ fn test_config_validate_accepts_empty_config() {
         assert_eq!(json["errors"], serde_json::Value::Array(vec![]));
         assert_eq!(json["warnings"], serde_json::Value::Array(vec![]));
 
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_config_validate_rejects_removed_change_detection_policy() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("config-rejects-change-detection")?;
+        ws.add_crate("test-crate", "0.1.0", &[])?;
+        ws.commit("Add test crate")?;
+        fs::write(
+            ws.path.join(".config/rail.toml"),
+            "[change-detection]\nconfidence_profile = \"strict\"\n",
+        )?;
+
+        let output = run_cargo_rail(&ws.path, &["rail", "config", "validate", "--no-strict"])?;
+        assert_eq!(output.status.code(), Some(2));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("change-detection"), "{stdout}");
+        assert!(stdout.contains("cargo rail config migrate"), "{stdout}");
         Ok(())
     })();
     super::helpers::finish_test(result);
@@ -1194,7 +1208,7 @@ bot_pr_confidence_profile = "strict"
         assert!(!migrated.contains("[toolchain]"));
         assert!(!migrated.contains("[crates.demo.sync]"));
         assert!(!migrated.contains("conservative_unclassified_owner_fallback"));
-        assert!(migrated.contains("unknown_file_policy = \"owned_build_test\""));
+        assert!(!migrated.contains("[change-detection]"));
         let second = run_cargo_rail(&ws.path, &["rail", "config", "migrate", "--check"])?;
         assert!(second.status.success(), "applied migrations must be idempotent");
 
@@ -1204,7 +1218,7 @@ bot_pr_confidence_profile = "strict"
 }
 
 #[test]
-fn test_config_migrate_normalizes_legacy_policy_values_without_overriding_explicit_policy() {
+fn test_config_migrate_removes_legacy_planning_policy() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("config-migrate-policy-values")?;
         ws.add_crate("test-crate", "0.1.0", &[])?;
@@ -1214,7 +1228,7 @@ fn test_config_migrate_normalizes_legacy_policy_values_without_overriding_explic
         fs::write(&config_path, "[change-detection]\nunknown_file_policy = true\n")?;
         let output = run_cargo_rail(&ws.path, &["rail", "config", "migrate"])?;
         assert!(output.status.success());
-        assert!(fs::read_to_string(&config_path)?.contains("unknown_file_policy = \"owned_build_test\""));
+        assert!(!fs::read_to_string(&config_path)?.contains("change-detection"));
 
         fs::write(
             &config_path,
@@ -1223,7 +1237,7 @@ fn test_config_migrate_normalizes_legacy_policy_values_without_overriding_explic
         let output = run_cargo_rail(&ws.path, &["rail", "config", "migrate"])?;
         assert!(output.status.success());
         let migrated = fs::read_to_string(&config_path)?;
-        assert!(migrated.contains("unknown_file_policy = \"workspace_infra\""));
+        assert!(!migrated.contains("unknown_file_policy"));
         assert!(!migrated.contains("conservative_unclassified_owner_fallback"));
 
         Ok(())

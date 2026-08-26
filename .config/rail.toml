@@ -36,17 +36,75 @@ fallback = "skip"
 [release.changelog.filters]
 skip_types = ["build", "chore", "ci", "refactor", "style", "test"]
 
-[change-detection]
-infrastructure = [
-  ".github/**",
-  "distribution/**",
-  "scripts/**",
-  "tests/compatibility/**",
+# Repository work declarations contain positive inputs only. Cargo, rustfmt,
+# dependency policy, release-semver, and Surface semantics remain code-owned.
+[plan.work.cargo-command-policy]
+scope = "repository"
+paths = [
+  ".github/**/*.yaml",
+  ".github/**/*.yml",
+  "docs/**/*.md",
+  "scripts/**/*.sh",
+  "scripts/**/*.py",
+  "src/**/*.rs",
+  "tests/**/*.rs",
   "justfile",
-  "deny.toml",
-  "rust-toolchain.toml",
+]
+
+[plan.work.installers]
+scope = "repository"
+paths = ["install.ps1", "install.sh", "scripts/ci/check-installers.sh"]
+
+[plan.work."docs.generated"]
+scope = "repository"
+paths = [
+  "src/commands/cli.rs",
+  "scripts/docs/**",
+  "tests/compatibility/manifest.json",
+  "distribution/release-targets.json",
+]
+
+[plan.work.compiler-fact-driver]
+scope = "repository"
+paths = [
+  "tools/compiler-fact-driver/**",
+  "scripts/check-compiler-fact-driver.sh",
+  "scripts/with-compiler-fact-driver.sh",
+  "src/compiler/**",
   "rustfmt.toml",
-  ".config/nextest.toml",
-  "Cargo.toml",
-  "Cargo.lock",
+]
+
+[plan.work.compatibility]
+scope = "variants"
+cargo = ["cargo.build", "cargo.test"]
+paths = [
+  ".github/workflows/compatibility.yaml",
+  "scripts/ci/run-compatibility.py",
+  "scripts/ci/run-filesystem-compatibility.py",
+  "scripts/ci/support-matrix.py",
+  "tests/compatibility/**",
+]
+variant_catalog = "distribution/compatibility-plan-variants.json"
+
+[plan.work.release-archives]
+scope = "variants"
+paths = [
+  ".github/workflows/release-archives.yaml",
+  "distribution/release-targets.json",
+  "scripts/install.*",
+  "scripts/package-release-archive.py",
+  "scripts/ci/support-matrix.py",
+  "scripts/ci/verify-release-components.py",
+  "src/main.rs",
+  "tools/compiler-fact-driver/**",
+]
+variant_catalog = "distribution/release-archive-plan-variants.json"
+
+[plan.work.action-pins]
+scope = "repository"
+paths = [
+  ".github/actions-lock.yaml",
+  ".github/**/*.yaml",
+  ".github/**/*.yml",
+  "scripts/ci/pin-actions.sh",
 ]

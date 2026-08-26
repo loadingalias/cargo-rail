@@ -64,6 +64,9 @@ ssh-collect-distributed-execution target run_id destination:
 check:
     @scripts/check/check.sh
 
+check-affected:
+    @scripts/check/check.sh --affected
+
 check-compiler-fact-driver:
     @scripts/check-compiler-fact-driver.sh
 
@@ -93,6 +96,12 @@ build-all:
 
 bench-unify packages="25" runs="10":
     @scripts/bench/unify.sh "{{ packages }}" "{{ runs }}"
+
+bench-plan runs="20":
+    @if command -v python3 >/dev/null 2>&1; then python3 scripts/bench/plan.py run "{{ runs }}"; else python scripts/bench/plan.py run "{{ runs }}"; fi
+
+bench-plan-smoke:
+    @if command -v python3 >/dev/null 2>&1; then python3 scripts/bench/plan.py smoke; else python scripts/bench/plan.py smoke; fi
 
 bench-native-cache runs:
     @scripts/bench/native-cache.sh run "{{ runs }}"
@@ -244,7 +253,7 @@ gen-fixture members output:
 # Explainability
 
 plan:
-    cargo run --quiet --locked --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail plan --merge-base -f json
+    cargo run --quiet --locked --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail plan --json
 
 # Maintenance
 

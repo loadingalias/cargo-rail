@@ -1,48 +1,31 @@
-# Planning and Execution: With Task Runner
+# Planning and Execution: With a Task Runner
 
-Use this pattern when your repository already has `just`, `make`, `xtask`, or scripts. Cargo-Rail emits surface scope;
-the task runner maps it to repository-specific commands.
+Use this pattern when the repository already has `just`, `make`, `xtask`, or scripts. Cargo-Rail decides named work;
+the task runner keeps command semantics.
 
 ```bash
 cargo rail --config examples/planning/with-task-runner/rail.toml config validate --strict
+cargo rail --config examples/planning/with-task-runner/rail.toml plan --json > target/plan-v8.json
 ```
 
 ## Local example
 
 ```bash
-PLAN=$(cargo rail --config examples/planning/with-task-runner/rail.toml plan --merge-base -f json)
-TEST_SCOPE=$(echo "$PLAN" | jq -c '.surfaces.test.scope')
+if [ "$(scripts/plan/read.py is-required target/plan-v8.json cargo.test)" = "true" ]; then
+  CARGO_ARGS=()
+  while IFS= read -r -d '' argument; do
+    CARGO_ARGS+=("$argument")
+  done < <(scripts/plan/read.py cargo-args target/plan-v8.json cargo.test)
+  cargo xtask test "${CARGO_ARGS[@]}"
+fi
 
-if echo "$PLAN" | jq -e '.surfaces.test.enabled' > /dev/null; then
-  if echo "$TEST_SCOPE" | jq -e '.mode == "workspace"' > /dev/null; then
-    cargo xtask test --workspace
-  elif echo "$TEST_SCOPE" | jq -e '.mode == "crates"' > /dev/null; then
-    echo "$TEST_SCOPE" | jq -r '.crates[]' | xargs cargo xtask test
-  fi
+if [ "$(scripts/plan/read.py is-required target/plan-v8.json themes)" = "true" ]; then
+  cargo xtask validate-themes
 fi
 ```
 
-## CI example
+## CI boundary
 
-```yaml
-- uses: loadingalias/cargo-rail-action@47e86bde928ce420b85efa5f8d3b5feb96fd0ffc # v7.0.0
-  id: rail
-  with:
-    mode: debug
-    version: 0.23.0
-
-- name: Run targeted tests
-  if: steps.rail.outputs.test == 'true'
-  env:
-    PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
-  run: |
-    TEST_SCOPE=$(jq -c '.surfaces.test.scope' "$PLAN_FILE")
-    MODE=$(echo "$TEST_SCOPE" | jq -r '.mode')
-    if [ "$MODE" = "workspace" ]; then
-      cargo xtask test --workspace
-    elif [ "$MODE" = "crates" ]; then
-      echo "$TEST_SCOPE" | jq -r '.crates[]' | xargs cargo xtask test
-    fi
-```
-
-Execute the selected surface's `scope`. Do not reconstruct it from `impact`.
+Transfer the exact plan as an artifact. Every execution job validates contract v8, verifies checkout `HEAD` against
+`inputs.head_commit`, and consumes only its registered work decision. Do not reconstruct work from changed paths or
+evidence descriptions.

@@ -1,13 +1,13 @@
 //! Typed `rail.toml` configuration and discovery.
 
-mod change_detection;
+pub(crate) mod plan;
 mod release;
 pub(crate) mod schema;
 mod split;
 mod surface;
 mod unify;
 
-pub use change_detection::{ChangeDetectionConfig, ConfidenceProfile, UnknownFilePolicy};
+pub use plan::{PlanConfig, PlanWorkConfig, PlanWorkScope};
 pub use release::{
     ChangelogConfig, ChangelogFilters, ChangelogRelativeTo, ChangelogShape, CommitPolicy, CrateReleaseConfig,
     GroupSpec, Pre1BreakingBump, ReleaseConfig, ReleaseRegistryPublication, ReleaseRemoteEffects, ReleaseSource,
@@ -32,11 +32,13 @@ use std::path::{Path, PathBuf};
 
 pub(crate) const REMOVED_RUN_CONFIG_MESSAGE: &str = "[run] configuration is no longer supported; execute Cargo and cargo-nextest directly, keep repository tasks in Just or CI, and consume typed package scope from `cargo rail plan`";
 pub(crate) const REMOVED_CACHE_CONFIG_MESSAGE: &str = "[cache] repository configuration is no longer supported; select optional L2 authority from machine or CI state with CARGO_RAIL_CACHE_REMOTE";
+pub(crate) const REMOVED_CHANGE_DETECTION_CONFIG_MESSAGE: &str = "[change-detection] configuration is no longer supported; declare positive inputs for repository-owned work under [plan.work.NAME], use per-work evidence completeness for Cargo work, then run `cargo rail config migrate` to remove the retired table";
 
 pub(crate) fn reject_removed_configuration(doc: &toml_edit::DocumentMut) -> Result<(), String> {
     for (name, message) in [
         ("run", REMOVED_RUN_CONFIG_MESSAGE),
         ("cache", REMOVED_CACHE_CONFIG_MESSAGE),
+        ("change-detection", REMOVED_CHANGE_DETECTION_CONFIG_MESSAGE),
     ] {
         if doc.as_table().contains_key(name) {
             return Err(message.to_string());
@@ -59,12 +61,12 @@ pub struct RailConfig {
     /// Release management settings
     #[serde(default)]
     pub release: ReleaseConfig,
-    /// Change detection settings (for planner classification)
-    #[serde(default, rename = "change-detection")]
-    pub change_detection: ChangeDetectionConfig,
     /// Rust source-surface analysis policy
     #[serde(default)]
     pub surface: SurfaceConfig,
+    /// Input-only declarations for repository-owned planner work.
+    #[serde(default)]
+    pub plan: PlanConfig,
     /// Per-crate configuration (overrides workspace defaults)
     #[serde(default)]
     pub crates: BTreeMap<String, CrateConfig>,
@@ -98,6 +100,28 @@ pub enum ConfigLoadResult {
 }
 
 impl RailConfig {
+    pub(crate) fn parse_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let content = std::str::from_utf8(bytes).map_err(|error| format!("file is not valid UTF-8: {error}"))?;
+        let doc: toml_edit::DocumentMut = content
+            .parse()
+            .map_err(|error: toml_edit::TomlError| error.to_string())?;
+        reject_removed_configuration(&doc)?;
+        toml_edit::de::from_document(doc).map_err(|error| error.to_string())
+    }
+
+    /// Parse a captured historical configuration after removing tables that
+    /// have no authority in the current planner contract.
+    pub(crate) fn parse_historical_planning_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let content = std::str::from_utf8(bytes).map_err(|error| format!("file is not valid UTF-8: {error}"))?;
+        let mut doc: toml_edit::DocumentMut = content
+            .parse()
+            .map_err(|error: toml_edit::TomlError| error.to_string())?;
+        for retired in ["run", "cache", "change-detection"] {
+            doc.as_table_mut().remove(retired);
+        }
+        Self::parse_bytes(doc.to_string().as_bytes())
+    }
+
     fn parse_path(path: &Path) -> Result<(Self, Vec<u8>), String> {
         let bytes = fs::read(path).map_err(|error| format!("failed to read file: {error}"))?;
         let content = std::str::from_utf8(&bytes).map_err(|error| format!("file is not valid UTF-8: {error}"))?;

@@ -39,7 +39,7 @@ fn plan_diagnostics_are_out_of_band_and_count_real_boundaries() {
         ws.modify_file("member-a", "src/lib.rs", "pub fn changed() {}\n")?;
         ws.commit("Change member-a")?;
 
-        let args = ["rail", "plan", "--since", "HEAD~1", "--format", "json"];
+        let args = ["rail", "plan", "--since", "HEAD~1", "--json"];
         let expected = run_cargo_rail(&ws.path, &args)?;
         ensure!(expected.status.success(), "warm-up plan failed");
 
@@ -54,8 +54,7 @@ fn plan_diagnostics_are_out_of_band_and_count_real_boundaries() {
                 "plan",
                 "--since",
                 "HEAD~1",
-                "--format",
-                "json",
+                "--json",
             ],
         )?;
 
@@ -90,13 +89,18 @@ fn plan_diagnostics_are_out_of_band_and_count_real_boundaries() {
         assert_eq!(counters["target_view_loads"], 0);
         assert!(counters["hash_operations"].as_u64().is_some_and(|count| count >= 3));
         assert!(counters["hash_input_bytes"].as_u64().is_some_and(|bytes| bytes > 0));
-        assert!(
-            counters["hashed_file_bytes_read"]
-                .as_u64()
-                .is_some_and(|bytes| bytes > 0)
+        assert_eq!(
+            counters["hashed_file_bytes_read"], 0,
+            "a committed one-file plan must use captured Git object identities without hashing tracked files"
         );
-        assert_eq!(counters["git_subprocesses"], 11);
-        assert_eq!(counters["graph_traversals"], 1);
+        assert!(
+            counters["git_subprocesses"].as_u64().is_some_and(|count| count <= 10),
+            "sparse planning must improve on the 11-process v7 capture baseline"
+        );
+        assert_eq!(
+            counters["graph_traversals"], 6,
+            "each independently scoped Cargo work kind must query its own propagation domain"
+        );
         assert!(counters["graph_node_visits"].as_u64().is_some_and(|count| count >= 2));
         assert!(counters["graph_edge_visits"].as_u64().is_some_and(|count| count >= 1));
         Ok(())
@@ -207,8 +211,7 @@ fn snapshot_identity_records_credential_capability_not_raw_token_material() {
                     "plan",
                     "--since",
                     "HEAD",
-                    "--format",
-                    "json",
+                    "--json",
                 ])
                 .output()?)
         };
@@ -272,8 +275,7 @@ fn unify_diagnostics_distinguish_base_and_target_metadata_loads() {
                 diagnostics.to_str().context("non-UTF-8 diagnostics path")?,
                 "unify",
                 "--check",
-                "--format",
-                "json",
+                "--json",
             ],
         )?;
         ensure!(

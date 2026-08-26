@@ -6,23 +6,20 @@ command.
 ## Planning selected the wrong work
 
 ```bash
-cargo rail plan --merge-base --explain
-cargo rail plan --merge-base -f json
+cargo rail plan --explain
+cargo rail plan --json
 ```
 
 Read these fields in order:
 
-1. `inputs.refs` — did the plan compare the intended range?
-2. `files` — did it capture and classify the expected paths?
-3. `trace` — which ownership, semantic, graph, confidence, or fallback reason fired?
-4. `surfaces.NAME` — was the relevant surface enabled, and with which reason IDs?
-5. `surfaces.NAME.scope` — which packages belong to that surface?
+1. `inputs.base`, `inputs.head`, and `inputs.head_commit` — did the plan compare the intended states?
+2. `changes` — did it preserve the expected file, Cargo structural, and configuration deltas?
+3. `work.NAME.state` and `.cause` — is the named work required, skipped, forced, or evidence-bounded?
+4. `work.NAME.evidence` and top-level `evidence` — which exact proof records support the decision?
+5. `work.NAME.scope` — which packages, targets, or variants belong to required work?
 
-Use `scope` for combined execution and `surfaces.NAME.scope` for one surface. `impact` explains the decision; it is not
-execution scope. Historical `--from/--to` plans widen package work because Cargo cannot resolve an unchecked-out tree.
-
-If the plan is right but execution is wrong, inspect the Cargo or nextest command that consumed
-`surfaces.NAME.scope.cargo_args`. Command-specific flags belong to that tool. See [Planning](planning.md).
+Consume only one required work item's typed scope. Explanation and evidence fields are not execution input. If the plan
+is right but execution is wrong, inspect the Cargo, nextest, Just, script, or CI consumer. See [Planning](planning.md).
 
 ## Configuration is not what you expected
 
@@ -56,7 +53,7 @@ without starting analysis.
 For an unexpected gate or finding, inspect the planner, effective policy, and report authority separately:
 
 ```bash
-cargo rail plan --merge-base -f json | jq '.surfaces.surface'
+cargo rail plan --json | jq '.work.surface'
 cargo rail config explain -f json | jq '.fields[] | select(.path | startswith("surface."))'
 cargo rail surface --prepare -f json
 cargo rail surface --check -f json
@@ -191,9 +188,10 @@ Do not commit the conflict manually. Resume verifies the branch, parent, owned p
 
 ## CI and local plans differ
 
-Use the same base ref and confidence policy in both environments. `--merge-base` and `--since` are not interchangeable
-unless they resolve to the same commit. Compare `inputs.refs.resolved_base`, `inputs.confidence_profile`, and
-`inputs.config_fingerprint` in JSON output before inspecting package impact.
+Transfer the same plan whenever possible. When a machine must re-plan, use the same exact base, captured source, Cargo
+universe, toolchain, variant catalogs, and compatible evidence. Compare `inputs`, `changes`, and the top-level plan
+identity before inspecting individual work decisions. `--since` is an exact base override; the default resolves the
+default-branch merge base.
 
 ## Exit codes
 

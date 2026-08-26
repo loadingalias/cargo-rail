@@ -3,7 +3,6 @@
 mod helpers;
 mod test_cache_installation;
 mod test_check;
-mod test_classification;
 mod test_clean;
 mod test_compiler_observation;
 mod test_config;
@@ -11,7 +10,6 @@ mod test_distributed_compilation;
 mod test_error_handling;
 mod test_frontdoor_smoke;
 mod test_git_notes;
-mod test_hash;
 mod test_init;
 mod test_instrumentation;
 mod test_msrv;
@@ -21,7 +19,8 @@ mod test_output_contracts;
 mod test_ownership_index;
 mod test_plan;
 mod test_plan_apply;
-mod test_plan_classification_corpus;
+mod test_plan_consumers;
+mod test_plan_work_inventory;
 mod test_release_changelog;
 mod test_resolution_view;
 #[cfg(unix)]

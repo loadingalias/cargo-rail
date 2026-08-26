@@ -1,0 +1,48 @@
+{
+  "variant_catalog_version": 1,
+  "work": "release-archives",
+  "variants": [
+    {
+      "id": "aarch64-pc-windows-msvc",
+      "dimensions": { "target": "aarch64-pc-windows-msvc", "os": "windows-11-arm", "archive": "zip", "surface": true },
+      "paths": ["src/main.rs", "tools/compiler-fact-driver/**"],
+      "config": [],
+      "cargo": ["cargo.build"]
+    },
+    {
+      "id": "aarch64-unknown-linux-gnu",
+      "dimensions": { "target": "aarch64-unknown-linux-gnu", "os": "ubuntu-24.04-arm", "archive": "tar", "surface": true },
+      "paths": ["src/main.rs", "tools/compiler-fact-driver/**"],
+      "config": [],
+      "cargo": ["cargo.build"]
+    },
+    {
+      "id": "aarch64-unknown-linux-musl",
+      "dimensions": { "target": "aarch64-unknown-linux-musl", "os": "ubuntu-24.04-arm", "archive": "tar", "surface": false },
+      "paths": ["src/main.rs", "tools/compiler-fact-driver/**"],
+      "config": [],
+      "cargo": ["cargo.build"]
+    },
+    {
+      "id": "x86-64-pc-windows-msvc",
+      "dimensions": { "target": "x86_64-pc-windows-msvc", "os": "windows-2022", "archive": "zip", "surface": true },
+      "paths": ["src/main.rs", "tools/compiler-fact-driver/**"],
+      "config": [],
+      "cargo": ["cargo.build"]
+    },
+    {
+      "id": "x86-64-unknown-linux-gnu",
+      "dimensions": { "target": "x86_64-unknown-linux-gnu", "os": "ubuntu-22.04", "archive": "tar", "surface": true },
+      "paths": ["src/main.rs", "tools/compiler-fact-driver/**"],
+      "config": [],
+      "cargo": ["cargo.build"]
+    },
+    {
+      "id": "x86-64-unknown-linux-musl",
+      "dimensions": { "target": "x86_64-unknown-linux-musl", "os": "ubuntu-22.04", "archive": "tar", "surface": false },
+      "paths": ["src/main.rs", "tools/compiler-fact-driver/**"],
+      "config": [],
+      "cargo": ["cargo.build"]
+    }
+  ]
+}

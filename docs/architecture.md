@@ -10,7 +10,7 @@ Cargo-Rail has six workflows:
 | Workflow             | Authority                                                        | Result                                                         |
 | -------------------- | ---------------------------------------------------------------- | -------------------------------------------------------------- |
 | `unify`              | Resolved Cargo graph plus compiler evidence                      | A checked or applied manifest mutation plan                    |
-| `plan`               | Changed source plus the declared dependency universe             | Selected surfaces and typed package scopes                     |
+| `plan`               | Captured changes, Cargo structure, declared and observed inputs  | Evidence-backed named work with typed scopes                   |
 | `surface`            | Authenticated compiler facts plus exact compiler-crate authority | Reachability findings or exact visibility mutations            |
 | caching              | Exact compiler inputs and verified result bytes                  | Diagnostic reuse or one compiler-result restore                |
 | `change` / `release` | Reviewed change intent plus exact Git and registry state         | Versions, changelogs, publications, and durable recovery state |
@@ -34,12 +34,16 @@ inputs before mutation. Commands derive narrower views from the context instead 
 
 ## Planning and direct consumption
 
-`plan` owns change classification, crate ownership, conservative reverse dependency impact, surface selection, and
-package scope. Its declared dependency universe includes optional and target-gated edges without changing the exact
-Cargo graph. Cargo, cargo-nextest, Just, and CI consume each surface's final `cargo_args` array directly.
+`planning/` preserves typed source and configuration changes, evaluates Cargo target membership and dependency domains,
+and produces one decision for every code-owned or repository-declared work item. Its dependency universe includes
+optional and target-gated edges without changing the exact Cargo graph. Compatible compiler observations can prove a
+bounded Cargo skip; incomplete observations require only their owning work. A source-bound portable base package,
+target, and conservative-edge model can narrow removed-member history while unsupported resolver semantics remain an
+explicit workspace fallback.
 
-Text explanations, JSON, schema, hashing, and GitHub projections all come from this protocol. See
-[Planning](planning.md).
+Cargo, cargo-nextest, Just, scripts, and CI consume each required work item's typed scope directly. Text and JSON are
+projections of that same decision model, and the GitHub workflow transfers the schema-owned JSON plan as an artifact.
+See [Planning](planning.md).
 
 ## Mutation and external effects
 
@@ -105,7 +109,8 @@ belong to `cache/`; compiler sessions and evidence remain in `compiler/`.
 | ------------------------------------------ | ---------------------------------------------------------------------------------------------- |
 | `workspace/`, `source/`                    | Captured authority and derived workspace views                                                 |
 | `cargo/`, `graph/`, `toml/`                | Cargo resolution, graph algorithms, and lossless editing                                       |
-| `change_detection/`, `commands/plan.rs`    | File semantics, impact, surfaces, and scope                                                    |
+| `planning/`, `change_detection/semantic.rs` | Typed changes, evidence, work evaluation, Cargo impact, and selectors                          |
+| `commands/plan.rs`                         | Comparison validation and text/JSON rendering selection                                        |
 | `surface.rs`, `commands/surface.rs`        | Rust declaration reachability, diagnostic policy, exact visibility plans, and reports          |
 | `compiler/`                                | Pre-Clap compiler invocation, sessions, observations, diagnostics, and native-result decisions |
 | `cache/`                                   | Shared immutable CAS primitives, retained output manifests, measurement, and reclamation       |

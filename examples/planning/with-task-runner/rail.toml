@@ -4,8 +4,9 @@
 # Strategy: cargo rail plan provides the execution scope,
 # your task runner handles execution.
 
-[change-detection]
-infrastructure = [
+[plan.work.repository-validation]
+scope = "repository"
+paths = [
   ".github/**",
   "scripts/**",
   "justfile",
@@ -16,11 +17,15 @@ infrastructure = [
   "Cargo.toml",
   "Cargo.lock",
 ]
-confidence_profile = "balanced"
-unknown_file_policy = "strict"
 
-# Custom surfaces for non-Rust assets
-[change-detection.custom]
-themes = ["runtime/themes/**"]
-queries = ["runtime/queries/**"]
-book = ["book/**"]
+[plan.work.themes]
+scope = "repository"
+paths = ["runtime/themes/**"]
+
+[plan.work.queries]
+scope = "repository"
+paths = ["runtime/queries/**"]
+
+[plan.work.book]
+scope = "repository"
+paths = ["book/**"]

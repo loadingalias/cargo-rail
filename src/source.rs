@@ -325,6 +325,14 @@ impl ChangeSet {
     }
 }
 
+/// Root-independent identity of one captured source path's contents and mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SourceContentIdentity {
+    GitObject { object_id: String, mode: String },
+    Sha256 { digest: String, executable: bool },
+    Symlink { target: String },
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SourceExclusions(Vec<RepositoryPath>);
 
@@ -394,10 +402,6 @@ impl SourceExclusions {
     fn contains(&self, path: &RepositoryPath) -> bool {
         self.0.iter().any(|root| path_is_within(path, root))
     }
-
-    pub(crate) fn contains_path(&self, path: &Path) -> RailResult<bool> {
-        Ok(self.contains(&RepositoryPath::new(path)?))
-    }
 }
 
 enum ResolvedExclusionRoot {
@@ -449,6 +453,243 @@ pub struct GitWorktreeCapture {
     state: GitCaptureState,
     filesystem: Vec<FilesystemObservation>,
     exclusions: SourceExclusions,
+}
+
+/// Sparse immutable Git capture for change planning.
+///
+/// The index supplies exact identities for clean tracked files. Only paths that
+/// differ from the index are read and hashed during capture; evaluator-requested
+/// clean files are loaded later from their captured Git object IDs. This keeps
+/// planning bound to one Git/worktree moment without materializing a complete
+/// content-hashed source tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlanningSourceCapture {
+    state: GitCaptureState,
+    files: BTreeMap<RepositoryPath, PlanningFileCapture>,
+    exclusions: SourceExclusions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlanningFileCapture {
+    entry: Option<SourceTreeEntry>,
+    observation: Option<FilesystemObservation>,
+    bytes: Option<Arc<[u8]>>,
+}
+
+impl PlanningSourceCapture {
+    pub(crate) fn capture_excluding(git: &SystemGit, generated_roots: &[PathBuf]) -> RailResult<Self> {
+        let exclusions = SourceExclusions::from_absolute_roots(git, generated_roots)?;
+        let state = read_planning_capture_state(git, &exclusions)?;
+        let files = capture_planning_files(git, state.status.provenance.keys())?;
+        Ok(Self {
+            state,
+            files,
+            exclusions,
+        })
+    }
+
+    pub(crate) fn exclude_generated_roots(&mut self, git: &SystemGit, generated_roots: &[PathBuf]) -> RailResult<()> {
+        self.exclusions.extend_absolute_roots(git, generated_roots)?;
+        self.state.index.retain(|entry| !self.exclusions.contains(&entry.path));
+        self.state
+            .status
+            .provenance
+            .retain(|path, _| !self.exclusions.contains(path));
+        self.state
+            .status
+            .untracked
+            .retain(|path| !self.exclusions.contains(path));
+        self.files.retain(|path, _| !self.exclusions.contains(path));
+        Ok(())
+    }
+
+    pub(crate) fn is_indexed(&self, path: &RepositoryPath) -> bool {
+        self.state.index.binary_search_by(|entry| entry.path.cmp(path)).is_ok()
+    }
+
+    pub(crate) fn head_commit(&self) -> &str {
+        &self.state.head
+    }
+
+    pub(crate) fn is_untracked(&self, path: &RepositoryPath) -> bool {
+        self.state.status.untracked.binary_search(path).is_ok()
+    }
+
+    pub(crate) fn validate_unchanged(&self, git: &SystemGit) -> RailResult<()> {
+        ensure_planning_capture_state_unchanged(git, &self.state, &self.exclusions)?;
+        let mut validated_directories = BTreeSet::new();
+        for (path, expected) in &self.files {
+            let current = capture_filesystem_entry(
+                &git.worktree_root,
+                path,
+                expected.observation.as_ref().and_then(|entry| entry.index_kind),
+                &mut validated_directories,
+                GIT_CAPTURE_DRIFT_HELP,
+            )?;
+            match (expected.entry.as_ref(), expected.observation.as_ref(), current) {
+                (None, None, None) => {}
+                (Some(entry), Some(observation), Some(current))
+                    if current.entry == *entry && current.observation.metadata == observation.metadata => {}
+                _ => {
+                    return Err(capture_drift_error(format!(
+                        "source file '{}' changed during capture",
+                        path
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn changes_from(&self, git: &SystemGit, base: &str) -> RailResult<ChangeSet> {
+        let mut final_changes = read_diff(git, base, None, &self.exclusions)?;
+        if !self.state.status.untracked.is_empty() {
+            merge_sparse_untracked_changes(&mut final_changes, &self.state.status.untracked);
+        }
+
+        let mut provenance = self.state.status.provenance.clone();
+        if provenance.is_empty() {
+            mark_provenance(&mut provenance, &final_changes, ChangeLayer::Committed);
+        } else {
+            let committed = read_diff(git, base, Some("HEAD"), &self.exclusions)?;
+            mark_provenance(&mut provenance, &committed, ChangeLayer::Committed);
+            for change in &final_changes {
+                if !provenance.contains_key(&change.path) {
+                    provenance
+                        .entry(change.path.clone())
+                        .or_default()
+                        .insert(ChangeLayer::Unstaged);
+                }
+            }
+        }
+        Ok(build_change_set(final_changes, provenance))
+    }
+
+    pub(crate) fn read_current_files(&self, git: &SystemGit, paths: &[RepositoryPath]) -> RailResult<Vec<Vec<u8>>> {
+        let mut result = vec![None; paths.len()];
+        let mut pending = Vec::new();
+        for (position, path) in paths.iter().enumerate() {
+            if self.exclusions.contains(path) {
+                result[position] = Some(Vec::new());
+                continue;
+            }
+            if let Some(captured) = self.files.get(path) {
+                let bytes = match (&captured.entry, &captured.bytes) {
+                    (None, None) => Vec::new(),
+                    (
+                        Some(SourceTreeEntry {
+                            kind: SourceEntryKind::RegularFile { .. },
+                            ..
+                        }),
+                        Some(bytes),
+                    ) => bytes.to_vec(),
+                    (
+                        Some(SourceTreeEntry {
+                            kind: SourceEntryKind::Symlink { .. },
+                            ..
+                        }),
+                        _,
+                    ) => {
+                        return Err(RailError::with_help(
+                            format!("cannot parse sparse planning input '{}' through a symbolic link", path),
+                            "replace the planning input with a regular file",
+                        ));
+                    }
+                    _ => {
+                        return Err(RailError::message(format!(
+                            "sparse planning input '{}' has inconsistent captured bytes",
+                            path
+                        )));
+                    }
+                };
+                result[position] = Some(bytes);
+                continue;
+            }
+            match self.state.index.binary_search_by(|entry| entry.path.cmp(path)) {
+                Ok(index) => pending.push((position, self.state.index[index].object_id.as_str())),
+                Err(_) => result[position] = Some(Vec::new()),
+            }
+        }
+
+        if !pending.is_empty() {
+            let object_ids = pending.iter().map(|(_, object)| *object).collect::<Vec<_>>();
+            let blobs = git.read_blobs_bulk(&object_ids)?;
+            for ((position, _), bytes) in pending.into_iter().zip(blobs) {
+                result[position] = Some(bytes);
+            }
+        }
+        result
+            .into_iter()
+            .map(|bytes| bytes.ok_or_else(|| RailError::message("sparse planning file read was not resolved")))
+            .collect()
+    }
+
+    pub(crate) fn identity(&self) -> ContentDigest {
+        let mut framed = Vec::new();
+        append_source_identity_frame(&mut framed, b"head", self.state.head.as_bytes());
+        for entry in &self.state.index {
+            append_source_identity_frame(&mut framed, b"path", entry.path.as_str().as_bytes());
+            append_source_identity_frame(&mut framed, b"object", entry.object_id.as_bytes());
+            append_source_identity_frame(
+                &mut framed,
+                b"mode",
+                match entry.kind {
+                    IndexKind::RegularFile { executable: false } => b"100644",
+                    IndexKind::RegularFile { executable: true } => b"100755",
+                    IndexKind::Symlink => b"120000",
+                },
+            );
+        }
+        for (path, file) in &self.files {
+            if is_credential_config_path(path) {
+                continue;
+            }
+            append_source_identity_frame(&mut framed, b"dirty-path", path.as_str().as_bytes());
+            match file.entry.as_ref().map(|entry| &entry.kind) {
+                Some(SourceEntryKind::RegularFile { digest, executable }) => {
+                    append_source_identity_frame(&mut framed, b"dirty-content", digest.as_bytes());
+                    append_source_identity_frame(&mut framed, b"dirty-executable", &[u8::from(*executable)]);
+                }
+                Some(SourceEntryKind::Symlink { target }) => {
+                    append_source_identity_frame(&mut framed, b"dirty-symlink", target.as_bytes());
+                }
+                Some(SourceEntryKind::Deleted) | None => {
+                    append_source_identity_frame(&mut framed, b"dirty-state", b"absent");
+                }
+            }
+        }
+        ContentDigest::sha256(&framed)
+    }
+
+    pub(crate) fn current_content_identity(&self, path: &RepositoryPath) -> Option<SourceContentIdentity> {
+        if self.exclusions.contains(path) {
+            return None;
+        }
+        if let Some(file) = self.files.get(path) {
+            return match file.entry.as_ref().map(|entry| &entry.kind) {
+                Some(SourceEntryKind::RegularFile { digest, executable }) => Some(SourceContentIdentity::Sha256 {
+                    digest: digest.to_string(),
+                    executable: *executable,
+                }),
+                Some(SourceEntryKind::Symlink { target }) => {
+                    Some(SourceContentIdentity::Symlink { target: target.clone() })
+                }
+                Some(SourceEntryKind::Deleted) | None => None,
+            };
+        }
+        let index = self.state.index.binary_search_by(|entry| entry.path.cmp(path)).ok()?;
+        let entry = &self.state.index[index];
+        Some(SourceContentIdentity::GitObject {
+            object_id: entry.object_id.clone(),
+            mode: entry.kind.mode().to_string(),
+        })
+    }
+}
+
+fn is_credential_config_path(path: &RepositoryPath) -> bool {
+    matches!(path.as_str(), ".cargo/config" | ".cargo/config.toml")
+        || path.as_str().ends_with("/.cargo/config")
+        || path.as_str().ends_with("/.cargo/config.toml")
 }
 
 impl GitWorktreeCapture {
@@ -632,6 +873,16 @@ enum IndexKind {
     Symlink,
 }
 
+impl IndexKind {
+    fn mode(self) -> &'static str {
+        match self {
+            Self::RegularFile { executable: false } => "100644",
+            Self::RegularFile { executable: true } => "100755",
+            Self::Symlink => "120000",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct IndexEntry {
     path: RepositoryPath,
@@ -732,6 +983,12 @@ fn read_git_capture_state(git: &SystemGit, exclusions: &SourceExclusions) -> Rai
     })
 }
 
+fn read_planning_capture_state(git: &SystemGit, exclusions: &SourceExclusions) -> RailResult<GitCaptureState> {
+    let index = read_index(git, exclusions)?;
+    let (head, status) = read_worktree_status_with_head(git, exclusions)?;
+    Ok(GitCaptureState { head, index, status })
+}
+
 fn ensure_git_capture_state_unchanged(
     git: &SystemGit,
     expected: &GitCaptureState,
@@ -750,6 +1007,34 @@ fn ensure_git_capture_state_unchanged(
     }
     if status != expected.status {
         return Err(capture_drift_error("Git worktree status changed during source capture"));
+    }
+    Ok(())
+}
+
+fn ensure_planning_capture_state_unchanged(
+    git: &SystemGit,
+    expected: &GitCaptureState,
+    exclusions: &SourceExclusions,
+) -> RailResult<()> {
+    // Porcelain v2 reports HEAD plus every staged/unstaged/untracked delta in
+    // one snapshot. Equality with the initial status proves that no content or
+    // mode mutation relevant to planning appeared while Cargo metadata loaded;
+    // clean index entries remain bound by their initially captured object IDs.
+    let (head, status) = read_worktree_status_with_head(git, exclusions)?;
+    if head != expected.head {
+        return Err(capture_drift_error("Git HEAD changed during source capture"));
+    }
+    if status != expected.status {
+        let path = expected
+            .status
+            .provenance
+            .keys()
+            .chain(status.provenance.keys())
+            .find(|path| expected.status.provenance.get(*path) != status.provenance.get(*path));
+        return Err(path.map_or_else(
+            || capture_drift_error("Git worktree status changed during source capture"),
+            |path| capture_drift_error(format!("source file '{}' changed during capture", path)),
+        ));
     }
     Ok(())
 }
@@ -853,12 +1138,41 @@ fn read_worktree_status(git: &SystemGit, exclusions: &SourceExclusions) -> RailR
     parse_worktree_status(&output.stdout, exclusions)
 }
 
+fn read_worktree_status_with_head(
+    git: &SystemGit,
+    exclusions: &SourceExclusions,
+) -> RailResult<(String, WorktreeStatus)> {
+    let output =
+        git.run_git_at_worktree_root(&["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"])?;
+    let (head, status) = parse_worktree_status_records(&output.stdout, exclusions)?;
+    let head = head.ok_or_else(|| RailError::message("Git status did not report a branch object identity"))?;
+    Ok((head, status))
+}
+
 fn parse_worktree_status(output: &[u8], exclusions: &SourceExclusions) -> RailResult<WorktreeStatus> {
+    Ok(parse_worktree_status_records(output, exclusions)?.1)
+}
+
+fn parse_worktree_status_records(
+    output: &[u8],
+    exclusions: &SourceExclusions,
+) -> RailResult<(Option<String>, WorktreeStatus)> {
     let mut status = WorktreeStatus::default();
+    let mut head = None;
     let mut records = output.split(|byte| *byte == 0).filter(|record| !record.is_empty());
     while let Some(record) = records.next() {
         let text = std::str::from_utf8(record).map_err(|_| RailError::message("Git status path is not valid UTF-8"))?;
         match record.first().copied() {
+            Some(b'#') => {
+                if let Some(oid) = text.strip_prefix("# branch.oid ") {
+                    if oid == "(initial)" {
+                        return Err(RailError::message(
+                            "cannot capture planning state before the first Git commit",
+                        ));
+                    }
+                    head = Some(oid.to_string());
+                }
+            }
             Some(b'1') => {
                 let fields: Vec<&str> = text.splitn(9, ' ').collect();
                 if fields.len() != 9 || fields[1].len() != 2 {
@@ -909,7 +1223,7 @@ fn parse_worktree_status(output: &[u8], exclusions: &SourceExclusions) -> RailRe
     }
     status.untracked.sort();
     status.untracked.dedup();
-    Ok(status)
+    Ok((head, status))
 }
 
 fn mark_status_path(
@@ -1173,6 +1487,88 @@ fn capture_final_tree(
     }
 
     Ok((SourceTree::new(entries)?, filesystem))
+}
+
+fn capture_planning_files<'a>(
+    git: &SystemGit,
+    paths: impl Iterator<Item = &'a RepositoryPath>,
+) -> RailResult<BTreeMap<RepositoryPath, PlanningFileCapture>> {
+    let mut files = BTreeMap::new();
+    let mut validated_directories = BTreeSet::new();
+    for path in paths {
+        let captured = capture_filesystem_entry(
+            &git.worktree_root,
+            path,
+            None,
+            &mut validated_directories,
+            GIT_CAPTURE_DRIFT_HELP,
+        )?;
+        let file = match captured {
+            Some(captured) => {
+                let bytes = if let SourceEntryKind::RegularFile { digest, .. } = captured.entry.kind {
+                    let bytes = fs::read(git.worktree_root.join(path.as_path())).map_err(|error| {
+                        capture_drift_error(format!("failed to retain sparse planning input '{}': {}", path, error))
+                    })?;
+                    crate::instrumentation::record_hashed_file_bytes_read(bytes.len());
+                    if ContentDigest::sha256(&bytes) != digest {
+                        return Err(capture_drift_error(format!(
+                            "source file '{}' changed during capture",
+                            path
+                        )));
+                    }
+                    Some(Arc::from(bytes))
+                } else {
+                    None
+                };
+                PlanningFileCapture {
+                    entry: Some(captured.entry),
+                    observation: Some(captured.observation),
+                    bytes,
+                }
+            }
+            None => PlanningFileCapture {
+                entry: None,
+                observation: None,
+                bytes: None,
+            },
+        };
+        files.insert(path.clone(), file);
+    }
+    Ok(files)
+}
+
+fn merge_sparse_untracked_changes(changes: &mut Vec<ParsedChange>, untracked: &[RepositoryPath]) {
+    let mut by_path = std::mem::take(changes)
+        .into_iter()
+        .map(|change| (change.path.clone(), change))
+        .collect::<BTreeMap<_, _>>();
+    for path in untracked {
+        match by_path.get_mut(path) {
+            Some(change) if change.kind == SourceChangeKind::Deleted => {
+                change.kind = SourceChangeKind::Modified;
+                change.relation = None;
+            }
+            Some(_) => {}
+            None => {
+                by_path.insert(
+                    path.clone(),
+                    ParsedChange {
+                        path: path.clone(),
+                        kind: SourceChangeKind::Added,
+                        relation: None,
+                    },
+                );
+            }
+        }
+    }
+    *changes = by_path.into_values().collect();
+}
+
+fn append_source_identity_frame(output: &mut Vec<u8>, tag: &[u8], value: &[u8]) {
+    output.extend_from_slice(&(tag.len() as u64).to_le_bytes());
+    output.extend_from_slice(tag);
+    output.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    output.extend_from_slice(value);
 }
 
 fn capture_git_tree(git: &SystemGit, revision: &str, exclusions: &SourceExclusions) -> RailResult<SourceTree> {
@@ -1528,6 +1924,24 @@ fn read_diff(
         }
     }
     Ok(changes)
+}
+
+/// Capture a rich, repository-relative change set between two Git objects.
+///
+/// This is the object-pair counterpart to [`PlanningSourceCapture::changes_from`]:
+/// it preserves rename/copy relations and committed provenance without reading
+/// either tree's file contents or consulting the checkout.
+pub(crate) fn changes_between_objects(
+    git: &SystemGit,
+    base: &str,
+    head: &str,
+    exclusions: &SourceExclusions,
+) -> RailResult<ChangeSet> {
+    let mut changes = read_diff(git, base, Some(head), exclusions)?;
+    changes.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    let mut provenance = BTreeMap::new();
+    mark_provenance(&mut provenance, &changes, ChangeLayer::Committed);
+    Ok(build_change_set(changes, provenance))
 }
 
 fn parse_name_status(output: &[u8]) -> RailResult<Vec<ParsedChange>> {

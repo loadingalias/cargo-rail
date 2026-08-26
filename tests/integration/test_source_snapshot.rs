@@ -347,7 +347,7 @@ fn plan_excludes_ignored_and_default_generated_state_without_hiding_named_source
             std::fs::write(path, content)?;
         }
 
-        let output = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--format", "json"])?;
+        let output = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--json"])?;
         assert!(
             output.status.success(),
             "plan failed: stdout={} stderr={}",
@@ -355,7 +355,7 @@ fn plan_excludes_ignored_and_default_generated_state_without_hiding_named_source
             String::from_utf8_lossy(&output.stderr)
         );
         let plan: Value = serde_json::from_slice(&output.stdout)?;
-        let paths = plan["files"]
+        let paths = plan["changes"]["files"]
             .as_array()
             .expect("files should be an array")
             .iter()
@@ -391,7 +391,7 @@ fn plan_excludes_exact_custom_cargo_and_cargo_rail_roots_without_blanket_target_
             std::fs::write(path, content)?;
         }
 
-        let output = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--format", "json"])?;
+        let output = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--json"])?;
         assert!(
             output.status.success(),
             "plan failed: stdout={} stderr={}",
@@ -399,7 +399,7 @@ fn plan_excludes_exact_custom_cargo_and_cargo_rail_roots_without_blanket_target_
             String::from_utf8_lossy(&output.stderr)
         );
         let plan: Value = serde_json::from_slice(&output.stdout)?;
-        let paths = plan["files"]
+        let paths = plan["changes"]["files"]
             .as_array()
             .expect("files should be an array")
             .iter()
@@ -431,13 +431,10 @@ fn historical_plan_excludes_resolved_generated_roots_without_reading_worktree_st
         let head = ws.commit("Commit historical generated and source paths")?;
         std::fs::write(ws.path.join("untracked.txt"), "must not enter object comparison\n")?;
 
-        let output = run_cargo_rail(
-            &ws.path,
-            &["rail", "plan", "--from", &base, "--to", &head, "--format", "json"],
-        )?;
+        let output = run_cargo_rail(&ws.path, &["rail", "plan", "--from", &base, "--to", &head, "--json"])?;
         assert!(output.status.success());
         let plan: Value = serde_json::from_slice(&output.stdout)?;
-        let paths = plan["files"]
+        let paths = plan["changes"]["files"]
             .as_array()
             .expect("files should be an array")
             .iter()
@@ -599,7 +596,7 @@ fn plan_rejects_an_unmerged_index_with_actionable_diagnostics() {
         let unmerged = git(&ws.path, &["ls-files", "--unmerged", "--", "crates/demo/conflict.txt"])?;
         assert!(!unmerged.stdout.is_empty(), "fixture did not create an unmerged index");
 
-        let output = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--format", "json"])?;
+        let output = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--json"])?;
         assert_actionable_capture_error(
             &output,
             "cannot capture unmerged index entry 'crates/demo/conflict.txt'",
@@ -620,7 +617,7 @@ fn plan_rejects_an_unsupported_filesystem_object_with_actionable_diagnostics() -
     std::fs::remove_file(&unsupported)?;
     std::fs::create_dir(&unsupported)?;
 
-    let output = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--format", "json"])?;
+    let output = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--json"])?;
     assert_actionable_capture_error(
         &output,
         "cannot capture unsupported filesystem object 'crates/demo/tracked-object'",
@@ -642,7 +639,7 @@ fn plan_rejects_a_unix_socket_without_reading_it() -> Result<()> {
     std::fs::remove_file(&unsupported)?;
     let _listener = UnixListener::bind(&unsupported)?;
 
-    let output = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--format", "json"])?;
+    let output = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--json"])?;
     assert_actionable_capture_error(
         &output,
         "cannot capture unsupported filesystem object 'crates/demo/tracked-socket'",
@@ -660,6 +657,7 @@ fn plan_rejects_exact_file_drift_during_capture() {
         let crate_root = ws.add_crate("demo", "0.1.0", &[])?;
         std::fs::write(crate_root.join("a-victim.txt"), "before!!\n")?;
         ws.commit("Add deterministic capture-drift fixture")?;
+        std::fs::write(crate_root.join("a-victim.txt"), "during!!\n")?;
 
         let real_git = Command::new("sh").args(["-c", "command -v git"]).output()?;
         assert!(real_git.status.success(), "failed to resolve the real Git executable");
@@ -672,7 +670,7 @@ fn plan_rejects_exact_file_drift_during_capture() {
             &wrapper,
             r#"#!/bin/sh
 for argument in "$@"; do
-  if [ "$argument" = "ls-files" ]; then
+  if [ "$argument" = "status" ]; then
     count=0
     if [ -f "$CARGO_RAIL_TEST_DRIFT_COUNTER" ]; then
       IFS= read -r count < "$CARGO_RAIL_TEST_DRIFT_COUNTER"
@@ -680,7 +678,13 @@ for argument in "$@"; do
     count=$((count + 1))
     printf '%s\n' "$count" > "$CARGO_RAIL_TEST_DRIFT_COUNTER"
     if [ "$count" -eq 2 ]; then
+      output="$CARGO_RAIL_TEST_DRIFT_COUNTER-output"
+      "$CARGO_RAIL_TEST_REAL_GIT" "$@" > "$output"
+      result=$?
       printf 'after!!!\n' > "$CARGO_RAIL_TEST_DRIFT_FILE"
+      command cat "$output"
+      command rm "$output"
+      exit "$result"
     fi
     break
   fi
@@ -703,7 +707,7 @@ exec "$CARGO_RAIL_TEST_REAL_GIT" "$@"
             .env("CARGO_RAIL_TEST_REAL_GIT", real_git)
             .env("CARGO_RAIL_TEST_DRIFT_COUNTER", counter)
             .env("CARGO_RAIL_TEST_DRIFT_FILE", crate_root.join("a-victim.txt"))
-            .args(["rail", "plan", "--since", "HEAD", "--format", "json"])
+            .args(["rail", "plan", "--since", "HEAD", "--json"])
             .output()?;
         assert_actionable_capture_error(
             &output,

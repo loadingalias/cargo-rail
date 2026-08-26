@@ -262,7 +262,7 @@ fn equivalent_checkout_roots_have_the_same_versioned_snapshot_id() {
 }
 
 #[test]
-fn snapshot_id_binds_lossless_rail_and_semantic_cargo_configuration() {
+fn plan_identity_binds_lossless_rail_and_semantic_cargo_configuration() {
     let result: Result<()> = (|| {
         let workspace = TestWorkspace::new_named("snapshot-config-identity")?;
         workspace.add_crate("member", "0.1.0", &[])?;
@@ -274,7 +274,7 @@ fn snapshot_id_binds_lossless_rail_and_semantic_cargo_configuration() {
         workspace.commit("Add snapshot configuration fixture")?;
 
         let diagnostics = tempfile::tempdir()?;
-        let snapshot_id = |name: &str| -> Result<String> {
+        let plan_identity = |name: &str| -> Result<String> {
             let output_path = diagnostics.path().join(format!("{name}.json"));
             let output = run_cargo_rail(
                 &workspace.path,
@@ -285,8 +285,7 @@ fn snapshot_id_binds_lossless_rail_and_semantic_cargo_configuration() {
                     "plan",
                     "--since",
                     "HEAD",
-                    "--format",
-                    "json",
+                    "--json",
                 ],
             )?;
             anyhow::ensure!(
@@ -295,20 +294,20 @@ fn snapshot_id_binds_lossless_rail_and_semantic_cargo_configuration() {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
-            let counters: serde_json::Value = serde_json::from_slice(&std::fs::read(output_path)?)?;
-            Ok(counters["snapshot_id"]
+            let plan: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+            Ok(plan["identity"]
                 .as_str()
-                .context("diagnostics should contain a snapshot ID")?
+                .context("plan should contain a portable identity")?
                 .to_string())
         };
 
-        let first_id = snapshot_id("first")?;
+        let first_id = plan_identity("first")?;
         std::fs::write(workspace.path.join("rail.toml"), "# second lossless form\n")?;
-        assert_ne!(first_id, snapshot_id("changed-rail")?);
+        assert_ne!(first_id, plan_identity("changed-rail")?);
 
         std::fs::write(workspace.path.join("rail.toml"), "# first lossless form\n")?;
         std::fs::write(workspace.path.join(".cargo/config.toml"), "[net]\nretry = 3\n")?;
-        assert_ne!(first_id, snapshot_id("changed-cargo")?);
+        assert_ne!(first_id, plan_identity("changed-cargo")?);
         Ok(())
     })();
     super::helpers::finish_test(result);

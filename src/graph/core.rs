@@ -883,15 +883,6 @@ impl WorkspaceGraph {
             .collect()
     }
 
-    /// Map files to exact owning workspace packages.
-    pub(crate) fn files_to_package_ids(&self, file_paths: &[impl AsRef<Path>]) -> HashSet<PackageId> {
-        file_paths
-            .iter()
-            .filter_map(|path| self.file_to_package(path.as_ref()))
-            .map(|package| package.id.clone())
-            .collect()
-    }
-
     /// Find node index by crate name.
     fn find_node(&self, crate_name: &str) -> RailResult<NodeIndex> {
         let Some(matches) = self.workspace_name_index.get(crate_name) else {

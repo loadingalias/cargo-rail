@@ -21,8 +21,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 FIXTURE_ROOT = REPOSITORY_ROOT / "tests/compatibility/fixtures/front-door"
 MANIFEST_PATH = REPOSITORY_ROOT / "tests/compatibility/manifest.json"
 PACKAGE = "cargo-rail-compatibility-fixture"
-PLAN_CONTRACT_VERSION = 7
-SCOPE_CONTRACT_VERSION = 4
+PLAN_CONTRACT_VERSION = 8
 SCRUBBED_ENVIRONMENT = (
     "CARGO",
     "CARGO_BUILD_TARGET",
@@ -159,7 +158,7 @@ def initialize_workspace(destination: Path, env: dict[str, str]) -> None:
 
 def planner_scopes(cargo_rail: Path, workspace: Path, env: dict[str, str]) -> dict[str, tuple[str, ...]]:
     result = run(
-        [str(cargo_rail), "rail", "plan", "--since", "HEAD^", "--format", "json"],
+        [str(cargo_rail), "rail", "plan", "--since", "HEAD^", "--json"],
         cwd=workspace,
         env=env,
     )
@@ -167,14 +166,15 @@ def planner_scopes(cargo_rail: Path, workspace: Path, env: dict[str, str]) -> di
         plan = json.loads(result.stdout)
         if plan["plan_contract_version"] != PLAN_CONTRACT_VERSION:
             raise CompatibilityError("planner contract version changed")
-        if plan["scope"]["scope_contract_version"] != SCOPE_CONTRACT_VERSION:
-            raise CompatibilityError("planner scope contract version changed")
         scopes = {}
         for surface in ("build", "test"):
-            decision = plan["surfaces"][surface]
-            arguments = decision["scope"]["cargo_args"]
-            if decision["enabled"] is not True or not isinstance(arguments, list):
-                raise CompatibilityError(f"planner did not enable {surface}")
+            decision = plan["work"][f"cargo.{surface}"]
+            selection = decision["scope"]["selection"]
+            arguments = selection["cargo_args"]
+            if decision["state"] != "required" or decision["scope"]["kind"] != "cargo":
+                raise CompatibilityError(f"planner did not require cargo.{surface}")
+            if not isinstance(arguments, list):
+                raise CompatibilityError(f"planner omitted cargo.{surface} arguments")
             if not all(isinstance(argument, str) and argument for argument in arguments):
                 raise CompatibilityError(f"planner emitted an invalid {surface} Cargo argument")
             scopes[surface] = tuple(arguments)

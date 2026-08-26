@@ -65,8 +65,9 @@ consumer_scope = "workspace"
 [release]
 remote_effects = "auto"
 
-[change-detection.custom]
-verification = ["verification/**"]
+[plan.work.verification]
+scope = "repository"
+paths = ["verification/**"]
 ```
 
 ## Top-level fields
@@ -77,7 +78,7 @@ verification = ["verification/**"]
 | `unify`            | defaults | Dependency and manifest policy.                                                                                                          |
 | `surface`          | defaults | Rust declaration reachability, diagnostic, and visibility-repair policy.                                                                 |
 | `release`          | defaults | Release, changelog, and remote-effect policy.                                                                                            |
-| `change-detection` | defaults | Planner classification policy.                                                                                                           |
+| `plan`             | defaults | Positive input declarations for repository-owned work.                                                                                    |
 | `crates`           |     `{}` | Per-crate split, release, and changelog policy.                                                                                          |
 
 The old empty `[workspace]`, `[toolchain]`, and `[crates.NAME.sync]` tables had no behavior and are deprecated.
@@ -322,30 +323,38 @@ skip_types = ["chore", "ci"]
 exclude_paths = ["fixtures/**"]
 ```
 
-## `[change-detection]`
+## `[plan.work.NAME]`
 
-Cargo ownership and reverse dependency impact come from the resolved graph. The globs below classify infrastructure
-and custom repository surfaces; they do not replace crate ownership with hand-maintained path filters.
+Cargo-Rail owns Cargo work semantics. Repository configuration declares only positive inputs for opaque work whose
+commands remain in Just, scripts, or CI.
 
-| Field                 |                Default | Behavior                                                            |
-| --------------------- | ---------------------: | ------------------------------------------------------------------- |
-| `infrastructure`      | built-in tooling globs | Paths that select workspace-wide infrastructure work.               |
-| `custom`              |                   `{}` | Named planner-output categories mapped to path globs.               |
-| `unknown_file_policy` |             `"strict"` | `"docs"`, `"owned_build_test"`, `"workspace_infra"`, or `"strict"`. |
-| `confidence_profile`  |           `"balanced"` | Repository default: `"strict"`, `"balanced"`, or `"fast"`.          |
+| Field             | Required/default | Behavior                                                                                 |
+| ----------------- | ---------------: | ---------------------------------------------------------------------------------------- |
+| `scope`           |         required | `"repository"`, `"cargo"`, or `"variants"`.                                             |
+| `paths`           |             `[]` | Positive repository-relative input globs.                                                |
+| `config`          |             `[]` | Exact schema-owned effective configuration fields consumed by this work.                 |
+| `cargo`           |             `[]` | Built-in Cargo work IDs that require this work; Cargo scope inherits their exact selectors. |
+| `variant_catalog` |             none | Required for variant work; path to a catalog conforming to plan-variants contract v1.    |
 
-Provider identity does not change planner policy. CI can override the repository profile on the CLI; bot authorship
-is not a policy input.
+IDs use lowercase ASCII letters, digits, dots, and hyphens. Absolute paths, parent traversal, negative patterns,
+unknown configuration fields, unknown Cargo work IDs, commands, and malformed catalogs are rejected.
 
 ```toml
-[change-detection]
-infrastructure = [".github/**", "scripts/**", "Cargo.lock"]
-confidence_profile = "strict"
+[plan.work.verification]
+scope = "repository"
+paths = ["verification/**"]
 
-[change-detection.custom]
-verification = ["verification/**"]
-assets = ["web/assets/**"]
+[plan.work.compatibility]
+scope = "variants"
+paths = ["tests/compatibility/**"]
+cargo = ["cargo.build", "cargo.test"]
+variant_catalog = "distribution/compatibility-plan-variants.json"
 ```
+
+The retired `[change-detection]` section is rejected by current configuration loading. `cargo rail config migrate
+--check` reads the raw older file and reports the removal; translate still-owned positive globs to named work before
+applying the migration. Historical planner comparisons remove the retired table only from their captured in-memory
+view because it has no v8 semantics.
 
 ## Removed execution configuration
 
@@ -412,9 +421,7 @@ Deprecated fields remain parseable for a bounded compatibility window. They emit
 | `unify.detect_undeclared_features`, `unify.fix_undeclared_features` | Remove; diagnostics plus `unify --check`/apply define the boundary.                                             |
 | `unify.pin_transitives`, `unify.transitive_host`                    | Merge enabled pinning and its host into `unify.transitive_pinning`.                                             |
 | `unify.msrv`, `unify.msrv_source`, `unify.enforce_msrv_inheritance` | Merge one valid choice into `unify.msrv_policy`.                                                                |
-| `change-detection.bot_pr_confidence_profile`                        | Remove; provider identity no longer changes policy.                                                             |
-| `change-detection.conservative_unclassified_owner_fallback`         | Rename to the equivalent explicit `unknown_file_policy`.                                                        |
-| Boolean `change-detection.unknown_file_policy`                      | Replace `true` with `"owned_build_test"` or `false` with `"docs"`.                                              |
+| `[change-detection]`                                                | Translate still-owned positive globs to named work, then remove the retired v7 planner policy.                  |
 | `release.require_clean`, `release.publish_delay`                    | Remove; cleanliness is fixed command behavior and registry convergence is an explicit stop-and-resume boundary. |
 | `release.push`, `release.create_github_release`, `release.forge`    | Merge the valid effect combination into one `release.remote_effects` value.                                     |
 

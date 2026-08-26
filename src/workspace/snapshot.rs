@@ -257,6 +257,10 @@ impl DerivedViews {
         self.resolutions.cargo_current_dir()
     }
 
+    pub(crate) fn cargo_config(&self) -> RailResult<Arc<CargoConfigSnapshot>> {
+        self.resolutions.cargo_config()
+    }
+
     pub(crate) fn multi_target_metadata(&self) -> RailResult<Arc<MultiTargetMetadata>> {
         cached_snapshot_view(self.multi_target_metadata.get_or_init(|| {
             if !self.analysis_targets.is_empty() {

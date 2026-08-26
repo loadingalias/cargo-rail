@@ -8,10 +8,10 @@ Choose the direct consumer:
 Inspect scope without running work:
 
 ```bash
-cargo rail plan --merge-base --explain
+cargo rail plan --explain
 ```
 
-`scope` contains the Cargo package selection. `impact` explains how changed crates and dependents produced it.
+Each required Cargo work decision contains its own typed package and target selection.
 
 Validate both policy files from the repository root:
 
@@ -22,5 +22,5 @@ cargo rail --config examples/planning/with-task-runner/rail.toml config validate
 
 ## See also
 
-- [Configuration reference](../../docs/config.md#change-detection)
+- [Configuration reference](../../docs/config.md#planworkname)
 - [Planning guide](../../docs/planning.md)

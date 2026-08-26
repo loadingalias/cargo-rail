@@ -12,6 +12,16 @@ on:
         required: false
         default: false
         type: boolean
+      selected-matrix:
+        description: Planner-selected archive matrix or explicit all
+        required: false
+        default: "all"
+        type: string
+      plan-artifact:
+        description: Exact v8 plan artifact to verify before execution
+        required: false
+        default: ""
+        type: string
 
 env:
   CARGO_INCREMENTAL: 0
@@ -37,6 +47,17 @@ jobs:
           persist-credentials: false
           ref: ${{ inputs.ref }}
 
+      - name: Download exact plan
+        if: inputs.plan-artifact != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.plan-artifact }}
+          path: target
+
+      - name: Verify checkout against plan
+        if: inputs.plan-artifact != ''
+        run: scripts/plan/read.py verify-checkout target/plan-v8.json
+
       - name: Bind package identity
         id: package
         shell: bash
@@ -57,6 +78,7 @@ jobs:
         shell: bash
         env:
           STAGE: ${{ inputs.stage }}
+          SELECTED_MATRIX: ${{ inputs.selected-matrix }}
         run: |
           set -euo pipefail
           python3 scripts/ci/support-matrix.py --github-matrix >/dev/null
@@ -72,11 +94,15 @@ jobs:
             )
             and ((map(.target) | length) == (map(.target) | unique | length))
           ' distribution/release-targets.json >/dev/null
-          matrix="$(
-            jq -c --arg stage "$STAGE" \
-              '{include: (if $stage == "true" then . else map(select(.commit_ci)) end)}' \
-              distribution/release-targets.json
-          )"
+          if [ "$SELECTED_MATRIX" = all ]; then
+            matrix="$(
+              jq -c --arg stage "$STAGE" \
+                '{include: (if $stage == "true" then . else map(select(.commit_ci)) end)}' \
+                distribution/release-targets.json
+            )"
+          else
+            matrix="$SELECTED_MATRIX"
+          fi
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   build:
@@ -99,6 +125,17 @@ jobs:
         env:
           RELEASE_SHA: ${{ needs.prepare.outputs.release_sha }}
         run: test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+
+      - name: Download exact plan
+        if: inputs.plan-artifact != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ inputs.plan-artifact }}
+          path: target
+
+      - name: Verify checkout against plan
+        if: inputs.plan-artifact != ''
+        run: scripts/plan/read.py verify-checkout target/plan-v8.json
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master

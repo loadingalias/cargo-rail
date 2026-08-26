@@ -16,8 +16,6 @@ pub(crate) enum ImpactDomain {
 /// Evidence that forced conservative propagation rather than a proven active edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ImpactFallback {
-    /// The compared Git objects do not have an exact historical Cargo resolution.
-    HistoricalResolutionUnavailable,
     /// Cargo reported a dependency kind unknown to this version of cargo-rail.
     UnknownDependencyKind,
 }
