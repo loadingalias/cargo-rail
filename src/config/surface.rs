@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::error::ConfigError;
 
@@ -118,6 +118,81 @@ pub enum SurfaceDoctestCoverage {
     Disabled,
 }
 
+/// Target views selected for complete source-surface analysis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SurfaceTargetSelection {
+    /// Inherit the host view and every target from the top-level workspace policy.
+    Workspace,
+    /// Analyze one explicit non-empty subset containing `host` and/or configured target triples.
+    Explicit(Vec<String>),
+}
+
+impl Default for SurfaceTargetSelection {
+    fn default() -> Self {
+        Self::Explicit(vec!["host".to_string()])
+    }
+}
+
+impl Serialize for SurfaceTargetSelection {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Workspace => serializer.serialize_str("workspace"),
+            Self::Explicit(targets) => targets.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SurfaceTargetSelection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Representation {
+            Mode(String),
+            Explicit(Vec<String>),
+        }
+
+        match Representation::deserialize(deserializer)? {
+            Representation::Mode(mode) if mode == "workspace" => Ok(Self::Workspace),
+            Representation::Mode(mode) => Err(de::Error::custom(format!(
+                "surface.targets mode must be 'workspace', found '{mode}'"
+            ))),
+            Representation::Explicit(targets) => Ok(Self::Explicit(targets)),
+        }
+    }
+}
+
+impl SurfaceTargetSelection {
+    /// Resolve the exact target views selected by this policy.
+    pub fn effective(&self, workspace_targets: &[String]) -> Vec<String> {
+        match self {
+            Self::Workspace => {
+                let mut targets = Vec::with_capacity(workspace_targets.len() + 1);
+                targets.push("host".to_string());
+                targets.extend(workspace_targets.iter().cloned());
+                targets
+            }
+            Self::Explicit(targets) => targets.clone(),
+        }
+    }
+
+    pub(crate) fn explicit(&self) -> Option<&[String]> {
+        match self {
+            Self::Workspace => None,
+            Self::Explicit(targets) => Some(targets),
+        }
+    }
+
+    pub(crate) fn inherits_workspace(&self) -> bool {
+        matches!(self, Self::Workspace)
+    }
+}
+
 /// One whole compiler crate kept outside closed-world authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -201,8 +276,8 @@ pub struct SurfaceConfig {
     pub enabled: bool,
     /// Closed-world authority for non-publishable internal packages.
     pub consumer_scope: SurfaceConsumerScope,
-    /// Required compiler target views (`host` or a configured target triple).
-    pub targets: Vec<String>,
+    /// Required compiler target views, either an explicit subset or the workspace target policy.
+    pub targets: SurfaceTargetSelection,
     /// Whether `pub(crate)` to `pub(super)` findings are enabled.
     pub crate_visibility: SurfaceCrateVisibility,
     /// Preserve uniform field visibility when visibility repair is enabled.
@@ -231,7 +306,7 @@ impl Default for SurfaceConfig {
         Self {
             enabled: false,
             consumer_scope: SurfaceConsumerScope::Open,
-            targets: vec!["host".to_string()],
+            targets: SurfaceTargetSelection::default(),
             crate_visibility: SurfaceCrateVisibility::Preserve,
             preserve_uniform_fields: false,
             lint: Vec::new(),
@@ -249,10 +324,12 @@ impl Default for SurfaceConfig {
 impl SurfaceConfig {
     /// Validate policy syntax that does not require Cargo workspace state.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.targets.is_empty() {
-            return Err(invalid("surface.targets", "must contain at least one target view"));
+        if let Some(targets) = self.targets.explicit() {
+            if targets.is_empty() {
+                return Err(invalid("surface.targets", "must contain at least one target view"));
+            }
+            validate_unique_non_empty(targets, "surface.targets")?;
         }
-        validate_unique_non_empty(&self.targets, "surface.targets")?;
 
         for (index, directive) in self.lint.iter().enumerate() {
             let field = format!("surface.lint.{index}");
@@ -387,6 +464,22 @@ impl SurfaceConfig {
         }
         Ok(())
     }
+
+    /// Validate an explicit Surface subset against the top-level target authority.
+    pub fn validate_workspace_targets(&self, workspace_targets: &[String]) -> Result<(), ConfigError> {
+        let Some(targets) = self.targets.explicit() else {
+            return Ok(());
+        };
+        for target in targets.iter().filter(|target| target.as_str() != "host") {
+            if !workspace_targets.contains(target) {
+                return Err(invalid(
+                    "surface.targets",
+                    format!("target '{target}' is not declared in top-level targets"),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn validate_policy_owner(package: Option<&str>, crate_name: Option<&str>, field: &str) -> Result<(), ConfigError> {
@@ -451,6 +544,32 @@ mod tests {
         assert!(!SurfaceConfig::default().enabled);
         let config: SurfaceConfig = toml_edit::de::from_str("enabled = true").unwrap();
         assert!(config.enabled);
+    }
+
+    #[test]
+    fn workspace_target_selection_includes_host_and_top_level_targets() {
+        let config: SurfaceConfig = toml_edit::de::from_str("targets = \"workspace\"").unwrap();
+        assert_eq!(
+            config
+                .targets
+                .effective(&["aarch64-unknown-linux-gnu".to_string(), "wasm32-wasip1".to_string()]),
+            ["host", "aarch64-unknown-linux-gnu", "wasm32-wasip1"]
+        );
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn explicit_target_selection_must_be_a_workspace_subset() {
+        let config: SurfaceConfig = toml_edit::de::from_str("targets = [\"host\", \"wasm32-wasip1\"]").unwrap();
+        config
+            .validate_workspace_targets(&["wasm32-wasip1".to_string()])
+            .unwrap();
+        assert!(config.validate_workspace_targets(&[]).is_err());
+    }
+
+    #[test]
+    fn unknown_target_selection_mode_is_rejected() {
+        toml_edit::de::from_str::<SurfaceConfig>("targets = \"automatic\"").unwrap_err();
     }
 
     #[test]

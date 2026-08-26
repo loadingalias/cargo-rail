@@ -74,6 +74,7 @@ pub(crate) fn run_setup(
       "cache_base": plan.cache_base(),
       "max_bytes": plan.max_bytes(),
       "remote": remote,
+      "root_portability": plan.root_portability(),
       "distributed": plan.distributed_mode(),
       "distributed_policy": plan.distributed_policy(),
     });
@@ -151,6 +152,9 @@ fn render_installation_operation(
         }
         if let Some(cache) = details["cache_base"].as_str() {
             println!("  local cache base: {cache}");
+        }
+        if let Some(root_portability) = details["root_portability"].as_str() {
+            println!("  root portability: {root_portability}");
         }
         if let Some(distributed) = details["distributed"].as_str() {
             println!("  distributed mode: {distributed}");
@@ -351,6 +355,9 @@ fn render_status(status: &CacheStatus) {
     }
     if let Some(cache) = &status.installation.cache_base {
         println!("    local cache base: {cache}");
+    }
+    if let Some(root_portability) = status.installation.root_portability {
+        println!("    root portability: {root_portability}");
     }
     if let Some(distributed) = status.installation.distributed {
         println!("    distributed mode: {distributed}");

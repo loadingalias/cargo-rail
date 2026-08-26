@@ -17,7 +17,7 @@ pub use split::{CratePath, CrateSplitConfig, SplitConfig, SplitMode, WorkspaceMo
 pub use surface::{
     SurfaceConfig, SurfaceConsumerScope, SurfaceCrateVisibility, SurfaceDoctest, SurfaceDoctestCoverage,
     SurfaceExclude, SurfaceExternal, SurfaceFeatureProfile, SurfaceLintDirective, SurfaceLintLevel, SurfaceOverride,
-    SurfaceProduct,
+    SurfaceProduct, SurfaceTargetSelection,
 };
 pub use unify::{
     ConsumerScope, ExactPinHandling, MajorVersionConflict, MsrvPolicy, MsrvSource, TransitiveFeatureHost,

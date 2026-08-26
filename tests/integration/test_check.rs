@@ -40,7 +40,7 @@ require_clean = false
         ws.commit("Add real-crate with release config")?;
 
         // Check for non-existent crate should fail
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "nonexistent"])?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--publication", "nonexistent"])?;
         assert!(!output.status.success(), "check for nonexistent crate should fail");
 
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -79,7 +79,7 @@ require_clean = false
         ws.commit("Add valid-crate with release config")?;
 
         // Check should pass
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "valid-crate"])?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--publication", "valid-crate"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         assert!(
@@ -123,7 +123,7 @@ require_clean = false
         ws.commit("Add crates with release config")?;
 
         // Check all should pass
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--all"])?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--publication", "--all"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         assert!(
@@ -173,7 +173,7 @@ require_clean = true
 
         // Preview should succeed. Exact dirt is enforced against the bound release
         // plan at the first write, not by this read-only command.
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "dirty-crate"])?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--publication", "dirty-crate"])?;
         assert!(
             output.status.success(),
             "read-only release check should tolerate dirt.\nstdout:\n{}\nstderr:\n{}",
@@ -228,7 +228,10 @@ require_clean = false
         ws.commit("Add private-crate with config")?;
 
         // Check should succeed and report the crate as not publishable
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "private-crate"])?;
+        let output = run_cargo_rail(
+            &ws.path,
+            &["rail", "release", "check", "--publication", "private-crate"],
+        )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         assert!(
@@ -274,7 +277,7 @@ require_clean = false
         ws.commit("Add some-crate with release config")?;
 
         // Check should pass with proper config
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "some-crate"])?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--publication", "some-crate"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         assert!(
@@ -316,7 +319,7 @@ require_clean = false
         ws.commit("Add any-crate with config")?;
 
         // Check with no args should fail
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "check"])?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--publication"])?;
         assert!(!output.status.success(), "check with no args should fail");
 
         let stderr = String::from_utf8_lossy(&output.stderr);

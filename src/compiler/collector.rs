@@ -45,8 +45,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File};
-use std::io::{BufReader, Read as _, Write as _};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -63,6 +63,357 @@ pub(crate) struct CompilerDiagnosticsCollector<'a> {
     targets: Vec<&'a str>,
     identity: CompilerCacheIdentity,
     artifact_budget: CompilerArtifactBudget,
+    acquisition: Option<CompilerAcquisitionRequest>,
+}
+
+const SURFACE_ACQUISITION_CONTRACT_VERSION: u32 = 1;
+
+/// One Surface product whose policy depends on compiler acquisition.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct CompilerAcquisitionProduct {
+    pub(crate) package: String,
+    pub(crate) cargo_target: String,
+    pub(crate) kind: String,
+}
+
+/// Stable inputs needed to journal and resume one Surface acquisition.
+#[derive(Debug, Clone)]
+pub(crate) struct CompilerAcquisitionRequest {
+    pub(crate) snapshot_identity: String,
+    pub(crate) configuration_fingerprint: String,
+    pub(crate) products: Vec<CompilerAcquisitionProduct>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompilerAcquisitionHeader {
+    record: String,
+    surface_acquisition_contract_version: u32,
+    acquisition_identity: String,
+    snapshot_identity: String,
+    configuration_fingerprint: String,
+    manifest: String,
+    resume_command: Vec<String>,
+    concurrency: usize,
+    artifact_soft_limit_bytes: u64,
+    artifact_hard_limit_bytes: u64,
+    cancellation: String,
+    interruption: String,
+    products: Vec<CompilerAcquisitionProduct>,
+    views: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CompilerAcquisitionViewRecord<'a> {
+    record: &'static str,
+    acquisition_identity: &'a str,
+    ordinal: usize,
+    view_identity: String,
+    status: &'static str,
+    selected_products: Vec<CompilerAcquisitionProduct>,
+    packages: &'a BTreeSet<String>,
+    cargo_targets: Vec<CompilerAcquisitionCargoTarget>,
+    feature_profile: String,
+    target_triple: &'a str,
+    command_class: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+struct CompilerAcquisitionCargoTarget {
+    package: String,
+    target: String,
+    kinds: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CompilerAcquisitionSummary<'a> {
+    record: &'static str,
+    acquisition_identity: &'a str,
+    state: &'static str,
+    planned: usize,
+    reused: usize,
+    completed: usize,
+    failed: usize,
+    not_started: usize,
+    manifest: &'a str,
+    resume_command: &'a [String],
+}
+
+struct CompilerAcquisitionJournal {
+    path: PathBuf,
+    display_path: String,
+    header: CompilerAcquisitionHeader,
+    writer: File,
+    views: Vec<AnalysisView>,
+    status: Vec<&'static str>,
+}
+
+impl CompilerAcquisitionJournal {
+    fn begin(
+        workspace_root: &Path,
+        request: &CompilerAcquisitionRequest,
+        schedule: &AnalysisSchedule,
+        budget: CompilerArtifactBudget,
+    ) -> RailResult<Self> {
+        let mut views = schedule.views().to_vec();
+        views.sort_by(analysis_view_execution_order);
+        let identity_bytes = serde_json::to_vec(&(
+            &request.snapshot_identity,
+            &request.configuration_fingerprint,
+            views
+                .iter()
+                .map(|view| {
+                    (
+                        view.command_class(),
+                        view.platform(),
+                        view.features(),
+                        view.packages(),
+                        view.fact_families(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        ))?;
+        let acquisition_identity = format!(
+            "surface-acquisition-v1-sha256-{}",
+            ContentDigest::sha256(&identity_bytes)
+        );
+        let directory = crate::workspace::cargo_rail_state_root(workspace_root).join("surface-acquisitions-v1");
+        fs::create_dir_all(&directory).map_err(|error| {
+            RailError::message(format!(
+                "failed to create Surface acquisition journal directory '{}': {error}",
+                directory.display()
+            ))
+        })?;
+        let directory = crate::utils::canonicalize_existing(&directory)?;
+        let path = directory.join(format!("{acquisition_identity}.jsonl"));
+        let display_path = path
+            .strip_prefix(workspace_root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let resume_command = vec![
+            "cargo".to_string(),
+            "rail".to_string(),
+            "surface".to_string(),
+            "--resume".to_string(),
+            display_path.clone(),
+            "--format".to_string(),
+            "json".to_string(),
+        ];
+        let header = CompilerAcquisitionHeader {
+            record: "manifest".to_string(),
+            surface_acquisition_contract_version: SURFACE_ACQUISITION_CONTRACT_VERSION,
+            acquisition_identity,
+            snapshot_identity: request.snapshot_identity.clone(),
+            configuration_fingerprint: request.configuration_fingerprint.clone(),
+            manifest: display_path.clone(),
+            resume_command,
+            concurrency: 1,
+            artifact_soft_limit_bytes: budget.soft_limit_bytes,
+            artifact_hard_limit_bytes: budget.hard_limit_bytes,
+            cancellation: "the active Cargo child is terminated before command return".to_string(),
+            interruption: "replay this journal, recapture the workspace, and trust only exact complete fact objects"
+                .to_string(),
+            products: request.products.clone(),
+            views: views.len(),
+        };
+
+        let mut initial = Vec::new();
+        serde_json::to_writer(&mut initial, &header)?;
+        initial.push(b'\n');
+        for (ordinal, view) in views.iter().enumerate() {
+            serde_json::to_writer(
+                &mut initial,
+                &Self::view_record(&header, ordinal, view, "planned", Vec::new(), None)?,
+            )?;
+            initial.push(b'\n');
+        }
+        crate::utils::write_file_atomic(&path, &initial)?;
+        let writer = OpenOptions::new().append(true).open(&path).map_err(|error| {
+            RailError::message(format!(
+                "failed to open Surface acquisition journal '{}': {error}",
+                path.display()
+            ))
+        })?;
+        progress!("  Surface acquisition manifest: {display_path}");
+        Ok(Self {
+            path,
+            display_path,
+            header,
+            writer,
+            status: vec!["planned"; views.len()],
+            views,
+        })
+    }
+
+    fn view_record<'a>(
+        header: &'a CompilerAcquisitionHeader,
+        ordinal: usize,
+        view: &'a AnalysisView,
+        status: &'static str,
+        cargo_targets: Vec<CompilerAcquisitionCargoTarget>,
+        error: Option<String>,
+    ) -> RailResult<CompilerAcquisitionViewRecord<'a>> {
+        let view_bytes = serde_json::to_vec(&(
+            view.command_class(),
+            view.platform(),
+            view.features(),
+            view.packages(),
+            view.fact_families(),
+        ))?;
+        let matching_targets = cargo_targets.iter().collect::<BTreeSet<_>>();
+        let selected_products = header
+            .products
+            .iter()
+            .filter(|product| {
+                view.packages().contains(&product.package)
+                    && (matching_targets.is_empty()
+                        || matching_targets.iter().any(|cargo_target| {
+                            (&cargo_target.package, &cargo_target.target) == (&product.package, &product.cargo_target)
+                        }))
+            })
+            .cloned()
+            .collect();
+        Ok(CompilerAcquisitionViewRecord {
+            record: "view",
+            acquisition_identity: &header.acquisition_identity,
+            ordinal,
+            view_identity: format!("compiler-view-v1-sha256-{}", ContentDigest::sha256(&view_bytes)),
+            status,
+            selected_products,
+            packages: view.packages(),
+            cargo_targets,
+            feature_profile: view.features().label(),
+            target_triple: view.platform().as_str(),
+            command_class: view.command_class(),
+            error,
+        })
+    }
+
+    fn transition(
+        &mut self,
+        ordinal: usize,
+        status: &'static str,
+        cargo_targets: Vec<CompilerAcquisitionCargoTarget>,
+        error: Option<String>,
+    ) -> RailResult<()> {
+        let view = self
+            .views
+            .get(ordinal)
+            .ok_or_else(|| RailError::message("Surface acquisition journal ordinal is out of bounds"))?;
+        self.status[ordinal] = status;
+        serde_json::to_writer(
+            &mut self.writer,
+            &Self::view_record(&self.header, ordinal, view, status, cargo_targets, error)?,
+        )?;
+        self.writer.write_all(b"\n").map_err(RailError::from)?;
+        self.writer.flush().map_err(RailError::from)
+    }
+
+    fn finish(&mut self, state: &'static str) -> RailResult<()> {
+        let count = |status| self.status.iter().filter(|candidate| **candidate == status).count();
+        let summary = CompilerAcquisitionSummary {
+            record: "summary",
+            acquisition_identity: &self.header.acquisition_identity,
+            state,
+            planned: count("planned"),
+            reused: count("reused"),
+            completed: count("completed"),
+            failed: count("failed"),
+            not_started: count("not-started"),
+            manifest: &self.display_path,
+            resume_command: &self.header.resume_command,
+        };
+        serde_json::to_writer(&mut self.writer, &summary)?;
+        self.writer.write_all(b"\n").map_err(RailError::from)?;
+        self.writer.sync_all().map_err(RailError::from)
+    }
+
+    fn fail(
+        &mut self,
+        ordinal: usize,
+        cargo_targets: Vec<CompilerAcquisitionCargoTarget>,
+        error: &RailError,
+    ) -> RailResult<()> {
+        self.transition(ordinal, "failed", cargo_targets, Some(error.to_string()))?;
+        for next in (ordinal + 1)..self.views.len() {
+            if self.status[next] == "planned" {
+                self.transition(next, "not-started", Vec::new(), None)?;
+            }
+        }
+        self.finish("partial")
+    }
+
+    fn resume_help(&self) -> String {
+        format!(
+            "resume with '{}' after correcting the source failure; Cargo-Rail will recapture the workspace and reuse only exact complete facts",
+            self.header.resume_command.join(" ")
+        )
+    }
+}
+
+/// Validate that a requested resume journal belongs to this workspace and
+/// still names the same effective Surface configuration.
+pub(crate) fn validate_compiler_acquisition_resume(
+    workspace_root: &Path,
+    path: &Path,
+    configuration_fingerprint: &str,
+) -> RailResult<()> {
+    let expected_directory = crate::workspace::cargo_rail_state_root(workspace_root).join("surface-acquisitions-v1");
+    let expected_directory = crate::utils::canonicalize_existing(&expected_directory).map_err(|error| {
+        RailError::with_help(
+            format!("the workspace has no Surface acquisition journal directory: {error}"),
+            "run 'cargo rail surface' once without --resume to create an acquisition manifest",
+        )
+    })?;
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace_root.join(path)
+    };
+    let metadata = fs::symlink_metadata(&candidate).map_err(|error| {
+        RailError::message(format!(
+            "failed to inspect Surface acquisition manifest '{}': {error}",
+            candidate.display()
+        ))
+    })?;
+    if !metadata.is_file() || crate::utils::is_symlink_or_reparse(&metadata) {
+        return Err(RailError::message(format!(
+            "Surface acquisition manifest '{}' is not a real regular file",
+            candidate.display()
+        )));
+    }
+    let candidate = crate::utils::canonicalize_existing(&candidate)?;
+    if !candidate.starts_with(&expected_directory) {
+        return Err(RailError::message(format!(
+            "Surface acquisition manifest '{}' is outside the current workspace's journal authority",
+            candidate.display()
+        )));
+    }
+    let file = File::open(&candidate).map_err(RailError::from)?;
+    let first = BufReader::new(file)
+        .lines()
+        .next()
+        .transpose()
+        .map_err(RailError::from)?
+        .ok_or_else(|| RailError::message("Surface acquisition manifest is empty"))?;
+    let header: CompilerAcquisitionHeader = serde_json::from_str(&first)?;
+    if header.record != "manifest"
+        || header.surface_acquisition_contract_version != SURFACE_ACQUISITION_CONTRACT_VERSION
+    {
+        return Err(RailError::message(
+            "Surface acquisition manifest has an unsupported contract",
+        ));
+    }
+    if header.configuration_fingerprint != configuration_fingerprint {
+        return Err(RailError::with_help(
+            "Surface acquisition resume configuration differs from the planned acquisition",
+            "rerun 'cargo rail surface' without --resume to plan the changed configuration",
+        ));
+    }
+    Ok(())
 }
 
 /// Storage authority for the command-owned Cargo working set shared across evidence views.
@@ -580,6 +931,7 @@ pub(crate) fn capture_transparent_native_session(
     target_root: &Path,
     rustc_program: &OsStr,
     cache: &LocalCacheSelection,
+    root_portability: crate::cache::installation::InstalledRootPortability,
 ) -> RailResult<(NativeCompilerSession, u64, TransparentNativeSessionMemo)> {
     let source_root = crate::utils::canonicalize_existing(source_root)?;
     let resolved_rustc = crate::executable::resolve_executable_path(rustc_program, &source_root)?;
@@ -628,13 +980,14 @@ pub(crate) fn capture_transparent_native_session(
     append_identity_frame(&mut framed, b"compiler-sysroot", sysroot_identity.as_bytes());
     let capability_identity = format!("sha256:{}", ContentDigest::sha256(&framed));
     let compiler_environment = transparent_native_compiler_process_env_fingerprint(target_root)?;
-    let session = NativeCompilerSession::capture(
+    let session = NativeCompilerSession::capture_with_root_portability(
         &source_root,
         &rustc_verbose_version,
         &capability_identity,
         &compiler_environment,
         crate::compiler::native_cache::native_cache_execution_contract(),
         NativeSessionAuthority::Exact,
+        root_portability,
     )?;
     let inventory = compiler_sysroot_inventory(&rustc_sysroot, host_target)?;
     let sysroot_evidence = capture_exact_sysroot_evidence(&inventory)
@@ -670,6 +1023,7 @@ pub(crate) fn capture_transparent_native_session(
     _target_root: &Path,
     _rustc_program: &OsStr,
     _cache: &LocalCacheSelection,
+    _root_portability: crate::cache::installation::InstalledRootPortability,
 ) -> RailResult<(NativeCompilerSession, u64, TransparentNativeSessionMemo)> {
     Err(RailError::message(
         "transparent compiler session memoization is unsupported on this platform",
@@ -787,11 +1141,17 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
             targets,
             identity: identity.clone(),
             artifact_budget: CompilerArtifactBudget::default(),
+            acquisition: None,
         }
     }
 
     pub(crate) fn with_artifact_budget(mut self, budget: CompilerArtifactBudget) -> Self {
         self.artifact_budget = budget;
+        self
+    }
+
+    pub(crate) fn with_acquisition_manifest(mut self, request: CompilerAcquisitionRequest) -> Self {
+        self.acquisition = Some(request);
         self
     }
 
@@ -862,6 +1222,13 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                 metrics,
             });
         }
+        let mut acquisition_journal = self
+            .acquisition
+            .as_ref()
+            .map(|request| {
+                CompilerAcquisitionJournal::begin(self.workspace_root, request, &schedule, self.artifact_budget)
+            })
+            .transpose()?;
         let typed_snapshot = if typed_packages.is_empty() {
             None
         } else {
@@ -982,7 +1349,9 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
         let mut skipped_member_targets = 0usize;
         let mut active_artifact_target = None::<String>;
         let mut active_artifact_target_dirty = false;
-        for (view, stale_members) in stale_configurations {
+        let acquisition_views = stale_configurations.len();
+        let acquisition_progress_interval = acquisition_views.div_ceil(100).max(1);
+        for (acquisition_ordinal, (view, stale_members)) in stale_configurations.into_iter().enumerate() {
             let target = view.platform().as_str();
             let features = view.features();
             if active_artifact_target.as_deref() != Some(target) {
@@ -1062,6 +1431,9 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                 diagnostic_members.clone()
             };
             if active_members.is_empty() {
+                if let Some(journal) = acquisition_journal.as_mut() {
+                    journal.transition(acquisition_ordinal, "reused", Vec::new(), None)?;
+                }
                 continue;
             }
 
@@ -1070,13 +1442,20 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                 stale_set.insert(*member);
             }
 
-            progress!(
-                "  Collecting compiler evidence for target {} ({} package{})...",
-                format_args!("{} / {}", target, features.label()),
-                active_members.len(),
-                if active_members.len() == 1 { "" } else { "s" }
-            );
-            let started = Instant::now();
+            let report_progress = acquisition_ordinal == 0
+                || acquisition_ordinal + 1 == acquisition_views
+                || (acquisition_ordinal + 1).is_multiple_of(acquisition_progress_interval);
+            if report_progress {
+                progress!(
+                    "  Collecting compiler evidence view {}/{} for target {} ({} package{})...",
+                    acquisition_ordinal + 1,
+                    metrics.analysis_views,
+                    format_args!("{} / {}", target, features.label()),
+                    active_members.len(),
+                    if active_members.len() == 1 { "" } else { "s" }
+                );
+            }
+            let started = report_progress.then(Instant::now);
             if collect_typed && prepared_driver.is_none() {
                 prepared_driver = Some(
                     PreparedCompilerFactDriver::prepare(
@@ -1131,7 +1510,15 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
             } else {
                 None
             };
-            let mut run = run_workspace_check(
+            if let Err(error) = surface_acquisition_test_fault(acquisition_ordinal) {
+                if let Some(journal) = acquisition_journal.as_mut() {
+                    journal.fail(acquisition_ordinal, Vec::new(), &error)?;
+                    return Err(RailError::with_help(error.to_string(), journal.resume_help()));
+                }
+                return Err(error);
+            }
+            let mut failed_cargo_targets = Vec::new();
+            let run = run_workspace_check(
                 self.workspace_root,
                 &self.identity,
                 &view,
@@ -1139,14 +1526,32 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                 artifact_authority.target_dir(),
                 typed_context.as_ref(),
                 artifact_authority.budget,
-            )
-            .with_context(|| {
-                format!(
-                    "acquiring compiler evidence for target '{} / {}'",
-                    view.platform().as_str(),
-                    view.features().label()
-                )
-            })?;
+                &package_to_member,
+                &mut failed_cargo_targets,
+            );
+            let mut run = match run {
+                Ok(run) => run,
+                Err(error) => {
+                    let error = error.context(format!(
+                        "acquiring compiler evidence for target '{} / {}'",
+                        view.platform().as_str(),
+                        view.features().label()
+                    ));
+                    if let Some(journal) = acquisition_journal.as_mut() {
+                        if let Err(journal_error) = journal.fail(acquisition_ordinal, failed_cargo_targets, &error) {
+                            return Err(RailError::message(format!(
+                                "{error}; failed to finalize Surface acquisition manifest '{}': {journal_error}",
+                                journal.path.display()
+                            )));
+                        }
+                        return Err(RailError::with_help(error.to_string(), journal.resume_help()));
+                    }
+                    return Err(error);
+                }
+            };
+            if let Some(journal) = acquisition_journal.as_mut() {
+                journal.transition(acquisition_ordinal, "completed", Vec::new(), None)?;
+            }
             active_artifact_target_dirty = true;
             metrics.cargo_views_executed += 1;
             metrics.compiler_invocations += run.invocations.len();
@@ -1185,11 +1590,13 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                 }
                 compiler_facts.extend(fresh_facts);
             }
-            progress!(
-                "    Finished target {} in {:.1}s",
-                format_args!("{} / {}", target, features.label()),
-                started.elapsed().as_secs_f64()
-            );
+            if let Some(started) = started {
+                progress!(
+                    "    Finished target {} in {:.1}s",
+                    format_args!("{} / {}", target, features.label()),
+                    started.elapsed().as_secs_f64()
+                );
+            }
             if !view
                 .fact_families()
                 .contains(&crate::compiler::scheduler::CompilerFactFamily::StableDiagnostics)
@@ -1301,6 +1708,9 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                     RailError::message("active compiler artifact target disappeared before final reclamation")
                 })?,
             )?;
+        }
+        if let Some(journal) = acquisition_journal.as_mut() {
+            journal.finish("complete")?;
         }
 
         store.flush()?;
@@ -1523,6 +1933,19 @@ fn feature_execution_priority(features: &FeatureSelection) -> u8 {
     }
 }
 
+fn surface_acquisition_test_fault(ordinal: usize) -> RailResult<()> {
+    let requested = std::env::var("CARGO_RAIL_SURFACE_FAIL_ACQUISITION_VIEW")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok());
+    if requested == Some(ordinal + 1) {
+        return Err(RailError::message(format!(
+            "injected Surface compiler acquisition failure at view {}",
+            ordinal + 1
+        )));
+    }
+    Ok(())
+}
+
 fn build_candidate_target_index(
     candidates: &[CompilerCandidate],
 ) -> HashMap<String, BTreeMap<CandidateId, BTreeSet<String>>> {
@@ -1607,6 +2030,10 @@ struct TypedAcquisitionContext<'a> {
     packages: &'a BTreeSet<String>,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one compiler acquisition keeps its captured authority, exact view, output, and failure evidence together"
+)]
 fn run_workspace_check(
     workspace_root: &Path,
     identity: &CompilerCacheIdentity,
@@ -1615,6 +2042,8 @@ fn run_workspace_check(
     cargo_target: &Path,
     typed: Option<&TypedAcquisitionContext<'_>>,
     artifact_budget: CompilerArtifactBudget,
+    package_to_member: &HashMap<String, String>,
+    failed_cargo_targets: &mut Vec<CompilerAcquisitionCargoTarget>,
 ) -> RailResult<WorkspaceCheckOutput> {
     let wrapper = compiler_observation_wrapper()?;
     let existing_workspace_wrapper = identity.rustc_workspace_wrapper.as_deref();
@@ -1708,6 +2137,7 @@ fn run_workspace_check(
     })?;
     let output = bounded.output;
     if !output.status.success() {
+        *failed_cargo_targets = compiler_error_targets(&output.stdout, package_to_member);
         let diagnostics = cargo_failure_diagnostics(&output.stdout);
         let stderr = if diagnostics.is_empty() {
             bounded_cargo_failure_stderr(&output.stderr)
@@ -1762,6 +2192,42 @@ fn run_workspace_check(
         compiler_facts,
         artifact_high_water_bytes: bounded.high_water_bytes,
     })
+}
+
+fn compiler_error_targets(
+    stdout: &[u8],
+    package_to_member: &HashMap<String, String>,
+) -> Vec<CompilerAcquisitionCargoTarget> {
+    let mut targets = Message::parse_stream(BufReader::new(stdout))
+        .filter_map(Result::ok)
+        .filter_map(|message| match message {
+            Message::CompilerMessage(message)
+                if matches!(
+                    message.message.level,
+                    cargo_metadata::diagnostic::DiagnosticLevel::Error
+                        | cargo_metadata::diagnostic::DiagnosticLevel::Ice
+                ) =>
+            {
+                let package_id = message.package_id.to_string();
+                Some(CompilerAcquisitionCargoTarget {
+                    package: package_to_member.get(&package_id).cloned().unwrap_or(package_id),
+                    target: message.target.name,
+                    kinds: message
+                        .target
+                        .kind
+                        .iter()
+                        .filter_map(|kind| serde_json::to_value(kind).ok())
+                        .filter_map(|kind| kind.as_str().map(str::to_string))
+                        .collect(),
+                })
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    targets.sort();
+    targets
 }
 
 const MAX_COMPILER_ARTIFACT_FREE_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -4766,6 +5232,11 @@ edition = "2024"
                     .views()
                     .len();
             assert_eq!((combined_views, diagnostic_views + typed_views), (3, 6));
+            // The diagnostics-only lane proves the fixture's sole candidate in
+            // its first view and stops. The remaining two scheduled diagnostic
+            // views are intentionally eliminated; the independent baseline is
+            // executed work, not the schedule's theoretical upper bound.
+            let independent_diagnostic_views = 1;
 
             let driver_source = std::env::var_os("CARGO_RAIL_TEST_FACT_DRIVER")
                 .map(PathBuf::from)
@@ -4795,7 +5266,7 @@ edition = "2024"
             let expected_cold_views = if lane == "combined" {
                 combined_views
             } else {
-                diagnostic_views + typed_views
+                independent_diagnostic_views + typed_views
             };
             assert_eq!(cold_cargo_views, expected_cold_views);
             if cold.compiler_facts.is_empty() {

@@ -10,8 +10,9 @@ cargo rail cache status --scope local --format json
 ```
 
 The setup receipt selects one local CAS authority and byte bound. Workspaces under the same OS user and receipt share
-exact compiler results. Action identity remains bound to the canonical physical workspace root because Rust metadata
-and diagnostics can contain source paths. A second checkout first misses, then reuses its own root-bound variant.
+exact compiler results. The default physical mode binds action identity to the canonical workspace root because Rust
+metadata and diagnostics can contain source paths. A second checkout at another root first misses, then reuses its own
+root-bound variant. Use a standardized canonical checkout path or explicitly qualify remapping for cross-root L2.
 
 ## What is shared
 
@@ -72,9 +73,16 @@ cargo rail cache setup --check --remote \
   --remote-mode read-write
 cargo rail cache setup --remote \
   's3://company-cargo-rail-cache/rust/team?region=us-east-1&owner=123456789012' \
-  --remote-mode read-write
+  --remote-mode read-write \
+  --root-portability remap
 cargo build --workspace --all-features --locked
 ```
+
+`--root-portability remap` is machine-owned opt-in authority. Cargo-Rail keeps the physical root in its local session,
+injects one exact logical-root remap, and shares only certified workspace Rust metadata/library actions. Eligible cache
+events include `root_portability_remap_eligible`. Existing remaps, external or generated source namespaces, native
+search inputs, ambiguous roots, and unreviewed output classes bypass with a named reason. Omit the option to retain
+physical-root identity; that is the safe alternative for runners configured with one canonical checkout path.
 
 In GitHub Actions, configure provider credentials first. Every later Cargo command in that job uses the installed
 receipt:

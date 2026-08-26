@@ -540,7 +540,7 @@ log = "0.4"
             "the exact failed authority was not reported:\n{stderr}"
         );
         assert_eq!(
-            stderr.matches("Collecting compiler evidence for target").count(),
+            stderr.matches("Collecting compiler evidence view").count(),
             1,
             "Unify continued after its proof was already impossible:\n{stderr}"
         );

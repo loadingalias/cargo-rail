@@ -71,6 +71,12 @@ Warm analysis reports `metrics.acquisition`. An unchanged exact hit has zero Car
 miss or bypass names its reason and acquires new compiler evidence. Plain `cargo rail surface` reports findings with
 exit 0. `--check` exits 1 for deny findings or configuration diagnostics. Operational failures exit 2.
 
+When one of many compiler views fails, use the exact `surface --resume` command in the operational error. Inspect the
+JSONL manifest under `target/cargo-rail/surface-acquisitions-v1/` for the failed package, Cargo target, target triple,
+feature profile, and remaining views. Correct the source failure before resuming. Cargo-Rail recaptures current state
+and trusts the fact CAS, not the journal's prior completion labels, so interrupted or edited manifests cannot authorize
+stale compiler evidence.
+
 ## Cache reuse did not happen
 
 Use the doctor for the cache boundary you are testing:

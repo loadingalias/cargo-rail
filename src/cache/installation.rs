@@ -62,6 +62,7 @@ pub(crate) struct SetupRequest {
     pub(crate) remote_url: Option<String>,
     pub(crate) remote_mode: Option<String>,
     pub(crate) remote_environment: Vec<String>,
+    pub(crate) root_portability: Option<String>,
     pub(crate) local_only: bool,
 }
 
@@ -205,6 +206,10 @@ impl SetupPlan {
             .map(DistributedPlacementPolicy::as_str)
     }
 
+    pub(crate) const fn root_portability(&self) -> &'static str {
+        self.receipt.root_portability.as_str()
+    }
+
     pub(crate) fn receipt_path(&self) -> RailResult<PathBuf> {
         Ok(self.receipt.installation_directory()?.join(RECEIPT_FILE))
     }
@@ -237,8 +242,32 @@ pub(crate) struct InstallationReceipt {
     cache: LocalCacheSelection,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     remote: Option<crate::remote_cache::InstalledRemoteCache>,
+    #[serde(default, skip_serializing_if = "InstalledRootPortability::is_physical")]
+    root_portability: InstalledRootPortability,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     distributed: Option<InstalledDistributedQualification>,
+}
+
+/// Explicit machine authority for sharing remapped compiler results across checkout roots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum InstalledRootPortability {
+    #[default]
+    Physical,
+    Remap,
+}
+
+impl InstalledRootPortability {
+    pub(crate) const fn is_physical(&self) -> bool {
+        matches!(self, Self::Physical)
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Physical => "physical",
+            Self::Remap => "remap",
+        }
+    }
 }
 
 /// Optional machine-owned execution authority installed beside the wrapper.
@@ -329,6 +358,10 @@ impl InstallationReceipt {
 
     pub(crate) fn remote(&self) -> Option<&crate::remote_cache::InstalledRemoteCache> {
         self.remote.as_ref()
+    }
+
+    pub(crate) const fn root_portability(&self) -> InstalledRootPortability {
+        self.root_portability
     }
 
     pub(crate) fn local_distributed_worker(&self) -> Option<&Path> {
@@ -608,6 +641,8 @@ pub(crate) struct InstallationStatus {
     pub(crate) cache_base: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) max_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) root_portability: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) distributed: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1031,6 +1066,24 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
     } else {
         existing.as_ref().and_then(|receipt| receipt.remote.clone())
     };
+    let root_portability = match request.root_portability.as_deref() {
+        Some("physical") => InstalledRootPortability::Physical,
+        Some("remap") if remote.is_some() => InstalledRootPortability::Remap,
+        Some("remap") => {
+            return Err(RailError::message(
+                "root portability remapping requires an installed remote cache authority",
+            ));
+        }
+        Some(mode) => {
+            return Err(RailError::message(format!(
+                "unsupported root portability mode '{mode}'"
+            )));
+        }
+        None => existing.as_ref().map_or(
+            InstalledRootPortability::Physical,
+            InstallationReceipt::root_portability,
+        ),
+    };
     let authority = existing
         .as_ref()
         .map(|receipt| receipt.authority.clone())
@@ -1054,6 +1107,7 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
         worker_generation,
         cache,
         remote,
+        root_portability,
         distributed: distributed_worker
             .as_ref()
             .map(|worker| InstalledDistributedQualification {
@@ -1746,6 +1800,7 @@ pub(crate) fn status(current_dir: &Path) -> RailResult<InstallationStatus> {
             wrapper_path: None,
             cache_base: None,
             max_bytes: None,
+            root_portability: None,
             distributed: None,
             distributed_policy: None,
             distributed_placement_history: None,
@@ -1868,6 +1923,7 @@ pub(crate) fn status(current_dir: &Path) -> RailResult<InstallationStatus> {
         wrapper_path: Some(receipt.wrapper_path.to_string_lossy().into_owned()),
         cache_base: Some(receipt.cache.base().to_string_lossy().into_owned()),
         max_bytes: Some(receipt.cache.max_bytes()),
+        root_portability: Some(receipt.root_portability.as_str()),
         distributed: receipt
             .distributed
             .as_ref()

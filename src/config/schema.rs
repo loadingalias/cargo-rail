@@ -382,7 +382,7 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
     ),
     policy(
         "surface.targets",
-        "Selects the host and configured target views required for source-surface conclusions.",
+        "Selects an explicit host/configured-target subset or inherits the top-level workspace target policy.",
     ),
     policy(
         "surface.crate_visibility",

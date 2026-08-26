@@ -845,6 +845,115 @@ fn test_config_explain_json_reports_effective_default_and_source() {
 }
 
 #[test]
+fn test_config_workspace_surface_targets_are_materialized_with_provenance() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("config-surface-workspace-targets")?;
+        ws.add_crate("test-crate", "0.1.0", &[])?;
+        ws.commit("Add test crate")?;
+        fs::write(
+            ws.path.join(".config/rail.toml"),
+            r#"targets = ["aarch64-unknown-linux-gnu", "wasm32-wasip1"]
+
+[surface]
+targets = "workspace"
+"#,
+        )?;
+
+        let printed = run_cargo_rail(&ws.path, &["rail", "config", "print", "-f", "json"])?;
+        assert!(printed.status.success(), "config print failed: {printed:?}");
+        let printed: serde_json::Value = serde_json::from_slice(&printed.stdout)?;
+        assert_eq!(
+            printed["config"]["surface"]["targets"],
+            serde_json::json!(["host", "aarch64-unknown-linux-gnu", "wasm32-wasip1"])
+        );
+
+        let explained = run_cargo_rail(&ws.path, &["rail", "config", "explain", "-f", "json"])?;
+        assert!(explained.status.success(), "config explain failed: {explained:?}");
+        let explained: serde_json::Value = serde_json::from_slice(&explained.stdout)?;
+        let targets = explained["fields"]
+            .as_array()
+            .and_then(|fields| fields.iter().find(|field| field["path"] == "surface.targets"))
+            .expect("surface.targets explanation");
+        assert_eq!(targets["configured"], "workspace");
+        assert_eq!(
+            targets["effective"],
+            serde_json::json!(["host", "aarch64-unknown-linux-gnu", "wasm32-wasip1"])
+        );
+        assert!(
+            targets["source"]
+                .as_str()
+                .is_some_and(|source| source.ends_with("rail.toml (inherited from targets)"))
+        );
+
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_config_explicit_surface_target_subset_does_not_inherit_new_targets() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("config-surface-explicit-targets")?;
+        ws.add_crate("test-crate", "0.1.0", &[])?;
+        ws.commit("Add test crate")?;
+        fs::write(
+            ws.path.join(".config/rail.toml"),
+            r#"targets = ["aarch64-unknown-linux-gnu", "wasm32-wasip1"]
+
+[surface]
+targets = ["host", "wasm32-wasip1"]
+"#,
+        )?;
+
+        let printed = run_cargo_rail(&ws.path, &["rail", "config", "print", "-f", "json"])?;
+        assert!(printed.status.success(), "config print failed: {printed:?}");
+        let printed: serde_json::Value = serde_json::from_slice(&printed.stdout)?;
+        assert_eq!(
+            printed["config"]["surface"]["targets"],
+            serde_json::json!(["host", "wasm32-wasip1"])
+        );
+
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_config_validate_rejects_surface_target_outside_workspace_policy() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("config-surface-unknown-target")?;
+        ws.add_crate("test-crate", "0.1.0", &[])?;
+        ws.commit("Add test crate")?;
+        fs::write(
+            ws.path.join(".config/rail.toml"),
+            r#"targets = ["aarch64-unknown-linux-gnu"]
+
+[surface]
+targets = ["wasm32-wasip1"]
+"#,
+        )?;
+
+        let output = run_cargo_rail(&ws.path, &["rail", "config", "validate", "--strict", "-f", "json"])?;
+        assert_eq!(output.status.code(), Some(2));
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(json["valid"], false);
+        assert!(
+            json["errors"]
+                .as_array()
+                .is_some_and(|errors| errors.iter().any(|error| {
+                    error["section"] == "surface"
+                        && error["message"]
+                            .as_str()
+                            .is_some_and(|message| message.contains("not declared in top-level targets"))
+                }))
+        );
+
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
 fn test_config_explain_text_uses_same_field_values_as_json() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("config-explain-text")?;

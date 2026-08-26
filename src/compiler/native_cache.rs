@@ -139,6 +139,11 @@ pub(crate) struct NativeCompilerSession {
     identity: String,
     /// Exact workspace-root binding for this session and every reusable action.
     source_root_identity: String,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::cache::installation::InstalledRootPortability::is_physical"
+    )]
+    root_portability: crate::cache::installation::InstalledRootPortability,
     class: NativeCompilerClass,
     capability_identity: String,
     compiler_process_environment_identity: String,
@@ -1665,9 +1670,26 @@ impl NativeActionCapture {
         ))
     }
 
-    /// Bind exact compiler outputs to the physical source namespace rustc observed.
-    fn compilation_root_identity(&self) -> String {
+    /// Bind exact compiler outputs to the source namespace rustc observed.
+    ///
+    /// The installed root-portability authority admits only a narrowly verified
+    /// compiler class and adds an exact workspace remap. That class must use a
+    /// logical namespace here; retaining the physical namespace would silently
+    /// partition otherwise portable L2 actions by checkout root.
+    fn compilation_root_identity(&self, observation: &RawCompilerInvocation) -> RailResult<String> {
         let mut framed = Vec::from(&b"cargo-rail-native-compilation-root\0"[..]);
+        if observation.compiler_arguments.iter().any(|argument| {
+            argument
+                .strip_prefix("--remap-path-prefix=")
+                .and_then(|value| value.rsplit_once('='))
+                .is_some_and(|(_, destination)| destination == crate::compiler::distributed::VIRTUAL_WORKSPACE)
+        }) {
+            let portable_root = self.portable_source_root()?;
+            append_frame(&mut framed, b"source-root", portable_root.as_bytes());
+            append_frame(&mut framed, b"source-root-spelling", portable_root.as_bytes());
+            crate::instrumentation::record_hash(framed.len());
+            return Ok(format!("sha256:{}", ContentDigest::sha256(&framed)));
+        }
         append_frame(
             &mut framed,
             b"source-root",
@@ -1715,7 +1737,7 @@ impl NativeActionCapture {
             );
         }
         crate::instrumentation::record_hash(framed.len());
-        format!("sha256:{}", ContentDigest::sha256(&framed))
+        Ok(format!("sha256:{}", ContentDigest::sha256(&framed)))
     }
 
     fn portable_source_root(&self) -> RailResult<String> {
@@ -4277,7 +4299,13 @@ fn installed_native_session(
             Ok(memo) => memo,
             Err(_) => return Ok(None),
         };
-        crate::compiler::collector::reuse_transparent_native_session(&memo, source_root, target_root, rustc_program)
+        let session = crate::compiler::collector::reuse_transparent_native_session(
+            &memo,
+            source_root,
+            target_root,
+            rustc_program,
+        )?;
+        Ok(session.filter(|session| session.root_portability == receipt.root_portability()))
     }
 
     if let Some(session) = load(receipt, source_root, target_root, rustc_program)? {
@@ -4292,6 +4320,7 @@ fn installed_native_session(
         target_root,
         rustc_program,
         receipt.cache(),
+        receipt.root_portability(),
     )?;
     crate::cache::installation::store_session_memo(receipt, &memo.encode()?)?;
     Ok(session)
@@ -4333,13 +4362,14 @@ fn open_active_remote_store()
 }
 
 impl NativeCompilerSession {
-    pub(crate) fn capture(
+    pub(crate) fn capture_with_root_portability(
         source_root: &Path,
         rustc_verbose_version: &str,
         capability_identity: &str,
         compiler_process_environment_identity: &str,
         execution_contract: &str,
         authority: NativeSessionAuthority,
+        root_portability: crate::cache::installation::InstalledRootPortability,
     ) -> RailResult<Self> {
         let source_root = crate::utils::canonicalize_existing(source_root)?;
         let source_root_identity = path_identity(&source_root)?;
@@ -4347,6 +4377,7 @@ impl NativeCompilerSession {
         let identity = session_identity(
             &class,
             &source_root_identity,
+            root_portability,
             capability_identity,
             compiler_process_environment_identity,
             execution_contract,
@@ -4356,6 +4387,7 @@ impl NativeCompilerSession {
             version: NATIVE_COMPILER_SESSION_VERSION,
             identity,
             source_root_identity,
+            root_portability,
             class,
             capability_identity: capability_identity.to_string(),
             compiler_process_environment_identity: compiler_process_environment_identity.to_string(),
@@ -4419,6 +4451,7 @@ impl NativeCompilerSession {
         let expected = session_identity(
             &self.class,
             &self.source_root_identity,
+            self.root_portability,
             &self.capability_identity,
             &self.compiler_process_environment_identity,
             &self.execution_contract,
@@ -4915,23 +4948,33 @@ fn result_key(
 fn session_identity(
     class: &NativeCompilerClass,
     source_root_identity: &str,
+    root_portability: crate::cache::installation::InstalledRootPortability,
     capability_identity: &str,
     compiler_process_environment_identity: &str,
     execution_contract: &str,
     authority: NativeSessionAuthority,
 ) -> RailResult<String> {
     let class = serde_json::to_vec(class)?;
+    let root_identity = match root_portability {
+        crate::cache::installation::InstalledRootPortability::Physical => source_root_identity,
+        crate::cache::installation::InstalledRootPortability::Remap => crate::compiler::distributed::VIRTUAL_WORKSPACE,
+    };
+    // Adding an explicit root-portability authority changes session identity
+    // even for the conservative physical mode. Version both modes together so
+    // no version-13 identity is silently reinterpreted under a new frame set.
+    let version = 14_u32;
     Ok(sha256_identity(
         "sha256:",
         b"cargo-rail-native-compiler-session\0",
         &[
-            (b"version", &13_u32.to_le_bytes()),
+            (b"version", &version.to_le_bytes()),
             (
                 b"toolchain-capability-contract",
                 &NATIVE_CACHE_IDENTITY_CONTRACT_VERSION.to_le_bytes(),
             ),
             (b"class", &class),
-            (b"source-root", source_root_identity.as_bytes()),
+            (b"source-root", root_identity.as_bytes()),
+            (b"root-portability", root_portability.as_str().as_bytes()),
             (b"capability", capability_identity.as_bytes()),
             (
                 b"compiler-process-environment",
@@ -5085,7 +5128,10 @@ fn base_action_key(
             (b"version", &9_u32.to_le_bytes()),
             (b"session", session_identity.as_bytes()),
             (b"class", &class),
-            (b"compilation-root", capture.compilation_root_identity().as_bytes()),
+            (
+                b"compilation-root",
+                capture.compilation_root_identity(observation)?.as_bytes(),
+            ),
             (b"pre-execution", &pre_execution),
             (b"source-state", &source_state),
             (b"generated-state", &generated_state),
@@ -5130,6 +5176,7 @@ fn portable_native_cache_key_inputs<'a>(
         ));
     }
     compiler_arguments[*source_argument] = portable_crate_root.clone();
+    normalize_portable_root_remap_arguments(&mut compiler_arguments)?;
     Ok(PortableNativeCacheKeyInputs {
         cfg,
         compiler_arguments,
@@ -5141,6 +5188,37 @@ fn portable_native_cache_key_inputs<'a>(
         }],
         dependency_artifacts,
     })
+}
+
+fn normalize_portable_root_remap_arguments(arguments: &mut [String]) -> RailResult<()> {
+    let mut index = 0usize;
+    while index < arguments.len() {
+        if arguments[index] == "--remap-path-prefix" {
+            let value = arguments
+                .get_mut(index + 1)
+                .ok_or_else(|| RailError::message("portable root remap value is missing"))?;
+            if value
+                .rsplit_once('=')
+                .is_some_and(|(_, destination)| destination == crate::compiler::distributed::VIRTUAL_WORKSPACE)
+            {
+                *value = format!("repository:={}", crate::compiler::distributed::VIRTUAL_WORKSPACE);
+            }
+            index += 2;
+            continue;
+        }
+        if let Some(value) = arguments[index].strip_prefix("--remap-path-prefix=")
+            && value
+                .rsplit_once('=')
+                .is_some_and(|(_, destination)| destination == crate::compiler::distributed::VIRTUAL_WORKSPACE)
+        {
+            arguments[index] = format!(
+                "--remap-path-prefix=repository:={}",
+                crate::compiler::distributed::VIRTUAL_WORKSPACE
+            );
+        }
+        index += 1;
+    }
+    Ok(())
 }
 
 /// Derive protocol v3 only when the captured native action is already the
@@ -6288,7 +6366,9 @@ fn invocation_bypass_reason(
     if !supported_pathless_toolchain_externs(&observation.compiler_arguments, &observation.crate_types) {
         return Some("dependency_artifact_path_unavailable");
     }
-    if let Some(reason) = compiler_argument_bypass_reason(&observation.compiler_arguments, None) {
+    let current_directory = std::env::current_dir().ok();
+    if let Some(reason) = compiler_argument_bypass_reason(&observation.compiler_arguments, current_directory.as_deref())
+    {
         return Some(reason);
     }
     if let Some(reason) = observation.dependency_artifacts.iter().find_map(|(_, artifact)| {
@@ -6939,6 +7019,29 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
             return OuterCacheAction::Execute;
         }
     };
+    let portable_compiler_arguments;
+    let compiler_arguments = if session.root_portability == crate::cache::installation::InstalledRootPortability::Remap
+    {
+        match root_portable_compiler_arguments(compiler_arguments, source_root, &original_current_dir) {
+            Ok(arguments) => {
+                portable_compiler_arguments = arguments;
+                portable_compiler_arguments.as_slice()
+            }
+            Err(reason) => {
+                configure_cold(
+                    command,
+                    CompilerCacheWrapperStatus::Bypassed,
+                    reason,
+                    None,
+                    0,
+                    diagnostic_wrapper,
+                );
+                return OuterCacheAction::Execute;
+            }
+        }
+    } else {
+        compiler_arguments
+    };
     let mut recorder = match crate::compiler::observation::begin_invocation_in(
         observation_directory,
         source_root,
@@ -7018,6 +7121,19 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
             return OuterCacheAction::Execute;
         }
     };
+    if session.root_portability == crate::cache::installation::InstalledRootPortability::Remap
+        && let Err(reason) = root_portable_action_class(recorder.observation(), &capture, &output_paths, source_root)
+    {
+        configure_cold(
+            command,
+            CompilerCacheWrapperStatus::Bypassed,
+            reason,
+            None,
+            initial_input_bytes.saturating_add(capture.bytes_hashed),
+            diagnostic_wrapper,
+        );
+        return OuterCacheAction::Execute;
+    }
     let distributed_worker = context
         .installation
         .as_ref()
@@ -7570,6 +7686,9 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
         );
         return OuterCacheAction::Execute;
     }
+    if session.root_portability == crate::cache::installation::InstalledRootPortability::Remap {
+        miss_reason.push_str(";root_portability_remap_eligible");
+    }
     let metadata = configure_cold(
         command,
         CompilerCacheWrapperStatus::Miss,
@@ -7596,6 +7715,86 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
         cache_bytes_read: metrics.cache_bytes_read,
         distributed_placement,
     }))
+}
+
+fn root_portable_compiler_arguments(
+    arguments: &[OsString],
+    source_root: &Path,
+    current_directory: &Path,
+) -> Result<Vec<OsString>, &'static str> {
+    if arguments.iter().any(|argument| {
+        argument.to_str().is_some_and(|argument| {
+            argument.starts_with("--remap-path-prefix") || argument.starts_with("--remap-path-scope")
+        })
+    }) {
+        return Err("root_portability_remap_conflict");
+    }
+    let canonical_root =
+        crate::utils::canonicalize_existing(source_root).map_err(|_| "root_portability_source_root_unavailable")?;
+    let canonical_current = crate::utils::canonicalize_existing(current_directory)
+        .map_err(|_| "root_portability_source_root_unavailable")?;
+    if canonical_current != canonical_root {
+        return Err("root_portability_source_root_ambiguous");
+    }
+    let manifest_root = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .ok_or("root_portability_package_root_unavailable")?;
+    let manifest_root =
+        crate::utils::canonicalize_existing(&manifest_root).map_err(|_| "root_portability_package_root_unavailable")?;
+    if !manifest_root.starts_with(&canonical_root) {
+        return Err("root_portability_external_source_unmodeled");
+    }
+    let root = canonical_root
+        .to_str()
+        .ok_or("root_portability_non_utf8_root_unmodeled")?;
+    let mut remapped = arguments.to_vec();
+    remapped.push(
+        format!(
+            "--remap-path-prefix={root}={}",
+            crate::compiler::distributed::VIRTUAL_WORKSPACE
+        )
+        .into(),
+    );
+    Ok(remapped)
+}
+
+/// Certify the exact non-linking or Rust-library output class admitted for
+/// checkout-root sharing. The injected physical remap is removed only from the
+/// cloned authority view; rustc still receives it for the real compilation.
+fn root_portable_action_class(
+    observation: &RawCompilerInvocation,
+    capture: &NativeActionCapture,
+    output_paths: &NativeOutputPaths,
+    source_root: &Path,
+) -> Result<(), &'static str> {
+    let expected = format!(
+        "--remap-path-prefix=repository:={}",
+        crate::compiler::distributed::VIRTUAL_WORKSPACE
+    );
+    let mut authority = observation.clone();
+    if authority.compiler_arguments.last().map(String::as_str) != Some(expected.as_str()) {
+        return Err("root_portability_remap_authority_mismatch");
+    }
+    authority.compiler_arguments.pop();
+    if !authority.environment_reads.is_empty() {
+        return Err("root_portability_environment_unmodeled");
+    }
+    if !authority.bypasses.is_empty() {
+        return Err("root_portability_observation_unmodeled");
+    }
+    if capture.generated.is_some() {
+        return Err("root_portability_generated_source_unmodeled");
+    }
+    if !capture.native_searches.is_empty() {
+        return Err("root_portability_native_search_unmodeled");
+    }
+    if !capture.pathless_extern_searches.is_empty() {
+        return Err("root_portability_pathless_extern_unmodeled");
+    }
+    if !capture.approved_environment.entries.is_empty() {
+        return Err("root_portability_environment_selector_unmodeled");
+    }
+    distributed_rust_library_authority_with_remap(&authority, capture, output_paths, source_root, false).map(|_| ())
 }
 
 fn prepare_distributed_local_fallback(
@@ -8500,6 +8699,13 @@ fn restore_and_publish(
             || hit_source.reason().to_string(),
             |remote| format!("{};{remote}", hit_source.reason()),
         );
+    let reason = if context.installation.as_ref().is_some_and(|receipt| {
+        receipt.root_portability() == crate::cache::installation::InstalledRootPortability::Remap
+    }) {
+        format!("{reason};root_portability_remap_eligible")
+    } else {
+        reason
+    };
     write_cache_event(
         CompilerCacheWrapperStatus::Hit,
         &reason,
@@ -10289,9 +10495,15 @@ fn portable_dep_info_source_roots(
         ));
     }
     replacements.dedup();
-    Ok(replacements.iter().fold(bytes.to_vec(), |current, (from, to)| {
+    let portable = replacements.iter().fold(bytes.to_vec(), |current, (from, to)| {
         replace_bytes(&current, from, to).0
-    }))
+    });
+    Ok(replace_bytes(
+        &portable,
+        crate::compiler::distributed::VIRTUAL_WORKSPACE.as_bytes(),
+        PORTABLE_SOURCE_ROOT.as_bytes(),
+    )
+    .0)
 }
 
 fn rebind_dep_info_source_roots(
@@ -14066,6 +14278,7 @@ pub(crate) mod tests {
         let identity = session_identity(
             &class,
             &source_root_identity,
+            crate::cache::installation::InstalledRootPortability::Physical,
             &capability_identity,
             &compiler_process_environment_identity,
             &execution_contract,
@@ -14076,6 +14289,7 @@ pub(crate) mod tests {
             version: NATIVE_COMPILER_SESSION_VERSION,
             identity,
             source_root_identity,
+            root_portability: crate::cache::installation::InstalledRootPortability::Physical,
             class,
             capability_identity,
             compiler_process_environment_identity,
@@ -15901,6 +16115,7 @@ pub(crate) mod tests {
             session_identity(
                 &session.class,
                 &session.source_root_identity,
+                session.root_portability,
                 capability,
                 environment,
                 contract,
@@ -15942,6 +16157,7 @@ pub(crate) mod tests {
         session.identity = session_identity(
             &session.class,
             &session.source_root_identity,
+            session.root_portability,
             &session.capability_identity,
             &session.compiler_process_environment_identity,
             &session.execution_contract,
@@ -15965,6 +16181,41 @@ pub(crate) mod tests {
         fs::write(&session_file, serde_json::to_vec(&first_session).expect("session JSON")).expect("session file");
         NativeCompilerSession::load(&session_file, first.path()).expect("matching physical root");
         NativeCompilerSession::load(&session_file, second.path()).expect_err("replayed session file must fail closed");
+    }
+
+    #[test]
+    fn remapped_session_identity_is_portable_but_its_session_file_is_root_bound() {
+        let first = tempfile::tempdir().expect("first source root");
+        let second = tempfile::tempdir().expect("second source root");
+        let mut session = graduated_session(path_identity(first.path()).expect("first root identity"));
+        session.root_portability = crate::cache::installation::InstalledRootPortability::Remap;
+        session.identity = session_identity(
+            &session.class,
+            &session.source_root_identity,
+            session.root_portability,
+            &session.capability_identity,
+            &session.compiler_process_environment_identity,
+            &session.execution_contract,
+            session.authority,
+        )
+        .expect("portable session identity");
+        let second_identity = session_identity(
+            &session.class,
+            &path_identity(second.path()).expect("second root identity"),
+            session.root_portability,
+            &session.capability_identity,
+            &session.compiler_process_environment_identity,
+            &session.execution_contract,
+            session.authority,
+        )
+        .expect("second portable session identity");
+        assert_eq!(session.identity, second_identity);
+
+        let session_file = first.path().join("session.json");
+        fs::write(&session_file, serde_json::to_vec(&session).expect("session JSON")).expect("session file");
+        NativeCompilerSession::load(&session_file, first.path()).expect("matching physical session root");
+        NativeCompilerSession::load(&session_file, second.path())
+            .expect_err("portable identity must not move authority");
     }
 
     #[test]

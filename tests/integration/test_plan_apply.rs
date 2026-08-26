@@ -178,6 +178,7 @@ fn test_release_apply_from_plan_file() {
             r#"tag_prefix = "v"
 tag_format = "v{version}"
 require_clean = false
+require_release_notes = false
 "#,
         )?;
         std::fs::create_dir_all(ws.path.join(".changes"))?;
@@ -265,7 +266,13 @@ fn test_release_plan_rejects_unreviewed_file_before_mutation() {
             r#"tag_prefix = "v"
 tag_format = "v{version}"
 require_clean = false
+require_release_notes = false
 "#,
+        )?;
+        std::fs::create_dir_all(ws.path.join(".changes"))?;
+        std::fs::write(
+            ws.path.join(".changes/release-authority.md"),
+            "---\n\"release-authority\" = \"patch\"\n---\n\nExercise release mutation authority.\n",
         )?;
         let config_head = ws.commit("Configure release")?;
 
@@ -284,7 +291,13 @@ require_clean = false
                 "--json",
             ],
         )?;
-        assert_eq!(check.status.code(), Some(1));
+        assert_eq!(
+            check.status.code(),
+            Some(1),
+            "release plan check failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&check.stdout),
+            String::from_utf8_lossy(&check.stderr)
+        );
         let plan_dir = TempDir::new()?;
         let plan_path = plan_dir.path().join("release-plan.json");
         std::fs::write(&plan_path, &check.stdout)?;

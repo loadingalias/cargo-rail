@@ -151,7 +151,7 @@ Source installs and `cargo binstall` keep `surface --schema`, but cannot prepare
 | ------------------------- | ------------: | ----------------------------------------------------------------------------------------------------------------------------------------------- |
 | `enabled`                 |       `false` | Include the whole-workspace `surface` gate in planner and CI decisions. Direct `cargo rail surface` inspection remains available when disabled. |
 | `consumer_scope`          |      `"open"` | `"workspace"` permits closed-world conclusions at the compiler-crate boundary described below.                                                  |
-| `targets`                 |    `["host"]` | Compiler target views to merge. Use `"host"` or target triples already captured by the top-level `targets` policy.                              |
+| `targets`                 |    `["host"]` | Compiler target views to merge. Use `"workspace"` to inherit host plus every top-level target, or an explicit subset containing `"host"` and/or configured target triples. |
 | `crate_visibility`        |  `"preserve"` | `"allow"` enables the otherwise allow-by-default `unnecessary-crate-visibility` class.                                                          |
 | `preserve_uniform_fields` |       `false` | Preserve one intentional field-visibility level across a struct or union instead of reducing fields independently.                              |
 | `lint`                    |          `[]` | Ordered global `{ selector, level }` directives. Later matching directives win; `selector` is `warnings` or one exact lint.                     |
@@ -177,7 +177,7 @@ preserved even when another observation is closed. `[[surface.external]]` opens 
 [surface]
 enabled = true
 consumer_scope = "workspace"
-targets = ["host", "x86_64-unknown-linux-gnu"]
+targets = "workspace"
 crate_visibility = "allow"
 preserve_uniform_fields = true
 
@@ -227,9 +227,18 @@ Each product or policy entry can use an optional Cargo target triple or `cfg(...
 requires exactly one owner selector, `package` or Rust compiler `crate`; exclusions require exactly one of `module` or
 `file`. Missing and ambiguous item selectors are configuration failures instead of broad matches.
 
-`surface.targets` selects only target views declared by the repository's top-level target policy. With no explicit
-feature profiles, Cargo-Rail derives default, no-default, all-features, and applicable selected-feature views from
-manifests and cfg expressions. Explicit profiles replace that matrix exactly.
+`surface.targets = "workspace"` inherits the host view and every target declared by the repository's top-level target
+policy. An explicit array remains a stable subset and may contain `"host"` and target triples from that top-level
+policy. Cargo-Rail rejects stale or unknown explicit triples instead of capturing a second target authority. With no
+explicit feature profiles, Cargo-Rail derives default, no-default, all-features, and applicable selected-feature views
+from manifests and cfg expressions. Explicit profiles replace that matrix exactly.
+
+Each Surface analysis writes an append-only JSONL acquisition manifest under
+`target/cargo-rail/surface-acquisitions-v1/`. If a Cargo view fails, the manifest records the exact failed product,
+package, Cargo target, target triple, feature profile, completed views, and unstarted views. After correcting the
+source failure, run the `cargo rail surface --resume MANIFEST --format json` command reported in the error. Resume
+recaptures the workspace and effective configuration and reuses only independently verified complete fact objects;
+journal status never authorizes reuse. Resume is read-only and cannot be combined with `--fix`.
 
 See [Migrate from Hawk](migrate-hawk.md) for configuration and command mappings.
 
@@ -239,6 +248,11 @@ Reviewed `.changes/*.md` files are the default authority for bumps and release p
 migration. Remote release modes bind the prepared commit and wait for readiness on its exact SHA. Registry publication
 is a separate default-deny authority and requires both `registry_publication = "crates-io"` and `--publish`; when
 authorized, it runs in dependency order, observes crates.io state, and creates tags last.
+
+`cargo rail release check` validates the same local crate, bump, changelog, release-note, and tag plan as
+`cargo rail release run --check`; pending local changes exit 1. Neither command performs mutations or external effects,
+and JSON output lists every excluded effect. Use `release check --publication` for the separate publishable-crate
+readiness scope; add `--extended` there for publish dry-run, MSRV, and semver evidence.
 
 | Field                       |                       Default | Behavior                                                                                                                                                                                                                                                                                                                                                                 |
 | --------------------------- | ----------------------------: | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |

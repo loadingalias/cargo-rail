@@ -1359,6 +1359,33 @@ cargo rail cache setup --remote \\
 cargo build --workspace --all-features --locked
 ```
 
+The default `--root-portability physical` mode binds actions to the canonical checkout root. Use it when runners use
+one standardized canonical checkout path; identical physical roots can share L2 without remapping.
+
+Different checkout roots require an explicit machine authority:
+
+```bash
+cargo rail cache setup --check --remote \
+  's3://company-cargo-rail-cache/rust/team?region=us-east-1&owner=123456789012' \
+  --remote-mode read-write \
+  --root-portability remap
+cargo rail cache setup --remote \
+  's3://company-cargo-rail-cache/rust/team?region=us-east-1&owner=123456789012' \
+  --remote-mode read-write \
+  --root-portability remap
+```
+
+Remap mode validates the physical root in the local session, admits workspace-owned Rust units only after certifying
+their output class, and invokes rustc with one exact workspace-to-logical-root remap. The action identity retains the
+logical remap, exact source topology, symlink evidence, compiler, target, flags, environment digests, dependency
+bytes, and result bytes. Verified restore rebinds dep-info and diagnostics to the consumer checkout. Cache status and
+eligible events report `root_portability = "remap"` and `root_portability_remap_eligible`.
+
+An existing remap, an external package root, an ambiguous or non-UTF-8 root, generated `OUT_DIR` sources, native
+search namespaces, and any output class outside the reviewed Rust metadata/library boundary bypass cross-root reuse
+with a named reason and execute normally. Standardize canonical checkout roots and retain physical mode when a
+workload cannot qualify.
+
 `loadingalias/cargo-rail-action/cache@47e86bde928ce420b85efa5f8d3b5feb96fd0ffc` accepts the same URL as `url`, runs
 setup once, and leaves later ordinary
 Cargo commands in that GitHub Actions job on the installed cache path. Configure provider credentials before Cargo

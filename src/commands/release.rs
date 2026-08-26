@@ -122,6 +122,7 @@ pub fn run_release_plan(
     let target_crates = plan.canonical_crate_order.clone();
     let mutation_plan = build_release_mutation_plan(ctx, &plan, skip_publish, skip_tag, false, release_config)?;
     let has_pending_changes = !mutation_plan.actions.is_empty();
+    let readiness = release_check_readiness(has_pending_changes, skip_publish, skip_tag, release_config);
 
     if !has_pending_changes {
         if json {
@@ -129,6 +130,7 @@ pub fn run_release_plan(
               "release_plan": plan,
               "mutation_plan": mutation_plan,
               "check": true,
+              "readiness": readiness,
             });
             let output = crate::output::machine_json_envelope("release", "check", "no_changes", 0, payload);
             let json_output = serde_json::to_string_pretty(&output)
@@ -146,12 +148,14 @@ pub fn run_release_plan(
 
     // Validate changelog paths (catches path traversal issues early)
     validator.validate_changelog_paths(&target_crates, release_config)?;
+    validator.validate_apply_preconditions(&plan, true, skip_tag, false, release_config.require_release_notes)?;
 
     if json {
         let payload = serde_json::json!({
           "release_plan": plan,
           "mutation_plan": mutation_plan,
           "check": true,
+          "readiness": readiness,
         });
         let output = crate::output::machine_json_envelope("release", "check", "pending_changes", 1, payload);
         let json_output = serde_json::to_string_pretty(&output)
@@ -421,8 +425,8 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
     Ok(())
 }
 
-/// Validate release readiness
-pub fn run_release_check(
+/// Validate registry publication readiness.
+pub fn run_release_publication_check(
     ctx: &WorkspaceContext,
     crate_names: Option<Vec<String>>,
     all: bool,
@@ -460,6 +464,24 @@ pub fn run_release_check(
         skipped_crates = skipped;
 
         if publishable.is_empty() {
+            if json {
+                let payload = serde_json::json!({
+                  "action": "check",
+                  "readiness": publication_check_readiness(),
+                  "status": "failed",
+                  "crates": [],
+                  "count": 0,
+                  "skipped": skipped_crates
+                      .iter()
+                      .map(|(name, reason)| serde_json::json!({"crate": name, "reason": reason}))
+                      .collect::<Vec<_>>(),
+                  "error": "no publishable crates found",
+                  "help": "All workspace crates have publish = false. Check Cargo.toml or rail.toml settings."
+                });
+                let output = crate::output::machine_json_envelope("release", "validate", "failed", 2, payload);
+                println!("{}", serde_json::to_string_pretty(&output)?);
+                return Err(RailError::ExitWithCode { code: 2 });
+            }
             return Err(RailError::with_help(
                 "no publishable crates found",
                 "All workspace crates have publish = false. Check Cargo.toml or rail.toml settings.",
@@ -618,6 +640,7 @@ pub fn run_release_check(
     if json {
         let mut payload = serde_json::json!({
           "action": "check",
+          "readiness": publication_check_readiness(),
           "status": if has_extended_failures || has_commit_diagnostic_failures || has_change_file_failures || has_shallow_failures { "failed" } else { "passed" },
           "crates": results,
           "count": results.len()
@@ -704,6 +727,49 @@ pub fn run_release_check(
     }
 
     Ok(())
+}
+
+fn release_check_readiness(
+    has_pending_changes: bool,
+    skip_publish: bool,
+    skip_tag: bool,
+    release_config: &crate::config::ReleaseConfig,
+) -> serde_json::Value {
+    serde_json::json!({
+      "scope": "local",
+      "effects_executed": [],
+      "effects_excluded_from_check": [
+        "workspace_mutation",
+        "git_commit",
+        "git_tag",
+        "git_push",
+        "forge_release",
+        "registry_publication"
+      ],
+      "planned_effects": {
+        "workspace_mutation": has_pending_changes,
+        "git_commit": has_pending_changes,
+        "git_tag": has_pending_changes && !skip_tag,
+        "git_push": has_pending_changes && release_config.remote_effects != ReleaseRemoteEffects::None,
+        "forge_release": has_pending_changes && release_config.remote_effects.creates_forge_release(),
+        "registry_publication": has_pending_changes && !skip_publish
+      }
+    })
+}
+
+fn publication_check_readiness() -> serde_json::Value {
+    serde_json::json!({
+      "scope": "publication",
+      "effects_executed": [],
+      "effects_excluded_from_check": [
+        "workspace_mutation",
+        "git_commit",
+        "git_tag",
+        "git_push",
+        "forge_release",
+        "registry_publication"
+      ]
+    })
 }
 
 /// Finalize a merged release PR through exact-SHA checks, publication, tags, and forge releases.

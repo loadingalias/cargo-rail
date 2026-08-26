@@ -101,6 +101,7 @@ Examples:
   cargo rail surface --prepare              # Prove exact-toolchain producer readiness
   cargo rail surface --check --explain      # Inspect complete Rust reachability
   cargo rail surface --check -f json        # Emit the versioned machine contract
+  cargo rail surface --resume MANIFEST -f json  # Resume a partial compiler acquisition
   cargo rail surface --fix --dry-run --explain  # Preview exact visibility edits
   cargo rail surface --fix --backup         # Apply verified edits with recovery evidence
   cargo rail surface --schema               # Print the versioned JSON Schema";
@@ -144,8 +145,9 @@ const RELEASE_HELP: &str = "\
 Examples:
   cargo rail release init my-crate              # Configure release for my-crate
   cargo rail release init my-crate --dry-run    # Preview generated config
-  cargo rail release check my-crate             # Validate release readiness
-  cargo rail release check my-crate --extended  # Run publish, MSRV, and semver checks
+  cargo rail release check my-crate                    # Validate the local release plan
+  cargo rail release check my-crate --publication     # Validate registry publication readiness
+  cargo rail release check my-crate --publication -e  # Run publish, MSRV, and semver checks
   cargo rail release run my-crate --check       # Check for a pending release (exit 1)
   cargo rail release run my-crate               # Prepare a local release without registry publication
   cargo rail release run my-crate --publish     # Match configured crates.io authority at invocation
@@ -193,6 +195,7 @@ const CACHE_HELP: &str = "\
 Examples:
   cargo rail cache setup --check                  # Preview transparent compiler reuse setup
   cargo rail cache setup                          # Install or repair the Cargo wrapper
+  cargo rail cache setup --remote URL --root-portability remap  # Qualify cross-root L2 reuse
   cargo rail cache status                         # Inspect workspace and shared local cache state
   cargo rail cache status --scope local -f json  # Inspect the shared local CAS only
   cargo rail cache recover --check                # Preview byte-preserving markerless CAS recovery
@@ -312,6 +315,13 @@ pub enum Commands {
         /// Apply exact visibility reductions
         #[arg(long, conflicts_with = "check")]
         fix: bool,
+        /// Resume from a prior partial acquisition manifest
+        #[arg(
+            long,
+            value_name = "MANIFEST",
+            conflicts_with_all = ["prepare", "fix", "dry_run", "backup", "schema"]
+        )]
+        resume: Option<PathBuf>,
         /// Render the exact mutation plan without writing
         #[arg(long, requires = "fix", conflicts_with = "backup")]
         dry_run: bool,
@@ -343,7 +353,7 @@ pub enum Commands {
         /// Print the versioned surface JSON Schema and exit
         #[arg(
             long,
-            conflicts_with_all = ["prepare", "check", "fix", "dry_run", "backup", "output", "explain", "only"]
+            conflicts_with_all = ["prepare", "check", "fix", "resume", "dry_run", "backup", "output", "explain", "only"]
         )]
         schema: bool,
     },
@@ -653,8 +663,11 @@ pub struct CacheSetupArgs {
     /// Additional reviewed compiler environment name admitted to L2 identity.
     #[arg(long = "remote-environment", value_name = "NAME", requires = "remote")]
     pub remote_environment: Vec<String>,
+    /// Cross-checkout authority: physical roots remain exact; remap qualifies portable L2 results.
+    #[arg(long, value_name = "MODE", value_parser = ["physical", "remap"])]
+    pub root_portability: Option<String>,
     /// Remove persisted remote activation while preserving local reuse.
-    #[arg(long, conflicts_with_all = ["remote", "remote_mode", "remote_environment"])]
+    #[arg(long, conflicts_with_all = ["remote", "remote_mode", "remote_environment", "root_portability"])]
     pub local_only: bool,
     /// Enable the same-host distributed protocol qualification path.
     #[arg(long, conflicts_with = "distributed_endpoint")]
@@ -966,7 +979,7 @@ pub enum ReleaseCommand {
         #[arg(long, short = 'f', default_value_t, value_enum)]
         format: TextJsonOutputFormat,
     },
-    /// Validate release readiness
+    /// Validate the same local release plan selected by `release run --check`
     Check {
         /// Crate name(s) to check (mutually exclusive with --all)
         #[arg(conflicts_with = "all", value_name = "CRATE")]
@@ -974,9 +987,18 @@ pub enum ReleaseCommand {
         /// Check all workspace crates (mutually exclusive with crate names)
         #[arg(short, long)]
         all: bool,
-        /// Run extended validation (publish dry-run, MSRV, optional semver checks)
-        #[arg(long, short = 'e')]
+        /// Version bump [auto, major, minor, patch, prerelease, release, or "x.y.z"]
+        #[arg(long, default_value = "auto")]
+        bump: String,
+        /// Validate registry publication readiness instead of the local release plan
+        #[arg(long)]
+        publication: bool,
+        /// Run extended publication validation (publish dry-run, MSRV, optional semver checks)
+        #[arg(long, short = 'e', requires = "publication")]
         extended: bool,
+        /// Exclude git tag creation from the local release plan
+        #[arg(long, conflicts_with = "publication")]
+        skip_tag: bool,
         /// Expand explicit crate selection to include the full dependent closure
         #[arg(long)]
         include_dependents: bool,

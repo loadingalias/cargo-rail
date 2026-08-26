@@ -23,6 +23,8 @@ TEST_NAME = "compiler::collector::tests::compiler_fact_acquisition_qualification
 MINIMUM_QUALIFICATION_SAMPLES = 20
 MINIMUM_COMBINED_REDUCTION_PERCENT = 10.0
 MAXIMUM_WARM_FRACTION = 0.10
+COMBINED_CARGO_VIEWS = 3
+INDEPENDENT_CARGO_VIEWS = 4
 SCRUBBED_ENVIRONMENT = (
     "CARGO_BUILD_JOBS",
     "CARGO_BUILD_RUSTC_WRAPPER",
@@ -344,7 +346,8 @@ def measure_sample(
         payload = extract_result(stdout.read_bytes())
         if payload.get("schema_version") != 2 or payload.get("lane") != lane:
             raise QualificationError("test workload record does not match the requested lane")
-        if payload.get("cold_cargo_views") != (3 if lane == "combined" else 6):
+        expected_cargo_views = COMBINED_CARGO_VIEWS if lane == "combined" else INDEPENDENT_CARGO_VIEWS
+        if payload.get("cold_cargo_views") != expected_cargo_views:
             raise QualificationError("test workload executed the wrong number of Cargo views")
         if lane == "combined" and (
             payload.get("warm_cargo_views") != 0 or payload.get("warm_compiler_invocations") != 0
@@ -572,8 +575,8 @@ def run_qualification(runs: int, evidence_kind: str) -> Path:
                 "minimum_samples_per_lane": MINIMUM_QUALIFICATION_SAMPLES,
                 "combined_p50_and_p95_reduction_min_percent": MINIMUM_COMBINED_REDUCTION_PERCENT,
                 "warm_p50_and_p95_maximum_fraction_of_combined_cold": MAXIMUM_WARM_FRACTION,
-                "combined_cargo_views": 3,
-                "independent_cargo_views": 6,
+                "combined_cargo_views": COMBINED_CARGO_VIEWS,
+                "independent_cargo_views": INDEPENDENT_CARGO_VIEWS,
                 "warm_cargo_views": 0,
                 "warm_compiler_invocations": 0,
             },

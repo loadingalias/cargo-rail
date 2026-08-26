@@ -203,7 +203,9 @@ pub fn run_config_print(
     }
 
     // Load config from explicit path or search
-    let (config, config_path) = load_config_with_path(workspace_root, config_override)?;
+    let (mut config, config_path) = load_config_with_path(workspace_root, config_override)?;
+    let effective_surface_targets = config.surface.targets.effective(&config.targets);
+    config.surface.targets = crate::config::SurfaceTargetSelection::Explicit(effective_surface_targets);
 
     if json {
         // JSON output: serialize the config struct
@@ -281,7 +283,11 @@ pub fn run_config_explain(
         .into_iter()
         .map(|deprecation| (deprecation.path, deprecation.spec))
         .collect();
-    let effective = serde_json::to_value(&config).map_err(|error| RailError::message(error.to_string()))?;
+    let mut effective = serde_json::to_value(&config).map_err(|error| RailError::message(error.to_string()))?;
+    if let Some(surface_targets) = effective.pointer_mut("/surface/targets") {
+        *surface_targets = serde_json::to_value(config.surface.targets.effective(&config.targets))
+            .map_err(|error| RailError::message(error.to_string()))?;
+    }
     let defaults =
         serde_json::to_value(RailConfig::default()).map_err(|error| RailError::message(error.to_string()))?;
 
@@ -303,7 +309,9 @@ pub fn run_config_explain(
             let configured_value = configured.get(&path).cloned();
             let effective_value = effective.get(&path).cloned().unwrap_or(serde_json::Value::Null);
             let compatibility_source = has_compatibility_source(&path, &configured);
-            let source = if configured_value.is_some() || compatibility_source {
+            let source = if path == "surface.targets" && config.surface.targets.inherits_workspace() {
+                format!("{} (inherited from targets)", config_path.display())
+            } else if configured_value.is_some() || compatibility_source {
                 config_path.display().to_string()
             } else {
                 "default".to_string()
@@ -524,6 +532,9 @@ pub fn run_config_validate_standalone(
                 errors.push(ValidationIssue::new("unify", e.to_string()));
             }
             if let Err(e) = config.surface.validate() {
+                errors.push(ValidationIssue::new("surface", e.to_string()));
+            }
+            if let Err(e) = config.surface.validate_workspace_targets(&config.targets) {
                 errors.push(ValidationIssue::new("surface", e.to_string()));
             }
             if let Err(e) = config.release.changelog.filters.validate("release.changelog.filters") {

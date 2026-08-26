@@ -378,6 +378,138 @@ reason = "fixture product"
 
 #[test]
 #[ignore = "requires the exact rustc-dev companion authority embedded by the protocol harness"]
+fn surface_partial_acquisition_is_machine_resumable_and_reuses_exact_completed_views() {
+    let result: Result<()> = (|| {
+        let workspace = TestWorkspace::new_named("surface-acquisition-resume")?;
+        let package = workspace.add_crate("surface-resume-app", "0.1.0", &[])?;
+        let manifest = fs::read_to_string(package.join("Cargo.toml"))?;
+        let features = (0..12)
+            .map(|index| format!("feature-{index} = []"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(
+            package.join("Cargo.toml"),
+            format!("{manifest}\n[features]\n{features}\n"),
+        )?;
+        fs::write(
+            package.join("src/main.rs"),
+            "fn main() { live(); }\npub fn live() {}\npub fn dead_public() {}\n",
+        )?;
+        let profiles = (0..12)
+            .map(|index| {
+                format!("[[surface.feature-profile]]\nname = \"profile-{index}\"\nfeatures = [\"feature-{index}\"]\n")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(
+            workspace.path.join(".config/rail.toml"),
+            format!(
+                r#"[surface]
+consumer_scope = "workspace"
+doctest_coverage = "disabled"
+
+[[surface.product]]
+package = "surface-resume-app"
+bin = "surface-resume-app"
+reason = "resume fixture product"
+
+{profiles}
+"#
+            ),
+        )?;
+        fs::write(
+            workspace.path.join("rust-toolchain.toml"),
+            include_str!("../../rust-toolchain.toml"),
+        )?;
+        workspace.commit("Add Surface resume fixture")?;
+
+        let failed = run_cargo_rail_with_env(
+            &workspace.path,
+            &["rail", "surface", "--format", "json"],
+            &[("CARGO_RAIL_SURFACE_FAIL_ACQUISITION_VIEW", "10")],
+        )?;
+        assert_eq!(failed.status.code(), Some(2));
+        assert!(
+            failed.stderr.is_empty(),
+            "JSON failure must keep stderr empty: {}",
+            String::from_utf8_lossy(&failed.stderr)
+        );
+        let failure: serde_json::Value = serde_json::from_slice(&failed.stdout)?;
+        assert!(failure["help"].as_str().is_some_and(|help| help.contains("--resume")));
+
+        let journal_directory = workspace.path.join("target/cargo-rail/surface-acquisitions-v1");
+        let journals = fs::read_dir(&journal_directory)?.collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(journals.len(), 1);
+        let journal = journals[0].path();
+        let records = fs::read_to_string(&journal)?
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<Vec<serde_json::Value>, _>>()?;
+        let header = &records[0];
+        assert_eq!(header["surface_acquisition_contract_version"], 1);
+        assert_eq!(header["views"], 12);
+        assert_eq!(header["concurrency"], 1);
+        assert_eq!(header["products"][0]["package"], "surface-resume-app");
+        let failed_view = records
+            .iter()
+            .find(|record| record["status"] == "failed")
+            .ok_or_else(|| anyhow!("partial journal has no failed view"))?;
+        assert_eq!(failed_view["ordinal"], 9);
+        assert_eq!(failed_view["target_triple"], "default");
+        assert_eq!(failed_view["command_class"], "cargo-check-all-targets");
+        assert_eq!(
+            failed_view["selected_products"][0]["cargo_target"],
+            "surface-resume-app"
+        );
+        let partial = records
+            .iter()
+            .find(|record| record["record"] == "summary")
+            .ok_or_else(|| anyhow!("partial journal has no summary"))?;
+        assert_eq!(partial["state"], "partial");
+        assert_eq!(partial["completed"], 9);
+        assert_eq!(partial["failed"], 1);
+        assert_eq!(partial["not_started"], 2);
+        assert_eq!(partial["planned"], 0);
+
+        let journal_argument = journal
+            .strip_prefix(&workspace.path)?
+            .to_str()
+            .ok_or_else(|| anyhow!("journal path is not UTF-8"))?;
+        let resumed = run_cargo_rail(
+            &workspace.path,
+            &["rail", "surface", "--resume", journal_argument, "--format", "json"],
+        )?;
+        assert!(
+            resumed.status.success(),
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&resumed.stdout),
+            String::from_utf8_lossy(&resumed.stderr)
+        );
+        let mut resumed_report: serde_json::Value = serde_json::from_slice(&resumed.stdout)?;
+        assert_eq!(resumed_report["metrics"]["acquisition"]["analysis_views"], 12);
+        assert_eq!(resumed_report["metrics"]["acquisition"]["fact_cache_hits"], 9);
+        assert_eq!(resumed_report["metrics"]["acquisition"]["cargo_views_executed"], 3);
+
+        fs::remove_dir_all(workspace.path.join("target/cargo-rail-test-cache"))?;
+        let cold = run_cargo_rail(&workspace.path, &["rail", "surface", "--format", "json"])?;
+        assert!(cold.status.success());
+        let mut cold_report: serde_json::Value = serde_json::from_slice(&cold.stdout)?;
+        for report in [&mut resumed_report, &mut cold_report] {
+            report["metrics"] = serde_json::Value::Null;
+            report["cache"] = serde_json::Value::Null;
+            report["fragments"] = serde_json::Value::Null;
+        }
+        assert_eq!(
+            resumed_report, cold_report,
+            "resume and cold analysis must produce the same complete policy report"
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+#[ignore = "requires the exact rustc-dev companion authority embedded by the protocol harness"]
 fn surface_fix_failure_matrix_restores_every_written_source() {
     let result: Result<()> = (|| {
         let workspace = TestWorkspace::new_named("surface-failure-matrix")?;

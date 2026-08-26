@@ -69,7 +69,7 @@ pub use hash::{run_diff_hash, run_hash};
 pub use init::{run_init, run_init_standalone};
 pub use plan::{PlanOptions, run_plan};
 pub use release::{
-    ReleaseFinalizeOptions, run_release_check, run_release_finalize, run_release_init, run_release_plan,
+    ReleaseFinalizeOptions, run_release_finalize, run_release_init, run_release_plan, run_release_publication_check,
     run_release_publish, run_release_status_standalone,
 };
 pub use split::{run_split, run_split_init};
@@ -226,6 +226,7 @@ pub fn try_dispatch_pre_context(
                         remote,
                         remote_mode,
                         remote_environment,
+                        root_portability,
                         local_only,
                         distributed_local,
                         distributed_endpoint,
@@ -246,6 +247,7 @@ pub fn try_dispatch_pre_context(
                             remote_url: remote,
                             remote_mode,
                             remote_environment,
+                            root_portability,
                             local_only,
                             distributed_local,
                             distributed_endpoint,
@@ -356,6 +358,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
             prepare,
             check,
             fix,
+            resume,
             dry_run,
             backup,
             format,
@@ -369,6 +372,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
                 prepare,
                 check,
                 fix,
+                resume,
                 dry_run,
                 backup,
                 format,
@@ -561,7 +565,10 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
             cli::ReleaseCommand::Check {
                 crate_names,
                 all,
+                bump,
+                publication,
                 extended,
+                skip_tag,
                 include_dependents,
                 format,
             } => {
@@ -570,7 +577,11 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext) -> RailResult<()> {
                 } else {
                     Some(crate_names)
                 };
-                run_release_check(ctx, names, all, extended, include_dependents, format)
+                if publication {
+                    run_release_publication_check(ctx, names, all, extended, include_dependents, format)
+                } else {
+                    run_release_plan(ctx, names, bump, false, skip_tag, include_dependents, format)
+                }
             }
             cli::ReleaseCommand::Finalize {
                 crate_names,

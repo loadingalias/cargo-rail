@@ -56,6 +56,13 @@ pub(crate) struct AnalysisView {
 }
 
 impl AnalysisView {
+    pub(crate) fn command_class(&self) -> &'static str {
+        match self.acquisition {
+            AnalysisAcquisition::CheckAllTargets => "cargo-check-all-targets",
+            AnalysisAcquisition::CompileDoctests => "cargo-test-doc-no-run",
+        }
+    }
+
     pub(crate) fn platform(&self) -> &PlatformTarget {
         &self.platform
     }

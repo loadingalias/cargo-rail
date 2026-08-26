@@ -248,6 +248,7 @@ impl<'a> ReleasePlanner<'a> {
         let mut crate_plans = Vec::with_capacity(ordered_targets.len());
         let mut version_map: FxHashMap<String, Version> = FxHashMap::default();
         let mut histories: HashMap<HistoryKey, AttributedHistory> = HashMap::new();
+        let mut changed_code_by_base: HashMap<Option<String>, HashSet<String>> = HashMap::new();
         let workspace_members = self.ctx.graph().workspace_members();
         let pending_changes = if self.release_config.source.uses_changes() {
             PendingChangeSet::load(
@@ -266,6 +267,7 @@ impl<'a> ReleasePlanner<'a> {
                 bump_request,
                 &version_map,
                 &mut histories,
+                &mut changed_code_by_base,
                 &pending_changes,
                 None,
             )? {
@@ -284,6 +286,7 @@ impl<'a> ReleasePlanner<'a> {
                 &mut skipped,
                 &mut version_map,
                 &mut histories,
+                &mut changed_code_by_base,
                 &pending_changes,
             )?;
         }
@@ -577,12 +580,17 @@ impl<'a> ReleasePlanner<'a> {
     }
 
     /// Plan release for a single crate
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one release-plan transition shares deterministic version, history, code-change, and intent state"
+    )]
     fn plan_crate(
         &self,
         crate_name: &str,
         bump_request: &BumpRequest,
         version_map: &FxHashMap<String, Version>,
         histories: &mut HashMap<HistoryKey, AttributedHistory>,
+        changed_code_by_base: &mut HashMap<Option<String>, HashSet<String>>,
         pending_changes: &PendingChangeSet,
         version_group_force: Option<&VersionGroupForce>,
     ) -> RailResult<CratePlanOutcome> {
@@ -608,17 +616,54 @@ impl<'a> ReleasePlanner<'a> {
 
         let generate_changelog = !changelog_config.is_some_and(|changelog_cfg| changelog_cfg.skip);
 
-        let (commits, commit_refs) = if self.release_config.source.uses_commits() {
-            let filters = effective_changelog_filters(&self.release_config.changelog.filters, changelog_config);
-            let attributor = CommitAttributor::new(self.ctx);
-            let history = history_for_range(histories, &attributor, previous_tag.clone(), "HEAD", Some(filters))?;
-            let attributed: Vec<&AttributedCommit> = history.for_crate(crate_name).collect();
-            let commits = planned_commits(&attributed);
-            let commit_refs = attributed.iter().map(|commit| commit.as_ref()).collect();
-            (commits, commit_refs)
-        } else {
-            (Vec::new(), Vec::new())
-        };
+        let spec = ChangelogSpec::resolve(&self.release_config.changelog, changelog_config)?;
+        let (commits, commit_refs, commit_diagnostics, attributed_code_changes) =
+            if self.release_config.source.uses_commits() {
+                let filters = effective_changelog_filters(&self.release_config.changelog.filters, changelog_config);
+                let attributor = CommitAttributor::new(self.ctx);
+                let history = history_for_range(histories, &attributor, previous_tag.clone(), "HEAD", Some(filters))?;
+                let attributed_code_changes = history.has_code_changes(crate_name);
+                let attributed: Vec<&AttributedCommit> = history.for_crate(crate_name).collect();
+                let commits = planned_commits(&attributed);
+                let commit_refs: Vec<CommitRef<'_>> = attributed.iter().map(|commit| commit.as_ref()).collect();
+                let commit_diagnostics = spec.diagnose(&commit_refs);
+                (commits, commit_refs, commit_diagnostics, attributed_code_changes)
+            } else {
+                (Vec::new(), Vec::new(), Vec::new(), false)
+            };
+        if self.release_config.unconventional_commits == CommitPolicy::Deny && !commit_diagnostics.is_empty() {
+            return Err(RailError::with_help(
+                format!(
+                    "commit diagnostics failed for {crate_name}: {}",
+                    commit_diagnostics
+                        .iter()
+                        .map(CommitDiagnostic::describe)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+                "rewrite the commit subjects or select an explicit compatibility policy",
+            ));
+        }
+        if self.release_config.requires_change_file(crate_name) && !pending_changes.covers(crate_name) {
+            let has_code_changes = if self.release_config.source == ReleaseSource::Changes {
+                self.changed_code_crates(previous_tag.clone(), changed_code_by_base)?
+                    .contains(crate_name)
+            } else {
+                attributed_code_changes
+            };
+            if has_code_changes {
+                return Err(RailError::with_help(
+                    format!(
+                        "missing change files for {crate_name}: code changes require {} coverage",
+                        self.release_config.change_dir
+                    ),
+                    format!(
+                        "add reviewed release intent under {}, or change the explicit coverage policy",
+                        self.release_config.change_dir
+                    ),
+                ));
+            }
+        }
         let inferred_bump = commits
             .iter()
             .filter_map(|commit| bump_level_from_str(commit.bump.as_deref()))
@@ -689,7 +734,6 @@ impl<'a> ReleasePlanner<'a> {
         // Determine tag name
         let tag_name = self.format_tag(crate_name, &new_version);
 
-        let spec = ChangelogSpec::resolve(&self.release_config.changelog, changelog_config)?;
         let links = resolve_links(
             &self.release_config.changelog,
             changelog_config,
@@ -722,12 +766,6 @@ impl<'a> ReleasePlanner<'a> {
         } else {
             Vec::new()
         };
-        let commit_diagnostics = if self.release_config.source.uses_commits() {
-            spec.diagnose(&commit_refs)
-        } else {
-            Vec::new()
-        };
-
         let bump = format!("{} -> {}", current_version, new_version);
         let publish_intent = if publish {
             "publish_to_crates_io".to_string()
@@ -785,6 +823,10 @@ impl<'a> ReleasePlanner<'a> {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "version-group reconciliation updates the same deterministic release planning state as individual crates"
+    )]
     fn apply_version_groups(
         &self,
         ordered_targets: &[String],
@@ -792,6 +834,7 @@ impl<'a> ReleasePlanner<'a> {
         skipped: &mut Vec<SkippedCrate>,
         version_map: &mut FxHashMap<String, Version>,
         histories: &mut HashMap<HistoryKey, AttributedHistory>,
+        changed_code_by_base: &mut HashMap<Option<String>, HashSet<String>>,
         pending_changes: &PendingChangeSet,
     ) -> RailResult<()> {
         if self.release_config.version_groups.is_empty() {
@@ -838,6 +881,7 @@ impl<'a> ReleasePlanner<'a> {
                 &BumpRequest::Auto,
                 version_map,
                 histories,
+                changed_code_by_base,
                 pending_changes,
                 Some(&force),
             )? {

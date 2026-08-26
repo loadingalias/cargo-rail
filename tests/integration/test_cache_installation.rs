@@ -131,6 +131,7 @@ fn cargo_check_remote(
         .env_remove("AWS_ENDPOINT_URL_S3")
         .env_remove("AWS_PROFILE")
         .env_remove("AWS_DEFAULT_PROFILE")
+        .env_remove("OUT_DIR")
         .env_remove("RUSTC_WRAPPER")
         .env_remove("RUSTC_WORKSPACE_WRAPPER");
     if let Some(rustc) = rustc {
@@ -149,8 +150,18 @@ fn cargo_check_remote(
 }
 
 fn cargo_check_installed_remote(workspace: &Path, cargo_home: &Path, coverage: &Path) -> Result<Output> {
+    cargo_check_installed_remote_with_rustflags(workspace, cargo_home, coverage, None)
+}
+
+fn cargo_check_installed_remote_with_rustflags(
+    workspace: &Path,
+    cargo_home: &Path,
+    coverage: &Path,
+    rustflags: Option<&str>,
+) -> Result<Output> {
     let coverage = fs::canonicalize(coverage).context("canonicalize native-cache coverage directory")?;
-    Command::new("cargo")
+    let mut command = Command::new("cargo");
+    command
         .current_dir(workspace)
         .args(["check", "--quiet"])
         .env("CARGO_HOME", cargo_home)
@@ -171,10 +182,15 @@ fn cargo_check_installed_remote(workspace: &Path, cargo_home: &Path, coverage: &
         .env_remove("AWS_SECURITY_TOKEN")
         .env_remove("AWS_PROFILE")
         .env_remove("AWS_DEFAULT_PROFILE")
+        .env_remove("OUT_DIR")
         .env_remove("RUSTC_WRAPPER")
-        .env_remove("RUSTC_WORKSPACE_WRAPPER")
-        .output()
-        .context("run cargo check with installed remote policy")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER");
+    if let Some(rustflags) = rustflags {
+        command.env("RUSTFLAGS", rustflags);
+    } else {
+        command.env_remove("RUSTFLAGS");
+    }
+    command.output().context("run cargo check with installed remote policy")
 }
 
 #[derive(Clone)]
@@ -564,9 +580,10 @@ fn setup_preview_apply_repeat_status_and_exact_remove_are_lossless() {
         )?;
         assert!(status.status.success(), "installation status failed: {status:?}");
         let status = json(&status)?;
-        assert_eq!(status["status"]["schema_version"], 12);
+        assert_eq!(status["status"]["schema_version"], 13);
         assert_eq!(status["status"]["installation"]["state"], "installed");
         assert_eq!(status["status"]["installation"]["healthy"], true);
+        assert_eq!(status["status"]["installation"]["root_portability"], "physical");
         let wrapper = PathBuf::from(
             status["status"]["installation"]["wrapper_path"]
                 .as_str()
@@ -963,7 +980,7 @@ fn cache_status_reports_only_redacted_machine_selected_remote_authority() {
             .output()?;
         assert!(output.status.success(), "remote status failed: {output:?}");
         let value = json(&output)?;
-        assert_eq!(value["status"]["schema_version"], 12);
+        assert_eq!(value["status"]["schema_version"], 13);
         assert_eq!(value["status"]["remote"]["activation"], "direct_transport_selected");
         assert_eq!(value["status"]["remote"]["provider"], "aws-s3");
         assert_eq!(value["status"]["remote"]["mode"], "read");
@@ -1092,6 +1109,139 @@ fn setup_owned_remote_is_automatic_coordinated_and_removable() {
         assert!(
             !installation.exists(),
             "coordinator state survived exact installation removal: {residue:?}"
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn remap_authority_restores_a_verified_l2_result_across_checkout_roots() {
+    let result: Result<()> = (|| {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let first = TestWorkspace::new_single_crate("portable-root-fixture", "0.1.0")?;
+        let second = TestWorkspace::new_single_crate("portable-root-fixture", "0.1.0")?;
+        for workspace in [&first.path, &second.path] {
+            fs::write(workspace.join("src/lib.rs"), "fn unused() {}\n")?;
+        }
+        let remote = LoopbackS3::start()?;
+        let remote_url = remote.remote_url();
+        let first_home = tempfile::tempdir()?;
+        let second_home = tempfile::tempdir()?;
+
+        let unbacked = rail(
+            &first.path,
+            first_home.path(),
+            &["rail", "cache", "setup", "--root-portability", "remap"],
+        )?;
+        assert_eq!(unbacked.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&unbacked.stderr)
+                .contains("root portability remapping requires an installed remote cache authority")
+        );
+
+        for (workspace, cargo_home, mode) in [
+            (&first.path, first_home.path(), "read-write"),
+            (&second.path, second_home.path(), "read"),
+        ] {
+            let setup = rail(
+                workspace,
+                cargo_home,
+                &[
+                    "rail",
+                    "cache",
+                    "setup",
+                    "--remote",
+                    &remote_url,
+                    "--remote-mode",
+                    mode,
+                    "--root-portability",
+                    "remap",
+                    "-f",
+                    "json",
+                ],
+            )?;
+            assert!(setup.status.success(), "portable setup failed: {setup:?}");
+            assert_eq!(json(&setup)?["root_portability"], "remap");
+            let status = rail(
+                workspace,
+                cargo_home,
+                &["rail", "cache", "status", "--scope", "local", "-f", "json"],
+            )?;
+            assert_eq!(json(&status)?["status"]["installation"]["root_portability"], "remap");
+        }
+
+        let first_coverage = tempfile::tempdir()?;
+        let second_coverage = tempfile::tempdir()?;
+        #[cfg(unix)]
+        {
+            fs::set_permissions(first_coverage.path(), fs::Permissions::from_mode(0o700))?;
+            fs::set_permissions(second_coverage.path(), fs::Permissions::from_mode(0o700))?;
+        }
+        let seeded = cargo_check_installed_remote(&first.path, first_home.path(), first_coverage.path())?;
+        assert!(seeded.status.success(), "portable seed failed: {seeded:?}");
+        let seed_events = coverage_events(first_coverage.path())?;
+        let restored = cargo_check_installed_remote(&second.path, second_home.path(), second_coverage.path())?;
+        assert!(restored.status.success(), "portable restore failed: {restored:?}");
+        let events = coverage_events(second_coverage.path())?;
+        assert!(
+            events.iter().any(|event| {
+                event["status"] == "hit"
+                    && event["reason"].as_str().is_some_and(|reason| {
+                        reason.starts_with("verified_remote_result")
+                            && reason.contains("root_portability_remap_eligible")
+                    })
+            }),
+            "second checkout did not report a verified L2 hit: seed={seed_events:?}, restored={events:?}, requests={:?}",
+            remote.requests()
+        );
+        let seeded_diagnostics = String::from_utf8_lossy(&seeded.stderr);
+        let restored_diagnostics = String::from_utf8_lossy(&restored.stderr);
+        assert!(seeded_diagnostics.contains("function `unused` is never used"));
+        assert!(restored_diagnostics.contains("function `unused` is never used"));
+        assert!(!restored_diagnostics.contains(first.path.to_string_lossy().as_ref()));
+
+        let first_root = first.path.to_string_lossy().into_owned().into_bytes();
+        let mut pending = vec![second.path.join("target")];
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(directory)? {
+                let entry = entry?;
+                let file_type = entry.file_type()?;
+                if file_type.is_dir() {
+                    pending.push(entry.path());
+                } else if file_type.is_file() {
+                    let bytes = fs::read(entry.path())?;
+                    assert!(
+                        !bytes.windows(first_root.len()).any(|window| window == first_root),
+                        "restored output leaked the producer checkout root: {}",
+                        entry.path().display()
+                    );
+                }
+            }
+        }
+
+        fs::remove_dir_all(first.path.join("target"))?;
+        let ambiguous_coverage = tempfile::tempdir()?;
+        #[cfg(unix)]
+        fs::set_permissions(ambiguous_coverage.path(), fs::Permissions::from_mode(0o700))?;
+        let ambiguous = cargo_check_installed_remote_with_rustflags(
+            &first.path,
+            first_home.path(),
+            ambiguous_coverage.path(),
+            Some("--remap-path-prefix=/tmp=/ambiguous"),
+        )?;
+        assert!(
+            ambiguous.status.success(),
+            "ambiguous remap fallback failed: {ambiguous:?}"
+        );
+        let ambiguous_events = coverage_events(ambiguous_coverage.path())?;
+        assert!(
+            ambiguous_events.iter().any(|event| {
+                event["status"] == "bypassed" && event["reason"] == "remapped_path_observation_unavailable"
+            }),
+            "an existing path remap did not fail closed with its named reason: {ambiguous_events:?}"
         );
         Ok(())
     })();

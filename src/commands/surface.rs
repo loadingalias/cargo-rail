@@ -10,6 +10,9 @@ use serde::Serialize;
 use crate::backup::{BackupManager, BackupMetadata};
 use crate::cargo::{ManifestAnalyzer, TargetSpecificationIdentity};
 use crate::commands::common::SurfaceOutputFormat;
+use crate::compiler::collector::{
+    CompilerAcquisitionProduct, CompilerAcquisitionRequest, validate_compiler_acquisition_resume,
+};
 use crate::compiler::driver::{CompilerFactDriverAuthority, CompilerFactDriverReadiness};
 use crate::compiler::facts::{CompilerFactDomain, CompilerFactTargetKind, ValidatedCompilerFactObject};
 use crate::compiler::{CompilerAnalysisMetrics, CompilerCacheIdentity, CompilerDiagnosticsCollector, FeatureSelection};
@@ -43,6 +46,8 @@ pub struct SurfaceOptions {
     pub check: bool,
     /// Apply exact visibility reductions.
     pub fix: bool,
+    /// Prior partial acquisition manifest to revalidate before exact reuse.
+    pub resume: Option<PathBuf>,
     /// Render an exact mutation plan without writing.
     pub dry_run: bool,
     /// Create a bounded backup before mutation.
@@ -288,6 +293,7 @@ pub fn run_surface(ctx: &WorkspaceContext, options: SurfaceOptions) -> RailResul
     let preparation_conflicts = options.prepare
         && (options.check
             || options.fix
+            || options.resume.is_some()
             || options.dry_run
             || options.backup
             || options.explain
@@ -305,7 +311,15 @@ pub fn run_surface(ctx: &WorkspaceContext, options: SurfaceOptions) -> RailResul
 
     let config = ctx.config().map(|config| config.surface.clone()).unwrap_or_default();
     config.validate().map_err(RailError::Config)?;
+    if let Some(manifest) = &options.resume {
+        validate_compiler_acquisition_resume(
+            ctx.workspace_root(),
+            manifest,
+            ctx.snapshot()?.configuration_fingerprint(),
+        )?;
+    }
     let mut initial = analyze_surface(ctx, &config)?;
+    ctx.validate_snapshot_unchanged()?;
     filter_findings(&mut initial.findings, &options.only);
 
     if !options.fix {
@@ -446,7 +460,8 @@ fn analyze_surface(ctx: &WorkspaceContext, config: &SurfaceConfig) -> RailResult
     let workspace_packages = ctx.cargo().workspace_members();
     let manifests = ManifestAnalyzer::parse_snapshot(snapshot, &workspace_packages)?;
     let cache_identity = CompilerCacheIdentity::capture(snapshot)?;
-    let targets = selected_target_views(config);
+    let workspace_targets = ctx.config().map(|config| config.targets.as_slice()).unwrap_or_default();
+    let targets = selected_target_views(config, workspace_targets);
     let target_refs = targets.iter().map(String::as_str).collect::<Vec<_>>();
     let typed_packages = workspace_packages
         .iter()
@@ -467,8 +482,14 @@ fn analyze_surface(ctx: &WorkspaceContext, config: &SurfaceConfig) -> RailResult
     } else {
         BTreeSet::new()
     };
+    let acquisition = CompilerAcquisitionRequest {
+        snapshot_identity: snapshot.id().to_string(),
+        configuration_fingerprint: snapshot.configuration_fingerprint().to_string(),
+        products: acquisition_products(config, &workspace_packages),
+    };
     let collector =
-        CompilerDiagnosticsCollector::with_identity(ctx.workspace_root(), &manifests, target_refs, &cache_identity);
+        CompilerDiagnosticsCollector::with_identity(ctx.workspace_root(), &manifests, target_refs, &cache_identity)
+            .with_acquisition_manifest(acquisition);
     let feature_profiles = configured_feature_profiles(config);
     let evidence = if feature_profiles.is_empty() {
         collector.collect_with_typed_items(snapshot, &[], &typed_packages, &doctest_packages)?
@@ -518,6 +539,45 @@ fn analyze_surface(ctx: &WorkspaceContext, config: &SurfaceConfig) -> RailResult
             graph: analysis.metrics,
         },
     })
+}
+
+fn acquisition_products(config: &SurfaceConfig, packages: &[&Package]) -> Vec<CompilerAcquisitionProduct> {
+    if !config.product.is_empty() {
+        return config
+            .product
+            .iter()
+            .filter_map(|product| {
+                product
+                    .bin
+                    .as_ref()
+                    .map(|target| (target, "binary"))
+                    .or_else(|| product.lib.as_ref().map(|target| (target, "library")))
+                    .map(|(target, kind)| CompilerAcquisitionProduct {
+                        package: product.package.clone(),
+                        cargo_target: target.clone(),
+                        kind: kind.to_string(),
+                    })
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+    }
+    packages
+        .iter()
+        .flat_map(|package| {
+            package
+                .targets
+                .iter()
+                .filter(|target| target.kind.contains(&TargetKind::Bin))
+                .map(|target| CompilerAcquisitionProduct {
+                    package: package.name.to_string(),
+                    cargo_target: target.name.clone(),
+                    kind: "binary".to_string(),
+                })
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn configured_feature_profiles(config: &SurfaceConfig) -> Vec<FeatureSelection> {
@@ -1147,7 +1207,13 @@ fn validate_workspace_policy(
             TargetSpecificationIdentity::Custom(specification) => specification.name(),
         })
         .collect::<BTreeSet<_>>();
-    for target in config.targets.iter().filter(|target| target.as_str() != "host") {
+    let workspace_targets = ctx.config().map(|config| config.targets.as_slice()).unwrap_or_default();
+    for target in config
+        .targets
+        .effective(workspace_targets)
+        .into_iter()
+        .filter(|target| target != "host")
+    {
         if !available_targets.contains(target.as_str()) {
             return Err(RailError::message(format!(
                 "surface target '{target}' is absent from the captured target views"
@@ -1164,11 +1230,18 @@ fn is_library_target(kind: &TargetKind) -> bool {
     )
 }
 
-fn selected_target_views(config: &SurfaceConfig) -> Vec<String> {
+fn selected_target_views(config: &SurfaceConfig, workspace_targets: &[String]) -> Vec<String> {
     config
         .targets
-        .iter()
-        .map(|target| if target == "host" { "default" } else { target }.to_string())
+        .effective(workspace_targets)
+        .into_iter()
+        .map(|target| {
+            if target == "host" {
+                "default".to_string()
+            } else {
+                target
+            }
+        })
         .collect()
 }
 

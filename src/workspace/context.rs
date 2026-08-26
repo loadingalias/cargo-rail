@@ -730,23 +730,17 @@ impl WorkspaceContext {
 
             // Validate source-surface policy before any compiler acquisition.
             cfg.surface.validate().map_err(RailError::Config)?;
+            cfg.surface
+                .validate_workspace_targets(&cfg.targets)
+                .map_err(RailError::Config)?;
 
             // Validate unify config (e.g., the transitive pinning host path).
             cfg.unify.validate(&workspace_root).map_err(RailError::Config)?;
         }
 
-        // Capture every target required by either workspace-wide analysis or the
-        // surface domain. `host` names the already-captured native/default view.
+        // The top-level policy is the only non-host target authority. Surface
+        // either inherits it or selects an already-declared subset.
         let mut targets = config.as_ref().map(|c| c.targets.clone()).unwrap_or_default();
-        if let Some(cfg) = &config {
-            targets.extend(
-                cfg.surface
-                    .targets
-                    .iter()
-                    .filter(|target| target.as_str() != "host")
-                    .cloned(),
-            );
-        }
         targets.sort();
         targets.dedup();
         let derived_views = Arc::new(DerivedViews::new(

@@ -33,6 +33,25 @@ struct RawSpan {
     end: u64,
 }
 
+fn merge_visibility_span_into_declaration(
+    declaration: &mut RawSpan,
+    visibility: &RawSpan,
+    from_expansion: bool,
+    diagnostic_path: &str,
+) -> Result<(), String> {
+    if visibility.path == declaration.path {
+        declaration.start = declaration.start.min(visibility.start);
+        declaration.end = declaration.end.max(visibility.end);
+        return Ok(());
+    }
+    if from_expansion {
+        return Ok(());
+    }
+    Err(format!(
+        "{diagnostic_path}: non-expanded declaration and written visibility span different source files"
+    ))
+}
+
 struct RawItem {
     id: CompilerItemId,
     span: RawSpan,
@@ -324,11 +343,12 @@ impl<'tcx> Collector<'tcx> {
         let (written_visibility, written_visibility_complete) = written_visibility(self.tcx, def_id, visibility_span);
         let raw_visibility_span = visibility_span.map(|span| self.capture_span(span)).transpose()?;
         if let Some(visibility) = &raw_visibility_span {
-            if visibility.path != raw_span.path {
-                return Err("declaration and written visibility span different source files".to_string());
-            }
-            raw_span.start = raw_span.start.min(visibility.start);
-            raw_span.end = raw_span.end.max(visibility.end);
+            merge_visibility_span_into_declaration(
+                &mut raw_span,
+                visibility,
+                span.from_expansion(),
+                &self.tcx.def_path_str(def_id.to_def_id()),
+            )?;
         }
         let effective_visibility = self
             .tcx
@@ -655,8 +675,25 @@ fn generated_source_path(bytes: &[u8]) -> CompilerFactSourcePath {
 }
 
 fn item_id(tcx: TyCtxt<'_>, def_id: DefId) -> CompilerItemId {
-    let hash = tcx.def_path_hash(def_id);
-    CompilerItemId([hash.stable_crate_id().as_u64(), hash.local_hash().as_u64()])
+    let crate_identity = identity_word(
+        b"cargo-rail-compiler-crate-v1\0",
+        tcx.crate_name(def_id.krate).as_str().as_bytes(),
+    );
+    let item_identity = identity_word(
+        b"cargo-rail-compiler-item-path-v1\0",
+        tcx.def_path(def_id).to_string_no_crate_verbose().as_bytes(),
+    );
+    CompilerItemId([crate_identity, item_identity])
+}
+
+fn identity_word(domain: &[u8], value: &[u8]) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(value);
+    let digest = hasher.finalize();
+    let mut identity = [0_u8; 8];
+    identity.copy_from_slice(&digest[..8]);
+    u64::from_le_bytes(identity)
 }
 
 fn fact_kind(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<CompilerFactItemKind> {
@@ -941,5 +978,43 @@ impl<'tcx> Visitor<'tcx> for ReferenceVisitor<'tcx> {
             }
         }
         intravisit::walk_pat(self, pattern);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raw_span(path: &str, start: u64, end: u64) -> RawSpan {
+        RawSpan {
+            path: CompilerFactSourcePath::Repository(path.to_string()),
+            start,
+            end,
+        }
+    }
+
+    #[test]
+    fn expansion_visibility_may_come_from_a_different_source_file() {
+        let mut declaration = raw_span("src/lib.rs", 20, 40);
+        let visibility = raw_span("src/macros.rs", 4, 7);
+
+        merge_visibility_span_into_declaration(&mut declaration, &visibility, true, "app::Expanded")
+            .expect("macro expansion visibility is conservative, not mutable");
+
+        assert_eq!(declaration.start, 20);
+        assert_eq!(declaration.end, 40);
+    }
+
+    #[test]
+    fn written_declaration_rejects_visibility_from_a_different_source_file() {
+        let mut declaration = raw_span("src/lib.rs", 20, 40);
+        let visibility = raw_span("src/macros.rs", 4, 7);
+
+        let error = merge_visibility_span_into_declaration(&mut declaration, &visibility, false, "app::Written")
+            .expect_err("source-written visibility must share declaration authority");
+
+        assert!(error.contains("app::Written"));
+        assert_eq!(declaration.start, 20);
+        assert_eq!(declaration.end, 40);
     }
 }

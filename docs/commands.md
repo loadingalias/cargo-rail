@@ -169,6 +169,7 @@ Options:
 Examples:
   cargo rail cache setup --check                  # Preview transparent compiler reuse setup
   cargo rail cache setup                          # Install or repair the Cargo wrapper
+  cargo rail cache setup --remote URL --root-portability remap  # Qualify cross-root L2 reuse
   cargo rail cache status                         # Inspect workspace and shared local cache state
   cargo rail cache status --scope local -f json  # Inspect the shared local CAS only
   cargo rail cache recover --check                # Preview byte-preserving markerless CAS recovery
@@ -217,6 +218,11 @@ Options:
 
       --remote-environment <NAME>
           Additional reviewed compiler environment name admitted to L2 identity
+
+      --root-portability <MODE>
+          Cross-checkout authority: physical roots remain exact; remap qualifies portable L2 results
+
+          [possible values: physical, remap]
 
       --local-only
           Remove persisted remote activation while preserving local reuse
@@ -601,11 +607,14 @@ Options:
       --fix
           Apply exact visibility reductions
 
-      --dry-run
-          Render the exact mutation plan without writing
+      --resume <MANIFEST>
+          Resume from a prior partial acquisition manifest
 
       --workspace-root <PATH>
           Workspace root directory (default: current directory)
+
+      --dry-run
+          Render the exact mutation plan without writing
 
       --backup
           Create a bounded backup before applying visibility edits
@@ -649,6 +658,7 @@ Examples:
   cargo rail surface --prepare              # Prove exact-toolchain producer readiness
   cargo rail surface --check --explain      # Inspect complete Rust reachability
   cargo rail surface --check -f json        # Emit the versioned machine contract
+  cargo rail surface --resume MANIFEST -f json  # Resume a partial compiler acquisition
   cargo rail surface --fix --dry-run --explain  # Preview exact visibility edits
   cargo rail surface --fix --backup         # Apply verified edits with recovery evidence
   cargo rail surface --schema               # Print the versioned JSON Schema
@@ -1067,7 +1077,7 @@ Usage: cargo rail release [OPTIONS] <COMMAND>
 Commands:
   init      Configure release settings
   run       Execute release (plan or publish)
-  check     Validate release readiness
+  check     Validate the same local release plan selected by `release run --check`
   finalize  Finalize a merged release PR (tag, push, publish)
   resume    Resume an interrupted release from its durable state file
   status    Show durable release state and the safe recovery command
@@ -1096,8 +1106,9 @@ Options:
 Examples:
   cargo rail release init my-crate              # Configure release for my-crate
   cargo rail release init my-crate --dry-run    # Preview generated config
-  cargo rail release check my-crate             # Validate release readiness
-  cargo rail release check my-crate --extended  # Run publish, MSRV, and semver checks
+  cargo rail release check my-crate                    # Validate the local release plan
+  cargo rail release check my-crate --publication     # Validate registry publication readiness
+  cargo rail release check my-crate --publication -e  # Run publish, MSRV, and semver checks
   cargo rail release run my-crate --check       # Check for a pending release (exit 1)
   cargo rail release run my-crate               # Prepare a local release without registry publication
   cargo rail release run my-crate --publish     # Match configured crates.io authority at invocation
@@ -1210,7 +1221,7 @@ Options:
 ### cargo rail release check
 
 ```
-Validate release readiness
+Validate the same local release plan selected by `release run --check`
 
 Usage: cargo rail release check [OPTIONS] [CRATE]...
 
@@ -1225,14 +1236,28 @@ Options:
   -q, --quiet
           Suppress progress messages (for CI/automation)
 
-  -e, --extended
-          Run extended validation (publish dry-run, MSRV, optional semver checks)
+      --bump <BUMP>
+          Version bump [auto, major, minor, patch, prerelease, release, or "x.y.z"]
+
+          [default: auto]
 
       --json
           Output as JSON where supported; rejected otherwise (shorthand for -f json)
 
       --config <PATH>
           Path to rail.toml config file (bypass search order)
+
+      --publication
+          Validate registry publication readiness instead of the local release plan
+
+  -e, --extended
+          Run extended publication validation (publish dry-run, MSRV, optional semver checks)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
+      --skip-tag
+          Exclude git tag creation from the local release plan
 
       --include-dependents
           Expand explicit crate selection to include the full dependent closure
@@ -1245,9 +1270,6 @@ Options:
           - json: Machine-readable JSON output
 
           [default: text]
-
-      --workspace-root <PATH>
-          Workspace root directory (default: current directory)
 
   -h, --help
           Print help (see a summary with '-h')

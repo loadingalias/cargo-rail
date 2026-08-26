@@ -127,7 +127,9 @@ fn release_plan_works_on_single_crate_repo() {
         ws.write_release_config(
             r#"tag_prefix = "v"
 tag_format = "v{version}"
+source = "commits"
 require_clean = false
+require_release_notes = false
 "#,
         )?;
 
@@ -1240,6 +1242,11 @@ fn release_plan_auto_ignores_inconclusive_semver_checks() {
         // A non-zero exit without the breaking-summary marker is an operational
         // failure (first release: no baseline on crates.io) — never an escalation.
         let ws = semver_shim_workspace("release-auto-semver-inconclusive")?;
+        std::fs::create_dir_all(ws.path.join(".changes"))?;
+        std::fs::write(
+            ws.path.join(".changes/no-release.md"),
+            "---\n\"lib-a\" = \"none\"\n---\n\nReviewed documentation-only change.\n",
+        )?;
 
         let output = run_with_semver_shim(
             &ws,
@@ -1563,8 +1570,7 @@ fn release_check_reports_shallow_clone_in_failure_taxonomy() {
 
         assert_eq!(output.status.code(), Some(2), "release check should fail\n{}", combined);
         assert!(
-            combined.contains("release history")
-                && combined.contains("shallow clone")
+            combined.contains("--bump auto cannot run in a shallow clone")
                 && combined.contains("git fetch --unshallow --tags"),
             "output:\n{}",
             combined
@@ -2942,6 +2948,22 @@ require_clean = false
         ws.commit("Add lib-a")?;
         ws.tag("v0.1.0", "Initial lib-a")?;
 
+        let check = run_cargo_rail(&ws.path, &["rail", "release", "check", "lib-a", "--bump", "patch"])?;
+        let check_combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&check.stdout),
+            String::from_utf8_lossy(&check.stderr)
+        );
+        assert_eq!(
+            check.status.code(),
+            Some(2),
+            "release check should fail\n{check_combined}"
+        );
+        assert!(
+            check_combined.contains("no release notes for lib-a v0.1.1"),
+            "expected missing release notes error\n{check_combined}"
+        );
+
         // No commits since last tag -> generated changelog entries are empty.
         let output = run_cargo_rail(
             &ws.path,
@@ -3065,6 +3087,7 @@ fn test_release_creates_gitlab_release_with_glab() {
         ws.write_release_config(
             r#"tag_prefix = "v"
 tag_format = "v{version}"
+source = "commits"
 require_clean = false
 require_release_notes = false
 remote_effects = "gitlab"
@@ -3135,6 +3158,7 @@ fn test_release_errors_when_gitlab_forge_binary_missing() {
         ws.write_release_config(
             r#"tag_prefix = "v"
 tag_format = "v{version}"
+source = "commits"
 require_clean = false
 require_release_notes = false
 remote_effects = "gitlab"
@@ -3607,6 +3631,7 @@ fn test_release_resume_reconciles_push_that_completed_before_failure() {
         git(&ws.path, &["push", "-u", "origin", "main"])?;
         ws.write_release_config(
             r#"tag_format = "v{version}"
+source = "commits"
 require_clean = false
 require_release_notes = false
 remote_effects = "push"
@@ -3759,6 +3784,7 @@ fn test_release_abort_reconciles_push_rejected_by_local_hook() {
         }
         ws.write_release_config(
             r#"tag_format = "v{version}"
+source = "commits"
 require_clean = false
 require_release_notes = false
 remote_effects = "push"
@@ -3812,6 +3838,7 @@ fn test_release_notes_override_satisfies_required_notes() {
         let ws = TestWorkspace::new_single_crate("manual-notes", "0.1.0")?;
         ws.write_release_config(
             r#"tag_format = "v{version}"
+source = "commits"
 require_clean = false
 require_release_notes = true
 "#,
@@ -3858,7 +3885,7 @@ fn test_release_json_output() {
         let ws = TestWorkspace::new_single_crate("json-release", "0.1.0")?;
 
         // Configure release
-        ws.write_release_config("require_clean = false\n")?;
+        ws.write_release_config("source = \"commits\"\nrequire_clean = false\nrequire_release_notes = false\n")?;
 
         // Run release plan with --json
         let output = run_cargo_rail(
@@ -3893,7 +3920,7 @@ fn test_release_skip_tag_flag() {
         let ws = TestWorkspace::new_single_crate("skip-tag-crate", "0.1.0")?;
 
         // Configure release
-        ws.write_release_config("require_clean = false\n")?;
+        ws.write_release_config("source = \"commits\"\nrequire_clean = false\nrequire_release_notes = false\n")?;
 
         // Run release plan with --skip-tag
         let output = run_cargo_rail(
@@ -3925,7 +3952,7 @@ fn test_release_publication_is_default_deny() {
         let ws = TestWorkspace::new_single_crate("skip-pub-crate", "0.1.0")?;
 
         // Configure release
-        ws.write_release_config("require_clean = false\n")?;
+        ws.write_release_config("source = \"commits\"\nrequire_clean = false\nrequire_release_notes = false\n")?;
 
         let output = run_cargo_rail(&ws.path, &["rail", "release", "run", "--check", "--bump", "patch"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -3941,7 +3968,9 @@ fn test_release_publication_is_default_deny() {
             stdout
         );
 
-        ws.write_release_config("require_clean = false\nremote_effects = \"push\"\n")?;
+        ws.write_release_config(
+            "source = \"commits\"\nrequire_clean = false\nrequire_release_notes = false\nremote_effects = \"push\"\n",
+        )?;
         let missing_config_authority = run_cargo_rail(
             &ws.path,
             &["rail", "release", "run", "--check", "--bump", "patch", "--publish"],
@@ -3961,7 +3990,9 @@ fn test_release_publication_is_default_deny() {
 fn release_local_effects_never_plan_registry_or_remote_actions() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_single_crate("local-release-authority", "0.1.0")?;
-        ws.write_release_config("require_clean = false\nremote_effects = \"none\"\n")?;
+        ws.write_release_config(
+            "source = \"commits\"\nrequire_clean = false\nrequire_release_notes = false\nremote_effects = \"none\"\n",
+        )?;
 
         let output = run_cargo_rail(
             &ws.path,
@@ -4020,8 +4051,13 @@ fn cargo_publish_authority_cannot_be_widened_by_rail_config() {
             anyhow::ensure!(manifest.contains(publish_line));
             std::fs::write(&manifest_path, manifest)?;
             ws.write_release_config(&format!(
-                "require_clean = false\nremote_effects = \"push\"\nregistry_publication = \"crates-io\"\n\n[crates.{name}.release]\npublish = true\n"
+                "require_clean = false\nrequire_release_notes = false\nremote_effects = \"push\"\nregistry_publication = \"crates-io\"\n\n[crates.{name}.release]\npublish = true\n"
             ))?;
+            std::fs::create_dir_all(ws.path.join(".changes"))?;
+            std::fs::write(
+                ws.path.join(".changes/publish-authority.md"),
+                format!("---\n\"{name}\" = \"patch\"\n---\n\nExercise Cargo publication authority.\n"),
+            )?;
 
             let output = run_cargo_rail(
                 &ws.path,
@@ -4062,7 +4098,7 @@ fn test_release_explicit_version() {
         let ws = TestWorkspace::new_single_crate("explicit-ver", "0.1.0")?;
 
         // Configure release
-        ws.write_release_config("require_clean = false\n")?;
+        ws.write_release_config("source = \"commits\"\nrequire_clean = false\nrequire_release_notes = false\n")?;
 
         // Run release with explicit version
         let output = run_cargo_rail(&ws.path, &["rail", "release", "run", "--check", "--bump", "2.0.0"])?;
@@ -4438,7 +4474,7 @@ relative_to = "crate"
 fn test_bump_prerelease_from_stable() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_single_crate("prerelease-test", "1.0.0")?;
-        ws.write_release_config("require_clean = false\n")?;
+        ws.write_release_config("source = \"commits\"\nrequire_clean = false\nrequire_release_notes = false\n")?;
 
         // Run release plan with --bump prerelease
         let output = run_cargo_rail(&ws.path, &["rail", "release", "run", "--check", "--bump", "prerelease"])?;
@@ -4461,7 +4497,7 @@ fn test_bump_prerelease_from_stable() {
 fn test_bump_prerelease_increment() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_single_crate("prerelease-inc", "2.0.0-rc.1")?;
-        ws.write_release_config("require_clean = false\n")?;
+        ws.write_release_config("source = \"commits\"\nrequire_clean = false\nrequire_release_notes = false\n")?;
 
         // Run release plan with --bump prerelease
         let output = run_cargo_rail(&ws.path, &["rail", "release", "run", "--check", "--bump", "prerelease"])?;
@@ -4484,7 +4520,7 @@ fn test_bump_prerelease_increment() {
 fn test_bump_release_strips_prerelease() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_single_crate("release-strip", "1.5.0-beta.3")?;
-        ws.write_release_config("require_clean = false\n")?;
+        ws.write_release_config("source = \"commits\"\nrequire_clean = false\nrequire_release_notes = false\n")?;
 
         // Run release plan with --bump release
         let output = run_cargo_rail(&ws.path, &["rail", "release", "run", "--check", "--bump", "release"])?;
@@ -4513,7 +4549,10 @@ fn test_release_check_extended_validates_publish() {
         ws.write_release_config("require_clean = false\n")?;
 
         // Run release check with --extended --all (single-crate needs explicit crate name or --all)
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--extended", "--all"])?;
+        let output = run_cargo_rail(
+            &ws.path,
+            &["rail", "release", "check", "--publication", "--extended", "--all"],
+        )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -4538,7 +4577,18 @@ fn test_release_check_extended_json() {
         ws.write_release_config("require_clean = false\n")?;
 
         // Run release check with --extended --json --all
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--extended", "--json", "--all"])?;
+        let output = run_cargo_rail(
+            &ws.path,
+            &[
+                "rail",
+                "release",
+                "check",
+                "--publication",
+                "--extended",
+                "--json",
+                "--all",
+            ],
+        )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         // Should be valid JSON with extended field
@@ -5268,6 +5318,78 @@ edition = "2021"
     Ok(())
 }
 
+#[test]
+fn release_check_uses_the_same_local_plan_for_an_unpublishable_workspace() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("release-check-local-unpublishable")?;
+        write_release_config(&ws, "remote_effects = \"none\"")?;
+        add_unpublishable_crate(&ws, "internal", "0.1.0")?;
+        ws.commit("feat: add internal release")?;
+
+        let check = run_cargo_rail(&ws.path, &["rail", "release", "check", "--all", "--format", "json"])?;
+        let run = run_cargo_rail(
+            &ws.path,
+            &["rail", "release", "run", "--all", "--check", "--format", "json"],
+        )?;
+        assert_eq!(check.status.code(), Some(1));
+        assert_eq!(run.status.code(), Some(1));
+
+        let check: serde_json::Value = serde_json::from_slice(&check.stdout)?;
+        let run: serde_json::Value = serde_json::from_slice(&run.stdout)?;
+        assert_eq!(check["release_plan"], run["release_plan"]);
+        assert_eq!(check["mutation_plan"], run["mutation_plan"]);
+        assert_eq!(check["release_plan"]["summary"]["crates_to_publish"], 0);
+        assert_eq!(check["release_plan"]["summary"]["crates_to_tag"], 1);
+        assert_eq!(check["readiness"]["scope"], "local");
+        assert_eq!(check["readiness"]["effects_executed"], serde_json::json!([]));
+        assert_eq!(check["readiness"]["planned_effects"]["git_tag"], true);
+        assert_eq!(check["readiness"]["planned_effects"]["registry_publication"], false);
+        assert_eq!(
+            check["readiness"]["effects_excluded_from_check"],
+            serde_json::json!([
+                "workspace_mutation",
+                "git_commit",
+                "git_tag",
+                "git_push",
+                "forge_release",
+                "registry_publication"
+            ])
+        );
+
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn release_publication_check_names_its_publishable_only_scope() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("release-check-publication-unpublishable")?;
+        write_release_config(&ws, "")?;
+        add_unpublishable_crate(&ws, "internal", "0.1.0")?;
+        ws.commit("feat: add internal release")?;
+
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--publication", "--all"])?;
+        assert_eq!(output.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("no publishable crates found"));
+
+        let json = run_cargo_rail(
+            &ws.path,
+            &["rail", "release", "check", "--publication", "--all", "--format", "json"],
+        )?;
+        assert_eq!(json.status.code(), Some(2));
+        let json: serde_json::Value = serde_json::from_slice(&json.stdout)?;
+        assert_eq!(json["result"], "failed");
+        assert_eq!(json["exit_code"], 2);
+        assert_eq!(json["readiness"]["scope"], "publication");
+        assert_eq!(json["readiness"]["effects_executed"], serde_json::json!([]));
+        assert_eq!(json["error"], "no publishable crates found");
+
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
 /// Test that --all skips crates with publish = false in Cargo.toml
 #[test]
 fn test_release_check_all_skips_unpublishable_cargo_toml() {
@@ -5284,7 +5406,7 @@ fn test_release_check_all_skips_unpublishable_cargo_toml() {
         ws.commit("Add crates")?;
 
         // Run release check --all
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--all"])?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--publication", "--all"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -5338,7 +5460,7 @@ fn test_release_check_path_deps_allowed_for_unpublishable() {
         ws.commit("Add crates")?;
 
         // Run release check --all
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--all"])?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--publication", "--all"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -5374,7 +5496,10 @@ fn test_release_check_explicit_unpublishable_crate() {
         ws.commit("Add crates")?;
 
         // Run release check on the specific crate
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "internal-tool"])?;
+        let output = run_cargo_rail(
+            &ws.path,
+            &["rail", "release", "check", "--publication", "internal-tool"],
+        )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         // Should succeed and report the crate as not publishable
@@ -5408,7 +5533,10 @@ fn test_release_check_json_includes_skipped() {
         ws.commit("Add crates")?;
 
         // Run release check --all --json
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--all", "--json"])?;
+        let output = run_cargo_rail(
+            &ws.path,
+            &["rail", "release", "check", "--publication", "--all", "--json"],
+        )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         // Parse JSON
@@ -5464,7 +5592,7 @@ publish = false
         )?;
 
         // Run release check --all
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--all"])?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--publication", "--all"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
 

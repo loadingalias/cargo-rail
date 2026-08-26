@@ -521,12 +521,16 @@ impl SurfaceGraph {
                     .or_else(|| compiler_items.get(&edge.target).cloned())
                     .unwrap_or_default();
                 for target in targets {
+                    let crosses_crate_boundary = items
+                        .get(&source)
+                        .zip(items.get(&target))
+                        .is_some_and(|(source, target)| source.compiler_crates.is_disjoint(&target.compiler_crates));
                     edges.insert(SurfaceEdge {
                         source: source.clone(),
                         target: target.clone(),
                         kind: edge.kind,
                     });
-                    if edge.source.0[0] != edge.target.0[0] {
+                    if crosses_crate_boundary {
                         if object.unit.domain == CompilerFactDomain::Production {
                             workspace_library_roots.insert(target.clone());
                         }
@@ -1218,9 +1222,9 @@ mod tests {
     }
 
     #[test]
-    fn cross_crate_reference_requires_public_and_propagates_interface_requirements() {
+    fn semantic_cross_crate_reference_ignores_opaque_item_id_collisions() {
         let consumer = item(
-            (CRATE_B, 1),
+            (CRATE_A, 10),
             (0, 10),
             CompilerFactItemKind::Function,
             CompilerFactVisibility::Private,
@@ -1229,7 +1233,7 @@ mod tests {
             "consumer",
             CompilerFactDomain::Production,
             vec![consumer.clone()],
-            vec![body((CRATE_B, 1), (CRATE_A, 1))],
+            vec![body((CRATE_A, 10), (CRATE_A, 1))],
             vec![consumer.id],
             Vec::new(),
         );

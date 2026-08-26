@@ -3,7 +3,7 @@
 [surface]
 enabled = true
 consumer_scope = "open" # use workspace only for a closed private consumer graph
-targets = ["host"]
+targets = "workspace" # host plus every target from the top-level `targets` policy
 crate_visibility = "allow" # preserve | allow
 preserve_uniform_fields = true
 doctest_coverage = "automatic" # automatic | disabled
