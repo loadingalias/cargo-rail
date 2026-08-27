@@ -7744,7 +7744,11 @@ fn root_portable_compiler_arguments(
     if !manifest_root.starts_with(&canonical_root) {
         return Err("root_portability_external_source_unmodeled");
     }
-    let root = canonical_root
+    // rustc observes paths from the process working directory. On Windows,
+    // canonicalization can expand an 8.3 checkout spelling, so remapping the
+    // canonical path would leave the spelling Cargo actually supplied inside
+    // compiler outputs while still claiming cross-root portability.
+    let root = current_directory
         .to_str()
         .ok_or("root_portability_non_utf8_root_unmodeled")?;
     let mut remapped = arguments.to_vec();
@@ -13855,6 +13859,35 @@ pub(crate) mod tests {
                 &format!("repository:={virtual_root}"),
                 None
             ));
+            Ok(())
+        })();
+        result.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_portable_arguments_remap_the_validated_invocation_spelling() {
+        use std::os::unix::fs::symlink;
+
+        let result: RailResult<()> = (|| {
+            let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+            let canonical = crate::utils::canonicalize_existing(repository)?;
+            let directory = tempfile::tempdir()?;
+            let spelling = directory.path().join("checkout-spelling");
+            symlink(repository, &spelling)?;
+            let arguments = [OsString::from("src/lib.rs")];
+
+            let remapped =
+                root_portable_compiler_arguments(&arguments, &canonical, &spelling).map_err(RailError::message)?;
+
+            assert_eq!(
+                remapped.last(),
+                Some(&OsString::from(format!(
+                    "--remap-path-prefix={}={}",
+                    spelling.display(),
+                    crate::compiler::distributed::VIRTUAL_WORKSPACE
+                )))
+            );
             Ok(())
         })();
         result.unwrap();
