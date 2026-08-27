@@ -13,7 +13,7 @@ cargo rail --config examples/unify/rail.toml unify --check --explain
 `--check` does not edit manifests. It exits `1` when changes are pending. Review the explanation, then apply:
 
 ```bash
-cargo rail --config examples/unify/rail.toml unify
+cargo rail --config examples/unify/rail.toml unify apply
 ```
 
 Use `consumer_scope = "workspace"` only when no external consumer can activate private package features. Use

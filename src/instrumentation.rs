@@ -319,10 +319,6 @@ pub fn record_snapshot_id(snapshot_id: String) {
     }
 }
 
-pub(crate) fn record_cargo_metadata_cache_hit() {
-    add(|counters| &counters.cargo_metadata_cache_hits, 1);
-}
-
 pub(crate) fn record_hash(input_bytes: usize) {
     record_hash_operation();
     record_hash_input_bytes(input_bytes);

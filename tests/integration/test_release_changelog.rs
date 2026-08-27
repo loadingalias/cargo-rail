@@ -1008,7 +1008,12 @@ registry_publication = "crates-io"
             "crates-io:registry-shadow@0.1.1"
         );
 
-        let cleaned = run_with_path_prefix(&ws, shim.path(), &["rail", "clean"])?;
+        let transaction_id = state["transaction_id"].as_str().unwrap();
+        let cleaned = run_with_path_prefix(
+            &ws,
+            shim.path(),
+            &["rail", "clean", "--release-journal", transaction_id],
+        )?;
         assert!(cleaned.status.success(), "{}", String::from_utf8_lossy(&cleaned.stderr));
         std::fs::remove_file(&published_path)?;
         let status = run_with_path_prefix(&ws, shim.path(), &["rail", "release", "status", "--format", "json"])?;
@@ -2283,6 +2288,8 @@ fn change_add_uses_stable_slug_hash_names_and_rejects_duplicate_intent() {
             "minor",
             "--message",
             "Added deterministic filenames for reviewed release intent.",
+            "--format",
+            "names-only",
         ];
         let output = run_cargo_rail(&ws.path, &args)?;
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2423,7 +2430,7 @@ fn change_add_rejects_change_dir_that_escapes_workspace() {
         );
         assert_eq!(output.status.code(), Some(2), "change add should fail\n{}", combined);
         assert!(
-            combined.contains("invalid release.change_dir")
+            combined.contains("invalid configuration for 'release.change_dir'")
                 && combined.contains("change_dir must be a workspace-relative path"),
             "output:\n{}",
             combined
@@ -2456,6 +2463,8 @@ fn change_dir_override_round_trips_through_release_consumption() {
                 "minor",
                 "--message",
                 "Added configurable change directory.",
+                "--format",
+                "names-only",
             ],
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2701,6 +2710,8 @@ fn change_file_drives_auto_bump_and_is_consumed_on_release() {
                 "minor",
                 "--message",
                 "Added reviewed release intent.",
+                "--format",
+                "names-only",
             ],
         )?;
         let add_stdout = String::from_utf8_lossy(&add_output.stdout);
@@ -4817,7 +4828,10 @@ require_release_notes = false
         );
 
         std::fs::write(&manifest_path, manifest)?;
-        let clean = run_cargo_rail(&ws.path, &["rail", "clean"])?;
+        let clean = run_cargo_rail(
+            &ws.path,
+            &["rail", "clean", "--release-journal", state_path.to_str().unwrap()],
+        )?;
         assert!(!clean.status.success(), "clean must refuse an active journal");
         assert!(String::from_utf8_lossy(&clean.stderr).contains("clean refused active release transaction"));
 
@@ -4826,7 +4840,10 @@ require_release_notes = false
         assert!(config_path.exists(), "test release config disappeared before recovery");
         let resumed = run_cargo_rail(&ws.path, &["rail", "release", "resume", state_path.to_str().unwrap()])?;
         assert!(resumed.status.success(), "{}", String::from_utf8_lossy(&resumed.stderr));
-        let cleaned = run_cargo_rail(&ws.path, &["rail", "clean"])?;
+        let cleaned = run_cargo_rail(
+            &ws.path,
+            &["rail", "clean", "--release-journal", state_path.to_str().unwrap()],
+        )?;
         assert!(cleaned.status.success(), "{}", String::from_utf8_lossy(&cleaned.stderr));
         assert!(!state_path.exists(), "clean should prune the completed journal");
         Ok(())
@@ -4914,11 +4931,14 @@ require_release_notes = false
         std::fs::write(ws.path.join("superseding.txt"), "new release input\n")?;
         ws.commit("Supersede unstarted release plan")?;
 
-        let cleaned = run_cargo_rail(&ws.path, &["rail", "clean"])?;
-        assert!(cleaned.status.success(), "{}", String::from_utf8_lossy(&cleaned.stderr));
+        let cleaned = run_cargo_rail(
+            &ws.path,
+            &["rail", "clean", "--release-journal", state_path.to_str().unwrap()],
+        )?;
+        assert_eq!(cleaned.status.code(), Some(2));
         assert!(
-            !state_path.exists(),
-            "clean should prune the effect-free superseded journal"
+            state_path.exists(),
+            "active superseded state is not terminal cleanup authority"
         );
         Ok(())
     })();
@@ -4964,13 +4984,27 @@ require_release_notes = false
             "release commit must carry the plan-bound transaction identity"
         );
 
-        let status = run_cargo_rail(&ws.path, &["rail", "release", "status", "--format", "json"])?;
+        let active = run_cargo_rail(&ws.path, &["rail", "release", "status", "--format", "json"])?;
+        let active: serde_json::Value = serde_json::from_slice(&active.stdout)?;
+        assert_eq!(active["transactions"], serde_json::json!([]));
+
+        let status = run_cargo_rail(
+            &ws.path,
+            &["rail", "release", "status", "--history", "--format", "json"],
+        )?;
         let status: serde_json::Value = serde_json::from_slice(&status.stdout)?;
         assert_eq!(status["transactions"][0]["state"], "released:complete");
         assert_eq!(status["transactions"][0]["recoverability"], "terminal");
-        let cleaned = run_cargo_rail(&ws.path, &["rail", "clean"])?;
+        assert_eq!(
+            status["transactions"][0]["safe_operator_command"],
+            format!("cargo rail clean --release-journal {transaction_id}")
+        );
+        let cleaned = run_cargo_rail(&ws.path, &["rail", "clean", "--release-journal", transaction_id])?;
         assert!(cleaned.status.success(), "{}", String::from_utf8_lossy(&cleaned.stderr));
-        let reconstructed = run_cargo_rail(&ws.path, &["rail", "release", "status", "--format", "json"])?;
+        let reconstructed = run_cargo_rail(
+            &ws.path,
+            &["rail", "release", "status", "--history", "--format", "json"],
+        )?;
         let reconstructed: serde_json::Value = serde_json::from_slice(&reconstructed.stdout)?;
         assert_eq!(reconstructed["transactions"][0]["state"], "released:git");
         assert_eq!(reconstructed["transactions"][0]["recoverability"], "terminal");
@@ -4993,7 +5027,10 @@ fn historical_prepare_with_merged_descendant_tag_is_terminal_not_finalizable() {
         let merged_sha = ws.commit("Merge prepared release")?;
         git(&ws.path, &["tag", "-a", "v0.1.1", "-m", "Release v0.1.1", &merged_sha])?;
 
-        let status = run_cargo_rail(&ws.path, &["rail", "release", "status", "--format", "json"])?;
+        let status = run_cargo_rail(
+            &ws.path,
+            &["rail", "release", "status", "--history", "--format", "json"],
+        )?;
         assert!(status.status.success(), "{}", String::from_utf8_lossy(&status.stderr));
         let status: serde_json::Value = serde_json::from_slice(&status.stdout)?;
         let reconstructed = status["transactions"]
@@ -5006,7 +5043,10 @@ fn historical_prepare_with_merged_descendant_tag_is_terminal_not_finalizable() {
         assert_eq!(reconstructed["recoverability"], "terminal");
         assert_eq!(reconstructed["ambiguity"], false);
         assert_eq!(reconstructed["exact_sha"], merged_sha);
-        assert_eq!(reconstructed["safe_operator_command"], "cargo rail clean");
+        assert_eq!(
+            reconstructed["safe_operator_command"],
+            "none (transaction is terminal; no release journal exists)"
+        );
         assert_ne!(prepare_sha, merged_sha);
         assert!(
             reconstructed["observations"]
@@ -5103,6 +5143,147 @@ fn test_release_requires_explicit_confirmation_non_interactive() {
     super::helpers::finish_test(result);
 }
 
+#[cfg(unix)]
+#[test]
+fn release_confirmation_pty_accepts_only_yes_and_keeps_the_prompt_on_stderr() {
+    fn fixture(name: &str) -> Result<TestWorkspace> {
+        let ws = TestWorkspace::new_named(name)?;
+        write_release_config(&ws, "")?;
+        ws.add_crate("lib-a", "0.1.0", &[])?;
+        ws.commit("Add lib-a")?;
+        ws.tag("lib-a-v0.1.0", "Initial release")?;
+        ws.modify_file("lib-a", "src/lib.rs", "pub fn pty_confirmation() {}")?;
+        ws.commit("feat: add PTY confirmation fixture")?;
+        Ok(ws)
+    }
+
+    fn run_in_pty(ws: &TestWorkspace, answer: &[u8]) -> Result<(String, String)> {
+        const PTY_RUNNER: &str = r#"
+import os
+import pty
+import subprocess
+import sys
+import time
+
+binary, root, stdout_path, stderr_path, answer_hex = sys.argv[1:]
+master, slave = pty.openpty()
+try:
+    with open(stdout_path, "wb") as stdout, open(stderr_path, "wb") as stderr:
+        child = subprocess.Popen(
+            [binary, "rail", "release", "run", "lib-a", "--bump", "patch", "--skip-publish", "--skip-tag"],
+            cwd=root,
+            stdin=slave,
+            stdout=stdout,
+            stderr=stderr,
+            close_fds=True,
+        )
+    os.close(slave)
+    slave = -1
+    deadline = time.monotonic() + 30
+    prompt = b"Proceed? [y/N] "
+    while time.monotonic() < deadline:
+        try:
+            with open(stderr_path, "rb") as stderr:
+                if prompt in stderr.read():
+                    break
+        except FileNotFoundError:
+            pass
+        if child.poll() is not None:
+            raise RuntimeError(f"command exited before prompting: {child.returncode}")
+        time.sleep(0.02)
+    else:
+        child.kill()
+        child.wait()
+        raise RuntimeError("command did not reach its confirmation prompt")
+    os.write(master, bytes.fromhex(answer_hex))
+    returncode = child.wait(timeout=60)
+    if returncode != 0:
+        raise RuntimeError(f"command failed after prompting: {returncode}")
+finally:
+    if slave >= 0:
+        os.close(slave)
+    os.close(master)
+"#;
+
+        let stdout = ws.path.join("target/pty-stdout");
+        let stderr = ws.path.join("target/pty-stderr");
+        std::fs::create_dir_all(ws.path.join("target"))?;
+        let answer_hex = answer.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let runner = Command::new("python3")
+            .args(["-c", PTY_RUNNER])
+            .arg(env!("CARGO_BIN_EXE_cargo-rail"))
+            .arg(&ws.path)
+            .arg(&stdout)
+            .arg(&stderr)
+            .arg(answer_hex)
+            .output()?;
+        anyhow::ensure!(
+            runner.status.success(),
+            "PTY runner failed: {}",
+            String::from_utf8_lossy(&runner.stderr)
+        );
+        Ok((std::fs::read_to_string(stdout)?, std::fs::read_to_string(stderr)?))
+    }
+
+    let result: Result<()> = (|| {
+        for (name, answer) in [
+            ("lower-y", &b"y\r"[..]),
+            ("upper-y", &b"Y\r"[..]),
+            ("lower-yes", &b"yes\r"[..]),
+            ("mixed-yes", &b"YeS\r"[..]),
+        ] {
+            let accepted = fixture(&format!("release-confirmation-pty-{name}"))?;
+            let (stdout, stderr) = run_in_pty(&accepted, answer)?;
+            assert!(
+                stderr.contains("Proceed? [y/N] "),
+                "prompt missing from stderr for {name}: {stderr}"
+            );
+            assert!(
+                !stdout.contains("Proceed? [y/N] "),
+                "prompt leaked to stdout for {name}: {stdout}"
+            );
+            assert!(
+                std::fs::read_to_string(accepted.path.join("crates/lib-a/Cargo.toml"))?.contains("version = \"0.1.1\""),
+                "accepted answer {name} did not authorize the release"
+            );
+        }
+
+        for (name, answer) in [
+            ("enter", &b"\r"[..]),
+            ("n", &b"n\r"[..]),
+            ("no", &b"no\r"[..]),
+            ("leading-space", &b" y\r"[..]),
+            ("trailing-space", &b"yes \r"[..]),
+            ("other", &b"anything\r"[..]),
+            ("eof", &b"\x04"[..]),
+        ] {
+            let rejected = fixture(&format!("release-confirmation-pty-{name}"))?;
+            let head = git(&rejected.path, &["rev-parse", "HEAD"])?.stdout;
+            let (stdout, stderr) = run_in_pty(&rejected, answer)?;
+            assert!(
+                stderr.contains("Proceed? [y/N] "),
+                "prompt missing from stderr for {name}: {stderr}"
+            );
+            assert!(
+                !stdout.contains("Proceed? [y/N] "),
+                "prompt leaked to stdout for {name}: {stdout}"
+            );
+            assert_eq!(
+                git(&rejected.path, &["rev-parse", "HEAD"])?.stdout,
+                head,
+                "rejected answer {name} changed HEAD"
+            );
+            assert!(
+                std::fs::read_to_string(rejected.path.join("crates/lib-a/Cargo.toml"))?.contains("version = \"0.1.0\""),
+                "rejected answer {name} mutated the manifest"
+            );
+        }
+
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
 /// Test that release fails from detached HEAD
 #[test]
 fn test_release_detached_head_fails() {
@@ -5138,9 +5319,9 @@ fn test_release_detached_head_fails() {
     super::helpers::finish_test(result);
 }
 
-/// Test that release from non-default branch fails without --yes
+/// Test that confirmation does not authorize a non-default branch.
 #[test]
-fn test_release_non_default_branch_fails_without_yes() {
+fn test_release_non_default_branch_fails_without_branch_authority() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("release-branch")?;
         write_release_config(&ws, "")?;
@@ -5151,22 +5332,31 @@ fn test_release_non_default_branch_fails_without_yes() {
         // Create and switch to a feature branch
         crate::helpers::git(&ws.path, &["checkout", "-b", "feature-branch"])?;
 
-        // Run release without --yes (should fail)
+        // --yes skips only the prompt; it does not authorize this branch.
         let output = run_cargo_rail(
             &ws.path,
-            &["rail", "release", "run", "lib-a", "--bump", "patch", "--skip-publish"],
+            &[
+                "rail",
+                "release",
+                "run",
+                "lib-a",
+                "--bump",
+                "patch",
+                "--skip-publish",
+                "--yes",
+            ],
         )?;
 
         let stderr = String::from_utf8_lossy(&output.stderr);
 
         assert!(
             !output.status.success(),
-            "Release from non-default branch should fail without --yes.\nstderr:\n{}",
+            "Release from non-default branch should fail without branch authority.\nstderr:\n{}",
             stderr
         );
         assert!(
-            stderr.contains("feature-branch") || stderr.contains("not default branch") || stderr.contains("--yes"),
-            "Error should mention branch name or --yes flag.\nstderr:\n{}",
+            stderr.contains("feature-branch") && stderr.contains("--allow-non-default-branch"),
+            "Error should name the branch authority flag.\nstderr:\n{}",
             stderr
         );
 
@@ -5175,9 +5365,9 @@ fn test_release_non_default_branch_fails_without_yes() {
     super::helpers::finish_test(result);
 }
 
-/// Test that release from non-default branch succeeds with --yes
+/// Test that prompt and branch authority are independently explicit.
 #[test]
-fn test_release_non_default_branch_succeeds_with_yes() {
+fn test_release_non_default_branch_requires_confirmation_and_branch_flags() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("release-branch-yes")?;
         write_release_config(&ws, "")?;
@@ -5205,6 +5395,7 @@ fn test_release_non_default_branch_succeeds_with_yes() {
                 "patch",
                 "--skip-publish",
                 "--yes",
+                "--allow-non-default-branch",
             ],
         )?;
 

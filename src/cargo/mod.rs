@@ -6,7 +6,7 @@
 //! - Clean unification with minimal features
 
 // Core modules
-pub mod cargo_transform;
+mod cargo_transform;
 pub mod feature_scanner;
 pub mod manifest_analyzer;
 mod manifest_ops; // Internal - used only by manifest_writer and cargo_transform
@@ -19,7 +19,7 @@ pub mod unify_report;
 pub mod unify_types;
 
 // Re-export main types for convenience
-pub use cargo_transform::{CargoTransform, TransformContext};
+pub(crate) use cargo_transform::ManifestTransformPolicy;
 pub use feature_scanner::{FeatureScanResult, FeatureScanner};
 pub use manifest_analyzer::{DepKey, DepKind, DepUsage, ManifestAnalyzer};
 pub use manifest_writer::ManifestWriter;

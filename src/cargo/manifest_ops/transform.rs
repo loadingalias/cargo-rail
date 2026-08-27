@@ -6,26 +6,6 @@ use toml_edit::{DocumentMut, Item, Table, Value};
 
 use super::workspace_ref::is_package_workspace_inherited;
 
-// Batch Transformation Operations
-
-/// Transform all dependencies in a section
-pub fn transform_dependencies_in_section<F>(doc: &mut DocumentMut, section: &str, mut transform_fn: F) -> RailResult<()>
-where
-    F: FnMut(&str, &mut Item) -> RailResult<()>,
-{
-    if let Some(deps) = doc.get_mut(section).and_then(|d| d.as_table_mut()) {
-        let dep_names: Vec<String> = deps.iter().map(|(k, _)| k.to_string()).collect();
-
-        for dep_name in dep_names {
-            if let Some(dep_item) = deps.get_mut(&dep_name) {
-                transform_fn(&dep_name, dep_item)?;
-            }
-        }
-    }
-
-    Ok(())
-}
-
 /// Resolve workspace references in package fields
 pub fn resolve_package_workspace_inheritance(doc: &mut DocumentMut, workspace_package: &Table) -> RailResult<()> {
     let fields = [
@@ -99,38 +79,6 @@ pub fn dep_kind_to_section(kind: DepKind) -> &'static str {
 mod tests {
     use super::*;
     use toml_edit::{DocumentMut, InlineTable, Item, Table, Value};
-
-    #[test]
-    fn test_transform_dependencies_in_section() {
-        let content = "[dependencies]\nserde = \"1.0\"\ntokio = \"1.0\"\n";
-        let mut doc: DocumentMut = content.parse().unwrap();
-
-        let mut count = 0;
-        transform_dependencies_in_section(&mut doc, "dependencies", |_name, _item| {
-            count += 1;
-            Ok(())
-        })
-        .unwrap();
-
-        assert_eq!(count, 2);
-    }
-
-    #[test]
-    fn test_transform_dependencies_can_modify() {
-        let content = "[dependencies]\nserde = \"1.0\"\n";
-        let mut doc: DocumentMut = content.parse().unwrap();
-
-        transform_dependencies_in_section(&mut doc, "dependencies", |_name, item| {
-            set_version(item, "2.0")?;
-            Ok(())
-        })
-        .unwrap();
-
-        // Verify version was changed
-        let deps = doc.get("dependencies").unwrap().as_table().unwrap();
-        let serde = deps.get("serde").unwrap();
-        assert_eq!(serde.as_str().unwrap(), "2.0");
-    }
 
     #[test]
     fn test_resolve_package_workspace_inheritance() {

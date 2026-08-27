@@ -49,6 +49,22 @@ pub enum RailError {
     /// I/O errors
     Io(io::Error),
 
+    /// A typed error from an external parser or subsystem.
+    External {
+        /// Stable operation-level description.
+        message: &'static str,
+        /// Native source error retained for inspection and diagnostics.
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+
+    /// Operation context around another typed Cargo-Rail error.
+    Context {
+        /// The operation that failed.
+        context: String,
+        /// The error produced by that operation.
+        source: Box<RailError>,
+    },
+
     /// Generic error with message and optional context
     Message {
         /// Error message
@@ -98,14 +114,19 @@ impl RailError {
 
     /// Add context to an existing error
     pub fn context(self, ctx: impl Into<String>) -> Self {
-        let ctx_str = ctx.into();
         match self {
-            RailError::Message { message, context, help } => RailError::Message {
-                message,
-                context: Some(context.map(|c| format!("{}\n{}", ctx_str, c)).unwrap_or(ctx_str)),
-                help,
+            RailError::CheckHasPendingChanges | RailError::ExitWithCode { .. } => self,
+            source => RailError::Context {
+                context: ctx.into(),
+                source: Box::new(source),
             },
-            _ => self,
+        }
+    }
+
+    fn external(message: &'static str, source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::External {
+            message,
+            source: Box::new(source),
         }
     }
 
@@ -114,6 +135,7 @@ impl RailError {
         match self {
             RailError::CheckHasPendingChanges => ExitCode::CheckFailed,
             RailError::ExitWithCode { code } => ExitCode::Custom(*code),
+            RailError::Context { source, .. } => source.exit_code(),
             _ => ExitCode::Error,
         }
     }
@@ -124,8 +146,38 @@ impl RailError {
             RailError::Config(e) => e.help_message(),
             RailError::Git(e) => e.help_message(),
             RailError::Message { help, .. } => help.clone(),
+            RailError::Context { source, .. } => source.help_message(),
             _ => None,
         }
+    }
+
+    /// Whether this error chain ends in a broken stdout or stderr pipe.
+    pub fn is_broken_pipe(&self) -> bool {
+        match self {
+            RailError::Io(error) => error.kind() == io::ErrorKind::BrokenPipe,
+            RailError::Context { source, .. } => source.is_broken_pipe(),
+            _ => false,
+        }
+    }
+
+    fn machine_parts(&self) -> (String, Option<String>) {
+        let mut contexts = Vec::new();
+        let mut current = self;
+        while let RailError::Context { context, source } = current {
+            contexts.push(context.as_str());
+            current = source;
+        }
+
+        let (message, legacy_context) = match current {
+            RailError::Message { message, context, .. } => (message.clone(), context.as_deref()),
+            _ => (current.to_string(), None),
+        };
+        if let Some(context) = legacy_context {
+            contexts.push(context);
+        }
+
+        let context = (!contexts.is_empty()).then(|| contexts.join("\n"));
+        (message, context)
     }
 }
 
@@ -135,6 +187,8 @@ impl fmt::Display for RailError {
             RailError::Config(e) => write!(f, "{}", e),
             RailError::Git(e) => write!(f, "{}", e),
             RailError::Io(e) => write!(f, "{}", e),
+            RailError::External { message, source } => write!(f, "{}: {}", message, source),
+            RailError::Context { context, source } => write!(f, "{}\n{}", source, context),
             RailError::Message { message, context, .. } => {
                 write!(f, "{}", message)?;
                 if let Some(ctx) = context {
@@ -151,7 +205,11 @@ impl fmt::Display for RailError {
 impl std::error::Error for RailError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            RailError::Config(e) => Some(e),
+            RailError::Git(e) => Some(e),
             RailError::Io(e) => Some(e),
+            RailError::External { source, .. } => Some(source.as_ref()),
+            RailError::Context { source, .. } => Some(source.as_ref()),
             _ => None,
         }
     }
@@ -177,61 +235,61 @@ impl From<&str> for RailError {
 
 impl From<toml_edit::TomlError> for RailError {
     fn from(err: toml_edit::TomlError) -> Self {
-        RailError::message(format!("invalid TOML: {}", err))
+        RailError::external("invalid TOML", err)
     }
 }
 
 impl From<cargo_metadata::Error> for RailError {
     fn from(err: cargo_metadata::Error) -> Self {
-        RailError::message(format!("cargo metadata failed: {}", err))
+        RailError::external("cargo metadata failed", err)
     }
 }
 
 impl From<std::num::ParseIntError> for RailError {
     fn from(err: std::num::ParseIntError) -> Self {
-        RailError::message(format!("invalid number: {}", err))
+        RailError::external("invalid number", err)
     }
 }
 
 impl From<toml_edit::de::Error> for RailError {
     fn from(err: toml_edit::de::Error) -> Self {
-        RailError::message(format!("invalid TOML: {}", err))
+        RailError::external("invalid TOML", err)
     }
 }
 
 impl From<toml_edit::ser::Error> for RailError {
     fn from(err: toml_edit::ser::Error) -> Self {
-        RailError::message(format!("TOML serialization failed: {}", err))
+        RailError::external("TOML serialization failed", err)
     }
 }
 
 impl From<serde_json::Error> for RailError {
     fn from(err: serde_json::Error) -> Self {
-        RailError::message(format!("invalid JSON: {}", err))
+        RailError::external("invalid JSON", err)
     }
 }
 
 impl From<std::str::Utf8Error> for RailError {
     fn from(err: std::str::Utf8Error) -> Self {
-        RailError::message(format!("invalid UTF-8: {}", err))
+        RailError::external("invalid UTF-8", err)
     }
 }
 
 impl From<std::string::FromUtf8Error> for RailError {
     fn from(err: std::string::FromUtf8Error) -> Self {
-        RailError::message(format!("invalid UTF-8: {}", err))
+        RailError::external("invalid UTF-8", err)
     }
 }
 
 impl From<std::path::StripPrefixError> for RailError {
     fn from(err: std::path::StripPrefixError) -> Self {
-        RailError::message(format!("path error: {}", err))
+        RailError::external("path error", err)
     }
 }
 
 impl From<std::env::VarError> for RailError {
     fn from(err: std::env::VarError) -> Self {
-        RailError::message(format!("environment variable error: {}", err))
+        RailError::external("environment variable error", err)
     }
 }
 
@@ -341,6 +399,8 @@ impl fmt::Display for ConfigError {
     }
 }
 
+impl std::error::Error for ConfigError {}
+
 /// Git operation errors
 #[derive(Debug)]
 pub enum GitError {
@@ -437,6 +497,8 @@ impl fmt::Display for GitError {
     }
 }
 
+impl std::error::Error for GitError {}
+
 /// Result type alias for cargo-rail
 pub type RailResult<T> = Result<T, RailError>;
 
@@ -520,10 +582,7 @@ pub fn print_error(error: &RailError) {
 
 /// Print error as structured JSON to stdout
 fn print_error_json(error: &RailError) {
-    let (message, context) = match error {
-        RailError::Message { message, context, .. } => (message.clone(), context.clone()),
-        _ => (error.to_string(), None),
-    };
+    let (message, context) = error.machine_parts();
 
     let json_error = JsonError {
         error: true,
@@ -540,5 +599,115 @@ fn print_error_json(error: &RailError) {
     } else {
         // Fallback to text if JSON serialization fails
         crate::error!("{}", error);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error as _;
+
+    fn rail_source(error: &RailError) -> &RailError {
+        error
+            .source()
+            .and_then(|source| source.downcast_ref::<RailError>())
+            .expect("context must retain its RailError source")
+    }
+
+    #[test]
+    fn context_retains_configuration_git_and_filesystem_sources() {
+        let config = RailError::Config(ConfigError::MissingField {
+            field: "release.source".to_string(),
+        })
+        .context("validating release policy");
+        let config = rail_source(&config);
+        assert!(matches!(config, RailError::Config(ConfigError::MissingField { .. })));
+        assert!(
+            config
+                .source()
+                .is_some_and(|source| source.downcast_ref::<ConfigError>().is_some())
+        );
+
+        let git = RailError::Git(GitError::CommitNotFound {
+            sha: "deadbeef".to_string(),
+        })
+        .context("resolving release base");
+        let git = rail_source(&git);
+        assert!(matches!(git, RailError::Git(GitError::CommitNotFound { .. })));
+        assert!(
+            git.source()
+                .is_some_and(|source| source.downcast_ref::<GitError>().is_some())
+        );
+
+        let io = RailError::from(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
+            .context("opening recovery journal");
+        let io = rail_source(&io);
+        assert!(matches!(io, RailError::Io(_)));
+        assert!(
+            io.source()
+                .is_some_and(|source| source.downcast_ref::<io::Error>().is_some())
+        );
+    }
+
+    #[test]
+    fn external_conversions_retain_cargo_and_serialization_sources() {
+        let cargo = RailError::from(cargo_metadata::Error::NoJson).context("capturing Cargo metadata");
+        let cargo = rail_source(&cargo);
+        assert!(matches!(cargo, RailError::External { .. }));
+        assert!(
+            cargo
+                .source()
+                .is_some_and(|source| source.downcast_ref::<cargo_metadata::Error>().is_some())
+        );
+
+        let serde = serde_json::from_str::<serde_json::Value>("{").expect_err("JSON must be invalid");
+        let serde = RailError::from(serde).context("reading recovery receipt");
+        let serde = rail_source(&serde);
+        assert!(matches!(serde, RailError::External { .. }));
+        assert!(
+            serde
+                .source()
+                .is_some_and(|source| source.downcast_ref::<serde_json::Error>().is_some())
+        );
+    }
+
+    #[test]
+    fn nested_context_survives_text_machine_help_and_exit_boundaries() {
+        let error = RailError::with_help("recovery failed", "resume with the recorded transaction ID")
+            .context("restoring manifests")
+            .context("aborting release transaction");
+
+        assert_eq!(
+            error.to_string(),
+            "recovery failed\nrestoring manifests\naborting release transaction"
+        );
+        assert_eq!(error.exit_code(), ExitCode::Error);
+        assert_eq!(
+            error.help_message().as_deref(),
+            Some("resume with the recorded transaction ID")
+        );
+
+        let (message, context) = error.machine_parts();
+        assert_eq!(message, "recovery failed");
+        assert_eq!(
+            context.as_deref(),
+            Some("aborting release transaction\nrestoring manifests")
+        );
+    }
+
+    #[test]
+    fn context_preserves_control_outcomes_and_broken_pipe_detection() {
+        assert!(matches!(
+            RailError::CheckHasPendingChanges.context("ignored"),
+            RailError::CheckHasPendingChanges
+        ));
+        assert!(matches!(
+            RailError::ExitWithCode { code: 42 }.context("ignored"),
+            RailError::ExitWithCode { code: 42 }
+        ));
+
+        let broken_pipe =
+            RailError::from(io::Error::new(io::ErrorKind::BrokenPipe, "closed")).context("writing report");
+        assert!(broken_pipe.is_broken_pipe());
     }
 }

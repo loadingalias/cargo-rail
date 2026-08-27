@@ -38,7 +38,6 @@ if [ "$AFFECTED" = true ]; then
   else
     "$PLAN_READER" validate "$PLAN_FILE"
   fi
-  "$PLAN_READER" verify-checkout "$PLAN_FILE"
 fi
 cleanup() {
   if [ "$OWN_PLAN" = true ]; then
@@ -109,6 +108,9 @@ if required cargo.clippy; then
   else
     CLIPPY_ARGS=(--workspace)
   fi
+  if [ "$AFFECTED" = true ]; then
+    "$PLAN_READER" verify-checkout "$PLAN_FILE"
+  fi
   if [ "$FIX_MODE" = true ]; then
     cargo clippy "${CLIPPY_ARGS[@]}" --all-targets --all-features --locked --fix
   else
@@ -136,6 +138,9 @@ if required cargo.doc; then
     done < <("$PLAN_READER" cargo-args "$PLAN_FILE" cargo.doc)
   else
     DOC_ARGS=(--workspace)
+  fi
+  if [ "$AFFECTED" = true ]; then
+    "$PLAN_READER" verify-checkout "$PLAN_FILE"
   fi
   RUSTDOCFLAGS="-D warnings" cargo doc "${DOC_ARGS[@]}" --no-deps --all-features --locked
 else

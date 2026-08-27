@@ -35,6 +35,17 @@ fn plan(ws: &TestWorkspace, args: &[&str]) -> Result<Value> {
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
+fn write_saved_plan(ws: &TestWorkspace, name: &str, plan: &Value) -> Result<String> {
+    let path = ws.path.join("target").join(name);
+    std::fs::create_dir_all(path.parent().context("saved plan path has no parent")?)?;
+    std::fs::write(&path, serde_json::to_vec_pretty(plan)?)?;
+    Ok(path.to_str().context("saved plan path is not UTF-8")?.to_string())
+}
+
+fn verify_saved_plan(ws: &TestWorkspace, path: &str) -> Result<std::process::Output> {
+    run_cargo_rail(&ws.path, &["rail", "plan", "--verify", path])
+}
+
 fn sign_planning_evidence(mut manifest: Value) -> Result<Value> {
     manifest["identity"] = Value::String(String::new());
     fn canonicalize(value: Value) -> Value {
@@ -534,6 +545,35 @@ fn test_declared_cargo_work_inherits_subscribed_cargo_scope() {
 }
 
 #[test]
+fn test_declared_cargo_work_propagates_incomplete_subscribed_scope() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("plan-declared-incomplete-cargo-scope")?;
+        ws.add_crate("scope", "0.1.0", &[])?;
+        std::fs::write(
+            ws.path.join(".config/rail.toml"),
+            "[plan.work.miri]\nscope = 'cargo'\ncargo = ['cargo.test']\n",
+        )?;
+        ws.commit("establish declared Cargo subscription")?;
+        std::fs::write(
+            ws.path.join(".config/nextest.toml"),
+            "[profile.default]\nfail-fast = true\n",
+        )?;
+
+        let planned = plan(&ws, &["--since", "HEAD"])?;
+        assert_eq!(planned["work"]["cargo.test"]["cause"], "incomplete_evidence");
+        assert_eq!(planned["work"]["miri"]["state"], "required");
+        assert_eq!(planned["work"]["miri"]["cause"], "incomplete_evidence");
+        assert_eq!(
+            planned["work"]["miri"]["scope"]["selection"],
+            planned["work"]["cargo.test"]["scope"]["selection"]
+        );
+        assert_eq!(planned["work"]["miri"]["scope"]["selection"]["kind"], "workspace");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
 fn test_plan_propagates_cargo_domains_with_portable_selectors() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("plan-cargo-domains")?;
@@ -564,6 +604,64 @@ fn test_plan_propagates_cargo_domains_with_portable_selectors() {
                     .as_str()
                     .is_some_and(|key| !key.contains(ws.path.to_string_lossy().as_ref()))))
         );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_plan_cargo_selectors_exclude_non_workspace_dependency_packages() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("plan-non-workspace-dependency")?;
+        let root_manifest = std::fs::read_to_string(ws.path.join("Cargo.toml"))?;
+        std::fs::write(
+            ws.path.join("Cargo.toml"),
+            root_manifest.replace(
+                "members = [\"crates/*\"]",
+                "members = [\"crates/*\"]\nexclude = [\"vendor/external\"]",
+            ),
+        )?;
+        let external = ws.path.join("vendor/external");
+        std::fs::create_dir_all(external.join("src"))?;
+        std::fs::write(
+            external.join("Cargo.toml"),
+            "[package]\nname = \"external\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )?;
+        std::fs::write(external.join("src/lib.rs"), "pub fn external() {}\n")?;
+        ws.add_crate(
+            "consumer",
+            "0.1.0",
+            &[("external", r#"{ path = "../../vendor/external" }"#)],
+        )?;
+        generate_lockfile(&ws)?;
+        ws.commit("establish non-workspace dependency")?;
+
+        let external_manifest = std::fs::read_to_string(external.join("Cargo.toml"))?;
+        std::fs::write(
+            external.join("Cargo.toml"),
+            external_manifest.replace("version = \"0.1.0\"", "version = \"0.2.0\""),
+        )?;
+        generate_lockfile(&ws)?;
+        git(&ws.path, &["add", "vendor/external/Cargo.toml"])?;
+        git(&ws.path, &["commit", "-m", "update non-workspace dependency manifest"])?;
+
+        let plan = plan(&ws, &["--since", "HEAD"])?;
+        for work in [
+            "cargo.build",
+            "cargo.clippy",
+            "cargo.doc",
+            "cargo.doctest",
+            "cargo.test",
+        ] {
+            let packages = plan["work"][work]["scope"]["selection"]["packages"]
+                .as_array()
+                .with_context(|| format!("{work} package selectors missing"))?;
+            let names = packages
+                .iter()
+                .filter_map(|package| package["name"].as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(names, ["consumer"], "{work}");
+        }
         Ok(())
     })();
     super::helpers::finish_test(result);
@@ -705,6 +803,185 @@ fn test_plan_object_pair_reads_member_manifests_from_objects() {
             expected["work"]["cargo.build"]["scope"]["selection"]["packages"][0]["name"],
             "manifest-authority"
         );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_plan_object_pair_uses_only_to_tree_authority() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("plan-object-complete-head-authority")?;
+        ws.add_crate("base-member", "0.1.0", &[])?;
+        let base = ws.commit("establish object planning base")?;
+
+        ws.add_crate("head-member", "0.1.0", &[])?;
+        std::fs::create_dir_all(ws.path.join("distribution"))?;
+        std::fs::create_dir_all(ws.path.join(".cargo"))?;
+        std::fs::write(
+            ws.path.join(".config/rail.toml"),
+            "[plan.work.historical]\nscope = 'variants'\ncargo = ['cargo.test']\nvariant_catalog = 'distribution/historical.json'\n",
+        )?;
+        std::fs::write(
+            ws.path.join("distribution/historical.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "variant_catalog_version": 1,
+                "work": "historical",
+                "variants": [{
+                    "id": "head",
+                    "dimensions": {"runner": "head-runner"},
+                    "cargo": ["cargo.test"]
+                }]
+            }))?,
+        )?;
+        std::fs::write(
+            ws.path.join(".cargo/config.toml"),
+            "[build]\ntarget-dir = 'target/head'\n",
+        )?;
+        let head = ws.commit("establish complete object planning head")?;
+
+        let expected = plan(&ws, &["--from", &base, "--to", &head])?;
+        assert_eq!(expected["inputs"]["head"], head);
+        assert_eq!(expected["work"]["historical"]["state"], "required");
+        assert_eq!(
+            expected["work"]["historical"]["scope"]["selection"]["variants"][0]["id"],
+            "head"
+        );
+        let selected_packages = expected["work"]["cargo.test"]["scope"]["selection"]["packages"]
+            .as_array()
+            .context("historical Cargo package selection missing")?;
+        assert!(selected_packages.iter().any(|package| package["name"] == "head-member"));
+
+        let root_manifest = std::fs::read_to_string(ws.path.join("Cargo.toml"))?;
+        std::fs::write(
+            ws.path.join("Cargo.toml"),
+            root_manifest.replace("members = [\"crates/*\"]", "members = [\"crates/base-member\"]"),
+        )?;
+        std::fs::write(
+            ws.path.join(".config/rail.toml"),
+            "[plan.work.live]\nscope = 'repository'\npaths = ['live/**']\n",
+        )?;
+        std::fs::write(ws.path.join("distribution/historical.json"), b"not json")?;
+        std::fs::write(
+            ws.path.join(".cargo/config.toml"),
+            "[build]\ntarget-dir = 'target/live'\n",
+        )?;
+
+        let with_conflicting_checkout = plan(&ws, &["--from", &base, "--to", &head])?;
+        assert_eq!(with_conflicting_checkout, expected);
+
+        let clone_root = tempfile::TempDir::new()?;
+        let clone = clone_root.path().join("clone");
+        let output = Command::new("git")
+            .args(["clone", "--quiet", "--no-local"])
+            .arg(&ws.path)
+            .arg(&clone)
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "clone failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let cloned = run_cargo_rail(&clone, &["rail", "plan", "--from", &base, "--to", &head, "--json"])?;
+        ensure!(
+            cloned.status.success(),
+            "cloned historical plan failed: {}",
+            String::from_utf8_lossy(&cloned.stderr)
+        );
+        let cloned: Value = serde_json::from_slice(&cloned.stdout)?;
+        assert_eq!(cloned, expected);
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_saved_worktree_plan_rejects_every_git_drift_layer() {
+    let result: Result<()> = (|| {
+        for drift in ["unstaged", "staged", "untracked", "deleted", "renamed"] {
+            let ws = TestWorkspace::new_named(&format!("plan-verify-{drift}"))?;
+            let package = ws.add_crate("verify", "0.1.0", &[])?;
+            generate_lockfile(&ws)?;
+            ws.commit("establish saved-plan verification fixture")?;
+            let saved = plan(&ws, &["--since", "HEAD"])?;
+            let path = write_saved_plan(&ws, "saved-plan.json", &saved)?;
+            let unchanged = verify_saved_plan(&ws, &path)?;
+            ensure!(
+                unchanged.status.success(),
+                "unchanged {drift} fixture failed verification: {}",
+                String::from_utf8_lossy(&unchanged.stderr)
+            );
+
+            match drift {
+                "unstaged" => std::fs::write(package.join("src/lib.rs"), "pub fn unstaged() {}\n")?,
+                "staged" => {
+                    std::fs::write(package.join("src/lib.rs"), "pub fn staged() {}\n")?;
+                    git(&ws.path, &["add", "crates/verify/src/lib.rs"])?;
+                }
+                "untracked" => std::fs::write(package.join("src/untracked.rs"), "pub fn untracked() {}\n")?,
+                "deleted" => std::fs::remove_file(package.join("src/lib.rs"))?,
+                "renamed" => std::fs::rename(package.join("src/lib.rs"), package.join("src/renamed.rs"))?,
+                other => return Err(anyhow!("unknown saved-plan drift fixture '{other}'")),
+            }
+            let rejected = verify_saved_plan(&ws, &path)?;
+            assert_eq!(rejected.status.code(), Some(2), "{drift} drift was accepted");
+            assert!(rejected.stdout.is_empty(), "{drift} verification emitted stdout");
+        }
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_saved_worktree_plan_rejects_executable_mode_drift() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("plan-verify-executable-mode")?;
+        let package = ws.add_crate("verify", "0.1.0", &[])?;
+        generate_lockfile(&ws)?;
+        ws.commit("establish executable-mode fixture")?;
+        let saved = plan(&ws, &["--since", "HEAD"])?;
+        let path = write_saved_plan(&ws, "saved-plan.json", &saved)?;
+        let source = package.join("src/lib.rs");
+        let mut permissions = std::fs::metadata(&source)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(source, permissions)?;
+
+        let rejected = verify_saved_plan(&ws, &path)?;
+        assert_eq!(rejected.status.code(), Some(2));
+        assert!(rejected.stdout.is_empty());
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_saved_object_plan_requires_clean_exact_head_and_ignores_generated_roots() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("plan-verify-object")?;
+        let package = ws.add_crate("verify", "0.1.0", &[])?;
+        generate_lockfile(&ws)?;
+        let base = ws.commit("establish object verification base")?;
+        std::fs::write(package.join("src/lib.rs"), "pub fn head() {}\n")?;
+        let head = ws.commit("establish object verification head")?;
+        let saved = plan(&ws, &["--from", &base, "--to", &head])?;
+        let path = write_saved_plan(&ws, "saved-object-plan.json", &saved)?;
+
+        std::fs::create_dir_all(ws.path.join("target/generated"))?;
+        std::fs::write(ws.path.join("target/generated/ignored"), b"generated")?;
+        let unchanged = verify_saved_plan(&ws, &path)?;
+        ensure!(
+            unchanged.status.success(),
+            "clean object plan failed: {}",
+            String::from_utf8_lossy(&unchanged.stderr)
+        );
+
+        std::fs::write(ws.path.join("execution-drift.txt"), b"drift")?;
+        let dirty = verify_saved_plan(&ws, &path)?;
+        assert_eq!(dirty.status.code(), Some(2));
+        assert!(dirty.stdout.is_empty());
         Ok(())
     })();
     super::helpers::finish_test(result);

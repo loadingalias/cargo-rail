@@ -132,6 +132,12 @@ impl SplitConfig {
                 field: format!("remote for split '{}'", self.name),
             }));
         }
+        if self.branch.trim().is_empty() {
+            return Err(RailError::Config(ConfigError::InvalidField {
+                field: format!("crates.{}.split.branch", self.name),
+                reason: "branch must not be empty".to_string(),
+            }));
+        }
 
         // Validate mode-specific requirements
         match self.mode {

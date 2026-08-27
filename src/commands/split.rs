@@ -12,6 +12,16 @@ use crate::split::SplitEngine;
 use crate::utils;
 use crate::workspace::WorkspaceContext;
 use rayon::prelude::*;
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct SplitAppliedCrate {
+    crate_name: String,
+    target_repo: std::path::PathBuf,
+    mode: &'static str,
+    pending_commits: usize,
+    status: &'static str,
+}
 
 /// Arguments for the split run command
 #[derive(Debug)]
@@ -40,9 +50,6 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
     let machine = args.format != SplitOutputFormat::Text;
 
     // JSON mode enables structured error output and suppresses progress
-    if args.format.is_json_like() {
-        crate::output::set_json_mode(true);
-    }
 
     // Dirty worktree check (unless --allow-dirty or --check mode)
     if !args.check && !args.allow_dirty {
@@ -63,31 +70,35 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
 
     let config_count = builder.count();
     let configs = builder.build_split_configs()?;
+    if configs.is_empty() && args.all {
+        return render_empty_all(args.format);
+    }
     let snapshots = collect_split_snapshots(ctx, &configs)?;
     let expected_mutation_plan = build_split_mutation_plan(ctx, &configs, args.allow_dirty)?;
 
     // Check mode: show plan
     if args.check {
-        let pending = configs
+        let pending_commits = configs
             .iter()
-            .map(|config| SplitEngine::has_pending_changes(ctx, config))
+            .map(|config| SplitEngine::pending_commit_count(ctx, config))
             .collect::<RailResult<Vec<_>>>()?;
-        let has_pending = pending.iter().any(|pending| *pending);
+        let has_pending = pending_commits.iter().any(|count| *count > 0);
         let result = if has_pending { "pending_changes" } else { "clean" };
         let exit_code = i32::from(has_pending);
         match args.format {
             SplitOutputFormat::Json => {
                 let crates: Vec<_> = configs
                     .iter()
-                    .zip(&pending)
-                    .map(|(config, pending)| {
+                    .zip(&pending_commits)
+                    .map(|(config, pending_commits)| {
                         serde_json::json!({
                           "crate_name": config.crate_name,
-                          "mode": format!("{:?}", config.mode),
+                          "mode": split_mode_name(&config.mode),
                           "target_repo": config.target_repo_path,
                           "branch": config.branch,
                           "remote_url": config.remote_url,
-                          "pending": pending,
+                          "pending": *pending_commits > 0,
+                          "pending_commits": pending_commits,
                         })
                     })
                     .collect();
@@ -111,38 +122,47 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
                 }
             }
             SplitOutputFormat::JsonLines => {
-                for (config, pending) in configs.iter().zip(&pending) {
+                for (config, pending_commits) in configs.iter().zip(&pending_commits) {
                     let obj = serde_json::json!({
                       "crate_name": config.crate_name,
-                      "mode": format!("{:?}", config.mode),
+                      "mode": split_mode_name(&config.mode),
                       "target_repo": config.target_repo_path.display().to_string(),
                       "branch": config.branch,
                       "remote_url": config.remote_url,
-                      "pending": pending,
+                      "pending": *pending_commits > 0,
+                      "pending_commits": pending_commits,
                     });
                     println!("{}", serde_json::to_string(&obj)?);
                 }
             }
             SplitOutputFormat::Text => {
-                println!("split plan:\n");
-                for (config, pending) in configs.iter().zip(&pending) {
-                    println!("  {}", config.crate_name);
-                    println!("    status: {}", if *pending { "pending" } else { "clean" });
-                    println!("    mode: {:?}", config.mode);
-                    println!("    members:");
-                    for member in &config.ownership.members {
-                        println!("      {}", member);
+                for (config, pending_commits) in configs.iter().zip(&pending_commits) {
+                    println!(
+                        "{}: local source -> target repository {} ({} pending commit(s), mode {})",
+                        config.crate_name,
+                        config.target_repo_path.display(),
+                        pending_commits,
+                        split_mode_name(&config.mode)
+                    );
+                    if crate::output::is_verbose() {
+                        println!("  Members: {}", config.ownership.members.join(", "));
+                        if let Some(remote) = &config.remote_url {
+                            println!("  Remote: {remote}");
+                        }
+                        println!("  Branch: {}", config.branch);
                     }
-                    println!("    target: {}", config.target_repo_path.display());
-                    if let Some(ref remote) = config.remote_url {
-                        println!("    remote: {}", remote);
-                    }
-                    println!("    branch: {}", config.branch);
                 }
                 if has_pending {
-                    println!("\nChanges detected. Run without --check to apply.");
+                    println!(
+                        "Next: cargo rail split run {}",
+                        if args.all {
+                            "--all"
+                        } else {
+                            configs[0].crate_name.as_str()
+                        }
+                    );
                 } else {
-                    println!("\nNo changes detected.");
+                    println!("Split targets are current.");
                 }
             }
         }
@@ -167,7 +187,7 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
             println!("  {} -> {}", config.crate_name, config.target_repo_path.display());
         }
 
-        if !utils::prompt_for_confirmation("\nproceed? [Enter/Ctrl+C]")? {
+        if !utils::prompt_for_confirmation()? {
             println!("cancelled");
             return Ok(());
         }
@@ -200,41 +220,49 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
             format!("planned split for {} crate(s)", config_count),
         )],
     )?;
-    progress!("receipt: {}", plan_receipt.display());
-
-    let output_crates: Vec<_> = configs
-        .iter()
-        .map(|config| {
-            serde_json::json!({
-              "crate_name": config.crate_name,
-              "target_repo": config.target_repo_path,
-              "status": "applied",
-            })
-        })
-        .collect();
+    if crate::output::is_verbose() {
+        progress!("plan receipt: {}", plan_receipt.display());
+    }
 
     // Execute splits
-    if config_count > 1 && args.all {
+    let output_crates = if config_count > 1 && args.all {
         progress!("splitting {} crates...", config_count);
-        let results: Vec<RailResult<()>> = configs
+        let results: Vec<RailResult<SplitAppliedCrate>> = configs
             .into_par_iter()
             .map(|config| {
-                progress!("  {}", config.crate_name);
+                if crate::output::is_verbose() {
+                    progress!("  {}", config.crate_name);
+                }
                 let engine = SplitEngine::new(ctx)?;
-                engine.split(&config)
+                let pending_commits = engine.split_with_pending_count(&config)?;
+                Ok(SplitAppliedCrate {
+                    crate_name: config.crate_name,
+                    target_repo: config.target_repo_path,
+                    mode: split_mode_name(&config.mode),
+                    pending_commits,
+                    status: if pending_commits == 0 { "current" } else { "applied" },
+                })
             })
             .collect();
-
-        for result in results {
-            result?;
-        }
+        results.into_iter().collect::<RailResult<Vec<_>>>()?
     } else {
+        let mut output_crates = Vec::with_capacity(configs.len());
         for config in configs {
-            progress!("splitting {}...", config.crate_name);
+            if crate::output::is_verbose() {
+                progress!("splitting {}...", config.crate_name);
+            }
             let engine = SplitEngine::new(ctx)?;
-            engine.split(&config)?;
+            let pending_commits = engine.split_with_pending_count(&config)?;
+            output_crates.push(SplitAppliedCrate {
+                crate_name: config.crate_name,
+                target_repo: config.target_repo_path,
+                mode: split_mode_name(&config.mode),
+                pending_commits,
+                status: if pending_commits == 0 { "current" } else { "applied" },
+            });
         }
-    }
+        output_crates
+    };
 
     let apply_receipt = mutation::write_receipt(
         ctx.workspace_root(),
@@ -247,23 +275,41 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
             MutationTrace::new("SPLIT_APPLY_COMPLETED", "completed split apply"),
         ],
     )?;
-    progress!("receipt: {}", apply_receipt.display());
+    if crate::output::is_verbose() {
+        progress!("apply receipt: {}", apply_receipt.display());
+    }
 
     match args.format {
-        SplitOutputFormat::Text => println!("split complete"),
+        SplitOutputFormat::Text => {
+            for item in &output_crates {
+                println!(
+                    "{}: local source -> target repository {} ({} pending commit(s), mode {})",
+                    item.crate_name,
+                    item.target_repo.display(),
+                    item.pending_commits,
+                    item.mode
+                );
+            }
+            println!(
+                "Split complete: {} crate(s), {} pending commit(s) processed.",
+                output_crates.len(),
+                output_crates.iter().map(|item| item.pending_commits).sum::<usize>()
+            );
+            println!("Receipt: {}", apply_receipt.display());
+        }
         SplitOutputFormat::Json => {
             let payload = serde_json::json!({
               "crates": output_crates,
               "count": output_crates.len(),
+              "plan_receipt": plan_receipt,
+              "receipt": apply_receipt,
             });
             let output = crate::output::machine_json_envelope("split", "apply", "success", 0, payload);
             println!("{}", serde_json::to_string_pretty(&output)?);
         }
         SplitOutputFormat::NamesOnly => {
             for item in &output_crates {
-                if let Some(crate_name) = item["crate_name"].as_str() {
-                    println!("{}", crate_name);
-                }
+                println!("{}", item.crate_name);
             }
         }
         SplitOutputFormat::JsonLines => {
@@ -271,6 +317,31 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
                 println!("{}", serde_json::to_string(item)?);
             }
         }
+    }
+    Ok(())
+}
+
+fn split_mode_name(mode: &crate::config::SplitMode) -> &'static str {
+    match mode {
+        crate::config::SplitMode::Single => "single",
+        crate::config::SplitMode::Combined => "combined",
+    }
+}
+
+fn render_empty_all(format: SplitOutputFormat) -> RailResult<()> {
+    match format {
+        SplitOutputFormat::Text => println!("No split operations are configured."),
+        SplitOutputFormat::Json => {
+            let output = crate::output::machine_json_envelope(
+                "split",
+                "selection",
+                "clean",
+                0,
+                serde_json::json!({ "crates": [], "count": 0 }),
+            );
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+        SplitOutputFormat::NamesOnly | SplitOutputFormat::JsonLines => {}
     }
     Ok(())
 }

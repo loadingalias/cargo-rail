@@ -20,7 +20,6 @@ mod test_ownership_index;
 mod test_plan;
 mod test_plan_apply;
 mod test_plan_consumers;
-mod test_plan_work_inventory;
 mod test_release_changelog;
 mod test_resolution_view;
 #[cfg(unix)]

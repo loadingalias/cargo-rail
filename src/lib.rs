@@ -2,6 +2,23 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+// Rust's standard printing macros panic when a downstream pipe closes. Keep
+// command output line-oriented while making `BrokenPipe` a normal CLI boundary.
+macro_rules! print {
+    ($($arg:tt)*) => {{
+        $crate::output::write_stdout(format_args!($($arg)*), false)
+    }};
+}
+
+macro_rules! println {
+    () => {{
+        $crate::output::write_stdout(format_args!(""), true)
+    }};
+    ($($arg:tt)*) => {{
+        $crate::output::write_stdout(format_args!($($arg)*), true)
+    }};
+}
+
 /// Backup and restore for undo operations.
 pub mod backup;
 pub(crate) mod build_script;

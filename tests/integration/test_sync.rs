@@ -356,7 +356,7 @@ fn test_sync_manual_conflict_stops_before_commit_and_resumes_from_receipt() {
             "manual conflict must use exit code 1"
         );
         let stdout = String::from_utf8_lossy(&conflicted.stdout);
-        assert!(stdout.contains("sync conflicted"), "stdout:\n{stdout}");
+        assert!(stdout.contains("Sync conflicted"), "stdout:\n{stdout}");
 
         let head = git(&ws.path, &["rev-parse", "HEAD"])?;
         assert_eq!(
@@ -1078,14 +1078,12 @@ fn test_sync_from_remote_idempotent() {
             String::from_utf8_lossy(&output2.stderr)
         );
 
-        // Verify "already up-to-date" or similar message (progress output goes to stderr)
-        let stderr2 = String::from_utf8_lossy(&output2.stderr);
+        // Normal output carries the material result; engine chatter is verbose-only.
+        let stdout2 = String::from_utf8_lossy(&output2.stdout);
         assert!(
-            stderr2.contains("already up-to-date")
-                || stderr2.contains("No new commits")
-                || stderr2.contains("0 commits"),
-            "Second sync should indicate nothing to sync. stderr: {}",
-            stderr2
+            stdout2.contains("Sync complete: 0 commits"),
+            "Second sync should indicate nothing to sync. stdout: {}",
+            stdout2
         );
 
         // Count PR branches - should still be exactly one (not two)

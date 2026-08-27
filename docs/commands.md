@@ -14,21 +14,29 @@ state in separate tools.
 ## cargo rail
 
 ```
-The Rust workspace engine.
+Cargo-Rail turns one captured Rust workspace into trustworthy plans, checks, mutations, releases, and compiler reuse.
 
-Cargo-Rail turns Cargo's resolved workspace model and an exact source snapshot into affected CI, source-surface analysis,
-verified compiler reuse, dependency coherence, exact-SHA releases, and crate synchronization.
+Common inspection:
+  cargo rail plan                         # Decide required repository work
+  cargo rail surface --check              # Check Rust visibility findings
+  cargo rail config explain               # Show configured policy overrides
+  cargo rail cache status                 # Inspect compiler-cache health
 
-Quick start:
-  cargo rail plan --explain                       # Inspect required named work and evidence
-  cargo rail plan --json                          # Export the versioned work plan
-  cargo rail surface --explain                     # Inspect Rust reachability and visibility
-  cargo rail cache setup                           # Enable transparent compiler reuse
-  cargo rail unify --check --explain              # Inspect dependency changes (exit 1 when pending)
+Workspace mutation:
+  cargo rail init                         # Create sparse repository policy
+  cargo rail unify apply                  # Apply dependency coherence edits
+  cargo rail change add --help            # Record release intent
+  cargo rail clean --help                 # Select owned artifacts to remove
+
+Advanced and external operations:
+  cargo rail split --help                 # Extract a crate with Git history
+  cargo rail sync --help                  # Synchronize split repositories
+  cargo rail release --help               # Prepare or publish exact-SHA releases
+  cargo rail doctor --help                # Inspect compiler integration
 
 Docs: https://github.com/loadingalias/cargo-rail
 
-Usage: cargo rail [OPTIONS] <COMMAND>
+Usage: cargo-rail [OPTIONS] <COMMAND>
 
 Commands:
   doctor       Inspect native compiler-cache capability
@@ -47,8 +55,18 @@ Commands:
   help         Print this message or the help of the given subcommand(s)
 
 Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Global Options:
   -q, --quiet
           Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
 
       --json
           Output as JSON where supported; rejected otherwise
@@ -58,12 +76,6 @@ Options:
 
       --workspace-root <PATH>
           Workspace root directory (default: current directory)
-
-  -h, --help
-          Print help (see a summary with '-h')
-
-  -V, --version
-          Print version
 ```
 
 ---
@@ -73,19 +85,22 @@ Options:
 ```
 Inspect native compiler-cache capability
 
-Usage: cargo rail doctor [OPTIONS] <COMMAND>
+Usage: cargo-rail doctor [OPTIONS] <COMMAND>
 
 Commands:
   native-cache  Inspect the exact native-cache compiler identity
   help          Print this message or the help of the given subcommand(s)
 
 Options:
+  -h, --help     Print help
+  -V, --version  Print version
+
+Global Options:
   -q, --quiet                  Suppress progress messages (for CI/automation)
+  -v, --verbose                Show bounded operational detail
       --json                   Output as JSON where supported; rejected otherwise
       --config <PATH>          Path to rail.toml config file (bypass search order)
       --workspace-root <PATH>  Workspace root directory (default: current directory)
-  -h, --help                   Print help
-  -V, --version                Print version
 ```
 
 ---
@@ -95,7 +110,7 @@ Options:
 ```
 Inspect the exact native-cache compiler identity
 
-Usage: cargo rail doctor native-cache [OPTIONS]
+Usage: cargo-rail doctor native-cache [OPTIONS]
 
 Options:
   -f, --format <FORMAT>
@@ -103,12 +118,22 @@ Options:
 
           Possible values:
           - text: Human-readable text output (default)
-          - json: Machine-readable JSON output
+          - json: Machine-readable JSON compatibility spelling; prefer global `--json`
 
           [default: text]
 
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Global Options:
   -q, --quiet
           Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
 
       --json
           Output as JSON where supported; rejected otherwise
@@ -118,12 +143,6 @@ Options:
 
       --workspace-root <PATH>
           Workspace root directory (default: current directory)
-
-  -h, --help
-          Print help (see a summary with '-h')
-
-  -V, --version
-          Print version
 ```
 
 ---
@@ -133,20 +152,30 @@ Options:
 ```
 Inspect or reclaim explicitly scoped cache state
 
-Usage: cargo rail cache [OPTIONS] <COMMAND>
+Usage: cargo-rail cache [OPTIONS] <COMMAND>
 
 Commands:
   setup      Install or repair transparent verified compiler reuse
-  normalize  Validate and normalize one machine-owned remote cache URL without network access
-  status     Report exact bytes, counts, bounds, leases, and ownership scope
+  normalize  (Advanced) Validate and normalize one machine-owned remote cache URL without network access
+  status     Report cache installation and owned-storage health
   recover    Quarantine a selected markerless CAS and create a fresh owned authority
   clean      Reclaim one explicitly selected cache scope
   remove     Remove only transparent compiler-cache state owned by the setup receipt
   help       Print this message or the help of the given subcommand(s)
 
 Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Global Options:
   -q, --quiet
           Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
 
       --json
           Output as JSON where supported; rejected otherwise
@@ -157,18 +186,15 @@ Options:
       --workspace-root <PATH>
           Workspace root directory (default: current directory)
 
-  -h, --help
-          Print help (see a summary with '-h')
-
-  -V, --version
-          Print version
+Remote URLs, credentials, provider environments, and distributed execution are machine-owned authority. Use setup
+flags only after qualification has established the required trust domain, root portability, and worker identity.
 
 Examples:
   cargo rail cache setup --check                  # Preview transparent compiler reuse setup
   cargo rail cache setup                          # Install or repair the Cargo wrapper
   cargo rail cache setup --remote URL --root-portability remap  # Qualify cross-root L2 reuse
   cargo rail cache status                         # Inspect workspace and shared local cache state
-  cargo rail cache status --scope local -f json  # Inspect the shared local CAS only
+  cargo rail cache status --scope local --json   # Inspect the shared local CAS only
   cargo rail cache recover --check                # Preview byte-preserving markerless CAS recovery
   cargo rail cache recover                        # Quarantine the old tree and create a fresh CAS
   cargo rail cache clean --scope workspace --check  # Preview workspace cache reclamation
@@ -184,23 +210,14 @@ Examples:
 ```
 Install or repair transparent verified compiler reuse
 
-Usage: cargo rail cache setup [OPTIONS]
+Usage: cargo-rail cache setup [OPTIONS]
 
 Options:
       --local-dir <PATH>
           Local cache base directory (defaults to Cargo home)
 
-  -q, --quiet
-          Suppress progress messages (for CI/automation)
-
-      --json
-          Output as JSON where supported; rejected otherwise
-
       --max-size <SIZE>
           Positive binary byte size such as 10GiB
-
-      --config <PATH>
-          Path to rail.toml config file (bypass search order)
 
       --remote <URL>
           Machine-owned remote cache URL to persist with this installation
@@ -209,9 +226,6 @@ Options:
           Maximum remote authority; explicit selection defaults to read-write
 
           [possible values: read, read-write]
-
-      --workspace-root <PATH>
-          Workspace root directory (default: current directory)
 
       --remote-environment <NAME>
           Additional reviewed compiler environment name admitted to L2 identity
@@ -258,7 +272,7 @@ Options:
 
           Possible values:
           - text: Human-readable text output (default)
-          - json: Machine-readable JSON output
+          - json: Machine-readable JSON compatibility spelling; prefer global `--json`
 
           [default: text]
 
@@ -267,6 +281,22 @@ Options:
 
   -V, --version
           Print version
+
+Global Options:
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
+
+      --json
+          Output as JSON where supported; rejected otherwise
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
 ```
 
 ---
@@ -274,9 +304,9 @@ Options:
 ### cargo rail cache normalize
 
 ```
-Validate and normalize one machine-owned remote cache URL without network access
+(Advanced) Validate and normalize one machine-owned remote cache URL without network access
 
-Usage: cargo rail cache normalize [OPTIONS] <URL>
+Usage: cargo-rail cache normalize [OPTIONS] <URL>
 
 Arguments:
   <URL>
@@ -288,11 +318,30 @@ Options:
 
           [possible values: read, read-write]
 
+      --environment <NAME>
+          Additional reviewed compiler environment name admitted to L2 identity
+
+  -f, --format <FORMAT>
+          Report format
+
+          Possible values:
+          - text: Human-readable text output (default)
+          - json: Machine-readable JSON compatibility spelling; prefer global `--json`
+
+          [default: text]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Global Options:
   -q, --quiet
           Suppress progress messages (for CI/automation)
 
-      --environment <NAME>
-          Additional reviewed compiler environment name admitted to L2 identity
+  -v, --verbose
+          Show bounded operational detail
 
       --json
           Output as JSON where supported; rejected otherwise
@@ -300,23 +349,8 @@ Options:
       --config <PATH>
           Path to rail.toml config file (bypass search order)
 
-  -f, --format <FORMAT>
-          Report format
-
-          Possible values:
-          - text: Human-readable text output (default)
-          - json: Machine-readable JSON output
-
-          [default: text]
-
       --workspace-root <PATH>
           Workspace root directory (default: current directory)
-
-  -h, --help
-          Print help (see a summary with '-h')
-
-  -V, --version
-          Print version
 ```
 
 ---
@@ -324,14 +358,11 @@ Options:
 ### cargo rail cache status
 
 ```
-Report exact bytes, counts, bounds, leases, and ownership scope
+Report cache installation and owned-storage health
 
-Usage: cargo rail cache status [OPTIONS]
+Usage: cargo-rail cache status [OPTIONS]
 
 Options:
-  -q, --quiet
-          Suppress progress messages (for CI/automation)
-
       --scope <SCOPE>
           Cache scope to inspect
 
@@ -347,9 +378,22 @@ Options:
 
           Possible values:
           - text: Human-readable text output (default)
-          - json: Machine-readable JSON output
+          - json: Machine-readable JSON compatibility spelling; prefer global `--json`
 
           [default: text]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Global Options:
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
 
       --json
           Output as JSON where supported; rejected otherwise
@@ -359,12 +403,6 @@ Options:
 
       --workspace-root <PATH>
           Workspace root directory (default: current directory)
-
-  -h, --help
-          Print help (see a summary with '-h')
-
-  -V, --version
-          Print version
 ```
 
 ---
@@ -374,23 +412,33 @@ Options:
 ```
 Quarantine a selected markerless CAS and create a fresh owned authority
 
-Usage: cargo rail cache recover [OPTIONS]
+Usage: cargo-rail cache recover [OPTIONS]
 
 Options:
   -c, --check
           Preview the exact quarantine move without modifying cache state
-
-  -q, --quiet
-          Suppress progress messages (for CI/automation)
 
   -f, --format <FORMAT>
           Report format
 
           Possible values:
           - text: Human-readable text output (default)
-          - json: Machine-readable JSON output
+          - json: Machine-readable JSON compatibility spelling; prefer global `--json`
 
           [default: text]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Global Options:
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
 
       --json
           Output as JSON where supported; rejected otherwise
@@ -400,12 +448,6 @@ Options:
 
       --workspace-root <PATH>
           Workspace root directory (default: current directory)
-
-  -h, --help
-          Print help (see a summary with '-h')
-
-  -V, --version
-          Print version
 ```
 
 ---
@@ -415,12 +457,9 @@ Options:
 ```
 Reclaim one explicitly selected cache scope
 
-Usage: cargo rail cache clean [OPTIONS] --scope <SCOPE>
+Usage: cargo-rail cache clean [OPTIONS] --scope <SCOPE>
 
 Options:
-  -q, --quiet
-          Suppress progress messages (for CI/automation)
-
       --scope <SCOPE>
           Cache scope to reclaim; required to prevent accidental cross-workspace deletion
 
@@ -432,29 +471,36 @@ Options:
   -c, --check
           Preview exact bytes and paths without deleting them
 
-      --json
-          Output as JSON where supported; rejected otherwise
-
-      --config <PATH>
-          Path to rail.toml config file (bypass search order)
-
   -f, --format <FORMAT>
           Report format
 
           Possible values:
           - text: Human-readable text output (default)
-          - json: Machine-readable JSON output
+          - json: Machine-readable JSON compatibility spelling; prefer global `--json`
 
           [default: text]
-
-      --workspace-root <PATH>
-          Workspace root directory (default: current directory)
 
   -h, --help
           Print help (see a summary with '-h')
 
   -V, --version
           Print version
+
+Global Options:
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
+
+      --json
+          Output as JSON where supported; rejected otherwise
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
 ```
 
 ---
@@ -464,23 +510,33 @@ Options:
 ```
 Remove only transparent compiler-cache state owned by the setup receipt
 
-Usage: cargo rail cache remove [OPTIONS]
+Usage: cargo-rail cache remove [OPTIONS]
 
 Options:
   -c, --check
           Preview exact Cargo configuration and private-state changes
-
-  -q, --quiet
-          Suppress progress messages (for CI/automation)
 
   -f, --format <FORMAT>
           Report format
 
           Possible values:
           - text: Human-readable text output (default)
-          - json: Machine-readable JSON output
+          - json: Machine-readable JSON compatibility spelling; prefer global `--json`
 
           [default: text]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Global Options:
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
 
       --json
           Output as JSON where supported; rejected otherwise
@@ -490,12 +546,6 @@ Options:
 
       --workspace-root <PATH>
           Workspace root directory (default: current directory)
-
-  -h, --help
-          Print help (see a summary with '-h')
-
-  -V, --version
-          Print version
 ```
 
 ---
@@ -505,38 +555,32 @@ Options:
 ```
 Build an evidence-backed named-work plan
 
-Usage: cargo rail plan [OPTIONS]
+Usage: cargo-rail plan [OPTIONS]
 
 Options:
-  -q, --quiet
-          Suppress progress messages (for CI/automation)
-
       --since <SINCE>
           Git ref to compare against (auto-detects default branch)
 
       --from <FROM>
           Start ref (for SHA pair mode)
 
-      --json
-          Output as JSON where supported; rejected otherwise
-
-      --config <PATH>
-          Path to rail.toml config file (bypass search order)
-
       --to <TO>
           End ref (for SHA pair mode)
 
-      --workspace-root <PATH>
-          Workspace root directory (default: current directory)
-
       --explain
           Show concise human reasoning chain
+
+      --explain-work <WORK_ID>
+          Explain one exact work decision, including when it was skipped
 
       --all
           Require every registered work item with full valid scope
 
       --evidence <PATH>
           Load portable compatible observed-input evidence
+
+      --verify <PATH>
+          Revalidate one saved plan against the current execution authority
 
       --schema
           Print the versioned planner JSON Schema and exit
@@ -547,14 +591,32 @@ Options:
   -V, --version
           Print version
 
+Global Options:
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
+
+      --json
+          Output as JSON where supported; rejected otherwise
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
 Examples:
   cargo rail plan                           # Changes since the default-branch merge base
   cargo rail plan --json                    # Full machine-readable work contract
   cargo rail plan --since HEAD~5            # Changes in last 5 commits
   cargo rail plan --from abc --to def       # Changes between two SHAs
-  cargo rail plan --explain                 # Show concise proof chain
+  cargo rail plan --explain                 # Explain required decisions
+  cargo rail plan --explain-work cargo.test # Explain one decision, even when skipped
   cargo rail plan --all                     # Safely require every registered work item
   cargo rail plan --evidence inputs.json    # Use compatible observed-input evidence
+  cargo rail plan --verify plan.json        # Revalidate a saved plan without executing it
   cargo rail plan --schema                  # Print the versioned JSON Schema
   cargo rail plan --json > plan.json        # Redirect the exact plan to a file
 ```
@@ -566,32 +628,20 @@ Examples:
 ```
 Analyze and repair complete Rust declaration reachability and visibility
 
-Usage: cargo rail surface [OPTIONS]
+Usage: cargo-rail surface [OPTIONS]
 
 Options:
       --prepare
           Prepare and authenticate the exact-toolchain Surface producer without analysis
 
-  -q, --quiet
-          Suppress progress messages (for CI/automation)
-
       --check
           Fail on denied findings without modifying source (for CI)
-
-      --json
-          Output as JSON where supported; rejected otherwise
-
-      --config <PATH>
-          Path to rail.toml config file (bypass search order)
 
       --fix
           Apply exact visibility reductions
 
       --resume <MANIFEST>
           Resume from a prior partial acquisition manifest
-
-      --workspace-root <PATH>
-          Workspace root directory (default: current directory)
 
       --dry-run
           Render the exact mutation plan without writing
@@ -604,7 +654,7 @@ Options:
 
           Possible values:
           - text:   Human-readable text output (default)
-          - json:   Machine-readable JSON output
+          - json:   Machine-readable JSON compatibility spelling; prefer global `--json`
           - github: GitHub Actions key/value output
 
           [default: text]
@@ -629,6 +679,22 @@ Options:
   -V, --version
           Print version
 
+Global Options:
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
+
+      --json
+          Output as JSON where supported; rejected otherwise
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
 Set `[surface] enabled = true` to include this gate in planner-selected CI.
 Set `[surface] consumer_scope = "workspace"` only when each closed compiler
 crate has no consumers outside the captured workspace.
@@ -637,8 +703,8 @@ Examples:
   cargo rail surface                        # Inspect and report without modifying source
   cargo rail surface --prepare              # Prove exact-toolchain producer readiness
   cargo rail surface --check --explain      # Inspect complete Rust reachability
-  cargo rail surface --check -f json        # Emit the versioned machine contract
-  cargo rail surface --resume MANIFEST -f json  # Resume a partial compiler acquisition
+  cargo rail surface --check --json         # Emit the versioned machine contract
+  cargo rail surface --resume MANIFEST --json  # Resume a partial compiler acquisition
   cargo rail surface --fix --dry-run --explain  # Preview exact visibility edits
   cargo rail surface --fix --backup         # Apply verified edits with recovery evidence
   cargo rail surface --schema               # Print the versioned JSON Schema
@@ -651,49 +717,32 @@ Examples:
 ```
 Analyze and repair workspace dependency coherence
 
-Usage: cargo rail unify [OPTIONS] [COMMAND]
+Usage: cargo-rail unify [OPTIONS] [COMMAND]
 
 Commands:
+  apply   Apply the exact dependency-coherence decision
   doctor  Inspect Cargo resolution semantics without changing files
   undo    Restore manifests from a previous backup
   help    Print this message or the help of the given subcommand(s)
 
 Options:
-  -q, --quiet
-          Suppress progress messages (for CI/automation)
-
-      --json
-          Output as JSON where supported; rejected otherwise
-
   -c, --check
           Check for pending manifest changes without modifying manifests (exit 1 when pending)
-
-      --config <PATH>
-          Path to rail.toml config file (bypass search order)
-
-      --plan <PATH>
-          Apply from a previously generated mutation plan file
-
-      --workspace-root <PATH>
-          Workspace root directory (default: current directory)
 
   -f, --format <FORMAT>
           Output format
 
           Possible values:
           - text: Human-readable text output (default)
-          - json: Machine-readable JSON output
+          - json: Machine-readable JSON compatibility spelling; prefer global `--json`
 
           [default: text]
 
-      --backup
-          Create backups of all modified files
+      --report
+          Generate the dependency report
 
-      --skip-report
-          Skip generating the unify report
-
-      --report-path <REPORT_PATH>
-          Custom path for the unify report (default: target/cargo-rail/unify-report.md)
+      --report-path <PATH>
+          Durable report destination
 
   -o, --output <PATH>
           Write output to file (overwrites existing content)
@@ -710,15 +759,85 @@ Options:
   -V, --version
           Print version
 
+Global Options:
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
+
+      --json
+          Output as JSON where supported; rejected otherwise
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
 Examples:
+  cargo rail unify                        # Preview dependency changes (exit 0)
   cargo rail unify --check                # Check for pending changes (exit 1)
-  cargo rail unify --check --explain      # Show why each decision was made
-  cargo rail unify --check -f json -o out.json  # Write JSON output to file
-  cargo rail unify                        # Apply changes
-  cargo rail unify --backup               # Apply with backup
+  cargo rail unify --explain              # Show why each decision was made
   cargo rail unify --show-diff            # Show manifest changes
+  cargo rail unify apply                  # Apply the current decision
+  cargo rail unify apply --backup         # Apply with backup
   cargo rail unify undo                   # Restore from backup
   cargo rail unify undo --list            # List available backups
+```
+
+---
+
+### cargo rail unify apply
+
+```
+Apply the exact dependency-coherence decision
+
+Usage: cargo-rail unify apply [OPTIONS]
+
+Options:
+      --plan <PATH>
+          Apply from a previously generated mutation plan file
+
+      --backup
+          Create backups of all modified files
+
+      --report
+          Generate the dependency report
+
+      --report-path <PATH>
+          Durable report destination
+
+  -f, --format <FORMAT>
+          Output format
+
+          Possible values:
+          - text: Human-readable text output (default)
+          - json: Machine-readable JSON compatibility spelling; prefer global `--json`
+
+          [default: text]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Global Options:
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
+
+      --json
+          Output as JSON where supported; rejected otherwise
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
 ```
 
 ---
@@ -728,7 +847,7 @@ Examples:
 ```
 Inspect Cargo resolution semantics without changing files
 
-Usage: cargo rail unify doctor [OPTIONS]
+Usage: cargo-rail unify doctor [OPTIONS]
 
 Options:
   -f, --format <FORMAT>
@@ -736,12 +855,22 @@ Options:
 
           Possible values:
           - text: Human-readable text output (default)
-          - json: Machine-readable JSON output
+          - json: Machine-readable JSON compatibility spelling; prefer global `--json`
 
           [default: text]
 
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Global Options:
   -q, --quiet
           Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
 
       --json
           Output as JSON where supported; rejected otherwise
@@ -751,12 +880,6 @@ Options:
 
       --workspace-root <PATH>
           Workspace root directory (default: current directory)
-
-  -h, --help
-          Print help (see a summary with '-h')
-
-  -V, --version
-          Print version
 ```
 
 ---
@@ -766,17 +889,45 @@ Options:
 ```
 Restore manifests from a previous backup
 
-Usage: cargo rail unify undo [OPTIONS]
+Usage: cargo-rail unify undo [OPTIONS]
 
 Options:
-      --list                   List available backups instead of restoring
-  -q, --quiet                  Suppress progress messages (for CI/automation)
-      --backup-id <BACKUP_ID>  Specific backup ID to restore (defaults to most recent)
-      --json                   Output as JSON where supported; rejected otherwise
-      --config <PATH>          Path to rail.toml config file (bypass search order)
-      --workspace-root <PATH>  Workspace root directory (default: current directory)
-  -h, --help                   Print help
-  -V, --version                Print version
+      --list
+          List available backups instead of restoring
+
+      --backup-id <BACKUP_ID>
+          Specific backup ID to restore (defaults to most recent)
+
+  -f, --format <FORMAT>
+          Output format
+
+          Possible values:
+          - text: Human-readable text output (default)
+          - json: Machine-readable JSON compatibility spelling; prefer global `--json`
+
+          [default: text]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Global Options:
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
+
+      --json
+          Output as JSON where supported; rejected otherwise
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
 ```
 
 ---
@@ -786,7 +937,7 @@ Options:
 ```
 Initialize configuration (rail.toml)
 
-Usage: cargo rail init [OPTIONS]
+Usage: cargo-rail init [OPTIONS]
 
 Options:
   -o, --output <OUTPUT>
@@ -794,23 +945,17 @@ Options:
 
           [default: .config/rail.toml]
 
-  -q, --quiet
-          Suppress progress messages (for CI/automation)
-
       --force
           Overwrite existing configuration
-
-      --json
-          Output as JSON where supported; rejected otherwise
-
-      --config <PATH>
-          Path to rail.toml config file (bypass search order)
 
       --dry-run
           Preview generated config without writing
 
-      --workspace-root <PATH>
-          Workspace root directory (default: current directory)
+      --target <TRIPLE>
+          Add an exact supported Cargo target triple (repeatable)
+
+      --detect-targets
+          Detect target triples from repository files
 
   -h, --help
           Print help (see a summary with '-h')
@@ -818,10 +963,27 @@ Options:
   -V, --version
           Print version
 
+Global Options:
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
+
+      --json
+          Output as JSON where supported; rejected otherwise
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
 Examples:
   cargo rail init                       # Generate .config/rail.toml
   cargo rail init --dry-run             # Preview generated config
-  cargo rail init -o rail.toml          # Custom output path
+  cargo rail init --target wasm32-wasip1 # Declare one supported target
+  cargo rail init --detect-targets       # Opt in to repository target detection
   cargo rail init --force               # Overwrite existing config
 ```
 
@@ -832,7 +994,7 @@ Examples:
 ```
 (Advanced) Split a crate to a standalone repository with git history
 
-Usage: cargo rail split [OPTIONS] <COMMAND>
+Usage: cargo-rail split [OPTIONS] <COMMAND>
 
 Commands:
   init  Configure split for crate(s)
@@ -840,8 +1002,18 @@ Commands:
   help  Print this message or the help of the given subcommand(s)
 
 Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Global Options:
   -q, --quiet
           Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
 
       --json
           Output as JSON where supported; rejected otherwise
@@ -851,12 +1023,6 @@ Options:
 
       --workspace-root <PATH>
           Workspace root directory (default: current directory)
-
-  -h, --help
-          Print help (see a summary with '-h')
-
-  -V, --version
-          Print version
 
 This is an advanced feature for extracting crates to standalone repositories
 while preserving git history. Most teams should start with 'plan', 'cache',
@@ -878,19 +1044,22 @@ Examples:
 ```
 Configure split for crate(s)
 
-Usage: cargo rail split init [OPTIONS] [CRATE]...
+Usage: cargo-rail split init [OPTIONS] [CRATE]...
 
 Arguments:
   [CRATE]...  Crate name(s) to configure
 
 Options:
-      --dry-run                Preview generated config without writing
+      --dry-run  Preview generated config without writing
+  -h, --help     Print help
+  -V, --version  Print version
+
+Global Options:
   -q, --quiet                  Suppress progress messages (for CI/automation)
+  -v, --verbose                Show bounded operational detail
       --json                   Output as JSON where supported; rejected otherwise
       --config <PATH>          Path to rail.toml config file (bypass search order)
       --workspace-root <PATH>  Workspace root directory (default: current directory)
-  -h, --help                   Print help
-  -V, --version                Print version
 ```
 
 ---
@@ -900,7 +1069,7 @@ Options:
 ```
 Execute split operation
 
-Usage: cargo rail split run [OPTIONS] [CRATE]
+Usage: cargo-rail split run [OPTIONS] [CRATE]
 
 Arguments:
   [CRATE]
@@ -910,26 +1079,14 @@ Options:
   -a, --all
           Split all configured crates
 
-  -q, --quiet
-          Suppress progress messages (for CI/automation)
-
-      --json
-          Output as JSON where supported; rejected otherwise
-
       --remote <REMOTE>
           Override remote repository
 
   -c, --check
           Check for pending split changes (exit 1 when pending)
 
-      --config <PATH>
-          Path to rail.toml config file (bypass search order)
-
       --plan <PATH>
           Apply from a previously generated mutation plan file
-
-      --workspace-root <PATH>
-          Workspace root directory (default: current directory)
 
       --allow-dirty
           Allow running on dirty worktree (uncommitted changes)
@@ -942,7 +1099,7 @@ Options:
 
           Possible values:
           - text:       Human-readable text output (default)
-          - json:       Machine-readable JSON output
+          - json:       Machine-readable JSON compatibility spelling; prefer global `--json`
           - names-only: Names only, one per line
           - jsonl:      JSON Lines format (one object per line)
 
@@ -953,6 +1110,22 @@ Options:
 
   -V, --version
           Print version
+
+Global Options:
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
+
+      --json
+          Output as JSON where supported; rejected otherwise
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
 ```
 
 ---
@@ -962,7 +1135,7 @@ Options:
 ```
 (Advanced) Sync changes between monorepo and split repos
 
-Usage: cargo rail sync [OPTIONS] [CRATE_NAME]
+Usage: cargo-rail sync [OPTIONS] [CRATE_NAME]
 
 Arguments:
   [CRATE_NAME]
@@ -972,26 +1145,14 @@ Options:
   -a, --all
           Sync all configured crates (mutually exclusive with crate name)
 
-  -q, --quiet
-          Suppress progress messages (for CI/automation)
-
-      --json
-          Output as JSON where supported; rejected otherwise
-
       --remote <REMOTE>
           Override remote repository
-
-      --config <PATH>
-          Path to rail.toml config file (bypass search order)
 
       --from-remote
           Sync from remote to monorepo only
 
       --to-remote
           Sync from monorepo to remote only
-
-      --workspace-root <PATH>
-          Workspace root directory (default: current directory)
 
       --strategy <STRATEGY>
           Conflict resolution strategy
@@ -1024,7 +1185,7 @@ Options:
 
           Possible values:
           - text: Human-readable text output (default)
-          - json: Machine-readable JSON output
+          - json: Machine-readable JSON compatibility spelling; prefer global `--json`
 
           [default: text]
 
@@ -1033,6 +1194,22 @@ Options:
 
   -V, --version
           Print version
+
+Global Options:
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
+
+      --json
+          Output as JSON where supported; rejected otherwise
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
 
 This is an advanced feature for bidirectional sync between monorepo and split
 repositories. Requires 'split' to be configured first.
@@ -1052,12 +1229,12 @@ Examples:
 ```
 Publish releases (version bump, changelog, tag, publish)
 
-Usage: cargo rail release [OPTIONS] <COMMAND>
+Usage: cargo-rail release [OPTIONS] <COMMAND>
 
 Commands:
   init      Configure release settings
   run       Execute release (plan or publish)
-  check     Validate the same local release plan selected by `release run --check`
+  check     Validate the local release plan or publication readiness
   finalize  Finalize a merged release PR (tag, push, publish)
   resume    Resume an interrupted release from its durable state file
   status    Show durable release state and the safe recovery command
@@ -1065,8 +1242,18 @@ Commands:
   help      Print this message or the help of the given subcommand(s)
 
 Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Global Options:
   -q, --quiet
           Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
 
       --json
           Output as JSON where supported; rejected otherwise
@@ -1077,19 +1264,12 @@ Options:
       --workspace-root <PATH>
           Workspace root directory (default: current directory)
 
-  -h, --help
-          Print help (see a summary with '-h')
-
-  -V, --version
-          Print version
-
 Examples:
   cargo rail release init my-crate              # Configure release for my-crate
   cargo rail release init my-crate --dry-run    # Preview generated config
   cargo rail release check my-crate                    # Validate the local release plan
   cargo rail release check my-crate --publication     # Validate registry publication readiness
   cargo rail release check my-crate --publication -e  # Run publish, MSRV, and semver checks
-  cargo rail release run my-crate --check       # Check for a pending release (exit 1)
   cargo rail release run my-crate               # Prepare a local release without registry publication
   cargo rail release run my-crate --publish     # Match configured crates.io authority at invocation
   cargo rail release run my-crate --include-dependents  # Release selected crate plus dependent closure
@@ -1110,19 +1290,22 @@ Examples:
 ```
 Configure release settings
 
-Usage: cargo rail release init [OPTIONS] [CRATE]...
+Usage: cargo-rail release init [OPTIONS] [CRATE]...
 
 Arguments:
   [CRATE]...  Crate name(s) to configure (optional)
 
 Options:
-      --dry-run                Preview generated config without writing
+      --dry-run  Preview generated config without writing
+  -h, --help     Print help
+  -V, --version  Print version
+
+Global Options:
   -q, --quiet                  Suppress progress messages (for CI/automation)
+  -v, --verbose                Show bounded operational detail
       --json                   Output as JSON where supported; rejected otherwise
       --config <PATH>          Path to rail.toml config file (bypass search order)
       --workspace-root <PATH>  Workspace root directory (default: current directory)
-  -h, --help                   Print help
-  -V, --version                Print version
 ```
 
 ---
@@ -1132,7 +1315,7 @@ Options:
 ```
 Execute release (plan or publish)
 
-Usage: cargo rail release run [OPTIONS] [CRATE]...
+Usage: cargo-rail release run [OPTIONS] [CRATE]...
 
 Arguments:
   [CRATE]...
@@ -1142,28 +1325,16 @@ Options:
   -a, --all
           Release all workspace crates
 
-  -q, --quiet
-          Suppress progress messages (for CI/automation)
-
       --bump <BUMP>
           Version bump [auto, major, minor, patch, prerelease, release, or "x.y.z"]
 
           [default: auto]
 
-      --json
-          Output as JSON where supported; rejected otherwise
-
   -c, --check
-          Check for a pending release plan (exit 1 when pending)
-
-      --config <PATH>
-          Path to rail.toml config file (bypass search order)
+          Deprecated compatibility check spelling; use `release check`
 
       --plan <PATH>
           Apply from a previously generated mutation plan file
-
-      --workspace-root <PATH>
-          Workspace root directory (default: current directory)
 
       --publish
           Positively authorize irreversible publication to crates.io
@@ -1178,14 +1349,17 @@ Options:
           Expand explicit crate selection to include the full dependent closure
 
   -y, --yes
-          Skip confirmation prompts and allow non-default branch
+          Skip the interactive confirmation prompt
+
+      --allow-non-default-branch
+          Authorize release execution from a non-default branch
 
   -f, --format <FORMAT>
           Output format
 
           Possible values:
           - text: Human-readable text output (default)
-          - json: Machine-readable JSON output
+          - json: Machine-readable JSON compatibility spelling; prefer global `--json`
 
           [default: text]
 
@@ -1194,6 +1368,22 @@ Options:
 
   -V, --version
           Print version
+
+Global Options:
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
+
+      --json
+          Output as JSON where supported; rejected otherwise
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
 ```
 
 ---
@@ -1201,9 +1391,9 @@ Options:
 ### cargo rail release check
 
 ```
-Validate the same local release plan selected by `release run --check`
+Validate the local release plan or publication readiness
 
-Usage: cargo rail release check [OPTIONS] [CRATE]...
+Usage: cargo-rail release check [OPTIONS] [CRATE]...
 
 Arguments:
   [CRATE]...
@@ -1213,28 +1403,16 @@ Options:
   -a, --all
           Check all workspace crates (mutually exclusive with crate names)
 
-  -q, --quiet
-          Suppress progress messages (for CI/automation)
-
       --bump <BUMP>
           Version bump [auto, major, minor, patch, prerelease, release, or "x.y.z"]
 
           [default: auto]
-
-      --json
-          Output as JSON where supported; rejected otherwise
-
-      --config <PATH>
-          Path to rail.toml config file (bypass search order)
 
       --publication
           Validate registry publication readiness instead of the local release plan
 
   -e, --extended
           Run extended publication validation (publish dry-run, MSRV, optional semver checks)
-
-      --workspace-root <PATH>
-          Workspace root directory (default: current directory)
 
       --skip-tag
           Exclude git tag creation from the local release plan
@@ -1247,7 +1425,7 @@ Options:
 
           Possible values:
           - text: Human-readable text output (default)
-          - json: Machine-readable JSON output
+          - json: Machine-readable JSON compatibility spelling; prefer global `--json`
 
           [default: text]
 
@@ -1256,6 +1434,22 @@ Options:
 
   -V, --version
           Print version
+
+Global Options:
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
+
+      --json
+          Output as JSON where supported; rejected otherwise
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
 ```
 
 ---
@@ -1265,7 +1459,7 @@ Options:
 ```
 Finalize a merged release PR (tag, push, publish)
 
-Usage: cargo rail release finalize [OPTIONS] [CRATE]...
+Usage: cargo-rail release finalize [OPTIONS] [CRATE]...
 
 Arguments:
   [CRATE]...
@@ -1275,36 +1469,27 @@ Options:
   -a, --all
           Finalize all workspace crates with release notes for their current versions
 
-  -q, --quiet
-          Suppress progress messages (for CI/automation)
-
-      --json
-          Output as JSON where supported; rejected otherwise
-
       --publish
           Positively authorize irreversible publication to crates.io
 
-      --config <PATH>
-          Path to rail.toml config file (bypass search order)
-
       --skip-tag
           Skip git tag creation
-
-      --workspace-root <PATH>
-          Workspace root directory (default: current directory)
 
       --include-dependents
           Expand explicit crate selection to include the full dependent closure and version groups
 
   -y, --yes
-          Skip confirmation prompts and allow non-default branch
+          Skip the interactive confirmation prompt
+
+      --allow-non-default-branch
+          Authorize release execution from a non-default branch
 
   -f, --format <FORMAT>
           Output format
 
           Possible values:
           - text: Human-readable text output (default)
-          - json: Machine-readable JSON output
+          - json: Machine-readable JSON compatibility spelling; prefer global `--json`
 
           [default: text]
 
@@ -1313,6 +1498,22 @@ Options:
 
   -V, --version
           Print version
+
+Global Options:
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
+
+      --json
+          Output as JSON where supported; rejected otherwise
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
 ```
 
 ---
@@ -1322,18 +1523,21 @@ Options:
 ```
 Resume an interrupted release from its durable state file
 
-Usage: cargo rail release resume [OPTIONS] <STATE>
+Usage: cargo-rail release resume [OPTIONS] <STATE>
 
 Arguments:
   <STATE>  State path printed by the interrupted release
 
 Options:
+  -h, --help     Print help
+  -V, --version  Print version
+
+Global Options:
   -q, --quiet                  Suppress progress messages (for CI/automation)
+  -v, --verbose                Show bounded operational detail
       --json                   Output as JSON where supported; rejected otherwise
       --config <PATH>          Path to rail.toml config file (bypass search order)
       --workspace-root <PATH>  Workspace root directory (default: current directory)
-  -h, --help                   Print help
-  -V, --version                Print version
 ```
 
 ---
@@ -1343,24 +1547,37 @@ Options:
 ```
 Show durable release state and the safe recovery command
 
-Usage: cargo rail release status [OPTIONS] [STATE]
+Usage: cargo-rail release status [OPTIONS] [STATE]
 
 Arguments:
   [STATE]
           Inspect one state file instead of every known release transaction
 
 Options:
+      --history
+          Include terminal and reconstructed transaction history
+
   -f, --format <FORMAT>
           Output format
 
           Possible values:
           - text: Human-readable text output (default)
-          - json: Machine-readable JSON output
+          - json: Machine-readable JSON compatibility spelling; prefer global `--json`
 
           [default: text]
 
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Global Options:
   -q, --quiet
           Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
 
       --json
           Output as JSON where supported; rejected otherwise
@@ -1370,12 +1587,6 @@ Options:
 
       --workspace-root <PATH>
           Workspace root directory (default: current directory)
-
-  -h, --help
-          Print help (see a summary with '-h')
-
-  -V, --version
-          Print version
 ```
 
 ---
@@ -1385,19 +1596,22 @@ Options:
 ```
 Abort an active release that has not reached remote side effects
 
-Usage: cargo rail release abort [OPTIONS] <STATE>
+Usage: cargo-rail release abort [OPTIONS] <STATE>
 
 Arguments:
   <STATE>  State path printed by the active release
 
 Options:
+  -y, --yes      Confirm restoration of the pre-release local state
+  -h, --help     Print help
+  -V, --version  Print version
+
+Global Options:
   -q, --quiet                  Suppress progress messages (for CI/automation)
-  -y, --yes                    Confirm restoration of the pre-release local state
+  -v, --verbose                Show bounded operational detail
       --json                   Output as JSON where supported; rejected otherwise
       --config <PATH>          Path to rail.toml config file (bypass search order)
       --workspace-root <PATH>  Workspace root directory (default: current directory)
-  -h, --help                   Print help
-  -V, --version                Print version
 ```
 
 ---
@@ -1407,7 +1621,7 @@ Options:
 ```
 Manage pending release intent files
 
-Usage: cargo rail change [OPTIONS] <COMMAND>
+Usage: cargo-rail change [OPTIONS] <COMMAND>
 
 Commands:
   add     Create a pending change file
@@ -1416,8 +1630,18 @@ Commands:
   help    Print this message or the help of the given subcommand(s)
 
 Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Global Options:
   -q, --quiet
           Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
 
       --json
           Output as JSON where supported; rejected otherwise
@@ -1427,12 +1651,6 @@ Options:
 
       --workspace-root <PATH>
           Workspace root directory (default: current directory)
-
-  -h, --help
-          Print help (see a summary with '-h')
-
-  -V, --version
-          Print version
 
 Examples:
   cargo rail change add rail-core --bump minor --message "Added auto bump planning"
@@ -1456,7 +1674,7 @@ file's crates is rejected so no pending intent is ever lost.
 ```
 Create a pending change file
 
-Usage: cargo rail change add [OPTIONS] --bump <BUMP> [CRATE]...
+Usage: cargo-rail change add [OPTIONS] --bump <BUMP> [CRATE]...
 
 Arguments:
   [CRATE]...
@@ -1466,17 +1684,8 @@ Options:
       --bump <BUMP>
           Release intent for the covered crate(s): none, patch, minor, major
 
-  -q, --quiet
-          Suppress progress messages (for CI/automation)
-
-      --json
-          Output as JSON where supported; rejected otherwise
-
   -m, --message <MESSAGE>
           User-facing changelog entry body (omit in a terminal to open $VISUAL/$EDITOR)
-
-      --config <PATH>
-          Path to rail.toml config file (bypass search order)
 
       --name <SLUG>
           Override the generated filename slug
@@ -1486,19 +1695,32 @@ Options:
 
           Possible values:
           - text:       Human-readable text output (default)
-          - json:       Machine-readable JSON output
+          - json:       Machine-readable JSON compatibility spelling; prefer global `--json`
           - names-only: Names only, one per line
 
           [default: text]
-
-      --workspace-root <PATH>
-          Workspace root directory (default: current directory)
 
   -h, --help
           Print help (see a summary with '-h')
 
   -V, --version
           Print version
+
+Global Options:
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
+
+      --json
+          Output as JSON where supported; rejected otherwise
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
 ```
 
 ---
@@ -1508,7 +1730,7 @@ Options:
 ```
 Show pending change files
 
-Usage: cargo rail change status [OPTIONS]
+Usage: cargo-rail change status [OPTIONS]
 
 Options:
   -f, --format <FORMAT>
@@ -1516,13 +1738,23 @@ Options:
 
           Possible values:
           - text:       Human-readable text output (default)
-          - json:       Machine-readable JSON output
+          - json:       Machine-readable JSON compatibility spelling; prefer global `--json`
           - names-only: Names only, one per line
 
           [default: text]
 
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Global Options:
   -q, --quiet
           Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
 
       --json
           Output as JSON where supported; rejected otherwise
@@ -1532,12 +1764,6 @@ Options:
 
       --workspace-root <PATH>
           Workspace root directory (default: current directory)
-
-  -h, --help
-          Print help (see a summary with '-h')
-
-  -V, --version
-          Print version
 ```
 
 ---
@@ -1547,17 +1773,11 @@ Options:
 ```
 Check that changed crates have pending change files
 
-Usage: cargo rail change check [OPTIONS]
+Usage: cargo-rail change check [OPTIONS]
 
 Options:
-  -q, --quiet
-          Suppress progress messages (for CI/automation)
-
       --since <REF>
           Compare against this git ref
-
-      --json
-          Output as JSON where supported; rejected otherwise
 
       --merge-base
           Compare from the merge-base with the default branch
@@ -1565,21 +1785,15 @@ Options:
       --all
           Scan the full reachable history
 
-      --config <PATH>
-          Path to rail.toml config file (bypass search order)
-
       --required
           Require coverage for every changed crate, ignoring release.require_change_files
-
-      --workspace-root <PATH>
-          Workspace root directory (default: current directory)
 
   -f, --format <FORMAT>
           Output format
 
           Possible values:
           - text:       Human-readable text output (default)
-          - json:       Machine-readable JSON output
+          - json:       Machine-readable JSON compatibility spelling; prefer global `--json`
           - names-only: Names only, one per line
 
           [default: text]
@@ -1589,6 +1803,22 @@ Options:
 
   -V, --version
           Print version
+
+Global Options:
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
+
+      --json
+          Output as JSON where supported; rejected otherwise
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
 ```
 
 ---
@@ -1598,39 +1828,36 @@ Options:
 ```
 Clean generated artifacts owned by the current workspace
 
-Usage: cargo rail clean [OPTIONS]
+Usage: cargo-rail clean [OPTIONS]
 
 Options:
+      --all
+          Clean every eligible workspace-owned artifact class
+
       --cache
           Clean cache state owned by this workspace
 
-  -q, --quiet
-          Suppress progress messages (for CI/automation)
+      --prune-backups
+          Prune backups beyond the configured retention bound
 
-      --backups
-          Prune old backups
-
-      --json
-          Output as JSON where supported; rejected otherwise
-
-      --config <PATH>
-          Path to rail.toml config file (bypass search order)
+      --all-backups
+          Delete every workspace backup
 
       --reports
           Clean generated reports
 
+      --release-journal <ID_OR_PATH>
+          Delete exactly one terminal release journal by transaction ID or state path
+
   -c, --check
           Check for pending cleanup without deleting files (exit 1 when pending)
-
-      --workspace-root <PATH>
-          Workspace root directory (default: current directory)
 
   -f, --format <FORMAT>
           Output format
 
           Possible values:
           - text: Human-readable text output (default)
-          - json: Machine-readable JSON output
+          - json: Machine-readable JSON compatibility spelling; prefer global `--json`
 
           [default: text]
 
@@ -1640,12 +1867,30 @@ Options:
   -V, --version
           Print version
 
+Global Options:
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
+
+      --json
+          Output as JSON where supported; rejected otherwise
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
+
 Examples:
-  cargo rail clean                      # Clean all current-workspace Cargo-Rail artifacts
+  cargo rail clean --all                # Clean every eligible current-workspace artifact
   cargo rail clean --cache              # Clean current-workspace cache state
-  cargo rail clean --backups            # Prune old backups
+  cargo rail clean --prune-backups      # Prune backups beyond configured retention
+  cargo rail clean --all-backups        # Delete every backup
   cargo rail clean --reports            # Clean generated reports
-  cargo rail clean --check              # Check for pending cleanup (exit 1)
+  cargo rail clean --release-journal ID # Delete one terminal release journal
+  cargo rail clean --cache --check      # Check selected cleanup (exit 1 when pending)
 ```
 
 ---
@@ -1655,7 +1900,7 @@ Examples:
 ```
 Configuration management
 
-Usage: cargo rail config [OPTIONS] <COMMAND>
+Usage: cargo-rail config [OPTIONS] <COMMAND>
 
 Commands:
   locate    Print the path to the active config file
@@ -1666,8 +1911,18 @@ Commands:
   help      Print this message or the help of the given subcommand(s)
 
 Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Global Options:
   -q, --quiet
           Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
 
       --json
           Output as JSON where supported; rejected otherwise
@@ -1678,18 +1933,14 @@ Options:
       --workspace-root <PATH>
           Workspace root directory (default: current directory)
 
-  -h, --help
-          Print help (see a summary with '-h')
-
-  -V, --version
-          Print version
-
 Examples:
   cargo rail config locate              # Show which config file is active
   cargo rail config print               # Show effective config with defaults
   cargo rail config validate            # Validate rail.toml
-  cargo rail config validate -f json    # JSON output for CI
+  cargo rail config validate --json     # JSON output for CI
   cargo rail config explain             # Explain effective values and sources
+  cargo rail config explain targets     # Explain one field in full
+  cargo rail config explain --all       # Explain the complete field inventory
   cargo rail config migrate --check     # Check for pending semantic migrations
   cargo rail config migrate             # Apply explicit semantic migrations
 ```
@@ -1703,7 +1954,7 @@ Print the path to the active config file
 
 Shows which config file is being used. Searches in order: rail.toml, .rail.toml, .cargo/rail.toml, .config/rail.toml
 
-Usage: cargo rail config locate [OPTIONS]
+Usage: cargo-rail config locate [OPTIONS]
 
 Options:
   -f, --format <FORMAT>
@@ -1711,12 +1962,22 @@ Options:
 
           Possible values:
           - text: Human-readable text output (default)
-          - json: Machine-readable JSON output
+          - json: Machine-readable JSON compatibility spelling; prefer global `--json`
 
           [default: text]
 
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Global Options:
   -q, --quiet
           Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
 
       --json
           Output as JSON where supported; rejected otherwise
@@ -1726,12 +1987,6 @@ Options:
 
       --workspace-root <PATH>
           Workspace root directory (default: current directory)
-
-  -h, --help
-          Print help (see a summary with '-h')
-
-  -V, --version
-          Print version
 ```
 
 ---
@@ -1743,7 +1998,7 @@ Print canonical effective configuration with defaults
 
 Shows the merged repository policy: user settings plus defaults for any unset fields. Text output is reusable `rail.toml` input and omits deprecated compatibility-only fields.
 
-Usage: cargo rail config print [OPTIONS]
+Usage: cargo-rail config print [OPTIONS]
 
 Options:
   -f, --format <FORMAT>
@@ -1751,12 +2006,22 @@ Options:
 
           Possible values:
           - text: Human-readable text output (default)
-          - json: Machine-readable JSON output
+          - json: Machine-readable JSON compatibility spelling; prefer global `--json`
 
           [default: text]
 
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Global Options:
   -q, --quiet
           Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
 
       --json
           Output as JSON where supported; rejected otherwise
@@ -1766,12 +2031,6 @@ Options:
 
       --workspace-root <PATH>
           Workspace root directory (default: current directory)
-
-  -h, --help
-          Print help (see a summary with '-h')
-
-  -V, --version
-          Print version
 ```
 
 ---
@@ -1783,7 +2042,7 @@ Validate the configuration file
 
 Checks for parse errors, unknown keys, and semantic issues. By default, unknown keys warn locally but error in CI environments (detected via CI, GITHUB_ACTIONS, GITLAB_CI, or CIRCLECI env vars).
 
-Usage: cargo rail config validate [OPTIONS]
+Usage: cargo-rail config validate [OPTIONS]
 
 Options:
   -f, --format <FORMAT>
@@ -1791,33 +2050,37 @@ Options:
 
           Possible values:
           - text: Human-readable text output (default)
-          - json: Machine-readable JSON output
+          - json: Machine-readable JSON compatibility spelling; prefer global `--json`
 
           [default: text]
-
-  -q, --quiet
-          Suppress progress messages (for CI/automation)
-
-      --json
-          Output as JSON where supported; rejected otherwise
 
       --strict
           Treat warnings as errors (auto-enabled in CI)
 
-      --config <PATH>
-          Path to rail.toml config file (bypass search order)
-
       --no-strict
           Never treat warnings as errors (overrides CI auto-detection)
-
-      --workspace-root <PATH>
-          Workspace root directory (default: current directory)
 
   -h, --help
           Print help (see a summary with '-h')
 
   -V, --version
           Print version
+
+Global Options:
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
+
+      --json
+          Output as JSON where supported; rejected otherwise
+
+      --config <PATH>
+          Path to rail.toml config file (bypass search order)
+
+      --workspace-root <PATH>
+          Workspace root directory (default: current directory)
 ```
 
 ---
@@ -1827,20 +2090,37 @@ Options:
 ```
 Explain effective values, defaults, sources, and deprecations
 
-Usage: cargo rail config explain [OPTIONS]
+Usage: cargo-rail config explain [OPTIONS] [FIELD]...
+
+Arguments:
+  [FIELD]...
+          Exact configuration field path(s) to explain in full
 
 Options:
+      --all
+          Explain every known effective field
+
   -f, --format <FORMAT>
           Output format
 
           Possible values:
           - text: Human-readable text output (default)
-          - json: Machine-readable JSON output
+          - json: Machine-readable JSON compatibility spelling; prefer global `--json`
 
           [default: text]
 
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Global Options:
   -q, --quiet
           Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
 
       --json
           Output as JSON where supported; rejected otherwise
@@ -1850,12 +2130,6 @@ Options:
 
       --workspace-root <PATH>
           Workspace root directory (default: current directory)
-
-  -h, --help
-          Print help (see a summary with '-h')
-
-  -V, --version
-          Print version
 ```
 
 ---
@@ -1867,23 +2141,33 @@ Apply explicit semantic configuration migrations
 
 This never adds coded defaults. It only performs reviewed migrations for deprecated fields while preserving unrelated TOML formatting.
 
-Usage: cargo rail config migrate [OPTIONS]
+Usage: cargo-rail config migrate [OPTIONS]
 
 Options:
       --check
           Check for pending migrations without modifying rail.toml
-
-  -q, --quiet
-          Suppress progress messages (for CI/automation)
 
   -f, --format <FORMAT>
           Output format
 
           Possible values:
           - text: Human-readable text output (default)
-          - json: Machine-readable JSON output
+          - json: Machine-readable JSON compatibility spelling; prefer global `--json`
 
           [default: text]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Global Options:
+  -q, --quiet
+          Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
 
       --json
           Output as JSON where supported; rejected otherwise
@@ -1893,12 +2177,6 @@ Options:
 
       --workspace-root <PATH>
           Workspace root directory (default: current directory)
-
-  -h, --help
-          Print help (see a summary with '-h')
-
-  -V, --version
-          Print version
 ```
 
 ---
@@ -1908,7 +2186,7 @@ Options:
 ```
 Generate shell completions
 
-Usage: cargo rail completions [OPTIONS] <SHELL>
+Usage: cargo-rail completions [OPTIONS] <SHELL>
 
 Arguments:
   <SHELL>
@@ -1917,8 +2195,18 @@ Arguments:
           [possible values: bash, elvish, fish, powershell, zsh]
 
 Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Global Options:
   -q, --quiet
           Suppress progress messages (for CI/automation)
+
+  -v, --verbose
+          Show bounded operational detail
 
       --json
           Output as JSON where supported; rejected otherwise
@@ -1928,12 +2216,6 @@ Options:
 
       --workspace-root <PATH>
           Workspace root directory (default: current directory)
-
-  -h, --help
-          Print help (see a summary with '-h')
-
-  -V, --version
-          Print version
 
 Examples:
   cargo rail completions bash           # Output bash completions

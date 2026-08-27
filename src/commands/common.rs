@@ -58,7 +58,7 @@ pub enum TextJsonOutputFormat {
     /// Human-readable text output (default)
     #[default]
     Text,
-    /// Machine-readable JSON output
+    /// Machine-readable JSON compatibility spelling; prefer global `--json`
     Json,
 }
 
@@ -80,7 +80,7 @@ pub enum SplitOutputFormat {
     /// Human-readable text output (default)
     #[default]
     Text,
-    /// Machine-readable JSON output
+    /// Machine-readable JSON compatibility spelling; prefer global `--json`
     Json,
     /// Names only, one per line
     #[value(name = "names-only", alias = "names")]
@@ -108,7 +108,7 @@ pub enum ChangeOutputFormat {
     /// Human-readable text output (default)
     #[default]
     Text,
-    /// Machine-readable JSON output
+    /// Machine-readable JSON compatibility spelling; prefer global `--json`
     Json,
     /// Names only, one per line
     #[value(name = "names-only", alias = "names")]
@@ -136,7 +136,7 @@ pub enum UnifyOutputFormat {
     /// Human-readable text output (default)
     #[default]
     Text,
-    /// Machine-readable JSON output
+    /// Machine-readable JSON compatibility spelling; prefer global `--json`
     Json,
 }
 
@@ -158,7 +158,7 @@ pub enum SurfaceOutputFormat {
     /// Human-readable text output (default)
     #[default]
     Text,
-    /// Machine-readable JSON output
+    /// Machine-readable JSON compatibility spelling; prefer global `--json`
     Json,
     /// GitHub Actions key/value output
     #[value(name = "github")]
@@ -173,7 +173,7 @@ impl SurfaceOutputFormat {
 
     /// Check if this format is structured output.
     pub fn is_json_like(&self) -> bool {
-        matches!(self, Self::Json | Self::GitHub)
+        self.is_json()
     }
 }
 

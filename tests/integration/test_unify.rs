@@ -140,26 +140,19 @@ fn test_unify_apply_json_is_a_single_machine_envelope() {
                     .as_array()
                     .is_some_and(|mutations| mutations.iter().any(|mutation| mutation["path"] == "Cargo.lock"))
         }));
-        assert!(check_actions.iter().any(|action| {
-            action["code"] == "WRITE_REPORT"
-                && action["expected_mutations"].as_array().is_some_and(|mutations| {
-                    mutations
-                        .iter()
-                        .any(|mutation| mutation["path"] == "target/cargo-rail/unify-report.md")
-                })
-        }));
+        assert!(check_actions.iter().all(|action| action["code"] != "WRITE_REPORT"));
 
-        let skip_report_check = run_cargo_rail(
+        let report_check = run_cargo_rail(
             &workspace.path,
-            &["rail", "unify", "--check", "--skip-report", "--format", "json"],
+            &["rail", "unify", "--check", "--report", "--format", "json"],
         )?;
-        assert_eq!(skip_report_check.status.code(), Some(1));
-        let skip_report_json: serde_json::Value = serde_json::from_slice(&skip_report_check.stdout)?;
+        assert_eq!(report_check.status.code(), Some(1));
+        let report_json: serde_json::Value = serde_json::from_slice(&report_check.stdout)?;
         assert!(
-            skip_report_json["mutation_plan"]["actions"]
+            report_json["mutation_plan"]["actions"]
                 .as_array()
-                .is_some_and(|actions| actions.iter().all(|action| action["code"] != "WRITE_REPORT")),
-            "--skip-report check plans must not authorize report output"
+                .is_some_and(|actions| actions.iter().any(|action| action["code"] == "WRITE_REPORT")),
+            "--report must authorize report output"
         );
         let check_proof = check_json["proof_fingerprint"]
             .as_str()
@@ -173,7 +166,7 @@ fn test_unify_apply_json_is_a_single_machine_envelope() {
             .collect::<Vec<_>>();
         check_coverage_identities.sort();
 
-        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--format", "json"])?;
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply", "--format", "json"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -270,7 +263,10 @@ fn test_unify_apply_verifies_the_captured_target_and_selected_feature_views() {
             .collect::<Vec<_>>();
         expected_identities.sort();
 
-        let apply = run_cargo_rail(&workspace.path, &["rail", "unify", "--format", "json"])?;
+        let apply = run_cargo_rail(
+            &workspace.path,
+            &["rail", "unify", "apply", "--report", "--format", "json"],
+        )?;
         assert!(
             apply.status.success(),
             "target/feature coverage verification should succeed.\nstdout:\n{}\nstderr:\n{}",
@@ -334,6 +330,8 @@ fn test_unify_apply_restores_manifests_and_lockfile_when_a_late_output_fails() {
             &[
                 "rail",
                 "unify",
+                "apply",
+                "--report",
                 "--format",
                 "json",
                 "--report-path",
@@ -377,7 +375,16 @@ fn test_unify_rejects_a_report_path_that_aliases_graph_state() {
 
         let apply = run_cargo_rail(
             &workspace.path,
-            &["rail", "unify", "--format", "json", "--report-path", "Cargo.toml"],
+            &[
+                "rail",
+                "unify",
+                "apply",
+                "--report",
+                "--format",
+                "json",
+                "--report-path",
+                "Cargo.toml",
+            ],
         )?;
         assert!(!apply.status.success());
         let error: serde_json::Value = serde_json::from_slice(&apply.stdout)?;
@@ -397,6 +404,8 @@ fn test_unify_rejects_a_report_path_that_aliases_graph_state() {
             &[
                 "rail",
                 "unify",
+                "apply",
+                "--report",
                 "--format",
                 "json",
                 "--report-path",
@@ -471,7 +480,7 @@ fn test_unify_resolution_based_merging_no_false_positives() {
 
         // Should show success
         assert!(
-            stdout.contains("changed:") && stdout.contains("next:"),
+            stdout.contains("Pending:") && stdout.contains("Next: cargo rail unify apply"),
             "Should complete analysis successfully.\nOutput:\n{}",
             stdout
         );
@@ -578,7 +587,7 @@ root = "."
         );
 
         // Run apply - should SUCCEED but skip the conflicting dependency
-        let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+        let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         let apply_stdout = String::from_utf8_lossy(&apply_output.stdout);
         let apply_stderr = String::from_utf8_lossy(&apply_output.stderr);
 
@@ -648,7 +657,7 @@ fn test_unify_feature_union() {
         // The workspace dependency will have NO features, and each member will keep its local features.
         // This is correct behavior - we just verify unification is possible.
         assert!(
-            stdout.contains("changed:") && stdout.contains("next:"),
+            stdout.contains("Pending:") && stdout.contains("Next: cargo rail unify apply"),
             "Should show dependencies can be unified.\nOutput:\n{}",
             stdout
         );
@@ -713,7 +722,7 @@ root = "."
         );
 
         // Run apply - should SUCCEED
-        let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+        let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(
             apply_output.status.success(),
             "Apply should succeed.\nstdout:\n{}\nstderr:\n{}",
@@ -847,7 +856,7 @@ fn test_unify_end_to_end_analyze_then_apply() {
         );
 
         // Apply unification
-        let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+        let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         let apply_stdout = String::from_utf8_lossy(&apply_output.stdout);
 
         assert!(
@@ -883,7 +892,7 @@ fn test_unify_end_to_end_analyze_then_apply() {
         let final_stdout = String::from_utf8_lossy(&final_analyze.stdout);
 
         assert!(
-            final_stdout.contains("status: no changes"),
+            final_stdout.contains("Dependencies are coherent."),
             "After unification, there should be no more unifiable deps.\nOutput:\n{}",
             final_stdout
         );
@@ -937,7 +946,7 @@ exclude = ["tokio"]
         );
 
         // Run apply to verify config exclusion persists
-        let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+        let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(apply_output.status.success(), "Apply should succeed");
 
         // Workspace should have anyhow and serde, but NOT tokio
@@ -1015,7 +1024,7 @@ tempfile = "3.0"
         workspace.commit("Add crates with dev-dependencies")?;
 
         // Run unify
-        let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(
             output.status.success(),
             "Unify should succeed.\nOutput:\n{}",
@@ -1100,7 +1109,7 @@ cc = "1.0"
         workspace.commit("Add crates with build-dependencies")?;
 
         // Run unify
-        let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(
             output.status.success(),
             "Unify should succeed.\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
@@ -1172,7 +1181,7 @@ serde = { version = "1.0", features = ["derive"] }
         workspace.commit("Add crates with existing workspace.dependencies")?;
 
         // Run unify
-        let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(
             output.status.success(),
             "Unify should succeed.\nOutput:\n{}",
@@ -1342,7 +1351,10 @@ repository = "https://example.invalid/repository"
             })
         }));
 
-        let apply = run_cargo_rail(&workspace.path, &["rail", "unify", "--format", "json"])?;
+        let apply = run_cargo_rail(
+            &workspace.path,
+            &["rail", "unify", "apply", "--report", "--format", "json"],
+        )?;
         assert!(
             apply.status.success(),
             "package inheritance apply failed:\nstdout: {}\nstderr: {}",
@@ -1458,7 +1470,7 @@ fn test_unify_local_features_calculation() {
         workspace.commit("Add crates with different features")?;
 
         // Run unify
-        let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(
             output.status.success(),
             "Unify should succeed.\nOutput:\n{}",
@@ -1519,7 +1531,7 @@ serde = { version = "1.0", default-features = false }
         )?;
         workspace.commit("Add cross-domain default feature policy")?;
 
-        let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(
             output.status.success(),
             "unify should preserve per-domain defaults:\nstdout: {}\nstderr: {}",
@@ -1606,7 +1618,7 @@ root = "."
         )?;
 
         // Run apply
-        let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+        let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(
             apply_output.status.success(),
             "Apply should succeed.\nstdout:\n{}\nstderr:\n{}",
@@ -1679,7 +1691,7 @@ include_paths = false
 
         workspace.commit("Add tokio-style member dependencies with crates-io patch")?;
 
-        let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(
             output.status.success(),
             "unify should succeed.\nstdout:\n{}\nstderr:\n{}",
@@ -1742,7 +1754,7 @@ fn test_unify_workspace_member_cohort_unifies_atomically() {
 
         // The low-usage members (tokio-stream/tokio-util) should still unify because
         // workspace-member cohorts are handled atomically.
-        let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(
             output.status.success(),
             "unify should succeed.\nstdout:\n{}\nstderr:\n{}",
@@ -1854,7 +1866,7 @@ fn test_unify_workspace_member_cohort_with_non_default_members_still_unifies() {
 
         workspace.commit("Add non-default workspace member cohort")?;
 
-        let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(
             output.status.success(),
             "unify should succeed.\nstdout:\n{}\nstderr:\n{}",
@@ -1961,7 +1973,7 @@ core-member = "0.1.0"
 
         workspace.commit("Add workspace member feature split scenario")?;
 
-        let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(
             output.status.success(),
             "unify should succeed.\nstdout:\n{}\nstderr:\n{}",
@@ -2288,7 +2300,7 @@ msrv_policy = { mode = "disabled" }
             "a feature used by one exact alias must remain on that declaration"
         );
 
-        let apply = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+        let apply = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(
             apply.status.success(),
             "renamed dependency unification should apply: {}",
@@ -2376,13 +2388,13 @@ msrv_policy = { mode = "disabled" }
 
         // Should show no unification opportunities since each has only 1 user
         assert!(
-            analyze_stdout.contains("status: no changes"),
+            analyze_stdout.contains("Dependencies are coherent."),
             "Should show no unification opportunities when deps are properly separated.\nOutput:\n{}",
             analyze_stdout
         );
 
         // Run apply - should succeed (no changes needed)
-        let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+        let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         let apply_stdout = String::from_utf8_lossy(&apply_output.stdout);
 
         // Should indicate no changes
@@ -2556,7 +2568,7 @@ serde = "=1.0.200"
         workspace.commit("Add crates with exact pins")?;
 
         // Run unify apply
-        let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(
             output.status.success(),
             "Unify should succeed.\nstderr: {}",
@@ -2751,19 +2763,12 @@ fn test_unify_report_generation() {
 
         workspace.commit("Add crates")?;
 
-        // Configure rail.toml with report generation enabled
-        std::fs::write(
-            workspace.path.join("rail.toml"),
-            r#"[workspace]
-root = "."
-
-[unify.output]
-generate_report = true
-"#,
-        )?;
+        // Report generation is explicit command-owned output. Keep repository
+        // configuration sparse instead of relying on the retired `unify.output` table.
+        std::fs::write(workspace.path.join("rail.toml"), "")?;
 
         // Run apply
-        let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+        let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply", "--report"])?;
         assert!(
             apply_output.status.success(),
             "Apply should succeed.\nOutput:\n{}",
@@ -2839,7 +2844,7 @@ root = "."
         )?;
 
         // Run apply
-        let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+        let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(apply_output.status.success(), "Apply should succeed");
 
         // Check workspace Cargo.toml was created successfully
@@ -2888,7 +2893,7 @@ root = "."
         )?;
 
         // Run apply with --backup
-        let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "--backup"])?;
+        let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply", "--backup"])?;
         let apply_stdout = String::from_utf8_lossy(&apply_output.stdout);
 
         assert!(
@@ -2961,7 +2966,7 @@ fn test_unify_apply_writes_mutation_receipts() {
         workspace.add_crate("crate-b", "0.1.0", &[("serde", r#""1.0""#)])?;
         workspace.commit("Add crates for unify receipt test")?;
 
-        let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(
             output.status.success(),
             "unify apply should succeed.\nstdout:\n{}\nstderr:\n{}",
@@ -3078,7 +3083,7 @@ fn test_unify_apply_from_plan_file() {
 
         let apply_output = run_cargo_rail(
             &workspace.path,
-            &["rail", "unify", "--plan", plan_path.to_string_lossy().as_ref()],
+            &["rail", "unify", "apply", "--plan", plan_path.to_string_lossy().as_ref()],
         )?;
         assert!(
             apply_output.status.success(),
@@ -3230,7 +3235,7 @@ required-features = ["example-gate"]
         )?;
         workspace.commit("Add public and private empty feature flags")?;
 
-        let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(
             output.status.success(),
             "unify should safely prune only the private feature\nstdout:\n{}\nstderr:\n{}",
@@ -3280,7 +3285,7 @@ log = { version = "0.4", optional = true }
         )?;
         workspace.commit("Add dormant private configuration with open consumers")?;
 
-        let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(
             output.status.success(),
             "open-world preservation must leave a valid graph\nstdout:\n{}\nstderr:\n{}",
@@ -3346,7 +3351,7 @@ windows-only = { path = "../windows-only" }
         )?;
         workspace.commit("Add a platform-filtered graph beside a dead private feature")?;
 
-        let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(
             output.status.success(),
             "pre- and post-edit graph verification must use the same platform filter\nstdout:\n{}\nstderr:\n{}",
@@ -3538,7 +3543,7 @@ pub fn impossible_platform_root() {}
             serde_json::to_string_pretty(&json)?
         );
 
-        let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(
             output.status.success(),
             "reachability edits must pass post-edit graph verification\nstdout:\n{}\nstderr:\n{}",

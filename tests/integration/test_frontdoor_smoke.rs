@@ -1,4 +1,4 @@
-use crate::helpers::{TestWorkspace, git, run_cargo_rail};
+use crate::helpers::{TestWorkspace, cargo_rail_command, git, run_cargo_rail};
 use anyhow::Result;
 
 fn setup_frontdoor_workspace(name: &str) -> Result<TestWorkspace> {
@@ -30,6 +30,7 @@ fn test_documented_frontdoor_commands_smoke() {
         for (script, work, executor) in [
             (&build_script, "cargo.build", "cargo build"),
             (&test_script, "cargo.test", "cargo nextest run"),
+            (&test_script, "cargo.doctest", "cargo test --doc"),
         ] {
             assert!(script.contains("scripts/plan/read.py"));
             assert!(script.contains(&format!("is-required \"$PLAN_FILE\" {work}")));
@@ -64,6 +65,71 @@ fn test_documented_frontdoor_commands_smoke() {
             );
         }
 
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn direct_and_cargo_sentinel_invocations_share_one_cli_grammar() {
+    let result: Result<()> = (|| {
+        let ws = setup_frontdoor_workspace("frontdoor-normalized-argv")?;
+        let direct = run_cargo_rail(&ws.path, &["plan", "--since", "HEAD", "--json"])?;
+        let cargo = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--json"])?;
+        assert!(direct.status.success(), "direct plan failed: {direct:?}");
+        assert!(cargo.status.success(), "Cargo sentinel plan failed: {cargo:?}");
+        assert_eq!(direct.stdout, cargo.stdout);
+        assert_eq!(direct.stderr, cargo.stderr);
+
+        let help = cargo_rail_command(&ws.path)?.arg("--help").output()?;
+        assert!(help.status.success(), "direct help failed: {help:?}");
+        let help = String::from_utf8(help.stdout)?;
+        assert!(help.contains("Usage: cargo-rail"), "unexpected direct help:\n{help}");
+        assert!(
+            !help.contains("Usage: cargo rail"),
+            "direct help exposed Cargo's shim:\n{help}"
+        );
+
+        let version = cargo_rail_command(&ws.path)?.arg("--version").output()?;
+        assert!(version.status.success(), "direct version failed: {version:?}");
+        assert!(
+            String::from_utf8(version.stdout)?.starts_with("cargo-rail "),
+            "direct version must identify the executable"
+        );
+
+        let misplaced = run_cargo_rail(&ws.path, &["release", "--yes", "status"])?;
+        assert_eq!(
+            misplaced.status.code(),
+            Some(2),
+            "parent-only grammar must reject child options"
+        );
+        assert!(
+            String::from_utf8_lossy(&misplaced.stderr).contains("unexpected argument '--yes'"),
+            "unexpected parser error: {}",
+            String::from_utf8_lossy(&misplaced.stderr)
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn every_completion_shell_uses_the_normalized_root_and_nested_options() {
+    let result: Result<()> = (|| {
+        let ws = setup_frontdoor_workspace("frontdoor-completions")?;
+        for shell in ["bash", "elvish", "fish", "powershell", "zsh"] {
+            let direct = run_cargo_rail(&ws.path, &["completions", shell])?;
+            let cargo = run_cargo_rail(&ws.path, &["rail", "completions", shell])?;
+            assert!(direct.status.success(), "direct {shell} completions failed: {direct:?}");
+            assert!(cargo.status.success(), "Cargo {shell} completions failed: {cargo:?}");
+            assert_eq!(direct.stdout, cargo.stdout, "{shell} grammar diverged by front door");
+            let completion = String::from_utf8(direct.stdout)?;
+            assert!(completion.contains("cargo-rail"), "{shell} omitted the executable root");
+            assert!(
+                completion.contains("allow-non-default-branch"),
+                "{shell} omitted a nested release option"
+            );
+        }
         Ok(())
     })();
     super::helpers::finish_test(result);

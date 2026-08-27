@@ -21,7 +21,7 @@ fn test_unify_undo_restores_latest_backup() {
         let original_lockfile = std::fs::read(workspace.path.join("Cargo.lock"))?;
 
         // Run unify with --backup flag to create a backup
-        let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "--backup"])?;
+        let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply", "--backup"])?;
         assert!(apply_output.status.success(), "Unify apply should succeed");
 
         // Verify files were modified
@@ -73,7 +73,7 @@ fn test_unify_undo_list() {
         workspace.commit("Add test crates")?;
 
         // Run unify with --backup flag to create a backup
-        let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "--backup"])?;
+        let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply", "--backup"])?;
         assert!(apply_output.status.success());
 
         // Run undo --list
@@ -133,8 +133,8 @@ fn test_unify_undo_specific_backup_id() {
         let original_content = std::fs::read_to_string(workspace.path.join("Cargo.toml"))?;
 
         // Create two backups by running unify twice
-        run_cargo_rail(&workspace.path, &["rail", "unify", "--backup"])?;
-        run_cargo_rail(&workspace.path, &["rail", "unify", "--backup"])?;
+        run_cargo_rail(&workspace.path, &["rail", "unify", "apply", "--backup"])?;
+        run_cargo_rail(&workspace.path, &["rail", "unify", "apply", "--backup"])?;
 
         // Get list of backups
         let list_output = run_cargo_rail(&workspace.path, &["rail", "unify", "undo", "--list"])?;

@@ -718,7 +718,15 @@ mode = "single"
         // Run split - should use parallel prefetch
         let output = run_cargo_rail(
             &ws.path,
-            &["rail", "split", "run", "prefetch-lib", "--yes", "--allow-dirty"],
+            &[
+                "rail",
+                "--verbose",
+                "split",
+                "run",
+                "prefetch-lib",
+                "--yes",
+                "--allow-dirty",
+            ],
         )?;
 
         // Verify split succeeded
@@ -1277,7 +1285,7 @@ members = ["outside"]
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stderr.contains("Crate 'outside' not found") && !target_dir.path().join(".git").exists(),
+            stderr.contains("crate 'outside' not found in configuration") && !target_dir.path().join(".git").exists(),
             "member resolution should fail before target mutation\nstderr:\n{}",
             stderr
         );
@@ -1346,12 +1354,12 @@ mode = "single"
             String::from_utf8_lossy(&output2.stderr)
         );
 
-        // Verify "already up-to-date" message (progress output goes to stderr)
-        let stderr2 = String::from_utf8_lossy(&output2.stderr);
+        // Normal output reports the exact pre-apply pending count.
+        let stdout2 = String::from_utf8_lossy(&output2.stdout);
         assert!(
-            stderr2.contains("already up-to-date") || stderr2.contains("already split"),
-            "Second run should indicate already up-to-date. stderr: {}",
-            stderr2
+            stdout2.contains("0 pending commit(s)"),
+            "Second run should indicate already up-to-date. stdout: {}",
+            stdout2
         );
 
         // Get commit count after second split
@@ -1507,12 +1515,12 @@ members = ["lib-core", "service-api"]
             String::from_utf8_lossy(&output2.stderr)
         );
 
-        // Verify "already up-to-date" message (progress output goes to stderr)
-        let stderr2 = String::from_utf8_lossy(&output2.stderr);
+        // Normal output reports the exact pre-apply pending count.
+        let stdout2 = String::from_utf8_lossy(&output2.stdout);
         assert!(
-            stderr2.contains("already up-to-date") || stderr2.contains("already split"),
-            "Second run should indicate already up-to-date. stderr: {}",
-            stderr2
+            stdout2.contains("0 pending commit(s)"),
+            "Second run should indicate already up-to-date. stdout: {}",
+            stdout2
         );
 
         // Verify no changes
@@ -1663,12 +1671,11 @@ include = ["rustfmt.toml", ".editorconfig"]
         let output2 = run_cargo_rail(&ws.path, &["rail", "split", "run", "aux-lib", "--yes", "--allow-dirty"])?;
         assert!(output2.status.success());
 
-        // Progress output goes to stderr
-        let stderr2 = String::from_utf8_lossy(&output2.stderr);
+        let stdout2 = String::from_utf8_lossy(&output2.stdout);
         assert!(
-            stderr2.contains("already up-to-date") || stderr2.contains("already split"),
-            "Should be up-to-date. stderr: {}",
-            stderr2
+            stdout2.contains("0 pending commit(s)"),
+            "Should be up-to-date. stdout: {}",
+            stdout2
         );
 
         // Count should be the same

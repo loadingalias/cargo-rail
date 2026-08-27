@@ -266,12 +266,14 @@ impl ReleaseState {
         if path.exists() {
             let existing = Self::load(&path)?;
             let help = match existing.status {
-        ReleaseStatus::Active => format!("resume it with 'cargo rail release resume {}'", path.display()),
-        ReleaseStatus::Complete | ReleaseStatus::Aborted => {
-          "inspect it with 'cargo rail release status'; clean terminal journals before repeating the same transaction"
-            .to_string()
-        }
-      };
+                ReleaseStatus::Active => format!("resume it with 'cargo rail release resume {}'", path.display()),
+                ReleaseStatus::Complete | ReleaseStatus::Aborted => {
+                    format!(
+                        "delete only this terminal journal with 'cargo rail clean --release-journal {}'",
+                        state.transaction_id
+                    )
+                }
+            };
             return Err(RailError::with_help(
                 format!(
                     "release transaction '{}' already exists at '{}'",

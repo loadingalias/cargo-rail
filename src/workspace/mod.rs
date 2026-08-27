@@ -13,8 +13,6 @@ use std::path::{Path, PathBuf};
 
 /// Unified workspace context (includes optional GitState and CargoState)
 pub mod context;
-/// File path utilities
-pub mod files;
 /// Immutable authoritative workspace capture.
 pub mod snapshot;
 /// High-level façade for crate information queries

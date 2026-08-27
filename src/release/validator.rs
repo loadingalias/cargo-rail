@@ -123,7 +123,7 @@ impl<'a> ReleaseValidator<'a> {
             if current != default && !allow_non_default {
                 return Err(RailError::with_help(
                     format!("Releasing from '{}', not default branch '{}'", current, default),
-                    format!("Pass --yes to confirm, or checkout {}", default),
+                    format!("pass --allow-non-default-branch, or checkout {default}"),
                 ));
             }
             if current != default {

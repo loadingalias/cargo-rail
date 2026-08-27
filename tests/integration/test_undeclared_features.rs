@@ -149,7 +149,7 @@ tokio = { version = "1", features = ["rt"] }
         )?;
         workspace.commit("Declare an inactive provider feature")?;
 
-        let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(
             output.status.success(),
             "unify should not invent causality from an inactive declaration\nstdout:\n{}\nstderr:\n{}",
@@ -353,7 +353,7 @@ tokio = { version = "1.0", features = ["rt"] }
         workspace.commit("Add crates")?;
 
         // Run unify (not --check, so it applies changes)
-        let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(
             output.status.success(),
             "Unify should succeed.\nstdout: {}\nstderr: {}",
@@ -600,7 +600,7 @@ serde = "1"
             String::from_utf8_lossy(&before.stderr)
         );
 
-        let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(
             output.status.success(),
             "target-specific causal repair should verify\nstdout:\n{}\nstderr:\n{}",

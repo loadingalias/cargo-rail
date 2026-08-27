@@ -1,248 +1,212 @@
-//! Cargo.toml transformation for split/sync operations
-//!
-//! This module provides simple Cargo.toml transformations needed by split and sync:
-//! - Transform workspace dependencies to standalone format (for splits)
-//! - Transform standalone dependencies back to workspace format (for syncs)
+//! Captured Cargo manifest policy for split and sync transforms.
+
+use std::collections::BTreeMap;
+
+use cargo_metadata::Metadata;
+use semver::VersionReq;
+use toml_edit::{DocumentMut, Item, Table, Value};
 
 use crate::cargo::manifest_ops;
-use crate::error::{RailError, RailResult};
-use cargo_metadata::Metadata;
-use std::cell::RefCell;
-use std::path::PathBuf;
-use toml_edit::{DocumentMut, Item, Table};
+use crate::error::{RailError, RailResult, ResultExt as _};
+use crate::workspace::WorkspaceContext;
 
-/// Context for Cargo.toml transformations
-#[derive(Debug)]
-pub struct TransformContext {
-    /// Name of the crate being transformed
-    pub crate_name: String,
-    /// Workspace root path
-    pub workspace_root: PathBuf,
-    /// Whether the target repo will have a workspace structure
-    /// - true: keep `[lints] workspace = true` (target is a workspace)
-    /// - false: resolve `[lints]` to actual values (target is standalone)
-    pub target_has_workspace: bool,
+#[derive(Debug, Clone)]
+struct StandaloneDependency {
+    package: Option<String>,
+    version: String,
 }
 
-/// Cargo.toml transformer for split/sync operations
-///
-/// Caches the workspace document to avoid repeated I/O when transforming multiple manifests.
-/// Uses interior mutability (`RefCell`) so the public API remains `&self`.
+/// Immutable transformation policy derived from one authoritative workspace snapshot.
 #[derive(Debug)]
-pub struct CargoTransform {
-    metadata: Metadata,
-    /// Cached workspace document (loaded lazily via RefCell for interior mutability)
-    cached_workspace_doc: RefCell<Option<DocumentMut>>,
-    /// Workspace root for lazy loading
-    workspace_root: PathBuf,
+pub(crate) struct ManifestTransformPolicy {
+    workspace_package: Option<Table>,
+    workspace_lints: Option<Item>,
+    dependencies: BTreeMap<String, StandaloneDependency>,
 }
 
-impl CargoTransform {
-    /// Create a new transformer with workspace metadata
-    pub fn new(metadata: Metadata) -> Self {
-        let workspace_root = metadata.workspace_root.as_std_path().to_path_buf();
-        Self {
-            metadata,
-            cached_workspace_doc: RefCell::new(None),
-            workspace_root,
-        }
+impl ManifestTransformPolicy {
+    pub(crate) fn capture(ctx: &WorkspaceContext) -> RailResult<Self> {
+        let manifest = ctx.snapshot()?.workspace_manifest()?;
+        let path = manifest.path().as_path();
+        let content = std::str::from_utf8(manifest.bytes())
+            .with_context(|| format!("workspace manifest '{}' is not valid UTF-8", path.display()))?;
+        let document = content
+            .parse::<DocumentMut>()
+            .with_context(|| format!("failed to parse captured workspace manifest '{}'", path.display()))?;
+        Self::from_document(&document, ctx.cargo().metadata())
     }
 
-    /// Ensure workspace doc is loaded and cached
-    fn ensure_workspace_doc_cached(&self) -> RailResult<()> {
-        let already_cached = self.cached_workspace_doc.borrow().is_some();
-        if !already_cached {
-            let workspace_toml_path = self.workspace_root.join("Cargo.toml");
-            let doc = manifest_ops::read_toml_file(&workspace_toml_path)?;
-            *self.cached_workspace_doc.borrow_mut() = Some(doc);
-        }
-        Ok(())
-    }
+    fn from_document(document: &DocumentMut, metadata: &Metadata) -> RailResult<Self> {
+        let workspace = document.get("workspace").and_then(Item::as_table);
+        let workspace_package = workspace
+            .and_then(|table| table.get("package"))
+            .and_then(Item::as_table)
+            .cloned();
+        let workspace_lints = workspace.and_then(|table| table.get("lints")).cloned();
+        let mut dependencies = BTreeMap::new();
 
-    /// Get workspace.package table, loading and caching the workspace doc if needed
-    ///
-    /// Uses `RefCell` for interior mutability - loads once, caches for reuse.
-    fn get_workspace_package(&self) -> RailResult<Option<Table>> {
-        self.ensure_workspace_doc_cached()?;
-
-        let cache = self.cached_workspace_doc.borrow();
-        Ok(cache
-            .as_ref()
-            .and_then(|doc| doc.get("workspace"))
-            .and_then(|w| w.as_table())
-            .and_then(|w| w.get("package"))
-            .and_then(|p| p.as_table())
-            .cloned())
-    }
-
-    /// Get workspace.lints table, loading and caching the workspace doc if needed
-    fn get_workspace_lints(&self) -> RailResult<Option<Item>> {
-        self.ensure_workspace_doc_cached()?;
-
-        let cache = self.cached_workspace_doc.borrow();
-        Ok(cache
-            .as_ref()
-            .and_then(|doc| doc.get("workspace"))
-            .and_then(|w| w.as_table())
-            .and_then(|w| w.get("lints"))
-            .cloned())
-    }
-
-    /// Transform a Cargo.toml from workspace format to split (standalone) format
-    ///
-    /// This replaces workspace dependency references with concrete version requirements.
-    pub fn transform_to_split(&self, content: &str, context: &TransformContext) -> RailResult<String> {
-        let mut doc: DocumentMut = content
-            .parse()
-            .map_err(|e| RailError::message(format!("Failed to parse Cargo.toml: {}", e)))?;
-
-        // Remove workspace inheritance markers and resolve to actual values
-        self.resolve_workspace_inheritance(&mut doc)?;
-
-        // Transform workspace dependencies to standalone format
-        self.transform_dependencies_to_standalone(&mut doc)?;
-
-        // Handle `[lints]` section based on target workspace mode
-        // - If target has workspace: keep `[lints] workspace = true`
-        // - If target is standalone: resolve to actual values or remove
-        if !context.target_has_workspace {
-            self.resolve_lints_workspace_inheritance(&mut doc)?;
-        }
-
-        Ok(doc.to_string())
-    }
-
-    /// Transform a Cargo.toml from split (standalone) format back to workspace format
-    ///
-    /// This is currently a no-op since syncing from remote to mono doesn't need transformation.
-    /// The crate in the monorepo already uses workspace format.
-    pub fn transform_to_mono(&self, content: &str, _context: &TransformContext) -> RailResult<String> {
-        // For now, pass through unchanged. If we need to restore workspace.dependencies
-        // references, we can implement that here.
-        Ok(content.to_string())
-    }
-
-    /// Resolve workspace inheritance (workspace = true fields) to actual values
-    ///
-    /// Uses cached workspace document to avoid repeated I/O.
-    fn resolve_workspace_inheritance(&self, doc: &mut DocumentMut) -> RailResult<()> {
-        // Get workspace.package table from cache (loads workspace doc if needed)
-        if let Some(workspace_pkg) = self.get_workspace_package()? {
-            manifest_ops::resolve_package_workspace_inheritance(doc, &workspace_pkg)?;
-        }
-
-        Ok(())
-    }
-
-    /// Resolve `[lints]` workspace inheritance for standalone split targets
-    ///
-    /// If the crate has `[lints] workspace = true`, this:
-    /// 1. Removes the `workspace = true` marker
-    /// 2. Copies the actual lints from `[workspace.lints]` into `[lints]`
-    /// 3. If no workspace lints exist, removes the `[lints]` section entirely
-    fn resolve_lints_workspace_inheritance(&self, doc: &mut DocumentMut) -> RailResult<()> {
-        // Check if [lints] section exists and has workspace = true
-        let has_workspace_lints = doc
-            .get("lints")
-            .and_then(|l| l.as_table())
-            .and_then(|t| t.get("workspace"))
-            .and_then(|w| w.as_value())
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        if !has_workspace_lints {
-            return Ok(());
-        }
-
-        // Get workspace.lints from source workspace
-        let workspace_lints = self.get_workspace_lints()?;
-
-        // Remove [lints] section first
-        doc.remove("lints");
-
-        // If workspace has lints, copy them to [lints] section
-        if let Some(ws_lints) = workspace_lints {
-            doc.insert("lints", ws_lints);
-        }
-        // If no workspace lints, we've already removed the section - crate will use defaults
-
-        Ok(())
-    }
-
-    /// Transform workspace dependencies to standalone format
-    fn transform_dependencies_to_standalone(&self, doc: &mut DocumentMut) -> RailResult<()> {
-        // Transform each dependency section using manifest_ops
-        manifest_ops::transform_dependencies_in_section(doc, "dependencies", |name, item| {
-            self.transform_and_resolve_dep(item, name)
-        })?;
-
-        manifest_ops::transform_dependencies_in_section(doc, "dev-dependencies", |name, item| {
-            self.transform_and_resolve_dep(item, name)
-        })?;
-
-        manifest_ops::transform_dependencies_in_section(doc, "build-dependencies", |name, item| {
-            self.transform_and_resolve_dep(item, name)
-        })?;
-
-        Ok(())
-    }
-
-    /// Helper: transform and resolve a single dependency
-    fn transform_and_resolve_dep(&self, dep_item: &mut Item, dep_name: &str) -> RailResult<()> {
-        // Check if this is a workspace dependency using manifest_ops
-        if manifest_ops::is_workspace_dep(dep_item) {
-            // Find the dependency version in workspace metadata
-            if let Some(pkg) = self.metadata.packages.iter().find(|p| p.name == dep_name) {
-                let version = pkg.version.to_string();
-
-                // Remove workspace marker and set version using manifest_ops
-                manifest_ops::extract_workspace_marker(dep_item);
-                manifest_ops::set_version(dep_item, &version)?;
+        if let Some(table) = workspace
+            .and_then(|table| table.get("dependencies"))
+            .and_then(Item::as_table)
+        {
+            for (alias, item) in table {
+                let package = dependency_field(item, "package")
+                    .filter(|name| *name != alias)
+                    .map(str::to_string);
+                let package_name = package.as_deref().unwrap_or(alias);
+                let declared = item.as_str().or_else(|| dependency_field(item, "version"));
+                let requirement = declared.and_then(|value| VersionReq::parse(value).ok());
+                let mut candidates = metadata
+                    .packages
+                    .iter()
+                    .filter(|candidate| candidate.name == package_name)
+                    .filter(|candidate| {
+                        requirement
+                            .as_ref()
+                            .is_none_or(|requirement| requirement.matches(&candidate.version))
+                    })
+                    .collect::<Vec<_>>();
+                candidates.sort_unstable_by(|left, right| left.version.cmp(&right.version));
+                let version = candidates
+                    .last()
+                    .map(|package| package.version.to_string())
+                    .or_else(|| declared.map(str::to_string));
+                if let Some(version) = version {
+                    dependencies.insert(alias.to_string(), StandaloneDependency { package, version });
+                }
             }
         }
 
-        // Remove path dependencies (they won't be valid in split repo)
-        // This applies to both workspace and non-workspace dependencies
-        manifest_ops::remove_path(dep_item);
+        Ok(Self {
+            workspace_package,
+            workspace_lints,
+            dependencies,
+        })
+    }
 
+    /// Transform one captured Cargo manifest into standalone split form.
+    pub(crate) fn transform_to_split(&self, content: &str, target_has_workspace: bool) -> RailResult<String> {
+        let mut document = content
+            .parse::<DocumentMut>()
+            .context("failed to parse Cargo.toml selected for split transformation")?;
+
+        if let Some(workspace_package) = &self.workspace_package {
+            manifest_ops::resolve_package_workspace_inheritance(&mut document, workspace_package)?;
+        }
+        self.transform_dependencies_to_standalone(&mut document)?;
+        if !target_has_workspace {
+            self.resolve_lints_workspace_inheritance(&mut document);
+        }
+
+        Ok(document.to_string())
+    }
+
+    fn resolve_lints_workspace_inheritance(&self, document: &mut DocumentMut) {
+        let inherited = document
+            .get("lints")
+            .and_then(Item::as_table)
+            .and_then(|table| table.get("workspace"))
+            .and_then(Item::as_value)
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !inherited {
+            return;
+        }
+
+        document.remove("lints");
+        if let Some(workspace_lints) = &self.workspace_lints {
+            document.insert("lints", workspace_lints.clone());
+        }
+    }
+
+    fn transform_dependencies_to_standalone(&self, document: &mut DocumentMut) -> RailResult<()> {
+        transform_dependency_sections(document.as_table_mut(), |name, item| {
+            self.transform_dependency(name, item)
+        })?;
+
+        let Some(targets) = document.get_mut("target").and_then(Item::as_table_mut) else {
+            return Ok(());
+        };
+        for (_, target) in targets.iter_mut() {
+            if let Some(target) = target.as_table_mut() {
+                transform_dependency_sections(target, |name, item| self.transform_dependency(name, item))?;
+            }
+        }
         Ok(())
     }
+
+    fn transform_dependency(&self, name: &str, item: &mut Item) -> RailResult<()> {
+        if manifest_ops::is_workspace_dep(item) {
+            let dependency = self.dependencies.get(name).ok_or_else(|| {
+                RailError::message(format!(
+                    "workspace dependency '{name}' has no captured standalone version"
+                ))
+            })?;
+            manifest_ops::extract_workspace_marker(item);
+            manifest_ops::set_version(item, &dependency.version)?;
+            if let Some(package) = &dependency.package {
+                set_dependency_package(item, package)?;
+            }
+        }
+
+        manifest_ops::remove_path(item);
+        Ok(())
+    }
+}
+
+fn dependency_field<'a>(item: &'a Item, field: &str) -> Option<&'a str> {
+    item.as_inline_table()
+        .and_then(|table| table.get(field))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            item.as_table()
+                .and_then(|table| table.get(field))
+                .and_then(Item::as_value)
+                .and_then(Value::as_str)
+        })
+}
+
+fn set_dependency_package(item: &mut Item, package: &str) -> RailResult<()> {
+    if let Some(table) = item.as_inline_table_mut() {
+        table.insert("package", Value::from(package));
+        return Ok(());
+    }
+    if let Some(table) = item.as_table_mut() {
+        table.insert("package", Item::Value(Value::from(package)));
+        return Ok(());
+    }
+    Err(RailError::message(
+        "cannot set package alias on a non-table dependency declaration",
+    ))
+}
+
+fn transform_dependency_sections(
+    document: &mut Table,
+    mut transform: impl FnMut(&str, &mut Item) -> RailResult<()>,
+) -> RailResult<()> {
+    for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        let Some(dependencies) = document.get_mut(section).and_then(Item::as_table_mut) else {
+            continue;
+        };
+        let names = dependencies
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .collect::<Vec<_>>();
+        for name in names {
+            if let Some(item) = dependencies.get_mut(&name) {
+                transform(&name, item)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_transform_workspace_dep() {
-        let input = r#"
-[package]
-name = "test-crate"
-version = "0.1.0"
-
-[dependencies]
-other-crate = { workspace = true }
-serde = "1.0"
-"#;
-
-        // For testing, we'll just verify it parses and doesn't crash
-        let doc: DocumentMut = input.parse().unwrap();
-        assert!(doc.get("dependencies").is_some());
-    }
-
-    #[test]
-    fn test_transform_to_mono_passthrough() {
-        let input = r#"
-[package]
-name = "test-crate"
-version = "0.1.0"
-
-[dependencies]
-serde = "1.0"
-"#;
-
-        // Create a minimal metadata for testing
-        let metadata_json = serde_json::json!({
+    fn empty_metadata() -> Metadata {
+        serde_json::from_value(serde_json::json!({
             "packages": [],
             "workspace_members": [],
             "resolve": null,
@@ -250,78 +214,50 @@ serde = "1.0"
             "version": 1,
             "workspace_root": "/tmp",
             "metadata": null
-        });
-
-        let metadata: Metadata = serde_json::from_value(metadata_json).unwrap();
-        let transformer = CargoTransform::new(metadata);
-        let context = TransformContext {
-            crate_name: "test-crate".to_string(),
-            workspace_root: PathBuf::from("/tmp"),
-            target_has_workspace: false,
-        };
-
-        let result = transformer.transform_to_mono(input, &context).unwrap();
-        assert_eq!(result, input);
+        }))
+        .unwrap()
     }
 
     #[test]
-    fn test_resolve_lints_workspace_inheritance_removes_workspace_true() {
-        // Test that [lints] workspace = true is removed when no workspace lints exist
-        let input = r#"
+    fn captured_policy_resolves_aliases_lints_and_target_dependencies() {
+        let workspace = r#"
+[workspace]
+
+[workspace.package]
+edition = "2024"
+
+[workspace.dependencies]
+renamed = { package = "actual", version = "1.2" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+"#
+        .parse::<DocumentMut>()
+        .unwrap();
+        let policy = ManifestTransformPolicy::from_document(&workspace, &empty_metadata()).unwrap();
+        let member = r#"
 [package]
-name = "test-crate"
+name = "member"
 version = "0.1.0"
+edition.workspace = true
 
 [lints]
 workspace = true
+
+[target.'cfg(unix)'.dependencies]
+renamed = { workspace = true, features = ["extra"] }
 "#;
 
-        let mut doc: DocumentMut = input.parse().unwrap();
-
-        // Verify [lints] workspace = true exists before
-        assert!(doc.get("lints").is_some());
-        let lints = doc.get("lints").unwrap().as_table().unwrap();
-        assert!(lints.get("workspace").is_some());
-
-        // Remove [lints] section (simulating no workspace lints)
-        doc.remove("lints");
-
-        // Verify it's gone
-        assert!(doc.get("lints").is_none());
-    }
-
-    #[test]
-    fn test_resolve_lints_workspace_inheritance_copies_workspace_lints() {
-        // Test that [lints] workspace = true is replaced with actual workspace.lints content
-        let input = r#"
-[package]
-name = "test-crate"
-version = "0.1.0"
-
-[lints]
-workspace = true
-"#;
-
-        let mut doc: DocumentMut = input.parse().unwrap();
-
-        // Simulate having workspace.lints content
-        let workspace_lints = r#"
-[rust]
-unexpected_cfgs = { level = "warn" }
-"#;
-        let ws_lints_doc: DocumentMut = workspace_lints.parse().unwrap();
-
-        // Remove [lints] section first
-        doc.remove("lints");
-
-        // Insert workspace lints content
-        if let Some(lints_item) = ws_lints_doc.as_item().as_table() {
-            doc.insert("lints", Item::Table(lints_item.clone()));
-        }
-
-        // Verify [lints.rust] now exists with actual content
-        let lints = doc.get("lints").unwrap().as_table().unwrap();
-        assert!(lints.get("rust").is_some());
-        assert!(lints.get("workspace").is_none()); // No workspace = true
+        let transformed = policy.transform_to_split(member, false).unwrap();
+        let document = transformed.parse::<DocumentMut>().unwrap();
+        assert_eq!(document["package"]["edition"].as_str(), Some("2024"));
+        assert_eq!(document["lints"]["rust"]["unsafe_code"].as_str(), Some("forbid"));
+        let dependency = document["target"]["cfg(unix)"]["dependencies"]["renamed"]
+            .as_inline_table()
+            .unwrap();
+        assert_eq!(dependency.get("version").and_then(Value::as_str), Some("1.2"));
+        assert_eq!(dependency.get("package").and_then(Value::as_str), Some("actual"));
+        assert!(dependency.get("workspace").is_none());
+        assert!(dependency.get("features").is_some());
     }
 }

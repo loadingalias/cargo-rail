@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 const STATUS_SCAN_MAX_ENTRIES: usize = 1_000_000;
 const WORKSPACE_LOCK_BYTES: u64 = 0;
+const RETIRED_METADATA_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Exclusive authority over cache-owned state inside one workspace.
 pub(crate) struct WorkspaceCacheLock {
@@ -229,7 +230,7 @@ fn workspace_status(workspace_root: &Path) -> RailResult<WorkspaceCacheStatus> {
         (
             "cargo_metadata",
             root.join("metadata.json"),
-            Some(crate::workspace::context::METADATA_CACHE_MAX_BYTES),
+            Some(RETIRED_METADATA_MAX_BYTES),
         ),
         (
             "legacy_compiler_evidence",

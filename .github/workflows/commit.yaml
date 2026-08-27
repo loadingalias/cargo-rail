@@ -137,6 +137,44 @@ jobs:
           rustup component add rustc-dev
           just check-compiler-fact-driver
 
+  cargo:
+    name: Build and Test
+    needs: plan
+    if: >-
+      contains(fromJSON(needs.plan.outputs.required-work), 'cargo.build') ||
+      contains(fromJSON(needs.plan.outputs.required-work), 'cargo.test') ||
+      contains(fromJSON(needs.plan.outputs.required-work), 'cargo.doctest')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup
+        uses: ./.github/actions/setup
+        with:
+          cache-key: commit-cargo
+          install-nextest: "true"
+
+      - name: Download exact plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: cargo-rail-plan-v8
+          path: target
+
+      - name: Verify checkout against plan
+        run: scripts/plan/read.py verify-checkout target/plan-v8.json
+
+      - name: Execute required Cargo work
+        env:
+          CARGO_RAIL_PLAN_FILE: target/plan-v8.json
+        run: |
+          just build
+          just test
+
   compatibility:
     name: Compatibility
     needs: plan

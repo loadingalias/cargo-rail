@@ -1,7 +1,10 @@
 //! `cargo rail plan` comparison validation and v8 rendering.
 
 use std::io::Write as _;
+use std::path::Path;
 use std::path::PathBuf;
+
+use serde::Deserialize;
 
 use crate::error::{RailError, RailResult};
 use crate::graph::DependencyUniverse;
@@ -17,6 +20,8 @@ pub struct PlanOptions {
     pub json: bool,
     /// Show human evidence detail in text output.
     pub explain: bool,
+    /// Explain one exact work decision, including a skipped decision.
+    pub explain_work: Option<String>,
     /// Monotonically require every registered work item.
     pub all: bool,
     /// Optional portable observed-input evidence.
@@ -77,6 +82,23 @@ impl PlanComparison {
             }
         }
     }
+
+    pub(crate) fn resolve_objects_before_context(
+        &self,
+        workspace_root: &std::path::Path,
+    ) -> RailResult<Option<(String, String)>> {
+        let Self::Objects { from, to } = self else {
+            return Ok(None);
+        };
+        let git = crate::git::SystemGit::open(workspace_root)?;
+        let from = git.resolve_reference(&format!("{from}^{{commit}}"))?;
+        let to = git.resolve_reference(&format!("{to}^{{commit}}"))?;
+        Ok(Some((from, to)))
+    }
+
+    pub(crate) fn replace_objects(&mut self, from: String, to: String) {
+        *self = Self::Objects { from, to };
+    }
 }
 
 impl ResolvedComparison {
@@ -99,17 +121,134 @@ pub fn print_plan_schema() {
     print!("{}", include_str!("../../schemas/plan-v8.schema.json"));
 }
 
+#[derive(Debug, Deserialize)]
+struct SavedPlanAuthority {
+    plan_contract_version: u32,
+    inputs: SavedPlanInputs,
+}
+
+#[derive(Debug, Deserialize)]
+struct SavedPlanInputs {
+    head: String,
+    head_commit: String,
+    capture: Option<String>,
+    cargo: String,
+    configuration: String,
+    toolchain: String,
+    target: String,
+    platform: String,
+}
+
+pub(crate) fn verify_saved_plan(
+    workspace_root: &Path,
+    config_override: Option<&Path>,
+    plan_file: &Path,
+) -> RailResult<()> {
+    const MAX_PLAN_BYTES: u64 = 64 * 1024 * 1024;
+
+    let metadata = std::fs::metadata(plan_file).map_err(|error| {
+        RailError::message(format!(
+            "failed to inspect saved plan '{}': {error}",
+            plan_file.display()
+        ))
+    })?;
+    if !metadata.is_file() || metadata.len() > MAX_PLAN_BYTES {
+        return Err(RailError::message(format!(
+            "saved plan '{}' must be a regular file no larger than {MAX_PLAN_BYTES} bytes",
+            plan_file.display()
+        )));
+    }
+    let saved: SavedPlanAuthority = serde_json::from_slice(&std::fs::read(plan_file)?).map_err(|error| {
+        RailError::message(format!("failed to parse saved plan '{}': {error}", plan_file.display()))
+    })?;
+    if saved.plan_contract_version != 8 {
+        return Err(RailError::message(format!(
+            "saved plan uses unsupported contract version {}",
+            saved.plan_contract_version
+        )));
+    }
+
+    let context = WorkspaceContext::build_with_planning_verification_and_config(workspace_root, config_override)?;
+    let current_head = context
+        .planning_head_commit()
+        .ok_or_else(|| RailError::message("saved-plan verification requires Git planning capture"))?;
+    verify_saved_binding("head commit", &saved.inputs.head_commit, current_head)?;
+
+    if saved.inputs.head == "WORKTREE" {
+        let expected = saved
+            .inputs
+            .capture
+            .as_deref()
+            .ok_or_else(|| RailError::message("saved worktree plan has no captured source authority"))?;
+        let current = context
+            .planning_snapshot_id()
+            .ok_or_else(|| RailError::message("current worktree has no captured source authority"))?;
+        verify_saved_binding("worktree capture", expected, &current)?;
+    } else {
+        verify_saved_binding("object head", &saved.inputs.head_commit, &saved.inputs.head)?;
+        let capture = context
+            .planning_source_capture()
+            .ok_or_else(|| RailError::message("saved object plan verification requires sparse source capture"))?;
+        let changes = capture.changes_from(context.git()?.git(), "HEAD")?;
+        if !changes.entries().is_empty() {
+            let paths = changes
+                .entries()
+                .iter()
+                .take(8)
+                .map(|change| change.path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(saved_plan_drift(format!(
+                "object-bound execution checkout has non-generated source drift: {paths}"
+            )));
+        }
+    }
+
+    let cargo =
+        DependencyUniverse::from_metadata(context.cargo().metadata(), context.planning_authority_source_root())?;
+    verify_saved_binding("Cargo universe", &saved.inputs.cargo, cargo.identity())?;
+    let configuration = context.planning_cargo_configuration_identity()?;
+    verify_saved_binding("Cargo configuration", &saved.inputs.configuration, &configuration)?;
+    let toolchain = planning_toolchain_identity(&context)?;
+    verify_saved_binding("toolchain", &saved.inputs.toolchain, &toolchain)?;
+    let target = planning_target_identity(&configuration, &toolchain);
+    verify_saved_binding("planning target", &saved.inputs.target, &target)?;
+    let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+    verify_saved_binding("platform", &saved.inputs.platform, &platform)?;
+    Ok(())
+}
+
+fn verify_saved_binding(name: &str, expected: &str, current: &str) -> RailResult<()> {
+    if expected == current {
+        Ok(())
+    } else {
+        Err(saved_plan_drift(format!(
+            "saved {name} '{expected}' does not match current authority '{current}'"
+        )))
+    }
+}
+
+fn saved_plan_drift(message: String) -> RailError {
+    RailError::with_help(
+        message,
+        "discard the saved plan, stop concurrent workspace changes, and create a new plan before execution",
+    )
+}
+
 /// Build and render one evidence-backed named-work plan.
 pub fn run_plan(ctx: &WorkspaceContext, opts: PlanOptions) -> RailResult<()> {
-    if opts.json {
-        crate::output::set_json_mode(true);
-    }
     let plan = build_work_plan(ctx, &opts)?;
+    ctx.validate_planning_source_unchanged()?;
     let rendered = if opts.json {
         serde_json::to_string_pretty(&plan)
             .map_err(|error| RailError::message(format!("JSON serialization failed: {error}")))?
     } else {
-        crate::planning::format_work_plan(&plan, opts.explain)
+        crate::planning::format_work_plan(
+            &plan,
+            opts.explain,
+            opts.explain_work.as_deref(),
+            crate::output::is_verbose(),
+        )?
     };
     let mut stdout = std::io::BufWriter::new(std::io::stdout().lock());
     stdout.write_all(rendered.as_bytes())?;
@@ -122,11 +261,12 @@ pub fn run_plan(ctx: &WorkspaceContext, opts: PlanOptions) -> RailResult<()> {
 
 fn build_work_plan(ctx: &WorkspaceContext, opts: &PlanOptions) -> RailResult<crate::planning::WorkPlan> {
     let comparison = opts.comparison.clone().resolve(ctx)?;
-    let dependency_universe = DependencyUniverse::from_metadata(ctx.cargo().metadata(), ctx.git()?.repo_root())?;
+    let dependency_universe =
+        DependencyUniverse::from_metadata(ctx.cargo().metadata(), ctx.planning_authority_source_root())?;
     let planning_index = collect_planning_index(ctx, &comparison)?;
     let semantic_changes = crate::change_detection::semantic::analyze(
         ctx,
-        planning_index.files(),
+        planning_index.paths(),
         comparison.base(),
         comparison.object_head(),
     )?;
@@ -157,7 +297,7 @@ fn build_work_plan(ctx: &WorkspaceContext, opts: &PlanOptions) -> RailResult<cra
     };
     crate::planning::build_work_plan(
         ctx,
-        &planning_index,
+        planning_index,
         authority,
         &dependency_universe,
         &semantic_changes,

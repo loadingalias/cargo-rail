@@ -67,7 +67,7 @@ fn test_msrv_source_max_preserves_higher_workspace_version() {
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         assert!(
-            stdout.contains("status: no changes"),
+            stdout.contains("Dependencies are coherent."),
             "Should recognize that the existing workspace rust-version already satisfies MSRV.\nOutput:\n{}",
             stdout
         );
@@ -93,7 +93,7 @@ fn test_msrv_source_workspace_preserves_existing() {
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         assert!(
-            stdout.contains("status: no changes"),
+            stdout.contains("Dependencies are coherent."),
             "Should preserve the existing workspace rust-version without planning changes.\nOutput:\n{}",
             stdout
         );
@@ -283,7 +283,7 @@ msrv_policy = { mode = "compute", source = "workspace" }
         workspace.add_crate("a", "0.1.0", &[])?;
         workspace.commit("Add member crate")?;
 
-        let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(
             output.status.success(),
             "unify should succeed.\nStdout:\n{}\nStderr:\n{}",
@@ -318,7 +318,7 @@ msrv_policy = { mode = "compute", source = "workspace", inherit = true }
         workspace.add_crate("b", "0.1.0", &[])?;
         workspace.commit("Add member crates")?;
 
-        let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(
             output.status.success(),
             "unify should succeed.\nStdout:\n{}\nStderr:\n{}",

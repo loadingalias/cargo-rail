@@ -1,5 +1,43 @@
 # Benchmarking
 
+## Planner qualification
+
+`just bench-plan-smoke` builds `cargo-rail` from the current source in an isolated target directory, then runs one
+sample in each planner lane. The retained `results.json` binds HEAD, the index and non-ignored worktree, the candidate
+and harness digests, the toolchain, the host, every raw sample, and the consumer-reader measurement. A smoke result has
+`status = "completed_unqualified"`; it checks the harness but does not qualify latency.
+
+Run the 20-sample qualification only on a quiet pinned machine:
+
+```bash
+just bench-plan 20
+```
+
+Results default to `target/benchmarks/plan/<UTC timestamp>/results.json`. The harness writes
+`status = "incomplete"` before it builds or measures anything. It persists each accepted sample before checking the
+budgets, then seals the result as `qualified`, `completed_unqualified`, or `failed`. A failed result retains
+`failure_reason`; do not delete it before diagnosing a missed bound.
+
+An external candidate is a separate comparison mode. It requires a provenance sidecar and never represents the
+current checkout implicitly:
+
+```json
+{
+  "schema_version": 1,
+  "source_identity": "sha256:<64 lowercase hexadecimal digits>",
+  "binary_sha256": "<64 lowercase hexadecimal digits>"
+}
+```
+
+```bash
+python3 scripts/bench/plan.py smoke \
+  --candidate /path/to/cargo-rail \
+  --candidate-provenance /path/to/provenance.json
+```
+
+The harness verifies the binary digest before creating fixtures or collecting samples. Keep any additional provenance
+fields in the sidecar; the result retains the sidecar path and digest with the declared immutable source identity.
+
 ## Source-surface analysis
 
 Compare `cargo rail surface` and Hawk with the same source commit, compiler identity, production products, feature

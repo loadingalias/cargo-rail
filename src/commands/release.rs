@@ -74,6 +74,8 @@ pub struct ReleaseFinalizeOptions {
     pub include_dependents: bool,
     /// Confirm the irreversible release effects without an interactive prompt.
     pub yes: bool,
+    /// Authorize finalization from a non-default branch.
+    pub allow_non_default_branch: bool,
     /// Select human-readable or machine-readable output.
     pub format: TextJsonOutputFormat,
 }
@@ -92,9 +94,6 @@ pub fn run_release_plan(
     let json = format.is_json();
 
     // JSON mode enables structured error output and suppresses progress
-    if json {
-        crate::output::set_json_mode(true);
-    }
 
     let bump_request = bump.parse::<BumpRequest>()?;
 
@@ -201,6 +200,8 @@ pub struct ReleasePublishArgs {
     pub include_dependents: bool,
     /// Skip interactive confirmation prompts.
     pub yes: bool,
+    /// Authorize release execution from a non-default branch.
+    pub allow_non_default_branch: bool,
     /// Apply using a previously generated mutation plan.
     pub plan_path: Option<std::path::PathBuf>,
     /// Output format.
@@ -211,9 +212,6 @@ pub struct ReleasePublishArgs {
 pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> RailResult<()> {
     ctx.snapshot()?;
     let json = args.format.is_json();
-    if json {
-        crate::output::set_json_mode(true);
-    }
 
     let config = ctx.config().map(|c| &c.release);
     let release_config =
@@ -269,8 +267,7 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
     let effective_skip_tag = args.skip_tag || args.pr;
     validator.validate(&target_crates, false)?;
 
-    // Validate branch state (detached HEAD = error, non-default branch = error unless --yes)
-    if let Some(warning) = validator.validate_branch(args.yes)? {
+    if let Some(warning) = validator.validate_branch(args.allow_non_default_branch)? {
         if json {
             warnings.push(warning);
         } else {
@@ -294,7 +291,7 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
         if !from_file.operation_id.starts_with("release-") {
             return Err(RailError::with_help(
                 format!("plan '{}' is not a release plan", path.display()),
-                "generate a release plan using 'cargo rail release run --check --json'".to_string(),
+                "generate a release plan using 'cargo rail release check --json'".to_string(),
             ));
         }
         mutation::validate_pre_apply_with_allowed_paths(ctx, &from_file, std::slice::from_ref(path))?;
@@ -344,7 +341,7 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
             println!("  - publish to crates.io (irreversible)");
         }
 
-        if !crate::utils::prompt_for_confirmation("\nproceed? [Enter/Ctrl+C]")? {
+        if !crate::utils::prompt_for_confirmation()? {
             println!("cancelled");
             return Ok(());
         }
@@ -438,9 +435,6 @@ pub fn run_release_publication_check(
     let json = format.is_json();
 
     // JSON mode enables structured error output and suppresses progress
-    if json {
-        crate::output::set_json_mode(true);
-    }
 
     let config = ctx.config().map(|c| &c.release);
     let release_config =
@@ -781,13 +775,11 @@ pub fn run_release_finalize(ctx: &WorkspaceContext, options: ReleaseFinalizeOpti
         skip_tag,
         include_dependents,
         yes,
+        allow_non_default_branch,
         format,
     } = options;
     ctx.snapshot()?;
     let json = format.is_json();
-    if json {
-        crate::output::set_json_mode(true);
-    }
 
     let release_config = ctx
         .config()
@@ -819,7 +811,7 @@ pub fn run_release_finalize(ctx: &WorkspaceContext, options: ReleaseFinalizeOpti
     let target_crates = plan.canonical_crate_order.clone();
     let validator = ReleaseValidator::new(ctx);
     validator.validate(&target_crates, true)?;
-    if let Some(warning) = validator.validate_branch(yes)? {
+    if let Some(warning) = validator.validate_branch(allow_non_default_branch)? {
         if json {
             warnings.push(warning);
         } else {
@@ -832,6 +824,10 @@ pub fn run_release_finalize(ctx: &WorkspaceContext, options: ReleaseFinalizeOpti
     }
 
     enforce_safety_gate("release finalize", yes, None, io::stdin().is_terminal() && !json)?;
+    if !yes && io::stdin().is_terminal() && !json && !crate::utils::prompt_for_confirmation()? {
+        println!("cancelled");
+        return Ok(());
+    }
     let publisher = ReleasePublisher::new(ctx, release_config);
     let generated_transaction_id =
         build_release_mutation_plan(ctx, &plan, skip_publish, skip_tag, false, release_config)?.operation_id;
@@ -926,6 +922,7 @@ fn registry_publication_skipped(publish: bool, release_config: &crate::config::R
 pub fn run_release_status_standalone(
     workspace_root: &Path,
     state_path: Option<&Path>,
+    history: bool,
     format: TextJsonOutputFormat,
 ) -> RailResult<()> {
     let requested_transaction = state_path
@@ -992,8 +989,12 @@ pub fn run_release_status_standalone(
         ));
     }
 
+    reports.sort_by(|left, right| left.transaction_id.cmp(&right.transaction_id));
+    if state_path.is_none() && !history {
+        reports.retain(|report| report.recoverability != "terminal" || report.ambiguity);
+    }
+
     if format.is_json() {
-        crate::output::set_json_mode(true);
         let payload = serde_json::json!({ "transactions": reports });
         let output = crate::output::machine_json_envelope("release", "status", "success", 0, payload);
         println!("{}", serde_json::to_string_pretty(&output)?);
@@ -1001,7 +1002,7 @@ pub fn run_release_status_standalone(
     }
 
     if reports.is_empty() {
-        println!("no release transactions");
+        println!("No active or actionable release transactions.");
         return Ok(());
     }
     for (index, report) in reports.iter().enumerate() {
@@ -1009,17 +1010,23 @@ pub fn run_release_status_standalone(
             println!();
         }
         println!("{}  {}", report.transaction_id, report.state);
-        println!("  exact SHA: {}", report.exact_sha.as_deref().unwrap_or("not prepared"));
-        println!("  completed: {}", report.completed_effect.as_deref().unwrap_or("none"));
-        println!("  next: {}", report.next_effect.as_deref().unwrap_or("none"));
-        if report.observations.is_empty() {
-            println!("  observations: none");
-        } else {
-            println!("  observations: {}", report.observations.join(", "));
+        println!(
+            "  Last completed effect: {}",
+            report.completed_effect.as_deref().unwrap_or("none")
+        );
+        println!("  Next effect: {}", report.next_effect.as_deref().unwrap_or("none"));
+        println!("  Ambiguous: {}", if report.ambiguity { "yes" } else { "no" });
+        println!("  Action: {}", report.safe_operator_command);
+        if crate::output::is_verbose() {
+            println!("  Exact SHA: {}", report.exact_sha.as_deref().unwrap_or("not prepared"));
+            println!("  Recoverability: {}", report.recoverability);
+            if let Some(journal) = &report.journal {
+                println!("  Journal: {}", journal.display());
+            }
+            if !report.observations.is_empty() {
+                println!("  Observations: {}", report.observations.join(", "));
+            }
         }
-        println!("  ambiguity: {}", report.ambiguity);
-        println!("  recoverability: {}", report.recoverability);
-        println!("  safe command: {}", report.safe_operator_command);
     }
     Ok(())
 }
@@ -1049,53 +1056,57 @@ fn release_status_report(state: ReleaseState, path: PathBuf) -> ReleaseStatusRep
     };
     for crate_state in &state.crates {
         record(
-            format!("commit:{}", crate_state.name),
+            format!("local preparation commit for {}", crate_state.name),
             crate_state.commit.status,
             crate_state.commit.object.as_deref(),
         );
     }
     record(
-        "push_commit".to_string(),
+        "remote Git commit push".to_string(),
         state.commit_push.status,
         state.commit_push.object.as_deref(),
     );
     record(
-        "exact_sha_checks".to_string(),
+        "remote exact-SHA readiness validation".to_string(),
         state.readiness.status,
         state.readiness.object.as_deref(),
     );
     for crate_state in &state.crates {
         record(
-            format!("publish:{}", crate_state.name),
+            format!("irreversible registry publication for {}", crate_state.name),
             crate_state.publication.status,
             crate_state.publication.object.as_deref(),
         );
     }
     for crate_state in &state.crates {
         record(
-            format!("tag:{}", crate_state.name),
+            format!("local Git tag for {}", crate_state.name),
             crate_state.tag.status,
             crate_state.tag.object.as_deref(),
         );
     }
     record(
-        "push_tags".to_string(),
+        "remote Git tag push".to_string(),
         state.tag_push.status,
         state.tag_push.object.as_deref(),
     );
     for crate_state in &state.crates {
         record(
-            format!("forge_create:{}", crate_state.name),
+            format!("remote forge draft for {}", crate_state.name),
             crate_state.forge_draft.status,
             crate_state.forge_draft.object.as_deref(),
         );
         record(
-            format!("forge_release:{}", crate_state.name),
+            format!("remote forge publication for {}", crate_state.name),
             crate_state.forge_publication.status,
             crate_state.forge_publication.object.as_deref(),
         );
     }
-    record("abort".to_string(), state.abort.status, state.abort.object.as_deref());
+    record(
+        "local release restoration".to_string(),
+        state.abort.status,
+        state.abort.object.as_deref(),
+    );
 
     let abort_in_progress = state.abort.status == StepStatus::InProgress;
     if state.status == ReleaseStatus::Aborted {
@@ -1110,7 +1121,10 @@ fn release_status_report(state: ReleaseState, path: PathBuf) -> ReleaseStatusRep
             if ambiguity { "reconcile" } else { "resumable" }.to_string(),
             format!("cargo rail release resume {}", path.display()),
         ),
-        ReleaseStatus::Complete | ReleaseStatus::Aborted => ("terminal".to_string(), "cargo rail clean".to_string()),
+        ReleaseStatus::Complete | ReleaseStatus::Aborted => (
+            "terminal".to_string(),
+            format!("cargo rail clean --release-journal {}", state.transaction_id),
+        ),
     };
     ReleaseStatusReport {
         transaction_id: state.transaction_id,
@@ -1151,7 +1165,7 @@ fn reconstructed_status_report(workspace_root: &Path, transaction: GitReleaseTra
         ),
     };
     let safe_operator_command = if terminal {
-        "cargo rail clean".to_string()
+        "none (transaction is terminal; no release journal exists)".to_string()
     } else if prepare && !ambiguous {
         format!(
             "cargo rail release finalize {} --yes",
@@ -1832,6 +1846,10 @@ pub fn run_release_resume(ctx: &WorkspaceContext, state: &std::path::Path) -> Ra
 /// Abort an active release before any external side effect has occurred.
 pub fn run_release_abort(ctx: &WorkspaceContext, state: &std::path::Path, yes: bool) -> RailResult<()> {
     enforce_safety_gate("release abort", yes, None, io::stdin().is_terminal())?;
+    if !yes && io::stdin().is_terminal() && !crate::utils::prompt_for_confirmation()? {
+        println!("cancelled");
+        return Ok(());
+    }
     let release_config = ctx
         .config()
         .as_ref()

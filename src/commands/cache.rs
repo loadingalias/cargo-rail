@@ -13,9 +13,6 @@ pub(crate) fn run_normalize(
     environment: Vec<String>,
     format: TextJsonOutputFormat,
 ) -> RailResult<()> {
-    if format.is_json() {
-        crate::output::set_json_mode(true);
-    }
     let selection = crate::remote_cache::RemoteCacheSelection::parse(remote_url, mode, &environment)
         .map_err(|error| RailError::message(format!("remote cache URL is invalid: {error}")))?;
     let status = crate::remote_cache::RemoteCacheConfigurationStatus::from_selection(&selection);
@@ -32,16 +29,14 @@ pub(crate) fn run_normalize(
         );
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
-        println!("remote compiler cache authority");
-        println!("  normalized URL: {}", selection.normalized_url());
-        println!("  provider: {}", status.provider);
-        println!("  protocol: {}", status.protocol);
-        println!("  authority: {}", status.authority);
-        println!("  mode: {}", status.mode);
-        println!(
-            "  shared compiler environment names: {}",
-            status.shared_environment_names
-        );
+        println!("Normalized remote cache URL: {}", selection.normalized_url());
+        if crate::output::is_verbose() {
+            println!(
+                "Provider: {}; protocol: {}; mode: {}",
+                status.provider, status.protocol, status.mode
+            );
+            println!("Shared compiler environments: {}", status.shared_environment_names);
+        }
     }
     Ok(())
 }
@@ -53,10 +48,24 @@ pub(crate) fn run_setup(
     check: bool,
     format: TextJsonOutputFormat,
 ) -> RailResult<()> {
-    if format.is_json() {
-        crate::output::set_json_mode(true);
+    if check && request == crate::cache::installation::SetupRequest::default() {
+        let status = crate::cache::installation::status(current_dir)?;
+        if status.healthy && status.state == "installed" {
+            let details = serde_json::json!({
+              "changed": false,
+              "config_path": status.config_path,
+              "config_field": "build.rustc-wrapper",
+              "config_action": "unchanged",
+              "wrapper_path": status.wrapper_path,
+              "receipt_path": null,
+              "private_state_action": "verify",
+              "cache_base": status.cache_base,
+            });
+            return render_installation_operation("setup_check", false, &details, format);
+        }
     }
-    let plan = crate::cache::installation::plan_setup(current_dir, &request)?;
+    let plan = crate::cache::installation::plan_setup(current_dir, &request)
+        .map_err(|error| cache_setup_source_error(current_dir, error))?;
     let pending = plan.pending();
     let receipt_path = plan.receipt_path()?;
     let remote = plan
@@ -90,11 +99,27 @@ pub(crate) fn run_setup(
     render_installation_operation("setup", false, &details, format)
 }
 
+fn cache_setup_source_error(current_dir: &Path, error: RailError) -> RailError {
+    if !error
+        .to_string()
+        .contains("compiler cache worker executable is unavailable")
+    {
+        return error;
+    }
+    let source_checkout = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.canonicalize().ok())
+        .zip(current_dir.canonicalize().ok())
+        .is_some_and(|(executable, root)| executable.starts_with(root.join("target")));
+    if source_checkout {
+        error.context("run `just build-all`, then rerun `cargo rail cache setup --check`")
+    } else {
+        error.context("reinstall the complete cargo-rail component set, then rerun `cargo rail cache setup --check`")
+    }
+}
+
 /// Preview or apply removal of the exact receipt-owned installation.
 pub(crate) fn run_remove(current_dir: &Path, check: bool, format: TextJsonOutputFormat) -> RailResult<()> {
-    if format.is_json() {
-        crate::output::set_json_mode(true);
-    }
     let plan = crate::cache::installation::plan_removal(current_dir)?;
     let pending = plan.pending();
     let details = serde_json::json!({
@@ -125,6 +150,7 @@ fn render_installation_operation(
     details: &serde_json::Value,
     format: TextJsonOutputFormat,
 ) -> RailResult<()> {
+    let changed = details["changed"].as_bool().unwrap_or(false);
     if format.is_json() {
         let mut payload = details.clone();
         payload["pending"] = serde_json::Value::Bool(pending);
@@ -137,41 +163,29 @@ fn render_installation_operation(
         );
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
-        println!("transparent compiler cache {operation}");
-        println!(
-            "  Cargo config: {}",
-            details["config_path"].as_str().unwrap_or("unknown")
-        );
-        println!(
-            "  Cargo field: {} ({})",
-            details["config_field"].as_str().unwrap_or("build.rustc-wrapper"),
-            details["config_action"].as_str().unwrap_or("unknown")
-        );
-        if let Some(wrapper) = details["wrapper_path"].as_str() {
-            println!("  wrapper: {wrapper}");
+        match (operation, pending, changed) {
+            ("setup_check", true, _) => {
+                println!("Cache setup pending.");
+                println!("Next: cargo rail cache setup");
+            }
+            ("setup_check", false, _) | ("setup", false, false) => println!("Cache already configured."),
+            ("setup", false, true) => println!("Cache repaired."),
+            ("remove_check", true, _) => {
+                println!("Cache removal pending.");
+                println!("Next: cargo rail cache remove");
+            }
+            ("remove_check", false, _) | ("remove", false, false) => println!("Cache already removed."),
+            ("remove", false, true) => println!("Cache removed."),
+            _ => println!("Cache operation complete."),
         }
-        if let Some(cache) = details["cache_base"].as_str() {
-            println!("  local cache base: {cache}");
-        }
-        if let Some(root_portability) = details["root_portability"].as_str() {
-            println!("  root portability: {root_portability}");
-        }
-        if let Some(distributed) = details["distributed"].as_str() {
-            println!("  distributed mode: {distributed}");
-        }
-        if let Some(policy) = details["distributed_policy"].as_str() {
-            println!("  distributed placement: {policy}");
-        }
-        if let Some(receipt) = details["receipt_path"].as_str() {
-            println!("  setup receipt: {receipt}");
-        }
-        if let Some(action) = details["private_state_action"].as_str() {
-            println!("  private state: {action}");
-        }
-        if pending {
-            println!("  changes pending");
-        } else {
-            println!("  no pending changes");
+        if crate::output::is_verbose() {
+            println!("Cargo config: {}", details["config_path"].as_str().unwrap_or("unknown"));
+            if let Some(wrapper) = details["wrapper_path"].as_str() {
+                println!("Wrapper: {wrapper}");
+            }
+            if let Some(receipt) = details["receipt_path"].as_str() {
+                println!("Receipt: {receipt}");
+            }
         }
     }
     Ok(())
@@ -179,9 +193,6 @@ fn render_installation_operation(
 
 /// Report selected cache scopes without creating workspace context or cache state.
 pub(crate) fn run_status(workspace_root: &Path, scope: CacheScope, format: TextJsonOutputFormat) -> RailResult<()> {
-    if format.is_json() {
-        crate::output::set_json_mode(true);
-    }
     let status = crate::cache::status(workspace_root, scope.includes_workspace(), scope.includes_local())?;
     if format.is_json() {
         let output = crate::output::machine_json_envelope(
@@ -200,9 +211,6 @@ pub(crate) fn run_status(workspace_root: &Path, scope: CacheScope, format: TextJ
 
 /// Preview or apply byte-preserving recovery of one selected markerless CAS.
 pub(crate) fn run_recover(workspace_root: &Path, check: bool, format: TextJsonOutputFormat) -> RailResult<()> {
-    if format.is_json() {
-        crate::output::set_json_mode(true);
-    }
     let plan = if check {
         crate::cache::installation::plan_local_cache_recovery(workspace_root)?
     } else {
@@ -229,7 +237,7 @@ pub(crate) fn run_recover(workspace_root: &Path, check: bool, format: TextJsonOu
         }
         println!("  selected root: {}", plan.selected_root);
         println!("  quarantine: {}", plan.quarantine_root);
-        println!("  retained bytes: {}", plan.bytes);
+        println!("  retained: {}", human_bytes(plan.bytes));
         println!("  receipt: {}", plan.receipt_path);
     } else {
         println!("local CAS recovery not required");
@@ -248,9 +256,6 @@ pub(crate) fn run_clean(
     check: bool,
     format: TextJsonOutputFormat,
 ) -> RailResult<()> {
-    if format.is_json() {
-        crate::output::set_json_mode(true);
-    }
     if check {
         let status = crate::cache::status(workspace_root, scope.includes_workspace(), scope.includes_local())?;
         let pending = has_state(&status);
@@ -312,10 +317,15 @@ pub(crate) fn run_clean(
         println!("nothing to reclaim");
     } else {
         println!(
-            "reclaimed {} bytes from {} cache path(s)",
-            removal.bytes,
+            "Reclaimed {} from {} cache path(s).",
+            human_bytes(removal.bytes),
             removal.paths.len()
         );
+        if crate::output::is_verbose() {
+            for path in &removal.paths {
+                println!("  {path}");
+            }
+        }
     }
     Ok(())
 }
@@ -344,123 +354,111 @@ fn total_bytes(status: &CacheStatus) -> u64 {
 }
 
 fn render_status(status: &CacheStatus) {
-    println!("cache status");
-    println!("  transparent compiler reuse");
-    println!("    state: {}", status.installation.state);
-    println!("    healthy: {}", status.installation.healthy);
-    println!("    Cargo home: {}", status.installation.cargo_home);
-    println!("    Cargo config: {}", status.installation.config_path);
-    if let Some(wrapper) = &status.installation.wrapper_path {
-        println!("    wrapper: {wrapper}");
-    }
-    if let Some(cache) = &status.installation.cache_base {
-        println!("    local cache base: {cache}");
-    }
-    if let Some(root_portability) = status.installation.root_portability {
-        println!("    root portability: {root_portability}");
-    }
-    if let Some(distributed) = status.installation.distributed {
-        println!("    distributed mode: {distributed}");
-    }
-    if let Some(policy) = status.installation.distributed_policy {
-        println!("    distributed placement: {policy}");
-    }
-    if let Some(history) = &status.installation.distributed_placement_history {
-        println!(
-            "    distributed history: {} classes, {} local / {} remote observations, {} active backoffs",
-            history.classes, history.local_observations, history.remote_observations, history.active_backoffs
-        );
-    }
-    println!("    Cargo L0: {}", status.installation.cargo_l0);
     println!(
-        "    observed L1: {} hits / {} misses / {} bypasses / {} failures",
+        "Installation: {} ({})",
+        if status.installation.healthy {
+            "healthy"
+        } else {
+            "unhealthy"
+        },
+        status.installation.state
+    );
+    println!(
+        "Reuse: {} hits, {} misses, {} bypasses, {} failures",
         status.installation.usage.hits,
         status.installation.usage.misses,
         status.installation.usage.bypasses,
         status.installation.usage.failures
     );
+    for issue in &status.installation.issues {
+        println!("Warning: {issue}");
+    }
+    if let Some(workspace) = &status.workspace {
+        println!(
+            "Workspace: {} in {} file(s)",
+            human_bytes(workspace.bytes),
+            workspace.files
+        );
+    }
+    if let Some(local) = &status.local {
+        if let Some(cache) = &local.cache {
+            println!(
+                "Local cache: {} / {} ({} results, {} objects)",
+                human_bytes(cache.bytes),
+                human_bytes(cache.max_bytes),
+                cache.results,
+                cache.objects
+            );
+        } else {
+            println!("Local cache: absent");
+        }
+    }
+    if crate::output::is_verbose() {
+        render_verbose_status(status);
+    }
+}
+
+fn render_verbose_status(status: &CacheStatus) {
+    println!("Cargo home: {}", status.installation.cargo_home);
+    println!("Cargo config: {}", status.installation.config_path);
+    if let Some(wrapper) = &status.installation.wrapper_path {
+        println!("Wrapper: {wrapper}");
+    }
     println!(
-        "    usage ledger: {} events (full: {})",
+        "Usage ledger: {} event(s); full={}",
         status.installation.usage.recorded_events, status.installation.usage.ledger_full
     );
     println!(
-        "    early bypass ledger: {} events (full: {}; incomplete tail: {})",
+        "Early bypass ledger: {} event(s); full={}; incomplete_tail={}",
         status.installation.usage.early_bypasses,
         status.installation.usage.early_bypass_ledger_full,
         status.installation.usage.early_bypass_incomplete_tail
     );
     for (reason, count) in &status.installation.usage.early_bypass_reasons {
-        println!("      {reason}: {count}");
-    }
-    for issue in &status.installation.issues {
-        println!("    issue: {issue}");
+        println!("  bypass {reason}: {count}");
     }
     if let Some(workspace) = &status.workspace {
-        println!("  workspace");
-        println!("    root: {}", workspace.root);
-        println!("    bytes: {}", workspace.bytes);
-        println!("    files: {}", workspace.files);
-        println!("    directories: {}", workspace.directories);
-        println!("    fully bounded: {}", workspace.fully_bounded);
+        println!("Workspace root: {}", workspace.root);
         for artifact in &workspace.artifacts {
-            let bound = artifact
-                .max_bytes
-                .map_or_else(|| "unbounded".to_string(), |bytes| bytes.to_string());
             println!(
-                "    {}: {} bytes (bound: {}, path: {})",
-                artifact.kind, artifact.bytes, bound, artifact.path
+                "  {}: {} at {}",
+                artifact.kind,
+                human_bytes(artifact.bytes),
+                artifact.path
             );
         }
     }
-    if let Some(local) = &status.local {
-        println!("  local (shared across workspaces)");
-        if let Some(cache) = &local.cache {
-            println!("    root: {}", cache.root);
-            println!("    trust domain: {}", cache.trust_domain);
-            println!("    bytes: {} / {}", cache.bytes, cache.max_bytes);
-            println!("    committed result bytes: {}", cache.committed_result_bytes);
-            println!("    results: {}", cache.results);
-            println!("    objects: {}", cache.objects);
-            println!("    pins: {}", cache.pins);
-            println!(
-                "    native actions: {} ({} unique, {} conflicted, {} quarantined)",
-                cache.native_actions, cache.native_unique, cache.native_conflicted, cache.native_quarantined
-            );
-            println!(
-                "    native origins: {} local / {} remote",
-                cache.native_local_origins, cache.native_remote_origins
-            );
-            println!(
-                "    native terminal ledger: {} / {} bytes (disabled: {})",
-                cache.native_ledger_bytes, cache.native_ledger_max_bytes, cache.native_ledger_disabled
-            );
-            println!("    active leases: {}", cache.active_leases);
-            println!("    stale leases: {}", cache.stale_leases);
-            println!(
-                "    staging: {} entries / {} bytes",
-                cache.staging_entries, cache.staging_bytes
-            );
-            println!("    reclaimable bytes: {}", cache.reclaimable_bytes);
-            if let Some(oldest) = cache.oldest_used_unix_ms {
-                println!("    oldest use (unix ms): {oldest}");
-            }
-            if let Some(newest) = cache.newest_used_unix_ms {
-                println!("    newest use (unix ms): {newest}");
-            }
-        } else {
-            println!("    current authority root: absent");
-        }
+    if let Some(local) = &status.local
+        && let Some(cache) = &local.cache
+    {
+        println!("Local root: {}", cache.root);
+        println!("Trust domain: {}", cache.trust_domain);
+        println!(
+            "Native actions: {} ({} unique, {} conflicted, {} quarantined)",
+            cache.native_actions, cache.native_unique, cache.native_conflicted, cache.native_quarantined
+        );
+        println!("Leases: {} active, {} stale", cache.active_leases, cache.stale_leases);
+        println!("Reclaimable: {}", human_bytes(cache.reclaimable_bytes));
     }
     if let Some(remote) = &status.remote {
-        println!("  remote (machine-owned)");
-        println!("    activation: {}", remote.activation);
-        println!("    provider: {}", remote.provider);
-        println!("    protocol: {}", remote.protocol);
-        println!("    authority: {}", remote.authority);
-        println!("    mode: {}", remote.mode);
         println!(
-            "    shared compiler environment names: {}",
-            remote.shared_environment_names
+            "Remote: {} via {} ({}; {})",
+            remote.activation, remote.provider, remote.protocol, remote.mode
         );
+    }
+}
+
+pub(crate) fn human_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }

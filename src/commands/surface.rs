@@ -167,6 +167,10 @@ struct SurfaceReportFinding {
     level: SurfaceLintLevel,
     #[serde(skip_serializing_if = "Option::is_none")]
     policy_reason: Option<String>,
+    #[serde(skip)]
+    line: Option<usize>,
+    #[serde(skip)]
+    column: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -287,9 +291,6 @@ pub fn print_surface_schema() {
 
 /// Analyze the complete configured Rust source surface.
 pub fn run_surface(ctx: &WorkspaceContext, options: SurfaceOptions) -> RailResult<()> {
-    if options.format.is_json_like() {
-        crate::output::set_json_mode(true);
-    }
     let preparation_conflicts = options.prepare
         && (options.check
             || options.fix
@@ -1466,6 +1467,8 @@ fn apply_diagnostic_policy(analysis: &SurfaceAnalysis, config: &SurfaceConfig) -
                 finding: finding.clone(),
                 level,
                 policy_reason: reason,
+                line: None,
+                column: None,
             });
         }
     }
@@ -1630,6 +1633,7 @@ fn build_report(
         .collect();
     let products = report_products(config, &facts);
     let config_bytes = serde_json::to_vec(config)?;
+    let findings = locate_and_sort_findings(snapshot, findings)?;
     let reasons = used_reasons(&findings);
 
     Ok(SurfaceReport {
@@ -1803,6 +1807,61 @@ fn used_reasons(findings: &[SurfaceReportFinding]) -> Vec<SurfaceReason> {
         .collect()
 }
 
+fn locate_and_sort_findings(
+    snapshot: &WorkspaceSnapshot,
+    mut findings: Vec<SurfaceReportFinding>,
+) -> RailResult<Vec<SurfaceReportFinding>> {
+    let mut source_cache = BTreeMap::<String, Vec<u8>>::new();
+    for report_finding in &mut findings {
+        let finding = &report_finding.finding;
+        if finding.source_generated {
+            continue;
+        }
+        if !source_cache.contains_key(&finding.source) {
+            let path = RepositoryPath::new(Path::new(&finding.source))?;
+            let Some(bytes) = snapshot.read_source_file(&path)? else {
+                continue;
+            };
+            source_cache.insert(finding.source.clone(), bytes);
+        }
+        let bytes = source_cache
+            .get(&finding.source)
+            .expect("captured Surface source was inserted");
+        let offset = finding.visibility_start.unwrap_or(finding.declaration_start);
+        let (line, column) = source_location(bytes, offset)?;
+        report_finding.line = Some(line);
+        report_finding.column = Some(column);
+    }
+    findings.sort_by(|left, right| {
+        left.finding
+            .source
+            .cmp(&right.finding.source)
+            .then_with(|| left.line.cmp(&right.line))
+            .then_with(|| left.column.cmp(&right.column))
+            .then_with(|| lint_level_name(left.level).cmp(lint_level_name(right.level)))
+            .then_with(|| left.finding.kind.as_str().cmp(right.finding.kind.as_str()))
+            .then_with(|| left.finding.identity.cmp(&right.finding.identity))
+    });
+    Ok(findings)
+}
+
+fn source_location(bytes: &[u8], offset: u64) -> RailResult<(usize, usize)> {
+    let offset = usize::try_from(offset)
+        .ok()
+        .filter(|offset| *offset <= bytes.len())
+        .ok_or_else(|| RailError::message("surface diagnostic byte offset exceeds captured source"))?;
+    let prefix = std::str::from_utf8(&bytes[..offset])
+        .map_err(|_| RailError::message("surface diagnostic byte offset is not a UTF-8 boundary"))?;
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let column = prefix
+        .rsplit_once('\n')
+        .map_or(prefix, |(_, tail)| tail)
+        .chars()
+        .count()
+        + 1;
+    Ok((line, column))
+}
+
 fn render_report(
     report: &SurfaceReport,
     format: SurfaceOutputFormat,
@@ -1845,19 +1904,21 @@ fn render_report(
 fn render_text(report: &SurfaceReport, explain: bool) -> String {
     let mut output = String::new();
     if report.findings.is_empty() && report.configuration_diagnostics.is_empty() {
-        output.push_str("surface: clean\n");
+        output.push_str("Surface is clean.\n");
     } else {
-        output.push_str("surface: ");
+        output.push_str("Surface: ");
         output.push_str(&report.findings.len().to_string());
         output.push_str(" finding(s), ");
         output.push_str(&report.configuration_diagnostics.len().to_string());
         output.push_str(" configuration diagnostic(s)\n");
     }
-    output.push_str("snapshot: ");
-    output.push_str(&report.snapshot.identity);
-    output.push_str("\ncompiler fragments: ");
-    output.push_str(&report.completeness.fragments.to_string());
-    output.push('\n');
+    if crate::output::is_verbose() {
+        output.push_str("Snapshot: ");
+        output.push_str(&report.snapshot.identity);
+        output.push_str("\nCompiler fragments: ");
+        output.push_str(&report.completeness.fragments.to_string());
+        output.push('\n');
+    }
     if explain && !report.completeness.retention_reasons.is_empty() {
         let reasons = report
             .completeness
@@ -1872,27 +1933,36 @@ fn render_text(report: &SurfaceReport, explain: bool) -> String {
     }
     for report_finding in &report.findings {
         let finding = &report_finding.finding;
-        let package = finding.packages.first().map(String::as_str).unwrap_or("unknown");
-        let path = finding
+        let item = finding
             .diagnostic_paths
             .first()
             .map(String::as_str)
             .unwrap_or(&finding.name);
-        output.push_str(finding.kind.as_str());
-        output.push_str(" [");
-        output.push_str(lint_level_name(report_finding.level));
-        output.push_str("] ");
-        output.push_str(package);
-        output.push(' ');
-        output.push_str(path);
-        output.push_str(" at ");
         output.push_str(&finding.source);
         output.push(':');
         output.push_str(
-            &finding
-                .visibility_start
-                .map_or_else(|| "implicit".to_string(), |offset| offset.to_string()),
+            &report_finding
+                .line
+                .map_or_else(|| "?".to_string(), |line| line.to_string()),
         );
+        output.push(':');
+        output.push_str(
+            &report_finding
+                .column
+                .map_or_else(|| "?".to_string(), |column| column.to_string()),
+        );
+        output.push_str(": ");
+        output.push_str(lint_level_name(report_finding.level));
+        output.push('[');
+        output.push_str(finding.kind.as_str());
+        output.push_str("]: ");
+        output.push_str(finding.item_kind);
+        output.push(' ');
+        output.push_str(item);
+        if let Some(replacement) = finding.replacement {
+            output.push_str("; proposed visibility: ");
+            output.push_str(if replacement.is_empty() { "private" } else { replacement });
+        }
         output.push('\n');
         if explain {
             output.push_str("  reasons: ");
@@ -2000,6 +2070,13 @@ mod tests {
             !github.contains("\ncommit-hash:"),
             "embedded JSON must stay on one line"
         );
+    }
+
+    #[test]
+    fn source_locations_count_unicode_scalars_instead_of_utf8_bytes() {
+        let source = "fn α() { pub fn β() {} }\n";
+        let offset = source.find("pub").expect("visibility offset") as u64;
+        assert_eq!(source_location(source.as_bytes(), offset).unwrap(), (1, 10));
     }
 
     fn compiler_crate() -> SurfaceCompilerCrate {

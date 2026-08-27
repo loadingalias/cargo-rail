@@ -126,6 +126,39 @@ fn blocked_issue_lines(plan: &crate::cargo::UnificationPlan) -> Vec<String> {
         .collect()
 }
 
+fn changed_dependency_names(plan: &crate::cargo::UnificationPlan) -> Vec<String> {
+    let mut names = BTreeSet::new();
+    names.extend(plan.workspace_deps.iter().map(|dependency| dependency.name.to_string()));
+    names.extend(
+        plan.transitive_pins
+            .iter()
+            .map(|dependency| dependency.name.to_string()),
+    );
+    names.extend(
+        plan.unused_deps
+            .iter()
+            .map(|dependency| dependency.dep_name.to_string()),
+    );
+    names.extend(
+        plan.undeclared_features
+            .iter()
+            .map(|feature| feature.dep_name.to_string()),
+    );
+    for edit in plan.member_edits.values().flatten() {
+        match edit {
+            crate::cargo::MemberEdit::UseWorkspace { dep_name, .. }
+            | crate::cargo::MemberEdit::RemoveDep { dep_name, .. }
+            | crate::cargo::MemberEdit::AddFeatures { dep_name, .. } => {
+                names.insert(dep_name.to_string());
+            }
+            crate::cargo::MemberEdit::RemoveFeature { .. }
+            | crate::cargo::MemberEdit::EnforceMsrvInheritance
+            | crate::cargo::MemberEdit::InheritPackageField { .. } => {}
+        }
+    }
+    names.into_iter().collect()
+}
+
 fn write_compact_summary(
     sink: &mut UnifyTextSink,
     plan: &crate::cargo::UnificationPlan,
@@ -133,135 +166,46 @@ fn write_compact_summary(
     has_changes: bool,
     actions: &[MutationAction],
 ) {
-    outln!(sink, "unify");
-    outln!(sink);
-    outln!(sink, "changed:");
-
     let workspace_dep_names: Vec<String> = plan.workspace_deps.iter().map(|dep| dep.name.to_string()).collect();
-    if workspace_dep_names.is_empty()
+    let nothing_changed = workspace_dep_names.is_empty()
         && plan.member_edit_count() == 0
         && plan.transitive_pins.is_empty()
         && !msrv_write_needed
         && plan.pruned_features.is_empty()
-        && plan.unused_deps.is_empty()
-    {
-        outln!(sink, "  none");
-    } else {
-        if !workspace_dep_names.is_empty() {
-            outln!(
-                sink,
-                "  workspace deps ({}): {}",
-                workspace_dep_names.len(),
-                format_preview_list(&workspace_dep_names, 8)
-            );
-        }
-
-        let members_affected = plan.member_edits.len();
-        if plan.member_edit_count() > 0 {
-            outln!(
-                sink,
-                "  member edits: {} across {} crate(s)",
-                plan.member_edit_count(),
-                members_affected
-            );
-        }
-
-        let package_inheritance_edits = plan.package_inheritance_edit_count();
-        if package_inheritance_edits > 0 {
-            outln!(
-                sink,
-                "  package-field inheritance: {} declaration(s)",
-                package_inheritance_edits
-            );
-        }
-
-        if !plan.transitive_pins.is_empty() {
-            let pin_names: Vec<String> = plan.transitive_pins.iter().map(|pin| pin.name.to_string()).collect();
-            outln!(
-                sink,
-                "  transitive pins ({}): {}",
-                pin_names.len(),
-                format_preview_list(&pin_names, 8)
-            );
-        }
-
-        let undeclared_fix_count: usize = plan
-            .member_edits
-            .values()
-            .flat_map(|edits| edits.iter())
-            .filter_map(|edit| match edit {
-                crate::cargo::MemberEdit::AddFeatures { features_to_add, .. } => Some(features_to_add.len()),
-                _ => None,
-            })
-            .sum();
-        if undeclared_fix_count > 0 {
-            let crates_fixed = plan
-                .member_edits
-                .values()
-                .filter(|edits| {
-                    edits
-                        .iter()
-                        .any(|edit| matches!(edit, crate::cargo::MemberEdit::AddFeatures { .. }))
-                })
-                .count();
-            outln!(
-                sink,
-                "  undeclared-feature fixes: {} feature(s) across {} crate(s)",
-                undeclared_fix_count,
-                crates_fixed
-            );
-        }
-
-        if !plan.unused_deps.is_empty() {
-            outln!(sink, "  unused deps removed: {}", plan.unused_deps.len());
-        }
-        if !plan.pruned_features.is_empty() {
-            outln!(sink, "  dead features pruned: {}", plan.pruned_features.len());
-        }
-        if msrv_write_needed && let Some(msrv) = plan.computed_msrv.as_ref() {
-            outln!(
-                sink,
-                "  rust-version: {}.{}.{}",
-                msrv.version.major,
-                msrv.version.minor,
-                msrv.version.patch
-            );
-        }
-    }
-
-    outln!(sink);
-    outln!(sink, "will mutate:");
-    let targets = mutation_targets(actions);
-    if targets.is_empty() {
-        outln!(sink, "  none");
-    } else {
-        outln!(sink, "  {}", format_preview_list(&targets, 8));
-    }
-
-    outln!(sink);
-    outln!(sink, "blocked:");
+        && plan.unused_deps.is_empty();
     let blocked = blocked_issue_lines(plan);
-    if blocked.is_empty() {
-        outln!(sink, "  none");
-    } else {
+    if !blocked.is_empty() {
+        outln!(sink, "Blocked:");
         for line in blocked.iter().take(5) {
             outln!(sink, "  {}", line);
         }
         if blocked.len() > 5 {
             outln!(sink, "  ... +{} more", blocked.len() - 5);
         }
-    }
-
-    outln!(sink);
-    outln!(sink, "next:");
-    if !blocked.is_empty() {
-        outln!(sink, "  cargo rail unify --check --explain");
-    } else if has_changes {
-        outln!(sink, "  cargo rail unify");
-        outln!(sink, "  cargo rail unify --check --show-diff");
-        outln!(sink, "  cargo rail unify --check --explain");
+        outln!(sink, "Next: cargo rail unify --explain");
+    } else if has_changes && !nothing_changed {
+        let root_manifest_changed = !workspace_dep_names.is_empty()
+            || !plan.transitive_pins.is_empty()
+            || msrv_write_needed
+            || plan.package_inheritance_edit_count() > 0;
+        let manifests = plan.member_edits.len() + usize::from(root_manifest_changed);
+        let dependency_names = changed_dependency_names(plan);
+        outln!(sink, "Pending: {manifests} manifest(s).");
+        if !dependency_names.is_empty() {
+            outln!(sink, "Dependencies: {}", format_preview_list(&dependency_names, 8));
+        }
+        if crate::output::is_verbose() {
+            let targets = mutation_targets(actions);
+            outln!(
+                sink,
+                "Mutation paths ({}): {}",
+                targets.len(),
+                format_preview_list(&targets, 8)
+            );
+        }
+        outln!(sink, "Next: cargo rail unify apply");
     } else {
-        outln!(sink, "  cargo rail unify --check --explain");
+        outln!(sink, "Dependencies are coherent.");
     }
 }
 
@@ -865,7 +809,6 @@ pub fn run_unify_doctor(ctx: &WorkspaceContext, format: UnifyOutputFormat) -> Ra
     };
 
     if format.is_json() {
-        crate::output::set_json_mode(true);
         let value = crate::output::machine_json_envelope(
             "unify",
             "doctor",
@@ -938,6 +881,7 @@ pub fn run_unify_doctor(ctx: &WorkspaceContext, format: UnifyOutputFormat) -> Ra
 #[derive(Debug)]
 #[doc(hidden)]
 pub struct UnifyAnalyzeOptions<'a> {
+    pub(crate) check: bool,
     pub(crate) show_diff: bool,
     pub(crate) explain: bool,
     pub(crate) format: UnifyOutputFormat,
@@ -950,6 +894,7 @@ pub struct UnifyAnalyzeOptions<'a> {
 /// Analyze workspace dependencies (check mode)
 pub fn run_unify_analyze(ctx: &WorkspaceContext, options: UnifyAnalyzeOptions<'_>) -> RailResult<()> {
     let UnifyAnalyzeOptions {
+        check,
         show_diff,
         explain,
         format,
@@ -962,9 +907,6 @@ pub fn run_unify_analyze(ctx: &WorkspaceContext, options: UnifyAnalyzeOptions<'_
     let json = format.is_json();
 
     // JSON mode enables structured error output and suppresses progress
-    if json {
-        crate::output::set_json_mode(true);
-    }
 
     // Create analyzer (config comes from rail.toml via ctx)
     let analyzer = UnifyAnalyzer::new(ctx)?;
@@ -1079,7 +1021,7 @@ pub fn run_unify_analyze(ctx: &WorkspaceContext, options: UnifyAnalyzeOptions<'_
 
         let exit_code = if plan.has_blocking_issues() {
             2
-        } else if has_changes {
+        } else if has_changes && check {
             1
         } else {
             0
@@ -1091,7 +1033,13 @@ pub fn run_unify_analyze(ctx: &WorkspaceContext, options: UnifyAnalyzeOptions<'_
         } else {
             "success"
         };
-        let output_json = crate::output::machine_json_envelope("unify", "check", result, exit_code, payload);
+        let output_json = crate::output::machine_json_envelope(
+            "unify",
+            if check { "check" } else { "preview" },
+            result,
+            exit_code,
+            payload,
+        );
         let rendered =
             serde_json::to_string_pretty(&output_json).map_err(|e| RailError::message(format!("JSON error: {}", e)))?;
         write_output(&rendered, output)?;
@@ -1099,7 +1047,7 @@ pub fn run_unify_analyze(ctx: &WorkspaceContext, options: UnifyAnalyzeOptions<'_
         if plan.has_blocking_issues() {
             return Err(RailError::message("blocking issues prevent unification"));
         }
-        if has_changes {
+        if has_changes && check {
             return Err(RailError::CheckHasPendingChanges);
         }
         return Ok(());
@@ -1249,14 +1197,11 @@ pub fn run_unify_analyze(ctx: &WorkspaceContext, options: UnifyAnalyzeOptions<'_
             write_output(&content, output)?;
         }
         return Err(RailError::message("blocking issues prevent unification"));
-    } else if has_changes {
+    } else if has_changes && check {
         if let Some(content) = sink.finish() {
             write_output(&content, output)?;
         }
         return Err(RailError::CheckHasPendingChanges);
-    } else {
-        outln!(sink);
-        outln!(sink, "status: no changes");
     }
 
     if let Some(content) = sink.finish() {
@@ -1868,9 +1813,6 @@ pub fn run_unify_apply(
     use std::path::PathBuf;
 
     let json = format.is_json();
-    if json {
-        crate::output::set_json_mode(true);
-    }
 
     // Create analyzer (config comes from rail.toml via ctx)
     let analyzer = UnifyAnalyzer::new(ctx)?;
@@ -2322,13 +2264,37 @@ pub fn run_unify_apply(
 }
 
 /// Restore a previous state from backup
-pub fn run_unify_undo(workspace_root: &std::path::Path, list: bool, backup_id: Option<String>) -> RailResult<()> {
+pub fn run_unify_undo(
+    workspace_root: &std::path::Path,
+    list: bool,
+    backup_id: Option<String>,
+    format: crate::commands::common::TextJsonOutputFormat,
+) -> RailResult<()> {
     use crate::backup::BackupManager;
 
     let backup_manager = BackupManager::new(workspace_root);
 
     if list {
         let backups = backup_manager.list_backups()?;
+
+        if format.is_json() {
+            let output = crate::output::machine_json_envelope(
+                "unify",
+                "undo_list",
+                "success",
+                0,
+                serde_json::json!({
+                    "backups": backups.iter().enumerate().map(|(index, backup)| serde_json::json!({
+                        "id": backup.id,
+                        "latest": index == 0,
+                        "timestamp": backup.metadata.timestamp,
+                        "files": backup.metadata.files_modified,
+                    })).collect::<Vec<_>>(),
+                }),
+            );
+            println!("{}", serde_json::to_string_pretty(&output)?);
+            return Ok(());
+        }
 
         if backups.is_empty() {
             println!("no backups found");
@@ -2362,6 +2328,19 @@ pub fn run_unify_undo(workspace_root: &std::path::Path, list: bool, backup_id: O
     };
 
     backup_manager.restore_backup(&target_backup_id)?;
+
+    if format.is_json() {
+        let output = crate::output::machine_json_envelope(
+            "unify",
+            "undo",
+            "restored",
+            0,
+            serde_json::json!({ "backup_id": target_backup_id }),
+        );
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("Restored backup {target_backup_id}.");
+    }
 
     Ok(())
 }

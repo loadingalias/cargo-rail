@@ -143,8 +143,14 @@ one standardized canonical checkout path; identical physical roots can share L2 
 Different checkout roots require an explicit machine authority:
 
 ```bash
-cargo rail cache setup --check --remote   's3://company-cargo-rail-cache/rust/team?region=us-east-1&owner=123456789012'   --remote-mode read-write   --root-portability remap
-cargo rail cache setup --remote   's3://company-cargo-rail-cache/rust/team?region=us-east-1&owner=123456789012'   --remote-mode read-write   --root-portability remap
+cargo rail cache setup --check --remote \
+  's3://company-cargo-rail-cache/rust/team?region=us-east-1&owner=123456789012' \
+  --remote-mode read-write \
+  --root-portability remap
+cargo rail cache setup --remote \
+  's3://company-cargo-rail-cache/rust/team?region=us-east-1&owner=123456789012' \
+  --remote-mode read-write \
+  --root-portability remap
 ```
 
 Remap mode validates the physical root in the local session, admits workspace-owned Rust units only after certifying

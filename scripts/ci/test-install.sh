@@ -15,10 +15,11 @@ targets=(
   "Linux x86_64 gnu x86_64-unknown-linux-gnu true"
   "Linux x86_64 musl x86_64-unknown-linux-musl false"
 )
+# Native Windows jq uses CRLF records. Target identity does not include the record terminator.
 diff -u \
   <(jq -r '.[] | select(.target | endswith("-pc-windows-msvc") | not) | .target' \
-    distribution/release-targets.json | sort) \
-  <(printf '%s\n' "${targets[@]}" | awk '{print $4}' | sort)
+    distribution/release-targets.json | sed 's/\r$//' | LC_ALL=C sort) \
+  <(printf '%s\n' "${targets[@]}" | awk '{print $4}' | LC_ALL=C sort)
 
 for specification in "${targets[@]}"; do
   read -r system machine libc target surface <<< "$specification"
@@ -53,7 +54,11 @@ for specification in "${targets[@]}"; do
 done
 
 installer="$temporary/install.sh"
-sed 's#repository="https://github.com/loadingalias/cargo-rail"#repository="file://'$temporary'/repository"#' \
+repository_url="file://$temporary/repository"
+if command -v cygpath >/dev/null 2>&1; then
+  repository_url="file:///$(cygpath -m "$temporary/repository")"
+fi
+sed "s#repository=\"https://github.com/loadingalias/cargo-rail\"#repository=\"$repository_url\"#" \
   scripts/install.sh > "$installer"
 chmod +x "$installer"
 

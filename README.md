@@ -116,9 +116,10 @@ changed source
   → Cargo, nextest, Just, CI, etc.
 ```
 
-Cross-process consumers must validate contract v8, its content-derived identity, and checkout `HEAD` before executing
-typed selectors. This repository's Commit workflow transfers one plan artifact and validates it with
-[`scripts/plan/read.py`](scripts/plan/read.py). See [Planning](docs/planning.md).
+Cross-process consumers must validate contract v8, its content-derived identity, and the complete saved execution
+authority before executing typed selectors. Comparing `HEAD` alone is insufficient. This repository's Commit workflow
+transfers one plan artifact and validates it with [`scripts/plan/read.py`](scripts/plan/read.py). See
+[Planning](docs/planning.md).
 
 ### GitHub Actions
 
@@ -138,6 +139,7 @@ The v8 Action runs the planner once and exposes the validated plan, required wor
     CARGO_ARGS=()
     while IFS= read -r -d '' arg; do CARGO_ARGS+=("$arg"); done \
       < <(python3 "$PLAN_READER" cargo-args "$PLAN_FILE" cargo.test)
+    python3 "$PLAN_READER" verify-checkout "$PLAN_FILE"
     cargo nextest run "${CARGO_ARGS[@]}" --locked
 ```
 
@@ -147,7 +149,7 @@ Its `mode` input is required: use `read` for untrusted jobs and grant `read-writ
 
 ## Carry Intent Through Release Workflow
 
-- `cargo rail unify --check` derives one reviewable dependency repair from the captured workspace; `cargo rail unify --backup` applies it reversibly.
+- `cargo rail unify --check` derives one reviewable dependency repair from the captured workspace; `cargo rail unify apply --backup` applies it reversibly.
 - `cargo rail change` records bump and release-note intent in `.changes/` during the change itself.
 - `cargo rail release` carries that intent through versioning, changelogs, exact-SHA readiness, tags, publication, and durable resume state.
 - `cargo rail split` moves relevant crate history into an OSS repository; `cargo rail sync` maps later changes in both directions and stops with a resumable receipt when Git three-way merge needs a human.

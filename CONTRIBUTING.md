@@ -105,7 +105,7 @@ Cargo-Rail:
 ```bash
 cargo build --locked --bin cargo-rail
 release_cli="$PWD/target/debug/cargo-rail"
-"$release_cli" rail release run --all --bump auto --check
+"$release_cli" rail release check --all --bump auto
 "$release_cli" rail release run --all --bump auto --yes
 ```
 

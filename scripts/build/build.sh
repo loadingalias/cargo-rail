@@ -14,7 +14,6 @@ if [ -z "$PLAN_FILE" ]; then
 else
   "$PLAN_READER" validate "$PLAN_FILE"
 fi
-"$PLAN_READER" verify-checkout "$PLAN_FILE"
 cleanup() {
   if [ "$OWN_PLAN" = true ]; then
     rm -f -- "$PLAN_FILE"
@@ -32,5 +31,6 @@ while IFS= read -r -d '' argument; do
   CARGO_ARGS+=("$argument")
 done < <("$PLAN_READER" cargo-args "$PLAN_FILE" cargo.build)
 
+"$PLAN_READER" verify-checkout "$PLAN_FILE"
 echo "Building affected packages..."
 cargo build "${CARGO_ARGS[@]}" --all-targets --all-features --locked

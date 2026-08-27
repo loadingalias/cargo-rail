@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -96,12 +97,22 @@ class Lane:
     metadata_authority: str = "fresh_snapshot"
 
 
+@dataclass(frozen=True)
+class Candidate:
+    binary: Path
+    mode: str
+    provenance: dict[str, Any]
+
+
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser()
     subcommands = value.add_subparsers(dest="operation", required=True)
-    subcommands.add_parser("smoke")
+    smoke = subcommands.add_parser("smoke")
     run = subcommands.add_parser("run")
     run.add_argument("runs", type=int, nargs="?", default=FULL_RUNS)
+    for command in (smoke, run):
+        command.add_argument("--candidate", type=Path)
+        command.add_argument("--candidate-provenance", type=Path)
     return value
 
 
@@ -261,15 +272,130 @@ def large_diff(root: Path, _environment: dict[str, str]) -> int:
     return LARGE_DIFF_FILES
 
 
-def release_binary() -> Path:
-    configured = os.environ.get("CARGO_RAIL_BIN")
+def binary_digest(binary: Path) -> str:
+    return hashlib.sha256(binary.read_bytes()).hexdigest()
+
+
+def repository_source_evidence(environment: dict[str, str]) -> dict[str, str]:
+    head = command_text(["git", "rev-parse", "HEAD"], environment)
+    index = run_command(
+        ["git", "ls-files", "--stage", "-z"],
+        cwd=REPOSITORY_ROOT,
+        environment=environment,
+    ).stdout
+    listed = run_command(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+        cwd=REPOSITORY_ROOT,
+        environment=environment,
+    ).stdout
+    worktree = hashlib.sha256()
+    for raw_path in listed.split(b"\0"):
+        if not raw_path:
+            continue
+        path = REPOSITORY_ROOT / os.fsdecode(raw_path)
+        worktree.update(len(raw_path).to_bytes(8, "big"))
+        worktree.update(raw_path)
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            worktree.update(b"missing")
+            continue
+        if path.is_symlink():
+            target = os.fsencode(os.readlink(path))
+            worktree.update(b"symlink")
+            worktree.update(len(target).to_bytes(8, "big"))
+            worktree.update(target)
+        elif path.is_file():
+            worktree.update(b"file")
+            worktree.update(b"x" if metadata.st_mode & 0o111 else b"-")
+            with path.open("rb") as source:
+                for block in iter(lambda: source.read(1024 * 1024), b""):
+                    worktree.update(block)
+        else:
+            raise BenchmarkError(f"unsupported source entry in benchmark identity: {path}")
+    evidence = {
+        "head": head,
+        "index_sha256": hashlib.sha256(index).hexdigest(),
+        "worktree_sha256": worktree.hexdigest(),
+    }
+    canonical = json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()
+    evidence["identity"] = f"sha256:{hashlib.sha256(canonical).hexdigest()}"
+    return evidence
+
+
+def prepare_candidate(
+    configured: Path | None,
+    provenance_path: Path | None,
+    output: Path,
+    environment: dict[str, str],
+    source: dict[str, str],
+) -> Candidate:
+    configured = configured or (Path(value) if (value := os.environ.get("CARGO_RAIL_BIN")) else None)
+    provenance_path = provenance_path or (
+        Path(value) if (value := os.environ.get("CARGO_RAIL_BIN_PROVENANCE")) else None
+    )
     suffix = ".exe" if os.name == "nt" else ""
-    binary = Path(configured) if configured else REPOSITORY_ROOT / f"target/release/cargo-rail{suffix}"
-    if not binary.is_file():
-        raise BenchmarkError(
-            f"release binary does not exist: {binary}; run cargo build --release --locked --bin cargo-rail"
+    if configured is None:
+        if provenance_path is not None:
+            raise BenchmarkError("--candidate-provenance requires --candidate")
+        target = output / "scratch/candidate-target"
+        run_command(
+            [
+                "cargo",
+                "build",
+                "--release",
+                "--locked",
+                "--bin",
+                "cargo-rail",
+                "--target-dir",
+                str(target),
+            ],
+            cwd=REPOSITORY_ROOT,
+            environment=environment,
         )
-    return binary.resolve()
+        current = repository_source_evidence(environment)
+        if current != source:
+            raise BenchmarkError("repository source changed while building the planner benchmark candidate")
+        binary = target / f"release/cargo-rail{suffix}"
+        if not binary.is_file():
+            raise BenchmarkError(f"isolated candidate build omitted {binary}")
+        return Candidate(
+            binary=binary.resolve(),
+            mode="exact_source_build",
+            provenance={
+                "source": source,
+                "profile": "release",
+                "target_directory": str(target.resolve()),
+                "binary_sha256": binary_digest(binary),
+            },
+        )
+
+    binary = configured.expanduser().resolve()
+    if not binary.is_file():
+        raise BenchmarkError(f"external candidate does not exist: {binary}")
+    if provenance_path is None:
+        raise BenchmarkError("an external candidate requires --candidate-provenance with an immutable source identity")
+    try:
+        provenance = json.loads(provenance_path.read_bytes())
+    except (OSError, json.JSONDecodeError) as error:
+        raise BenchmarkError(f"cannot read external candidate provenance: {error}") from error
+    if provenance.get("schema_version") != 1:
+        raise BenchmarkError("external candidate provenance uses an unsupported schema")
+    actual_digest = binary_digest(binary)
+    if provenance.get("binary_sha256") != actual_digest:
+        raise BenchmarkError("external candidate digest does not match its provenance")
+    source_identity = provenance.get("source_identity")
+    if not isinstance(source_identity, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", source_identity) is None:
+        raise BenchmarkError("external candidate provenance has no immutable SHA-256 source identity")
+    return Candidate(
+        binary=binary,
+        mode="external_provenance",
+        provenance={
+            **provenance,
+            "provenance_file": str(provenance_path.resolve()),
+            "provenance_sha256": hashlib.sha256(provenance_path.read_bytes()).hexdigest(),
+        },
+    )
 
 
 def bootstrap_target_directory() -> Path:
@@ -306,12 +432,6 @@ def command_for_lane(binary: Path, lane: Lane, diagnostics: Path) -> list[str]:
     raise BenchmarkError(f"unknown runner: {lane.runner}")
 
 
-def remove_metadata_cache(fixture: Fixture) -> None:
-    state = fixture.root / "target/cargo-rail"
-    if state.exists():
-        shutil.rmtree(state)
-
-
 def validate_diagnostics(diagnostics: dict[str, Any], lane: Lane) -> None:
     if diagnostics.get("schema_version") != DIAGNOSTIC_SCHEMA_VERSION:
         raise BenchmarkError(f"{lane.name}: unexpected diagnostic schema: {diagnostics.get('schema_version')}")
@@ -324,11 +444,7 @@ def validate_diagnostics(diagnostics: dict[str, Any], lane: Lane) -> None:
         raise BenchmarkError(f"{lane.name}: planner did not capture metadata exactly once")
     loads = diagnostics.get("cargo_metadata_loads")
     hits = diagnostics.get("cargo_metadata_cache_hits")
-    expected = {
-        "fresh_snapshot": (1, 0),
-        "workspace_cache_cold": (1, 0),
-        "workspace_cache_warm": (0, 1),
-    }.get(lane.metadata_authority)
+    expected = {"fresh_snapshot": (1, 0)}.get(lane.metadata_authority)
     if expected is None:
         raise BenchmarkError(f"{lane.name}: unknown metadata authority: {lane.metadata_authority}")
     if (loads, hits) != expected:
@@ -344,8 +460,6 @@ def measure_once(
     diagnostics: Path,
     environment: dict[str, str],
 ) -> tuple[dict[str, Any], bytes]:
-    if lane.metadata_authority == "workspace_cache_cold":
-        remove_metadata_cache(lane.fixture)
     started = time.perf_counter_ns()
     completed = run_command(
         command_for_lane(binary, lane, diagnostics),
@@ -421,6 +535,7 @@ def measure_lane(
     runs: int,
     diagnostics_root: Path,
     environment: dict[str, str],
+    record_sample: Callable[[str, dict[str, Any]], None],
 ) -> dict[str, Any]:
     if lane.warmup:
         warmup = diagnostics_root / f"{lane.name}-warmup.json"
@@ -435,6 +550,7 @@ def measure_lane(
             raise BenchmarkError(f"{lane.name}: equivalent samples produced different plan JSON")
         expected_stdout = stdout
         samples.append(sample)
+        record_sample(lane.name, sample)
         print(
             f"plan benchmark: lane={lane.name} sample={index + 1}/{runs} "
             f"wall={sample['wall_ns'] / 1_000_000:.1f}ms",
@@ -462,7 +578,22 @@ def results_directory() -> Path:
     return result.resolve()
 
 
-def environment_evidence(binary: Path, environment: dict[str, str]) -> dict[str, Any]:
+def persist_evidence(path: Path, evidence: dict[str, Any]) -> None:
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def harness_evidence() -> dict[str, str]:
+    path = Path(__file__).resolve()
+    return {
+        "path": str(path.relative_to(REPOSITORY_ROOT)),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+
+
+def environment_evidence(candidate: Candidate, environment: dict[str, str]) -> dict[str, Any]:
+    binary = candidate.binary
     return {
         "platform": platform.platform(),
         "machine": platform.machine(),
@@ -471,14 +602,19 @@ def environment_evidence(binary: Path, environment: dict[str, str]) -> dict[str,
         "rustc": command_text(["rustc", "-vV"], environment),
         "git": command_text(["git", "--version"], environment),
         "cargo_rail": command_text([str(binary), "rail", "--version"], environment),
-        "cargo_rail_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
-        "repository_head": command_text(["git", "rev-parse", "HEAD"], environment),
+        "candidate_mode": candidate.mode,
+        "candidate": candidate.provenance,
         "rustup_toolchain": environment["RUSTUP_TOOLCHAIN"],
         "bootstrap_target_directory": str(bootstrap_target_directory()),
     }
 
 
-def measure_consumer(plan_bytes: bytes, root: Path, runs: int) -> dict[str, Any]:
+def measure_consumer(
+    plan_bytes: bytes,
+    root: Path,
+    runs: int,
+    record_sample: Callable[[int], None],
+) -> dict[str, Any]:
     path = root / "consumer-plan.json"
     path.write_bytes(plan_bytes)
     reader_path = REPOSITORY_ROOT / "scripts/plan/read.py"
@@ -493,11 +629,22 @@ def measure_consumer(plan_bytes: bytes, root: Path, runs: int) -> dict[str, Any]
         started = time.perf_counter_ns()
         plan = reader.load_plan(path)
         reader.cargo_args(plan, "cargo.build")
-        samples.append(time.perf_counter_ns() - started)
-    return {"wall_ns": statistics(samples), "operations": ["validate", "cargo.build selector lowering"]}
+        sample = time.perf_counter_ns() - started
+        samples.append(sample)
+        record_sample(sample)
+    return {
+        "wall_ns": statistics(samples),
+        "samples_ns": samples,
+        "operations": ["validate", "cargo.build selector lowering"],
+    }
 
 
 def enforce_budgets(lanes: dict[str, Any], consumer: dict[str, Any], runs: int) -> dict[str, Any]:
+    # The test hook runs only after every lane and consumer sample has been
+    # persisted, so it proves that a budget-stage failure seals complete evidence
+    # even when an earlier real budget would also reject the candidate.
+    if os.environ.get("CARGO_RAIL_BENCH_TEST_BUDGET_FAILURE") == "1":
+        raise BenchmarkError("injected planner budget failure")
     for name, maximum in GIT_SUBPROCESS_BUDGET.items():
         actual = lanes[name]["summary"]["counters"]["git_subprocesses"]["max"]
         if actual > maximum:
@@ -531,86 +678,147 @@ def enforce_budgets(lanes: dict[str, Any], consumer: dict[str, Any], runs: int) 
     }
 
 
-def benchmark(runs: int) -> Path:
+def benchmark(
+    runs: int,
+    configured_candidate: Path | None,
+    configured_provenance: Path | None,
+) -> Path:
     if runs <= 0:
         raise BenchmarkError("planner benchmark runs must be positive")
-    binary = release_binary()
-    environment = benchmark_environment()
-    for tool in ("cargo", "git", "rustc", "rustup"):
-        if shutil.which(tool, path=environment.get("PATH")) is None:
-            raise BenchmarkError(f"missing required benchmark tool: {tool}")
-    active_toolchain = command_text(["rustup", "show", "active-toolchain"], environment).split()
-    if not active_toolchain:
-        raise BenchmarkError("rustup did not report the repository toolchain")
-    environment["RUSTUP_TOOLCHAIN"] = active_toolchain[0]
-
-    with tempfile.TemporaryDirectory(prefix="cargo-rail-plan-bench-") as temporary:
-        temporary_root = Path(temporary)
-        end_to_end = create_fixture(temporary_root, "end-to-end", environment)
-        git(end_to_end.root, environment, "branch", "origin/main")
-        git(end_to_end.root, environment, "commit", "--allow-empty", "-m", "Benchmark merge-base head")
-        fixtures = {
-            "clean": create_fixture(temporary_root, "clean", environment),
-            "rust": create_fixture(temporary_root, "rust", environment, rust_change),
-            "markdown": create_fixture(temporary_root, "markdown", environment, markdown_change),
-            "config": create_fixture(temporary_root, "config", environment, config_change),
-            "manifest": create_fixture(temporary_root, "manifest", environment, manifest_change),
-            "large": create_fixture(temporary_root, "large", environment, large_diff),
-            "objects": create_fixture(temporary_root, "objects", environment, object_pair=True),
-            "end_to_end": Fixture(end_to_end.root, (), 0),
-        }
-        lanes = (
-            Lane("clean_worktree", fixtures["clean"]),
-            Lane("one_rust_file", fixtures["rust"]),
-            Lane("one_markdown_file", fixtures["markdown"]),
-            Lane("semantic_config", fixtures["config"]),
-            Lane("semantic_manifest", fixtures["manifest"]),
-            Lane("large_diff", fixtures["large"]),
-            Lane(
-                "object_pair_cold_metadata",
-                fixtures["objects"],
-                warmup=False,
-                metadata_authority="workspace_cache_cold",
-            ),
-            Lane(
-                "object_pair_warm_metadata",
-                fixtures["objects"],
-                metadata_authority="workspace_cache_warm",
-            ),
-            Lane("end_to_end_just_plan", fixtures["end_to_end"], runner="cargo_bootstrap"),
-        )
-        diagnostics_root = temporary_root / "diagnostics"
-        diagnostics_root.mkdir()
-        measured = {}
-        clean_plan = None
-        for lane in lanes:
-            measured[lane.name] = measure_lane(binary, lane, runs, diagnostics_root, environment)
-            if lane.name == "clean_worktree":
-                diagnostics = diagnostics_root / "consumer-source-plan.json"
-                _, clean_plan = measure_once(binary, lane, diagnostics, environment)
-        if clean_plan is None:
-            raise BenchmarkError("clean planner lane produced no consumer fixture")
-        consumer = measure_consumer(clean_plan, temporary_root, runs)
-        budgets = enforce_budgets(measured, consumer, runs)
-
-    result = {
-        "schema_version": 1,
+    output = results_directory()
+    summary = output / "results.json"
+    evidence: dict[str, Any] = {
+        "schema_version": 2,
         "benchmark": "plan-v8-qualification",
-        "recorded_at": datetime.now(UTC).isoformat(),
+        "status": "incomplete",
+        "failure_reason": None,
+        "started_at": datetime.now(UTC).isoformat(),
+        "completed_at": None,
         "runs_per_lane": runs,
+        "harness": harness_evidence(),
+        "source": None,
+        "environment": None,
         "fixture": {
             "packages": 2,
             "large_diff_files": LARGE_DIFF_FILES,
         },
-        "environment": environment_evidence(binary, environment),
-        "lanes": measured,
-        "consumer_validation": consumer,
-        "budgets": budgets,
+        "lanes": {},
+        "consumer_validation": None,
+        "budgets": None,
     }
-    output = results_directory()
-    summary = output / "results.json"
-    summary.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    return summary
+    persist_evidence(summary, evidence)
+    environment = benchmark_environment()
+    try:
+        for tool in ("cargo", "git", "rustc", "rustup"):
+            if shutil.which(tool, path=environment.get("PATH")) is None:
+                raise BenchmarkError(f"missing required benchmark tool: {tool}")
+        active_toolchain = command_text(["rustup", "show", "active-toolchain"], environment).split()
+        if not active_toolchain:
+            raise BenchmarkError("rustup did not report the repository toolchain")
+        environment["RUSTUP_TOOLCHAIN"] = active_toolchain[0]
+        source = repository_source_evidence(environment)
+        evidence["source"] = source
+        persist_evidence(summary, evidence)
+        candidate = prepare_candidate(
+            configured_candidate,
+            configured_provenance,
+            output,
+            environment,
+            source,
+        )
+        evidence["environment"] = environment_evidence(candidate, environment)
+        persist_evidence(summary, evidence)
+
+        def record_sample(lane_name: str, sample: dict[str, Any]) -> None:
+            evidence["lanes"][lane_name]["samples"].append(sample)
+            persist_evidence(summary, evidence)
+
+        with tempfile.TemporaryDirectory(prefix="cargo-rail-plan-bench-") as temporary:
+            temporary_root = Path(temporary)
+            end_to_end = create_fixture(temporary_root, "end-to-end", environment)
+            git(end_to_end.root, environment, "branch", "origin/main")
+            git(end_to_end.root, environment, "commit", "--allow-empty", "-m", "Benchmark merge-base head")
+            fixtures = {
+                "clean": create_fixture(temporary_root, "clean", environment),
+                "rust": create_fixture(temporary_root, "rust", environment, rust_change),
+                "markdown": create_fixture(temporary_root, "markdown", environment, markdown_change),
+                "config": create_fixture(temporary_root, "config", environment, config_change),
+                "manifest": create_fixture(temporary_root, "manifest", environment, manifest_change),
+                "large": create_fixture(temporary_root, "large", environment, large_diff),
+                "objects": create_fixture(temporary_root, "objects", environment, object_pair=True),
+                "end_to_end": Fixture(end_to_end.root, (), 0),
+            }
+            lanes = (
+                Lane("clean_worktree", fixtures["clean"]),
+                Lane("one_rust_file", fixtures["rust"]),
+                Lane("one_markdown_file", fixtures["markdown"]),
+                Lane("semantic_config", fixtures["config"]),
+                Lane("semantic_manifest", fixtures["manifest"]),
+                Lane("large_diff", fixtures["large"]),
+                Lane(
+                    "object_pair_cold_metadata",
+                    fixtures["objects"],
+                    warmup=False,
+                ),
+                Lane("object_pair_warm_metadata", fixtures["objects"]),
+                Lane("end_to_end_just_plan", fixtures["end_to_end"], runner="cargo_bootstrap"),
+            )
+            diagnostics_root = temporary_root / "diagnostics"
+            diagnostics_root.mkdir()
+            measured = {}
+            clean_plan = None
+            for lane in lanes:
+                evidence["lanes"][lane.name] = {
+                    "runner": lane.runner,
+                    "metadata_authority": lane.metadata_authority,
+                    "comparison": "objects" if "--from" in lane.fixture.plan_args else "worktree",
+                    "changed_files": lane.fixture.expected_changed_files,
+                    "samples": [],
+                }
+                persist_evidence(summary, evidence)
+                measured[lane.name] = measure_lane(
+                    candidate.binary,
+                    lane,
+                    runs,
+                    diagnostics_root,
+                    environment,
+                    record_sample,
+                )
+                evidence["lanes"][lane.name] = measured[lane.name]
+                persist_evidence(summary, evidence)
+                if lane.name == "clean_worktree":
+                    diagnostics = diagnostics_root / "consumer-source-plan.json"
+                    _, clean_plan = measure_once(candidate.binary, lane, diagnostics, environment)
+            if clean_plan is None:
+                raise BenchmarkError("clean planner lane produced no consumer fixture")
+            evidence["consumer_validation"] = {
+                "operations": ["validate", "cargo.build selector lowering"],
+                "samples_ns": [],
+            }
+            persist_evidence(summary, evidence)
+
+            def record_consumer_sample(sample: int) -> None:
+                evidence["consumer_validation"]["samples_ns"].append(sample)
+                persist_evidence(summary, evidence)
+
+            consumer = measure_consumer(clean_plan, temporary_root, runs, record_consumer_sample)
+            evidence["consumer_validation"] = consumer
+            persist_evidence(summary, evidence)
+
+        budgets = enforce_budgets(measured, consumer, runs)
+        evidence["budgets"] = budgets
+        evidence["status"] = "qualified" if budgets["qualified"] else "completed_unqualified"
+        evidence["completed_at"] = datetime.now(UTC).isoformat()
+        persist_evidence(summary, evidence)
+        return summary
+    except Exception as error:
+        evidence["status"] = "failed"
+        evidence["failure_reason"] = str(error)
+        evidence["completed_at"] = datetime.now(UTC).isoformat()
+        persist_evidence(summary, evidence)
+        if isinstance(error, BenchmarkError):
+            raise BenchmarkError(f"{error}; evidence: {summary}") from error
+        raise BenchmarkError(f"unexpected benchmark failure: {error}; evidence: {summary}") from error
 
 
 def main() -> int:
@@ -618,7 +826,7 @@ def main() -> int:
     runs = 1 if arguments.operation == "smoke" else arguments.runs
     if arguments.operation == "run" and runs < FULL_RUNS:
         raise BenchmarkError(f"full planner qualification requires at least {FULL_RUNS} runs per lane")
-    summary = benchmark(runs)
+    summary = benchmark(runs, arguments.candidate, arguments.candidate_provenance)
     print(summary)
     return 0
 

@@ -30,6 +30,4 @@ pub use navigation::{
 pub use fields::{build_feature_array, extract_features, remove_path, set_features};
 
 // Batch Transformation Operations
-pub use transform::{
-    dep_kind_to_section, resolve_package_workspace_inheritance, set_version, transform_dependencies_in_section,
-};
+pub use transform::{dep_kind_to_section, resolve_package_workspace_inheritance, set_version};

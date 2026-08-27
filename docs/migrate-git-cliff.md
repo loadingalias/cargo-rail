@@ -10,7 +10,7 @@ from history; changes mode records intent in `.changes/*.md` during review.
 ## Migration path
 
 1. Configure `source = "commits"` and map the existing changelog policy.
-2. Compare `cargo rail release run --all --bump auto --check` with the current release plan.
+2. Compare `cargo rail release check --all --bump auto` with the current release plan.
 3. Add `.changes/*.md` files to new pull requests with `cargo rail change add`.
 4. Switch to `source = "changes"` after every pending release has reviewed change intent.
 5. Run `cargo rail change check --merge-base --required`, then remove the old release automation.
@@ -150,7 +150,7 @@ relative_to = "crate"
 Use `--bump auto` for conventional-commit-driven bumps:
 
 ```bash
-cargo rail release run --all --bump auto --check
+cargo rail release check --all --bump auto
 cargo rail release check --all --extended
 ```
 

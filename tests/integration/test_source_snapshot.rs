@@ -717,3 +717,62 @@ exec "$CARGO_RAIL_TEST_REAL_GIT" "$@"
     })();
     super::helpers::finish_test(result);
 }
+
+#[cfg(unix)]
+#[test]
+fn plan_rejects_worktree_drift_during_the_live_diff_without_emitting_a_plan() {
+    let result: Result<()> = (|| {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let ws = TestWorkspace::new_named("source-diff-drift")?;
+        let crate_root = ws.add_crate("demo", "0.1.0", &[])?;
+        let victim = crate_root.join("src/lib.rs");
+        ws.commit("Add deterministic diff-drift fixture")?;
+
+        let real_git = Command::new("sh").args(["-c", "command -v git"]).output()?;
+        assert!(real_git.status.success(), "failed to resolve the real Git executable");
+        let real_git = String::from_utf8(real_git.stdout)?.trim().to_string();
+
+        let wrapper_dir = ws.path.join(".git/rail-test-diff-bin");
+        std::fs::create_dir_all(&wrapper_dir)?;
+        let wrapper = wrapper_dir.join("git");
+        std::fs::write(
+            &wrapper,
+            r#"#!/bin/sh
+for argument in "$@"; do
+  if [ "$argument" = "diff" ]; then
+    output="$CARGO_RAIL_TEST_DIFF_OUTPUT"
+    "$CARGO_RAIL_TEST_REAL_GIT" "$@" > "$output"
+    result=$?
+    printf 'pub fn changed_during_diff() {}\n' > "$CARGO_RAIL_TEST_DRIFT_FILE"
+    command cat "$output"
+    command rm "$output"
+    exit "$result"
+  fi
+done
+exec "$CARGO_RAIL_TEST_REAL_GIT" "$@"
+"#,
+        )?;
+        let mut permissions = std::fs::metadata(&wrapper)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&wrapper, permissions)?;
+
+        let path = std::env::join_paths(
+            std::iter::once(wrapper_dir).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())),
+        )?;
+        let output = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+            .current_dir(&ws.path)
+            .env("PATH", path)
+            .env("CARGO_RAIL_TEST_REAL_GIT", real_git)
+            .env("CARGO_RAIL_TEST_DIFF_OUTPUT", ws.path.join(".git/rail-diff-output"))
+            .env("CARGO_RAIL_TEST_DRIFT_FILE", victim)
+            .args(["rail", "plan", "--since", "HEAD", "--json"])
+            .output()?;
+        assert_actionable_capture_error(
+            &output,
+            "source file 'crates/demo/src/lib.rs' changed during capture",
+            "retry after concurrent filesystem and Git operations have finished",
+        )
+    })();
+    super::helpers::finish_test(result);
+}

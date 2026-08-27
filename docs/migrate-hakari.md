@@ -15,7 +15,7 @@ resolved workspace.
    `hakari.toml`.
 3. Enable transitive pinning in `rail.toml`.
 4. Run `cargo rail unify --check --explain` and review each planned pin.
-5. Apply with `cargo rail unify --backup`.
+5. Apply with `cargo rail unify apply --backup`.
 6. Run every supported feature/target build and test view, then compare `cargo tree --duplicates` and build timing with
    the baseline. Restore the migration commit if parity is not established.
 
@@ -31,7 +31,7 @@ transitive_pinning = { host = "root" }
 ```bash
 cargo rail init
 cargo rail unify --check --explain
-cargo rail unify --backup
+cargo rail unify apply --backup
 ```
 
 ## Rollback

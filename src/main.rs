@@ -1,7 +1,7 @@
 //! Entry point for cargo-rail
 //!
 //! This is intentionally thin - all logic lives in the library.
-use cargo_rail::commands::{self, CargoCli, PreContextDispatch, RailCli};
+use cargo_rail::commands::{self, PreContextDispatch, RailCli};
 use cargo_rail::error::{RailError, RailResult, print_error};
 use cargo_rail::instrumentation::DiagnosticSession;
 
@@ -15,7 +15,22 @@ fn main() {
     }
 
     let cli_preparation_started = Instant::now();
-    let CargoCli::Rail(mut cli) = CargoCli::parse();
+    let mut argv = std::env::args_os().collect::<Vec<_>>();
+    if argv.get(1).is_some_and(|argument| argument == "rail") {
+        argv.remove(1);
+    }
+    let mut cli = RailCli::parse_from(argv);
+
+    let protocol = if cli.json {
+        cargo_rail::output::OutputProtocol::Json
+    } else {
+        cli.command.output_protocol()
+    };
+    cargo_rail::output::init(cargo_rail::output::InvocationOutput::capture_protocol(
+        cli.quiet,
+        cli.verbose,
+        protocol,
+    ));
 
     // Apply global --json flag to command format fields
     if cli.json
@@ -40,15 +55,6 @@ fn main() {
 }
 
 fn run(cli: RailCli, cli_preparation_started: Instant) -> RailResult<()> {
-    // Initialize output control (quiet mode)
-    cargo_rail::output::init(cli.quiet);
-
-    // Detect JSON mode early (before building workspace context)
-    // This ensures progress messages during metadata loading are suppressed
-    if cli.json || cli.command.is_json_format() {
-        cargo_rail::output::set_json_mode(true);
-    }
-
     // Get workspace root (from --workspace-root flag or current directory)
     let workspace_root = if let Some(ref root) = cli.workspace_root {
         if root.is_absolute() {
@@ -97,6 +103,9 @@ fn run(cli: RailCli, cli_preparation_started: Instant) -> RailResult<()> {
 }
 
 fn exit_with_error(err: RailError) -> ! {
+    if err.is_broken_pipe() {
+        std::process::exit(0);
+    }
     print_error(&err);
     std::process::exit(err.exit_code().as_i32());
 }

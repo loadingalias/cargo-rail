@@ -1,8 +1,10 @@
 //! Integration tests for `cargo rail config` commands (locate, print, validate, explain, migrate)
 
-use crate::helpers::{TestWorkspace, run_cargo_rail};
+use crate::helpers::{TestWorkspace, cargo_rail_command, run_cargo_rail};
 use anyhow::Result;
 use std::fs;
+use std::io::Write as _;
+use std::process::Stdio;
 
 // Config Locate Tests
 
@@ -39,8 +41,11 @@ fn test_config_locate_no_config() {
         // Run config locate
         let output = run_cargo_rail(&ws.path, &["rail", "config", "locate"])?;
 
-        // Verify failure
-        assert!(!output.status.success(), "config locate should fail without config");
+        // Absence is a successful query result, not an operational failure.
+        assert!(
+            output.status.success(),
+            "config locate should report absence successfully"
+        );
 
         // Verify helpful message
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -449,9 +454,9 @@ fn test_config_validate_rejects_removed_change_detection_policy() {
 
         let output = run_cargo_rail(&ws.path, &["rail", "config", "validate", "--no-strict"])?;
         assert_eq!(output.status.code(), Some(2));
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("change-detection"), "{stdout}");
-        assert!(stdout.contains("cargo rail config migrate"), "{stdout}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("change-detection"), "{stderr}");
+        assert!(stderr.contains("cargo rail config migrate"), "{stderr}");
         Ok(())
     })();
     super::helpers::finish_test(result);
@@ -740,6 +745,146 @@ fn test_config_validate_with_config_flag() {
 }
 
 #[test]
+fn test_config_structural_dynamic_keys_round_trip_and_validate_strictly() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("config-structural-dynamic-keys")?;
+        ws.add_crate("cli-tools", "0.1.0", &[])?;
+        ws.commit("Add dynamic-key fixture")?;
+        fs::write(
+            ws.path.join(".config/rail.toml"),
+            r#"[plan.work."docs.generated"]
+scope = "repository"
+paths = ["docs/**"]
+
+[crates."cli-tools".release]
+publish = false
+"#,
+        )?;
+
+        let validated = run_cargo_rail(&ws.path, &["rail", "config", "validate", "--strict", "-f", "json"])?;
+        assert!(
+            validated.status.success(),
+            "dynamic keys failed strict validation: {validated:?}"
+        );
+        let explained = run_cargo_rail(&ws.path, &["rail", "config", "explain", "-f", "json"])?;
+        assert!(
+            explained.status.success(),
+            "dynamic keys failed explanation: {explained:?}"
+        );
+        let explained: serde_json::Value = serde_json::from_slice(&explained.stdout)?;
+        assert!(explained["fields"].as_array().is_some_and(|fields| {
+            fields
+                .iter()
+                .any(|field| field["path"] == "plan.work.\"docs.generated\".paths")
+        }));
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_canonical_config_print_validates_from_stdin() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("config-validate-stdin")?;
+        ws.add_crate("test-crate", "0.1.0", &[])?;
+        ws.commit("Add stdin validation fixture")?;
+        let printed = run_cargo_rail(&ws.path, &["rail", "config", "print"])?;
+        assert!(printed.status.success(), "canonical print failed: {printed:?}");
+
+        let mut child = cargo_rail_command(&ws.path)?
+            .args(["rail", "--config", "-", "config", "validate", "--strict", "-f", "json"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        child.stdin.take().expect("piped stdin").write_all(&printed.stdout)?;
+        let validated = child.wait_with_output()?;
+        assert!(validated.status.success(), "stdin validation failed: {validated:?}");
+        let value: serde_json::Value = serde_json::from_slice(&validated.stdout)?;
+        assert_eq!(value["valid"], true);
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_unknown_keys_fail_normal_loading_even_without_strict_validation() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("config-unknown-normal-load")?;
+        ws.add_crate("test-crate", "0.1.0", &[])?;
+        ws.commit("Add unknown-key fixture")?;
+        fs::write(ws.path.join(".config/rail.toml"), "targtes = []\n")?;
+
+        for args in [
+            &["rail", "config", "validate", "--no-strict"][..],
+            &["rail", "config", "print"][..],
+            &["rail", "plan", "--since", "HEAD"][..],
+        ] {
+            let output = run_cargo_rail(&ws.path, args)?;
+            assert_eq!(output.status.code(), Some(2), "unknown key accepted by {args:?}");
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(combined.contains("unknown configuration key 'targtes'"), "{combined}");
+        }
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_semantic_config_failures_match_validation_and_plan_consumers() {
+    let result: Result<()> = (|| {
+        let fixtures = [
+            (
+                "planner-id",
+                "[plan.work.Invalid]\nscope = \"repository\"\npaths = [\"docs/**\"]\n",
+                "must match [a-z][a-z0-9.-]*",
+            ),
+            (
+                "release",
+                "[release]\ntag_format = \"\"\n",
+                "tag_format cannot be empty",
+            ),
+            (
+                "split",
+                "[crates.test-crate.split]\nremote = \"https://example.invalid/repo.git\"\nbranch = \"\"\nmode = \"single\"\nmembers = [\"test-crate\"]\n",
+                "branch must not be empty",
+            ),
+            (
+                "target",
+                "targets = [\"definitely-not-a-rust-target\"]\n",
+                "invalid target triple",
+            ),
+        ];
+        for (name, config, needle) in fixtures {
+            let ws = TestWorkspace::new_named(&format!("config-shared-validator-{name}"))?;
+            ws.add_crate("test-crate", "0.1.0", &[])?;
+            ws.commit("Add shared-validator fixture")?;
+            fs::write(ws.path.join(".config/rail.toml"), config)?;
+
+            for args in [
+                &["rail", "config", "validate", "--no-strict"][..],
+                &["rail", "plan", "--since", "HEAD"][..],
+            ] {
+                let output = run_cargo_rail(&ws.path, args)?;
+                assert_eq!(output.status.code(), Some(2), "{name} was accepted by {args:?}");
+                let combined = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(combined.contains(needle), "{name} via {args:?}: {combined}");
+            }
+        }
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
 fn test_config_validate_with_missing_config_flag_fails() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("config-validate-with-missing-flag")?;
@@ -781,7 +926,7 @@ fn test_config_validate_rejects_removed_repository_cache_authority() {
 
         let output = run_cargo_rail(&ws.path, &["rail", "config", "validate", "--no-strict"])?;
         assert_eq!(output.status.code(), Some(2));
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = String::from_utf8_lossy(&output.stderr);
         assert!(
             stdout.contains("[cache] repository configuration is no longer supported")
                 && stdout.contains("CARGO_RAIL_CACHE_REMOTE"),
@@ -828,7 +973,17 @@ fn test_config_explain_json_reports_effective_default_and_source() {
         let config_path = ws.path.join(".config").join("rail.toml");
         fs::write(&config_path, "[unify]\nmsrv_policy = { mode = \"disabled\" }\n")?;
 
-        let output = run_cargo_rail(&ws.path, &["rail", "config", "explain", "-f", "json"])?;
+        let output = run_cargo_rail(
+            &ws.path,
+            &[
+                "rail",
+                "config",
+                "explain",
+                "unify.msrv_policy.mode",
+                "unify.consumer_scope",
+                "--json",
+            ],
+        )?;
         assert!(output.status.success(), "config explain should succeed");
         let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
         assert_eq!(json["command"], "config");
@@ -978,7 +1133,7 @@ fn test_config_explain_text_uses_same_field_values_as_json() {
             "[unify]\nmsrv_policy = { mode = \"disabled\" }\n",
         )?;
 
-        let output = run_cargo_rail(&ws.path, &["rail", "config", "explain"])?;
+        let output = run_cargo_rail(&ws.path, &["rail", "config", "explain", "unify.msrv_policy.mode"])?;
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("unify.msrv_policy.mode"));

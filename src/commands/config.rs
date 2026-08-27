@@ -2,10 +2,11 @@
 
 use crate::commands::common::TextJsonOutputFormat;
 use crate::config::{RailConfig, schema};
-use crate::error::{RailError, RailResult};
+use crate::error::{ConfigError, RailError, RailResult};
 use crate::toml::TomlEditor;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 fn print_config_json<T: Serialize>(mode: &str, result: &str, exit_code: i32, payload: &T) -> RailResult<()> {
@@ -110,10 +111,6 @@ pub fn run_config_locate(
 ) -> RailResult<()> {
     let json = format.is_json();
 
-    if json {
-        crate::output::set_json_mode(true);
-    }
-
     // If config path was explicitly provided, use it
     if let Some(explicit_path) = config_override {
         let path = if explicit_path.is_absolute() {
@@ -179,7 +176,6 @@ pub fn run_config_locate(
         }
         println!();
         println!("hint: run 'cargo rail init' to create one");
-        return Err(RailError::ExitWithCode { code: 1 });
     }
 
     Ok(())
@@ -197,10 +193,6 @@ pub fn run_config_print(
     format: TextJsonOutputFormat,
 ) -> RailResult<()> {
     let json = format.is_json();
-
-    if json {
-        crate::output::set_json_mode(true);
-    }
 
     // Load config from explicit path or search
     let (mut config, config_path) = load_config_with_path(workspace_root, config_override)?;
@@ -263,12 +255,11 @@ struct ExplainResult {
 pub fn run_config_explain(
     workspace_root: &Path,
     config_override: Option<&Path>,
+    requested_fields: &[String],
+    all: bool,
     format: TextJsonOutputFormat,
 ) -> RailResult<()> {
     let json = format.is_json();
-    if json {
-        crate::output::set_json_mode(true);
-    }
 
     let config_path = resolve_config_path(workspace_root, config_override)?;
     let (config, bytes) = RailConfig::load_path_with_bytes(&config_path)?;
@@ -297,19 +288,21 @@ pub fn run_config_explain(
     let paths: BTreeSet<_> = effective
         .keys()
         .chain(configured.keys())
-        .filter(|path| schema::field_spec(path).is_some())
+        .filter(|path| schema::field_spec_path(path).is_some())
         .cloned()
         .collect();
 
-    let fields = paths
+    let mut fields: Vec<_> = paths
         .into_iter()
         .filter_map(|path| {
-            let field_spec = schema::field_spec(&path)?;
+            let field_spec = schema::field_spec_path(&path)?;
             let spec = deprecations.get(&path).copied().unwrap_or(field_spec);
             let configured_value = configured.get(&path).cloned();
             let effective_value = effective.get(&path).cloned().unwrap_or(serde_json::Value::Null);
             let compatibility_source = has_compatibility_source(&path, &configured);
-            let source = if path == "surface.targets" && config.surface.targets.inherits_workspace() {
+            let source = if path == schema::ConfigPath::from_dotted("surface.targets")
+                && config.surface.targets.inherits_workspace()
+            {
                 format!("{} (inherited from targets)", config_path.display())
             } else if configured_value.is_some() || compatibility_source {
                 config_path.display().to_string()
@@ -318,7 +311,7 @@ pub fn run_config_explain(
             };
             let default = defaults.get(&path).cloned();
             Some(ExplainedField {
-                path,
+                path: path.to_string(),
                 configured: configured_value,
                 effective: effective_value,
                 default,
@@ -330,6 +323,21 @@ pub fn run_config_explain(
         })
         .collect();
 
+    if !all && requested_fields.is_empty() {
+        fields.retain(|field| field.configured.is_some() || field.source != "default");
+    } else if !requested_fields.is_empty() {
+        let requested: BTreeSet<_> = requested_fields.iter().map(String::as_str).collect();
+        let known: BTreeSet<_> = fields.iter().map(|field| field.path.as_str()).collect();
+        let unknown: Vec<_> = requested.difference(&known).copied().collect();
+        if !unknown.is_empty() {
+            return Err(RailError::with_help(
+                format!("unknown configuration field(s): {}", unknown.join(", ")),
+                "run `cargo rail config explain --all` to list known fields",
+            ));
+        }
+        fields.retain(|field| requested.contains(field.path.as_str()));
+    }
+
     let result = ExplainResult {
         command: "config",
         action: "explain",
@@ -339,7 +347,23 @@ pub fn run_config_explain(
     if json {
         print_config_json("explain", "success", 0, &result)
     } else {
-        println!("config: {}", config_path.display());
+        if !all && requested_fields.is_empty() {
+            if result.fields.is_empty() {
+                println!("No configured overrides.");
+            } else {
+                for field in &result.fields {
+                    println!(
+                        "{} = {} ({})",
+                        field.path,
+                        display_json_value(&field.effective),
+                        field.source
+                    );
+                }
+            }
+            return Ok(());
+        }
+
+        println!("Configuration: {}", config_path.display());
         for field in &result.fields {
             println!("\n{}", field.path);
             println!(
@@ -370,9 +394,17 @@ pub fn run_config_explain(
     }
 }
 
-fn has_compatibility_source(path: &str, configured: &BTreeMap<String, serde_json::Value>) -> bool {
-    let contains_any = |paths: &[&str]| paths.iter().any(|path| configured.contains_key(*path));
-    match path {
+fn has_compatibility_source(
+    path: &schema::ConfigPath,
+    configured: &BTreeMap<schema::ConfigPath, serde_json::Value>,
+) -> bool {
+    let contains_any = |paths: &[&str]| {
+        paths
+            .iter()
+            .any(|path| configured.contains_key(&schema::ConfigPath::from_dotted(path)))
+    };
+    let rendered = path.to_string();
+    match rendered.as_str() {
         "release.remote_effects" => contains_any(&["release.push", "release.create_github_release", "release.forge"]),
         path if path.starts_with("unify.transitive_pinning.") => {
             contains_any(&["unify.pin_transitives", "unify.transitive_host"])
@@ -384,33 +416,32 @@ fn has_compatibility_source(path: &str, configured: &BTreeMap<String, serde_json
     }
 }
 
-fn flatten_json(value: &serde_json::Value) -> BTreeMap<String, serde_json::Value> {
-    fn visit(value: &serde_json::Value, path: &str, fields: &mut BTreeMap<String, serde_json::Value>) {
+fn flatten_json(value: &serde_json::Value) -> BTreeMap<schema::ConfigPath, serde_json::Value> {
+    fn visit(
+        value: &serde_json::Value,
+        path: &schema::ConfigPath,
+        fields: &mut BTreeMap<schema::ConfigPath, serde_json::Value>,
+    ) {
         match value {
             serde_json::Value::Object(object) if !object.is_empty() => {
                 for (key, value) in object {
-                    let child = if path.is_empty() {
-                        key.clone()
-                    } else {
-                        format!("{path}.{key}")
-                    };
-                    visit(value, &child, fields);
+                    visit(value, &path.child(key), fields);
                 }
             }
             serde_json::Value::Array(array) if !array.is_empty() && array.iter().all(serde_json::Value::is_object) => {
                 for (index, value) in array.iter().enumerate() {
-                    visit(value, &format!("{path}.{index}"), fields);
+                    visit(value, &path.child(index.to_string()), fields);
                 }
             }
-            _ if !path.is_empty() => {
-                fields.insert(path.to_string(), value.clone());
+            _ if !path.is_root() => {
+                fields.insert(path.clone(), value.clone());
             }
             _ => {}
         }
     }
 
     let mut fields = BTreeMap::new();
-    visit(value, "", &mut fields);
+    visit(value, &schema::ConfigPath::root(), &mut fields);
     fields
 }
 
@@ -425,6 +456,8 @@ fn display_json_value(value: &serde_json::Value) -> String {
 fn load_config_with_path(workspace_root: &Path, config_override: Option<&Path>) -> RailResult<(RailConfig, PathBuf)> {
     let config_path = resolve_config_path(workspace_root, config_override)?;
     let (config, _) = RailConfig::load_path_with_bytes(&config_path)?;
+    let workspace_members = standalone_workspace_members(workspace_root)?;
+    config.validate(workspace_root, workspace_members.as_deref())?;
     Ok((config, config_path))
 }
 
@@ -443,16 +476,13 @@ pub fn run_config_validate_standalone(
     let json = format.is_json();
     let strict = strictness.is_strict();
 
-    if json {
-        crate::output::set_json_mode(true);
-    }
-
     let mut errors: Vec<ValidationIssue> = Vec::new();
     let mut warnings: Vec<ValidationIssue> = Vec::new();
 
-    // Find config file
-    let config_path = match resolve_config_path(workspace_root, config_override) {
-        Ok(path) => path,
+    // Find and read one configuration source. `-` is an explicit, read-only
+    // stdin protocol so canonical output can be validated without a temp file.
+    let (config_path, content) = match read_validation_source(workspace_root, config_override) {
+        Ok(source) => source,
         Err(err) => {
             let is_default_lookup_miss = config_override.is_none();
             if json {
@@ -475,17 +505,14 @@ pub fn run_config_validate_standalone(
                 return Err(RailError::ExitWithCode { code: 2 });
             }
             if is_default_lookup_miss {
-                println!("no configuration file found");
-                println!("\nhelp: run 'cargo rail init' to create one");
-                return Err(RailError::message("no configuration file found"));
+                return Err(RailError::with_help(
+                    "no configuration file found",
+                    "run 'cargo rail init' to create one",
+                ));
             }
             return Err(err);
         }
     };
-
-    // Read raw content for unknown key detection
-    let content = std::fs::read_to_string(&config_path)
-        .map_err(|e| RailError::message(format!("failed to read {}: {}", config_path.display(), e)))?;
 
     // Check for parse errors with line/column info
     let raw_doc: Result<toml_edit::DocumentMut, _> = content.parse();
@@ -505,7 +532,7 @@ pub fn run_config_validate_standalone(
         if let Err(message) = crate::config::reject_removed_configuration(doc) {
             errors.push(ValidationIssue::new("removed_configuration", message));
         }
-        check_unknown_keys(doc, &mut warnings);
+        check_unknown_keys(doc, &mut errors);
         for deprecation in schema::present_deprecations(doc) {
             if let Some(message) = deprecation.spec.deprecation {
                 warnings.push(ValidationIssue::new(
@@ -517,58 +544,19 @@ pub fn run_config_validate_standalone(
     }
 
     // Try to load and validate semantically
-    let parsed_config = toml_edit::de::from_str::<RailConfig>(&content)
+    let parsed_config = RailConfig::parse_bytes(content.as_bytes())
         .map_err(|error| RailError::message(format!("failed to parse {}: {error}", config_path.display())));
     match parsed_config {
         Ok(config) => {
-            if let Err(e) = config.unify.validate(workspace_root) {
-                errors.push(ValidationIssue::new("unify", e.to_string()));
-            }
-            if let Err(e) = config.surface.validate() {
-                errors.push(ValidationIssue::new("surface", e.to_string()));
-            }
-            if let Err(e) = config.surface.validate_workspace_targets(&config.targets) {
-                errors.push(ValidationIssue::new("surface", e.to_string()));
-            }
-            if let Err(e) = config.release.changelog.filters.validate("release.changelog.filters") {
-                errors.push(ValidationIssue::new("release.changelog.filters", e.to_string()));
-            }
-
-            // Validate per-crate split config
-            for (crate_name, crate_config) in &config.crates {
-                if let Some(changelog_cfg) = &crate_config.changelog
-                    && let Some(filters) = &changelog_cfg.filters
-                    && let Err(e) = filters.validate(&format!("crates.{}.changelog.filters", crate_name))
-                {
-                    errors.push(ValidationIssue::new(
-                        format!("crates.{}.changelog.filters", crate_name),
-                        e.to_string(),
-                    ));
-                }
-                if let Some(split_cfg) = &crate_config.split {
-                    if split_cfg.remote.is_empty() {
-                        errors.push(ValidationIssue::new(
-                            format!("crates.{}.split", crate_name),
-                            "missing required field: remote",
-                        ));
-                    }
-                    if split_cfg.branch.is_empty() {
-                        errors.push(ValidationIssue::new(
-                            format!("crates.{}.split", crate_name),
-                            "branch must not be empty",
-                        ));
-                    }
-                }
-            }
-
-            // Check targets are valid
-            for target in &config.targets {
-                if !target.contains('-') {
-                    warnings.push(ValidationIssue::new(
-                        "targets",
-                        format!("'{}' doesn't look like a valid target triple", target),
-                    ));
-                }
+            match standalone_workspace_members(workspace_root)
+                .and_then(|members| config.validate(workspace_root, members.as_deref()))
+            {
+                Ok(config_warnings) => warnings.extend(
+                    config_warnings
+                        .into_iter()
+                        .map(|warning| ValidationIssue::new("config", warning)),
+                ),
+                Err(error) => errors.push(validation_issue_from_error(&error)),
             }
         }
         Err(err) => {
@@ -606,7 +594,7 @@ pub fn run_config_validate_standalone(
             if valid { 0 } else { 2 },
             &result,
         )?;
-    } else {
+    } else if valid {
         println!("config: {}", config_path.display());
         if strict && is_ci_environment() {
             println!("mode: strict (CI detected)");
@@ -615,40 +603,49 @@ pub fn run_config_validate_standalone(
         }
         println!();
 
-        if !final_errors.is_empty() {
-            println!("errors:");
-            for e in &final_errors {
-                if let (Some(line), Some(col)) = (e.line, e.column) {
-                    println!("  [{}:{}:{}] {}", e.section, line, col, e.message);
-                } else {
-                    println!("  [{}] {}", e.section, e.message);
-                }
-            }
-            println!();
-        }
-
         if !final_warnings.is_empty() {
-            println!("warnings:");
+            eprintln!("warnings:");
             for w in &final_warnings {
-                println!("  [{}] {}", w.section, w.message);
+                eprintln!("  [{}] {}", w.section, w.message);
             }
-            println!();
+            eprintln!();
         }
-
-        if valid {
-            println!("configuration is valid");
-        } else {
-            println!("configuration has {} error(s)", final_errors.len());
+        println!("configuration is valid");
+    } else {
+        eprintln!("config: {}", config_path.display());
+        if strict {
+            eprintln!("mode: strict");
         }
+        eprintln!();
+        eprintln!("errors:");
+        for error in &final_errors {
+            if let (Some(line), Some(column)) = (error.line, error.column) {
+                eprintln!("  [{}:{}:{}] {}", error.section, line, column, error.message);
+            } else {
+                eprintln!("  [{}] {}", error.section, error.message);
+            }
+        }
+        eprintln!();
+        eprintln!("configuration has {} error(s)", final_errors.len());
     }
 
     if valid {
         Ok(())
-    } else if json {
-        Err(RailError::ExitWithCode { code: 2 })
     } else {
-        Err(RailError::message("configuration validation failed"))
+        Err(RailError::ExitWithCode { code: 2 })
     }
+}
+
+fn read_validation_source(workspace_root: &Path, config_override: Option<&Path>) -> RailResult<(PathBuf, String)> {
+    if config_override == Some(Path::new("-")) {
+        let mut content = String::new();
+        std::io::stdin().lock().read_to_string(&mut content)?;
+        return Ok((PathBuf::from("<stdin>"), content));
+    }
+    let path = resolve_config_path(workspace_root, config_override)?;
+    let content = std::fs::read_to_string(&path)
+        .map_err(|error| RailError::message(format!("failed to read {}: {error}", path.display())))?;
+    Ok((path, content))
 }
 
 /// Extract line/column from toml_edit error message if present
@@ -669,33 +666,45 @@ fn extract_toml_error_location(err: &str) -> Option<(usize, usize)> {
 
 /// Check for unknown keys in the TOML document
 fn check_unknown_keys(doc: &toml_edit::DocumentMut, warnings: &mut Vec<ValidationIssue>) {
-    fn visit(table: &toml_edit::Table, prefix: &str, warnings: &mut Vec<ValidationIssue>) {
-        for (key, item) in table {
-            let path = if prefix.is_empty() {
-                key.to_string()
-            } else {
-                format!("{prefix}.{key}")
-            };
-            if !schema::is_known_path(&path) {
-                let section = path.split('.').next().unwrap_or("config");
-                warnings.push(ValidationIssue::new(
-                    section,
-                    format!("unknown configuration key '{path}'"),
-                ));
-                continue;
-            }
-
-            if let Some(child) = item.as_table() {
-                visit(child, &path, warnings);
-            } else if let Some(array) = item.as_array_of_tables() {
-                for (index, child) in array.iter().enumerate() {
-                    visit(child, &format!("{path}.{index}"), warnings);
-                }
-            }
+    for path in schema::document_paths(doc) {
+        if !schema::is_known_config_path(&path) {
+            warnings.push(ValidationIssue::new(
+                path.first().unwrap_or("config"),
+                format!("unknown configuration key '{path}'"),
+            ));
         }
     }
+}
 
-    visit(doc.as_table(), "", warnings);
+fn validation_issue_from_error(error: &RailError) -> ValidationIssue {
+    let (field, message) = match error {
+        RailError::Config(ConfigError::InvalidField { field, reason }) => (field.as_str(), reason.clone()),
+        RailError::Config(ConfigError::InvalidValue { field, .. }) => (field.as_str(), error.to_string()),
+        RailError::Config(ConfigError::MissingField { field }) => (field.as_str(), error.to_string()),
+        _ => return ValidationIssue::new("config", error.to_string()),
+    };
+    ValidationIssue::new(field.split('.').next().unwrap_or("config"), message)
+}
+
+fn standalone_workspace_members(workspace_root: &Path) -> RailResult<Option<Vec<String>>> {
+    if !workspace_root.join("Cargo.toml").is_file() {
+        return Ok(None);
+    }
+    let mut command = cargo_metadata::MetadataCommand::new();
+    command.current_dir(workspace_root).no_deps();
+    let metadata = match command.exec() {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(None),
+    };
+    let member_ids = metadata.workspace_members.iter().collect::<BTreeSet<_>>();
+    Ok(Some(
+        metadata
+            .packages
+            .iter()
+            .filter(|package| member_ids.contains(&package.id))
+            .map(|package| package.name.to_string())
+            .collect(),
+    ))
 }
 
 // Config Migrate
@@ -727,10 +736,6 @@ pub fn run_config_migrate(
     format: TextJsonOutputFormat,
 ) -> RailResult<()> {
     let json = format.is_json();
-
-    if json {
-        crate::output::set_json_mode(true);
-    }
 
     let config_path = resolve_config_path(workspace_root, config_override)?;
     let mut editor = TomlEditor::open(&config_path)?;
@@ -872,7 +877,10 @@ pub fn run_config_migrate(
     } else if has_changes {
         print_migrations(&config_path, &changes, false);
     } else {
-        println!("config: {} (no migrations pending)", config_path.display());
+        println!("Configuration is current.");
+        if crate::output::is_verbose() {
+            println!("Config: {}", config_path.display());
+        }
     }
 
     Ok(())
@@ -1226,22 +1234,31 @@ fn migrate_reserved_sync_tables(editor: &mut TomlEditor, changes: &mut Vec<Migra
 }
 
 fn print_migrations(config_path: &Path, changes: &[MigrationChange], check: bool) {
-    println!("config: {}", config_path.display());
     if changes.is_empty() {
-        println!("no migrations pending");
+        println!("Configuration is current.");
+        if crate::output::is_verbose() {
+            println!("Config: {}", config_path.display());
+        }
         return;
     }
-    println!();
+    println!(
+        "{} {} semantic configuration change(s) in {}:",
+        if check { "Pending:" } else { "Applied" },
+        changes.len(),
+        config_path.display()
+    );
     for change in changes {
-        let verb = if check { "would migrate" } else { "migrated" };
         if let Some(replacement) = &change.replacement {
-            println!("{verb}: {} -> {}", change.path, replacement);
+            println!("  replace {} with {}", change.path, replacement);
         } else {
-            println!("{verb}: {} ({})", change.path, change.message);
+            println!("  remove {}", change.path);
+        }
+        if crate::output::is_verbose() {
+            println!("    {}", change.message);
         }
     }
     if check {
-        println!("\nrun without --check to apply");
+        println!("Next: cargo rail config migrate");
     }
 }
 

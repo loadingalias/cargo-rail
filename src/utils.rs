@@ -702,19 +702,26 @@ pub fn is_local_path(path: &str) -> bool {
     false
 }
 
-/// Prompt user for confirmation (Enter to confirm, Ctrl+C or any input to cancel)
-///
-/// Returns Ok(true) if user presses Enter without typing anything.
-/// Returns Ok(false) if user types anything before pressing Enter.
-pub fn prompt_for_confirmation(message: &str) -> RailResult<bool> {
-    print!("\n{}: ", message);
-    io::stdout().flush()?;
+/// Prompt for an explicit mutation confirmation on stderr.
+pub fn prompt_for_confirmation() -> RailResult<bool> {
+    prompt_for_confirmation_from(&mut io::stdin().lock(), &mut io::stderr().lock())
+}
+
+fn prompt_for_confirmation_from(reader: &mut impl io::BufRead, writer: &mut impl io::Write) -> RailResult<bool> {
+    writer.write_all(b"Proceed? [y/N] ")?;
+    writer.flush()?;
 
     let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-
-    // If user just presses Enter (empty line), that's a confirmation
-    Ok(input.trim().is_empty())
+    let bytes = match reader.read_line(&mut input) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if bytes == 0 {
+        return Ok(false);
+    }
+    let answer = input.trim_end_matches(['\r', '\n']);
+    Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
 }
 
 /// Detect CHANGELOG file in a crate directory
@@ -755,11 +762,52 @@ pub fn path_to_git_format(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
 
     use super::*;
+
+    struct InterruptedReader;
+
+    impl io::Read for InterruptedReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::Interrupted))
+        }
+    }
+
+    impl io::BufRead for InterruptedReader {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            Err(io::Error::from(io::ErrorKind::Interrupted))
+        }
+
+        fn consume(&mut self, _amount: usize) {}
+
+        fn read_line(&mut self, _buffer: &mut String) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::Interrupted))
+        }
+    }
+
+    #[test]
+    fn confirmation_accepts_only_an_explicit_yes_and_uses_the_exact_prompt() {
+        for answer in ["y\n", "Y\n", "yes\n", "YeS\r\n"] {
+            let mut reader = Cursor::new(answer.as_bytes());
+            let mut prompt = Vec::new();
+            assert!(prompt_for_confirmation_from(&mut reader, &mut prompt).unwrap());
+            assert_eq!(prompt, b"Proceed? [y/N] ");
+        }
+        for answer in ["\n", "n\n", "no\n", " y\n", "yes \n", "anything\n", ""] {
+            let mut reader = Cursor::new(answer.as_bytes());
+            let mut prompt = Vec::new();
+            assert!(!prompt_for_confirmation_from(&mut reader, &mut prompt).unwrap());
+            assert_eq!(prompt, b"Proceed? [y/N] ");
+        }
+        let mut reader = InterruptedReader;
+        let mut prompt = Vec::new();
+        assert!(!prompt_for_confirmation_from(&mut reader, &mut prompt).unwrap());
+        assert_eq!(prompt, b"Proceed? [y/N] ");
+    }
 
     #[cfg(windows)]
     #[test]

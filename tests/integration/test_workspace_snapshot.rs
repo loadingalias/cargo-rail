@@ -22,6 +22,73 @@ fn generate_lockfile(root: &Path) -> Result<()> {
     Ok(())
 }
 
+fn workspace_member_names(context: &WorkspaceContext) -> Vec<String> {
+    let mut names = context
+        .cargo()
+        .workspace_members()
+        .into_iter()
+        .map(|package| package.name.to_string())
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+#[test]
+fn generic_context_uses_fresh_cargo_glob_membership() {
+    let result: Result<()> = (|| {
+        let workspace = TestWorkspace::new_named("fresh-cargo-glob-membership")?;
+        workspace.add_crate("alpha", "0.1.0", &[])?;
+        workspace.add_crate("beta", "0.1.0", &[])?;
+        let legacy_cache = workspace.path.join("target/cargo-rail/metadata.json");
+        std::fs::create_dir_all(legacy_cache.parent().unwrap())?;
+        std::fs::write(&legacy_cache, b"deliberately invalid stale metadata")?;
+
+        assert_eq!(
+            workspace_member_names(&WorkspaceContext::build(&workspace.path)?),
+            ["alpha", "beta"]
+        );
+
+        std::fs::remove_dir_all(workspace.path.join("crates/beta"))?;
+        assert_eq!(
+            workspace_member_names(&WorkspaceContext::build(&workspace.path)?),
+            ["alpha"]
+        );
+
+        workspace.add_crate("beta", "0.1.0", &[])?;
+        assert_eq!(
+            workspace_member_names(&WorkspaceContext::build(&workspace.path)?),
+            ["alpha", "beta"]
+        );
+
+        std::fs::rename(workspace.path.join("crates/beta"), workspace.path.join("crates/gamma"))?;
+        let gamma_manifest = workspace.path.join("crates/gamma/Cargo.toml");
+        let manifest = std::fs::read_to_string(&gamma_manifest)?.replace("name = \"beta\"", "name = \"gamma\"");
+        std::fs::write(gamma_manifest, manifest)?;
+        assert_eq!(
+            workspace_member_names(&WorkspaceContext::build(&workspace.path)?),
+            ["alpha", "gamma"]
+        );
+
+        let root_manifest = workspace.path.join("Cargo.toml");
+        let manifest = std::fs::read_to_string(&root_manifest)?.replace(
+            "members = [\"crates/*\"]",
+            "members = [\"crates/*\"]\nexclude = [\"crates/gamma\"]",
+        );
+        std::fs::write(root_manifest, manifest)?;
+        assert_eq!(
+            workspace_member_names(&WorkspaceContext::build(&workspace.path)?),
+            ["alpha"]
+        );
+        assert_eq!(
+            std::fs::read(&legacy_cache)?,
+            b"deliberately invalid stale metadata",
+            "generic context must neither read nor rewrite the retired metadata cache"
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
 #[test]
 fn workspace_snapshot_captures_exact_inputs_and_reuses_the_base_resolution() {
     let result: Result<()> = (|| {

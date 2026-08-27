@@ -1,5 +1,6 @@
 //! Named-work local and CI consumer contract tests.
 
+use crate::helpers::{TestWorkspace, run_cargo_rail};
 use anyhow::Result;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
@@ -8,12 +9,27 @@ use std::process::Command;
 const COMMIT_WORKFLOW: &str = include_str!("../../.github/workflows/commit.yaml");
 const COMPATIBILITY_WORKFLOW: &str = include_str!("../../.github/workflows/compatibility.yaml");
 const ARCHIVE_WORKFLOW: &str = include_str!("../../.github/workflows/release-archives.yaml");
+const BUILD_SCRIPT: &str = include_str!("../../scripts/build/build.sh");
+const TEST_SCRIPT: &str = include_str!("../../scripts/test/test.sh");
 
 fn reader() -> Command {
     let mut command = Command::new(if cfg!(windows) { "python" } else { "python3" });
     command
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .arg("scripts/plan/read.py");
+    command
+}
+
+fn reader_at(workspace: &std::path::Path) -> Command {
+    let mut command = Command::new(if cfg!(windows) { "python" } else { "python3" });
+    command
+        .current_dir(workspace)
+        .env("CARGO_RAIL_BIN", env!("CARGO_BIN_EXE_cargo-rail"))
+        .env("RUSTC_WRAPPER", "")
+        .env("CARGO_BUILD_RUSTC_WRAPPER", "")
+        .env("RUSTC_WORKSPACE_WRAPPER", "")
+        .env("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "")
+        .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/plan/read.py"));
     command
 }
 
@@ -251,6 +267,36 @@ fn test_plan_reader_rejects_contract_or_projection_drift() {
 }
 
 #[test]
+fn test_plan_reader_delegates_final_authority_verification_to_cargo_rail() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("plan-reader-authority")?;
+        let package = ws.add_crate("reader", "0.1.0", &[])?;
+        ws.commit("establish plan reader authority")?;
+        let output = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--json"])?;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let path = ws.path.join("target/saved-plan.json");
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        std::fs::write(&path, output.stdout)?;
+
+        let unchanged = reader_at(&ws.path).args(["verify-checkout"]).arg(&path).output()?;
+        assert!(
+            unchanged.status.success(),
+            "{}",
+            String::from_utf8_lossy(&unchanged.stderr)
+        );
+        assert!(unchanged.stdout.is_empty());
+
+        std::fs::write(package.join("src/lib.rs"), "pub fn drift() {}\n")?;
+        let rejected = reader_at(&ws.path).args(["verify-checkout"]).arg(&path).output()?;
+        assert_eq!(rejected.status.code(), Some(2));
+        assert!(rejected.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("cargo-rail rejected current execution authority"));
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
 fn test_plan_reader_emits_plain_all_variant_sentinel() {
     let result: Result<()> = (|| {
         let directory = tempfile::tempdir()?;
@@ -294,4 +340,22 @@ fn test_commit_workflow_uses_named_work_and_planner_matrices_only() {
     assert!(ARCHIVE_WORKFLOW.contains("scripts/ci/smoke-release-tar.sh"));
     assert!(COMPATIBILITY_WORKFLOW.contains("verify-checkout"));
     assert!(ARCHIVE_WORKFLOW.contains("verify-checkout"));
+}
+
+#[test]
+fn test_commit_workflow_consumes_every_builtin_cargo_execution_decision() {
+    for work in ["cargo.build", "cargo.test", "cargo.doctest"] {
+        assert!(
+            COMMIT_WORKFLOW.contains(&format!("required-work), '{work}')")),
+            "Commit workflow does not route required {work}"
+        );
+    }
+    assert!(COMMIT_WORKFLOW.contains("just build"));
+    assert!(COMMIT_WORKFLOW.contains("just test"));
+    assert!(BUILD_SCRIPT.contains("is-required \"$PLAN_FILE\" cargo.build"));
+    assert!(BUILD_SCRIPT.contains("cargo-args \"$PLAN_FILE\" cargo.build"));
+    for work in ["cargo.test", "cargo.doctest"] {
+        assert!(TEST_SCRIPT.contains(&format!("is-required \"$PLAN_FILE\" {work}")));
+        assert!(TEST_SCRIPT.contains(&format!("cargo-args \"$PLAN_FILE\" {work}")));
+    }
 }

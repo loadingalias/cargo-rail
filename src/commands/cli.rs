@@ -8,64 +8,79 @@
 use super::common::{
     ChangeOutputFormat, SplitOutputFormat, SurfaceOutputFormat, TextJsonOutputFormat, UnifyOutputFormat,
 };
+use crate::output::OutputProtocol;
 use crate::sync::ConflictStrategy;
 use clap::{Args, CommandFactory, Parser, Subcommand, error::ErrorKind};
 use clap_complete::Shell;
 use std::path::PathBuf;
 
 const MAIN_HELP: &str = "\
-The Rust workspace engine.
+Cargo-Rail turns one captured Rust workspace into trustworthy plans, checks, mutations, releases, and compiler reuse.
 
-Cargo-Rail turns Cargo's resolved workspace model and an exact source snapshot into affected CI, source-surface analysis,
-verified compiler reuse, dependency coherence, exact-SHA releases, and crate synchronization.
+Common inspection:
+  cargo rail plan                         # Decide required repository work
+  cargo rail surface --check              # Check Rust visibility findings
+  cargo rail config explain               # Show configured policy overrides
+  cargo rail cache status                 # Inspect compiler-cache health
 
-Quick start:
-  cargo rail plan --explain                       # Inspect required named work and evidence
-  cargo rail plan --json                          # Export the versioned work plan
-  cargo rail surface --explain                     # Inspect Rust reachability and visibility
-  cargo rail cache setup                           # Enable transparent compiler reuse
-  cargo rail unify --check --explain              # Inspect dependency changes (exit 1 when pending)
+Workspace mutation:
+  cargo rail init                         # Create sparse repository policy
+  cargo rail unify apply                  # Apply dependency coherence edits
+  cargo rail change add --help            # Record release intent
+  cargo rail clean --help                 # Select owned artifacts to remove
+
+Advanced and external operations:
+  cargo rail split --help                 # Extract a crate with Git history
+  cargo rail sync --help                  # Synchronize split repositories
+  cargo rail release --help               # Prepare or publish exact-SHA releases
+  cargo rail doctor --help                # Inspect compiler integration
 
 Docs: https://github.com/loadingalias/cargo-rail";
-
-/// Root CLI wrapper for cargo subcommand integration
-///
-/// This wrapper allows cargo-rail to be invoked as `cargo rail <subcommand>`.
-#[derive(Debug, Parser)]
-#[command(name = "cargo")]
-#[command(bin_name = "cargo")]
-#[command(styles = get_styles())]
-pub enum CargoCli {
-    /// The Rust workspace engine
-    #[command(about = "The Rust workspace engine", long_about = MAIN_HELP)]
-    Rail(RailCli),
-}
 
 /// Main CLI structure for cargo-rail
 ///
 /// Contains global options and the subcommand to execute.
 #[derive(Debug, Parser)]
-#[command(name = "rail")]
+#[command(name = "cargo-rail")]
+#[command(bin_name = "cargo-rail")]
 #[command(version)]
-#[command(about = "The Rust workspace engine")]
+#[command(
+    about = "Turn one captured Rust workspace into trustworthy plans, checks, mutations, releases, and compiler reuse"
+)]
 #[command(long_about = MAIN_HELP)]
 #[command(propagate_version = true)]
 #[command(styles = get_styles())]
 pub struct RailCli {
     /// Suppress progress messages (for CI/automation)
-    #[arg(long, short, global = true)]
+    #[arg(
+        long,
+        short,
+        global = true,
+        conflicts_with = "verbose",
+        help_heading = "Global Options"
+    )]
     pub quiet: bool,
 
+    /// Show bounded operational detail
+    #[arg(
+        long,
+        short = 'v',
+        global = true,
+        conflicts_with = "quiet",
+        help_heading = "Global Options"
+    )]
+    pub verbose: bool,
+
     /// Output as JSON where supported; rejected otherwise
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = "Global Options")]
     pub json: bool,
 
     /// Path to rail.toml config file (bypass search order)
-    #[arg(long, global = true, value_name = "PATH")]
+    #[arg(long, global = true, value_name = "PATH", help_heading = "Global Options")]
     pub config: Option<PathBuf>,
 
     /// Workspace root directory (default: current directory)
-    #[arg(long, global = true, value_name = "PATH")]
+    #[arg(long, global = true, value_name = "PATH", help_heading = "Global Options")]
     pub workspace_root: Option<PathBuf>,
 
     /// Write diagnostic performance counters to this JSON file
@@ -83,9 +98,11 @@ Examples:
   cargo rail plan --json                    # Full machine-readable work contract
   cargo rail plan --since HEAD~5            # Changes in last 5 commits
   cargo rail plan --from abc --to def       # Changes between two SHAs
-  cargo rail plan --explain                 # Show concise proof chain
+  cargo rail plan --explain                 # Explain required decisions
+  cargo rail plan --explain-work cargo.test # Explain one decision, even when skipped
   cargo rail plan --all                     # Safely require every registered work item
   cargo rail plan --evidence inputs.json    # Use compatible observed-input evidence
+  cargo rail plan --verify plan.json        # Revalidate a saved plan without executing it
   cargo rail plan --schema                  # Print the versioned JSON Schema
   cargo rail plan --json > plan.json        # Redirect the exact plan to a file";
 
@@ -98,20 +115,20 @@ Examples:
   cargo rail surface                        # Inspect and report without modifying source
   cargo rail surface --prepare              # Prove exact-toolchain producer readiness
   cargo rail surface --check --explain      # Inspect complete Rust reachability
-  cargo rail surface --check -f json        # Emit the versioned machine contract
-  cargo rail surface --resume MANIFEST -f json  # Resume a partial compiler acquisition
+  cargo rail surface --check --json         # Emit the versioned machine contract
+  cargo rail surface --resume MANIFEST --json  # Resume a partial compiler acquisition
   cargo rail surface --fix --dry-run --explain  # Preview exact visibility edits
   cargo rail surface --fix --backup         # Apply verified edits with recovery evidence
   cargo rail surface --schema               # Print the versioned JSON Schema";
 
 const UNIFY_HELP: &str = "\
 Examples:
+  cargo rail unify                        # Preview dependency changes (exit 0)
   cargo rail unify --check                # Check for pending changes (exit 1)
-  cargo rail unify --check --explain      # Show why each decision was made
-  cargo rail unify --check -f json -o out.json  # Write JSON output to file
-  cargo rail unify                        # Apply changes
-  cargo rail unify --backup               # Apply with backup
+  cargo rail unify --explain              # Show why each decision was made
   cargo rail unify --show-diff            # Show manifest changes
+  cargo rail unify apply                  # Apply the current decision
+  cargo rail unify apply --backup         # Apply with backup
   cargo rail unify undo                   # Restore from backup
   cargo rail unify undo --list            # List available backups";
 
@@ -146,7 +163,6 @@ Examples:
   cargo rail release check my-crate                    # Validate the local release plan
   cargo rail release check my-crate --publication     # Validate registry publication readiness
   cargo rail release check my-crate --publication -e  # Run publish, MSRV, and semver checks
-  cargo rail release run my-crate --check       # Check for a pending release (exit 1)
   cargo rail release run my-crate               # Prepare a local release without registry publication
   cargo rail release run my-crate --publish     # Match configured crates.io authority at invocation
   cargo rail release run my-crate --include-dependents  # Release selected crate plus dependent closure
@@ -178,24 +194,30 @@ const INIT_HELP: &str = "\
 Examples:
   cargo rail init                       # Generate .config/rail.toml
   cargo rail init --dry-run             # Preview generated config
-  cargo rail init -o rail.toml          # Custom output path
+  cargo rail init --target wasm32-wasip1 # Declare one supported target
+  cargo rail init --detect-targets       # Opt in to repository target detection
   cargo rail init --force               # Overwrite existing config";
 
 const CLEAN_HELP: &str = "\
 Examples:
-  cargo rail clean                      # Clean all current-workspace Cargo-Rail artifacts
+  cargo rail clean --all                # Clean every eligible current-workspace artifact
   cargo rail clean --cache              # Clean current-workspace cache state
-  cargo rail clean --backups            # Prune old backups
+  cargo rail clean --prune-backups      # Prune backups beyond configured retention
+  cargo rail clean --all-backups        # Delete every backup
   cargo rail clean --reports            # Clean generated reports
-  cargo rail clean --check              # Check for pending cleanup (exit 1)";
+  cargo rail clean --release-journal ID # Delete one terminal release journal
+  cargo rail clean --cache --check      # Check selected cleanup (exit 1 when pending)";
 
 const CACHE_HELP: &str = "\
+Remote URLs, credentials, provider environments, and distributed execution are machine-owned authority. Use setup
+flags only after qualification has established the required trust domain, root portability, and worker identity.
+
 Examples:
   cargo rail cache setup --check                  # Preview transparent compiler reuse setup
   cargo rail cache setup                          # Install or repair the Cargo wrapper
   cargo rail cache setup --remote URL --root-portability remap  # Qualify cross-root L2 reuse
   cargo rail cache status                         # Inspect workspace and shared local cache state
-  cargo rail cache status --scope local -f json  # Inspect the shared local CAS only
+  cargo rail cache status --scope local --json   # Inspect the shared local CAS only
   cargo rail cache recover --check                # Preview byte-preserving markerless CAS recovery
   cargo rail cache recover                        # Quarantine the old tree and create a fresh CAS
   cargo rail cache clean --scope workspace --check  # Preview workspace cache reclamation
@@ -208,8 +230,10 @@ Examples:
   cargo rail config locate              # Show which config file is active
   cargo rail config print               # Show effective config with defaults
   cargo rail config validate            # Validate rail.toml
-  cargo rail config validate -f json    # JSON output for CI
+  cargo rail config validate --json     # JSON output for CI
   cargo rail config explain             # Explain effective values and sources
+  cargo rail config explain targets     # Explain one field in full
+  cargo rail config explain --all       # Explain the complete field inventory
   cargo rail config migrate --check     # Check for pending semantic migrations
   cargo rail config migrate             # Apply explicit semantic migrations";
 
@@ -272,14 +296,24 @@ pub enum Commands {
         /// Show concise human reasoning chain
         #[arg(long)]
         explain: bool,
+        /// Explain one exact work decision, including when it was skipped
+        #[arg(long, value_name = "WORK_ID")]
+        explain_work: Option<String>,
         /// Require every registered work item with full valid scope
         #[arg(long)]
         all: bool,
         /// Load portable compatible observed-input evidence
         #[arg(long, value_name = "PATH")]
         evidence: Option<PathBuf>,
+        /// Revalidate one saved plan against the current execution authority
+        #[arg(
+            long,
+            value_name = "PATH",
+            conflicts_with_all = ["since", "from", "to", "merge_base", "explain", "explain_work", "all", "evidence", "schema"]
+        )]
+        verify: Option<PathBuf>,
         /// Print the versioned planner JSON Schema and exit
-        #[arg(long, conflicts_with_all = ["since", "from", "to", "merge_base", "explain", "all", "evidence"])]
+        #[arg(long, conflicts_with_all = ["since", "from", "to", "merge_base", "explain", "explain_work", "all", "evidence", "verify"])]
         schema: bool,
     },
 
@@ -344,26 +378,20 @@ pub enum Commands {
     /// Analyze and repair workspace dependency coherence
     #[command(after_long_help = UNIFY_HELP)]
     Unify {
-        /// Subcommand (doctor or undo)
+        /// Explicit mutation, diagnostics, or recovery operation
         #[command(subcommand)]
         command: Option<UnifyCommand>,
         /// Check for pending manifest changes without modifying manifests (exit 1 when pending)
         #[arg(long, short = 'c')]
         check: bool,
-        /// Apply from a previously generated mutation plan file
-        #[arg(long, value_name = "PATH", conflicts_with = "check")]
-        plan: Option<PathBuf>,
         /// Output format
         #[arg(long, short = 'f', default_value_t, value_enum)]
         format: UnifyOutputFormat,
-        /// Create backups of all modified files
+        /// Generate the dependency report
         #[arg(long)]
-        backup: bool,
-        /// Skip generating the unify report
-        #[arg(long)]
-        skip_report: bool,
-        /// Custom path for the unify report (default: target/cargo-rail/unify-report.md)
-        #[arg(long)]
+        report: bool,
+        /// Durable report destination
+        #[arg(long, value_name = "PATH", requires = "report")]
         report_path: Option<PathBuf>,
         /// Write output to file (overwrites existing content)
         #[arg(long, short = 'o', value_name = "PATH", requires = "check")]
@@ -388,6 +416,12 @@ pub enum Commands {
         /// Preview generated config without writing
         #[arg(long)]
         dry_run: bool,
+        /// Add an exact supported Cargo target triple (repeatable)
+        #[arg(long = "target", value_name = "TRIPLE", conflicts_with = "detect_targets")]
+        targets: Vec<String>,
+        /// Detect target triples from repository files
+        #[arg(long, conflicts_with = "targets")]
+        detect_targets: bool,
     },
 
     /// (Advanced) Split a crate to a standalone repository with git history
@@ -462,15 +496,24 @@ pub enum Commands {
     /// Clean generated artifacts owned by the current workspace
     #[command(after_long_help = CLEAN_HELP)]
     Clean {
+        /// Clean every eligible workspace-owned artifact class.
+        #[arg(long, conflicts_with_all = ["cache", "prune_backups", "all_backups", "reports", "release_journal"])]
+        all: bool,
         /// Clean cache state owned by this workspace
         #[arg(long)]
         cache: bool,
-        /// Prune old backups
-        #[arg(long)]
-        backups: bool,
+        /// Prune backups beyond the configured retention bound.
+        #[arg(long, conflicts_with = "all_backups")]
+        prune_backups: bool,
+        /// Delete every workspace backup.
+        #[arg(long, conflicts_with = "prune_backups")]
+        all_backups: bool,
         /// Clean generated reports
         #[arg(long)]
         reports: bool,
+        /// Delete exactly one terminal release journal by transaction ID or state path.
+        #[arg(long, value_name = "ID_OR_PATH")]
+        release_journal: Option<String>,
         /// Check for pending cleanup without deleting files (exit 1 when pending)
         #[arg(long, short = 'c')]
         check: bool,
@@ -651,7 +694,7 @@ pub struct CacheSetupArgs {
 pub enum CacheCommand {
     /// Install or repair transparent verified compiler reuse.
     Setup(Box<CacheSetupArgs>),
-    /// Validate and normalize one machine-owned remote cache URL without network access.
+    /// (Advanced) Validate and normalize one machine-owned remote cache URL without network access.
     Normalize {
         /// AWS S3, Azure Blob Storage, or Cloudflare R2 URL.
         #[arg(value_name = "URL")]
@@ -666,7 +709,7 @@ pub enum CacheCommand {
         #[arg(long, short = 'f', default_value_t, value_enum)]
         format: TextJsonOutputFormat,
     },
-    /// Report exact bytes, counts, bounds, leases, and ownership scope.
+    /// Report cache installation and owned-storage health.
     Status {
         /// Cache scope to inspect.
         #[arg(long, value_enum, default_value = "all")]
@@ -776,6 +819,12 @@ pub enum ConfigCommand {
     },
     /// Explain effective values, defaults, sources, and deprecations
     Explain {
+        /// Exact configuration field path(s) to explain in full
+        #[arg(value_name = "FIELD", conflicts_with = "all")]
+        fields: Vec<String>,
+        /// Explain every known effective field
+        #[arg(long, conflicts_with = "fields")]
+        all: bool,
         /// Output format
         #[arg(long, short = 'f', default_value_t, value_enum)]
         format: TextJsonOutputFormat,
@@ -797,6 +846,24 @@ pub enum ConfigCommand {
 /// Subcommands for `cargo rail unify`
 #[derive(Debug, Subcommand)]
 pub enum UnifyCommand {
+    /// Apply the exact dependency-coherence decision
+    Apply {
+        /// Apply from a previously generated mutation plan file
+        #[arg(long, value_name = "PATH")]
+        plan: Option<PathBuf>,
+        /// Create backups of all modified files
+        #[arg(long)]
+        backup: bool,
+        /// Generate the dependency report
+        #[arg(long)]
+        report: bool,
+        /// Durable report destination
+        #[arg(long, value_name = "PATH", requires = "report")]
+        report_path: Option<PathBuf>,
+        /// Output format
+        #[arg(long, short = 'f', default_value_t, value_enum)]
+        format: UnifyOutputFormat,
+    },
     /// Inspect Cargo resolution semantics without changing files
     Doctor {
         /// Output format
@@ -811,6 +878,9 @@ pub enum UnifyCommand {
         /// Specific backup ID to restore (defaults to most recent)
         #[arg(long = "backup-id")]
         backup_id: Option<String>,
+        /// Output format
+        #[arg(long, short = 'f', default_value_t, value_enum)]
+        format: TextJsonOutputFormat,
     },
 }
 
@@ -878,7 +948,7 @@ pub enum ReleaseCommand {
         /// Version bump [auto, major, minor, patch, prerelease, release, or "x.y.z"]
         #[arg(long, default_value = "auto")]
         bump: String,
-        /// Check for a pending release plan (exit 1 when pending)
+        /// Deprecated compatibility check spelling; use `release check`
         #[arg(long, short = 'c')]
         check: bool,
         /// Apply from a previously generated mutation plan file
@@ -900,14 +970,17 @@ pub enum ReleaseCommand {
         /// Expand explicit crate selection to include the full dependent closure
         #[arg(long)]
         include_dependents: bool,
-        /// Skip confirmation prompts and allow non-default branch
+        /// Skip the interactive confirmation prompt.
         #[arg(short = 'y', long)]
         yes: bool,
+        /// Authorize release execution from a non-default branch.
+        #[arg(long)]
+        allow_non_default_branch: bool,
         /// Output format
         #[arg(long, short = 'f', default_value_t, value_enum)]
         format: TextJsonOutputFormat,
     },
-    /// Validate the same local release plan selected by `release run --check`
+    /// Validate the local release plan or publication readiness
     Check {
         /// Crate name(s) to check (mutually exclusive with --all)
         #[arg(conflicts_with = "all", value_name = "CRATE")]
@@ -955,9 +1028,12 @@ pub enum ReleaseCommand {
         /// Expand explicit crate selection to include the full dependent closure and version groups
         #[arg(long)]
         include_dependents: bool,
-        /// Skip confirmation prompts and allow non-default branch
+        /// Skip the interactive confirmation prompt.
         #[arg(short = 'y', long)]
         yes: bool,
+        /// Authorize release execution from a non-default branch.
+        #[arg(long)]
+        allow_non_default_branch: bool,
         /// Output format
         #[arg(long, short = 'f', default_value_t, value_enum)]
         format: TextJsonOutputFormat,
@@ -973,6 +1049,9 @@ pub enum ReleaseCommand {
         /// Inspect one state file instead of every known release transaction
         #[arg(value_name = "STATE")]
         state: Option<PathBuf>,
+        /// Include terminal and reconstructed transaction history
+        #[arg(long)]
+        history: bool,
         /// Output format
         #[arg(long, short = 'f', default_value_t, value_enum)]
         format: TextJsonOutputFormat,
@@ -1039,57 +1118,89 @@ fn get_styles() -> clap::builder::Styles {
     clap::builder::Styles::styled()
 }
 
+fn text_json_protocol(json: bool) -> OutputProtocol {
+    if json {
+        OutputProtocol::Json
+    } else {
+        OutputProtocol::Text
+    }
+}
+
 impl Commands {
-    /// Check if this command uses JSON-like output format
-    ///
-    /// Returns true for any format that produces structured output.
-    /// Used for early JSON mode detection to suppress progress messages.
-    pub fn is_json_format(&self) -> bool {
+    /// Select the invocation's complete output transport before fallible work.
+    #[doc(hidden)]
+    pub fn output_protocol(&self) -> OutputProtocol {
         match self {
             Commands::Doctor {
                 command: DoctorCommand::NativeCache { format },
-            } => format.is_json_like(),
+            } => text_json_protocol(format.is_json()),
             Commands::Cache { command } => match command {
-                CacheCommand::Setup(setup) => setup.format.is_json_like(),
+                CacheCommand::Setup(setup) => text_json_protocol(setup.format.is_json()),
                 CacheCommand::Normalize { format, .. }
                 | CacheCommand::Status { format, .. }
                 | CacheCommand::Recover { format, .. }
                 | CacheCommand::Clean { format, .. }
-                | CacheCommand::Remove { format, .. } => format.is_json_like(),
+                | CacheCommand::Remove { format, .. } => text_json_protocol(format.is_json()),
             },
-            Commands::Sync { format, .. } | Commands::Clean { format, .. } => format.is_json_like(),
-            Commands::Plan { json, schema, .. } => *schema || *json,
+            Commands::Sync { format, .. } | Commands::Clean { format, .. } => text_json_protocol(format.is_json()),
+            Commands::Plan { schema: true, .. } => OutputProtocol::Raw,
+            Commands::Plan { json, .. } => text_json_protocol(*json),
+            Commands::Surface { schema: true, .. } => OutputProtocol::Raw,
+            Commands::Surface { format, .. } => match format {
+                SurfaceOutputFormat::Text => OutputProtocol::Text,
+                SurfaceOutputFormat::Json => OutputProtocol::Json,
+                SurfaceOutputFormat::GitHub => OutputProtocol::Raw,
+            },
             Commands::Unify {
-                command: Some(UnifyCommand::Doctor { format }),
+                command: Some(UnifyCommand::Doctor { format } | UnifyCommand::Apply { format, .. }),
                 ..
-            } => format.is_json_like(),
-            Commands::Unify { format, .. } => format.is_json_like(),
+            } => text_json_protocol(format.is_json()),
+            Commands::Unify {
+                command: Some(UnifyCommand::Undo { format, .. }),
+                ..
+            } => text_json_protocol(format.is_json()),
+            Commands::Unify { format, .. } => text_json_protocol(format.is_json()),
             Commands::Split { command } => match command {
-                SplitCommand::Init { .. } => false,
-                SplitCommand::Run { format, .. } => format.is_json_like(),
+                SplitCommand::Init { .. } => OutputProtocol::Text,
+                SplitCommand::Run { format, .. } => match format {
+                    SplitOutputFormat::Text => OutputProtocol::Text,
+                    SplitOutputFormat::Json => OutputProtocol::Json,
+                    SplitOutputFormat::NamesOnly | SplitOutputFormat::JsonLines => OutputProtocol::Raw,
+                },
             },
             Commands::Release { command } => match command {
-                ReleaseCommand::Init { .. } => false,
-                ReleaseCommand::Resume { .. } | ReleaseCommand::Abort { .. } => false,
-                ReleaseCommand::Status { format, .. } => format.is_json_like(),
+                ReleaseCommand::Init { .. } | ReleaseCommand::Resume { .. } | ReleaseCommand::Abort { .. } => {
+                    OutputProtocol::Text
+                }
+                ReleaseCommand::Status { format, .. } => text_json_protocol(format.is_json()),
                 ReleaseCommand::Run { format, .. }
                 | ReleaseCommand::Check { format, .. }
-                | ReleaseCommand::Finalize { format, .. } => format.is_json_like(),
+                | ReleaseCommand::Finalize { format, .. } => text_json_protocol(format.is_json()),
             },
             Commands::Change { command } => match command {
                 ChangeCommand::Add { format, .. }
                 | ChangeCommand::Status { format }
-                | ChangeCommand::Check { format, .. } => format.is_json_like(),
+                | ChangeCommand::Check { format, .. } => match format {
+                    ChangeOutputFormat::Text => OutputProtocol::Text,
+                    ChangeOutputFormat::Json => OutputProtocol::Json,
+                    ChangeOutputFormat::NamesOnly => OutputProtocol::Raw,
+                },
             },
             Commands::Config { command } => match command {
                 ConfigCommand::Locate { format }
                 | ConfigCommand::Print { format }
-                | ConfigCommand::Explain { format }
+                | ConfigCommand::Explain { format, .. }
                 | ConfigCommand::Validate { format, .. }
-                | ConfigCommand::Migrate { format, .. } => format.is_json_like(),
+                | ConfigCommand::Migrate { format, .. } => text_json_protocol(format.is_json()),
             },
-            _ => false,
+            Commands::Completions { .. } => OutputProtocol::Raw,
+            _ => OutputProtocol::Text,
         }
+    }
+
+    /// Check whether this command emits exactly one complete JSON value.
+    pub fn is_json_format(&self) -> bool {
+        self.output_protocol() == OutputProtocol::Json
     }
 
     /// Apply global `--json` by overriding the selected command's format.
@@ -1098,10 +1209,6 @@ impl Commands {
     /// of silently emitting text while JSON mode is enabled.
     pub fn apply_json_override(&mut self) -> Result<(), clap::Error> {
         let unsupported = match self {
-            Commands::Unify {
-                command: Some(UnifyCommand::Undo { .. }),
-                ..
-            } => Some("unify undo"),
             Commands::Split {
                 command: SplitCommand::Init { .. },
             } => Some("split init"),
@@ -1118,9 +1225,38 @@ impl Commands {
             _ => None,
         };
         if let Some(command) = unsupported {
-            return Err(CargoCli::command().error(
+            return Err(RailCli::command().error(
                 ErrorKind::ArgumentConflict,
                 format!("--json is not supported by 'cargo rail {command}'"),
+            ));
+        }
+
+        let incompatible_stream = match self {
+            Commands::Split {
+                command: SplitCommand::Run { format, .. },
+            } => match format {
+                SplitOutputFormat::NamesOnly => Some("names-only"),
+                SplitOutputFormat::JsonLines => Some("jsonl"),
+                SplitOutputFormat::Text | SplitOutputFormat::Json => None,
+            },
+            Commands::Surface { format, .. } => match format {
+                SurfaceOutputFormat::GitHub => Some("github"),
+                SurfaceOutputFormat::Text | SurfaceOutputFormat::Json => None,
+            },
+            Commands::Change { command } => match command {
+                ChangeCommand::Add { format, .. }
+                | ChangeCommand::Status { format }
+                | ChangeCommand::Check { format, .. } => match format {
+                    ChangeOutputFormat::NamesOnly => Some("names-only"),
+                    ChangeOutputFormat::Text | ChangeOutputFormat::Json => None,
+                },
+            },
+            _ => None,
+        };
+        if let Some(format) = incompatible_stream {
+            return Err(RailCli::command().error(
+                ErrorKind::ArgumentConflict,
+                format!("--json conflicts with the distinct '--format {format}' stream protocol"),
             ));
         }
 
@@ -1142,9 +1278,13 @@ impl Commands {
             Commands::Plan { json, .. } => *json = true,
             Commands::Surface { format, .. } => *format = SurfaceOutputFormat::Json,
             Commands::Unify {
-                command: Some(UnifyCommand::Doctor { format }),
+                command: Some(UnifyCommand::Doctor { format } | UnifyCommand::Apply { format, .. }),
                 ..
             } => *format = UnifyOutputFormat::Json,
+            Commands::Unify {
+                command: Some(UnifyCommand::Undo { format, .. }),
+                ..
+            } => *format = TextJsonOutputFormat::Json,
             Commands::Unify { format, .. } => *format = UnifyOutputFormat::Json,
             Commands::Split {
                 command: SplitCommand::Run { format, .. },
@@ -1167,7 +1307,7 @@ impl Commands {
             Commands::Config { command } => match command {
                 ConfigCommand::Locate { format }
                 | ConfigCommand::Print { format }
-                | ConfigCommand::Explain { format }
+                | ConfigCommand::Explain { format, .. }
                 | ConfigCommand::Validate { format, .. }
                 | ConfigCommand::Migrate { format, .. } => *format = TextJsonOutputFormat::Json,
             },
@@ -1180,13 +1320,65 @@ impl Commands {
 
 /// Generate shell completions and print to stdout
 pub fn generate_completions(shell: Shell) {
-    let mut cmd = CargoCli::command();
+    let mut cmd = RailCli::command();
     clap_complete::generate(shell, &mut cmd, "cargo-rail", &mut std::io::stdout());
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_cache_size;
+    use super::{RailCli, parse_cache_size};
+    use crate::output::OutputProtocol;
+    use clap::Parser as _;
+
+    #[test]
+    fn surface_formats_select_distinct_output_protocols() {
+        for (format, expected) in [
+            ("text", OutputProtocol::Text),
+            ("json", OutputProtocol::Json),
+            ("github", OutputProtocol::Raw),
+        ] {
+            let cli = RailCli::try_parse_from(["cargo-rail", "surface", "--format", format])
+                .expect("surface format must parse");
+            assert_eq!(
+                cli.command.output_protocol(),
+                expected,
+                "surface --format {format} selected the wrong transport"
+            );
+            assert_eq!(
+                cli.command.is_json_format(),
+                expected == OutputProtocol::Json,
+                "surface --format {format} selected the wrong JSON compatibility mode"
+            );
+        }
+    }
+
+    #[test]
+    fn command_owned_streams_select_the_raw_output_protocol() {
+        let cases: &[&[&str]] = &[
+            &["cargo-rail", "plan", "--schema"],
+            &["cargo-rail", "surface", "--schema"],
+            &["cargo-rail", "surface", "--format", "github"],
+            &["cargo-rail", "split", "run", "crate-a", "--format", "names-only"],
+            &["cargo-rail", "split", "run", "crate-a", "--format", "jsonl"],
+            &["cargo-rail", "change", "status", "--format", "names-only"],
+            &["cargo-rail", "completions", "bash"],
+        ];
+
+        for arguments in cases {
+            let cli = RailCli::try_parse_from(arguments.iter().copied()).expect("raw stream command must parse");
+            assert_eq!(
+                cli.command.output_protocol(),
+                OutputProtocol::Raw,
+                "{} must retain its command-owned raw stream",
+                arguments[1..].join(" ")
+            );
+            assert!(
+                !cli.command.is_json_format(),
+                "{} must not select JSON error rendering",
+                arguments[1..].join(" ")
+            );
+        }
+    }
 
     #[test]
     fn transparent_cache_size_grammar_is_exact_and_bounded() {

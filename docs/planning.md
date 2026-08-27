@@ -181,16 +181,22 @@ bounded Cargo fallback. Complete synthetic fixtures qualify planner behavior wit
 
 ## Process and machine boundaries
 
-Transfer the exact plan file, not reconstructed booleans. Before execution, a consumer must:
+Transfer the exact plan file, not reconstructed booleans. Before starting each consuming process, a consumer must:
 
 1. validate contract v8 and its required-work projection;
-2. verify that checkout `HEAD` equals `inputs.head_commit`;
-3. lower only the typed scope belonging to the selected work ID; and
-4. reject unknown work, variants, or selector shapes before starting tools.
+2. lower only the typed scope belonging to the selected work ID;
+3. reject unknown work, variants, or selector shapes; and
+4. run `scripts/plan/read.py verify-checkout PLAN` from the execution workspace immediately before the executor, then
+   start the executor only when verification succeeds.
+
+`verify-checkout` delegates to the matching Cargo-Rail binary through `cargo rail plan --verify`. It revalidates the
+complete saved execution authority: the head commit, worktree capture or clean object-bound checkout, Cargo universe
+and configuration, toolchain, planning target, and platform. Comparing `HEAD` alone does not authorize execution.
+Drift fails with exit code `2`; verification emits no selectors and performs no mutation.
 
 The Commit workflow uploads one plan artifact. Quality, compatibility, archive, and Surface jobs download that same
-artifact and verify the checkout before execution. Reusable workflows receive planner-selected matrices; missing
-variant evidence is represented as explicit `all`, never an inferred empty matrix.
+artifact and verify its complete execution authority immediately before each executor. Reusable workflows receive
+planner-selected matrices; missing variant evidence is represented as explicit `all`, never an inferred empty matrix.
 
 Compiler reuse remains independent of planning. Run `cargo rail cache setup` on an execution machine when verified L1
 reuse is desired; planning never treats a cache hit as evidence that work is unnecessary.

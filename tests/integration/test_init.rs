@@ -170,7 +170,8 @@ fn test_init_generated_config_passes_strict_validate() {
         let validate_output = run_cargo_rail(&ws.path, &["rail", "config", "validate", "--strict", "-f", "json"])?;
         assert!(
             validate_output.status.success(),
-            "generated config must pass strict validation. stderr:\n{}",
+            "generated config must pass strict validation. stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&validate_output.stdout),
             String::from_utf8_lossy(&validate_output.stderr)
         );
 
@@ -222,32 +223,30 @@ fn test_init_omits_default_sections_and_templates() {
     super::helpers::finish_test(result);
 }
 
-/// Test that --output to a different path works when default config exists
+/// Init must not create an inactive configuration behind the discovered file.
 #[test]
-fn test_init_output_different_path_with_existing_config() {
+fn test_init_refuses_shadowed_output_path() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("init-output-diff")?;
 
         // Create config at default location
-        let default_config = ws.path.join(".config/rail.toml");
+        let default_config = ws.path.join(".config").join("rail.toml");
         std::fs::create_dir_all(ws.path.join(".config"))?;
         std::fs::write(&default_config, "# existing config\n[unify]\n")?;
         assert!(default_config.exists(), "default config should exist");
 
-        // Run init with different output path - should succeed without --force
+        // A different output would not become active under config discovery.
         let custom_path = "custom-rail.toml";
         let output = run_cargo_rail(&ws.path, &["rail", "init", "--output", custom_path])?;
 
         assert!(
-            output.status.success(),
-            "init with different --output should succeed even with existing config"
+            !output.status.success(),
+            "init must reject an output shadowed by the active config"
         );
 
-        // Verify custom config was created
+        // The inactive config was never created and the active file is unchanged.
         let custom_config = ws.path.join(custom_path);
-        assert!(custom_config.exists(), "custom config should be created");
-
-        // Verify default config still exists (unchanged)
+        assert!(!custom_config.exists(), "shadowed config must not be created");
         assert!(default_config.exists(), "default config should still exist");
         let default_content = std::fs::read_to_string(&default_config)?;
         assert!(
@@ -255,11 +254,11 @@ fn test_init_output_different_path_with_existing_config() {
             "default config should be unchanged"
         );
 
-        // Verify stderr warns about existing config
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stderr.contains("note:") && stderr.contains("existing config"),
-            "should warn about existing config, got: {}",
+            stderr.contains("active configuration already exists")
+                && stderr.contains(default_config.to_string_lossy().as_ref()),
+            "error must name the active config, got: {}",
             stderr
         );
 

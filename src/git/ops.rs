@@ -27,6 +27,88 @@ pub(crate) enum GitIndexChange {
 }
 
 impl SystemGit {
+    /// Materialize one immutable Git tree into an empty directory without
+    /// changing repository state or creating a Git worktree.
+    pub(crate) fn materialize_tree(&self, commit_sha: &str, destination: &Path) -> RailResult<()> {
+        let destination_metadata = std::fs::symlink_metadata(destination).map_err(|error| {
+            RailError::message(format!(
+                "failed to inspect historical planning root '{}': {error}",
+                destination.display()
+            ))
+        })?;
+        if !destination_metadata.file_type().is_dir() {
+            return Err(RailError::message(format!(
+                "historical planning root '{}' is not a directory",
+                destination.display()
+            )));
+        }
+        if std::fs::read_dir(destination)?.next().is_some() {
+            return Err(RailError::message(format!(
+                "historical planning root '{}' is not empty",
+                destination.display()
+            )));
+        }
+
+        let entries = self.collect_tree_entries_for_paths(commit_sha, &[PathBuf::from(".")])?;
+        let object_ids = entries.iter().map(|entry| entry.object_id.as_str()).collect::<Vec<_>>();
+        let blobs = self.read_blobs_bulk(&object_ids)?;
+        for (entry, bytes) in entries.into_iter().zip(blobs) {
+            let relative = crate::source::RepositoryPath::new(&entry.path)?;
+            let path = destination.join(relative.as_path());
+            let parent = path
+                .parent()
+                .ok_or_else(|| RailError::message(format!("historical tree path '{}' has no parent", relative)))?;
+            std::fs::create_dir_all(parent).map_err(|error| {
+                RailError::message(format!(
+                    "failed to create historical tree directory '{}': {error}",
+                    parent.display()
+                ))
+            })?;
+            match entry.mode.as_str() {
+                "100644" | "100755" => {
+                    use std::io::Write as _;
+
+                    let mut file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)
+                        .map_err(|error| {
+                            RailError::message(format!(
+                                "failed to create historical tree file '{}': {error}",
+                                path.display()
+                            ))
+                        })?;
+                    file.write_all(&bytes).map_err(|error| {
+                        RailError::message(format!(
+                            "failed to write historical tree file '{}': {error}",
+                            path.display()
+                        ))
+                    })?;
+                    #[cfg(unix)]
+                    if entry.mode == "100755" {
+                        use std::os::unix::fs::PermissionsExt as _;
+
+                        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+                    }
+                }
+                "120000" => materialize_historical_symlink(destination, &path, &bytes)?,
+                "160000" => {
+                    return Err(RailError::with_help(
+                        format!("historical planning does not support Git submodule '{}'", relative),
+                        "select a revision whose Cargo workspace is fully represented by repository files",
+                    ));
+                }
+                mode => {
+                    return Err(RailError::message(format!(
+                        "historical tree entry '{}' has unsupported Git mode '{mode}'",
+                        relative
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Normalize a path to be relative to the work tree
     ///
     /// If the path is absolute, resolve both representations before stripping the
@@ -969,6 +1051,68 @@ impl SystemGit {
     }
 }
 
+fn materialize_historical_symlink(destination: &Path, path: &Path, bytes: &[u8]) -> RailResult<()> {
+    let target = std::str::from_utf8(bytes).map_err(|_| {
+        RailError::message(format!(
+            "historical symbolic-link target for '{}' is not valid UTF-8",
+            path.display()
+        ))
+    })?;
+    let target_path = Path::new(target);
+    if target_path.is_absolute() {
+        return Err(RailError::with_help(
+            format!(
+                "historical symbolic link '{}' points outside the isolated tree",
+                path.display()
+            ),
+            "select a revision whose Cargo workspace does not depend on external symbolic links",
+        ));
+    }
+    let parent = path
+        .parent()
+        .and_then(|parent| parent.strip_prefix(destination).ok())
+        .ok_or_else(|| RailError::message("historical symbolic link has no contained parent"))?;
+    let mut depth = parent.components().count();
+    for component in target_path.components() {
+        match component {
+            std::path::Component::Normal(_) => depth += 1,
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir if depth > 0 => depth -= 1,
+            std::path::Component::ParentDir | std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                return Err(RailError::with_help(
+                    format!(
+                        "historical symbolic link '{}' escapes the isolated tree",
+                        path.display()
+                    ),
+                    "select a revision whose Cargo workspace does not depend on external symbolic links",
+                ));
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, path).map_err(|error| {
+            RailError::message(format!(
+                "failed to materialize historical symbolic link '{}': {error}",
+                path.display()
+            ))
+        })?;
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(target, path).map_err(|error| {
+            RailError::with_help(
+                format!(
+                    "failed to materialize historical symbolic link '{}': {error}",
+                    path.display()
+                ),
+                "enable symbolic-link creation or select a historical Cargo workspace without symbolic links",
+            )
+        })?;
+    }
+    Ok(())
+}
+
 /// Parse `git diff --name-status -z` output into (path, change_type) pairs.
 ///
 /// Handles:
@@ -1313,6 +1457,20 @@ mod tests {
     /// Helper to get the git repository root
     fn find_git_root() -> PathBuf {
         env::current_dir().unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn historical_materialization_rejects_symlink_escape() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let link = nested.join("link");
+
+        let error = materialize_historical_symlink(root.path(), &link, b"../../outside")
+            .expect_err("historical symlink escaped the isolated tree");
+        assert!(error.to_string().contains("escapes the isolated tree"), "{error}");
+        assert!(!link.exists());
     }
 
     #[test]

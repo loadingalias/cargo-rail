@@ -55,9 +55,6 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
     let json = args.format.is_json();
 
     // JSON mode enables structured error output and suppresses progress
-    if json {
-        crate::output::set_json_mode(true);
-    }
 
     if let Some(receipt) = args.resume.as_deref() {
         return run_sync_resume(ctx, receipt, json);
@@ -83,10 +80,19 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
     let config_count = builder.count();
 
     if config_count == 0 && args.all {
-        return Err(crate::error::RailError::with_help(
-            "no crates configured for sync",
-            "run 'cargo rail split init' first",
-        ));
+        if json {
+            let output = crate::output::machine_json_envelope(
+                "sync",
+                "selection",
+                "clean",
+                0,
+                serde_json::json!({ "crates": [], "count": 0 }),
+            );
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        } else {
+            println!("No sync operations are configured.");
+        }
+        return Ok(());
     }
 
     let direction = match (args.from_remote, args.to_remote) {
@@ -102,45 +108,45 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
     };
 
     let configs = builder.build_sync_configs()?;
+    let selected_repositories = configs
+        .iter()
+        .map(|(config, _)| (config.crate_name.clone(), config.target_repo_path.display().to_string()))
+        .collect::<std::collections::BTreeMap<_, _>>();
     let snapshots = collect_sync_snapshots(ctx, &configs, &direction, args.strategy)?;
     let expected_mutation_plan = build_sync_mutation_plan(ctx, &configs, &direction, args.strategy, args.allow_dirty)?;
     let pre_heads = collect_sync_heads(ctx.workspace_root(), &configs);
 
     // Check mode
     if args.check {
-        let pending = configs
+        let pending_commits = configs
             .iter()
             .map(|(config, target_exists)| {
                 if !target_exists {
-                    return Ok(true);
+                    return Ok(1);
                 }
                 let mut engine = SyncEngine::new(ctx, config.clone(), args.strategy)?;
-                engine.has_pending_changes(&direction)
+                engine.pending_commit_count(&direction)
             })
             .collect::<RailResult<Vec<_>>>()?;
-        let has_pending = pending.iter().any(|pending| *pending);
+        let has_pending = pending_commits.iter().any(|count| *count > 0);
         let result = if has_pending { "pending_changes" } else { "clean" };
         let exit_code = i32::from(has_pending);
         if json {
-            let dir_str = match direction {
-                SyncDirection::MonoToRemote => "to_remote",
-                SyncDirection::RemoteToMono => "from_remote",
-                SyncDirection::Both => "bidirectional",
-                SyncDirection::None => "none",
-            };
+            let dir_str = direction_name(&direction);
 
             let crates: Vec<_> = configs
                 .iter()
-                .zip(&pending)
-                .map(|((sync_config, target_exists), pending)| {
+                .zip(&pending_commits)
+                .map(|((sync_config, target_exists), pending_commits)| {
                     serde_json::json!({
                       "crate_name": sync_config.crate_name,
-                      "mode": format!("{:?}", sync_config.mode),
+                      "mode": split_mode_name(&sync_config.mode),
                       "target_repo": sync_config.target_repo_path,
                       "branch": sync_config.branch,
                       "remote_url": sync_config.remote_url,
                       "target_exists": target_exists,
-                      "pending": pending,
+                      "pending": *pending_commits > 0,
+                      "pending_commits": pending_commits,
                     })
                 })
                 .collect();
@@ -149,7 +155,7 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
               "command": "sync",
               "check": true,
               "direction": dir_str,
-              "strategy": format!("{:?}", args.strategy).to_lowercase(),
+              "strategy": strategy_name(args.strategy),
               "crates": crates,
               "count": configs.len(),
               "planning": {
@@ -168,31 +174,35 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
             };
         }
 
-        let dir_display = match direction {
-            SyncDirection::MonoToRemote => "mono -> remote",
-            SyncDirection::RemoteToMono => "remote -> mono",
-            SyncDirection::Both => "bidirectional",
-            SyncDirection::None => "none",
-        };
-
-        println!("sync plan:\n");
-        for ((sync_config, target_exists), pending) in configs.iter().zip(&pending) {
-            println!("  {}", sync_config.crate_name);
-            println!("    status: {}", if *pending { "pending" } else { "clean" });
-            println!("    direction: {}", dir_display);
-            println!("    target: {}", sync_config.target_repo_path.display());
-            println!("    remote: {}", sync_config.remote_url);
-            println!("    strategy: {}", format!("{:?}", args.strategy).to_lowercase());
+        for ((sync_config, target_exists), pending_commits) in configs.iter().zip(&pending_commits) {
+            println!(
+                "{}: {}; repository {} ({} pending commit(s))",
+                sync_config.crate_name,
+                direction_display(&direction),
+                sync_config.target_repo_path.display(),
+                pending_commits
+            );
             if !target_exists {
-                println!("    warning: target repo missing (run split first)");
+                println!("  Warning: target repository is missing; run split first.");
+            }
+            if crate::output::is_verbose() {
+                println!("  Remote: {}", sync_config.remote_url);
+                println!("  Conflict strategy: {}", strategy_name(args.strategy));
             }
         }
 
         if has_pending {
-            println!("\nChanges detected. Run without --check to apply.");
+            println!(
+                "Next: cargo rail sync {}",
+                if args.all {
+                    "--all"
+                } else {
+                    configs[0].0.crate_name.as_str()
+                }
+            );
             return Err(crate::error::RailError::CheckHasPendingChanges);
         }
-        println!("\nNo changes detected.");
+        println!("Sync targets are current.");
         return Ok(());
     }
 
@@ -228,7 +238,7 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
             println!("  {} {}{}", sync_config.crate_name, dir_sym, status);
         }
 
-        if !utils::prompt_for_confirmation("\nproceed? [Enter/Ctrl+C]")? {
+        if !utils::prompt_for_confirmation()? {
             println!("cancelled");
             return Ok(());
         }
@@ -261,7 +271,9 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
             format!("planned sync for {} crate(s)", config_count),
         )],
     )?;
-    progress!("receipt: {}", plan_receipt.display());
+    if crate::output::is_verbose() {
+        progress!("plan receipt: {}", plan_receipt.display());
+    }
 
     // Execute syncs and collect per-crate results
     let configs_for_exec = configs.clone();
@@ -276,7 +288,9 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
                     let crate_name = sync_config.crate_name.clone();
 
                     if !target_exists {
-                        progress!("  {} skipped (run split first)", crate_name);
+                        if crate::output::is_verbose() {
+                            progress!("  {} skipped (run split first)", crate_name);
+                        }
                         return Ok(CrateSyncResult {
                             crate_name,
                             result: SyncResult::default(),
@@ -284,7 +298,9 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
                         });
                     }
 
-                    progress!("  {}", crate_name);
+                    if crate::output::is_verbose() {
+                        progress!("  {}", crate_name);
+                    }
                     let mut engine = SyncEngine::new(ctx, sync_config, strategy)?;
 
                     let result = match direction {
@@ -309,7 +325,9 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
                 let crate_name = sync_config.crate_name.clone();
 
                 if !target_exists {
-                    progress!("{} skipped (run split first)", crate_name);
+                    if crate::output::is_verbose() {
+                        progress!("{} skipped (run split first)", crate_name);
+                    }
                     results.push(CrateSyncResult {
                         crate_name,
                         result: SyncResult::default(),
@@ -318,7 +336,9 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
                     continue;
                 }
 
-                progress!("syncing {}...", crate_name);
+                if crate::output::is_verbose() {
+                    progress!("syncing {}...", crate_name);
+                }
                 let mut engine = SyncEngine::new(ctx, sync_config, args.strategy)?;
 
                 let result = match direction {
@@ -342,11 +362,13 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
         };
 
     // Print summary
-    print_sync_summary(&crate_results, json)?;
+    print_sync_summary(&crate_results, json, Some(&direction), &selected_repositories)?;
     let post_heads = collect_sync_heads(ctx.workspace_root(), &configs);
     let audit_path =
         write_sync_audit_artifact(ctx.workspace_root(), &configs, &crate_results, &pre_heads, &post_heads)?;
-    progress!("sync audit: {}", audit_path.display());
+    if crate::output::is_verbose() {
+        progress!("sync audit: {}", audit_path.display());
+    }
     if crate_results
         .iter()
         .any(|result| result.result.status == crate::sync::SyncStatus::Conflicted)
@@ -364,7 +386,12 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
             MutationTrace::new("SYNC_APPLY_COMPLETED", "completed sync apply"),
         ],
     )?;
-    progress!("receipt: {}", apply_receipt.display());
+    if crate::output::is_verbose() {
+        progress!("apply receipt: {}", apply_receipt.display());
+    }
+    if !json {
+        println!("Receipt: {}", apply_receipt.display());
+    }
 
     Ok(())
 }
@@ -386,6 +413,8 @@ fn run_sync_resume(ctx: &WorkspaceContext, receipt: &Path, json: bool) -> RailRe
         ));
     }
 
+    let selected_repositories =
+        std::collections::BTreeMap::from([(crate_name.clone(), config.target_repo_path.display().to_string())]);
     let mut engine = SyncEngine::new(ctx, config, ConflictStrategy::Manual)?;
     let result = engine.resume_from_receipt(receipt)?;
     let results = vec![CrateSyncResult {
@@ -393,7 +422,7 @@ fn run_sync_resume(ctx: &WorkspaceContext, receipt: &Path, json: bool) -> RailRe
         result,
         skipped: false,
     }];
-    print_sync_summary(&results, json)?;
+    print_sync_summary(&results, json, None, &selected_repositories)?;
     if results
         .iter()
         .any(|result| result.result.status == crate::sync::SyncStatus::Conflicted)
@@ -404,7 +433,12 @@ fn run_sync_resume(ctx: &WorkspaceContext, receipt: &Path, json: bool) -> RailRe
 }
 
 /// Print sync results summary
-fn print_sync_summary(results: &[CrateSyncResult], json: bool) -> RailResult<()> {
+fn print_sync_summary(
+    results: &[CrateSyncResult],
+    json: bool,
+    direction: Option<&SyncDirection>,
+    repositories: &std::collections::BTreeMap<String, String>,
+) -> RailResult<()> {
     if json {
         let crates: Vec<_> = results
       .iter()
@@ -418,6 +452,7 @@ fn print_sync_summary(results: &[CrateSyncResult], json: bool) -> RailResult<()>
 
         serde_json::json!({
           "crate": r.crate_name,
+          "target_repository": repositories.get(&r.crate_name),
           "commits_synced": r.result.commits_synced,
           "conflicts": conflicts,
           "status": if r.result.status == crate::sync::SyncStatus::Conflicted { "conflicted" } else { "complete" },
@@ -435,6 +470,7 @@ fn print_sync_summary(results: &[CrateSyncResult], json: bool) -> RailResult<()>
             .any(|result| result.result.status == crate::sync::SyncStatus::Conflicted);
         let payload = serde_json::json!({
           "command": "sync",
+          "direction": direction.map(direction_name).unwrap_or("resume"),
           "crates": crates,
           "summary": {
             "total_commits": total_commits,
@@ -462,62 +498,101 @@ fn print_sync_summary(results: &[CrateSyncResult], json: bool) -> RailResult<()>
         .iter()
         .any(|result| result.result.status == crate::sync::SyncStatus::Conflicted);
 
-    // Per-crate details (only if multiple crates or conflicts)
-    if active_results.len() > 1 || total_conflicts > 0 {
-        println!();
-        for r in &active_results {
-            let commit_word = if r.result.commits_synced == 1 {
-                "commit"
+    for r in &active_results {
+        let commit_word = if r.result.commits_synced == 1 {
+            "commit"
+        } else {
+            "commits"
+        };
+        let repository = repositories.get(&r.crate_name).map(String::as_str).unwrap_or("unknown");
+        let direction = direction.map(direction_display).unwrap_or("resumed conflict");
+        if r.result.conflicts.is_empty() {
+            println!(
+                "{}: {}; repository {} ({} {})",
+                r.crate_name, direction, repository, r.result.commits_synced, commit_word
+            );
+        } else {
+            let conflict_word = if r.result.conflicts.len() == 1 {
+                "conflict"
             } else {
-                "commits"
+                "conflicts"
             };
-            if r.result.conflicts.is_empty() {
-                println!("  {}: {} {}", r.crate_name, r.result.commits_synced, commit_word);
-            } else {
-                let conflict_word = if r.result.conflicts.len() == 1 {
-                    "conflict"
-                } else {
-                    "conflicts"
-                };
-                println!(
-                    "  {}: {} {}, {} {}",
-                    r.crate_name,
-                    r.result.commits_synced,
-                    commit_word,
-                    r.result.conflicts.len(),
-                    conflict_word
-                );
-                for conflict in &r.result.conflicts {
-                    println!("    {}", conflict.file_path.display());
+            println!(
+                "{}: {}; repository {} ({} {}, {} {})",
+                r.crate_name,
+                direction,
+                repository,
+                r.result.commits_synced,
+                commit_word,
+                r.result.conflicts.len(),
+                conflict_word
+            );
+            for conflict in &r.result.conflicts {
+                if crate::output::is_verbose() {
+                    println!("  Conflict: {}", conflict.file_path.display());
                 }
             }
         }
-        println!();
     }
 
     // Summary line
     let commit_word = if total_commits == 1 { "commit" } else { "commits" };
     if conflicted {
         println!(
-            "sync conflicted: {} unresolved path(s); no conflicted commit was created",
+            "Sync conflicted: {} unresolved path(s); no conflicted commit was created.",
             total_conflicts
         );
         for result in &active_results {
             if let Some(receipt) = &result.result.conflict_receipt {
-                println!("resume: cargo rail sync --resume {}", receipt.display());
+                println!("Conflict receipt: {}", receipt.display());
+                println!("Next: cargo rail sync --resume {}", receipt.display());
             }
         }
     } else if total_conflicts > 0 {
         let conflict_word = if total_conflicts == 1 { "conflict" } else { "conflicts" };
         println!(
-            "sync complete: {} {}, {} {}",
+            "Sync complete: {} {}, {} {}.",
             total_commits, commit_word, total_conflicts, conflict_word
         );
     } else {
-        println!("sync complete: {} {}", total_commits, commit_word);
+        println!("Sync complete: {} {}.", total_commits, commit_word);
     }
 
     Ok(())
+}
+
+fn split_mode_name(mode: &crate::config::SplitMode) -> &'static str {
+    match mode {
+        crate::config::SplitMode::Single => "single",
+        crate::config::SplitMode::Combined => "combined",
+    }
+}
+
+fn direction_name(direction: &SyncDirection) -> &'static str {
+    match direction {
+        SyncDirection::MonoToRemote => "local_to_remote",
+        SyncDirection::RemoteToMono => "remote_to_local",
+        SyncDirection::Both => "bidirectional",
+        SyncDirection::None => "none",
+    }
+}
+
+fn direction_display(direction: &SyncDirection) -> &'static str {
+    match direction {
+        SyncDirection::MonoToRemote => "local source -> remote target",
+        SyncDirection::RemoteToMono => "remote source -> local target",
+        SyncDirection::Both => "local and remote bidirectional",
+        SyncDirection::None => "no direction",
+    }
+}
+
+fn strategy_name(strategy: ConflictStrategy) -> &'static str {
+    match strategy {
+        ConflictStrategy::Ours => "ours",
+        ConflictStrategy::Theirs => "theirs",
+        ConflictStrategy::Manual => "manual",
+        ConflictStrategy::Union => "union",
+    }
 }
 
 fn build_sync_mutation_plan(
@@ -552,7 +627,7 @@ fn build_sync_mutation_plan(
                 Some(format!(
                     "direction={}, strategy={}, target_exists={}, source_head={}, target_head={}, mapping_count={}",
                     direction_name,
-                    format!("{:?}", strategy).to_lowercase(),
+                    strategy_name(strategy),
                     target_exists,
                     source_head,
                     target_head,
@@ -614,7 +689,7 @@ fn collect_sync_snapshots(
             Ok(serde_json::json!({
               "crate_name": config.crate_name,
               "direction": direction_name,
-              "strategy": format!("{:?}", strategy).to_lowercase(),
+              "strategy": strategy_name(strategy),
               "source_head": source_head,
               "target_head": target_head,
               "target_exists": target_exists,

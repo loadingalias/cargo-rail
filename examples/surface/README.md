@@ -11,9 +11,8 @@ cargo rail --config examples/surface/rail.toml surface --prepare
 cargo rail --config examples/surface/rail.toml surface --check --explain
 ```
 
-Surface merges compiler views before deciding whether a declaration is unused or too visible. In plain terms: it
-checks the whole house before declaring a door unnecessary. Keep `consumer_scope = "open"` unless the workspace owns
-every consumer of its private packages.
+Surface merges every configured compiler view before deciding whether a declaration is unused or too visible. Keep
+`consumer_scope = "open"` unless the workspace owns every consumer of its private packages.
 
 The complete native installer includes authenticated Surface driver authority. `surface --prepare` installs the exact
 Cargo-selected rustup toolchain component when absent and authenticates the selected producer before analysis. Source

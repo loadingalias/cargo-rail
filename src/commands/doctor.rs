@@ -6,10 +6,6 @@ use crate::workspace::WorkspaceContext;
 
 /// Report the exact native-cache identity represented by the captured rustc toolchain.
 pub fn run_native_cache_doctor(ctx: &WorkspaceContext, format: TextJsonOutputFormat) -> RailResult<()> {
-    if format.is_json() {
-        crate::output::set_json_mode(true);
-    }
-
     let capability = crate::compiler::collector::native_cache_capability(ctx.snapshot()?)?;
     let installation = crate::cache::installation::status(ctx.workspace_root())?;
     let remote = crate::remote_cache::configuration_status(ctx.workspace_root())

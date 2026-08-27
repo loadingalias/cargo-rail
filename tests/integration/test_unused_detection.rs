@@ -596,7 +596,7 @@ eyre = "0.6"
         assert_eq!(proof["incomplete_observations"], 0);
         assert_eq!(proof["applicable_configurations"], proof["complete_configurations"]);
 
-        let apply = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+        let apply = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(
             apply.status.success(),
             "unify apply should succeed\nstdout:\n{}\nstderr:\n{}",
@@ -877,7 +877,7 @@ tracing_log = { package = "log", version = "0.4" }
             check_stdout
         );
 
-        let apply = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+        let apply = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(
             apply.status.success(),
             "unify should remove the renamed declaration\nstdout:\n{}\nstderr:\n{}",
@@ -1356,7 +1356,7 @@ log = { version = "0.4", optional = true }
         )?;
         workspace.commit("Add private and public inactive optional dependencies")?;
 
-        let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(
             output.status.success(),
             "optional dependency cleanup should verify\nstdout:\n{}\nstderr:\n{}",
@@ -1529,7 +1529,7 @@ glob = "0.3"
             "build-script cache bypass must be explicit\n{}",
             serde_json::to_string_pretty(&repeated_json)?
         );
-        let output = run_cargo_rail(&workspace.path, &["rail", "unify"])?;
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(
             output.status.success(),
             "domain-specific cleanup should verify\nstdout:\n{}\nstderr:\n{}",

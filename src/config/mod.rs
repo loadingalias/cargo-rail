@@ -100,13 +100,23 @@ pub enum ConfigLoadResult {
 }
 
 impl RailConfig {
+    fn from_document(doc: toml_edit::DocumentMut) -> Result<Self, String> {
+        reject_removed_configuration(&doc)?;
+        if let Some(path) = schema::document_paths(&doc)
+            .into_iter()
+            .find(|path| !schema::is_known_config_path(path))
+        {
+            return Err(format!("unknown configuration key '{path}'"));
+        }
+        toml_edit::de::from_document(doc).map_err(|error| error.to_string())
+    }
+
     pub(crate) fn parse_bytes(bytes: &[u8]) -> Result<Self, String> {
         let content = std::str::from_utf8(bytes).map_err(|error| format!("file is not valid UTF-8: {error}"))?;
         let doc: toml_edit::DocumentMut = content
             .parse()
             .map_err(|error: toml_edit::TomlError| error.to_string())?;
-        reject_removed_configuration(&doc)?;
-        toml_edit::de::from_document(doc).map_err(|error| error.to_string())
+        Self::from_document(doc)
     }
 
     /// Parse a captured historical configuration after removing tables that
@@ -128,14 +138,74 @@ impl RailConfig {
         let doc: toml_edit::DocumentMut = content
             .parse()
             .map_err(|error: toml_edit::TomlError| error.to_string())?;
-        reject_removed_configuration(&doc)?;
         for deprecation in schema::present_deprecations(&doc) {
             if let Some(message) = deprecation.spec.deprecation {
                 crate::warn!("{} in {}: {}", deprecation.path, path.display(), message);
             }
         }
-        let config = toml_edit::de::from_document(doc).map_err(|error| error.to_string())?;
+        let config = Self::from_document(doc)?;
         Ok((config, bytes))
+    }
+
+    /// Validate every semantic configuration rule available at this boundary.
+    pub(crate) fn validate(
+        &self,
+        workspace_root: &Path,
+        workspace_members: Option<&[String]>,
+    ) -> RailResult<Vec<String>> {
+        self.plan.validate().map_err(RailError::Config)?;
+        self.surface.validate().map_err(RailError::Config)?;
+        self.surface
+            .validate_workspace_targets(&self.targets)
+            .map_err(RailError::Config)?;
+        self.unify.validate(workspace_root).map_err(RailError::Config)?;
+        self.release
+            .changelog
+            .filters
+            .validate("release.changelog.filters")
+            .map_err(RailError::Config)?;
+
+        for (crate_name, crate_config) in &self.crates {
+            if let Some(filters) = crate_config
+                .changelog
+                .as_ref()
+                .and_then(|changelog| changelog.filters.as_ref())
+            {
+                filters
+                    .validate(&format!("crates.{crate_name}.changelog.filters"))
+                    .map_err(RailError::Config)?;
+            }
+        }
+        for split in self.build_split_configs() {
+            split.validate()?;
+        }
+
+        let Some(workspace_members) = workspace_members else {
+            return Ok(Vec::new());
+        };
+        if !self.targets.is_empty() {
+            crate::targets::validate_targets(&self.targets)?;
+        }
+        let warnings = self.release.validate(workspace_members).map_err(RailError::Config)?;
+        for (crate_name, crate_config) in &self.crates {
+            // A split table may name a combined-repository boundary rather
+            // than one Cargo package. Per-package release/changelog tables
+            // without that boundary must still resolve to a real member.
+            if crate_config.split.is_none()
+                && (crate_config.release.is_some() || crate_config.changelog.is_some())
+                && !workspace_members.contains(crate_name)
+            {
+                return Err(RailError::Config(ConfigError::CrateNotFound {
+                    name: crate_name.clone(),
+                }));
+            }
+        }
+        for split in self.build_split_configs() {
+            if let Some(member) = split.members.iter().find(|member| !workspace_members.contains(*member)) {
+                return Err(RailError::Config(ConfigError::CrateNotFound { name: member.clone() }));
+            }
+        }
+        Ok(warnings)
     }
 
     pub(crate) fn load_path_with_bytes(path: &Path) -> RailResult<(Self, Vec<u8>)> {

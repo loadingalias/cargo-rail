@@ -48,10 +48,10 @@ pub mod sync;
 pub mod unify;
 
 pub use change::{ChangeCheckOptions, run_change_add, run_change_check, run_change_status};
-pub use clean::run_clean;
+pub use clean::{CleanContext, run_clean};
 #[doc(hidden)]
 pub use cli::{
-    CacheCommand, CacheScope, CargoCli, ChangeCommand, Commands, DoctorCommand, RailCli, ReleaseCommand, SplitCommand,
+    CacheCommand, CacheScope, ChangeCommand, Commands, DoctorCommand, RailCli, ReleaseCommand, SplitCommand,
     generate_completions,
 };
 pub use common::{ChangeOutputFormat, SplitOutputFormat, SurfaceOutputFormat, TextJsonOutputFormat};
@@ -113,8 +113,25 @@ impl PreparedContext {
 
     /// Build the exact workspace context required by this command.
     #[doc(hidden)]
-    pub fn build(self, workspace_root: &Path) -> RailResult<(Commands, WorkspaceContext, Option<PlanOptions>)> {
-        let context = if self.command.requires_workspace_snapshot() {
+    pub fn build(mut self, workspace_root: &Path) -> RailResult<(Commands, WorkspaceContext, Option<PlanOptions>)> {
+        let historical = self
+            .plan_options
+            .as_ref()
+            .map(|options| options.comparison.resolve_objects_before_context(workspace_root))
+            .transpose()?
+            .flatten();
+        let context = if let Some((from, to)) = historical {
+            let context = WorkspaceContext::build_historical_planning_with_config(
+                workspace_root,
+                &from,
+                &to,
+                self.config_override.as_deref(),
+            );
+            if let Some(options) = self.plan_options.as_mut() {
+                options.comparison.replace_objects(from, to);
+            }
+            context
+        } else if self.command.requires_workspace_snapshot() {
             WorkspaceContext::build_with_snapshot_and_config(workspace_root, self.config_override.as_deref())
         } else if self.command.requires_planning_source_capture() {
             WorkspaceContext::build_with_planning_capture_and_config(workspace_root, self.config_override.as_deref())
@@ -140,6 +157,14 @@ pub fn try_dispatch_pre_context(
     json: bool,
 ) -> RailResult<PreContextDispatch> {
     match cmd {
+        Commands::Plan {
+            verify: Some(plan_file),
+            ..
+        } => {
+            plan::verify_saved_plan(workspace_root, config_override, &plan_file)?;
+            Ok(PreContextDispatch::Handled)
+        }
+
         Commands::Plan { schema: true, .. } => {
             plan::print_plan_schema();
             Ok(PreContextDispatch::Handled)
@@ -152,8 +177,10 @@ pub fn try_dispatch_pre_context(
             merge_base,
             json,
             explain,
+            explain_work,
             all,
             evidence,
+            verify: None,
             schema: false,
         } => {
             let comparison = plan::PlanComparison::from_cli(&since, &from, &to, merge_base)?;
@@ -164,8 +191,10 @@ pub fn try_dispatch_pre_context(
                 merge_base,
                 json,
                 explain,
+                explain_work: explain_work.clone(),
                 all,
                 evidence: evidence.clone(),
+                verify: None,
                 schema: false,
             };
             Ok(PreContextDispatch::NeedsContext(PreparedContext::new_plan(
@@ -175,6 +204,7 @@ pub fn try_dispatch_pre_context(
                     comparison,
                     json,
                     explain,
+                    explain_work,
                     all,
                     evidence,
                 },
@@ -194,16 +224,27 @@ pub fn try_dispatch_pre_context(
             )?))
         }
 
-        Commands::Init { output, force, dry_run } => {
-            init::run_init_standalone(workspace_root, &output, force, dry_run, json)?;
+        Commands::Init {
+            output,
+            force,
+            dry_run,
+            targets,
+            detect_targets,
+        } => {
+            init::run_init_standalone(workspace_root, &output, force, dry_run, json, &targets, detect_targets)?;
             Ok(PreContextDispatch::Handled)
         }
 
         Commands::Unify {
-            command: Some(cli::UnifyCommand::Undo { list, backup_id }),
+            command:
+                Some(cli::UnifyCommand::Undo {
+                    list,
+                    backup_id,
+                    format,
+                }),
             ..
         } => {
-            unify::run_unify_undo(workspace_root, list, backup_id)?;
+            unify::run_unify_undo(workspace_root, list, backup_id, format)?;
             Ok(PreContextDispatch::Handled)
         }
 
@@ -248,14 +289,41 @@ pub fn try_dispatch_pre_context(
         }
 
         Commands::Config {
-            command: cli::ConfigCommand::Explain { format },
+            command: cli::ConfigCommand::Explain { fields, all, format },
         } => {
-            config::run_config_explain(workspace_root, config_override, format)?;
+            config::run_config_explain(workspace_root, config_override, &fields, all, format)?;
             Ok(PreContextDispatch::Handled)
         }
 
         Commands::Completions { shell } => {
             cli::generate_completions(shell);
+            Ok(PreContextDispatch::Handled)
+        }
+
+        Commands::Clean {
+            all,
+            cache,
+            prune_backups,
+            all_backups,
+            reports,
+            release_journal,
+            check,
+            format,
+        } => {
+            let context = clean::CleanContext::capture(workspace_root, config_override)?;
+            run_clean(
+                &context,
+                clean::CleanOptions {
+                    all,
+                    cache,
+                    prune_backups,
+                    all_backups,
+                    reports,
+                    release_journal,
+                    check,
+                    format,
+                },
+            )?;
             Ok(PreContextDispatch::Handled)
         }
 
@@ -323,9 +391,9 @@ pub fn try_dispatch_pre_context(
         }
 
         Commands::Release {
-            command: cli::ReleaseCommand::Status { state, format },
+            command: cli::ReleaseCommand::Status { state, history, format },
         } => {
-            release::run_release_status_standalone(workspace_root, state.as_deref(), format)?;
+            release::run_release_status_standalone(workspace_root, state.as_deref(), history, format)?;
             Ok(PreContextDispatch::Handled)
         }
 
@@ -414,32 +482,44 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext, prepared_plan: Option<Pla
         Commands::Unify {
             command,
             check,
-            plan,
             format,
-            backup,
-            skip_report,
+            report,
             report_path,
             output,
             show_diff,
             explain,
         } => match command {
             Some(cli::UnifyCommand::Doctor { format }) => run_unify_doctor(ctx, format),
+            Some(cli::UnifyCommand::Apply {
+                plan,
+                backup,
+                report,
+                report_path,
+                format,
+            }) => run_unify_apply(ctx, backup, !report, report_path, plan, format),
             Some(cli::UnifyCommand::Undo { .. }) => Err(crate::error::RailError::message(
                 "unify undo reached workspace dispatch",
             )),
-            None if check => run_unify_analyze(
-                ctx,
-                UnifyAnalyzeOptions {
-                    show_diff,
-                    explain,
-                    format,
-                    output: output.as_ref(),
-                    backup,
-                    no_report: skip_report,
-                    report_path: report_path.as_ref(),
-                },
-            ),
-            None => run_unify_apply(ctx, backup, skip_report, report_path, plan, format),
+            None => {
+                if !check {
+                    crate::warn!(
+                        "bare 'cargo rail unify' is preview-only; use 'cargo rail unify apply' to modify manifests"
+                    );
+                }
+                run_unify_analyze(
+                    ctx,
+                    UnifyAnalyzeOptions {
+                        check,
+                        show_diff,
+                        explain,
+                        format,
+                        output: output.as_ref(),
+                        backup: false,
+                        no_report: !report,
+                        report_path: report_path.as_ref(),
+                    },
+                )
+            }
         },
 
         // Split/Sync
@@ -556,6 +636,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext, prepared_plan: Option<Pla
                 pr,
                 include_dependents,
                 yes,
+                allow_non_default_branch,
                 format,
             } => {
                 let names = if all || crate_names.is_empty() {
@@ -566,6 +647,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext, prepared_plan: Option<Pla
 
                 let publish = publish && !skip_publish;
                 if check {
+                    crate::warn!("'release run --check' is deprecated; use 'cargo rail release check'");
                     run_release_plan(ctx, names, bump, publish, skip_tag, include_dependents, format)
                 } else {
                     run_release_publish(
@@ -579,6 +661,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext, prepared_plan: Option<Pla
                             pr,
                             include_dependents,
                             yes,
+                            allow_non_default_branch,
                             plan_path: plan,
                             format,
                         },
@@ -614,6 +697,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext, prepared_plan: Option<Pla
                 skip_tag,
                 include_dependents,
                 yes,
+                allow_non_default_branch,
                 format,
             } => {
                 let names = if all || crate_names.is_empty() {
@@ -630,6 +714,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext, prepared_plan: Option<Pla
                         skip_tag,
                         include_dependents,
                         yes,
+                        allow_non_default_branch,
                         format,
                     },
                 )
@@ -642,13 +727,9 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext, prepared_plan: Option<Pla
         },
 
         // Clean
-        Commands::Clean {
-            cache,
-            backups,
-            reports,
-            check,
-            format,
-        } => run_clean(ctx, cache, backups, reports, check, format),
+        Commands::Clean { .. } => Err(crate::error::RailError::message(
+            "clean command reached workspace dispatch",
+        )),
 
         Commands::Cache { .. } => Err(crate::error::RailError::message(
             "cache command reached workspace dispatch",

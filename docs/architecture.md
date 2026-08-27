@@ -107,7 +107,7 @@ belong to `cache/`; compiler sessions and evidence remain in `compiler/`.
 
 | Modules                                    | Responsibility                                                                                 |
 | ------------------------------------------ | ---------------------------------------------------------------------------------------------- |
-| `workspace/`, `source/`                    | Captured authority and derived workspace views                                                 |
+| `workspace/`, `source.rs`                  | Captured authority and derived workspace views                                                 |
 | `cargo/`, `graph/`, `toml/`                | Cargo resolution, graph algorithms, and lossless editing                                       |
 | `planning/`, `change_detection/semantic.rs` | Typed changes, evidence, work evaluation, Cargo impact, and selectors                          |
 | `commands/plan.rs`                         | Comparison validation and text/JSON rendering selection                                        |

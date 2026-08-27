@@ -3,15 +3,15 @@
 //! Rebuilds crate history into a target repository while preserving stable commit
 //! metadata and applying manifest transformations for split modes.
 
-use crate::cargo::{CargoTransform, TransformContext};
+use crate::cargo::ManifestTransformPolicy;
 use crate::config::{SplitMode, WorkspaceMode};
 use crate::error::{GitError, RailError, RailResult, ResultExt, git_command_diagnostics};
 use crate::git::git_cmd_for_path;
 use crate::git::mappings::{HistorySide, MappingStore, OriginContext, append_origin_trailers, repository_identity};
 use crate::git::{CommitInfo, CommitMetadata, SystemGit};
-use crate::progress;
 use crate::split::SplitPathCapabilities;
 use crate::utils;
+use crate::verbose_progress as progress;
 use crate::workspace::WorkspaceContext;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
@@ -82,13 +82,19 @@ struct PrefetchedWindow {
 /// For a typical crate with ~1-2MB of files, 50 commits uses ~50-100MB max
 const PREFETCH_WINDOW_SIZE: usize = 50;
 
+const fn split_mode_name(mode: &SplitMode) -> &'static str {
+    match mode {
+        SplitMode::Single => "single",
+        SplitMode::Combined => "combined",
+    }
+}
+
 /// Parameters for recreating a commit in the target repository
 struct RecreateCommitParams<'a> {
     commit: &'a CommitInfo,
     source_paths: &'a [PathBuf],
     crate_paths: &'a [PathBuf],
     target_repo_path: &'a Path,
-    crate_name: &'a str,
     mode: &'a SplitMode,
     workspace_mode: &'a WorkspaceMode,
     mapping_store: &'a MappingStore,
@@ -118,14 +124,13 @@ struct CommitParams<'a> {
 #[derive(Debug)]
 pub struct SplitEngine<'a> {
     ctx: &'a WorkspaceContext,
-    transform: CargoTransform,
+    transform: ManifestTransformPolicy,
 }
 
 impl<'a> SplitEngine<'a> {
     /// Create a new split engine from workspace context
     pub fn new(ctx: &'a WorkspaceContext) -> RailResult<Self> {
-        // Build CargoTransform from context's metadata
-        let transformer = CargoTransform::new(ctx.cargo().metadata().clone());
+        let transformer = ManifestTransformPolicy::capture(ctx)?;
 
         Ok(Self {
             ctx,
@@ -135,8 +140,21 @@ impl<'a> SplitEngine<'a> {
 
     /// Return whether committed source history lacks target mapping evidence.
     pub fn has_pending_changes(ctx: &WorkspaceContext, config: &SplitParams) -> RailResult<bool> {
+        Ok(Self::pending_commit_count(ctx, config)? > 0)
+    }
+
+    /// Count committed source-history entries lacking target mapping evidence.
+    pub fn pending_commit_count(ctx: &WorkspaceContext, config: &SplitParams) -> RailResult<usize> {
         if !config.target_repo_path.join(".git").exists() {
-            return Ok(true);
+            let mut owned_paths = config.crate_paths.clone();
+            owned_paths.extend(config.asset_paths.iter().cloned());
+            owned_paths.sort();
+            owned_paths.dedup();
+            return Ok(ctx
+                .git()?
+                .git()
+                .get_commits_touching_paths(&owned_paths, None, "HEAD")?
+                .len());
         }
         config.path_capabilities.validate_target_repository()?;
         let target_git = SystemGit::open(&config.target_repo_path)?;
@@ -172,7 +190,10 @@ impl<'a> SplitEngine<'a> {
                 "commit the Cargo members and explicit assets before splitting",
             ));
         }
-        Ok(commits.iter().any(|commit| !mappings.has_mapping(&commit.sha)))
+        Ok(commits
+            .iter()
+            .filter(|commit| !mappings.has_mapping(&commit.sha))
+            .count())
     }
 
     /// Walk commit history and filter commits that touch the given paths
@@ -276,12 +297,7 @@ impl<'a> SplitEngine<'a> {
                 })?;
                 let target_has_workspace =
                     *params.mode == SplitMode::Combined && *params.workspace_mode == WorkspaceMode::Workspace;
-                let context = TransformContext {
-                    crate_name: params.crate_name.to_string(),
-                    workspace_root: self.ctx.workspace_root().to_path_buf(),
-                    target_has_workspace,
-                };
-                let transformed = self.transform.transform_to_split(content, &context)?;
+                let transformed = self.transform.transform_to_split(content, target_has_workspace)?;
                 self.write_target_blob(params.target_repo_path, transformed.as_bytes())?
             } else {
                 entry.object_id.clone()
@@ -499,6 +515,11 @@ impl<'a> SplitEngine<'a> {
 
     /// Execute a split operation (idempotent - re-runs sync new commits only)
     pub fn split(&self, config: &SplitParams) -> RailResult<()> {
+        self.split_with_pending_count(config).map(|_| ())
+    }
+
+    /// Execute a split and return the exact pre-apply pending commit count.
+    pub(crate) fn split_with_pending_count(&self, config: &SplitParams) -> RailResult<usize> {
         let target = config.path_capabilities.authorize_target(&config.target_repo_path)?;
         if target != config.path_capabilities.target_root() {
             return Err(RailError::message(
@@ -520,8 +541,8 @@ impl<'a> SplitEngine<'a> {
             }
         }
         config.path_capabilities.validate_target_repository()?;
-        progress!("🚂 Splitting crate: {}", config.crate_name);
-        progress!("   Mode: {:?}", config.mode);
+        progress!("Splitting crate: {}", config.crate_name);
+        progress!("   Mode: {}", split_mode_name(&config.mode));
         progress!("   Target: {}", config.target_repo_path.display());
 
         if !config.asset_paths.is_empty() {
@@ -596,6 +617,7 @@ impl<'a> SplitEngine<'a> {
             .iter()
             .filter(|c| mapping_store.has_mapping(&c.sha))
             .count();
+        let pending_commits = filtered_commits.len().saturating_sub(already_mapped_count);
 
         if already_mapped_count > 0 {
             progress!("   Found {} commits already split (will skip)", already_mapped_count);
@@ -605,10 +627,10 @@ impl<'a> SplitEngine<'a> {
         if already_mapped_count == filtered_commits.len() && !filtered_commits.is_empty() {
             config.path_capabilities.validate_target_repository()?;
             mapping_store.migrate_legacy_mappings(&config.target_repo_path, &origin)?;
-            progress!("\n✅ Split already up-to-date!");
+            progress!("Split already up to date.");
             progress!("   All {} commits have been split previously.", filtered_commits.len());
             progress!("   Target repo: {}", config.target_repo_path.display());
-            return Ok(());
+            return Ok(0);
         }
 
         if filtered_commits.is_empty() {
@@ -673,7 +695,6 @@ impl<'a> SplitEngine<'a> {
                         source_paths: &owned_paths,
                         crate_paths: &config.crate_paths,
                         target_repo_path: &config.target_repo_path,
-                        crate_name: &config.crate_name,
                         mode: &config.mode,
                         workspace_mode: &config.workspace_mode,
                         mapping_store: &mapping_store,
@@ -749,7 +770,7 @@ impl<'a> SplitEngine<'a> {
         // Push to remote if URL is configured and is not a local file path
         if let Some(ref remote_url) = config.remote_url {
             if !remote_url.is_empty() && !utils::is_local_path(remote_url) {
-                progress!("\n🚀 Pushing to remote...");
+                progress!("Pushing to remote...");
 
                 // Open the target repo
                 let target_git = SystemGit::open(&config.target_repo_path)?;
@@ -765,9 +786,9 @@ impl<'a> SplitEngine<'a> {
                 // Push to remote
                 target_git.push_to_remote("origin", &config.branch)?;
 
-                progress!("   ✅ Pushed to {}", remote_url);
+                progress!("   Pushed to {}", remote_url);
             } else {
-                progress!("\n💾 Split repository created locally");
+                progress!("Split repository created locally.");
                 if utils::is_local_path(remote_url) {
                     progress!("   Note: Remote is a local path, skipping push");
                     progress!(
@@ -783,17 +804,17 @@ impl<'a> SplitEngine<'a> {
                 progress!("   git push -u origin {}", config.branch);
             }
         } else {
-            progress!("\n⚠️  No remote URL configured - repository created locally only");
+            progress!("No remote URL configured; repository created locally only.");
             progress!("   To push manually:");
             progress!("   cd {}", config.target_repo_path.display());
             progress!("   git remote add origin <url>");
             progress!("   git push -u origin {}", config.branch);
         }
 
-        progress!("\n✅ Split complete!");
+        progress!("Split complete.");
         progress!("   Target repo: {}", config.target_repo_path.display());
 
-        Ok(())
+        Ok(pending_commits)
     }
 
     /// Ensure target repository exists and is initialized

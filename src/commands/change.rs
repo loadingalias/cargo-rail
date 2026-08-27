@@ -42,9 +42,6 @@ pub fn run_change_add(
     format: ChangeOutputFormat,
 ) -> RailResult<()> {
     ctx.snapshot()?;
-    if format.is_json() {
-        crate::output::set_json_mode(true);
-    }
     if crate_names.is_empty() {
         return Err(RailError::with_help(
             "change add requires at least one crate",
@@ -100,9 +97,18 @@ pub fn run_change_add(
         });
         let envelope = crate::output::machine_json_envelope("change", "add", "success", 0, payload);
         println!("{}", serde_json::to_string_pretty(&envelope)?);
-    } else {
-        // Bare path on stdout so shells can capture it directly.
+    } else if format == ChangeOutputFormat::NamesOnly {
         println!("{}", file.path.display());
+    } else {
+        println!("Created {}", display_change_path(ctx, &file.path));
+        println!(
+            "Bump: {}",
+            file.intents
+                .iter()
+                .map(|intent| format!("{} {}", intent.crate_name, intent.bump))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
     Ok(())
 }
@@ -110,9 +116,6 @@ pub fn run_change_add(
 /// Print pending change-file status.
 pub fn run_change_status(ctx: &WorkspaceContext, format: ChangeOutputFormat) -> RailResult<()> {
     ctx.snapshot()?;
-    if format.is_json() {
-        crate::output::set_json_mode(true);
-    }
 
     let workspace_members = ctx.graph().workspace_members();
     let pending = PendingChangeSet::load(ctx.workspace_root(), configured_change_dir(ctx), workspace_members)?;
@@ -164,15 +167,17 @@ pub fn run_change_status(ctx: &WorkspaceContext, format: ChangeOutputFormat) -> 
         };
         println!("  {}: {} ({})", summary.crate_name, summary.bump, suffix);
     }
-    println!();
-    println!("pending change files:");
-    for file in &pending.files {
-        println!("  {}", file.path.display());
-        for intent in &file.intents {
-            println!("    {}: {}", intent.crate_name, intent.bump);
-        }
-        if let Some(first_line) = file.body.lines().find(|line| !line.trim().is_empty()) {
-            println!("    {}", first_line.trim());
+    if crate::output::is_verbose() {
+        println!();
+        println!("pending change files:");
+        for file in &pending.files {
+            println!("  {}", display_change_path(ctx, &file.path));
+            for intent in &file.intents {
+                println!("    {}: {}", intent.crate_name, intent.bump);
+            }
+            if let Some(first_line) = file.body.lines().find(|line| !line.trim().is_empty()) {
+                println!("    {}", first_line.trim());
+            }
         }
     }
     Ok(())
@@ -181,9 +186,6 @@ pub fn run_change_status(ctx: &WorkspaceContext, format: ChangeOutputFormat) -> 
 /// Check changed crates for pending change-file coverage.
 pub fn run_change_check(ctx: &WorkspaceContext, options: ChangeCheckOptions) -> RailResult<()> {
     ctx.snapshot()?;
-    if options.format.is_json() {
-        crate::output::set_json_mode(true);
-    }
     let default_release_config;
     let release_config = if let Some(config) = ctx.config() {
         &config.release
@@ -362,22 +364,29 @@ fn print_change_check_text(
     covered_crates: &[String],
     missing_change_files: &[String],
 ) {
-    println!("change check");
-    println!("base: {}", base.unwrap_or("<all history>"));
-    if required_override {
-        println!("required: all changed crates");
-    } else {
-        println!("required: release.require_change_files");
-    }
-    println!("changed code crates: {}", list_or_none(changed_code_crates));
-    println!("covered crates: {}", list_or_none(covered_crates));
-
     if missing_change_files.is_empty() {
         println!("change files: ok");
     } else {
         println!("missing change files:");
         for crate_name in missing_change_files {
             println!("  {}", crate_name);
+        }
+    }
+    if crate::output::is_verbose() {
+        println!("Base: {}", base.unwrap_or("all history"));
+        println!(
+            "Requirement: {}",
+            if required_override {
+                "all changed crates"
+            } else {
+                "release.require_change_files"
+            }
+        );
+        if !changed_code_crates.is_empty() {
+            println!("Changed code crates: {}", changed_code_crates.join(", "));
+        }
+        if !covered_crates.is_empty() {
+            println!("Covered crates: {}", covered_crates.join(", "));
         }
     }
 }
@@ -409,14 +418,6 @@ fn print_change_check_json(
     let envelope = crate::output::machine_json_envelope("change", "check", status, exit_code, payload);
     println!("{}", serde_json::to_string_pretty(&envelope)?);
     Ok(())
-}
-
-fn list_or_none(items: &[String]) -> String {
-    if items.is_empty() {
-        "none".to_string()
-    } else {
-        items.join(", ")
-    }
 }
 
 struct EditedChange {

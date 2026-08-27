@@ -1,7 +1,7 @@
 use anyhow::Result;
 use cargo_rail::backup::{BackupManager, BackupMetadata};
+use cargo_rail::commands::clean::{CleanContext, CleanOptions};
 use cargo_rail::commands::{TextJsonOutputFormat, run_clean};
-use cargo_rail::workspace::WorkspaceContext;
 use std::fs;
 use tempfile::TempDir;
 
@@ -189,7 +189,7 @@ fn apply_cleanup_migrates_an_owned_pre_lifecycle_local_cas() {
 #[test]
 fn compatibility_cleanup_never_removes_the_shared_local_cas() {
     let result: Result<()> = (|| {
-        for arguments in [&["rail", "clean"][..], &["rail", "clean", "--cache"][..]] {
+        for arguments in [&["rail", "clean", "--all"][..], &["rail", "clean", "--cache"][..]] {
             let workspace = create_test_workspace()?;
             let cache = TempDir::new().unwrap();
             let root = create_empty_local_cas(&cache)?;
@@ -289,8 +289,8 @@ fn test_clean_all() {
         let manager = BackupManager::new(temp.path());
         assert_eq!(manager.list_backups().unwrap().len(), 5);
 
-        // Run clean (no flags = clean all)
-        let output = run_cache_command(&temp, &cache, &["rail", "clean"]);
+        // Every artifact class requires explicit all-authority.
+        let output = run_cache_command(&temp, &cache, &["rail", "clean", "--all"]);
         assert!(output.status.success(), "clean all failed: {output:?}");
 
         // Verify artifacts removed
@@ -358,10 +358,23 @@ fn test_clean_refuses_to_follow_a_cache_state_symlink() {
 fn test_clean_reports_only() {
     let result: Result<()> = (|| {
         let temp = create_test_workspace()?;
-        let ctx = WorkspaceContext::build(temp.path()).unwrap();
+        let ctx = CleanContext::capture(temp.path(), None).unwrap();
 
         // Run clean --reports
-        run_clean(&ctx, false, false, true, false, TextJsonOutputFormat::default()).unwrap();
+        run_clean(
+            &ctx,
+            CleanOptions {
+                all: false,
+                cache: false,
+                prune_backups: false,
+                all_backups: false,
+                reports: true,
+                release_journal: None,
+                check: false,
+                format: TextJsonOutputFormat::default(),
+            },
+        )
+        .unwrap();
 
         // Verify reports removed, others remain
         assert!(temp.path().join("target/cargo-rail/metadata.json").exists());
@@ -375,13 +388,43 @@ fn test_clean_reports_only() {
 }
 
 #[test]
+fn test_clean_reports_without_cargo_or_git_discovery() {
+    let result: Result<()> = (|| {
+        let workspace = TempDir::new()?;
+        let report = workspace.path().join("target/cargo-rail/report.md");
+        fs::create_dir_all(report.parent().unwrap())?;
+        fs::write(&report, "generated report\n")?;
+
+        let cache = TempDir::new()?;
+        let output = run_cache_command(&workspace, &cache, &["rail", "clean", "--reports"]);
+        assert!(output.status.success(), "narrow clean failed: {output:?}");
+        assert!(!report.exists());
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
 fn test_clean_backups_prune() {
     let result: Result<()> = (|| {
         let temp = create_test_workspace()?;
-        let ctx = WorkspaceContext::build(temp.path()).unwrap();
+        let ctx = CleanContext::capture(temp.path(), None).unwrap();
 
-        // Run clean --backups (should prune to default 3)
-        run_clean(&ctx, false, true, false, false, TextJsonOutputFormat::default()).unwrap();
+        // Run clean --prune-backups (should prune to default 3)
+        run_clean(
+            &ctx,
+            CleanOptions {
+                all: false,
+                cache: false,
+                prune_backups: true,
+                all_backups: false,
+                reports: false,
+                release_journal: None,
+                check: false,
+                format: TextJsonOutputFormat::default(),
+            },
+        )
+        .unwrap();
 
         // Verify backups pruned, others remain
         assert!(temp.path().join("target/cargo-rail/metadata.json").exists());
@@ -395,21 +438,22 @@ fn test_clean_backups_prune() {
 }
 
 #[test]
-fn test_clean_default() {
+fn test_bare_clean_is_a_usage_error_without_mutation() {
     let result: Result<()> = (|| {
         let temp = create_test_workspace()?;
         let cache = TempDir::new().unwrap();
 
-        // Run clean (no flags) -> should clean everything now
+        // Bare clean has no deletion authority.
         let output = run_cache_command(&temp, &cache, &["rail", "clean"]);
-        assert!(output.status.success(), "default cleanup failed: {output:?}");
+        assert_eq!(output.status.code(), Some(2), "bare clean must fail: {output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("explicit artifact selector"));
 
-        // Verify everything removed
-        assert!(!temp.path().join("target/cargo-rail/metadata.json").exists());
-        assert!(!temp.path().join("target/cargo-rail/cache").exists());
-        assert!(!temp.path().join("target/cargo-rail/report.md").exists());
+        // Verify nothing was removed.
+        assert!(temp.path().join("target/cargo-rail/metadata.json").exists());
+        assert!(temp.path().join("target/cargo-rail/cache").exists());
+        assert!(temp.path().join("target/cargo-rail/report.md").exists());
         let manager = BackupManager::new(temp.path());
-        assert_eq!(manager.list_backups().unwrap().len(), 0);
+        assert_eq!(manager.list_backups().unwrap().len(), 5);
         Ok(())
     })();
     super::helpers::finish_test(result);

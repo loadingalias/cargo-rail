@@ -312,7 +312,16 @@ fn diagnostics_refuse_to_replace_existing_files_before_dispatch() {
         )?;
 
         assert_eq!(output.status.code(), Some(2));
-        assert!(String::from_utf8_lossy(&output.stderr).contains("failed to reserve diagnostic counter file"));
+        assert!(
+            output.stdout.is_empty(),
+            "raw schema failure must not change stdout protocols: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let stderr = String::from_utf8(output.stderr)?;
+        assert!(
+            stderr.contains("failed to reserve diagnostic counter file"),
+            "raw schema failure must report its diagnostic on stderr: {stderr}"
+        );
         assert_eq!(std::fs::read_to_string(diagnostics)?, "keep\n");
         Ok(())
     })();
@@ -345,6 +354,44 @@ fn pre_context_diagnostics_have_one_fixed_phase_schema() {
             Some(3),
             "phase keys are a versioned fixed contract"
         );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn clean_captures_no_cargo_metadata_or_dependency_graph() {
+    let result: Result<()> = (|| {
+        let workspace = TestWorkspace::new_named("diagnostic-clean-context")?;
+        workspace.add_crate("member", "0.1.0", &[])?;
+        let report = workspace.path.join("target/cargo-rail/report.md");
+        std::fs::create_dir_all(report.parent().context("report parent")?)?;
+        std::fs::write(&report, "generated report\n")?;
+
+        let output_dir = TempDir::new()?;
+        let diagnostics = output_dir.path().join("clean.json");
+        let measured = run_cargo_rail(
+            &workspace.path,
+            &[
+                "rail",
+                "--diagnostics-file",
+                diagnostics.to_str().context("non-UTF-8 diagnostics path")?,
+                "clean",
+                "--reports",
+                "--check",
+                "--json",
+            ],
+        )?;
+        assert_eq!(measured.status.code(), Some(1), "clean preview failed: {measured:?}");
+        assert!(report.is_file(), "check mode must not remove the report");
+
+        let counters = read_counters(&diagnostics)?;
+        assert_eq!(counters["cargo_metadata_loads"], 0);
+        assert_eq!(counters["cargo_metadata_cache_hits"], 0);
+        assert_eq!(counters["graph_traversals"], 0);
+        assert_eq!(counters["graph_node_visits"], 0);
+        assert_eq!(counters["graph_edge_visits"], 0);
+        assert_eq!(counters["phases"]["workspace_capture_cargo_metadata"]["invocations"], 0);
         Ok(())
     })();
     super::helpers::finish_test(result);

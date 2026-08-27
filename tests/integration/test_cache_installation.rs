@@ -513,6 +513,46 @@ fn json(output: &Output) -> Result<serde_json::Value> {
 }
 
 #[test]
+fn setup_check_in_a_source_checkout_reports_the_missing_component_recovery() {
+    let result: Result<()> = (|| {
+        let source_checkout = tempfile::tempdir()?;
+        let source_root = source_checkout.path();
+        let source_target = source_root.join("target");
+        fs::create_dir_all(&source_target)?;
+        let isolated_bin = tempfile::Builder::new()
+            .prefix("cargo-rail-missing-worker-")
+            .tempdir_in(&source_target)?;
+        let executable_name = Path::new(env!("CARGO_BIN_EXE_cargo-rail"))
+            .file_name()
+            .context("cargo-rail test binary has no file name")?;
+        let executable = isolated_bin.path().join(executable_name);
+        fs::copy(env!("CARGO_BIN_EXE_cargo-rail"), &executable)?;
+        let cargo_home = tempfile::tempdir()?;
+
+        let output = Command::new(&executable)
+            .current_dir(source_root)
+            .args(["rail", "cache", "setup", "--check"])
+            .env("CARGO_HOME", cargo_home.path())
+            .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
+            .output()?;
+
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("native compiler cache worker executable is unavailable"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("just build-all"), "{stderr}");
+        assert!(stderr.contains("cargo rail cache setup --check"), "{stderr}");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
 fn setup_preview_apply_repeat_status_and_exact_remove_are_lossless() {
     let result: Result<()> = (|| {
         let workspace = TestWorkspace::new_single_crate("transparent-setup", "0.1.0")?;
@@ -1801,7 +1841,7 @@ fn compiler_fact_collection_bypasses_an_ordinary_native_result_hit() {
             rustc_invocations
         );
         assert!(
-            String::from_utf8_lossy(&analysis.stdout).contains("unused deps removed: 1"),
+            String::from_utf8_lossy(&analysis.stdout).contains("Dependencies: helper"),
             "unused path dependency was not planned\nstdout:\n{}",
             String::from_utf8_lossy(&analysis.stdout)
         );

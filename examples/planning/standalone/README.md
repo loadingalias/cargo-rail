@@ -17,15 +17,17 @@ if [ "$(scripts/plan/read.py is-required target/plan-v8.json cargo.test)" = "tru
   while IFS= read -r -d '' argument; do
     CARGO_ARGS+=("$argument")
   done < <(scripts/plan/read.py cargo-args target/plan-v8.json cargo.test)
+  scripts/plan/read.py verify-checkout target/plan-v8.json
   cargo nextest run "${CARGO_ARGS[@]}" --locked
 fi
 ```
 
 ## CI boundary
 
-Create the plan once, transfer it as an artifact, and verify `inputs.head_commit` against checkout `HEAD` before
-execution. Gate a job with `required`, then read only that work item's scope. Reject an unknown contract or malformed
-selector before starting Cargo.
+Create the plan once and transfer it as an artifact. In each execution workspace, validate contract v8, gate the job
+with `required`, and lower only that work item's typed scope. Then run `verify-checkout` immediately before Cargo. It
+delegates to the matching Cargo-Rail binary and verifies the complete saved execution authority; matching `HEAD` alone
+is insufficient.
 
 ```bash
 scripts/plan/read.py validate target/plan-v8.json

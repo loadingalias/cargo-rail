@@ -16,9 +16,8 @@ use crate::source::{
 };
 use crate::workspace::snapshot::{CapturedLockfile, CapturedRailConfig, DerivedViews, WorkspaceSnapshot};
 use cargo_metadata::{Metadata, MetadataCommand, Package};
-use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::Read as _;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -45,109 +44,14 @@ pub struct CargoState {
     proc_macro_crates: std::collections::HashSet<String>,
 }
 
-/// Cache version - increment when MetadataCache format changes
-/// This ensures old cache files are automatically invalidated
-const CACHE_VERSION: u32 = 2;
-pub(crate) const METADATA_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
-
-/// Metadata cache structure
-#[derive(Serialize, Deserialize)]
-struct MetadataCache {
-    /// Cache format version - used to invalidate on schema changes
-    #[serde(default)]
-    version: u32,
-    /// FNV-1a hash of Cargo.toml + Cargo.lock + all workspace member Cargo.toml manifests
-    hash: u64,
-    /// Cached metadata
-    metadata: Metadata,
-}
-
 impl CargoState {
-    /// Load cargo metadata from workspace root
-    ///
-    /// Uses a content-based cache (FNV-1a hash of workspace Cargo.toml/Cargo.lock + all workspace member Cargo.toml)
-    /// stored in `target/cargo-rail/metadata.json` to speed up subsequent loads.
+    /// Load fresh Cargo-owned workspace metadata.
     fn load(workspace_root: &Path) -> RailResult<Self> {
-        // Metadata caching is optional. Hold the workspace cache lifecycle authority
-        // across lookup, Cargo acquisition, and publication so scoped cleanup cannot
-        // race with a stale read or recreate state after deletion.
-        let cache_lock = crate::cache::lock_workspace(workspace_root).ok();
-        let cache_dir = super::cargo_rail_state_root(workspace_root);
-        let cache_file = cache_dir.join("metadata.json");
-
-        // Try to load from cache
-        // Cache is valid only if:
-        // 1. Version matches (cache format unchanged)
-        // 2. Hash matches (workspace + member manifests unchanged)
-        // 3. Workspace root path matches (repo hasn't been moved/copied)
-        if cache_lock.is_some()
-            && let Some(cache) = read_metadata_cache(&cache_file)
-            && cache.version == CACHE_VERSION
-        {
-            // Validate workspace root path matches current location
-            // This handles the case where a repo is copied/moved to a different path
-            let cached_root = cache.metadata.workspace_root.as_std_path();
-            let current_root_canonical = workspace_root
-                .canonicalize()
-                .unwrap_or_else(|_| workspace_root.to_path_buf());
-            let cached_root_canonical = cached_root.canonicalize().unwrap_or_else(|_| cached_root.to_path_buf());
-
-            if current_root_canonical == cached_root_canonical {
-                let current_hash = compute_workspace_hash_with_members(workspace_root, &cache.metadata);
-                if cache.hash == current_hash {
-                    // Cache hit - use cached metadata
-                    crate::instrumentation::record_cargo_metadata_cache_hit();
-                    return Ok(Self::from_metadata(Arc::new(cache.metadata)));
-                }
-            }
-            // Hash mismatch or path mismatch - cache is stale, will reload below
-        }
-
-        // Cache miss or mismatch - load fresh metadata
         crate::instrumentation::record_cargo_metadata_load(false);
         let metadata = MetadataCommand::new()
             .manifest_path(workspace_root.join("Cargo.toml"))
             .exec()?;
-
-        let metadata = Arc::new(metadata);
-
-        // Save to cache
-        if cache_lock.is_some() && create_metadata_cache_directory(workspace_root, &cache_dir).is_ok() {
-            let current_hash = compute_workspace_hash_with_members(workspace_root, &metadata);
-            #[derive(Serialize)]
-            struct MetadataCacheRef<'a> {
-                version: u32,
-                hash: u64,
-                metadata: &'a Metadata,
-            }
-            let cache = MetadataCacheRef {
-                version: CACHE_VERSION,
-                hash: current_hash,
-                metadata: &metadata,
-            };
-            match serde_json::to_vec(&cache) {
-                Ok(bytes) if bytes.len() as u64 <= METADATA_CACHE_MAX_BYTES => {
-                    if let Err(e) = crate::utils::write_file_atomic(&cache_file, &bytes) {
-                        crate::warn!("failed to write metadata cache {}: {}", cache_file.display(), e);
-                    }
-                }
-                Ok(_) => {
-                    crate::warn!(
-                        "metadata cache exceeds its {}-byte bound (proceeding without cache)",
-                        METADATA_CACHE_MAX_BYTES
-                    );
-                }
-                Err(e) => {
-                    crate::warn!(
-                        "failed to serialize metadata cache {}: {} (proceeding without cache)",
-                        cache_file.display(),
-                        e
-                    );
-                }
-            }
-        }
-
-        Ok(Self::from_metadata(metadata))
+        Ok(Self::from_metadata(Arc::new(metadata)))
     }
 
     fn load_fresh(
@@ -178,11 +82,13 @@ impl CargoState {
         Ok(Self::from_metadata(Arc::new(metadata)))
     }
 
-    fn load_planning(workspace_root: &Path) -> RailResult<Self> {
+    fn load_planning(workspace_root: &Path, cargo_current_dir: &Path, require_existing_lock: bool) -> RailResult<Self> {
         crate::instrumentation::record_cargo_metadata_load(false);
         let mut command = MetadataCommand::new();
-        command.manifest_path(workspace_root.join("Cargo.toml"));
-        if workspace_root.join("Cargo.lock").is_file() {
+        command
+            .current_dir(cargo_current_dir)
+            .manifest_path(workspace_root.join("Cargo.toml"));
+        if require_existing_lock || workspace_root.join("Cargo.lock").is_file() {
             command.other_options(vec!["--locked".to_string()]);
         }
         let metadata = command.exec()?;
@@ -318,113 +224,6 @@ impl CargoState {
     }
 }
 
-fn read_metadata_cache(path: &Path) -> Option<MetadataCache> {
-    let metadata = fs::symlink_metadata(path).ok()?;
-    if !metadata.is_file()
-        || crate::utils::is_symlink_or_reparse(&metadata)
-        || !has_single_link(&metadata)
-        || metadata.len() > METADATA_CACHE_MAX_BYTES
-    {
-        return None;
-    }
-    let bytes = fs::read(path).ok()?;
-    if bytes.len() as u64 != metadata.len() {
-        return None;
-    }
-    serde_json::from_slice(&bytes).ok()
-}
-
-fn create_metadata_cache_directory(workspace_root: &Path, cache_dir: &Path) -> RailResult<()> {
-    let workspace_root = crate::utils::canonicalize_existing(workspace_root)?;
-    let mut current = workspace_root.clone();
-    for component in ["target", "cargo-rail"] {
-        current.push(component);
-        match fs::create_dir(&current) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
-        }
-        let metadata = fs::symlink_metadata(&current)?;
-        if !metadata.is_dir() || crate::utils::is_symlink_or_reparse(&metadata) {
-            return Err(RailError::message(format!(
-                "metadata cache path '{}' is not a real directory",
-                current.display()
-            )));
-        }
-    }
-    if current != cache_dir || !crate::utils::canonicalize_existing(&current)?.starts_with(workspace_root) {
-        return Err(RailError::message("metadata cache directory escaped the workspace"));
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn has_single_link(metadata: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-    metadata.nlink() == 1
-}
-
-#[cfg(not(unix))]
-fn has_single_link(_metadata: &fs::Metadata) -> bool {
-    true
-}
-
-/// Compute a content-based hash of workspace manifests
-///
-/// Uses FNV-1a hash of workspace Cargo.toml/Cargo.lock plus all workspace member Cargo.toml
-/// manifests to detect changes that invalidate cached cargo metadata.
-fn compute_workspace_hash_with_members(workspace_root: &Path, metadata: &Metadata) -> u64 {
-    const FNV_PRIME: u64 = 0x100000001b3;
-    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-
-    let mut hash = FNV_OFFSET_BASIS;
-    crate::instrumentation::record_hash_operation();
-
-    fn hash_file(hash: &mut u64, path: &Path, fnv_prime: u64) {
-        let Ok(mut file) = fs::File::open(path) else {
-            // If the file doesn't exist or can't be opened, still mix in a marker so the hash
-            // is very unlikely to match a previous state where it was readable.
-            // This avoids "accidental cache hit" if a file becomes unreadable.
-            *hash ^= 0xff;
-            *hash = hash.wrapping_mul(fnv_prime);
-            crate::instrumentation::record_hash_input_bytes(1);
-            return;
-        };
-
-        let mut buffer = [0; 8192];
-        while let Ok(n) = file.read(&mut buffer) {
-            if n == 0 {
-                break;
-            }
-            crate::instrumentation::record_hash_input_bytes(n);
-            crate::instrumentation::record_hashed_file_bytes_read(n);
-            for byte in &buffer[..n] {
-                *hash ^= *byte as u64;
-                *hash = hash.wrapping_mul(fnv_prime);
-            }
-        }
-    }
-
-    // Hash workspace root Cargo.toml and Cargo.lock (if present)
-    hash_file(&mut hash, &workspace_root.join("Cargo.toml"), FNV_PRIME);
-    hash_file(&mut hash, &workspace_root.join("Cargo.lock"), FNV_PRIME);
-
-    // Hash all workspace member manifests (sorted for determinism)
-    let mut member_manifests: Vec<PathBuf> = metadata
-        .workspace_packages()
-        .iter()
-        .map(|p| p.manifest_path.as_std_path().to_path_buf())
-        .collect();
-
-    member_manifests.sort_unstable_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
-
-    for manifest_path in member_manifests {
-        hash_file(&mut hash, &manifest_path, FNV_PRIME);
-    }
-
-    hash
-}
-
 // Git State (merged from git_state.rs)
 
 /// Git state for the workspace
@@ -534,6 +333,20 @@ pub struct WorkspaceContext {
 
     /// Exact discovered configuration path for planning deltas.
     config_path: Option<PathBuf>,
+
+    /// Root used to make captured repository paths portable. Historical object
+    /// planning owns a temporary materialization rather than the live Git root.
+    authority_source_root: PathBuf,
+
+    /// Retains the isolated `to` tree for the lifetime of an object-pair plan.
+    historical_planning: Option<HistoricalPlanningAuthority>,
+}
+
+#[derive(Debug)]
+struct HistoricalPlanningAuthority {
+    _root: tempfile::TempDir,
+    to: String,
+    capture: String,
 }
 
 impl WorkspaceContext {
@@ -586,6 +399,90 @@ impl WorkspaceContext {
         Self::build_inner(workspace_root, ContextCapture::Planning, config_override)
     }
 
+    pub(crate) fn build_with_planning_verification_and_config(
+        workspace_root: &Path,
+        config_override: Option<&Path>,
+    ) -> RailResult<Self> {
+        Self::build_inner(workspace_root, ContextCapture::PlanningVerification, config_override)
+    }
+
+    pub(crate) fn build_historical_planning_with_config(
+        workspace_root: &Path,
+        from: &str,
+        to: &str,
+        config_override: Option<&Path>,
+    ) -> RailResult<Self> {
+        let source_git = Arc::new(GitState::open(workspace_root)?);
+        let requested_root = crate::utils::canonicalize_existing(workspace_root).map_err(|error| {
+            RailError::message(format!(
+                "failed to resolve requested historical workspace root '{}': {error}",
+                workspace_root.display()
+            ))
+        })?;
+        let requested_relative =
+            crate::utils::path_relative_to(source_git.repo_root(), &requested_root).map_err(|error| {
+                RailError::message(format!(
+                    "historical workspace root '{}' is outside Git worktree '{}': {error}",
+                    requested_root.display(),
+                    source_git.repo_root().display()
+                ))
+            })?;
+        let root = tempfile::TempDir::new()
+            .map_err(|error| RailError::message(format!("failed to create historical planning root: {error}")))?;
+        let materialized_source_root = root.path().join("source");
+        fs::create_dir(&materialized_source_root)?;
+        let materialized_source_root =
+            crate::utils::canonicalize_existing(&materialized_source_root).map_err(|error| {
+                RailError::message(format!(
+                    "failed to resolve historical planning root '{}': {error}",
+                    materialized_source_root.display()
+                ))
+            })?;
+        source_git
+            .git()
+            .materialize_tree(to, &materialized_source_root)
+            .map_err(|error| error.context(format!("failed to materialize historical planning tree '{to}'")))?;
+        let materialized_requested_root = materialized_source_root.join(requested_relative);
+        let mapped_config = config_override.map(|path| {
+            if !path.is_absolute() {
+                return path.to_path_buf();
+            }
+            path.strip_prefix(source_git.repo_root()).map_or_else(
+                |_| path.to_path_buf(),
+                |relative| materialized_source_root.join(relative),
+            )
+        });
+        let mut context = Self::build_inner_at(
+            &materialized_requested_root,
+            ContextCapture::Planning,
+            mapped_config.as_deref(),
+            Some(&materialized_requested_root),
+        )
+        .map_err(|error| {
+            error.context(format!(
+                "historical tree '{to}' cannot form a supported Cargo workspace or declared planning policy"
+            ))
+        })?;
+        let workspace_prefix = crate::utils::path_relative_to(&materialized_source_root, context.workspace_root())
+            .map_err(|error| {
+                RailError::message(format!(
+                    "historical Cargo workspace '{}' escapes materialized tree '{}': {error}",
+                    context.workspace_root().display(),
+                    materialized_source_root.display()
+                ))
+            })?;
+        let capture_input = format!("historical-planning-v1\0{from}\0{to}");
+        context.workspace_prefix = (!workspace_prefix.as_os_str().is_empty()).then_some(workspace_prefix);
+        context.git = Some(source_git);
+        context.authority_source_root = materialized_source_root;
+        context.historical_planning = Some(HistoricalPlanningAuthority {
+            _root: root,
+            to: to.to_string(),
+            capture: format!("v1-sha256-{}", ContentDigest::sha256(capture_input.as_bytes())),
+        });
+        Ok(context)
+    }
+
     /// Build a context with one complete immutable workspace snapshot.
     ///
     /// Existing commands do not use this constructor until their ordered snapshot
@@ -611,6 +508,15 @@ impl WorkspaceContext {
     }
 
     fn build_inner(workspace_root: &Path, capture: ContextCapture, config_override: Option<&Path>) -> RailResult<Self> {
+        Self::build_inner_at(workspace_root, capture, config_override, None)
+    }
+
+    fn build_inner_at(
+        workspace_root: &Path,
+        capture: ContextCapture,
+        config_override: Option<&Path>,
+        cargo_current_dir: Option<&Path>,
+    ) -> RailResult<Self> {
         let process_current_dir = std::env::current_dir().map_err(|error| {
             RailError::message(format!("failed to determine Cargo metadata current directory: {error}"))
         })?;
@@ -619,11 +525,7 @@ impl WorkspaceContext {
         } else {
             process_current_dir.join(workspace_root)
         };
-        let cargo_current_dir = process_current_dir;
-        let preloaded_metadata = None;
-        let preloaded_inputs = None;
-        let preloaded_lockfile = None;
-
+        let cargo_current_dir = cargo_current_dir.map_or(process_current_dir, Path::to_path_buf);
         // Load git state when available. Cargo-only commands such as `unify --check`
         // must work in source sandboxes that intentionally omit `.git`.
         let git = match GitState::open(workspace_root) {
@@ -640,7 +542,7 @@ impl WorkspaceContext {
         } else {
             None
         };
-        let mut planning_source_capture = if capture == ContextCapture::Planning {
+        let mut planning_source_capture = if capture.is_planning() {
             git.as_ref()
                 .map(|state| PlanningSourceCapture::capture_excluding(state.git(), &initial_generated_roots))
                 .transpose()?
@@ -648,33 +550,32 @@ impl WorkspaceContext {
             None
         };
 
-        let planning_cargo_config = if capture == ContextCapture::Planning {
+        let planning_cargo_config = if capture.is_planning() {
             Some(Arc::new(CargoConfigSnapshot::capture(&cargo_current_dir)?))
         } else {
             None
         };
 
         let resolution_inputs = if capture == ContextCapture::Snapshot {
-            match preloaded_inputs {
-                Some(inputs) => Some(inputs),
-                None => Some(ResolutionViews::capture_inputs(&cargo_current_dir)?),
-            }
+            Some(ResolutionViews::capture_inputs(&cargo_current_dir)?)
         } else {
             None
         };
 
         // Load cargo state
-        let cargo = Arc::new(if let Some(metadata) = preloaded_metadata {
-            CargoState::from_metadata(Arc::new(metadata))
-        } else if let Some(inputs) = &resolution_inputs {
+        let cargo = Arc::new(if let Some(inputs) = &resolution_inputs {
             CargoState::load_fresh(
                 workspace_root,
                 &cargo_current_dir,
                 inputs.toolchain.cargo_program(),
                 inputs.cargo_config.has_credential_capability(),
             )?
-        } else if capture == ContextCapture::Planning {
-            CargoState::load_planning(workspace_root)?
+        } else if capture.is_planning() {
+            CargoState::load_planning(
+                workspace_root,
+                &cargo_current_dir,
+                capture == ContextCapture::PlanningVerification,
+            )?
         } else {
             CargoState::load(workspace_root)?
         });
@@ -703,11 +604,7 @@ impl WorkspaceContext {
         let generated_lockfile = if let (Some(capture), Some(git)) = (source_capture.as_mut(), git.as_ref()) {
             let generated_roots = validated_generated_source_roots(git.repo_root(), &workspace_root, &cargo)?;
             capture.exclude_generated_roots(git.git(), &generated_roots)?;
-            if preloaded_lockfile.is_some() {
-                None
-            } else {
-                stabilize_cargo_generated_lockfile(capture, git, &workspace_root, &generated_roots)?
-            }
+            stabilize_cargo_generated_lockfile(capture, git, &workspace_root, &generated_roots)?
         } else {
             None
         };
@@ -773,27 +670,13 @@ impl WorkspaceContext {
             None => (None, None, Some(workspace_root.clone()), None),
         };
 
-        // Validate configured targets against rustc's canonical target list
-        if capture != ContextCapture::Snapshot
-            && let Some(ref cfg) = config
-            && !cfg.targets.is_empty()
-        {
-            crate::targets::validate_targets(&cfg.targets)?;
-        }
-
-        // Validate config settings that require workspace context
         if let Some(ref cfg) = config {
-            // Validate input-only planner work declarations before evaluation.
-            cfg.plan.validate().map_err(RailError::Config)?;
-
-            // Validate source-surface policy before any compiler acquisition.
-            cfg.surface.validate().map_err(RailError::Config)?;
-            cfg.surface
-                .validate_workspace_targets(&cfg.targets)
-                .map_err(RailError::Config)?;
-
-            // Validate unify config (e.g., the transitive pinning host path).
-            cfg.unify.validate(&workspace_root).map_err(RailError::Config)?;
+            let workspace_members = cargo
+                .workspace_members()
+                .into_iter()
+                .map(|package| package.name.to_string())
+                .collect::<Vec<_>>();
+            cfg.validate(&workspace_root, Some(&workspace_members))?;
         }
 
         // The top-level policy is the only non-host target authority. Surface
@@ -811,7 +694,7 @@ impl WorkspaceContext {
             let generated_lock_marker = generated_lockfile
                 .as_ref()
                 .map(|lockfile| (lockfile.path().to_path_buf(), ContentDigest::sha256(lockfile.bytes())));
-            let captured_lockfile = preloaded_lockfile.or(generated_lockfile);
+            let captured_lockfile = generated_lockfile;
             let source = match (&source_capture, &git) {
                 (Some(capture), Some(_)) => capture.shared_snapshot(),
                 (None, None) => Arc::new(SourceSnapshot::capture_filesystem(
@@ -864,7 +747,9 @@ impl WorkspaceContext {
                 ));
             }
         }
-        if let Some(lockfile) = planning_generated_lockfile {
+        if capture == ContextCapture::Planning
+            && let Some(lockfile) = planning_generated_lockfile
+        {
             write_generated_lock_marker(
                 &workspace_root,
                 lockfile.path(),
@@ -872,6 +757,9 @@ impl WorkspaceContext {
             )?;
         }
 
+        let authority_source_root = git
+            .as_ref()
+            .map_or_else(|| workspace_root.clone(), |git| git.repo_root().to_path_buf());
         Ok(Self {
             workspace_root,
             git,
@@ -884,6 +772,8 @@ impl WorkspaceContext {
             snapshot,
             config,
             config_path: captured_config_path,
+            authority_source_root,
+            historical_planning: None,
         })
     }
 
@@ -954,24 +844,28 @@ impl WorkspaceContext {
     }
 
     pub(crate) fn planning_snapshot_id(&self) -> Option<String> {
-        self.planning_source_capture
+        self.historical_planning
             .as_ref()
-            .map(|capture| format!("v1-sha256-{}", capture.identity()))
+            .map(|authority| authority.capture.clone())
+            .or_else(|| {
+                self.planning_source_capture
+                    .as_ref()
+                    .map(|capture| format!("v1-sha256-{}", capture.identity()))
+            })
     }
 
     pub(crate) fn planning_head_commit(&self) -> Option<&str> {
-        self.planning_source_capture().map(PlanningSourceCapture::head_commit)
+        self.historical_planning
+            .as_ref()
+            .map(|authority| authority.to.as_str())
+            .or_else(|| self.planning_source_capture().map(PlanningSourceCapture::head_commit))
     }
 
     pub(crate) fn planning_cargo_configuration_identity(&self) -> RailResult<String> {
-        let source_root = self
-            .git
-            .as_ref()
-            .map_or(self.workspace_root.as_path(), |git| git.repo_root());
         let identity = self
             .derived_views
             .cargo_config()?
-            .portable_snapshot_identity(source_root)?;
+            .portable_snapshot_identity(&self.authority_source_root)?;
         Ok(format!(
             "cargo-configuration-v1:sha256:{}",
             ContentDigest::sha256(&identity)
@@ -987,6 +881,25 @@ impl WorkspaceContext {
     }
 
     pub(crate) fn read_planning_current_files(&self, paths: &[String]) -> RailResult<Vec<Vec<u8>>> {
+        if self.historical_planning.is_some() {
+            return paths
+                .iter()
+                .map(|path| {
+                    let path = RepositoryPath::new(Path::new(path))?;
+                    let absolute = self.workspace_root.join(path.as_path());
+                    let metadata = fs::symlink_metadata(&absolute).map_err(|error| {
+                        RailError::message(format!("failed to read historical planning input '{}': {error}", path))
+                    })?;
+                    if !metadata.file_type().is_file() {
+                        return Err(RailError::with_help(
+                            format!("historical planning input '{}' is not a regular file", path),
+                            "replace the declared input with a regular repository file",
+                        ));
+                    }
+                    fs::read(absolute).map_err(Into::into)
+                })
+                .collect();
+        }
         let capture = self
             .planning_source_capture()
             .ok_or_else(|| RailError::message("workspace context was built without sparse planning source capture"))?;
@@ -1080,9 +993,42 @@ impl WorkspaceContext {
     /// Capture one rich source change set between exact Git objects.
     pub(crate) fn object_source_changes(&self, base: &str, head: &str) -> RailResult<ChangeSet> {
         let git = self.git()?;
-        let generated_roots = validated_generated_source_roots(git.repo_root(), &self.workspace_root, &self.cargo)?;
+        let generated_roots = if self.historical_planning.is_some() {
+            generated_source_roots(&self.workspace_root, &self.cargo)
+                .into_iter()
+                .filter_map(|root| {
+                    root.strip_prefix(&self.authority_source_root)
+                        .ok()
+                        .map(|relative| git.repo_root().join(relative))
+                })
+                .collect()
+        } else {
+            validated_generated_source_roots(git.repo_root(), &self.workspace_root, &self.cargo)?
+        };
         let exclusions = SourceExclusions::from_absolute_roots(git.git(), &generated_roots)?;
         changes_between_objects(git.git(), base, head, &exclusions)
+    }
+
+    pub(crate) fn planning_authority_source_root(&self) -> &Path {
+        &self.authority_source_root
+    }
+
+    pub(crate) fn repository_path_from_workspace(&self, path: &Path) -> RailResult<PathBuf> {
+        let relative = if path.is_absolute() {
+            path.strip_prefix(&self.workspace_root).map_err(|_| {
+                RailError::message(format!(
+                    "workspace path '{}' is outside captured workspace '{}'",
+                    path.display(),
+                    self.workspace_root.display()
+                ))
+            })?
+        } else {
+            path
+        };
+        Ok(self
+            .workspace_prefix
+            .as_ref()
+            .map_or_else(|| relative.to_path_buf(), |prefix| prefix.join(relative)))
     }
 
     /// Get multi-target metadata, loading lazily on first access.
@@ -1156,6 +1102,13 @@ impl WorkspaceContext {
         snapshot.validate_live_authoritative_inputs()
     }
 
+    pub(crate) fn validate_planning_source_unchanged(&self) -> RailResult<()> {
+        if let (Some(capture), Some(git)) = (&self.planning_source_capture, &self.git) {
+            capture.validate_unchanged(git.git())?;
+        }
+        Ok(())
+    }
+
     /// Load each target's exact rustc cfg set once for the command context.
     pub fn target_cfg_sets(&self) -> RailResult<Arc<std::collections::HashMap<String, TargetCfgSet>>> {
         if let Some(snapshot) = &self.snapshot {
@@ -1205,7 +1158,14 @@ enum ContextCapture {
     None,
     Worktree,
     Planning,
+    PlanningVerification,
     Snapshot,
+}
+
+impl ContextCapture {
+    fn is_planning(self) -> bool {
+        matches!(self, Self::Planning | Self::PlanningVerification)
+    }
 }
 
 fn validate_resolution_inputs_unchanged(initial: &ResolutionInputs, current: &ResolutionInputs) -> RailResult<()> {
@@ -1432,50 +1392,6 @@ fn validate_cargo_output_root(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn metadata_cache_rejects_oversized_input_before_deserialization() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("metadata.json");
-        fs::File::create(&path)
-            .unwrap()
-            .set_len(METADATA_CACHE_MAX_BYTES + 1)
-            .unwrap();
-
-        assert!(read_metadata_cache(&path).is_none());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn metadata_cache_rejects_links_and_linked_state_roots() {
-        use std::os::unix::fs::symlink;
-
-        let root = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let outside_file = outside.path().join("metadata.json");
-        fs::write(&outside_file, b"{}").unwrap();
-        let linked_file = root.path().join("metadata.json");
-        symlink(&outside_file, &linked_file).unwrap();
-        assert!(read_metadata_cache(&linked_file).is_none());
-
-        let linked_target = root.path().join("target");
-        symlink(outside.path(), &linked_target).unwrap();
-        let error = create_metadata_cache_directory(root.path(), &root.path().join("target/cargo-rail"))
-            .expect_err("linked workspace state root must be rejected");
-        assert!(error.to_string().contains("not a real directory"), "{error}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn metadata_cache_rejects_hard_links() {
-        let root = tempfile::tempdir().unwrap();
-        let outside = root.path().join("outside.json");
-        let linked = root.path().join("metadata.json");
-        fs::write(&outside, b"{}").unwrap();
-        fs::hard_link(&outside, &linked).unwrap();
-
-        assert!(read_metadata_cache(&linked).is_none());
-    }
 
     #[test]
     fn test_workspace_context_build() {

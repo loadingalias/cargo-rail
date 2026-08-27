@@ -47,7 +47,7 @@ const DISTRIBUTED_PLACEMENT_LOCK_FILE: &str = "distributed-placement-v1.lock";
 const DIRECT_LAUNCHER_ENV: &str = "CARGO_RAIL_DIRECT_CACHE_LAUNCHER";
 
 /// Requested machine policy. Omitted values preserve an existing installation.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SetupRequest {
     pub(crate) distributed_local: bool,
     pub(crate) distributed_endpoint: Option<String>,

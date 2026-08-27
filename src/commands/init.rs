@@ -8,8 +8,24 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Generate rail.toml configuration
-pub fn run_init(ctx: &WorkspaceContext, output_path: &str, force: bool, dry_run: bool, json: bool) -> RailResult<()> {
-    run_init_impl(ctx.workspace_root(), output_path, force, dry_run, json)
+pub fn run_init(
+    ctx: &WorkspaceContext,
+    output_path: &str,
+    force: bool,
+    dry_run: bool,
+    json: bool,
+    targets: &[String],
+    detect_targets: bool,
+) -> RailResult<()> {
+    run_init_impl(
+        ctx.workspace_root(),
+        output_path,
+        force,
+        dry_run,
+        json,
+        targets,
+        detect_targets,
+    )
 }
 
 /// Detect target triples across config files in the workspace
@@ -67,7 +83,15 @@ fn is_cargo_workspace(workspace_root: &Path) -> bool {
 }
 
 /// Shared implementation for both run_init and run_init_standalone
-fn run_init_impl(workspace_root: &Path, output_path: &str, force: bool, dry_run: bool, json: bool) -> RailResult<()> {
+fn run_init_impl(
+    workspace_root: &Path,
+    output_path: &str,
+    force: bool,
+    dry_run: bool,
+    json: bool,
+    selected_targets: &[String],
+    detect_repository_targets: bool,
+) -> RailResult<()> {
     let config_path = workspace_root.join(output_path);
 
     // Warn if not a Cargo workspace (skip warnings in quiet/JSON mode)
@@ -88,16 +112,22 @@ fn run_init_impl(workspace_root: &Path, output_path: &str, force: bool, dry_run:
         if !json {
             progress!("overwriting: {}", config_path.display());
         }
-    } else if let Some(existing) = check_existing_config(workspace_root) {
-        // A config exists elsewhere - warn but allow writing to different path
-        if !dry_run && !json && !crate::output::is_quiet() {
-            crate::note!("existing config found at {}", existing.display());
-            eprintln!("      (search order: rail.toml, .rail.toml, .cargo/rail.toml, .config/rail.toml)\n");
-        }
+    } else if let Some(existing) = check_existing_config(workspace_root)
+        && existing != config_path
+    {
+        return Err(RailError::with_help(
+            format!("active configuration already exists: {}", existing.display()),
+            "edit the active file, or pass its exact path with --output and --force",
+        ));
     }
 
-    let detected_targets = detect_targets(workspace_root)?;
-    let toml_content = build_sparse_config(&detected_targets);
+    let mut targets = selected_targets.to_vec();
+    if detect_repository_targets {
+        targets.extend(detect_targets(workspace_root)?);
+    }
+    targets.sort();
+    targets.dedup();
+    let toml_content = build_sparse_config(&targets);
 
     if dry_run {
         if json {
@@ -105,7 +135,7 @@ fn run_init_impl(workspace_root: &Path, output_path: &str, force: bool, dry_run:
               "command": "init",
               "dry_run": true,
               "config_path": config_path.display().to_string(),
-              "targets_detected": detected_targets,
+              "targets": targets,
               "content": toml_content
             });
             let output = crate::output::machine_json_envelope("init", "dry_run", "success", 0, payload);
@@ -115,7 +145,8 @@ fn run_init_impl(workspace_root: &Path, output_path: &str, force: bool, dry_run:
                     .map_err(|error| RailError::message(format!("failed to serialize init result: {error}")))?
             );
         } else {
-            println!("{}", toml_content);
+            println!("Destination: {}\n", config_path.display());
+            print!("{}", toml_content);
         }
     } else {
         ensure_output_dir(&config_path)?;
@@ -126,7 +157,7 @@ fn run_init_impl(workspace_root: &Path, output_path: &str, force: bool, dry_run:
               "command": "init",
               "status": "created",
               "config_path": config_path.display().to_string(),
-              "targets_detected": detected_targets
+              "targets": targets
             });
             let output = crate::output::machine_json_envelope("init", "apply", "created", 0, payload);
             println!(
@@ -135,8 +166,8 @@ fn run_init_impl(workspace_root: &Path, output_path: &str, force: bool, dry_run:
                     .map_err(|error| RailError::message(format!("failed to serialize init result: {error}")))?
             );
         } else {
-            progress!("created: {}", config_path.display());
-            progress!("\nnext: cargo rail unify --check");
+            println!("Created {}", config_path.display());
+            println!("Next: cargo rail config validate");
         }
     }
 
@@ -150,8 +181,18 @@ pub fn run_init_standalone(
     force: bool,
     dry_run: bool,
     json: bool,
+    targets: &[String],
+    detect_targets: bool,
 ) -> RailResult<()> {
-    run_init_impl(workspace_root, output_path, force, dry_run, json)
+    run_init_impl(
+        workspace_root,
+        output_path,
+        force,
+        dry_run,
+        json,
+        targets,
+        detect_targets,
+    )
 }
 
 #[cfg(test)]

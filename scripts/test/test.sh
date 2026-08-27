@@ -56,7 +56,6 @@ if [ -z "$PLAN_FILE" ]; then
 else
   "$PLAN_READER" validate "$PLAN_FILE"
 fi
-"$PLAN_READER" verify-checkout "$PLAN_FILE"
 cleanup() {
   if [ "$OWN_PLAN" = true ]; then
     rm -f -- "$PLAN_FILE"
@@ -73,6 +72,7 @@ if [ "$("$PLAN_READER" is-required "$PLAN_FILE" cargo.test)" = "true" ]; then
     CARGO_ARGS+=("$argument")
   done < <("$PLAN_READER" target-args "$PLAN_FILE" cargo.test)
 
+  "$PLAN_READER" verify-checkout "$PLAN_FILE"
   cargo nextest run "${CARGO_ARGS[@]}" -P "$NEXTEST_PROFILE" --all-features --locked --config-file .config/nextest.toml
 else
   echo "No affected nextest targets."
@@ -83,6 +83,7 @@ if [ "$("$PLAN_READER" is-required "$PLAN_FILE" cargo.doctest)" = "true" ]; then
   while IFS= read -r -d '' argument; do
     DOCTEST_ARGS+=("$argument")
   done < <("$PLAN_READER" cargo-args "$PLAN_FILE" cargo.doctest)
+  "$PLAN_READER" verify-checkout "$PLAN_FILE"
   cargo test --doc "${DOCTEST_ARGS[@]}" --all-features --locked
 else
   echo "No affected doctest targets."

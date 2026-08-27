@@ -140,13 +140,15 @@ changes select the named `surface` work item. Consume that decision directly:
 ```bash
 cargo rail plan --json > target/plan-v8.json
 if [ "$(scripts/plan/read.py is-required target/plan-v8.json surface)" = "true" ]; then
+  scripts/plan/read.py verify-checkout target/plan-v8.json
   cargo rail surface --check
 fi
 ```
 
-Transfer the exact v8 plan to the Surface job instead of recreating path rules in workflow YAML. Verify checkout
-`HEAD` against `inputs.head_commit` before execution. Surface still needs the release driver or the repository's exact
-source-built embedded driver used by its bootstrap job.
+Transfer the exact v8 plan to the Surface job instead of recreating path rules in workflow YAML. Run
+`verify-checkout` from the execution workspace immediately before Surface; it delegates to the matching Cargo-Rail
+binary and revalidates the complete saved execution authority, not only `HEAD`. Surface still needs the release driver
+or the repository's exact source-built embedded driver used by its bootstrap job.
 
 ## Compare before removing Hawk
 

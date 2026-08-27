@@ -542,7 +542,9 @@ impl PlanningSourceCapture {
     }
 
     pub(crate) fn changes_from(&self, git: &SystemGit, base: &str) -> RailResult<ChangeSet> {
+        self.validate_unchanged(git)?;
         let mut final_changes = read_diff(git, base, None, &self.exclusions)?;
+        self.validate_unchanged(git)?;
         if !self.state.status.untracked.is_empty() {
             merge_sparse_untracked_changes(&mut final_changes, &self.state.status.untracked);
         }

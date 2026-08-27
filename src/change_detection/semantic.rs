@@ -33,14 +33,14 @@ struct MemberManifestInput {
     after: Vec<u8>,
 }
 
-pub(crate) fn analyze(
+pub(crate) fn analyze<'a>(
     ctx: &WorkspaceContext,
-    changed_files: &[String],
+    changed_files: impl IntoIterator<Item = &'a str>,
     base_ref: &str,
     head_ref: Option<&str>,
 ) -> RailResult<BTreeMap<String, SemanticFileChange>> {
     let semantic_paths = changed_files
-        .iter()
+        .into_iter()
         .filter(|path| {
             matches!(
                 classify_path(std::path::Path::new(path)),
@@ -56,19 +56,26 @@ pub(crate) fn analyze(
         .iter()
         .map(|path| ctx.workspace_root().join(path))
         .collect::<Vec<_>>();
-    let base_items = absolute_paths
+    let repository_paths = absolute_paths
+        .iter()
+        .map(|path| ctx.repository_path_from_workspace(path))
+        .collect::<RailResult<Vec<_>>>()?;
+    let base_items = repository_paths
         .iter()
         .map(|path| (base_ref, path.as_path()))
         .collect::<Vec<_>>();
     let base = ctx.git()?.git().read_files_bulk(&base_items)?;
     let head = if let Some(head_ref) = head_ref {
-        let head_items = absolute_paths
+        let head_items = repository_paths
             .iter()
             .map(|path| (head_ref, path.as_path()))
             .collect::<Vec<_>>();
         ctx.git()?.git().read_files_bulk(&head_items)?
     } else if ctx.planning_source_capture().is_some() {
-        let paths = semantic_paths.iter().map(|path| (*path).clone()).collect::<Vec<_>>();
+        let paths = semantic_paths
+            .iter()
+            .map(|path| (*path).to_string())
+            .collect::<Vec<_>>();
         ctx.read_planning_current_files(&paths)?
     } else {
         absolute_paths
@@ -103,7 +110,7 @@ pub(crate) fn analyze(
                     )));
                 }
             };
-            Ok((path.clone(), change))
+            Ok((path.to_string(), change))
         })
         .collect()
 }
@@ -118,10 +125,20 @@ fn member_manifest_inputs(
         .iter()
         .map(|package| package.manifest_path.as_std_path())
         .collect::<Vec<_>>();
-    let base_items = absolute_paths.iter().map(|path| (base_ref, *path)).collect::<Vec<_>>();
+    let repository_paths = absolute_paths
+        .iter()
+        .map(|path| ctx.repository_path_from_workspace(path))
+        .collect::<RailResult<Vec<_>>>()?;
+    let base_items = repository_paths
+        .iter()
+        .map(|path| (base_ref, path.as_path()))
+        .collect::<Vec<_>>();
     let before = ctx.git()?.git().read_files_bulk(&base_items)?;
     let after = if let Some(head_ref) = head_ref {
-        let head_items = absolute_paths.iter().map(|path| (head_ref, *path)).collect::<Vec<_>>();
+        let head_items = repository_paths
+            .iter()
+            .map(|path| (head_ref, path.as_path()))
+            .collect::<Vec<_>>();
         ctx.git()?.git().read_files_bulk(&head_items)?
     } else if ctx.planning_source_capture().is_some() {
         let paths = absolute_paths

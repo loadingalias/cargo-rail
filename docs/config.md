@@ -88,8 +88,9 @@ project policy. `cargo rail config migrate` removes the old table without materi
 
 ## `[unify]`
 
-`cargo rail unify --check` diagnoses without mutating manifests. It may update compiler-evidence cache and reports
-under `target/cargo-rail/`. It exits 1 when proven edits are pending. Running without `--check` applies the plan.
+`cargo rail unify` previews without mutating manifests. `--check` makes the same decision but exits 1 when proven edits
+are pending. Analysis may update compiler-evidence cache; reports are generated only with `--report`.
+`cargo rail unify apply` owns manifest mutation.
 `cargo rail unify doctor` is a cheaper resolution diagnostic. It reports the selected Cargo channel, resolver, feature
 mode, source and policy overrides, target domains, ambiguous aliases, and a recommended action. Compiler evidence
 caching and deterministic ordering cannot be disabled.
@@ -250,10 +251,10 @@ migration. Remote release modes bind the prepared commit and wait for readiness 
 is a separate default-deny authority and requires both `registry_publication = "crates-io"` and `--publish`; when
 authorized, it runs in dependency order, observes crates.io state, and creates tags last.
 
-`cargo rail release check` validates the same local crate, bump, changelog, release-note, and tag plan as
-`cargo rail release run --check`; pending local changes exit 1. Neither command performs mutations or external effects,
-and JSON output lists every excluded effect. Use `release check --publication` for the separate publishable-crate
-readiness scope; add `--extended` there for publish dry-run, MSRV, and semver evidence.
+`cargo rail release check` validates the same local crate, bump, changelog, release-note, and tag plan as the
+deprecated `cargo rail release run --check` spelling; pending local changes exit 1. Neither command performs mutations
+or external effects, and JSON output lists every excluded effect. Use `release check --publication` for the separate
+publishable-crate readiness scope; add `--extended` there for publish dry-run, MSRV, and semver evidence.
 
 | Field                       |                       Default | Behavior                                                                                                                                                                                                                                                                                                                                                                 |
 | --------------------------- | ----------------------------: | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |

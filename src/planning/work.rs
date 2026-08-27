@@ -197,58 +197,117 @@ pub(crate) struct EvidenceRecord {
     pub(crate) complete: bool,
 }
 
-pub(crate) fn format_work_plan(plan: &WorkPlan, explain: bool) -> String {
-    let skipped = plan.work.len().saturating_sub(plan.required.len());
-    let fallbacks = plan
-        .work
-        .values()
-        .filter(|decision| {
-            matches!(
-                decision,
-                WorkDecision::Required {
-                    cause: WorkCause::IncompleteEvidence,
-                    ..
-                }
-            )
-        })
-        .count();
-    let mut output = format!(
-        "plan\n\nrequired work: {}\nskipped work: {skipped}\nfallback work: {fallbacks}\nchanged inputs: {}\noverride: {}\n",
-        if plan.required.is_empty() {
-            "none".to_string()
-        } else {
-            plan.required.join(", ")
-        },
-        plan.changes.files.len() + plan.changes.cargo.len() + plan.changes.config.len(),
-        match plan.inputs.r#override {
-            PlanOverride::None => "none",
-            PlanOverride::All => "all",
+pub(crate) fn format_work_plan(
+    plan: &WorkPlan,
+    explain: bool,
+    explain_work: Option<&str>,
+    verbose: bool,
+) -> RailResult<String> {
+    if let Some(id) = explain_work
+        && !plan.work.contains_key(id)
+    {
+        return Err(RailError::with_help(
+            format!("unknown work ID '{id}'"),
+            format!(
+                "choose one of: {}",
+                plan.work.keys().cloned().collect::<Vec<_>>().join(", ")
+            ),
+        ));
+    }
+
+    let mut output = String::new();
+    if plan.required.is_empty() {
+        output.push_str("No work required.\n");
+    } else {
+        output.push_str("Required work:\n");
+        for id in &plan.required {
+            let WorkDecision::Required { scope, .. } = &plan.work[id] else {
+                continue;
+            };
+            output.push_str(&format!("  {id} [{}]\n", human_scope(scope)));
         }
-    );
-    if explain {
-        output.push('\n');
-        for (id, decision) in &plan.work {
-            let (state, refs) = match decision {
-                WorkDecision::Skipped { evidence } => ("skipped".to_string(), evidence),
+    }
+
+    if verbose {
+        let changed = plan.changes.files.len() + plan.changes.cargo.len() + plan.changes.config.len();
+        let skipped = plan.work.len().saturating_sub(plan.required.len());
+        output.push_str(&format!("Changed inputs: {changed}; skipped work: {skipped}.\n"));
+    }
+
+    let selected = if let Some(id) = explain_work {
+        vec![(id, &plan.work[id])]
+    } else if explain {
+        plan.required
+            .iter()
+            .filter_map(|id| plan.work.get(id).map(|decision| (id.as_str(), decision)))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if !selected.is_empty() {
+        output.push_str("\nDecision proof:\n");
+        for (id, decision) in selected {
+            let (state, references) = match decision {
+                WorkDecision::Skipped { evidence } => ("skipped", evidence),
                 WorkDecision::Required { cause, evidence, .. } => (
-                    format!(
-                        "required ({})",
-                        match cause {
-                            WorkCause::ChangedInput => "changed input",
-                            WorkCause::IncompleteEvidence => "incomplete evidence",
-                            WorkCause::ForcedAll => "forced all",
-                        }
-                    ),
+                    match cause {
+                        WorkCause::ChangedInput => "required: changed input",
+                        WorkCause::IncompleteEvidence => "required: incomplete evidence widened scope",
+                        WorkCause::ForcedAll => "required: --all",
+                    },
                     evidence,
                 ),
             };
-            output.push_str(&format!("{id}: {state}\n"));
-            for evidence in refs.iter().filter_map(|reference| plan.evidence.get(reference)) {
-                output.push_str(&format!("  {}\n", evidence.description));
+            output.push_str(&format!("  {id} ({state})\n"));
+            for evidence in references.iter().filter_map(|reference| plan.evidence.get(reference)) {
+                output.push_str(&format!("    {}", evidence.description));
+                if let Some(input) = &evidence.input {
+                    output.push_str(&format!(" [{input}]"));
+                }
+                output.push('\n');
             }
         }
     }
-    output
+    Ok(output)
+}
+
+fn human_scope(scope: &WorkScope) -> String {
+    match scope {
+        WorkScope::Repository => "repository".to_string(),
+        WorkScope::Cargo {
+            selection: CargoSelection::Workspace { targets, .. },
+        } => match targets.len() {
+            0 => "Cargo workspace".to_string(),
+            count => format!("Cargo workspace, {count} target(s)"),
+        },
+        WorkScope::Cargo {
+            selection: CargoSelection::Packages { packages, targets, .. },
+        } => {
+            let names = packages
+                .iter()
+                .map(|package| package.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if targets.is_empty() {
+                format!("Cargo packages: {names}")
+            } else {
+                format!("Cargo packages: {names}; {} target(s)", targets.len())
+            }
+        }
+        WorkScope::Variants {
+            selection: VariantSelection::All { .. },
+        } => "all variants".to_string(),
+        WorkScope::Variants {
+            selection: VariantSelection::Selected { variants, .. },
+        } => format!(
+            "variants: {}",
+            variants
+                .iter()
+                .map(|variant| variant.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -315,7 +374,8 @@ struct EvidenceIdentity<'a> {
 
 struct Evaluator<'a> {
     ctx: &'a WorkspaceContext,
-    index: &'a PlanningIndex,
+    paths: &'a [&'a str],
+    config_deltas: &'a [ConfigDelta],
     dependency_universe: &'a DependencyUniverse,
     semantic_changes: &'a BTreeMap<String, SemanticFileChange>,
     observed: &'a PlanningEvidenceState,
@@ -325,7 +385,7 @@ struct Evaluator<'a> {
 
 pub(crate) fn build_work_plan(
     ctx: &WorkspaceContext,
-    index: &PlanningIndex,
+    index: PlanningIndex,
     authority: WorkPlanAuthority,
     dependency_universe: &DependencyUniverse,
     semantic_changes: &BTreeMap<String, SemanticFileChange>,
@@ -345,32 +405,39 @@ pub(crate) fn build_work_plan(
         dependency_universe,
         ctx,
     );
-    let mut evaluator = Evaluator {
-        ctx,
-        index,
-        dependency_universe,
-        semantic_changes,
-        observed: &observed,
-        evidence: BTreeMap::new(),
-        decisions: BTreeMap::new(),
+    let (work, required, evidence) = {
+        let paths = index.paths().collect::<Vec<_>>();
+        let mut evaluator = Evaluator {
+            ctx,
+            paths: &paths,
+            config_deltas: index.config_deltas(),
+            dependency_universe,
+            semantic_changes,
+            observed: &observed,
+            evidence: BTreeMap::new(),
+            decisions: BTreeMap::new(),
+        };
+
+        for spec in specs.iter().filter(|spec| spec.origin == "builtin") {
+            evaluator.evaluate_builtin(spec)?;
+        }
+        for spec in specs.iter().filter(|spec| spec.origin == "repository") {
+            evaluator.evaluate_declared(spec)?;
+        }
+        if force_all {
+            evaluator.force_all(&specs)?;
+        }
+
+        let required = evaluator
+            .decisions
+            .iter()
+            .filter_map(|(id, decision)| matches!(decision, WorkDecision::Required { .. }).then_some(id.clone()))
+            .collect::<Vec<_>>();
+        validate_decisions(&specs, &evaluator.decisions, &required, &evaluator.evidence)?;
+        (evaluator.decisions, required, evaluator.evidence)
     };
 
-    for spec in specs.iter().filter(|spec| spec.origin == "builtin") {
-        evaluator.evaluate_builtin(spec)?;
-    }
-    for spec in specs.iter().filter(|spec| spec.origin == "repository") {
-        evaluator.evaluate_declared(spec)?;
-    }
-    if force_all {
-        evaluator.force_all(&specs)?;
-    }
-
-    let required = evaluator
-        .decisions
-        .iter()
-        .filter_map(|(id, decision)| matches!(decision, WorkDecision::Required { .. }).then_some(id.clone()))
-        .collect::<Vec<_>>();
-    validate_decisions(&specs, &evaluator.decisions, &required, &evaluator.evidence)?;
+    let PlanningIndex { file_changes, config } = index;
 
     let mut plan = WorkPlan {
         plan_contract_version: PLAN_CONTRACT_VERSION,
@@ -394,13 +461,13 @@ pub(crate) fn build_work_plan(
             },
         },
         changes: WorkChanges {
-            files: index.file_changes().to_vec(),
+            files: file_changes,
             cargo: cargo_structural_deltas(ctx, semantic_changes),
-            config: index.config_deltas().to_vec(),
+            config,
         },
-        work: evaluator.decisions,
+        work,
         required,
-        evidence: evaluator.evidence,
+        evidence,
     };
     plan.identity = plan_identity(&plan)?;
     Ok(plan)
@@ -542,13 +609,12 @@ fn validate_variant_catalog(id: &str, path: &str, catalog: &mut VariantCatalog) 
 impl Evaluator<'_> {
     fn evaluate_builtin(&mut self, spec: &WorkSpec) -> RailResult<()> {
         let config_inputs = self
-            .index
-            .config_deltas()
+            .config_deltas
             .iter()
             .filter(|delta| crate::config::schema::field_consumers(&delta.path).contains(&spec.id.as_str()))
             .map(|delta| format!("config:{}", delta.path))
             .collect::<Vec<_>>();
-        let paths = self.index.files();
+        let paths = self.paths;
         let direct = match spec.id.as_str() {
             "cargo.fmt" => paths
                 .iter()
@@ -652,7 +718,7 @@ impl Evaluator<'_> {
         Ok(())
     }
 
-    fn observed_cargo_decision(&mut self, spec: &WorkSpec, paths: &[String]) -> RailResult<Option<WorkDecision>> {
+    fn observed_cargo_decision(&mut self, spec: &WorkSpec, paths: &[&str]) -> RailResult<Option<WorkDecision>> {
         if let Some((code, description)) = self.observed.incompatibility() {
             let code = code.to_string();
             let description = description.to_string();
@@ -713,7 +779,7 @@ impl Evaluator<'_> {
         let changed = observed
             .inputs
             .iter()
-            .filter(|input| paths.contains(&input.path))
+            .filter(|input| paths.contains(&input.path.as_str()))
             .cloned()
             .collect::<Vec<_>>();
         if changed.is_empty() {
@@ -753,10 +819,9 @@ impl Evaluator<'_> {
     }
 
     fn evaluate_declared(&mut self, spec: &WorkSpec) -> RailResult<()> {
-        let path_inputs = matching_paths(&spec.paths, self.index.files())?;
+        let path_inputs = matching_paths(&spec.paths, self.paths)?;
         let config_inputs = self
-            .index
-            .config_deltas()
+            .config_deltas
             .iter()
             .filter(|delta| {
                 spec.config.contains(&delta.path)
@@ -768,17 +833,18 @@ impl Evaluator<'_> {
         let selected_cargo = spec
             .cargo
             .iter()
-            .filter(|id| {
-                matches!(
-                    self.decisions.get(*id),
-                    Some(WorkDecision::Required {
-                        cause: WorkCause::ChangedInput,
-                        ..
-                    })
-                )
-            })
+            .filter(|id| matches!(self.decisions.get(*id), Some(WorkDecision::Required { .. })))
             .cloned()
             .collect::<Vec<_>>();
+        let incomplete_cargo = selected_cargo.iter().any(|id| {
+            matches!(
+                self.decisions.get(id),
+                Some(WorkDecision::Required {
+                    cause: WorkCause::IncompleteEvidence,
+                    ..
+                })
+            )
+        });
         let config_changed = !config_inputs.is_empty();
         let cargo_inputs = selected_cargo
             .iter()
@@ -808,24 +874,34 @@ impl Evaluator<'_> {
             } else {
                 direct.join(",")
             };
-            let evidence = self.add_evidence(
-                "changed_input",
-                &spec.id,
-                Some(&input),
-                true,
-                "a declared positive input changed".to_string(),
-            )?;
+            let (code, complete, description, cause) = if incomplete_cargo {
+                (
+                    "subscribed_cargo_incomplete",
+                    false,
+                    "subscribed Cargo work lacks complete negative evidence".to_string(),
+                    WorkCause::IncompleteEvidence,
+                )
+            } else {
+                (
+                    "changed_input",
+                    true,
+                    "a declared positive input changed".to_string(),
+                    WorkCause::ChangedInput,
+                )
+            };
+            let evidence = self.add_evidence(code, &spec.id, Some(&input), complete, description)?;
+            let path_refs = path_inputs.iter().map(String::as_str).collect::<Vec<_>>();
             let scope = if spec.scope == WorkSpecScope::Cargo {
                 WorkScope::Cargo {
                     selection: self.declared_cargo_selection(spec, &path_inputs, config_changed, &selected_cargo)?,
                 }
             } else {
-                self.scope_for(spec, &path_inputs, evidence.clone(), selected_variants)?
+                self.scope_for(spec, &path_refs, evidence.clone(), selected_variants)?
             };
             self.decisions.insert(
                 spec.id.clone(),
                 WorkDecision::Required {
-                    cause: WorkCause::ChangedInput,
+                    cause,
                     scope,
                     evidence: vec![evidence],
                 },
@@ -834,7 +910,7 @@ impl Evaluator<'_> {
             let evidence = self.add_evidence(
                 "declared_inputs_disjoint",
                 &spec.id,
-                Some(&self.index.files().join(",")),
+                Some(&self.paths.join(",")),
                 true,
                 "all declared path, config, and changed-Cargo inputs are disjoint".to_string(),
             )?;
@@ -865,7 +941,6 @@ impl Evaluator<'_> {
             .iter()
             .filter_map(|id| match self.decisions.get(id) {
                 Some(WorkDecision::Required {
-                    cause: WorkCause::ChangedInput,
                     scope: WorkScope::Cargo { selection },
                     ..
                 }) => Some(selection.clone()),
@@ -873,13 +948,14 @@ impl Evaluator<'_> {
             })
             .collect::<Vec<_>>();
         if !paths.is_empty() {
+            let paths = paths.iter().map(String::as_str).collect::<Vec<_>>();
             selections.push(cargo_selection(
                 self.ctx,
                 self.dependency_universe,
                 self.semantic_changes,
                 self.observed.base_model(),
                 &spec.id,
-                paths,
+                &paths,
             )?);
         }
         merge_cargo_selections(selections)
@@ -891,21 +967,12 @@ impl Evaluator<'_> {
         };
         let mut selected = Vec::new();
         for row in &catalog.variants {
-            let path_match = !matching_paths(&row.paths, self.index.files())?.is_empty();
-            let config_match = self
-                .index
-                .config_deltas()
+            let path_match = !matching_paths(&row.paths, self.paths)?.is_empty();
+            let config_match = self.config_deltas.iter().any(|delta| row.config.contains(&delta.path));
+            let cargo_match = row
+                .cargo
                 .iter()
-                .any(|delta| row.config.contains(&delta.path));
-            let cargo_match = row.cargo.iter().any(|id| {
-                matches!(
-                    self.decisions.get(id),
-                    Some(WorkDecision::Required {
-                        cause: WorkCause::ChangedInput,
-                        ..
-                    })
-                )
-            });
+                .any(|id| matches!(self.decisions.get(id), Some(WorkDecision::Required { .. })));
             if path_match || config_match || cargo_match {
                 selected.push(SelectedVariant {
                     id: row.id.clone(),
@@ -919,7 +986,7 @@ impl Evaluator<'_> {
     fn scope_for(
         &self,
         spec: &WorkSpec,
-        paths: &[String],
+        paths: &[&str],
         evidence: String,
         variants: Option<Vec<SelectedVariant>>,
     ) -> RailResult<WorkScope> {
@@ -1051,7 +1118,7 @@ fn merge_cargo_selections(selections: Vec<CargoSelection>) -> RailResult<CargoSe
 fn cargo_direct_inputs(
     ctx: &WorkspaceContext,
     id: &str,
-    paths: &[String],
+    paths: &[&str],
     semantic_changes: &BTreeMap<String, SemanticFileChange>,
 ) -> Vec<String> {
     paths
@@ -1110,7 +1177,7 @@ fn is_test_only_path(path: &str) -> bool {
     path.starts_with("tests/") || path.contains("/tests/") || path.starts_with("benches/") || path.contains("/benches/")
 }
 
-fn cargo_membership_uncertain(ctx: &WorkspaceContext, paths: &[String]) -> bool {
+fn cargo_membership_uncertain(ctx: &WorkspaceContext, paths: &[&str]) -> bool {
     paths.iter().any(|path| {
         !is_cargo_structural_input(path)
             && !(path.ends_with(".rs") && is_current_target_root(ctx, path))
@@ -1134,7 +1201,7 @@ fn is_current_target_root(ctx: &WorkspaceContext, path: &str) -> bool {
     })
 }
 
-fn matching_paths(patterns: &[String], files: &[String]) -> RailResult<Vec<String>> {
+fn matching_paths(patterns: &[String], files: &[&str]) -> RailResult<Vec<String>> {
     let patterns = patterns
         .iter()
         .map(|pattern| {
@@ -1145,7 +1212,7 @@ fn matching_paths(patterns: &[String], files: &[String]) -> RailResult<Vec<Strin
     Ok(files
         .iter()
         .filter(|path| patterns.iter().any(|pattern| pattern.matches(path)))
-        .cloned()
+        .map(|path| (*path).to_string())
         .collect())
 }
 
@@ -1155,11 +1222,11 @@ fn cargo_selection(
     semantic_changes: &BTreeMap<String, SemanticFileChange>,
     base_model: Option<&PortableBaseModel>,
     work: &str,
-    paths: &[String],
+    paths: &[&str],
 ) -> RailResult<CargoSelection> {
     if paths.iter().any(|path| {
         matches!(
-            semantic_changes.get(path).map(|change| &change.scope),
+            semantic_changes.get(*path).map(|change| &change.scope),
             Some(SemanticScope::Workspace)
         )
     }) {
@@ -1174,7 +1241,7 @@ fn cargo_selection(
         });
     }
     let mut seeds = HashSet::new();
-    for path in paths {
+    for &path in paths {
         match semantic_changes.get(path).map(|change| &change.scope) {
             Some(SemanticScope::None) => {}
             Some(SemanticScope::Packages(packages)) => seeds.extend(packages.iter().cloned()),
@@ -1222,6 +1289,17 @@ fn cargo_selection(
         }
     }
 
+    // Dependency packages seed reverse-impact propagation, but Cargo work is
+    // executed against this workspace. Never lower a registry, Git, or
+    // non-member path dependency into `cargo --package`.
+    selected.retain(|package| ctx.cargo().metadata().workspace_members.contains(package));
+    if selected.is_empty() {
+        return Ok(CargoSelection::Workspace {
+            cargo_args: Vec::new(),
+            targets: Vec::new(),
+        });
+    }
+
     let packages_by_id = ctx
         .cargo()
         .metadata()
@@ -1246,7 +1324,7 @@ fn historical_cargo_selection(
     model: &PortableBaseModel,
     semantic_changes: &BTreeMap<String, SemanticFileChange>,
     work: &str,
-    paths: &[String],
+    paths: &[&str],
 ) -> Option<RailResult<CargoSelection>> {
     let current = ctx
         .cargo()
@@ -1263,14 +1341,15 @@ fn historical_cargo_selection(
     if removed.is_empty() {
         return None;
     }
-    let root_manifest_changed = paths.iter().any(|path| path == "Cargo.toml");
+    let root_manifest_changed = paths.contains(&"Cargo.toml");
     let removed_seeds = removed
         .into_iter()
         .filter(|package| {
             root_manifest_changed
                 || (!package.root.is_empty()
                     && paths.iter().any(|path| {
-                        path == &format!("{}/Cargo.toml", package.root)
+                        let path = *path;
+                        path == format!("{}/Cargo.toml", package.root)
                             || path
                                 .strip_prefix(&package.root)
                                 .is_some_and(|suffix| suffix.starts_with('/'))
@@ -1327,7 +1406,7 @@ fn historical_cargo_selection(
 fn selection_for_packages(
     ctx: &WorkspaceContext,
     packages: &mut Vec<&Package>,
-    paths: &[String],
+    paths: &[&str],
 ) -> RailResult<CargoSelection> {
     packages.sort_unstable_by_key(|package| portable_package_key(ctx, package));
     packages.dedup_by(|left, right| left.id == right.id);
@@ -1402,8 +1481,8 @@ fn portable_package_key(ctx: &WorkspaceContext, package: &Package) -> String {
     format!("{}@{}#path:{relative}", package.name, package.version)
 }
 
-fn target_selectors(ctx: &WorkspaceContext, packages: &[&Package], paths: &[String]) -> Vec<CargoTargetSelector> {
-    let path_set = paths.iter().map(String::as_str).collect::<BTreeSet<_>>();
+fn target_selectors(ctx: &WorkspaceContext, packages: &[&Package], paths: &[&str]) -> Vec<CargoTargetSelector> {
+    let path_set = paths.iter().copied().collect::<BTreeSet<_>>();
     let mut targets = Vec::new();
     for package in packages {
         let package_key = portable_package_key(ctx, package);

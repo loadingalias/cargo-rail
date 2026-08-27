@@ -9,6 +9,7 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 from typing import Any
@@ -351,18 +352,37 @@ def matrix(plan: dict[str, Any], work_id: str, family: str | None) -> Any:
     return {"include": rows}
 
 
-def verify_checkout(plan: dict[str, Any]) -> None:
-    expected = plan.get("inputs", {}).get("head_commit")
-    require(isinstance(expected, str), "plan has no captured head commit")
+def verify_checkout(path: pathlib.Path) -> None:
+    configured = os.environ.get("CARGO_RAIL_BIN")
+    if configured:
+        command = [configured, "rail"]
+    else:
+        script = pathlib.Path(__file__).resolve()
+        repository = script.parents[2] if len(script.parents) > 2 else None
+        if repository is not None and (repository / "Cargo.toml").is_file():
+            bootstrap_target = os.environ.get("RAIL_BOOTSTRAP_TARGET_DIR", "target/cargo-rail-bootstrap")
+            command = [
+                "cargo",
+                "run",
+                "--quiet",
+                "--locked",
+                "--target-dir",
+                bootstrap_target,
+                "--",
+                "rail",
+            ]
+        else:
+            binary = shutil.which("cargo-rail")
+            require(binary is not None, "matching cargo-rail binary is unavailable for saved-plan verification")
+            command = [binary, "rail"]
     result = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
+        [*command, "plan", "--verify", str(path.resolve())],
         check=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
     )
-    require(result.returncode == 0, f"cannot resolve checkout HEAD: {result.stderr.strip()}")
-    require(result.stdout.strip() == expected, f"checkout HEAD {result.stdout.strip()} does not match plan {expected}")
+    require(result.returncode == 0, f"cargo-rail rejected current execution authority: {result.stderr.decode(errors='replace').strip()}")
+    require(not result.stdout, "cargo-rail saved-plan verification emitted unexpected stdout")
 
 
 def emit_null(arguments: list[str]) -> None:
@@ -423,7 +443,7 @@ def main() -> int:
         selected = matrix(plan, arguments.work, arguments.family)
         emit_line("all" if selected == "all" else json.dumps(selected, separators=(",", ":")))
     elif arguments.command == "verify-checkout":
-        verify_checkout(plan)
+        verify_checkout(arguments.path)
     return 0
 
 

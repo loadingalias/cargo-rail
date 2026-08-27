@@ -3,6 +3,65 @@
 //! Defaults live with their typed configuration fields. This module records why
 //! a field exists; it is deliberately not a second defaults registry.
 
+use std::fmt;
+
+/// One concrete TOML path whose keys remain distinct from TOML separators.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct ConfigPath {
+    segments: Vec<String>,
+}
+
+impl ConfigPath {
+    pub(crate) fn root() -> Self {
+        Self { segments: Vec::new() }
+    }
+
+    pub(crate) fn from_dotted(path: &str) -> Self {
+        Self {
+            segments: path.split('.').map(str::to_string).collect(),
+        }
+    }
+
+    pub(crate) fn child(&self, segment: impl Into<String>) -> Self {
+        let mut segments = self.segments.clone();
+        segments.push(segment.into());
+        Self { segments }
+    }
+
+    pub(crate) fn segments(&self) -> &[String] {
+        &self.segments
+    }
+
+    pub(crate) fn is_root(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    pub(crate) fn first(&self) -> Option<&str> {
+        self.segments.first().map(String::as_str)
+    }
+}
+
+impl fmt::Display for ConfigPath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, segment) in self.segments.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str(".")?;
+            }
+            if !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            {
+                formatter.write_str(segment)?;
+            } else {
+                let quoted = serde_json::to_string(segment).map_err(|_| fmt::Error)?;
+                formatter.write_str(&quoted)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Why a configuration input exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldClassification {
@@ -656,6 +715,10 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
 
 /// Look up metadata for an exact or dynamic dotted path.
 pub fn field_spec(path: &str) -> Option<&'static FieldSpec> {
+    field_spec_path(&ConfigPath::from_dotted(path))
+}
+
+pub(crate) fn field_spec_path(path: &ConfigPath) -> Option<&'static FieldSpec> {
     FIELD_SPECS.iter().find(|spec| path_matches(spec.path, path))
 }
 
@@ -685,25 +748,31 @@ pub fn field_consumers(path: &str) -> &'static [&'static str] {
     }
 }
 
-/// Whether a concrete path is a classified field or a container leading to one.
-pub fn is_known_path(path: &str) -> bool {
-    field_spec(path).is_some() || FIELD_SPECS.iter().any(|spec| path_prefix_matches(spec.path, path))
+pub(crate) fn is_known_config_path(path: &ConfigPath) -> bool {
+    field_spec_path(path).is_some()
+        || FIELD_SPECS.iter().any(|spec| path_prefix_matches(spec.path, path))
+        || (1..path.segments().len()).any(|length| {
+            let ancestor = ConfigPath {
+                segments: path.segments()[..length].to_vec(),
+            };
+            field_spec_path(&ancestor).is_some_and(|spec| spec.deprecation.is_some())
+        })
 }
 
-fn path_matches(pattern: &str, path: &str) -> bool {
+fn path_matches(pattern: &str, path: &ConfigPath) -> bool {
     let pattern = pattern.split('.');
-    let path = path.split('.');
-    pattern.clone().count() == path.clone().count()
+    pattern.clone().count() == path.segments().len()
         && pattern
-            .zip(path)
+            .zip(path.segments())
             .all(|(expected, actual)| expected.starts_with('<') || expected == actual)
 }
 
-fn path_prefix_matches(pattern: &str, path: &str) -> bool {
+fn path_prefix_matches(pattern: &str, path: &ConfigPath) -> bool {
     let pattern = pattern.split('.');
-    let path = path.split('.');
-    path.clone().count() < pattern.clone().count()
+    path.segments().len() < pattern.clone().count()
         && path
+            .segments()
+            .iter()
             .zip(pattern)
             .all(|(actual, expected)| expected.starts_with('<') || actual == expected)
 }
@@ -712,7 +781,7 @@ fn path_prefix_matches(pattern: &str, path: &str) -> bool {
 #[derive(Debug)]
 pub struct PresentDeprecation {
     /// Concrete dotted path from the document.
-    pub path: String,
+    pub(crate) path: ConfigPath,
     /// Inventory entry that matched the path.
     pub spec: &'static FieldSpec,
 }
@@ -720,13 +789,13 @@ pub struct PresentDeprecation {
 /// Find deprecated compatibility inputs without interpreting their values.
 pub fn present_deprecations(doc: &toml_edit::DocumentMut) -> Vec<PresentDeprecation> {
     let mut paths = Vec::new();
-    collect_table_paths(doc.as_table(), "", &mut paths);
+    collect_table_paths(doc.as_table(), &ConfigPath::root(), &mut paths);
     paths.sort_unstable();
     paths.dedup();
     let mut deprecations: Vec<_> = paths
         .into_iter()
         .filter_map(|path| {
-            let spec = field_spec(&path)?;
+            let spec = field_spec_path(&path)?;
             spec.deprecation.map(|_| PresentDeprecation { path, spec })
         })
         .collect();
@@ -734,20 +803,24 @@ pub fn present_deprecations(doc: &toml_edit::DocumentMut) -> Vec<PresentDeprecat
     deprecations
 }
 
-fn collect_table_paths(table: &toml_edit::Table, prefix: &str, paths: &mut Vec<String>) {
+pub(crate) fn document_paths(doc: &toml_edit::DocumentMut) -> Vec<ConfigPath> {
+    let mut paths = Vec::new();
+    collect_table_paths(doc.as_table(), &ConfigPath::root(), &mut paths);
+    paths.sort_unstable();
+    paths.dedup();
+    paths
+}
+
+fn collect_table_paths(table: &toml_edit::Table, prefix: &ConfigPath, paths: &mut Vec<ConfigPath>) {
     for (key, item) in table {
-        let path = if prefix.is_empty() {
-            key.to_string()
-        } else {
-            format!("{prefix}.{key}")
-        };
+        let path = prefix.child(key);
         paths.push(path.clone());
 
         if let Some(child) = item.as_table() {
             collect_table_paths(child, &path, paths);
         } else if let Some(array) = item.as_array_of_tables() {
             for (index, child) in array.iter().enumerate() {
-                collect_table_paths(child, &format!("{path}.{index}"), paths);
+                collect_table_paths(child, &path.child(index.to_string()), paths);
             }
         }
     }
@@ -767,6 +840,31 @@ mod tests {
             field_spec("release.changelog.groups.0.title").map(|field| field.path),
             Some("release.changelog.groups.<index>.title")
         );
+    }
+
+    #[test]
+    fn structural_paths_preserve_dynamic_keys() {
+        let doc: toml_edit::DocumentMut = r#"
+[plan.work."docs.generated"]
+paths = ["docs/**"]
+
+[crates."cli-tools".release]
+publish = false
+"#
+        .parse()
+        .unwrap();
+        let paths = document_paths(&doc);
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.to_string() == "plan.work.\"docs.generated\".paths")
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.to_string() == "crates.cli-tools.release.publish")
+        );
+        assert!(paths.iter().all(is_known_config_path));
     }
 
     #[test]
@@ -822,7 +920,7 @@ compiler_diag_cache = false
         .expect("valid fixture");
         let paths: Vec<_> = present_deprecations(&doc)
             .into_iter()
-            .map(|deprecation| deprecation.path)
+            .map(|deprecation| deprecation.path.to_string())
             .collect();
         assert_eq!(
             paths,

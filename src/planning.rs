@@ -43,43 +43,15 @@ pub(crate) struct IndexedFileChange {
     pub(crate) after: Option<String>,
 }
 
-/// Rich captured source state retained alongside its workspace path projection.
-#[derive(Debug, Clone)]
-enum PlanningSourceChanges {
-    Worktree {
-        changes: ChangeSet,
-        identities: Vec<SourceIdentityPair>,
-    },
-    Objects {
-        changes: ChangeSet,
-        identities: Vec<SourceIdentityPair>,
-    },
-}
-
-#[derive(Debug, Clone)]
-struct SourceIdentityPair {
-    before: Option<SourceContentIdentity>,
-    after: Option<SourceContentIdentity>,
-}
-
 /// One deterministic semantic view consumed by every planner evaluator.
 #[derive(Debug, Clone)]
 pub(crate) struct PlanningIndex {
-    source: PlanningSourceChanges,
-    files: Vec<String>,
     file_changes: Vec<IndexedFileChange>,
     config: Vec<ConfigDelta>,
 }
 
 impl PlanningIndex {
     pub(crate) fn from_worktree(ctx: &WorkspaceContext, changes: ChangeSet, base_ref: &str) -> RailResult<Self> {
-        let files = changes
-            .entries()
-            .iter()
-            .filter_map(|change| ctx.to_workspace_path(change.path.as_path()))
-            .map(|path| crate::utils::path_to_git_format(&path))
-            .collect::<Vec<_>>();
-        let config = effective_config_deltas(ctx, &files, base_ref, None)?;
         let repository_paths = changes
             .entries()
             .iter()
@@ -89,36 +61,31 @@ impl PlanningIndex {
         let capture = ctx
             .planning_source_capture()
             .ok_or_else(|| RailError::message("worktree planning index requires one sparse planning source capture"))?;
-        let identities: Vec<SourceIdentityPair> = changes
-            .entries()
-            .iter()
-            .map(|change| SourceIdentityPair {
-                before: before.get(change.path.as_path()).cloned(),
-                after: capture.current_content_identity(&change.path),
-            })
-            .collect();
         let file_changes = changes
             .entries()
             .iter()
-            .zip(&identities)
-            .filter_map(|(change, identity)| {
+            .filter_map(|change| {
                 let path = ctx.to_workspace_path(change.path.as_path())?;
                 Some(IndexedFileChange {
                     path: crate::utils::path_to_git_format(&path),
                     kind: source_change_kind(change.kind).to_string(),
                     relation: change.relation.as_ref().map(change_relation),
                     provenance: change_provenance(change.provenance),
-                    before: identity.before.as_ref().map(content_identity),
-                    after: identity.after.as_ref().map(content_identity),
+                    before: before.get(change.path.as_path()).map(content_identity),
+                    after: capture
+                        .current_content_identity(&change.path)
+                        .as_ref()
+                        .map(content_identity),
                 })
             })
-            .collect();
-        let index = Self {
-            source: PlanningSourceChanges::Worktree { changes, identities },
-            files: sorted_unique(files),
-            file_changes,
-            config,
-        };
+            .collect::<Vec<_>>();
+        let config = effective_config_deltas(
+            ctx,
+            file_changes.iter().map(|change| change.path.as_str()),
+            base_ref,
+            None,
+        )?;
+        let index = Self { file_changes, config };
         index.validate()?;
         Ok(index)
     }
@@ -129,13 +96,6 @@ impl PlanningIndex {
         base_ref: &str,
         head_ref: &str,
     ) -> RailResult<Self> {
-        let files = changes
-            .entries()
-            .iter()
-            .filter_map(|change| ctx.to_workspace_path(change.path.as_path()))
-            .map(|path| crate::utils::path_to_git_format(&path))
-            .collect::<Vec<_>>();
-        let config = effective_config_deltas(ctx, &files, base_ref, Some(head_ref))?;
         let repository_paths = changes
             .entries()
             .iter()
@@ -143,56 +103,41 @@ impl PlanningIndex {
             .collect::<Vec<_>>();
         let before = content_identities_at_ref(ctx, base_ref, &repository_paths)?;
         let after = content_identities_at_ref(ctx, head_ref, &repository_paths)?;
-        let identities = changes
-            .entries()
-            .iter()
-            .map(|change| SourceIdentityPair {
-                before: before.get(change.path.as_path()).cloned(),
-                after: after.get(change.path.as_path()).cloned(),
-            })
-            .collect::<Vec<_>>();
         let file_changes = changes
             .entries()
             .iter()
-            .zip(&identities)
-            .filter_map(|(change, identity)| {
+            .filter_map(|change| {
                 let path = ctx.to_workspace_path(change.path.as_path())?;
                 Some(IndexedFileChange {
                     path: crate::utils::path_to_git_format(&path),
                     kind: source_change_kind(change.kind).to_string(),
                     relation: change.relation.as_ref().map(change_relation),
                     provenance: change_provenance(change.provenance),
-                    before: identity.before.as_ref().map(content_identity),
-                    after: identity.after.as_ref().map(content_identity),
+                    before: before.get(change.path.as_path()).map(content_identity),
+                    after: after.get(change.path.as_path()).map(content_identity),
                 })
             })
-            .collect();
-        let index = Self {
-            source: PlanningSourceChanges::Objects { changes, identities },
-            files: sorted_unique(files),
-            file_changes,
-            config,
-        };
+            .collect::<Vec<_>>();
+        let config = effective_config_deltas(
+            ctx,
+            file_changes.iter().map(|change| change.path.as_str()),
+            base_ref,
+            Some(head_ref),
+        )?;
+        let index = Self { file_changes, config };
         index.validate()?;
         Ok(index)
     }
 
-    pub(crate) fn files(&self) -> &[String] {
-        &self.files
+    pub(crate) fn paths(&self) -> impl Iterator<Item = &str> {
+        self.file_changes.iter().map(|change| change.path.as_str())
     }
 
     pub(crate) fn config_deltas(&self) -> &[ConfigDelta] {
         &self.config
     }
 
-    pub(crate) fn file_changes(&self) -> &[IndexedFileChange] {
-        &self.file_changes
-    }
-
     fn validate(&self) -> RailResult<()> {
-        if !self.files.windows(2).all(|pair| pair[0] < pair[1]) {
-            return Err(RailError::message("planning source paths are not strictly sorted"));
-        }
         if !self.config.windows(2).all(|pair| pair[0].path < pair[1].path) {
             return Err(RailError::message(
                 "planning configuration deltas are not strictly sorted",
@@ -200,32 +145,6 @@ impl PlanningIndex {
         }
         if !self.file_changes.windows(2).all(|pair| pair[0].path < pair[1].path) {
             return Err(RailError::message("planning file changes are not strictly sorted"));
-        }
-        let source_count = match &self.source {
-            PlanningSourceChanges::Worktree { changes, identities } => {
-                if changes.entries().len() != identities.len() {
-                    return Err(RailError::message(
-                        "captured source changes and content identities have different lengths",
-                    ));
-                }
-                for identity in identities {
-                    let _ = (&identity.before, &identity.after);
-                }
-                changes.entries().len()
-            }
-            PlanningSourceChanges::Objects { changes, identities } => {
-                if changes.entries().len() != identities.len() {
-                    return Err(RailError::message(
-                        "captured object changes and content identities have different lengths",
-                    ));
-                }
-                changes.entries().len()
-            }
-        };
-        if source_count < self.files.len() {
-            return Err(RailError::message(
-                "planning path projection contains more paths than its captured source evidence",
-            ));
         }
         Ok(())
     }
@@ -293,19 +212,15 @@ fn content_identities_at_ref(
         .collect())
 }
 
-fn sorted_unique(values: Vec<String>) -> Vec<String> {
-    values.into_iter().collect::<BTreeSet<_>>().into_iter().collect()
-}
-
-fn effective_config_deltas(
+fn effective_config_deltas<'a>(
     ctx: &WorkspaceContext,
-    changed_files: &[String],
+    changed_files: impl IntoIterator<Item = &'a str>,
     base_ref: &str,
     head_ref: Option<&str>,
 ) -> RailResult<Vec<ConfigDelta>> {
     let candidates = config_candidates(ctx)?;
     if !changed_files
-        .iter()
+        .into_iter()
         .any(|path| candidates.iter().any(|candidate| candidate == path))
     {
         return Ok(Vec::new());
@@ -339,11 +254,14 @@ fn config_candidates(ctx: &WorkspaceContext) -> RailResult<Vec<String>> {
 }
 
 fn config_at_ref(ctx: &WorkspaceContext, revision: &str, candidates: &[String]) -> RailResult<RailConfig> {
-    let absolute = candidates
+    let repository_paths = candidates
         .iter()
-        .map(|candidate| ctx.workspace_root().join(candidate))
-        .collect::<Vec<_>>();
-    let entries = ctx.git()?.git().collect_tree_entries_for_paths(revision, &absolute)?;
+        .map(|candidate| ctx.repository_path_from_workspace(PathBuf::from(candidate).as_path()))
+        .collect::<RailResult<Vec<_>>>()?;
+    let entries = ctx
+        .git()?
+        .git()
+        .collect_tree_entries_for_paths(revision, &repository_paths)?;
     let selected = candidates.iter().find(|candidate| {
         entries.iter().any(|entry| {
             ctx.to_workspace_path(&entry.path)
@@ -353,7 +271,7 @@ fn config_at_ref(ctx: &WorkspaceContext, revision: &str, candidates: &[String]) 
     let Some(selected) = selected else {
         return Ok(RailConfig::default());
     };
-    let path = ctx.workspace_root().join(selected);
+    let path = ctx.repository_path_from_workspace(PathBuf::from(selected).as_path())?;
     let bytes = ctx.git()?.git().read_files_bulk(&[(revision, path.as_path())])?;
     RailConfig::parse_historical_planning_bytes(&bytes[0]).map_err(|message| {
         RailError::with_help(

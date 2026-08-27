@@ -3,16 +3,16 @@
 //! Coordinates commit mapping, conflict detection/resolution, and Cargo.toml
 //! transforms while preserving deterministic sync behavior.
 
-use crate::cargo::{CargoTransform, TransformContext};
+use crate::cargo::ManifestTransformPolicy;
 use crate::config::{SplitMode, WorkspaceMode};
 use crate::error::RailResult;
 use crate::git::mappings::{HistorySide, MappingStore, OriginContext, append_origin_trailers};
 use crate::git::ops::{GitIndexChange, GitTreeEntry};
 use crate::git::{CommitMetadata, SystemGit};
-use crate::progress;
 use crate::split::{SplitOwnership, SplitPathCapabilities};
 use crate::sync::conflict::{ConflictClass, ConflictInfo, ConflictResolver, ConflictStrategy};
 use crate::utils;
+use crate::verbose_progress as progress;
 use crate::workspace::WorkspaceContext;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -152,7 +152,7 @@ pub struct SyncEngine<'a> {
     /// Origin evidence for target commits synthesized into the monorepo.
     target_origin: OriginContext,
     /// Cargo.toml transformer
-    transform: CargoTransform,
+    transform: ManifestTransformPolicy,
     /// Conflict resolver
     conflict_resolver: ConflictResolver,
 }
@@ -189,7 +189,7 @@ impl<'a> SyncEngine<'a> {
             &config.crate_name,
             &config.ownership.snapshot_id,
         )?;
-        let transformer = CargoTransform::new(ctx.cargo().metadata().clone());
+        let transformer = ManifestTransformPolicy::capture(ctx)?;
 
         // Create unique temporary directory for conflict resolution (avoid conflicts in parallel tests)
         let temp_dir = config.path_capabilities.authorize_temporary(Path::new(&format!(
@@ -246,12 +246,19 @@ impl<'a> SyncEngine<'a> {
 
     /// Classify whether the selected direction has mapped commits pending.
     pub fn has_pending_changes(&mut self, direction: &SyncDirection) -> RailResult<bool> {
+        Ok(self.pending_commit_count(direction)? > 0)
+    }
+
+    /// Count mapped-history commits pending in the selected public direction.
+    pub fn pending_commit_count(&mut self, direction: &SyncDirection) -> RailResult<usize> {
         self.load_mapping_evidence()?;
         match direction {
-            SyncDirection::MonoToRemote => self.check_mono_has_changes(),
-            SyncDirection::RemoteToMono => self.check_remote_has_changes(),
-            SyncDirection::Both => Ok(self.check_mono_has_changes()? || self.check_remote_has_changes()?),
-            SyncDirection::None => Ok(false),
+            SyncDirection::MonoToRemote => self.pending_mono_commits(),
+            SyncDirection::RemoteToMono => self.pending_remote_commits(),
+            SyncDirection::Both => Ok(self
+                .pending_mono_commits()?
+                .saturating_add(self.pending_remote_commits()?)),
+            SyncDirection::None => Ok(0),
         }
     }
 
@@ -418,7 +425,7 @@ impl<'a> SyncEngine<'a> {
 
     /// Sync changes from monorepo to remote repository
     pub fn sync_to_remote(&mut self) -> RailResult<SyncResult> {
-        progress!("   Syncing monorepo → remote...");
+        progress!("Syncing local source to remote target...");
 
         self.load_mappings()?;
 
@@ -501,7 +508,7 @@ impl<'a> SyncEngine<'a> {
 
     /// Sync changes from remote repository to monorepo
     pub fn sync_from_remote(&mut self) -> RailResult<SyncResult> {
-        progress!("   Syncing remote → monorepo...");
+        progress!("Syncing remote source to local target...");
 
         // Check current branch - NEVER commit directly to protected branches
         let _current_branch = self.ctx.git()?.git().current_branch()?;
@@ -668,12 +675,12 @@ impl<'a> SyncEngine<'a> {
             && synced_count > 0
         {
             progress!(
-                "\n✅ Synced {} commit{} to branch: {}",
+                "Synced {} commit{} to branch: {}",
                 synced_count,
                 if synced_count == 1 { "" } else { "s" },
                 branch_name
             );
-            progress!("\n📋 To create a pull request:");
+            progress!("To create a pull request:");
             progress!("   git push origin {}", branch_name);
 
             // Try to detect GitHub URL and suggest gh CLI command
@@ -882,15 +889,9 @@ impl<'a> SyncEngine<'a> {
                     remote_path.display()
                 ))
             })?;
-            let object_id = if remote_path.file_name() == Some(std::ffi::OsStr::new("Cargo.toml")) {
-                let content = remote_git.read_blobs_bulk(&[entry.object_id.as_str()])?;
-                mono_git.write_blob(&self.transform_manifest_to_mono(&content[0])?)?
-            } else {
-                entry.object_id.clone()
-            };
             changes.push(GitIndexChange::Upsert(GitTreeEntry {
                 mode: entry.mode.clone(),
-                object_id,
+                object_id: entry.object_id.clone(),
                 path: mono_path.clone(),
             }));
         }
@@ -907,10 +908,7 @@ impl<'a> SyncEngine<'a> {
                 .collect::<HashMap<_, _>>();
             for mono_path in resolved {
                 let full_path = self.config.path_capabilities.authorize_source_mutation(&mono_path)?;
-                let (mut content, mode) = read_worktree_blob(&full_path, modes.get(&mono_path).map(String::as_str))?;
-                if mode != "120000" && mono_path.file_name() == Some(std::ffi::OsStr::new("Cargo.toml")) {
-                    content = self.transform_manifest_to_mono(&content)?;
-                }
+                let (content, mode) = read_worktree_blob(&full_path, modes.get(&mono_path).map(String::as_str))?;
                 changes.push(GitIndexChange::Upsert(GitTreeEntry {
                     mode,
                     object_id: mono_git.write_blob(&content)?,
@@ -949,13 +947,10 @@ impl<'a> SyncEngine<'a> {
             .map(|(remote_path, _, _)| (commit.sha.as_str(), remote_path.as_path()))
             .collect::<Vec<_>>();
         let contents = remote_git.read_files_bulk(&items)?;
-        for ((remote_path, mono_path, _), mut content) in modifications.into_iter().zip(contents) {
+        for ((_, mono_path, _), content) in modifications.into_iter().zip(contents) {
             let path = self.config.path_capabilities.authorize_source_mutation(mono_path)?;
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
-            }
-            if remote_path.file_name() == Some(std::ffi::OsStr::new("Cargo.toml")) {
-                content = self.transform_manifest_to_mono(&content)?;
             }
             write_worktree_file(&path, &content)?;
         }
@@ -967,23 +962,10 @@ impl<'a> SyncEngine<'a> {
             .map_err(|error| crate::error::RailError::message(format!("Cargo.toml is not UTF-8: {error}")))?;
         let target_has_workspace =
             self.config.mode == SplitMode::Combined && self.config.workspace_mode == WorkspaceMode::Workspace;
-        let context = TransformContext {
-            crate_name: self.config.crate_name.clone(),
-            workspace_root: self.ctx.workspace_root().to_path_buf(),
-            target_has_workspace,
-        };
-        Ok(self.transform.transform_to_split(content, &context)?.into_bytes())
-    }
-
-    fn transform_manifest_to_mono(&self, content: &[u8]) -> RailResult<Vec<u8>> {
-        let content = std::str::from_utf8(content)
-            .map_err(|error| crate::error::RailError::message(format!("Cargo.toml is not UTF-8: {error}")))?;
-        let context = TransformContext {
-            crate_name: self.config.crate_name.clone(),
-            workspace_root: self.ctx.workspace_root().to_path_buf(),
-            target_has_workspace: true,
-        };
-        Ok(self.transform.transform_to_mono(content, &context)?.into_bytes())
+        Ok(self
+            .transform
+            .transform_to_split(content, target_has_workspace)?
+            .into_bytes())
     }
 
     fn mapped_target_parents(&self, commit: &crate::git::CommitInfo, current_head: &str) -> Vec<String> {
@@ -1153,7 +1135,7 @@ impl<'a> SyncEngine<'a> {
             {
                 Ok(crate::sync::conflict::MergeResult::Success) => {
                     // Merged successfully - add to resolved files to prevent overwriting
-                    progress!("      ✅ Auto-merged {}", mono_path.display());
+                    progress!("      Auto-merged {}", mono_path.display());
                     resolved_files.push(mono_path.clone());
                 }
                 Ok(crate::sync::conflict::MergeResult::Conflicts(_paths)) => {
@@ -1181,6 +1163,10 @@ impl<'a> SyncEngine<'a> {
     }
 
     fn check_mono_has_changes(&self) -> RailResult<bool> {
+        Ok(self.pending_mono_commits()? > 0)
+    }
+
+    fn pending_mono_commits(&self) -> RailResult<usize> {
         let last_synced = self.find_last_synced_mono_commit()?;
         let new_commits =
             self.ctx
@@ -1190,10 +1176,15 @@ impl<'a> SyncEngine<'a> {
 
         Ok(new_commits
             .into_iter()
-            .any(|commit| !self.mapping_store.has_mapping(&commit.sha)))
+            .filter(|commit| !self.mapping_store.has_mapping(&commit.sha))
+            .count())
     }
 
     fn check_remote_has_changes(&self) -> RailResult<bool> {
+        Ok(self.pending_remote_commits()? > 0)
+    }
+
+    fn pending_remote_commits(&self) -> RailResult<usize> {
         let remote_git = SystemGit::open(&self.config.target_repo_path)?;
 
         // Fetch from remote (skip for local paths)
@@ -1216,7 +1207,7 @@ impl<'a> SyncEngine<'a> {
             .filter(|commit| !self.mapping_store.has_reverse_mapping(&commit.sha))
             .collect();
 
-        Ok(!relevant_commits.is_empty())
+        Ok(relevant_commits.len())
     }
 }
 
