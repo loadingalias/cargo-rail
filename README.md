@@ -116,10 +116,11 @@ changed source
   → Cargo, nextest, Just, CI, etc.
 ```
 
-Cross-process consumers must validate contract v8, its content-derived identity, and the complete saved execution
-authority before executing typed selectors. Comparing `HEAD` alone is insufficient. This repository's Commit workflow
-transfers one plan artifact and validates it with [`scripts/plan/read.py`](scripts/plan/read.py). See
-[Planning](docs/planning.md).
+Cross-process consumers must validate contract v8 and its content-derived identity, then verify that the current head
+and captured source match the saved plan before executing typed selectors. Comparing `HEAD` alone is insufficient.
+Planner machine identities remain provenance; executor-local Cargo, toolchain, and platform state cannot rewrite the
+decision. This repository's Commit workflow transfers one plan artifact and validates it with
+[`scripts/plan/read.py`](scripts/plan/read.py). See [Planning](docs/planning.md).
 
 ### GitHub Actions
 

@@ -305,7 +305,7 @@ pub enum Commands {
         /// Load portable compatible observed-input evidence
         #[arg(long, value_name = "PATH")]
         evidence: Option<PathBuf>,
-        /// Revalidate one saved plan against the current execution authority
+        /// Verify that the current checkout matches one saved plan
         #[arg(
             long,
             value_name = "PATH",

@@ -3160,7 +3160,6 @@ fn json_value_kind(value: &JsonValue) -> &'static str {
 
 fn is_relevant_environment(name: &str) -> bool {
     name == "CARGO"
-        || name == "CARGO_HOME"
         || name == "CARGO_INCREMENTAL"
         || name == "CARGO_ENCODED_RUSTFLAGS"
         || name == "CARGO_ENCODED_RUSTDOCFLAGS"
@@ -3705,6 +3704,7 @@ mod tests {
         assert!(is_relevant_environment("CARGO_PROFILE_DEV_OPT_LEVEL"));
         assert!(is_relevant_environment("CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_DEBUG"));
         assert!(is_relevant_environment("CARGO_INCREMENTAL"));
+        assert!(!is_relevant_environment("CARGO_HOME"));
         assert!(!is_relevant_environment("CARGO_RAIL_UNRELATED"));
     }
 

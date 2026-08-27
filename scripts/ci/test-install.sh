@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+python_command=python3
+if ! command -v "$python_command" >/dev/null 2>&1; then
+  python_command=python
+fi
+if ! command -v "$python_command" >/dev/null 2>&1; then
+  echo "Python 3 is required to test the installer" >&2
+  exit 2
+fi
+
 temporary="$(mktemp -d "${TMPDIR:-/tmp}/cargo-rail-installer-test.XXXXXX")"
 trap 'rm -rf "$temporary"' EXIT HUP INT TERM
 
@@ -43,7 +52,7 @@ for specification in "${targets[@]}"; do
 
   archive="cargo-rail-$target.tar.gz"
   tar -czf "$release/$archive" -C "$temporary/payload" "cargo-rail-$target"
-  scripts/package-release-archive.py "$release/$archive" \
+  "$python_command" scripts/package-release-archive.py "$release/$archive" \
     --target "$target" --version "$version" --surface "$surface"
   if command -v sha256sum >/dev/null 2>&1; then
     digest="$(sha256sum "$release/$archive" | awk '{print $1}')"

@@ -387,7 +387,7 @@ def verify_checkout(path: pathlib.Path) -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    require(result.returncode == 0, f"cargo-rail rejected current execution authority: {result.stderr.decode(errors='replace').strip()}")
+    require(result.returncode == 0, f"cargo-rail rejected current checkout binding: {result.stderr.decode(errors='replace').strip()}")
     require(not result.stdout, "cargo-rail saved-plan verification emitted unexpected stdout")
 
 

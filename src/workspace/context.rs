@@ -550,7 +550,7 @@ impl WorkspaceContext {
             None
         };
 
-        let planning_cargo_config = if capture.is_planning() {
+        let planning_cargo_config = if capture == ContextCapture::Planning {
             Some(Arc::new(CargoConfigSnapshot::capture(&cargo_current_dir)?))
         } else {
             None

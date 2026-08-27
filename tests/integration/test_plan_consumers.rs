@@ -307,7 +307,38 @@ fn test_plan_reader_delegates_final_authority_verification_to_cargo_rail() {
         let rejected = reader_at(&ws.path).args(["verify-checkout"]).arg(&path).output()?;
         assert_eq!(rejected.status.code(), Some(2));
         assert!(rejected.stdout.is_empty());
-        assert!(String::from_utf8_lossy(&rejected.stderr).contains("cargo-rail rejected current execution authority"));
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("cargo-rail rejected current checkout binding"));
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_plan_reader_accepts_matching_checkout_from_another_planning_host() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("plan-reader-cross-host")?;
+        ws.add_crate("reader", "0.1.0", &[])?;
+        ws.commit("establish cross-host plan authority")?;
+        let output = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--json"])?;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let mut plan: Value = serde_json::from_slice(&output.stdout)?;
+        plan["inputs"]["cargo"] = Value::String(format!("resolution-universe-v1:sha256:{}", "a".repeat(64)));
+        plan["inputs"]["configuration"] = Value::String(format!("cargo-configuration-v1:sha256:{}", "b".repeat(64)));
+        plan["inputs"]["toolchain"] = Value::String("foreign-toolchain".to_string());
+        plan["inputs"]["target"] = Value::String(format!("planning-target-v1:sha256:{}", "c".repeat(64)));
+        plan["inputs"]["platform"] = Value::String("windows-x86_64".to_string());
+        let plan = sign_plan(plan);
+        let path = ws.path.join("target/cross-host-plan.json");
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        std::fs::write(&path, serde_json::to_vec(&plan)?)?;
+
+        let verified = reader_at(&ws.path).args(["verify-checkout"]).arg(&path).output()?;
+        assert!(
+            verified.status.success(),
+            "{}",
+            String::from_utf8_lossy(&verified.stderr)
+        );
+        assert!(verified.stdout.is_empty());
         Ok(())
     })();
     super::helpers::finish_test(result);
@@ -319,10 +350,7 @@ fn test_source_reader_bootstrap_preserves_direct_binary_authority() {
         let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("saved-plan.json");
-        let bootstrap_target = std::path::Path::new(env!("CARGO_BIN_EXE_cargo-rail"))
-            .parent()
-            .and_then(std::path::Path::parent)
-            .expect("cargo-rail test binary must be inside a Cargo target directory");
+        let bootstrap_target = directory.path().join("bootstrap-target");
         let planned = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
             .current_dir(repository)
             .args(["rail", "plan", "--since", "HEAD", "--json"])

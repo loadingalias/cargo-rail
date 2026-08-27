@@ -580,7 +580,7 @@ Options:
           Load portable compatible observed-input evidence
 
       --verify <PATH>
-          Revalidate one saved plan against the current execution authority
+          Verify that the current checkout matches one saved plan
 
       --schema
           Print the versioned planner JSON Schema and exit

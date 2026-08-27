@@ -122,7 +122,7 @@ pub fn print_plan_schema() {
 }
 
 #[derive(Debug, Deserialize)]
-struct SavedPlanAuthority {
+struct SavedPlanBinding {
     plan_contract_version: u32,
     inputs: SavedPlanInputs,
 }
@@ -132,11 +132,6 @@ struct SavedPlanInputs {
     head: String,
     head_commit: String,
     capture: Option<String>,
-    cargo: String,
-    configuration: String,
-    toolchain: String,
-    target: String,
-    platform: String,
 }
 
 pub(crate) fn verify_saved_plan(
@@ -158,7 +153,7 @@ pub(crate) fn verify_saved_plan(
             plan_file.display()
         )));
     }
-    let saved: SavedPlanAuthority = serde_json::from_slice(&std::fs::read(plan_file)?).map_err(|error| {
+    let saved: SavedPlanBinding = serde_json::from_slice(&std::fs::read(plan_file)?).map_err(|error| {
         RailError::message(format!("failed to parse saved plan '{}': {error}", plan_file.display()))
     })?;
     if saved.plan_contract_version != 8 {
@@ -198,23 +193,11 @@ pub(crate) fn verify_saved_plan(
                 .map(|change| change.path.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            return Err(saved_plan_drift(format!(
+            return Err(saved_checkout_drift(format!(
                 "object-bound execution checkout has non-generated source drift: {paths}"
             )));
         }
     }
-
-    let cargo =
-        DependencyUniverse::from_metadata(context.cargo().metadata(), context.planning_authority_source_root())?;
-    verify_saved_binding("Cargo universe", &saved.inputs.cargo, cargo.identity())?;
-    let configuration = context.planning_cargo_configuration_identity()?;
-    verify_saved_binding("Cargo configuration", &saved.inputs.configuration, &configuration)?;
-    let toolchain = planning_toolchain_identity(&context)?;
-    verify_saved_binding("toolchain", &saved.inputs.toolchain, &toolchain)?;
-    let target = planning_target_identity(&configuration, &toolchain);
-    verify_saved_binding("planning target", &saved.inputs.target, &target)?;
-    let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
-    verify_saved_binding("platform", &saved.inputs.platform, &platform)?;
     Ok(())
 }
 
@@ -222,13 +205,13 @@ fn verify_saved_binding(name: &str, expected: &str, current: &str) -> RailResult
     if expected == current {
         Ok(())
     } else {
-        Err(saved_plan_drift(format!(
+        Err(saved_checkout_drift(format!(
             "saved {name} '{expected}' does not match current authority '{current}'"
         )))
     }
 }
 
-fn saved_plan_drift(message: String) -> RailError {
+fn saved_checkout_drift(message: String) -> RailError {
     RailError::with_help(
         message,
         "discard the saved plan, stop concurrent workspace changes, and create a new plan before execution",

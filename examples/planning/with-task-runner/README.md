@@ -30,5 +30,5 @@ fi
 
 Transfer the exact plan as an artifact. Every execution job validates contract v8 and consumes only its registered
 work decision. Immediately before each task-runner command, `verify-checkout` must use the matching Cargo-Rail binary
-to revalidate the complete saved execution authority. Matching `HEAD` alone is insufficient. Do not reconstruct work
-from changed paths or evidence descriptions.
+to verify the exact head and captured source state. Matching `HEAD` alone is insufficient. Do not reconstruct work
+from changed paths, evidence descriptions, or executor-local Cargo and toolchain state.

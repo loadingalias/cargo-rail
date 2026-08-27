@@ -147,8 +147,9 @@ fi
 
 Transfer the exact v8 plan to the Surface job instead of recreating path rules in workflow YAML. Run
 `verify-checkout` from the execution workspace immediately before Surface; it delegates to the matching Cargo-Rail
-binary and revalidates the complete saved execution authority, not only `HEAD`. Surface still needs the release driver
-or the repository's exact source-built embedded driver used by its bootstrap job.
+binary and verifies the exact head and captured source state, not only `HEAD`. Surface still needs the release driver
+or the repository's exact source-built embedded driver used by its bootstrap job. The consumer validates planner
+machine identities as signed plan provenance; it does not replace them with executor-local values.
 
 ## Compare before removing Hawk
 

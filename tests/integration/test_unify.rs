@@ -2654,6 +2654,13 @@ anyhow = "1.0"
 
         // Run unify check with explanation output
         let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--explain"])?;
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "unify check should report pending changes.\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         // anyhow should be unified (no exact pin)
@@ -2722,6 +2729,13 @@ serde = "=1.0.200"
 
         // Run unify check
         let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--explain"])?;
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "unify check should report pending changes.\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         // serde should be in the plan (warn mode converts but still unifies)
@@ -3078,7 +3092,9 @@ fn test_unify_apply_from_plan_file() {
         assert_eq!(
             check_output.status.code(),
             Some(1),
-            "check should report pending changes"
+            "check should report pending changes.\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&check_output.stdout),
+            String::from_utf8_lossy(&check_output.stderr)
         );
 
         let apply_output = run_cargo_rail(

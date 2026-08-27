@@ -1405,10 +1405,16 @@ mode = "single"
         std::fs::write(ws.path.join("rail.toml"), config)?;
 
         // First split
-        run_cargo_rail(
+        let output1 = run_cargo_rail(
             &ws.path,
             &["rail", "split", "run", "incremental-lib", "--yes", "--allow-dirty"],
         )?;
+        assert!(
+            output1.status.success(),
+            "Initial split should succeed.\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output1.stdout),
+            String::from_utf8_lossy(&output1.stderr)
+        );
 
         // Get commit count after first split
         let log1 = git(split_dir.path(), &["rev-list", "--count", "HEAD"])?;

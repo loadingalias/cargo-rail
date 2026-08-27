@@ -7,7 +7,7 @@ use anyhow::{Context as _, Result, anyhow, ensure};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
-use crate::helpers::{TestWorkspace, git, run_cargo_rail};
+use crate::helpers::{TestWorkspace, git, run_cargo_rail, run_cargo_rail_with_env};
 
 const PLAN_V8_SCHEMA: &str = include_str!("../../schemas/plan-v8.schema.json");
 const PLAN_VARIANTS_V1_SCHEMA: &str = include_str!("../../schemas/plan-variants-v1.schema.json");
@@ -44,6 +44,43 @@ fn write_saved_plan(ws: &TestWorkspace, name: &str, plan: &Value) -> Result<Stri
 
 fn verify_saved_plan(ws: &TestWorkspace, path: &str) -> Result<std::process::Output> {
     run_cargo_rail(&ws.path, &["rail", "plan", "--verify", path])
+}
+
+#[test]
+fn test_plan_identity_ignores_equivalent_empty_cargo_home_locations() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("plan-cargo-home-equivalence")?;
+        ws.add_crate("portable", "0.1.0", &[])?;
+        ws.commit("establish Cargo home equivalence fixture")?;
+        let first_home = tempfile::tempdir()?;
+        let second_home = tempfile::tempdir()?;
+
+        let first = run_cargo_rail_with_env(
+            &ws.path,
+            &["rail", "plan", "--since", "HEAD", "--json"],
+            &[(
+                "CARGO_HOME",
+                first_home.path().to_str().context("first Cargo home is not UTF-8")?,
+            )],
+        )?;
+        ensure!(first.status.success(), "{}", String::from_utf8_lossy(&first.stderr));
+        let second = run_cargo_rail_with_env(
+            &ws.path,
+            &["rail", "plan", "--since", "HEAD", "--json"],
+            &[(
+                "CARGO_HOME",
+                second_home.path().to_str().context("second Cargo home is not UTF-8")?,
+            )],
+        )?;
+        ensure!(second.status.success(), "{}", String::from_utf8_lossy(&second.stderr));
+        let first: Value = serde_json::from_slice(&first.stdout)?;
+        let second: Value = serde_json::from_slice(&second.stdout)?;
+
+        assert_eq!(first["inputs"]["configuration"], second["inputs"]["configuration"]);
+        assert_eq!(first["identity"], second["identity"]);
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
 }
 
 fn sign_planning_evidence(mut manifest: Value) -> Result<Value> {

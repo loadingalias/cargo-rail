@@ -189,14 +189,19 @@ Transfer the exact plan file, not reconstructed booleans. Before starting each c
 4. run `scripts/plan/read.py verify-checkout PLAN` from the execution workspace immediately before the executor, then
    start the executor only when verification succeeds.
 
-`verify-checkout` delegates to the matching Cargo-Rail binary through `cargo rail plan --verify`. It revalidates the
-complete saved execution authority: the head commit, worktree capture or clean object-bound checkout, Cargo universe
-and configuration, toolchain, planning target, and platform. Comparing `HEAD` alone does not authorize execution.
-Drift fails with exit code `2`; verification emits no selectors and performs no mutation.
+`verify-checkout` first validates the complete v8 contract and canonical plan identity. It then delegates to the
+matching Cargo-Rail binary through `cargo rail plan --verify` to bind the plan to the current source: the exact head
+commit plus either the worktree capture or a clean object-bound checkout. Comparing `HEAD` alone does not authorize
+execution. Drift fails with exit code `2`; verification emits no selectors and performs no mutation.
+
+Cargo, configuration, toolchain, target, and platform identities record the environment that produced the plan. A
+consumer does not recompute those planner-owned facts. This preserves one decision across Linux, macOS, and Windows
+instead of allowing each execution host to create a different authority.
 
 The Commit workflow uploads one plan artifact. Quality, compatibility, archive, and Surface jobs download that same
-artifact and verify its complete execution authority immediately before each executor. Reusable workflows receive
-planner-selected matrices; missing variant evidence is represented as explicit `all`, never an inferred empty matrix.
+artifact, validate its contract, and verify its checkout binding immediately before each executor. Reusable workflows
+receive planner-selected matrices; missing variant evidence is represented as explicit `all`, never an inferred empty
+matrix.
 
 Compiler reuse remains independent of planning. Run `cargo rail cache setup` on an execution machine when verified L1
 reuse is desired; planning never treats a cache hit as evidence that work is unnecessary.

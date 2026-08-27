@@ -26,8 +26,9 @@ fi
 
 Create the plan once and transfer it as an artifact. In each execution workspace, validate contract v8, gate the job
 with `required`, and lower only that work item's typed scope. Then run `verify-checkout` immediately before Cargo. It
-delegates to the matching Cargo-Rail binary and verifies the complete saved execution authority; matching `HEAD` alone
-is insufficient.
+validates the canonical plan, then delegates to the matching Cargo-Rail binary to verify the exact head and captured
+source state. Matching `HEAD` alone is insufficient. Planner machine identities remain provenance, so the same plan
+can authorize its selected work on Linux, macOS, and Windows.
 
 ```bash
 scripts/plan/read.py validate target/plan-v8.json

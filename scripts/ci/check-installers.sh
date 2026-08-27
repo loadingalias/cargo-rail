@@ -3,7 +3,15 @@ set -euo pipefail
 
 sh -n scripts/install.sh
 scripts/ci/test-install.sh
-python3 scripts/ci/http-fixture-server.py --help >/dev/null
+python_command=python3
+if ! command -v "$python_command" >/dev/null 2>&1; then
+  python_command=python
+fi
+if ! command -v "$python_command" >/dev/null 2>&1; then
+  echo "Python 3 is required to validate the installers" >&2
+  exit 2
+fi
+"$python_command" scripts/ci/http-fixture-server.py --help >/dev/null
 
 for placeholder in '@CARGO_RAIL_VERSION@'; do
   for installer in scripts/install.sh scripts/install.ps1; do
