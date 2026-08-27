@@ -10,7 +10,7 @@ const COMPATIBILITY_WORKFLOW: &str = include_str!("../../.github/workflows/compa
 const ARCHIVE_WORKFLOW: &str = include_str!("../../.github/workflows/release-archives.yaml");
 
 fn reader() -> Command {
-    let mut command = Command::new("python3");
+    let mut command = Command::new(if cfg!(windows) { "python" } else { "python3" });
     command
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .arg("scripts/plan/read.py");
@@ -291,6 +291,7 @@ fn test_commit_workflow_uses_named_work_and_planner_matrices_only() {
     assert!(COMPATIBILITY_WORKFLOW.contains("inputs.compatibility-matrix"));
     assert!(COMPATIBILITY_WORKFLOW.contains("inputs.filesystem-matrix"));
     assert!(ARCHIVE_WORKFLOW.contains("inputs.selected-matrix"));
+    assert!(ARCHIVE_WORKFLOW.contains("scripts/ci/smoke-release-tar.sh"));
     assert!(COMPATIBILITY_WORKFLOW.contains("verify-checkout"));
     assert!(ARCHIVE_WORKFLOW.contains("verify-checkout"));
 }

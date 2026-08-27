@@ -987,11 +987,7 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
     for fragment in (
         "workflow_call:",
         "distribution/release-targets.json",
-        worker_verifier,
-        'smoke="$(pwd)/smoke"',
-        "--cargo-rail-fact-protocol-version",
-        "surface --prepare",
-        "surface --check",
+        "scripts/ci/smoke-release-tar.sh",
         "if: inputs.stage",
         "actions/attest@",
         "actions/upload-artifact@",
@@ -999,6 +995,22 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         require(
             fragment in archive_workflow,
             f"release archive workflow is missing {fragment}",
+        )
+    archive_smoke = (
+        REPOSITORY_ROOT / "scripts/ci/smoke-release-tar.sh"
+    ).read_text(encoding="utf-8")
+    for fragment in (
+        worker_verifier,
+        'smoke="$(mktemp -d',
+        "--cargo-rail-fact-protocol-version",
+        "capture_surface stable-prepare",
+        "capture_surface stable-check",
+        "capture_surface nightly-prepare",
+        "capture_surface nightly-check",
+    ):
+        require(
+            fragment in archive_smoke,
+            f"release archive smoke command is missing {fragment}",
         )
     require(
         "rustup component list" not in archive_workflow,

@@ -369,6 +369,11 @@ def emit_null(arguments: list[str]) -> None:
     sys.stdout.buffer.write(b"".join(argument.encode("utf-8") + b"\0" for argument in arguments))
 
 
+def emit_line(value: str) -> None:
+    """Write one machine line without platform newline translation."""
+    sys.stdout.buffer.write(value.encode("utf-8") + b"\n")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -405,18 +410,18 @@ def main() -> int:
     if arguments.command == "validate":
         return 0
     if arguments.command == "required":
-        print(json.dumps(plan["required"], separators=(",", ":")))
+        emit_line(json.dumps(plan["required"], separators=(",", ":")))
     elif arguments.command == "identity":
-        print(plan["identity"])
+        emit_line(plan["identity"])
     elif arguments.command == "is-required":
-        print("true" if decision(plan, arguments.work)["state"] == "required" else "false")
+        emit_line("true" if decision(plan, arguments.work)["state"] == "required" else "false")
     elif arguments.command == "cargo-args":
         emit_null(cargo_args(plan, arguments.work))
     elif arguments.command == "target-args":
         emit_null(target_args(plan, arguments.work))
     elif arguments.command == "matrix":
         selected = matrix(plan, arguments.work, arguments.family)
-        print("all" if selected == "all" else json.dumps(selected, separators=(",", ":")))
+        emit_line("all" if selected == "all" else json.dumps(selected, separators=(",", ":")))
     elif arguments.command == "verify-checkout":
         verify_checkout(plan)
     return 0
