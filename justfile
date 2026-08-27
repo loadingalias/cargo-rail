@@ -253,7 +253,7 @@ gen-fixture members output:
 # Explainability
 
 plan:
-    cargo run --quiet --locked --target-dir "${RAIL_BOOTSTRAP_TARGET_DIR:-target/cargo-rail-bootstrap}" -- rail plan --json
+    @scripts/plan/read.py create -
 
 # Maintenance
 

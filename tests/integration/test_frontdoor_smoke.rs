@@ -25,7 +25,8 @@ fn test_documented_frontdoor_commands_smoke() {
             "just build-release should produce the complete release artifact set"
         );
         assert!(justfile.contains("@scripts/build/build.sh"));
-        assert!(justfile.contains("rail plan --json"));
+        assert!(justfile.contains("@scripts/plan/read.py create -"));
+        assert!(!justfile.contains("cargo run --quiet --locked --target-dir"));
         assert!(!justfile.contains("rail run"));
         for (script, work, executor) in [
             (&build_script, "cargo.build", "cargo build"),

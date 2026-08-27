@@ -267,6 +267,23 @@ fn test_plan_reader_rejects_contract_or_projection_drift() {
 }
 
 #[test]
+fn test_plan_reader_creates_one_valid_plan_on_stdout() {
+    let result: Result<()> = (|| {
+        let output = reader()
+            .env("CARGO_RAIL_BIN", env!("CARGO_BIN_EXE_cargo-rail"))
+            .args(["create", "-", "--all"])
+            .output()?;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let plan: Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(plan["plan_contract_version"], 8);
+        assert_eq!(plan["inputs"]["override"], "all");
+        assert!(plan["required"].as_array().is_some_and(|required| !required.is_empty()));
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
 fn test_plan_reader_delegates_final_authority_verification_to_cargo_rail() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("plan-reader-authority")?;
@@ -291,6 +308,40 @@ fn test_plan_reader_delegates_final_authority_verification_to_cargo_rail() {
         assert_eq!(rejected.status.code(), Some(2));
         assert!(rejected.stdout.is_empty());
         assert!(String::from_utf8_lossy(&rejected.stderr).contains("cargo-rail rejected current execution authority"));
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_source_reader_bootstrap_preserves_direct_binary_authority() {
+    let result: Result<()> = (|| {
+        let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("saved-plan.json");
+        let bootstrap_target = std::path::Path::new(env!("CARGO_BIN_EXE_cargo-rail"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("cargo-rail test binary must be inside a Cargo target directory");
+        let planned = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+            .current_dir(repository)
+            .args(["rail", "plan", "--since", "HEAD", "--json"])
+            .output()?;
+        assert!(planned.status.success(), "{}", String::from_utf8_lossy(&planned.stderr));
+        std::fs::write(&path, planned.stdout)?;
+
+        let verified = reader()
+            .env_remove("CARGO_RAIL_BIN")
+            .env("RAIL_BOOTSTRAP_TARGET_DIR", bootstrap_target)
+            .args(["verify-checkout"])
+            .arg(&path)
+            .output()?;
+        assert!(
+            verified.status.success(),
+            "{}",
+            String::from_utf8_lossy(&verified.stderr)
+        );
+        assert!(verified.stdout.is_empty());
         Ok(())
     })();
     super::helpers::finish_test(result);

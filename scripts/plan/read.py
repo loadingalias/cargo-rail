@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from typing import Any
 
 
@@ -257,24 +258,43 @@ def decision(plan: dict[str, Any], work_id: str) -> dict[str, Any]:
     return value
 
 
-def create_plan(path: pathlib.Path, force_all: bool) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    binary = os.environ.get("CARGO_RAIL_BIN")
-    if binary:
-        command = [binary, "rail", "plan"]
-    else:
-        bootstrap_target = os.environ.get("RAIL_BOOTSTRAP_TARGET_DIR", "target/cargo-rail-bootstrap")
-        command = [
+def cargo_rail_command() -> list[str]:
+    configured = os.environ.get("CARGO_RAIL_BIN")
+    if configured:
+        return [configured, "rail"]
+
+    script = pathlib.Path(__file__).resolve()
+    repository = script.parents[2] if len(script.parents) > 2 else None
+    if repository is None or not (repository / "Cargo.toml").is_file():
+        binary = shutil.which("cargo-rail")
+        require(binary is not None, "matching cargo-rail binary is unavailable")
+        return [binary, "rail"]
+
+    configured_target = pathlib.Path(os.environ.get("RAIL_BOOTSTRAP_TARGET_DIR", "target/cargo-rail-bootstrap"))
+    target = configured_target if configured_target.is_absolute() else repository / configured_target
+    result = subprocess.run(
+        [
             "cargo",
-            "run",
+            "build",
             "--quiet",
             "--locked",
             "--target-dir",
-            bootstrap_target,
-            "--",
-            "rail",
-            "plan",
-        ]
+            str(target),
+            "--bin",
+            "cargo-rail",
+        ],
+        cwd=repository,
+        check=False,
+    )
+    require(result.returncode == 0, f"cargo-rail source build failed with exit code {result.returncode}")
+    binary = target / "debug" / ("cargo-rail.exe" if os.name == "nt" else "cargo-rail")
+    require(binary.is_file(), f"cargo-rail source build did not produce {binary}")
+    return [str(binary), "rail"]
+
+
+def create_plan(path: pathlib.Path, force_all: bool) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    command = [*cargo_rail_command(), "plan"]
     since = os.environ.get("RAIL_SINCE")
     zero_before = bool(since) and set(since) == {"0"}
     if zero_before:
@@ -292,6 +312,13 @@ def create_plan(path: pathlib.Path, force_all: bool) -> None:
     if result.returncode != 0:
         raise PlanError(f"cargo-rail planning failed with exit code {result.returncode}")
     load_plan(path)
+
+
+def create_plan_stdout(force_all: bool) -> None:
+    with tempfile.TemporaryDirectory(prefix="cargo-rail-plan-") as directory:
+        path = pathlib.Path(directory) / "plan.json"
+        create_plan(path, force_all)
+        sys.stdout.buffer.write(path.read_bytes())
 
 
 def cargo_args(plan: dict[str, Any], work_id: str) -> list[str]:
@@ -353,28 +380,7 @@ def matrix(plan: dict[str, Any], work_id: str, family: str | None) -> Any:
 
 
 def verify_checkout(path: pathlib.Path) -> None:
-    configured = os.environ.get("CARGO_RAIL_BIN")
-    if configured:
-        command = [configured, "rail"]
-    else:
-        script = pathlib.Path(__file__).resolve()
-        repository = script.parents[2] if len(script.parents) > 2 else None
-        if repository is not None and (repository / "Cargo.toml").is_file():
-            bootstrap_target = os.environ.get("RAIL_BOOTSTRAP_TARGET_DIR", "target/cargo-rail-bootstrap")
-            command = [
-                "cargo",
-                "run",
-                "--quiet",
-                "--locked",
-                "--target-dir",
-                bootstrap_target,
-                "--",
-                "rail",
-            ]
-        else:
-            binary = shutil.which("cargo-rail")
-            require(binary is not None, "matching cargo-rail binary is unavailable for saved-plan verification")
-            command = [binary, "rail"]
+    command = cargo_rail_command()
     result = subprocess.run(
         [*command, "plan", "--verify", str(path.resolve())],
         check=False,
@@ -424,7 +430,10 @@ def main() -> int:
     arguments = parser.parse_args()
 
     if arguments.command == "create":
-        create_plan(arguments.path, arguments.all)
+        if arguments.path == pathlib.Path("-"):
+            create_plan_stdout(arguments.all)
+        else:
+            create_plan(arguments.path, arguments.all)
         return 0
     plan = load_plan(arguments.path)
     if arguments.command == "validate":
