@@ -75,7 +75,7 @@ def tree_sha256(root: Path) -> str:
 
 
 def command_output(command: list[str], environment: dict[str, str] | None = None) -> str:
-    completed = subprocess.run(command, env=environment, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    completed = subprocess.run(command, env=environment, check=True, capture_output=True)
     return completed.stdout.decode().strip()
 
 
@@ -102,8 +102,8 @@ def build_reference(source: Path, rust: str, output: Path) -> Path:
         ["cargo", "build", "--release", "--locked"],
         cwd=source,
         env=environment,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        check=False,
+        capture_output=True,
     )
     (output / "reference-build.stdout").write_bytes(completed.stdout)
     (output / "reference-build.stderr").write_bytes(completed.stderr)
@@ -170,8 +170,8 @@ def run_analyzer(
         time_command(command, time_evidence),
         cwd=workspace,
         env=environment,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        check=False,
+        capture_output=True,
     )
     elapsed = (time.perf_counter_ns() - started) / 1_000_000_000
     evidence.with_suffix(".stdout").write_bytes(process.stdout)

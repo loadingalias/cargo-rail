@@ -153,11 +153,11 @@ while IFS= read -r listed; do
   [[ -f "$path" ]] || continue
   case "$relative" in
     */__pycache__/* | *.pyc) continue ;;
-    justfile | README.md | CONTRIBUTING.md | docs/*.md | docs/**/*.md | examples/*.md | examples/**/*.md) ;;
-    scripts/*.sh | scripts/**/*.sh | scripts/*.ps1 | scripts/**/*.ps1 | scripts/*.py | scripts/**/*.py | scripts/*.json | scripts/**/*.json)
+    justfile | README.md | CONTRIBUTING.md | docs/*.md | examples/*.md) ;;
+    scripts/*.sh | scripts/*.ps1 | scripts/*.py | scripts/*.json)
       [[ "$relative" == *-test.sh ]] && continue
       ;;
-    .github/*.yaml | .github/**/*.yaml | .github/*.yml | .github/**/*.yml) ;;
+    .github/*.yaml | .github/*.yml) ;;
     .zed/tasks.json)
       scan_zed_tasks "$path" "$relative"
       continue

@@ -20,7 +20,7 @@ if "$CHECKER" --root "$TMP_ROOT" >/dev/null 2>&1; then
   fail "unlocked command was accepted"
 fi
 
-printf '%s\n' '#!/usr/bin/env bash' 'cargo test \' '  --locked \' '  --workspace' >"$TMP_ROOT/scripts/ci/example.sh"
+printf '%s\n' '#!/usr/bin/env bash' "cargo test \\" "  --locked \\" '  --workspace' >"$TMP_ROOT/scripts/ci/example.sh"
 "$CHECKER" --root "$TMP_ROOT" || fail "multiline locked command was rejected"
 
 printf '%s\n' '#!/usr/bin/env bash' '# cargo check --workspace' >"$TMP_ROOT/scripts/ci/example.sh"

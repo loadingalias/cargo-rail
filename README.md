@@ -174,7 +174,8 @@ remove complexity or strengthen evidence are welcome.
 ## Docs & Support
 
 Start with [Planning](docs/planning.md), the [cache contract](docs/caching.md), or the
-[command reference](docs/commands.md). Config is documented in [docs/config.md](docs/config.md); focused examples live under [examples/](examples/).
+[command reference](docs/commands.md). [The configuration reference](docs/config.md) contains the complete field
+contract and focused policy snippets. Start with an empty `rail.toml` and keep only choices that differ from defaults.
 
 Cargo-Rail is licensed under [MIT](LICENSE). See [Contributing](CONTRIBUTING.md), the
 [security policy](SECURITY.md), [releases](https://github.com/loadingalias/cargo-rail/releases), and the [issue tracker](https://github.com/loadingalias/cargo-rail/issues).

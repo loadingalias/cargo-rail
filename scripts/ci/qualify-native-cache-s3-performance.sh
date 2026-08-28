@@ -710,16 +710,18 @@ jq -n \
 
 git -C "$repo_root" status --porcelain=v1 --untracked-files=all >"$results/worktree-status.txt"
 capture_worktree_patch "$results/worktree.diff"
-printf '%s  %s\n' \
-  "$(sha256_file "$repo_root/scripts/ci/qualify-native-cache-s3-performance.sh")" \
-  scripts/ci/qualify-native-cache-s3-performance.sh >"$results/harness-sha256.txt"
-printf '%s  %s\n' "$(sha256_file "$measure")" scripts/bench/measure-command.py >>"$results/harness-sha256.txt"
-printf '%s  %s\n' \
-  "$(sha256_file "$coverage_reporter")" \
-  scripts/bench/native-cache-coverage.py >>"$results/harness-sha256.txt"
-printf '%s  %s\n' \
-  "$(sha256_file "$repo_root/scripts/fixtures/materialize-native-cache.sh")" \
-  scripts/fixtures/materialize-native-cache.sh >>"$results/harness-sha256.txt"
+{
+  printf '%s  %s\n' \
+    "$(sha256_file "$repo_root/scripts/ci/qualify-native-cache-s3-performance.sh")" \
+    scripts/ci/qualify-native-cache-s3-performance.sh
+  printf '%s  %s\n' "$(sha256_file "$measure")" scripts/bench/measure-command.py
+  printf '%s  %s\n' \
+    "$(sha256_file "$coverage_reporter")" \
+    scripts/bench/native-cache-coverage.py
+  printf '%s  %s\n' \
+    "$(sha256_file "$repo_root/scripts/fixtures/materialize-native-cache.sh")" \
+    scripts/fixtures/materialize-native-cache.sh
+} >"$results/harness-sha256.txt"
 
 jq -n \
   --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \

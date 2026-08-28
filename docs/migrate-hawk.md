@@ -26,7 +26,7 @@ analyzing the workspace.
 
 Source installs and `cargo binstall` can print `surface --schema`, but cannot prepare or analyze code. Contributors
 changing the compiler integration can use the source-build steps in
-[CONTRIBUTING.md](../CONTRIBUTING.md#surface-development).
+[CONTRIBUTING.md](../CONTRIBUTING.md#work-on-surface-compiler-integration).
 
 ## Configure the native workflow
 

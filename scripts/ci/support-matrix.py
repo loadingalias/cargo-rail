@@ -76,7 +76,7 @@ def read_optional_nextest_version() -> str:
     return required
 
 
-def load_ci_tool_archives() -> tuple["CiToolArchive", ...]:
+def load_ci_tool_archives() -> tuple[CiToolArchive, ...]:
     path = REPOSITORY_ROOT / ".config/ci-tool-archives.tsv"
     lines = path.read_text(encoding="utf-8").splitlines()
     entries: list[CiToolArchive] = []
@@ -799,38 +799,46 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
     setup_action = (REPOSITORY_ROOT / ".github/actions/setup/action.yaml").read_text(
         encoding="utf-8"
     )
-    toolchain_selector_path = "scripts/ci/select-rust-toolchain.sh"
-    toolchain_selector = (REPOSITORY_ROOT / toolchain_selector_path).read_text(
+    toolchain_installer_path = "scripts/ci/install-rust-toolchain.sh"
+    toolchain_installer = (REPOSITORY_ROOT / toolchain_installer_path).read_text(
         encoding="utf-8"
     )
     require(
-        re.search(
-            rf"^[ \t]+toolchain:[ \t]+{re.escape(repository_toolchain)}[ \t]*$",
-            setup_action,
-            re.MULTILINE,
-        )
-        is not None,
-        f"repository setup action must install repository toolchain {repository_toolchain}",
+        "rust-toolchain.toml" in toolchain_installer,
+        "CI Rust installer must derive its default toolchain from rust-toolchain.toml",
     )
     for fragment in (
+        'rustup_home="$RUNNER_TEMP/cargo-rail-rustup"',
+        "--component cargo",
         "RUSTUP_TOOLCHAIN=%s",
         "RUSTUP_AUTO_INSTALL=0",
-        'rustup which --toolchain "$toolchain" rustc',
-        'rustup which --toolchain "$toolchain" cargo',
+        'rustup which --toolchain "$selected" "$program"',
+        'rustup run "$selected" "$program" --version',
     ):
         require(
-            fragment in toolchain_selector,
-            f"Rust toolchain selector is missing {fragment}",
+            fragment in toolchain_installer,
+            f"CI Rust installer is missing {fragment}",
         )
     require(
-        toolchain_selector_path in setup_action,
-        "repository setup action must select the installed Rust toolchain",
+        toolchain_installer_path in setup_action,
+        "repository setup action must use the CI Rust installer",
     )
     require(
-        setup_action.index(toolchain_selector_path)
+        setup_action.index(toolchain_installer_path)
         < setup_action.index("taiki-e/install-action@")
         < setup_action.index("Swatinem/rust-cache@"),
-        "repository setup action must select Rust before installing tools or restoring caches",
+        "repository setup action must install Rust before tools or caches",
+    )
+    action_sources = [
+        setup_action,
+        *(
+            path.read_text(encoding="utf-8")
+            for path in sorted((REPOSITORY_ROOT / ".github/workflows").glob("*.yaml"))
+        ),
+    ]
+    require(
+        all("dtolnay/rust-toolchain@" not in source for source in action_sources),
+        "GitHub Actions must keep Rust installation in the repository script",
     )
 
     rail_config = load_toml(REPOSITORY_ROOT / ".config/rail.toml")
@@ -964,7 +972,7 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
     for fragment in (
         "--compatibility-matrix",
         "--filesystem-matrix",
-        toolchain_selector_path,
+        toolchain_installer_path,
         "--selection-probes",
         "--cross-target-mutation-probes",
         manifest.corpus_runner,
@@ -979,8 +987,8 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
             f"compatibility workflow is missing {fragment}",
         )
     require(
-        compatibility_workflow.count(toolchain_selector_path) == 2,
-        "compatibility workflow must select Rust in both execution jobs",
+        compatibility_workflow.count(toolchain_installer_path) == 2,
+        "compatibility workflow must install Rust in both execution jobs",
     )
     for caller in (".github/workflows/bootstrap.yaml", ".github/workflows/commit.yaml"):
         source = (REPOSITORY_ROOT / caller).read_text(encoding="utf-8")
@@ -1001,8 +1009,8 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         "release workflow must keep cargo-deny as the single dependency policy gate",
     )
     require(
-        toolchain_selector_path in release_workflow,
-        "release workflow must select its installed Rust toolchain",
+        toolchain_installer_path in release_workflow,
+        "release workflow must use the CI Rust installer",
     )
 
     worker_verifier = "scripts/ci/verify-distributed-worker.py"
@@ -1019,7 +1027,7 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
     ).read_text(encoding="utf-8")
     for fragment in (
         "workflow_call:",
-        toolchain_selector_path,
+        toolchain_installer_path,
         "distribution/release-targets.json",
         "scripts/ci/smoke-release-tar.sh",
         "if: inputs.stage",

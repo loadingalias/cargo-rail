@@ -20,8 +20,7 @@ def run(program: str, *arguments: str) -> bytes:
     completed = subprocess.run(
         [program, *arguments],
         stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         check=False,
     )
     if completed.returncode != 0:

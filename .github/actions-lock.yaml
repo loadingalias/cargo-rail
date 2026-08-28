@@ -54,11 +54,6 @@ mikepenz/action-junit-report:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Rust Toolchain & Ecosystem
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-dtolnay/rust-toolchain:
-  ref: master
-  sha: "2c7215f132e9ebf062739d9130488b56d53c060c"
-  updated: "2026-07-25T14:41:49Z"
-  notes: "Rust toolchain installation for stable, MSRV, and release builds"
 taiki-e/install-action:
   ref: v2.85.9
   sha: "91ddec75689c4c78665b598d188dc821c5a43e5c"

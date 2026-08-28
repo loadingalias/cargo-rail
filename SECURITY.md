@@ -1,17 +1,22 @@
 # Security Policy
 
-## Supported Versions
+## Supported releases
 
-Security fixes apply to the latest release. Reproduce the issue there before reporting it.
+Security fixes target the latest Cargo-Rail release. Report a vulnerability even if you found it in an older release;
+include every version or commit you tested.
 
-## Report a Vulnerability
+## Report a vulnerability privately
 
-Report vulnerabilities privately through GitHub Security Advisories:
+Submit the report through [GitHub's private vulnerability form](https://github.com/loadingalias/cargo-rail/security/advisories/new).
+Do not put vulnerability details in a public issue, discussion, pull request, or commit.
 
-- <https://github.com/loadingalias/cargo-rail/security/advisories/new>
+Include:
 
-Include the affected version, operating system, impact, reproduction steps, and a proof of concept when available. Do
-not include vulnerability details in a public issue.
+- the affected Cargo-Rail version or commit;
+- the operating system, target, Rust toolchain, and installation method when relevant;
+- the security impact and required attacker access;
+- the smallest reliable reproduction or proof of concept; and
+- known mitigations or a suggested fix, if available.
 
-If GitHub Security Advisories are unavailable, open a public issue that asks for a private contact channel but contains
-no vulnerability details. If you receive no response within 48 hours, email thealiaslab@gmail.com.
+If GitHub Security Advisories are unavailable, email `thealiaslab@gmail.com` with the same information. Keep the report
+private until a fix is released or a disclosure timeline is agreed.

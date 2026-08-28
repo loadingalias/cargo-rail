@@ -135,17 +135,13 @@ jobs:
           exit 1
 
       - name: Install MSRV toolchain
-        id: rust-toolchain
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
-        with:
-          toolchain: ${{ steps.release.outputs.msrv }}
-          components: clippy, rustfmt
-
-      - name: Select exact MSRV toolchain
         shell: bash
         env:
-          SELECTED_RUST_TOOLCHAIN: ${{ steps.rust-toolchain.outputs.name }}
-        run: scripts/ci/select-rust-toolchain.sh "$SELECTED_RUST_TOOLCHAIN"
+          TOOLCHAIN: ${{ steps.release.outputs.msrv }}
+        run: >-
+          scripts/ci/install-rust-toolchain.sh
+          --toolchain "$TOOLCHAIN"
+          --components clippy,rustfmt
 
       - name: Install just
         uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9
@@ -161,12 +157,6 @@ jobs:
         uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9
         with:
           tool: cargo-deny@0.20.2
-
-      - name: Setup Rust cache
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          shared-key: cargo-rail-release-gate-v1
-          key: ${{ steps.release.outputs.release_sha }}
 
       - name: Verify action pins
         run: just verify-actions

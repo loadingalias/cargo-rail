@@ -2,6 +2,8 @@
 set -euo pipefail
 
 sh -n scripts/install.sh
+bash -n scripts/ci/install-rust-toolchain.sh
+scripts/ci/install-rust-toolchain-test.sh
 scripts/ci/test-install.sh
 python_command=python3
 if ! command -v "$python_command" >/dev/null 2>&1; then
@@ -13,17 +15,17 @@ if ! command -v "$python_command" >/dev/null 2>&1; then
 fi
 "$python_command" scripts/ci/http-fixture-server.py --help >/dev/null
 
-for placeholder in '@CARGO_RAIL_VERSION@'; do
-  for installer in scripts/install.sh scripts/install.ps1; do
-    count="$(grep -Foc "$placeholder" "$installer")"
-    if [ "$count" -ne 1 ]; then
-      echo "$installer must contain exactly one $placeholder placeholder" >&2
-      exit 1
-    fi
-  done
+placeholder='@CARGO_RAIL_VERSION@'
+for installer in scripts/install.sh scripts/install.ps1; do
+  count="$(grep -Foc "$placeholder" "$installer")"
+  if [ "$count" -ne 1 ]; then
+    echo "$installer must contain exactly one $placeholder placeholder" >&2
+    exit 1
+  fi
 done
 
 if command -v pwsh >/dev/null 2>&1; then
+  # shellcheck disable=SC2016 # PowerShell owns interpolation in this program.
   pwsh -NoLogo -NoProfile -Command '
     $tokens = $null
     $errors = $null

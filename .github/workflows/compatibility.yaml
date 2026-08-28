@@ -37,7 +37,6 @@ env:
 permissions:
   contents: read
   checks: write
-  pull-requests: write
 
 jobs:
   support:
@@ -68,16 +67,19 @@ jobs:
       - name: Generate compatibility matrices
         id: matrices
         shell: bash
+        env:
+          SELECTED_COMPATIBILITY_MATRIX: ${{ inputs.compatibility-matrix }}
+          SELECTED_FILESYSTEM_MATRIX: ${{ inputs.filesystem-matrix }}
         run: |
-          if [ '${{ inputs.compatibility-matrix }}' = all ]; then
+          if [ "$SELECTED_COMPATIBILITY_MATRIX" = all ]; then
             compatibility="$(python3 scripts/ci/support-matrix.py --compatibility-matrix)"
           else
-            compatibility='${{ inputs.compatibility-matrix }}'
+            compatibility="$SELECTED_COMPATIBILITY_MATRIX"
           fi
-          if [ '${{ inputs.filesystem-matrix }}' = all ]; then
+          if [ "$SELECTED_FILESYSTEM_MATRIX" = all ]; then
             filesystem="$(python3 scripts/ci/support-matrix.py --filesystem-matrix)"
           else
-            filesystem='${{ inputs.filesystem-matrix }}'
+            filesystem="$SELECTED_FILESYSTEM_MATRIX"
           fi
           {
             echo "compatibility=$compatibility"
@@ -113,17 +115,15 @@ jobs:
         run: scripts/plan/read.py verify-checkout target/plan-v8.json
 
       - name: Install selected Rust toolchain
-        id: rust-toolchain
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
-        with:
-          toolchain: ${{ matrix.compatibility.toolchain }}
-          targets: ${{ matrix.compatibility.targets }}
-
-      - name: Select exact Rust toolchain
         shell: bash
         env:
-          SELECTED_RUST_TOOLCHAIN: ${{ steps.rust-toolchain.outputs.name }}
-        run: scripts/ci/select-rust-toolchain.sh "$SELECTED_RUST_TOOLCHAIN"
+          TOOLCHAIN: ${{ matrix.compatibility.toolchain }}
+          TARGETS: ${{ matrix.compatibility.targets }}
+        run: >-
+          scripts/ci/install-rust-toolchain.sh
+          --toolchain "$TOOLCHAIN"
+          --components clippy,rustfmt
+          --targets "$TARGETS"
 
       - name: Install just for endpoint suites
         if: matrix.compatibility.full-suite
@@ -287,16 +287,10 @@ jobs:
         run: scripts/plan/read.py verify-checkout target/plan-v8.json
 
       - name: Install selected Rust toolchain
-        id: rust-toolchain
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
-        with:
-          toolchain: ${{ matrix.filesystem.toolchain }}
-
-      - name: Select exact Rust toolchain
         shell: bash
         env:
-          SELECTED_RUST_TOOLCHAIN: ${{ steps.rust-toolchain.outputs.name }}
-        run: scripts/ci/select-rust-toolchain.sh "$SELECTED_RUST_TOOLCHAIN"
+          TOOLCHAIN: ${{ matrix.filesystem.toolchain }}
+        run: scripts/ci/install-rust-toolchain.sh --toolchain "$TOOLCHAIN"
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9

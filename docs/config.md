@@ -449,4 +449,3 @@ cargo rail config validate --strict
 
 - [Command reference](commands.md)
 - [Planning](planning.md)
-- [Split/sync example](../examples/split-sync/README.md)

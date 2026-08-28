@@ -1,7 +1,6 @@
 name: Setup cargo-rail Environment
 description: |
   Install Rust toolchain, cargo tools, and configure caching.
-  All actions skip if already installed.
 
 inputs:
   cache-key:
@@ -17,17 +16,8 @@ runs:
   using: composite
   steps:
     - name: Install repository Rust toolchain
-      id: rust-toolchain
-      uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
-      with:
-        toolchain: 1.98.0
-        components: clippy, rustfmt
-
-    - name: Select repository Rust toolchain
       shell: bash
-      env:
-        SELECTED_RUST_TOOLCHAIN: ${{ steps.rust-toolchain.outputs.name }}
-      run: scripts/ci/select-rust-toolchain.sh "$SELECTED_RUST_TOOLCHAIN"
+      run: scripts/ci/install-rust-toolchain.sh --components clippy,rustfmt
 
     - name: Install just
       uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9
@@ -43,23 +33,7 @@ runs:
     - name: Setup Rust Cache
       uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       with:
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # Cache Strategy:
-        # - Caches: ~/.cargo (deps, tools) and ./target (build artifacts)
-        # - Cache key includes: workflow, platform, rustc version, Cargo.lock hash
-        # - Host triple automatically included in cache key
-        # - Separate caches per workflow and target triple via 'key' input
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
         shared-key: "cargo-rail-v2"
-
-        # Workflow and platform-specific suffix, such as commit-ubuntu-24.04.
-        # Ensures each workflow and platform maintains separate cache
         key: ${{ inputs.cache-key }}
-
-        # Cache even on test failures (build artifacts still useful)
         cache-on-failure: true
-
-        # Only save from main branch (prevents cache thrashing)
-        # Feature branches READ from main's cache but don't WRITE new ones
         save-if: ${{ github.ref == 'refs/heads/main' }}

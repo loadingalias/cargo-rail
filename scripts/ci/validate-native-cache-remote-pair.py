@@ -13,7 +13,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-
 WORKLOADS = ("check", "build", "test")
 REQUIRED_COMPILER_CLASSES = (
     "binary",

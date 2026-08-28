@@ -126,7 +126,7 @@ capture_worktree_patch() {
 
 shared_git="$state/fixture-git-source"
 workloads=(check build test)
-setup_mode=read
+setup_mode="read"
 [[ "$phase" == producer ]] && setup_mode=read-write
 source_cargo_home="${CARGO_HOME:-${HOME:?HOME is required}/.cargo}"
 source_cargo_home="$(cd "$source_cargo_home" && pwd -P)"

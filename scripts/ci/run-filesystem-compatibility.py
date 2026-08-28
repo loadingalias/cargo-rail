@@ -20,7 +20,7 @@ class FilesystemError(RuntimeError):
 
 
 def run(argv: list[str]) -> str:
-    completed = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    completed = subprocess.run(argv, capture_output=True, check=False)
     if completed.returncode != 0:
         raise FilesystemError(
             f"command exited {completed.returncode}: {subprocess.list2cmdline(argv)}\n"
@@ -36,8 +36,7 @@ def filesystem_kind(root: Path) -> str:
         device = run(["df", "-P", str(root)]).splitlines()[-1].split()[0]
         raw = subprocess.run(
             ["diskutil", "info", "-plist", device],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             check=False,
         )
         if raw.returncode != 0:

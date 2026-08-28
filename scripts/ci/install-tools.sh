@@ -15,8 +15,10 @@ readonly HYPERFINE_VERSION=1.20.0
 readonly SCCACHE_VERSION=0.17.0
 readonly JQ_VERSION=1.8.2
 
-readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-readonly REPOSITORY_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
+REPOSITORY_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+readonly REPOSITORY_ROOT
 readonly CI_TOOL_ARCHIVES="$REPOSITORY_ROOT/.config/ci-tool-archives.tsv"
 
 ci_tool_version() {

@@ -1,36 +1,69 @@
 # Contributing to Cargo-Rail
 
-## Set up
+## Set up the repository
 
-You need:
+Install these tools:
 
-- Rust at the [public MSRV](Cargo.toml) (the repository toolchain installs automatically via `rust-toolchain.toml`)
-- Python 3.11 or newer
-- `just`
-- `cargo-nextest`
-- `cargo-deny`
+- Rust through `rustup`; `rust-toolchain.toml` selects the repository toolchain and components.
+- Python 3.11 or newer.
+- `just`, `cargo-nextest`, and `cargo-deny`.
 
-Then run the same checks used during development:
+Run commands from the repository root. Use `just --list` to see the maintained command surface.
+
+## Make a change
+
+- Keep each change focused on one problem.
+- Put user-visible behavior in the library. Keep `src/main.rs` limited to process setup, diagnostics, and dispatch.
+- Add or update tests for changed behavior. The normal suite uses cargo-nextest; doctests run separately.
+- Update documentation when commands, configuration, output, side effects, compatibility, or recovery behavior changes.
+- Record user-visible intent in `.changes/`:
+
+  ```bash
+  cargo rail change add cargo-rail --bump patch --message "Describe the user-visible result."
+  ```
+
+  Choose `minor` or `major` when the compatibility impact requires it. Use `none` only to record a reviewed change
+  that should not produce a release or changelog entry.
+
+## Validate the worktree
+
+Inspect the planner-selected work, then run the affected local lanes:
+
+```bash
+just plan
+just check-affected
+just build
+just test
+git diff --check
+```
+
+Run the complete lanes when a change crosses planner, mutation, cache, compiler, release, platform, or public-contract
+boundaries:
 
 ```bash
 just check
-just test
-```
-
-`just check` is workspace-wide and read-only. Use `just fix` only when you intend to format files and apply Clippy's
-automatic fixes. CI runs `just check` too.
-
-After changing features, dependency resolution, or target-specific behavior, run the full suite:
-
-```bash
 just test-all
 ```
 
-## Surface development
+`just check` is workspace-wide and read-only. `just fix` formats files and applies Clippy fixes; run it only when those
+edits are intended. Use the contract-specific recipes listed by `just --list` for compiler-driver, Windows-target,
+action-pin, benchmark, qualification, or remote-machine work.
 
-End users get authenticated Surface driver authority from the complete native installer; `surface --prepare` installs
-and verifies the exact selected toolchain component. Contributors need `rustc-dev` only when changing or validating
-Surface's compiler integration:
+## Regenerate owned documentation
+
+Do not hand-edit `docs/commands.md` or `docs/caching.md`. They are generated from CLI help and executable support
+authorities. Regenerate them after changing their inputs:
+
+```bash
+just gen-docs
+```
+
+Inspect and commit the generated diff with the source change.
+
+## Work on Surface compiler integration
+
+General CLI, planner, release, dependency, and documentation work does not require compiler internals. When changing
+Surface's compiler integration, install `rustc-dev` for the selected toolchain and validate the excluded driver:
 
 ```bash
 rustup component add rustc-dev
@@ -38,69 +71,32 @@ just check-compiler-fact-driver
 scripts/with-compiler-fact-driver.sh cargo build --locked --bin cargo-rail
 ```
 
-The driver is separate because it uses compiler internals tied to one exact Rust toolchain. General CLI,
-documentation, planner, release, and dependency work does not require it.
+The driver is built separately because it is tied to one exact Rust compiler toolchain.
 
-## Change requirements
+## Support performance claims with evidence
 
-- Keep the patch scoped to one problem.
-- Put production behavior in the library; `main.rs` stays limited to argument handling and error reporting.
-- Add or update tests for changed behavior. Tests run through `cargo-nextest`; this repository does not use
-  `cargo test` for the normal suite.
-- Update user documentation when commands, configuration, output, side effects, or exit codes change.
-- Add a `.changes/*.md` file for any user-visible change — CLI, configuration, documentation, performance, safety,
-  or release behavior. A few sentences aimed at users is enough; these files become the changelog/release-notes.
-- Run `just check && just test` before opening a pull request.
+Follow [the benchmarking guide](docs/benchmarking.md). State the workload, host, toolchain, command, sample count,
+correctness checks, and before/after results. Preserve raw results. Compare cache implementations on the same host,
+and do not generalize a result beyond the platforms and workload that were measured.
 
-## Generated documentation
+Native compiler-cache work must cover the repository's same-root and independent-root fixtures. Compare native Cargo,
+Cargo-Rail disabled, Cargo-Rail cold, Cargo-Rail warm, and the pinned sccache baseline when that comparison is relevant.
+Report hits, misses, bypass reasons, bytes hashed and restored, and exact output-byte equivalence.
 
-Two docs are generated, not hand-edited: `docs/commands.md` comes from CLI help, and `docs/caching.md`
-is assembled from the native CI manifest, release target registry, and runtime cache contract. Regenerate both after
-changing commands, flags, defaults, support inventories, or cache eligibility:
+## Open a pull request
 
-```bash
-just gen-docs
-```
-
-## Performance changes
-
-A performance claim must identify the workload, host, toolchain, commands, sample count, and before/after values. Use
-point measurements for one sample and p50 or p95 only for a sufficient sample set. Compare cache implementations on
-one host. Preserve raw results and report failed correctness checks.
-
-Native compiler-cache changes must run the checked-in same-root output-directory and independent-root fixture. When a
-change can affect those lanes, measure native Cargo, Cargo-Rail disabled, Cargo-Rail cold, Cargo-Rail warm, and the
-pinned sccache comparator. Report hits, misses, bypasses, reasons, bytes hashed and restored, and exact output-byte
-equivalence.
-
-The benchmark recipes accept package and run counts:
-
-```bash
-just bench-unify 25 10
-cargo build --release --locked
-just bench-native-cache 1
-```
-
-Use `just bench-native-cache 10` only when the decision requires distribution or tail evidence.
-
-## Pull requests
-
-- Explain the user-visible result and the reason for the change.
-- Include the commands you used to verify it.
-- Call out compatibility changes to CLI output, configuration, planner contracts, or release state.
+- Explain the user-visible result and why the change is needed.
+- List the exact validation commands and their results.
+- Identify compatibility changes to CLI output, configuration, plan contracts, stored formats, or release state.
 - Link the issue when one exists.
 
-## Release policy
+## Perform a maintainer release
 
-- Add the change file in the pull request that introduces the user-visible behavior.
-- Accumulate reviewed change files into a coherent minor release instead of tagging each merged change.
-- Cut an immediate patch only for a regression, security issue, broken package, or broken installer.
-- Test release infrastructure with check mode or manual workflow dispatch. Never create public tags to test the
-  pipeline.
-- Published version tags and release assets are immutable.
+Accumulate reviewed change files into a coherent minor release. Cut an immediate patch only for a regression, security
+issue, broken package, or broken installer. Test release infrastructure through check mode or manual workflow dispatch;
+do not create public tags as a test. Published tags and release assets are immutable.
 
-For a direct maintainer release from `main`, use the current checkout's binary rather than an older globally installed
-Cargo-Rail:
+From `main`, build and use the current checkout's binary:
 
 ```bash
 cargo build --locked --bin cargo-rail
@@ -109,11 +105,11 @@ release_cli="$PWD/target/debug/cargo-rail"
 "$release_cli" rail release run --all --bump auto --yes
 ```
 
-The check command exits `1` when it finds a pending release. That is the expected preview result. The apply command
-pushes one exact release commit and exits while GitHub checks, including all release archives, are pending. After they
-pass, run the exact `"$release_cli" rail release resume <STATE>` command printed by the tool. Do not rerun `release
-run`, move a published tag, or replace an existing release asset.
+`release check` exits `1` when it finds a pending release; that is the expected preview result. `release run` pushes one
+exact release commit and stops while its GitHub checks, including release archives, are pending. After the checks pass,
+run the exact `"$release_cli" rail release resume <STATE>` command printed by Cargo-Rail. Do not rerun `release run`,
+move a published tag, or replace a release asset.
 
-## Security
+## Report security issues privately
 
-Do not open public issues for vulnerabilities. See [SECURITY.md](SECURITY.md).
+Do not open a public issue for a vulnerability. Follow [the security policy](SECURITY.md).
