@@ -1,6 +1,26 @@
 # Changelog
 
 
+
+## [0.24.0](https://github.com/loadingalias/cargo-rail/compare/v0.23.0...v0.24.0) - 2026-08-28
+
+- Install each CI Rust toolchain into a job-private Rustup home, require Cargo explicitly, and bind downstream steps to
+  the verified host-qualified toolchain. This removes runner-image Rustup state from compatibility and release archive
+  bootstrap.
+
+- Replaced planner surfaces with the v8 evidence-backed named-work contract, exact Cargo and CI selectors, sparse source capture, and one strict local/CI consumer. Cargo-scoped repository work now inherits exact selectors from subscribed Cargo decisions. Removed the retired classification policy, duplicate affected-work APIs, and planning-only hash, diff-hash, and graph commands.
+  Source-checkout consumers now build Cargo-Rail before invoking the binary directly, so plan creation and saved-plan verification observe the same Cargo environment.
+  Saved-plan consumers validate one canonical decision and bind it to the exact source checkout without recomputing the planner's Cargo, toolchain, target, or platform identities. Equivalent Cargo home locations no longer change planning identity by path alone.
+
+- Fixed Surface macro spans and target inheritance, added resumable compiler acquisitions and cross-root remote cache
+  reuse, and aligned release checks with the local release plan.
+  Release packaging now resolves the non-yanked `chacha20` version selected by the Azure SDK dependency chain.
+
+- Preserve verified cross-checkout cache reuse on Windows by remapping the exact checkout spelling observed by rustc.
+  Native Windows installer and integration qualification now use platform-correct line endings, file URLs, and path
+  construction.
+
+
 ## [0.23.0](https://github.com/loadingalias/cargo-rail/compare/v0.22.2...v0.23.0) - 2026-08-25
 
 - Install authenticated, component-aware Cargo-Rail archives on Apple Silicon macOS, Linux, and Windows. Surface exposes
