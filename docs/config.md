@@ -1,11 +1,11 @@
-# Configuration Reference
+# Configuration
 
-`rail.toml` supplies repository policy. It does not copy Cargo-Rail's internal defaults. An empty file is valid, and
-omitted fields use coded defaults.
+`rail.toml` contains sparse repository policy. An empty file is valid; omitted fields use coded defaults. Keep
+commands, credentials, timeouts, setup, and execution in their owning tools.
 
-## File discovery
+## Find and inspect configuration
 
-Cargo-Rail uses the first file found in this order:
+Cargo-Rail uses the first file found:
 
 1. `rail.toml`
 2. `.rail.toml`
@@ -15,40 +15,25 @@ Cargo-Rail uses the first file found in this order:
 `--config PATH` bypasses discovery. Relative paths are resolved from `--workspace-root`.
 
 ```bash
+cargo rail init --dry-run
+cargo rail init
 cargo rail config locate
-cargo rail --config config/ci.toml config validate --strict
+cargo rail config print
+cargo rail config explain --all -f json
+cargo rail config validate --strict
+cargo rail config migrate --check
 ```
 
-## Create, inspect, and migrate
+`config print` emits canonical effective TOML, including defaults. `config explain` reports each configured and
+effective value, its default, source, classification, reason, and deprecation state. Use those commands instead of
+copying defaults from documentation.
 
-```bash
-cargo rail init --dry-run            # Preview the sparse file
-cargo rail init                      # Write detected non-default choices
-cargo rail config print              # Print the fully effective config
-cargo rail config explain            # Explain value, default, source, and behavior
-cargo rail config validate --strict  # Reject warnings and invalid policy
-cargo rail config migrate --check    # Read-only; exit 1 when migration is pending
-cargo rail config migrate            # Apply explicit semantic migrations
-```
+`config migrate --check` is read-only and exits `1` when migration is pending. Run `cargo rail config migrate` only
+after reviewing its semantic actions.
 
-Text `config print` output is canonical reusable `rail.toml`: it contains effective repository policy and coded
-defaults, omits compatibility-only inputs, passes `config validate --strict`, and has no pending migration. JSON
-contains the same effective public policy under `config`. Reprinting the generated TOML preserves that policy.
+## Start sparse
 
-`config migrate` preserves unrelated TOML and does not write coded defaults. Deprecated inputs warn while accepted.
-
-Text and JSON explanations use the same field records. Each record contains the configured value, effective value,
-default, source, classification, reason, and deprecation guidance.
-
-## Minimal configuration
-
-No policy is required:
-
-```toml
-# Empty rail.toml is valid.
-```
-
-A typical repository should contain only choices that differ from defaults:
+Keep only choices that differ from defaults:
 
 ```toml
 targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
@@ -59,8 +44,6 @@ major_version_conflict = "bump"
 
 [surface]
 enabled = true
-# Only when every compiler crate closed by policy has no external consumers.
-consumer_scope = "workspace"
 
 [release]
 remote_effects = "auto"
@@ -70,382 +53,105 @@ scope = "repository"
 paths = ["verification/**"]
 ```
 
-## Top-level fields
+## Policy families
 
-| Field              |  Default | Behavior                                                                                                                                 |
-| ------------------ | -------: | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `targets`          |     `[]` | Additional target triples used for target-aware resolution and compiler evidence. `init` can detect these from repository configuration. |
-| `unify`            | defaults | Dependency and manifest policy.                                                                                                          |
-| `surface`          | defaults | Rust declaration reachability, diagnostic, and visibility-repair policy.                                                                 |
-| `release`          | defaults | Release, changelog, and remote-effect policy.                                                                                            |
-| `plan`             | defaults | Positive input declarations for repository-owned work.                                                                                    |
-| `crates`           |     `{}` | Per-crate split, release, and changelog policy.                                                                                          |
+| Family | Owns |
+|---|---|
+| `targets` | Additional target triples used by target-aware workspace decisions |
+| `[unify]` | Dependency and manifest policy |
+| `[surface]` | Compiler-derived reachability and visibility policy |
+| `[release]` | Release intent, changelogs, and external-effect authority |
+| `[plan.work.NAME]` | Positive inputs and selector shape for repository-owned work |
+| `[crates.NAME]` | Per-crate split, release, and changelog policy |
 
-The old empty `[workspace]`, `[toolchain]`, and `[crates.NAME.sync]` tables had no behavior and are deprecated.
-Repository `[cache]` configuration is rejected: transparent L1 setup and optional L2 selection are machine state, not
-project policy. `cargo rail config migrate` removes the old table without materializing a destination. See
-[Caching](caching.md#shared-native-cache-l2) for the non-secret URL grammar and current activation boundary.
+### Dependency policy
 
-## `[unify]`
+`cargo rail unify` previews one dependency decision. `--check` makes the same decision and exits `1` when edits are
+pending. `cargo rail unify apply` revalidates and writes the planned manifest changes.
 
-`cargo rail unify` previews without mutating manifests. `--check` makes the same decision but exits 1 when proven edits
-are pending. Analysis may update compiler-evidence cache; reports are generated only with `--report`.
-`cargo rail unify apply` owns manifest mutation.
-`cargo rail unify doctor` is a cheaper resolution diagnostic. It reports the selected Cargo channel, resolver, feature
-mode, source and policy overrides, target domains, ambiguous aliases, and a recommended action. Compiler evidence
-caching and deterministic ordering cannot be disabled.
+Use `consumer_scope = "workspace"` only when the workspace contains every consumer of the affected private packages.
+Published packages remain open-world. A major-version unification requires explicit `major_version_conflict = "bump"`
+authority. Exact pins, renamed dependencies, MSRV policy, preserved features, and backup retention remain independent
+choices; inspect their current defaults with `config explain --all`.
 
-`unify --check --explain` keeps feature evidence separated by exact manifest declaration. Each feature rule names the
-member, Cargo.toml alias, normal/development/build domain, target predicate, explicit features, default-feature state,
-and optional state. Renamed aliases do not share feature-provider evidence unless `include_renamed = true` explicitly
-selects package-level union behavior.
-When dependency domains disagree on default features, the workspace baseline disables them. Declarations that need
-them opt back in through the explicit `default` feature. This preserves narrow target, development, and build domains.
+### Surface policy
 
-Unused dependencies require complete declaration-kind, target, feature, and compilation evidence. Dormant features and
-optional dependencies are deleted only when `consumer_scope = "workspace"` proves the private workspace is the
-complete consumer universe. Published packages remain open-world.
+`surface.enabled = true` adds the whole-workspace Surface gate to planning. Direct `cargo rail surface` inspection is
+available even when the gate is disabled.
 
-| Field                                |                     Default | Behavior                                                                                                                                         |
-| ------------------------------------ | --------------------------: | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `include_paths`                      |                      `true` | Include path dependency declarations in unification.                                                                                             |
-| `include_renamed`                    |                     `false` | Include renamed declarations such as `alias = { package = "real", ... }`.                                                                        |
-| `exclude`                            |                        `[]` | Dependency names excluded from unification. Workspace-member cohorts remain atomic.                                                              |
-| `include`                            |                        `[]` | Dependency names force-included in unification.                                                                                                  |
-| `strict_version_compat`              |                      `true` | Treat incompatible existing workspace requirements as blocking.                                                                                  |
-| `exact_pin_handling`                 |                    `"warn"` | Handle exact pins with `"skip"`, `"preserve"`, or `"warn"`.                                                                                      |
-| `major_version_conflict`             |                    `"warn"` | `"warn"` keeps incompatible majors split; `"bump"` explicitly accepts unification to the highest resolved major.                                 |
-| `transitive_pinning`                 |                       unset | Enable host-owned pins for fragmented transitive features and select `host = "root"` or a member path. Virtual workspaces require a member path. |
-| `msrv_policy`                        |  compute/max/no inheritance | Disabled, or compute with source `"deps"`, `"workspace"`, or `"max"` and boolean inheritance.                                                    |
-| `consumer_scope`                     |                    `"open"` | Use `"workspace"` only for a closed private consumer graph.                                                                                      |
-| `preserve_features`                  |                        `[]` | Glob patterns for dormant features that must survive closed-world pruning.                                                                       |
-| `skip_undeclared_patterns`           | common implementation names | Glob patterns for borrowed feature names intentionally excluded from diagnostics.                                                                |
-| `max_backups`                        |                         `3` | Number of recovery backups retained after mutation.                                                                                              |
-| `compiler_artifact_soft_limit_bytes` |               `34359738368` | Report storage pressure when the command-owned compiler working set reaches 32 GiB.                                                              |
-| `compiler_artifact_hard_limit_bytes` |               `68719476736` | Stop compiler acquisition when that working set reaches 64 GiB.                                                                                  |
+Keep `consumer_scope = "open"` unless the workspace owns every consumer of its non-publishable compiler crates.
+Declare products, external crates, feature profiles, doctest coverage, lint levels, overrides, and exclusions only
+when Cargo-Rail's automatic workspace model does not express the intended boundary.
 
-Example policy:
+`cargo rail surface --schema` exposes the report contract. `surface --check` is read-only; `surface --fix --dry-run`
+previews exact source edits before `surface --fix` receives write authority.
 
-```toml
-[unify]
-include_renamed = true
-msrv_policy = { mode = "compute", source = "workspace", inherit = true }
-consumer_scope = "workspace"
-preserve_features = ["unstable-*", "bench*"]
-```
+### Release policy
 
-## `[surface]`
+Reviewed `.changes/*.md` files are the default source for bumps and release prose. `cargo rail release check` previews
+the local plan and exits `1` when a release is pending. It performs no mutation or external effect.
 
-`cargo rail surface` merges authenticated compiler facts from production, non-production, build-script, proc-macro,
-doctest, feature, and configured target views into one physical declaration graph. With no operation flag it prints a
-read-only report and exits 0 even when findings exist. `--check` uses the same analysis but exits 1 for `deny` findings
-or configuration diagnostics; `warn` findings remain visible with exit 0. `--fix --dry-run` emits the exact mutation
-plan. `--fix` revalidates the captured snapshot, edits only planned visibility spans, recompiles every configured view,
-and writes a receipt after successful verification. Dead-public findings are report-only.
+`remote_effects` controls Git and forge effects. Registry publication is separate and requires both
+`registry_publication = "crates-io"` and `--publish` on the exact release invocation. Remote modes persist
+transaction state and stop at readiness or registry-convergence boundaries; resume the recorded state instead of
+replanning.
 
-The complete installer in the [README](../README.md#installation) includes authenticated prebuilt and offline-source
-driver authority. `cargo rail surface --prepare` resolves the workspace's exact Cargo-selected compiler, installs its
-`rustc-dev` component through `rustup` when compiler development metadata is absent, builds a toolchain-matched driver
-when the prebuilt one differs, and authenticates both before analysis. It does not change the user default toolchain.
-Source installs and `cargo binstall` keep `surface --schema`, but cannot prepare or analyze code.
+To replace commit-driven changelog automation:
 
-| Field                     |       Default | Behavior                                                                                                                                        |
-| ------------------------- | ------------: | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `enabled`                 |       `false` | Include the whole-workspace `surface` gate in planner and CI decisions. Direct `cargo rail surface` inspection remains available when disabled. |
-| `consumer_scope`          |      `"open"` | `"workspace"` permits closed-world conclusions at the compiler-crate boundary described below.                                                  |
-| `targets`                 |    `["host"]` | Compiler target views to merge. Use `"workspace"` to inherit host plus every top-level target, or an explicit subset containing `"host"` and/or configured target triples. |
-| `crate_visibility`        |  `"preserve"` | `"allow"` enables the otherwise allow-by-default `unnecessary-crate-visibility` class.                                                          |
-| `preserve_uniform_fields` |       `false` | Preserve one intentional field-visibility level across a struct or union instead of reducing fields independently.                              |
-| `lint`                    |          `[]` | Ordered global `{ selector, level }` directives. Later matching directives win; `selector` is `warnings` or one exact lint.                     |
-| `product`                 |          `[]` | Complete shipped binary/library roots. When empty, every workspace binary is implicit; an explicit list replaces that inference.                |
-| `feature-profile`         |          `[]` | Exact Cargo feature profiles. Empty uses automatic coverage; an explicit list replaces it.                                                      |
-| `doctest`                 |          `[]` | Exact doctest package set. Empty follows `doctest_coverage`.                                                                                    |
-| `doctest_coverage`        | `"automatic"` | `"automatic"` covers every doctest-enabled workspace package; `"disabled"` covers none and cannot accompany explicit doctests.                  |
-| `external`                |          `[]` | Exact compiler crates deliberately kept outside closed-world authority, each with a reason.                                                     |
-| `override`                |          `[]` | Item-specific policy. `allow` suppresses, `expect` suppresses but fails when stale, and `warn`/`deny` retain a finding.                         |
-| `exclude`                 |          `[]` | Module- or repository-file-scoped policy with the same `allow`, `expect`, `warn`, and `deny` levels.                                            |
+1. Set `release.source = "commits"` temporarily.
+2. Match the existing changelog filters and compare `cargo rail release check --all --bump auto` with the old plan.
+3. Add reviewed intent to new changes with `cargo rail change add`.
+4. Switch to `source = "changes"` only after every pending release has reviewed change files.
 
-The four lint names are `dead-public`, `unnecessary-public`, `unnecessary-restricted-visibility`, and
-`unnecessary-crate-visibility`. Core findings deny by default; crate-visibility reductions allow by default. The
-ordered `warnings` selector applies to the three core classes. `--only` filters
-finding classes after policy evaluation and never hides unknown, ambiguous, overlapping, or stale policy diagnostics.
+Cargo-Rail uses fixed changelog placeholders rather than a template engine. Put prose that needs custom logic in the
+reviewed change file.
 
-Closed-world authority is exact per compiler crate, not per package. Selected binary products are closed even in a
-publishable package. With `consumer_scope = "workspace"`, non-publishable library, proc-macro, and build-script targets
-are also closed; publishable libraries stay open. A physical declaration observed in any open compiler crate is
-preserved even when another observation is closed. `[[surface.external]]` opens a named compiler crate explicitly.
+### Repository work
+
+`[plan.work.NAME]` declares inputs, not commands:
 
 ```toml
-[surface]
-enabled = true
-consumer_scope = "workspace"
-targets = "workspace"
-crate_visibility = "allow"
-preserve_uniform_fields = true
-
-[[surface.product]]
-package = "app"
-bin = "app"
-target = "cfg(unix)"
-reason = "shipped application"
-
-[[surface.feature-profile]]
-name = "server"
-no-default-features = true
-features = ["tls", "metrics"]
-
-[[surface.doctest]]
-package = "app-core"
-
-[[surface.external]]
-crate = "app_ffi"
-reason = "loaded by consumers outside this workspace"
-
-[[surface.lint]]
-selector = "warnings"
-level = "warn"
-
-[[surface.lint]]
-selector = "dead-public"
-level = "deny"
-
-[[surface.override]]
-lint = "dead-public"
-crate = "app_core"
-item = "migration::legacy_entry"
-kind = "function"
-target = "cfg(unix)"
-level = "expect"
-reason = "removed after downstream migration"
-
-[[surface.exclude]]
-package = "app-core"
-module = "generated"
-level = "expect"
-reason = "generated protocol bindings"
-```
-
-Each product or policy entry can use an optional Cargo target triple or `cfg(...)` selector. An override and exclusion
-requires exactly one owner selector, `package` or Rust compiler `crate`; exclusions require exactly one of `module` or
-`file`. Missing and ambiguous item selectors are configuration failures instead of broad matches.
-
-`surface.targets = "workspace"` inherits the host view and every target declared by the repository's top-level target
-policy. An explicit array remains a stable subset and may contain `"host"` and target triples from that top-level
-policy. Cargo-Rail rejects stale or unknown explicit triples instead of capturing a second target authority. With no
-explicit feature profiles, Cargo-Rail derives default, no-default, all-features, and applicable selected-feature views
-from manifests and cfg expressions. Explicit profiles replace that matrix exactly.
-
-Each Surface analysis writes an append-only JSONL acquisition manifest under
-`target/cargo-rail/surface-acquisitions-v1/`. If a Cargo view fails, the manifest records the exact failed product,
-package, Cargo target, target triple, feature profile, completed views, and unstarted views. After correcting the
-source failure, run the `cargo rail surface --resume MANIFEST --format json` command reported in the error. Resume
-recaptures the workspace and effective configuration and reuses only independently verified complete fact objects;
-journal status never authorizes reuse. Resume is read-only and cannot be combined with `--fix`.
-
-See [Migrate from Hawk](migrate-hawk.md) for configuration and command mappings.
-
-## `[release]`
-
-Reviewed `.changes/*.md` files are the default authority for bumps and release prose. Commit-derived modes support
-migration. Remote release modes bind the prepared commit and wait for readiness on its exact SHA. Registry publication
-is a separate default-deny authority and requires both `registry_publication = "crates-io"` and `--publish`; when
-authorized, it runs in dependency order, observes crates.io state, and creates tags last.
-
-`cargo rail release check` validates the same local crate, bump, changelog, release-note, and tag plan as the
-deprecated `cargo rail release run --check` spelling; pending local changes exit 1. Neither command performs mutations
-or external effects, and JSON output lists every excluded effect. Use `release check --publication` for the separate
-publishable-crate readiness scope; add `--extended` there for publish dry-run, MSRV, and semver evidence.
-
-| Field                       |                       Default | Behavior                                                                                                                                                                                                                                                                                                                                                                 |
-| --------------------------- | ----------------------------: | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `source`                    |                   `"changes"` | `"changes"` uses reviewed intent only. `"commits"` and `"both"` are explicit compatibility modes.                                                                                                                                                                                                                                                                        |
-| `tag_prefix`                |                         `"v"` | Value rendered by `{prefix}`.                                                                                                                                                                                                                                                                                                                                            |
-| `tag_format`                | `"{crate}-{prefix}{version}"` | Tag namespace. Multi-crate formats should include `{crate}`.                                                                                                                                                                                                                                                                                                             |
-| `remote_effects`            |                      `"none"` | `"none"` stays local. Other modes push the exact release commit, then exit until GitHub reports complete counts with at least one successful non-skipped context and no pending/failed context, or GitLab reports a successful exact-SHA pipeline. Publication follows readiness; tags are pushed last. `"auto"`, `"github"`, and `"gitlab"` also create forge releases. |
-| `registry_publication`      |                      `"none"` | Registry authority independent from Git/forge effects. `"crates-io"` permits publication only when the invocation also passes `--publish`; Cargo manifest registry restrictions remain the upper bound.                                                                                                                                                      |
-| `sign_tags`                 |                       `false` | Sign release tags with the configured Git signing mechanism.                                                                                                                                                                                                                                                                                                             |
-| `require_changelog_entries` |                       `false` | Fail when a released crate has no generated changelog entries.                                                                                                                                                                                                                                                                                                           |
-| `require_release_notes`     |                        `true` | Require reviewed notes before tag, publish, or forge effects.                                                                                                                                                                                                                                                                                                            |
-| `release_notes_dir`         |             `"release-notes"` | Manual release-note override directory.                                                                                                                                                                                                                                                                                                                                  |
-| `change_dir`                |                  `".changes"` | Reviewed release-intent directory.                                                                                                                                                                                                                                                                                                                                       |
-| `pre_1_breaking_bump`       |                     `"minor"` | Map breaking 0.x intent to `"minor"` or `"major"`.                                                                                                                                                                                                                                                                                                                       |
-| `unconventional_commits`    |                      `"warn"` | Compatibility-mode policy for non-conventional commits; ignored in changes mode.                                                                                                                                                                                                                                                                                         |
-| `semver_check`              |                      `"warn"` | `"off"` disables external validation. A confirmed bump mismatch blocks instead of escalating reviewed intent.                                                                                                                                                                                                                                                            |
-| `require_change_files`      |                       `false` | Compatibility-mode coverage policy. Changes mode always gates every changed crate.                                                                                                                                                                                                                                                                                       |
-| `version_groups`            |                          `{}` | Named crate lists released in lockstep at their maximum required bump.                                                                                                                                                                                                                                                                                                   |
-
-```toml
-[release]
-source = "changes"
-tag_format = "{prefix}{version}"
-remote_effects = "auto"
-registry_publication = "crates-io"
-sign_tags = true
-
-[release.version_groups]
-core = ["rail-core", "rail-graph", "rail-git"]
-```
-
-`cargo rail release run` defaults to `--bump auto`. In changes mode, only `patch`, `minor`, or `major` entries select a
-crate. `none` records reviewed no-release intent and satisfies coverage without adding changelog prose. Release-worthy
-entries in one file are consumed atomically. `none` entries outside the release plan are retained by an exact
-frontmatter rewrite. Dependency-only releases receive a synthesized patch entry. Use `source = "commits"` or
-`source = "both"` only during migration from a commit-driven workflow.
-
-### `[release.changelog]`
-
-| Field          |          Default | Behavior                                                                                                  |
-| -------------- | ---------------: | --------------------------------------------------------------------------------------------------------- |
-| `path`         | `"CHANGELOG.md"` | Changelog path.                                                                                           |
-| `relative_to`  |        `"crate"` | Resolve from each crate or use `"workspace"`.                                                             |
-| `entry_format` |    built-in line | Bounded placeholders: `{scope}`, `{breaking}`, `{description}`, `{prs}`, `{sha}`, `{sha_link}`, `{type}`. |
-| `emoji`        |           `true` | Render emoji in section headings.                                                                         |
-| `group_order`  |   built-in order | Deterministic commit-type section order.                                                                  |
-| `fallback`     |        `"other"` | Section for unlisted types, or `"skip"`.                                                                  |
-| `groups`       |             `[]` | Custom commit-type groups.                                                                                |
-| `commit_url`   |         inferred | Override the `{sha}` link template.                                                                       |
-| `pr_url`       |         inferred | Override the `{pr}` link template.                                                                        |
-
-`[release.changelog.filters]` supports `skip_types`, `skip_scopes`, `include_paths`, and `exclude_paths`, all empty by default. Breaking entries are not suppressed by ordinary type filtering.
-
-```toml
-[release.changelog]
-relative_to = "workspace"
-emoji = false
-fallback = "skip"
-
-[[release.changelog.groups]]
-types = ["sec", "security"]
-title = "Security"
-emoji = "🔒"
-
-[release.changelog.filters]
-skip_types = ["chore", "ci"]
-exclude_paths = ["fixtures/**"]
-```
-
-## `[plan.work.NAME]`
-
-Cargo-Rail owns Cargo work semantics. Repository configuration declares only positive inputs for opaque work whose
-commands remain in Just, scripts, or CI.
-
-| Field             | Required/default | Behavior                                                                                 |
-| ----------------- | ---------------: | ---------------------------------------------------------------------------------------- |
-| `scope`           |         required | `"repository"`, `"cargo"`, or `"variants"`.                                             |
-| `paths`           |             `[]` | Positive repository-relative input globs.                                                |
-| `config`          |             `[]` | Exact schema-owned effective configuration fields consumed by this work.                 |
-| `cargo`           |             `[]` | Built-in Cargo work IDs that require this work; Cargo scope inherits their exact selectors. |
-| `variant_catalog` |             none | Required for variant work; path to a catalog conforming to plan-variants contract v1.    |
-
-IDs use lowercase ASCII letters, digits, dots, and hyphens. Absolute paths, parent traversal, negative patterns,
-unknown configuration fields, unknown Cargo work IDs, commands, and malformed catalogs are rejected.
-
-```toml
-[plan.work.verification]
-scope = "repository"
-paths = ["verification/**"]
-
 [plan.work.compatibility]
 scope = "variants"
 paths = ["tests/compatibility/**"]
+config = ["targets"]
 cargo = ["cargo.build", "cargo.test"]
 variant_catalog = "distribution/compatibility-plan-variants.json"
 ```
 
-The retired `[change-detection]` section is rejected by current configuration loading. `cargo rail config migrate
---check` reads the raw older file and reports the removal; translate still-owned positive globs to named work before
-applying the migration. Historical planner comparisons remove the retired table only from their captured in-memory
-view because it has no v8 semantics.
+`scope` is `repository`, `cargo`, or `variants`. Paths are positive repository-relative globs. `config` names exact
+effective fields. `cargo` subscribes the work item to built-in Cargo decisions. Variant work requires a checked-in
+catalog conforming to [`plan-variants-v1.schema.json`](../schemas/plan-variants-v1.schema.json).
 
-## Removed execution configuration
+Absolute paths, parent traversal, negative globs, commands, unknown fields, and malformed catalogs are rejected. See
+[Planning](planning.md) for selector and consumer rules.
 
-The former execution table is rejected with an actionable diagnostic. Keep repository commands in Cargo,
-cargo-nextest, Just, or CI, and pass typed package scope from `cargo rail plan`.
+### Per-crate policy
 
-## `[crates.NAME]`
+`[crates.NAME.split]` maps package-owned history and explicit non-Cargo assets to one split destination. `include` adds
+non-Cargo files; `exclude` can only narrow that explicit set. Cargo-owned package files cannot be excluded.
 
-### Split and sync
+`[crates.NAME.release]` may narrow publication. `[crates.NAME.changelog]` overrides workspace changelog policy for one
+crate.
 
-`[crates.NAME.split]` is the single source of split/sync mapping policy.
+## Rejected ownership
 
-| Field            | Required/default | Behavior                                                                                               |
-| ---------------- | ---------------: | ------------------------------------------------------------------------------------------------------ |
-| `remote`         |         required | Git URL or local test path.                                                                            |
-| `branch`         |         required | Destination branch.                                                                                    |
-| `mode`           |         required | `"single"` for one member or `"combined"` for multiple members.                                        |
-| `workspace_mode` |   `"standalone"` | Combined layout: `"standalone"` or `"workspace"`.                                                      |
-| `members`        |       split name | Cargo package names owned by the split. Single mode requires one; combined mode requires at least two. |
-| `include`        |             `[]` | Glob patterns selecting explicit non-Cargo files from the workspace snapshot.                          |
-| `exclude`        |             `[]` | Glob patterns narrowing `include`; Cargo-owned member files cannot be excluded.                        |
+Repository `[cache]` configuration is rejected. Remote URLs, credentials, provider environment, local CAS placement,
+and distributed-worker selection are machine-owned cache setup.
 
-```toml
-[crates.my-crate.split]
-remote = "git@github.com:org/my-crate.git"
-branch = "main"
-mode = "single"
-include = ["LICENSE"]
-```
+Execution tables and the retired `[change-detection]` policy are rejected. Keep commands in Cargo, nextest, Just,
+scripts, or CI, and register only their positive inputs under `[plan.work.NAME]`.
 
-Cargo roots, dependency closure, and intersecting release version groups are resolved by package identity from one
-`WorkspaceSnapshot`. A single split whose key differs from its package name must set `members = ["package-name"]`.
-Included assets retain their workspace-relative paths; ambiguous single-split mappings are rejected before mutation.
-
-### Release and changelog overrides
-
-`[crates.NAME.release]` supports `publish`, which defaults to `true` but can only narrow the registries authorized by
-Cargo.toml. `[crates.NAME.changelog]` can override `path`,
-`relative_to`, `skip`, `entry_format`, `emoji`, `group_order`, `fallback`, `groups`, `filters`, `commit_url`, and
-`pr_url`. Absent values inherit `[release.changelog]`.
-
-```toml
-[crates.internal.release]
-publish = false
-
-[crates.my-crate.changelog]
-path = "HISTORY.md"
-emoji = false
-```
-
-## Deprecated inputs and migrations
-
-Deprecated fields remain parseable for a bounded compatibility window. They emit warnings and have one
-`config migrate` action.
-
-| Deprecated input                                                    | Migration                                                                                                       |
-| ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `[workspace]`, `[toolchain]`, `[crates.NAME.sync]`                  | Remove the empty reserved table.                                                                                |
-| `crates.NAME.split.paths`                                           | Resolve each legacy Cargo path to its package name and write `split.members`.                                   |
-| `unify.compiler_diag_cache`                                         | Remove; correct caching is automatic.                                                                           |
-| `unify.sort_dependencies`                                           | Remove; edits are always deterministic.                                                                         |
-| `unify.prune_dead_features`                                         | Remove; diagnostics are unconditional and deletion uses `consumer_scope`.                                       |
-| `unify.detect_unused`, `unify.remove_unused`                        | Remove; diagnostics plus `unify --check`/apply define the boundary.                                             |
-| `unify.detect_undeclared_features`, `unify.fix_undeclared_features` | Remove; diagnostics plus `unify --check`/apply define the boundary.                                             |
-| `unify.pin_transitives`, `unify.transitive_host`                    | Merge enabled pinning and its host into `unify.transitive_pinning`.                                             |
-| `unify.msrv`, `unify.msrv_source`, `unify.enforce_msrv_inheritance` | Merge one valid choice into `unify.msrv_policy`.                                                                |
-| `[change-detection]`                                                | Translate still-owned positive globs to named work, then remove the retired v7 planner policy.                  |
-| `release.require_clean`, `release.publish_delay`                    | Remove; cleanliness is fixed command behavior and registry convergence is an explicit stop-and-resume boundary. |
-| `release.push`, `release.create_github_release`, `release.forge`    | Merge the valid effect combination into one `release.remote_effects` value.                                     |
-
-```bash
-cargo rail config migrate --check -f json
-cargo rail config migrate
-cargo rail config validate --strict
-```
+Deprecated fields remain readable only for explicit semantic migration. `config migrate` preserves unrelated TOML and
+does not materialize coded defaults.
 
 ## Exit behavior
 
-| Command                    | Exit 0                          | Exit 1            | Exit 2                              |
-| -------------------------- | ------------------------------- | ----------------- | ----------------------------------- |
-| `config migrate --check`   | No migration pending            | Migration pending | Error                               |
-| Mutation command `--check` | No mutation pending             | Mutation pending  | Error                               |
-| `config validate`          | Valid under selected strictness | —                 | Invalid or unreadable configuration |
+| Command | Exit `0` | Exit `1` | Exit `2` |
+|---|---|---|---|
+| `config migrate --check` | No migration | Migration pending | Invalid input or operation |
+| Mutation command `--check` | No mutation | Mutation pending | Invalid input or operation |
+| `config validate` | Valid at selected strictness | — | Invalid or unreadable configuration |
 
-## Environment
-
-`config validate` enables strict mode when `CI`, `GITHUB_ACTIONS`, `GITLAB_CI`, or `CIRCLECI` is present. Use
-`--no-strict` only when warnings are intentionally non-blocking.
-
-## See also
-
-- [Command reference](commands.md)
-- [Planning](planning.md)
+`config validate` enables strict mode in common CI environments. Use `--no-strict` only when warnings are deliberately
+non-blocking.

@@ -1,121 +1,74 @@
 # Architecture
 
-Cargo-Rail is a library-backed workspace engine built on Cargo's resolved model. Commands share captured source,
-configuration, toolchain, metadata, and graph state.
+Cargo-Rail is a library-backed Rust workspace engine. It captures one workspace view, makes bounded decisions from
+that view, and leaves execution to Cargo, nextest, Just, scripts, CI, Git, forges, and registries.
 
-## Mental model
+## One model, separate workflows
 
-Cargo-Rail has six workflows:
+| Workflow | Owns | Does not own |
+|---|---|---|
+| `plan` | Changed inputs, Cargo impact, named-work decisions, typed selectors | Task execution |
+| `unify` | Dependency diagnostics and manifest mutation plans | General Cargo execution |
+| `surface` | Compiler-derived reachability and visibility plans | Source lints outside its compiler contract |
+| cache | Verified compiler facts and results | Cargo freshness or incremental compilation |
+| `change` / `release` | Reviewed release intent and durable publication state | Forge, registry, or Git implementation |
+| `split` / `sync` | Crate ownership, history mapping, and conflict receipts | General repository synchronization |
 
-| Workflow             | Authority                                                        | Result                                                         |
-| -------------------- | ---------------------------------------------------------------- | -------------------------------------------------------------- |
-| `unify`              | Resolved Cargo graph plus compiler evidence                      | A checked or applied manifest mutation plan                    |
-| `plan`               | Captured changes, Cargo structure, declared and observed inputs  | Evidence-backed named work with typed scopes                   |
-| `surface`            | Authenticated compiler facts plus exact compiler-crate authority | Reachability findings or exact visibility mutations            |
-| caching              | Exact compiler inputs and verified result bytes                  | Diagnostic reuse or one compiler-result restore                |
-| `change` / `release` | Reviewed change intent plus exact Git and registry state         | Versions, changelogs, publications, and durable recovery state |
-| `split` / `sync`     | Captured source, Git history, and split ownership                | Standalone history or mapped changes with origin evidence      |
+These workflows share captured infrastructure but do not invoke one another implicitly.
 
-The workflows share infrastructure but do not invoke one another implicitly.
+## Captured workspace authority
 
-## One captured workspace view
+`WorkspaceContext` owns the source capture, effective configuration, Cargo metadata, dependency graph, lockfile,
+toolchain, targets, and repository boundary used by a command. Derived feature and target views stay bound to those
+inputs.
 
-`main.rs` handles CLI preparation and pre-context commands, then builds one `WorkspaceContext` and passes it to the
-selected command. Depending on the command, that context owns:
+Snapshot-bound commands revalidate the relevant live state before writing. A command may cross a named live boundary,
+such as Git readiness or registry state, only when it revalidates that boundary at the operation that uses it.
 
-- the Git worktree and repository boundary;
-- Cargo metadata and the base dependency graph;
-- parsed `rail.toml`;
-- captured source, manifests, lockfile, Cargo configuration, toolchain, and target identities; and
-- lazy feature/target resolution views derived from those inputs.
+## Decisions and execution
 
-Source capture precedes metadata operations that may create generated state. Snapshot-bound commands revalidate live
-inputs before mutation. Commands derive narrower views from the context instead of reloading workspace state.
+- Planning emits one typed decision per work item. Consumers lower its package, target, or variant scope directly.
+- Compiler facts, native cache results, local CAS objects, and remote objects retain separate identities and
+  validation rules.
+- Surface accepts only authenticated, complete compiler facts for the selected compiler-crate views.
 
-## Planning and direct consumption
+Incomplete evidence widens or bypasses only its owning decision. It never becomes permission to skip work or restore a
+result.
 
-`planning/` preserves typed source and configuration changes, evaluates Cargo target membership and dependency domains,
-and produces one decision for every code-owned or repository-declared work item. Its dependency universe includes
-optional and target-gated edges without changing the exact Cargo graph. Compatible compiler observations can prove a
-bounded Cargo skip; incomplete observations require only their owning work. A source-bound portable base package,
-target, and conservative-edge model can narrow removed-member history while unsupported resolver semantics remain an
-explicit workspace fallback.
+## Mutation boundary
 
-Cargo, cargo-nextest, Just, scripts, and CI consume each required work item's typed scope directly. Text and JSON are
-projections of that same decision model, and the GitHub workflow transfers the schema-owned JSON plan as an artifact.
-See [Planning](planning.md).
+Every filesystem mutation follows the same sequence:
 
-## Mutation and external effects
-
-Filesystem mutation follows check, plan, revalidate, apply:
-
-1. Capture the relevant source and Git state.
-2. Build deterministic actions with exact authorized paths.
+1. Capture the relevant source and repository state.
+2. Build a deterministic plan with exact authorized paths.
 3. Revalidate the captured assumptions immediately before writing.
-4. Apply only the planned changes and record a receipt or backup where recovery requires one.
+4. Apply only the planned changes and persist recovery evidence when needed.
 
-Release, split, and sync add Git, forge, remote, or registry effects. Before crossing those boundaries, they persist
-the identity and progress needed for retry or reconciliation. External publication cannot be rolled back.
+Release, split, and sync persist transaction identity before remote or irreversible effects. External publication is
+reconciled through durable state; it is not described as rollback-capable.
 
-Paths are validated capabilities, not unchecked strings. Manifest and configuration edits preserve TOML data outside
-the operation's ownership.
+## Process and platform boundaries
 
-## Cache authority
+`src/main.rs` owns process entry, pre-Clap compiler-role dispatch, one context build, diagnostics, and library
+dispatch. User-visible behavior belongs in the library.
 
-A cache lookup is not proof. Cargo-Rail revalidates the inputs, action/result binding, and stored bytes owned by that
-cache layer before reuse. Unsupported or incomplete evidence bypasses reuse and executes the normal tool.
-The compiler-evidence and native compiler-result layers are documented in [Caching](caching.md). `surface` consumes
-complete authenticated typed facts from that compiler boundary; it does not reconstruct a second source graph.
+Compiler roles preserve Cargo's selected program, arguments, wrapper order, working directory, streams, environment,
+signals, and exit status. Cache and analysis roles receive narrow inputs and never build a workspace context inside a
+compiler process.
 
-## Surface authority and report protocol
-
-Surface authority belongs to compiler crates: package, Cargo target, Rust crate name, target kind, and observation
-role. A selected binary product is closed independently of package publishability. With the explicit workspace
-consumer-scope assertion, a non-publishable library, proc-macro, or build-script crate is also closed; a publishable
-library or configured external crate remains open. When one physical declaration has both open and closed compiler
-observations, the open observation wins. Selected internal libraries seed production reachability only from their
-actual cross-crate production consumers.
-
-Every inspection, check, and mutation projection uses surface contract v2. It records audited and open compiler
-targets, selected products, exact feature and target views, completeness, policy, diagnostics, cache observations,
-acquisition metrics, and the mutation plan. Inspection is read-only and non-failing. `--check` exits 1 for
-configuration errors or deny-level findings. Operational failures exit 2. Machine output is one schema-owned stdout
-value.
-
-Source-built installations have no compiler-analysis authority. Schema output remains pre-context, but preparation
-and analysis reject the installation before Cargo metadata or workspace acquisition. Complete native installers place
-authenticated prebuilt and offline-source driver authority beside the CLI. `surface --prepare` resolves Cargo's exact
-selected compiler, installs its `rustc-dev` component through `rustup` when compiler development metadata is absent,
-manufactures a toolchain-matched driver from the authenticated source when needed, and authenticates the staged driver
-and compiler library. The driver protocol verifies that authority and the captured workspace capability before
-accepting compiler facts.
-
-## Compiler process boundary
-
-Compiler roles are classified once, before Clap and workspace capture. The invocation boundary captures Cargo's exact
-program and argv. Transparent execution preserves the live working directory, inherited non-private environment,
-wrapper order, streams, signals, and exit status. The analysis role adds only its owned lint or observation-output
-arguments. Cache and compiler-fact domains receive narrow invocation inputs; neither constructs a command plan or
-`WorkspaceContext` inside a rustc process.
-
-The wrapper order is Cargo-Rail cache, analysis workspace driver, explicitly compatible existing workspace wrapper,
-then the selected compiler. The cache and fact domains retain separate identities and authority. Analysis uses a
-private capability bound to one source root and observation directory. Shared immutable objects and output manifests
-belong to `cache/`; compiler sessions and evidence remain in `compiler/`.
+`src/windows_fs.rs` is the only production `unsafe` and Win32 FFI boundary. Its safe API remains crate-private.
 
 ## Module ownership
 
-| Modules                                    | Responsibility                                                                                 |
-| ------------------------------------------ | ---------------------------------------------------------------------------------------------- |
-| `workspace/`, `source.rs`                  | Captured authority and derived workspace views                                                 |
-| `cargo/`, `graph/`, `toml/`                | Cargo resolution, graph algorithms, and lossless editing                                       |
-| `planning/`, `change_detection/semantic.rs` | Typed changes, evidence, work evaluation, Cargo impact, and selectors                          |
-| `commands/plan.rs`                         | Comparison validation and text/JSON rendering selection                                        |
-| `surface.rs`, `commands/surface.rs`        | Rust declaration reachability, diagnostic policy, exact visibility plans, and reports          |
-| `compiler/`                                | Pre-Clap compiler invocation, sessions, observations, diagnostics, and native-result decisions |
-| `cache/`                                   | Shared immutable CAS primitives, retained output manifests, measurement, and reclamation       |
-| `mutation/`                                | Plan/apply drift checks, authorized paths, and receipts                                        |
-| `release/`, `split/`, `sync/`              | Workflows that cross repository or publication boundaries                                      |
-| `git/`, source path types, process helpers | External capabilities and containment                                                          |
-
-`src/main.rs` remains a thin process entry point. User-visible behavior belongs in the library.
+| Modules | Responsibility |
+|---|---|
+| `workspace/`, `source.rs` | Captured workspace authority and derived views |
+| `cargo/`, `graph/`, `toml/` | Cargo resolution, graph operations, and lossless TOML edits |
+| `planning/` | Typed changes, evidence, named work, impact, and selectors |
+| `commands/plan.rs` | Comparison validation and plan rendering |
+| `surface.rs`, `commands/surface.rs` | Reachability, policy, findings, mutation plans, and reports |
+| `compiler/` | Compiler invocation, facts, sessions, and native-result decisions |
+| `cache/`, `remote_cache/` | Local immutable objects, result retention, and remote transport |
+| `mutation/` | Drift checks, authorized writes, backups, and receipts |
+| `release/`, `split/`, `sync/` | Durable Git, forge, registry, and cross-repository workflows |
+| `git/`, path types, process helpers | External capability and containment boundaries |

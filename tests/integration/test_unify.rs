@@ -8,7 +8,7 @@
 //! - dep_kinds display
 //! - End-to-end analyze → apply workflow
 
-use crate::helpers::{TestWorkspace, run_cargo_rail};
+use crate::helpers::{TestWorkspace, run_cargo_rail, rustc_host_target};
 use anyhow::Result;
 use cargo_rail::source::SourceSnapshot;
 use cargo_rail::workspace::WorkspaceContext;
@@ -226,6 +226,7 @@ fn test_unify_apply_json_is_a_single_machine_envelope() {
 fn test_unify_apply_verifies_the_captured_target_and_selected_feature_views() {
     let result: Result<()> = (|| {
         let workspace = TestWorkspace::new_named("unify-apply-coverage")?;
+        let target = rustc_host_target()?;
         workspace.add_crate("app", "0.1.0", &[("tempfile", r#""3.0""#)])?;
         workspace.add_crate("worker", "0.1.0", &[("tempfile", r#""3.0""#)])?;
 
@@ -241,7 +242,7 @@ fn test_unify_apply_verifies_the_captured_target_and_selected_feature_views() {
         )?;
         std::fs::write(
             workspace.path.join(".config/rail.toml"),
-            "targets = [\"x86_64-unknown-linux-gnu\"]\n\n[unify]\nmsrv_policy = { mode = \"disabled\" }\n",
+            format!("targets = [\"{target}\"]\n\n[unify]\nmsrv_policy = {{ mode = \"disabled\" }}\n"),
         )?;
         workspace.commit("Create target-specific coverage and a unification edit")?;
 
@@ -250,8 +251,10 @@ fn test_unify_apply_verifies_the_captured_target_and_selected_feature_views() {
         let check_json: serde_json::Value = serde_json::from_slice(&check.stdout)?;
         let views = check_json["coverage"]["views"].as_array().expect("coverage views");
         assert!(
-            views.iter().all(|view| view["target"] == "x86_64-unknown-linux-gnu"),
-            "every emitted view must retain the configured target"
+            views
+                .iter()
+                .all(|view| view["target"].as_str() == Some(target.as_str())),
+            "every emitted view must retain the configured target {target}"
         );
         assert!(
             views.iter().any(|view| view["features"]["mode"] == "selected"),

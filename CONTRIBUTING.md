@@ -13,6 +13,7 @@ Run commands from the repository root. Use `just --list` to see the maintained c
 ## Make a change
 
 - Keep each change focused on one problem.
+- Read [the architecture guide](docs/architecture.md) before changing an ownership or mutation boundary.
 - Put user-visible behavior in the library. Keep `src/main.rs` limited to process setup, diagnostics, and dispatch.
 - Add or update tests for changed behavior. The normal suite uses cargo-nextest; doctests run separately.
 - Update documentation when commands, configuration, output, side effects, compatibility, or recovery behavior changes.
@@ -51,8 +52,8 @@ action-pin, benchmark, qualification, or remote-machine work.
 
 ## Regenerate owned documentation
 
-Do not hand-edit `docs/commands.md` or `docs/caching.md`. They are generated from CLI help and executable support
-authorities. Regenerate them after changing their inputs:
+Do not hand-edit `docs/caching.md`. It is generated from executable support authorities. Regenerate it after changing
+its inputs:
 
 ```bash
 just gen-docs

@@ -1,6 +1,6 @@
 //! Test helpers for integration tests
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tempfile::TempDir;
@@ -46,6 +46,16 @@ pub fn cargo_command(cwd: &Path) -> Command {
     command.current_dir(cwd);
     disable_ambient_cargo_wrappers(&mut command);
     command
+}
+
+/// Return the host target reported by the selected Rust compiler.
+pub fn rustc_host_target() -> Result<String> {
+    let output = Command::new("rustc").arg("-vV").output()?;
+    ensure!(output.status.success(), "rustc -vV failed");
+    String::from_utf8(output.stdout)?
+        .lines()
+        .find_map(|line| line.strip_prefix("host: ").map(str::to_owned))
+        .context("rustc -vV did not report a host target")
 }
 
 /// Build a cargo-rail command isolated from developer compiler wrappers and Git configuration.

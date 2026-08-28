@@ -64,8 +64,9 @@ paths = [
 [plan.work."docs.generated"]
 scope = "repository"
 paths = [
-  "src/commands/cli.rs",
   "scripts/docs/**",
+  "scripts/ci/support-matrix.py",
+  "src/compiler/native_cache.rs",
   "tests/compatibility/manifest.json",
   "distribution/release-targets.json",
 ]

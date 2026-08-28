@@ -4,20 +4,11 @@ use std::process::Command;
 use anyhow::{Context, Result, ensure};
 use tempfile::TempDir;
 
-use crate::helpers::{TestWorkspace, run_cargo_rail};
+use crate::helpers::{TestWorkspace, run_cargo_rail, rustc_host_target};
 
 fn read_counters(path: &Path) -> Result<serde_json::Value> {
     let bytes = std::fs::read(path).with_context(|| format!("reading diagnostics from {}", path.display()))?;
     Ok(serde_json::from_slice(&bytes)?)
-}
-
-fn host_target() -> Result<String> {
-    let output = Command::new("rustc").arg("-vV").output()?;
-    ensure!(output.status.success(), "rustc -vV failed");
-    String::from_utf8(output.stdout)?
-        .lines()
-        .find_map(|line| line.strip_prefix("host: ").map(str::to_owned))
-        .context("rustc -vV did not report a host target")
 }
 
 #[test]
@@ -261,7 +252,7 @@ fn unify_diagnostics_distinguish_base_and_target_metadata_loads() {
         ws.add_crate("demo", "0.1.0", &[])?;
         std::fs::write(
             ws.path.join(".config/rail.toml"),
-            format!("targets = [\"{}\"]\n\n[unify]\nmsrv = false\n", host_target()?),
+            format!("targets = [\"{}\"]\n\n[unify]\nmsrv = false\n", rustc_host_target()?),
         )?;
         ws.commit("Add target fixture")?;
 

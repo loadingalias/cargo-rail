@@ -2339,5 +2339,8 @@ fn print_changelog_migration_hint(workspace_root: &std::path::Path) {
     }
 
     println!("\nfound existing changelog/release config: {}", existing.join(", "));
-    println!("migration guide: docs/migrate-git-cliff.md");
+    println!(
+        "migration: set release.source = \"commits\" and compare \
+         'cargo rail release check --all --bump auto' before removing existing automation"
+    );
 }

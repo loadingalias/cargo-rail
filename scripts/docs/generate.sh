@@ -1,203 +1,50 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Documentation Generator
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#
-# Generates docs/commands.md from the CLI's --help output and
-# docs/caching.md from executable support registries and the runtime cache contract.
-#
-# Usage:
-#   ./scripts/docs/generate.sh           # Generate docs
-#   ./scripts/docs/generate.sh --check   # Verify docs are up-to-date (CI mode)
-#
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repository_root="$(cd "$script_dir/../.." && pwd)"
+output_file="$repository_root/docs/caching.md"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-OUTPUT_FILE="$REPO_ROOT/docs/commands.md"
-CACHE_OUTPUT_FILE="$REPO_ROOT/docs/caching.md"
-BINARY="$REPO_ROOT/target/debug/cargo-rail"
+check=false
+case "${1:-}" in
+  "") ;;
+  --check) check=true ;;
+  *)
+    echo "Usage: $0 [--check]" >&2
+    exit 2
+    ;;
+esac
+if (( $# > 1 )); then
+  echo "Usage: $0 [--check]" >&2
+  exit 2
+fi
 
-CHECK_MODE=false
+python_command=python3
+if ! command -v "$python_command" >/dev/null 2>&1; then
+  python_command=python
+fi
+if ! command -v "$python_command" >/dev/null 2>&1; then
+  echo "generated documentation requires Python" >&2
+  exit 127
+fi
 
-for arg in "$@"; do
-  case $arg in
-    --check)
-      CHECK_MODE=true
-      shift
-      ;;
-    *)
-      echo "Unknown option: $arg"
-      echo "Usage: $0 [--check]"
-      exit 1
-      ;;
-  esac
-done
+generated="$(
+  PYTHONIOENCODING=utf-8 "$python_command" "$repository_root/scripts/ci/support-matrix.py" --markdown | sed 's/\r$//'
+)"
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Build if needed
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-ensure_binary() {
-  # Always build (cargo is incremental and will no-op when up to date).
-  # This prevents regenerating docs from a stale binary.
-  echo "Building cargo-rail..."
-  cargo build --locked --manifest-path "$REPO_ROOT/Cargo.toml" --quiet
-}
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Generate markdown
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-generate_docs() {
-  local output=""
-
-  # Header
-  output+="# Command Reference
-
-> Auto-generated from \`cargo rail --help\`. Do not edit manually.
->
-> Regenerate with: \`./scripts/docs/generate.sh\`
-
-This is the exhaustive CLI surface. Start with \`cargo rail plan --explain\` to inspect required named work,
-then pass each selected work item's typed Cargo arguments to Cargo, cargo-nextest, Just, or CI. Adopt dependency,
-release, and split/sync workflows independently; they share one captured workspace view rather than rebuilding Cargo
-state in separate tools.
-
----
-
-"
-
-  # Main help
-  output+="## cargo rail
-
-\`\`\`
-$("$BINARY" rail --help)
-\`\`\`
-
----
-
-"
-
-  # Get list of subcommands (parse from help output)
-  local commands
-  commands=$("$BINARY" rail --help | awk '/^Commands:$/,/^Options:$/' | grep -E '^\s+\w' | awk '{print $1}' | grep -v '^help$')
-
-  for cmd in $commands; do
-    local help_output
-    help_output=$("$BINARY" rail "$cmd" --help 2>&1 || true)
-
-    output+="## cargo rail $cmd
-
-\`\`\`
-$help_output
-\`\`\`
-
----
-
-"
-
-    # Check if this command has subcommands
-    if echo "$help_output" | grep -q "^Commands:"; then
-      local subcommands
-      subcommands=$(echo "$help_output" | awk '/^Commands:$/,/^Options:$/' | grep -E '^\s+\w' | awk '{print $1}' | grep -v '^help$')
-
-      for subcmd in $subcommands; do
-        local subcmd_help
-        subcmd_help=$("$BINARY" rail "$cmd" "$subcmd" --help 2>&1 || true)
-
-        # Only add if help was successfully retrieved
-        if [ -n "$subcmd_help" ] && ! echo "$subcmd_help" | grep -q "^error:"; then
-          output+="### cargo rail $cmd $subcmd
-
-\`\`\`
-$subcmd_help
-\`\`\`
-
----
-
-"
-        fi
-      done
-    fi
-  done
-
-  # Remove trailing ---
-  output="${output%---
-
-}"
-
-  printf '%s\n' "$output" | sed 's/[[:blank:]]*$//'
-}
-
-generate_caching() {
-  local python_command=python3
-  if ! command -v "$python_command" >/dev/null 2>&1; then
-    python_command=python
+if [[ "$check" == true ]]; then
+  if [[ ! -f "$output_file" ]]; then
+    echo "$output_file does not exist; run: just gen-docs" >&2
+    exit 1
   fi
-  if ! command -v "$python_command" >/dev/null 2>&1; then
-    echo "ERROR: generated documentation requires Python" >&2
-    return 127
+  if ! diff -q <(printf '%s\n' "$generated") "$output_file" >/dev/null; then
+    echo "$output_file is out of date; run: just gen-docs" >&2
+    diff -u "$output_file" <(printf '%s\n' "$generated") || true
+    exit 1
   fi
-  PYTHONIOENCODING=utf-8 "$python_command" "$REPO_ROOT/scripts/ci/support-matrix.py" --markdown | sed 's/\r$//'
-}
+  echo "generated documentation is up to date"
+  exit 0
+fi
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Main
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-main() {
-  ensure_binary
-  mkdir -p "$(dirname "$OUTPUT_FILE")"
-
-  local generated
-  generated=$(generate_docs)
-  local generated_caching
-  generated_caching=$(generate_caching)
-
-  if [ "$CHECK_MODE" = true ]; then
-    if [ ! -f "$OUTPUT_FILE" ]; then
-      echo "ERROR: $OUTPUT_FILE does not exist"
-      echo "Run: ./scripts/docs/generate.sh"
-      exit 1
-    fi
-
-    if ! diff -q <(echo "$generated") "$OUTPUT_FILE" > /dev/null 2>&1; then
-      echo "ERROR: docs/commands.md is out of date"
-      echo ""
-      echo "Diff:"
-      diff <(echo "$generated") "$OUTPUT_FILE" || true
-      echo ""
-      echo "Run: ./scripts/docs/generate.sh"
-      exit 1
-    fi
-
-    if [ ! -f "$CACHE_OUTPUT_FILE" ]; then
-      echo "ERROR: $CACHE_OUTPUT_FILE does not exist"
-      echo "Run: ./scripts/docs/generate.sh"
-      exit 1
-    fi
-
-    if ! diff -q <(echo "$generated_caching") "$CACHE_OUTPUT_FILE" > /dev/null 2>&1; then
-      echo "ERROR: docs/caching.md is out of date"
-      echo ""
-      echo "Diff:"
-      diff <(echo "$generated_caching") "$CACHE_OUTPUT_FILE" || true
-      echo ""
-      echo "Run: ./scripts/docs/generate.sh"
-      exit 1
-    fi
-
-    echo "generated documentation is up-to-date"
-    exit 0
-  fi
-
-  echo "$generated" > "$OUTPUT_FILE"
-  echo "$generated_caching" > "$CACHE_OUTPUT_FILE"
-  echo "Generated: $OUTPUT_FILE"
-  echo "Generated: $CACHE_OUTPUT_FILE"
-}
-
-main
+printf '%s\n' "$generated" >"$output_file"
+echo "generated: $output_file"

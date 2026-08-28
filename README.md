@@ -87,17 +87,13 @@ Unsupported or incompletely observed work runs through normal Cargo. Crucially, 
 `cargo clean` intentionally leaves Cargo-Rail's shared local CAS intact, so an empty target tree can still reuse verified compiler work. Local result storage has a 10 GiB default byte bound. Before an incoming result would exceed it, Cargo-Rail removes the oldest eligible action authorities while protecting leased or in-flight results. `CARGO_RAIL_CACHE=off` provides a cold baseline without touching the CAS. Inspect `cargo rail cache status --scope local` and preview complete CAS removal with `cargo rail cache clean --scope local --check`; after local cleanup, rerun `cargo rail cache setup` to repair the empty authority. See the [cache contract and cleanup policy](docs/caching.md#storage-and-cleanup).
 
 In the retained same-shape `c8i.large` six-crate dependency-DAG qualification, Cargo-Rail completed in 10.098 seconds p50 versus 14.338 seconds for local Cargo and 14.191 seconds for pinned distributed sccache. Small, single-large-unit, and
-parallel-check workloads lost; the retained automatic policy kept the measured small and large placement classes local. This is an operator-bounded result, not a universal speed claim. Read the [cache contract and measurements](docs/caching.md#distributed-compiler-execution).
+parallel-check workloads lost; the retained automatic policy kept the measured small and large placement classes local. This is an operator-bounded result, not a universal speed claim. Read the [benchmark contract](docs/benchmarking.md#claim-requirements).
 
 ## Know the Code Your Products Reach
 
 `cargo rail surface` merges real compiler facts across products, libraries, build scripts, proc macros, doctests, features, and configured targets. It reports dead public declarations and visibility wider than actual consumers need.
 
 Surface can apply proven visibility reductions with `--fix`; dead code remains report-only. `rail.toml` defines analysis policy, while source mutation always requires explicit CLI authorization.
-
-Surface extends Astral’s “Hawk” v0.1.13 model with explicit compiler-crate authority, automatic feature and doctest
-coverage, configured multi-target merging, content-bound fact reuse, versioned reports, and drift-checked fixes with
-rollback. See [Migrate from Hawk](docs/migrate-hawk.md).
 
 ## Give Every Executor Exact Work
 
@@ -173,9 +169,9 @@ remove complexity or strengthen evidence are welcome.
 
 ## Docs & Support
 
-Start with [Planning](docs/planning.md), the [cache contract](docs/caching.md), or the
-[command reference](docs/commands.md). [The configuration reference](docs/config.md) contains the complete field
-contract and focused policy snippets. Start with an empty `rail.toml` and keep only choices that differ from defaults.
+Start with [Planning](docs/planning.md), the [cache contract](docs/caching.md), or
+[Troubleshooting](docs/troubleshooting.md). [Configuration](docs/config.md) explains the repository policy boundary;
+use `cargo rail <command> --help` for the exact CLI. Contributors can start with [Architecture](docs/architecture.md).
 
 Cargo-Rail is licensed under [MIT](LICENSE). See [Contributing](CONTRIBUTING.md), the
 [security policy](SECURITY.md), [releases](https://github.com/loadingalias/cargo-rail/releases), and the [issue tracker](https://github.com/loadingalias/cargo-rail/issues).

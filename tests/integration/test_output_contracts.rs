@@ -342,6 +342,7 @@ fn test_clean_text_uses_iec_units_and_verbose_owns_paths() {
         let artifact = ws.path.join("target").join("cargo-rail").join("metadata.json");
         std::fs::create_dir_all(artifact.parent().expect("artifact parent"))?;
         std::fs::write(&artifact, vec![b'x'; 2048])?;
+        let artifact = cargo_rail::utils::canonicalize_existing(&artifact)?;
 
         let normal = run_cargo_rail(&ws.path, &["rail", "clean", "--cache", "--check"])?;
         assert_eq!(normal.status.code(), Some(1));
