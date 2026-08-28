@@ -57,7 +57,7 @@ jobs:
 
       - name: Exact compiler fact driver
         run: |
-          rustup component add rustc-dev
+          rustup component add rustc-dev --toolchain "$RUSTUP_TOOLCHAIN"
           just check-compiler-fact-driver
 
       - name: Enforce Rust surface

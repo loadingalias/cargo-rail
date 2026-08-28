@@ -134,7 +134,7 @@ jobs:
       - name: Exact compiler fact driver
         if: contains(fromJSON(needs.plan.outputs.required-work), 'compiler-fact-driver')
         run: |
-          rustup component add rustc-dev
+          rustup component add rustc-dev --toolchain "$RUSTUP_TOOLCHAIN"
           just check-compiler-fact-driver
 
   cargo:
@@ -229,7 +229,7 @@ jobs:
 
       - name: Enforce planner-selected surface
         run: |
-          rustup component add rustc-dev
+          rustup component add rustc-dev --toolchain "$RUSTUP_TOOLCHAIN"
           scripts/with-compiler-fact-driver.sh cargo build --locked \
             --bin cargo-rail --bin cargo-rail-compiler-observation
           target/debug/cargo-rail rail surface --check --format github

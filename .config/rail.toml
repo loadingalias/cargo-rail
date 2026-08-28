@@ -81,6 +81,7 @@ paths = [
   ".github/workflows/compatibility.yaml",
   "scripts/ci/run-compatibility.py",
   "scripts/ci/run-filesystem-compatibility.py",
+  "scripts/ci/select-rust-toolchain.sh",
   "scripts/ci/support-matrix.py",
   "tests/compatibility/**",
 ]
@@ -93,6 +94,7 @@ paths = [
   "distribution/release-targets.json",
   "scripts/install.*",
   "scripts/package-release-archive.py",
+  "scripts/ci/select-rust-toolchain.sh",
   "scripts/ci/support-matrix.py",
   "scripts/ci/verify-release-components.py",
   "src/main.rs",

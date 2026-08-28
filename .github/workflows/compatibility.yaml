@@ -113,10 +113,17 @@ jobs:
         run: scripts/plan/read.py verify-checkout target/plan-v8.json
 
       - name: Install selected Rust toolchain
+        id: rust-toolchain
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: ${{ matrix.compatibility.toolchain }}
           targets: ${{ matrix.compatibility.targets }}
+
+      - name: Select exact Rust toolchain
+        shell: bash
+        env:
+          SELECTED_RUST_TOOLCHAIN: ${{ steps.rust-toolchain.outputs.name }}
+        run: scripts/ci/select-rust-toolchain.sh "$SELECTED_RUST_TOOLCHAIN"
 
       - name: Install just for endpoint suites
         if: matrix.compatibility.full-suite
@@ -138,8 +145,6 @@ jobs:
           cache-on-failure: true
 
       - name: Build cargo-rail executables with selected toolchain
-        env:
-          RUSTUP_TOOLCHAIN: ${{ matrix.compatibility.toolchain }}
         run: cargo build --locked --bins
 
       - name: Verify Windows installer
@@ -149,8 +154,6 @@ jobs:
 
       - name: Verify distributed worker front door
         shell: bash
-        env:
-          RUSTUP_TOOLCHAIN: ${{ matrix.compatibility.toolchain }}
         run: |
           worker="target/debug/cargo-rail-distributed-worker"
           python_command=python3
@@ -177,8 +180,6 @@ jobs:
 
       - name: Run front-door compatibility corpus
         shell: bash
-        env:
-          RUSTUP_TOOLCHAIN: ${{ matrix.compatibility.toolchain }}
         run: |
           cargo_rail="target/debug/cargo-rail"
           if [ "$RUNNER_OS" = "Windows" ]; then
@@ -204,34 +205,24 @@ jobs:
 
       - name: Build all endpoint targets
         if: matrix.compatibility.full-suite
-        env:
-          RUSTUP_TOOLCHAIN: ${{ matrix.compatibility.toolchain }}
         run: just build-all
 
       - name: Run full endpoint suite
         if: matrix.compatibility.full-suite && runner.os != 'Windows'
-        env:
-          RUSTUP_TOOLCHAIN: ${{ matrix.compatibility.toolchain }}
         run: just test-all
 
       - name: Run full Windows endpoint suite
         if: matrix.compatibility.full-suite && runner.os == 'Windows'
-        env:
-          RUSTUP_TOOLCHAIN: ${{ matrix.compatibility.toolchain }}
         run: cargo nextest run --workspace -P commit --all-features --locked --config-file .config/nextest.toml
 
       - name: Run doctests
         if: matrix.compatibility.full-suite
-        env:
-          RUSTUP_TOOLCHAIN: ${{ matrix.compatibility.toolchain }}
         run: cargo test --doc -p cargo-rail --all-features --locked
 
       - name: Qualify exact compiler fact driver
         if: matrix.compatibility.full-suite
-        env:
-          RUSTUP_TOOLCHAIN: ${{ matrix.compatibility.toolchain }}
         run: |
-          rustup component add rustc-dev
+          rustup component add rustc-dev --toolchain "$RUSTUP_TOOLCHAIN"
           just check-compiler-fact-driver
 
       - name: Upload JUnit test report
@@ -296,9 +287,16 @@ jobs:
         run: scripts/plan/read.py verify-checkout target/plan-v8.json
 
       - name: Install selected Rust toolchain
+        id: rust-toolchain
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: ${{ matrix.filesystem.toolchain }}
+
+      - name: Select exact Rust toolchain
+        shell: bash
+        env:
+          SELECTED_RUST_TOOLCHAIN: ${{ steps.rust-toolchain.outputs.name }}
+        run: scripts/ci/select-rust-toolchain.sh "$SELECTED_RUST_TOOLCHAIN"
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9
@@ -414,7 +412,7 @@ jobs:
         if: matrix.filesystem.setup == 'windows-ntfs-vhd'
         shell: bash
         run: |
-          rustup component add rustc-dev
+          rustup component add rustc-dev --toolchain "$RUSTUP_TOOLCHAIN"
           scripts/test-compiler-fact-protocol.sh
 
       - name: Run front-door corpus on the qualified filesystem

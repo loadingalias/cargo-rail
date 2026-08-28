@@ -799,6 +799,10 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
     setup_action = (REPOSITORY_ROOT / ".github/actions/setup/action.yaml").read_text(
         encoding="utf-8"
     )
+    toolchain_selector_path = "scripts/ci/select-rust-toolchain.sh"
+    toolchain_selector = (REPOSITORY_ROOT / toolchain_selector_path).read_text(
+        encoding="utf-8"
+    )
     require(
         re.search(
             rf"^[ \t]+toolchain:[ \t]+{re.escape(repository_toolchain)}[ \t]*$",
@@ -807,6 +811,26 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         )
         is not None,
         f"repository setup action must install repository toolchain {repository_toolchain}",
+    )
+    for fragment in (
+        "RUSTUP_TOOLCHAIN=%s",
+        "RUSTUP_AUTO_INSTALL=0",
+        'rustup which --toolchain "$toolchain" rustc',
+        'rustup which --toolchain "$toolchain" cargo',
+    ):
+        require(
+            fragment in toolchain_selector,
+            f"Rust toolchain selector is missing {fragment}",
+        )
+    require(
+        toolchain_selector_path in setup_action,
+        "repository setup action must select the installed Rust toolchain",
+    )
+    require(
+        setup_action.index(toolchain_selector_path)
+        < setup_action.index("taiki-e/install-action@")
+        < setup_action.index("Swatinem/rust-cache@"),
+        "repository setup action must select Rust before installing tools or restoring caches",
     )
 
     rail_config = load_toml(REPOSITORY_ROOT / ".config/rail.toml")
@@ -940,6 +964,7 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
     for fragment in (
         "--compatibility-matrix",
         "--filesystem-matrix",
+        toolchain_selector_path,
         "--selection-probes",
         "--cross-target-mutation-probes",
         manifest.corpus_runner,
@@ -953,6 +978,10 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
             fragment in compatibility_workflow,
             f"compatibility workflow is missing {fragment}",
         )
+    require(
+        compatibility_workflow.count(toolchain_selector_path) == 2,
+        "compatibility workflow must select Rust in both execution jobs",
+    )
     for caller in (".github/workflows/bootstrap.yaml", ".github/workflows/commit.yaml"):
         source = (REPOSITORY_ROOT / caller).read_text(encoding="utf-8")
         require(
@@ -971,6 +1000,10 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         "cargo-audit" not in release_workflow,
         "release workflow must keep cargo-deny as the single dependency policy gate",
     )
+    require(
+        toolchain_selector_path in release_workflow,
+        "release workflow must select its installed Rust toolchain",
+    )
 
     worker_verifier = "scripts/ci/verify-distributed-worker.py"
     require(
@@ -986,6 +1019,7 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
     ).read_text(encoding="utf-8")
     for fragment in (
         "workflow_call:",
+        toolchain_selector_path,
         "distribution/release-targets.json",
         "scripts/ci/smoke-release-tar.sh",
         "if: inputs.stage",
@@ -1016,6 +1050,13 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         "rustup component list" not in archive_workflow,
         "release archive workflow must prove Surface capability instead of Rustup component inventory",
     )
+    for workflow_path in sorted((REPOSITORY_ROOT / ".github/workflows").glob("*.yaml")):
+        for line in workflow_path.read_text(encoding="utf-8").splitlines():
+            if "rustup component add rustc-dev" in line:
+                require(
+                    '--toolchain "$RUSTUP_TOOLCHAIN"' in line,
+                    f"{workflow_path.relative_to(REPOSITORY_ROOT)} must add rustc-dev to the selected toolchain",
+                )
     for caller, stage in (
         (".github/workflows/commit.yaml", "stage: false"),
         (".github/workflows/release.yaml", "stage: true"),

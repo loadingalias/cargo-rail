@@ -138,9 +138,16 @@ jobs:
         run: scripts/plan/read.py verify-checkout target/plan-v8.json
 
       - name: Install Rust
+        id: rust-toolchain
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
           toolchain: ${{ needs.prepare.outputs.msrv }}
+
+      - name: Select exact Rust toolchain
+        shell: bash
+        env:
+          SELECTED_RUST_TOOLCHAIN: ${{ steps.rust-toolchain.outputs.name }}
+        run: scripts/ci/select-rust-toolchain.sh "$SELECTED_RUST_TOOLCHAIN"
 
       - name: Manufacture exact compiler fact driver
         id: fact-driver
@@ -172,7 +179,7 @@ jobs:
 
           host="$(rustc -vV | sed -n 's/^host: //p')"
           test "$host" = "$TARGET"
-          rustup component add rustc-dev
+          rustup component add rustc-dev --toolchain "$RUSTUP_TOOLCHAIN"
           scripts/build-compiler-fact-driver.sh
 
           suffix=""

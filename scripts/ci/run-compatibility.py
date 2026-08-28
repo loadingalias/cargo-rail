@@ -98,6 +98,7 @@ def selected_environment(toolchain: str, cargo_home: Path, cache: Path) -> dict[
             "CARGO_NET_OFFLINE": "true",
             "CARGO_RAIL_CACHE_DIR": str(cache),
             "CARGO_TERM_COLOR": "never",
+            "RUSTUP_AUTO_INSTALL": "0",
             "RUSTUP_TOOLCHAIN": toolchain,
         }
     )

@@ -43,6 +43,12 @@ threads-required = "num-test-threads"
 slow-timeout = { period = "60s", terminate-after = 6 }
 
 [[profile.default.overrides]]
+filter = 'binary(integration) & test(=test_plan_consumers::test_source_reader_bootstrap_preserves_direct_binary_authority)'
+test-group = 'cargo-subprocess'
+# This test proves a fresh source bootstrap in an isolated target directory.
+slow-timeout = { period = "60s", terminate-after = 4 }
+
+[[profile.default.overrides]]
 filter = 'binary(integration) & test(=test_compiler_observation::source_capture_limit_bypasses_cold_without_creating_authority)'
 leak-timeout = { period = "10s", result = "fail" }
 

@@ -16,6 +16,19 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Install repository Rust toolchain
+      id: rust-toolchain
+      uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+      with:
+        toolchain: 1.98.0
+        components: clippy, rustfmt
+
+    - name: Select repository Rust toolchain
+      shell: bash
+      env:
+        SELECTED_RUST_TOOLCHAIN: ${{ steps.rust-toolchain.outputs.name }}
+      run: scripts/ci/select-rust-toolchain.sh "$SELECTED_RUST_TOOLCHAIN"
+
     - name: Install just
       uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9
       with:
@@ -26,12 +39,6 @@ runs:
       uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9
       with:
         tool: cargo-nextest@0.9.143
-
-    - name: Install repository Rust toolchain
-      uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
-      with:
-        toolchain: 1.98.0
-        components: clippy, rustfmt
 
     - name: Setup Rust Cache
       uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
