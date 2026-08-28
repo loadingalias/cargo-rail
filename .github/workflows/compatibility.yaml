@@ -71,6 +71,7 @@ jobs:
           SELECTED_COMPATIBILITY_MATRIX: ${{ inputs.compatibility-matrix }}
           SELECTED_FILESYSTEM_MATRIX: ${{ inputs.filesystem-matrix }}
         run: |
+          python3 scripts/ci/support-matrix.py --github-matrix >/dev/null
           if [ "$SELECTED_COMPATIBILITY_MATRIX" = all ]; then
             compatibility="$(python3 scripts/ci/support-matrix.py --compatibility-matrix)"
           else
@@ -89,6 +90,7 @@ jobs:
   msrv:
     name: MSRV (${{ matrix.compatibility.name }})
     needs: support
+    if: fromJSON(needs.support.outputs.compatibility-matrix).include[0] != null
     runs-on: ${{ matrix.compatibility.runner }}
     timeout-minutes: 60
     strategy:
@@ -221,6 +223,7 @@ jobs:
 
       - name: Qualify exact compiler fact driver
         if: matrix.compatibility.full-suite
+        shell: bash
         run: |
           rustup component add rustc-dev --toolchain "$RUSTUP_TOOLCHAIN"
           just check-compiler-fact-driver
@@ -261,6 +264,7 @@ jobs:
   filesystem:
     name: Filesystem (${{ matrix.filesystem.name }})
     needs: support
+    if: fromJSON(needs.support.outputs.filesystem-matrix).include[0] != null
     runs-on: ${{ matrix.filesystem.runner }}
     timeout-minutes: 45
     strategy:

@@ -972,11 +972,14 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
     for fragment in (
         "--compatibility-matrix",
         "--filesystem-matrix",
+        "python3 scripts/ci/support-matrix.py --github-matrix >/dev/null",
         toolchain_installer_path,
         "--selection-probes",
         "--cross-target-mutation-probes",
         manifest.corpus_runner,
         "scripts/ci/run-filesystem-compatibility.py",
+        "if: fromJSON(needs.support.outputs.compatibility-matrix).include[0] != null",
+        "if: fromJSON(needs.support.outputs.filesystem-matrix).include[0] != null",
         "just build-all",
         "just test-all",
         "cargo nextest run --workspace -P commit --all-features --locked --config-file .config/nextest.toml",
@@ -989,6 +992,18 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
     require(
         compatibility_workflow.count(toolchain_installer_path) == 2,
         "compatibility workflow must install Rust in both execution jobs",
+    )
+    exact_driver_step = """\
+      - name: Qualify exact compiler fact driver
+        if: matrix.compatibility.full-suite
+        shell: bash
+        run: |
+          rustup component add rustc-dev --toolchain "$RUSTUP_TOOLCHAIN"
+          just check-compiler-fact-driver
+"""
+    require(
+        exact_driver_step in compatibility_workflow,
+        "compatibility workflow must install rustc-dev and qualify the exact compiler fact driver under Bash",
     )
     for caller in (".github/workflows/bootstrap.yaml", ".github/workflows/commit.yaml"):
         source = (REPOSITORY_ROOT / caller).read_text(encoding="utf-8")
