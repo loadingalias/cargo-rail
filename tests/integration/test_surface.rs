@@ -5,7 +5,7 @@ use std::fs;
 use crate::helpers::{NestedWorkspace, TestWorkspace, run_cargo_rail, run_cargo_rail_with_env};
 use anyhow::{Result, anyhow};
 
-const SURFACE_V2_SCHEMA: &str = include_str!("../../schemas/surface-v2.schema.json");
+const SURFACE_V3_SCHEMA: &str = include_str!("../../schemas/surface-v3.schema.json");
 
 #[test]
 fn compiler_observation_process_reports_its_private_protocol() {
@@ -32,9 +32,9 @@ fn surface_schema_is_pre_context_and_matches_the_published_contract() {
             output.status.success(),
             "surface --schema should not load workspace state"
         );
-        assert_eq!(String::from_utf8_lossy(&output.stdout), SURFACE_V2_SCHEMA);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), SURFACE_V3_SCHEMA);
         assert!(output.stderr.is_empty(), "schema output must keep stderr empty");
-        let schema: serde_json::Value = serde_json::from_str(SURFACE_V2_SCHEMA)?;
+        let schema: serde_json::Value = serde_json::from_str(SURFACE_V3_SCHEMA)?;
         jsonschema::validator_for(&schema).map_err(|error| anyhow::anyhow!("invalid surface schema: {error}"))?;
         Ok(())
     })();
@@ -195,7 +195,7 @@ reason = "fixture product"
         );
 
         let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-        let schema: serde_json::Value = serde_json::from_str(SURFACE_V2_SCHEMA)?;
+        let schema: serde_json::Value = serde_json::from_str(SURFACE_V3_SCHEMA)?;
         let validator =
             jsonschema::validator_for(&schema).map_err(|error| anyhow!("invalid surface schema: {error}"))?;
         let errors = validator
@@ -206,11 +206,46 @@ reason = "fixture product"
         assert_eq!(report["metrics"]["acquisition"]["analysis_views"], 2);
         assert_eq!(report["metrics"]["acquisition"]["cargo_views_executed"], 2);
         assert_eq!(report["metrics"]["graph"]["traversals"], 3);
+        assert_eq!(
+            report["retention"]["fragment_item_observations"],
+            report["completeness"]["items"]
+        );
+        assert_eq!(report["retention"]["merged_items"], report["metrics"]["graph"]["nodes"]);
+        assert_eq!(
+            report["retention"]["conservative_observations"],
+            report["completeness"]["retentions"]
+        );
         assert!(
             report["completeness"]["retention_reasons"]["generated-registration"]
                 .as_u64()
                 .is_some_and(|count| count > 0),
             "generated test-harness registration must remain named conservative evidence"
+        );
+        let generated_registration = report["retention"]["reasons"]
+            .as_array()
+            .and_then(|reasons| reasons.iter().find(|reason| reason["code"] == "generated-registration"))
+            .ok_or_else(|| anyhow!("generated-registration retention detail is missing"))?;
+        assert_eq!(
+            generated_registration["observations"],
+            report["completeness"]["retention_reasons"]["generated-registration"]
+        );
+        assert!(
+            generated_registration["observations"].as_u64().unwrap()
+                >= generated_registration["unique_items"].as_u64().unwrap()
+        );
+        assert!(
+            generated_registration["predicate"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert!(
+            generated_registration["representatives"]
+                .as_array()
+                .is_some_and(|examples| examples.len() <= 3)
+        );
+        assert!(
+            report["retention"]["counterfactual"].is_null(),
+            "normal Surface analysis must not pay for counterfactual graph traversals"
         );
 
         let findings = report["findings"]
@@ -237,7 +272,9 @@ reason = "fixture product"
         let inspected = run_cargo_rail(&workspace.path, &["rail", "surface", "--format", "json"])?;
         assert!(
             inspected.status.success(),
-            "inspection must report findings without turning them into a failing gate"
+            "inspection must report findings without turning them into a failing gate: stdout={} stderr={}",
+            String::from_utf8_lossy(&inspected.stdout),
+            String::from_utf8_lossy(&inspected.stderr)
         );
         let inspected_report: serde_json::Value = serde_json::from_slice(&inspected.stdout)?;
         assert_eq!(inspected_report["mode"], "inspect");
@@ -568,7 +605,11 @@ reason = "failure-matrix product"
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
-            assert!(String::from_utf8_lossy(&output.stderr).contains(&format!("injected surface failure at {point}")));
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(&format!("injected surface failure at {point}")),
+                "{point}: unexpected stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
             assert_eq!(fs::read_to_string(package.join("src/main.rs"))?, main_source, "{point}");
             assert_eq!(
                 fs::read_to_string(package.join("src/support.rs"))?,

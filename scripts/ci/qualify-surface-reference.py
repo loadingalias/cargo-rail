@@ -258,7 +258,7 @@ def normalized_reference(report: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def normalized_rail(report: dict[str, Any]) -> list[dict[str, Any]]:
-    require(report.get("surface_contract_version") == 2, "Cargo-Rail surface contract changed")
+    require(report.get("surface_contract_version") == 3, "Cargo-Rail surface contract changed")
     require(report.get("completeness", {}).get("complete") is True, "Cargo-Rail evidence is incomplete")
     require(report.get("authority", {}).get("audited_targets"), "Cargo-Rail audited no closed targets")
     findings = []

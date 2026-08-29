@@ -181,7 +181,7 @@ else
   # exact compiler library required by the authenticated driver.
   capture_surface stable-check 1 "" --check
   stable_report="$captured_output"
-  assert_json "stable surface contract" "$stable_report" '.surface_contract_version' 2
+  assert_json "stable surface contract" "$stable_report" '.surface_contract_version' 3
   assert_json "stable audited targets" "$stable_report" '.authority.audited_targets | length > 0' true
   assert_json "stable dead-public finding" "$stable_report" '.findings | any(.name == "dead_public")' true
 
@@ -197,7 +197,7 @@ else
 
   capture_surface nightly-check 1 "$nightly_toolchain" --check
   nightly_report="$captured_output"
-  assert_json "nightly surface contract" "$nightly_report" '.surface_contract_version' 2
+  assert_json "nightly surface contract" "$nightly_report" '.surface_contract_version' 3
   assert_json "nightly surface toolchain" "$nightly_report" '.toolchain.rustc | contains("1.99.0-nightly")' true
   assert_json "nightly audited targets" "$nightly_report" '.authority.audited_targets | length > 0' true
 fi

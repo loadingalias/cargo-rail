@@ -411,7 +411,7 @@ jobs:
           $surfaceExit = $LASTEXITCODE
           $surfaceReport = $surfaceJson | Out-String | ConvertFrom-Json
           Pop-Location
-          if ($surfaceExit -ne 1 -or $surfaceReport.surface_contract_version -ne 2) {
+          if ($surfaceExit -ne 1 -or $surfaceReport.surface_contract_version -ne 3) {
             throw "archive surface fixture did not report its versioned findings"
           }
           if ($surfaceReport.authority.audited_targets.Count -eq 0) {
@@ -450,7 +450,7 @@ jobs:
           $nightlyReport = $nightlyJson | Out-String | ConvertFrom-Json
           Pop-Location
           Remove-Item Env:RUSTUP_TOOLCHAIN, Env:CARGO, Env:RUSTC, Env:RUSTDOC
-          if ($nightlyExit -ne 1 -or $nightlyReport.surface_contract_version -ne 2 -or $nightlyReport.toolchain.rustc -notmatch '1\.99\.0-nightly' -or $nightlyReport.authority.audited_targets.Count -eq 0) {
+          if ($nightlyExit -ne 1 -or $nightlyReport.surface_contract_version -ne 3 -or $nightlyReport.toolchain.rustc -notmatch '1\.99\.0-nightly' -or $nightlyReport.authority.audited_targets.Count -eq 0) {
             throw "archive dated-nightly Surface qualification failed"
           }
           $actual = (& $binary.FullName rail --version).Trim()

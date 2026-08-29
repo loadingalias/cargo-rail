@@ -29,13 +29,13 @@ use crate::source::{ContentDigest, RepositoryPath};
 use crate::surface::{
     SurfaceAnalysis, SurfaceCompilerCrate, SurfaceFinding, SurfaceFindingKind, SurfaceGraph, SurfaceGraphMetrics,
     SurfaceItemAnalysis, SurfacePolicy, SurfaceProductKind, SurfaceProductRoot, SurfaceProductSelection,
-    retention_reason_code, target_selector_matches,
+    SurfaceRetentionSummary, retention_reason_code, target_selector_matches,
 };
 use crate::workspace::{CargoState, WorkspaceContext, WorkspaceSnapshot};
 
-const SURFACE_CONTRACT_VERSION: u32 = 2;
+const SURFACE_CONTRACT_VERSION: u32 = 3;
 const SURFACE_PREPARATION_CONTRACT_VERSION: u32 = 1;
-const SURFACE_SCHEMA_JSON: &str = include_str!("../../schemas/surface-v2.schema.json");
+const SURFACE_SCHEMA_JSON: &str = include_str!("../../schemas/surface-v3.schema.json");
 
 /// Options for the `surface` domain command.
 #[derive(Debug)]
@@ -92,6 +92,7 @@ struct SurfaceReport {
     targets: Vec<String>,
     features: Vec<SurfaceFeatureView>,
     completeness: SurfaceCompleteness,
+    retention: SurfaceRetentionSummary,
     findings: Vec<SurfaceReportFinding>,
     configuration_diagnostics: Vec<SurfaceConfigurationDiagnostic>,
     reasons: Vec<SurfaceReason>,
@@ -251,6 +252,7 @@ struct SurfaceRun {
     findings: Vec<SurfaceReportFinding>,
     configuration_diagnostics: Vec<SurfaceConfigurationDiagnostic>,
     authority: SurfaceAuthorityReport,
+    retention: SurfaceRetentionSummary,
     metrics: SurfaceRunMetrics,
 }
 
@@ -319,7 +321,7 @@ pub fn run_surface(ctx: &WorkspaceContext, options: SurfaceOptions) -> RailResul
             ctx.snapshot()?.configuration_fingerprint(),
         )?;
     }
-    let mut initial = analyze_surface(ctx, &config)?;
+    let mut initial = analyze_surface(ctx, &config, options.explain)?;
     ctx.validate_snapshot_unchanged()?;
     filter_findings(&mut initial.findings, &options.only);
 
@@ -368,7 +370,7 @@ pub fn run_surface(ctx: &WorkspaceContext, options: SurfaceOptions) -> RailResul
                 "surface configuration changed across post-mutation verification",
             ));
         }
-        let mut verified = analyze_surface(&verified_context, &verified_config)?;
+        let mut verified = analyze_surface(&verified_context, &verified_config, options.explain)?;
         filter_findings(&mut verified.findings, &options.only);
         verified_context.validate_snapshot_unchanged()?;
         verify_surface_updates(&ctx.git()?.git().worktree_root, &updates)?;
@@ -455,7 +457,7 @@ fn filter_findings(findings: &mut Vec<SurfaceReportFinding>, only: &[String]) {
     }
 }
 
-fn analyze_surface(ctx: &WorkspaceContext, config: &SurfaceConfig) -> RailResult<SurfaceRun> {
+fn analyze_surface(ctx: &WorkspaceContext, config: &SurfaceConfig, counterfactuals: bool) -> RailResult<SurfaceRun> {
     let snapshot = ctx.snapshot()?;
     validate_workspace_policy(ctx, snapshot, config)?;
     let workspace_packages = ctx.cargo().workspace_members();
@@ -527,7 +529,11 @@ fn analyze_surface(ctx: &WorkspaceContext, config: &SurfaceConfig) -> RailResult
     )
     .with_products(products)
     .preserving_uniform_fields(config.preserve_uniform_fields);
-    let analysis = graph.analyze(&policy)?;
+    let analysis = if counterfactuals {
+        graph.analyze_with_counterfactuals(&policy)?
+    } else {
+        graph.analyze(&policy)?
+    };
     let policy_result = apply_diagnostic_policy(&analysis, config)?;
     Ok(SurfaceRun {
         targets,
@@ -535,6 +541,7 @@ fn analyze_surface(ctx: &WorkspaceContext, config: &SurfaceConfig) -> RailResult
         findings: policy_result.findings,
         configuration_diagnostics: policy_result.configuration_diagnostics,
         authority,
+        retention: analysis.retention,
         metrics: SurfaceRunMetrics {
             acquisition: evidence.metrics,
             graph: analysis.metrics,
@@ -1594,6 +1601,7 @@ fn build_report(
         findings,
         configuration_diagnostics,
         authority,
+        retention,
         metrics,
     } = run;
     let mut fragments = facts
@@ -1660,6 +1668,7 @@ fn build_report(
         targets,
         features,
         completeness: completeness(&facts)?,
+        retention,
         findings,
         configuration_diagnostics,
         reasons,
@@ -1919,17 +1928,8 @@ fn render_text(report: &SurfaceReport, explain: bool) -> String {
         output.push_str(&report.completeness.fragments.to_string());
         output.push('\n');
     }
-    if explain && !report.completeness.retention_reasons.is_empty() {
-        let reasons = report
-            .completeness
-            .retention_reasons
-            .iter()
-            .map(|(reason, count)| format!("{reason}={count}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        output.push_str("conservative retentions: ");
-        output.push_str(&reasons);
-        output.push('\n');
+    if explain {
+        render_retention_explanation(&mut output, &report.retention);
     }
     for report_finding in &report.findings {
         let finding = &report_finding.finding;
@@ -1990,6 +1990,72 @@ fn render_text(report: &SurfaceReport, explain: bool) -> String {
         }
     }
     output
+}
+
+fn render_retention_explanation(output: &mut String, retention: &SurfaceRetentionSummary) {
+    output.push_str("Conservative proof observations: ");
+    output.push_str(&retention.conservative_observations.to_string());
+    output.push_str(" retention row(s) across ");
+    output.push_str(&retention.fragment_item_observations.to_string());
+    output.push_str(" fragment item observation(s); ");
+    output.push_str(&retention.unique_retained_items.to_string());
+    output.push_str(" unique retained item(s) across ");
+    output.push_str(&retention.merged_items.to_string());
+    output.push_str(" merged graph item(s).\n");
+    for reason in &retention.reasons {
+        output.push_str("  ");
+        output.push_str(&reason.code);
+        output.push_str(": observations=");
+        output.push_str(&reason.observations.to_string());
+        output.push_str(", unique-items=");
+        output.push_str(&reason.unique_items.to_string());
+        output.push_str("; predicate: ");
+        output.push_str(reason.predicate);
+        output.push('\n');
+        for representative in &reason.representatives {
+            output.push_str("    example: ");
+            output.push_str(&representative.source);
+            output.push(':');
+            output.push_str(&representative.declaration_start.to_string());
+            output.push('-');
+            output.push_str(&representative.declaration_end.to_string());
+            output.push(' ');
+            output.push_str(representative.item_kind);
+            if let Some(path) = representative.diagnostic_paths.first() {
+                output.push(' ');
+                output.push_str(path);
+            }
+            output.push('\n');
+        }
+    }
+    if let Some(counterfactual) = &retention.counterfactual {
+        output.push_str("Counterfactual suppression (omit one reason; retain all alternatives): ");
+        output.push_str(&counterfactual.suppressed_finding_observations.to_string());
+        output.push_str(" finding observation(s), ");
+        output.push_str(&counterfactual.traversals.to_string());
+        output.push_str(" graph traversal(s), ");
+        output.push_str(&counterfactual.edge_visits.to_string());
+        output.push_str(" edge visit(s).\n");
+        for reason in &counterfactual.reasons {
+            output.push_str("  ");
+            output.push_str(&reason.code);
+            output.push_str(": suppressed-findings=");
+            output.push_str(&reason.suppressed_findings.to_string());
+            if !reason.finding_kinds.is_empty() {
+                output.push_str(" (");
+                output.push_str(
+                    &reason
+                        .finding_kinds
+                        .iter()
+                        .map(|(kind, count)| format!("{kind}={count}"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+                output.push(')');
+            }
+            output.push('\n');
+        }
+    }
 }
 
 fn lint_level_name(level: SurfaceLintLevel) -> &'static str {
@@ -2142,8 +2208,44 @@ mod tests {
                 retained: false,
             }],
             findings: vec![finding()],
+            retention: SurfaceRetentionSummary {
+                fragment_item_observations: 1,
+                merged_items: 1,
+                conservative_observations: 0,
+                unique_retained_items: 0,
+                representative_limit: 3,
+                reasons: Vec::new(),
+                counterfactual: None,
+            },
             metrics: SurfaceGraphMetrics::default(),
         }
+    }
+
+    #[test]
+    fn retention_explanation_renders_zero_evidence() {
+        let retention = SurfaceRetentionSummary {
+            fragment_item_observations: 4,
+            merged_items: 2,
+            conservative_observations: 0,
+            unique_retained_items: 0,
+            representative_limit: 3,
+            reasons: Vec::new(),
+            counterfactual: Some(crate::surface::SurfaceRetentionCounterfactualSummary {
+                basis: "omit-one-reason-before-diagnostic-policy",
+                traversals: 0,
+                edge_visits: 0,
+                suppressed_finding_observations: 0,
+                reasons: Vec::new(),
+            }),
+        };
+        let mut output = String::new();
+        render_retention_explanation(&mut output, &retention);
+        assert!(output.contains(
+            "0 retention row(s) across 4 fragment item observation(s); 0 unique retained item(s) across 2 merged graph item(s)."
+        ));
+        assert!(output.contains(
+            "Counterfactual suppression (omit one reason; retain all alternatives): 0 finding observation(s)"
+        ));
     }
 
     #[test]

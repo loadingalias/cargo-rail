@@ -22,12 +22,15 @@ local health does not prove that any remote provider request succeeded.
 ## What the current Surface counts mean
 
 The current two-view Surface run captured 20 compiler fragments containing
-58,362 item observations and merged them into 45,692 graph nodes. It reported
-16,844 conservative retention observations:
+59,532 item observations and merged them into 46,652 graph nodes. It reported
+17,164 conservative retention observations affecting 15,597 unique merged
+items:
 
-- 3,369 `allow-dead-code` observations;
-- 1,284 `generated-registration` observations; and
-- 12,191 `unresolved-trait-dispatch` observations.
+- 3,373 `allow-dead-code` observations affecting 3,097 unique items;
+- 1,320 `generated-registration` observations affecting 1,320 unique items;
+  and
+- 12,471 `unresolved-trait-dispatch` observations affecting 12,370 unique
+  items.
 
 These are not findings, source defects, or necessarily unique declarations.
 `SurfaceCompleteness` sums each fragment's retention rows before the graph
@@ -49,8 +52,7 @@ report does not identify its provenance.
 
 ## CR-DOGFOOD-001: Make Surface retention evidence understandable
 
-**Evidence:** Confirmed product explainability gap; analysis-precision
-investigation required
+**Evidence:** Explainability resolved; measured precision change not justified
 
 `cargo rail surface --check --explain` renders only one aggregate count per
 retention reason. The output does not say that the counts are fragment
@@ -61,30 +63,28 @@ which targets and views dominate a reason. The name
 predicate is trait or trait-implementation membership, not one unresolved
 dispatch call site.
 
-Required work:
+Surface report contract v3 resolves the explainability slice. It preserves the
+raw completeness totals, adds the merged denominators above, reports raw and
+unique counts per predicate, and includes at most three deterministic physical
+declaration examples with the exact implemented predicate. Text output calls
+these conservative proof observations rather than issues. A repeated
+production/non-production fixture proves that raw rows merge without losing a
+conservative root or double-counting the unique item.
 
-1. Preserve raw observation counts for acquisition completeness, but add
-   unique merged-item counts per retention reason.
-2. Break retention evidence down by domain, target, compiler view, written
-   versus generated provenance, and lint-level provenance where rustc exposes
-   it reliably.
-3. Make text output call these values conservative proof observations, not
-   issues. Include the total fragment observations and unique graph nodes so
-   the denominator is visible.
-4. Add a bounded explanation mode that identifies representative retained
-   declarations and the exact predicate that retained each one without
-   flooding terminal output.
-5. Measure how many otherwise eligible findings each reason suppresses. Do
-   not call a large count an analysis defect until this counterfactual is
-   known.
-6. Investigate narrower trait-dispatch authority from compiler facts. Any
-   reduction must remain fail-closed for generic, dynamic, associated-item,
-   and cross-crate dispatch.
+`--explain` now measures one precision question separately: omit one retention
+reason while keeping every other reason and graph authority active, then count
+newly eligible findings before diagnostic policy. The 2026-08-29 repository
+measurement found zero suppressed findings for `allow-dead-code`,
+`generated-registration`, and `unresolved-trait-dispatch`. The normal path
+remained three traversals and 177,914 edge visits. Explanation added six
+traversals and 408,109 edge visits. Compiler acquisition dominated the command,
+so this single run supports no wall-time claim.
 
-Acceptance requires counts that reconcile from fragments to unique graph
-items, stable machine fields or an explicit schema transition, fixtures for
-repeated production and non-production observations, and no loss of a
-conservative root.
+There is therefore no evidence for narrowing trait dispatch, and its
+fail-closed semantics remain unchanged. Domain, target-view, generated-source,
+and lint-provenance breakdowns are a separate possible observability expansion;
+they should grow the contract only when a consumer demonstrates an actionable
+need.
 
 ## CR-DOGFOOD-002: Expose root portability in the cache Action
 

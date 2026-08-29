@@ -20,6 +20,7 @@ use crate::source::ContentDigest;
 
 const SURFACE_ITEM_IDENTITY_PREFIX: &str = "surface-item-v1-sha256-";
 const SURFACE_FINDING_IDENTITY_PREFIX: &str = "surface-finding-v1-sha256-";
+const SURFACE_RETENTION_EXAMPLE_LIMIT: usize = 3;
 
 /// Root-independent identity of source bytes used by a declaration.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -177,6 +178,27 @@ pub(crate) fn retention_reason_code(object: &CompilerFactObject, reason: &Compil
     }
 }
 
+fn retention_reason_predicate(code: &str) -> &'static str {
+    match code {
+        "allow-dead-code" => "rustc's effective dead_code lint level is allow for the definition",
+        "foreign-export" => "compiler evidence marks the definition as a foreign export",
+        "no-mangle" => "rustc codegen attributes include no_mangle for the definition",
+        "export-name" => "rustc codegen attributes assign an exported symbol name to the definition",
+        "used" => "rustc codegen attributes mark the definition as compiler- or linker-used",
+        "proc-macro" => "the definition is public in a proc-macro crate",
+        "unresolved-trait-dispatch" => "the definition's immediate parent is a trait or an implementation of a trait",
+        "required-implementation-interface" => {
+            "compiler evidence requires the definition to preserve an implementation interface"
+        }
+        "generated-registration" => {
+            "a non-production expansion-generated constant registers a written function with the same diagnostic path"
+        }
+        "incomplete-provenance" => "compiler evidence cannot prove complete source or reference provenance",
+        "externally-addressed" => "compiler evidence indicates that the definition may be addressed outside Rust edges",
+        _ => "the compiler-fact producer supplied a conservative extension reason",
+    }
+}
+
 #[derive(Debug)]
 struct SurfaceItem {
     identity: String,
@@ -211,8 +233,10 @@ impl SurfaceItem {
         }
     }
 
-    fn classification_is_supported(&self) -> bool {
-        self.retentions.is_empty()
+    fn classification_is_supported(&self, omitted_retention: Option<&str>) -> bool {
+        self.retentions
+            .iter()
+            .all(|reason| Some(reason.as_str()) == omitted_retention)
             && self.names.len() == 1
             && self.effective_visibilities.len() == 1
             && self.macro_provenance == BTreeSet::from([SurfaceMacroProvenance::Written])
@@ -362,7 +386,61 @@ pub(crate) struct SurfaceItemAnalysis {
 pub(crate) struct SurfaceAnalysis {
     pub(crate) items: Vec<SurfaceItemAnalysis>,
     pub(crate) findings: Vec<SurfaceFinding>,
+    pub(crate) retention: SurfaceRetentionSummary,
     pub(crate) metrics: SurfaceGraphMetrics,
+}
+
+/// Conservative compiler proof observations before and after physical-item merge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct SurfaceRetentionSummary {
+    pub(crate) fragment_item_observations: u64,
+    pub(crate) merged_items: u64,
+    pub(crate) conservative_observations: u64,
+    pub(crate) unique_retained_items: u64,
+    pub(crate) representative_limit: usize,
+    pub(crate) reasons: Vec<SurfaceRetentionReasonSummary>,
+    pub(crate) counterfactual: Option<SurfaceRetentionCounterfactualSummary>,
+}
+
+/// One stable retention predicate and its raw and merged impact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct SurfaceRetentionReasonSummary {
+    pub(crate) code: String,
+    pub(crate) predicate: &'static str,
+    pub(crate) observations: u64,
+    pub(crate) unique_items: u64,
+    pub(crate) representatives: Vec<SurfaceRetentionRepresentative>,
+}
+
+/// One deterministic physical declaration illustrating a retention predicate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct SurfaceRetentionRepresentative {
+    pub(crate) item_identity: String,
+    pub(crate) item_kind: &'static str,
+    pub(crate) packages: Vec<String>,
+    pub(crate) diagnostic_paths: Vec<String>,
+    pub(crate) source: String,
+    pub(crate) source_generated: bool,
+    pub(crate) declaration_start: u64,
+    pub(crate) declaration_end: u64,
+}
+
+/// Omit-one-reason measurement; all other conservative evidence remains active.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct SurfaceRetentionCounterfactualSummary {
+    pub(crate) basis: &'static str,
+    pub(crate) traversals: usize,
+    pub(crate) edge_visits: usize,
+    pub(crate) suppressed_finding_observations: u64,
+    pub(crate) reasons: Vec<SurfaceRetentionCounterfactualReason>,
+}
+
+/// Findings enabled only when one named conservative predicate is omitted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct SurfaceRetentionCounterfactualReason {
+    pub(crate) code: String,
+    pub(crate) suppressed_findings: u64,
+    pub(crate) finding_kinds: BTreeMap<&'static str, u64>,
 }
 
 /// Exact amount of merged graph work performed by the three required closures.
@@ -381,9 +459,12 @@ pub(crate) struct SurfaceGraph {
     incoming: BTreeMap<SurfaceItemKey, BTreeSet<SurfaceItemKey>>,
     product_roots: BTreeMap<SurfaceProductObservation, BTreeSet<SurfaceItemKey>>,
     workspace_library_roots: BTreeSet<SurfaceItemKey>,
-    production_retention_roots: BTreeSet<SurfaceItemKey>,
-    non_production_roots: BTreeSet<SurfaceItemKey>,
+    production_retention_roots_by_reason: BTreeMap<String, BTreeSet<SurfaceItemKey>>,
+    non_production_entry_roots: BTreeSet<SurfaceItemKey>,
+    non_production_retention_roots_by_reason: BTreeMap<String, BTreeSet<SurfaceItemKey>>,
     required_public_roots: BTreeSet<SurfaceItemKey>,
+    fragment_item_observations: u64,
+    retention_observations: BTreeMap<String, u64>,
 }
 
 impl SurfaceGraph {
@@ -400,6 +481,7 @@ impl SurfaceGraph {
         let required_coverage = required_compiler_fact_coverage();
         let mut producer = None;
         let mut sources = BTreeMap::<CompilerFactSourcePath, (String, u64)>::new();
+        let mut fragment_item_observations = 0_u64;
         for object in objects {
             if !required_coverage.is_subset(&object.completion.coverage) {
                 return Err(RailError::message(
@@ -415,6 +497,9 @@ impl SurfaceGraph {
             } else {
                 producer = Some(&object.producer_authority);
             }
+            fragment_item_observations = fragment_item_observations
+                .checked_add(object.completion.items)
+                .ok_or_else(|| RailError::message("surface item observation count overflow"))?;
             for source in &object.sources {
                 let authority = (source.content_digest.clone(), source.bytes);
                 if sources
@@ -469,9 +554,11 @@ impl SurfaceGraph {
         let mut edges = BTreeSet::new();
         let mut product_roots = BTreeMap::<SurfaceProductObservation, BTreeSet<SurfaceItemKey>>::new();
         let mut workspace_library_roots = BTreeSet::new();
-        let mut production_retention_roots = BTreeSet::new();
-        let mut non_production_roots = BTreeSet::new();
+        let mut production_retention_roots_by_reason = BTreeMap::<String, BTreeSet<SurfaceItemKey>>::new();
+        let mut non_production_entry_roots = BTreeSet::new();
+        let mut non_production_retention_roots_by_reason = BTreeMap::<String, BTreeSet<SurfaceItemKey>>::new();
         let mut required_public_roots = BTreeSet::new();
+        let mut retention_observations = BTreeMap::<String, u64>::new();
         for (object_index, object) in objects.iter().enumerate() {
             let local = &local_items[object_index];
             let product = surface_product(object).map(|root| SurfaceProductObservation {
@@ -497,20 +584,31 @@ impl SurfaceGraph {
                         product_roots.entry(product.clone()).or_default().insert(root);
                     }
                 } else {
-                    non_production_roots.insert(root);
+                    non_production_entry_roots.insert(root);
                 }
             }
             for retention in &object.retentions {
                 let root = local[&retention.item].clone();
+                let reason = retention_reason_code(object, &retention.reason);
                 items
                     .get_mut(&root)
                     .ok_or_else(|| RailError::message("surface retention root disappeared during graph merge"))?
                     .retentions
-                    .insert(retention_reason_code(object, &retention.reason));
+                    .insert(reason.clone());
+                let observations = retention_observations.entry(reason.clone()).or_default();
+                *observations = observations
+                    .checked_add(1)
+                    .ok_or_else(|| RailError::message("surface retention observation count overflow"))?;
                 if object.unit.domain == CompilerFactDomain::Production {
-                    production_retention_roots.insert(root);
+                    production_retention_roots_by_reason
+                        .entry(reason)
+                        .or_default()
+                        .insert(root);
                 } else {
-                    non_production_roots.insert(root);
+                    non_production_retention_roots_by_reason
+                        .entry(reason)
+                        .or_default()
+                        .insert(root);
                 }
             }
             for edge in &object.edges {
@@ -555,16 +653,125 @@ impl SurfaceGraph {
             incoming,
             product_roots,
             workspace_library_roots,
-            production_retention_roots,
-            non_production_roots,
+            production_retention_roots_by_reason,
+            non_production_entry_roots,
+            non_production_retention_roots_by_reason,
             required_public_roots,
+            fragment_item_observations,
+            retention_observations,
         })
     }
 
     /// Compute the three closures and classify only declarations under explicit closed-world authority.
     pub(crate) fn analyze(&self, policy: &SurfacePolicy) -> RailResult<SurfaceAnalysis> {
-        let mut production_roots = self.production_retention_roots.clone();
+        self.analyze_baseline(policy).map(|(analysis, _)| analysis)
+    }
+
+    /// Measure each retention predicate without changing the authoritative result.
+    pub(crate) fn analyze_with_counterfactuals(&self, policy: &SurfacePolicy) -> RailResult<SurfaceAnalysis> {
+        let (mut analysis, required_public) = self.analyze_baseline(policy)?;
+        let baseline_finding_identities = analysis
+            .findings
+            .iter()
+            .map(|finding| finding.identity.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut traversals = 0_usize;
+        let mut edge_visits = 0_usize;
+        let mut suppressed_finding_observations = 0_u64;
+        let mut reasons = Vec::with_capacity(self.retention_observations.len());
+        for code in self.retention_observations.keys() {
+            let production_roots = self.production_roots(policy, Some(code))?;
+            let non_production_roots = self.non_production_roots(Some(code));
+            let (production_live, production_visits) = self.closure(&production_roots, |_| true);
+            let (non_production_live, non_production_visits) = self.closure(&non_production_roots, |_| true);
+            traversals = traversals
+                .checked_add(2)
+                .ok_or_else(|| RailError::message("surface counterfactual traversal count overflow"))?;
+            edge_visits = edge_visits
+                .checked_add(production_visits)
+                .and_then(|total| total.checked_add(non_production_visits))
+                .ok_or_else(|| RailError::message("surface counterfactual edge visit count overflow"))?;
+            let (_, findings) = self.classify(
+                policy,
+                &production_live,
+                &non_production_live,
+                &required_public,
+                Some(code),
+            )?;
+            let suppressed = findings
+                .iter()
+                .filter(|finding| !baseline_finding_identities.contains(finding.identity.as_str()))
+                .collect::<Vec<_>>();
+            let suppressed_findings = u64::try_from(suppressed.len())
+                .map_err(|_| RailError::message("surface counterfactual finding count exceeds report capacity"))?;
+            suppressed_finding_observations = suppressed_finding_observations
+                .checked_add(suppressed_findings)
+                .ok_or_else(|| RailError::message("surface counterfactual finding count overflow"))?;
+            let mut finding_kinds = BTreeMap::<&'static str, u64>::new();
+            for finding in suppressed {
+                let count = finding_kinds.entry(finding.kind.as_str()).or_default();
+                *count = count
+                    .checked_add(1)
+                    .ok_or_else(|| RailError::message("surface counterfactual finding kind count overflow"))?;
+            }
+            reasons.push(SurfaceRetentionCounterfactualReason {
+                code: code.clone(),
+                suppressed_findings,
+                finding_kinds,
+            });
+        }
+        analysis.retention.counterfactual = Some(SurfaceRetentionCounterfactualSummary {
+            basis: "omit-one-reason-before-diagnostic-policy",
+            traversals,
+            edge_visits,
+            suppressed_finding_observations,
+            reasons,
+        });
+        Ok(analysis)
+    }
+
+    fn analyze_baseline(&self, policy: &SurfacePolicy) -> RailResult<(SurfaceAnalysis, BTreeSet<SurfaceItemKey>)> {
+        let production_roots = self.production_roots(policy, None)?;
+        let non_production_roots = self.non_production_roots(None);
         let required_public_roots = self.required_public_roots.clone();
+        let (production_live, production_edge_visits) = self.closure(&production_roots, |_| true);
+        let (non_production_live, non_production_edge_visits) = self.closure(&non_production_roots, |_| true);
+        let (required_public, required_public_edge_visits) = self.closure(&required_public_roots, |kind| {
+            matches!(
+                kind,
+                CompilerFactEdgeKind::Interface
+                    | CompilerFactEdgeKind::Reexport
+                    | CompilerFactEdgeKind::VisibilityParent
+                    | CompilerFactEdgeKind::VisibilityRequirement
+            )
+        });
+        let (items, findings) =
+            self.classify(policy, &production_live, &non_production_live, &required_public, None)?;
+        let analysis = SurfaceAnalysis {
+            items,
+            findings,
+            retention: self.retention_summary()?,
+            metrics: SurfaceGraphMetrics {
+                nodes: self.items.len(),
+                edges: self.adjacency.values().map(BTreeSet::len).sum(),
+                traversals: 3,
+                edge_visits: production_edge_visits + non_production_edge_visits + required_public_edge_visits,
+            },
+        };
+        Ok((analysis, required_public))
+    }
+
+    fn production_roots(
+        &self,
+        policy: &SurfacePolicy,
+        omitted_retention: Option<&str>,
+    ) -> RailResult<BTreeSet<SurfaceItemKey>> {
+        let mut production_roots = self
+            .production_retention_roots_by_reason
+            .iter()
+            .filter(|(reason, _)| Some(reason.as_str()) != omitted_retention)
+            .flat_map(|(_, roots)| roots.iter().cloned())
+            .collect::<BTreeSet<_>>();
         if policy.products.is_empty() {
             for (product, roots) in &self.product_roots {
                 if product.root.kind == SurfaceProductKind::Binary {
@@ -609,17 +816,28 @@ impl SurfaceGraph {
                 }
             }
         }
-        let (production_live, production_edge_visits) = self.closure(&production_roots, |_| true);
-        let (non_production_live, non_production_edge_visits) = self.closure(&self.non_production_roots, |_| true);
-        let (required_public, required_public_edge_visits) = self.closure(&required_public_roots, |kind| {
-            matches!(
-                kind,
-                CompilerFactEdgeKind::Interface
-                    | CompilerFactEdgeKind::Reexport
-                    | CompilerFactEdgeKind::VisibilityParent
-                    | CompilerFactEdgeKind::VisibilityRequirement
-            )
-        });
+        Ok(production_roots)
+    }
+
+    fn non_production_roots(&self, omitted_retention: Option<&str>) -> BTreeSet<SurfaceItemKey> {
+        let mut roots = self.non_production_entry_roots.clone();
+        roots.extend(
+            self.non_production_retention_roots_by_reason
+                .iter()
+                .filter(|(reason, _)| Some(reason.as_str()) != omitted_retention)
+                .flat_map(|(_, retained)| retained.iter().cloned()),
+        );
+        roots
+    }
+
+    fn classify(
+        &self,
+        policy: &SurfacePolicy,
+        production_live: &BTreeSet<SurfaceItemKey>,
+        non_production_live: &BTreeSet<SurfaceItemKey>,
+        required_public: &BTreeSet<SurfaceItemKey>,
+        omitted_retention: Option<&str>,
+    ) -> RailResult<(Vec<SurfaceItemAnalysis>, Vec<SurfaceFinding>)> {
         let mut analyzed_items = Vec::with_capacity(self.items.len());
         let mut findings = Vec::new();
         for (key, item) in &self.items {
@@ -642,7 +860,7 @@ impl SurfaceGraph {
                 retained: !item.retentions.is_empty(),
             };
             if self.item_has_closed_world_authority(item, policy)
-                && item.classification_is_supported()
+                && item.classification_is_supported(omitted_retention)
                 && let Some(kind) = self.classify_item(key, item, &state, policy)
             {
                 let identity = finding_identity(key, kind)?;
@@ -675,15 +893,70 @@ impl SurfaceGraph {
         if policy.preserve_uniform_fields {
             self.preserve_uniform_field_findings(&mut findings);
         }
-        Ok(SurfaceAnalysis {
-            items: analyzed_items,
-            findings,
-            metrics: SurfaceGraphMetrics {
-                nodes: self.items.len(),
-                edges: self.adjacency.values().map(BTreeSet::len).sum(),
-                traversals: 3,
-                edge_visits: production_edge_visits + non_production_edge_visits + required_public_edge_visits,
-            },
+        Ok((analyzed_items, findings))
+    }
+
+    fn retention_summary(&self) -> RailResult<SurfaceRetentionSummary> {
+        let merged_items = u64::try_from(self.items.len())
+            .map_err(|_| RailError::message("surface merged item count exceeds report capacity"))?;
+        let mut unique_retained_items = 0_u64;
+        let mut unique_items_by_reason = BTreeMap::<String, u64>::new();
+        let mut representatives_by_reason = BTreeMap::<String, Vec<SurfaceRetentionRepresentative>>::new();
+        for (key, item) in &self.items {
+            if item.retentions.is_empty() {
+                continue;
+            }
+            unique_retained_items = unique_retained_items
+                .checked_add(1)
+                .ok_or_else(|| RailError::message("surface retained item count overflow"))?;
+            for code in &item.retentions {
+                let count = unique_items_by_reason.entry(code.clone()).or_default();
+                *count = count
+                    .checked_add(1)
+                    .ok_or_else(|| RailError::message("surface retention reason item count overflow"))?;
+                let representatives = representatives_by_reason.entry(code.clone()).or_default();
+                if representatives.len() >= SURFACE_RETENTION_EXAMPLE_LIMIT {
+                    continue;
+                }
+                let (source, source_generated) = match &key.span.source.path {
+                    CompilerFactSourcePath::Repository(path) => (path.clone(), false),
+                    CompilerFactSourcePath::Generated(path) => (path.clone(), true),
+                };
+                representatives.push(SurfaceRetentionRepresentative {
+                    item_identity: item.identity.clone(),
+                    item_kind: item_kind_name(key.kind),
+                    packages: item.packages.iter().map(|package| package.name.clone()).collect(),
+                    diagnostic_paths: item.diagnostic_paths.iter().cloned().collect(),
+                    source,
+                    source_generated,
+                    declaration_start: key.span.start,
+                    declaration_end: key.span.end,
+                });
+            }
+        }
+        let conservative_observations = self.retention_observations.values().try_fold(0_u64, |total, count| {
+            total
+                .checked_add(*count)
+                .ok_or_else(|| RailError::message("surface retention observation count overflow"))
+        })?;
+        let mut reasons = Vec::with_capacity(self.retention_observations.len());
+        for (code, observations) in &self.retention_observations {
+            reasons.push(SurfaceRetentionReasonSummary {
+                code: code.clone(),
+                predicate: retention_reason_predicate(code),
+                observations: *observations,
+                unique_items: unique_items_by_reason.get(code).copied().unwrap_or_default(),
+                representatives: representatives_by_reason.remove(code).unwrap_or_default(),
+            });
+        }
+        Ok(SurfaceRetentionSummary {
+            fragment_item_observations: self.fragment_item_observations,
+            merged_items,
+            conservative_observations,
+            unique_retained_items,
+            representative_limit: SURFACE_RETENTION_EXAMPLE_LIMIT,
+            reasons,
+            counterfactual: None,
         })
     }
 
@@ -1295,6 +1568,167 @@ mod tests {
         assert!(analysis.findings.is_empty());
         assert!(analysis.items[0].production_live);
         assert!(analysis.items[0].retained);
+    }
+
+    #[test]
+    fn counterfactual_counts_finding_kind_transitions_on_the_same_item() {
+        let retained = item(
+            (CRATE_A, 1),
+            (0, 10),
+            CompilerFactItemKind::Function,
+            CompilerFactVisibility::Public,
+        );
+        let child = item(
+            (CRATE_A, 2),
+            (20, 30),
+            CompilerFactItemKind::Function,
+            CompilerFactVisibility::Public,
+        );
+        let retained_id = retained.id;
+        let facts = object(
+            "app",
+            CompilerFactDomain::Production,
+            vec![retained, child],
+            vec![body((CRATE_A, 1), (CRATE_A, 2))],
+            Vec::new(),
+            vec![(retained_id, CompilerFactRetentionReason::AllowDeadCode)],
+        );
+
+        let graph = SurfaceGraph::from_objects(&[&facts]).expect("merge retained graph");
+        let baseline = graph.analyze(&policy(&["app"], false)).expect("analyze retained graph");
+        assert_eq!(baseline.findings.len(), 1);
+        assert_eq!(baseline.findings[0].kind, SurfaceFindingKind::UnnecessaryPublic);
+
+        let counterfactual = graph
+            .analyze_with_counterfactuals(&policy(&["app"], false))
+            .expect("measure retention counterfactual")
+            .retention
+            .counterfactual
+            .expect("counterfactual summary");
+        assert_eq!(counterfactual.suppressed_finding_observations, 2);
+        let allow = counterfactual
+            .reasons
+            .iter()
+            .find(|reason| reason.code == "allow-dead-code")
+            .expect("allow-dead-code counterfactual");
+        assert_eq!(allow.suppressed_findings, 2);
+        assert_eq!(allow.finding_kinds.get("dead-public"), Some(&2));
+    }
+
+    #[test]
+    fn retention_summary_distinguishes_observations_from_merged_items_and_bounds_examples() {
+        let production_items = (0_u64..4)
+            .map(|index| {
+                item(
+                    (CRATE_A, index + 1),
+                    (index * 20, index * 20 + 10),
+                    CompilerFactItemKind::Function,
+                    CompilerFactVisibility::Public,
+                )
+            })
+            .collect::<Vec<_>>();
+        let non_production_items = (0_u64..4)
+            .map(|index| {
+                item(
+                    (CRATE_B, index + 1),
+                    (index * 20, index * 20 + 10),
+                    CompilerFactItemKind::Function,
+                    CompilerFactVisibility::Public,
+                )
+            })
+            .collect::<Vec<_>>();
+        let production_retentions = production_items
+            .iter()
+            .map(|item| (item.id, CompilerFactRetentionReason::AllowDeadCode))
+            .chain(std::iter::once((
+                production_items[0].id,
+                CompilerFactRetentionReason::UnresolvedTraitDispatch,
+            )))
+            .collect();
+        let non_production_retentions = non_production_items
+            .iter()
+            .map(|item| (item.id, CompilerFactRetentionReason::AllowDeadCode))
+            .chain(std::iter::once((
+                non_production_items[0].id,
+                CompilerFactRetentionReason::UnresolvedTraitDispatch,
+            )))
+            .collect();
+        let production = object(
+            "app",
+            CompilerFactDomain::Production,
+            production_items,
+            Vec::new(),
+            Vec::new(),
+            production_retentions,
+        );
+        let non_production = object(
+            "app",
+            CompilerFactDomain::NonProduction,
+            non_production_items,
+            Vec::new(),
+            Vec::new(),
+            non_production_retentions,
+        );
+
+        let graph =
+            SurfaceGraph::from_objects(&[&production, &non_production]).expect("merge equivalent compiler views");
+        let retention = graph
+            .analyze(&policy(&["app"], false))
+            .expect("analyze retained items")
+            .retention;
+
+        assert_eq!(retention.fragment_item_observations, 8);
+        assert_eq!(retention.merged_items, 4);
+        assert_eq!(retention.conservative_observations, 10);
+        assert_eq!(retention.unique_retained_items, 4);
+        assert_eq!(retention.representative_limit, 3);
+        let allow = retention
+            .reasons
+            .iter()
+            .find(|reason| reason.code == "allow-dead-code")
+            .expect("allow-dead-code summary");
+        assert_eq!((allow.observations, allow.unique_items), (8, 4));
+        assert_eq!(allow.representatives.len(), 3);
+        assert_eq!(
+            allow
+                .representatives
+                .iter()
+                .map(|example| example.declaration_start)
+                .collect::<Vec<_>>(),
+            vec![0, 20, 40]
+        );
+        let trait_dispatch = retention
+            .reasons
+            .iter()
+            .find(|reason| reason.code == "unresolved-trait-dispatch")
+            .expect("unresolved-trait-dispatch summary");
+        assert_eq!((trait_dispatch.observations, trait_dispatch.unique_items), (2, 1));
+        assert_eq!(trait_dispatch.representatives.len(), 1);
+        assert!(trait_dispatch.predicate.contains("immediate parent"));
+
+        let counterfactual = graph
+            .analyze_with_counterfactuals(&policy(&["app"], false))
+            .expect("measure omit-one-reason counterfactuals")
+            .retention
+            .counterfactual
+            .expect("counterfactual summary");
+        assert_eq!(counterfactual.basis, "omit-one-reason-before-diagnostic-policy");
+        assert_eq!(counterfactual.traversals, 4);
+        assert_eq!(counterfactual.suppressed_finding_observations, 3);
+        let allow = counterfactual
+            .reasons
+            .iter()
+            .find(|reason| reason.code == "allow-dead-code")
+            .expect("allow-dead-code counterfactual");
+        assert_eq!(allow.suppressed_findings, 3);
+        assert_eq!(allow.finding_kinds.get("dead-public"), Some(&3));
+        let trait_dispatch = counterfactual
+            .reasons
+            .iter()
+            .find(|reason| reason.code == "unresolved-trait-dispatch")
+            .expect("unresolved-trait-dispatch counterfactual");
+        assert_eq!(trait_dispatch.suppressed_findings, 0);
+        assert!(trait_dispatch.finding_kinds.is_empty());
     }
 
     #[test]

@@ -86,6 +86,13 @@ when Cargo-Rail's automatic workspace model does not express the intended bounda
 `cargo rail surface --schema` exposes the report contract. `surface --check` is read-only; `surface --fix --dry-run`
 previews exact source edits before `surface --fix` receives write authority.
 
+Surface report contract v3 separates raw compiler observations from merged physical declarations. Its `retention`
+section reports both denominators, per-predicate observation and unique-item counts, and at most three deterministic
+representatives per predicate. `--explain` additionally runs an omit-one-reason counterfactual before diagnostic
+policy; every other retention reason and graph authority remains active. Those suppressed-finding counts measure
+conservative impact, not false positives. Without `--explain`, the counterfactual is `null` and Surface performs only
+its three authoritative graph traversals.
+
 ### Release policy
 
 Reviewed `.changes/*.md` files are the default source for bumps and release prose. `cargo rail release check` previews
