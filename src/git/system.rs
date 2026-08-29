@@ -231,11 +231,25 @@ impl SystemGit {
 
     /// Hash bytes with the repository's configured Git object format.
     pub(crate) fn hash_bytes(&self, bytes: &[u8]) -> RailResult<String> {
+        self.hash_bytes_with_path(None, bytes)
+    }
+
+    /// Hash worktree bytes after applying clean filters for a worktree-relative `path`.
+    pub(crate) fn hash_path_bytes(&self, path: &str, bytes: &[u8]) -> RailResult<String> {
+        self.hash_bytes_with_path(Some(path), bytes)
+    }
+
+    fn hash_bytes_with_path(&self, path: Option<&str>, bytes: &[u8]) -> RailResult<String> {
         use std::io::Write as _;
 
         crate::instrumentation::record_hash(bytes.len());
-        let mut cmd = self.git_cmd();
-        cmd.args(["hash-object", "--stdin"])
+        let mut cmd = path.map_or_else(|| self.git_cmd(), |_| git_cmd_for_path(&self.worktree_root));
+        cmd.arg("hash-object");
+        let path_argument = path.map(|path| format!("--path={path}"));
+        if let Some(path_argument) = &path_argument {
+            cmd.arg(path_argument);
+        }
+        cmd.arg("--stdin")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -253,7 +267,10 @@ impl SystemGit {
             .map_err(|error| RailError::message(format!("failed to read git hash-object output: {}", error)))?;
         if !output.status.success() {
             return Err(RailError::Git(GitError::CommandFailed {
-                command: "git hash-object --stdin".to_string(),
+                command: path.map_or_else(
+                    || "git hash-object --stdin".to_string(),
+                    |path| format!("git hash-object --path={path} --stdin"),
+                ),
                 stderr: git_command_diagnostics(&output.stdout, &output.stderr),
             }));
         }

@@ -329,6 +329,12 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
         println!("\nthis will:");
         println!("  - modify Cargo.toml (version bumps)");
         println!("  - update changelogs");
+        if !plan.auxiliary_lockfiles.is_empty() {
+            println!(
+                "  - update {} declared auxiliary Cargo lockfile(s)",
+                plan.auxiliary_lockfiles.len()
+            );
+        }
         if args.pr {
             println!("  - create and push a release PR branch");
         } else {
@@ -1874,7 +1880,11 @@ fn build_release_mutation_plan(
         })?)
     };
     let mut actions = Vec::with_capacity(
-        plan.crates.len() * 7 + plan.change_files_to_delete.len() + plan.change_files_to_update.len() + 3,
+        plan.crates.len() * 7
+            + plan.change_files_to_delete.len()
+            + plan.change_files_to_update.len()
+            + plan.auxiliary_lockfiles.len()
+            + 3,
     );
 
     for (index, crate_plan) in plan.crates.iter().enumerate() {
@@ -1976,6 +1986,28 @@ fn build_release_mutation_plan(
                 MutationEffect::Write,
             )?]),
         );
+        if index + 1 == plan.crates.len() {
+            for auxiliary in &plan.auxiliary_lockfiles {
+                actions.push(
+                    MutationAction::new(
+                        "UPDATE_AUXILIARY_LOCKFILE",
+                        auxiliary.lockfile_path.display().to_string(),
+                        Some(format!("manifest={}", auxiliary.manifest_path.display())),
+                    )
+                    .with_payload(serde_json::json!({
+                      "manifest": auxiliary.manifest_path,
+                      "lockfile": auxiliary.lockfile_path,
+                      "before_digest": auxiliary.before_digest,
+                      "after_digest": auxiliary.after_digest,
+                    }))
+                    .with_mutations(vec![release_mutation(
+                        ctx,
+                        &ctx.workspace_root().join(&auxiliary.lockfile_path),
+                        MutationEffect::Write,
+                    )?]),
+                );
+            }
+        }
         if !pr {
             actions.push(
                 MutationAction::new(

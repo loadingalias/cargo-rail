@@ -11,6 +11,7 @@ use crate::release::state::{
     ReleaseStatus, StepStatus, validate_state_path,
 };
 use crate::release::version::VersionBumper;
+use crate::source::ContentDigest;
 use crate::utils::canonicalize_existing;
 use crate::workspace::WorkspaceContext;
 use crate::{progress, warn};
@@ -298,6 +299,8 @@ impl<'a> ReleasePublisher<'a> {
             }
             self.update_lockfile_for_crate(&crate_plan.name)?;
         }
+
+        self.write_auxiliary_lockfiles(plan)?;
 
         self.stage_planned_paths(planned_paths, control_paths)?;
         let mut message = format!(
@@ -604,6 +607,9 @@ impl<'a> ReleasePublisher<'a> {
                         )?;
                         if !state.crates.iter().any(|crate_state| crate_state.commit.is_complete()) {
                             self.consume_change_files(&state.plan)?;
+                        }
+                        if index + 1 == state.plan.crates.len() {
+                            self.write_auxiliary_lockfiles(&state.plan)?;
                         }
                         fault_before("commit", &crate_plan.name)?;
                         self.commit_version_bump(state, &crate_plan)
@@ -1062,6 +1068,70 @@ impl<'a> ReleasePublisher<'a> {
             )));
         }
 
+        Ok(())
+    }
+
+    fn write_auxiliary_lockfiles(&self, plan: &ReleasePlan) -> RailResult<()> {
+        let workspace_root = canonicalize_existing(self.ctx.workspace_root())?;
+        for projection in &plan.auxiliary_lockfiles {
+            let path = self.ctx.workspace_root().join(&projection.lockfile_path);
+            let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                RailError::message(format!(
+                    "failed to inspect planned auxiliary Cargo lockfile '{}': {error}",
+                    projection.lockfile_path.display()
+                ))
+            })?;
+            if !metadata.file_type().is_file() || crate::utils::is_symlink_or_reparse(&metadata) {
+                return Err(RailError::with_help(
+                    format!(
+                        "planned auxiliary Cargo lockfile '{}' is not a regular file",
+                        projection.lockfile_path.display()
+                    ),
+                    "restore the committed lockfile, regenerate the release plan, and retry",
+                ));
+            }
+            let parent = path
+                .parent()
+                .ok_or_else(|| RailError::message("auxiliary Cargo lockfile has no parent directory"))?;
+            let parent = canonicalize_existing(parent)?;
+            if !parent.starts_with(&workspace_root) {
+                return Err(RailError::with_help(
+                    format!(
+                        "auxiliary Cargo lockfile '{}' resolves outside workspace '{}'",
+                        projection.lockfile_path.display(),
+                        workspace_root.display()
+                    ),
+                    "keep release.auxiliary_cargo_manifests and their lockfiles inside the workspace",
+                ));
+            }
+
+            let current = fs::read(&path)?;
+            let current_digest = release_content_digest(&current);
+            if current_digest == projection.after_digest {
+                continue;
+            }
+            if current_digest != projection.before_digest {
+                return Err(RailError::with_help(
+                    format!(
+                        "auxiliary Cargo lockfile '{}' drifted (planned {}, current {})",
+                        projection.lockfile_path.display(),
+                        projection.before_digest,
+                        current_digest
+                    ),
+                    "restore the planned lockfile bytes or regenerate the release plan",
+                ));
+            }
+            if release_content_digest(projection.content.as_bytes()) != projection.after_digest {
+                return Err(RailError::with_help(
+                    format!(
+                        "release plan contains inconsistent post-release bytes for '{}'",
+                        projection.lockfile_path.display()
+                    ),
+                    "discard the release state or plan file and regenerate it with this cargo-rail version",
+                ));
+            }
+            crate::utils::write_file_atomic(&path, projection.content.as_bytes())?;
+        }
         Ok(())
     }
 
@@ -2106,6 +2176,10 @@ fn release_pr_body(plan: &ReleasePlan) -> String {
     out
 }
 
+fn release_content_digest(bytes: &[u8]) -> String {
+    format!("sha256:{}", ContentDigest::sha256(bytes))
+}
+
 fn step_may_have_side_effect(step: &crate::release::state::Step) -> bool {
     step.status == StepStatus::InProgress || step.object.is_some()
 }
@@ -2216,7 +2290,7 @@ mod tests {
     #[test]
     fn release_branch_name_is_stable() {
         let plan = ReleasePlan {
-            plan_contract_version: 4,
+            plan_contract_version: crate::release::planner::RELEASE_PLAN_CONTRACT_VERSION,
             snapshot_id: String::new(),
             source: crate::config::ReleaseSource::Changes,
             canonical_crate_order: Vec::new(),
@@ -2228,6 +2302,7 @@ mod tests {
             },
             change_files_to_delete: Vec::new(),
             change_files_to_update: Vec::new(),
+            auxiliary_lockfiles: Vec::new(),
             skipped: Vec::new(),
         };
         assert_eq!(release_branch_name(&plan).unwrap(), release_branch_name(&plan).unwrap());

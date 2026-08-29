@@ -4,7 +4,7 @@ use crate::config::unify::default_true;
 use crate::error::ConfigError;
 use serde::{Deserialize, Deserializer, Serialize, de};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 
 /// Release configuration (workspace-wide defaults)
 #[derive(Debug, Clone, Serialize)]
@@ -115,6 +115,14 @@ pub struct ReleaseConfig {
     #[serde(default)]
     pub version_groups: BTreeMap<String, Vec<String>>,
 
+    /// Standalone Cargo manifests whose committed lockfiles project release versions.
+    ///
+    /// Each path is workspace-relative and must name `Cargo.toml`. Cargo-Rail
+    /// resolves the owning workspace lockfile and plans its exact post-release
+    /// bytes without mutating the live checkout.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub auxiliary_cargo_manifests: Vec<PathBuf>,
+
     /// Changelog location and shape (workspace defaults).
     ///
     /// Every key can be overridden per crate under `[crates.NAME.changelog]`.
@@ -142,6 +150,7 @@ impl Default for ReleaseConfig {
             semver_check: SemverCheckPolicy::default(),
             require_change_files: RequireChangeFiles::default(),
             version_groups: BTreeMap::new(),
+            auxiliary_cargo_manifests: Vec::new(),
             changelog: ChangelogShape::default(),
         }
     }
@@ -228,10 +237,43 @@ impl ReleaseConfig {
         }
 
         self.validate_version_groups(workspace_members)?;
+        self.validate_auxiliary_cargo_manifests()?;
 
         self.changelog.filters.validate("release.changelog.filters")?;
 
         Ok(warnings)
+    }
+
+    fn validate_auxiliary_cargo_manifests(&self) -> Result<(), ConfigError> {
+        let mut previous = None;
+        let mut manifests = self.auxiliary_cargo_manifests.iter().collect::<Vec<_>>();
+        manifests.sort_unstable();
+        for manifest in manifests {
+            let valid_components = manifest
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)));
+            if manifest.as_os_str().is_empty()
+                || manifest.is_absolute()
+                || !valid_components
+                || manifest.file_name().is_none_or(|name| name != "Cargo.toml")
+            {
+                return Err(ConfigError::InvalidField {
+                    field: "release.auxiliary_cargo_manifests".to_string(),
+                    reason: format!(
+                        "'{}' must be a workspace-relative Cargo.toml path without parent traversal",
+                        manifest.display()
+                    ),
+                });
+            }
+            if previous == Some(manifest) {
+                return Err(ConfigError::InvalidField {
+                    field: "release.auxiliary_cargo_manifests".to_string(),
+                    reason: format!("duplicate manifest '{}'", manifest.display()),
+                });
+            }
+            previous = Some(manifest);
+        }
+        Ok(())
     }
 
     fn validate_version_groups(&self, workspace_members: &[String]) -> Result<(), ConfigError> {
@@ -392,6 +434,7 @@ struct ReleaseConfigInput {
     semver_check: SemverCheckPolicy,
     require_change_files: RequireChangeFiles,
     version_groups: BTreeMap<String, Vec<String>>,
+    auxiliary_cargo_manifests: Vec<PathBuf>,
     changelog: ChangelogShape,
 }
 
@@ -419,6 +462,7 @@ impl Default for ReleaseConfigInput {
             semver_check: config.semver_check,
             require_change_files: config.require_change_files,
             version_groups: config.version_groups,
+            auxiliary_cargo_manifests: config.auxiliary_cargo_manifests,
             changelog: config.changelog,
         }
     }
@@ -487,6 +531,7 @@ impl<'de> Deserialize<'de> for ReleaseConfig {
             semver_check: input.semver_check,
             require_change_files: input.require_change_files,
             version_groups: input.version_groups,
+            auxiliary_cargo_manifests: input.auxiliary_cargo_manifests,
             changelog: input.changelog,
         })
     }
@@ -825,6 +870,7 @@ mod tests {
         assert!(!config.require_change_files.is_enabled());
         assert!(config.requires_change_file("any-crate"));
         assert!(config.version_groups.is_empty());
+        assert!(config.auxiliary_cargo_manifests.is_empty());
         assert!(config.require_release_notes);
     }
 
@@ -960,5 +1006,35 @@ mod tests {
             .insert("cli".to_string(), vec!["real".to_string()]);
         let err = config.validate(&["real".to_string()]).unwrap_err();
         assert!(err.to_string().contains("multiple version groups"));
+    }
+
+    #[test]
+    fn auxiliary_cargo_manifests_are_exact_relative_manifests() {
+        let config: ReleaseConfig =
+            toml_edit::de::from_str("auxiliary_cargo_manifests = [\"fuzz/Cargo.toml\", \"tools/check/Cargo.toml\"]")
+                .unwrap();
+        assert_eq!(config.auxiliary_cargo_manifests.len(), 2);
+        config.validate(&["real".to_string()]).unwrap();
+
+        for invalid in [
+            "../fuzz/Cargo.toml",
+            "./fuzz/Cargo.toml",
+            "fuzz/Manifest.toml",
+            "/tmp/Cargo.toml",
+        ] {
+            let config = ReleaseConfig {
+                auxiliary_cargo_manifests: vec![PathBuf::from(invalid)],
+                ..ReleaseConfig::default()
+            };
+            let error = config.validate(&["real".to_string()]).unwrap_err();
+            assert!(error.to_string().contains("workspace-relative Cargo.toml"), "{error}");
+        }
+
+        let config = ReleaseConfig {
+            auxiliary_cargo_manifests: vec![PathBuf::from("fuzz/Cargo.toml"); 2],
+            ..ReleaseConfig::default()
+        };
+        let error = config.validate(&["real".to_string()]).unwrap_err();
+        assert!(error.to_string().contains("duplicate manifest"), "{error}");
     }
 }

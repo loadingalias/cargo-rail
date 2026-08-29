@@ -96,6 +96,19 @@ the local plan and exits `1` when a release is pending. It performs no mutation 
 transaction state and stop at readiness or registry-convergence boundaries; resume the recorded state instead of
 replanning.
 
+Standalone tools or fuzz workspaces that depend on released packages by path can declare their exact manifests with
+`auxiliary_cargo_manifests`. Cargo-Rail resolves each manifest's committed `Cargo.lock`, computes its post-release
+bytes in an isolated copy of the captured workspace, binds the before/after digests into the release plan, and writes
+only those lockfiles during release apply. Each manifest and lockfile must be a regular file whose index identity,
+filter-cleaned worktree content, and executable mode exactly match `HEAD`; every local Cargo package must resolve
+inside the captured Git source.
+This is a Cargo-only projection, not a general command hook.
+
+```toml
+[release]
+auxiliary_cargo_manifests = ["fuzz/Cargo.toml", "tools/check/Cargo.toml"]
+```
+
 To replace commit-driven changelog automation:
 
 1. Set `release.source = "commits"` temporarily.

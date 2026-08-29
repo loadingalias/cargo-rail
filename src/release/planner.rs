@@ -22,6 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 pub(crate) const RELEASE_REGISTRY: &str = "crates-io";
+pub(crate) const RELEASE_PLAN_CONTRACT_VERSION: u32 = 5;
 
 /// A plan for releasing one or more crates
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +46,9 @@ pub struct ReleasePlan {
     /// Pending change files rewritten to retain unreleased no-release intent.
     #[serde(default)]
     pub change_files_to_update: Vec<PlannedChangeFileUpdate>,
+    /// Exact standalone Cargo lockfile projections produced by this release.
+    #[serde(default)]
+    pub auxiliary_lockfiles: Vec<PlannedAuxiliaryLockfile>,
     /// Target crates excluded from the plan, with the reason (auto mode only).
     pub skipped: Vec<SkippedCrate>,
 }
@@ -183,6 +187,21 @@ pub struct PlannedChangeFileUpdate {
     /// Change file rewritten by the release commit.
     pub path: PathBuf,
     /// Canonical content containing only retained no-release intents.
+    pub content: String,
+}
+
+/// One exact committed standalone Cargo lockfile update.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannedAuxiliaryLockfile {
+    /// Configured workspace-relative manifest that owns this projection.
+    pub manifest_path: PathBuf,
+    /// Resolved workspace-relative committed lockfile.
+    pub lockfile_path: PathBuf,
+    /// SHA-256 of the committed lockfile bytes used to plan.
+    pub before_digest: String,
+    /// SHA-256 of the exact post-release bytes.
+    pub after_digest: String,
+    /// Exact UTF-8 Cargo.lock content to write during apply and recovery.
     pub content: String,
 }
 
@@ -328,9 +347,14 @@ impl<'a> ReleasePlanner<'a> {
             .into_iter()
             .map(|(path, content)| PlannedChangeFileUpdate { path, content })
             .collect();
+        let auxiliary_lockfiles = crate::release::auxiliary::plan_lockfiles(
+            self.ctx,
+            &crate_plans,
+            &self.release_config.auxiliary_cargo_manifests,
+        )?;
 
         Ok(ReleasePlan {
-            plan_contract_version: 4,
+            plan_contract_version: RELEASE_PLAN_CONTRACT_VERSION,
             snapshot_id: self.ctx.snapshot()?.id().to_string(),
             source: self.release_config.source,
             canonical_crate_order,
@@ -338,6 +362,7 @@ impl<'a> ReleasePlanner<'a> {
             summary,
             change_files_to_delete: consumption.delete,
             change_files_to_update,
+            auxiliary_lockfiles,
             skipped,
         })
     }
@@ -563,7 +588,7 @@ impl<'a> ReleasePlanner<'a> {
 
         let crates_to_publish = crate_plans.iter().filter(|plan| plan.publish).count();
         Ok(ReleasePlan {
-            plan_contract_version: 4,
+            plan_contract_version: RELEASE_PLAN_CONTRACT_VERSION,
             snapshot_id: self.ctx.snapshot()?.id().to_string(),
             source: self.release_config.source,
             canonical_crate_order: crate_plans.iter().map(|plan| plan.name.clone()).collect(),
@@ -575,6 +600,7 @@ impl<'a> ReleasePlanner<'a> {
             crates: crate_plans,
             change_files_to_delete: Vec::new(),
             change_files_to_update: Vec::new(),
+            auxiliary_lockfiles: Vec::new(),
             skipped: Vec::new(),
         })
     }
@@ -1333,6 +1359,18 @@ impl ReleasePlan {
                 if !causes.is_empty() {
                     output.push_str(&format!("   Causes: {}\n", causes.join(", ")));
                 }
+            }
+            output.push('\n');
+        }
+
+        if !self.auxiliary_lockfiles.is_empty() {
+            output.push_str("Auxiliary Cargo lockfiles:\n");
+            for projection in &self.auxiliary_lockfiles {
+                output.push_str(&format!(
+                    "  {} — {}\n",
+                    projection.lockfile_path.display(),
+                    projection.manifest_path.display()
+                ));
             }
             output.push('\n');
         }

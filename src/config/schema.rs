@@ -360,6 +360,10 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
         "release.version_groups.<name>",
         "Defines crates that version and release in lockstep.",
     ),
+    policy(
+        "release.auxiliary_cargo_manifests",
+        "Names standalone Cargo manifests whose committed lockfiles are exact release projections.",
+    ),
     policy("release.changelog.path", "Defines the default changelog path."),
     policy(
         "release.changelog.relative_to",

@@ -3,12 +3,15 @@
 use crate::config::ReleaseConfig;
 use crate::error::{RailError, RailResult};
 use crate::git::SystemGit;
-use crate::release::planner::{RELEASE_REGISTRY, ReleasePlan};
+use crate::release::planner::{RELEASE_PLAN_CONTRACT_VERSION, RELEASE_REGISTRY, ReleasePlan};
 use crate::release::remote::RemoteRepository;
 use crate::utils::canonicalize_existing;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+const RELEASE_STATE_SCHEMA_VERSION: u32 = 5;
+const LEGACY_RELEASE_STATE_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ReleaseState {
@@ -235,7 +238,7 @@ impl ReleaseState {
             })
             .collect();
         let state = Self {
-            schema_version: 4,
+            schema_version: RELEASE_STATE_SCHEMA_VERSION,
             transaction_id: transaction_id.clone(),
             status: ReleaseStatus::Active,
             phase: if reconstructed.is_some() {
@@ -302,7 +305,21 @@ impl ReleaseState {
     }
 
     pub fn load(path: &Path) -> RailResult<Self> {
-        let mut state: Self = serde_json::from_slice(&std::fs::read(path)?)
+        let bytes = std::fs::read(path)?;
+        let document: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|error| RailError::message(format!("invalid release state '{}': {}", path.display(), error)))?;
+        if document.get("schema_version").and_then(serde_json::Value::as_u64)
+            == Some(u64::from(RELEASE_STATE_SCHEMA_VERSION))
+            && !document
+                .pointer("/plan/auxiliary_lockfiles")
+                .is_some_and(serde_json::Value::is_array)
+        {
+            return Err(RailError::message(format!(
+                "release state version {} is missing its auxiliary Cargo lockfile projection field",
+                RELEASE_STATE_SCHEMA_VERSION
+            )));
+        }
+        let mut state: Self = serde_json::from_value(document)
             .map_err(|error| RailError::message(format!("invalid release state '{}': {}", path.display(), error)))?;
         if state.schema_version == 1 {
             state.migrate_v1();
@@ -312,14 +329,18 @@ impl ReleaseState {
         }
         if state.schema_version == 3 {
             state.publish_registry = (!state.skip_publish).then(|| RELEASE_REGISTRY.to_string());
-            state.schema_version = 4;
+            state.schema_version = LEGACY_RELEASE_STATE_SCHEMA_VERSION;
         }
-        if state.schema_version != 4 {
+        if state.schema_version == LEGACY_RELEASE_STATE_SCHEMA_VERSION {
+            state.migrate_v4()?;
+        }
+        if state.schema_version != RELEASE_STATE_SCHEMA_VERSION {
             return Err(RailError::message(format!(
                 "unsupported release state version {}",
                 state.schema_version
             )));
         }
+        state.validate_contract()?;
         if state.skip_publish != state.publish_registry.is_none()
             || state
                 .publish_registry
@@ -334,6 +355,7 @@ impl ReleaseState {
     }
 
     pub fn save(&self, path: &Path, checkpoint: &str) -> RailResult<()> {
+        self.validate_contract()?;
         let parent = path
             .parent()
             .ok_or_else(|| RailError::message("release state path has no parent"))?;
@@ -376,6 +398,46 @@ impl ReleaseState {
                 ))
             })?;
         }
+        Ok(())
+    }
+
+    fn validate_contract(&self) -> RailResult<()> {
+        if self.schema_version != RELEASE_STATE_SCHEMA_VERSION {
+            return Err(RailError::message(format!(
+                "cannot persist unsupported release state version {}",
+                self.schema_version
+            )));
+        }
+        if self.plan.plan_contract_version != RELEASE_PLAN_CONTRACT_VERSION {
+            return Err(RailError::with_help(
+                format!(
+                    "release state version {} requires embedded release plan contract {}, found {}",
+                    RELEASE_STATE_SCHEMA_VERSION, RELEASE_PLAN_CONTRACT_VERSION, self.plan.plan_contract_version
+                ),
+                "resume with the cargo-rail version that created this state, or safely abort and replan",
+            ));
+        }
+        Ok(())
+    }
+
+    fn migrate_v4(&mut self) -> RailResult<()> {
+        if !(1..RELEASE_PLAN_CONTRACT_VERSION).contains(&self.plan.plan_contract_version) {
+            return Err(RailError::with_help(
+                format!(
+                    "legacy release state version {} contains unsupported release plan contract {}",
+                    LEGACY_RELEASE_STATE_SCHEMA_VERSION, self.plan.plan_contract_version
+                ),
+                "resume with the cargo-rail version that created this state, or safely abort and replan",
+            ));
+        }
+        if !self.plan.auxiliary_lockfiles.is_empty() {
+            return Err(RailError::with_help(
+                "legacy release state version 4 cannot authorize auxiliary Cargo lockfile projections",
+                "safely abort the legacy transaction and generate a new release plan",
+            ));
+        }
+        self.plan.plan_contract_version = RELEASE_PLAN_CONTRACT_VERSION;
+        self.schema_version = RELEASE_STATE_SCHEMA_VERSION;
         Ok(())
     }
 
@@ -561,4 +623,134 @@ fn journal_fault(boundary: &str, checkpoint: &str) -> RailResult<()> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ReleaseSource;
+    use crate::release::planner::{PlannedAuxiliaryLockfile, ReleaseSummary};
+
+    fn fixture(schema_version: u32, plan_contract_version: u32) -> ReleaseState {
+        ReleaseState {
+            schema_version,
+            transaction_id: "release-test".to_string(),
+            status: ReleaseStatus::Active,
+            phase: ReleasePhase::Planned,
+            mode: ReleaseMode::Run,
+            plan: ReleasePlan {
+                plan_contract_version,
+                snapshot_id: String::new(),
+                source: ReleaseSource::Changes,
+                canonical_crate_order: Vec::new(),
+                crates: Vec::new(),
+                summary: ReleaseSummary {
+                    total_crates: 0,
+                    crates_to_publish: 0,
+                    crates_to_tag: 0,
+                },
+                change_files_to_delete: Vec::new(),
+                change_files_to_update: Vec::new(),
+                auxiliary_lockfiles: Vec::new(),
+                skipped: Vec::new(),
+            },
+            release_config: ReleaseConfig::default(),
+            remote_repository: None,
+            publish_registry: None,
+            skip_publish: true,
+            skip_tag: true,
+            initial_head: "head".to_string(),
+            branch: "main".to_string(),
+            planned_paths: Vec::new(),
+            control_paths: Vec::new(),
+            local_input_backups: Vec::new(),
+            crates: Vec::new(),
+            release_commit: None,
+            commit_push: Step::default(),
+            readiness: Step::default(),
+            tag_push: Step::default(),
+            abort: Step::default(),
+        }
+    }
+
+    fn load_fixture(state: &ReleaseState) -> RailResult<ReleaseState> {
+        load_value(serde_json::to_value(state)?)
+    }
+
+    fn load_value(value: serde_json::Value) -> RailResult<ReleaseState> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("state.json");
+        std::fs::write(&path, serde_json::to_vec(&value)?)?;
+        ReleaseState::load(&path)
+    }
+
+    #[test]
+    fn legacy_v4_state_without_auxiliary_projection_migrates() {
+        let loaded = load_fixture(&fixture(4, 4)).unwrap();
+        assert_eq!(loaded.schema_version, RELEASE_STATE_SCHEMA_VERSION);
+        assert_eq!(loaded.plan.plan_contract_version, RELEASE_PLAN_CONTRACT_VERSION);
+        assert!(loaded.plan.auxiliary_lockfiles.is_empty());
+    }
+
+    #[test]
+    fn legacy_v4_state_rejects_new_plan_or_auxiliary_projection() {
+        let error = load_fixture(&fixture(4, RELEASE_PLAN_CONTRACT_VERSION)).unwrap_err();
+        assert!(
+            error.to_string().contains("unsupported release plan contract 5"),
+            "{error}"
+        );
+
+        let mut state = fixture(4, 4);
+        state.plan.auxiliary_lockfiles.push(PlannedAuxiliaryLockfile {
+            manifest_path: PathBuf::from("aux/Cargo.toml"),
+            lockfile_path: PathBuf::from("aux/Cargo.lock"),
+            before_digest: "sha256:before".to_string(),
+            after_digest: "sha256:after".to_string(),
+            content: "version = 4\n".to_string(),
+        });
+        let error = load_fixture(&state).unwrap_err();
+        assert!(
+            error.to_string().contains("cannot authorize auxiliary Cargo lockfile"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn current_state_requires_exact_embedded_plan_contract() {
+        load_fixture(&fixture(RELEASE_STATE_SCHEMA_VERSION, RELEASE_PLAN_CONTRACT_VERSION)).unwrap();
+        for plan_contract in [4, RELEASE_PLAN_CONTRACT_VERSION + 1] {
+            let error = load_fixture(&fixture(RELEASE_STATE_SCHEMA_VERSION, plan_contract)).unwrap_err();
+            assert!(
+                error.to_string().contains("requires embedded release plan contract 5"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn current_state_requires_auxiliary_projection_field() {
+        let mut state =
+            serde_json::to_value(fixture(RELEASE_STATE_SCHEMA_VERSION, RELEASE_PLAN_CONTRACT_VERSION)).unwrap();
+        state["plan"].as_object_mut().unwrap().remove("auxiliary_lockfiles");
+        let error = load_value(state).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("missing its auxiliary Cargo lockfile projection field"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn future_state_schema_is_rejected() {
+        let error = load_fixture(&fixture(
+            RELEASE_STATE_SCHEMA_VERSION + 1,
+            RELEASE_PLAN_CONTRACT_VERSION,
+        ))
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("unsupported release state version 6"),
+            "{error}"
+        );
+    }
 }
