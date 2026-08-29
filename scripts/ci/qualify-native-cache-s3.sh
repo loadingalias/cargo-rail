@@ -132,6 +132,11 @@ setup_mode="read"
 [[ "$phase" == producer ]] && setup_mode=read-write
 source_cargo_home="${CARGO_HOME:-${HOME:?HOME is required}/.cargo}"
 source_cargo_home="$(cd "$source_cargo_home" && pwd -P)"
+# Fixture registry dependencies are exact entries in the root lockfile. Seed them before the
+# materializer enforces offline lockfile generation; prebuilt binaries do not warm Cargo's registry.
+env -u RUSTC_WRAPPER -u CARGO_BUILD_RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER \
+  -u CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER CARGO_HOME="$source_cargo_home" \
+  cargo fetch --manifest-path "$repo_root/Cargo.toml" --locked --quiet
 for workload in "${workloads[@]}"; do
   root="$state/fixtures/$workload"
   cargo_home="$state/cargo-homes/$workload"

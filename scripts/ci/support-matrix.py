@@ -1063,6 +1063,7 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         '"${temporary_root_args[@]}"',
         manifest.corpus_runner,
         "scripts/ci/run-filesystem-compatibility.py",
+        'mount="/mnt/cargo-rail-tmpfs"',
         "if: fromJSON(needs.support.outputs.compatibility-matrix).include[0] != null",
         "if: fromJSON(needs.support.outputs.filesystem-matrix).include[0] != null",
         "just build-all",
@@ -1077,6 +1078,36 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
     require(
         compatibility_workflow.count(toolchain_installer_path) == 2,
         "compatibility workflow must install Rust in both execution jobs",
+    )
+    require(
+        '$RUNNER_TEMP/cargo-rail-tmpfs' not in compatibility_workflow,
+        "tmpfs compatibility workspaces must remain outside the runner home configuration hierarchy",
+    )
+    windows_cache_cleanup_step = """\
+      - name: Remove ambient Windows compiler-cache installation
+        if: matrix.compatibility.full-suite && runner.os == 'Windows'
+        shell: bash
+        run: target/debug/cargo-rail.exe rail cache remove --quiet
+"""
+    require(
+        windows_cache_cleanup_step in compatibility_workflow,
+        "Windows endpoint tests must remove the receipt-owned ambient compiler-cache installation",
+    )
+    windows_test_step = """\
+      - name: Run full Windows endpoint suite
+        if: matrix.compatibility.full-suite && runner.os == 'Windows'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.r2_access_key_id }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.r2_secret_access_key }}
+          AWS_EC2_METADATA_DISABLED: "true"
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          TMPDIR: ${{ runner.temp }}
+        run: cargo nextest run --workspace -P commit --all-features --locked --config-file .config/nextest.toml
+"""
+    require(
+        windows_test_step in compatibility_workflow,
+        "Windows endpoint tests must create temporary workspaces outside the user Cargo configuration hierarchy",
     )
     exact_driver_step = """\
       - name: Qualify exact compiler fact driver

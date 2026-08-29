@@ -252,12 +252,20 @@ jobs:
           AWS_EC2_METADATA_DISABLED: "true"
         run: just test-all
 
+      - name: Remove ambient Windows compiler-cache installation
+        if: matrix.compatibility.full-suite && runner.os == 'Windows'
+        shell: bash
+        run: target/debug/cargo-rail.exe rail cache remove --quiet
+
       - name: Run full Windows endpoint suite
         if: matrix.compatibility.full-suite && runner.os == 'Windows'
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.r2_access_key_id }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.r2_secret_access_key }}
           AWS_EC2_METADATA_DISABLED: "true"
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          TMPDIR: ${{ runner.temp }}
         run: cargo nextest run --workspace -P commit --all-features --locked --config-file .config/nextest.toml
 
       - name: Run doctests
@@ -384,8 +392,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mount="$RUNNER_TEMP/cargo-rail-tmpfs"
-          mkdir -p "$mount"
+          mount="/mnt/cargo-rail-tmpfs"
+          sudo mkdir -p "$mount"
           sudo mount -t tmpfs -o size=512m,mode=0700 cargo-rail-tmpfs "$mount"
           sudo chown "$(id -u):$(id -g)" "$mount"
           mkdir "$mount/tmp"
@@ -506,11 +514,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mount="$RUNNER_TEMP/cargo-rail-tmpfs"
+          mount="/mnt/cargo-rail-tmpfs"
           if mountpoint -q "$mount"; then
             sudo umount "$mount"
           fi
-          rmdir "$mount" 2>/dev/null || true
+          sudo rmdir "$mount" 2>/dev/null || true
 
       - name: Detach NTFS VHD and remove UNC share
         if: always() && matrix.filesystem.setup == 'windows-ntfs-vhd'
