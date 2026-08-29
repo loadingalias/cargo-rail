@@ -229,6 +229,7 @@ jobs:
             --toolchain "${{ matrix.compatibility.toolchain }}" \
             --expected-rust-release "${{ matrix.compatibility.release }}" \
             --expected-host "${{ matrix.compatibility.target }}" \
+            --temporary-root "$RUNNER_TEMP" \
             "${selection_args[@]}"
 
       - name: Build all endpoint targets

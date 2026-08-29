@@ -31,7 +31,8 @@ jobs:
   # ==========================================================================
   plan:
     name: Plan
-    runs-on: ubuntu-latest
+    # Build the uploaded planner on the oldest Linux runtime that consumes it.
+    runs-on: ubuntu-22.04
     permissions:
       contents: read
     outputs:

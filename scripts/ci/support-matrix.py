@@ -53,6 +53,46 @@ def load_toml(path: Path) -> dict[str, Any]:
         ) from error
 
 
+def validate_native_cache_fixture_dependencies() -> None:
+    fixture = load_toml(
+        REPOSITORY_ROOT / "tests/fixtures/native_cache/real_world/Cargo.toml"
+    )
+    lockfile = load_toml(REPOSITORY_ROOT / "Cargo.lock")
+    locked_packages = {
+        (package.get("name"), package.get("version"))
+        for package in lockfile.get("package", [])
+        if isinstance(package, dict)
+    }
+    dependencies = fixture.get("workspace", {}).get("dependencies", {})
+    require(
+        isinstance(dependencies, dict),
+        "native-cache fixture workspace.dependencies must be a table",
+    )
+    for name, dependency in dependencies.items():
+        if isinstance(dependency, str):
+            version = dependency
+            package = name
+        elif isinstance(dependency, dict):
+            version = dependency.get("version")
+            package = dependency.get("package", name)
+        else:
+            raise ContractError(
+                f"native-cache fixture dependency {name} has an invalid specification"
+            )
+        if version is None:
+            continue
+        require(
+            isinstance(version, str) and version.startswith("="),
+            f"native-cache fixture dependency {name} must select one exact version",
+        )
+        exact_version = version.removeprefix("=")
+        require(
+            (package, exact_version) in locked_packages,
+            f"native-cache fixture dependency {package} {exact_version} must match "
+            "Cargo.lock so CI can seed it offline",
+        )
+
+
 def read_optional_nextest_version() -> str:
     config = load_toml(REPOSITORY_ROOT / ".config/nextest.toml")
     nextest_version = config.get("nextest-version")
@@ -720,6 +760,7 @@ def load_native_cache_contract() -> NativeCacheContract:
 
 
 def validate_inventories(manifest: CompatibilityManifest) -> None:
+    validate_native_cache_fixture_dependencies()
     native_targets = {host.target for host in manifest.native_hosts}
     release_cross_targets = set(manifest.release_cross_targets)
     required_release_targets = native_targets | release_cross_targets
@@ -1018,6 +1059,7 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         toolchain_installer_path,
         "--selection-probes",
         "--cross-target-mutation-probes",
+        '--temporary-root "$RUNNER_TEMP"',
         manifest.corpus_runner,
         "scripts/ci/run-filesystem-compatibility.py",
         "if: fromJSON(needs.support.outputs.compatibility-matrix).include[0] != null",
@@ -1061,6 +1103,11 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
     commit_workflow = (
         REPOSITORY_ROOT / ".github/workflows/commit.yaml"
     ).read_text(encoding="utf-8")
+    require(
+        "  plan:\n    name: Plan\n" in commit_workflow
+        and "    runs-on: ubuntu-22.04\n" in commit_workflow,
+        "Commit planner must run on Ubuntu 22.04 so its uploaded binary executes on every Linux consumer",
+    )
     for fragment in (
         "vars.CARGO_RAIL_CACHE_REMOTE",
         "secrets.CARGO_RAIL_R2_ACCESS_KEY_ID",
