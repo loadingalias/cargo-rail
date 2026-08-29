@@ -489,6 +489,7 @@ fn test_repository_reader_prefers_the_installed_release_without_an_explicit_boot
     super::helpers::finish_test(result);
 }
 
+#[cfg(unix)]
 fn load_plan_for_test(path: &std::path::Path) -> Result<Value> {
     Ok(serde_json::from_slice(&std::fs::read(path)?)?)
 }

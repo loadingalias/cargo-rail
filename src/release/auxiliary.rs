@@ -162,14 +162,17 @@ fn materialize_snapshot(ctx: &WorkspaceContext, destination: &Path) -> RailResul
             .ok_or_else(|| RailError::message(format!("captured source path '{}' has no parent", entry.path)))?;
         fs::create_dir_all(parent)?;
         match &entry.kind {
-            SourceEntryKind::RegularFile { executable, .. } => {
+            SourceEntryKind::RegularFile {
+                executable: _executable,
+                ..
+            } => {
                 let bytes = snapshot
                     .read_source_file(&entry.path)?
                     .ok_or_else(|| RailError::message(format!("captured source file '{}' disappeared", entry.path)))?;
                 let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
                 file.write_all(&bytes)?;
                 #[cfg(unix)]
-                if *executable {
+                if *_executable {
                     use std::os::unix::fs::PermissionsExt as _;
                     fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
                 }
