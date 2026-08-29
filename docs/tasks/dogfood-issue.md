@@ -1,6 +1,6 @@
 # Cargo-Rail dogfood issues
 
-**Status:** Open; product, Action, and operator-integration work required
+**Status:** Implementation complete; hosted and cross-trust authenticated proof remains
 **Reviewed:** 2026-08-29
 **Cargo-Rail baseline:** `v0.24.0@7c59b78ccc684a76a623d446f43f686acae26450`
 **Action baseline:** `v8@6e7355bfca7a308da74b1cc3487a539567adc286`
@@ -174,6 +174,12 @@ Use separate bucket-scoped credentials for GitHub and remote machines even
 though they address one cache. A single cache means one bucket and namespace,
 not one long-lived secret copied into every trust domain. Live bidirectional
 cross-root traffic is deliberately deferred to final remote qualification.
+
+Final remote qualification was attempted after the local and native-musl gates passed. It stopped before cache
+traffic because the configured macOS Keychain item contained no R2 parent credential. The failed bootstrap created no
+cache authority, and its instances and EBS volumes were deleted. The operator adapter is complete, but bidirectional
+cross-root reuse remains unproved until an authorized parent credential is installed. No Windows host was provisioned
+merely to reproduce the same missing-authority failure.
 
 ## Completion evidence
 
