@@ -157,7 +157,7 @@ jq -s \
         compiler_modes: $compiler_modes[0]
       },
       compiler_class_coverage: {
-        complete: ($missing_compiler_classes | length) == 0,
+        complete: (($missing_compiler_classes | length) == 0),
         required: $required_compiler_classes,
         observed: $observed_compiler_classes,
         missing: $missing_compiler_classes

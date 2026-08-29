@@ -224,12 +224,16 @@ jobs:
           if [ "${{ matrix.compatibility.cross-target-mutation-probes }}" = "true" ]; then
             selection_args+=(--cross-target-mutation-probes)
           fi
+          temporary_root_args=()
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            temporary_root_args=(--temporary-root "$RUNNER_TEMP")
+          fi
           "$python_command" scripts/ci/run-compatibility.py \
             --cargo-rail "$cargo_rail" \
             --toolchain "${{ matrix.compatibility.toolchain }}" \
             --expected-rust-release "${{ matrix.compatibility.release }}" \
             --expected-host "${{ matrix.compatibility.target }}" \
-            --temporary-root "$RUNNER_TEMP" \
+            "${temporary_root_args[@]}" \
             "${selection_args[@]}"
 
       - name: Build all endpoint targets

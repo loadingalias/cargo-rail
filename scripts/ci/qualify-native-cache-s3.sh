@@ -345,7 +345,7 @@ jq -n \
   | ($required - $observed) as $missing
   | {
       schema_version: 1,
-      complete: ($missing | length) == 0,
+      complete: (($missing | length) == 0),
       required: $required,
       observed: $observed,
       missing: $missing,
