@@ -144,6 +144,15 @@ Use `loadingalias/cargo-rail-action/cache@v8` separately in each execution job t
 Its `mode` input is required: use `read` for untrusted jobs and grant `read-write` only to trusted seed jobs. See the
 [Action guide](https://github.com/loadingalias/cargo-rail-action).
 
+This repository dogfoods the same boundary. Local Just commands use the installed release; trusted `main` and release
+jobs use the v8 cache action against one private Cloudflare R2 authority. Pull requests remain local-only. R2
+credentials are attached only to steps that execute compiler work, while CI and developer machines use distinct
+bucket-scoped credentials for the same remote authority. The Commit workflow builds the checked-out planner once—
+necessary because that source may introduce the next plan contract—then transfers both its exact v8 plan and planner
+binary to fail-closed consumers. A release tag reuses the archives already built, smoke-tested, and attested by that
+exact-SHA Commit run, building only release-only targets unless an explicit recovery run must reconstruct the full
+set.
+
 ## Carry Intent Through Release Workflow
 
 - `cargo rail unify --check` derives one reviewable dependency repair from the captured workspace; `cargo rail unify apply --backup` applies it reversibly.

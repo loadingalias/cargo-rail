@@ -68,6 +68,25 @@ r2://ACCOUNT_ID/BUCKET/PREFIX
 azure://ACCOUNT/CONTAINER/PREFIX
 ```
 
+### Cloudflare R2
+
+Use a private, default-jurisdiction bucket and an R2 API token scoped to Object Read & Write for that bucket. The
+token's S3 access key ID and secret access key must be present for setup and every compiler process that should use
+L2; a Wrangler login or Cloudflare API token is not an S3 credential pair.
+
+```bash
+export AWS_ACCESS_KEY_ID='<R2 access key ID>'
+export AWS_SECRET_ACCESS_KEY='<R2 secret access key>'
+
+cargo rail cache normalize   'r2://0123456789abcdef0123456789abcdef/cargo-rail-cache'
+cargo rail cache setup --check --remote   'r2://0123456789abcdef0123456789abcdef/cargo-rail-cache'   --remote-mode read-write --root-portability remap
+cargo rail cache setup --remote   'r2://0123456789abcdef0123456789abcdef/cargo-rail-cache'   --remote-mode read-write --root-portability remap
+```
+
+Use distinct bucket-scoped credential pairs for CI and developer machines even when they share one R2 authority.
+Keep the protocol marker at `native-v5/protocol`; a lifecycle rule may expire `native-v5/entries/` without deleting
+the marker. Scope the prefix relative to the selected URL root when the URL includes a prefix.
+
 Use `cargo rail cache normalize URL` to validate a URL without resolving credentials or contacting storage.
 Credentials stay outside URLs, repository configuration, result packs, diagnostics, compiler arguments, and cache
 keys. Prefer a machine or container role, OIDC, or a preconfigured profile.

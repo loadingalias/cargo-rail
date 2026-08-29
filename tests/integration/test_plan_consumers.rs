@@ -9,8 +9,12 @@ use std::process::Command;
 const COMMIT_WORKFLOW: &str = include_str!("../../.github/workflows/commit.yaml");
 const COMPATIBILITY_WORKFLOW: &str = include_str!("../../.github/workflows/compatibility.yaml");
 const ARCHIVE_WORKFLOW: &str = include_str!("../../.github/workflows/release-archives.yaml");
-const BUILD_SCRIPT: &str = include_str!("../../scripts/build/build.sh");
-const TEST_SCRIPT: &str = include_str!("../../scripts/test/test.sh");
+const RELEASE_WORKFLOW: &str = include_str!("../../.github/workflows/release.yaml");
+const CACHE_ACTION: &str = include_str!("../../.github/actions/cache/action.yaml");
+const SETUP_ACTION: &str = include_str!("../../.github/actions/setup/action.yaml");
+const CACHE_SETUP: &str = include_str!("../../scripts/cache/setup.sh");
+const CARGO_SCRIPT: &str = include_str!("../../scripts/cargo/run.sh");
+const VERIFY_SCRIPT: &str = include_str!("../../scripts/plan/verify.sh");
 
 fn reader() -> Command {
     let mut command = Command::new(if cfg!(windows) { "python" } else { "python3" });
@@ -375,6 +379,47 @@ fn test_source_reader_bootstrap_preserves_direct_binary_authority() {
     super::helpers::finish_test(result);
 }
 
+#[cfg(unix)]
+#[test]
+fn test_repository_reader_prefers_the_installed_release_without_an_explicit_bootstrap() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let result: Result<()> = (|| {
+        let directory = tempfile::tempdir()?;
+        let bin = directory.path().join("bin");
+        std::fs::create_dir(&bin)?;
+        let launcher = bin.join("cargo-rail");
+        let marker = directory.path().join("selected-installed-release");
+        let plan = directory.path().join("plan.json");
+        std::fs::write(
+            &launcher,
+            "#!/bin/sh\n: > \"$CARGO_RAIL_READER_MARKER\"\nexec \"$CARGO_RAIL_READER_DELEGATE\" \"$@\"\n",
+        )?;
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700))?;
+        let path = std::env::join_paths(
+            std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())),
+        )?;
+
+        let output = reader()
+            .env_remove("CARGO_RAIL_BIN")
+            .env_remove("RAIL_BOOTSTRAP_TARGET_DIR")
+            .env("PATH", path)
+            .env("CARGO_RAIL_READER_MARKER", &marker)
+            .env("CARGO_RAIL_READER_DELEGATE", env!("CARGO_BIN_EXE_cargo-rail"))
+            .args(["create", plan.to_str().unwrap(), "--all"])
+            .output()?;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(marker.is_file(), "reader did not select cargo-rail from PATH");
+        assert_eq!(load_plan_for_test(&plan)?["plan_contract_version"], 8);
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+fn load_plan_for_test(path: &std::path::Path) -> Result<Value> {
+    Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+}
+
 #[test]
 fn test_plan_reader_emits_plain_all_variant_sentinel() {
     let result: Result<()> = (|| {
@@ -417,8 +462,8 @@ fn test_commit_workflow_uses_named_work_and_planner_matrices_only() {
     assert!(COMPATIBILITY_WORKFLOW.contains("inputs.filesystem-matrix"));
     assert!(ARCHIVE_WORKFLOW.contains("inputs.selected-matrix"));
     assert!(ARCHIVE_WORKFLOW.contains("scripts/ci/smoke-release-tar.sh"));
-    assert!(COMPATIBILITY_WORKFLOW.contains("verify-checkout"));
-    assert!(ARCHIVE_WORKFLOW.contains("verify-checkout"));
+    assert!(COMPATIBILITY_WORKFLOW.contains("scripts/plan/verify.sh"));
+    assert!(ARCHIVE_WORKFLOW.contains("scripts/plan/verify.sh"));
 }
 
 #[test]
@@ -431,10 +476,71 @@ fn test_commit_workflow_consumes_every_builtin_cargo_execution_decision() {
     }
     assert!(COMMIT_WORKFLOW.contains("just build"));
     assert!(COMMIT_WORKFLOW.contains("just test"));
-    assert!(BUILD_SCRIPT.contains("is-required \"$PLAN_FILE\" cargo.build"));
-    assert!(BUILD_SCRIPT.contains("cargo-args \"$PLAN_FILE\" cargo.build"));
+    assert!(CARGO_SCRIPT.contains("run_cargo_work cargo.build"));
     for work in ["cargo.test", "cargo.doctest"] {
-        assert!(TEST_SCRIPT.contains(&format!("is-required \"$PLAN_FILE\" {work}")));
-        assert!(TEST_SCRIPT.contains(&format!("cargo-args \"$PLAN_FILE\" {work}")));
+        assert!(CARGO_SCRIPT.contains(&format!("run_cargo_work {work}")));
     }
+    assert!(CARGO_SCRIPT.contains("scripts/plan/verify.sh \"$plan_file\""));
+    assert!(VERIFY_SCRIPT.contains("GITHUB_ACTIONS"));
+    assert!(VERIFY_SCRIPT.contains("target/debug/cargo-rail"));
+}
+
+#[test]
+fn test_ci_dogfoods_released_cache_and_reuses_exact_source_authority() {
+    assert!(CACHE_ACTION.contains("loadingalias/cargo-rail-action/cache@"));
+    assert!(CACHE_ACTION.contains("# v8"));
+    assert!(CACHE_ACTION.contains("version: 0.24.0"));
+    assert!(CACHE_ACTION.contains("scripts/cache/setup.sh --max-size 10GiB"));
+    assert!(CACHE_SETUP.contains("--root-portability remap"));
+    assert!(COMMIT_WORKFLOW.contains("target/debug/cargo-rail"));
+    assert!(COMMIT_WORKFLOW.contains("scripts/plan/verify.sh target/plan-v8.json"));
+    assert!(COMMIT_WORKFLOW.contains("stage: ${{ github.event_name == 'push'"));
+}
+
+#[test]
+fn test_ci_uses_one_r2_authority_with_bounded_credentials() {
+    for source in [COMMIT_WORKFLOW, COMPATIBILITY_WORKFLOW, ARCHIVE_WORKFLOW] {
+        assert!(!source.contains("CACHE_QUALIFICATION_AWS_"));
+        assert!(!source.contains("configure-aws-credentials"));
+        assert!(!source.contains("native-cache-role:"));
+        assert!(!source.contains("native-cache-region:"));
+        assert!(!source.contains("native-cache-account:"));
+    }
+
+    assert!(COMMIT_WORKFLOW.contains("vars.CARGO_RAIL_CACHE_REMOTE"));
+    assert!(COMMIT_WORKFLOW.contains("secrets.CARGO_RAIL_R2_ACCESS_KEY_ID"));
+    assert!(COMMIT_WORKFLOW.contains("secrets.CARGO_RAIL_R2_SECRET_ACCESS_KEY"));
+    assert!(COMMIT_WORKFLOW.contains("github.event_name == 'push'"));
+    assert!(RELEASE_WORKFLOW.contains("native-cache-url: ${{ vars.CARGO_RAIL_CACHE_REMOTE }}"));
+    assert!(RELEASE_WORKFLOW.contains("r2_access_key_id: ${{ secrets.CARGO_RAIL_R2_ACCESS_KEY_ID }}"));
+    assert!(RELEASE_WORKFLOW.contains("r2_secret_access_key: ${{ secrets.CARGO_RAIL_R2_SECRET_ACCESS_KEY }}"));
+
+    for source in [COMPATIBILITY_WORKFLOW, ARCHIVE_WORKFLOW] {
+        assert!(source.contains("secrets:\n      r2_access_key_id:"));
+        assert!(source.contains("r2_secret_access_key:"));
+        assert!(source.contains("remote-credentials-ready:"));
+    }
+    assert!(CACHE_ACTION.contains("r2://*)"));
+    assert!(CACHE_ACTION.contains("CARGO_RAIL_CACHE_CREDENTIALS_READY"));
+    assert!(!CACHE_ACTION.contains("AWS_ACCESS_KEY_ID"));
+    assert!(!CACHE_ACTION.contains("AWS_SECRET_ACCESS_KEY"));
+    assert!(!SETUP_ACTION.contains("AWS_ACCESS_KEY_ID"));
+    assert!(!SETUP_ACTION.contains("AWS_SECRET_ACCESS_KEY"));
+}
+
+#[test]
+fn test_release_reuses_exact_sha_commit_archives_with_recovery_fallback() {
+    for fragment in [
+        "gh run list",
+        "actions/runs/$run_id/artifacts",
+        "run-id: ${{ needs.verify-release.outputs.commit_run_id }}",
+        "rebuilding every archive for recovery",
+    ] {
+        assert!(
+            RELEASE_WORKFLOW.contains(fragment),
+            "missing release handoff: {fragment}"
+        );
+    }
+    assert!(!RELEASE_WORKFLOW.contains("cargo nextest run"));
+    assert!(!RELEASE_WORKFLOW.contains("Verify Clippy"));
 }

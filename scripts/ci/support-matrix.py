@@ -826,7 +826,7 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
     require(
         setup_action.index(toolchain_installer_path)
         < setup_action.index("taiki-e/install-action@")
-        < setup_action.index("Swatinem/rust-cache@"),
+        < setup_action.index("./.github/actions/cache"),
         "repository setup action must install Rust before tools or caches",
     )
     action_sources = [
@@ -944,6 +944,41 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         "cargo-deny",
         cargo_deny_match.group(1),
     )
+    cargo_rail_match = re.search(
+        r"^readonly CARGO_RAIL_VERSION=([0-9]+\.[0-9]+\.[0-9]+)$",
+        install_tools,
+        re.MULTILINE,
+    )
+    require(
+        cargo_rail_match is not None,
+        "scripts/ci/install-tools.sh must install one exact Cargo-Rail release",
+    )
+    cache_action = (REPOSITORY_ROOT / ".github/actions/cache/action.yaml").read_text(
+        encoding="utf-8"
+    )
+    for fragment in (
+        "loadingalias/cargo-rail-action/cache@",
+        "# v8",
+        f"version: {cargo_rail_match.group(1)}",
+        "scripts/cache/setup.sh --max-size 10GiB",
+        "remote-credentials-ready:",
+        "r2://*)",
+    ):
+        require(
+            fragment in cache_action,
+            f"repository cache action is missing {fragment}",
+        )
+    require(
+        "configure-aws-credentials" not in cache_action
+        and "AWS_ACCESS_KEY_ID" not in cache_action
+        and "AWS_SECRET_ACCESS_KEY" not in cache_action,
+        "repository cache action must not receive or export provider credentials",
+    )
+    require(
+        "--root-portability remap"
+        in (REPOSITORY_ROOT / "scripts/cache/setup.sh").read_text(encoding="utf-8"),
+        "repository cache setup must qualify cross-checkout identities",
+    )
     expected_just_targets = {
         ("unknown-linux-musl", "x86_64"),
         ("unknown-linux-musl", "aarch64"),
@@ -997,6 +1032,10 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
       - name: Qualify exact compiler fact driver
         if: matrix.compatibility.full-suite
         shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.r2_access_key_id }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.r2_secret_access_key }}
+          AWS_EC2_METADATA_DISABLED: "true"
         run: |
           rustup component add rustc-dev --toolchain "$RUSTUP_TOOLCHAIN"
           just check-compiler-fact-driver
@@ -1012,21 +1051,54 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
             f"{caller} does not call the compatibility workflow",
         )
 
+    commit_workflow = (
+        REPOSITORY_ROOT / ".github/workflows/commit.yaml"
+    ).read_text(encoding="utf-8")
+    for fragment in (
+        "vars.CARGO_RAIL_CACHE_REMOTE",
+        "secrets.CARGO_RAIL_R2_ACCESS_KEY_ID",
+        "secrets.CARGO_RAIL_R2_SECRET_ACCESS_KEY",
+        "native-cache-credentials-ready:",
+        "r2_access_key_id:",
+        "r2_secret_access_key:",
+    ):
+        require(
+            fragment in commit_workflow,
+            f"Commit workflow is missing R2 cache authority: {fragment}",
+        )
+    for legacy in (
+        "CACHE_QUALIFICATION_AWS_",
+        "configure-aws-credentials",
+        "native-cache-role:",
+        "native-cache-region:",
+        "native-cache-account:",
+    ):
+        require(
+            legacy not in commit_workflow,
+            f"Commit workflow retains legacy AWS cache wiring: {legacy}",
+        )
+
     release_workflow = (REPOSITORY_ROOT / ".github/workflows/release.yaml").read_text(
         encoding="utf-8"
     )
-    require(
-        "test --doc -p cargo-rail --all-features --locked" in release_workflow,
-        "release workflow must run doctests",
-    )
-    require(
-        "cargo-audit" not in release_workflow,
-        "release workflow must keep cargo-deny as the single dependency policy gate",
-    )
-    require(
-        toolchain_installer_path in release_workflow,
-        "release workflow must use the CI Rust installer",
-    )
+    for fragment in (
+        "gh run list",
+        "actions/runs/$run_id/artifacts",
+        "selected-matrix: ${{ needs.verify-release.outputs.matrix }}",
+        "run-id: ${{ needs.verify-release.outputs.commit_run_id }}",
+        "native-cache-url: ${{ vars.CARGO_RAIL_CACHE_REMOTE }}",
+        "r2_access_key_id: ${{ secrets.CARGO_RAIL_R2_ACCESS_KEY_ID }}",
+        "r2_secret_access_key: ${{ secrets.CARGO_RAIL_R2_SECRET_ACCESS_KEY }}",
+    ):
+        require(
+            fragment in release_workflow,
+            f"release workflow is missing exact-SHA archive reuse: {fragment}",
+        )
+    for duplicated_gate in ("cargo " + "nextest run", "cargo " + "deny", "Verify Clippy"):
+        require(
+            duplicated_gate not in release_workflow,
+            f"release workflow repeats the Commit gate: {duplicated_gate}",
+        )
 
     worker_verifier = "scripts/ci/verify-distributed-worker.py"
     require(
@@ -1048,6 +1120,9 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         "if: inputs.stage",
         "actions/attest@",
         "actions/upload-artifact@",
+        "secrets.r2_access_key_id",
+        "secrets.r2_secret_access_key",
+        "remote-credentials-ready:",
     ):
         require(
             fragment in archive_workflow,
@@ -1081,7 +1156,10 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
                     f"{workflow_path.relative_to(REPOSITORY_ROOT)} must add rustc-dev to the selected toolchain",
                 )
     for caller, stage in (
-        (".github/workflows/commit.yaml", "stage: false"),
+        (
+            ".github/workflows/commit.yaml",
+            "stage: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}",
+        ),
         (".github/workflows/release.yaml", "stage: true"),
     ):
         source = (REPOSITORY_ROOT / caller).read_text(encoding="utf-8")
@@ -1341,6 +1419,30 @@ s3://BUCKET/PREFIX?region=REGION&owner=AWS_ACCOUNT_ID
 r2://ACCOUNT_ID/BUCKET/PREFIX
 azure://ACCOUNT/CONTAINER/PREFIX
 ```
+
+### Cloudflare R2
+
+Use a private, default-jurisdiction bucket and an R2 API token scoped to Object Read & Write for that bucket. The
+token's S3 access key ID and secret access key must be present for setup and every compiler process that should use
+L2; a Wrangler login or Cloudflare API token is not an S3 credential pair.
+
+```bash
+export AWS_ACCESS_KEY_ID='<R2 access key ID>'
+export AWS_SECRET_ACCESS_KEY='<R2 secret access key>'
+
+cargo rail cache normalize \
+  'r2://0123456789abcdef0123456789abcdef/cargo-rail-cache'
+cargo rail cache setup --check --remote \
+  'r2://0123456789abcdef0123456789abcdef/cargo-rail-cache' \
+  --remote-mode read-write --root-portability remap
+cargo rail cache setup --remote \
+  'r2://0123456789abcdef0123456789abcdef/cargo-rail-cache' \
+  --remote-mode read-write --root-portability remap
+```
+
+Use distinct bucket-scoped credential pairs for CI and developer machines even when they share one R2 authority.
+Keep the protocol marker at `native-v5/protocol`; a lifecycle rule may expire `native-v5/entries/` without deleting
+the marker. Scope the prefix relative to the selected URL root when the URL includes a prefix.
 
 Use `cargo rail cache normalize URL` to validate a URL without resolving credentials or contacting storage.
 Credentials stay outside URLs, repository configuration, result packs, diagnostics, compiler arguments, and cache

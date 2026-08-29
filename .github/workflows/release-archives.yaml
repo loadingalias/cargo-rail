@@ -22,6 +22,23 @@ on:
         required: false
         default: ""
         type: string
+      native-cache-url:
+        description: Machine-owned Cargo-Rail remote cache URL
+        required: false
+        default: ""
+        type: string
+      native-cache-mode:
+        description: Cargo-Rail remote authority
+        required: false
+        default: read
+        type: string
+    secrets:
+      r2_access_key_id:
+        description: Bucket-scoped Cloudflare R2 access key ID
+        required: false
+      r2_secret_access_key:
+        description: Bucket-scoped Cloudflare R2 secret access key
+        required: false
 
 env:
   CARGO_INCREMENTAL: 0
@@ -56,7 +73,7 @@ jobs:
 
       - name: Verify checkout against plan
         if: inputs.plan-artifact != ''
-        run: scripts/plan/read.py verify-checkout target/plan-v8.json
+        run: scripts/plan/verify.sh target/plan-v8.json
 
       - name: Bind package identity
         id: package
@@ -109,6 +126,10 @@ jobs:
     name: Build and Verify (${{ matrix.target }})
     needs: prepare
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -126,6 +147,22 @@ jobs:
           RELEASE_SHA: ${{ needs.prepare.outputs.release_sha }}
         run: test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
 
+      - name: Install Rust
+        shell: bash
+        env:
+          TOOLCHAIN: ${{ needs.prepare.outputs.msrv }}
+        run: scripts/ci/install-rust-toolchain.sh --toolchain "$TOOLCHAIN"
+
+      - name: Setup Cargo and compiler caches
+        uses: ./.github/actions/cache
+        with:
+          shared-key: cargo-rail-release-archives-v2
+          cache-key: ${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          remote-url: ${{ inputs.native-cache-url }}
+          remote-mode: ${{ inputs.native-cache-mode }}
+          remote-credentials-ready: ${{ inputs.native-cache-url == '' || (secrets.r2_access_key_id != '' && secrets.r2_secret_access_key != '') }}
+
       - name: Download exact plan
         if: inputs.plan-artifact != ''
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -135,19 +172,16 @@ jobs:
 
       - name: Verify checkout against plan
         if: inputs.plan-artifact != ''
-        run: scripts/plan/read.py verify-checkout target/plan-v8.json
-
-      - name: Install Rust
-        shell: bash
-        env:
-          TOOLCHAIN: ${{ needs.prepare.outputs.msrv }}
-        run: scripts/ci/install-rust-toolchain.sh --toolchain "$TOOLCHAIN"
+        run: scripts/plan/verify.sh target/plan-v8.json
 
       - name: Manufacture exact compiler fact driver
         id: fact-driver
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.r2_access_key_id }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.r2_secret_access_key }}
+          AWS_EC2_METADATA_DISABLED: "true"
         run: |
           set -euo pipefail
           if [[ "${{ matrix.surface }}" != "true" ]]; then
@@ -256,6 +290,10 @@ jobs:
       - name: Build archive
         id: build
         uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1.30.2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.r2_access_key_id }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.r2_secret_access_key }}
+          AWS_EC2_METADATA_DISABLED: "true"
         with:
           bin: cargo-rail,cargo-rail-compiler-observation,cargo-rail-native-rustc-wrapper,cargo-rail-native-rustc-worker,cargo-rail-distributed-worker
           archive: cargo-rail-${{ matrix.target }}

@@ -263,14 +263,23 @@ def cargo_rail_command() -> list[str]:
     if configured:
         return [configured, "rail"]
 
+    # Ordinary repository use dogfoods the released binary. Protocol-transition
+    # callers opt into a source build by naming its isolated target directory.
+    if "RAIL_BOOTSTRAP_TARGET_DIR" not in os.environ:
+        binary = shutil.which("cargo-rail")
+        if binary is not None:
+            return [binary, "rail"]
+
     script = pathlib.Path(__file__).resolve()
     repository = script.parents[2] if len(script.parents) > 2 else None
-    if repository is None or not (repository / "Cargo.toml").is_file():
-        binary = shutil.which("cargo-rail")
-        require(binary is not None, "matching cargo-rail binary is unavailable")
-        return [binary, "rail"]
+    require(
+        repository is not None and (repository / "Cargo.toml").is_file(),
+        "matching cargo-rail binary is unavailable",
+    )
 
-    configured_target = pathlib.Path(os.environ.get("RAIL_BOOTSTRAP_TARGET_DIR", "target/cargo-rail-bootstrap"))
+    configured_target = pathlib.Path(
+        os.environ.get("RAIL_BOOTSTRAP_TARGET_DIR", "target/cargo-rail-bootstrap")
+    )
     target = configured_target if configured_target.is_absolute() else repository / configured_target
     result = subprocess.run(
         [

@@ -18,27 +18,21 @@ fn test_documented_frontdoor_commands_smoke() {
         let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let readme = std::fs::read_to_string(repo_root.join("README.md"))?;
         let justfile = std::fs::read_to_string(repo_root.join("justfile"))?;
-        let build_script = std::fs::read_to_string(repo_root.join("scripts/build/build.sh"))?;
-        let test_script = std::fs::read_to_string(repo_root.join("scripts/test/test.sh"))?;
+        let cargo_script = std::fs::read_to_string(repo_root.join("scripts/cargo/run.sh"))?;
         assert!(
             justfile.contains("cargo build --workspace --all-targets --all-features --release --locked"),
             "just build-release should produce the complete release artifact set"
         );
-        assert!(justfile.contains("@scripts/build/build.sh"));
+        assert!(justfile.contains("@scripts/cargo/run.sh build"));
+        assert!(justfile.contains("@scripts/cargo/run.sh test"));
         assert!(justfile.contains("@scripts/plan/read.py create -"));
         assert!(!justfile.contains("cargo run --quiet --locked --target-dir"));
         assert!(!justfile.contains("rail run"));
-        for (script, work, executor) in [
-            (&build_script, "cargo.build", "cargo build"),
-            (&test_script, "cargo.test", "cargo nextest run"),
-            (&test_script, "cargo.doctest", "cargo test --doc"),
-        ] {
-            assert!(script.contains("scripts/plan/read.py"));
-            assert!(script.contains(&format!("is-required \"$PLAN_FILE\" {work}")));
-            assert!(script.contains(&format!("cargo-args \"$PLAN_FILE\" {work}")));
-            assert!(script.contains(executor));
-            assert!(!script.contains(" rail run"));
-        }
+        assert!(cargo_script.contains("scripts/plan/read.py"));
+        assert!(cargo_script.contains("run_cargo_work cargo.build build"));
+        assert!(cargo_script.contains("run_cargo_work cargo.test nextest run"));
+        assert!(cargo_script.contains("run_cargo_work cargo.doctest test --doc"));
+        assert!(!cargo_script.contains(" rail run"));
 
         let cases: &[(&str, &[&str], &str)] = &[
             ("README plan", &["rail", "plan"], "cargo rail plan"),

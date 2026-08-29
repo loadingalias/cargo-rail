@@ -100,7 +100,8 @@ scope = "variants"
 paths = [
   ".github/workflows/release-archives.yaml",
   "distribution/release-targets.json",
-  "scripts/install.*",
+  "scripts/install.ps1",
+  "scripts/install.sh",
   "scripts/package-release-archive.py",
   "scripts/ci/install-rust-toolchain.sh",
   "scripts/ci/support-matrix.py",

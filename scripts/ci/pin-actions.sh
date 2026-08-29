@@ -82,13 +82,16 @@ check_dependencies() {
 resolve_ref_to_sha() {
   local action="$1"  # e.g., "actions/checkout"
   local ref="$2"     # e.g., "v4" or "master"
+  local owner repository_name ignored repository
+  IFS=/ read -r owner repository_name ignored <<<"$action"
+  repository="$owner/$repository_name"
 
   echo "  Resolving $action@$ref..." >&2
 
   # Try gh CLI first (respects auth, higher rate limits)
   if command -v gh &> /dev/null && gh auth status &> /dev/null; then
     local sha
-    sha=$(gh api "repos/$action/commits/$ref" --jq '.sha' 2>/dev/null || echo "")
+    sha=$(gh api "repos/$repository/commits/$ref" --jq '.sha' 2>/dev/null || echo "")
     if [ -n "$sha" ]; then
       echo "$sha"
       return 0
@@ -97,7 +100,7 @@ resolve_ref_to_sha() {
 
   # Fallback to curl (unauthenticated, 60 req/hour limit)
   local sha
-  sha=$(curl -fsSL "https://api.github.com/repos/$action/commits/$ref" 2>/dev/null | jq -r '.sha // empty')
+  sha=$(curl -fsSL "https://api.github.com/repos/$repository/commits/$ref" 2>/dev/null | jq -r '.sha // empty')
 
   if [ -z "$sha" ]; then
     echo "ERROR: Failed to resolve $action@$ref" >&2

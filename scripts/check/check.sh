@@ -92,9 +92,17 @@ fi
 
 echo "Dependency and security policy..."
 if required dependency-policy; then
+  cargo rail unify --check --explain
   cargo deny --locked check -D warnings all
 else
   echo "Skipped dependency policy."
+fi
+
+echo "Reviewed release intent..."
+if required cargo.package; then
+  cargo rail change check --merge-base --required
+else
+  echo "Skipped change-file coverage."
 fi
 
 # Clippy performs Cargo's check pass, so do not run a separate `cargo check` first.
@@ -109,7 +117,7 @@ if required cargo.clippy; then
     CLIPPY_ARGS=(--workspace)
   fi
   if [ "$AFFECTED" = true ]; then
-    "$PLAN_READER" verify-checkout "$PLAN_FILE"
+    scripts/plan/verify.sh "$PLAN_FILE"
   fi
   if [ "$FIX_MODE" = true ]; then
     cargo clippy "${CLIPPY_ARGS[@]}" --all-targets --all-features --locked --fix
@@ -140,7 +148,7 @@ if required cargo.doc; then
     DOC_ARGS=(--workspace)
   fi
   if [ "$AFFECTED" = true ]; then
-    "$PLAN_READER" verify-checkout "$PLAN_FILE"
+    scripts/plan/verify.sh "$PLAN_FILE"
   fi
   RUSTDOCFLAGS="-D warnings" cargo doc "${DOC_ARGS[@]}" --no-deps --all-features --locked
 else

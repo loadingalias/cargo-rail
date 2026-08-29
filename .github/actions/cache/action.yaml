@@ -1,0 +1,79 @@
+name: Setup Cargo and Cargo-Rail caches
+description: Preserve Cargo inputs and enable authenticated compiler reuse when remote authority is present.
+
+inputs:
+  cache-key:
+    description: Job-specific Cargo cache key
+    required: true
+  shared-key:
+    description: Stable Cargo cache namespace
+    required: false
+    default: cargo-rail-v3
+  save-if:
+    description: Whether Swatinem/rust-cache may save this job's Cargo cache
+    required: false
+    default: "false"
+  remote-url:
+    description: Machine-owned Cargo-Rail cache URL; empty keeps compiler reuse local
+    required: false
+    default: ""
+  remote-mode:
+    description: Cargo-Rail remote authority
+    required: false
+    default: read
+  remote-credentials-ready:
+    description: Whether the caller proved that the selected R2 credential pair is present
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Preserve Cargo inputs
+      uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      with:
+        shared-key: ${{ inputs.shared-key }}
+        key: ${{ inputs.cache-key }}
+        cache-on-failure: true
+        cache-bin: false
+        cache-targets: ${{ inputs.remote-url == '' }}
+        save-if: ${{ inputs.save-if }}
+
+    - name: Validate R2 cache authority
+      if: inputs.remote-url != ''
+      shell: bash
+      env:
+        CARGO_RAIL_CACHE_REMOTE: ${{ inputs.remote-url }}
+        CARGO_RAIL_CACHE_CREDENTIALS_READY: ${{ inputs.remote-credentials-ready }}
+      run: |
+        set -euo pipefail
+        case "$CARGO_RAIL_CACHE_REMOTE" in
+          r2://*) ;;
+          *)
+            echo "This repository accepts only a Cloudflare R2 compiler-cache authority." >&2
+            exit 2
+            ;;
+        esac
+        if [ "$CARGO_RAIL_CACHE_CREDENTIALS_READY" != true ]; then
+          echo "The selected R2 compiler cache requires both repository credentials." >&2
+          exit 2
+        fi
+
+    - name: Enable Cargo-Rail compiler reuse
+      if: inputs.remote-url != ''
+      uses: loadingalias/cargo-rail-action/cache@6e7355bfca7a308da74b1cc3487a539567adc286 # v8
+      with:
+        url: ${{ inputs.remote-url }}
+        mode: ${{ inputs.remote-mode }}
+        max-size: 10GiB
+        version: 0.24.0
+
+    # v8 does not yet expose root-portability. Reapply the same bounded setup
+    # through v0.24.0 so dev-machine and CI checkout roots share L2 identities.
+    - name: Qualify portable cache identities
+      if: inputs.remote-url != ''
+      shell: bash
+      env:
+        CARGO_RAIL_CACHE_REMOTE: ${{ inputs.remote-url }}
+        CARGO_RAIL_CACHE_MODE: ${{ inputs.remote-mode }}
+      run: scripts/cache/setup.sh --max-size 10GiB

@@ -12,12 +12,6 @@ targets = [
 [advisories]
 yanked = "deny"
 unsound = "all"
-ignore = [
-  # aws-sdk-s3 constrains lru to ^0.16.3. Its affected LruCache key is a
-  # String wrapper with non-panicking Drop, so RUSTSEC-2026-0253 is unreachable.
-  # Remove this ignore when aws-sdk-s3 permits an lru release that fixes the advisory.
-  { id = "RUSTSEC-2026-0253", reason = "aws-sdk-s3's cache key cannot panic during Drop" },
-]
 
 [licenses]
 # Only allow licenses we actually encounter
@@ -54,7 +48,6 @@ skip = [
   # petgraph, the AWS SDK's LRU cache, and indexmap use successive hashbrown
   # lines; remove these skips when those constraints converge.
   "hashbrown@0.15.5",
-  "hashbrown@0.16.1",
   "foldhash@0.1.5",
   # Proc-macro dependencies are still split between Syn 2 and 3; remove this
   # skip when all selected proc macros accept one Syn line.

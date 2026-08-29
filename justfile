@@ -65,6 +65,9 @@ check:
     @scripts/check/check.sh
 
 check-affected:
+    @scripts/plan/affected.sh
+
+quality-affected:
     @scripts/check/check.sh --affected
 
 check-compiler-fact-driver:
@@ -78,10 +81,10 @@ fix:
     @scripts/check/check.sh --fix
 
 test crate="":
-    @scripts/test/test.sh "{{ crate }}"
+    @scripts/cargo/run.sh test "{{ crate }}"
 
 build:
-    @scripts/build/build.sh
+    @scripts/cargo/run.sh build
 
 build-release:
     cargo build --workspace --all-targets --all-features --release --locked
@@ -89,7 +92,7 @@ build-release:
 # Full Workspace Commands (no change detection)
 
 test-all:
-    @scripts/test/test.sh --all
+    @scripts/cargo/run.sh test --all
 
 build-all:
     cargo build --workspace --all-targets --all-features --locked
@@ -254,6 +257,27 @@ gen-fixture members output:
 
 plan:
     @scripts/plan/read.py create -
+
+unify:
+    @cargo rail unify --check --explain --show-diff
+
+surface:
+    @cargo rail surface --check --explain
+
+cache-status:
+    @cargo rail cache status
+
+rail-cache-setup *args="":
+    @scripts/cache/setup.sh {{ args }}
+
+changes:
+    @cargo rail change status
+
+release-check:
+    @cargo rail release check cargo-rail
+
+release-status:
+    @cargo rail release status --history
 
 # Maintenance
 

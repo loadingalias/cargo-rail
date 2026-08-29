@@ -35,14 +35,18 @@ LATENCY_BUDGET_NS = {
     "object_pair_warm_metadata": {"p95": 250_000_000},
 }
 GIT_SUBPROCESS_BUDGET = {
-    "clean_worktree": 7,
-    "one_rust_file": 9,
-    "one_markdown_file": 9,
-    "semantic_config": 11,
-    "semantic_manifest": 11,
-    "large_diff": 9,
-    "object_pair_cold_metadata": 6,
-    "object_pair_warm_metadata": 6,
+    # These are exact structural ceilings for v8's captured planning authority:
+    # initial index/status capture, post-metadata and post-plan drift checks, and
+    # (for object pairs) the isolated historical-tree boundary. Keep them at the
+    # measured lower bound so one additional Git process remains a regression.
+    "clean_worktree": 9,
+    "one_rust_file": 11,
+    "one_markdown_file": 11,
+    "semantic_config": 13,
+    "semantic_manifest": 12,
+    "large_diff": 11,
+    "object_pair_cold_metadata": 12,
+    "object_pair_warm_metadata": 12,
 }
 CONSUMER_P95_BUDGET_NS = 25_000_000
 COUNTERS = (

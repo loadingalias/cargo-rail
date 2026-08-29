@@ -11,6 +11,18 @@ inputs:
     description: Install cargo-nextest for jobs that execute tests
     required: false
     default: "true"
+  native-cache-url:
+    description: Machine-owned Cargo-Rail remote cache URL
+    required: false
+    default: ""
+  native-cache-mode:
+    description: Cargo-Rail remote authority
+    required: false
+    default: read
+  native-cache-credentials-ready:
+    description: Whether the caller proved that the selected R2 credential pair is present
+    required: false
+    default: "false"
 
 runs:
   using: composite
@@ -30,10 +42,11 @@ runs:
       with:
         tool: cargo-nextest@0.9.143
 
-    - name: Setup Rust Cache
-      uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+    - name: Setup Cargo and compiler caches
+      uses: ./.github/actions/cache
       with:
-        shared-key: "cargo-rail-v2"
-        key: ${{ inputs.cache-key }}
-        cache-on-failure: true
+        cache-key: ${{ inputs.cache-key }}
         save-if: ${{ github.ref == 'refs/heads/main' }}
+        remote-url: ${{ inputs.native-cache-url }}
+        remote-mode: ${{ inputs.native-cache-mode }}
+        remote-credentials-ready: ${{ inputs.native-cache-credentials-ready }}

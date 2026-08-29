@@ -11,6 +11,7 @@ case "$profile" in
 esac
 
 readonly CARGO_DENY_VERSION=0.20.2
+readonly CARGO_RAIL_VERSION=0.24.0
 readonly HYPERFINE_VERSION=1.20.0
 readonly SCCACHE_VERSION=0.17.0
 readonly JQ_VERSION=1.8.2
@@ -383,11 +384,32 @@ install_jq() {
   trap - RETURN
 }
 
+install_cargo_rail() {
+  if command -v cargo-rail >/dev/null 2>&1 && \
+    [[ "$(cargo rail --version 2>&1)" == "cargo-rail $CARGO_RAIL_VERSION" ]]; then
+    echo "cargo-rail $CARGO_RAIL_VERSION is already installed"
+    return
+  fi
+
+  if [[ "$rust_host" == *-pc-windows-msvc ]]; then
+    powershell.exe -NoProfile -ExecutionPolicy Bypass \
+      -File scripts/install.ps1 -Version "$CARGO_RAIL_VERSION"
+  else
+    scripts/install.sh "$CARGO_RAIL_VERSION"
+  fi
+  [[ "$(cargo rail --version 2>&1)" == "cargo-rail $CARGO_RAIL_VERSION" ]] || {
+    echo "cargo-rail did not install exact version $CARGO_RAIL_VERSION" >&2
+    exit 1
+  }
+}
+
 install_just
 install_jq
+install_cargo_rail
 
 just --version
 jq --version
+cargo rail --version
 
 case "$profile" in
   *-ci)
