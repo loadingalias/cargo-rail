@@ -180,6 +180,11 @@ pub(crate) struct SelectedVariant {
     pub(crate) dimensions: BTreeMap<String, ScalarDimension>,
 }
 
+struct SelectedVariants {
+    variants: Vec<SelectedVariant>,
+    all_required_inputs_attributed: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum ScalarDimension {
@@ -820,7 +825,7 @@ impl Evaluator<'_> {
 
     fn evaluate_declared(&mut self, spec: &WorkSpec) -> RailResult<()> {
         let path_inputs = matching_paths(&spec.paths, self.paths)?;
-        let config_inputs = self
+        let required_config = self
             .config_deltas
             .iter()
             .filter(|delta| {
@@ -828,7 +833,7 @@ impl Evaluator<'_> {
                     || delta.path == format!("plan.work.{}", spec.id)
                     || delta.path.starts_with(&format!("plan.work.{}.", spec.id))
             })
-            .map(|delta| format!("config:{}", delta.path))
+            .map(|delta| delta.path.clone())
             .collect::<Vec<_>>();
         let selected_cargo = spec
             .cargo
@@ -845,7 +850,11 @@ impl Evaluator<'_> {
                 })
             )
         });
-        let config_changed = !config_inputs.is_empty();
+        let config_changed = !required_config.is_empty();
+        let config_inputs = required_config
+            .iter()
+            .map(|path| format!("config:{path}"))
+            .collect::<Vec<_>>();
         let cargo_inputs = selected_cargo
             .iter()
             .map(|id| format!("cargo:{id}"))
@@ -861,13 +870,17 @@ impl Evaluator<'_> {
         // changed work input can require the family while the catalog still
         // proves an exact row subset; only an unmatched required input widens
         // to the explicit `all` selection.
-        let selected_variants = self.select_variants(spec)?;
-        if !direct.is_empty() || selected_variants.as_ref().is_some_and(|variants| !variants.is_empty()) {
+        let selected_variants = self.select_variants(spec, &path_inputs, &required_config, &selected_cargo)?;
+        if !direct.is_empty()
+            || selected_variants
+                .as_ref()
+                .is_some_and(|selection| !selection.variants.is_empty())
+        {
             let input = if direct.is_empty() {
                 selected_variants
                     .as_ref()
                     .into_iter()
-                    .flatten()
+                    .flat_map(|selection| &selection.variants)
                     .map(|variant| format!("variant:{}", variant.id))
                     .collect::<Vec<_>>()
                     .join(",")
@@ -961,26 +974,55 @@ impl Evaluator<'_> {
         merge_cargo_selections(selections)
     }
 
-    fn select_variants(&self, spec: &WorkSpec) -> RailResult<Option<Vec<SelectedVariant>>> {
+    fn select_variants(
+        &self,
+        spec: &WorkSpec,
+        required_paths: &[String],
+        required_config: &[String],
+        required_cargo: &[String],
+    ) -> RailResult<Option<SelectedVariants>> {
         let Some(catalog) = &spec.catalog else {
             return Ok(None);
         };
+        let mut unmatched_paths = required_paths.iter().map(String::as_str).collect::<HashSet<_>>();
+        let mut unmatched_config = required_config.iter().map(String::as_str).collect::<HashSet<_>>();
+        let mut unmatched_cargo = required_cargo.iter().map(String::as_str).collect::<HashSet<_>>();
         let mut selected = Vec::new();
         for row in &catalog.variants {
-            let path_match = !matching_paths(&row.paths, self.paths)?.is_empty();
-            let config_match = self.config_deltas.iter().any(|delta| row.config.contains(&delta.path));
-            let cargo_match = row
+            let matched_paths = matching_paths(&row.paths, self.paths)?;
+            for path in &matched_paths {
+                unmatched_paths.remove(path.as_str());
+            }
+            let mut matched = !matched_paths.is_empty();
+            for delta in self
+                .config_deltas
+                .iter()
+                .filter(|delta| row.config.contains(&delta.path))
+            {
+                matched = true;
+                unmatched_config.remove(delta.path.as_str());
+            }
+            for id in row
                 .cargo
                 .iter()
-                .any(|id| matches!(self.decisions.get(id), Some(WorkDecision::Required { .. })));
-            if path_match || config_match || cargo_match {
+                .filter(|id| matches!(self.decisions.get(*id), Some(WorkDecision::Required { .. })))
+            {
+                matched = true;
+                unmatched_cargo.remove(id.as_str());
+            }
+            if matched {
                 selected.push(SelectedVariant {
                     id: row.id.clone(),
                     dimensions: row.dimensions.clone(),
                 });
             }
         }
-        Ok(Some(selected))
+        Ok(Some(SelectedVariants {
+            variants: selected,
+            all_required_inputs_attributed: unmatched_paths.is_empty()
+                && unmatched_config.is_empty()
+                && unmatched_cargo.is_empty(),
+        }))
     }
 
     fn scope_for(
@@ -988,7 +1030,7 @@ impl Evaluator<'_> {
         spec: &WorkSpec,
         paths: &[&str],
         evidence: String,
-        variants: Option<Vec<SelectedVariant>>,
+        variants: Option<SelectedVariants>,
     ) -> RailResult<WorkScope> {
         Ok(match spec.scope {
             WorkSpecScope::Repository => WorkScope::Repository,
@@ -1004,7 +1046,12 @@ impl Evaluator<'_> {
             },
             WorkSpecScope::Variants => WorkScope::Variants {
                 selection: match variants {
-                    Some(variants) if !variants.is_empty() => VariantSelection::Selected { variants, evidence },
+                    Some(selection) if selection.all_required_inputs_attributed && !selection.variants.is_empty() => {
+                        VariantSelection::Selected {
+                            variants: selection.variants,
+                            evidence,
+                        }
+                    }
                     Some(_) | None => VariantSelection::All { evidence },
                 },
             },

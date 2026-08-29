@@ -557,6 +557,86 @@ fn test_plan_variant_catalog_selects_exact_rows_for_changed_cargo_work() {
 }
 
 #[test]
+fn test_plan_variant_catalog_widens_only_for_unattributed_required_inputs() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("plan-variant-input-attribution")?;
+        ws.add_crate("variant-attribution", "0.1.0", &[])?;
+        for directory in ["ci/shared", "ci/linux", "ci/windows", "docs"] {
+            std::fs::create_dir_all(ws.path.join(directory))?;
+        }
+        std::fs::write(
+            ws.path.join(".config/rail.toml"),
+            "[plan.work.ci-suite]\nscope = 'variants'\npaths = ['ci/shared/**']\nvariant_catalog = 'distribution/variants.json'\n",
+        )?;
+        std::fs::create_dir_all(ws.path.join("distribution"))?;
+        std::fs::write(
+            ws.path.join("distribution/variants.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "variant_catalog_version": 1,
+                "work": "ci-suite",
+                "variants": [
+                    {"id": "linux", "dimensions": {"runner": "ubuntu-latest"}, "paths": ["ci/linux/**"]},
+                    {"id": "windows", "dimensions": {"runner": "windows-latest"}, "paths": ["ci/windows/**"]}
+                ]
+            }))?,
+        )?;
+        for path in [
+            "ci/shared/run.sh",
+            "ci/linux/run.sh",
+            "ci/windows/run.ps1",
+            "docs/unrelated.md",
+        ] {
+            std::fs::write(ws.path.join(path), "before\n")?;
+        }
+        ws.commit("establish variant input attribution")?;
+
+        let restore = |paths: &[&str]| -> Result<()> {
+            for path in paths {
+                std::fs::write(ws.path.join(path), "before\n")?;
+            }
+            Ok(())
+        };
+        let selected_ids = |plan: &Value| {
+            plan["work"]["ci-suite"]["scope"]["selection"]["variants"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|variant| variant["id"].as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        };
+
+        std::fs::write(ws.path.join("ci/shared/run.sh"), "shared change\n")?;
+        let shared_only = plan(&ws, &["--since", "HEAD"])?;
+        assert_eq!(shared_only["work"]["ci-suite"]["scope"]["selection"]["kind"], "all");
+        restore(&["ci/shared/run.sh"])?;
+
+        std::fs::write(ws.path.join("ci/linux/run.sh"), "linux change\n")?;
+        let variant_only = plan(&ws, &["--since", "HEAD"])?;
+        assert_eq!(selected_ids(&variant_only), ["linux"]);
+        restore(&["ci/linux/run.sh"])?;
+
+        std::fs::write(ws.path.join("ci/shared/run.sh"), "shared change\n")?;
+        std::fs::write(ws.path.join("ci/linux/run.sh"), "linux change\n")?;
+        let mixed = plan(&ws, &["--since", "HEAD"])?;
+        assert_eq!(mixed["work"]["ci-suite"]["scope"]["selection"]["kind"], "all");
+        restore(&["ci/shared/run.sh", "ci/linux/run.sh"])?;
+
+        std::fs::write(ws.path.join("ci/linux/run.sh"), "linux change\n")?;
+        std::fs::write(ws.path.join("ci/windows/run.ps1"), "windows change\n")?;
+        let multiple = plan(&ws, &["--since", "HEAD"])?;
+        assert_eq!(selected_ids(&multiple), ["linux", "windows"]);
+        restore(&["ci/linux/run.sh", "ci/windows/run.ps1"])?;
+
+        std::fs::write(ws.path.join("ci/linux/run.sh"), "linux change\n")?;
+        std::fs::write(ws.path.join("docs/unrelated.md"), "unrelated change\n")?;
+        let unrelated = plan(&ws, &["--since", "HEAD"])?;
+        assert_eq!(selected_ids(&unrelated), ["linux"]);
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
 fn test_declared_cargo_work_inherits_subscribed_cargo_scope() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("plan-declared-cargo-scope")?;
@@ -880,10 +960,7 @@ fn test_plan_object_pair_uses_only_to_tree_authority() {
         let expected = plan(&ws, &["--from", &base, "--to", &head])?;
         assert_eq!(expected["inputs"]["head"], head);
         assert_eq!(expected["work"]["historical"]["state"], "required");
-        assert_eq!(
-            expected["work"]["historical"]["scope"]["selection"]["variants"][0]["id"],
-            "head"
-        );
+        assert_eq!(expected["work"]["historical"]["scope"]["selection"]["kind"], "all");
         let selected_packages = expected["work"]["cargo.test"]["scope"]["selection"]["packages"]
             .as_array()
             .context("historical Cargo package selection missing")?;
