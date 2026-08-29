@@ -221,8 +221,10 @@ impl DependencyUniverse {
         let mut stack = seeds.iter().cloned().collect::<Vec<_>>();
         stack.sort();
         let mut visited = seeds.clone();
-        let mut impact = ImpactPropagation::default();
-        impact.build_origins = seeds.iter().map(|seed| (seed.clone(), seed.clone())).collect();
+        let mut impact = ImpactPropagation {
+            build_origins: seeds.iter().map(|seed| (seed.clone(), seed.clone())).collect(),
+            ..ImpactPropagation::default()
+        };
         let mut node_visits = 0;
         let mut edge_visits = 0;
 

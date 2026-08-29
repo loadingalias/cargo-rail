@@ -158,12 +158,12 @@ fn check_auxiliary_release(ws: &TestWorkspace) -> Result<std::process::Output> {
 
 fn assert_only_crlf(path: &Path) -> Result<()> {
     let bytes = std::fs::read(path)?;
-    assert!(
+    anyhow::ensure!(
         bytes.windows(2).any(|window| window == b"\r\n"),
         "{} was not CRLF",
         path.display()
     );
-    assert!(
+    anyhow::ensure!(
         bytes
             .iter()
             .enumerate()
@@ -215,19 +215,26 @@ auxiliary_cargo_manifests = ["aux/Cargo.toml"]
     let initial_head = ws.commit("Configure external auxiliary path dependency")?;
 
     let check = check_auxiliary_release(&ws)?;
-    assert!(!check.status.success());
+    anyhow::ensure!(
+        !check.status.success(),
+        "release check unexpectedly accepted an external auxiliary dependency\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
     let stderr = String::from_utf8_lossy(&check.stderr);
     if absolute {
-        assert!(
+        anyhow::ensure!(
             stderr.contains("outside the captured source") && stderr.contains(&external.path().display().to_string()),
             "{stderr}"
         );
     } else {
-        assert!(stderr.contains("cargo metadata --locked failed"), "{stderr}");
+        anyhow::ensure!(stderr.contains("cargo metadata --locked failed"), "{stderr}");
     }
-    assert_eq!(
-        git(&ws.path, &["rev-parse", "HEAD"])?.stdout,
-        format!("{initial_head}\n").as_bytes()
+    let final_head = git(&ws.path, &["rev-parse", "HEAD"])?.stdout;
+    anyhow::ensure!(
+        final_head == format!("{initial_head}\n").as_bytes(),
+        "release check moved HEAD from {initial_head} to {}",
+        String::from_utf8_lossy(&final_head).trim()
     );
     Ok(())
 }

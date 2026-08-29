@@ -952,11 +952,11 @@ fn structural_cargo_impact(
             }
         }
         for (key, origin) in historical_development_origins {
-            if let Some(package) = current_by_key.get(&key) {
-                if !impact.build.contains(package) {
-                    impact.development.insert(package.clone());
-                    impact.historical_development_origins.insert(package.clone(), origin);
-                }
+            if let Some(package) = current_by_key.get(&key)
+                && !impact.build.contains(package)
+            {
+                impact.development.insert(package.clone());
+                impact.historical_development_origins.insert(package.clone(), origin);
             }
         }
     }
@@ -1603,9 +1603,12 @@ fn cargo_root_selected(selection: &CargoSelection, root: &ResolvedCargoRoot) -> 
             };
             targets.is_empty()
                 || targets.iter().any(|target| {
-                    target.package == root.package_key
-                        && target.name == root_target.name
-                        && target.kind == root_target.kinds
+                    (target.package.as_str(), target.name.as_str(), target.kind.as_slice())
+                        == (
+                            root.package_key.as_str(),
+                            root_target.name.as_str(),
+                            root_target.kinds.as_slice(),
+                        )
                 })
         }
     }
@@ -1882,7 +1885,11 @@ fn declared_path_selection(
         match semantic_changes.get(*path).map(|change| &change.scope) {
             Some(SemanticScope::None) => {}
             Some(SemanticScope::Packages(packages)) => selected.extend(packages.iter().cloned()),
-            Some(SemanticScope::Workspace) => unreachable!("workspace changes returned above"),
+            Some(SemanticScope::Workspace) => {
+                return Err(RailError::message(
+                    "workspace semantic scope escaped declared-path selection",
+                ));
+            }
             None => {
                 if let Some(package) = ctx
                     .graph()

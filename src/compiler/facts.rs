@@ -1197,7 +1197,7 @@ mod tests {
         legacy_v3.version = 3;
         legacy_v3.object.version = 3;
         assert!(decode(&legacy_v3).is_err());
-        assert!(decode_object(&legacy_v3).is_err());
+        decode_object(&legacy_v3).unwrap_err();
 
         let mut incomplete = fragment;
         incomplete
