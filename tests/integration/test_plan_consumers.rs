@@ -12,7 +12,6 @@ const ARCHIVE_WORKFLOW: &str = include_str!("../../.github/workflows/release-arc
 const RELEASE_WORKFLOW: &str = include_str!("../../.github/workflows/release.yaml");
 const CACHE_ACTION: &str = include_str!("../../.github/actions/cache/action.yaml");
 const SETUP_ACTION: &str = include_str!("../../.github/actions/setup/action.yaml");
-const CACHE_SETUP: &str = include_str!("../../scripts/cache/setup.sh");
 const CARGO_SCRIPT: &str = include_str!("../../scripts/cargo/run.sh");
 const VERIFY_SCRIPT: &str = include_str!("../../scripts/plan/verify.sh");
 
@@ -562,10 +561,11 @@ fn test_commit_workflow_consumes_every_builtin_cargo_execution_decision() {
 #[test]
 fn test_ci_dogfoods_released_cache_and_reuses_exact_source_authority() {
     assert!(CACHE_ACTION.contains("loadingalias/cargo-rail-action/cache@"));
-    assert!(CACHE_ACTION.contains("# v8"));
+    assert!(CACHE_ACTION.contains("# v8.1.0"));
     assert!(CACHE_ACTION.contains("version: 0.24.0"));
-    assert!(CACHE_ACTION.contains("scripts/cache/setup.sh --max-size 10GiB"));
-    assert!(CACHE_SETUP.contains("--root-portability remap"));
+    assert!(CACHE_ACTION.contains("root-portability: remap"));
+    assert!(!CACHE_ACTION.contains("scripts/cache/setup.sh --max-size 10GiB"));
+    assert!(!CACHE_ACTION.contains("strict-probe: \"true\""));
     assert!(COMMIT_WORKFLOW.contains("target/debug/cargo-rail"));
     assert!(COMMIT_WORKFLOW.contains("scripts/plan/verify.sh target/plan-v8.json"));
     assert!(COMMIT_WORKFLOW.contains("stage: ${{ github.event_name == 'push'"));

@@ -89,8 +89,8 @@ fn plan_diagnostics_are_out_of_band_and_count_real_boundaries() {
             "sparse planning must improve on the 11-process v7 capture baseline"
         );
         assert_eq!(
-            counters["graph_traversals"], 6,
-            "each independently scoped Cargo work kind must query its own propagation domain"
+            counters["graph_traversals"], 1,
+            "all Cargo work kinds must derive from one shared structural reverse-dependency closure"
         );
         assert!(counters["graph_node_visits"].as_u64().is_some_and(|count| count >= 2));
         assert!(counters["graph_edge_visits"].as_u64().is_some_and(|count| count >= 1));
