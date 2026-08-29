@@ -88,54 +88,38 @@ need.
 
 ## CR-DOGFOOD-002: Expose root portability in the cache Action
 
-**Evidence:** Confirmed companion-action contract gap
+**Evidence:** Implementation complete; Action publication remains
 
-Action v8 runs `cargo rail cache setup` without `--root-portability`. Physical
-root identity is therefore the default. This repository must immediately run
-the same setup a second time through a local script with
-`--root-portability remap` so GitHub checkout roots and remote development
-checkout roots can share the certified portable result classes.
+The companion Action now accepts typed `physical` and `remap` values, defaults
+compatibly to `physical`, passes the value through its one setup transaction,
+and includes the selected policy in its redacted status projection. Contract
+tests cover both values and reject invalid input. This repository pins that new
+Action commit, selects `remap`, and no longer repeats setup through a local
+script.
 
-Add an optional, typed `root-portability` input to the cache Action with
-`physical` as the compatibility default and `remap` as the only other value.
-Pass it through the single setup transaction, include the selected mode in the
-redacted status projection, and test both values plus invalid input. Release
-the addition through the Action release train; do not mutate the pinned v8
-commit in place.
-
-The repository workaround can be removed only after the newly released Action
-is pinned and its status output proves `remap`.
+The pin is exact but the Action commit and its release ref remain unpublished
+until this work is reviewed and pushed.
 
 ## CR-DOGFOOD-003: Add a remote cache readiness proof
 
-**Evidence:** Confirmed product and companion-action observability gap
+**Evidence:** Product and Action contracts complete; authenticated hosted proof remains
 
-The cache Action reports a healthy local installation and
-`direct_transport_selected`, then explicitly says that status inspection did
-not contact the provider. Invalid credentials, a missing bucket, an
-incompatible or absent protocol marker, and a network failure can therefore
-produce a green setup step. Cargo-Rail intentionally falls back to compilation
-on remote failure, so CI can silently stop sharing results while remaining
-correct.
+`cargo rail cache probe` reuses the persisted authority, authenticated object
+transport, and protocol-marker implementation. It reports only provider, mode,
+readiness, and marker state. Read mode requires a compatible marker; read-write
+mode may initialize an absent marker safely. Authentication, authorization,
+transport, and incompatible-protocol failures remain distinct diagnostics.
 
-Add a bounded Cargo-Rail remote probe that uses the installed authority and
-credentials, redacts the URL and object identities, and distinguishes at
-least:
-
-- authenticated read access and compatible protocol marker;
-- an uninitialized read-write authority that can be initialized safely;
-- authentication or authorization failure;
-- transport failure; and
-- incompatible protocol state.
-
-The cache Action should expose the probe result separately from local health
-and support a strict input that fails a cache-seeding job when remote readiness
-is not proved. Ordinary compilation must keep its existing correctness-first
-fallback.
+The companion Action exposes a strict probe input in its single setup
+transaction and preflights command support before making setup changes. Its
+default remains non-strict for compatibility. Cargo-Rail compilation retains
+its correctness-first remote-failure fallback. The repository's source-built
+R2 qualification probes both producer and read-only consumer jobs explicitly;
+the hosted transaction cannot run until the commits are pushed.
 
 ## CR-DOGFOOD-004: Complete the Cloudflare R2 contract and proof
 
-**Evidence:** Repository integration complete; Cargo-Rail and Action follow-up remains
+**Evidence:** Contract and workflow complete; hosted transaction remains
 
 On 2026-08-29 the repository selected one normalized R2 authority for trusted
 `main` and release compiler work. Wrangler confirmed that the URL account,
@@ -146,9 +130,12 @@ that execute compiler work, gives reusable workflows named secrets, and gives
 pull requests no remote URL or credential. Legacy AWS OIDC wiring is no longer
 part of the repository contract.
 
-This proves configuration, not a provider transaction. The bucket was empty
-at inspection time, and Action v8 still cannot prove authenticated remote
-readiness. CR-DOGFOOD-003 and the producer/consumer evidence below remain open.
+The source-built qualification workflow now uses a disposable prefix, probes
+authenticated readiness, publishes verified native-cache results, restores
+them from a separate read-only job rooted at a distinct fixture path, validates
+the two evidence packs, and removes objects plus incomplete multipart uploads
+in an unconditional cleanup job. Hosted producer/consumer evidence remains
+open until the reviewed commits are pushed.
 
 Cargo-Rail's `r2://` parser requires a 32-hex account ID, rejects query
 parameters, and hard-codes the default
@@ -158,31 +145,19 @@ so they cannot currently be selected. The repository must use a default-
 jurisdiction bucket until the URL contract grows a typed jurisdiction without
 accepting arbitrary endpoints.
 
-The companion Action's R2 test passes the syntactically invalid URL
-`r2://account/bucket/prefix` to a fake Cargo command. Its fake status also does
-not prove a real R2 normalization or transport boundary. Add contract tests
-against Cargo-Rail's accepted 32-hex URL, provider projection, credential
-environment, session-token support, and fail-closed invalid URL behavior.
-
-Add provider-specific documentation covering default-jurisdiction bucket
-creation, bucket-scoped R2 API credentials, the standard AWS credential
-environment consumed by Cargo-Rail, non-public bucket policy, and lifecycle
-rules that expire only `native-v5/entries/` while preserving the protocol
-marker. Document that R2 has free included usage and zero egress charges, not
-unlimited free storage or operations.
+Parser tests now cover the accepted 32-hex account, derived provider endpoint,
+and rejection of noncanonical accounts, ports, queries, and jurisdiction
+syntax. The companion tests cover accepted R2 projection, credential and
+session-token transport, and fail-closed invalid input. Provider documentation
+records private default-jurisdiction buckets, scoped API credentials, standard
+AWS environment variables, marker-preserving lifecycle rules, and metered
+storage and operations.
 
 ## CR-DOGFOOD-005: Make remote development machines join the same authority
 
-**Evidence:** Confirmed operator-integration defect
+**Evidence:** Operator adapter complete; live cross-root proof remains
 
-The current `dev-machines` project routing recognizes `rail` as a Cargo-Rail
-cache consumer, explicitly excludes `cargo-rail` from the generic remote-cache
-path, and therefore configures neither path for this repository. Bootstrap
-does not run `rail-cache-setup`, and the generated machine environment does not
-carry R2 credentials. AWS, Azure, and Latitude instances cannot currently
-share the repository's CI authority.
-
-Fix the external adapter so the `cargo-rail` project:
+The external `dev-machines` adapter now:
 
 1. selects the Cargo-Rail cache path on every provider;
 2. receives the one canonical `r2://ACCOUNT_ID/BUCKET/PREFIX` authority;
@@ -192,12 +167,13 @@ Fix the external adapter so the `cargo-rail` project:
 5. runs `just rail-cache-setup --max-size 10GiB` during bootstrap;
 6. persists `--root-portability remap` through that repository front door;
 7. removes or expires credentials with the machine lease; and
-8. proves a cross-root producer/consumer pair against the same exact object
-   authority before claiming sharing.
+8. records distinct producer and consumer fixture-root identities in the
+   retained evidence pair.
 
 Use separate bucket-scoped credentials for GitHub and remote machines even
 though they address one cache. A single cache means one bucket and namespace,
-not one long-lived secret copied into every trust domain.
+not one long-lived secret copied into every trust domain. Live bidirectional
+cross-root traffic is deliberately deferred to final remote qualification.
 
 ## Completion evidence
 

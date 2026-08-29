@@ -83,7 +83,7 @@ def retained_inputs(root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     require(root.is_dir(), f"retained result directory does not exist: {root}")
     environment = load_object(root / "environment.json")
     result = load_object(root / "result.json")
-    require(environment.get("schema_version") == 2, f"unsupported environment schema in {root}")
+    require(environment.get("schema_version") == 3, f"unsupported environment schema in {root}")
     require(result.get("schema_version") == 2, f"unsupported result schema in {root}")
     require(result.get("passed") is True, f"retained qualification did not pass: {root}")
     require_string(environment.get("phase"), f"{root} phase")
@@ -98,8 +98,10 @@ def retained_inputs(root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
         "worktree_status_sha256",
         "release_binary_sha256",
         "benchmark_harness_sha256",
+        "fixture_root_identity",
     ):
         require_digest(environment.get(field), f"{root} {field}")
+    require(environment.get("root_portability") == "remap", f"{root} did not qualify remapped root identities")
     require_string(environment.get("rustc"), f"{root} rustc")
     require_string(environment.get("cargo"), f"{root} cargo")
     remote = require_object(environment.get("remote"), f"{root} remote authority")
@@ -163,6 +165,10 @@ def validate_pair(producer_root: Path, consumer_root: Path) -> dict[str, Any]:
         require(producer_remote.get(field) == consumer_remote.get(field), f"remote {field} differs across roots")
     require(producer_remote.get("mode") == "read-write", "producer remote mode is not read-write")
     require(consumer_remote.get("mode") == "read", "consumer remote mode is not read-only")
+    require(
+        producer_environment.get("fixture_root_identity") != consumer_environment.get("fixture_root_identity"),
+        "producer and consumer fixture roots are identical",
+    )
 
     producer_workloads = require_object(producer.get("workloads"), "producer workloads")
     consumer_workloads = require_object(consumer.get("workloads"), "consumer workloads")
@@ -229,6 +235,7 @@ def validate_pair(producer_root: Path, consumer_root: Path) -> dict[str, Any]:
         "generated_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "run_id": producer_environment["run_id"],
         "remote": {"provider": producer_remote["provider"], "authority": producer_remote["authority"]},
+        "distinct_fixture_roots": True,
         "root_independent_action_multisets_equal": True,
         "exact_outputs_equal": True,
         "read_only_consumer": True,
@@ -243,7 +250,7 @@ def validate_pair(producer_root: Path, consumer_root: Path) -> dict[str, Any]:
 def write_fixture(root: Path, phase: str) -> None:
     remote_mode = "read-write" if phase == "producer" else "read"
     environment = {
-        "schema_version": 2,
+        "schema_version": 3,
         "phase": phase,
         "run_id": "fixture",
         "repository_commit": "a" * 40,
@@ -251,6 +258,8 @@ def write_fixture(root: Path, phase: str) -> None:
         "worktree_status_sha256": "c" * 64,
         "release_binary_sha256": "d" * 64,
         "benchmark_harness_sha256": "e" * 64,
+        "fixture_root_identity": ("1" if phase == "producer" else "2") * 64,
+        "root_portability": "remap",
         "rustc": "rustc fixture",
         "cargo": "cargo fixture",
         "remote": {
@@ -307,6 +316,16 @@ def self_test() -> None:
         write_fixture(producer, "producer")
         write_fixture(consumer, "consumer")
         require(validate_pair(producer, consumer)["passed"] is True, "passing fixture did not validate")
+        environment = load_object(consumer / "environment.json")
+        environment["fixture_root_identity"] = "1" * 64
+        (consumer / "environment.json").write_text(json.dumps(environment), encoding="utf-8")
+        try:
+            validate_pair(producer, consumer)
+        except ValidationError:
+            pass
+        else:
+            raise AssertionError("identical fixture roots were accepted")
+        write_fixture(consumer, "consumer")
         result = load_object(consumer / "result.json")
         result["workloads"]["check"]["primary"]["remote_hit_action_ids"] = []
         (consumer / "result.json").write_text(json.dumps(result), encoding="utf-8")

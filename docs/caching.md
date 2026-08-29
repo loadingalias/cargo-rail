@@ -70,9 +70,10 @@ azure://ACCOUNT/CONTAINER/PREFIX
 
 ### Cloudflare R2
 
-Use a private, default-jurisdiction bucket and an R2 API token scoped to Object Read & Write for that bucket. The
-token's S3 access key ID and secret access key must be present for setup and every compiler process that should use
-L2; a Wrangler login or Cloudflare API token is not an S3 credential pair.
+Use a private, [default-jurisdiction bucket](https://developers.cloudflare.com/r2/reference/data-location/) with
+public access disabled. Create an [R2 API token](https://developers.cloudflare.com/r2/api/tokens/) scoped to Object
+Read & Write for that bucket. Its S3 access key ID and secret access key must be present for setup and every compiler
+process that should use L2; a Wrangler login or general Cloudflare API token is not an S3 credential pair.
 
 ```bash
 export AWS_ACCESS_KEY_ID='<R2 access key ID>'
@@ -81,11 +82,25 @@ export AWS_SECRET_ACCESS_KEY='<R2 secret access key>'
 cargo rail cache normalize   'r2://0123456789abcdef0123456789abcdef/cargo-rail-cache'
 cargo rail cache setup --check --remote   'r2://0123456789abcdef0123456789abcdef/cargo-rail-cache'   --remote-mode read-write --root-portability remap
 cargo rail cache setup --remote   'r2://0123456789abcdef0123456789abcdef/cargo-rail-cache'   --remote-mode read-write --root-portability remap
+cargo rail cache probe --format json
 ```
 
 Use distinct bucket-scoped credential pairs for CI and developer machines even when they share one R2 authority.
-Keep the protocol marker at `native-v5/protocol`; a lifecycle rule may expire `native-v5/entries/` without deleting
-the marker. Scope the prefix relative to the selected URL root when the URL includes a prefix.
+Keep the protocol marker at `native-v5/protocol`; an [object lifecycle
+rule](https://developers.cloudflare.com/r2/buckets/object-lifecycles/) may expire `native-v5/entries/` without
+deleting the marker. Scope the prefix relative to the selected URL root when the URL includes a prefix.
+
+Cargo-Rail currently models only R2's default jurisdiction and derives its standard account endpoint. It deliberately
+has no jurisdiction or arbitrary-endpoint syntax. Use a default-jurisdiction bucket until a real consumer requires a
+typed jurisdiction contract.
+
+`cache probe` uses the persisted authority and standard AWS credential environment, including a session token when
+present. It proves authenticated marker compatibility and may initialize an absent marker only in `read-write` mode;
+its JSON output contains the provider, mode, readiness, and marker state but no URL, object key, or credential value.
+
+R2 includes bounded monthly Standard-storage and operation allowances and does not charge direct R2 egress, but
+storage and Class A/Class B operations beyond those allowances are billed. Treat it as metered infrastructure, not
+unlimited free storage; verify the current [R2 pricing](https://developers.cloudflare.com/r2/pricing/).
 
 Use `cargo rail cache normalize URL` to validate a URL without resolving credentials or contacting storage.
 Credentials stay outside URLs, repository configuration, result packs, diagnostics, compiler arguments, and cache

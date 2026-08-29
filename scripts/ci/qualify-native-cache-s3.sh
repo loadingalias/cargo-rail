@@ -87,7 +87,7 @@ expected_prefix="cache/cargo-rail/$provider_slug/v3/task9/$run_id"
 }
 
 results="$repo_root/benchmark_results/native-cache/$run_id-$phase"
-state="$repo_root/benchmark_results/native-cache-s3-state/$run_id"
+state="$repo_root/benchmark_results/native-cache-s3-state/$run_id-$phase"
 [[ ! -e "$results" ]] || {
   echo "remote-cache qualification result already exists: $results" >&2
   exit 2
@@ -98,6 +98,8 @@ state="$repo_root/benchmark_results/native-cache-s3-state/$run_id"
 }
 mkdir -p "$results/raw" "$state/cargo-homes" "$state/caches" "$state/fixtures"
 chmod 700 "$results" "$results/raw" "$state" "$state/cargo-homes" "$state/caches" "$state/fixtures"
+fixture_root="$(cd "$state/fixtures" && pwd -P)"
+fixture_root_identity="$(printf '%s' "$fixture_root" | { sha256sum 2>/dev/null || shasum -a 256; } | awk '{print $1}')"
 
 sha256_file() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -150,7 +152,7 @@ for workload in "${workloads[@]}"; do
     env -u RUSTC_WRAPPER -u CARGO_BUILD_RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER \
       -u CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER CARGO_HOME="$cargo_home" \
       "$binary" rail cache setup --local-dir "$state/caches/$workload" --max-size 10GiB \
-        --remote "$remote_url" --remote-mode "$setup_mode" >/dev/null
+        --remote "$remote_url" --remote-mode "$setup_mode" --root-portability remap >/dev/null
   )
 done
 
@@ -384,8 +386,9 @@ jq -n \
   --arg authority "$(jq -r '.remote.authority' <<<"$normalized")" \
   --arg mode "$(jq -r '.remote.mode' <<<"$normalized")" \
   --arg credentials "$credential_model" \
+  --arg fixture_root_identity "$fixture_root_identity" \
   '{
-    schema_version: 2,
+    schema_version: 3,
     generated_at: $generated_at,
     phase: $phase,
     run_id: $run_id,
@@ -399,6 +402,8 @@ jq -n \
     host: $host,
     dev_machine_target: $target,
     instance_type: $instance_type,
+    fixture_root_identity: $fixture_root_identity,
+    root_portability: "remap",
     remote: {
       provider: $provider,
       authority: $authority,

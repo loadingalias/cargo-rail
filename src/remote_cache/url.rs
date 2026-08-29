@@ -710,8 +710,25 @@ mod tests {
             authority.normalized_url(),
             "r2://0123456789abcdef0123456789abcdef/cache/team"
         );
+        assert_eq!(authority.provider_name(), "cloudflare-r2");
+        assert_eq!(
+            authority.endpoint(),
+            "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com"
+        );
         assert_eq!(authority.region, "auto");
         assert_eq!(authority.addressing, "path");
+    }
+
+    #[test]
+    fn r2_rejects_noncanonical_accounts_and_jurisdiction_queries() {
+        for invalid in [
+            "r2://account/cache/team",
+            "r2://0123456789abcdef0123456789abcdeg/cache/team",
+            "r2://0123456789abcdef0123456789abcdef:443/cache/team",
+            "r2://0123456789abcdef0123456789abcdef/cache/team?jurisdiction=eu",
+        ] {
+            assert!(RemoteCacheAuthority::parse(invalid).is_err(), "accepted {invalid}");
+        }
     }
 
     #[test]

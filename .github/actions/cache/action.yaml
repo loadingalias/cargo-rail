@@ -61,19 +61,10 @@ runs:
 
     - name: Enable Cargo-Rail compiler reuse
       if: inputs.remote-url != ''
-      uses: loadingalias/cargo-rail-action/cache@6e7355bfca7a308da74b1cc3487a539567adc286 # v8
+      uses: loadingalias/cargo-rail-action/cache@30ce9d2ae5ad48f0b95150f1810385e694ab9604 # v8.1.0
       with:
         url: ${{ inputs.remote-url }}
         mode: ${{ inputs.remote-mode }}
         max-size: 10GiB
+        root-portability: remap
         version: 0.24.0
-
-    # v8 does not yet expose root-portability. Reapply the same bounded setup
-    # through v0.24.0 so dev-machine and CI checkout roots share L2 identities.
-    - name: Qualify portable cache identities
-      if: inputs.remote-url != ''
-      shell: bash
-      env:
-        CARGO_RAIL_CACHE_REMOTE: ${{ inputs.remote-url }}
-        CARGO_RAIL_CACHE_MODE: ${{ inputs.remote-mode }}
-      run: scripts/cache/setup.sh --max-size 10GiB
