@@ -604,6 +604,54 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
         "plan.work.<name>.variant_catalog",
         "Selects a checked-in declarative variant catalog.",
     ),
+    policy(
+        "plan.work.<name>.cargo_prerequisites",
+        "Declares bounded one-hop Cargo artifact prerequisites for this named work item.",
+    ),
+    policy(
+        "plan.work.<name>.cargo_prerequisites.<index>.source_work",
+        "Names the code-owned Cargo execution work that activates this prerequisite edge.",
+    ),
+    policy(
+        "plan.work.<name>.cargo_prerequisites.<index>.when",
+        "Selects source packages or exact targets that activate this prerequisite edge.",
+    ),
+    policy(
+        "plan.work.<name>.cargo_prerequisites.<index>.when.<index>.package",
+        "Names an exact source workspace package.",
+    ),
+    policy(
+        "plan.work.<name>.cargo_prerequisites.<index>.when.<index>.target",
+        "Selects an optional exact source Cargo target.",
+    ),
+    policy(
+        "plan.work.<name>.cargo_prerequisites.<index>.when.<index>.target.name",
+        "Names the exact source Cargo target.",
+    ),
+    policy(
+        "plan.work.<name>.cargo_prerequisites.<index>.when.<index>.target.kind",
+        "Names one exact source Cargo target kind.",
+    ),
+    policy(
+        "plan.work.<name>.cargo_prerequisites.<index>.require",
+        "Selects prerequisite packages or exact targets emitted by this named work item.",
+    ),
+    policy(
+        "plan.work.<name>.cargo_prerequisites.<index>.require.<index>.package",
+        "Names an exact prerequisite workspace package.",
+    ),
+    policy(
+        "plan.work.<name>.cargo_prerequisites.<index>.require.<index>.target",
+        "Selects an optional exact prerequisite Cargo target.",
+    ),
+    policy(
+        "plan.work.<name>.cargo_prerequisites.<index>.require.<index>.target.name",
+        "Names the exact prerequisite Cargo target.",
+    ),
+    policy(
+        "plan.work.<name>.cargo_prerequisites.<index>.require.<index>.target.kind",
+        "Names one exact prerequisite Cargo target kind.",
+    ),
     policy("crates", "Defines per-crate policy overrides."),
     policy(
         "crates.<name>.split.remote",

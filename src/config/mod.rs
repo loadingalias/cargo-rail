@@ -7,7 +7,9 @@ mod split;
 mod surface;
 mod unify;
 
-pub use plan::{PlanConfig, PlanWorkConfig, PlanWorkScope};
+pub use plan::{
+    CargoPrerequisiteConfig, CargoRootConfig, CargoTargetRootConfig, PlanConfig, PlanWorkConfig, PlanWorkScope,
+};
 pub use release::{
     ChangelogConfig, ChangelogFilters, ChangelogRelativeTo, ChangelogShape, CommitPolicy, CrateReleaseConfig,
     GroupSpec, Pre1BreakingBump, ReleaseConfig, ReleaseRegistryPublication, ReleaseRemoteEffects, ReleaseSource,

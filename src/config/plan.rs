@@ -34,6 +34,41 @@ pub struct PlanWorkConfig {
     pub cargo: Vec<String>,
     /// Optional checked-in variant catalog.
     pub variant_catalog: Option<String>,
+    /// Bounded one-hop Cargo artifact prerequisites emitted as this work item.
+    #[serde(default)]
+    pub cargo_prerequisites: Vec<CargoPrerequisiteConfig>,
+}
+
+/// A conditional edge from selected Cargo work to prerequisite artifacts.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CargoPrerequisiteConfig {
+    /// Code-owned Cargo work whose execution selection activates the edge.
+    pub source_work: String,
+    /// Selected source packages or targets that activate the edge.
+    pub when: Vec<CargoRootConfig>,
+    /// Packages or exact targets that must be built first.
+    pub require: Vec<CargoRootConfig>,
+}
+
+/// A workspace package or one exact target within that package.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CargoRootConfig {
+    /// Exact workspace package name.
+    pub package: String,
+    /// Optional exact target identity.
+    pub target: Option<CargoTargetRootConfig>,
+}
+
+/// Exact Cargo target name and kind.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CargoTargetRootConfig {
+    /// Cargo target name.
+    pub name: String,
+    /// One target kind reported by Cargo metadata.
+    pub kind: String,
 }
 
 /// Scope kind for repository-owned work.
@@ -71,8 +106,16 @@ impl PlanConfig {
 impl PlanWorkConfig {
     fn validate(&self, id: &str) -> Result<(), ConfigError> {
         let field = format!("plan.work.{id}");
-        if self.paths.is_empty() && self.config.is_empty() && self.cargo.is_empty() {
-            return Err(invalid(&field, "at least one of paths, config, or cargo is required"));
+        if self.paths.is_empty()
+            && self.config.is_empty()
+            && self.cargo.is_empty()
+            && self.cargo_prerequisites.is_empty()
+            && self.variant_catalog.is_none()
+        {
+            return Err(invalid(
+                &field,
+                "at least one of paths, config, cargo, variant_catalog, or cargo_prerequisites is required",
+            ));
         }
         validate_unique(&self.paths, &format!("{field}.paths"))?;
         validate_unique(&self.config, &format!("{field}.config"))?;
@@ -106,8 +149,59 @@ impl PlanWorkConfig {
             }
             validate_positive_path(path, &format!("{field}.variant_catalog"), false)?;
         }
+        if !self.cargo_prerequisites.is_empty() && self.scope != PlanWorkScope::Cargo {
+            return Err(invalid(
+                &format!("{field}.cargo_prerequisites"),
+                "cargo_prerequisites is allowed only for cargo scope",
+            ));
+        }
+        let mut prerequisites = BTreeSet::new();
+        for (index, prerequisite) in self.cargo_prerequisites.iter().enumerate() {
+            let item = format!("{field}.cargo_prerequisites.{index}");
+            if CARGO_WORK_IDS
+                .binary_search(&prerequisite.source_work.as_str())
+                .is_err()
+            {
+                return Err(invalid(
+                    &format!("{item}.source_work"),
+                    &format!("'{}' is not a code-owned Cargo work ID", prerequisite.source_work),
+                ));
+            }
+            if prerequisite.when.is_empty() || prerequisite.require.is_empty() {
+                return Err(invalid(
+                    &item,
+                    "when and require must each name at least one Cargo root",
+                ));
+            }
+            validate_cargo_roots(&prerequisite.when, &format!("{item}.when"))?;
+            validate_cargo_roots(&prerequisite.require, &format!("{item}.require"))?;
+            if !prerequisites.insert(prerequisite) {
+                return Err(invalid(
+                    &format!("{field}.cargo_prerequisites"),
+                    "duplicate Cargo prerequisite edge",
+                ));
+            }
+        }
         Ok(())
     }
+}
+
+fn validate_cargo_roots(roots: &[CargoRootConfig], field: &str) -> Result<(), ConfigError> {
+    let mut unique = BTreeSet::new();
+    for root in roots {
+        if root.package.is_empty() || root.package.starts_with('-') {
+            return Err(invalid(field, "package names must be non-empty and not option-like"));
+        }
+        if let Some(target) = &root.target
+            && (target.name.is_empty() || target.kind.is_empty())
+        {
+            return Err(invalid(field, "target names and kinds must be non-empty"));
+        }
+        if !unique.insert(root) {
+            return Err(invalid(field, "duplicate Cargo root"));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_stable_id(id: &str, field: &str) -> Result<(), ConfigError> {

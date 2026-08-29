@@ -222,10 +222,16 @@ impl DependencyUniverse {
         stack.sort();
         let mut visited = seeds.clone();
         let mut impact = ImpactPropagation::default();
+        impact.build_origins = seeds.iter().map(|seed| (seed.clone(), seed.clone())).collect();
         let mut node_visits = 0;
         let mut edge_visits = 0;
 
         while let Some(dependency) = stack.pop() {
+            let origin = impact
+                .build_origins
+                .get(&dependency)
+                .expect("visited package has an originating seed")
+                .clone();
             node_visits += 1;
             let Some(edges) = self.reverse_edges.get(&dependency) else {
                 continue;
@@ -265,8 +271,18 @@ impl DependencyUniverse {
                     });
                 }
 
-                if domain == ImpactDomain::Build && visited.insert(edge.dependent.clone()) {
-                    stack.push(edge.dependent.clone());
+                match domain {
+                    ImpactDomain::Build if visited.insert(edge.dependent.clone()) => {
+                        impact.build_origins.insert(edge.dependent.clone(), origin.clone());
+                        stack.push(edge.dependent.clone());
+                    }
+                    ImpactDomain::Development => {
+                        impact
+                            .development_origins
+                            .entry(edge.dependent.clone())
+                            .or_insert_with(|| origin.clone());
+                    }
+                    ImpactDomain::Build => {}
                 }
             }
         }

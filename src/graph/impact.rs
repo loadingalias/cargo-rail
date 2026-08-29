@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 
 use cargo_metadata::{DependencyKind, PackageId};
+use rustc_hash::FxHashMap;
 
 /// Compilation domain affected in a dependent workspace package.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -44,6 +45,10 @@ pub(crate) struct ImpactPropagation {
     pub(crate) build: BTreeSet<PackageId>,
     /// Packages affected only in tests, examples, and benches.
     pub(crate) development: BTreeSet<PackageId>,
+    /// Deterministic changed package whose build-domain path first reached each package.
+    pub(crate) build_origins: FxHashMap<PackageId, PackageId>,
+    /// Deterministic changed package whose development-domain path first reached each package.
+    pub(crate) development_origins: FxHashMap<PackageId, PackageId>,
     /// Deterministically ordered semantic propagation evidence.
     pub(crate) steps: Vec<ImpactStep>,
 }
@@ -51,6 +56,8 @@ pub(crate) struct ImpactPropagation {
 impl ImpactPropagation {
     pub(super) fn normalize(&mut self) {
         self.development.retain(|package| !self.build.contains(package));
+        self.development_origins
+            .retain(|package, _| !self.build_origins.contains_key(package));
         sort_steps(&mut self.steps);
     }
 }

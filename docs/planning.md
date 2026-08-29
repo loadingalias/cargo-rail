@@ -53,6 +53,17 @@ variant_catalog = "distribution/compatibility-plan-variants.json"
 `cargo` subscriptions inherit the selected built-in Cargo scope. A changed declared path adds its package scope. A
 changed configuration input widens the declared work to the Cargo workspace because policy can affect every member.
 
+Variant catalog v2 models deliverable impact without subscribing the deliverable to conservative `cargo.build`.
+Each row declares `cargo_roots` containing exact workspace packages or targets and `external_paths` for inputs outside
+Cargo's graph. Cargo-Rail computes one structural reverse build closure for the plan and selects rows whose roots are
+affected. Root Cargo manifests, the lockfile, Cargo configuration, and the toolchain select every Cargo-rooted row.
+Unrelated external paths do not select a deliverable merely because compiler input evidence is incomplete.
+
+Runtime artifacts remain separate from test execution. A Cargo-scoped named work item with `cargo_prerequisites`
+emits only prerequisite packages and targets; the source `cargo.test` selector still owns which tests execute.
+Changing a declared artifact propagates back to its explicitly named test root. Relationships are one hop and contain
+no commands.
+
 Work IDs use lowercase ASCII letters, digits, dots, and hyphens. Paths are positive repository-relative globs.
 Absolute paths, parent traversal, negative patterns, commands, unknown configuration fields, and malformed variant
 catalogs are rejected.
@@ -92,7 +103,34 @@ captured worktree or a clean object-bound checkout. Comparing `HEAD` alone is in
 selectors are emitted or work starts.
 
 `scripts/plan/read.py` is the strict reference consumer. It validates identities, projections, selector shapes,
-checkout binding, and workflow matrices before emitting NUL-delimited arguments.
+checkout binding, and workflow matrices before emitting NUL-delimited arguments. `cargo-scope` distinguishes
+`skipped`, `workspace`, and `packages`; `package-names` emits names only for exact package scope and rejects duplicate
+names.
+
+## Migrate a pre-v8 consumer
+
+Do not float a Cargo-Rail binary across a machine contract. Pin an exact release or use the matching major Action with
+its exact default binary, and pin that Action by full commit SHA.
+
+For a v0.23-style consumer:
+
+1. Remove the retired `[change-detection]` table and register only repository-owned positive inputs under
+   `[plan.work.NAME]`.
+2. Replace `cargo rail plan -f json` with `cargo rail plan --json`.
+3. Replace legacy `.scope` parsing with named work and the strict reader:
+
+```bash
+scope="$(python3 "$PLAN_READER" cargo-scope "$PLAN_FILE" cargo.test)"
+if [[ "$scope" == packages ]]; then
+  while IFS= read -r -d '' package; do
+    test_packages+=("$package")
+  done < <(python3 "$PLAN_READER" package-names "$PLAN_FILE" cargo.test)
+fi
+```
+
+Built-in Cargo scope is exact for declared Cargo graph relationships. Without compatible complete observed evidence,
+compiler-visible inputs conservatively widen Cargo execution. That claim does not model subprocess, dynamic-library,
+container, or other runtime edges; declare those relationships explicitly.
 
 ## Observed-input evidence
 

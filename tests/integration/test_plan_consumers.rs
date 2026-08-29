@@ -189,6 +189,29 @@ fn test_plan_reader_preserves_argv_and_lowers_targets_and_variants() {
         assert_eq!(output.stdout, b"-p\0demo;echo-not-a-shell\0");
 
         let output = reader()
+            .args(["cargo-scope", path.to_str().unwrap(), "cargo.test"])
+            .output()?;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(output.stdout, b"packages\n");
+
+        let output = reader()
+            .args(["package-names", path.to_str().unwrap(), "cargo.test"])
+            .output()?;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(output.stdout, b"demo\0");
+
+        let output = reader()
+            .args(["cargo-scope", path.to_str().unwrap(), "cargo.build"])
+            .output()?;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(output.stdout, b"skipped\n");
+        let output = reader()
+            .args(["package-names", path.to_str().unwrap(), "cargo.build"])
+            .output()?;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(output.stdout.is_empty());
+
+        let output = reader()
             .args(["target-args", path.to_str().unwrap(), "cargo.test"])
             .output()?;
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
@@ -223,6 +246,57 @@ fn test_plan_reader_preserves_argv_and_lowers_targets_and_variants() {
             serde_json::from_slice::<Value>(&output.stdout)?,
             serde_json::json!({"include": []})
         );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_plan_reader_distinguishes_workspace_and_rejects_ambiguous_package_names() {
+    let result: Result<()> = (|| {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("plan.json");
+        let mut workspace = fixture();
+        workspace["work"]["cargo.test"]["scope"]["selection"] = serde_json::json!({
+            "kind": "workspace",
+            "cargo_args": [],
+            "targets": []
+        });
+        std::fs::write(&path, serde_json::to_vec(&sign_plan(workspace))?)?;
+        let output = reader()
+            .args(["cargo-scope", path.to_str().unwrap(), "cargo.test"])
+            .output()?;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(output.stdout, b"workspace\n");
+        let output = reader()
+            .args(["package-names", path.to_str().unwrap(), "cargo.test"])
+            .output()?;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(output.stdout.is_empty());
+
+        let mut punctuation = fixture();
+        punctuation["work"]["cargo.test"]["scope"]["selection"]["packages"][0]["name"] = "demo-name_123".into();
+        std::fs::write(&path, serde_json::to_vec(&sign_plan(punctuation))?)?;
+        let output = reader()
+            .args(["package-names", path.to_str().unwrap(), "cargo.test"])
+            .output()?;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(output.stdout, b"demo-name_123\0");
+
+        let mut ambiguous = fixture();
+        ambiguous["work"]["cargo.test"]["scope"]["selection"]["packages"] = serde_json::json!([
+            {"key": "demo@0.1.0#path:a", "name": "demo", "cargo_spec": "demo@0.1.0"},
+            {"key": "demo@0.2.0#path:b", "name": "demo", "cargo_spec": "demo@0.2.0"}
+        ]);
+        ambiguous["work"]["cargo.test"]["scope"]["selection"]["cargo_args"] =
+            serde_json::json!(["-p", "demo@0.1.0", "-p", "demo@0.2.0"]);
+        ambiguous["work"]["cargo.test"]["scope"]["selection"]["targets"] = serde_json::json!([]);
+        std::fs::write(&path, serde_json::to_vec(&sign_plan(ambiguous))?)?;
+        let output = reader()
+            .args(["package-names", path.to_str().unwrap(), "cargo.test"])
+            .output()?;
+        assert_eq!(output.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("package names are ambiguous"));
         Ok(())
     })();
     super::helpers::finish_test(result);

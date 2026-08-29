@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/loadingalias/cargo-rail/main/schemas/plan-variants-v2.schema.json",
+  "title": "cargo-rail declarative planner variants v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["variant_catalog_version", "work", "variants"],
+  "properties": {
+    "variant_catalog_version": { "const": 2 },
+    "work": { "$ref": "#/$defs/id" },
+    "variants": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/variant" }
+    }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[a-z][a-z0-9.-]*$" },
+    "string_array": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "kind"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "kind": { "type": "string", "minLength": 1 }
+      }
+    },
+    "cargo_root": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["package"],
+      "properties": {
+        "package": { "type": "string", "minLength": 1 },
+        "target": {
+          "oneOf": [
+            { "$ref": "#/$defs/target" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "variant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "dimensions"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "dimensions": {
+          "type": "object",
+          "additionalProperties": { "type": ["string", "integer", "boolean"] }
+        },
+        "external_paths": { "$ref": "#/$defs/string_array" },
+        "config": { "$ref": "#/$defs/string_array" },
+        "cargo_roots": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/cargo_root" },
+          "uniqueItems": true
+        }
+      },
+      "anyOf": [
+        { "properties": { "external_paths": { "minItems": 1 } }, "required": ["external_paths"] },
+        { "properties": { "config": { "minItems": 1 } }, "required": ["config"] },
+        { "properties": { "cargo_roots": { "minItems": 1 } }, "required": ["cargo_roots"] }
+      ]
+    }
+  }
+}

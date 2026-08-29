@@ -343,6 +343,38 @@ def cargo_args(plan: dict[str, Any], work_id: str) -> list[str]:
     return arguments
 
 
+def cargo_scope(plan: dict[str, Any], work_id: str) -> str:
+    selected = decision(plan, work_id)
+    if selected["state"] == "skipped":
+        return "skipped"
+    scope = selected["scope"]
+    require(scope.get("kind") == "cargo", f"work {work_id} does not have Cargo scope")
+    selection = scope.get("selection")
+    require(isinstance(selection, dict), f"work {work_id} has no Cargo selection")
+    kind = selection.get("kind")
+    require(kind in {"workspace", "packages"}, f"work {work_id} has an unknown Cargo selection")
+    return kind
+
+
+def package_names(plan: dict[str, Any], work_id: str) -> list[str]:
+    selected = decision(plan, work_id)
+    if selected["state"] == "skipped":
+        return []
+    scope = selected["scope"]
+    require(scope.get("kind") == "cargo", f"work {work_id} does not have Cargo scope")
+    selection = scope.get("selection")
+    require(isinstance(selection, dict), f"work {work_id} has no Cargo selection")
+    if selection.get("kind") == "workspace":
+        return []
+    require(selection.get("kind") == "packages", f"work {work_id} has an unknown Cargo selection")
+    packages = selection.get("packages")
+    require(isinstance(packages, list), f"work {work_id} packages are malformed")
+    names = [package.get("name") for package in packages if isinstance(package, dict)]
+    require(len(names) == len(packages) and all(isinstance(name, str) and name for name in names), f"work {work_id} package names are malformed")
+    require(len(names) == len(set(names)), f"work {work_id} package names are ambiguous")
+    return names
+
+
 def target_args(plan: dict[str, Any], work_id: str) -> list[str]:
     selected = decision(plan, work_id)
     if selected["state"] == "skipped":
@@ -427,6 +459,12 @@ def main() -> int:
     cargo = commands.add_parser("cargo-args")
     cargo.add_argument("path", type=pathlib.Path)
     cargo.add_argument("work")
+    scope = commands.add_parser("cargo-scope")
+    scope.add_argument("path", type=pathlib.Path)
+    scope.add_argument("work")
+    packages = commands.add_parser("package-names")
+    packages.add_argument("path", type=pathlib.Path)
+    packages.add_argument("work")
     targets = commands.add_parser("target-args")
     targets.add_argument("path", type=pathlib.Path)
     targets.add_argument("work")
@@ -455,6 +493,10 @@ def main() -> int:
         emit_line("true" if decision(plan, arguments.work)["state"] == "required" else "false")
     elif arguments.command == "cargo-args":
         emit_null(cargo_args(plan, arguments.work))
+    elif arguments.command == "cargo-scope":
+        emit_line(cargo_scope(plan, arguments.work))
+    elif arguments.command == "package-names":
+        emit_null(package_names(plan, arguments.work))
     elif arguments.command == "target-args":
         emit_null(target_args(plan, arguments.work))
     elif arguments.command == "matrix":

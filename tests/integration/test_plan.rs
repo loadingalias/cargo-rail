@@ -11,6 +11,7 @@ use crate::helpers::{TestWorkspace, git, run_cargo_rail, run_cargo_rail_with_env
 
 const PLAN_V8_SCHEMA: &str = include_str!("../../schemas/plan-v8.schema.json");
 const PLAN_VARIANTS_V1_SCHEMA: &str = include_str!("../../schemas/plan-variants-v1.schema.json");
+const PLAN_VARIANTS_V2_SCHEMA: &str = include_str!("../../schemas/plan-variants-v2.schema.json");
 const PLANNING_EVIDENCE_V1_SCHEMA: &str = include_str!("../../schemas/planning-evidence-v1.schema.json");
 
 const CARGO_WORK: [&str; 6] = [
@@ -463,6 +464,8 @@ fn test_plan_all_is_monotonic_and_variant_fallback_is_explicit() {
 #[test]
 fn test_plan_variant_catalogs_validate_against_published_schema() {
     let result: Result<()> = (|| {
+        let v2: Value = serde_json::from_str(PLAN_VARIANTS_V2_SCHEMA)?;
+        jsonschema::validator_for(&v2).map_err(|error| anyhow!("invalid v2 schema: {error}"))?;
         let schema: Value = serde_json::from_str(PLAN_VARIANTS_V1_SCHEMA)?;
         let validator = jsonschema::validator_for(&schema).map_err(|error| anyhow!("invalid schema: {error}"))?;
         for path in [
@@ -1107,12 +1110,32 @@ fn test_plan_portable_base_model_bounds_removed_member_impact() {
         let ws = TestWorkspace::new_named("plan-portable-base-model")?;
         ws.add_crate("base-a", "0.1.0", &[])?;
         let dependent = ws.add_crate("base-b", "0.1.0", &[("base-a", r#"{ path = "../base-a" }"#)])?;
+        ws.add_crate("base-c", "0.1.0", &[])?;
+        std::fs::create_dir_all(ws.path.join("distribution"))?;
+        std::fs::write(
+            ws.path.join(".config/rail.toml"),
+            "[plan.work.deliverables]\nscope = 'variants'\nvariant_catalog = 'distribution/deliverables.json'\n",
+        )?;
+        std::fs::write(
+            ws.path.join("distribution/deliverables.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "variant_catalog_version": 2,
+                "work": "deliverables",
+                "variants": [
+                    {"id": "affected", "dimensions": {}, "cargo_roots": [{"package": "base-b"}]},
+                    {"id": "unrelated", "dimensions": {}, "cargo_roots": [{"package": "base-c"}]}
+                ]
+            }))?,
+        )?;
         let base = ws.commit("establish base dependency")?;
 
         let root_manifest = std::fs::read_to_string(ws.path.join("Cargo.toml"))?;
         std::fs::write(
             ws.path.join("Cargo.toml"),
-            root_manifest.replace("members = [\"crates/*\"]", "members = [\"crates/base-b\"]"),
+            root_manifest.replace(
+                "members = [\"crates/*\"]",
+                "members = [\"crates/base-b\", \"crates/base-c\"]",
+            ),
         )?;
         let dependent_manifest = std::fs::read_to_string(dependent.join("Cargo.toml"))?;
         std::fs::write(
@@ -1160,6 +1183,479 @@ fn test_plan_portable_base_model_bounds_removed_member_impact() {
             assert_eq!(selection["packages"].as_array().map(Vec::len), Some(1), "{id}");
             assert_eq!(selection["packages"][0]["name"], "base-b", "{id}");
         }
+        let variants = bounded["work"]["deliverables"]["scope"]["selection"]["variants"]
+            .as_array()
+            .context("deliverable variants missing")?
+            .iter()
+            .filter_map(|variant| variant["id"].as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(variants, BTreeSet::from(["affected", "unrelated"]));
+        let evidence_id = bounded["work"]["deliverables"]["evidence"][0]
+            .as_str()
+            .context("deliverable evidence ID missing")?;
+        assert!(
+            bounded["evidence"][evidence_id]["input"]
+                .as_str()
+                .is_some_and(|input| input.contains("cargo:workspace->variant:affected"))
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_plan_variant_catalog_v2_rejects_work_level_cargo_subscriptions() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("plan-variant-v2-cargo-subscription")?;
+        ws.add_crate("demo", "0.1.0", &[])?;
+        std::fs::create_dir_all(ws.path.join("distribution"))?;
+        std::fs::write(
+            ws.path.join(".config/rail.toml"),
+            "[plan.work.deliverables]\nscope = 'variants'\ncargo = ['cargo.build']\nvariant_catalog = 'distribution/deliverables.json'\n",
+        )?;
+        std::fs::write(
+            ws.path.join("distribution/deliverables.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "variant_catalog_version": 2,
+                "work": "deliverables",
+                "variants": [{
+                    "id": "demo",
+                    "dimensions": {},
+                    "external_paths": ["crates/demo/**"]
+                }]
+            }))?,
+        )?;
+        ws.commit("establish invalid v2 Cargo subscription")?;
+
+        let output = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--json"])?;
+        assert_eq!(output.status.code(), Some(2));
+        let error: Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(
+            error["message"],
+            "variant catalog 'distribution/deliverables.json' uses contract 2, so plan.work.deliverables.cargo must be empty; v2 Cargo impact derives only from typed cargo_roots"
+        );
+        assert!(error.get("plan_contract_version").is_none());
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_plan_variant_catalog_v2_resolves_cargo_roots_fail_closed() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("plan-variant-v2-root-validation")?;
+        let package = ws.add_crate("demo", "0.1.0", &[])?;
+        std::fs::write(package.join("src/main.rs"), "fn main() {}\n")?;
+        std::fs::create_dir_all(ws.path.join("distribution"))?;
+        std::fs::write(
+            ws.path.join(".config/rail.toml"),
+            "[plan.work.deliverables]\nscope = 'variants'\nvariant_catalog = 'distribution/deliverables.json'\n",
+        )?;
+        let catalog_path = ws.path.join("distribution/deliverables.json");
+        let write_catalog = |roots: Value| -> Result<()> {
+            std::fs::write(
+                &catalog_path,
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "variant_catalog_version": 2,
+                    "work": "deliverables",
+                    "variants": [{"id": "demo", "dimensions": {}, "cargo_roots": roots}]
+                }))?,
+            )?;
+            Ok(())
+        };
+        write_catalog(serde_json::json!([{"package": "missing"}]))?;
+        ws.commit("establish invalid catalog")?;
+        let unknown_package = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--json"])?;
+        assert_eq!(unknown_package.status.code(), Some(2));
+        let unknown_package: Value = serde_json::from_slice(&unknown_package.stdout)?;
+        assert!(
+            unknown_package["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("unknown workspace package 'missing'"))
+        );
+
+        write_catalog(serde_json::json!([{
+            "package": "demo",
+            "target": {"name": "missing", "kind": "bin"}
+        }]))?;
+        let unknown_target = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--json"])?;
+        assert_eq!(unknown_target.status.code(), Some(2));
+        let unknown_target: Value = serde_json::from_slice(&unknown_target.stdout)?;
+        assert!(
+            unknown_target["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("unknown target 'bin:missing'"))
+        );
+
+        write_catalog(serde_json::json!([{"package": "demo"}, {"package": "demo"}]))?;
+        let duplicate = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--json"])?;
+        assert_eq!(duplicate.status.code(), Some(2));
+        let duplicate: Value = serde_json::from_slice(&duplicate.stdout)?;
+        assert!(
+            duplicate["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("duplicate Cargo roots"))
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_plan_variant_evidence_names_only_seeds_reaching_each_row() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("plan-variant-origin-provenance")?;
+        ws.add_crate("affected-seed", "0.1.0", &[])?;
+        ws.add_crate(
+            "affected-root",
+            "0.1.0",
+            &[("affected-seed", r#"{ path = "../affected-seed" }"#)],
+        )?;
+        ws.add_crate("disjoint-seed", "0.1.0", &[])?;
+        ws.add_crate("unrelated-root", "0.1.0", &[])?;
+        std::fs::create_dir_all(ws.path.join("distribution"))?;
+        std::fs::write(
+            ws.path.join(".config/rail.toml"),
+            "[plan.work.deliverables]\nscope = 'variants'\nvariant_catalog = 'distribution/deliverables.json'\n",
+        )?;
+        std::fs::write(
+            ws.path.join("distribution/deliverables.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "variant_catalog_version": 2,
+                "work": "deliverables",
+                "variants": [
+                    {"id": "affected", "dimensions": {}, "cargo_roots": [{"package": "affected-root"}]},
+                    {"id": "unrelated", "dimensions": {}, "cargo_roots": [{"package": "unrelated-root"}]}
+                ]
+            }))?,
+        )?;
+        ws.commit("establish variant provenance fixture")?;
+
+        ws.modify_file("affected-seed", "src/lib.rs", "pub fn affected() {}\n")?;
+        ws.modify_file("disjoint-seed", "src/lib.rs", "pub fn disjoint() {}\n")?;
+        let planned = plan(&ws, &["--since", "HEAD"])?;
+        let variants = planned["work"]["deliverables"]["scope"]["selection"]["variants"]
+            .as_array()
+            .context("deliverable variants missing")?
+            .iter()
+            .filter_map(|variant| variant["id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(variants, ["affected"]);
+        let evidence_id = planned["work"]["deliverables"]["evidence"][0]
+            .as_str()
+            .context("deliverable evidence ID missing")?;
+        assert_eq!(
+            planned["evidence"][evidence_id]["input"].as_str(),
+            Some("cargo:affected-seed@0.1.0#path:crates/affected-seed->variant:affected")
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_plan_variant_evidence_names_removed_historical_seed() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("plan-variant-historical-origin")?;
+        let removed = ws.add_crate("removed-seed", "0.1.0", &[])?;
+        let affected = ws.add_crate(
+            "affected-root",
+            "0.1.0",
+            &[("removed-seed", r#"{ path = "../removed-seed" }"#)],
+        )?;
+        ws.add_crate("unrelated-root", "0.1.0", &[])?;
+        std::fs::create_dir_all(ws.path.join("distribution"))?;
+        std::fs::write(
+            ws.path.join(".config/rail.toml"),
+            "[plan.work.deliverables]\nscope = 'variants'\nvariant_catalog = 'distribution/deliverables.json'\n",
+        )?;
+        std::fs::write(
+            ws.path.join("distribution/deliverables.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "variant_catalog_version": 2,
+                "work": "deliverables",
+                "variants": [
+                    {"id": "affected", "dimensions": {}, "cargo_roots": [{"package": "affected-root"}]},
+                    {"id": "unrelated", "dimensions": {}, "cargo_roots": [{"package": "unrelated-root"}]}
+                ]
+            }))?,
+        )?;
+        ws.commit("establish historical variant provenance fixture")?;
+
+        std::fs::remove_dir_all(removed)?;
+        let manifest = std::fs::read_to_string(affected.join("Cargo.toml"))?;
+        std::fs::write(
+            affected.join("Cargo.toml"),
+            manifest.replace("removed-seed = { path = \"../removed-seed\" }\n", ""),
+        )?;
+        let cold = plan(&ws, &["--since", "HEAD"])?;
+        let base_model = serde_json::json!({
+            "packages": [
+                {
+                    "key": "affected-root@0.1.0#path:crates/affected-root",
+                    "name": "affected-root",
+                    "root": "crates/affected-root",
+                    "targets": [{"name": "affected_root", "kind": ["lib"], "src_path": "crates/affected-root/src/lib.rs"}]
+                },
+                {
+                    "key": "removed-seed@0.1.0#path:crates/removed-seed",
+                    "name": "removed-seed",
+                    "root": "crates/removed-seed",
+                    "targets": [{"name": "removed_seed", "kind": ["lib"], "src_path": "crates/removed-seed/src/lib.rs"}]
+                }
+            ],
+            "edges": [{
+                "dependency": "removed-seed@0.1.0#path:crates/removed-seed",
+                "dependent": "affected-root@0.1.0#path:crates/affected-root",
+                "domain": "build"
+            }]
+        });
+        let evidence = complete_evidence_with_base_model(&cold, HashMap::new(), base_model)?;
+        let evidence_path = write_evidence(&ws, "historical-origin-evidence.json", &evidence)?;
+        let bounded = plan(&ws, &["--since", "HEAD", "--evidence", &evidence_path])?;
+        let variants = bounded["work"]["deliverables"]["scope"]["selection"]["variants"]
+            .as_array()
+            .context("deliverable variants missing")?
+            .iter()
+            .filter_map(|variant| variant["id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(variants, ["affected"]);
+        let evidence_id = bounded["work"]["deliverables"]["evidence"][0]
+            .as_str()
+            .context("deliverable evidence ID missing")?;
+        assert_eq!(
+            bounded["evidence"][evidence_id]["input"].as_str(),
+            Some(
+                "cargo:affected-root@0.1.0#path:crates/affected-root->variant:affected,cargo:removed-seed@0.1.0#path:crates/removed-seed->variant:affected"
+            )
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_plan_variant_catalog_v2_models_iggy_deliverables_exactly() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("plan-iggy-deliverables")?;
+        ws.add_crate("common", "0.1.0", &[])?;
+        ws.add_crate("server", "0.1.0", &[("common", r#"{ path = "../common" }"#)])?;
+        ws.add_crate("mcp", "0.1.0", &[("common", r#"{ path = "../common" }"#)])?;
+        ws.add_crate("dashboard-frontend", "0.1.0", &[])?;
+        ws.add_crate(
+            "dashboard-server",
+            "0.1.0",
+            &[("dashboard-frontend", r#"{ path = "../dashboard-frontend" }"#)],
+        )?;
+        ws.add_crate("connectors", "0.1.0", &[])?;
+        ws.add_crate("connector-plugin", "0.1.0", &[])?;
+        std::fs::create_dir_all(ws.path.join("distribution"))?;
+        std::fs::write(
+            ws.path.join(".config/rail.toml"),
+            "[plan.work.deliverables]\nscope = 'variants'\nvariant_catalog = 'distribution/deliverables.json'\n",
+        )?;
+
+        let common_paths = [
+            ".dockerignore",
+            "LICENSE",
+            "NOTICE",
+            "scripts/ci/third-party-licenses.sh",
+        ];
+        let row = |id: &str, roots: &[&str], extra: &[&str], rust: bool| {
+            let mut paths = common_paths.to_vec();
+            if rust {
+                paths.extend(["about.toml", "about.hbs"]);
+            }
+            paths.extend_from_slice(extra);
+            serde_json::json!({
+                "id": id,
+                "dimensions": {"image": id},
+                "cargo_roots": roots.iter().map(|package| serde_json::json!({"package": package})).collect::<Vec<_>>(),
+                "external_paths": paths
+            })
+        };
+        let catalog = serde_json::json!({
+            "variant_catalog_version": 2,
+            "work": "deliverables",
+            "variants": [
+                row("server", &["server"], &["core/server/Dockerfile", "web/**", "scripts/ci/render-node-licenses.mjs"], true),
+                row("mcp", &["mcp"], &["core/mcp/Dockerfile"], true),
+                row("dashboard", &["dashboard-server", "dashboard-frontend"], &["core/dashboard/Dockerfile"], true),
+                row("connectors", &["connectors"], &["core/connectors/Dockerfile"], true),
+                row("web", &[], &["web/**", "scripts/ci/render-node-licenses.mjs"], false)
+            ]
+        });
+        let schema: Value = serde_json::from_str(PLAN_VARIANTS_V2_SCHEMA)?;
+        let validator = jsonschema::validator_for(&schema).map_err(|error| anyhow!("invalid schema: {error}"))?;
+        let errors = validator
+            .iter_errors(&catalog)
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>();
+        assert!(errors.is_empty(), "v2 catalog failed schema: {errors:#?}");
+        std::fs::write(
+            ws.path.join("distribution/deliverables.json"),
+            serde_json::to_vec_pretty(&catalog)?,
+        )?;
+
+        for relative in common_paths.into_iter().chain([
+            "about.toml",
+            "about.hbs",
+            "core/server/Dockerfile",
+            "core/mcp/Dockerfile",
+            "core/dashboard/Dockerfile",
+            "core/connectors/Dockerfile",
+            "web/Dockerfile",
+            "web/app.ts",
+            "scripts/ci/render-node-licenses.mjs",
+            "foreign/node/package-lock.json",
+            "docs/guide.md",
+        ]) {
+            let path = ws.path.join(relative);
+            std::fs::create_dir_all(path.parent().context("fixture path has no parent")?)?;
+            std::fs::write(path, "before\n")?;
+        }
+        ws.commit("establish Iggy deliverable model")?;
+
+        let cases = [
+            ("crates/server/src/lib.rs", vec!["server"]),
+            ("crates/common/src/lib.rs", vec!["mcp", "server"]),
+            ("web/app.ts", vec!["server", "web"]),
+            ("crates/dashboard-frontend/src/lib.rs", vec!["dashboard"]),
+            ("crates/connector-plugin/src/lib.rs", vec![]),
+            ("foreign/node/package-lock.json", vec![]),
+            ("docs/guide.md", vec![]),
+            ("core/mcp/Dockerfile", vec!["mcp"]),
+            (".dockerignore", vec!["connectors", "dashboard", "mcp", "server", "web"]),
+            ("LICENSE", vec!["connectors", "dashboard", "mcp", "server", "web"]),
+            (
+                "scripts/ci/third-party-licenses.sh",
+                vec!["connectors", "dashboard", "mcp", "server", "web"],
+            ),
+            ("about.hbs", vec!["connectors", "dashboard", "mcp", "server"]),
+            ("scripts/ci/render-node-licenses.mjs", vec!["server", "web"]),
+            ("Cargo.toml", vec!["connectors", "dashboard", "mcp", "server"]),
+        ];
+        for (relative, expected) in cases {
+            let path = ws.path.join(relative);
+            let original = std::fs::read(&path)?;
+            let mut changed = original.clone();
+            if relative == "Cargo.toml" {
+                changed.extend_from_slice(b"\n[plan-test]\nchanged = true\n");
+            } else {
+                changed.extend_from_slice(b"\n# changed\n");
+            }
+            std::fs::write(&path, changed)?;
+            let planned = plan(&ws, &["--since", "HEAD"])?;
+            if expected.is_empty() {
+                assert_eq!(planned["work"]["deliverables"]["state"], "skipped", "{relative}");
+            } else {
+                let actual = planned["work"]["deliverables"]["scope"]["selection"]["variants"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|variant| variant["id"].as_str())
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected, "{relative}: {planned}");
+            }
+            std::fs::write(path, original)?;
+        }
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_plan_emits_runtime_artifacts_as_distinct_cargo_work() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("plan-runtime-artifacts")?;
+        for package in [
+            "integration",
+            "server",
+            "cli",
+            "mcp",
+            "connectors",
+            "connector-plugin",
+            "unit",
+        ] {
+            let root = ws.add_crate(package, "0.1.0", &[])?;
+            if !matches!(package, "integration" | "unit") {
+                std::fs::write(root.join("src/main.rs"), "fn main() {}\n")?;
+            }
+            if package == "server" {
+                std::fs::write(root.join("src/internal.rs"), "pub fn unchanged() {}\n")?;
+            }
+        }
+        std::fs::write(
+            ws.path.join(".config/rail.toml"),
+            r#"[plan.work.runtime-artifacts]
+scope = "cargo"
+cargo_prerequisites = [
+  { source_work = "cargo.test", when = [{ package = "integration" }], require = [
+    { package = "server", target = { name = "server", kind = "bin" } },
+    { package = "cli", target = { name = "cli", kind = "bin" } },
+    { package = "mcp", target = { name = "mcp", kind = "bin" } },
+    { package = "connectors", target = { name = "connectors", kind = "bin" } },
+    { package = "connector-plugin", target = { name = "connector-plugin", kind = "bin" } },
+  ] },
+]
+"#,
+        )?;
+        ws.commit("establish runtime artifact edges")?;
+
+        let package_names = |planned: &Value, work: &str| {
+            planned["work"][work]["scope"]["selection"]["packages"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|package| package["name"].as_str().map(str::to_string))
+                .collect::<BTreeSet<_>>()
+        };
+
+        let integration_path = ws.path.join("crates/integration/src/lib.rs");
+        let integration_original = std::fs::read(&integration_path)?;
+        std::fs::write(&integration_path, "pub fn changed() {}\n")?;
+        let integration = plan(&ws, &["--since", "HEAD"])?;
+        assert_eq!(
+            package_names(&integration, "cargo.test"),
+            BTreeSet::from(["integration".to_string()])
+        );
+        assert_eq!(
+            package_names(&integration, "runtime-artifacts"),
+            BTreeSet::from([
+                "cli".to_string(),
+                "connector-plugin".to_string(),
+                "connectors".to_string(),
+                "mcp".to_string(),
+                "server".to_string(),
+            ])
+        );
+        assert_eq!(
+            integration["work"]["runtime-artifacts"]["scope"]["selection"]["targets"]
+                .as_array()
+                .map(Vec::len),
+            Some(5)
+        );
+        std::fs::write(integration_path, integration_original)?;
+
+        let server_path = ws.path.join("crates/server/src/internal.rs");
+        let server_original = std::fs::read(&server_path)?;
+        std::fs::write(&server_path, "pub fn changed() {}\n")?;
+        let cold_artifact = plan(&ws, &["--since", "HEAD"])?;
+        let evidence = complete_evidence(&cold_artifact, HashMap::new())?;
+        let evidence_path = write_evidence(&ws, "runtime-artifact-evidence.json", &evidence)?;
+        let artifact = plan(&ws, &["--since", "HEAD", "--evidence", &evidence_path])?;
+        assert_eq!(
+            package_names(&artifact, "cargo.test"),
+            BTreeSet::from(["integration".to_string(), "server".to_string()]),
+            "runtime artifact changes must propagate back to their declared test execution root"
+        );
+        assert!(!package_names(&artifact, "cargo.test").contains("cli"));
+        std::fs::write(server_path, server_original)?;
+
+        ws.modify_file("unit", "src/lib.rs", "pub fn changed() {}\n")?;
+        let unit = plan(&ws, &["--since", "HEAD"])?;
+        assert_eq!(package_names(&unit, "cargo.test"), BTreeSet::from(["unit".to_string()]));
+        assert_eq!(unit["work"]["runtime-artifacts"]["state"], "skipped");
         Ok(())
     })();
     super::helpers::finish_test(result);

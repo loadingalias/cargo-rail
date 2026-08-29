@@ -121,7 +121,26 @@ variant_catalog = "distribution/compatibility-plan-variants.json"
 
 `scope` is `repository`, `cargo`, or `variants`. Paths are positive repository-relative globs. `config` names exact
 effective fields. `cargo` subscribes the work item to built-in Cargo decisions. Variant work requires a checked-in
-catalog conforming to [`plan-variants-v1.schema.json`](../schemas/plan-variants-v1.schema.json).
+catalog. Version 1 catalogs subscribe rows to work-level inputs. Version 2 catalogs conform to
+[`plan-variants-v2.schema.json`](../schemas/plan-variants-v2.schema.json) and declare typed Cargo package or exact
+target roots plus external paths. Their structural build impact is independent of conservative built-in Cargo work.
+
+A Cargo-scoped named work item may declare bounded one-hop artifact prerequisites:
+
+```toml
+[plan.work.runtime-artifacts]
+scope = "cargo"
+cargo_prerequisites = [
+  { source_work = "cargo.test", when = [{ package = "integration" }], require = [
+    { package = "server", target = { name = "server", kind = "bin" } },
+    { package = "plugin", target = { name = "plugin", kind = "cdylib" } },
+  ] },
+]
+```
+
+`when` selects execution packages or targets. `require` emits a separate build selector and adds the declared
+execution root when an artifact changes. Package and target identities must resolve uniquely in captured Cargo
+metadata. This is not a command hook or task graph.
 
 Absolute paths, parent traversal, negative globs, commands, unknown fields, and malformed catalogs are rejected. See
 [Planning](planning.md) for selector and consumer rules.
