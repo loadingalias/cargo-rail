@@ -86,6 +86,27 @@ fn rail(workspace: &Path, cargo_home: &Path, arguments: &[&str]) -> Result<Outpu
         .context("run cargo-rail cache command")
 }
 
+fn remote_probe(workspace: &Path, cargo_home: &Path, remote: &str, mode: &str) -> Result<Output> {
+    Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+        .current_dir(workspace)
+        .args(["rail", "cache", "probe", "-f", "json"])
+        .env("CARGO_HOME", cargo_home)
+        .env("CARGO_RAIL_CACHE_REMOTE", remote)
+        .env("CARGO_RAIL_CACHE_MODE", mode)
+        .env("AWS_ACCESS_KEY_ID", "fixture-access-key")
+        .env("AWS_SECRET_ACCESS_KEY", "fixture-secret-key")
+        .env("AWS_SESSION_TOKEN", "fixture-session-token")
+        .env("AWS_EC2_METADATA_DISABLED", "true")
+        .env("AWS_CONFIG_FILE", workspace.join("missing-aws-config"))
+        .env("AWS_SHARED_CREDENTIALS_FILE", workspace.join("missing-aws-credentials"))
+        .env_remove("AWS_ENDPOINT_URL")
+        .env_remove("AWS_ENDPOINT_URL_S3")
+        .env_remove("AWS_PROFILE")
+        .env_remove("AWS_DEFAULT_PROFILE")
+        .output()
+        .context("probe loopback remote cache")
+}
+
 fn cargo_check(workspace: &Path, cargo_home: &Path, rustc: Option<&Path>, cache: Option<&str>) -> Result<Output> {
     let mut command = Command::new("cargo");
     command
@@ -312,6 +333,22 @@ impl LoopbackS3 {
         };
         *last ^= 0xff;
         object.etag = "\"corrupt-result\"".to_string();
+        true
+    }
+
+    fn corrupt_protocol_marker(&self) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        let Some(object) = state
+            .objects
+            .iter_mut()
+            .find_map(|(key, object)| key.ends_with("/protocol").then_some(object))
+        else {
+            return false;
+        };
+        object.body = b"incompatible protocol".to_vec();
+        object.etag = "\"corrupt-protocol\"".to_string();
         true
     }
 }
@@ -1353,6 +1390,74 @@ fn cache_normalize_is_network_free_canonical_and_rejects_credentials() {
         )?;
         assert_eq!(rejected.status.code(), Some(2));
         assert!(!String::from_utf8_lossy(&rejected.stderr).contains("top-secret"));
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn cache_probe_authenticates_and_reports_protocol_marker_state() {
+    let result: Result<()> = (|| {
+        let workspace = TestWorkspace::new_single_crate("remote-probe", "0.1.0")?;
+        let cargo_home = tempfile::tempdir()?;
+        let remote = LoopbackS3::start()?;
+        let remote_url = remote.remote_url();
+
+        let initialized = remote_probe(&workspace.path, cargo_home.path(), &remote_url, "read-write")?;
+        assert!(
+            initialized.status.success(),
+            "marker initialization failed: {initialized:?}"
+        );
+        let initialized_json = json(&initialized)?;
+        assert_eq!(initialized_json["result"], "ready");
+        assert_eq!(initialized_json["ready"], true);
+        assert_eq!(initialized_json["protocol_marker"], "initialized");
+        assert_eq!(initialized_json["remote"]["provider"], "s3-compatible");
+        assert_eq!(initialized_json["remote"]["mode"], "read-write");
+        assert!(
+            remote
+                .requests()
+                .iter()
+                .any(|(method, path)| method == "PUT" && path.ends_with("/protocol")),
+            "probe did not initialize the protocol marker"
+        );
+
+        let puts_before_existing = remote.requests().iter().filter(|(method, _)| method == "PUT").count();
+        let existing = remote_probe(&workspace.path, cargo_home.path(), &remote_url, "read")?;
+        assert!(existing.status.success(), "existing marker probe failed: {existing:?}");
+        assert_eq!(json(&existing)?["protocol_marker"], "existing");
+        assert_eq!(
+            remote.requests().iter().filter(|(method, _)| method == "PUT").count(),
+            puts_before_existing,
+            "read-only probe wrote to the object store"
+        );
+
+        let missing_url = remote_url.replace("/team?", "/missing?");
+        let missing = remote_probe(&workspace.path, cargo_home.path(), &missing_url, "read")?;
+        assert_eq!(missing.status.code(), Some(2));
+        let missing_json = json(&missing)?;
+        assert_eq!(missing_json["result"], "probe_failed");
+        assert_eq!(missing_json["ready"], false);
+        assert_eq!(missing_json["failure"]["kind"], "configuration_failure");
+
+        #[cfg(unix)]
+        {
+            remote.set_available(false);
+            let unavailable = remote_probe(&workspace.path, cargo_home.path(), &remote_url, "read")?;
+            remote.set_available(true);
+            assert_eq!(unavailable.status.code(), Some(2));
+            assert_eq!(json(&unavailable)?["failure"]["kind"], "transport_failure");
+        }
+
+        assert!(remote.corrupt_protocol_marker());
+        let incompatible = remote_probe(&workspace.path, cargo_home.path(), &remote_url, "read")?;
+        assert_eq!(incompatible.status.code(), Some(2));
+        assert_eq!(json(&incompatible)?["failure"]["kind"], "integrity_failure");
+        let output = String::from_utf8_lossy(&incompatible.stdout);
+        assert!(!output.contains(&remote_url));
+        assert!(!output.contains("fixture-access-key"));
+        assert!(!output.contains("fixture-secret-key"));
+        assert!(!output.contains("fixture-session-token"));
         Ok(())
     })();
     super::helpers::finish_test(result);

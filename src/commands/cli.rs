@@ -709,6 +709,12 @@ pub enum CacheCommand {
         #[arg(long, short = 'f', default_value_t, value_enum)]
         format: TextJsonOutputFormat,
     },
+    /// Authenticate the selected remote object store and validate its protocol marker.
+    Probe {
+        /// Report format.
+        #[arg(long, short = 'f', default_value_t, value_enum)]
+        format: TextJsonOutputFormat,
+    },
     /// Report cache installation and owned-storage health.
     Status {
         /// Cache scope to inspect.
@@ -1137,6 +1143,7 @@ impl Commands {
             Commands::Cache { command } => match command {
                 CacheCommand::Setup(setup) => text_json_protocol(setup.format.is_json()),
                 CacheCommand::Normalize { format, .. }
+                | CacheCommand::Probe { format }
                 | CacheCommand::Status { format, .. }
                 | CacheCommand::Recover { format, .. }
                 | CacheCommand::Clean { format, .. }
@@ -1267,6 +1274,7 @@ impl Commands {
             Commands::Cache { command } => match command {
                 CacheCommand::Setup(setup) => setup.format = TextJsonOutputFormat::Json,
                 CacheCommand::Normalize { format, .. }
+                | CacheCommand::Probe { format }
                 | CacheCommand::Status { format, .. }
                 | CacheCommand::Recover { format, .. }
                 | CacheCommand::Clean { format, .. }

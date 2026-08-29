@@ -378,6 +378,7 @@ pub fn try_dispatch_pre_context(
                     environment,
                     format,
                 } => cache::run_normalize(&url, mode.as_deref(), environment, format)?,
+                cli::CacheCommand::Probe { format } => cache::run_probe(workspace_root, format)?,
                 cli::CacheCommand::Status { scope, format } => cache::run_status(workspace_root, scope, format)?,
                 cli::CacheCommand::Recover { check, format } => {
                     cache::run_recover(workspace_root, check, format)?;

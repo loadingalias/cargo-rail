@@ -7,7 +7,9 @@ use std::io::{BufReader, Seek as _, Write as _};
 
 use serde::{Deserialize, Serialize};
 
-use super::{RemoteCacheMode, RemoteCacheSelection, RemoteStoreError, RemoteStoreResult, azure, s3};
+use super::{
+    RemoteCacheMode, RemoteCacheSelection, RemoteProtocolMarkerState, RemoteStoreError, RemoteStoreResult, azure, s3,
+};
 use crate::compiler::native_cache::pack::NativeAssociation;
 
 pub(super) const OBJECT_NAMESPACE: &str = "native-v5";
@@ -290,13 +292,23 @@ pub(super) struct ObjectStore {
 }
 
 pub(super) fn connect(selection: &RemoteCacheSelection) -> RemoteStoreResult<ObjectStore> {
+    connect_with_marker(selection).map(|(store, _)| store)
+}
+
+pub(super) fn probe(selection: &RemoteCacheSelection) -> RemoteStoreResult<RemoteProtocolMarkerState> {
+    connect_with_marker(selection).map(|(_, marker)| marker)
+}
+
+fn connect_with_marker(
+    selection: &RemoteCacheSelection,
+) -> RemoteStoreResult<(ObjectStore, RemoteProtocolMarkerState)> {
     let store = ObjectStore {
         backend: Backend::connect(selection)?,
         prefix: selection.authority.prefix().to_string(),
         mode: selection.mode(),
     };
-    store.ensure_protocol_marker()?;
-    Ok(store)
+    let marker = store.ensure_protocol_marker()?;
+    Ok((store, marker))
 }
 
 impl ObjectStore {
@@ -338,10 +350,10 @@ impl ObjectStore {
         }
     }
 
-    fn ensure_protocol_marker(&self) -> RemoteStoreResult<()> {
+    fn ensure_protocol_marker(&self) -> RemoteStoreResult<RemoteProtocolMarkerState> {
         let key = self.marker_key();
         match self.backend.get_marker(&key)? {
-            Some(bytes) if bytes == PROTOCOL_MARKER => return Ok(()),
+            Some(bytes) if bytes == PROTOCOL_MARKER => return Ok(RemoteProtocolMarkerState::Existing),
             Some(_) => {
                 return Err(RemoteStoreError::integrity(
                     "remote cache protocol marker is incompatible",
@@ -356,7 +368,7 @@ impl ObjectStore {
         }
         let _ = self.backend.put_bytes(&key, PROTOCOL_MARKER, PutCondition::Absent)?;
         match self.backend.get_marker(&key)? {
-            Some(bytes) if bytes == PROTOCOL_MARKER => Ok(()),
+            Some(bytes) if bytes == PROTOCOL_MARKER => Ok(RemoteProtocolMarkerState::Initialized),
             _ => Err(RemoteStoreError::integrity(
                 "remote cache protocol marker did not converge",
             )),

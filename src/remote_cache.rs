@@ -137,6 +137,15 @@ impl RemoteStoreError {
             | RemoteStoreErrorKind::Authentication => "remote_cache_unavailable",
         }
     }
+
+    pub(crate) const fn probe_failure(&self) -> &'static str {
+        match self.kind {
+            RemoteStoreErrorKind::Integrity => "integrity_failure",
+            RemoteStoreErrorKind::Configuration => "configuration_failure",
+            RemoteStoreErrorKind::Unavailable => "transport_failure",
+            RemoteStoreErrorKind::Authentication => "authentication_failure",
+        }
+    }
 }
 
 impl fmt::Display for RemoteStoreError {
@@ -155,6 +164,30 @@ pub(super) type RemoteStoreResult<T> = Result<T, RemoteStoreError>;
 pub(crate) enum RemoteCacheMode {
     Read,
     ReadWrite,
+}
+
+/// Result of authenticating the selected object store and validating its protocol marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RemoteProtocolMarkerState {
+    Existing,
+    Initialized,
+}
+
+impl RemoteProtocolMarkerState {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Existing => "existing",
+            Self::Initialized => "initialized",
+        }
+    }
+}
+
+/// Redacted product-level remote-cache readiness report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct RemoteCacheProbeStatus {
+    pub(crate) remote: RemoteCacheConfigurationStatus,
+    pub(crate) protocol_marker: RemoteProtocolMarkerState,
 }
 
 /// Canonical non-secret remote policy persisted in private machine setup state.
@@ -592,6 +625,20 @@ pub(crate) fn configuration_status(
         .map(InstalledRemoteCache::selection)
         .transpose()
         .map(|selection| selection.as_ref().map(RemoteCacheConfigurationStatus::from_selection))
+}
+
+/// Authenticate the selected direct object store and validate its exact protocol marker.
+pub(crate) fn probe(current_dir: &std::path::Path) -> RemoteStoreResult<RemoteCacheProbeStatus> {
+    let installed = crate::cache::installation::installed_remote(current_dir)
+        .map_err(|_| RemoteStoreError::configuration("installed remote cache policy is unavailable"))?;
+    let selection = RemoteCacheSelection::from_environment_or_installed(installed.as_ref())?
+        .ok_or_else(|| RemoteStoreError::configuration("no remote cache authority is selected"))?;
+    let remote = RemoteCacheConfigurationStatus::from_selection(&selection);
+    let protocol_marker = object::probe(&selection)?;
+    Ok(RemoteCacheProbeStatus {
+        remote,
+        protocol_marker,
+    })
 }
 
 fn parse_environment_policy(value: &std::ffi::OsStr) -> RemoteStoreResult<Vec<String>> {

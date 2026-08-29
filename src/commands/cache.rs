@@ -41,6 +41,60 @@ pub(crate) fn run_normalize(
     Ok(())
 }
 
+/// Authenticate the selected object store and validate its protocol marker.
+pub(crate) fn run_probe(current_dir: &Path, format: TextJsonOutputFormat) -> RailResult<()> {
+    match crate::remote_cache::probe(current_dir) {
+        Ok(probe) => {
+            if format.is_json() {
+                let output = crate::output::machine_json_envelope(
+                    "cache",
+                    "probe",
+                    "ready",
+                    0,
+                    serde_json::json!({
+                      "ready": true,
+                      "remote": probe.remote,
+                      "protocol_marker": probe.protocol_marker,
+                    }),
+                );
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                println!("Remote cache ready.");
+                if crate::output::is_verbose() {
+                    println!(
+                        "Provider: {}; protocol: {}; mode: {}",
+                        probe.remote.provider, probe.remote.protocol, probe.remote.mode
+                    );
+                    println!("Protocol marker: {}", probe.protocol_marker.as_str());
+                }
+            }
+            Ok(())
+        }
+        Err(error) => {
+            let failure = error.probe_failure();
+            if format.is_json() {
+                let output = crate::output::machine_json_envelope(
+                    "cache",
+                    "probe",
+                    "probe_failed",
+                    2,
+                    serde_json::json!({
+                      "ready": false,
+                      "failure": {
+                        "kind": failure,
+                        "message": error.to_string(),
+                      },
+                    }),
+                );
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                println!("Remote cache probe failed ({failure}): {error}");
+            }
+            Err(RailError::ExitWithCode { code: 2 })
+        }
+    }
+}
+
 /// Preview or apply one exact transparent compiler-cache installation.
 pub(crate) fn run_setup(
     current_dir: &Path,
