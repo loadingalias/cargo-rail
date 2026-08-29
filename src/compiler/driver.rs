@@ -602,6 +602,7 @@ fn runtime_compiler_fact_driver(
         .direct_rustc_sysroot()
         .join("bin")
         .join(if cfg!(windows) { "rustc.exe" } else { "rustc" });
+    let rustflags = runtime_fact_driver_rustflags(build.path(), selected.host);
     let mut command = Command::new(snapshot.toolchain().cargo_program());
     command
         .current_dir(build.path())
@@ -611,13 +612,7 @@ fn runtime_compiler_fact_driver(
         .env("RUSTC", &rustc)
         .env("RUSTC_BOOTSTRAP", "cargo_rail_fact_driver")
         .env("CARGO_TARGET_DIR", &target)
-        .env(
-            "RUSTFLAGS",
-            format!(
-                "--remap-path-prefix={}=/cargo-rail-fact-driver --remap-path-scope=object",
-                build.path().display()
-            ),
-        )
+        .env("RUSTFLAGS", rustflags)
         .env_remove("RUSTC_WRAPPER")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .env_remove("CARGO_ENCODED_RUSTFLAGS");
@@ -691,6 +686,19 @@ fn runtime_compiler_fact_driver(
     })?;
     load_cached_runtime_driver(&entry, source, snapshot.toolchain(), &compiler_library_path)?
         .ok_or_else(|| RailError::message("selected-toolchain fact driver disappeared after commit"))
+}
+
+fn runtime_fact_driver_rustflags(build_root: &Path, rustc_host: &str) -> String {
+    let mut flags = format!(
+        "--remap-path-prefix={}=/cargo-rail-fact-driver --remap-path-scope=object",
+        build_root.display()
+    );
+    if rustc_host.ends_with("-unknown-linux-musl") {
+        // rustc_driver is shared. A musl-host companion must retain the native
+        // dynamic loader even though the Cargo-Rail release binary is static.
+        flags.push_str(" -C target-feature=-crt-static");
+    }
+    flags
 }
 
 fn read_authenticated_component(path: &Path, expected_digest: &str, maximum_bytes: u64) -> RailResult<Vec<u8>> {
@@ -2092,6 +2100,17 @@ mod tests {
             file.set_permissions(fs::Permissions::from_mode(0o700))
                 .expect("make component executable");
         }
+    }
+
+    #[test]
+    fn musl_runtime_driver_keeps_the_dynamic_loader() {
+        let build = Path::new("/temporary/driver-build");
+        let musl = runtime_fact_driver_rustflags(build, "x86_64-unknown-linux-musl");
+        assert!(musl.contains("--remap-path-prefix=/temporary/driver-build=/cargo-rail-fact-driver"));
+        assert!(musl.contains("-C target-feature=-crt-static"));
+
+        let gnu = runtime_fact_driver_rustflags(build, "x86_64-unknown-linux-gnu");
+        assert!(!gnu.contains("crt-static"));
     }
 
     #[cfg(unix)]

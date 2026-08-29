@@ -23,7 +23,7 @@ case "${1:-}" in
             'binary: rustc' \
             'commit-hash: fixture' \
             'commit-date: 2026-08-18' \
-            'host: aarch64-pc-windows-msvc' \
+            "host: ${FAKE_RUSTC_HOST:-aarch64-pc-windows-msvc}" \
             'release: 1.98.0' \
             'LLVM version: fixture'
         else

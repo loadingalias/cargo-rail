@@ -4,11 +4,12 @@ set -euo pipefail
 repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 
 usage() {
-  echo "usage: $0 [--toolchain <major.minor.patch>] [--components <comma-list>] [--targets <comma-list>]" >&2
+  echo "usage: $0 [--toolchain <major.minor.patch>] [--host <target-triple>] [--components <comma-list>] [--targets <comma-list>]" >&2
   exit 2
 }
 
 toolchain=""
+host=""
 component_list=""
 target_list=""
 while [[ "$#" -gt 0 ]]; do
@@ -16,6 +17,11 @@ while [[ "$#" -gt 0 ]]; do
     --toolchain)
       [[ "$#" -ge 2 ]] || usage
       toolchain="$2"
+      shift 2
+      ;;
+    --host)
+      [[ "$#" -ge 2 ]] || usage
+      host="$2"
       shift 2
       ;;
     --components)
@@ -41,6 +47,7 @@ if [[ -z "$toolchain" ]]; then
 fi
 
 [[ "$toolchain" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || usage
+[[ -z "$host" || "$host" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || usage
 : "${GITHUB_ENV:?GitHub Actions environment file is not available}"
 : "${RUNNER_TEMP:?GitHub Actions runner temporary directory is not available}"
 command -v rustup >/dev/null 2>&1 || {
@@ -75,19 +82,30 @@ rustup_home="$RUNNER_TEMP/cargo-rail-rustup"
 mkdir -p "$rustup_home"
 export RUSTUP_HOME="$rustup_home"
 
-install=(toolchain install "$toolchain" --profile minimal --no-self-update --component cargo)
+install_name="$toolchain"
+if [[ -n "$host" ]]; then
+  install_name="$toolchain-$host"
+fi
+install=(toolchain install "$install_name" --profile minimal --no-self-update --component cargo)
+if [[ -n "$host" ]]; then
+  install+=(--force-non-host)
+fi
 append_list "$component_list" component --component
 append_list "$target_list" target --target
 rustup "${install[@]}"
 
-rustc_verbose="$(rustup run "$toolchain" rustc --version --verbose)"
+rustc_verbose="$(rustup run "$install_name" rustc --version --verbose)"
 release="$(sed -n 's/^release: //p' <<<"$rustc_verbose")"
-host="$(sed -n 's/^host: //p' <<<"$rustc_verbose")"
-[[ "$release" == "$toolchain" && "$host" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
+installed_host="$(sed -n 's/^host: //p' <<<"$rustc_verbose")"
+[[ "$release" == "$toolchain" && "$installed_host" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
   echo "installed rustc does not match requested toolchain $toolchain" >&2
   exit 1
 }
-selected="$toolchain-$host"
+if [[ -n "$host" && "$installed_host" != "$host" ]]; then
+  echo "installed rustc host $installed_host does not match requested host $host" >&2
+  exit 1
+fi
+selected="$toolchain-$installed_host"
 
 export RUSTUP_TOOLCHAIN="$selected"
 export RUSTUP_AUTO_INSTALL=0

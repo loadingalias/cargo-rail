@@ -19,14 +19,14 @@ case "$system-$machine" in
   Darwin-arm64) target="aarch64-apple-darwin"; surface=true ;;
   Linux-aarch64|Linux-arm64)
     if ldd --version 2>&1 | grep -qi musl; then
-      target="aarch64-unknown-linux-musl"; surface=false
+      target="aarch64-unknown-linux-musl"; surface=true
     else
       target="aarch64-unknown-linux-gnu"; surface=true
     fi
     ;;
   Linux-x86_64)
     if ldd --version 2>&1 | grep -qi musl; then
-      target="x86_64-unknown-linux-musl"; surface=false
+      target="x86_64-unknown-linux-musl"; surface=true
     else
       target="x86_64-unknown-linux-gnu"; surface=true
     fi

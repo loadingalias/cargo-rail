@@ -35,12 +35,16 @@ option bypasses discovery.
 
 ## Surface is unavailable or reports unexpected findings
 
-Source installs, `cargo binstall`, and musl archives cannot run Surface analysis; `surface --schema` remains
-available. Install the complete native component set, then prepare the exact workspace-selected toolchain:
+Source installs and `cargo binstall` cannot run Surface analysis; `surface --schema` remains available. Native
+archives—including both Linux musl archives—install the complete component set. Prepare the exact workspace-selected
+toolchain with:
 
 ```bash
 cargo rail surface --prepare -f json
 ```
+
+Linux musl Surface also requires the host's standard musl `libgcc_s` runtime, matching rustc's native host-tools
+dependency.
 
 Preparation may install `rustc-dev` for the selected rustup toolchain. It does not change the default toolchain.
 

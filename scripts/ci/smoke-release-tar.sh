@@ -106,6 +106,24 @@ assert_json() {
   fi
 }
 
+toolchain_for_target() {
+  local release="$1"
+  if [[ "$target" == *-linux-musl ]]; then
+    printf '%s-%s\n' "$release" "$target"
+  else
+    printf '%s\n' "$release"
+  fi
+}
+
+install_toolchain_for_target() {
+  local toolchain="$1"
+  local arguments=(toolchain install "$toolchain" --profile minimal)
+  if [[ "$target" == *-linux-musl ]]; then
+    arguments+=(--force-non-host)
+  fi
+  rustup "${arguments[@]}"
+}
+
 tar -xzf "$archive" -C "$smoke"
 binary="$(find "$smoke" -type f -name cargo-rail -print -quit)"
 observation="$(find "$smoke" -type f -name cargo-rail-compiler-observation -print -quit)"
@@ -162,7 +180,8 @@ else
   : "${CARGO_RAIL_FACT_DRIVER_COMPILER_LIBRARY:?compiler library authority is missing}"
   compiler_library="$(rustc --print sysroot)/$CARGO_RAIL_FACT_DRIVER_COMPILER_LIBRARY"
   compiler_library_directory="$(dirname "$compiler_library")"
-  if ! protocol="$(LD_LIBRARY_PATH="$compiler_library_directory" DYLD_LIBRARY_PATH="$compiler_library_directory" \
+  if ! protocol="$(LD_LIBRARY_PATH="$compiler_library_directory${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+    DYLD_LIBRARY_PATH="$compiler_library_directory${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" \
     "$driver" --cargo-rail-fact-protocol-version)"; then
     fail "compiler fact driver protocol probe failed"
   fi
@@ -185,8 +204,43 @@ else
   assert_json "stable audited targets" "$stable_report" '.authority.audited_targets | length > 0' true
   assert_json "stable dead-public finding" "$stable_report" '.findings | any(.name == "dead_public")' true
 
-  nightly_toolchain="nightly-2026-08-12"
-  rustup toolchain install "$nightly_toolchain" --profile minimal
+  if [[ "$target" == *-linux-musl ]]; then
+    capture_surface stable-warm 1 "" --check
+    stable_warm_report="$captured_output"
+    assert_json "warm surface contract" "$stable_warm_report" '.surface_contract_version' 3
+    assert_json "warm fact cache hits" "$stable_warm_report" '.metrics.acquisition.fact_cache_hits > 0' true
+    assert_json "warm Cargo executions" "$stable_warm_report" '.metrics.acquisition.cargo_views_executed' 0
+    assert_json "warm compiler invocations" "$stable_warm_report" '.metrics.acquisition.compiler_invocations' 0
+    stable_objects="$(jq -c '.cache.compiler_fact_objects' <<<"$stable_report")"
+    warm_objects="$(jq -c '.cache.compiler_fact_objects' <<<"$stable_warm_report")"
+    [[ "$warm_objects" == "$stable_objects" ]] || fail "warm Surface changed compiler fact object identities"
+
+    fallback_release="1.97.0"
+    fallback_toolchain="$(toolchain_for_target "$fallback_release")"
+    install_toolchain_for_target "$fallback_toolchain"
+    rustup component remove rustc-dev --toolchain "$fallback_toolchain" || true
+    capture_surface fallback-stable-prepare 0 "$fallback_toolchain" --prepare
+    fallback_preparation="$captured_output"
+    assert_json "fallback stable preparation result" "$fallback_preparation" '.result' ready
+    assert_json "fallback stable preparation contract" "$fallback_preparation" \
+      '.surface_preparation_contract_version' 1
+    assert_json "fallback stable preparation toolchain" "$fallback_preparation" \
+      ".toolchain.rustc | contains(\"$fallback_release\")" true
+    fallback_driver_identity="$(jq -r '.driver.identity' <<<"$fallback_preparation")"
+    stable_driver_identity="$(jq -r '.driver.identity' <<<"$stable_preparation")"
+    [[ "$fallback_driver_identity" != "$stable_driver_identity" ]] ||
+      fail "fallback stable toolchain reused the embedded driver identity"
+
+    capture_surface fallback-stable-check 1 "$fallback_toolchain" --check
+    fallback_report="$captured_output"
+    assert_json "fallback stable surface contract" "$fallback_report" '.surface_contract_version' 3
+    assert_json "fallback stable audited targets" "$fallback_report" '.authority.audited_targets | length > 0' true
+    assert_json "fallback stable dead-public finding" "$fallback_report" \
+      '.findings | any(.name == "dead_public")' true
+  fi
+
+  nightly_toolchain="$(toolchain_for_target nightly-2026-08-12)"
+  install_toolchain_for_target "$nightly_toolchain"
   rustup component remove rustc-dev --toolchain "$nightly_toolchain" || true
   capture_surface nightly-prepare 0 "$nightly_toolchain" --prepare
   nightly_preparation="$captured_output"

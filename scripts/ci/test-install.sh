@@ -20,9 +20,9 @@ mkdir -p "$release" "$temporary/payload"
 targets=(
   "Darwin arm64 native aarch64-apple-darwin true"
   "Linux aarch64 gnu aarch64-unknown-linux-gnu true"
-  "Linux aarch64 musl aarch64-unknown-linux-musl false"
+  "Linux aarch64 musl aarch64-unknown-linux-musl true"
   "Linux x86_64 gnu x86_64-unknown-linux-gnu true"
-  "Linux x86_64 musl x86_64-unknown-linux-musl false"
+  "Linux x86_64 musl x86_64-unknown-linux-musl true"
 )
 # Native Windows jq uses CRLF records. Target identity does not include the record terminator.
 diff -u \
@@ -97,9 +97,18 @@ for specification in "${targets[@]}"; do
   fi
   test -f "$cargo_home/bin/cargo-rail-components-v1.tsv"
   printf 'damaged' > "$cargo_home/bin/cargo-rail-native-rustc-worker"
+  if [ "$surface" = true ]; then
+    printf 'damaged' > "$cargo_home/bin/cargo-rail-fact-driver"
+    printf 'damaged' > "$cargo_home/bin/cargo-rail-fact-driver-source-v1.json"
+  fi
   INSTALLER_TEST_SYSTEM="$system" INSTALLER_TEST_MACHINE="$machine" INSTALLER_TEST_LIBC="$libc" \
     PATH="$temporary/bin:$PATH" CARGO_HOME="$cargo_home" "$installer" "$version" > /dev/null
   cmp scripts/ci/fixtures/fake-cargo-rail-installer-binary.sh "$cargo_home/bin/cargo-rail-native-rustc-worker"
+  if [ "$surface" = true ]; then
+    cmp "$payload/cargo-rail-fact-driver" "$cargo_home/bin/cargo-rail-fact-driver"
+    cmp "$payload/cargo-rail-fact-driver-source-v1.json" \
+      "$cargo_home/bin/cargo-rail-fact-driver-source-v1.json"
+  fi
 done
 
 if INSTALLER_TEST_SYSTEM=Darwin INSTALLER_TEST_MACHINE=x86_64 INSTALLER_TEST_LIBC=native \
@@ -142,3 +151,51 @@ if ! grep -Fq "digest mismatch for cargo-rail-native-rustc-worker" "$temporary/t
   exit 1
 fi
 test ! -e "$temporary/tampered-home/bin/cargo-rail"
+
+surface_archive="cargo-rail-x86_64-unknown-linux-musl.tar.gz"
+cp "$release/$surface_archive" "$temporary/surface-original.tar.gz"
+mkdir "$temporary/surface-missing-payload"
+tar -xzf "$temporary/surface-original.tar.gz" -C "$temporary/surface-missing-payload"
+rm "$temporary/surface-missing-payload/cargo-rail-x86_64-unknown-linux-musl/cargo-rail-fact-driver"
+tar -czf "$release/$surface_archive" -C "$temporary/surface-missing-payload" \
+  cargo-rail-x86_64-unknown-linux-musl
+printf '%s  %s\n' \
+  "$(if command -v sha256sum >/dev/null 2>&1; then sha256sum "$release/$surface_archive"; else shasum -a 256 "$release/$surface_archive"; fi | awk '{print $1}')" \
+  "$surface_archive" > "$release/SHA256SUMS"
+if INSTALLER_TEST_SYSTEM=Linux INSTALLER_TEST_MACHINE=x86_64 INSTALLER_TEST_LIBC=musl \
+  PATH="$temporary/bin:$PATH" CARGO_HOME="$temporary/missing-surface-home" \
+  "$installer" "$version" > /dev/null 2> "$temporary/missing-surface-stderr"; then
+  echo "installer accepted an archive missing its Surface driver" >&2
+  exit 1
+fi
+if ! grep -Fq "$surface_archive is missing cargo-rail-fact-driver" \
+  "$temporary/missing-surface-stderr"; then
+  echo "installer reported the wrong missing-Surface-driver failure:" >&2
+  sed 's/^/  /' "$temporary/missing-surface-stderr" >&2
+  exit 1
+fi
+test ! -e "$temporary/missing-surface-home/bin/cargo-rail"
+
+mkdir "$temporary/surface-tampered-payload"
+tar -xzf "$temporary/surface-original.tar.gz" -C "$temporary/surface-tampered-payload"
+surface_source="$temporary/surface-tampered-payload/cargo-rail-x86_64-unknown-linux-musl/cargo-rail-fact-driver-source-v1.json"
+surface_source_bytes="$(wc -c < "$surface_source" | tr -d ' ')"
+dd if=/dev/zero bs="$surface_source_bytes" count=1 2>/dev/null | tr '\000' x > "$surface_source"
+tar -czf "$release/$surface_archive" -C "$temporary/surface-tampered-payload" \
+  cargo-rail-x86_64-unknown-linux-musl
+printf '%s  %s\n' \
+  "$(if command -v sha256sum >/dev/null 2>&1; then sha256sum "$release/$surface_archive"; else shasum -a 256 "$release/$surface_archive"; fi | awk '{print $1}')" \
+  "$surface_archive" > "$release/SHA256SUMS"
+if INSTALLER_TEST_SYSTEM=Linux INSTALLER_TEST_MACHINE=x86_64 INSTALLER_TEST_LIBC=musl \
+  PATH="$temporary/bin:$PATH" CARGO_HOME="$temporary/tampered-surface-home" \
+  "$installer" "$version" > /dev/null 2> "$temporary/tampered-surface-stderr"; then
+  echo "installer accepted tampered Surface source authority" >&2
+  exit 1
+fi
+if ! grep -Fq "digest mismatch for cargo-rail-fact-driver-source-v1.json" \
+  "$temporary/tampered-surface-stderr"; then
+  echo "installer reported the wrong Surface-source-integrity failure:" >&2
+  sed 's/^/  /' "$temporary/tampered-surface-stderr" >&2
+  exit 1
+fi
+test ! -e "$temporary/tampered-surface-home/bin/cargo-rail"

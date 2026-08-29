@@ -174,6 +174,31 @@ jobs:
         if: inputs.plan-artifact != ''
         run: scripts/plan/verify.sh target/plan-v8.json
 
+      - name: Setup target toolchain
+        if: ${{ !contains(matrix.target, '-linux-musl') }}
+        uses: taiki-e/setup-cross-toolchain-action@12b7ad4acfa95a1476779d6c06699b96ec1691f8 # v1.42.0
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Install pinned native musl toolchain
+        if: contains(matrix.target, '-linux-musl')
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: scripts/ci/install-musl-toolchain.sh "$TARGET" "$GITHUB_ENV"
+
+      - name: Select exact native musl Rust host
+        if: contains(matrix.target, '-linux-musl')
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          TOOLCHAIN: ${{ needs.prepare.outputs.msrv }}
+        run: >-
+          scripts/ci/install-rust-toolchain.sh
+          --toolchain "$TOOLCHAIN"
+          --host "$TARGET"
+          --components rustc-dev
+
       - name: Manufacture exact compiler fact driver
         id: fact-driver
         shell: bash
@@ -188,80 +213,7 @@ jobs:
             echo "include=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-
-          sha256_file() {
-            if command -v sha256sum >/dev/null 2>&1; then
-              sha256sum "$1" | awk '{print $1}'
-            else
-              shasum -a 256 "$1" | awk '{print $1}'
-            fi
-          }
-
-          sha256_stream() {
-            if command -v sha256sum >/dev/null 2>&1; then
-              sha256sum | awk '{print $1}'
-            else
-              shasum -a 256 | awk '{print $1}'
-            fi
-          }
-
-          host="$(rustc -vV | sed -n 's/^host: //p')"
-          test "$host" = "$TARGET"
-          rustup component add rustc-dev --toolchain "$RUSTUP_TOOLCHAIN"
-          scripts/build-compiler-fact-driver.sh
-
-          suffix=""
-          if [[ "$TARGET" == *-windows-* ]]; then
-            suffix=".exe"
-          fi
-          source="tools/compiler-fact-driver/target/release/cargo-rail-fact-driver${suffix}"
-          component="cargo-rail-fact-driver${suffix}"
-          cp "$source" "$component"
-          digest="$(sha256_file "$component")"
-          source_bundle="cargo-rail-fact-driver-source-v1.json"
-          scripts/package-compiler-fact-driver-source.py "$source_bundle"
-          source_bundle_digest="$(sha256_file "$source_bundle")"
-          provenance="$({
-            for file in \
-              tools/compiler-fact-driver/Cargo.lock \
-              tools/compiler-fact-driver/Cargo.toml \
-              tools/compiler-fact-driver/build.rs \
-              tools/compiler-fact-driver/src/*.rs \
-              src/compiler/fact_protocol.rs; do
-              printf '%s  %s\n' "$(sha256_file "$file")" "$file"
-            done
-          } | sha256_stream)"
-          release="$(rustc -vV | sed -n 's/^release: //p')"
-          commit="$(rustc -vV | sed -n 's/^commit-hash: //p')"
-          sysroot="$(rustc --print sysroot)"
-          if command -v cygpath >/dev/null 2>&1; then
-            sysroot="$(cygpath -u "$sysroot")"
-          fi
-          compiler_libraries="$(find "$sysroot/lib" "$sysroot/bin" -maxdepth 1 -type f \( \
-            -name 'librustc_driver-*.so' -o \
-            -name 'librustc_driver-*.dylib' -o \
-            -name 'rustc_driver-*.dll' \
-          \) 2>/dev/null || true)"
-          test "$(printf '%s\n' "$compiler_libraries" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
-          compiler_library="$compiler_libraries"
-          compiler_library_relative="${compiler_library#"$sysroot"/}"
-          test "$compiler_library_relative" != "$compiler_library"
-          compiler_library_digest="$(sha256_file "$compiler_library")"
-
-          {
-            echo "CARGO_RAIL_FACT_DRIVER_FILE=$component"
-            echo "CARGO_RAIL_FACT_DRIVER_SHA256=sha256:$digest"
-            echo "CARGO_RAIL_FACT_DRIVER_PROVENANCE=sha256:$provenance"
-            echo "CARGO_RAIL_FACT_DRIVER_RUSTC_RELEASE=$release"
-            echo "CARGO_RAIL_FACT_DRIVER_RUSTC_COMMIT=$commit"
-            echo "CARGO_RAIL_FACT_DRIVER_RUSTC_HOST=$host"
-            echo "CARGO_RAIL_FACT_DRIVER_COMPILER_LIBRARY=$compiler_library_relative"
-            echo "CARGO_RAIL_FACT_DRIVER_COMPILER_LIBRARY_SHA256=sha256:$compiler_library_digest"
-            echo "CARGO_RAIL_FACT_DRIVER_SOURCE_FILE=$source_bundle"
-            echo "CARGO_RAIL_FACT_DRIVER_SOURCE_SHA256=sha256:$source_bundle_digest"
-            echo "CARGO_RAIL_FACT_DRIVER_SOURCE_PROVENANCE=sha256:$provenance"
-          } >> "$GITHUB_ENV"
-          echo "include=$component,$source_bundle" >> "$GITHUB_OUTPUT"
+          scripts/ci/manufacture-compiler-fact-driver.sh "$TARGET" "$GITHUB_ENV" "$GITHUB_OUTPUT"
 
       - name: Configure path remapping
         shell: bash
@@ -271,11 +223,6 @@ jobs:
             flags="${RUSTFLAGS} ${flags}"
           fi
           echo "RUSTFLAGS=$flags" >> "$GITHUB_ENV"
-
-      - name: Setup target toolchain
-        uses: taiki-e/setup-cross-toolchain-action@12b7ad4acfa95a1476779d6c06699b96ec1691f8 # v1.42.0
-        with:
-          target: ${{ matrix.target }}
 
       - name: Configure static linking (musl)
         if: contains(matrix.target, '-linux-musl')

@@ -18,7 +18,7 @@
     },
     {
       "id": "aarch64-unknown-linux-musl",
-      "dimensions": { "target": "aarch64-unknown-linux-musl", "os": "ubuntu-24.04-arm", "archive": "tar", "surface": false },
+      "dimensions": { "target": "aarch64-unknown-linux-musl", "os": "ubuntu-24.04-arm", "archive": "tar", "surface": true },
       "paths": ["src/main.rs", "tools/compiler-fact-driver/**"],
       "config": [],
       "cargo": ["cargo.build"]
@@ -39,7 +39,7 @@
     },
     {
       "id": "x86-64-unknown-linux-musl",
-      "dimensions": { "target": "x86_64-unknown-linux-musl", "os": "ubuntu-22.04", "archive": "tar", "surface": false },
+      "dimensions": { "target": "x86_64-unknown-linux-musl", "os": "ubuntu-22.04", "archive": "tar", "surface": true },
       "paths": ["src/main.rs", "tools/compiler-fact-driver/**"],
       "config": [],
       "cargo": ["cargo.build"]

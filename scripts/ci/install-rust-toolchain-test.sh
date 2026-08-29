@@ -34,6 +34,24 @@ grep -Fxq 'run 1.98.0-aarch64-pc-windows-msvc cargo --version' "$temporary/rustu
 grep -Fxq 'run 1.98.0-aarch64-pc-windows-msvc rustc --version' "$temporary/rustup.log"
 grep -Fxq 'run 1.98.0-aarch64-pc-windows-msvc rustdoc --version' "$temporary/rustup.log"
 
+: >"$temporary/github-env"
+: >"$temporary/rustup.log"
+musl_host="aarch64-unknown-linux-musl"
+env -i \
+  PATH="$test_path" \
+  GITHUB_ENV="$temporary/github-env" \
+  RUNNER_TEMP="$temporary/runner-temp" \
+  FAKE_EXPECTED_RUSTUP_HOME="$temporary/runner-temp/cargo-rail-rustup" \
+  FAKE_RUSTUP_LOG="$temporary/rustup.log" \
+  FAKE_RUSTC_HOST="$musl_host" \
+  "$bash_binary" --noprofile --norc "$script_dir/install-rust-toolchain.sh" \
+    --toolchain 1.98.0 --host "$musl_host" --components rustc-dev >/dev/null
+grep -Fxq \
+  "toolchain install 1.98.0-$musl_host --profile minimal --no-self-update --component cargo --force-non-host --component rustc-dev" \
+  "$temporary/rustup.log"
+grep -Fxq "RUSTUP_TOOLCHAIN=1.98.0-$musl_host" "$temporary/github-env"
+grep -Fxq "run 1.98.0-$musl_host cargo --version" "$temporary/rustup.log"
+
 if env -i \
   PATH="$test_path" \
   GITHUB_ENV="$temporary/github-env" \

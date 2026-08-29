@@ -37,8 +37,9 @@ irm https://github.com/loadingalias/cargo-rail/releases/latest/download/cargo-ra
 ```
 
 The installer verifies the native archive and every selected component. Complete GNU Linux, Windows, and Apple
-Silicon archives include cache helpers and authenticated Surface authority. Musl archives keep the core CLI but cannot
-run Surface analysis.
+Native archives for Apple silicon, Linux GNU, Linux musl, and Windows include cache helpers and authenticated Surface
+authority. Linux musl archives use a static core CLI and a native dynamically loaded compiler-fact driver.
+The driver relies on the host's standard musl `libgcc_s` runtime, as rustc host tools do.
 
 `cargo install cargo-rail --locked` and `cargo binstall cargo-rail` remain available. They cannot prepare or run Surface
 analysis; `surface --schema` still works. The native installer supplies Cargo-Rail's authenticated Surface driver and

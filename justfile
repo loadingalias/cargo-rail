@@ -61,6 +61,9 @@ ssh-collect-compiler-facts target run_id destination:
 ssh-collect-distributed-execution target run_id destination:
     @"{{ dev_machine }}" collect-results cargo-rail "{{ target }}" distributed-execution "{{ run_id }}" "{{ destination }}"
 
+ssh-collect-musl-surface target run_id destination:
+    @"{{ dev_machine }}" collect-results cargo-rail "{{ target }}" musl-surface "{{ run_id }}" "{{ destination }}"
+
 check:
     @scripts/check/check.sh
 
@@ -72,6 +75,9 @@ quality-affected:
 
 check-compiler-fact-driver:
     @scripts/check-compiler-fact-driver.sh
+
+qualify-musl-surface run_id:
+    @scripts/ci/qualify-musl-surface.sh "{{ run_id }}"
 
 check-windows-targets:
     cargo xwin check --workspace --all-targets --all-features --locked --target x86_64-pc-windows-msvc

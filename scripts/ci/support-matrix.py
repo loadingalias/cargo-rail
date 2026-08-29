@@ -746,6 +746,14 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
             isinstance(entry["surface"], bool),
             f"release-targets[{index}].surface must be a boolean",
         )
+        if target in {
+            "aarch64-unknown-linux-musl",
+            "x86_64-unknown-linux-musl",
+        }:
+            require(
+                entry["surface"] is True,
+                f"release-targets[{index}] must ship qualified musl Surface authority",
+            )
         require(
             isinstance(entry["commit_ci"], bool),
             f"release-targets[{index}].commit_ci must be a boolean",
@@ -1148,6 +1156,10 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         toolchain_installer_path,
         "distribution/release-targets.json",
         "scripts/ci/smoke-release-tar.sh",
+        "scripts/ci/manufacture-compiler-fact-driver.sh",
+        "scripts/ci/install-musl-toolchain.sh",
+        "Select exact native musl Rust host",
+        '--host "$TARGET"',
         "if: inputs.stage",
         "actions/attest@",
         "actions/upload-artifact@",
@@ -1168,6 +1180,9 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         "--cargo-rail-fact-protocol-version",
         "capture_surface stable-prepare",
         "capture_surface stable-check",
+        "capture_surface stable-warm",
+        "capture_surface fallback-stable-prepare",
+        "capture_surface fallback-stable-check",
         "capture_surface nightly-prepare",
         "capture_surface nightly-check",
     ):
@@ -1175,6 +1190,46 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
             fragment in archive_smoke,
             f"release archive smoke command is missing {fragment}",
         )
+    musl_qualifier_path = "scripts/ci/qualify-musl-surface.sh"
+    musl_qualifier = (REPOSITORY_ROOT / musl_qualifier_path).read_text(
+        encoding="utf-8"
+    )
+    for fragment in (
+        "aws-linux-x64)",
+        "aws-linux-arm64)",
+        "scripts/ci/install-musl-toolchain.sh",
+        "scripts/ci/install-rust-toolchain.sh",
+        "scripts/ci/manufacture-compiler-fact-driver.sh",
+        "scripts/package-release-archive.py",
+        "scripts/ci/smoke-release-tar.sh",
+        '[[ "$driver_protocol" == 4 ]]',
+    ):
+        require(
+            fragment in musl_qualifier,
+            f"native musl Surface qualification is missing {fragment}",
+        )
+    musl_installer = (
+        REPOSITORY_ROOT / "scripts/ci/install-musl-toolchain.sh"
+    ).read_text(encoding="utf-8")
+    for fragment in (
+        "sha256:f484a022584975c9bb413e1e18f4eff300fd437fec5610e9d84f1abd64100cdc",
+        "sha256:5a1aa71492e44d330c5583cae909fe56692c8c6b4d1064f9eb1fdc7fada3d98a",
+        "libgcc_s.so.1",
+        "system_runtime",
+        'cmp -s "$toolchain_runtime" "$system_runtime"',
+    ):
+        require(
+            fragment in musl_installer,
+            f"native musl toolchain installer is missing {fragment}",
+        )
+    just_source = (REPOSITORY_ROOT / "justfile").read_text(encoding="utf-8")
+    require(
+        "qualify-musl-surface run_id:" in just_source
+        and musl_qualifier_path in just_source
+        and "collect-results cargo-rail" in just_source
+        and "musl-surface" in just_source,
+        "native musl Surface qualification must be runnable and collectable through Just",
+    )
     require(
         "rustup component list" not in archive_workflow,
         "release archive workflow must prove Surface capability instead of Rustup component inventory",

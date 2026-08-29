@@ -3593,15 +3593,34 @@ fn compiler_sysroot_inventory(sysroot: &Path, host_target: &str) -> RailResult<C
     validate_sysroot_directory(&driver_lib)?;
 
     let mut files = Vec::new();
+    let mut self_contained_directory = None;
     for entry in std::fs::read_dir(&target_lib)? {
         let path = entry?.path();
         let metadata = std::fs::symlink_metadata(&path)?;
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
-            return Err(RailError::message(
-                "compiler target sysroot contains a non-regular entry",
-            ));
+        if metadata.is_file() && !crate::utils::is_symlink_or_reparse(&metadata) {
+            files.push(path);
+            continue;
         }
-        files.push(path);
+        if path.file_name() == Some(OsStr::new("self-contained"))
+            && metadata.is_dir()
+            && !crate::utils::is_symlink_or_reparse(&metadata)
+        {
+            for entry in std::fs::read_dir(&path)? {
+                let runtime = entry?.path();
+                let metadata = std::fs::symlink_metadata(&runtime)?;
+                if !metadata.is_file() || crate::utils::is_symlink_or_reparse(&metadata) {
+                    return Err(RailError::message(
+                        "compiler self-contained sysroot contains a non-regular entry",
+                    ));
+                }
+                files.push(runtime);
+            }
+            self_contained_directory = Some(path);
+            continue;
+        }
+        return Err(RailError::message(
+            "compiler target sysroot contains an unsupported non-regular entry",
+        ));
     }
     let mut driver_files = 0usize;
     for entry in std::fs::read_dir(&driver_lib)? {
@@ -3670,6 +3689,13 @@ fn compiler_sysroot_inventory(sysroot: &Path, host_target: &str) -> RailResult<C
             locations.push(evidence_location(
                 &sysroot,
                 &codegen_backends,
+                SysrootEvidenceKind::Directory,
+            )?);
+        }
+        if let Some(self_contained) = &self_contained_directory {
+            locations.push(evidence_location(
+                &sysroot,
+                self_contained,
                 SysrootEvidenceKind::Directory,
             )?);
         }
@@ -5849,11 +5875,15 @@ edition = "2024"
     }
 
     #[test]
-    fn compiler_sysroot_identity_rehashes_target_and_driver_bytes() {
+    fn compiler_sysroot_identity_rehashes_target_driver_and_self_contained_bytes() {
         let sysroot = tempfile::tempdir().expect("sysroot");
         let target_lib = sysroot.path().join("lib/rustlib/test-host/lib");
         std::fs::create_dir_all(&target_lib).expect("target lib");
         std::fs::write(target_lib.join("libcore-test.rlib"), b"target-one").expect("target library");
+        let self_contained = target_lib.join("self-contained");
+        std::fs::create_dir(&self_contained).expect("self-contained directory");
+        let runtime = self_contained.join("crt1.o");
+        std::fs::write(&runtime, b"runtime-one").expect("self-contained runtime");
         #[cfg(windows)]
         let driver = sysroot.path().join("bin/rustc_driver-test.dll");
         #[cfg(not(windows))]
@@ -5868,7 +5898,7 @@ edition = "2024"
         std::fs::write(rustc_implementation, b"rustc").expect("rustc implementation");
 
         let baseline = compiler_sysroot_fingerprint(sysroot.path(), "test-host", None).expect("baseline fingerprint");
-        assert_eq!(baseline.1, 20);
+        assert_eq!(baseline.1, 31);
         std::fs::write(target_lib.join("libcore-test.rlib"), b"target-two").expect("target mutation");
         let target_changed =
             compiler_sysroot_fingerprint(sysroot.path(), "test-host", None).expect("target fingerprint");
@@ -5877,6 +5907,22 @@ edition = "2024"
         let driver_changed =
             compiler_sysroot_fingerprint(sysroot.path(), "test-host", None).expect("driver fingerprint");
         assert_ne!(target_changed.0, driver_changed.0);
+        std::fs::write(&runtime, b"runtime-two").expect("self-contained runtime mutation");
+        let runtime_changed =
+            compiler_sysroot_fingerprint(sysroot.path(), "test-host", None).expect("runtime fingerprint");
+        assert_ne!(driver_changed.0, runtime_changed.0);
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&runtime, self_contained.join("linked-crt1.o")).expect("self-contained symlink");
+            let error = compiler_sysroot_fingerprint(sysroot.path(), "test-host", None)
+                .expect_err("self-contained symlinks must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains("compiler self-contained sysroot contains a non-regular entry")
+            );
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
