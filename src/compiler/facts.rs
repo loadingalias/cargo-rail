@@ -1193,6 +1193,12 @@ mod tests {
         wrong_version.version += 1;
         assert!(decode(&wrong_version).is_err());
 
+        let mut legacy_v3 = fragment.clone();
+        legacy_v3.version = 3;
+        legacy_v3.object.version = 3;
+        assert!(decode(&legacy_v3).is_err());
+        assert!(decode_object(&legacy_v3).is_err());
+
         let mut incomplete = fragment;
         incomplete
             .object

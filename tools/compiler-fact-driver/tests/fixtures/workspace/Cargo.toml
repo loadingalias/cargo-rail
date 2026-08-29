@@ -8,7 +8,9 @@ publish = false
 path = "../basic.rs"
 
 [dependencies]
+same_dependency_v1 = { package = "same-dependency", path = "same-dependency-v1" }
+same_dependency_v2 = { package = "same-dependency", path = "same-dependency-v2" }
 unused = { path = "unused" }
 
 [workspace]
-exclude = ["unused"]
+exclude = ["same-dependency-v1", "same-dependency-v2", "unused"]

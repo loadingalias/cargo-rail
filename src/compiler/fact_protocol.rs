@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) const COMPILER_FACT_PROTOCOL_VERSION: u32 = 3;
+pub(crate) const COMPILER_FACT_PROTOCOL_VERSION: u32 = 4;
 pub(crate) const COMPILER_FACT_ANNOUNCEMENT_CODE: &str = "cargo_rail_compiler_fact_v1";
 pub(crate) const COMPILER_FACT_ANNOUNCEMENT_PREFIX: &str = "cargo-rail-compiler-fact-v1:";
 pub(crate) const COMPILER_FACT_INVOCATION_ENV: &str = "CARGO_RAIL_COMPILER_FACT_INVOCATION";
@@ -129,7 +129,7 @@ pub(crate) struct CompilerFactPackage {
     pub(crate) source: Option<String>,
 }
 
-/// Opaque rustc item identity scoped to one exact compiler configuration.
+/// Complete rustc `DefPathHash`: stable crate identity, then crate-local definition identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub(crate) struct CompilerItemId(pub(crate) [u64; 2]);

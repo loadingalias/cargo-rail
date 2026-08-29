@@ -6,8 +6,18 @@ version = 4
 name = "fact-probe"
 version = "0.0.0"
 dependencies = [
+ "same-dependency 1.0.0",
+ "same-dependency 2.0.0",
  "unused",
 ]
+
+[[package]]
+name = "same-dependency"
+version = "1.0.0"
+
+[[package]]
+name = "same-dependency"
+version = "2.0.0"
 
 [[package]]
 name = "unused"

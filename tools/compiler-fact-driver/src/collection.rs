@@ -675,25 +675,8 @@ fn generated_source_path(bytes: &[u8]) -> CompilerFactSourcePath {
 }
 
 fn item_id(tcx: TyCtxt<'_>, def_id: DefId) -> CompilerItemId {
-    let crate_identity = identity_word(
-        b"cargo-rail-compiler-crate-v1\0",
-        tcx.crate_name(def_id.krate).as_str().as_bytes(),
-    );
-    let item_identity = identity_word(
-        b"cargo-rail-compiler-item-path-v1\0",
-        tcx.def_path(def_id).to_string_no_crate_verbose().as_bytes(),
-    );
-    CompilerItemId([crate_identity, item_identity])
-}
-
-fn identity_word(domain: &[u8], value: &[u8]) -> u64 {
-    let mut hasher = Sha256::new();
-    hasher.update(domain);
-    hasher.update(value);
-    let digest = hasher.finalize();
-    let mut identity = [0_u8; 8];
-    identity.copy_from_slice(&digest[..8]);
-    u64::from_le_bytes(identity)
+    let hash = tcx.def_path_hash(def_id);
+    CompilerItemId([hash.stable_crate_id().as_u64(), hash.local_hash().as_u64()])
 }
 
 fn fact_kind(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<CompilerFactItemKind> {
