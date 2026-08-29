@@ -49,6 +49,7 @@ const SANDBOX_READY_MAGIC: &[u8; 8] = b"CRXRUN3\0";
 const VIRTUAL_WORKER: &str = "/cargo-rail/exec/v3/worker";
 pub(crate) const VIRTUAL_ROOT: &str = "/cargo-rail/exec/v3";
 pub(crate) const VIRTUAL_WORKSPACE: &str = "/cargo-rail/exec/v3/workspace";
+pub(crate) const VIRTUAL_OUTPUT_DIRECTORY: &str = "target/cargo-rail-distributed/deps";
 const VIRTUAL_DEPENDENCIES: &str = "/cargo-rail/exec/v3/dependencies";
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_INPUT_ENTRIES: usize = 16 * 1024;
@@ -721,6 +722,7 @@ impl From<DistributedResultSlot> for ResponseSlot {
 /// One closed portable operation derived from an already captured native action.
 pub(crate) struct RustLibraryCandidate {
     inputs: Vec<CandidateInput>,
+    local_output_directory: Option<PathBuf>,
     operation: RustLibraryOperation,
 }
 
@@ -887,6 +889,7 @@ impl RustLibraryCandidate {
                 payload: CandidateInputPayload::Bytes(source),
             }],
             Vec::new(),
+            None,
         )
     }
 
@@ -894,6 +897,7 @@ impl RustLibraryCandidate {
         input: RustLibraryCandidateInput,
         mut sources: Vec<RustLibrarySourceInput>,
         dependencies: Vec<RustLibraryDependencyInput>,
+        local_output_directory: PathBuf,
     ) -> RailResult<Self> {
         sources.sort_unstable_by(|left, right| left.repository_relative_path.cmp(&right.repository_relative_path));
         let mut captured = Vec::with_capacity(sources.len().saturating_add(dependencies.len()));
@@ -928,13 +932,14 @@ impl RustLibraryCandidate {
             });
         }
         captured.sort_unstable_by(|left, right| left.frame.virtual_path.cmp(&right.frame.virtual_path));
-        Self::from_inputs(input, captured, portable_dependencies)
+        Self::from_inputs(input, captured, portable_dependencies, Some(local_output_directory))
     }
 
     fn from_inputs(
         input: RustLibraryCandidateInput,
         inputs: Vec<CandidateInput>,
         dependencies: Vec<RustLibraryDependency>,
+        local_output_directory: Option<PathBuf>,
     ) -> RailResult<Self> {
         let crate_type = match input.crate_type.as_str() {
             "bin" => RustLibraryCrateType::Bin,
@@ -949,6 +954,7 @@ impl RustLibraryCandidate {
         let source_virtual_path = virtual_source_path(&input.source_relative_path);
         let candidate = Self {
             inputs,
+            local_output_directory,
             operation: RustLibraryOperation {
                 cap_lints: input.options.cap_lints,
                 cargo_json_diagnostics: input.options.cargo_json_diagnostics,
@@ -994,8 +1000,11 @@ impl RustLibraryCandidate {
             .map(Path::new)
             .ok_or_else(|| RailError::message("distributed local fallback source path is invalid"))?;
         let source = workspace.join(source_relative);
-        let output_directory = workspace.join(&self.operation.output_relative_directory);
-        let output_directory = crate::utils::canonicalize_existing(&output_directory)?;
+        let output_directory = self
+            .local_output_directory
+            .as_deref()
+            .ok_or_else(|| RailError::message("distributed local output authority is unavailable"))?;
+        let output_directory = crate::utils::canonicalize_existing(output_directory)?;
         let source_metadata = fs::symlink_metadata(&source)?;
         if !source_metadata.is_file()
             || crate::utils::is_symlink_or_reparse(&source_metadata)
@@ -4033,7 +4042,7 @@ fn execute_request_in_process(
             .ok_or_else(|| RailError::message("distributed execution input staging is incomplete"))?;
         let destination = match frame.kind {
             InputKind::Source => workspace_directory.join(
-                source_relative_path(&frame.virtual_path)
+                workspace_input_relative_path(&frame.virtual_path)
                     .ok_or_else(|| RailError::message("distributed execution source input path is invalid"))?,
             ),
             InputKind::Dependency => {
@@ -5021,8 +5030,14 @@ fn validate_request(request: &ExecutionRequest, capability: &WorkerCapability) -
 }
 
 fn source_relative_path(virtual_path: &str) -> Option<&str> {
-    let relative = virtual_path.strip_prefix(VIRTUAL_WORKSPACE)?.strip_prefix('/')?;
+    let relative = workspace_input_relative_path(virtual_path)?;
     validate_source_relative_path(relative).ok()?;
+    Some(relative)
+}
+
+fn workspace_input_relative_path(virtual_path: &str) -> Option<&str> {
+    let relative = virtual_path.strip_prefix(VIRTUAL_WORKSPACE)?.strip_prefix('/')?;
+    validate_source_input_relative_path(relative).ok()?;
     Some(relative)
 }
 
@@ -5082,9 +5097,8 @@ fn validate_inputs(inputs: &[InputFrame], operation: &RustLibraryOperation) -> R
         match input.kind {
             InputKind::Source => {
                 source_count = source_count.saturating_add(1);
-                let relative = source_relative_path(&input.virtual_path)
+                let relative = workspace_input_relative_path(&input.virtual_path)
                     .ok_or_else(|| RailError::message("distributed execution source input path is invalid"))?;
-                validate_source_input_relative_path(relative)?;
                 let output = Path::new(&operation.output_relative_directory);
                 if Path::new(relative).starts_with(output) {
                     return Err(RailError::message(
@@ -6054,6 +6068,21 @@ mod tests {
 
     fn fixed_identity(prefix: &str, digit: char) -> String {
         format!("{prefix}{}", digit.to_string().repeat(64))
+    }
+
+    #[test]
+    fn normalized_codegen_command_preserves_linker_plugin_lto_authority() {
+        let enabled = RustLibraryCodegen {
+            linker_plugin_lto: Some(true),
+            ..RustLibraryCodegen::default()
+        };
+        let disabled = RustLibraryCodegen {
+            linker_plugin_lto: Some(false),
+            ..RustLibraryCodegen::default()
+        };
+
+        assert_eq!(rust_library_codegen_arguments(&enabled), ["-Clinker-plugin-lto=yes"]);
+        assert_eq!(rust_library_codegen_arguments(&disabled), ["-Clinker-plugin-lto=no"]);
     }
 
     fn capability() -> RailResult<WorkerCapability> {

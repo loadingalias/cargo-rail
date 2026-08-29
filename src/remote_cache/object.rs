@@ -12,10 +12,10 @@ use super::{
 };
 use crate::compiler::native_cache::pack::NativeAssociation;
 
-pub(super) const OBJECT_NAMESPACE: &str = "native-v5";
-pub(super) const PROTOCOL_MARKER: &[u8] = b"cargo-rail-native-cache-v5\n";
+pub(super) const OBJECT_NAMESPACE: &str = "native-v6";
+pub(super) const PROTOCOL_MARKER: &[u8] = b"cargo-rail-native-cache-v6\n";
 pub(super) const ENTRY_MAGIC: &[u8; 8] = b"CRNENTR1";
-pub(super) const ENTRY_VERSION: u16 = 1;
+pub(super) const ENTRY_VERSION: u16 = 2;
 pub(super) const ENTRY_PRELUDE_BYTES: u64 = 8 + 2 + 4;
 pub(super) const ENTRY_PRELUDE_LEN: usize = 8 + 2 + 4;
 // Remote entries optimize for the many consumers of one compiler miss. On
@@ -41,7 +41,7 @@ pub(crate) enum Lookup {
     Miss,
     Conflict,
     Unique {
-        environment_names: Vec<String>,
+        selector: crate::compiler::native_cache::NativeDynamicInputSelector,
         action_key: String,
         result_key: String,
         body: EntryBody,
@@ -59,7 +59,7 @@ pub(crate) enum Publication {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct EntryIdentity {
-    pub(super) environment_names: Vec<String>,
+    pub(super) selector: crate::compiler::native_cache::NativeDynamicInputSelector,
     pub(super) action_key: String,
     pub(super) result_key: String,
     pub(super) pack_length: u64,
@@ -390,7 +390,7 @@ impl ObjectStore {
                     .ok_or_else(|| RemoteStoreError::integrity("remote unique entry has no payload"))?;
                 let compressed_bytes = body.compressed_bytes();
                 Ok(Lookup::Unique {
-                    environment_names: identity.environment_names,
+                    selector: identity.selector,
                     action_key: identity.action_key,
                     result_key: identity.result_key,
                     body,
@@ -405,7 +405,7 @@ impl ObjectStore {
         &self,
         association: &NativeAssociation,
         base_action_key: &str,
-        environment_names: &[String],
+        selector: &crate::compiler::native_cache::NativeDynamicInputSelector,
         pack: File,
     ) -> RemoteStoreResult<Publication> {
         if !self.can_write() {
@@ -413,9 +413,11 @@ impl ObjectStore {
                 "selected remote cache mode does not permit publication",
             ));
         }
-        super::validate_environment_names(environment_names)?;
+        selector
+            .validate()
+            .map_err(|_| RemoteStoreError::integrity("remote dynamic-input selector is invalid"))?;
         let requested = EntryIdentity {
-            environment_names: environment_names.to_vec(),
+            selector: selector.clone(),
             action_key: association.action_key().to_string(),
             result_key: association.result_key().to_string(),
             pack_length: association.pack_length(),
@@ -452,7 +454,7 @@ impl ObjectStore {
                 EntryState::Unique { identity, .. } => {
                     let (first, second) = canonical_entry_pair(identity, requested.clone())?;
                     let conflict = EntryRecord {
-                        version: 1,
+                        version: 2,
                         base_action_key: base_action_key.to_string(),
                         state: EntryState::Conflict { first, second },
                     };
@@ -490,7 +492,10 @@ fn canonical_entry_pair(
 }
 
 fn validate_entry_identity(identity: &EntryIdentity) -> RemoteStoreResult<()> {
-    super::validate_environment_names(&identity.environment_names)?;
+    identity
+        .selector
+        .validate()
+        .map_err(|_| RemoteStoreError::integrity("remote entry dynamic-input selector is invalid"))?;
     crate::compiler::native_cache::validate_action_key(&identity.action_key)
         .map_err(|_| RemoteStoreError::integrity("remote entry action identity is invalid"))?;
     crate::compiler::native_cache::validate_result_key(&identity.result_key)
@@ -502,7 +507,7 @@ fn validate_entry_identity(identity: &EntryIdentity) -> RemoteStoreResult<()> {
 }
 
 fn validate_entry_record(record: &EntryRecord, base_action_key: &str) -> RemoteStoreResult<()> {
-    if record.version != 1 || record.base_action_key != base_action_key {
+    if record.version != 2 || record.base_action_key != base_action_key {
         return Err(RemoteStoreError::integrity(
             "remote entry does not match its object key",
         ));
@@ -557,7 +562,7 @@ fn encode_unique_entry(
     let payload_length = compressed.metadata().map_err(io_unavailable)?.len();
     compressed.rewind().map_err(io_unavailable)?;
     let record = EntryRecord {
-        version: 1,
+        version: 2,
         base_action_key: base_action_key.to_string(),
         state: EntryState::Unique {
             identity: identity.clone(),
@@ -696,7 +701,11 @@ mod tests {
 
     fn identity(value: u8) -> EntryIdentity {
         EntryIdentity {
-            environment_names: vec![format!("CARGO_RAIL_TEST_{value}")],
+            selector: crate::compiler::native_cache::NativeDynamicInputSelector::new(
+                vec![format!("CARGO_RAIL_TEST_{value}")],
+                vec![format!(".config/selected-{value}.json")],
+            )
+            .expect("selector"),
             action_key: action(value),
             result_key: result(value),
             pack_length: u64::from(value) + 1,
@@ -722,6 +731,18 @@ mod tests {
         let second = identity(2);
         let (left, right) = canonical_entry_pair(second.clone(), first.clone()).expect("pair");
         assert_eq!((left, right), (first, second));
+    }
+
+    #[test]
+    fn native_v6_namespace_and_prelude_do_not_reinterpret_v5_state() {
+        assert_eq!(OBJECT_NAMESPACE, "native-v6");
+        assert_eq!(PROTOCOL_MARKER, b"cargo-rail-native-cache-v6\n");
+
+        let mut legacy = [0_u8; ENTRY_PRELUDE_LEN];
+        legacy[..8].copy_from_slice(ENTRY_MAGIC);
+        legacy[8..10].copy_from_slice(&1_u16.to_le_bytes());
+        legacy[10..14].copy_from_slice(&1_u32.to_le_bytes());
+        decode_entry_prelude(&legacy).expect_err("native-v5 prelude must be rejected");
     }
 
     #[test]
@@ -775,7 +796,7 @@ mod tests {
         let first = identity(1);
         let second = identity(2);
         let record = EntryRecord {
-            version: 1,
+            version: 2,
             base_action_key: base(2),
             state: EntryState::Conflict { first, second },
         };

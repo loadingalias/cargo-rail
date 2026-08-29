@@ -432,7 +432,7 @@ pub(crate) enum RemoteLookup {
     Miss,
     Conflict,
     Unique {
-        environment_names: Vec<String>,
+        selector: crate::compiler::native_cache::NativeDynamicInputSelector,
         action_key: String,
         result_key: String,
         body: RemoteBody,
@@ -510,7 +510,7 @@ impl RemoteStore {
                 Ok(coordinator::Lookup::Miss) => return Ok(RemoteLookup::Miss),
                 Ok(coordinator::Lookup::Conflict) => return Ok(RemoteLookup::Conflict),
                 Ok(coordinator::Lookup::Unique {
-                    environment_names,
+                    selector,
                     action_key,
                     result_key,
                     body,
@@ -518,7 +518,7 @@ impl RemoteStore {
                     compressed_bytes,
                 }) => {
                     return Ok(RemoteLookup::Unique {
-                        environment_names,
+                        selector,
                         action_key,
                         result_key,
                         body: RemoteBody::Coordinated(body),
@@ -533,14 +533,14 @@ impl RemoteStore {
             object::Lookup::Miss => Ok(RemoteLookup::Miss),
             object::Lookup::Conflict => Ok(RemoteLookup::Conflict),
             object::Lookup::Unique {
-                environment_names,
+                selector,
                 action_key,
                 result_key,
                 body,
                 bytes,
                 compressed_bytes,
             } => Ok(RemoteLookup::Unique {
-                environment_names,
+                selector,
                 action_key,
                 result_key,
                 body: RemoteBody::Direct(body),
@@ -554,7 +554,7 @@ impl RemoteStore {
         &self,
         association: &crate::compiler::native_cache::pack::NativeAssociation,
         base_action_key: &str,
-        environment_names: &[String],
+        selector: &crate::compiler::native_cache::NativeDynamicInputSelector,
         pack: std::fs::File,
     ) -> RemoteStoreResult<RemotePublication> {
         if !self.coordinator_failed.load(Ordering::Acquire)
@@ -563,7 +563,7 @@ impl RemoteStore {
             match coordinator.publish(
                 association,
                 base_action_key,
-                environment_names,
+                selector,
                 pack.try_clone()
                     .map_err(|error| RemoteStoreError::unavailable(error.to_string()))?,
             ) {
@@ -571,8 +571,7 @@ impl RemoteStore {
                 Err(_) => self.coordinator_failed.store(true, Ordering::Release),
             }
         }
-        self.direct()?
-            .publish(association, base_action_key, environment_names, pack)
+        self.direct()?.publish(association, base_action_key, selector, pack)
     }
 }
 

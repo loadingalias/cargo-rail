@@ -1,7 +1,7 @@
 //! Front-door coverage for transparent local compiler-cache installation.
 
 use anyhow::{Context as _, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -171,7 +171,16 @@ fn cargo_check_remote(
 }
 
 fn cargo_check_installed_remote(workspace: &Path, cargo_home: &Path, coverage: &Path) -> Result<Output> {
-    cargo_check_installed_remote_with_rustflags(workspace, cargo_home, coverage, None)
+    cargo_check_installed_remote_with_options(workspace, cargo_home, coverage, None, None)
+}
+
+fn cargo_check_installed_remote_in_target(
+    workspace: &Path,
+    cargo_home: &Path,
+    coverage: &Path,
+    target: &Path,
+) -> Result<Output> {
+    cargo_check_installed_remote_with_options(workspace, cargo_home, coverage, None, Some(target))
 }
 
 fn cargo_check_installed_remote_with_rustflags(
@@ -179,6 +188,16 @@ fn cargo_check_installed_remote_with_rustflags(
     cargo_home: &Path,
     coverage: &Path,
     rustflags: Option<&str>,
+) -> Result<Output> {
+    cargo_check_installed_remote_with_options(workspace, cargo_home, coverage, rustflags, None)
+}
+
+fn cargo_check_installed_remote_with_options(
+    workspace: &Path,
+    cargo_home: &Path,
+    coverage: &Path,
+    rustflags: Option<&str>,
+    target: Option<&Path>,
 ) -> Result<Output> {
     let coverage = fs::canonicalize(coverage).context("canonicalize native-cache coverage directory")?;
     let mut command = Command::new("cargo");
@@ -210,6 +229,11 @@ fn cargo_check_installed_remote_with_rustflags(
         command.env("RUSTFLAGS", rustflags);
     } else {
         command.env_remove("RUSTFLAGS");
+    }
+    if let Some(target) = target {
+        command.env("CARGO_TARGET_DIR", target);
+    } else {
+        command.env_remove("CARGO_TARGET_DIR");
     }
     command.output().context("run cargo check with installed remote policy")
 }
@@ -309,6 +333,43 @@ impl LoopbackS3 {
         self.state
             .lock()
             .map_or_else(|_| Vec::new(), |state| state.requests.clone())
+    }
+
+    fn install_legacy_native_v5_fixture(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        for (path, body) in [
+            (
+                "/fixture-bucket/team/native-v5/protocol",
+                b"cargo-rail-native-cache-v5\n".as_slice(),
+            ),
+            (
+                "/fixture-bucket/team/native-v5/entries/00/legacy",
+                b"legacy-native-v5-entry".as_slice(),
+            ),
+        ] {
+            state.objects.insert(
+                path.to_string(),
+                FixtureObject {
+                    body: body.to_vec(),
+                    etag: "\"legacy-native-v5\"".to_string(),
+                },
+            );
+        }
+    }
+
+    fn legacy_native_v5_fixture_is_intact(&self) -> bool {
+        self.state.lock().is_ok_and(|state| {
+            state
+                .objects
+                .get("/fixture-bucket/team/native-v5/protocol")
+                .is_some_and(|object| object.body == b"cargo-rail-native-cache-v5\n")
+                && state
+                    .objects
+                    .get("/fixture-bucket/team/native-v5/entries/00/legacy")
+                    .is_some_and(|object| object.body == b"legacy-native-v5-entry")
+        })
     }
 
     #[cfg(unix)]
@@ -657,7 +718,7 @@ fn setup_preview_apply_repeat_status_and_exact_remove_are_lossless() {
         )?;
         assert!(status.status.success(), "installation status failed: {status:?}");
         let status = json(&status)?;
-        assert_eq!(status["status"]["schema_version"], 13);
+        assert_eq!(status["status"]["schema_version"], 14);
         assert_eq!(status["status"]["installation"]["state"], "installed");
         assert_eq!(status["status"]["installation"]["healthy"], true);
         assert_eq!(status["status"]["installation"]["root_portability"], "physical");
@@ -989,6 +1050,113 @@ fn receipt_qualified_local_distribution_executes_an_ordinary_cargo_library() {
     super::helpers::finish_test(result);
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn failure_reason_counters_remain_live_after_the_usage_ledger_fills() {
+    let result: Result<()> = (|| {
+        let workspace = TestWorkspace::new_single_crate("transparent-failure-telemetry", "0.1.0")?;
+        let cargo_home = tempfile::tempdir()?;
+        let setup = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "setup"])?;
+        assert!(setup.status.success(), "cache setup failed: {setup:?}");
+
+        let installation = cargo_home.path().join("cargo-rail/compiler-cache-v1");
+        fs::write(installation.join("usage-v1.log"), vec![b'B'; 64 * 1024])?;
+        let phases = [
+            ("action_capture", "complete_action_capture_unavailable"),
+            ("action_identity", "complete_action_identity_unavailable"),
+            (
+                "post_execution_witness",
+                "post_execution_witness_validation_unavailable",
+            ),
+        ];
+        let mut expected = BTreeMap::from([
+            ("complete_action_capture_unavailable", 0_u64),
+            ("complete_action_identity_unavailable", 0_u64),
+            ("post_execution_witness_validation_unavailable", 0_u64),
+        ]);
+
+        for (index, (phase, reason)) in phases.into_iter().enumerate() {
+            fs::write(
+                workspace.path.join("src/lib.rs"),
+                format!("pub fn telemetry_value() -> usize {{ {index} }}\n"),
+            )?;
+            let compiled = Command::new("cargo")
+                .current_dir(&workspace.path)
+                .args(["check", "--quiet"])
+                .env("CARGO_HOME", cargo_home.path())
+                .env("CARGO_INCREMENTAL", "0")
+                .env("CARGO_RAIL_TEST_NATIVE_ACTION_FAULT", phase)
+                .env_remove("RUSTC_WRAPPER")
+                .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .output()?;
+            assert!(
+                compiled.status.success(),
+                "injected {phase} failure changed the compiler result: {compiled:?}"
+            );
+            *expected.get_mut(reason).context("known failure reason")? += 1;
+
+            let status = rail(
+                &workspace.path,
+                cargo_home.path(),
+                &["rail", "cache", "status", "--scope", "local", "-f", "json"],
+            )?;
+            assert!(status.status.success(), "cache status failed: {status:?}");
+            let status = json(&status)?;
+            let installation_status = &status["status"]["installation"];
+            let usage = &installation_status["usage"];
+            assert_eq!(installation_status["healthy"], true);
+            assert_eq!(usage["recorded_events"], 64 * 1024);
+            assert_eq!(usage["ledger_full"], true);
+            assert_eq!(usage["failure_reason_counts_available"], true);
+            for (candidate, count) in &expected {
+                assert_eq!(
+                    usage["failure_reasons"][candidate], *count,
+                    "{phase} incremented the wrong stable failure class: {usage}"
+                );
+            }
+        }
+
+        let human = rail(
+            &workspace.path,
+            cargo_home.path(),
+            &["rail", "cache", "status", "--scope", "local"],
+        )?;
+        assert!(human.status.success(), "human cache status failed: {human:?}");
+        let human = String::from_utf8_lossy(&human.stdout);
+        for reason in expected.keys() {
+            assert!(
+                human.contains(&format!("Cache failure {reason}: 1")),
+                "human status omitted {reason}:\n{human}"
+            );
+        }
+
+        let counters = installation.join("failure-counters-v1.json");
+        let counter_lock = installation.join("failure-counters-v1.lock");
+        assert!(fs::metadata(&counters)?.len() <= 4 * 1024);
+        assert_eq!(fs::metadata(&counter_lock)?.len(), 0);
+
+        fs::write(&counters, b"{}\n")?;
+        let unavailable = rail(
+            &workspace.path,
+            cargo_home.path(),
+            &["rail", "cache", "status", "--scope", "local", "-f", "json"],
+        )?;
+        let unavailable = json(&unavailable)?;
+        assert_eq!(unavailable["status"]["installation"]["healthy"], true);
+        assert_eq!(
+            unavailable["status"]["installation"]["usage"]["failure_reason_counts_available"],
+            false
+        );
+
+        let remove = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "remove"])?;
+        assert!(remove.status.success(), "cache removal failed: {remove:?}");
+        assert!(!counters.exists());
+        assert!(!counter_lock.exists());
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
 #[test]
 fn setup_refuses_global_conflicts_and_workspace_shadowing() {
     let result: Result<()> = (|| {
@@ -1057,7 +1225,7 @@ fn cache_status_reports_only_redacted_machine_selected_remote_authority() {
             .output()?;
         assert!(output.status.success(), "remote status failed: {output:?}");
         let value = json(&output)?;
-        assert_eq!(value["status"]["schema_version"], 13);
+        assert_eq!(value["status"]["schema_version"], 14);
         assert_eq!(value["status"]["remote"]["activation"], "direct_transport_selected");
         assert_eq!(value["status"]["remote"]["provider"], "aws-s3");
         assert_eq!(value["status"]["remote"]["mode"], "read");
@@ -1201,9 +1369,15 @@ fn remap_authority_restores_a_verified_l2_result_across_checkout_roots() {
         let first = TestWorkspace::new_single_crate("portable-root-fixture", "0.1.0")?;
         let second = TestWorkspace::new_single_crate("portable-root-fixture", "0.1.0")?;
         for workspace in [&first.path, &second.path] {
-            fs::write(workspace.join("src/lib.rs"), "fn unused() {}\n")?;
+            fs::create_dir_all(workspace.join(".config"))?;
+            fs::write(workspace.join(".config/target-matrix.json"), "{\"target\":1}\n")?;
+            fs::write(
+                workspace.join("src/lib.rs"),
+                "const MATRIX: &str = include_str!(\"../.config/target-matrix.json\");\nfn unused() { let _ = MATRIX; }\n",
+            )?;
         }
         let remote = LoopbackS3::start()?;
+        remote.install_legacy_native_v5_fixture();
         let remote_url = remote.remote_url();
         let first_home = tempfile::tempdir()?;
         let second_home = tempfile::tempdir()?;
@@ -1252,15 +1426,31 @@ fn remap_authority_restores_a_verified_l2_result_across_checkout_roots() {
 
         let first_coverage = tempfile::tempdir()?;
         let second_coverage = tempfile::tempdir()?;
+        let external_targets = tempfile::tempdir()?;
+        let producer_target = external_targets.path().join("producer-target");
+        let consumer_target = external_targets.path().join("consumer-target");
+        let mutation_target = external_targets.path().join("mutation-target");
+        assert!(!producer_target.exists() && !consumer_target.exists() && !mutation_target.exists());
         #[cfg(unix)]
         {
             fs::set_permissions(first_coverage.path(), fs::Permissions::from_mode(0o700))?;
             fs::set_permissions(second_coverage.path(), fs::Permissions::from_mode(0o700))?;
         }
-        let seeded = cargo_check_installed_remote(&first.path, first_home.path(), first_coverage.path())?;
+        let seeded = cargo_check_installed_remote_in_target(
+            &first.path,
+            first_home.path(),
+            first_coverage.path(),
+            &producer_target,
+        )?;
         assert!(seeded.status.success(), "portable seed failed: {seeded:?}");
         let seed_events = coverage_events(first_coverage.path())?;
-        let restored = cargo_check_installed_remote(&second.path, second_home.path(), second_coverage.path())?;
+        let writes_before_consumer = remote.requests().iter().filter(|(method, _)| method == "PUT").count();
+        let restored = cargo_check_installed_remote_in_target(
+            &second.path,
+            second_home.path(),
+            second_coverage.path(),
+            &consumer_target,
+        )?;
         assert!(restored.status.success(), "portable restore failed: {restored:?}");
         let events = coverage_events(second_coverage.path())?;
         assert!(
@@ -1271,7 +1461,23 @@ fn remap_authority_restores_a_verified_l2_result_across_checkout_roots() {
                             && reason.contains("root_portability_remap_eligible")
                     })
             }),
-            "second checkout did not report a verified L2 hit: seed={seed_events:?}, restored={events:?}, requests={:?}",
+            "second checkout did not report a verified L2 hit: producer_stderr={}, consumer_stderr={}, seed={seed_events:?}, restored={events:?}, requests={:?}",
+            String::from_utf8_lossy(&seeded.stderr),
+            String::from_utf8_lossy(&restored.stderr),
+            remote.requests()
+        );
+        assert!(
+            remote.legacy_native_v5_fixture_is_intact(),
+            "native-v6 access changed cleanly unreachable native-v5 objects"
+        );
+        assert_eq!(
+            remote.requests().iter().filter(|(method, _)| method == "PUT").count(),
+            writes_before_consumer,
+            "read-only second-checkout restore wrote a remote object"
+        );
+        assert!(
+            remote.requests().iter().all(|(_, path)| !path.contains("/native-v5/")),
+            "the native-v6 client reached into the legacy native-v5 namespace: {:?}",
             remote.requests()
         );
         let seeded_diagnostics = String::from_utf8_lossy(&seeded.stderr);
@@ -1281,7 +1487,7 @@ fn remap_authority_restores_a_verified_l2_result_across_checkout_roots() {
         assert!(!restored_diagnostics.contains(first.path.to_string_lossy().as_ref()));
 
         let first_root = first.path.to_string_lossy().into_owned().into_bytes();
-        let mut pending = vec![second.path.join("target")];
+        let mut pending = vec![consumer_target];
         while let Some(directory) = pending.pop() {
             for entry in fs::read_dir(directory)? {
                 let entry = entry?;
@@ -1299,7 +1505,46 @@ fn remap_authority_restores_a_verified_l2_result_across_checkout_roots() {
             }
         }
 
-        fs::remove_dir_all(first.path.join("target"))?;
+        fs::write(second.path.join(".config/target-matrix.json"), "{\"target\":2}\n")?;
+        let mutated_coverage = tempfile::tempdir()?;
+        #[cfg(unix)]
+        fs::set_permissions(mutated_coverage.path(), fs::Permissions::from_mode(0o700))?;
+        let mutated = cargo_check_installed_remote_in_target(
+            &second.path,
+            second_home.path(),
+            mutated_coverage.path(),
+            &mutation_target,
+        )?;
+        assert!(
+            mutated.status.success(),
+            "same-size dynamic-input rebuild failed: {mutated:?}"
+        );
+        let mutated_events = coverage_events(mutated_coverage.path())?;
+        assert!(
+            mutated_events.iter().any(|event| event["status"] == "miss")
+                && mutated_events.iter().all(|event| event["status"] != "hit"),
+            "same-size selected-input mutation did not produce a clean miss: stderr={}, events={mutated_events:?}",
+            String::from_utf8_lossy(&mutated.stderr)
+        );
+        assert_eq!(
+            remote.requests().iter().filter(|(method, _)| method == "PUT").count(),
+            writes_before_consumer,
+            "read-only same-size miss wrote a remote object"
+        );
+        assert_eq!(
+            fs::read_dir(external_targets.path())?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|entry| entry.file_name())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                std::ffi::OsString::from("consumer-target"),
+                std::ffi::OsString::from("mutation-target"),
+                std::ffi::OsString::from("producer-target"),
+            ]),
+            "remote qualification wrote outside its exact external target roots"
+        );
+
         let ambiguous_coverage = tempfile::tempdir()?;
         #[cfg(unix)]
         fs::set_permissions(ambiguous_coverage.path(), fs::Permissions::from_mode(0o700))?;
@@ -2154,14 +2399,16 @@ fn custom_target_and_deterministic_flags_reuse_without_runtime_residue() {
         let coverage = tempfile::tempdir()?;
         fs::set_permissions(coverage.path(), fs::Permissions::from_mode(0o700))?;
         let coverage_path = fs::canonicalize(coverage.path())?;
-        let first_target = tempfile::tempdir()?;
+        let first_target_parent = tempfile::tempdir()?;
+        let first_target = first_target_parent.path().join("producer-target");
+        assert!(!first_target.exists(), "producer target existed before Cargo started");
         let first_runtime = tempfile::tempdir()?;
         let seed = Command::new("cargo")
             .current_dir(&workspace.path)
             .args(["check", "--quiet"])
             .env("CARGO_HOME", cargo_home.path())
             .env("CARGO_INCREMENTAL", "0")
-            .env("CARGO_TARGET_DIR", first_target.path())
+            .env("CARGO_TARGET_DIR", &first_target)
             .env("TMPDIR", first_runtime.path())
             .env("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1")
             .env("CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY", &coverage_path)
@@ -2174,15 +2421,27 @@ fn custom_target_and_deterministic_flags_reuse_without_runtime_residue() {
             .env_remove("RUSTC_WORKSPACE_WRAPPER")
             .output()?;
         assert!(seed.status.success(), "custom-target cache seed failed: {seed:?}");
+        assert!(first_target.is_dir(), "Cargo did not create the producer target");
+        assert_eq!(
+            fs::read_dir(first_target_parent.path())?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|entry| entry.file_name())
+                .collect::<Vec<_>>(),
+            [std::ffi::OsString::from("producer-target")],
+            "producer wrote outside its exact external target root"
+        );
         assert_no_native_runtime_residue(first_runtime.path())?;
 
-        let second_target = tempfile::tempdir()?;
+        let second_target_parent = tempfile::tempdir()?;
+        let second_target = second_target_parent.path().join("consumer-target");
+        assert!(!second_target.exists(), "consumer target existed before Cargo started");
         let reused = Command::new("cargo")
             .current_dir(&workspace.path)
             .args(["check", "--quiet"])
             .env("CARGO_HOME", cargo_home.path())
             .env("CARGO_INCREMENTAL", "0")
-            .env("CARGO_TARGET_DIR", second_target.path())
+            .env("CARGO_TARGET_DIR", &second_target)
             .env("TMPDIR", first_runtime.path())
             .env("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1")
             .env("CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY", &coverage_path)
@@ -2198,6 +2457,16 @@ fn custom_target_and_deterministic_flags_reuse_without_runtime_residue() {
             reused.status.success(),
             "the second physical target root did not reuse the verified action: {reused:?}; coverage: {:?}",
             native_coverage_summary(coverage.path())?
+        );
+        assert!(second_target.is_dir(), "Cargo did not create the consumer target");
+        assert_eq!(
+            fs::read_dir(second_target_parent.path())?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|entry| entry.file_name())
+                .collect::<Vec<_>>(),
+            [std::ffi::OsString::from("consumer-target")],
+            "consumer restore wrote outside its exact external target root"
         );
         assert_no_native_runtime_residue(first_runtime.path())?;
 

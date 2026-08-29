@@ -46,11 +46,14 @@ const STALE_LEASE_SECONDS: u64 = 24 * 60 * 60;
 const ACCESS_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const EVIDENCE_CANDIDATE_INDEX_VERSION: u32 = 1;
 const EVIDENCE_CANDIDATE_INDEX_DIRECTORY: &str = "compiler-evidence-candidates";
-const NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY: &str = "native-environment-selectors-v1";
+const NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY: &str = "native-dynamic-input-selectors-v1";
+const LEGACY_NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY: &str = "native-environment-selectors-v1";
 const NATIVE_LINK_CANDIDATE_DIRECTORY: &str = "native-link-candidates-v1";
 const NATIVE_LINK_CANDIDATE_VERSION: u32 = 1;
 const MAX_NATIVE_LINK_CANDIDATES: usize = 64;
 const MAX_NATIVE_LINK_CANDIDATE_BYTES: u64 = 1024;
+const NATIVE_RESTORE_LOCK_DIRECTORY: &str = "native-restore-locks-v1";
+const NATIVE_RESTORE_LOCK_SHARDS: u8 = 64;
 const MAX_NATIVE_ENVIRONMENT_SELECTOR_BYTES: u64 = 1024 * 1024;
 const NATIVE_ENVIRONMENT_SELECTOR_CONFLICT_BYTES: &[u8] =
     b"cargo-rail-native-environment-selector-conflict\nschema=1\n";
@@ -90,7 +93,7 @@ pub(crate) struct NativeCacheMiss {
 
 pub(crate) struct PackedNativeActionStagingRequest<'a> {
     pub(crate) base_action_key: &'a str,
-    pub(crate) environment_names: &'a [String],
+    pub(crate) selector: &'a crate::compiler::native_cache::NativeDynamicInputSelector,
     pub(crate) action_key: &'a str,
     pub(crate) result_key: &'a str,
     pub(crate) remote_authority: &'a crate::compiler::native_cache::RemoteAuthorityId,
@@ -281,6 +284,7 @@ pub(crate) struct LocalCasStatus {
     pub(crate) objects: u64,
     pub(crate) active_leases: u64,
     pub(crate) stale_leases: u64,
+    pub(crate) native_restore_lock_files: u64,
     pub(crate) staging_entries: u64,
     pub(crate) staging_bytes: u64,
     pub(crate) index_files: u64,
@@ -306,7 +310,7 @@ struct LocalCasLifecycleLock {
     _file: File,
 }
 
-/// One per-destination native restore lock protected from CAS staging cleanup.
+/// One bounded native restore-lock shard protected from CAS lifecycle cleanup.
 pub(crate) struct NativeRestoreLock {
     // Struct fields drop in declaration order: release the destination lock
     // while cleanup is still excluded by the shared lifecycle authority.
@@ -340,22 +344,22 @@ impl NativeActionHit<'_> {
     ///
     /// This hit retains the shared lifecycle lock, so an exclusive selector publisher cannot
     /// create a conflict between this check and the caller's restore.
-    pub(crate) fn validate_environment_selector<'a>(
+    pub(crate) fn validate_dynamic_input_selector(
         &self,
         base_action_key: &str,
-        expected_names: impl IntoIterator<Item = &'a str>,
+        expected: &crate::compiler::native_cache::NativeDynamicInputSelector,
     ) -> RailResult<()> {
         if self.cas.native_environment_selector_conflicted(base_action_key)? {
             return Err(RailError::message(
                 "local CAS native environment selector is durably conflicted",
             ));
         }
-        let Some(actual_names) = self.cas.load_native_environment_selector(base_action_key)? else {
+        let Some(actual) = self.cas.load_native_environment_selector(base_action_key)? else {
             return Err(RailError::message(
                 "local CAS native environment selector is absent for an authoritative action",
             ));
         };
-        if !actual_names.iter().map(String::as_str).eq(expected_names) {
+        if &actual != expected {
             return Err(RailError::message(
                 "local CAS native environment selector does not match the authoritative action",
             ));
@@ -369,9 +373,12 @@ impl NativeActionHit<'_> {
     }
 
     /// Revalidate the base-action selector before exposing this result remotely.
-    pub(crate) fn validate_remote_publication<'a>(&'a self, base_action_key: &str) -> RailResult<&'a [String]> {
-        let expected = self.validation.remote_publication_environment_names(base_action_key)?;
-        self.validate_environment_selector(base_action_key, expected.iter().map(String::as_str))?;
+    pub(crate) fn validate_remote_publication(
+        &self,
+        base_action_key: &str,
+    ) -> RailResult<crate::compiler::native_cache::NativeDynamicInputSelector> {
+        let expected = self.validation.remote_publication_selector(base_action_key)?;
+        self.validate_dynamic_input_selector(base_action_key, &expected)?;
         Ok(expected)
     }
 
@@ -443,8 +450,8 @@ impl PackedNativeActionHit<'_> {
         &self.header.base_action_key
     }
 
-    pub(crate) fn environment_names(&self) -> &[String] {
-        &self.header.environment_names
+    pub(crate) fn selector(&self) -> &crate::compiler::native_cache::NativeDynamicInputSelector {
+        &self.header.selector
     }
 
     pub(crate) fn action_key(&self) -> &str {
@@ -471,7 +478,7 @@ impl PackedNativeActionHit<'_> {
         Ok(file)
     }
 
-    pub(crate) fn validate_environment_selector(&self) -> RailResult<()> {
+    pub(crate) fn validate_dynamic_input_selector(&self) -> RailResult<()> {
         if self
             .cas
             .native_environment_selector_conflicted(&self.header.base_action_key)?
@@ -488,7 +495,7 @@ impl PackedNativeActionHit<'_> {
                 "local CAS packed native environment selector is absent",
             ));
         };
-        if actual != self.header.environment_names {
+        if actual != self.header.selector {
             return Err(RailError::message(
                 "local CAS packed native environment selector does not match its authority",
             ));
@@ -610,7 +617,7 @@ struct NativeResultOrigins {
 struct PackedNativeActionHeader {
     version: u32,
     base_action_key: String,
-    environment_names: Vec<String>,
+    selector: crate::compiler::native_cache::NativeDynamicInputSelector,
     action_key: String,
     result_key: String,
     remote_authority: String,
@@ -866,10 +873,11 @@ impl LocalCas {
     /// Serialize publication to one exact Cargo output set without leaving target-visible residue.
     pub(crate) fn native_restore_lock(&self, identity: &crate::source::ContentDigest) -> RailResult<NativeRestoreLock> {
         let lifecycle = self.read_lock()?;
-        let staging = self.root.join("staging");
-        validate_real_directory(&staging, "local CAS staging")?;
-        let path = staging.join(format!(".native-restore-{identity}.lock"));
-        let file = crate::utils::open_cache_lock_file(&path, true)?;
+        let locks = self.root.join(NATIVE_RESTORE_LOCK_DIRECTORY);
+        validate_real_directory(&locks, "local CAS native restore locks")?;
+        let shard = identity.as_bytes()[0] % NATIVE_RESTORE_LOCK_SHARDS;
+        let path = locks.join(format!("{shard:02x}.lock"));
+        let file = crate::utils::open_cache_lock_file(&path, false)?;
         if !crate::utils::private_file_matches_path(&file, &path, 0)? {
             return Err(RailError::message(
                 "native restore-commit lock is not a private empty file",
@@ -890,8 +898,11 @@ impl LocalCas {
         })
     }
 
-    /// Load the compiler-selected environment names for one environment-neutral action.
-    pub(crate) fn native_environment_selector(&self, base_action_key: &str) -> RailResult<Option<Vec<String>>> {
+    /// Load the compiler-selected dynamic inputs for one portable base action.
+    pub(crate) fn native_environment_selector(
+        &self,
+        base_action_key: &str,
+    ) -> RailResult<Option<crate::compiler::native_cache::NativeDynamicInputSelector>> {
         let _lock = self.read_lock()?;
         if self.native_environment_selector_conflicted(base_action_key)? {
             return Err(RailError::message(
@@ -907,14 +918,14 @@ impl LocalCas {
         Ok(selector)
     }
 
-    /// Immutably publish compiler-selected environment names for one environment-neutral action.
+    /// Immutably publish compiler-selected dynamic inputs for one portable base action.
     pub(crate) fn publish_native_environment_selector(
         &self,
         base_action_key: &str,
-        names: &[String],
+        selector: &crate::compiler::native_cache::NativeDynamicInputSelector,
     ) -> RailResult<NativeEnvironmentSelectorPublication> {
         let _lock = self.lock()?;
-        let bytes = encode_native_environment_selector(names)?;
+        let bytes = encode_native_environment_selector(selector)?;
         let destination = self.native_environment_selector_path(base_action_key)?;
         let directory = destination
             .parent()
@@ -925,7 +936,7 @@ impl LocalCas {
         }
 
         if let Some(existing) = self.load_native_environment_selector(base_action_key)? {
-            if existing != names {
+            if existing != *selector {
                 self.publish_native_environment_selector_conflict(base_action_key)?;
                 return Ok(NativeEnvironmentSelectorPublication::Diverged);
             }
@@ -958,7 +969,7 @@ impl LocalCas {
                     return Ok(NativeEnvironmentSelectorPublication::Diverged);
                 }
                 match self.load_native_environment_selector(base_action_key)? {
-                    Some(existing) if existing == names => {
+                    Some(existing) if existing == *selector => {
                         Ok(if self.native_environment_selector_conflicted(base_action_key)? {
                             NativeEnvironmentSelectorPublication::Diverged
                         } else {
@@ -1057,7 +1068,10 @@ impl LocalCas {
         }
     }
 
-    fn load_native_environment_selector(&self, base_action_key: &str) -> RailResult<Option<Vec<String>>> {
+    fn load_native_environment_selector(
+        &self,
+        base_action_key: &str,
+    ) -> RailResult<Option<crate::compiler::native_cache::NativeDynamicInputSelector>> {
         let path = self.native_environment_selector_path(base_action_key)?;
         let directory = self.root.join(NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY);
         validate_real_directory(&directory, "local CAS native environment selector directory")?;
@@ -1101,20 +1115,21 @@ impl LocalCas {
             )));
         }
         crate::instrumentation::record_cas_read(bytes.len() as u64);
-        let names: Vec<String> = serde_json::from_slice(&bytes).map_err(|error| {
-            RailError::message(format!(
-                "local CAS native environment selector '{}' is malformed: {error}",
-                path.display()
-            ))
-        })?;
-        if canonical_json(&names)? != bytes {
+        let selector: crate::compiler::native_cache::NativeDynamicInputSelector = serde_json::from_slice(&bytes)
+            .map_err(|error| {
+                RailError::message(format!(
+                    "local CAS native environment selector '{}' is malformed: {error}",
+                    path.display()
+                ))
+            })?;
+        if canonical_json(&selector)? != bytes {
             return Err(RailError::message(format!(
                 "local CAS native environment selector '{}' is not canonically encoded",
                 path.display()
             )));
         }
-        crate::compiler::native_cache::validate_environment_selector_names(names.iter().map(String::as_str))?;
-        Ok(Some(names))
+        selector.validate()?;
+        Ok(Some(selector))
     }
 
     fn native_environment_selector_path(&self, base_action_key: &str) -> RailResult<PathBuf> {
@@ -1251,7 +1266,7 @@ impl LocalCas {
     ) -> RailResult<PackedNativeActionStaging> {
         let PackedNativeActionStagingRequest {
             base_action_key,
-            environment_names,
+            selector,
             action_key,
             result_key,
             remote_authority,
@@ -1259,9 +1274,9 @@ impl LocalCas {
             compressed_bytes,
         } = request;
         let header = PackedNativeActionHeader {
-            version: 1,
+            version: 2,
             base_action_key: base_action_key.to_string(),
-            environment_names: environment_names.to_vec(),
+            selector: selector.clone(),
             action_key: action_key.to_string(),
             result_key: result_key.to_string(),
             remote_authority: remote_authority.as_str().to_string(),
@@ -1397,9 +1412,14 @@ impl LocalCas {
         ] {
             validate_real_directory(&root.join(name), "local CAS required directory")?;
         }
+        validate_native_restore_lock_directory(&root.join(NATIVE_RESTORE_LOCK_DIRECTORY))?;
         validate_optional_real_directory(
             &root.join(LEGACY_NATIVE_ACTION_STATE_DIRECTORY),
             "legacy local CAS native action state",
+        )?;
+        validate_optional_real_directory(
+            &root.join(LEGACY_NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY),
+            "legacy local CAS native environment selectors",
         )?;
         #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         validate_real_directory(
@@ -1439,13 +1459,19 @@ impl LocalCas {
             NATIVE_ACTION_STATE_DIRECTORY,
             NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY,
             NATIVE_LINK_CANDIDATE_DIRECTORY,
+            NATIVE_RESTORE_LOCK_DIRECTORY,
             EVIDENCE_CANDIDATE_INDEX_DIRECTORY,
         ] {
             create_real_directory(&root, name)?;
         }
+        initialize_native_restore_locks(&root)?;
         validate_optional_real_directory(
             &root.join(LEGACY_NATIVE_ACTION_STATE_DIRECTORY),
             "legacy local CAS native action state",
+        )?;
+        validate_optional_real_directory(
+            &root.join(LEGACY_NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY),
+            "legacy local CAS native environment selectors",
         )?;
         #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         create_real_directory(&root, SYSROOT_IDENTITY_MEMO_DIRECTORY)?;
@@ -2161,9 +2187,14 @@ fn initialize_selected_root(
     ] {
         create_real_directory(&root, name)?;
     }
+    initialize_native_restore_locks(&root)?;
     validate_optional_real_directory(
         &root.join(LEGACY_NATIVE_ACTION_STATE_DIRECTORY),
         "legacy local CAS native action state",
+    )?;
+    validate_optional_real_directory(
+        &root.join(LEGACY_NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY),
+        "legacy local CAS native environment selectors",
     )?;
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     create_real_directory(&root, SYSROOT_IDENTITY_MEMO_DIRECTORY)?;
@@ -2176,6 +2207,78 @@ fn initialize_selected_root(
         lifecycle_lock,
         max_bytes,
     })
+}
+
+fn native_restore_lock_name(shard: u8) -> String {
+    format!("{shard:02x}.lock")
+}
+
+fn validate_native_restore_lock_file(path: &Path) -> RailResult<()> {
+    let file = crate::utils::open_cache_lock_file(path, false)?;
+    if !crate::utils::private_file_matches_path(&file, path, 0)? {
+        return Err(RailError::message(format!(
+            "native restore-lock shard '{}' is not a private empty file",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Establish the complete fixed shard set while the caller holds exclusive
+/// CAS lifecycle authority. Once published, ordinary restores only open these
+/// paths and can never grow the synchronization namespace.
+fn initialize_native_restore_locks(root: &Path) -> RailResult<()> {
+    let directory = create_real_directory(root, NATIVE_RESTORE_LOCK_DIRECTORY)?;
+    let expected = (0..NATIVE_RESTORE_LOCK_SHARDS)
+        .map(native_restore_lock_name)
+        .collect::<BTreeSet<_>>();
+    for entry in bounded_directory_entries(&directory, "local CAS native restore locks")? {
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| RailError::message("native restore-lock shard has a non-UTF-8 name"))?;
+        if !expected.contains(&name) {
+            return Err(RailError::message(format!(
+                "native restore-lock directory contains unexpected entry '{name}'"
+            )));
+        }
+        validate_native_restore_lock_file(&entry.path())?;
+    }
+    for name in expected {
+        let path = directory.join(name);
+        match crate::utils::open_cache_lock_file(&path, true) {
+            Ok(file) if crate::utils::private_file_matches_path(&file, &path, 0)? => {}
+            Ok(_) => {
+                return Err(RailError::message(format!(
+                    "native restore-lock shard '{}' is not a private empty file",
+                    path.display()
+                )));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    sync_directory_before_commit(&directory)?;
+    validate_native_restore_lock_directory(&directory).map(|_| ())
+}
+
+fn validate_native_restore_lock_directory(directory: &Path) -> RailResult<u64> {
+    validate_real_directory(directory, "local CAS native restore locks")?;
+    let entries = bounded_directory_entries(directory, "local CAS native restore locks")?;
+    if entries.len() != usize::from(NATIVE_RESTORE_LOCK_SHARDS) {
+        return Err(RailError::message(format!(
+            "native restore-lock directory must contain exactly {NATIVE_RESTORE_LOCK_SHARDS} shards"
+        )));
+    }
+    for (shard, entry) in (0..NATIVE_RESTORE_LOCK_SHARDS).zip(entries) {
+        let expected = native_restore_lock_name(shard);
+        if entry.file_name() != OsStr::new(&expected) {
+            return Err(RailError::message(format!(
+                "native restore-lock directory is missing canonical shard '{expected}'"
+            )));
+        }
+        validate_native_restore_lock_file(&entry.path())?;
+    }
+    Ok(u64::from(NATIVE_RESTORE_LOCK_SHARDS))
 }
 
 fn selected_cache_authority(
@@ -2488,6 +2591,8 @@ fn validate_root_entries(root: &Path) -> RailResult<()> {
         NATIVE_ACTION_STATE_DIRECTORY,
         NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY,
         NATIVE_LINK_CANDIDATE_DIRECTORY,
+        NATIVE_RESTORE_LOCK_DIRECTORY,
+        LEGACY_NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY,
         LEGACY_NATIVE_ACTION_STATE_DIRECTORY,
         "pins",
         "results",
@@ -2515,9 +2620,11 @@ fn validate_root_entries(root: &Path) -> RailResult<()> {
     Ok(())
 }
 
-fn encode_native_environment_selector(names: &[String]) -> RailResult<Vec<u8>> {
-    crate::compiler::native_cache::validate_environment_selector_names(names.iter().map(String::as_str))?;
-    let bytes = canonical_json(&names)?;
+fn encode_native_environment_selector(
+    selector: &crate::compiler::native_cache::NativeDynamicInputSelector,
+) -> RailResult<Vec<u8>> {
+    selector.validate()?;
+    let bytes = canonical_json(selector)?;
     if bytes.len() as u64 > MAX_NATIVE_ENVIRONMENT_SELECTOR_BYTES {
         return Err(RailError::message(format!(
             "native environment selector exceeds its {MAX_NATIVE_ENVIRONMENT_SELECTOR_BYTES}-byte bound"
@@ -2616,13 +2723,11 @@ fn decode_native_action_state(bytes: &[u8], expected_action: &str) -> Result<Nat
 }
 
 fn validate_packed_native_action_header(header: &PackedNativeActionHeader, expected_action: &str) -> RailResult<()> {
-    if header.version != 1 || header.action_key != expected_action {
+    if header.version != 2 || header.action_key != expected_action {
         return Err(RailError::message("packed native action has an incompatible identity"));
     }
     crate::compiler::native_cache::validate_base_action_key(&header.base_action_key)?;
-    crate::compiler::native_cache::validate_environment_selector_names(
-        header.environment_names.iter().map(String::as_str),
-    )?;
+    header.selector.validate()?;
     crate::compiler::native_cache::validate_action_key(&header.action_key)?;
     crate::compiler::native_cache::validate_result_key(&header.result_key)?;
     crate::compiler::native_cache::RemoteAuthorityId::parse(header.remote_authority.clone())?;
@@ -5731,9 +5836,21 @@ pub(crate) fn existing_root_at(root: &Path) -> RailResult<Option<PathBuf>> {
     ] {
         validate_optional_real_directory(&root.join(name), "local CAS domain")?;
     }
+    let restore_locks = root.join(NATIVE_RESTORE_LOCK_DIRECTORY);
+    match fs::symlink_metadata(&restore_locks) {
+        Ok(_) => {
+            validate_native_restore_lock_directory(&restore_locks)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     validate_optional_real_directory(
         &root.join(LEGACY_NATIVE_ACTION_STATE_DIRECTORY),
         "legacy local CAS native action state",
+    )?;
+    validate_optional_real_directory(
+        &root.join(LEGACY_NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY),
+        "legacy local CAS native environment selectors",
     )?;
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     validate_optional_real_directory(&root.join(SYSROOT_IDENTITY_MEMO_DIRECTORY), "local CAS domain")?;
@@ -5890,6 +6007,11 @@ pub(crate) fn status_at_with_max(root: &Path, max_bytes: u64) -> RailResult<Opti
     let staging = &root.join("staging");
     let staging_entries = bounded_optional_directory_entries(staging, "local CAS staging")?.len() as u64;
     let (_, staging_bytes) = optional_tree_file_stats(staging)?;
+    let native_restore_lock_files = match fs::symlink_metadata(root.join(NATIVE_RESTORE_LOCK_DIRECTORY)) {
+        Ok(_) => validate_native_restore_lock_directory(&root.join(NATIVE_RESTORE_LOCK_DIRECTORY))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error.into()),
+    };
     let native_link_index_files = optional_tree_file_stats(&root.join(NATIVE_LINK_CANDIDATE_DIRECTORY))?.0;
     let index_files = optional_tree_file_stats(&root.join(EVIDENCE_CANDIDATE_INDEX_DIRECTORY))?
         .0
@@ -5919,6 +6041,7 @@ pub(crate) fn status_at_with_max(root: &Path, max_bytes: u64) -> RailResult<Opti
         objects,
         active_leases,
         stale_leases,
+        native_restore_lock_files,
         staging_entries,
         staging_bytes,
         index_files,
@@ -6287,6 +6410,14 @@ mod tests {
         format!("{}{value:064x}", crate::compiler::native_cache::BASE_ACTION_KEY_PREFIX)
     }
 
+    fn dynamic_selector(names: &[&str], paths: &[&str]) -> crate::compiler::native_cache::NativeDynamicInputSelector {
+        crate::compiler::native_cache::NativeDynamicInputSelector::new(
+            names.iter().map(|name| (*name).to_string()).collect(),
+            paths.iter().map(|path| (*path).to_string()).collect(),
+        )
+        .expect("valid test dynamic-input selector")
+    }
+
     fn native_action_key(value: u8) -> String {
         format!("{}{value:064x}", crate::compiler::native_cache::ACTION_KEY_PREFIX)
     }
@@ -6417,20 +6548,23 @@ mod tests {
         let cache = tempfile::tempdir().expect("cache base");
         let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
         let key = base_action_key(1);
-        let names = vec!["CARGO_CFG_TARGET_ARCH".to_string(), "P73_SELECTED".to_string()];
+        let selector = dynamic_selector(
+            &["CARGO_CFG_TARGET_ARCH", "P73_SELECTED"],
+            &[".config/target-matrix.json"],
+        );
 
         assert_eq!(cas.native_environment_selector(&key).expect("missing lookup"), None);
         assert_eq!(
-            cas.publish_native_environment_selector(&key, &names)
+            cas.publish_native_environment_selector(&key, &selector)
                 .expect("initial publication"),
             NativeEnvironmentSelectorPublication::Created
         );
         assert_eq!(
             cas.native_environment_selector(&key).expect("published lookup"),
-            Some(names.clone())
+            Some(selector.clone())
         );
         assert_eq!(
-            cas.publish_native_environment_selector(&key, &names)
+            cas.publish_native_environment_selector(&key, &selector)
                 .expect("equal publication"),
             NativeEnvironmentSelectorPublication::Converged
         );
@@ -6439,7 +6573,7 @@ mod tests {
         let path = cas.native_environment_selector_path(&key).expect("selector path");
         assert_eq!(
             fs::read(&path).expect("selector bytes"),
-            br#"["CARGO_CFG_TARGET_ARCH","P73_SELECTED"]"#
+            br#"{"version":1,"environment_names":["CARGO_CFG_TARGET_ARCH","P73_SELECTED"],"repository_paths":[".config/target-matrix.json"]}"#
         );
         let file = File::open(&path).expect("selector file");
         assert!(
@@ -6470,9 +6604,9 @@ mod tests {
         let destination =
             LocalCas::open_at(destination_base.path(), 16 * 1024 * 1024).expect("destination CAS should open");
         let base_action = base_action_key(91);
-        let environment_names = Vec::new();
+        let selector = crate::compiler::native_cache::NativeDynamicInputSelector::empty();
         destination
-            .publish_native_environment_selector(&base_action, &environment_names)
+            .publish_native_environment_selector(&base_action, &selector)
             .expect("environment selector publication");
         let authority =
             crate::compiler::native_cache::RemoteAuthorityId::parse(format!("remote-authority-v1-sha256-{:064x}", 7))
@@ -6480,7 +6614,7 @@ mod tests {
         let mut staging = destination
             .packed_native_action_staging(PackedNativeActionStagingRequest {
                 base_action_key: &base_action,
-                environment_names: &environment_names,
+                selector: &selector,
                 action_key: validation.action_key(),
                 result_key: validation.result_key(),
                 remote_authority: &authority,
@@ -6615,8 +6749,8 @@ mod tests {
         let cache = tempfile::tempdir().expect("cache base");
         let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
         let key = base_action_key(2);
-        let first = vec!["FIRST".to_string()];
-        let second = vec!["SECOND".to_string()];
+        let first = dynamic_selector(&["FIRST"], &["README.md"]);
+        let second = dynamic_selector(&["SECOND"], &[".config/target-matrix.json"]);
         cas.publish_native_environment_selector(&key, &first)
             .expect("first publication");
 
@@ -6657,17 +6791,17 @@ mod tests {
         let cas = Arc::new(LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open"));
         let barrier = Arc::new(Barrier::new(2));
         let key = base_action_key(3);
-        let names = vec!["P73_SELECTED".to_string()];
+        let selector = dynamic_selector(&["P73_SELECTED"], &["README.md"]);
         let outcomes = std::thread::scope(|scope| {
             let mut handles = Vec::new();
             for _ in 0..2 {
                 let cas = Arc::clone(&cas);
                 let barrier = Arc::clone(&barrier);
                 let key = key.clone();
-                let names = names.clone();
+                let selector = selector.clone();
                 handles.push(scope.spawn(move || {
                     barrier.wait();
-                    cas.publish_native_environment_selector(&key, &names)
+                    cas.publish_native_environment_selector(&key, &selector)
                         .expect("concurrent publication")
                 }));
             }
@@ -6691,7 +6825,7 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(cas.native_environment_selector(&key).expect("lookup"), Some(names));
+        assert_eq!(cas.native_environment_selector(&key).expect("lookup"), Some(selector));
     }
 
     #[test]
@@ -6700,17 +6834,20 @@ mod tests {
         let cas = Arc::new(LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open"));
         let barrier = Arc::new(Barrier::new(2));
         let key = base_action_key(10);
-        let selectors = [vec!["FIRST".to_string()], vec!["SECOND".to_string()]];
+        let selectors = [
+            dynamic_selector(&["FIRST"], &["README.md"]),
+            dynamic_selector(&["SECOND"], &[".config/target-matrix.json"]),
+        ];
         let outcomes = std::thread::scope(|scope| {
             selectors
                 .iter()
-                .map(|names| {
+                .map(|selector| {
                     let cas = Arc::clone(&cas);
                     let barrier = Arc::clone(&barrier);
                     let key = key.clone();
                     scope.spawn(move || {
                         barrier.wait();
-                        cas.publish_native_environment_selector(&key, names)
+                        cas.publish_native_environment_selector(&key, selector)
                             .expect("concurrent publication")
                     })
                 })
@@ -6735,7 +6872,7 @@ mod tests {
         assert!(
             selectors
                 .iter()
-                .any(|names| canonical_json(names).expect("canonical selector") == selector_bytes),
+                .any(|selector| canonical_json(selector).expect("canonical selector") == selector_bytes),
             "the immutable selector must contain one complete publication"
         );
         let conflict_path = cas
@@ -6759,8 +6896,8 @@ mod tests {
         let (manifest, validation) = native_fixture(output.path());
         store_native_fixture(&cas, output.path(), &manifest, &validation);
         let key = base_action_key(13);
-        let first = vec!["FIRST".to_string()];
-        let second = vec!["SECOND".to_string()];
+        let first = dynamic_selector(&["FIRST"], &["README.md"]);
+        let second = dynamic_selector(&["SECOND"], &[".config/target-matrix.json"]);
         cas.publish_native_environment_selector(&key, &first)
             .expect("first selector publication");
         let NativeActionLookup::Hit(hit) = cas
@@ -6781,7 +6918,7 @@ mod tests {
                 finished_tx.send(outcome).expect("publisher completion signal");
             });
             started_rx.recv().expect("publisher must start");
-            hit.validate_environment_selector(&key, first.iter().map(String::as_str))
+            hit.validate_dynamic_input_selector(&key, &first)
                 .expect("retained selector authority");
             assert!(matches!(
                 finished_rx.recv_timeout(std::time::Duration::from_millis(100)),
@@ -6805,8 +6942,7 @@ mod tests {
         let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
         let unsorted_key = base_action_key(4);
         let unsorted = vec!["Z".to_string(), "A".to_string()];
-        let error = cas
-            .publish_native_environment_selector(&unsorted_key, &unsorted)
+        let error = crate::compiler::native_cache::NativeDynamicInputSelector::new(unsorted, Vec::new())
             .expect_err("unsorted names must fail");
         assert!(error.to_string().contains("strictly sorted and unique"), "{error}");
         assert_eq!(
@@ -6816,7 +6952,7 @@ mod tests {
         );
 
         let malformed_key = base_action_key(5);
-        cas.publish_native_environment_selector(&malformed_key, &["VALID".to_string()])
+        cas.publish_native_environment_selector(&malformed_key, &dynamic_selector(&["VALID"], &[]))
             .expect("valid publication");
         let malformed_path = cas
             .native_environment_selector_path(&malformed_key)
@@ -6831,7 +6967,11 @@ mod tests {
         let noncanonical_path = cas
             .native_environment_selector_path(&noncanonical_key)
             .expect("noncanonical selector path");
-        fs::write(&noncanonical_path, b"[ \"VALID\" ]").expect("noncanonical selector");
+        fs::write(
+            &noncanonical_path,
+            br#"{"version":1, "environment_names":["VALID"],"repository_paths":[]}"#,
+        )
+        .expect("noncanonical selector");
         let error = cas
             .native_environment_selector(&noncanonical_key)
             .expect_err("noncanonical state must fail");
@@ -6842,7 +6982,6 @@ mod tests {
     fn native_environment_selector_validates_its_identity_names_and_bounds() {
         let cache = tempfile::tempdir().expect("cache base");
         let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
-        let key = base_action_key(9);
 
         let error = cas
             .native_environment_selector(&format!(
@@ -6860,15 +6999,13 @@ mod tests {
             CACHE_BASE_ENV.to_string(),
             "A".repeat(257),
         ] {
-            let error = cas
-                .publish_native_environment_selector(&key, &[invalid])
+            let error = crate::compiler::native_cache::NativeDynamicInputSelector::new(vec![invalid], Vec::new())
                 .expect_err("invalid environment name must fail");
             assert!(error.to_string().contains("invalid environment name"), "{error}");
         }
 
         let too_many = (0..=512).map(|index| format!("ENV_{index:04}")).collect::<Vec<_>>();
-        let error = cas
-            .publish_native_environment_selector(&key, &too_many)
+        let error = crate::compiler::native_cache::NativeDynamicInputSelector::new(too_many, Vec::new())
             .expect_err("name-count bound must fail");
         assert!(error.to_string().contains("512-name bound"), "{error}");
     }
@@ -6883,7 +7020,7 @@ mod tests {
             .expect("private selector path");
         fs::write(
             private_path,
-            canonical_json(&vec![CACHE_BASE_ENV.to_string()]).expect("canonical private selector"),
+            format!(r#"{{"version":1,"environment_names":["{CACHE_BASE_ENV}"],"repository_paths":[]}}"#),
         )
         .expect("private selector bytes");
         let error = cas
@@ -6896,9 +7033,10 @@ mod tests {
             .native_environment_selector_path(&too_many_key)
             .expect("bounded selector path");
         let too_many = (0..=512).map(|index| format!("ENV_{index:04}")).collect::<Vec<_>>();
+        let too_many = serde_json::to_string(&too_many).expect("canonical oversized names");
         fs::write(
             too_many_path,
-            canonical_json(&too_many).expect("canonical oversized selector"),
+            format!(r#"{{"version":1,"environment_names":{too_many},"repository_paths":[]}}"#),
         )
         .expect("oversized selector bytes");
         let error = cas
@@ -6915,7 +7053,7 @@ mod tests {
         let cache = tempfile::tempdir().expect("cache base");
         let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
         let hard_link_key = base_action_key(7);
-        cas.publish_native_environment_selector(&hard_link_key, &["VALID".to_string()])
+        cas.publish_native_environment_selector(&hard_link_key, &dynamic_selector(&["VALID"], &[]))
             .expect("valid publication");
         let hard_link_path = cas
             .native_environment_selector_path(&hard_link_key)
@@ -7610,6 +7748,98 @@ mod tests {
             );
         });
         assert!(!cas.root.exists());
+    }
+
+    #[test]
+    fn native_restore_locks_are_bounded_and_legacy_staging_locks_migrate() {
+        let cache = tempfile::tempdir().expect("cache base");
+        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        for destination in 0..4096_u64 {
+            let identity = ContentDigest::sha256(&destination.to_le_bytes());
+            drop(cas.native_restore_lock(&identity).expect("restore shard lock"));
+        }
+        let status = cas.status().expect("bounded restore-lock status");
+        assert_eq!(status.native_restore_lock_files, u64::from(NATIVE_RESTORE_LOCK_SHARDS));
+        assert_eq!(status.staging_entries, 0);
+
+        safe_remove_tree(&cas.root.join(NATIVE_RESTORE_LOCK_DIRECTORY)).expect("simulate legacy CAS layout");
+        let legacy = cas.root.join("staging").join(format!(
+            ".native-restore-{}.lock",
+            ContentDigest::sha256(b"legacy destination")
+        ));
+        fs::write(&legacy, b"").expect("legacy restore lock");
+
+        let migrated = LocalCas::open_at(cache.path(), 1024 * 1024).expect("legacy CAS should migrate");
+        assert!(
+            !legacy.exists(),
+            "exclusive lifecycle migration must remove the legacy lock"
+        );
+        let status = migrated.status().expect("migrated restore-lock status");
+        assert_eq!(status.native_restore_lock_files, u64::from(NATIVE_RESTORE_LOCK_SHARDS));
+        assert_eq!(status.staging_entries, 0);
+    }
+
+    #[test]
+    fn native_restore_lock_serializes_across_processes() {
+        const CACHE_ENV: &str = "CARGO_RAIL_TEST_NATIVE_RESTORE_LOCK_CACHE";
+        const CONTROL_ENV: &str = "CARGO_RAIL_TEST_NATIVE_RESTORE_LOCK_CONTROL";
+
+        let root = tempfile::tempdir().expect("restore-lock test root");
+        let cache = root.path().join("cache");
+        let control = root.path().join("control");
+        fs::create_dir(&cache).expect("cache base");
+        fs::create_dir(&control).expect("control directory");
+        let cas = LocalCas::open_at(&cache, 1024 * 1024).expect("CAS should open");
+        let identity = ContentDigest::sha256(b"shared restore destination");
+        let lock = cas.native_restore_lock(&identity).expect("parent restore lock");
+        let mut child = std::process::Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "cache::cas::tests::native_restore_lock_contention_worker",
+                "--nocapture",
+            ])
+            .env(CACHE_ENV, &cache)
+            .env(CONTROL_ENV, &control)
+            .spawn()
+            .expect("restore-lock worker should start");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !control.join("attempting").is_file() {
+            assert!(
+                child.try_wait().expect("worker status").is_none(),
+                "restore-lock worker exited before contention"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "restore-lock worker did not start"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !control.join("acquired").is_file(),
+            "a second process crossed the held restore-lock shard"
+        );
+        drop(lock);
+
+        let status = child.wait().expect("restore-lock worker status");
+        assert!(status.success(), "restore-lock worker failed: {status}");
+        assert!(control.join("acquired").is_file());
+    }
+
+    #[test]
+    fn native_restore_lock_contention_worker() {
+        const CACHE_ENV: &str = "CARGO_RAIL_TEST_NATIVE_RESTORE_LOCK_CACHE";
+        const CONTROL_ENV: &str = "CARGO_RAIL_TEST_NATIVE_RESTORE_LOCK_CONTROL";
+        let (Some(cache), Some(control)) = (std::env::var_os(CACHE_ENV), std::env::var_os(CONTROL_ENV)) else {
+            return;
+        };
+        let cache = fs::canonicalize(cache).expect("canonical cache base");
+        let control = PathBuf::from(control);
+        let cas = LocalCas::open_initialized_at(&cache, 1024 * 1024, None).expect("initialized CAS should open");
+        fs::write(control.join("attempting"), b"attempting\n").expect("contention signal");
+        let identity = ContentDigest::sha256(b"shared restore destination");
+        let _lock = cas.native_restore_lock(&identity).expect("worker restore lock");
+        fs::write(control.join("acquired"), b"acquired\n").expect("acquisition signal");
     }
 
     #[test]

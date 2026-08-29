@@ -7,18 +7,19 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use super::{
-    CDYLIB_SLOT, DEP_INFO_SLOT, DYLIB_SLOT, EXECUTABLE_SLOT, MAX_SOURCE_ENTRIES, METADATA_SLOT, NativeCompilerOutput,
-    NativeCompilerWitness, NativeResultIdentity, PROC_MACRO_SLOT, RESULT_KEY_PREFIX, RLIB_SLOT, STATICLIB_SLOT,
-    STDERR_SLOT, STDOUT_SLOT, sha256_identity, validate_action_key, validate_result_key, validate_sha256,
+    CDYLIB_SLOT, DEP_INFO_SLOT, DYLIB_SLOT, EXECUTABLE_SLOT, MAX_DYNAMIC_REPOSITORY_INPUTS, MAX_SOURCE_ENTRIES,
+    METADATA_SLOT, NativeCompilerOutput, NativeCompilerWitness, NativeResultIdentity, PROC_MACRO_SLOT,
+    RESULT_KEY_PREFIX, RLIB_SLOT, STATICLIB_SLOT, STDERR_SLOT, STDOUT_SLOT, sha256_identity, validate_action_key,
+    validate_result_key, validate_sha256,
 };
 use crate::error::{RailError, RailResult};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 const DESCRIPTOR_MAGIC: &[u8; 8] = b"CRNDESC1";
-const DESCRIPTOR_VERSION: u16 = 7;
-const IDENTITY_CONTRACT_VERSION: u16 = 12;
-const RESULT_CLASS_VERSION: u16 = 5;
+const DESCRIPTOR_VERSION: u16 = 8;
+const IDENTITY_CONTRACT_VERSION: u16 = 13;
+const RESULT_CLASS_VERSION: u16 = 6;
 const MAX_DESCRIPTOR_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DESCRIPTOR_STRING_BYTES: usize = 4 * 1024;
 const FIXED_DESCRIPTOR_PREFIX_BYTES: usize = 8 + 2 + 2 + 2 + 2;
@@ -134,7 +135,7 @@ impl NativeResultDescriptor {
         Ok(sha256_identity(
             RESULT_KEY_PREFIX,
             b"cargo-rail-native-compiler-result\0",
-            &[(b"version", &8_u32.to_le_bytes()), (b"descriptor", &descriptor)],
+            &[(b"version", &9_u32.to_le_bytes()), (b"descriptor", &descriptor)],
         ))
     }
 
@@ -153,6 +154,7 @@ impl NativeResultDescriptor {
         bytes.push(u8::from(self.witness.complete));
         push_strings(&mut bytes, &self.witness.source_paths)?;
         push_strings(&mut bytes, &self.witness.generated_paths)?;
+        push_strings(&mut bytes, &self.witness.repository_paths)?;
         push_strings(&mut bytes, &self.witness.dependency_names)?;
         push_strings(&mut bytes, &self.witness.environment_names)?;
         push_bytes(&mut bytes, &serde_json::to_vec(&self.witness.linker)?)?;
@@ -203,6 +205,7 @@ impl NativeResultDescriptor {
         let strings = std::iter::once(&self.action_key)
             .chain(self.witness.source_paths.iter())
             .chain(self.witness.generated_paths.iter())
+            .chain(self.witness.repository_paths.iter())
             .chain(self.witness.dependency_names.iter())
             .chain(self.witness.environment_names.iter())
             .chain(self.outputs.iter().map(|output| &output.file_name))
@@ -215,7 +218,7 @@ impl NativeResultDescriptor {
         let linker = serde_json::to_vec(&self.witness.linker)?;
         FIXED_DESCRIPTOR_PREFIX_BYTES
             .checked_add(strings)
-            .and_then(|total| total.checked_add(2 + 1 + 4 * 4 + 1))
+            .and_then(|total| total.checked_add(2 + 1 + 5 * 4 + 1))
             .and_then(|total| total.checked_add(4 + linker.len()))
             .and_then(|total| total.checked_add((self.outputs.len() + 2) * (1 + 2 + 8 + 32)))
             .ok_or_else(|| RailError::message("native result descriptor size overflow"))
@@ -223,15 +226,17 @@ impl NativeResultDescriptor {
 
     fn validate(&self) -> RailResult<()> {
         validate_action_key(&self.action_key)?;
-        if self.witness.version != 5
+        if self.witness.version != 6
             || !self.witness.complete
             || self.witness.source_paths.is_empty()
             || self.witness.source_paths.len() > MAX_SOURCE_ENTRIES
             || self.witness.generated_paths.len() > MAX_SOURCE_ENTRIES
+            || self.witness.repository_paths.len() > MAX_DYNAMIC_REPOSITORY_INPUTS
             || self.witness.dependency_names.len() > MAX_SOURCE_ENTRIES
             || self.witness.environment_names.len() > MAX_SOURCE_ENTRIES
             || !strictly_sorted(&self.witness.source_paths)
             || !strictly_sorted(&self.witness.generated_paths)
+            || !strictly_sorted(&self.witness.repository_paths)
             || !strictly_sorted(&self.witness.dependency_names)
             || !strictly_sorted(&self.witness.environment_names)
             || self
@@ -301,6 +306,7 @@ impl NativeResultDescriptor {
             .source_paths
             .iter()
             .chain(&self.witness.generated_paths)
+            .chain(&self.witness.repository_paths)
             .chain(&self.witness.dependency_names)
             .chain(&self.witness.environment_names)
         {
@@ -310,7 +316,13 @@ impl NativeResultDescriptor {
                 ));
             }
         }
-        for path in self.witness.source_paths.iter().chain(&self.witness.generated_paths) {
+        for path in self
+            .witness
+            .source_paths
+            .iter()
+            .chain(&self.witness.generated_paths)
+            .chain(&self.witness.repository_paths)
+        {
             if !super::native_relative_path(Path::new(path)).is_ok_and(|canonical| canonical == *path) {
                 return Err(RailError::message(
                     "native result descriptor contains an invalid source capability",
@@ -856,6 +868,14 @@ mod tests {
             fs::read(decoded.staging.path().join(STDERR_SLOT)).expect("decoded stderr"),
             b""
         );
+    }
+
+    #[test]
+    fn legacy_witness_version_is_not_reinterpreted() {
+        let mut validation = super::super::tests::cas_validation_with_stdout(b"");
+        validation.witness.version = 5;
+
+        descriptor_from_validation(&validation).expect_err("legacy witness must be rejected");
     }
 
     #[test]

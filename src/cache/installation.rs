@@ -20,12 +20,15 @@ const SESSION_MEMO_FILE: &str = "session.json";
 const SESSION_LOCK_FILE: &str = "session.lock";
 const USAGE_FILE: &str = "usage-v1.log";
 const EARLY_BYPASS_FILE: &str = "early-bypass-v1.log";
+const FAILURE_COUNTERS_FILE: &str = "failure-counters-v1.json";
+const FAILURE_COUNTERS_LOCK_FILE: &str = "failure-counters-v1.lock";
 const COORDINATOR_STATE_PREFIX: &str = "remote-coordinator-v1-";
 const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
 const MAX_SESSION_MEMO_BYTES: u64 = 256 * 1024;
 const MAX_USAGE_BYTES: u64 = 64 * 1024;
 const MAX_EARLY_BYPASS_BYTES: u64 = 64 * 1024;
 const MAX_EARLY_BYPASS_REASON_BYTES: usize = 96;
+const MAX_FAILURE_COUNTERS_BYTES: u64 = 4 * 1024;
 const MAX_DISTRIBUTED_PLACEMENT_HISTORY_BYTES: u64 = 64 * 1024;
 #[cfg(not(windows))]
 const WRAPPER_FILE: &str = "cargo-rail-native-rustc-wrapper";
@@ -324,6 +327,77 @@ pub(crate) struct InstallationSessionLock {
     _file: File,
 }
 
+/// Stable fail-open classes retained by ordinary cache status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeCacheFailureReason {
+    ActionCapture,
+    ActionIdentity,
+    PostExecutionWitness,
+}
+
+impl NativeCacheFailureReason {
+    const ALL: [Self; 3] = [Self::ActionCapture, Self::ActionIdentity, Self::PostExecutionWitness];
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ActionCapture => "complete_action_capture_unavailable",
+            Self::ActionIdentity => "complete_action_identity_unavailable",
+            Self::PostExecutionWitness => "post_execution_witness_validation_unavailable",
+        }
+    }
+
+    pub(crate) fn from_reason(reason: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|candidate| candidate.as_str() == reason)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeCacheFailureCounters {
+    schema_version: u32,
+    complete_action_capture_unavailable: u64,
+    complete_action_identity_unavailable: u64,
+    post_execution_witness_validation_unavailable: u64,
+}
+
+impl Default for NativeCacheFailureCounters {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            complete_action_capture_unavailable: 0,
+            complete_action_identity_unavailable: 0,
+            post_execution_witness_validation_unavailable: 0,
+        }
+    }
+}
+
+impl NativeCacheFailureCounters {
+    fn increment(&mut self, reason: NativeCacheFailureReason) {
+        let counter = match reason {
+            NativeCacheFailureReason::ActionCapture => &mut self.complete_action_capture_unavailable,
+            NativeCacheFailureReason::ActionIdentity => &mut self.complete_action_identity_unavailable,
+            NativeCacheFailureReason::PostExecutionWitness => &mut self.post_execution_witness_validation_unavailable,
+        };
+        *counter = counter.saturating_add(1);
+    }
+
+    fn status(&self) -> std::collections::BTreeMap<String, u64> {
+        NativeCacheFailureReason::ALL
+            .into_iter()
+            .map(|reason| {
+                let count = match reason {
+                    NativeCacheFailureReason::ActionCapture => self.complete_action_capture_unavailable,
+                    NativeCacheFailureReason::ActionIdentity => self.complete_action_identity_unavailable,
+                    NativeCacheFailureReason::PostExecutionWitness => {
+                        self.post_execution_witness_validation_unavailable
+                    }
+                };
+                (reason.as_str().to_string(), count)
+            })
+            .collect()
+    }
+}
+
 /// Bounded observational counts. These never authorize a restore.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct InstallationUsageStatus {
@@ -337,6 +411,8 @@ pub(crate) struct InstallationUsageStatus {
     pub(crate) early_bypass_reasons: std::collections::BTreeMap<String, u64>,
     pub(crate) early_bypass_ledger_full: bool,
     pub(crate) early_bypass_incomplete_tail: bool,
+    pub(crate) failure_reason_counts_available: bool,
+    pub(crate) failure_reasons: std::collections::BTreeMap<String, u64>,
 }
 
 impl InstallationReceipt {
@@ -432,6 +508,14 @@ impl InstallationReceipt {
 
     fn early_bypass_path(&self) -> RailResult<PathBuf> {
         Ok(self.installation_directory()?.join(EARLY_BYPASS_FILE))
+    }
+
+    fn failure_counters_path(&self) -> RailResult<PathBuf> {
+        Ok(self.installation_directory()?.join(FAILURE_COUNTERS_FILE))
+    }
+
+    fn failure_counters_lock_path(&self) -> RailResult<PathBuf> {
+        Ok(self.installation_directory()?.join(FAILURE_COUNTERS_LOCK_FILE))
     }
 
     fn distributed_placement_history_path(&self) -> RailResult<PathBuf> {
@@ -659,10 +743,23 @@ pub(crate) struct InstallationStatus {
 /// Ordinary cache execution deliberately discards this result. Explicit
 /// benchmark coverage instead surfaces it so its usage and action ledgers
 /// cannot silently diverge.
-pub(crate) fn record_usage(receipt: &InstallationReceipt, outcome: u8) -> RailResult<()> {
+pub(crate) fn record_usage(
+    receipt: &InstallationReceipt,
+    outcome: u8,
+    failure_reason: Option<NativeCacheFailureReason>,
+) -> RailResult<()> {
     if !matches!(outcome, b'H' | b'M' | b'B' | b'F') {
         return Err(RailError::message("compiler-cache usage outcome is invalid"));
     }
+    let usage = record_usage_event(receipt, outcome);
+    let failure = failure_reason.map(|reason| record_failure_reason(receipt, reason));
+    match (usage, failure) {
+        (Err(error), _) | (Ok(()), Some(Err(error))) => Err(error),
+        (Ok(()), None | Some(Ok(()))) => Ok(()),
+    }
+}
+
+fn record_usage_event(receipt: &InstallationReceipt, outcome: u8) -> RailResult<()> {
     let path = receipt.usage_path()?;
     let mut file = crate::utils::open_cache_lock_file(&path, true)?;
     #[cfg(unix)]
@@ -684,6 +781,53 @@ pub(crate) fn record_usage(receipt: &InstallationReceipt, outcome: u8) -> RailRe
     file.seek(std::io::SeekFrom::End(0))?;
     file.write_all(&[outcome])?;
     Ok(())
+}
+
+fn record_failure_reason(receipt: &InstallationReceipt, reason: NativeCacheFailureReason) -> RailResult<()> {
+    let lock_path = receipt.failure_counters_lock_path()?;
+    let lock = crate::utils::open_cache_lock_file(&lock_path, true)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        lock.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    if !crate::utils::private_file_matches_path(&lock, &lock_path, 0)? {
+        return Err(RailError::message(
+            "compiler-cache failure counter lock is not a private regular file",
+        ));
+    }
+    lock.lock()?;
+    if !crate::utils::private_file_matches_path(&lock, &lock_path, 0)? {
+        return Err(RailError::message(
+            "compiler-cache failure counter lock changed while it was acquired",
+        ));
+    }
+    let mut counters = read_failure_counters(receipt)?.unwrap_or_default();
+    counters.increment(reason);
+    write_private_atomic(&receipt.failure_counters_path()?, &encode_failure_counters(&counters)?)
+}
+
+fn read_failure_counters(receipt: &InstallationReceipt) -> RailResult<Option<NativeCacheFailureCounters>> {
+    let Some(bytes) = read_optional_regular(&receipt.failure_counters_path()?, MAX_FAILURE_COUNTERS_BYTES)? else {
+        return Ok(None);
+    };
+    let counters: NativeCacheFailureCounters = serde_json::from_slice(&bytes)?;
+    if counters.schema_version != 1 || encode_failure_counters(&counters)? != bytes {
+        return Err(RailError::message(
+            "compiler-cache failure counters are not canonical version 1 state",
+        ));
+    }
+    Ok(Some(counters))
+}
+
+fn encode_failure_counters(counters: &NativeCacheFailureCounters) -> RailResult<Vec<u8>> {
+    let mut bytes = serde_json::to_vec_pretty(counters)?;
+    bytes.push(b'\n');
+    if bytes.len() as u64 > MAX_FAILURE_COUNTERS_BYTES {
+        return Err(RailError::message("compiler-cache failure counters exceed their bound"));
+    }
+    Ok(bytes)
 }
 
 /// Record an acquisition-free wrapper bypass beside the validated installed binaries.
@@ -805,6 +949,26 @@ fn usage_status(receipt: &InstallationReceipt) -> RailResult<InstallationUsageSt
         }
     }
     Ok(usage)
+}
+
+fn populate_failure_reason_status(receipt: &InstallationReceipt, usage: &mut InstallationUsageStatus) {
+    usage.failure_reasons = NativeCacheFailureCounters::default().status();
+    match read_failure_counters(receipt) {
+        Ok(Some(counters)) => {
+            usage.failure_reasons = counters.status();
+            usage.failure_reason_counts_available = true;
+        }
+        Ok(None) => usage.failure_reason_counts_available = true,
+        Err(_) => usage.failure_reason_counts_available = false,
+    }
+}
+
+fn empty_usage_status() -> InstallationUsageStatus {
+    InstallationUsageStatus {
+        failure_reason_counts_available: true,
+        failure_reasons: NativeCacheFailureCounters::default().status(),
+        ..InstallationUsageStatus::default()
+    }
 }
 
 fn read_bounded_private_log(path: &Path, maximum: u64) -> RailResult<Option<Vec<u8>>> {
@@ -1609,6 +1773,7 @@ pub(crate) fn apply_removal(plan: RemovalPlan) -> RailResult<()> {
     if read_bounded_private_log(&receipt.early_bypass_path()?, MAX_EARLY_BYPASS_BYTES)?.is_some() {
         fs::remove_file(receipt.early_bypass_path()?)?;
     }
+    remove_failure_counter_state(&receipt)?;
     remove_distributed_placement_state(&receipt)?;
     fs::remove_file(&receipt_path)?;
     let session_lock_path = receipt.session_lock_path()?;
@@ -1627,6 +1792,37 @@ pub(crate) fn apply_removal(plan: RemovalPlan) -> RailResult<()> {
             Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
             Err(error) => return Err(error.into()),
         }
+    }
+    Ok(())
+}
+
+fn remove_failure_counter_state(receipt: &InstallationReceipt) -> RailResult<()> {
+    let lock_path = receipt.failure_counters_lock_path()?;
+    let lock = crate::utils::open_cache_lock_file(&lock_path, true)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        lock.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    if !crate::utils::private_file_matches_path(&lock, &lock_path, 0)? {
+        return Err(RailError::message(
+            "compiler-cache failure counter lock is not a private regular file",
+        ));
+    }
+    lock.lock()?;
+    if !crate::utils::private_file_matches_path(&lock, &lock_path, 0)? {
+        return Err(RailError::message(
+            "compiler-cache failure counter lock changed while it was acquired",
+        ));
+    }
+    let counters = receipt.failure_counters_path()?;
+    if read_optional_regular(&counters, MAX_FAILURE_COUNTERS_BYTES)?.is_some() {
+        fs::remove_file(counters)?;
+    }
+    drop(lock);
+    if read_optional_regular(&lock_path, 0)?.is_some() {
+        fs::remove_file(lock_path)?;
     }
     Ok(())
 }
@@ -1805,7 +2001,7 @@ pub(crate) fn status(current_dir: &Path) -> RailResult<InstallationStatus> {
             distributed_policy: None,
             distributed_placement_history: None,
             cargo_l0: "owned_by_cargo_not_observable_when_rustc_is_not_launched",
-            usage: InstallationUsageStatus::default(),
+            usage: empty_usage_status(),
             issues: Vec::new(),
         });
     };
@@ -1893,13 +2089,14 @@ pub(crate) fn status(current_dir: &Path) -> RailResult<InstallationStatus> {
     if let Err(error) = reject_shadowing_global_wrapper(current_dir, &config_path) {
         issues.push(error.to_string());
     }
-    let usage = match usage_status(&receipt) {
+    let mut usage = match usage_status(&receipt) {
         Ok(usage) => usage,
         Err(error) => {
             issues.push(error.to_string());
             InstallationUsageStatus::default()
         }
     };
+    populate_failure_reason_status(&receipt, &mut usage);
     let distributed_placement_history = if receipt
         .distributed
         .as_ref()

@@ -137,7 +137,7 @@ pub(crate) fn status(workspace_root: &Path, workspace: bool, local: bool) -> Rai
         None
     };
     Ok(CacheStatus {
-        schema_version: 13,
+        schema_version: 14,
         installation,
         workspace: workspace.then(|| workspace_status(workspace_root)).transpose()?,
         local: local

@@ -387,7 +387,7 @@ if [[ "$resume" != resume-outage ]]; then
     exit 2
   }
   digest="${base_action_key##*-}"
-  corrupt_key="$prefix/native-v5/entries/${digest:0:2}/$base_action_key"
+  corrupt_key="$prefix/native-v6/entries/${digest:0:2}/$base_action_key"
   provider_head "$corrupt_key" >"$results/corrupt-object-before.json"
   provider_corrupt "$corrupt_key" >"$results/corrupt-object-after.json"
   printf '%s\n' "$corrupt_key" >"$results/corrupt-object-key.txt"

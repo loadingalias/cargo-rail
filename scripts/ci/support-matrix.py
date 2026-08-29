@@ -1608,8 +1608,8 @@ cargo rail cache probe --format json
 ```
 
 Use distinct bucket-scoped credential pairs for CI and developer machines even when they share one R2 authority.
-Keep the protocol marker at `native-v5/protocol`; an [object lifecycle
-rule](https://developers.cloudflare.com/r2/buckets/object-lifecycles/) may expire `native-v5/entries/` without
+Keep the protocol marker at `native-v6/protocol`; an [object lifecycle
+rule](https://developers.cloudflare.com/r2/buckets/object-lifecycles/) may expire `native-v6/entries/` without
 deleting the marker. Scope the prefix relative to the selected URL root when the URL includes a prefix.
 
 Cargo-Rail currently models only R2's default jurisdiction and derives its standard account endpoint. It deliberately
@@ -1633,7 +1633,7 @@ protocol and entry publication. For an authority rooted at `PREFIX`, provider pe
 
 | Mode | Objects | Operations |
 |---|---|---|
-| `read` | `PREFIX/native-v5/protocol`, `PREFIX/native-v5/entries/*` | Object read |
+| `read` | `PREFIX/native-v6/protocol`, `PREFIX/native-v6/entries/*` | Object read |
 | `read-write` | The same objects | Object read and conditional write |
 
 Build credentials do not need list, delete, lifecycle, multipart-upload, or administrative authority. Keep provider

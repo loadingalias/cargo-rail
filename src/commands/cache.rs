@@ -424,6 +424,13 @@ fn render_status(status: &CacheStatus) {
         status.installation.usage.bypasses,
         status.installation.usage.failures
     );
+    if status.installation.usage.failure_reason_counts_available {
+        for (reason, count) in &status.installation.usage.failure_reasons {
+            println!("Cache failure {reason}: {count}");
+        }
+    } else {
+        println!("Cache failure reasons: unavailable");
+    }
     for issue in &status.installation.issues {
         println!("Warning: {issue}");
     }
@@ -471,6 +478,10 @@ fn render_verbose_status(status: &CacheStatus) {
     for (reason, count) in &status.installation.usage.early_bypass_reasons {
         println!("  bypass {reason}: {count}");
     }
+    println!(
+        "Failure reason counters: available={}",
+        status.installation.usage.failure_reason_counts_available
+    );
     if let Some(workspace) = &status.workspace {
         println!("Workspace root: {}", workspace.root);
         for artifact in &workspace.artifacts {
@@ -490,6 +501,10 @@ fn render_verbose_status(status: &CacheStatus) {
         println!(
             "Native actions: {} ({} unique, {} conflicted, {} quarantined)",
             cache.native_actions, cache.native_unique, cache.native_conflicted, cache.native_quarantined
+        );
+        println!(
+            "Native restore synchronization: {} persistent shard(s); staging residue: {} entry(s)",
+            cache.native_restore_lock_files, cache.staging_entries
         );
         println!("Leases: {} active, {} stale", cache.active_leases, cache.stale_leases);
         println!("Reclaimable: {}", human_bytes(cache.reclaimable_bytes));

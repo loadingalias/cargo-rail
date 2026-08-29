@@ -62,6 +62,8 @@ const CAPTURE_PAUSE_CRATE_ENV: &str = "CARGO_RAIL_TEST_NATIVE_CAPTURE_PAUSE_CRAT
 const CAPTURE_PAUSE_DIRECTORY_ENV: &str = "CARGO_RAIL_TEST_NATIVE_CAPTURE_PAUSE_DIRECTORY";
 #[cfg(debug_assertions)]
 const BENCH_COVERAGE_FAULT_ENV: &str = "CARGO_RAIL_TEST_BENCH_COVERAGE_FAULT";
+#[cfg(debug_assertions)]
+const NATIVE_ACTION_FAULT_ENV: &str = "CARGO_RAIL_TEST_NATIVE_ACTION_FAULT";
 pub(crate) const DIAGNOSTIC_EXECUTION_CONTRACT: &str = "diagnostic-workspace-wrapper-v13";
 pub(crate) const DIRECT_EXECUTION_CONTRACT: &str = "direct-global-wrapper-v14";
 #[cfg(not(windows))]
@@ -86,6 +88,9 @@ const MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BENCH_COVERAGE_EVENT_BYTES: usize = 1024 * 1024;
 const STREAM_MEMORY_SPOOL_BYTES: usize = 64 * 1024;
 const MAX_RESTORE_COMMIT_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_DYNAMIC_REPOSITORY_INPUTS: usize = 4096;
+pub(crate) const MAX_DYNAMIC_REPOSITORY_PATH_BYTES: usize = 4 * 1024;
+pub(crate) const MAX_DYNAMIC_REPOSITORY_TOTAL_PATH_BYTES: usize = 1024 * 1024;
 const NATIVE_RESTORE_TRANSACTION_VERSION: u32 = 4;
 const RESTORE_REGISTRATION_FILE: &str = "registration.json";
 const RESTORE_PENDING_COMMIT_FILE: &str = "commit.json";
@@ -539,6 +544,87 @@ struct ApprovedEnvEntry {
     root_mapped: bool,
 }
 
+/// Pre-lookup discovery authority for inputs rustc selected during an earlier
+/// execution of the same portable base action.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeDynamicInputSelector {
+    version: u32,
+    pub(crate) environment_names: Vec<String>,
+    pub(crate) repository_paths: Vec<String>,
+}
+
+impl NativeDynamicInputSelector {
+    pub(crate) fn new(environment_names: Vec<String>, repository_paths: Vec<String>) -> RailResult<Self> {
+        let selector = Self {
+            version: 1,
+            environment_names,
+            repository_paths,
+        };
+        selector.validate()?;
+        Ok(selector)
+    }
+
+    pub(crate) fn empty() -> Self {
+        Self {
+            version: 1,
+            environment_names: Vec::new(),
+            repository_paths: Vec::new(),
+        }
+    }
+
+    pub(crate) fn validate(&self) -> RailResult<()> {
+        if self.version != 1 {
+            return Err(RailError::message(
+                "native dynamic-input selector has an incompatible schema",
+            ));
+        }
+        validate_environment_selector_names(self.environment_names.iter().map(String::as_str))?;
+        let mut total_bytes = 0usize;
+        let mut previous = None::<&str>;
+        for path in &self.repository_paths {
+            total_bytes = total_bytes
+                .checked_add(path.len())
+                .ok_or_else(|| RailError::message("native dynamic-input selector path bytes overflow"))?;
+            if self.repository_paths.len() > MAX_DYNAMIC_REPOSITORY_INPUTS
+                || path.is_empty()
+                || path.len() > MAX_DYNAMIC_REPOSITORY_PATH_BYTES
+                || total_bytes > MAX_DYNAMIC_REPOSITORY_TOTAL_PATH_BYTES
+                || path.as_bytes().contains(&0)
+                || crate::source::RepositoryPath::new(Path::new(path)).is_err()
+                || !native_relative_path(Path::new(path)).is_ok_and(|normalized| normalized == *path)
+            {
+                return Err(RailError::message(
+                    "native dynamic-input selector contains an invalid repository path",
+                ));
+            }
+            if previous.is_some_and(|previous| previous >= path.as_str()) {
+                return Err(RailError::message(
+                    "native dynamic-input selector repository paths are not strictly sorted and unique",
+                ));
+            }
+            previous = Some(path);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum NativeSelectedRepositoryInputKind {
+    RegularFile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeSelectedRepositoryInput {
+    path: String,
+    kind: NativeSelectedRepositoryInputKind,
+    content_digest: String,
+    bytes: u64,
+    mode: u32,
+}
+
 /// Validate the one canonical environment-name set admitted by native cache selectors.
 pub(crate) fn validate_environment_selector_names<'a>(names: impl IntoIterator<Item = &'a str>) -> RailResult<()> {
     let mut count = 0usize;
@@ -603,6 +689,7 @@ struct NativeCompilerWitness {
     complete: bool,
     source_paths: Vec<String>,
     generated_paths: Vec<String>,
+    repository_paths: Vec<String>,
     dependency_names: Vec<String>,
     environment_names: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -925,7 +1012,10 @@ pub(crate) struct NativeActionCapture {
     native_searches: Vec<NativeNamespaceCapture>,
     pathless_extern_searches: Vec<NativePathlessExternSearchCapture>,
     approved_environment: ApprovedEnvState,
+    selected_repository_inputs: Vec<NativeSelectedRepositoryInput>,
     guard: NativeCaptureGuard,
+    capture_entries: usize,
+    capture_path_bytes: usize,
     bytes_hashed: u64,
 }
 
@@ -957,6 +1047,7 @@ struct NativePublicationProof {
     source_state: NativeSourceState,
     package_binding: Option<NativePackageBinding>,
     approved_environment: ApprovedEnvState,
+    selected_repository_inputs: Vec<NativeSelectedRepositoryInput>,
     guard_identity: String,
     environment_bytes_hashed: u64,
 }
@@ -1145,6 +1236,7 @@ fn authenticate_native_pack(
         session,
         observation,
         &initial_capture.approved_environment,
+        &initial_capture.selected_repository_inputs,
         None,
         descriptor,
     )?;
@@ -1227,6 +1319,25 @@ fn current_observed_reads(
         );
     }
     observed.extend(
+        witness
+            .repository_paths
+            .iter()
+            .map(|relative| {
+                let index = capture
+                    .selected_repository_inputs
+                    .binary_search_by(|input| input.path.as_str().cmp(relative))
+                    .map_err(|_| RailError::message("native result witness has no selected repository input"))?;
+                let input = &capture.selected_repository_inputs[index];
+                Ok(FileObservation {
+                    path: ObservationPath::capture(&source_root.join(relative), source_root, source_root),
+                    content_digest: input.content_digest.clone(),
+                    executable: source_mode_executable(input.mode),
+                    symlink_target: None,
+                })
+            })
+            .collect::<RailResult<Vec<_>>>()?,
+    );
+    observed.extend(
         current_observation
             .dependency_artifacts
             .iter()
@@ -1263,8 +1374,99 @@ struct NativeDependencyArtifactKey<'a> {
 }
 
 impl NativeActionCapture {
+    fn dynamic_input_selector(&self) -> RailResult<NativeDynamicInputSelector> {
+        NativeDynamicInputSelector::new(
+            self.approved_environment
+                .entries
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect(),
+            self.selected_repository_inputs
+                .iter()
+                .map(|input| input.path.clone())
+                .collect(),
+        )
+    }
+
     fn capture(observation: &RawCompilerInvocation, source_root: &Path) -> RailResult<Self> {
-        Self::capture_with_environment(observation, source_root, None, None)
+        Self::capture_with_selector(observation, source_root, &NativeDynamicInputSelector::empty(), None)
+    }
+
+    fn capture_with_selector(
+        observation: &RawCompilerInvocation,
+        source_root: &Path,
+        selector: &NativeDynamicInputSelector,
+        package_binding: Option<NativePackageBinding>,
+    ) -> RailResult<Self> {
+        selector.validate()?;
+        Self::capture_with_environment(
+            observation,
+            source_root,
+            None,
+            package_binding,
+            &selector.repository_paths,
+        )
+    }
+
+    /// Capture only the exact repository files named by a published selector.
+    /// A post-execution call refreshes those files in place so the compiler's
+    /// execution window is closed without rescanning the source namespace.
+    /// The initial capture remains authoritative for every namespace
+    /// it already observed, so rescanning those namespaces would add I/O without
+    /// strengthening the action identity.
+    fn select_repository_inputs(
+        &mut self,
+        observation: &RawCompilerInvocation,
+        workspace_root: &Path,
+        paths: &[String],
+    ) -> RailResult<()> {
+        let selected_entries = self.selected_repository_inputs.len();
+        let selected_path_bytes = self
+            .selected_repository_inputs
+            .iter()
+            .try_fold(0usize, |total, input| total.checked_add(input.path.len()))
+            .ok_or_else(|| RailError::message("native selected repository path-byte usage overflowed"))?;
+        let selected_bytes = self
+            .selected_repository_inputs
+            .iter()
+            .try_fold(0u64, |total, input| total.checked_add(input.bytes))
+            .ok_or_else(|| RailError::message("native selected repository byte usage overflowed"))?;
+        let started = Instant::now();
+        let mut budget = NativeCaptureBudget::resume(
+            native_capture_limits(observation)?,
+            self.capture_entries
+                .checked_sub(selected_entries)
+                .ok_or_else(|| RailError::message("native selected repository entry usage is invalid"))?,
+            self.capture_path_bytes
+                .checked_sub(selected_path_bytes)
+                .ok_or_else(|| RailError::message("native selected repository path-byte usage is invalid"))?,
+            self.bytes_hashed
+                .checked_sub(selected_bytes)
+                .ok_or_else(|| RailError::message("native selected repository byte usage is invalid"))?,
+        )?;
+        let (inputs, guards) = capture_selected_repository_inputs(workspace_root, paths, started, &mut budget)?;
+        let old_guard_paths = self
+            .selected_repository_inputs
+            .iter()
+            .map(|input| format!("repository:{}", input.path))
+            .collect::<BTreeSet<_>>();
+        self.guard
+            .entries
+            .retain(|entry| !old_guard_paths.contains(&entry.path));
+        self.guard.entries.extend(guards);
+        self.guard
+            .entries
+            .sort_unstable_by(|left, right| left.path.cmp(&right.path));
+        if self.guard.entries.windows(2).any(|pair| pair[0].path == pair[1].path) {
+            return Err(RailError::message(
+                "native action capture contains duplicate guard paths",
+            ));
+        }
+        self.selected_repository_inputs = inputs;
+        self.capture_entries = budget.entries;
+        self.capture_path_bytes = budget.path_bytes;
+        self.bytes_hashed = budget.bytes_hashed;
+        Ok(())
     }
 
     fn capture_with_publication_proof(
@@ -1278,6 +1480,11 @@ impl NativeActionCapture {
             source_root,
             Some(proof.approved_environment.clone()),
             proof.package_binding.clone(),
+            &proof
+                .selected_repository_inputs
+                .iter()
+                .map(|input| input.path.clone())
+                .collect::<Vec<_>>(),
         )
     }
 
@@ -1286,6 +1493,7 @@ impl NativeActionCapture {
         source_root: &Path,
         approved_environment: Option<ApprovedEnvState>,
         package_binding: Option<NativePackageBinding>,
+        selected_repository_paths: &[String],
     ) -> RailResult<Self> {
         let [declared] = observation.declared_inputs.as_slice() else {
             return Err(RailError::message(
@@ -1333,6 +1541,8 @@ impl NativeActionCapture {
         )?;
         let pathless_extern_searches =
             capture_pathless_extern_searches(&observation.compiler_arguments, source_root, started, &mut budget)?;
+        let (selected_repository_inputs, selected_guards) =
+            capture_selected_repository_inputs(source_root, selected_repository_paths, started, &mut budget)?;
         let package_binding = match &source_state.root {
             ObservationPath::Repository(_) => {
                 if package_binding.is_some() {
@@ -1356,6 +1566,7 @@ impl NativeActionCapture {
             None => (ApprovedEnvState::empty(), 0),
         };
         let mut guard_entries = guard.entries;
+        guard_entries.extend(selected_guards);
         for (name, artifact) in &observation.dependency_artifacts {
             let path = artifact.path.resolve(source_root);
             let relative = format!("dependency:{name}:{}", artifact_name(&path)?);
@@ -1392,7 +1603,10 @@ impl NativeActionCapture {
             native_searches,
             pathless_extern_searches,
             approved_environment,
+            selected_repository_inputs,
             guard: NativeCaptureGuard { entries: guard_entries },
+            capture_entries: budget.entries,
+            capture_path_bytes: budget.path_bytes,
             bytes_hashed: budget.bytes_hashed.saturating_add(environment_bytes),
         })
     }
@@ -1406,6 +1620,7 @@ impl NativeActionCapture {
             && self.native_searches == initial.native_searches
             && self.pathless_extern_searches == initial.pathless_extern_searches
             && self.approved_environment == initial.approved_environment
+            && self.selected_repository_inputs == initial.selected_repository_inputs
             && self.guard == initial.guard
     }
 
@@ -1480,6 +1695,8 @@ impl NativeActionCapture {
                     .source_state
                     .entries
                     .len()
+                    .checked_add(self.selected_repository_inputs.len())
+                    .ok_or_else(|| RailError::message("native restore guard count overflowed"))?
                     .checked_add(dependencies.len())
                     .ok_or_else(|| RailError::message("native restore guard count overflowed"))?
         {
@@ -1494,10 +1711,21 @@ impl NativeActionCapture {
             {
                 Ok(_) => (self.source_root.join(&expected.path), None),
                 Err(_) => {
-                    let index = dependencies
-                        .binary_search_by(|entry| entry.0.as_str().cmp(&expected.path))
-                        .map_err(|_| RailError::message("native restore guard path is not an action input"))?;
-                    (dependencies[index].1.clone(), Some(dependencies[index].2))
+                    if let Some(relative) = expected.path.strip_prefix("repository:") {
+                        let index = self
+                            .selected_repository_inputs
+                            .binary_search_by(|input| input.path.as_str().cmp(relative))
+                            .map_err(|_| {
+                                RailError::message("native restore guard repository path is not an action input")
+                            })?;
+                        let input = &self.selected_repository_inputs[index];
+                        (workspace_root.join(relative), Some(source_mode_executable(input.mode)))
+                    } else {
+                        let index = dependencies
+                            .binary_search_by(|entry| entry.0.as_str().cmp(&expected.path))
+                            .map_err(|_| RailError::message("native restore guard path is not an action input"))?;
+                        (dependencies[index].1.clone(), Some(dependencies[index].2))
+                    }
                 }
             };
             let metadata = fs::symlink_metadata(&path)?;
@@ -1779,6 +2007,8 @@ impl NativeActionCapture {
     fn witness(&self, observation: &RawCompilerInvocation, workspace_root: &Path) -> RailResult<NativeCompilerWitness> {
         let mut source_paths = Vec::with_capacity(observation.observed_reads.len());
         let mut generated_paths = Vec::new();
+        let mut repository_paths = Vec::new();
+        let canonical_workspace = crate::utils::canonicalize_existing(workspace_root)?;
         for observed in &observation.observed_reads {
             if observation
                 .dependency_artifacts
@@ -1794,20 +2024,39 @@ impl NativeActionCapture {
                 .generated
                 .as_ref()
                 .and_then(|generated| absolute.strip_prefix(&generated.root).ok());
-            let (relative, state, selected_paths) = match (source_relative, generated_relative, &self.generated) {
+            let selected_namespace = match (source_relative, generated_relative, &self.generated) {
                 (Some(_), Some(_), _) => {
                     return Err(RailError::message(
                         "compiler-selected input belongs to overlapping source and generated namespaces",
                     ));
                 }
-                (Some(relative), None, _) => (relative, &self.source_state, &mut source_paths),
-                (None, Some(relative), Some(generated)) => (relative, &generated.state, &mut generated_paths),
-                _ => {
-                    return Err(RailError::message(format!(
-                        "compiler selected input '{}' outside its complete namespaces",
-                        absolute.display()
-                    )));
+                (Some(relative), None, _) => Some((relative, &self.source_state, &mut source_paths)),
+                (None, Some(relative), Some(generated)) => Some((relative, &generated.state, &mut generated_paths)),
+                _ => None,
+            };
+            let Some((relative, state, selected_paths)) = selected_namespace else {
+                let relative = absolute
+                    .strip_prefix(&canonical_workspace)
+                    .map_err(|_| RailError::message("compiler selected an input outside the repository authority"))?;
+                let relative = native_relative_path(relative)?;
+                let selected = self
+                    .selected_repository_inputs
+                    .binary_search_by(|input| input.path.as_str().cmp(&relative))
+                    .ok()
+                    .map(|index| &self.selected_repository_inputs[index])
+                    .ok_or_else(|| {
+                        RailError::message("compiler-selected repository input is absent from its dynamic selector")
+                    })?;
+                if selected.content_digest != observed.content_digest
+                    || source_mode_executable(selected.mode) != observed.executable
+                    || observed.symlink_target.is_some()
+                {
+                    return Err(RailError::message(
+                        "compiler-selected repository input changed after selector capture",
+                    ));
                 }
+                repository_paths.push(relative);
+                continue;
             };
             let relative = native_relative_path(relative)?;
             let index = state
@@ -1834,6 +2083,17 @@ impl NativeActionCapture {
         source_paths.dedup();
         generated_paths.sort_unstable();
         generated_paths.dedup();
+        repository_paths.sort_unstable();
+        repository_paths.dedup();
+        if !repository_paths
+            .iter()
+            .map(String::as_str)
+            .eq(self.selected_repository_inputs.iter().map(|input| input.path.as_str()))
+        {
+            return Err(RailError::message(
+                "native dynamic-input selector does not match compiler-selected repository inputs",
+            ));
+        }
 
         let mut dependency_names = observation
             .dependency_artifacts
@@ -1873,10 +2133,11 @@ impl NativeActionCapture {
         environment_names.sort_unstable();
         environment_names.dedup();
         Ok(NativeCompilerWitness {
-            version: 5,
+            version: 6,
             complete: true,
             source_paths,
             generated_paths,
+            repository_paths,
             dependency_names,
             environment_names,
             linker: None,
@@ -1890,11 +2151,12 @@ impl NativeActionCapture {
             .map(|(name, _)| name.as_str())
             .collect::<Vec<_>>();
         dependencies.sort_unstable();
-        witness.version == 5
+        witness.version == 6
             && witness.complete
             && !witness.source_paths.is_empty()
             && strictly_sorted_unique_strings(&witness.source_paths)
             && strictly_sorted_unique_strings(&witness.generated_paths)
+            && strictly_sorted_unique_strings(&witness.repository_paths)
             && strictly_sorted_unique_strings(&witness.dependency_names)
             && validate_environment_selector_names(witness.environment_names.iter().map(String::as_str)).is_ok()
             && witness.dependency_names.iter().map(String::as_str).eq(dependencies)
@@ -1935,10 +2197,68 @@ impl NativeActionCapture {
                         .is_ok_and(|index| !self.approved_environment.entries[index].root_mapped)
             })
             && witness
+                .repository_paths
+                .iter()
+                .map(String::as_str)
+                .eq(self.selected_repository_inputs.iter().map(|input| input.path.as_str()))
+            && witness
                 .linker
                 .as_ref()
                 .is_none_or(|witness| validate_linker_witness(witness).is_ok())
     }
+}
+
+fn dynamic_input_selector_from_observation(
+    observation: &RawCompilerInvocation,
+    capture: &NativeActionCapture,
+    workspace_root: &Path,
+) -> RailResult<NativeDynamicInputSelector> {
+    let canonical_workspace = crate::utils::canonicalize_existing(workspace_root)?;
+    let mut repository_paths = Vec::new();
+    for observed in &observation.observed_reads {
+        if observation
+            .dependency_artifacts
+            .iter()
+            .any(|(_, dependency)| dependency == observed)
+        {
+            continue;
+        }
+        if observed.symlink_target.is_some() {
+            return Err(RailError::message(
+                "compiler-selected dynamic repository input is a symlink",
+            ));
+        }
+        let spelling = observed.path.resolve(workspace_root);
+        let absolute = crate::utils::canonicalize_existing(&spelling)?;
+        if absolute.starts_with(&capture.source_root)
+            || capture
+                .generated
+                .as_ref()
+                .is_some_and(|generated| absolute.starts_with(&generated.root))
+        {
+            continue;
+        }
+        let relative = absolute
+            .strip_prefix(&canonical_workspace)
+            .map_err(|_| RailError::message("compiler selected an input outside repository authority"))?;
+        let relative = native_relative_path(relative)?;
+        if canonical_workspace.join(&relative) != absolute {
+            return Err(RailError::message(
+                "compiler-selected dynamic repository input crosses a symlink or reparse boundary",
+            ));
+        }
+        repository_paths.push(relative);
+    }
+    repository_paths.sort_unstable();
+    repository_paths.dedup();
+    let mut environment_names = observation
+        .environment_reads
+        .iter()
+        .map(|environment| environment.name.clone())
+        .collect::<Vec<_>>();
+    environment_names.sort_unstable();
+    environment_names.dedup();
+    NativeDynamicInputSelector::new(environment_names, repository_paths)
 }
 
 fn validate_linker_witness(witness: &LinkerWitness) -> RailResult<()> {
@@ -3115,6 +3435,18 @@ impl NativeCaptureBudget {
         }
     }
 
+    fn resume(limits: NativeCaptureLimits, entries: usize, path_bytes: usize, bytes_hashed: u64) -> RailResult<Self> {
+        if entries > limits.entries || path_bytes > limits.path_bytes || bytes_hashed > limits.bytes_hashed {
+            return Err(RailError::message("native source capture budget is invalid"));
+        }
+        Ok(Self {
+            limits,
+            entries,
+            path_bytes,
+            bytes_hashed,
+        })
+    }
+
     fn account_entry(&mut self, path: &str) -> RailResult<()> {
         let entries = self
             .entries
@@ -3748,6 +4080,45 @@ fn capture_guarded_file(
     ))
 }
 
+fn capture_selected_repository_inputs(
+    workspace_root: &Path,
+    paths: &[String],
+    started: Instant,
+    budget: &mut NativeCaptureBudget,
+) -> RailResult<(Vec<NativeSelectedRepositoryInput>, Vec<NativeGuardEntry>)> {
+    let selector = NativeDynamicInputSelector::new(Vec::new(), paths.to_vec())?;
+    let canonical_root = crate::utils::canonicalize_existing(workspace_root)?;
+    let mut inputs = Vec::with_capacity(selector.repository_paths.len());
+    let mut guards = Vec::with_capacity(selector.repository_paths.len());
+    for relative in selector.repository_paths {
+        budget.account_entry(&relative)?;
+        let path = canonical_root.join(&relative);
+        let canonical = crate::utils::canonicalize_existing(&path).map_err(|error| {
+            RailError::message(format!(
+                "selected repository input '{relative}' is unavailable: {error}"
+            ))
+        })?;
+        if canonical != path || !canonical.starts_with(&canonical_root) {
+            return Err(RailError::message(
+                "selected repository input crosses a symlink or reparse boundary",
+            ));
+        }
+        let (content_digest, metadata, bytes) = capture_guarded_file(&canonical, started, budget)?;
+        inputs.push(NativeSelectedRepositoryInput {
+            path: relative.clone(),
+            kind: NativeSelectedRepositoryInputKind::RegularFile,
+            content_digest,
+            bytes,
+            mode: semantic_mode(&fs::symlink_metadata(&canonical)?),
+        });
+        guards.push(NativeGuardEntry {
+            path: format!("repository:{relative}"),
+            metadata,
+        });
+    }
+    Ok((inputs, guards))
+}
+
 fn artifact_name(path: &Path) -> RailResult<String> {
     path.file_name()
         .and_then(OsStr::to_str)
@@ -4036,6 +4407,7 @@ fn private_test_compiler_environment(name: &OsStr) -> bool {
                 | CAPTURE_PAUSE_CRATE_ENV
                 | CAPTURE_PAUSE_DIRECTORY_ENV
                 | BENCH_COVERAGE_FAULT_ENV
+                | NATIVE_ACTION_FAULT_ENV
         )
     )
 }
@@ -4506,6 +4878,7 @@ pub(crate) struct NativeCompilerValidation {
     linker_generations: Option<LinkerGenerationWitness>,
     observation: RawCompilerInvocation,
     compiler_environment_names: Vec<String>,
+    selected_repository_inputs: Vec<NativeSelectedRepositoryInput>,
     outputs: Vec<NativeCompilerOutput>,
     stdout_digest: String,
     stdout_bytes: u64,
@@ -4518,6 +4891,7 @@ impl NativeCompilerValidation {
         session: &NativeCompilerSession,
         observation: RawCompilerInvocation,
         approved_environment: &ApprovedEnvState,
+        selected_repository_inputs: &[NativeSelectedRepositoryInput],
         linker_generations: Option<LinkerGenerationWitness>,
         descriptor: pack::NativeResultDescriptor,
     ) -> RailResult<Self> {
@@ -4532,7 +4906,7 @@ impl NativeCompilerValidation {
             stderr_bytes,
         } = descriptor;
         let validation = Self {
-            version: 16,
+            version: 17,
             action_key,
             result_key,
             session_identity: session.identity.clone(),
@@ -4546,6 +4920,7 @@ impl NativeCompilerValidation {
                 .iter()
                 .map(|entry| entry.name.clone())
                 .collect(),
+            selected_repository_inputs: selected_repository_inputs.to_vec(),
             outputs,
             stdout_digest,
             stdout_bytes,
@@ -4575,7 +4950,7 @@ impl NativeCompilerValidation {
     }
 
     /// Verify that this exact action was derived from the supplied base action.
-    pub(crate) fn remote_publication_environment_names(&self, base_action_key: &str) -> RailResult<&[String]> {
+    pub(crate) fn remote_publication_selector(&self, base_action_key: &str) -> RailResult<NativeDynamicInputSelector> {
         self.validate_object()?;
         let approved_environment = ApprovedEnvState {
             version: 3,
@@ -4590,7 +4965,8 @@ impl NativeCompilerValidation {
                 })
                 .collect(),
         };
-        let pre_link_action = action_key_from_base(base_action_key, &approved_environment)?;
+        let pre_link_action =
+            action_key_from_base(base_action_key, &approved_environment, &self.selected_repository_inputs)?;
         let selected_action = if linked_observation(&self.observation) {
             witnessed_action_key(&pre_link_action, &self.witness)?
         } else {
@@ -4601,7 +4977,13 @@ impl NativeCompilerValidation {
                 "native remote publication base action does not bind its exact action",
             ));
         }
-        Ok(&self.compiler_environment_names)
+        NativeDynamicInputSelector::new(
+            self.compiler_environment_names.clone(),
+            self.selected_repository_inputs
+                .iter()
+                .map(|input| input.path.clone())
+                .collect(),
+        )
     }
 
     #[cfg(test)]
@@ -4728,7 +5110,7 @@ impl NativeCompilerValidation {
     }
 
     pub(crate) fn validate_object(&self) -> RailResult<()> {
-        if self.version != 16 {
+        if self.version != 17 {
             return Err(RailError::message(
                 "native compiler observation has an incompatible schema",
             ));
@@ -4760,6 +5142,7 @@ impl NativeCompilerValidation {
             || !complete_compiler_observation(&self.observation)
             || !outputs_match_observation(&self.outputs, &self.observation.emitted_outputs)
             || validate_environment_selector_names(self.compiler_environment_names.iter().map(String::as_str)).is_err()
+            || validate_selected_repository_inputs(&self.selected_repository_inputs).is_err()
             || validate_environment_selector_names(observed_environment_names.clone()).is_err()
             || !self
                 .compiler_environment_names
@@ -4771,12 +5154,26 @@ impl NativeCompilerValidation {
                 "native compiler observation is outside the graduated class",
             ));
         }
-        if self.witness.version != 5
+        if self.witness.version != 6
             || !self.witness.complete
             || !strictly_sorted_unique_strings(&self.witness.source_paths)
             || !strictly_sorted_unique_strings(&self.witness.generated_paths)
             || !strictly_sorted_unique_strings(&self.witness.dependency_names)
             || validate_environment_selector_names(self.witness.environment_names.iter().map(String::as_str)).is_err()
+            || !self
+                .witness
+                .repository_paths
+                .iter()
+                .map(String::as_str)
+                .eq(self.selected_repository_inputs.iter().map(|input| input.path.as_str()))
+            || self.selected_repository_inputs.iter().any(|input| {
+                !self.observation.observed_reads.iter().any(|observed| {
+                    observed.path == ObservationPath::Repository(input.path.clone())
+                        && observed.content_digest == input.content_digest
+                        && observed.executable == source_mode_executable(input.mode)
+                        && observed.symlink_target.is_none()
+                })
+            })
             || !self
                 .witness
                 .environment_names
@@ -4854,7 +5251,7 @@ impl NativeCompilerValidation {
 
 impl NativePublicationProof {
     fn validate_object(&self) -> RailResult<()> {
-        if self.version != 4 {
+        if self.version != 5 {
             return Err(RailError::message(
                 "native publication proof has an incompatible schema",
             ));
@@ -4870,8 +5267,28 @@ impl NativePublicationProof {
             }
         }
         self.approved_environment.validate_object()?;
+        validate_selected_repository_inputs(&self.selected_repository_inputs)?;
         validate_sha256(&self.guard_identity)
     }
+}
+
+fn validate_selected_repository_inputs(inputs: &[NativeSelectedRepositoryInput]) -> RailResult<()> {
+    let selector =
+        NativeDynamicInputSelector::new(Vec::new(), inputs.iter().map(|input| input.path.clone()).collect())?;
+    if inputs.len() != selector.repository_paths.len()
+        || inputs.iter().any(|input| {
+            input.kind != NativeSelectedRepositoryInputKind::RegularFile
+                || input.bytes > MAX_SOURCE_BYTES
+                || validate_sha256(&input.content_digest).is_err()
+        })
+        || inputs
+            .iter()
+            .try_fold(0u64, |total, input| total.checked_add(input.bytes))
+            .is_none_or(|bytes| bytes > MAX_SOURCE_BYTES)
+    {
+        return Err(RailError::message("native selected repository input state is invalid"));
+    }
+    Ok(())
 }
 
 fn validate_native_source_state(state: &NativeSourceState) -> RailResult<()> {
@@ -4999,7 +5416,11 @@ fn action_key(
     capture: &NativeActionCapture,
 ) -> RailResult<String> {
     let base_action = base_action_key(session_identity, class, observation, capture)?;
-    action_key_from_base(&base_action, &capture.approved_environment)
+    action_key_from_base(
+        &base_action,
+        &capture.approved_environment,
+        &capture.selected_repository_inputs,
+    )
 }
 
 fn link_candidate_selector(pre_link_action: &str) -> RailResult<String> {
@@ -5073,17 +5494,24 @@ fn revalidate_selected_action(
     }
 }
 
-fn action_key_from_base(base_action: &str, approved_environment: &ApprovedEnvState) -> RailResult<String> {
+fn action_key_from_base(
+    base_action: &str,
+    approved_environment: &ApprovedEnvState,
+    selected_repository_inputs: &[NativeSelectedRepositoryInput],
+) -> RailResult<String> {
     validate_identity(base_action, BASE_ACTION_KEY_PREFIX)?;
     approved_environment.validate_object()?;
+    validate_selected_repository_inputs(selected_repository_inputs)?;
     let approved_environment = serde_json::to_vec(approved_environment)?;
+    let selected_repository_inputs = serde_json::to_vec(selected_repository_inputs)?;
     Ok(sha256_identity(
         ACTION_KEY_PREFIX,
         b"cargo-rail-native-compiler-action\0",
         &[
-            (b"version", &14_u32.to_le_bytes()),
+            (b"version", &15_u32.to_le_bytes()),
             (b"base-action", base_action.as_bytes()),
             (b"approved-environment", &approved_environment),
+            (b"selected-repository-inputs", &selected_repository_inputs),
         ],
     ))
 }
@@ -5325,6 +5753,7 @@ fn distributed_rust_library_candidate_with_remap(
         },
         authority.sources,
         authority.dependencies,
+        authority.local_output_directory,
     )
     .map_err(|_| "distributed_source_capture_failed")
 }
@@ -5340,6 +5769,7 @@ struct DistributedRustLibraryAuthority {
     extra_filename: String,
     metadata: String,
     metadata_name: String,
+    local_output_directory: PathBuf,
     output_relative_directory: String,
     rlib_name: Option<String>,
     sources: Vec<crate::compiler::distributed::RustLibrarySourceInput>,
@@ -5424,7 +5854,13 @@ fn distributed_rust_library_authority_with_remap(
     let ObservationPath::Repository(namespace_relative) = &capture.source_state.root else {
         return Err("distributed_source_namespace_ineligible");
     };
-    let sources = distributed_source_inputs(capture, namespace_relative, source_relative_path, declared)?;
+    let sources = distributed_source_inputs(
+        capture,
+        namespace_relative,
+        source_relative_path,
+        declared,
+        workspace_root,
+    )?;
     let dependencies = distributed_dependency_inputs(observation, workspace_root)?;
 
     let arguments = DistributedRustLibraryArguments::parse(&observation.compiler_arguments)?;
@@ -5488,17 +5924,8 @@ fn distributed_rust_library_authority_with_remap(
         .dep_info
         .parent()
         .ok_or("distributed_output_contract_ineligible")?;
-    let canonical_root =
-        crate::utils::canonicalize_existing(workspace_root).map_err(|_| "distributed_output_contract_ineligible")?;
     let canonical_output =
         crate::utils::canonicalize_existing(output_parent).map_err(|_| "distributed_output_contract_ineligible")?;
-    let output_relative_directory = canonical_output
-        .strip_prefix(&canonical_root)
-        .map(crate::utils::path_to_git_format)
-        .map_err(|_| "distributed_output_contract_ineligible")?;
-    if crate::source::RepositoryPath::new(Path::new(&output_relative_directory)).is_err() {
-        return Err("distributed_output_contract_ineligible");
-    }
     let execution_options = arguments.execution_options();
     Ok(DistributedRustLibraryAuthority {
         crate_name: crate_name.to_string(),
@@ -5510,7 +5937,8 @@ fn distributed_rust_library_authority_with_remap(
         extra_filename: extra_filename.to_string(),
         metadata: arguments.metadata.ok_or("distributed_metadata_unavailable")?,
         metadata_name: metadata_name.to_string(),
-        output_relative_directory,
+        local_output_directory: canonical_output,
+        output_relative_directory: crate::compiler::distributed::VIRTUAL_OUTPUT_DIRECTORY.to_string(),
         rlib_name,
         dependencies,
         sources,
@@ -5525,6 +5953,7 @@ fn distributed_source_inputs(
     namespace_relative: &str,
     source_relative_path: &str,
     declared: &FileObservation,
+    workspace_root: &Path,
 ) -> Result<Vec<crate::compiler::distributed::RustLibrarySourceInput>, &'static str> {
     let mut sources = Vec::new();
     for entry in &capture.source_state.entries {
@@ -5550,6 +5979,21 @@ fn distributed_source_inputs(
             path: capture.source_root.join(&entry.path),
             repository_relative_path,
         });
+    }
+    sources.extend(capture.selected_repository_inputs.iter().map(|input| {
+        crate::compiler::distributed::RustLibrarySourceInput {
+            bytes: input.bytes,
+            content_digest: input.content_digest.clone(),
+            path: workspace_root.join(&input.path),
+            repository_relative_path: input.path.clone(),
+        }
+    }));
+    sources.sort_unstable_by(|left, right| left.repository_relative_path.cmp(&right.repository_relative_path));
+    if sources
+        .windows(2)
+        .any(|pair| pair[0].repository_relative_path == pair[1].repository_relative_path)
+    {
+        return Err("distributed_source_namespace_ineligible");
     }
     let root = sources
         .iter()
@@ -5823,7 +6267,13 @@ impl DistributedRustLibraryArguments {
 
     fn capture_codegen(&mut self, value: Option<&str>) -> Result<(), &'static str> {
         let value = value.ok_or("distributed_argument_shape_ineligible")?;
-        let (name, value) = value.split_once('=').ok_or("distributed_argument_shape_ineligible")?;
+        let (name, value) = value
+            .split_once('=')
+            .map_or((value, None), |(name, value)| (name, Some(value)));
+        if name == "linker-plugin-lto" {
+            return set_distributed_linker_plugin_lto(&mut self.codegen.linker_plugin_lto, value);
+        }
+        let value = value.ok_or("distributed_argument_shape_ineligible")?;
         match name {
             "metadata" => set_distributed_argument(&mut self.metadata, Some(value)),
             "extra-filename" => set_distributed_argument(&mut self.extra_filename, Some(value)),
@@ -5831,7 +6281,6 @@ impl DistributedRustLibraryArguments {
             "debuginfo" => set_distributed_argument(&mut self.codegen.debuginfo, Some(value)),
             "debug-assertions" => set_distributed_bool(&mut self.codegen.debug_assertions, value),
             "embed-bitcode" => set_distributed_bool(&mut self.codegen.embed_bitcode, value),
-            "linker-plugin-lto" => set_distributed_bool(&mut self.codegen.linker_plugin_lto, value),
             "lto" => set_distributed_argument(&mut self.codegen.lto, Some(value)),
             "opt-level" => set_distributed_argument(&mut self.codegen.opt_level, Some(value)),
             "overflow-checks" => set_distributed_bool(&mut self.codegen.overflow_checks, value),
@@ -5961,15 +6410,30 @@ fn set_distributed_argument(slot: &mut Option<String>, value: Option<&str>) -> R
 }
 
 fn set_distributed_bool(slot: &mut Option<bool>, value: &str) -> Result<(), &'static str> {
-    let value = match value {
-        "yes" => true,
-        "no" => false,
-        _ => return Err("distributed_argument_shape_ineligible"),
-    };
+    let value = distributed_bool(value).ok_or("distributed_argument_shape_ineligible")?;
     if slot.replace(value).is_some() {
         return Err("distributed_argument_shape_ineligible");
     }
     Ok(())
+}
+
+fn set_distributed_linker_plugin_lto(slot: &mut Option<bool>, value: Option<&str>) -> Result<(), &'static str> {
+    if slot.is_some() {
+        return Err("distributed_argument_shape_ineligible");
+    }
+    let enabled = value
+        .map_or(Some(true), distributed_bool)
+        .ok_or("distributed_linker_plugin_lto_path_ineligible")?;
+    *slot = Some(enabled);
+    Ok(())
+}
+
+fn distributed_bool(value: &str) -> Option<bool> {
+    match value {
+        "y" | "yes" | "on" | "true" => Some(true),
+        "n" | "no" | "off" | "false" => Some(false),
+        _ => None,
+    }
 }
 
 fn set_distributed_u32(slot: &mut Option<u32>, value: &str) -> Result<(), &'static str> {
@@ -7105,15 +7569,17 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
     if let Err(error) = recover_restore_commit_in(&cas, &output_paths, source_root, observation_directory) {
         return OuterCacheAction::OperationalFailure(error);
     }
-    let capture = NativeActionCapture::capture(recorder.observation(), source_root);
+    let capture = native_action_test_fault("action_capture", recorder.observation())
+        .and_then(|()| NativeActionCapture::capture(recorder.observation(), source_root));
     let capture_bytes = capture.as_ref().map_or(0, |capture| capture.bytes_hashed);
     let mut capture = match capture {
         Ok(capture) => capture,
-        Err(_) => {
+        Err(error) => {
+            report_native_action_diagnostic("action capture", &error);
             configure_cold(
                 command,
                 CompilerCacheWrapperStatus::Bypassed,
-                "complete_action_capture_unavailable",
+                crate::cache::installation::NativeCacheFailureReason::ActionCapture.as_str(),
                 None,
                 initial_input_bytes.saturating_add(capture_bytes),
                 diagnostic_wrapper,
@@ -7220,15 +7686,20 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
     let compiler_arguments = normalized_compiler_arguments.as_deref().unwrap_or(compiler_arguments);
     let observation = recorder.observation();
     let initial_input_bytes = estimated_input_bytes(observation, source_root);
-    let base_action = base_action_key(&session.identity, &session.class, observation, &capture).ok();
-    let provisional_action = action_key(&session.identity, &session.class, observation, &capture).ok();
-    let (base_action, provisional_action) = match (base_action, provisional_action) {
-        (Some(base_action), Some(provisional_action)) => (base_action, provisional_action),
-        _ => {
+    let action_identity = native_action_test_fault("action_identity", observation).and_then(|()| {
+        Ok((
+            base_action_key(&session.identity, &session.class, observation, &capture)?,
+            action_key(&session.identity, &session.class, observation, &capture)?,
+        ))
+    });
+    let (base_action, provisional_action) = match action_identity {
+        Ok(identity) => identity,
+        Err(error) => {
+            report_native_action_diagnostic("action identity", &error);
             configure_cold(
                 command,
                 CompilerCacheWrapperStatus::Bypassed,
-                "complete_action_capture_unavailable",
+                crate::cache::installation::NativeCacheFailureReason::ActionIdentity.as_str(),
                 None,
                 normalization_bytes.saturating_add(initial_input_bytes.saturating_add(capture.bytes_hashed)),
                 diagnostic_wrapper,
@@ -7260,8 +7731,8 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
     };
     let mut remote_entry = None;
     let mut selector_miss_reason = "environment_selector_not_found";
-    let mut environment_names = match cas.native_environment_selector(&base_action) {
-        Ok(Some(names)) => Some(names),
+    let mut dynamic_selector = match cas.native_environment_selector(&base_action) {
+        Ok(Some(selector)) => Some(selector),
         Ok(None) => None,
         Err(_) => {
             configure_cold(
@@ -7275,7 +7746,7 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
             return OuterCacheAction::Execute;
         }
     };
-    if environment_names.is_none()
+    if dynamic_selector.is_none()
         && let Some(selection) = active_remote_selection()
     {
         if !selection.direct_transport_supported() {
@@ -7295,19 +7766,19 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
             });
             match lookup {
                 Ok(crate::remote_cache::RemoteLookup::Unique {
-                    environment_names: names,
+                    selector,
                     action_key,
                     result_key,
                     body,
                     bytes,
                     compressed_bytes,
-                }) if selection.approves_environment_names(&names) => {
-                    match cas.publish_native_environment_selector(&base_action, &names) {
+                }) if selection.approves_environment_names(&selector.environment_names) => {
+                    match cas.publish_native_environment_selector(&base_action, &selector) {
                         Ok(crate::cache::cas::NativeEnvironmentSelectorPublication::Created)
                         | Ok(crate::cache::cas::NativeEnvironmentSelectorPublication::Converged) => {
-                            environment_names = Some(names.clone());
+                            dynamic_selector = Some(selector.clone());
                             remote_entry = Some(crate::remote_cache::RemoteLookup::Unique {
-                                environment_names: names,
+                                selector,
                                 action_key,
                                 result_key,
                                 body,
@@ -7333,8 +7804,8 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
             }
         }
     }
-    let environment_names = match environment_names {
-        Some(names) => names,
+    let dynamic_selector = match dynamic_selector {
+        Some(selector) => selector,
         None => {
             if let Some(candidate) = distributed_candidate.as_ref()
                 && prepare_distributed_local_fallback(command, rustc, candidate, source_root, observation_directory)
@@ -7379,11 +7850,35 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
             }));
         }
     };
+    capture = match capture.select_repository_inputs(observation, source_root, &dynamic_selector.repository_paths) {
+        Ok(())
+            if base_action_key(&session.identity, &session.class, observation, &capture)
+                .is_ok_and(|selected| selected == base_action) =>
+        {
+            capture
+        }
+        Ok(_) | Err(_) => {
+            configure_cold(
+                command,
+                CompilerCacheWrapperStatus::Bypassed,
+                "compiler_dynamic_input_selector_unavailable",
+                Some(provisional_action),
+                metrics.bytes_hashed,
+                diagnostic_wrapper,
+            );
+            return OuterCacheAction::Execute;
+        }
+    };
+    if distributed_candidate.is_some() {
+        distributed_candidate =
+            distributed_rust_library_candidate(observation, &capture, &output_paths, source_root, source_root_spelling)
+                .ok();
+    }
     match capture_approved_environment(
         source_root,
         source_root_spelling,
         &capture,
-        &environment_names,
+        &dynamic_selector.environment_names,
         Instant::now(),
     ) {
         Ok((environment, bytes_hashed)) => {
@@ -7404,11 +7899,12 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
     }
     let pre_link_action = match action_key(&session.identity, &session.class, observation, &capture) {
         Ok(action) => action,
-        Err(_) => {
+        Err(error) => {
+            report_native_action_diagnostic("selected action identity", &error);
             configure_cold(
                 command,
                 CompilerCacheWrapperStatus::Bypassed,
-                "selected_action_identity_unavailable",
+                crate::cache::installation::NativeCacheFailureReason::ActionIdentity.as_str(),
                 Some(provisional_action),
                 metrics.bytes_hashed,
                 diagnostic_wrapper,
@@ -7537,7 +8033,7 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
     if local_miss
         && let Some(selection) = active_remote_selection()
         && selection.direct_transport_supported()
-        && selection.approves_environment_names(&environment_names)
+        && selection.approves_environment_names(&dynamic_selector.environment_names)
     {
         metrics.begin_remote();
         let started = Instant::now();
@@ -7551,7 +8047,7 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
                 session: &session,
                 pre_link_action: &pre_link_action,
                 base_action_key: &base_action,
-                environment_names: &environment_names,
+                selector: &dynamic_selector,
                 remote_entry,
                 capture: &capture,
                 observation,
@@ -7567,7 +8063,7 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
         }
     }
     if local_miss
-        && environment_names.is_empty()
+        && dynamic_selector.environment_names.is_empty()
         && let Some(candidate) = distributed_candidate.as_ref()
     {
         let admission = crate::compiler::distributed::DistributedAdmissionAuthority {
@@ -8030,7 +8526,7 @@ struct DirectRemoteReuseRequest<'a> {
     session: &'a NativeCompilerSession,
     pre_link_action: &'a str,
     base_action_key: &'a str,
-    environment_names: &'a [String],
+    selector: &'a NativeDynamicInputSelector,
     remote_entry: Option<crate::remote_cache::RemoteLookup>,
     capture: &'a NativeActionCapture,
     observation: &'a RawCompilerInvocation,
@@ -8046,7 +8542,7 @@ fn attempt_direct_remote_reuse(request: DirectRemoteReuseRequest<'_>) -> DirectR
         session,
         pre_link_action,
         base_action_key,
-        environment_names,
+        selector,
         remote_entry,
         capture,
         observation,
@@ -8067,14 +8563,14 @@ fn attempt_direct_remote_reuse(request: DirectRemoteReuseRequest<'_>) -> DirectR
         Ok(crate::remote_cache::RemoteLookup::Miss) => return DirectRemoteReuse::Cold("remote_entry_not_found"),
         Ok(crate::remote_cache::RemoteLookup::Conflict) => return DirectRemoteReuse::Cold("remote_entry_conflicted"),
         Ok(crate::remote_cache::RemoteLookup::Unique {
-            environment_names: remote_environment_names,
+            selector: remote_selector,
             action_key: remote_action_key,
             result_key,
             body,
             bytes,
             compressed_bytes,
         }) => {
-            if remote_environment_names != environment_names
+            if &remote_selector != selector
                 || (!linked && remote_action_key != pre_link_action)
                 || validate_action_key(&remote_action_key).is_err()
             {
@@ -8094,7 +8590,7 @@ fn attempt_direct_remote_reuse(request: DirectRemoteReuseRequest<'_>) -> DirectR
     };
     let mut packed = match cas.packed_native_action_staging(crate::cache::cas::PackedNativeActionStagingRequest {
         base_action_key,
-        environment_names,
+        selector,
         action_key: &selected_action,
         result_key: &result_key,
         remote_authority: selection.authority(),
@@ -8271,7 +8767,10 @@ pub(crate) fn admit_distributed_rust_library_result(
         Ok(prepared) => prepared,
         Err(reason) => return LocalAdmission::RejectedBeforeEffect(reason),
     };
-    let environment_names = Vec::new();
+    let dynamic_selector = match initial_capture.dynamic_input_selector() {
+        Ok(selector) => selector,
+        Err(_) => return LocalAdmission::RejectedBeforeEffect("distributed_dynamic_input_selector_invalid"),
+    };
     let mut recapture_bytes = 0_u64;
     let (validation, _) = match cas.store_native_revalidated(prepared, |validation| {
         recapture_bytes = validation
@@ -8285,7 +8784,7 @@ pub(crate) fn admit_distributed_rust_library_result(
                     .map(crate::cache::installation::InstallationReceipt::authority),
             )
             .map_err(|failure| failure.error)?;
-        match cas.publish_native_environment_selector(expected_base_action, &environment_names)? {
+        match cas.publish_native_environment_selector(expected_base_action, &dynamic_selector)? {
             crate::cache::cas::NativeEnvironmentSelectorPublication::Created
             | crate::cache::cas::NativeEnvironmentSelectorPublication::Converged => Ok(()),
             crate::cache::cas::NativeEnvironmentSelectorPublication::Diverged => Err(RailError::message(
@@ -8493,7 +8992,7 @@ fn estimated_input_bytes(observation: &RawCompilerInvocation, source_root: &Path
         .fold(0u64, |total, metadata| total.saturating_add(metadata.len()))
 }
 
-fn validate_restore_environment_authority(
+fn validate_restore_dynamic_input_authority(
     cached: &crate::cache::cas::NativeActionHit<'_>,
     capture: &NativeActionCapture,
     observation: &RawCompilerInvocation,
@@ -8501,15 +9000,11 @@ fn validate_restore_environment_authority(
     let validation = &cached.validation;
     let base_action = base_action_key(&validation.session_identity, &validation.class, observation, capture)
         .map_err(RestorePublishFailure::Operational)?;
+    let selector = capture
+        .dynamic_input_selector()
+        .map_err(RestorePublishFailure::Operational)?;
     cached
-        .validate_environment_selector(
-            &base_action,
-            capture
-                .approved_environment
-                .entries
-                .iter()
-                .map(|entry| entry.name.as_str()),
-        )
+        .validate_dynamic_input_selector(&base_action, &selector)
         .map_err(RestorePublishFailure::Operational)?;
     Ok(base_action)
 }
@@ -8586,7 +9081,7 @@ fn restore_and_publish(
     let durability = native_durability_phase(NativeDurabilityPhase::RestoreTransaction);
     match &source {
         NativeRestoreSource::Materialized { cached, .. } => {
-            validate_restore_environment_authority(cached, initial_capture, current_observation)?;
+            validate_restore_dynamic_input_authority(cached, initial_capture, current_observation)?;
         }
         NativeRestoreSource::Packed {
             authority, validation, ..
@@ -8601,14 +9096,17 @@ fn restore_and_publish(
             if authority.base_action_key() != base_action
                 || authority.action_key() != validation.action_key()
                 || authority.result_key() != validation.result_key()
-                || authority.environment_names() != validation.witness.environment_names
+                || authority.selector()
+                    != &initial_capture
+                        .dynamic_input_selector()
+                        .map_err(RestorePublishFailure::Operational)?
             {
                 return Err(RestorePublishFailure::Operational(RailError::message(
                     "packed native authority does not match its live validation",
                 )));
             }
             authority
-                .validate_environment_selector()
+                .validate_dynamic_input_selector()
                 .map_err(RestorePublishFailure::Operational)?;
         }
     }
@@ -10263,6 +10761,25 @@ fn capture_test_pause(_phase: &str, _observation: &RawCompilerInvocation) -> Rai
     Ok(())
 }
 
+#[cfg(debug_assertions)]
+fn native_action_test_fault(phase: &str, _observation: &RawCompilerInvocation) -> RailResult<()> {
+    if std::env::var_os(NATIVE_ACTION_FAULT_ENV).as_deref() == Some(OsStr::new(phase)) {
+        return Err(RailError::message(format!("injected native {phase} failure")));
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn native_action_test_fault(_phase: &str, _observation: &RawCompilerInvocation) -> RailResult<()> {
+    Ok(())
+}
+
+fn report_native_action_diagnostic(operation: &str, error: &RailError) {
+    if BENCH_COVERAGE_DIRECTORY.get().is_some() {
+        eprintln!("cargo-rail native coverage: {operation} unavailable: {error}");
+    }
+}
+
 fn validated_output_parent(outputs: &NativeOutputPaths, source_root: &Path) -> RailResult<PathBuf> {
     let bindings = native_output_bindings(outputs);
     let output_parent = bindings
@@ -10917,7 +11434,8 @@ pub(crate) fn remove_cache_environment(command: &mut Command) {
         .env_remove(CAPTURE_PAUSE_PHASE_ENV)
         .env_remove(CAPTURE_PAUSE_CRATE_ENV)
         .env_remove(CAPTURE_PAUSE_DIRECTORY_ENV)
-        .env_remove(BENCH_COVERAGE_FAULT_ENV);
+        .env_remove(BENCH_COVERAGE_FAULT_ENV)
+        .env_remove(NATIVE_ACTION_FAULT_ENV);
     command
         .env_remove(SESSION_ENV)
         .env_remove(DISPOSITION_ENV)
@@ -11414,8 +11932,8 @@ fn publish_direct_remote_result(
             return Some("remote_publication_local_result_unavailable");
         }
     };
-    let environment_names = match cached.validate_remote_publication(base_action_key) {
-        Ok(names) if selection.approves_environment_names(names) => names.to_vec(),
+    let selector = match cached.validate_remote_publication(base_action_key) {
+        Ok(selector) if selection.approves_environment_names(&selector.environment_names) => selector,
         Ok(_) | Err(_) => return Some("remote_environment_not_shareable"),
     };
     let association = match cached.association() {
@@ -11436,7 +11954,7 @@ fn publish_direct_remote_result(
     if pack.metadata().is_err() || pack.rewind().is_err() {
         return Some("remote_publication_staging_failed");
     }
-    match remote.publish(&association, base_action_key, &environment_names, pack) {
+    match remote.publish(&association, base_action_key, &selector, pack) {
         Ok(crate::remote_cache::RemotePublication::Unique) => Some("remote_published"),
         Ok(crate::remote_cache::RemotePublication::Conflict) => Some("remote_entry_conflicted"),
         Err(_) => Some("remote_publication_failed"),
@@ -11553,16 +12071,43 @@ pub(crate) fn run_and_store(
         ));
         return status.code().unwrap_or(1);
     }
-    let environment_names = raw
-        .environment_reads
-        .iter()
-        .map(|environment| environment.name.clone())
-        .collect::<Vec<_>>();
+    let dynamic_selector = match dynamic_input_selector_from_observation(&raw, &capture, source_root) {
+        Ok(selector) => selector,
+        Err(error) => {
+            report_native_action_diagnostic("dynamic-input selector", &error);
+            let bytes_hashed = cold_input_bytes(&raw, source_root, 0);
+            drop(publish_and_record_cold_observation(
+                &mut raw,
+                "compiler_selected_dynamic_input_unavailable",
+                None,
+                None,
+                bytes_hashed,
+                cache_bytes_read,
+            ));
+            return status.code().unwrap_or(1);
+        }
+    };
+    capture = match capture.select_repository_inputs(&raw, source_root, &dynamic_selector.repository_paths) {
+        Ok(()) => capture,
+        Err(error) => {
+            report_native_action_diagnostic("selected repository input capture", &error);
+            let bytes_hashed = cold_input_bytes(&raw, source_root, 0);
+            drop(publish_and_record_cold_observation(
+                &mut raw,
+                "compiler_selected_repository_input_capture_unavailable",
+                None,
+                None,
+                bytes_hashed,
+                cache_bytes_read,
+            ));
+            return status.code().unwrap_or(1);
+        }
+    };
     let (approved_environment, selected_environment_bytes) = match capture_approved_environment(
         source_root,
         source_root_spelling,
         &capture,
-        &environment_names,
+        &dynamic_selector.environment_names,
         Instant::now(),
     ) {
         Ok(environment) => environment,
@@ -11580,13 +12125,28 @@ pub(crate) fn run_and_store(
         }
     };
     capture.approved_environment = approved_environment;
+    if !crate::compiler::native_cache::base_action_key(&session.identity, &session.class, &raw, &capture)
+        .is_ok_and(|current| current == base_action_key)
+    {
+        let bytes_hashed = cold_input_bytes(&raw, source_root, selected_environment_bytes);
+        drop(publish_and_record_cold_observation(
+            &mut raw,
+            "compiler_base_action_changed_after_dynamic_capture",
+            None,
+            None,
+            bytes_hashed,
+            cache_bytes_read,
+        ));
+        return status.code().unwrap_or(1);
+    }
     let pre_link_action = match action_key(&session.identity, &session.class, &raw, &capture) {
         Ok(action) => action,
-        Err(_) => {
+        Err(error) => {
+            report_native_action_diagnostic("post-execution action identity", &error);
             let bytes_hashed = cold_input_bytes(&raw, source_root, selected_environment_bytes);
             drop(publish_and_record_cold_observation(
                 &mut raw,
-                "compiler_selected_action_unavailable",
+                crate::cache::installation::NativeCacheFailureReason::ActionIdentity.as_str(),
                 None,
                 None,
                 bytes_hashed,
@@ -11595,13 +12155,16 @@ pub(crate) fn run_and_store(
             return status.code().unwrap_or(1);
         }
     };
-    let mut witness = match capture.witness(&raw, source_root) {
+    let mut witness = match native_action_test_fault("post_execution_witness", &raw)
+        .and_then(|()| capture.witness(&raw, source_root))
+    {
         Ok(witness) => witness,
-        Err(_) => {
+        Err(error) => {
+            report_native_action_diagnostic("post-execution witness validation", &error);
             let bytes_hashed = cold_input_bytes(&raw, source_root, selected_environment_bytes);
             drop(publish_and_record_cold_observation(
                 &mut raw,
-                "compiler_observation_outside_captured_action",
+                crate::cache::installation::NativeCacheFailureReason::PostExecutionWitness.as_str(),
                 Some(pre_link_action.clone()),
                 None,
                 bytes_hashed,
@@ -11659,7 +12222,8 @@ pub(crate) fn run_and_store(
     };
     let selected_action = match selected_action {
         Ok(action) => action,
-        Err(_) => {
+        Err(error) => {
+            report_native_action_diagnostic("witnessed action identity", &error);
             let bytes_hashed = cold_input_bytes(
                 &raw,
                 source_root,
@@ -11667,7 +12231,7 @@ pub(crate) fn run_and_store(
             );
             drop(publish_and_record_cold_observation(
                 &mut raw,
-                "compiler_selected_action_unavailable",
+                crate::cache::installation::NativeCacheFailureReason::ActionIdentity.as_str(),
                 link_candidate,
                 None,
                 bytes_hashed,
@@ -11761,7 +12325,7 @@ pub(crate) fn run_and_store(
                             admission_failure = failure.reason;
                             failure.error
                         })?;
-                    match cas.publish_native_environment_selector(&base_action_key, &environment_names) {
+                    match cas.publish_native_environment_selector(&base_action_key, &dynamic_selector) {
                         Ok(crate::cache::cas::NativeEnvironmentSelectorPublication::Created)
                         | Ok(crate::cache::cas::NativeEnvironmentSelectorPublication::Converged) => Ok(()),
                         Ok(crate::cache::cas::NativeEnvironmentSelectorPublication::Diverged) => {
@@ -12117,7 +12681,7 @@ fn prepare_distributed_result(
         }
 
         let distributed_dep_info = result.read_verified_frame(DistributedResultSlot::DepInfo)?;
-        let localized_dep_info = localize_distributed_dep_info(&distributed_dep_info, source_root)?;
+        let localized_dep_info = localize_distributed_dep_info(&distributed_dep_info, source_root, output_paths)?;
         let observed_reads =
             distributed_dep_info_observed_reads(&localized_dep_info, result.staging_path(), source_root)?;
         let dep_info =
@@ -12176,6 +12740,11 @@ fn prepare_distributed_result(
 
         let mut cache_observation = current_observation.clone();
         cache_observation.observed_reads = observed_reads;
+        normalize_selected_repository_observations(
+            &mut cache_observation,
+            &initial_capture.selected_repository_inputs,
+            source_root,
+        )?;
         cache_observation.emitted_outputs = bindings
             .iter()
             .zip(&outputs)
@@ -12208,6 +12777,7 @@ fn prepare_distributed_result(
             session,
             cache_observation,
             &initial_capture.approved_environment,
+            &initial_capture.selected_repository_inputs,
             None,
             pack::NativeResultDescriptor {
                 action_key: selected_action,
@@ -12311,14 +12881,47 @@ fn distributed_dep_info_observed_reads(
     Ok(observed)
 }
 
-fn localize_distributed_dep_info(bytes: &[u8], source_root: &Path) -> RailResult<Vec<u8>> {
-    let replacement = escape_dep_info_path(&source_root_display_bytes(source_root));
-    let (localized, replacements) = replace_bytes(
-        bytes,
+fn localize_distributed_dep_info(
+    bytes: &[u8],
+    source_root: &Path,
+    output_paths: &NativeOutputPaths,
+) -> RailResult<Vec<u8>> {
+    let output_parent = output_paths
+        .dep_info
+        .parent()
+        .ok_or_else(|| RailError::message("distributed dep-info output has no parent"))?;
+    let output_replacement = escape_dep_info_path(crate::utils::path_to_git_format(output_parent).as_bytes());
+    let virtual_output = crate::compiler::distributed::VIRTUAL_OUTPUT_DIRECTORY;
+    let virtual_output_backward = virtual_output.replace('/', "\\");
+    let virtual_workspace = crate::compiler::distributed::VIRTUAL_WORKSPACE;
+    let mut virtual_output_spellings = [
+        format!("{virtual_workspace}/{virtual_output}"),
+        format!("{virtual_workspace}\\{virtual_output_backward}"),
+        format!("{virtual_workspace}/{virtual_output_backward}"),
+        format!("{virtual_workspace}\\{virtual_output}"),
+        virtual_output.to_string(),
+        virtual_output_backward,
+    ]
+    .into_iter()
+    .flat_map(|path| encoded_output_path_forms(&path, OutputBindingEncoding::DepInfo))
+    .map(|(_, path)| path)
+    .collect::<Vec<_>>();
+    virtual_output_spellings.sort_unstable_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+    virtual_output_spellings.dedup();
+    let (localized, output_replacements) =
+        virtual_output_spellings
+            .iter()
+            .fold((bytes.to_vec(), 0usize), |(localized, count), spelling| {
+                let (localized, replacements) = replace_bytes(&localized, spelling, &output_replacement);
+                (localized, count.saturating_add(replacements))
+            });
+    let source_replacement = escape_dep_info_path(&source_root_display_bytes(source_root));
+    let (localized, _) = replace_bytes(
+        &localized,
         crate::compiler::distributed::VIRTUAL_WORKSPACE.as_bytes(),
-        &replacement,
+        &source_replacement,
     );
-    if replacements == 0
+    if output_replacements == 0
         || localized
             .windows(crate::compiler::distributed::VIRTUAL_ROOT.len())
             .any(|window| window == crate::compiler::distributed::VIRTUAL_ROOT.as_bytes())
@@ -12353,10 +12956,11 @@ fn native_publication_proof(
         return Err("cold_inputs_changed_before_admission");
     }
     Ok(NativePublicationProof {
-        version: 4,
+        version: 5,
         source_state: initial_capture.source_state.clone(),
         package_binding: initial_capture.package_binding.clone(),
         approved_environment,
+        selected_repository_inputs: initial_capture.selected_repository_inputs.clone(),
         guard_identity: initial_capture
             .guard_identity()
             .map_err(|_| "cold_final_capture_failed")?,
@@ -12407,6 +13011,11 @@ fn prepare_cold_result(
         let portable_dep_info =
             portable_dep_info_output_bindings(&dep_info_bytes, output_paths, source_root, initial_capture)?;
         let mut cache_observation = observation.clone();
+        normalize_selected_repository_observations(
+            &mut cache_observation,
+            &initial_capture.selected_repository_inputs,
+            source_root,
+        )?;
         let cached_dep_info = cache_observation
             .emitted_outputs
             .iter_mut()
@@ -12441,6 +13050,7 @@ fn prepare_cold_result(
             session,
             cache_observation,
             &initial_capture.approved_environment,
+            &initial_capture.selected_repository_inputs,
             linker_generations,
             pack::NativeResultDescriptor {
                 action_key: selected_action,
@@ -12490,10 +13100,50 @@ fn prepare_cold_result(
         let manifest = crate::cache::result::manifest_from_verified_native_slots(&slots)?;
         Ok((staging, manifest, validation))
     })();
-    let (staging, manifest, validation) = prepared.map_err(|_| "cold_result_preparation_failed")?;
+    let (staging, manifest, validation) = prepared.map_err(|error| {
+        report_native_action_diagnostic("cold result preparation", &error);
+        "cold_result_preparation_failed"
+    })?;
     let proof = native_publication_proof(initial_capture, source_root, source_root_spelling)?;
     let prepared = PreparedNativeResult::from_verified_local_cas_staging(staging, manifest, validation);
     Ok((prepared, proof))
+}
+
+fn normalize_selected_repository_observations(
+    observation: &mut RawCompilerInvocation,
+    selected_inputs: &[NativeSelectedRepositoryInput],
+    workspace_root: &Path,
+) -> RailResult<()> {
+    if selected_inputs.is_empty() {
+        return Ok(());
+    }
+    let canonical_root = crate::utils::canonicalize_existing(workspace_root)?;
+    for observed in &mut observation.observed_reads {
+        if observed.symlink_target.is_some() {
+            continue;
+        }
+        let spelling = observed.path.resolve(workspace_root);
+        let canonical = crate::utils::canonicalize_existing(&spelling)?;
+        let Ok(relative) = canonical.strip_prefix(&canonical_root) else {
+            continue;
+        };
+        let relative = native_relative_path(relative)?;
+        let Ok(index) = selected_inputs.binary_search_by(|input| input.path.as_str().cmp(&relative)) else {
+            continue;
+        };
+        let selected = &selected_inputs[index];
+        if selected.content_digest != observed.content_digest
+            || source_mode_executable(selected.mode) != observed.executable
+        {
+            return Err(RailError::message(
+                "selected repository observation changed before validation",
+            ));
+        }
+        observed.path = ObservationPath::Repository(relative);
+    }
+    observation.observed_reads.sort();
+    observation.observed_reads.dedup();
+    Ok(())
 }
 
 fn observed_output<'a>(
@@ -12679,7 +13329,8 @@ fn write_cache_event(
         CompilerCacheWrapperStatus::Miss => b'M',
         CompilerCacheWrapperStatus::Bypassed | CompilerCacheWrapperStatus::Disabled => b'B',
     };
-    let usage = crate::cache::installation::record_usage(receipt, outcome);
+    let failure_reason = crate::cache::installation::NativeCacheFailureReason::from_reason(reason);
+    let usage = crate::cache::installation::record_usage(receipt, outcome, failure_reason);
     let coverage =
         write_benchmark_coverage_event(status, reason, action_key, result_key, remote_base_action_key, metrics);
     if BENCH_COVERAGE_DIRECTORY.get().is_some() {
@@ -12988,7 +13639,7 @@ fn validate_benchmark_coverage_directory(directory: &Path) -> RailResult<()> {
 /// Record an operational wrapper failure after an installed context was authenticated.
 pub(crate) fn record_active_failure() {
     if let Some(receipt) = active_context().and_then(|context| context.installation.as_ref()) {
-        drop(crate::cache::installation::record_usage(receipt, b'F'));
+        drop(crate::cache::installation::record_usage(receipt, b'F', None));
     }
 }
 
@@ -13545,6 +14196,190 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn distributed_linker_plugin_lto_accepts_boolean_forms_and_rejects_paths() {
+        for arguments in [
+            vec!["-C", "linker-plugin-lto"],
+            vec!["-Clinker-plugin-lto"],
+            vec!["-C", "linker-plugin-lto=y"],
+            vec!["-Clinker-plugin-lto=yes"],
+            vec!["-Clinker-plugin-lto=on"],
+            vec!["-Clinker-plugin-lto=true"],
+        ] {
+            let arguments = arguments.into_iter().map(str::to_string).collect::<Vec<_>>();
+            let parsed = DistributedRustLibraryArguments::parse(&arguments).expect("enabled linker-plugin LTO");
+            assert_eq!(parsed.codegen.linker_plugin_lto, Some(true), "{arguments:?}");
+        }
+        for value in ["n", "no", "off", "false"] {
+            let arguments = vec![format!("-Clinker-plugin-lto={value}")];
+            let parsed = DistributedRustLibraryArguments::parse(&arguments).expect("disabled linker-plugin LTO");
+            assert_eq!(parsed.codegen.linker_plugin_lto, Some(false), "{arguments:?}");
+        }
+
+        for arguments in [
+            vec!["-Clinker-plugin-lto", "-Clinker-plugin-lto=yes"],
+            vec!["-C", "linker-plugin-lto=no", "-Clinker-plugin-lto=false"],
+        ] {
+            let arguments = arguments.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert!(matches!(
+                DistributedRustLibraryArguments::parse(&arguments),
+                Err("distributed_argument_shape_ineligible")
+            ));
+        }
+        for arguments in [
+            vec!["-C", "linker-plugin-lto=/opt/llvm/lib/LLVMgold.so"],
+            vec!["-Clinker-plugin-lto=plugin.dll"],
+        ] {
+            let arguments = arguments.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert!(matches!(
+                DistributedRustLibraryArguments::parse(&arguments),
+                Err("distributed_linker_plugin_lto_path_ineligible")
+            ));
+        }
+    }
+
+    #[test]
+    fn distributed_codegen_boole_accept_rustc_boolean_forms() {
+        for (enabled, values) in [(true, ["y", "yes", "on", "true"]), (false, ["n", "no", "off", "false"])] {
+            for value in values {
+                let arguments = [
+                    format!("-Cdebug-assertions={value}"),
+                    format!("-Cembed-bitcode={value}"),
+                    format!("-Coverflow-checks={value}"),
+                    format!("-Cprefer-dynamic={value}"),
+                ];
+                let parsed = DistributedRustLibraryArguments::parse(&arguments).expect("rustc boolean codegen form");
+                assert_eq!(parsed.codegen.debug_assertions, Some(enabled), "{arguments:?}");
+                assert_eq!(parsed.codegen.embed_bitcode, Some(enabled), "{arguments:?}");
+                assert_eq!(parsed.codegen.overflow_checks, Some(enabled), "{arguments:?}");
+                assert_eq!(parsed.codegen.prefer_dynamic, Some(enabled), "{arguments:?}");
+            }
+        }
+
+        let rscrypto_release = [
+            "-C".to_string(),
+            "linker-plugin-lto".to_string(),
+            "-C".to_string(),
+            "overflow-checks=on".to_string(),
+        ];
+        let parsed = DistributedRustLibraryArguments::parse(&rscrypto_release).expect("rscrypto release codegen forms");
+        assert_eq!(parsed.codegen.linker_plugin_lto, Some(true));
+        assert_eq!(parsed.codegen.overflow_checks, Some(true));
+    }
+
+    #[test]
+    fn dynamic_repository_inputs_bind_exact_actions_across_checkout_roots() {
+        let first = tempfile::tempdir().expect("first checkout");
+        let second = tempfile::tempdir().expect("second checkout");
+        for root in [first.path(), second.path()] {
+            fs::create_dir_all(root.join("src")).expect("source directory");
+            fs::create_dir_all(root.join(".config")).expect("configuration directory");
+            fs::create_dir_all(root.join("target/debug/deps")).expect("compiler output directory");
+            fs::write(root.join("src/lib.rs"), b"pub fn value() -> u8 { 1 }\n").expect("crate source");
+            fs::write(root.join(".config/target-matrix.json"), b"{\"target\":1}\n").expect("selected repository input");
+        }
+        let observation = |root: &Path| {
+            let mut observation = graduated_observation();
+            let output = observation
+                .compiler_arguments
+                .iter()
+                .position(|argument| argument == "--out-dir")
+                .and_then(|index| observation.compiler_arguments.get_mut(index + 1))
+                .expect("compiler output argument");
+            *output = crate::utils::path_to_git_format(&root.join("target/debug/deps"));
+            observation.compiler_arguments.push(format!(
+                "--remap-path-prefix=repository:={}",
+                crate::compiler::distributed::VIRTUAL_WORKSPACE
+            ));
+            observation
+        };
+        let pre_execution = observation(first.path());
+        let consumer_pre_execution = observation(second.path());
+        let mut completed = pre_execution.clone();
+        completed
+            .observed_reads
+            .push(observed_file(".config/target-matrix.json", b"{\"target\":1}\n"));
+        completed.observed_reads.sort();
+
+        let initial = NativeActionCapture::capture(&pre_execution, first.path()).expect("initial source capture");
+        let selector = dynamic_input_selector_from_observation(&completed, &initial, first.path())
+            .expect("dynamic-input selector");
+        assert_eq!(selector.repository_paths, [".config/target-matrix.json"]);
+        let producer = NativeActionCapture::capture_with_selector(&completed, first.path(), &selector, None)
+            .expect("producer selected-input capture");
+        let witness = producer.witness(&completed, first.path()).expect("producer witness");
+        assert_eq!(witness.repository_paths, selector.repository_paths);
+        let session = graduated_session(digest(b"portable session"));
+        let producer_base =
+            base_action_key(&session.identity, &session.class, &completed, &producer).expect("producer base action");
+        let producer_action =
+            action_key(&session.identity, &session.class, &completed, &producer).expect("producer exact action");
+
+        let consumer =
+            NativeActionCapture::capture_with_selector(&consumer_pre_execution, second.path(), &selector, None)
+                .expect("second-root selected-input capture");
+        assert_eq!(
+            base_action_key(&session.identity, &session.class, &consumer_pre_execution, &consumer)
+                .expect("consumer base"),
+            producer_base
+        );
+        assert_eq!(
+            action_key(&session.identity, &session.class, &consumer_pre_execution, &consumer).expect("consumer action"),
+            producer_action
+        );
+        assert!(consumer.validates_witness(&witness, &consumer_pre_execution));
+
+        fs::write(second.path().join(".config/target-matrix.json"), b"{\"target\":2}\n")
+            .expect("same-size selected-input mutation");
+        let mutated =
+            NativeActionCapture::capture_with_selector(&consumer_pre_execution, second.path(), &selector, None)
+                .expect("mutated selected-input capture");
+        assert_ne!(
+            action_key(&session.identity, &session.class, &consumer_pre_execution, &mutated).expect("mutated action"),
+            producer_action
+        );
+
+        fs::remove_file(second.path().join(".config/target-matrix.json")).expect("delete selected input");
+        NativeActionCapture::capture_with_selector(&consumer_pre_execution, second.path(), &selector, None)
+            .expect_err("deleted selected input must be rejected");
+
+        let external_directory = tempfile::tempdir().expect("external input directory");
+        let external = external_directory.path().join("external-input");
+        fs::write(&external, b"external\n").expect("external input");
+        let mut external_observation = completed.clone();
+        external_observation
+            .observed_reads
+            .push(FileObservation::capture(&external, first.path(), first.path()).expect("external observation"));
+        external_observation.observed_reads.sort();
+        dynamic_input_selector_from_observation(&external_observation, &initial, first.path())
+            .expect_err("external selected input must be rejected");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            symlink(&external, second.path().join(".config/target-matrix.json")).expect("selected-input symlink");
+            NativeActionCapture::capture_with_selector(&consumer_pre_execution, second.path(), &selector, None)
+                .expect_err("symlinked selected input must be rejected");
+        }
+        #[cfg(windows)]
+        {
+            fs::remove_dir(second.path().join(".config")).expect("empty selected-input directory");
+            let external_directory = tempfile::tempdir().expect("external selected-input directory");
+            fs::write(
+                external_directory.path().join("target-matrix.json"),
+                b"{\"target\":1}\n",
+            )
+            .expect("external selected input");
+            let external_directory = fs::canonicalize(external_directory.path()).expect("canonical external directory");
+            let _junction =
+                crate::windows_fs::create_directory_junction(&external_directory, &second.path().join(".config"))
+                    .expect("selected-input junction");
+            NativeActionCapture::capture_with_selector(&consumer_pre_execution, second.path(), &selector, None)
+                .expect_err("junction-selected input must be rejected");
+        }
+    }
+
+    #[test]
     fn distributed_candidate_requires_closed_source_dependency_and_argument_authority() {
         let result: RailResult<()> = (|| {
             let workspace = tempfile::tempdir()?;
@@ -13553,11 +14388,12 @@ pub(crate) mod tests {
                 "[package]\nname='fixture'\nversion='0.0.0'\n",
             )?;
             fs::create_dir(workspace.path().join("src"))?;
-            fs::create_dir_all(workspace.path().join("target/debug/deps"))?;
+            let external_target = tempfile::tempdir()?;
+            fs::create_dir(external_target.path().join("deps"))?;
             let source = workspace.path().join("src/lib.rs");
             fs::write(&source, b"pub fn value() -> u8 { 1 }\n")?;
             let suffix = "-0123456789abcdef";
-            let output = workspace.path().join("target/debug/deps");
+            let output = external_target.path().join("deps");
             let arguments = [
                 "--crate-name".to_string(),
                 "fixture".to_string(),
@@ -13649,7 +14485,14 @@ pub(crate) mod tests {
                     .any(|input| input.path == canonical_source && input.repository_relative_path == "src/lib.rs")
             );
             assert_eq!(authority.source_relative_path, "src/lib.rs");
-            assert_eq!(authority.output_relative_directory, "target/debug/deps");
+            assert_eq!(
+                authority.output_relative_directory,
+                crate::compiler::distributed::VIRTUAL_OUTPUT_DIRECTORY
+            );
+            assert_eq!(
+                authority.local_output_directory,
+                crate::utils::canonicalize_existing(&output)?
+            );
             let mut unnormalized = observation.clone();
             unnormalized
                 .compiler_arguments
@@ -13676,6 +14519,7 @@ pub(crate) mod tests {
                 extra_filename,
                 metadata,
                 metadata_name,
+                local_output_directory,
                 output_relative_directory,
                 rlib_name,
                 dependencies,
@@ -13703,6 +14547,7 @@ pub(crate) mod tests {
                 },
                 sources,
                 dependencies,
+                local_output_directory,
             )?;
             let temporary = tempfile::tempdir()?;
             let command =
@@ -13772,6 +14617,7 @@ pub(crate) mod tests {
                 extra_filename,
                 metadata,
                 metadata_name,
+                local_output_directory,
                 output_relative_directory,
                 rlib_name,
                 sources,
@@ -13798,6 +14644,7 @@ pub(crate) mod tests {
                 },
                 sources,
                 dependencies,
+                local_output_directory,
             )?;
             let metadata_command =
                 metadata_candidate.normalized_local_command(OsStr::new("rustc"), workspace.path(), temporary.path())?;
@@ -13924,8 +14771,13 @@ pub(crate) mod tests {
                 "[package]\nname='fixture'\nversion='0.0.0'\n",
             )?;
             fs::create_dir(workspace.path().join("src"))?;
+            fs::create_dir(workspace.path().join(".config"))?;
             fs::create_dir_all(workspace.path().join("target/debug/deps"))?;
-            fs::write(workspace.path().join("src/lib.rs"), b"pub fn value() -> u8 { 1 }\n")?;
+            fs::write(
+                workspace.path().join("src/lib.rs"),
+                b"pub const MATRIX: &str = include_str!(\"../.config/target-matrix.json\");\n",
+            )?;
+            fs::write(workspace.path().join(".config/target-matrix.json"), b"{\"target\":1}\n")?;
             let workspace_root = crate::utils::canonicalize_existing(workspace.path())?;
             let suffix = "-0123456789abcdef";
             let output = workspace_root.join("target/debug/deps");
@@ -13966,7 +14818,8 @@ pub(crate) mod tests {
                 .native_output_paths()
                 .ok_or_else(|| RailError::message("test native output paths were unavailable"))?;
             let observation = recorder.observation().clone();
-            let capture = NativeActionCapture::capture(&observation, &workspace_root)?;
+            let selector = test_dynamic_selector(&[], &[".config/target-matrix.json"]);
+            let capture = NativeActionCapture::capture_with_selector(&observation, &workspace_root, &selector, None)?;
             let declared = observation
                 .declared_inputs
                 .first()
@@ -13974,8 +14827,13 @@ pub(crate) mod tests {
             let ObservationPath::Repository(namespace) = &capture.source_state.root else {
                 return Err(RailError::message("test source namespace was not repository-owned"));
             };
-            let sources =
-                distributed_source_inputs(&capture, namespace, "src/lib.rs", declared).map_err(RailError::message)?;
+            let sources = distributed_source_inputs(&capture, namespace, "src/lib.rs", declared, &workspace_root)
+                .map_err(RailError::message)?;
+            assert!(
+                sources
+                    .iter()
+                    .any(|source| source.repository_relative_path == ".config/target-matrix.json")
+            );
             let candidate = crate::compiler::distributed::RustLibraryCandidate::from_captured_inputs(
                 crate::compiler::distributed::RustLibraryCandidateInput {
                     crate_name: "fixture".to_string(),
@@ -13986,7 +14844,7 @@ pub(crate) mod tests {
                     metadata: "0123456789abcdef".to_string(),
                     metadata_name: format!("libfixture{suffix}.rmeta"),
                     extra_filename: suffix.to_string(),
-                    output_relative_directory: "target/debug/deps".to_string(),
+                    output_relative_directory: crate::compiler::distributed::VIRTUAL_OUTPUT_DIRECTORY.to_string(),
                     source_relative_path: "src/lib.rs".to_string(),
                     test_mode: false,
                     toolchain_proc_macro: false,
@@ -13995,9 +14853,12 @@ pub(crate) mod tests {
                 },
                 sources,
                 Vec::new(),
+                output.clone(),
             )?;
             let dep_info = format!(
-                "{}/target/debug/deps/fixture{suffix}.d: src/lib.rs\n",
+                "{}/{}/fixture{suffix}.d: src/lib.rs {}/.config/target-matrix.json\n",
+                crate::compiler::distributed::VIRTUAL_WORKSPACE,
+                crate::compiler::distributed::VIRTUAL_OUTPUT_DIRECTORY,
                 crate::compiler::distributed::VIRTUAL_WORKSPACE
             );
             let result = crate::compiler::distributed::StagedExecutionResult::from_test_frames(
@@ -14041,7 +14902,14 @@ pub(crate) mod tests {
                 validation
                     .revalidate_publication(&session, &workspace_root, &proof, None)
                     .map(|_| ())
-                    .map_err(|failure| failure.error)
+                    .map_err(|failure| failure.error)?;
+                match cas.publish_native_environment_selector(&base_action, &selector)? {
+                    crate::cache::cas::NativeEnvironmentSelectorPublication::Created
+                    | crate::cache::cas::NativeEnvironmentSelectorPublication::Converged => Ok(()),
+                    crate::cache::cas::NativeEnvironmentSelectorPublication::Diverged => {
+                        Err(RailError::message("test dynamic-input selector diverged"))
+                    }
+                }
             })?;
             assert_eq!(
                 validation.action_key(),
@@ -14052,9 +14920,8 @@ pub(crate) mod tests {
                 crate::cache::cas::NativeActionLookup::Hit(_)
             ));
             assert!(matches!(
-                cas.publish_native_environment_selector(&base_action, &[])?,
-                crate::cache::cas::NativeEnvironmentSelectorPublication::Created
-                    | crate::cache::cas::NativeEnvironmentSelectorPublication::Converged
+                cas.publish_native_environment_selector(&base_action, &selector)?,
+                crate::cache::cas::NativeEnvironmentSelectorPublication::Converged
             ));
             let restore_context = NativeCacheContext {
                 session: NativeCacheSession::Prepared(session.clone()),
@@ -14380,7 +15247,10 @@ pub(crate) mod tests {
                 version: 3,
                 entries: environment,
             },
+            selected_repository_inputs: Vec::new(),
             guard: NativeCaptureGuard { entries: Vec::new() },
+            capture_entries: 0,
+            capture_path_bytes: 0,
             bytes_hashed: 0,
         }
     }
@@ -14393,10 +15263,11 @@ pub(crate) mod tests {
             .collect::<Vec<_>>();
         dependency_names.sort_unstable();
         NativeCompilerWitness {
-            version: 5,
+            version: 6,
             complete: true,
             source_paths: vec!["lib.rs".to_string()],
             generated_paths: Vec::new(),
+            repository_paths: Vec::new(),
             dependency_names,
             environment_names: observation
                 .environment_reads
@@ -14438,6 +15309,7 @@ pub(crate) mod tests {
             &session,
             observation,
             &capture.approved_environment,
+            &capture.selected_repository_inputs,
             None,
             pack::NativeResultDescriptor {
                 action_key: action,
@@ -14454,6 +15326,14 @@ pub(crate) mod tests {
 
     fn graduated_validation(observation: RawCompilerInvocation) -> NativeCompilerValidation {
         graduated_validation_with_streams(observation, b"", b"")
+    }
+
+    fn test_dynamic_selector(names: &[&str], paths: &[&str]) -> NativeDynamicInputSelector {
+        NativeDynamicInputSelector::new(
+            names.iter().map(|name| (*name).to_string()).collect(),
+            paths.iter().map(|path| (*path).to_string()).collect(),
+        )
+        .expect("valid test dynamic-input selector")
     }
 
     pub(crate) fn cas_validation_with_stdout(stdout: &[u8]) -> NativeCompilerValidation {
@@ -14532,8 +15412,16 @@ pub(crate) mod tests {
     #[test]
     fn empty_environment_selectors_are_authoritative() {
         for (revision, first, second) in [
-            (1_u8, Vec::new(), vec!["CARGO_INCREMENTAL".to_string()]),
-            (2_u8, vec!["CARGO_INCREMENTAL".to_string()], Vec::new()),
+            (
+                1_u8,
+                NativeDynamicInputSelector::empty(),
+                test_dynamic_selector(&["CARGO_INCREMENTAL"], &[]),
+            ),
+            (
+                2_u8,
+                test_dynamic_selector(&["CARGO_INCREMENTAL"], &[]),
+                NativeDynamicInputSelector::empty(),
+            ),
         ] {
             let cache = tempfile::tempdir().expect("cache base");
             let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
@@ -14610,7 +15498,7 @@ pub(crate) mod tests {
                 None
             );
             assert_eq!(
-                cas.publish_native_environment_selector(&base_action, &[])
+                cas.publish_native_environment_selector(&base_action, &NativeDynamicInputSelector::empty())
                     .expect("empty selector publication"),
                 crate::cache::cas::NativeEnvironmentSelectorPublication::Created
             );
@@ -14623,7 +15511,7 @@ pub(crate) mod tests {
         assert_eq!(
             cas.native_environment_selector(&base_action)
                 .expect("committed selector lookup"),
-            Some(Vec::new())
+            Some(NativeDynamicInputSelector::empty())
         );
         assert!(matches!(
             cas.native_action(&action).expect("committed action lookup"),
@@ -14642,7 +15530,7 @@ pub(crate) mod tests {
         let error = cas
             .store_native_revalidated(prepared_cas_fixture(validation), |_| {
                 assert_eq!(
-                    cas.publish_native_environment_selector(&base_action, &[])
+                    cas.publish_native_environment_selector(&base_action, &NativeDynamicInputSelector::empty())
                         .expect("empty selector publication"),
                     crate::cache::cas::NativeEnvironmentSelectorPublication::Created
                 );
@@ -14654,7 +15542,7 @@ pub(crate) mod tests {
         assert_eq!(
             cas.native_environment_selector(&base_action)
                 .expect("selector-only state"),
-            Some(Vec::new())
+            Some(NativeDynamicInputSelector::empty())
         );
         assert!(matches!(
             cas.native_action(&action).expect("aborted action lookup"),
@@ -14664,7 +15552,9 @@ pub(crate) mod tests {
 
     #[test]
     fn restore_rejects_absent_mismatched_and_conflicted_selectors() {
-        let validate = |first: Option<Vec<String>>, second: Option<Vec<String>>| -> Result<(), RestorePublishFailure> {
+        let validate = |first: Option<NativeDynamicInputSelector>,
+                        second: Option<NativeDynamicInputSelector>|
+         -> Result<(), RestorePublishFailure> {
             let cache = tempfile::tempdir().expect("cache base");
             let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("local CAS");
             let observation = graduated_observation();
@@ -14692,18 +15582,24 @@ pub(crate) mod tests {
             else {
                 panic!("stored native action must be authoritative");
             };
-            validate_restore_environment_authority(&hit, &capture, &observation).map(|_| ())
+            validate_restore_dynamic_input_authority(&hit, &capture, &observation).map(|_| ())
         };
 
         assert!(
-            validate(Some(Vec::new()), None).is_ok(),
+            validate(Some(NativeDynamicInputSelector::empty()), None).is_ok(),
             "matching selector must retain restore authority"
         );
         for (result, expected) in [
             (validate(None, None), "absent"),
-            (validate(Some(vec!["P73_OTHER".to_string()]), None), "does not match"),
             (
-                validate(Some(Vec::new()), Some(vec!["P73_OTHER".to_string()])),
+                validate(Some(test_dynamic_selector(&["P73_OTHER"], &[])), None),
+                "does not match",
+            ),
+            (
+                validate(
+                    Some(NativeDynamicInputSelector::empty()),
+                    Some(test_dynamic_selector(&["P73_OTHER"], &[])),
+                ),
                 "durably conflicted",
             ),
         ] {
@@ -16092,6 +16988,38 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn completed_restore_bypasses_leave_no_transactions_and_keep_locks_bounded() {
+        let root = tempfile::tempdir().expect("restore root");
+        let cache = tempfile::tempdir().expect("cache root");
+        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let observations = root.path().join("observations");
+        fs::create_dir(&observations).expect("observation directory");
+        let action_key = format!("{ACTION_KEY_PREFIX}{}", "c".repeat(64));
+
+        for destination in 0..256_u16 {
+            let output = root.path().join(format!("target/destination-{destination}/debug/deps"));
+            fs::create_dir_all(&output).expect("output directory");
+            let outputs = metadata_output_paths(
+                output.join(format!("fixture-{destination}.d")),
+                output.join(format!("libfixture-{destination}.rmeta")),
+            );
+            let paths = restore_commit_paths(&outputs, root.path()).expect("restore paths");
+            let mut transaction = begin_restore_transaction_in(&cas, &outputs, root.path(), &observations, &action_key)
+                .expect("registered transaction");
+            transaction.rollback().expect("private restore rollback");
+            assert!(!paths.marker.exists(), "restore authority marker must not remain");
+            assert!(
+                !paths.transaction_directory.exists(),
+                "private restore transaction must not remain"
+            );
+        }
+
+        let status = cas.status().expect("restore-lock status");
+        assert_eq!(status.native_restore_lock_files, 64);
+        assert_eq!(status.staging_entries, 0);
+    }
+
+    #[test]
     fn restore_transaction_rejects_an_rlib_for_a_metadata_only_action() {
         let root = tempfile::tempdir().expect("restore root");
         let cache = tempfile::tempdir().expect("cache root");
@@ -16364,6 +17292,7 @@ pub(crate) mod tests {
             &session,
             observation,
             &capture.approved_environment,
+            &capture.selected_repository_inputs,
             None,
             pack::NativeResultDescriptor {
                 action_key: action,

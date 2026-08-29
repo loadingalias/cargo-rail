@@ -188,7 +188,7 @@ impl Client {
             RESPONSE_MISS => Ok(Lookup::Miss),
             RESPONSE_CONFLICT => Ok(Lookup::Conflict),
             RESPONSE_PACK => {
-                let environment_names = read_environment_names(&mut stream)?;
+                let selector = read_dynamic_input_selector(&mut stream)?;
                 let action_key = read_string(&mut stream, IPC_MAX_IDENTITY_BYTES)?;
                 crate::compiler::native_cache::validate_action_key(&action_key)
                     .map_err(|_| RemoteStoreError::integrity("remote action identity is invalid"))?;
@@ -208,7 +208,7 @@ impl Client {
                     ));
                 }
                 Ok(Lookup::Unique {
-                    environment_names,
+                    selector,
                     action_key,
                     result_key,
                     body: PackReader {
@@ -229,7 +229,7 @@ impl Client {
         &self,
         association: &crate::compiler::native_cache::pack::NativeAssociation,
         base_action_key: &str,
-        environment_names: &[String],
+        selector: &crate::compiler::native_cache::NativeDynamicInputSelector,
         mut pack: File,
     ) -> RemoteStoreResult<object::Publication> {
         crate::compiler::native_cache::validate_action_key(association.action_key())
@@ -238,7 +238,9 @@ impl Client {
             .map_err(|_| RemoteStoreError::integrity("remote result identity is invalid"))?;
         crate::compiler::native_cache::validate_base_action_key(base_action_key)
             .map_err(|_| RemoteStoreError::integrity("remote selector identity is invalid"))?;
-        super::validate_environment_names(environment_names)?;
+        selector
+            .validate()
+            .map_err(|_| RemoteStoreError::integrity("remote dynamic-input selector is invalid"))?;
         let metadata = pack.metadata().map_err(io_unavailable)?;
         if !metadata.is_file() || metadata.len() != association.pack_length() {
             return Err(RemoteStoreError::integrity(
@@ -250,7 +252,7 @@ impl Client {
         write_string(&mut stream, association.action_key(), IPC_MAX_IDENTITY_BYTES)?;
         write_string(&mut stream, association.result_key(), IPC_MAX_IDENTITY_BYTES)?;
         write_string(&mut stream, base_action_key, IPC_MAX_IDENTITY_BYTES)?;
-        write_environment_names(&mut stream, environment_names)?;
+        write_dynamic_input_selector(&mut stream, selector)?;
         stream
             .write_all(&association.pack_length().to_le_bytes())
             .map_err(io_unavailable)?;
@@ -283,7 +285,7 @@ pub(super) enum Lookup {
     Miss,
     Conflict,
     Unique {
-        environment_names: Vec<String>,
+        selector: crate::compiler::native_cache::NativeDynamicInputSelector,
         action_key: String,
         result_key: String,
         body: PackReader,
@@ -693,7 +695,7 @@ fn handle_request(stream: &mut TcpStream, shared: &ServerShared) -> RemoteStoreR
                     write_response_prelude(stream, &shared.authority, RESPONSE_CONFLICT, metrics)
                 }
                 object::Lookup::Unique {
-                    environment_names,
+                    selector,
                     action_key,
                     result_key,
                     mut body,
@@ -701,7 +703,7 @@ fn handle_request(stream: &mut TcpStream, shared: &ServerShared) -> RemoteStoreR
                     compressed_bytes,
                 } => {
                     write_response_prelude(stream, &shared.authority, RESPONSE_PACK, metrics)?;
-                    write_environment_names(stream, &environment_names)?;
+                    write_dynamic_input_selector(stream, &selector)?;
                     write_string(stream, &action_key, IPC_MAX_IDENTITY_BYTES)?;
                     write_string(stream, &result_key, IPC_MAX_IDENTITY_BYTES)?;
                     stream.write_all(&bytes.to_le_bytes()).map_err(io_unavailable)?;
@@ -733,8 +735,8 @@ fn handle_publication(stream: &mut TcpStream, shared: &ServerShared) -> RemoteSt
         .map_err(|_| RemoteStoreError::integrity("remote result identity is invalid"))?;
     crate::compiler::native_cache::validate_base_action_key(&base_action_key)
         .map_err(|_| RemoteStoreError::integrity("remote selector identity is invalid"))?;
-    let environment_names = read_environment_names(stream)?;
-    if !shared.selection.approves_environment_names(&environment_names) {
+    let selector = read_dynamic_input_selector(stream)?;
+    if !shared.selection.approves_environment_names(&selector.environment_names) {
         return Err(RemoteStoreError::integrity(
             "remote publication environment exceeds its configured authority",
         ));
@@ -764,7 +766,7 @@ fn handle_publication(stream: &mut TcpStream, shared: &ServerShared) -> RemoteSt
     pack.rewind().map_err(io_unavailable)?;
     let started = Instant::now();
     let store = shared.store()?;
-    let publication = store.publish(&association, &base_action_key, &environment_names, pack)?;
+    let publication = store.publish(&association, &base_action_key, &selector, pack)?;
     let mut metrics = store.take_metrics();
     metrics.service_elapsed_ns = elapsed_nanos(started);
     match publication {
@@ -969,6 +971,53 @@ fn read_environment_names(stream: &mut TcpStream) -> RemoteStoreResult<Vec<Strin
     Ok(names)
 }
 
+fn write_dynamic_input_selector(
+    stream: &mut TcpStream,
+    selector: &crate::compiler::native_cache::NativeDynamicInputSelector,
+) -> RemoteStoreResult<()> {
+    selector
+        .validate()
+        .map_err(|_| RemoteStoreError::integrity("remote dynamic-input selector is invalid"))?;
+    write_environment_names(stream, &selector.environment_names)?;
+    let count = u16::try_from(selector.repository_paths.len())
+        .map_err(|_| RemoteStoreError::integrity("remote repository path count is out of range"))?;
+    stream.write_all(&count.to_le_bytes()).map_err(io_unavailable)?;
+    for path in &selector.repository_paths {
+        write_string(
+            stream,
+            path,
+            crate::compiler::native_cache::MAX_DYNAMIC_REPOSITORY_PATH_BYTES,
+        )?;
+    }
+    Ok(())
+}
+
+fn read_dynamic_input_selector(
+    stream: &mut TcpStream,
+) -> RemoteStoreResult<crate::compiler::native_cache::NativeDynamicInputSelector> {
+    let environment_names = read_environment_names(stream)?;
+    let mut count = [0_u8; 2];
+    stream.read_exact(&mut count).map_err(io_unavailable)?;
+    let count = usize::from(u16::from_le_bytes(count));
+    if count > crate::compiler::native_cache::MAX_DYNAMIC_REPOSITORY_INPUTS {
+        return Err(RemoteStoreError::integrity(
+            "remote repository path count exceeds its bound",
+        ));
+    }
+    let mut repository_paths = Vec::with_capacity(count);
+    let mut total_bytes = 0usize;
+    for _ in 0..count {
+        let path = read_string(stream, crate::compiler::native_cache::MAX_DYNAMIC_REPOSITORY_PATH_BYTES)?;
+        total_bytes = total_bytes
+            .checked_add(path.len())
+            .filter(|bytes| *bytes <= crate::compiler::native_cache::MAX_DYNAMIC_REPOSITORY_TOTAL_PATH_BYTES)
+            .ok_or_else(|| RemoteStoreError::integrity("remote repository path bytes exceed their bound"))?;
+        repository_paths.push(path);
+    }
+    crate::compiler::native_cache::NativeDynamicInputSelector::new(environment_names, repository_paths)
+        .map_err(|_| RemoteStoreError::integrity("remote dynamic-input selector is invalid"))
+}
+
 fn write_string(stream: &mut TcpStream, value: &str, maximum: usize) -> RemoteStoreResult<()> {
     if value.is_empty() || value.len() > maximum {
         return Err(RemoteStoreError::integrity(
@@ -1021,6 +1070,29 @@ mod tests {
         assert!(valid_token(&read));
         assert!(valid_token(&publish));
         assert_ne!(read, publish);
+    }
+
+    #[test]
+    fn dynamic_input_selector_round_trips_over_the_coordinator_protocol() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind listener");
+        let selector = crate::compiler::native_cache::NativeDynamicInputSelector::new(
+            vec!["CARGO_PKG_NAME".to_string()],
+            vec![".config/target-matrix.json".to_string()],
+        )
+        .expect("selector");
+        let sent = selector.clone();
+        let address = listener.local_addr().expect("listener address");
+        let writer = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).expect("connect coordinator test client");
+            write_dynamic_input_selector(&mut stream, &sent).expect("write selector");
+        });
+        let (mut stream, _) = listener.accept().expect("accept coordinator test client");
+
+        assert_eq!(
+            read_dynamic_input_selector(&mut stream).expect("read selector"),
+            selector
+        );
+        writer.join().expect("join coordinator test client");
     }
 
     #[test]

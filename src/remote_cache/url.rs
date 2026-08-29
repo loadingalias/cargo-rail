@@ -13,7 +13,7 @@ const MAX_REGION_BYTES: usize = 64;
 const MAX_BUCKET_BYTES: usize = 255;
 const MAX_PREFIX_BYTES: usize = 2 * 1024;
 const AUTHORITY_DOMAIN: &[u8] = b"cargo-rail-remote-authority-v2\0";
-const PROTOCOL: &str = "native-v5";
+const PROTOCOL: &str = "native-v6";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Provider {
