@@ -2201,6 +2201,7 @@ fn release_mutation(
             error
         ))
     })?;
+    let relative = std::path::PathBuf::from(utils::path_to_git_format(&relative));
     Ok(ExpectedMutation::capture(git_root, relative, effect))
 }
 
