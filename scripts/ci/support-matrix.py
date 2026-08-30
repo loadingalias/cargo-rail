@@ -1172,6 +1172,8 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         'just qualify-native-cache-s3 producer "$QUALIFICATION_RUN_ID"',
         'just qualify-native-cache-s3 consumer "$QUALIFICATION_RUN_ID"',
         "just validate-native-cache-remote-pair",
+        "native-cache-r2-consumer-failure-${{ env.QUALIFICATION_RUN_ID }}",
+        "if: failure()",
         "scripts/ci/cleanup-native-cache-r2-prefix.sh",
     ):
         require(
@@ -1190,11 +1192,38 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         'strict-probe: "true"' not in cache_action,
         "repository cache setup cannot require probe before its pinned Cargo-Rail release provides that command",
     )
+    remote_qualification = (
+        REPOSITORY_ROOT / "scripts/ci/qualify-native-cache-s3.sh"
+    ).read_text(encoding="utf-8")
     require(
-        "--root-portability remap"
-        in (REPOSITORY_ROOT / "scripts/ci/qualify-native-cache-s3.sh").read_text(encoding="utf-8"),
+        "--root-portability remap" in remote_qualification,
         "remote cache qualification must prove cross-root portable identities",
     )
+    for reason in (
+        "verified_remote_result",
+        "verified_local_result",
+        "remote_entry_not_found",
+        "stored_verified_result",
+        "remote_read_only",
+        "remote_published",
+    ):
+        require(
+            f'has_reason("{reason}")' in remote_qualification,
+            f"remote cache qualification does not classify the {reason} reason token",
+        )
+    require(
+        'def has_reason($token):' in remote_qualification
+        and 'split(";") | index($token)' in remote_qualification,
+        "remote cache qualification must classify composable reason tokens",
+    )
+    for stale_match in (
+        '.reason == "verified_remote_result"',
+        '.reason == "verified_local_result"',
+    ):
+        require(
+            stale_match not in remote_qualification,
+            f"remote cache qualification retains scalar reason matching: {stale_match}",
+        )
 
     release_workflow = (REPOSITORY_ROOT / ".github/workflows/release.yaml").read_text(
         encoding="utf-8"

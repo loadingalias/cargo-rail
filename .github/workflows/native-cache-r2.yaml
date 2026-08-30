@@ -160,6 +160,15 @@ jobs:
           "benchmark_results/native-cache/$QUALIFICATION_RUN_ID-consumer"
           "benchmark_results/native-cache/$QUALIFICATION_RUN_ID-pair.json"
 
+      - name: Upload failed consumer evidence
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-cache-r2-consumer-failure-${{ env.QUALIFICATION_RUN_ID }}
+          path: benchmark_results/native-cache/${{ env.QUALIFICATION_RUN_ID }}-consumer
+          retention-days: 14
+          if-no-files-found: warn
+
       - name: Upload validated cross-root evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

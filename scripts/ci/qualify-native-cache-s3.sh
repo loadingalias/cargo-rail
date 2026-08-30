@@ -194,24 +194,30 @@ event_summary() {
   local -a events=()
   mapfile -d '' -t events < <(find "$directory" -type f -name 'event-*.json' -print0 | sort -z)
   jq -s '
+    def has_reason($token):
+      (.reason | type) == "string"
+      and ((.reason | split(";") | index($token)) != null);
     {
       events: length,
       hits: ([.[] | select(.status == "hit")] | length),
       misses: ([.[] | select(.status == "miss")] | length),
       bypasses: ([.[] | select(.status == "bypassed" or .status == "disabled")] | length),
-      remote_hits: ([.[] | select(.status == "hit" and .reason == "verified_remote_result")] | length),
+      remote_hits: ([.[] | select(.status == "hit" and has_reason("verified_remote_result"))] | length),
       hit_remote_request_attempts: ([.[] | select(.status == "hit") | .remote_request_attempts] | add // 0),
       hit_remote_coordinator_requests: ([.[] | select(.status == "hit") | .remote_coordinator_requests] | add // 0),
       read_only_remote_misses: ([.[] | select(
-        .status == "miss" and .reason == "remote_entry_not_found;stored_verified_result;remote_read_only"
+        .status == "miss"
+        and has_reason("remote_entry_not_found")
+        and has_reason("stored_verified_result")
+        and has_reason("remote_read_only")
       )] | length),
-      remote_publications: ([.[] | select(.reason | contains("remote_published"))] | length),
-      published_action_ids: ([.[] | select(.reason | contains("remote_published")) | .action_id] | sort),
+      remote_publications: ([.[] | select(has_reason("remote_published"))] | length),
+      published_action_ids: ([.[] | select(has_reason("remote_published")) | .action_id] | sort),
       remote_hit_action_ids: ([.[] | select(
-        .status == "hit" and .reason == "verified_remote_result"
+        .status == "hit" and has_reason("verified_remote_result")
       ) | .action_id] | sort),
       local_hit_action_ids: ([.[] | select(
-        .status == "hit" and .reason == "verified_local_result"
+        .status == "hit" and has_reason("verified_local_result")
       ) | .action_id] | sort),
       rust_class_counts: (reduce [.[].action.action_class][] as $class ({};
         .[$class] = ((.[$class] // 0) + 1))),
@@ -303,6 +309,7 @@ for workload in "${workloads[@]}"; do
       and .remote_payload_bytes_written == 0
       and (.remote_errors | length) == 0
     ' "$summary" >/dev/null || {
+      jq . "$summary" >&2
       echo "remote-cache consumer did not import verified remote results without writes: $workload" >&2
       exit 1
     }
@@ -319,6 +326,8 @@ for workload in "${workloads[@]}"; do
       and .remote_payload_bytes_written == 0
       and (($remote[0].remote_hit_action_ids - .local_hit_action_ids) | length) == 0
     ' --slurpfile remote "$summary" "$offline" >/dev/null || {
+      jq -n --slurpfile remote "$summary" --slurpfile offline "$offline" \
+        '{remote: $remote[0], l1_offline: $offline[0]}' >&2
       echo "remote-cache consumer L1 hit attempted remote access: $workload" >&2
       exit 1
     }
