@@ -216,12 +216,19 @@ event_summary() {
       )] | length),
       remote_publications: ([.[] | select(has_reason("remote_published"))] | length),
       published_action_ids: ([.[] | select(has_reason("remote_published")) | .action_id] | sort),
+      published_action_keys: ([.[] | select(has_reason("remote_published")) | .action_key] | sort),
       remote_hit_action_ids: ([.[] | select(
         .status == "hit" and has_reason("verified_remote_result")
       ) | .action_id] | sort),
+      remote_hit_action_keys: ([.[] | select(
+        .status == "hit" and has_reason("verified_remote_result")
+      ) | .action_key] | sort),
       local_hit_action_ids: ([.[] | select(
         .status == "hit" and has_reason("verified_local_result")
       ) | .action_id] | sort),
+      local_hit_action_keys: ([.[] | select(
+        .status == "hit" and has_reason("verified_local_result")
+      ) | .action_key] | sort),
       rust_class_counts: (reduce [.[].action.action_class][] as $class ({};
         .[$class] = ((.[$class] // 0) + 1))),
       remote_request_attempts: ([.[].remote_request_attempts] | add // 0),

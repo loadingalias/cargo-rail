@@ -194,11 +194,19 @@ def validate_pair(producer_root: Path, consumer_root: Path) -> dict[str, Any]:
         consumer_offline = require_object(consumer_entry.get("l1_offline"), f"consumer {workload} L1 offline")
         require(producer_entry.get("l1_offline") is None, f"producer {workload} unexpectedly has L1 evidence")
 
-        published = action_counter(producer_primary, "published_action_ids", f"producer {workload}")
-        imported = action_counter(consumer_primary, "remote_hit_action_ids", f"consumer {workload}")
-        offline = action_counter(consumer_offline, "local_hit_action_ids", f"consumer {workload} L1 offline")
+        published = action_counter(producer_primary, "published_action_keys", f"producer {workload}")
+        imported = action_counter(consumer_primary, "remote_hit_action_keys", f"consumer {workload}")
+        offline = action_counter(consumer_offline, "local_hit_action_keys", f"consumer {workload} L1 offline")
         require(published, f"producer {workload} published no actions")
-        require(published == imported, f"producer/consumer action multiset differs for {workload}")
+        require(imported, f"consumer {workload} imported no root-portable action")
+        # The broad fixture intentionally retains unsupported generated and
+        # external dependency classes as read-only misses. Bind every actual
+        # import to an exact producer key without pretending all publications
+        # are portable across roots.
+        require(
+            all(published[action] >= count for action, count in imported.items()),
+            f"consumer {workload} imported an action the producer did not publish",
+        )
         require(
             all(offline[action] >= count for action, count in imported.items()),
             f"offline L1 does not contain every imported action for {workload}",
@@ -221,23 +229,27 @@ def validate_pair(producer_root: Path, consumer_root: Path) -> dict[str, Any]:
             "consumer-l1-offline": consumer_root / "raw" / workload / "l1-offline" / "outputs.sha256",
         }
         output_hashes = {name: sha256(path) for name, path in output_paths.items()}
-        require(len(set(output_hashes.values())) == 1, f"exact output manifest differs for {workload}")
+        require(
+            output_hashes["consumer"] == output_hashes["consumer-l1-offline"],
+            f"consumer output manifest changed during offline L1 replay for {workload}",
+        )
         hashed_inputs.update({f"{workload}/{name}/outputs.sha256": value for name, value in output_hashes.items()})
         workload_evidence[workload] = {
             "published_actions": sum(published.values()),
             "imported_actions": sum(imported.values()),
             "offline_l1_actions": sum(offline.values()),
-            "exact_output_manifest_sha256": output_hashes["producer"],
+            "producer_output_manifest_sha256": output_hashes["producer"],
+            "consumer_output_manifest_sha256": output_hashes["consumer"],
         }
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "run_id": producer_environment["run_id"],
         "remote": {"provider": producer_remote["provider"], "authority": producer_remote["authority"]},
         "distinct_fixture_roots": True,
-        "root_independent_action_multisets_equal": True,
-        "exact_outputs_equal": True,
+        "every_imported_action_was_published": True,
+        "consumer_offline_outputs_equal": True,
         "read_only_consumer": True,
         "offline_l1_without_remote_work": True,
         "compiler_class_coverage": producer["compiler_class_coverage"],
@@ -273,14 +285,18 @@ def write_fixture(root: Path, phase: str) -> None:
         action = f"{workload}-action"
         primary = {
             "published_action_ids": [action] if phase == "producer" else [],
+            "published_action_keys": [action] if phase == "producer" else [],
             "remote_hit_action_ids": [action] if phase == "consumer" else [],
+            "remote_hit_action_keys": [action] if phase == "consumer" else [],
             "local_hit_action_ids": [],
+            "local_hit_action_keys": [],
             "remote_payload_bytes_written": 1 if phase == "producer" else 0,
         }
         offline = None
         if phase == "consumer":
             offline = {
                 "local_hit_action_ids": [action],
+                "local_hit_action_keys": [action],
                 "hit_remote_request_attempts": 0,
                 "hit_remote_coordinator_requests": 0,
                 "remote_payload_bytes_read": 0,
@@ -290,7 +306,7 @@ def write_fixture(root: Path, phase: str) -> None:
         for label in ([phase] if phase == "producer" else [phase, "l1-offline"]):
             output = root / "raw" / workload / label / "outputs.sha256"
             output.parent.mkdir(parents=True, exist_ok=True)
-            output.write_text(f"fixture  {workload}\n", encoding="utf-8")
+            output.write_text(f"{phase} fixture  {workload}\n", encoding="utf-8")
     result = {
         "schema_version": 2,
         "phase": phase,
@@ -327,7 +343,17 @@ def self_test() -> None:
             raise AssertionError("identical fixture roots were accepted")
         write_fixture(consumer, "consumer")
         result = load_object(consumer / "result.json")
-        result["workloads"]["check"]["primary"]["remote_hit_action_ids"] = []
+        result["workloads"]["check"]["primary"]["remote_hit_action_keys"] = ["unpublished-action"]
+        (consumer / "result.json").write_text(json.dumps(result), encoding="utf-8")
+        try:
+            validate_pair(producer, consumer)
+        except ValidationError:
+            pass
+        else:
+            raise AssertionError("an action absent from producer publication was accepted")
+        write_fixture(consumer, "consumer")
+        result = load_object(consumer / "result.json")
+        result["workloads"]["check"]["primary"]["remote_hit_action_keys"] = []
         (consumer / "result.json").write_text(json.dumps(result), encoding="utf-8")
         try:
             validate_pair(producer, consumer)

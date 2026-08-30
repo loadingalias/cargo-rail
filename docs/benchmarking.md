@@ -94,9 +94,11 @@ separately from the bounded selected-input refresh; a warm lookup is not credibl
 ## Remote and platform qualification
 
 A loopback fixture or SDK mock proves protocol behavior, not provider performance. Cross-root remote evidence needs a
-producer and read-only consumer with empty local caches, a passing pair report, byte-identical outputs, and explicit
-absence, corruption, and outage fallback. Use the `qualify-native-cache-*`,
-`validate-native-cache-remote-pair`, and provider-specific cleanup recipes listed by `just --list`.
+producer and read-only consumer with empty local caches, a passing pair report, exact producer keys for every imported
+action, byte-identical consumer outputs after offline L1 replay, and explicit absence, corruption, and outage fallback.
+Broad compiler-class coverage may retain unsupported actions as safe read-only misses; do not misrepresent those
+root-bound outputs as portable. Use the `qualify-native-cache-*`, `validate-native-cache-remote-pair`, and
+provider-specific cleanup recipes listed by `just --list`.
 
 Remote performance needs disposable real provider authority and independent machines. Interleave Cargo-Rail import
 with the pinned remote comparator; retain provider requests, bytes, cache outcomes, selected-input mutation and

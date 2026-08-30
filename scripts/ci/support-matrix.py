@@ -1232,6 +1232,24 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         and 'split(";") | index($token)' in remote_qualification,
         "remote cache qualification must classify composable reason tokens",
     )
+    for action_key_field in (
+        "published_action_keys",
+        "remote_hit_action_keys",
+        "local_hit_action_keys",
+    ):
+        require(
+            action_key_field in remote_qualification,
+            f"remote cache qualification does not retain exact {action_key_field}",
+        )
+    portable_fixture = load_toml(
+        REPOSITORY_ROOT
+        / "tests/fixtures/native_cache/real_world/crates/fixture-portable/Cargo.toml"
+    )
+    require(
+        portable_fixture.get("package", {}).get("name") == "fixture-portable"
+        and "dependencies" not in portable_fixture,
+        "remote cache qualification needs one dependency-free portable positive control",
+    )
     for stale_match in (
         '.reason == "verified_remote_result"',
         '.reason == "verified_local_result"',
