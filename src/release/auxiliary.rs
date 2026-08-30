@@ -435,18 +435,13 @@ fn require_head_file(ctx: &WorkspaceContext, workspace_path: &Path, description:
             git.worktree_root.display()
         ))
     })?;
-    let repository_path = repository_path.to_str().ok_or_else(|| {
-        RailError::message(format!(
-            "{description} '{}' is not valid UTF-8",
-            repository_path.display()
-        ))
-    })?;
+    let repository_path = crate::utils::path_to_git_format(&repository_path);
 
-    let head = git.run_git_at_worktree_root(&["ls-tree", "-z", "HEAD", "--", repository_path])?;
-    let (head_mode, head_object) = parse_head_entry(&head.stdout, repository_path)
+    let head = git.run_git_at_worktree_root(&["ls-tree", "-z", "HEAD", "--", &repository_path])?;
+    let (head_mode, head_object) = parse_head_entry(&head.stdout, &repository_path)
         .ok_or_else(|| head_file_mismatch(description, workspace_path, "HEAD has no matching regular-file entry"))?;
-    let index = git.run_git_at_worktree_root(&["ls-files", "--stage", "-z", "--", repository_path])?;
-    let (index_mode, index_object) = parse_index_entry(&index.stdout, repository_path).ok_or_else(|| {
+    let index = git.run_git_at_worktree_root(&["ls-files", "--stage", "-z", "--", &repository_path])?;
+    let (index_mode, index_object) = parse_index_entry(&index.stdout, &repository_path).ok_or_else(|| {
         head_file_mismatch(
             description,
             workspace_path,
@@ -468,7 +463,7 @@ fn require_head_file(ctx: &WorkspaceContext, workspace_path: &Path, description:
             &format!("cannot read the worktree file: {error}"),
         )
     })?;
-    let worktree_object = git.hash_path_bytes(repository_path, &worktree)?;
+    let worktree_object = git.hash_path_bytes(&repository_path, &worktree)?;
     if worktree_object != head_object || !worktree_mode_matches(&metadata, &head_mode) {
         return Err(head_file_mismatch(
             description,
@@ -784,10 +779,25 @@ fn digest(bytes: &[u8]) -> String {
     format!("sha256:{}", ContentDigest::sha256(bytes))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn git_entry_parsers_use_portable_repository_paths() {
+        let path = crate::utils::path_to_git_format(Path::new("aux\\Cargo.toml"));
+        assert_eq!(path, "aux/Cargo.toml");
+        assert_eq!(
+            parse_head_entry(b"100644 blob head-object\taux/Cargo.toml\0", &path),
+            Some(("100644".to_string(), "head-object".to_string()))
+        );
+        assert_eq!(
+            parse_index_entry(b"100644 index-object 0\taux/Cargo.toml\0", &path),
+            Some(("100644".to_string(), "index-object".to_string()))
+        );
+    }
+
+    #[cfg(unix)]
     #[test]
     fn isolated_lockfile_reader_rejects_symlink_replacement() {
         let directory = tempfile::tempdir().unwrap();
