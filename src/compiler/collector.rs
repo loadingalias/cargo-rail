@@ -3383,6 +3383,12 @@ const MAX_SYSROOT_MEMO_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_GENERATION_IDENTIFIER_BYTES: usize = 256;
 #[cfg(any(windows, test))]
 const WINDOWS_SYSROOT_CAPTURE_ATTEMPTS: usize = 3;
+#[cfg(any(windows, test))]
+const WINDOWS_SYSROOT_GENERATION_SETTLE_INTERVAL: Duration = Duration::from_millis(20);
+#[cfg(windows)]
+const WINDOWS_FILETIME_UNIX_EPOCH_SECONDS: u64 = 11_644_473_600;
+#[cfg(windows)]
+const WINDOWS_FILETIME_TICKS_PER_SECOND: u64 = 10_000_000;
 const MAX_SYSROOT_FILES: usize = 4096;
 const MAX_SYSROOT_BYTES: u64 = 1024 * 1024 * 1024;
 
@@ -3494,8 +3500,7 @@ pub(crate) fn compiler_sysroot_fingerprint(
     let inventory = compiler_sysroot_inventory(sysroot, host_target)?;
 
     #[cfg(windows)]
-    let windows_before = capture_exact_sysroot_evidence(&inventory)
-        .ok_or_else(|| RailError::message("native cache cannot prove a stable local NTFS compiler sysroot"))?;
+    let windows_before = retry_unstable_windows_sysroot_capture(|| Ok(capture_exact_sysroot_evidence(&inventory)))?;
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     if let Some(memo_path) = memo_path
@@ -3572,9 +3577,12 @@ pub(crate) fn compiler_sysroot_fingerprint(
 
 #[cfg(any(windows, test))]
 fn retry_unstable_windows_sysroot_capture<T>(mut capture: impl FnMut() -> RailResult<Option<T>>) -> RailResult<T> {
-    for _ in 0..WINDOWS_SYSROOT_CAPTURE_ATTEMPTS {
+    for attempt in 0..WINDOWS_SYSROOT_CAPTURE_ATTEMPTS {
         if let Some(captured) = capture()? {
             return Ok(captured);
+        }
+        if attempt + 1 < WINDOWS_SYSROOT_CAPTURE_ATTEMPTS {
+            std::thread::sleep(WINDOWS_SYSROOT_GENERATION_SETTLE_INTERVAL);
         }
     }
     Err(RailError::message("compiler sysroot changed during identity capture"))
@@ -3894,6 +3902,8 @@ fn capture_exact_sysroot_evidence(inventory: &CompilerSysrootInventory) -> Optio
 fn capture_exact_sysroot_evidence(inventory: &CompilerSysrootInventory) -> Option<ExactSysrootEvidence> {
     const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0010;
 
+    let observed_at = windows_filetime_now()?;
+    let settle_ticks = u64::try_from(WINDOWS_SYSROOT_GENERATION_SETTLE_INTERVAL.as_nanos() / 100).ok()?;
     let root = crate::windows_fs::open_for_observation(&inventory.root).ok()?;
     let root_observation = crate::windows_fs::observe_file(&root).ok()?;
     crate::windows_fs::prove_local_ntfs(&root, root_observation.volume_serial_number).ok()?;
@@ -3919,6 +3929,10 @@ fn capture_exact_sysroot_evidence(inventory: &CompilerSysrootInventory) -> Optio
         if !valid_kind
             || observation != current_observation
             || observation.volume_serial_number != root_observation.volume_serial_number
+            || observation
+                .change_time
+                .checked_add(settle_ticks)
+                .is_none_or(|settled_at| settled_at > observed_at)
         {
             return None;
         }
@@ -3946,6 +3960,16 @@ fn capture_exact_sysroot_evidence(inventory: &CompilerSysrootInventory) -> Optio
         volume_identifier,
         entries,
     })
+}
+
+#[cfg(windows)]
+fn windows_filetime_now() -> Option<u64> {
+    let since_unix_epoch = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
+    since_unix_epoch
+        .as_secs()
+        .checked_add(WINDOWS_FILETIME_UNIX_EPOCH_SECONDS)?
+        .checked_mul(WINDOWS_FILETIME_TICKS_PER_SECOND)?
+        .checked_add(u64::from(since_unix_epoch.subsec_nanos()) / 100)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
