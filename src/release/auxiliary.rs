@@ -531,10 +531,11 @@ fn worktree_mode_matches(metadata: &fs::Metadata, head_mode: &str) -> bool {
 }
 
 fn head_file_mismatch(description: &str, workspace_path: &Path, reason: &str) -> RailError {
+    let workspace_path = crate::utils::path_to_git_format(workspace_path);
     RailError::with_help(
         format!(
             "{description} '{}' does not exactly match HEAD: {reason}",
-            workspace_path.display()
+            workspace_path
         ),
         "commit or restore the manifest and lockfile before planning a release",
     )

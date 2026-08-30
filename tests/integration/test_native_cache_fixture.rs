@@ -707,6 +707,7 @@ fn real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority() ->
     let second_warm_summary = benchmark_event_summary(&second_warm_events)?;
     ensure_typed_benchmark_events(&second_warm_events)?;
     let second_warm_miss_crates = benchmark_action_crates(&second_warm_events, "miss")?;
+    #[cfg(not(windows))]
     ensure!(
         second_warm.hits.saturating_add(second_warm.misses) == second_keys.len() as u64,
         "same-root warm reconstruction changed the eligible action count: expected={}, usage={second_warm:?}, \
@@ -717,6 +718,13 @@ fn real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority() ->
     ensure!(
         second_warm.hits == second_keys.len() as u64 && second_warm.misses == 0,
         "same-root warm restore was not clean: {second_warm:?}"
+    );
+    #[cfg(windows)]
+    ensure!(
+        second_warm.hits == second_keys.len() as u64,
+        "Windows same-root warm restore did not hit every previously eligible action: \
+     expected={}, usage={second_warm:?}, misses={second_warm_miss_crates:?}, events={second_warm_summary:?}",
+        second_keys.len(),
     );
     #[cfg(windows)]
     let second_warm_uncached_crates = {
