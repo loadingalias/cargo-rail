@@ -2,6 +2,38 @@
 
 
 
+
+## [0.25.0](https://github.com/loadingalias/cargo-rail/compare/v0.24.0...v0.25.0) - 2026-08-30
+
+- Allow repository checks invoked by Cargo-Rail's release push to recognize change files already consumed by that release transaction.
+
+- Add an authenticated remote-cache probe that validates the selected object store and exact protocol marker without exposing its URL or credentials.
+
+- Use the companion cache Action's single portable setup transaction, tighten Cloudflare R2 URL coverage, and document
+  the bounded default-jurisdiction and authenticated probe contracts.
+
+- Dogfood Cargo-Rail v0.24 planning, dependency policy, compiler caching, Surface, and exact-SHA release archive reuse throughout local and CI workflows.
+
+- Expose raw and merged Surface retention evidence with bounded examples, and measure omit-one-reason suppression only
+  when `surface --explain` requests the additional graph work.
+
+- Use rustc's complete definition-path identity for compiler facts and reject incompatible protocol-v3 facts after the protocol-v4 transition.
+
+- Widen variant-scoped work to every row whenever any required path, configuration, or Cargo input is not attributed by the selected catalog rows.
+
+- Model deliverables with typed Cargo roots and external paths, emit runtime artifacts as distinct named Cargo work,
+  and expose strict Cargo-scope and package-name projections to plan consumers.
+
+- Ship authenticated Surface authority in both native Linux musl archives, with exact-host driver manufacture, dynamic
+  musl loader proof, warm fact reuse, and stable and dated-nightly source fallback qualification.
+
+- Plan and commit exact post-release lockfiles for declared standalone Cargo manifests, with release plan/state v5 recovery binding and no generic command hook.
+
+- Make root-portable native reuse exact for compiler-selected repository files, retain bounded failure telemetry and
+  restore synchronization state, and accept rustc's boolean `linker-plugin-lto` spellings. The remote native-object
+  contract advances to `native-v6`; old `native-v5` objects remain cleanly unreachable.
+
+
 ## [0.24.0](https://github.com/loadingalias/cargo-rail/compare/v0.23.0...v0.24.0) - 2026-08-28
 
 - Install each CI Rust toolchain into a job-private Rustup home, require Cargo explicitly, and bind downstream steps to
