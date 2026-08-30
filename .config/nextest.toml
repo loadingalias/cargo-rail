@@ -58,11 +58,6 @@ leak-timeout = { period = "10s", result = "fail" }
 filter = 'binary(integration) & test(/test_(instrumentation|scale_fixture|source_snapshot|surface|unify|unused_detection|undeclared_features)/)'
 test-group = 'cargo-subprocess'
 
-[[profile.default.overrides]]
-filter = 'binary(integration) & test(/test_release_changelog::release_(auxiliary_|plans_auxiliary_|plans_and_commits_exact_auxiliary_)/)'
-test-group = 'cargo-subprocess'
-threads-required = "num-test-threads"
-
 [profile.commit]
 status-level = "fail"
 inherits = "default"

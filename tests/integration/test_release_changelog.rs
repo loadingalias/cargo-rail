@@ -137,12 +137,13 @@ publish = false
 
 fn configured_auxiliary_release(crate_name: &str) -> Result<TestWorkspace> {
     let ws = TestWorkspace::new_single_crate(crate_name, "0.1.0")?;
-    add_auxiliary_cargo_workspace(&ws, "aux", crate_name)?;
+    // `aux` is a reserved DOS device name; keep this shared fixture portable.
+    add_auxiliary_cargo_workspace(&ws, "auxiliary", crate_name)?;
     ws.write_release_config(
         r#"source = "both"
 tag_format = "v{version}"
 require_release_notes = false
-auxiliary_cargo_manifests = ["aux/Cargo.toml"]
+auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
 "#,
     )?;
     ws.commit("Configure auxiliary Cargo release projection")?;
@@ -214,12 +215,12 @@ edition = "2021"
     let dependency_path = dependency_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("external package path is not UTF-8"))?;
-    add_auxiliary_cargo_workspace_with_dependencies(&ws, "aux", &[("external-path-package", dependency_path)])?;
+    add_auxiliary_cargo_workspace_with_dependencies(&ws, "auxiliary", &[("external-path-package", dependency_path)])?;
     ws.write_release_config(
         r#"source = "both"
 tag_format = "v{version}"
 require_release_notes = false
-auxiliary_cargo_manifests = ["aux/Cargo.toml"]
+auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
 "#,
     )?;
     let initial_head = ws.commit("Configure external auxiliary path dependency")?;
@@ -1806,25 +1807,31 @@ fn release_auxiliary_accepts_git_clean_crlf_checkout() {
             ws.path.join(".gitattributes"),
             "**/Cargo.toml text eol=crlf\n**/Cargo.lock text eol=crlf\n",
         )?;
-        add_auxiliary_cargo_workspace(&ws, "aux", "aux-crlf")?;
+        add_auxiliary_cargo_workspace(&ws, "auxiliary", "aux-crlf")?;
         ws.write_release_config(
             r#"source = "both"
 tag_format = "v{version}"
 require_release_notes = false
-auxiliary_cargo_manifests = ["aux/Cargo.toml"]
+auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
 "#,
         )?;
         ws.commit("Configure a CRLF auxiliary Cargo projection")?;
 
-        for path in ["aux/Cargo.toml", "aux/Cargo.lock"] {
+        for path in ["auxiliary/Cargo.toml", "auxiliary/Cargo.lock"] {
             std::fs::remove_file(ws.path.join(path))?;
         }
         git(
             &ws.path,
-            &["checkout-index", "--force", "--", "aux/Cargo.toml", "aux/Cargo.lock"],
+            &[
+                "checkout-index",
+                "--force",
+                "--",
+                "auxiliary/Cargo.toml",
+                "auxiliary/Cargo.lock",
+            ],
         )?;
-        git(&ws.path, &["add", "--", "aux/Cargo.toml", "aux/Cargo.lock"])?;
-        for path in ["aux/Cargo.toml", "aux/Cargo.lock"] {
+        git(&ws.path, &["add", "--", "auxiliary/Cargo.toml", "auxiliary/Cargo.lock"])?;
+        for path in ["auxiliary/Cargo.toml", "auxiliary/Cargo.lock"] {
             assert_only_crlf(&ws.path.join(path))?;
         }
         let status = git(&ws.path, &["status", "--porcelain", "--untracked-files=no"])?;
@@ -1872,10 +1879,10 @@ fn release_auxiliary_accepts_git_clean_crlf_in_nested_workspace() {
         git(&ws.git_root, &["config", "core.autocrlf", "true"])?;
         std::fs::write(
             ws.git_root.join(".gitattributes"),
-            "rust/aux/Cargo.toml text eol=crlf\nrust/aux/Cargo.lock text eol=crlf\n",
+            "rust/auxiliary/Cargo.toml text eol=crlf\nrust/auxiliary/Cargo.lock text eol=crlf\n",
         )?;
         ws.add_crate("nested-crlf", "0.1.0")?;
-        let auxiliary = ws.workspace_root.join("aux");
+        let auxiliary = ws.workspace_root.join("auxiliary");
         std::fs::create_dir_all(auxiliary.join("src"))?;
         std::fs::write(
             auxiliary.join("Cargo.toml"),
@@ -1901,12 +1908,12 @@ nested-crlf = { path = "../crates/nested-crlf" }
 source = "both"
 tag_format = "v{version}"
 require_release_notes = false
-auxiliary_cargo_manifests = ["aux/Cargo.toml"]
+auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
 "#,
         )?;
         ws.commit("Configure a nested CRLF auxiliary Cargo projection")?;
 
-        for path in ["rust/aux/Cargo.toml", "rust/aux/Cargo.lock"] {
+        for path in ["rust/auxiliary/Cargo.toml", "rust/auxiliary/Cargo.lock"] {
             std::fs::remove_file(ws.git_root.join(path))?;
         }
         git(
@@ -1915,15 +1922,15 @@ auxiliary_cargo_manifests = ["aux/Cargo.toml"]
                 "checkout-index",
                 "--force",
                 "--",
-                "rust/aux/Cargo.toml",
-                "rust/aux/Cargo.lock",
+                "rust/auxiliary/Cargo.toml",
+                "rust/auxiliary/Cargo.lock",
             ],
         )?;
         git(
             &ws.git_root,
-            &["add", "--", "rust/aux/Cargo.toml", "rust/aux/Cargo.lock"],
+            &["add", "--", "rust/auxiliary/Cargo.toml", "rust/auxiliary/Cargo.lock"],
         )?;
-        for path in ["rust/aux/Cargo.toml", "rust/aux/Cargo.lock"] {
+        for path in ["rust/auxiliary/Cargo.toml", "rust/auxiliary/Cargo.lock"] {
             assert_only_crlf(&ws.git_root.join(path))?;
         }
         let status = git(&ws.git_root, &["status", "--porcelain", "--untracked-files=no"])?;
@@ -1968,7 +1975,7 @@ auxiliary_cargo_manifests = ["aux/Cargo.toml"]
 fn release_auxiliary_manifest_must_match_head() {
     let result: Result<()> = (|| {
         let ws = configured_auxiliary_release("aux-dirty-manifest")?;
-        let manifest = ws.path.join("aux/Cargo.toml");
+        let manifest = ws.path.join("auxiliary/Cargo.toml");
         let mut changed = std::fs::read_to_string(&manifest)?;
         changed.push_str("\n# uncommitted\n");
         std::fs::write(&manifest, changed)?;
@@ -1977,7 +1984,7 @@ fn release_auxiliary_manifest_must_match_head() {
         assert!(!check.status.success());
         let stderr = String::from_utf8_lossy(&check.stderr);
         assert!(
-            stderr.contains("auxiliary Cargo manifest 'aux/Cargo.toml' does not exactly match HEAD")
+            stderr.contains("auxiliary Cargo manifest 'auxiliary/Cargo.toml' does not exactly match HEAD")
                 && stderr.contains("filter-cleaned worktree content or executable mode differs"),
             "{stderr}"
         );
@@ -1991,7 +1998,7 @@ fn release_auxiliary_manifest_must_match_head() {
 fn release_auxiliary_lockfile_must_match_head() {
     let result: Result<()> = (|| {
         let ws = configured_auxiliary_release("aux-dirty-lock")?;
-        let lockfile = ws.path.join("aux/Cargo.lock");
+        let lockfile = ws.path.join("auxiliary/Cargo.lock");
         let mut changed = std::fs::read_to_string(&lockfile)?;
         changed.push_str("\n# uncommitted\n");
         std::fs::write(&lockfile, changed)?;
@@ -2000,7 +2007,7 @@ fn release_auxiliary_lockfile_must_match_head() {
         assert!(!check.status.success());
         let stderr = String::from_utf8_lossy(&check.stderr);
         assert!(
-            stderr.contains("auxiliary Cargo lockfile 'aux/Cargo.lock' does not exactly match HEAD")
+            stderr.contains("auxiliary Cargo lockfile 'auxiliary/Cargo.lock' does not exactly match HEAD")
                 && stderr.contains("filter-cleaned worktree content or executable mode differs"),
             "{stderr}"
         );
@@ -2014,19 +2021,19 @@ fn release_auxiliary_lockfile_must_match_head() {
 fn release_auxiliary_manifest_rejects_index_only_changes() {
     let result: Result<()> = (|| {
         let ws = configured_auxiliary_release("aux-index-manifest")?;
-        let manifest = ws.path.join("aux/Cargo.toml");
+        let manifest = ws.path.join("auxiliary/Cargo.toml");
         let original = std::fs::read(&manifest)?;
         let mut changed = original.clone();
         changed.extend_from_slice(b"\n# staged only\n");
         std::fs::write(&manifest, changed)?;
-        git(&ws.path, &["add", "--", "aux/Cargo.toml"])?;
+        git(&ws.path, &["add", "--", "auxiliary/Cargo.toml"])?;
         std::fs::write(&manifest, original)?;
 
         let check = check_auxiliary_release(&ws)?;
         assert!(!check.status.success());
         let stderr = String::from_utf8_lossy(&check.stderr);
         assert!(
-            stderr.contains("auxiliary Cargo manifest 'aux/Cargo.toml' does not exactly match HEAD")
+            stderr.contains("auxiliary Cargo manifest 'auxiliary/Cargo.toml' does not exactly match HEAD")
                 && stderr.contains("index entry differs from HEAD"),
             "{stderr}"
         );
@@ -2044,21 +2051,27 @@ fn release_auxiliary_manifest_rejects_intent_to_add() {
             r#"source = "both"
 tag_format = "v{version}"
 require_release_notes = false
-auxiliary_cargo_manifests = ["aux/Cargo.toml"]
+auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
 "#,
         )?;
         ws.commit("Configure an unmaterialized auxiliary workspace")?;
-        add_auxiliary_cargo_workspace(&ws, "aux", "aux-intent-manifest")?;
+        add_auxiliary_cargo_workspace(&ws, "auxiliary", "aux-intent-manifest")?;
         git(
             &ws.path,
-            &["add", "--intent-to-add", "--", "aux/Cargo.toml", "aux/Cargo.lock"],
+            &[
+                "add",
+                "--intent-to-add",
+                "--",
+                "auxiliary/Cargo.toml",
+                "auxiliary/Cargo.lock",
+            ],
         )?;
 
         let check = check_auxiliary_release(&ws)?;
         assert!(!check.status.success());
         let stderr = String::from_utf8_lossy(&check.stderr);
         assert!(
-            stderr.contains("auxiliary Cargo manifest 'aux/Cargo.toml' does not exactly match HEAD")
+            stderr.contains("auxiliary Cargo manifest 'auxiliary/Cargo.toml' does not exactly match HEAD")
                 && stderr.contains("HEAD has no matching regular-file entry"),
             "{stderr}"
         );
@@ -2083,7 +2096,7 @@ fn release_plans_auxiliary_lockfile_from_nested_workspace_root() {
     let result: Result<()> = (|| {
         let ws = NestedWorkspace::new("rust")?;
         ws.add_crate("nested-release", "0.1.0")?;
-        let auxiliary = ws.workspace_root.join("aux");
+        let auxiliary = ws.workspace_root.join("auxiliary");
         std::fs::create_dir_all(auxiliary.join("src"))?;
         std::fs::write(
             auxiliary.join("Cargo.toml"),
@@ -2109,7 +2122,7 @@ nested-release = { path = "../crates/nested-release" }
 source = "both"
 tag_format = "v{version}"
 require_release_notes = false
-auxiliary_cargo_manifests = ["aux/Cargo.toml"]
+auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
 "#,
         )?;
         ws.commit("Configure nested auxiliary Cargo projection")?;
@@ -2140,11 +2153,11 @@ auxiliary_cargo_manifests = ["aux/Cargo.toml"]
         let check: serde_json::Value = serde_json::from_slice(&check.stdout)?;
         assert_eq!(
             check["release_plan"]["auxiliary_lockfiles"][0]["manifest_path"],
-            "aux/Cargo.toml"
+            "auxiliary/Cargo.toml"
         );
         assert_eq!(
             check["release_plan"]["auxiliary_lockfiles"][0]["lockfile_path"],
-            "aux/Cargo.lock"
+            "auxiliary/Cargo.lock"
         );
 
         Ok(())
@@ -2156,12 +2169,12 @@ auxiliary_cargo_manifests = ["aux/Cargo.toml"]
 fn release_auxiliary_lockfile_plan_rejects_drift_before_mutation() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_single_crate("aux-drift", "0.1.0")?;
-        add_auxiliary_cargo_workspace(&ws, "aux", "aux-drift")?;
+        add_auxiliary_cargo_workspace(&ws, "auxiliary", "aux-drift")?;
         ws.write_release_config(
             r#"source = "both"
 tag_format = "v{version}"
 require_release_notes = false
-auxiliary_cargo_manifests = ["aux/Cargo.toml"]
+auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
 "#,
         )?;
         let initial_head = ws.commit("Configure auxiliary Cargo projection")?;
@@ -2185,7 +2198,7 @@ auxiliary_cargo_manifests = ["aux/Cargo.toml"]
         let plan_dir = tempfile::TempDir::new()?;
         let plan_path = plan_dir.path().join("release-plan.json");
         std::fs::write(&plan_path, &check.stdout)?;
-        let lockfile = ws.path.join("aux/Cargo.lock");
+        let lockfile = ws.path.join("auxiliary/Cargo.lock");
         let mut changed = std::fs::read_to_string(&lockfile)?;
         changed.push('\n');
         std::fs::write(&lockfile, changed)?;
@@ -2209,7 +2222,7 @@ auxiliary_cargo_manifests = ["aux/Cargo.toml"]
         assert!(!apply.status.success());
         let stderr = String::from_utf8_lossy(&apply.stderr);
         assert!(
-            stderr.contains("auxiliary Cargo lockfile 'aux/Cargo.lock' does not exactly match HEAD"),
+            stderr.contains("auxiliary Cargo lockfile 'auxiliary/Cargo.lock' does not exactly match HEAD"),
             "{stderr}"
         );
         assert_eq!(
@@ -2227,19 +2240,19 @@ auxiliary_cargo_manifests = ["aux/Cargo.toml"]
 fn release_auxiliary_cargo_failure_leaves_the_worktree_untouched() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_single_crate("aux-invalid", "0.1.0")?;
-        std::fs::create_dir_all(ws.path.join("aux"))?;
-        std::fs::write(ws.path.join("aux/Cargo.toml"), "this is not Cargo TOML\n")?;
-        std::fs::write(ws.path.join("aux/Cargo.lock"), "version = 4\n")?;
+        std::fs::create_dir_all(ws.path.join("auxiliary"))?;
+        std::fs::write(ws.path.join("auxiliary/Cargo.toml"), "this is not Cargo TOML\n")?;
+        std::fs::write(ws.path.join("auxiliary/Cargo.lock"), "version = 4\n")?;
         ws.write_release_config(
             r#"source = "both"
 tag_format = "v{version}"
 require_release_notes = false
-auxiliary_cargo_manifests = ["aux/Cargo.toml"]
+auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
 "#,
         )?;
         let initial_head = ws.commit("Add invalid auxiliary Cargo projection")?;
         let manifest = std::fs::read(ws.path.join("Cargo.toml"))?;
-        let lockfile = std::fs::read(ws.path.join("aux/Cargo.lock"))?;
+        let lockfile = std::fs::read(ws.path.join("auxiliary/Cargo.lock"))?;
 
         let check = run_cargo_rail(
             &ws.path,
@@ -2258,7 +2271,7 @@ auxiliary_cargo_manifests = ["aux/Cargo.toml"]
         assert!(!check.status.success());
         assert!(String::from_utf8_lossy(&check.stderr).contains("cargo locate-project failed"));
         assert_eq!(std::fs::read(ws.path.join("Cargo.toml"))?, manifest);
-        assert_eq!(std::fs::read(ws.path.join("aux/Cargo.lock"))?, lockfile);
+        assert_eq!(std::fs::read(ws.path.join("auxiliary/Cargo.lock"))?, lockfile);
         assert_eq!(
             git(&ws.path, &["rev-parse", "HEAD"])?.stdout,
             format!("{initial_head}\n").as_bytes()
@@ -2276,17 +2289,17 @@ fn release_auxiliary_cargo_rejects_undeclared_command_mutation() {
 
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_single_crate("aux-command-boundary", "0.1.0")?;
-        add_auxiliary_cargo_workspace(&ws, "aux", "aux-command-boundary")?;
+        add_auxiliary_cargo_workspace(&ws, "auxiliary", "aux-command-boundary")?;
         ws.write_release_config(
             r#"source = "both"
 tag_format = "v{version}"
 require_release_notes = false
-auxiliary_cargo_manifests = ["aux/Cargo.toml"]
+auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
 "#,
         )?;
         let initial_head = ws.commit("Configure bounded auxiliary Cargo projection")?;
         let manifest = std::fs::read(ws.path.join("Cargo.toml"))?;
-        let lockfile = std::fs::read(ws.path.join("aux/Cargo.lock"))?;
+        let lockfile = std::fs::read(ws.path.join("auxiliary/Cargo.lock"))?;
 
         let wrapper_dir = tempfile::TempDir::new()?;
         let wrapper = wrapper_dir.path().join("cargo-wrapper");
@@ -2322,7 +2335,7 @@ auxiliary_cargo_manifests = ["aux/Cargo.toml"]
         );
         assert!(!ws.path.join("undeclared-by-cargo").exists());
         assert_eq!(std::fs::read(ws.path.join("Cargo.toml"))?, manifest);
-        assert_eq!(std::fs::read(ws.path.join("aux/Cargo.lock"))?, lockfile);
+        assert_eq!(std::fs::read(ws.path.join("auxiliary/Cargo.lock"))?, lockfile);
         assert_eq!(
             git(&ws.path, &["rev-parse", "HEAD"])?.stdout,
             format!("{initial_head}\n").as_bytes()
@@ -2403,16 +2416,16 @@ auxiliary_cargo_manifests = ["aux-one/Cargo.toml", "aux-two/Cargo.toml"]
 fn release_auxiliary_lockfile_recovers_before_the_first_commit() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_single_crate("aux-recovery", "0.1.0")?;
-        add_auxiliary_cargo_workspace(&ws, "aux", "aux-recovery")?;
+        add_auxiliary_cargo_workspace(&ws, "auxiliary", "aux-recovery")?;
         ws.write_release_config(
             r#"source = "both"
 tag_format = "v{version}"
 require_release_notes = false
-auxiliary_cargo_manifests = ["aux/Cargo.toml"]
+auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
 "#,
         )?;
         let initial_head = ws.commit("Configure auxiliary Cargo recovery")?;
-        let before = std::fs::read(ws.path.join("aux/Cargo.lock"))?;
+        let before = std::fs::read(ws.path.join("auxiliary/Cargo.lock"))?;
 
         let interrupted = run_release_with_before_fault(
             &ws.path,
@@ -2430,7 +2443,7 @@ auxiliary_cargo_manifests = ["aux/Cargo.toml"]
             "commit:aux-recovery",
         )?;
         assert!(!interrupted.status.success());
-        assert_eq!(std::fs::read(ws.path.join("aux/Cargo.lock"))?, before);
+        assert_eq!(std::fs::read(ws.path.join("auxiliary/Cargo.lock"))?, before);
         assert!(std::fs::read_to_string(ws.path.join("Cargo.toml"))?.contains("version = \"0.1.0\""));
 
         let state_path = only_release_state(&ws.path)?;
@@ -2440,7 +2453,7 @@ auxiliary_cargo_manifests = ["aux/Cargo.toml"]
         assert_eq!(state["plan"]["auxiliary_lockfiles"].as_array().unwrap().len(), 1);
         let resumed = run_cargo_rail(&ws.path, &["rail", "release", "resume", state_path.to_str().unwrap()])?;
         assert!(resumed.status.success(), "{}", String::from_utf8_lossy(&resumed.stderr));
-        let after = std::fs::read_to_string(ws.path.join("aux/Cargo.lock"))?;
+        let after = std::fs::read_to_string(ws.path.join("auxiliary/Cargo.lock"))?;
         assert!(after.contains("name = \"aux-recovery\"\nversion = \"0.1.1\""));
         assert_eq!(
             git(&ws.path, &["rev-list", "--count", &format!("{initial_head}..HEAD")])?.stdout,
