@@ -58,6 +58,8 @@ Each row declares `cargo_roots` containing exact workspace packages or targets a
 Cargo's graph. Cargo-Rail computes one structural reverse build closure for the plan and selects rows whose roots are
 affected. Root Cargo manifests, the lockfile, Cargo configuration, and the toolchain select every Cargo-rooted row.
 Unrelated external paths do not select a deliverable merely because compiler input evidence is incomplete.
+If a required path, configuration input, or Cargo input is not attributed by any selected catalog row, Cargo-Rail
+selects every row rather than treating the gap as evidence that a deliverable is unaffected.
 
 Runtime artifacts remain separate from test execution. A Cargo-scoped named work item with `cargo_prerequisites`
 emits only prerequisite packages and targets; the source `cargo.test` selector still owns which tests execute.
@@ -106,31 +108,6 @@ selectors are emitted or work starts.
 checkout binding, and workflow matrices before emitting NUL-delimited arguments. `cargo-scope` distinguishes
 `skipped`, `workspace`, and `packages`; `package-names` emits names only for exact package scope and rejects duplicate
 names.
-
-## Migrate a pre-v8 consumer
-
-Do not float a Cargo-Rail binary across a machine contract. Pin an exact release or use the matching major Action with
-its exact default binary, and pin that Action by full commit SHA.
-
-For a v0.23-style consumer:
-
-1. Remove the retired `[change-detection]` table and register only repository-owned positive inputs under
-   `[plan.work.NAME]`.
-2. Replace `cargo rail plan -f json` with `cargo rail plan --json`.
-3. Replace legacy `.scope` parsing with named work and the strict reader:
-
-```bash
-scope="$(python3 "$PLAN_READER" cargo-scope "$PLAN_FILE" cargo.test)"
-if [[ "$scope" == packages ]]; then
-  while IFS= read -r -d '' package; do
-    test_packages+=("$package")
-  done < <(python3 "$PLAN_READER" package-names "$PLAN_FILE" cargo.test)
-fi
-```
-
-Built-in Cargo scope is exact for declared Cargo graph relationships. Without compatible complete observed evidence,
-compiler-visible inputs conservatively widen Cargo execution. That claim does not model subprocess, dynamic-library,
-container, or other runtime edges; declare those relationships explicitly.
 
 ## Observed-input evidence
 

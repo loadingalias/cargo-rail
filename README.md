@@ -36,9 +36,9 @@ Windows PowerShell:
 irm https://github.com/loadingalias/cargo-rail/releases/latest/download/cargo-rail-installer.ps1 | iex
 ```
 
-The installer verifies the native archive and every selected component. Complete GNU Linux, Windows, and Apple
-Native archives for Apple silicon, Linux GNU, Linux musl, and Windows include cache helpers and authenticated Surface
-authority. Linux musl archives use a static core CLI and a native dynamically loaded compiler-fact driver.
+The installer verifies the native archive and every selected component. Native archives for Apple silicon, GNU
+Linux, musl Linux, and Windows include cache helpers and authenticated Surface authority. Linux musl archives use a
+static core CLI and a native dynamically loaded compiler-fact driver.
 The driver relies on the host's standard musl `libgcc_s` runtime, as rustc host tools do.
 
 `cargo install cargo-rail --locked` and `cargo binstall cargo-rail` remain available. They cannot prepare or run Surface
@@ -85,16 +85,28 @@ Cargo-Rail caches compiler results, not copied target directories. Each hit reva
 
 Unsupported or incompletely observed work runs through normal Cargo. Crucially, no guessed hit can become a build result.
 
-`cargo clean` intentionally leaves Cargo-Rail's shared local CAS intact, so an empty target tree can still reuse verified compiler work. Local result storage has a 10 GiB default byte bound. Before an incoming result would exceed it, Cargo-Rail removes the oldest eligible action authorities while protecting leased or in-flight results. `CARGO_RAIL_CACHE=off` provides a cold baseline without touching the CAS. Inspect `cargo rail cache status --scope local` and preview complete CAS removal with `cargo rail cache clean --scope local --check`; after local cleanup, rerun `cargo rail cache setup` to repair the empty authority. See the [cache contract and cleanup policy](docs/caching.md#storage-and-cleanup).
+With root portability set to `remap`, Cargo-Rail discovers the regular repository files that rustc actually reads,
+persists only that bounded selector, and revalidates exact bytes and metadata before lookup. Physical checkout and
+`CARGO_TARGET_DIR` locations stay executor-local, so eligible work can reuse across independent roots without making
+a same-size input mutation look unchanged.
 
-In the retained same-shape `c8i.large` six-crate dependency-DAG qualification, Cargo-Rail completed in 10.098 seconds p50 versus 14.338 seconds for local Cargo and 14.191 seconds for pinned distributed sccache. Small, single-large-unit, and
-parallel-check workloads lost; the retained automatic policy kept the measured small and large placement classes local. This is an operator-bounded result, not a universal speed claim. Read the [benchmark contract](docs/benchmarking.md#claim-requirements).
+`cargo clean` intentionally leaves Cargo-Rail's shared local CAS intact, so an empty target tree can still reuse
+verified compiler work. Local result storage has a 10 GiB default byte bound. Before an incoming result would exceed
+it, Cargo-Rail removes the oldest eligible action authorities while protecting leased or in-flight results.
+`CARGO_RAIL_CACHE=off` provides a cold baseline without touching the CAS. Inspect
+`cargo rail cache status --scope local --json` and preview complete CAS removal with
+`cargo rail cache clean --scope local --check`; after local cleanup, rerun `cargo rail cache setup` to repair the
+empty authority. See the [cache contract and cleanup policy](docs/caching.md#inspect-clean-or-remove) and the
+[benchmark contract](docs/benchmarking.md#claim-requirements).
 
 ## Know the Code Your Products Reach
 
 `cargo rail surface` merges real compiler facts across products, libraries, build scripts, proc macros, doctests, features, and configured targets. It reports dead public declarations and visibility wider than actual consumers need.
 
-Surface can apply proven visibility reductions with `--fix`; dead code remains report-only. `rail.toml` defines analysis policy, while source mutation always requires explicit CLI authorization.
+Surface can apply proven visibility reductions with `--fix`; dead code remains report-only. With `--explain`, report
+contract v3 separates raw observations from merged declarations, shows bounded retention examples, and measures the
+findings suppressed by one conservative reason without adding that graph work to the normal path. `rail.toml` defines
+analysis policy, while source mutation always requires explicit CLI authorization.
 
 ## Give Every Executor Exact Work
 
@@ -102,7 +114,9 @@ Surface can apply proven visibility reductions with `--fix`; dead code remains r
 
 Every required Cargo work decision receives an exact `cargo_args` array. Pass that array to Cargo, nextest, Just, CI, etc. Do not rebuild scope from path globs or explanation fields.
 
-**The generic `cargo rail run` command was removed because Cargo-Rail should own planning, not arbitrary execution. This is not a task runner.**
+Variant catalogs can bind deliverables to typed Cargo roots and external inputs without subscribing every row to a
+conservative build. Named Cargo work can also project exact runtime-artifact prerequisites separately from the tests
+that consume them.
 
 ```text
 changed source
@@ -142,8 +156,9 @@ The v8 Action runs the planner once and exposes the validated plan, required wor
 ```
 
 Use `loadingalias/cargo-rail-action/cache@v8` separately in each execution job that needs remote compiler reuse.
-Its `mode` input is required: use `read` for untrusted jobs and grant `read-write` only to trusted seed jobs. See the
-[Action guide](https://github.com/loadingalias/cargo-rail-action).
+Its `mode` input is required: use `read` for untrusted jobs and grant `read-write` only to trusted seed jobs. The
+Action exposes typed root portability and an optional strict authenticated provider probe. See the [Action
+guide](https://github.com/loadingalias/cargo-rail-action).
 
 This repository dogfoods the same boundary. Local Just commands use the installed release; trusted `main` and release
 jobs use the v8 cache action against one private Cloudflare R2 authority. Pull requests remain local-only. R2
@@ -158,7 +173,7 @@ set.
 
 - `cargo rail unify --check` derives one reviewable dependency repair from the captured workspace; `cargo rail unify apply --backup` applies it reversibly.
 - `cargo rail change` records bump and release-note intent in `.changes/` during the change itself.
-- `cargo rail release` carries that intent through versioning, changelogs, exact-SHA readiness, tags, publication, and durable resume state.
+- `cargo rail release` carries that intent through versioning, changelogs, exact auxiliary Cargo lockfiles, exact-SHA readiness, tags, publication, and durable resume state.
 - `cargo rail split` moves relevant crate history into an OSS repository; `cargo rail sync` maps later changes in both directions and stops with a resumable receipt when Git three-way merge needs a human.
 
 Registry publication is denied by default. Mutations bind the captured snapshot, revalidate drift, and write only authorized paths.

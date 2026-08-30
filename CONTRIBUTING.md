@@ -80,9 +80,11 @@ Follow [the benchmarking guide](docs/benchmarking.md). State the workload, host,
 correctness checks, and before/after results. Preserve raw results. Compare cache implementations on the same host,
 and do not generalize a result beyond the platforms and workload that were measured.
 
-Native compiler-cache work must cover the repository's same-root and independent-root fixtures. Compare native Cargo,
-Cargo-Rail disabled, Cargo-Rail cold, Cargo-Rail warm, and the pinned sccache baseline when that comparison is relevant.
-Report hits, misses, bypass reasons, bytes hashed and restored, and exact output-byte equivalence.
+Native compiler-cache work must cover the repository's same-root and independent-root fixtures and an external
+`CARGO_TARGET_DIR`. A same-size mutation of a selected repository input must miss. Compare native Cargo, Cargo-Rail
+disabled, Cargo-Rail cold, Cargo-Rail warm, and the pinned sccache baseline when that comparison is relevant. Report
+full source-capture and selected-input refresh costs separately, plus hits, misses, bypass reasons, bytes hashed and
+restored, and exact output-byte equivalence.
 
 ## Open a pull request
 

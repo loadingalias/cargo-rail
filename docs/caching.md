@@ -34,9 +34,11 @@ bounded CAS. It refuses another global wrapper, persistent shadowing, ambiguous 
 or changed receipt-owned state. Repeating setup verifies or repairs only the same authority.
 
 Cargo freshness and incremental compilation remain L0. An L1 action binds the compiler, toolchain, arguments, target,
-environment, dependencies, source topology and bytes, native-search inputs, physical workspace root, and declared
-outputs. Stored descriptors and every output byte are reverified before restore. The bounded source capture
-deliberately over-invalidates when it cannot prove that an unused path was irrelevant.
+environment, dependencies, source topology and bytes, native-search inputs, and declared outputs. Physical mode also
+binds the canonical workspace root. Remap mode replaces that root only for certified portable result classes while
+keeping the executor's physical output directory out of the portable operation identity. Stored descriptors and every
+output byte are reverified before restore. The bounded source capture deliberately over-invalidates when it cannot
+prove that an unused path was irrelevant.
 
 A result is:
 
@@ -56,8 +58,12 @@ CARGO_RAIL_CACHE=off cargo check --locked
 Remote selection is machine state, never repository configuration. Persist L2 during setup, then use ordinary Cargo:
 
 ```bash
-cargo rail cache setup --check --remote   's3://company-cargo-rail-cache/rust/team?region=us-east-1&owner=123456789012'   --remote-mode read-write
-cargo rail cache setup --remote   's3://company-cargo-rail-cache/rust/team?region=us-east-1&owner=123456789012'   --remote-mode read-write
+cargo rail cache setup --check --remote \
+  's3://company-cargo-rail-cache/rust/team?region=us-east-1&owner=123456789012' \
+  --remote-mode read-write
+cargo rail cache setup --remote \
+  's3://company-cargo-rail-cache/rust/team?region=us-east-1&owner=123456789012' \
+  --remote-mode read-write
 ```
 
 Accepted URL families are:
@@ -79,10 +85,15 @@ process that should use L2; a Wrangler login or general Cloudflare API token is 
 export AWS_ACCESS_KEY_ID='<R2 access key ID>'
 export AWS_SECRET_ACCESS_KEY='<R2 secret access key>'
 
-cargo rail cache normalize   'r2://0123456789abcdef0123456789abcdef/cargo-rail-cache'
-cargo rail cache setup --check --remote   'r2://0123456789abcdef0123456789abcdef/cargo-rail-cache'   --remote-mode read-write --root-portability remap
-cargo rail cache setup --remote   'r2://0123456789abcdef0123456789abcdef/cargo-rail-cache'   --remote-mode read-write --root-portability remap
-cargo rail cache probe --format json
+cargo rail cache normalize \
+  'r2://0123456789abcdef0123456789abcdef/cargo-rail-cache'
+cargo rail cache setup --check --remote \
+  'r2://0123456789abcdef0123456789abcdef/cargo-rail-cache' \
+  --remote-mode read-write --root-portability remap
+cargo rail cache setup --remote \
+  'r2://0123456789abcdef0123456789abcdef/cargo-rail-cache' \
+  --remote-mode read-write --root-portability remap
+cargo rail cache probe --json
 ```
 
 Use distinct bucket-scoped credential pairs for CI and developer machines even when they share one R2 authority.
@@ -121,9 +132,16 @@ L1 remains authoritative, so an L1 hit makes no remote request. Absence, conflic
 throttling, or outage executes the compiler. `--local-only` removes persisted L2 selection while preserving L1.
 
 Physical-root mode is the default. It shares only checkouts at the same canonical path. Cross-root reuse requires
-`--root-portability remap`; that mode admits only certified workspace Rust metadata and library results. Existing
-remaps, external or generated source namespaces, native-search inputs, ambiguous roots, and unsupported output classes
-bypass cross-root reuse.
+`--root-portability remap`; that mode admits only certified workspace Rust metadata and library results. Rustc reads
+of regular repository files outside the package source root become a bounded dynamic selector. Before lookup,
+Cargo-Rail revalidates each selected path, file kind, byte length, content digest, and executable mode. Symlink or
+reparse crossings, inputs outside repository authority, generated namespaces, native-search inputs, ambiguous roots,
+user-selected remaps, and unsupported output classes bypass cross-root reuse.
+
+External `CARGO_TARGET_DIR` locations are supported for eligible native results. The cache identity uses one stable
+logical output directory, while local compilation and restore continue to use Cargo's exact physical output parent.
+Changing only a checkout or target root therefore preserves portable identity; changing a selected input, including a
+same-size edit, produces a miss.
 
 Additional L2 environment names must be reviewed and non-secret. Select them with repeated `--remote-environment`
 options during setup. Only value digests enter identity; raw values are not uploaded.
@@ -131,13 +149,19 @@ options during setup. Only value digests enter identity; raw values are not uplo
 ## Distribute eligible misses
 
 Distributed execution runs below Cargo L0, L1, and L2. It accepts only bounded compiler-only Rust operations with
-complete source and dependency inputs. Linked outputs, build scripts, generated namespaces, native dependencies,
-unmodeled options, and newly observed compiler environments remain local.
+complete source, dependency, and selected repository inputs. Linked outputs, build scripts, generated namespaces,
+native dependencies, unmodeled options, and newly observed compiler environments remain local.
 
 The client requires one complete mTLS worker authority:
 
 ```bash
-cargo rail cache setup --check   --distributed-endpoint '10.0.0.20:39443'   --distributed-server-name worker.example.internal   --distributed-capability 'worker-capability-v3:sha256:CAPABILITY_DIGEST'   --distributed-authority /etc/cargo-rail/server-ca.pem   --distributed-client-certificate /etc/cargo-rail/client.pem   --distributed-client-private-key /etc/cargo-rail/client.key
+cargo rail cache setup --check \
+  --distributed-endpoint '10.0.0.20:39443' \
+  --distributed-server-name worker.example.internal \
+  --distributed-capability 'worker-capability-v3:sha256:CAPABILITY_DIGEST' \
+  --distributed-authority /etc/cargo-rail/server-ca.pem \
+  --distributed-client-certificate /etc/cargo-rail/client.pem \
+  --distributed-client-private-key /etc/cargo-rail/client.key
 ```
 
 Run setup without `--check` only after reviewing the authority. The default `automatic` policy stays local until
@@ -164,7 +188,7 @@ and reasons.
 ## Inspect, clean, or remove
 
 ```bash
-cargo rail cache status --scope local --format json
+cargo rail cache status --scope local --json
 cargo rail cache clean --scope workspace --check
 cargo rail cache clean --scope local --check
 cargo rail cache remove --check
@@ -174,6 +198,11 @@ Workspace cleanup removes reconstructible state for the current checkout. Local 
 receipt-selected shared CAS after validating ownership and waiting for readers; rerun `cache setup` afterward.
 `cache remove` removes the owned Cargo field and private setup state but preserves CAS data. Every operation refuses
 changed, shadowed, linked, or unowned authority. Do not delete individual CAS objects or Cargo fingerprints by hand.
+
+Status schema 14 reports stable native failure-reason counters separately from the bounded 65,536-event usage ledger,
+so capture, identity, and post-execution witness failures remain visible after that ledger fills. If the counter file
+cannot be validated, `failure_reason_counts_available` is `false` instead of reporting invented zeroes. Verbose status
+also reports the fixed 64-shard native restore-lock namespace and any staging residue.
 
 ## Execution and reuse support
 
@@ -232,10 +261,12 @@ Deferred hosts need native hardware before Cargo-Rail can claim tested execution
 | Build-script compilation | Compiler result may reuse; script execution and generated output remain Cargo-owned cold work |
 | Native dependencies and `links` | Rust consumers may reuse only with complete native-search evidence; native tools execute cold |
 | Incremental, Clippy, rustdoc, and doctests | Bypass before result acquisition |
-| Cross targets, custom targets or target directories, and unsupported wrappers | Execute through the selected compiler chain |
+| External target directories | Active for eligible native units; Cargo's physical output parent remains executor-local |
+| Cross targets, custom targets, and unsupported wrappers | Execute through the selected compiler chain |
 
 The default Apple linker chain and a Linux `cc`-selected ELF linker with GNU-compatible dependency evidence are
-certified. Windows COFF linking, explicit linker selection, custom linker arguments, and external codegen backends
+certified. Bare and boolean `linker-plugin-lto` forms use rustc's boolean grammar; explicit plugin library paths remain
+unsupported. Windows COFF linking, explicit linker selection, custom linker arguments, and external codegen backends
 execute normally until their complete input boundary is graduated.
 
 ## Benchmark evidence

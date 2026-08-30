@@ -26,7 +26,7 @@ See [Planning](planning.md) for the consumer contract.
 
 ```bash
 cargo rail config locate
-cargo rail config explain --all -f json
+cargo rail config explain --all --json
 cargo rail config validate --strict
 ```
 
@@ -40,7 +40,7 @@ archives—including both Linux musl archives—install the complete component s
 toolchain with:
 
 ```bash
-cargo rail surface --prepare -f json
+cargo rail surface --prepare --json
 ```
 
 Linux musl Surface also requires the host's standard musl `libgcc_s` runtime, matching rustc's native host-tools
@@ -52,9 +52,9 @@ For an unexpected gate or finding, inspect planning, policy, readiness, and repo
 
 ```bash
 cargo rail plan --json | jq '.work.surface'
-cargo rail config explain surface -f json
-cargo rail surface --prepare -f json
-cargo rail surface --check -f json
+cargo rail config explain surface --json
+cargo rail surface --prepare --json
+cargo rail surface --check --json
 ```
 
 Before changing policy, verify the report's audited and open targets, products, target views, feature views, and
@@ -68,13 +68,20 @@ error. The acquisition journal identifies completed and pending views but never 
 
 ```bash
 cargo rail cache setup --check
-cargo rail cache status --scope local --format json
-cargo rail doctor native-cache --format json
+cargo rail cache probe --json
+cargo rail cache status --scope local --json
+cargo rail doctor native-cache --json
 ```
 
-A missing compiler identity, incremental compilation, unsupported compiler class, cross target, custom target
-directory, conflicting wrapper, different physical source root, or incomplete input evidence executes the original
-compiler. A bypass is safe fallback, not a failed hit.
+A missing compiler identity, incremental compilation, unsupported compiler class, cross target, conflicting wrapper,
+or incomplete input evidence executes the original compiler. Physical-root mode also binds the canonical checkout;
+use `--root-portability remap` only for certified cross-root Rust metadata and library results. External
+`CARGO_TARGET_DIR` locations are supported for eligible native results. A bypass is safe fallback, not a failed hit.
+
+Status schema 14 keeps native failure-reason counters outside the bounded 65,536-event usage ledger. Inspect
+`usage.failure_reason_counts_available` before interpreting `usage.failure_reasons`; event eviction does not erase
+those counters. A strict `cache probe` verifies authenticated provider and protocol readiness without exposing the
+remote URL, object names, credentials, or local paths.
 
 Disable an installed wrapper for one process tree without changing setup:
 
@@ -82,7 +89,7 @@ Disable an installed wrapper for one process tree without changing setup:
 CARGO_RAIL_CACHE=off cargo check --locked
 ```
 
-`cargo rail unify --check -f json` reports its separate compiler-evidence cache. That cache never restores Cargo build
+`cargo rail unify --check --json` reports its separate compiler-evidence cache. That cache never restores Cargo build
 artifacts.
 
 Preview cleanup before removing state:
@@ -105,7 +112,7 @@ See [Caching](caching.md) for exact eligibility and support.
 recovery command Cargo-Rail reports:
 
 ```bash
-cargo rail release status --format json
+cargo rail release status --json
 cargo rail release resume target/cargo-rail/releases/release-<id>.json
 ```
 

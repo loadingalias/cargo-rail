@@ -19,7 +19,7 @@ cargo rail init --dry-run
 cargo rail init
 cargo rail config locate
 cargo rail config print
-cargo rail config explain --all -f json
+cargo rail config explain --all --json
 cargo rail config validate --strict
 cargo rail config migrate --check
 ```
@@ -116,15 +116,9 @@ This is a Cargo-only projection, not a general command hook.
 auxiliary_cargo_manifests = ["fuzz/Cargo.toml", "tools/check/Cargo.toml"]
 ```
 
-To replace commit-driven changelog automation:
-
-1. Set `release.source = "commits"` temporarily.
-2. Match the existing changelog filters and compare `cargo rail release check --all --bump auto` with the old plan.
-3. Add reviewed intent to new changes with `cargo rail change add`.
-4. Switch to `source = "changes"` only after every pending release has reviewed change files.
-
-Cargo-Rail uses fixed changelog placeholders rather than a template engine. Put prose that needs custom logic in the
-reviewed change file.
+New changes should use reviewed change files. Commit-derived release prose remains compatibility behavior, not the
+default authoring path. Cargo-Rail uses fixed changelog placeholders rather than a template engine; put prose that
+needs custom logic in the reviewed change file.
 
 ### Repository work
 
@@ -178,11 +172,11 @@ crate.
 Repository `[cache]` configuration is rejected. Remote URLs, credentials, provider environment, local CAS placement,
 and distributed-worker selection are machine-owned cache setup.
 
-Execution tables and the retired `[change-detection]` policy are rejected. Keep commands in Cargo, nextest, Just,
-scripts, or CI, and register only their positive inputs under `[plan.work.NAME]`.
+Execution tables and path-category planning policy are rejected. Keep commands in Cargo, nextest, Just, scripts, or
+CI, and register only their positive inputs under `[plan.work.NAME]`.
 
-Deprecated fields remain readable only for explicit semantic migration. `config migrate` preserves unrelated TOML and
-does not materialize coded defaults.
+When `config explain` reports migration state, `config migrate` preserves unrelated TOML and does not materialize
+coded defaults.
 
 ## Exit behavior
 

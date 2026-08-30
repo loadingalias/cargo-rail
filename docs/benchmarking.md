@@ -87,6 +87,10 @@ just bench-native-cache-resume target/benchmarks/native-cache/<run>
 Resume refuses a changed repository or worktree. Start a new result after changing the source, harness, binary,
 toolchain, host, cache policy, or protocol.
 
+Root-portability evidence must cover same-root and independent-root checkouts, an external `CARGO_TARGET_DIR`, and a
+same-size mutation of a compiler-selected repository input that produces a miss. Report full source-capture work
+separately from the bounded selected-input refresh; a warm lookup is not credible if it hides either cost.
+
 ## Remote and platform qualification
 
 A loopback fixture or SDK mock proves protocol behavior, not provider performance. Cross-root remote evidence needs a
@@ -95,7 +99,8 @@ absence, corruption, and outage fallback. Use the `qualify-native-cache-*`,
 `validate-native-cache-remote-pair`, and provider-specific cleanup recipes listed by `just --list`.
 
 Remote performance needs disposable real provider authority and independent machines. Interleave Cargo-Rail import
-with the pinned remote comparator; retain provider requests, bytes, cache outcomes, resource use, and cleanup proof.
+with the pinned remote comparator; retain provider requests, bytes, cache outcomes, selected-input mutation and
+external-target-root evidence, resource use, and cleanup proof.
 
 Timing does not prove platform correctness. Run the native-host qualification front doors for every claimed host:
 
