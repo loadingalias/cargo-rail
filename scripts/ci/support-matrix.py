@@ -1250,6 +1250,15 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         and "dependencies" not in portable_fixture,
         "remote cache qualification needs one dependency-free portable positive control",
     )
+    portable_user_fixture = load_toml(
+        REPOSITORY_ROOT
+        / "tests/fixtures/native_cache/real_world/crates/fixture-portable-user/Cargo.toml"
+    )
+    require(
+        portable_user_fixture.get("dependencies", {}).get("fixture-portable", {}).get("path")
+        == "../fixture-portable",
+        "remote cache qualification must compile the portable control as a test dependency",
+    )
     for stale_match in (
         '.reason == "verified_remote_result"',
         '.reason == "verified_local_result"',
