@@ -140,8 +140,8 @@ pub(crate) fn plan_lockfiles(
             ContentDigest::sha256(&after),
         );
         projections.push(PlannedAuxiliaryLockfile {
-            manifest_path: workspace.manifest_path,
-            lockfile_path: workspace.lockfile_path,
+            manifest_path: portable_contract_path(&workspace.manifest_path),
+            lockfile_path: portable_contract_path(&workspace.lockfile_path),
             before_digest: digest(&before),
             after_digest: digest(&after),
             content,
@@ -287,6 +287,10 @@ fn relative_isolated(root: &Path, path: &Path) -> RailResult<PathBuf> {
             root.display()
         ))
     })
+}
+
+fn portable_contract_path(path: &Path) -> PathBuf {
+    PathBuf::from(crate::utils::path_to_git_format(path))
 }
 
 fn bind_planned_digest(
@@ -787,6 +791,10 @@ mod tests {
     fn git_entry_parsers_use_portable_repository_paths() {
         let path = crate::utils::path_to_git_format(Path::new("aux\\Cargo.toml"));
         assert_eq!(path, "aux/Cargo.toml");
+        assert_eq!(
+            portable_contract_path(Path::new("aux\\Cargo.lock")),
+            Path::new("aux/Cargo.lock")
+        );
         assert_eq!(
             parse_head_entry(b"100644 blob head-object\taux/Cargo.toml\0", &path),
             Some(("100644".to_string(), "head-object".to_string()))
