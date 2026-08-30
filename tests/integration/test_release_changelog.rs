@@ -8,10 +8,28 @@
 
 #[cfg(unix)]
 use crate::helpers::isolated_cargo_rail_command;
-use crate::helpers::{NestedWorkspace, TestWorkspace, cargo_rail_command, git, run_cargo_rail};
+use crate::helpers::{NestedWorkspace, TestWorkspace, cargo_command, cargo_rail_command, git, run_cargo_rail};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+fn generate_lockfile(workspace: &Path) -> Result<()> {
+    let output = cargo_command(workspace)
+        .args(["generate-lockfile", "--manifest-path", "Cargo.toml"])
+        .output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "Cargo.lock generation failed in '{}': {}",
+        workspace.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    anyhow::ensure!(
+        workspace.join("Cargo.lock").is_file(),
+        "Cargo succeeded without creating '{}'",
+        workspace.join("Cargo.lock").display()
+    );
+    Ok(())
+}
 
 fn write_release_config(ws: &TestWorkspace, extras: &str) -> Result<()> {
     ws.write_release_config(&format!(
@@ -113,15 +131,7 @@ publish = false
         ),
     )?;
     std::fs::write(root.join("src/lib.rs"), "pub fn auxiliary() {}\n")?;
-    let output = Command::new("cargo")
-        .args(["generate-lockfile", "--manifest-path"])
-        .arg(root.join("Cargo.toml"))
-        .output()?;
-    anyhow::ensure!(
-        output.status.success(),
-        "auxiliary Cargo.lock generation failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    generate_lockfile(&root)?;
     Ok(root)
 }
 
@@ -1632,7 +1642,13 @@ auxiliary_cargo_manifests = ["aux-one/Cargo.toml", "aux-two/Cargo.toml"]
                 "json",
             ],
         )?;
-        assert_eq!(check.status.code(), Some(1));
+        assert_eq!(
+            check.status.code(),
+            Some(1),
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&check.stdout),
+            String::from_utf8_lossy(&check.stderr)
+        );
         let check: serde_json::Value = serde_json::from_slice(&check.stdout)?;
         assert_eq!(check["release_plan"]["plan_contract_version"], 5);
         let projections = check["release_plan"]["auxiliary_lockfiles"]
@@ -1712,15 +1728,7 @@ fn release_updates_all_packages_in_one_auxiliary_cargo_invocation() {
         let ws = TestWorkspace::new()?;
         ws.add_crate("dual-release-one", "0.1.0", &[])?;
         ws.add_crate("dual-release-two", "0.1.0", &[])?;
-        let root_lock = Command::new("cargo")
-            .args(["generate-lockfile", "--manifest-path"])
-            .arg(ws.path.join("Cargo.toml"))
-            .output()?;
-        anyhow::ensure!(
-            root_lock.status.success(),
-            "root Cargo.lock generation failed: {}",
-            String::from_utf8_lossy(&root_lock.stderr)
-        );
+        generate_lockfile(&ws.path)?;
         add_auxiliary_cargo_workspace_with_dependencies(
             &ws,
             "aux-dual",
@@ -1884,16 +1892,8 @@ nested-crlf = { path = "../crates/nested-crlf" }
 "#,
         )?;
         std::fs::write(auxiliary.join("src/lib.rs"), "pub fn auxiliary() {}\n")?;
-        for manifest in [ws.workspace_root.join("Cargo.toml"), auxiliary.join("Cargo.toml")] {
-            let output = Command::new("cargo")
-                .args(["generate-lockfile", "--manifest-path"])
-                .arg(manifest)
-                .output()?;
-            anyhow::ensure!(
-                output.status.success(),
-                "Cargo.lock generation failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+        for workspace in [&ws.workspace_root, &auxiliary] {
+            generate_lockfile(workspace)?;
         }
         std::fs::write(
             ws.workspace_root.join(".config/rail.toml"),
@@ -2100,16 +2100,8 @@ nested-release = { path = "../crates/nested-release" }
 "#,
         )?;
         std::fs::write(auxiliary.join("src/lib.rs"), "pub fn auxiliary() {}\n")?;
-        for manifest in [ws.workspace_root.join("Cargo.toml"), auxiliary.join("Cargo.toml")] {
-            let output = Command::new("cargo")
-                .args(["generate-lockfile", "--manifest-path"])
-                .arg(manifest)
-                .output()?;
-            anyhow::ensure!(
-                output.status.success(),
-                "Cargo.lock generation failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+        for workspace in [&ws.workspace_root, &auxiliary] {
+            generate_lockfile(workspace)?;
         }
         std::fs::write(
             ws.workspace_root.join(".config/rail.toml"),
