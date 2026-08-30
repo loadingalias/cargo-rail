@@ -87,7 +87,8 @@ expected_prefix="cache/cargo-rail/$provider_slug/v3/task9/$run_id"
 }
 
 results="$repo_root/benchmark_results/native-cache/$run_id-$phase"
-state="$repo_root/benchmark_results/native-cache-s3-state/$run_id-$phase"
+state_root="$repo_root/benchmark_results/native-cache-s3-state/$run_id"
+state="$state_root/$phase"
 [[ ! -e "$results" ]] || {
   echo "remote-cache qualification result already exists: $results" >&2
   exit 2
@@ -126,7 +127,9 @@ capture_worktree_patch() {
   done < <(git -C "$repo_root" ls-files --others --exclude-standard -z)
 }
 
-shared_git="$state/fixture-git-source"
+# The file URL is a Cargo source identity, so producer and consumer must materialize
+# the same logical dependency even though their fixture roots are intentionally distinct.
+shared_git="$state_root/fixture-git-source"
 workloads=(check build test)
 setup_mode="read"
 [[ "$phase" == producer ]] && setup_mode=read-write
@@ -240,8 +243,6 @@ run_workload() {
   local root="$state/fixtures/$workload"
   local cargo_home="$state/cargo-homes/$workload"
   local directory="$results/raw/$workload/$label"
-  local mode=read
-  [[ "$phase" == producer ]] && mode=read-write
   rm -rf -- "$root/target"
   mkdir -p "$directory/events"
   chmod 700 "$directory" "$directory/events"
@@ -262,6 +263,9 @@ run_workload() {
     --unset CARGO_TARGET_DIR
     --unset RUSTFLAGS
     --unset CARGO_ENCODED_RUSTFLAGS
+    --unset CARGO_RAIL_CACHE_REMOTE
+    --unset CARGO_RAIL_CACHE_MODE
+    --unset CARGO_RAIL_CACHE_REMOTE_ENVIRONMENT
     --env "CARGO_HOME=$cargo_home"
     --env CARGO_TERM_COLOR=never
     --env CARGO_NET_OFFLINE=true

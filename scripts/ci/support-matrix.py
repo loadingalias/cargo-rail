@@ -1199,6 +1199,22 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         "--root-portability remap" in remote_qualification,
         "remote cache qualification must prove cross-root portable identities",
     )
+    require(
+        'state_root="$repo_root/benchmark_results/native-cache-s3-state/$run_id"'
+        in remote_qualification
+        and 'state="$state_root/$phase"' in remote_qualification
+        and 'shared_git="$state_root/fixture-git-source"' in remote_qualification,
+        "remote cache qualification must keep the logical Git source stable across fixture roots",
+    )
+    for transient_selector in (
+        "CARGO_RAIL_CACHE_REMOTE",
+        "CARGO_RAIL_CACHE_MODE",
+        "CARGO_RAIL_CACHE_REMOTE_ENVIRONMENT",
+    ):
+        require(
+            f"--unset {transient_selector}" in remote_qualification,
+            f"remote cache qualification does not isolate installed authority from {transient_selector}",
+        )
     for reason in (
         "verified_remote_result",
         "verified_local_result",
