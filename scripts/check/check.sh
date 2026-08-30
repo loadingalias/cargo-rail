@@ -100,7 +100,11 @@ fi
 
 echo "Reviewed release intent..."
 if required cargo.package; then
-  cargo rail change check --merge-base --required
+  if [ "${CARGO_RAIL_OPERATION:-}" = release ] && [ "${CARGO_RAIL_RELEASE_PUSH:-}" = 1 ]; then
+    echo "Release transaction consumed reviewed change files."
+  else
+    cargo rail change check --merge-base --required
+  fi
 else
   echo "Skipped change-file coverage."
 fi
