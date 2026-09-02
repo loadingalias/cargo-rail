@@ -2,6 +2,7 @@
 
 pub(crate) mod auxiliary;
 pub mod change_files;
+mod path_serde;
 pub mod planner;
 mod process;
 pub mod publisher;

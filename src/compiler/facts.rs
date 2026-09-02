@@ -651,9 +651,28 @@ impl CompilerFactPackage {
 
 impl CompilerFactSource {
     fn validate(&self) -> RailResult<()> {
-        validate_sha256(&self.content_digest, "compiler fact source digest")?;
+        match &self.identity {
+            CompilerFactSourceIdentity::Exact(digest) => {
+                validate_sha256(digest, "compiler fact exact-source digest")?;
+            }
+            CompilerFactSourceIdentity::CompilerGenerated(identity) => {
+                validate_sha256(identity, "compiler fact generated-source identity")?;
+                if !matches!(self.path, CompilerFactSourcePath::Generated(_)) {
+                    return Err(RailError::message(
+                        "compiler-generated source identity names a repository path",
+                    ));
+                }
+            }
+        }
         match &self.path {
-            CompilerFactSourcePath::Repository(path) => validate_repository_path(path),
+            CompilerFactSourcePath::Repository(path) => {
+                if !matches!(self.identity, CompilerFactSourceIdentity::Exact(_)) {
+                    return Err(RailError::message(
+                        "repository compiler fact source does not have exact byte authority",
+                    ));
+                }
+                validate_repository_path(path)
+            }
             CompilerFactSourcePath::Generated(path) => validate_generated_path(path),
         }
     }
@@ -817,7 +836,7 @@ fn validate_span(span: CompilerFactSpan, sources: &[CompilerFactSource]) -> Rail
     let is_within_source = span.end <= source.bytes;
     if !is_nonempty || !is_within_source {
         return Err(RailError::message(
-            "compiler fact span is empty or outside its exact source bytes",
+            "compiler fact span is empty or outside its source-coordinate extent",
         ));
     }
     Ok(())
@@ -1073,7 +1092,7 @@ mod tests {
                 ],
                 sources: vec![CompilerFactSource {
                     path: CompilerFactSourcePath::Repository("src/lib.rs".to_string()),
-                    content_digest: format!("sha256:{}", "6".repeat(64)),
+                    identity: CompilerFactSourceIdentity::Exact(format!("sha256:{}", "6".repeat(64))),
                     bytes: 22,
                 }],
                 items: vec![module(), function()],
@@ -1260,6 +1279,30 @@ mod tests {
         let mut mismatched = fragment();
         mismatched.object.items[0].macro_provenance = CompilerFactMacroProvenance::Generated;
         assert!(decode(&mismatched).is_err());
+
+        let mut opaque_repository = fragment();
+        opaque_repository.object.sources[0].identity =
+            CompilerFactSourceIdentity::CompilerGenerated(format!("sha256:{}", "a".repeat(64)));
+        assert!(decode(&opaque_repository).is_err());
+    }
+
+    #[test]
+    fn fragment_accepts_compiler_generated_source_identity_for_expansions() {
+        let mut generated = fragment();
+        generated.object.sources[0].path =
+            CompilerFactSourcePath::Generated(format!("/cargo-rail/generated/{}.rs", "a".repeat(64)));
+        generated.object.sources[0].identity =
+            CompilerFactSourceIdentity::CompilerGenerated(format!("sha256:{}", "a".repeat(64)));
+        for item in &mut generated.object.items {
+            item.macro_provenance = CompilerFactMacroProvenance::Expansion(None);
+        }
+        generated
+            .object
+            .completion
+            .coverage
+            .insert(CompilerFactCoverage::GeneratedSources);
+
+        decode(&generated).expect("compiler-generated expansion source should be admitted");
     }
 
     #[test]
@@ -1302,7 +1345,7 @@ mod tests {
         let mut cross_file = fragment();
         cross_file.object.sources.push(CompilerFactSource {
             path: CompilerFactSourcePath::Repository("src/z.rs".to_string()),
-            content_digest: format!("sha256:{}", "7".repeat(64)),
+            identity: CompilerFactSourceIdentity::Exact(format!("sha256:{}", "7".repeat(64))),
             bytes: 22,
         });
         cross_file.object.completion.sources += 1;

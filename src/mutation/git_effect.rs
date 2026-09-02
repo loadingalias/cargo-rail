@@ -2236,7 +2236,7 @@ fn retain_directory(path: &Path, description: &str) -> RailResult<RetainedDirect
         .map_err(|error| RailError::message(format!("failed to retain {description} '{}': {error}", path.display())))?
     };
     #[cfg(windows)]
-    let handle = crate::windows_fs::open_for_execution_guard(path)
+    let handle = crate::windows_fs::open_for_mutable_directory_guard(path)
         .map_err(|error| RailError::message(format!("failed to retain {description} '{}': {error}", path.display())))?;
     #[cfg(not(any(unix, windows)))]
     let handle = File::open(path)?;
@@ -2319,7 +2319,7 @@ fn retain_child_directory(parent: &RetainedDirectory, name: &str) -> RailResult<
         })?
     };
     #[cfg(windows)]
-    let handle = crate::windows_fs::open_for_execution_guard(&path)?;
+    let handle = crate::windows_fs::open_for_mutable_directory_guard(&path)?;
     #[cfg(not(any(unix, windows)))]
     let handle = File::open(&path)?;
     let directory = RetainedDirectory {

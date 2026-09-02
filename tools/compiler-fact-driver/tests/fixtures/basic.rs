@@ -7,6 +7,14 @@ tokio::task_local! {
   pub static TASK_CONTEXT: usize;
 }
 
+std::thread_local! {
+  static STD_THREAD_LOCAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub fn std_thread_local_value() -> bool {
+  STD_THREAD_LOCAL.get()
+}
+
 pub struct PublicType {
   private_field: usize,
 }

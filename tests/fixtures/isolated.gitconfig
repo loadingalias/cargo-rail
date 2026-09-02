@@ -1,1 +1,8 @@
-# Intentionally empty global Git configuration for integration tests.
+# Isolate integration fixtures from host identity and line-ending policy while
+# still allowing repository-local tests to opt into another mode explicitly.
+[user]
+	name = Cargo-Rail Integration Tests
+	email = cargo-rail-tests@example.invalid
+
+[core]
+	autocrlf = false

@@ -1150,6 +1150,24 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         '$RUNNER_TEMP/cargo-rail-tmpfs' not in compatibility_workflow,
         "tmpfs compatibility workspaces must remain outside the runner home configuration hierarchy",
     )
+    for fragment in (
+        "size=1g,mode=0700 cargo-rail-tmpfs",
+        "size=64m,mode=0700 cargo-rail-enospc-tmpfs",
+        'echo "FILESYSTEM_ENOSPC_ROOT=$enospc_mount"',
+        'echo "FILESYSTEM_ENOSPC_MAX_BYTES=67108864"',
+        "CARGO_RAIL_TEST_ENOSPC_ROOT: ${{ env.FILESYSTEM_ENOSPC_ROOT || env.FILESYSTEM_ROOT }}",
+        "CARGO_RAIL_TEST_ENOSPC_MAX_BYTES: ${{ env.FILESYSTEM_ENOSPC_MAX_BYTES || '536870912' }}",
+        "target/debug/cargo-rail-native-rustc-worker",
+    ):
+        require(
+            fragment in compatibility_workflow,
+            f"tmpfs compatibility workflow is missing bounded resource policy: {fragment}",
+        )
+    require(
+        'FIXTURE_CACHE_MAX_SIZE = "128MiB"' in corpus_runner
+        and 'FIXTURE_CACHE_MAX_SIZE,' in corpus_runner,
+        "front-door corpus must bound its fixture-only compiler cache",
+    )
     windows_cache_cleanup_step = """\
       - name: Remove ambient Windows compiler-cache installation
         if: matrix.compatibility.full-suite && runner.os == 'Windows'
@@ -1382,6 +1400,7 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         "scripts/ci/verify-gnu-runtime.py",
         "scripts/ci/manufacture-compiler-fact-driver.sh",
         "scripts/ci/install-musl-toolchain.sh",
+        "scripts/ci/test-release-components.py",
         "Select exact native musl Rust host",
         '--host "$TARGET"',
         "if: inputs.stage",
@@ -1396,6 +1415,16 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
             fragment in archive_workflow,
             f"release archive workflow is missing {fragment}",
         )
+    gnu_cargo_cache_step = """\
+      - name: Preserve Cargo inputs at the GNU runtime floor
+        if: endsWith(matrix.target, '-unknown-linux-gnu')
+        uses: ./.github/actions/cache
+"""
+    require(
+        gnu_cargo_cache_step in archive_workflow
+        and "if: ${{ !endsWith(matrix.target, '-unknown-linux-gnu') }}" in archive_workflow,
+        "GNU runtime-floor archives must not depend on a prior dynamically linked Cargo-Rail release",
+    )
     archive_smoke = (
         REPOSITORY_ROOT / "scripts/ci/smoke-release-tar.sh"
     ).read_text(encoding="utf-8")

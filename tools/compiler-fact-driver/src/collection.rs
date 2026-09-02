@@ -24,8 +24,8 @@ use crate::fact_protocol::{
     CompilerFactEdgeKind, CompilerFactEntryPoint, CompilerFactEntryPointKind, CompilerFactInvocation,
     CompilerFactItemKind, CompilerFactMacroProvenance, CompilerFactNamespace, CompilerFactObject,
     CompilerFactPhysicalIdentity, CompilerFactRetention, CompilerFactRetentionReason, CompilerFactSource,
-    CompilerFactSourcePath, CompilerFactSpan, CompilerFactStringId, CompilerFactVisibility, CompilerItemFact,
-    CompilerItemId,
+    CompilerFactSourceIdentity, CompilerFactSourcePath, CompilerFactSpan, CompilerFactStringId, CompilerFactVisibility,
+    CompilerItemFact, CompilerItemId,
 };
 
 struct RawSpan {
@@ -83,7 +83,7 @@ enum RawMacroProvenance {
 
 struct SourceData {
     path: CompilerFactSourcePath,
-    content_digest: String,
+    identity: CompilerFactSourceIdentity,
     bytes: u64,
 }
 
@@ -210,7 +210,7 @@ impl<'tcx> Collector<'tcx> {
             .values()
             .map(|source| CompilerFactSource {
                 path: source.path.clone(),
-                content_digest: source.content_digest.clone(),
+                identity: source.identity.clone(),
                 bytes: source.bytes,
             })
             .collect::<Vec<_>>();
@@ -442,7 +442,7 @@ impl<'tcx> Collector<'tcx> {
             return Err("rustc definition span crosses source files".to_string());
         }
         let physical = source_file_path(self.tcx, &source_file.name);
-        let (path, bytes) = if let Some(physical) = physical {
+        let source = if let Some(physical) = physical {
             let physical = fs::canonicalize(&physical).unwrap_or(physical);
             let bytes = fs::read(&physical).or_else(|_| {
                 source_file
@@ -453,25 +453,34 @@ impl<'tcx> Collector<'tcx> {
             });
             let bytes = bytes.map_err(|error| format!("read source '{}': {error}", physical.display()))?;
             let generated = self.generated_roots.iter().any(|root| physical.starts_with(root));
+            let digest = format!("sha256:{}", hex_digest(&bytes));
             let path = if !generated && let Ok(relative) = physical.strip_prefix(&self.source_root) {
                 CompilerFactSourcePath::Repository(protocol_path(relative))
             } else {
-                generated_source_path(&bytes)
+                generated_source_path(&digest)
             };
-            (path, bytes)
+            SourceData {
+                path,
+                identity: CompilerFactSourceIdentity::Exact(digest),
+                bytes: bytes.len() as u64,
+            }
+        } else if let Some(bytes) = source_file.src.as_deref().map(|source| source.as_bytes()) {
+            let digest = format!("sha256:{}", hex_digest(bytes));
+            SourceData {
+                path: generated_source_path(&digest),
+                identity: CompilerFactSourceIdentity::Exact(digest),
+                bytes: bytes.len() as u64,
+            }
         } else {
-            let bytes = source_file
-                .src
-                .as_deref()
-                .map(|source| source.as_bytes().to_vec())
-                .ok_or_else(|| "compiler-generated source bytes are unavailable".to_string())?;
-            (generated_source_path(&bytes), bytes)
+            let identity = compiler_generated_source_identity(&source_file)?;
+            SourceData {
+                path: compiler_generated_source_path(&identity),
+                identity: CompilerFactSourceIdentity::CompilerGenerated(identity),
+                bytes: source_file.unnormalized_source_len as u64,
+            }
         };
-        self.sources.entry(path.clone()).or_insert_with(|| SourceData {
-            path: path.clone(),
-            content_digest: format!("sha256:{}", hex_digest(&bytes)),
-            bytes: bytes.len() as u64,
-        });
+        let path = source.path.clone();
+        self.sources.entry(path.clone()).or_insert(source);
         Ok(RawSpan {
             path,
             start: source_file.original_relative_byte_pos(span.lo()).to_u32() as u64,
@@ -699,13 +708,58 @@ fn hex_digest(bytes: &[u8]) -> String {
     encoded
 }
 
-fn generated_source_path(bytes: &[u8]) -> CompilerFactSourcePath {
+fn generated_source_path(identity: &str) -> CompilerFactSourcePath {
     let root = if cfg!(windows) {
         "C:/cargo-rail/generated"
     } else {
         "/cargo-rail/generated"
     };
-    CompilerFactSourcePath::Generated(format!("{root}/{}.rs", hex_digest(bytes)))
+    let digest = identity.strip_prefix("sha256:").unwrap_or(identity);
+    CompilerFactSourcePath::Generated(format!("{root}/{digest}.rs"))
+}
+
+fn compiler_generated_source_path(identity: &str) -> CompilerFactSourcePath {
+    let root = if cfg!(windows) {
+        "C:/cargo-rail/compiler-generated"
+    } else {
+        "/cargo-rail/compiler-generated"
+    };
+    let digest = identity.strip_prefix("sha256:").unwrap_or(identity);
+    CompilerFactSourcePath::Generated(format!("{root}/{digest}.rs"))
+}
+
+fn compiler_generated_source_identity(source: &rustc_span::SourceFile) -> Result<String, String> {
+    let (kind, name_hash) = match &source.name {
+        FileName::MacroExpansion(hash) => (b"macro-expansion".as_slice(), hash.as_u64()),
+        FileName::ProcMacroSourceCode(hash) => (b"proc-macro-source".as_slice(), hash.as_u64()),
+        FileName::Anon(hash) => (b"anonymous-source".as_slice(), hash.as_u64()),
+        FileName::CliCrateAttr(hash) => (b"cli-crate-attribute".as_slice(), hash.as_u64()),
+        FileName::CfgSpec(hash) => (b"cfg-specification".as_slice(), hash.as_u64()),
+        FileName::InlineAsm(hash) => (b"inline-assembly".as_slice(), hash.as_u64()),
+        FileName::Real(_) | FileName::Custom(_) | FileName::DocTest(_, _) => {
+            return Err(format!(
+                "compiler-generated source '{:?}' has neither readable bytes nor a content-addressed virtual filename",
+                source.name
+            ));
+        }
+    };
+    let source_hash_kind = source.src_hash.kind.to_string();
+    let mut hasher = Sha256::new();
+    hasher.update(b"cargo-rail-compiler-generated-source-v1\0");
+    hasher.update((kind.len() as u64).to_le_bytes());
+    hasher.update(kind);
+    hasher.update(name_hash.to_le_bytes());
+    hasher.update(source.unnormalized_source_len.to_le_bytes());
+    hasher.update((source_hash_kind.len() as u64).to_le_bytes());
+    hasher.update(source_hash_kind.as_bytes());
+    hasher.update(source.src_hash.hash_bytes());
+    let digest = hasher.finalize();
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    Ok(format!("sha256:{encoded}"))
 }
 
 fn item_id(tcx: TyCtxt<'_>, def_id: DefId) -> CompilerItemId {
@@ -1058,6 +1112,7 @@ impl<'tcx> Visitor<'tcx> for ReferenceVisitor<'tcx> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustc_span::SourceFileHashAlgorithm;
 
     fn raw_span(path: &str, start: u64, end: u64) -> RawSpan {
         RawSpan {
@@ -1065,6 +1120,44 @@ mod tests {
             start,
             end,
         }
+    }
+
+    #[test]
+    fn compiler_generated_virtual_source_without_bytes_has_stable_identity() {
+        let text = "const __RUST_STD_INTERNAL_INIT: bool = false;";
+        let make_source = || {
+            let mut source = rustc_span::SourceFile::new(
+                FileName::macro_expansion_source_code(text),
+                text.to_string(),
+                SourceFileHashAlgorithm::Md5,
+                None,
+            )
+            .expect("virtual source");
+            source.src = None;
+            source
+        };
+
+        let first = make_source();
+        let second = make_source();
+        let identity = compiler_generated_source_identity(&first).expect("compiler-generated identity");
+        assert_eq!(
+            compiler_generated_source_identity(&second).expect("equivalent identity"),
+            identity
+        );
+        assert!(identity.starts_with("sha256:"));
+        let root = if cfg!(windows) {
+            "C:/cargo-rail/compiler-generated"
+        } else {
+            "/cargo-rail/compiler-generated"
+        };
+        assert_eq!(
+            compiler_generated_source_path(&identity),
+            CompilerFactSourcePath::Generated(format!(
+                "{root}/{}.rs",
+                identity.strip_prefix("sha256:").expect("identity digest")
+            ))
+        );
+        assert_eq!(first.unnormalized_source_len as usize, text.len());
     }
 
     #[test]

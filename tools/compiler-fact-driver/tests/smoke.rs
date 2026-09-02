@@ -17,8 +17,8 @@ use fact_protocol::{
     COMPILER_FACT_PROTOCOL_VERSION, CompilerFactCoverage, CompilerFactDomain, CompilerFactEdgeKind,
     CompilerFactFragment, CompilerFactInvocation, CompilerFactItemKind, CompilerFactMacroProvenance,
     CompilerFactNamespace, CompilerFactPackage, CompilerFactProducerAuthority, CompilerFactRole,
-    CompilerFactRunAuthority, CompilerFactSourcePath, CompilerFactTargetKind, CompilerFactUnit, CompilerFactVisibility,
-    CompilerItemFact,
+    CompilerFactRunAuthority, CompilerFactSourceIdentity, CompilerFactSourcePath, CompilerFactTargetKind,
+    CompilerFactUnit, CompilerFactVisibility, CompilerItemFact,
 };
 
 #[test]
@@ -158,6 +158,7 @@ fn matched_driver_emits_canonical_typed_fragment() {
 
     assert_compiler_item_identities(&fragment);
     assert_task_local_expansion(&fragment);
+    assert_std_thread_local_expansion(&fragment);
 
     let (_, second_bytes, second_fragment) = acquire(&second_target);
     assert_eq!(second_bytes, first_bytes);
@@ -203,9 +204,13 @@ fn assert_task_local_expansion(fragment: &CompilerFactFragment) {
             source.bytes > 0,
             "Tokio expansion must retain exact generated source bytes"
         );
+        assert!(matches!(source.identity, CompilerFactSourceIdentity::Exact(_)));
         assert!(item.physical.span.start < item.physical.span.end);
         assert!(item.physical.span.end <= source.bytes);
-        assert!(source.content_digest.starts_with("sha256:"));
+        assert!(matches!(
+            &source.identity,
+            CompilerFactSourceIdentity::Exact(digest) if digest.starts_with("sha256:")
+        ));
     }
 
     assert!(fragment.object.edges.iter().any(|edge| {
@@ -215,6 +220,24 @@ fn assert_task_local_expansion(fragment: &CompilerFactFragment) {
     assert!(fragment.object.edges.iter().any(|edge| {
         edge.source == generated_key.id && task_ids.contains(&edge.target) && edge.kind == CompilerFactEdgeKind::Body
     }));
+}
+
+fn assert_std_thread_local_expansion(fragment: &CompilerFactFragment) {
+    let generated = items(fragment)
+        .find(|item| diagnostic_path(fragment, item).ends_with("STD_THREAD_LOCAL::__RUST_STD_INTERNAL_INIT"))
+        .expect("std thread-local compiler-generated initializer");
+    let source = &fragment.object.sources[generated.physical.span.source as usize];
+    assert!(matches!(source.path, CompilerFactSourcePath::Generated(_)));
+    assert!(matches!(
+        source.identity,
+        CompilerFactSourceIdentity::Exact(_) | CompilerFactSourceIdentity::CompilerGenerated(_)
+    ));
+    assert!(generated.physical.span.start < generated.physical.span.end);
+    assert!(generated.physical.span.end <= source.bytes);
+    assert!(matches!(
+        generated.macro_provenance,
+        CompilerFactMacroProvenance::Expansion(_)
+    ));
 }
 
 fn assert_compiler_item_identities(fragment: &CompilerFactFragment) {

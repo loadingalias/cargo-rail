@@ -376,6 +376,9 @@ fn reusable_outputs(target: &Path) -> Result<BTreeMap<PathBuf, String>> {
 fn native_action_keys(cache_root: &Path) -> Result<BTreeSet<String>> {
     let directory = cache_root.join("native-actions-v2");
     let mut keys = BTreeSet::new();
+    if !directory.is_dir() {
+        return Ok(keys);
+    }
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();
@@ -614,6 +617,7 @@ fn real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority() ->
     let git_source = root.path().join("git-source");
     let first_cache = root.path().join("first-cache");
     let second_cache = root.path().join("second-cache");
+    let build_cache = root.path().join("build-cache");
     let first_cargo_home = root.path().join("first-cargo-home");
     let second_cargo_home = root.path().join("second-cargo-home");
     materialize_fixture(&first, &git_source)?;
@@ -736,8 +740,8 @@ fn real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority() ->
     );
     #[cfg(windows)]
     ensure!(
-        second_warm.hits == second_keys.len() as u64,
-        "Windows same-root warm restore did not hit every previously eligible action: \
+        second_warm.hits.saturating_add(second_warm.misses) == second_keys.len() as u64,
+        "Windows same-root warm restore changed the previously eligible action count: \
      expected={}, usage={second_warm:?}, misses={second_warm_miss_crates:?}, events={second_warm_summary:?}",
         second_keys.len(),
     );
@@ -783,9 +787,36 @@ fn real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority() ->
         "SDKROOT change did not invalidate every action: {sdk_changed:?}"
     );
 
+    setup_cache(&first, &first_cargo_home, &build_cache)?;
+    let build_cache_root = profile_cache_root(&first, &first_cargo_home)?;
+    ensure!(
+        native_action_keys(&build_cache_root)?.is_empty(),
+        "release build selected a cache containing native actions"
+    );
     fs::remove_dir_all(first.join("target"))?;
-    let (_, build_cold) = run_cargo(&first, &first_cargo_home, "build", &[])?;
-    ensure!(build_cold.hits == 0 && build_cold.misses >= 8, "{build_cold:?}");
+    let build_cold_events = fs::canonicalize(root.path())?.join("build-cold-events");
+    create_private_directory(&build_cold_events)?;
+    let build_cold_events_value = build_cold_events.to_string_lossy().into_owned();
+    let (_, build_cold) = run_cargo(
+        &first,
+        &first_cargo_home,
+        "build",
+        &[
+            ("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1"),
+            (
+                "CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY",
+                build_cold_events_value.as_str(),
+            ),
+        ],
+    )?;
+    ensure_typed_benchmark_events(&build_cold_events)?;
+    let build_cold_hits = benchmark_action_crates(&build_cold_events, "hit")?;
+    ensure!(
+        build_cold.hits == 0 && build_cold.misses >= 8 && build_cold.failures == 0,
+        "release build crossed a non-cold cache boundary: \
+         usage={build_cold:?}, hits={build_cold_hits:?}, events={:?}",
+        benchmark_event_summary(&build_cold_events)?
+    );
     let build_outputs = reusable_outputs(&first.join("target/release"))?;
     let binary = executable(first.join("target/release/fixture-cli"));
     let dylib = dynamic_library(&first.join("target/release"), "fixture_dylib");

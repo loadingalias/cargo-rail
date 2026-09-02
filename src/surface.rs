@@ -11,9 +11,9 @@ use serde::Serialize;
 
 use crate::compiler::facts::{
     CompilerFactDomain, CompilerFactEdgeKind, CompilerFactItemKind, CompilerFactMacroProvenance, CompilerFactNamespace,
-    CompilerFactObject, CompilerFactPackage, CompilerFactRetentionReason, CompilerFactRole, CompilerFactSourcePath,
-    CompilerFactSpan, CompilerFactTargetKind, CompilerFactVisibility, CompilerItemFact, CompilerItemId,
-    ValidatedCompilerFactObject, required_compiler_fact_coverage,
+    CompilerFactObject, CompilerFactPackage, CompilerFactRetentionReason, CompilerFactRole, CompilerFactSourceIdentity,
+    CompilerFactSourcePath, CompilerFactSpan, CompilerFactTargetKind, CompilerFactVisibility, CompilerItemFact,
+    CompilerItemId, ValidatedCompilerFactObject, required_compiler_fact_coverage,
 };
 use crate::error::{RailError, RailResult};
 use crate::source::ContentDigest;
@@ -22,11 +22,11 @@ const SURFACE_ITEM_IDENTITY_PREFIX: &str = "surface-item-v1-sha256-";
 const SURFACE_FINDING_IDENTITY_PREFIX: &str = "surface-finding-v1-sha256-";
 const SURFACE_RETENTION_EXAMPLE_LIMIT: usize = 3;
 
-/// Root-independent identity of source bytes used by a declaration.
+/// Root-independent source-coordinate identity used by a declaration.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 struct SurfaceSourceIdentity {
     path: CompilerFactSourcePath,
-    content_digest: String,
+    identity: CompilerFactSourceIdentity,
     bytes: u64,
 }
 
@@ -480,7 +480,7 @@ impl SurfaceGraph {
     fn from_objects(objects: &[&CompilerFactObject]) -> RailResult<Self> {
         let required_coverage = required_compiler_fact_coverage();
         let mut producer = None;
-        let mut sources = BTreeMap::<CompilerFactSourcePath, (String, u64)>::new();
+        let mut sources = BTreeMap::<CompilerFactSourcePath, (CompilerFactSourceIdentity, u64)>::new();
         let mut fragment_item_observations = 0_u64;
         for object in objects {
             if !required_coverage.is_subset(&object.completion.coverage) {
@@ -501,13 +501,13 @@ impl SurfaceGraph {
                 .checked_add(object.completion.items)
                 .ok_or_else(|| RailError::message("surface item observation count overflow"))?;
             for source in &object.sources {
-                let authority = (source.content_digest.clone(), source.bytes);
+                let authority = (source.identity.clone(), source.bytes);
                 if sources
                     .insert(source.path.clone(), authority.clone())
                     .is_some_and(|previous| previous != authority)
                 {
                     return Err(RailError::message(
-                        "surface analysis cannot merge conflicting bytes for one source path",
+                        "surface analysis cannot merge conflicting identities for one source path",
                     ));
                 }
             }
@@ -1252,7 +1252,7 @@ fn surface_span(object: &CompilerFactObject, span: CompilerFactSpan) -> RailResu
     Ok(SurfaceSpan {
         source: SurfaceSourceIdentity {
             path: source.path.clone(),
-            content_digest: source.content_digest.clone(),
+            identity: source.identity.clone(),
             bytes: source.bytes,
         },
         start: span.start,
@@ -1364,7 +1364,7 @@ mod tests {
             ],
             sources: vec![CompilerFactSource {
                 path: CompilerFactSourcePath::Repository(format!("crates/{package_name}/src/lib.rs")),
-                content_digest: format!("sha256:{package_name}"),
+                identity: CompilerFactSourceIdentity::Exact(format!("sha256:{package_name}")),
                 bytes: 1_000,
             }],
             completion: CompilerFactCompletion {
@@ -2046,7 +2046,7 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_source_bytes_cannot_be_merged() {
+    fn conflicting_source_identities_cannot_be_merged() {
         let definition = item(
             (CRATE_A, 1),
             (0, 10),
@@ -2069,12 +2069,12 @@ mod tests {
             Vec::new(),
             Vec::new(),
         );
-        second.sources[0].content_digest = "sha256:changed".to_string();
+        second.sources[0].identity = CompilerFactSourceIdentity::Exact("sha256:changed".to_string());
 
         let error = SurfaceGraph::from_objects(&[&first, &second])
             .err()
             .expect("conflicting sources must fail");
-        assert!(error.to_string().contains("conflicting bytes"));
+        assert!(error.to_string().contains("conflicting identities"));
     }
 
     #[test]

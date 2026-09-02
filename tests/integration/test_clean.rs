@@ -383,8 +383,11 @@ fn v025_compiler_diagnostics_status_and_cleanup_preserve_unknown_siblings() {
         let sibling = predecessor_cache.join("retained-by-another-owner");
         fs::write(&diagnostics, v025_fixture(V025_COMPILER_DIAGNOSTICS))?;
         fs::write(&sibling, b"not cargo-rail predecessor diagnostics")?;
-        let expected_diagnostics = fs::canonicalize(workspace.path())?
-            .join("target/cargo-rail/cache/compiler-diags-v1.json")
+        let expected_diagnostics = cargo_rail::utils::canonicalize_existing(workspace.path())?
+            .join("target")
+            .join("cargo-rail")
+            .join("cache")
+            .join("compiler-diags-v1.json")
             .display()
             .to_string();
 

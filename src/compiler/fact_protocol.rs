@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) const COMPILER_FACT_PROTOCOL_VERSION: u32 = 5;
+pub(crate) const COMPILER_FACT_PROTOCOL_VERSION: u32 = 6;
 pub(crate) const COMPILER_FACT_ANNOUNCEMENT_CODE: &str = "cargo_rail_compiler_fact_v1";
 pub(crate) const COMPILER_FACT_ANNOUNCEMENT_PREFIX: &str = "cargo-rail-compiler-fact-v1:";
 pub(crate) const COMPILER_FACT_INVOCATION_ENV: &str = "CARGO_RAIL_COMPILER_FACT_INVOCATION";
@@ -152,13 +152,23 @@ pub(crate) enum CompilerFactSourcePath {
     Generated(String),
 }
 
-/// Exact source bytes named by spans in this fragment.
+/// Source-coordinate authority named by spans in this fragment.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CompilerFactSource {
     pub(crate) path: CompilerFactSourcePath,
-    pub(crate) content_digest: String,
+    pub(crate) identity: CompilerFactSourceIdentity,
     pub(crate) bytes: u64,
+}
+
+/// Whether rustc exposed exact source bytes or only a compiler-owned identity.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "digest", rename_all = "snake_case")]
+pub(crate) enum CompilerFactSourceIdentity {
+    /// SHA-256 of the exact, independently readable source bytes.
+    Exact(String),
+    /// SHA-256 of rustc's content-addressed virtual-file identity.
+    CompilerGenerated(String),
 }
 
 /// UTF-8 byte range in one source-table entry.

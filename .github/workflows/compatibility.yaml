@@ -385,9 +385,12 @@ jobs:
           cargo nextest run -p cargo-rail -P commit --all-features --lib --locked \
             --config-file .config/nextest.toml --no-run
 
-      - name: Strip Linux native wrapper debug sections
+      - name: Strip Linux native cache debug sections
         if: runner.os == 'Linux'
-        run: strip --strip-debug target/debug/cargo-rail-native-rustc-wrapper
+        run: >-
+          strip --strip-debug
+          target/debug/cargo-rail-native-rustc-wrapper
+          target/debug/cargo-rail-native-rustc-worker
 
       - name: Provision Linux tmpfs volume
         if: matrix.filesystem.setup == 'linux-tmpfs'
@@ -395,12 +398,16 @@ jobs:
         run: |
           set -euo pipefail
           mount="/mnt/cargo-rail-tmpfs"
-          sudo mkdir -p "$mount"
-          sudo mount -t tmpfs -o size=512m,mode=0700 cargo-rail-tmpfs "$mount"
-          sudo chown "$(id -u):$(id -g)" "$mount"
+          enospc_mount="/mnt/cargo-rail-enospc-tmpfs"
+          sudo mkdir -p "$mount" "$enospc_mount"
+          sudo mount -t tmpfs -o size=1g,mode=0700 cargo-rail-tmpfs "$mount"
+          sudo mount -t tmpfs -o size=64m,mode=0700 cargo-rail-enospc-tmpfs "$enospc_mount"
+          sudo chown "$(id -u):$(id -g)" "$mount" "$enospc_mount"
           mkdir "$mount/tmp"
           {
             echo "FILESYSTEM_ROOT=$mount"
+            echo "FILESYSTEM_ENOSPC_ROOT=$enospc_mount"
+            echo "FILESYSTEM_ENOSPC_MAX_BYTES=67108864"
             echo "TMPDIR=$mount/tmp"
             echo "TMP=$mount/tmp"
             echo "TEMP=$mount/tmp"
@@ -505,22 +512,23 @@ jobs:
       - name: Prove ENOSPC leaves the old file authoritative
         shell: bash
         env:
-          CARGO_RAIL_TEST_ENOSPC_ROOT: ${{ env.FILESYSTEM_ROOT }}
-          CARGO_RAIL_TEST_ENOSPC_MAX_BYTES: 536870912
+          CARGO_RAIL_TEST_ENOSPC_ROOT: ${{ env.FILESYSTEM_ENOSPC_ROOT || env.FILESYSTEM_ROOT }}
+          CARGO_RAIL_TEST_ENOSPC_MAX_BYTES: ${{ env.FILESYSTEM_ENOSPC_MAX_BYTES || '536870912' }}
         run: |
           cargo nextest run -p cargo-rail -P commit --all-features --lib --locked --config-file .config/nextest.toml \
             -E 'test(=utils::tests::atomic_replacement_preserves_the_old_file_when_the_filesystem_is_full)'
 
-      - name: Unmount Linux tmpfs volume
+      - name: Unmount Linux tmpfs volumes
         if: always() && matrix.filesystem.setup == 'linux-tmpfs'
         shell: bash
         run: |
           set -euo pipefail
-          mount="/mnt/cargo-rail-tmpfs"
-          if mountpoint -q "$mount"; then
-            sudo umount "$mount"
-          fi
-          sudo rmdir "$mount" 2>/dev/null || true
+          for mount in /mnt/cargo-rail-enospc-tmpfs /mnt/cargo-rail-tmpfs; do
+            if mountpoint -q "$mount"; then
+              sudo umount "$mount"
+            fi
+            sudo rmdir "$mount" 2>/dev/null || true
+          done
 
       - name: Detach NTFS VHD and remove UNC share
         if: always() && matrix.filesystem.setup == 'windows-ntfs-vhd'

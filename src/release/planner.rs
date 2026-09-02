@@ -34,6 +34,7 @@ pub struct ReleasePlan {
     /// Summary statistics
     pub summary: ReleaseSummary,
     /// Pending change files consumed by this release plan.
+    #[serde(serialize_with = "super::path_serde::serialize_vec")]
     pub change_files_to_delete: Vec<PathBuf>,
     /// Pending change files rewritten to retain unreleased no-release intent.
     pub change_files_to_update: Vec<PlannedChangeFileUpdate>,
@@ -84,8 +85,10 @@ pub struct CrateReleasePlan {
     /// New version after bump
     pub new_version: Version,
     /// Path to Cargo.toml
+    #[serde(serialize_with = "super::path_serde::serialize")]
     pub manifest_path: PathBuf,
     /// Path to CHANGELOG.md
+    #[serde(serialize_with = "super::path_serde::serialize")]
     pub changelog_path: PathBuf,
     /// Git tag name for this release
     pub tag_name: String,
@@ -137,6 +140,7 @@ pub struct DependencyUpdate {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlannedChangeEntry {
     /// Source change file path.
+    #[serde(serialize_with = "super::path_serde::serialize")]
     pub path: PathBuf,
     /// Requested bump level.
     pub bump: ChangeBump,
@@ -148,6 +152,7 @@ pub struct PlannedChangeEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlannedChangeFileUpdate {
     /// Change file rewritten by the release commit.
+    #[serde(serialize_with = "super::path_serde::serialize")]
     pub path: PathBuf,
     /// Canonical content containing only retained no-release intents.
     pub content: String,
@@ -157,8 +162,10 @@ pub struct PlannedChangeFileUpdate {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlannedAuxiliaryLockfile {
     /// Configured workspace-relative manifest that owns this projection.
+    #[serde(serialize_with = "super::path_serde::serialize")]
     pub manifest_path: PathBuf,
     /// Resolved workspace-relative committed lockfile.
+    #[serde(serialize_with = "super::path_serde::serialize")]
     pub lockfile_path: PathBuf,
     /// SHA-256 of the committed lockfile bytes used to plan.
     pub before_digest: String,

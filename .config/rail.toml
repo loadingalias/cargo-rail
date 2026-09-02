@@ -49,6 +49,8 @@ paths = [
   "scripts/ci/check-installers.sh",
   "scripts/ci/fixtures/fake-ci-rustup.sh",
   "scripts/ci/install-rust-toolchain*.sh",
+  "scripts/ci/test-release-components.py",
+  "scripts/ci/verify-release-components.py",
 ]
 
 [plan.work."docs.generated"]
@@ -96,6 +98,7 @@ paths = [
   "scripts/ci/install-rust-toolchain.sh",
   "scripts/ci/support-matrix.py",
   "scripts/ci/test-gnu-runtime.py",
+  "scripts/ci/test-release-components.py",
   "scripts/ci/verify-gnu-runtime.py",
   "scripts/ci/fixtures/readelf-glibc-*.txt",
   "scripts/ci/verify-release-components.py",

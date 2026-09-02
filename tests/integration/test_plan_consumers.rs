@@ -743,7 +743,9 @@ fn test_ci_scopes_remote_cache_credentials_to_setup_and_compiler_steps() {
     assert_eq!(COMMIT_WORKFLOW.matches(commit_compiler).count(), 5);
     let reusable_compiler = "AWS_ACCESS_KEY_ID: ${{ inputs.native-cache-url != '' && secrets.r2_access_key_id || '' }}";
     assert_eq!(COMPATIBILITY_WORKFLOW.matches(reusable_compiler).count(), 7);
-    assert_eq!(ARCHIVE_WORKFLOW.matches(reusable_compiler).count(), 2);
+    assert_eq!(ARCHIVE_WORKFLOW.matches(reusable_compiler).count(), 0);
+    let archive_compiler = "AWS_ACCESS_KEY_ID: ${{ !endsWith(matrix.target, '-unknown-linux-gnu') && inputs.native-cache-url != '' && secrets.r2_access_key_id || '' }}";
+    assert_eq!(ARCHIVE_WORKFLOW.matches(archive_compiler).count(), 2);
 }
 
 #[test]

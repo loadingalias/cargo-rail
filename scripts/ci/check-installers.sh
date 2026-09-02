@@ -14,6 +14,7 @@ if ! command -v "$python_command" >/dev/null 2>&1; then
   exit 2
 fi
 "$python_command" scripts/ci/test-gnu-runtime.py
+"$python_command" scripts/ci/test-release-components.py
 "$python_command" scripts/ci/http-fixture-server.py --help >/dev/null
 
 placeholder='@CARGO_RAIL_VERSION@'

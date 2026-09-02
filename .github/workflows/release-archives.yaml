@@ -122,6 +122,9 @@ jobs:
           fi
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
+      - name: Verify release component contract
+        run: python3 scripts/ci/test-release-components.py
+
   build:
     name: Build and Verify (${{ matrix.target }})
     needs: prepare
@@ -153,7 +156,18 @@ jobs:
           TOOLCHAIN: ${{ needs.prepare.outputs.msrv }}
         run: scripts/ci/install-rust-toolchain.sh --toolchain "$TOOLCHAIN"
 
+      # GNU archive builders are the runtime-floor authority. Depending on a
+      # previously released dynamically linked binary would make that proof circular.
+      - name: Preserve Cargo inputs at the GNU runtime floor
+        if: endsWith(matrix.target, '-unknown-linux-gnu')
+        uses: ./.github/actions/cache
+        with:
+          shared-key: cargo-rail-release-archives-v2
+          cache-key: ${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       - name: Setup Cargo and compiler caches
+        if: ${{ !endsWith(matrix.target, '-unknown-linux-gnu') }}
         uses: ./.github/actions/cache
         with:
           shared-key: cargo-rail-release-archives-v2
@@ -212,8 +226,8 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-          AWS_ACCESS_KEY_ID: ${{ inputs.native-cache-url != '' && secrets.r2_access_key_id || '' }}
-          AWS_SECRET_ACCESS_KEY: ${{ inputs.native-cache-url != '' && secrets.r2_secret_access_key || '' }}
+          AWS_ACCESS_KEY_ID: ${{ !endsWith(matrix.target, '-unknown-linux-gnu') && inputs.native-cache-url != '' && secrets.r2_access_key_id || '' }}
+          AWS_SECRET_ACCESS_KEY: ${{ !endsWith(matrix.target, '-unknown-linux-gnu') && inputs.native-cache-url != '' && secrets.r2_secret_access_key || '' }}
           AWS_EC2_METADATA_DISABLED: "true"
         run: |
           set -euo pipefail
@@ -246,8 +260,8 @@ jobs:
         id: build
         uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1.30.2
         env:
-          AWS_ACCESS_KEY_ID: ${{ inputs.native-cache-url != '' && secrets.r2_access_key_id || '' }}
-          AWS_SECRET_ACCESS_KEY: ${{ inputs.native-cache-url != '' && secrets.r2_secret_access_key || '' }}
+          AWS_ACCESS_KEY_ID: ${{ !endsWith(matrix.target, '-unknown-linux-gnu') && inputs.native-cache-url != '' && secrets.r2_access_key_id || '' }}
+          AWS_SECRET_ACCESS_KEY: ${{ !endsWith(matrix.target, '-unknown-linux-gnu') && inputs.native-cache-url != '' && secrets.r2_secret_access_key || '' }}
           AWS_EC2_METADATA_DISABLED: "true"
         with:
           bin: cargo-rail,cargo-rail-compiler-observation,cargo-rail-native-rustc-wrapper,cargo-rail-native-rustc-worker,cargo-rail-distributed-worker

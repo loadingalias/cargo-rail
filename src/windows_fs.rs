@@ -702,6 +702,20 @@ pub(crate) fn open_for_execution_guard(path: &Path) -> io::Result<File> {
     options.open(path)
 }
 
+/// Retain one exact directory while permitting mutations beneath it.
+///
+/// Later operations may write the directory namespace, but cannot request the
+/// DELETE access required to rename, delete, or replace the guarded directory
+/// itself. Reparse points are opened rather than followed.
+pub(crate) fn open_for_mutable_directory_guard(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    options.open(path)
+}
+
 /// Open one execution-path guard while following the final reparse point.
 ///
 /// This is used only to prove that a private directory junction still resolves
@@ -1340,8 +1354,8 @@ fn unsupported_with_source(message: &str, source: io::Error) -> io::Error {
 mod tests {
     use super::{
         create_directory_junction, directory_junction_targets, observe_file, open_for_execution_guard,
-        open_for_execution_guard_following_reparse, open_for_observation, open_for_stable_byte_observation,
-        prove_local_ntfs, rename_write_through,
+        open_for_execution_guard_following_reparse, open_for_mutable_directory_guard, open_for_observation,
+        open_for_stable_byte_observation, prove_local_ntfs, rename_write_through,
     };
     use std::fs::{self, File};
     use std::io;
@@ -1452,6 +1466,45 @@ mod tests {
             before.change_time,
             after.change_time
         );
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fallible Windows setup precedes the test assertions"
+    )]
+    fn mutable_directory_guard_allows_child_mutation_but_excludes_replacement() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let guarded = directory.path().join("guarded");
+        let moved = directory.path().join("moved");
+        fs::create_dir(&guarded)?;
+
+        let guard = open_for_mutable_directory_guard(&guarded)?;
+        let observation = observe_file(&guard)?;
+        if !local_ntfs_or_explicitly_unsupported(&guard, observation.volume_serial_number)? {
+            return Ok(());
+        }
+
+        let child_directory = guarded.join("child");
+        let child = child_directory.join("before");
+        let renamed = child_directory.join("after");
+        fs::create_dir(&child_directory)?;
+        fs::write(&child, b"before")?;
+        fs::write(&child, b"after")?;
+        fs::rename(&child, &renamed)?;
+        fs::remove_file(&renamed)?;
+        fs::remove_dir(&child_directory)?;
+
+        let error = fs::rename(&guarded, &moved)
+            .expect_err("a retained directory must exclude deletion and namespace replacement");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(32),
+            "directory replacement must receive ERROR_SHARING_VIOLATION"
+        );
+        drop(guard);
+        fs::rename(&guarded, &moved)?;
         Ok(())
     }
 

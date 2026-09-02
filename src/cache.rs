@@ -570,7 +570,10 @@ mod tests {
         let diagnostics = workspace.path().join("target/cargo-rail/cache/compiler-diags-v1.json");
         let expected_removed = crate::utils::canonicalize_existing(workspace.path())
             .expect("canonical workspace")
-            .join("target/cargo-rail/cache/compiler-diags-v1.json")
+            .join("target")
+            .join("cargo-rail")
+            .join("cache")
+            .join("compiler-diags-v1.json")
             .to_string_lossy()
             .into_owned();
         fs::create_dir_all(diagnostics.parent().expect("diagnostics parent")).expect("diagnostics parent");

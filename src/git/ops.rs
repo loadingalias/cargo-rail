@@ -2876,6 +2876,7 @@ fn read_regular_file_nofollow(root: &Path, path: &Path) -> RailResult<(Vec<u8>, 
             path.display()
         )));
     }
+    drop(ancestor_guards);
     Ok((bytes, metadata))
 }
 
@@ -3547,6 +3548,7 @@ mod tests {
         git.set_config("user.name", "Test User").unwrap();
         git.set_config("user.email", "test@example.com").unwrap();
         git.set_config("commit.gpgsign", "false").unwrap();
+        git.set_config("core.autocrlf", "false").unwrap();
         (directory, git)
     }
 
@@ -4074,7 +4076,12 @@ mod tests {
             }),
             ("author timestamp", |effect| effect.metadata.author_timestamp += 1),
             ("author timezone", |effect| {
-                effect.metadata.author_timezone = "+0000".to_string()
+                effect.metadata.author_timezone = if effect.metadata.author_timezone == "+0000" {
+                    "+0100"
+                } else {
+                    "+0000"
+                }
+                .to_string()
             }),
             ("committer", |effect| effect.metadata.committer.push_str(" changed")),
             ("committer email", |effect| {
@@ -4082,7 +4089,12 @@ mod tests {
             }),
             ("committer timestamp", |effect| effect.metadata.committer_timestamp += 1),
             ("committer timezone", |effect| {
-                effect.metadata.committer_timezone = "+0000".to_string()
+                effect.metadata.committer_timezone = if effect.metadata.committer_timezone == "+0000" {
+                    "+0100"
+                } else {
+                    "+0000"
+                }
+                .to_string()
             }),
         ];
         for (name, mutate) in metadata_mutations {
@@ -4096,6 +4108,7 @@ mod tests {
         let worktree_before = std::fs::read(directory.path().join("file.txt")).unwrap();
         let objects_before = object_store_snapshot(&git);
         for (field, tampered) in variants {
+            assert_ne!(tampered, exact, "{field} mutation must change commit authority");
             let error = git
                 .install_prepared_object_pack_and_update_ref(
                     bundle.reopen().unwrap(),
@@ -4106,7 +4119,7 @@ mod tests {
                     Some(&parent),
                     "git-effect-v1-tampered-commit",
                 )
-                .expect_err("tampered commit authority must fail before repository mutation");
+                .expect_err(field);
             assert!(error.to_string().contains("does not match"), "{field}: {error}");
             assert_eq!(git.head_commit().unwrap(), ref_before, "{field}");
             assert_eq!(

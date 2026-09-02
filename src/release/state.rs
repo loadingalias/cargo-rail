@@ -38,7 +38,9 @@ pub(crate) struct ReleaseState {
     pub skip_tag: bool,
     pub initial_head: String,
     pub branch: String,
+    #[serde(serialize_with = "super::path_serde::serialize_vec")]
     pub planned_paths: Vec<PathBuf>,
+    #[serde(serialize_with = "super::path_serde::serialize_vec")]
     pub control_paths: Vec<PathBuf>,
     pub local_input_backups: Vec<LocalInputBackup>,
     pub crates: Vec<CrateReleaseState>,
@@ -69,6 +71,7 @@ pub(crate) struct ReleaseStateCreate<'a> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct LocalInputBackup {
+    #[serde(serialize_with = "super::path_serde::serialize")]
     pub path: PathBuf,
     pub content: String,
     #[serde(default)]
@@ -731,6 +734,34 @@ mod tests {
         state["plan"].as_object_mut().unwrap().remove("auxiliary_lockfiles");
         let error = load_value(state).unwrap_err();
         assert!(error.to_string().contains("auxiliary_lockfiles"), "{error}");
+    }
+
+    #[test]
+    fn current_state_serializes_release_paths_portably() {
+        let mut state = fixture(RELEASE_STATE_SCHEMA_VERSION, RELEASE_PLAN_CONTRACT_VERSION);
+        state.planned_paths = vec![PathBuf::from(r"crates\fixture\Cargo.toml")];
+        state.control_paths = vec![PathBuf::from(r"release-notes\fixture-v0.1.1.md")];
+        state.local_input_backups = vec![LocalInputBackup {
+            path: PathBuf::from(r".changes\fixture.md"),
+            content: String::new(),
+            restore: BackupRestorePolicy::BeforeFirstCommit,
+        }];
+        state.plan.change_files_to_delete = vec![PathBuf::from(r".changes\fixture.md")];
+
+        let document = serde_json::to_value(state).unwrap();
+        assert_eq!(
+            document["planned_paths"],
+            serde_json::json!(["crates/fixture/Cargo.toml"])
+        );
+        assert_eq!(
+            document["control_paths"],
+            serde_json::json!(["release-notes/fixture-v0.1.1.md"])
+        );
+        assert_eq!(document["local_input_backups"][0]["path"], ".changes/fixture.md");
+        assert_eq!(
+            document["plan"]["change_files_to_delete"],
+            serde_json::json!([".changes/fixture.md"])
+        );
     }
 
     #[test]

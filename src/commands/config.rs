@@ -1158,7 +1158,7 @@ impl SplitManifestAuthority {
 
 #[cfg(windows)]
 fn retain_windows_path(path: &Path, directory: bool) -> RailResult<RetainedWindowsPath> {
-    let handle = crate::windows_fs::open_for_execution_guard(path).map_err(|error| {
+    let handle = crate::windows_fs::open_for_mutable_directory_guard(path).map_err(|error| {
         RailError::message(format!(
             "failed to retain migration input '{}': {error}",
             path.display()
@@ -1826,8 +1826,8 @@ fn unix_opened_path(file: &std::fs::File) -> RailResult<PathBuf> {
     {
         use std::os::fd::AsRawFd as _;
 
-        return std::fs::read_link(Path::new("/proc/self/fd").join(file.as_raw_fd().to_string()))
-            .map_err(|error| RailError::message(format!("failed to resolve retained configuration path: {error}")));
+        std::fs::read_link(Path::new("/proc/self/fd").join(file.as_raw_fd().to_string()))
+            .map_err(|error| RailError::message(format!("failed to resolve retained configuration path: {error}")))
     }
     #[cfg(target_vendor = "apple")]
     {
@@ -2024,7 +2024,7 @@ impl MigrationDestination {
             .parent()
             .ok_or_else(|| RailError::message("configuration migration destination has no parent directory"))?
             .to_path_buf();
-        let parent = crate::windows_fs::open_for_execution_guard(&parent_path).map_err(|error| {
+        let parent = crate::windows_fs::open_for_mutable_directory_guard(&parent_path).map_err(|error| {
             RailError::message(format!(
                 "failed to retain configuration parent directory '{}': {error}",
                 parent_path.display()
@@ -3162,8 +3162,8 @@ mod migration_tests {
 
     #[cfg(windows)]
     #[test]
-    fn primitive_seam_preserves_windows_destination_replacements() -> RailResult<()> {
-        let final_workspace = TestWorkspace::new(ORIGINAL)?;
+    fn primitive_seam_preserves_windows_destination_replacements() {
+        let final_workspace = TestWorkspace::new(ORIGINAL).expect("final-revalidation workspace");
         let displaced_original = final_workspace.config.with_extension("toml.before-final");
         let mut seam = TestMigrationPrimitiveSeam {
             after_final_revalidation: Some(Box::new({
@@ -3179,16 +3179,23 @@ mod migration_tests {
         final_workspace
             .migrate(&mut seam)
             .expect_err("a destination replacement after final validation must not report success");
-        assert_eq!(std::fs::read(&final_workspace.config)?, ORIGINAL);
+        assert_eq!(
+            std::fs::read(&final_workspace.config).expect("restored final-revalidation destination"),
+            ORIGINAL
+        );
         assert!(!displaced_original.exists());
-        let backups = std::fs::read_dir(final_workspace.config.parent().expect("configuration has a parent"))?
+        let backups = std::fs::read_dir(final_workspace.config.parent().expect("configuration has a parent"))
+            .expect("final-revalidation artifacts")
             .filter_map(Result::ok)
             .filter(|entry| entry.file_name().to_string_lossy().contains(".cargo-rail-backup-"))
             .collect::<Vec<_>>();
         assert_eq!(backups.len(), 1);
-        assert_eq!(std::fs::read(backups[0].path())?, CONCURRENT);
+        assert_eq!(
+            std::fs::read(backups[0].path()).expect("preserved final-revalidation replacement"),
+            CONCURRENT
+        );
 
-        let published_workspace = TestWorkspace::new(ORIGINAL)?;
+        let published_workspace = TestWorkspace::new(ORIGINAL).expect("post-publication workspace");
         let displaced_published = published_workspace.config.with_extension("toml.after-publication");
         let mut seam = TestMigrationPrimitiveSeam {
             after_publication: Some(Box::new({
@@ -3204,15 +3211,25 @@ mod migration_tests {
         published_workspace
             .migrate(&mut seam)
             .expect_err("a post-publication replacement must not report success");
-        assert_eq!(std::fs::read(&published_workspace.config)?, CONCURRENT);
-        assert!(!std::fs::read(&displaced_published)?.is_empty());
-        let backups = std::fs::read_dir(published_workspace.config.parent().expect("configuration has a parent"))?
+        assert_eq!(
+            std::fs::read(&published_workspace.config).expect("preserved post-publication destination"),
+            CONCURRENT
+        );
+        assert!(
+            !std::fs::read(&displaced_published)
+                .expect("displaced published configuration")
+                .is_empty()
+        );
+        let backups = std::fs::read_dir(published_workspace.config.parent().expect("configuration has a parent"))
+            .expect("post-publication artifacts")
             .filter_map(Result::ok)
             .filter(|entry| entry.file_name().to_string_lossy().contains(".cargo-rail-backup-"))
             .collect::<Vec<_>>();
         assert_eq!(backups.len(), 1);
-        assert_eq!(std::fs::read(backups[0].path())?, ORIGINAL);
-        Ok(())
+        assert_eq!(
+            std::fs::read(backups[0].path()).expect("preserved post-publication predecessor"),
+            ORIGINAL
+        );
     }
 
     #[cfg(any(unix, windows))]

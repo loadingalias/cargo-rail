@@ -22,6 +22,7 @@ FIXTURE_ROOT = REPOSITORY_ROOT / "tests/compatibility/fixtures/front-door"
 MANIFEST_PATH = REPOSITORY_ROOT / "tests/compatibility/manifest.json"
 PACKAGE = "cargo-rail-compatibility-fixture"
 PLAN_CONTRACT_VERSION = 8
+FIXTURE_CACHE_MAX_SIZE = "128MiB"
 SCRUBBED_ENVIRONMENT = (
     "CARGO",
     "CARGO_BUILD_TARGET",
@@ -68,6 +69,14 @@ def display_argv(argv: list[str]) -> str:
     return subprocess.list2cmdline(argv)
 
 
+def storage_capacity(path: Path) -> str:
+    try:
+        storage = shutil.disk_usage(path)
+    except OSError as error:
+        return f"unavailable ({error})"
+    return f"{storage.free} of {storage.total} bytes available"
+
+
 def run(
     argv: list[str],
     *,
@@ -80,6 +89,7 @@ def run(
     if result.returncode not in expected_codes:
         raise CompatibilityError(
             f"command exited {result.returncode}, expected {expected_codes}: {display_argv(argv)}\n"
+            f"filesystem capacity at failure: {storage_capacity(cwd)}\n"
             f"stdout:\n{result.stdout.decode(errors='replace')}\n"
             f"stderr:\n{result.stderr.decode(errors='replace')}"
         )
@@ -318,7 +328,7 @@ def install_transparent_cache(cargo_rail: Path, workspace: Path, env: dict[str, 
             "--local-dir",
             env["CARGO_RAIL_CACHE_DIR"],
             "--max-size",
-            "1GiB",
+            FIXTURE_CACHE_MAX_SIZE,
             "--quiet",
         ],
         cwd=workspace,
