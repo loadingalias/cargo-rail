@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use crate::compiler::analysis::AnalysisContract;
 use crate::compiler::facts::{
     COMPILER_FACT_PROTOCOL_VERSION, CompilerFactCoverage, CompilerFactDomain, CompilerFactInvocation,
     CompilerFactPackage, CompilerFactProducerAuthority, CompilerFactRole, CompilerFactRunAuthority,
@@ -20,26 +21,37 @@ use crate::source::ContentDigest;
 use crate::workspace::WorkspaceSnapshot;
 
 pub(crate) const FACT_SESSION_ENV: &str = "CARGO_RAIL_COMPILER_FACT_SESSION";
-const FACT_SESSION_VERSION: u32 = 4;
+const FACT_SESSION_VERSION: u32 = 6;
+const LEGACY_FACT_SESSION_VERSION: u32 = 5;
 const MAX_FACT_SESSION_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Authenticated authority to publish facts for one explicitly launched compiler run.
 pub(crate) struct CompilerFactSession {
     observation_directory: PathBuf,
     source_root: PathBuf,
-    fact_families: BTreeSet<CompilerFactFamily>,
+    contract: AnalysisContract,
     typed: Option<CompilerFactTypedSession>,
+    acquisition: Option<crate::compiler::acquisition::broker::BrokerEnvironment>,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CompilerFactSessionRecord {
     version: u32,
+    contract: AnalysisContract,
+    session: AnalysisSessionEnvelope,
+}
+
+/// One-shot physical authority for a single launched Cargo analysis view.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnalysisSessionEnvelope {
     observation_directory_identity: String,
     source_root_identity: String,
-    fact_families: BTreeSet<CompilerFactFamily>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     typed: Option<CompilerFactTypedSession>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    acquisition: Option<crate::compiler::acquisition::broker::BrokerEnvironment>,
 }
 
 /// Exact driver, compiler, view, and Cargo-target authority for typed facts.
@@ -80,36 +92,56 @@ impl CompilerFactSession {
         source_root: &Path,
         fact_families: &BTreeSet<CompilerFactFamily>,
     ) -> RailResult<PathBuf> {
-        Self::write_with_typed(observation_directory, source_root, fact_families, None)
+        let contract = AnalysisContract::new(
+            fact_families.clone(),
+            "test-package".to_string(),
+            "default".to_string(),
+            crate::compiler::model::FeatureSelection::Default,
+            "test-analysis".to_string(),
+            "test-configuration".to_string(),
+            None,
+            BTreeSet::new(),
+        )?;
+        Self::write_with_typed(observation_directory, source_root, contract, None, None)
     }
 
     pub(crate) fn write_with_typed(
         observation_directory: &Path,
         source_root: &Path,
-        fact_families: &BTreeSet<CompilerFactFamily>,
+        contract: AnalysisContract,
         typed: Option<CompilerFactTypedSession>,
+        acquisition: Option<crate::compiler::acquisition::broker::BrokerEnvironment>,
     ) -> RailResult<PathBuf> {
-        if fact_families.is_empty() {
-            return Err(RailError::message(
-                "compiler fact capability requires at least one fact family",
-            ));
-        }
-        if fact_families.contains(&CompilerFactFamily::TypedRustItems) != typed.is_some() {
+        contract.validate()?;
+        if contract.requires_typed_facts() != typed.is_some() {
             return Err(RailError::message(
                 "compiler fact capability typed authority does not match its requested fact families",
             ));
         }
         if let Some(typed) = &typed {
             typed.validate()?;
+            if contract.producer() != Some(&typed.producer_authority)
+                || contract.required_coverage() != &typed.required_coverage
+            {
+                return Err(RailError::message(
+                    "compiler fact capability typed authority does not match its analysis contract",
+                ));
+            }
+        }
+        if let Some(acquisition) = &acquisition {
+            acquisition.validate()?;
         }
         let observation_directory = crate::utils::canonicalize_existing(observation_directory)?;
         let source_root = crate::utils::canonicalize_existing(source_root)?;
         let record = CompilerFactSessionRecord {
             version: FACT_SESSION_VERSION,
-            observation_directory_identity: path_identity(&observation_directory),
-            source_root_identity: path_identity(&source_root),
-            fact_families: fact_families.clone(),
-            typed,
+            contract,
+            session: AnalysisSessionEnvelope {
+                observation_directory_identity: path_identity(&observation_directory),
+                source_root_identity: path_identity(&source_root),
+                typed,
+                acquisition,
+            },
         };
         let encoded = serde_json::to_vec(&record)?;
         let mut builder = tempfile::Builder::new();
@@ -162,24 +194,36 @@ impl CompilerFactSession {
             ));
         }
         let record: CompilerFactSessionRecord = serde_json::from_slice(&encoded)?;
-        if record.version != FACT_SESSION_VERSION
-            || record.observation_directory_identity != path_identity(&canonical_observation_directory)
-            || record.source_root_identity != path_identity(&canonical_source_root)
-            || record.fact_families.is_empty()
-            || record.fact_families.contains(&CompilerFactFamily::TypedRustItems) != record.typed.is_some()
+        record.contract.validate()?;
+        if !matches!(record.version, LEGACY_FACT_SESSION_VERSION | FACT_SESSION_VERSION)
+            || (record.version == LEGACY_FACT_SESSION_VERSION && record.session.acquisition.is_some())
+            || record.session.observation_directory_identity != path_identity(&canonical_observation_directory)
+            || record.session.source_root_identity != path_identity(&canonical_source_root)
+            || record.contract.requires_typed_facts() != record.session.typed.is_some()
         {
             return Err(RailError::message(
                 "compiler fact capability does not authorize this compiler run",
             ));
         }
-        if let Some(typed) = &record.typed {
+        if let Some(typed) = &record.session.typed {
             typed.validate()?;
+            if record.contract.producer() != Some(&typed.producer_authority)
+                || record.contract.required_coverage() != &typed.required_coverage
+            {
+                return Err(RailError::message(
+                    "compiler fact capability typed authority does not match its analysis contract",
+                ));
+            }
+        }
+        if let Some(acquisition) = &record.session.acquisition {
+            acquisition.validate()?;
         }
         Ok(Self {
             observation_directory: observation_directory.to_path_buf(),
             source_root: source_root.to_path_buf(),
-            fact_families: record.fact_families,
-            typed: record.typed,
+            contract: record.contract,
+            typed: record.session.typed,
+            acquisition: record.session.acquisition,
         })
     }
 
@@ -192,11 +236,19 @@ impl CompilerFactSession {
     }
 
     pub(crate) fn fact_families(&self) -> &BTreeSet<CompilerFactFamily> {
-        &self.fact_families
+        self.contract.families()
+    }
+
+    pub(crate) fn analysis_contract(&self) -> &AnalysisContract {
+        &self.contract
     }
 
     pub(crate) fn typed(&self) -> Option<&CompilerFactTypedSession> {
         self.typed.as_ref()
+    }
+
+    pub(crate) fn acquisition(&self) -> Option<&crate::compiler::acquisition::broker::BrokerEnvironment> {
+        self.acquisition.as_ref()
     }
 }
 

@@ -992,10 +992,6 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
             .all(|event| event["reason"] != "verified_distributed_execution"),
         "automatic placement ignored its conservative cost gate: {automatic_events:?}"
     );
-    anyhow::ensure!(
-        installed.join("distributed-placement-v1.json").is_file(),
-        "automatic local execution did not retain placement history"
-    );
     let placement_status = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
         .current_dir(&workspace.path)
         .args(["rail", "cache", "status", "--scope", "local", "-f", "json"])
@@ -1004,9 +1000,24 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
     anyhow::ensure!(placement_status.status.success(), "placement status failed");
     let placement_status: serde_json::Value = serde_json::from_slice(&placement_status.stdout)?;
     let installation = &placement_status["status"]["installation"];
+    let profile_id = installation["profile_id"]
+        .as_str()
+        .context("automatic cache profile ID")?;
+    let profile_state = cargo_home
+        .path()
+        .join("cargo-rail/cache-profiles-v1/state")
+        .join(profile_id);
+    anyhow::ensure!(
+        profile_state.join("distributed-placement-v1.json").is_file(),
+        "automatic local execution did not retain placement history in the selected profile"
+    );
+    anyhow::ensure!(
+        installation["profile_id"] == setup["profile_id"],
+        "placement policy replacement changed the selected cache profile"
+    );
     anyhow::ensure!(installation["distributed_policy"] == "automatic");
     anyhow::ensure!(installation["distributed_placement_history"]["state"] == "ready");
-    anyhow::ensure!(installation["distributed_placement_history"]["local_observations"] == 4);
+    anyhow::ensure!(installation["distributed_placement_history"]["local_observations"] == 1);
     anyhow::ensure!(installation["distributed_placement_history"]["remote_observations"] == 2);
 
     let installed_key_bytes = fs::read(&installed_key)?;
@@ -1031,7 +1042,7 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
     anyhow::ensure!(repair.status.success(), "mTLS identity repair failed: {repair:?}");
     let remove = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
         .current_dir(&workspace.path)
-        .args(["rail", "cache", "remove"])
+        .args(["rail", "cache", "uninstall"])
         .env("CARGO_HOME", cargo_home.path())
         .output()?;
     anyhow::ensure!(remove.status.success(), "mTLS installation removal failed: {remove:?}");

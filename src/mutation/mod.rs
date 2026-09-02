@@ -16,6 +16,8 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+pub(crate) mod git_effect;
+
 /// Version for the mutation contract emitted by plan/apply flows.
 pub const MUTATION_CONTRACT_VERSION: u32 = 2;
 

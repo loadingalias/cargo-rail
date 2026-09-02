@@ -1,0 +1,143 @@
+{
+  "schema_version": 5,
+  "transaction_id": "release-v025-fixture",
+  "status": "active",
+  "phase": "publishing",
+  "mode": "run",
+  "plan": {
+    "plan_contract_version": 5,
+    "snapshot_id": "snapshot-v025",
+    "source": "changes",
+    "canonical_crate_order": ["fixture-crate"],
+    "crates": [
+      {
+        "name": "fixture-crate",
+        "current_version": "0.1.0",
+        "new_version": "0.1.1",
+        "manifest_path": "Cargo.toml",
+        "changelog_path": "CHANGELOG.md",
+        "tag_name": "fixture-v0.1.1",
+        "previous_tag": "v0.1.0",
+        "changelog_range_start": "v0.1.0",
+        "changelog_range_end": "HEAD",
+        "publish": true,
+        "publish_intent": "publish",
+        "generate_changelog": true,
+        "bump": "0.1.0 -> 0.1.1",
+        "bump_reason": "reviewed change intent",
+        "commits": [],
+        "commit_diagnostics": [],
+        "changelog_body": "- exact v0.25 fixture\n",
+        "changelog_entries": [],
+        "dependency_updates": [],
+        "change_entries": [
+          {
+            "path": ".changes/fixture.md",
+            "bump": "patch",
+            "body": "exact v0.25 fixture"
+          }
+        ],
+        "affected_dependents": []
+      }
+    ],
+    "summary": {
+      "total_crates": 1,
+      "crates_to_publish": 1,
+      "crates_to_tag": 1
+    },
+    "change_files_to_delete": [".changes/fixture.md"],
+    "change_files_to_update": [],
+    "auxiliary_lockfiles": [],
+    "skipped": []
+  },
+  "release_config": {
+    "source": "changes",
+    "tag_prefix": "v",
+    "tag_format": "fixture-v{version}",
+    "remote_effects": "github",
+    "registry_publication": "crates-io",
+    "sign_tags": false,
+    "require_changelog_entries": true,
+    "require_release_notes": true,
+    "release_notes_dir": "release-notes",
+    "change_dir": ".changes",
+    "pre_1_breaking_bump": "minor",
+    "unconventional_commits": "warn",
+    "semver_check": "warn",
+    "require_change_files": false,
+    "version_groups": {},
+    "changelog": {
+      "path": "CHANGELOG.md",
+      "relative_to": "crate",
+      "entry_format": "- {scope}{breaking}{description}{prs} ({sha_link})",
+      "emoji": true,
+      "group_order": ["breaking", "feat", "fix", "build", "chore", "ci", "deps", "docs", "other", "perf", "refactor", "style", "test"],
+      "fallback": "other",
+      "groups": [],
+      "filters": {
+        "skip_types": [],
+        "skip_scopes": [],
+        "include_paths": [],
+        "exclude_paths": []
+      },
+      "commit_url": null,
+      "pr_url": null
+    }
+  },
+  "remote_repository": {
+    "host": "github.com",
+    "path": "example/fixture"
+  },
+  "publish_registry": "crates-io",
+  "skip_publish": false,
+  "skip_tag": false,
+  "initial_head": "1111111111111111111111111111111111111111",
+  "branch": "main",
+  "planned_paths": ["Cargo.toml", "CHANGELOG.md", ".changes/fixture.md"],
+  "control_paths": [],
+  "local_input_backups": [
+    {
+      "path": ".changes/fixture.md",
+      "content": "---\nfixture-crate = \"patch\"\n---\n\nexact fixture\n",
+      "restore": "before_first_commit"
+    }
+  ],
+  "crates": [
+    {
+      "name": "fixture-crate",
+      "commit": {
+        "status": "complete",
+        "object": "2222222222222222222222222222222222222222"
+      },
+      "tag": {
+        "status": "in_progress",
+        "object": "2222222222222222222222222222222222222222"
+      },
+      "forge_draft": {
+        "status": "pending"
+      },
+      "publication": {
+        "status": "in_progress",
+        "object": "crates-io:fixture-crate@0.1.1"
+      },
+      "forge_publication": {
+        "status": "pending"
+      }
+    }
+  ],
+  "release_commit": "2222222222222222222222222222222222222222",
+  "commit_push": {
+    "status": "complete",
+    "object": "2222222222222222222222222222222222222222"
+  },
+  "readiness": {
+    "status": "complete",
+    "object": "success:2222222222222222222222222222222222222222"
+  },
+  "tag_push": {
+    "status": "pending"
+  },
+  "abort": {
+    "status": "pending"
+  }
+}

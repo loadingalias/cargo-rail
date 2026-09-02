@@ -54,7 +54,7 @@ msrv_policy = {{ mode = "compute", source = "{}" }}
 #[test]
 fn test_msrv_source_max_preserves_higher_workspace_version() {
     let result: Result<()> = (|| {
-        // Test that msrv_source = "max" preserves workspace version if it's higher
+        // Test that source = "max" preserves workspace version if it's higher
         let workspace = create_workspace_with_rust_version("1.85.0")?;
         write_rail_config(&workspace, "max")?;
 
@@ -80,7 +80,7 @@ fn test_msrv_source_max_preserves_higher_workspace_version() {
 #[test]
 fn test_msrv_source_workspace_preserves_existing() {
     let result: Result<()> = (|| {
-        // Test that msrv_source = "workspace" keeps existing rust-version
+        // Test that source = "workspace" keeps existing rust-version
         let workspace = create_workspace_with_rust_version("1.70.0")?;
         write_rail_config(&workspace, "workspace")?;
 

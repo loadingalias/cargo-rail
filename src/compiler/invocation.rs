@@ -13,6 +13,7 @@ use std::process::{Command, Stdio};
 
 use sha2::{Digest as _, Sha256};
 
+use crate::compiler::capability::LocalCompilerRole as InvocationRole;
 use crate::source::ContentDigest;
 
 /// Process-local control for the outer compiler cache boundary.
@@ -44,6 +45,10 @@ pub(crate) const OBSERVATION_SOURCE_ROOT_ENV: &str = "CARGO_RAIL_COMPILER_OBSERV
 /// Record invocations without enabling cargo-rail's workspace diagnostic lint.
 pub(crate) const OBSERVATION_ONLY_ENV: &str = "CARGO_RAIL_COMPILER_OBSERVATION_ONLY";
 
+/// Force the bounded diagnostic even when repository policy denies warnings.
+/// This argument is injected only into Cargo-Rail's diagnostic subprocess.
+pub(crate) const UNUSED_CRATE_DEPENDENCIES_DIAGNOSTIC_ARGUMENT: &str = "--force-warn=unused-crate-dependencies";
+
 /// Marker inherited only by rustdoc's generated doctest compiler children.
 pub(crate) const FACT_DOCTEST_BUILDER_ENV: &str = "CARGO_RAIL_COMPILER_FACT_DOCTEST_BUILDER";
 
@@ -66,17 +71,6 @@ pub enum PreClapDispatch {
     Cli,
     /// A compiler role ran and produced this process exit code.
     Exit(i32),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InvocationRole {
-    LinkAdapter,
-    DirectCache,
-    MarkedCache,
-    RustcObservation,
-    RustdocObservation,
-    DoctestBuilder,
-    DoctestRunner,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -432,7 +426,7 @@ fn run_direct_cache() -> i32 {
         configured_workspace_wrapper.as_deref(),
     );
     if let Some(reason) = cache_fast_bypass_reason(&invocation, observation_wrapper) {
-        record_early_cache_bypass(reason);
+        record_early_cache_bypass(&invocation, reason);
         crate::compiler::native_cache::record_benchmark_coverage_bypass(
             &invocation.program,
             &invocation.arguments,
@@ -447,14 +441,16 @@ fn run_direct_cache() -> i32 {
         }
         return run_transparently(command, "cargo-rail compiler cache wrapper");
     }
-    let context = crate::compiler::native_cache::NativeCacheContext::load_direct_invocation(
-        &invocation.program,
-        &invocation.arguments,
-    );
+    let context = invocation
+        .compiler_selection(observation_wrapper)
+        .ok_or("compiler_argv_unavailable")
+        .and_then(|(program, arguments)| {
+            crate::compiler::native_cache::NativeCacheContext::load_direct_invocation(program, arguments)
+        });
     match context {
         Ok(context) => run_cache_invocation(invocation, Some(context)),
         Err(reason) => {
-            record_early_cache_bypass(reason);
+            record_early_cache_bypass(&invocation, reason);
             crate::compiler::native_cache::record_benchmark_coverage_bypass(
                 &invocation.program,
                 &invocation.arguments,
@@ -472,9 +468,12 @@ fn run_direct_cache() -> i32 {
     }
 }
 
-fn record_early_cache_bypass(reason: &'static str) {
+fn record_early_cache_bypass(invocation: &CompilerInvocation, reason: &'static str) {
     let trace = std::env::var_os("CARGO_RAIL_CACHE_TRACE").as_deref() == Some(std::ffi::OsStr::new("1"));
-    match crate::cache::installation::record_early_bypass(reason) {
+    let result =
+        crate::compiler::native_cache::NativeCacheContext::direct_invocation_source_root(&invocation.arguments)
+            .and_then(|source_root| crate::cache::installation::record_early_bypass(&source_root, reason));
+    match result {
         Ok(()) if trace => eprintln!(
             "cargo-rail native cache trace: bypass class {reason}; inspect `cargo rail cache status --scope local`"
         ),
@@ -500,18 +499,12 @@ fn run_cache(context: Option<crate::compiler::native_cache::NativeCacheContext>,
 }
 
 fn cache_fast_bypass_reason(invocation: &CompilerInvocation, observation_wrapper: bool) -> Option<&'static str> {
-    if compiler_fact_requires_execution(
-        observation_wrapper,
-        std::env::var_os(crate::compiler::session::FACT_SESSION_ENV).is_some(),
-    ) {
-        return Some("compiler_fact_required");
+    if let Some(reason) = crate::compiler::native_cache::unsupported_native_cache_host_reason() {
+        return Some(reason);
     }
     let Some((program, arguments)) = invocation.compiler_selection(observation_wrapper) else {
         return Some("compiler_argv_unavailable");
     };
-    if !observation_wrapper && !direct_supported_compiler_program_shape(program) {
-        return Some("alternate_compiler_program_identity_unavailable");
-    }
     crate::compiler::native_cache::fast_bypass_reason(program, arguments)
 }
 
@@ -522,21 +515,6 @@ fn direct_fact_observation_wrapper(
     configured_workspace_wrapper: Option<&std::ffi::OsStr>,
 ) -> bool {
     rustc_observation && fact_session_present && configured_workspace_wrapper == Some(invocation.program.as_os_str())
-}
-
-fn compiler_fact_requires_execution(observation_wrapper: bool, fact_session_present: bool) -> bool {
-    observation_wrapper && fact_session_present
-}
-
-fn direct_supported_compiler_program_shape(program: &std::ffi::OsStr) -> bool {
-    Path::new(program)
-        .file_stem()
-        .and_then(std::ffi::OsStr::to_str)
-        .is_some_and(|name| {
-            name.eq_ignore_ascii_case("clippy-driver")
-                || name.eq_ignore_ascii_case("rustc")
-                || name.get(..5).is_some_and(|prefix| prefix.eq_ignore_ascii_case("rustc"))
-        })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -591,22 +569,8 @@ fn run_cache_invocation(
     match action {
         crate::compiler::native_cache::OuterCacheAction::Hit(exit_code) => exit_code,
         crate::compiler::native_cache::OuterCacheAction::Store(store) => {
-            let crate::compiler::native_cache::OuterCacheStore {
-                recorder,
-                capture,
-                base_action_key,
-                cache_bytes_read,
-                distributed_placement,
-            } = *store;
-            let exit_code = crate::compiler::native_cache::run_and_store(
-                command,
-                recorder,
-                capture,
-                base_action_key,
-                cache_bytes_read,
-                distributed_placement,
-                "cargo-rail compiler cache wrapper",
-            );
+            let exit_code =
+                crate::compiler::native_cache::run_and_store(command, *store, "cargo-rail compiler cache wrapper");
             benchmark_coverage_failure("cargo-rail compiler cache wrapper").unwrap_or(exit_code)
         }
         crate::compiler::native_cache::OuterCacheAction::OperationalFailure(error) => {
@@ -817,7 +781,7 @@ fn run_rustc_with_session(
             .fact_families()
             .contains(&crate::compiler::scheduler::CompilerFactFamily::StableDiagnostics)
     {
-        command.arg("--warn=unused-crate-dependencies");
+        command.arg(UNUSED_CRATE_DEPENDENCIES_DIAGNOSTIC_ARGUMENT);
     }
     command
         .env_remove(WRAPPER_MARKER)
@@ -835,7 +799,12 @@ fn run_rustc_with_session(
     }
 
     let status = command.status();
-    let fact_result = recorder.finish(status.as_ref().is_ok_and(std::process::ExitStatus::success));
+    recorder.set_compiler_exit_code(status.as_ref().ok().and_then(std::process::ExitStatus::code));
+    let fact_result = if std::env::var_os(crate::compiler::native_cache::ANALYSIS_OUTER_OBSERVATION_ENV).is_some() {
+        Ok(())
+    } else {
+        recorder.finish(status.as_ref().is_ok_and(std::process::ExitStatus::success))
+    };
 
     match (status, fact_result) {
         (Ok(status), Ok(())) => compiler_status_code(status),
@@ -1477,11 +1446,45 @@ mod tests {
     }
 
     #[test]
-    fn fact_required_workspace_compilation_bypasses_native_result_reuse() {
-        assert!(compiler_fact_requires_execution(true, true));
-        assert!(!compiler_fact_requires_execution(false, true));
-        assert!(!compiler_fact_requires_execution(true, false));
+    fn declared_local_compiler_roles_are_exactly_the_classifiable_roles() {
+        let classified = [
+            InvocationSignals {
+                link_adapter: true,
+                ..InvocationSignals::default()
+            },
+            InvocationSignals {
+                direct_cache: true,
+                ..InvocationSignals::default()
+            },
+            InvocationSignals {
+                marked_cache: true,
+                ..InvocationSignals::default()
+            },
+            InvocationSignals {
+                rustc_observation: true,
+                ..InvocationSignals::default()
+            },
+            InvocationSignals {
+                rustdoc_observation: true,
+                ..InvocationSignals::default()
+            },
+            InvocationSignals {
+                doctest_builder: true,
+                doctest_runner: true,
+                ..InvocationSignals::default()
+            },
+            InvocationSignals {
+                doctest_runner: true,
+                ..InvocationSignals::default()
+            },
+        ]
+        .map(|signals| signals.classify().expect("unambiguous role").expect("declared role"));
 
+        assert_eq!(classified, crate::compiler::capability::LocalCompilerRole::ALL);
+    }
+
+    #[test]
+    fn fact_session_detects_outer_observation_composition() {
         let invocation = CompilerInvocation::selected("fact-wrapper".into(), vec!["rustc".into()]);
         assert!(direct_fact_observation_wrapper(
             &invocation,
@@ -1507,16 +1510,6 @@ mod tests {
             true,
             Some(std::ffi::OsStr::new("other-wrapper"))
         ));
-    }
-
-    #[test]
-    fn direct_compiler_programs_include_clippy_only_for_explicit_bypass() {
-        assert!(direct_supported_compiler_program_shape(OsStr::new("rustc")));
-        assert!(direct_supported_compiler_program_shape(OsStr::new("rustc.exe")));
-        assert!(direct_supported_compiler_program_shape(OsStr::new("clippy-driver")));
-        assert!(!direct_supported_compiler_program_shape(OsStr::new(
-            "alternate-rust-compiler"
-        )));
     }
 
     #[cfg(unix)]

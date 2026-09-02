@@ -8,6 +8,7 @@ use rustc_hir as hir;
 use rustc_hir::Node;
 use rustc_hir::def::{CtorOf, DefKind, Res};
 use rustc_hir::def_id::{CRATE_DEF_ID, DefId, LocalDefId};
+use rustc_hir::definitions::DefPathData;
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_lint_defs::builtin::DEAD_CODE;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
@@ -36,20 +37,26 @@ struct RawSpan {
 fn merge_visibility_span_into_declaration(
     declaration: &mut RawSpan,
     visibility: &RawSpan,
-    from_expansion: bool,
+    expansion_authority: Option<&RawSpan>,
     diagnostic_path: &str,
 ) -> Result<(), String> {
-    if visibility.path == declaration.path {
-        declaration.start = declaration.start.min(visibility.start);
-        declaration.end = declaration.end.max(visibility.end);
-        return Ok(());
-    }
-    if from_expansion {
-        return Ok(());
-    }
-    Err(format!(
-        "{diagnostic_path}: non-expanded declaration and written visibility span different source files"
-    ))
+    let (authority_start, authority_end) = if visibility.path == declaration.path {
+        (declaration.start, declaration.end)
+    } else if let Some(authority) = expansion_authority
+        && authority.path == visibility.path
+        && visibility.start >= authority.start
+        && visibility.end <= authority.end
+    {
+        (authority.start, authority.end)
+    } else {
+        return Err(format!(
+            "{diagnostic_path}: declaration and written visibility span do not share source-coordinate authority"
+        ));
+    };
+    declaration.path = visibility.path.clone();
+    declaration.start = authority_start.min(visibility.start);
+    declaration.end = authority_end.max(visibility.end);
+    Ok(())
 }
 
 struct RawItem {
@@ -342,11 +349,16 @@ impl<'tcx> Collector<'tcx> {
         let visibility_span = visibility_span(self.tcx, def_id).filter(|span| span.lo() < span.hi());
         let (written_visibility, written_visibility_complete) = written_visibility(self.tcx, def_id, visibility_span);
         let raw_visibility_span = visibility_span.map(|span| self.capture_span(span)).transpose()?;
-        if let Some(visibility) = &raw_visibility_span {
+        if let Some((visibility, visibility_span)) = raw_visibility_span.as_ref().zip(visibility_span) {
+            let expansion_authority = if visibility.path != raw_span.path && span.from_expansion() {
+                self.capture_expansion_authority(span, visibility_span)?
+            } else {
+                None
+            };
             merge_visibility_span_into_declaration(
                 &mut raw_span,
                 visibility,
-                span.from_expansion(),
+                expansion_authority.as_ref(),
                 &self.tcx.def_path_str(def_id.to_def_id()),
             )?;
         }
@@ -397,6 +409,28 @@ impl<'tcx> Collector<'tcx> {
             effective_visibility,
             macro_provenance,
         })
+    }
+
+    fn capture_expansion_authority(
+        &mut self,
+        mut span: rustc_span::Span,
+        visibility: rustc_span::Span,
+    ) -> Result<Option<RawSpan>, String> {
+        let source_map = self.tcx.sess.source_map();
+        let visibility_source = source_map.lookup_source_file(visibility.lo()).start_pos;
+        while let Some(call_site) = span.parent_callsite() {
+            if call_site == span {
+                return Err("rustc returned a cyclic macro expansion ancestry".to_string());
+            }
+            span = call_site;
+            if span.is_dummy() || span.lo() >= span.hi() {
+                continue;
+            }
+            if source_map.lookup_source_file(span.lo()).start_pos == visibility_source {
+                return self.capture_span(span).map(Some);
+            }
+        }
+        Ok(None)
     }
 
     fn capture_span(&mut self, span: rustc_span::Span) -> Result<RawSpan, String> {
@@ -675,8 +709,65 @@ fn generated_source_path(bytes: &[u8]) -> CompilerFactSourcePath {
 }
 
 fn item_id(tcx: TyCtxt<'_>, def_id: DefId) -> CompilerItemId {
-    let hash = tcx.def_path_hash(def_id);
-    CompilerItemId([hash.stable_crate_id().as_u64(), hash.local_hash().as_u64()])
+    let crate_name = tcx.crate_name(def_id.krate);
+    let crate_name = crate_name.as_str();
+    let mut crate_hasher = Sha256::new();
+    crate_hasher.update(b"cargo-rail-compiler-item-crate-v1\0");
+    crate_hasher.update((crate_name.len() as u64).to_le_bytes());
+    crate_hasher.update(crate_name.as_bytes());
+    let crate_digest = crate_hasher.finalize();
+
+    // rustc's DefPathHash is deliberately seeded by StableCrateId. Cargo's
+    // `-Cmetadata` participates in that seed and can change when an otherwise
+    // identical workspace moves, so neither half is a portable fact identity.
+    // Encode the same crate-local structural path without the crate seed.
+    let def_path = tcx.def_path(def_id);
+    let mut definition_hasher = Sha256::new();
+    definition_hasher.update(b"cargo-rail-compiler-item-definition-v1\0");
+    definition_hasher.update((def_path.data.len() as u64).to_le_bytes());
+    for component in def_path.data {
+        let (tag, name) = def_path_component(component.data);
+        definition_hasher.update([tag]);
+        definition_hasher.update(component.disambiguator.to_le_bytes());
+        if let Some(name) = name {
+            let name = name.as_str();
+            definition_hasher.update((name.len() as u64).to_le_bytes());
+            definition_hasher.update(name.as_bytes());
+        } else {
+            definition_hasher.update(0_u64.to_le_bytes());
+        }
+    }
+    let definition_digest = definition_hasher.finalize();
+    CompilerItemId([
+        u64::from_le_bytes(crate_digest[..8].try_into().expect("SHA-256 prefix is eight bytes")),
+        u64::from_le_bytes(
+            definition_digest[..8]
+                .try_into()
+                .expect("SHA-256 prefix is eight bytes"),
+        ),
+    ])
+}
+
+fn def_path_component(data: DefPathData) -> (u8, Option<rustc_span::symbol::Symbol>) {
+    match data {
+        DefPathData::CrateRoot => (0, None),
+        DefPathData::Impl => (1, None),
+        DefPathData::ForeignMod => (2, None),
+        DefPathData::Use => (3, None),
+        DefPathData::GlobalAsm => (4, None),
+        DefPathData::TypeNs(name) => (5, Some(name)),
+        DefPathData::ValueNs(name) => (6, Some(name)),
+        DefPathData::MacroNs(name) => (7, Some(name)),
+        DefPathData::LifetimeNs(name) => (8, Some(name)),
+        DefPathData::Closure => (9, None),
+        DefPathData::Ctor => (10, None),
+        DefPathData::AnonConst => (11, None),
+        DefPathData::OpaqueTy => (12, None),
+        DefPathData::OpaqueLifetime(name) => (13, Some(name)),
+        DefPathData::AnonAssocTy(name) => (14, Some(name)),
+        DefPathData::SyntheticCoroutineBody => (15, None),
+        DefPathData::NestedStatic => (16, None),
+    }
 }
 
 fn fact_kind(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<CompilerFactItemKind> {
@@ -977,13 +1068,72 @@ mod tests {
     }
 
     #[test]
-    fn expansion_visibility_may_come_from_a_different_source_file() {
+    fn expansion_visibility_rebinds_to_its_call_site_source() {
+        let mut declaration = raw_span("src/macros.rs", 20, 40);
+        let visibility = raw_span("src/lib.rs", 104, 107);
+        let call_site = raw_span("src/lib.rs", 80, 120);
+
+        merge_visibility_span_into_declaration(&mut declaration, &visibility, Some(&call_site), "app::Expanded")
+            .expect("captured visibility should use its expansion call-site authority");
+
+        assert_eq!(
+            declaration.path,
+            CompilerFactSourcePath::Repository("src/lib.rs".to_string())
+        );
+        assert_eq!(declaration.start, 80);
+        assert_eq!(declaration.end, 120);
+    }
+
+    #[test]
+    fn declaration_envelopes_visibility_from_the_same_source() {
         let mut declaration = raw_span("src/lib.rs", 20, 40);
-        let visibility = raw_span("src/macros.rs", 4, 7);
+        let visibility = raw_span("src/lib.rs", 4, 7);
 
-        merge_visibility_span_into_declaration(&mut declaration, &visibility, true, "app::Expanded")
-            .expect("macro expansion visibility is conservative, not mutable");
+        merge_visibility_span_into_declaration(&mut declaration, &visibility, None, "app::Written")
+            .expect("one source file is one coordinate authority");
 
+        assert_eq!(declaration.start, 4);
+        assert_eq!(declaration.end, 40);
+    }
+
+    #[test]
+    fn expansion_visibility_rejects_an_unrelated_source_file() {
+        let mut declaration = raw_span("src/macros.rs", 20, 40);
+        let visibility = raw_span("src/lib.rs", 104, 107);
+        let unrelated_call_site = raw_span("src/other.rs", 80, 98);
+
+        let error = merge_visibility_span_into_declaration(
+            &mut declaration,
+            &visibility,
+            Some(&unrelated_call_site),
+            "app::Expanded",
+        )
+        .expect_err("unrelated visibility must not be assigned to an expansion");
+
+        assert!(error.contains("app::Expanded"));
+        assert_eq!(
+            declaration.path,
+            CompilerFactSourcePath::Repository("src/macros.rs".to_string())
+        );
+        assert_eq!(declaration.start, 20);
+        assert_eq!(declaration.end, 40);
+    }
+
+    #[test]
+    fn expansion_visibility_rejects_a_token_outside_the_call_site() {
+        let mut declaration = raw_span("src/macros.rs", 20, 40);
+        let visibility = raw_span("src/lib.rs", 104, 107);
+        let call_site = raw_span("src/lib.rs", 80, 98);
+
+        let error =
+            merge_visibility_span_into_declaration(&mut declaration, &visibility, Some(&call_site), "app::Expanded")
+                .expect_err("visibility outside the matched call site must remain invalid");
+
+        assert!(error.contains("app::Expanded"));
+        assert_eq!(
+            declaration.path,
+            CompilerFactSourcePath::Repository("src/macros.rs".to_string())
+        );
         assert_eq!(declaration.start, 20);
         assert_eq!(declaration.end, 40);
     }
@@ -993,7 +1143,7 @@ mod tests {
         let mut declaration = raw_span("src/lib.rs", 20, 40);
         let visibility = raw_span("src/macros.rs", 4, 7);
 
-        let error = merge_visibility_span_into_declaration(&mut declaration, &visibility, false, "app::Written")
+        let error = merge_visibility_span_into_declaration(&mut declaration, &visibility, None, "app::Written")
             .expect_err("source-written visibility must share declaration authority");
 
         assert!(error.contains("app::Written"));

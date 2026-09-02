@@ -1,9 +1,7 @@
 //! Release planning, validation, durable execution, and recovery.
 
-pub mod attribution;
 pub(crate) mod auxiliary;
 pub mod change_files;
-pub mod changelog;
 pub mod planner;
 mod process;
 pub mod publisher;

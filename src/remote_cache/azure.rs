@@ -20,7 +20,7 @@ use futures_util::TryStreamExt as _;
 
 use super::object::{
     ENTRY_PRELUDE_BYTES, ENTRY_PRELUDE_LEN, EntryBody, EntryState, MAX_ENTRY_BYTES, PutCondition, PutOutcome,
-    STREAM_BUFFER_BYTES, StoredEntry, TransferMetrics,
+    STREAM_BUFFER_BYTES, StoredBytes, StoredEntry, TransferMetrics,
 };
 use super::{RemoteCacheSelection, RemoteStoreError, RemoteStoreResult};
 
@@ -348,6 +348,28 @@ impl AzureBackend {
                 }))
             }
         }
+    }
+
+    pub(super) fn get_bytes(&self, key: &str, maximum: u64) -> RemoteStoreResult<Option<StoredBytes>> {
+        let Some(download) = self.download(key, maximum, RequestKind::CacheGet)? else {
+            return Ok(None);
+        };
+        let mut payload = self.payload(download.body, download.bytes)?;
+        let capacity = usize::try_from(download.bytes)
+            .map_err(|_| RemoteStoreError::integrity("remote evidence object length is invalid"))?;
+        let mut bytes = Vec::with_capacity(capacity);
+        payload
+            .read_to_end(&mut bytes)
+            .map_err(|_| RemoteStoreError::unavailable("remote evidence object stream failed"))?;
+        if bytes.len() != capacity {
+            return Err(RemoteStoreError::integrity(
+                "remote evidence object length changed while reading",
+            ));
+        }
+        Ok(Some(StoredBytes {
+            bytes,
+            etag: download.etag,
+        }))
     }
 
     pub(super) fn put_bytes(&self, key: &str, body: &[u8], condition: PutCondition) -> RemoteStoreResult<PutOutcome> {

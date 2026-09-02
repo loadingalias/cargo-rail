@@ -3,6 +3,17 @@
 use super::helpers::{TestWorkspace, run_cargo_rail};
 use anyhow::Result;
 
+fn write_publication_config(ws: &TestWorkspace) -> Result<()> {
+    std::fs::write(
+        ws.path.join(".config/rail.toml"),
+        r#"[release]
+remote_effects = "push"
+registry_publication = "crates-io"
+"#,
+    )?;
+    Ok(())
+}
+
 fn add_no_release_intent(ws: &TestWorkspace, crate_names: &[&str]) -> Result<()> {
     let entries = crate_names
         .iter()
@@ -27,15 +38,7 @@ fn test_check_validates_crate_exists() {
         ws.add_crate("real-crate", "0.1.0", &[("anyhow", "{ workspace = true }")])?;
 
         // Configure release
-        std::fs::write(
-            ws.path.join(".config/rail.toml"),
-            r#"[workspace]
-root = "."
-
-[release]
-require_clean = false
-"#,
-        )?;
+        write_publication_config(&ws)?;
 
         ws.commit("Add real-crate with release config")?;
 
@@ -65,15 +68,7 @@ fn test_check_passes_for_valid_crate() {
         ws.add_crate("valid-crate", "0.1.0", &[("anyhow", "{ workspace = true }")])?;
 
         // Configure release
-        std::fs::write(
-            ws.path.join(".config/rail.toml"),
-            r#"[workspace]
-root = "."
-
-[release]
-require_clean = false
-"#,
-        )?;
+        write_publication_config(&ws)?;
 
         add_no_release_intent(&ws, &["valid-crate"])?;
         ws.commit("Add valid-crate with release config")?;
@@ -109,15 +104,7 @@ fn test_check_all_crates() {
         ws.add_crate("crate-b", "0.1.0", &[("serde", "{ workspace = true }")])?;
 
         // Configure release
-        std::fs::write(
-            ws.path.join(".config/rail.toml"),
-            r#"[workspace]
-root = "."
-
-[release]
-require_clean = false
-"#,
-        )?;
+        write_publication_config(&ws)?;
 
         add_no_release_intent(&ws, &["crate-a", "crate-b"])?;
         ws.commit("Add crates with release config")?;
@@ -144,23 +131,15 @@ require_clean = false
 
 /// Test check remains a read-only preview when the worktree is dirty.
 #[test]
-fn test_check_tolerates_dirty_preview_despite_legacy_require_clean() {
+fn test_check_tolerates_dirty_preview() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("check-dirty")?;
 
         // Add a crate
         ws.add_crate("dirty-crate", "0.1.0", &[("anyhow", "{ workspace = true }")])?;
 
-        // Configure release with require_clean = true
-        std::fs::write(
-            ws.path.join(".config/rail.toml"),
-            r#"[workspace]
-root = "."
-
-[release]
-require_clean = true
-"#,
-        )?;
+        // Configure release policy.
+        write_publication_config(&ws)?;
 
         add_no_release_intent(&ws, &["dirty-crate"])?;
         ws.commit("Add dirty-crate with config")?;
@@ -214,18 +193,14 @@ publish = false
         std::fs::write(crate_path.join("src/lib.rs"), "pub fn hello() {}")?;
 
         // Configure release
-        std::fs::write(
-            ws.path.join(".config/rail.toml"),
-            r#"[workspace]
-root = "."
+        write_publication_config(&ws)?;
 
-[release]
-require_clean = false
-"#,
-        )?;
-
-        add_no_release_intent(&ws, &["private-crate"])?;
         ws.commit("Add private-crate with config")?;
+        std::fs::create_dir_all(ws.path.join(".changes"))?;
+        std::fs::write(
+            ws.path.join(".changes/private-crate.md"),
+            "---\n\"private-crate\" = \"patch\"\n---\n\nRelease the private crate.\n",
+        )?;
 
         // Check should succeed and report the crate as not publishable
         let output = run_cargo_rail(
@@ -234,9 +209,10 @@ require_clean = false
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
 
-        assert!(
-            output.status.success(),
-            "check should succeed for explicit unpublishable crate.\nstdout:\n{}\nstderr:\n{}",
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "pending release check should exit 1.\nstdout:\n{}\nstderr:\n{}",
             stdout,
             String::from_utf8_lossy(&output.stderr)
         );
@@ -253,25 +229,17 @@ require_clean = false
     super::helpers::finish_test(result);
 }
 
-/// Test check defaults to require_clean=true when no explicit release config
+/// Test check requires explicit release configuration.
 #[test]
 fn test_check_requires_release_config() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("check-no-config")?;
 
-        // Add a crate with release config (require_clean = false to allow clean workspace check)
+        // Add a crate with release config.
         ws.add_crate("some-crate", "0.1.0", &[])?;
 
-        // Config WITH [release] section and require_clean = false
-        std::fs::write(
-            ws.path.join(".config/rail.toml"),
-            r#"[workspace]
-root = "."
-
-[release]
-require_clean = false
-"#,
-        )?;
+        // Config with an explicit [release] section.
+        write_publication_config(&ws)?;
 
         add_no_release_intent(&ws, &["some-crate"])?;
         ws.commit("Add some-crate with release config")?;
@@ -306,15 +274,7 @@ fn test_check_requires_crate_or_all() {
         ws.add_crate("any-crate", "0.1.0", &[])?;
 
         // Configure release
-        std::fs::write(
-            ws.path.join(".config/rail.toml"),
-            r#"[workspace]
-root = "."
-
-[release]
-require_clean = false
-"#,
-        )?;
+        write_publication_config(&ws)?;
 
         ws.commit("Add any-crate with config")?;
 

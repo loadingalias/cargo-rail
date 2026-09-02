@@ -586,11 +586,11 @@ mod tests {
             lint: "unnecessary-public".to_string(),
             package: Some("app".to_string()),
             crate_name: None,
-            item: "migration::legacy".to_string(),
+            item: "internal::entry".to_string(),
             kind: Some("function".to_string()),
             target: None,
             level: SurfaceLintLevel::Expect,
-            reason: "migration compatibility".to_string(),
+            reason: "explicit test override".to_string(),
         });
         config.exclude.push(SurfaceExclude {
             package: Some("app".to_string()),
@@ -614,7 +614,7 @@ mod tests {
             lint: "dead-code".to_string(),
             package: Some("app".to_string()),
             crate_name: None,
-            item: "legacy".to_string(),
+            item: "entry".to_string(),
             kind: Some("function".to_string()),
             target: None,
             level: SurfaceLintLevel::Allow,

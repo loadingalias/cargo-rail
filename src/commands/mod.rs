@@ -1,50 +1,36 @@
-//! CLI commands for cargo-rail
+//! User-facing command preparation and dispatch.
 //!
-//! This module contains all user-facing command implementations:
-//!
-//! ## Dependency Unification
-//! - **unify**: Analyze and repair workspace dependency coherence
-//!
-//! ## Configuration Management
-//! - **init**: Initialize cargo-rail configuration (rail.toml)
-//! - **config**: Validate and manage configuration
-//!
-//! ## Split & Sync
-//! - **split**: Split monorepo crates to separate repositories
-//! - **sync**: Bidirectional sync between monorepo and split repos
-//!
-//! ## Inspection
-//! - **plan**: Deterministic file-first planner (primary planning surface)
-//!
-//! All commands accept `&WorkspaceContext` to avoid redundant workspace loads.
+//! Commands share one captured [`crate::workspace::WorkspaceContext`], but planning, compiler
+//! reuse, dependency repair, Surface, release, split, and sync retain separate
+//! decision and mutation boundaries.
 
 pub(crate) mod cache;
 /// Intent-file management.
 pub mod change;
-/// Clean up workspace artifacts
+/// Preview or remove selected Cargo-Rail state.
 pub mod clean;
 /// CLI argument definitions (clap structs) - internal, not part of stable API.
 #[doc(hidden)]
 pub mod cli;
-/// Common utilities for command implementations
+/// Common utilities for command implementations.
 pub mod common;
-/// Configuration management commands
+/// Inspect, validate, explain, and migrate repository policy.
 pub mod config;
-/// Read-only workspace and toolchain diagnostics
+/// Read-only workspace and toolchain diagnostics.
 pub mod doctor;
-/// Initialize cargo-rail configuration
+/// Generate sparse repository policy.
 pub mod init;
-/// Deterministic file-first change planner
+/// Deterministic affected-work planner.
 pub mod plan;
-/// Release planning and publishing
+/// Durable exact-SHA release transactions.
 pub mod release;
-/// Split crates into standalone repositories
+/// Crate extraction with preserved Git history.
 pub mod split;
 /// Complete Rust declaration reachability and visibility analysis.
 pub mod surface;
-/// Bidirectional sync between monorepo and split repos
+/// Synchronization with configured split repositories.
 pub mod sync;
-/// Workspace dependency unification commands
+/// Deterministic workspace dependency repair.
 pub mod unify;
 
 pub use change::{ChangeCheckOptions, run_change_add, run_change_check, run_change_status};
@@ -174,7 +160,6 @@ pub fn try_dispatch_pre_context(
             since,
             from,
             to,
-            merge_base,
             json,
             explain,
             explain_work,
@@ -183,12 +168,11 @@ pub fn try_dispatch_pre_context(
             verify: None,
             schema: false,
         } => {
-            let comparison = plan::PlanComparison::from_cli(&since, &from, &to, merge_base)?;
+            let comparison = plan::PlanComparison::from_cli(&since, &from, &to)?;
             let command = Commands::Plan {
                 since,
                 from,
                 to,
-                merge_base,
                 json,
                 explain,
                 explain_work: explain_work.clone(),
@@ -249,13 +233,6 @@ pub fn try_dispatch_pre_context(
         }
 
         Commands::Config {
-            command: cli::ConfigCommand::Migrate { check, format },
-        } => {
-            config::run_config_migrate(workspace_root, config_override, check, format)?;
-            Ok(PreContextDispatch::Handled)
-        }
-
-        Commands::Config {
             command:
                 cli::ConfigCommand::Validate {
                     format,
@@ -295,6 +272,13 @@ pub fn try_dispatch_pre_context(
             Ok(PreContextDispatch::Handled)
         }
 
+        Commands::Config {
+            command: cli::ConfigCommand::Migrate { check, format },
+        } => {
+            config::run_config_migrate(workspace_root, config_override, check, format)?;
+            Ok(PreContextDispatch::Handled)
+        }
+
         Commands::Completions { shell } => {
             cli::generate_completions(shell);
             Ok(PreContextDispatch::Handled)
@@ -331,6 +315,7 @@ pub fn try_dispatch_pre_context(
             match command {
                 cli::CacheCommand::Setup(setup) => {
                     let cli::CacheSetupArgs {
+                        profile,
                         local_dir,
                         max_size,
                         remote,
@@ -352,6 +337,7 @@ pub fn try_dispatch_pre_context(
                     cache::run_setup(
                         workspace_root,
                         crate::cache::installation::SetupRequest {
+                            profile_id: profile,
                             local_dir,
                             max_bytes: max_size,
                             remote_url: remote,
@@ -380,13 +366,25 @@ pub fn try_dispatch_pre_context(
                 } => cache::run_normalize(&url, mode.as_deref(), environment, format)?,
                 cli::CacheCommand::Probe { format } => cache::run_probe(workspace_root, format)?,
                 cli::CacheCommand::Status { scope, format } => cache::run_status(workspace_root, scope, format)?,
+                cli::CacheCommand::Profiles { format } => cache::run_profiles(workspace_root, format)?,
+                cli::CacheCommand::Detach { check, format } => {
+                    cache::run_detach(workspace_root, check, format)?;
+                }
+                cli::CacheCommand::DropProfile { profile, check, format } => {
+                    cache::run_drop_profile(workspace_root, &profile, check, format)?;
+                }
+                cli::CacheCommand::DropUnbound { check, format } => {
+                    cache::run_drop_unbound(workspace_root, check, format)?;
+                }
                 cli::CacheCommand::Recover { check, format } => {
                     cache::run_recover(workspace_root, check, format)?;
                 }
                 cli::CacheCommand::Clean { scope, check, format } => {
                     cache::run_clean(workspace_root, scope, check, format)?;
                 }
-                cli::CacheCommand::Remove { check, format } => cache::run_remove(workspace_root, check, format)?,
+                cli::CacheCommand::Uninstall { check, format } => {
+                    cache::run_uninstall(workspace_root, check, format)?;
+                }
             }
             Ok(PreContextDispatch::Handled)
         }
@@ -601,7 +599,6 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext, prepared_plan: Option<Pla
                 since,
                 merge_base,
                 all,
-                required,
                 format,
             } => run_change_check(
                 ctx,
@@ -609,7 +606,6 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext, prepared_plan: Option<Pla
                     since,
                     merge_base,
                     all,
-                    required,
                     format,
                 },
             ),
@@ -629,12 +625,11 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext, prepared_plan: Option<Pla
                 crate_names,
                 all,
                 bump,
-                check,
                 plan,
                 publish,
-                skip_publish,
                 skip_tag,
                 pr,
+                wait,
                 include_dependents,
                 yes,
                 allow_non_default_branch,
@@ -646,28 +641,23 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext, prepared_plan: Option<Pla
                     Some(crate_names)
                 };
 
-                let publish = publish && !skip_publish;
-                if check {
-                    crate::warn!("'release run --check' is deprecated; use 'cargo rail release check'");
-                    run_release_plan(ctx, names, bump, publish, skip_tag, include_dependents, format)
-                } else {
-                    run_release_publish(
-                        ctx,
-                        release::ReleasePublishArgs {
-                            crate_names: names,
-                            all,
-                            bump,
-                            publish,
-                            skip_tag,
-                            pr,
-                            include_dependents,
-                            yes,
-                            allow_non_default_branch,
-                            plan_path: plan,
-                            format,
-                        },
-                    )
-                }
+                run_release_publish(
+                    ctx,
+                    release::ReleasePublishArgs {
+                        crate_names: names,
+                        all,
+                        bump,
+                        publish,
+                        skip_tag,
+                        pr,
+                        wait,
+                        include_dependents,
+                        yes,
+                        allow_non_default_branch,
+                        plan_path: plan,
+                        format,
+                    },
+                )
             }
             cli::ReleaseCommand::Check {
                 crate_names,
@@ -685,7 +675,18 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext, prepared_plan: Option<Pla
                     Some(crate_names)
                 };
                 if publication {
-                    run_release_publication_check(ctx, names, all, extended, include_dependents, format)
+                    release::run_release_publication_check_with_plan_inputs(
+                        ctx,
+                        release::ReleasePublicationCheckArgs {
+                            crate_names: names,
+                            all,
+                            bump,
+                            extended,
+                            skip_tag,
+                            include_dependents,
+                            format,
+                        },
+                    )
                 } else {
                     run_release_plan(ctx, names, bump, false, skip_tag, include_dependents, format)
                 }
@@ -694,7 +695,6 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext, prepared_plan: Option<Pla
                 crate_names,
                 all,
                 publish,
-                skip_publish,
                 skip_tag,
                 include_dependents,
                 yes,
@@ -711,7 +711,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext, prepared_plan: Option<Pla
                     release::ReleaseFinalizeOptions {
                         crate_names: names,
                         all,
-                        publish: publish && !skip_publish,
+                        publish,
                         skip_tag,
                         include_dependents,
                         yes,

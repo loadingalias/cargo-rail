@@ -13,6 +13,7 @@ if ! command -v "$python_command" >/dev/null 2>&1; then
   echo "Python 3 is required to validate the installers" >&2
   exit 2
 fi
+"$python_command" scripts/ci/test-gnu-runtime.py
 "$python_command" scripts/ci/http-fixture-server.py --help >/dev/null
 
 placeholder='@CARGO_RAIL_VERSION@'

@@ -20,7 +20,8 @@ path with a stable miss or bypass reason.
 
 ## Set up local reuse
 
-One setup enables L1 for ordinary Cargo, nextest, Just, IDE, and CI commands using the same effective Cargo home:
+Setup enrolls the current workspace for ordinary Cargo, nextest, Just, IDE, and CI commands. Workspaces that share
+one effective Cargo home share the installed wrapper, but each enrollment owns a separate cache profile:
 
 ```bash
 cargo rail cache setup --check
@@ -29,9 +30,11 @@ cargo rail cache status --scope local
 cargo rail doctor native-cache
 ```
 
-Setup previews and then owns one global `build.rustc-wrapper`, private launcher and worker bytes, a receipt, and a
-bounded CAS. It refuses another global wrapper, persistent shadowing, ambiguous Cargo homes, linked authority paths,
-or changed receipt-owned state. Repeating setup verifies or repairs only the same authority.
+Setup previews and then owns one global `build.rustc-wrapper`, private launcher and worker bytes, and an installation
+receipt. It also binds the exact physical workspace root to one private profile with its own bounded CAS trust domain.
+Running setup in another workspace creates another profile; it does not replace the first profile. An unenrolled
+workspace executes normally without L1 or L2 reuse. Setup refuses another global wrapper, persistent shadowing,
+ambiguous Cargo homes, linked authority paths, or changed owned state.
 
 Cargo freshness and incremental compilation remain L0. An L1 action binds the compiler, toolchain, arguments, target,
 environment, dependencies, source topology and bytes, native-search inputs, and declared outputs. Physical mode also
@@ -55,7 +58,8 @@ CARGO_RAIL_CACHE=off cargo check --locked
 
 ## Share results remotely
 
-Remote selection is machine state, never repository configuration. Persist L2 during setup, then use ordinary Cargo:
+Remote selection is workspace-bound machine state, never repository configuration. Persist L2 in the current
+workspace profile during setup, then use ordinary Cargo:
 
 ```bash
 cargo rail cache setup --check --remote \
@@ -185,21 +189,32 @@ This store contains diagnostic evidence, not restorable Cargo artifacts.
 Check mode may update evidence under `target/cargo-rail/`. Inspect `evidence_cache` in JSON output for hits, misses,
 and reasons.
 
-## Inspect, clean, or remove
+## Inspect, clean, detach, or uninstall
 
 ```bash
 cargo rail cache status --scope local --json
+cargo rail cache profiles --json
 cargo rail cache clean --scope workspace --check
 cargo rail cache clean --scope local --check
-cargo rail cache remove --check
+cargo rail cache detach --check
+cargo rail cache drop-profile --profile PROFILE_ID --check
+cargo rail cache drop-unbound --check
+cargo rail cache uninstall --check
 ```
 
-Workspace cleanup removes reconstructible state for the current checkout. Local cleanup removes only the
-receipt-selected shared CAS after validating ownership and waiting for readers; rerun `cache setup` afterward.
-`cache remove` removes the owned Cargo field and private setup state but preserves CAS data. Every operation refuses
-changed, shadowed, linked, or unowned authority. Do not delete individual CAS objects or Cargo fingerprints by hand.
+Workspace cleanup removes reconstructible state for the current checkout. Local cleanup removes only the current
+profile's CAS after validating ownership and waiting for readers; rerun `cache setup` afterward. `cache detach`
+removes the current root binding but preserves the profile and CAS. `cache drop-profile` accepts an opaque ID from
+`cache profiles` and removes only a detached profile with no enrolled roots. `cache uninstall` removes the global
+wrapper, Cargo field, and installation receipt while preserving profiles and their CAS data.
 
-Status schema 14 reports stable native failure-reason counters separately from the bounded 65,536-event usage ledger,
+An upgrade from v0.25 retains its machine-global policy as unbound pre-profile state because that receipt cannot prove
+which workspace owned its remote. Runtime selection never uses that state. Enroll the intended workspace explicitly,
+then preview `cache drop-unbound` before removing the retained CAS. Every operation refuses changed, shadowed, linked,
+or unowned authority. Do not edit profile records, individual CAS objects, or Cargo fingerprints by hand.
+
+Status schema 15 reports the selected profile ID, workspace binding, trust domain, and redacted remote selection
+source. It reports stable native failure-reason counters separately from the bounded 65,536-event usage ledger,
 so capture, identity, and post-execution witness failures remain visible after that ledger fills. If the counter file
 cannot be validated, `failure_reason_counts_available` is `false` instead of reporting invented zeroes. Verbose status
 also reports the fixed 64-shard native restore-lock namespace and any staging residue.

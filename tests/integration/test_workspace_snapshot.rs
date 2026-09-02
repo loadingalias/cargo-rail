@@ -39,9 +39,6 @@ fn generic_context_uses_fresh_cargo_glob_membership() {
         let workspace = TestWorkspace::new_named("fresh-cargo-glob-membership")?;
         workspace.add_crate("alpha", "0.1.0", &[])?;
         workspace.add_crate("beta", "0.1.0", &[])?;
-        let legacy_cache = workspace.path.join("target/cargo-rail/metadata.json");
-        std::fs::create_dir_all(legacy_cache.parent().unwrap())?;
-        std::fs::write(&legacy_cache, b"deliberately invalid stale metadata")?;
 
         assert_eq!(
             workspace_member_names(&WorkspaceContext::build(&workspace.path)?),
@@ -78,11 +75,6 @@ fn generic_context_uses_fresh_cargo_glob_membership() {
         assert_eq!(
             workspace_member_names(&WorkspaceContext::build(&workspace.path)?),
             ["alpha"]
-        );
-        assert_eq!(
-            std::fs::read(&legacy_cache)?,
-            b"deliberately invalid stale metadata",
-            "generic context must neither read nor rewrite the retired metadata cache"
         );
         Ok(())
     })();

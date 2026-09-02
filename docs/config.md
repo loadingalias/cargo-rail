@@ -25,11 +25,14 @@ cargo rail config migrate --check
 ```
 
 `config print` emits canonical effective TOML, including defaults. `config explain` reports each configured and
-effective value, its default, source, classification, reason, and deprecation state. Use those commands instead of
+effective value, its default, source, classification, and reason. Use those commands instead of
 copying defaults from documentation.
 
-`config migrate --check` is read-only and exits `1` when migration is pending. Run `cargo rail config migrate` only
-after reviewing its semantic actions.
+`config migrate --check` previews the frozen v0.25 normalization and exits `1` when changes are pending. Review its
+field actions before running `cargo rail config migrate`. Apply mode edits only recognized v0.25 fields, preserves
+unrelated TOML, revalidates the file, and replaces it atomically without adding coded defaults. On Unix, success
+reports the preserved previous file as `Previous configuration` (`previous_config` in JSON). A failure reports every
+recovery path that remains.
 
 ## Start sparse
 
@@ -69,6 +72,12 @@ paths = ["verification/**"]
 `cargo rail unify` previews one dependency decision. `--check` makes the same decision and exits `1` when edits are
 pending. `cargo rail unify apply` revalidates and writes the planned manifest changes.
 
+Top-level `targets` always remain the dependency-resolution authority. By default, Unify acquires compiler evidence
+on every one of those domains. A workspace whose supported target policy is package- or feature-specific can set
+`unify.compiler_targets` to the exact top-level subset where Unify's workspace compiler command is valid. Dependencies
+that require an omitted resolution domain are retained unless another complete proof makes the compiler view
+unnecessary; the narrower evidence set never narrows Cargo resolution.
+
 Use `consumer_scope = "workspace"` only when the workspace contains every consumer of the affected private packages.
 Published packages remain open-world. A major-version unification requires explicit `major_version_conflict = "bump"`
 authority. Exact pins, renamed dependencies, MSRV policy, preserved features, and backup retention remain independent
@@ -76,8 +85,9 @@ choices; inspect their current defaults with `config explain --all`.
 
 ### Surface policy
 
-`surface.enabled = true` adds the whole-workspace Surface gate to planning. Direct `cargo rail surface` inspection is
-available even when the gate is disabled.
+`surface.enabled = true` adds the Surface gate to planning. Direct `cargo rail surface` inspection is available even
+when the gate is disabled. Surface analyzes the host by default. Set `surface.targets = "workspace"` to analyze the
+host and every top-level target, or list an explicit non-empty subset.
 
 Keep `consumer_scope = "open"` unless the workspace owns every consumer of its non-publishable compiler crates.
 Declare products, external crates, feature profiles, doctest coverage, lint levels, overrides, and exclusions only
@@ -100,8 +110,12 @@ the local plan and exits `1` when a release is pending. It performs no mutation 
 
 `remote_effects` controls Git and forge effects. Registry publication is separate and requires both
 `registry_publication = "crates-io"` and `--publish` on the exact release invocation. Remote modes persist
-transaction state and stop at readiness or registry-convergence boundaries; resume the recorded state instead of
+transaction state before external effects. `release run --wait` stays attached while exact-SHA checks are pending;
+without it, Cargo-Rail stops at the readiness boundary and reports the recorded state to resume instead of
 replanning.
+
+`release run --pr` is a separate reviewed path. Its `release finalize` step accepts only the merge commit that
+introduces the exact prepared transaction; a later commit or unrelated merge cannot inherit that release.
 
 Standalone tools or fuzz workspaces that depend on released packages by path can declare their exact manifests with
 `auxiliary_cargo_manifests`. Cargo-Rail resolves each manifest's committed `Cargo.lock`, computes its post-release
@@ -116,9 +130,7 @@ This is a Cargo-only projection, not a general command hook.
 auxiliary_cargo_manifests = ["fuzz/Cargo.toml", "tools/check/Cargo.toml"]
 ```
 
-New changes should use reviewed change files. Commit-derived release prose remains compatibility behavior, not the
-default authoring path. Cargo-Rail uses fixed changelog placeholders rather than a template engine; put prose that
-needs custom logic in the reviewed change file.
+Cargo-Rail uses fixed changelog structure rather than a template engine; put release prose in reviewed change files.
 
 ### Repository work
 
@@ -129,15 +141,17 @@ needs custom logic in the reviewed change file.
 scope = "variants"
 paths = ["tests/compatibility/**"]
 config = ["targets"]
-cargo = ["cargo.build", "cargo.test"]
 variant_catalog = "distribution/compatibility-plan-variants.json"
 ```
 
 `scope` is `repository`, `cargo`, or `variants`. Paths are positive repository-relative globs. `config` names exact
-effective fields. `cargo` subscribes the work item to built-in Cargo decisions. Variant work requires a checked-in
-catalog. Version 1 catalogs subscribe rows to work-level inputs. Version 2 catalogs conform to
-[`plan-variants-v2.schema.json`](../schemas/plan-variants-v2.schema.json) and declare typed Cargo package or exact
-target roots plus external paths. Their structural build impact is independent of conservative built-in Cargo work.
+effective fields. `cargo` subscribes repository- or Cargo-scoped work to built-in Cargo decisions. Variant work
+requires a checked-in catalog conforming to
+[`plan-variants-v2.schema.json`](../schemas/plan-variants-v2.schema.json). Each row declares typed Cargo package or
+exact target roots plus external paths; variant Cargo impact cannot be supplied by work-level string subscriptions.
+`features` binds one exact no-default-feature set and follows Cargo feature edges plus captured Rust module cfgs.
+`manifest` selects an exact entry in `release.auxiliary_cargo_manifests` and resolves its committed lockfile. Any
+source, cfg, manifest, or lock relationship Cargo-Rail cannot attribute exactly widens the variant family.
 
 A Cargo-scoped named work item may declare bounded one-hop artifact prerequisites:
 
@@ -174,9 +188,6 @@ and distributed-worker selection are machine-owned cache setup.
 
 Execution tables and path-category planning policy are rejected. Keep commands in Cargo, nextest, Just, scripts, or
 CI, and register only their positive inputs under `[plan.work.NAME]`.
-
-When `config explain` reports migration state, `config migrate` preserves unrelated TOML and does not materialize
-coded defaults.
 
 ## Exit behavior
 

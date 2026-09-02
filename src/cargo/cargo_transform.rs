@@ -8,6 +8,7 @@ use toml_edit::{DocumentMut, Item, Table, Value};
 
 use crate::cargo::manifest_ops;
 use crate::error::{RailError, RailResult, ResultExt as _};
+use crate::source::ContentDigest;
 use crate::workspace::WorkspaceContext;
 
 #[derive(Debug, Clone)]
@@ -82,6 +83,35 @@ impl ManifestTransformPolicy {
             workspace_lints,
             dependencies,
         })
+    }
+
+    /// Stable identity of the captured inputs that can change split manifest
+    /// output. Unrelated workspace bytes deliberately do not participate.
+    pub(crate) fn authority_digest(&self) -> String {
+        fn frame(output: &mut Vec<u8>, label: &[u8], value: &[u8]) {
+            output.extend_from_slice(&(label.len() as u64).to_be_bytes());
+            output.extend_from_slice(label);
+            output.extend_from_slice(&(value.len() as u64).to_be_bytes());
+            output.extend_from_slice(value);
+        }
+
+        let mut canonical = b"cargo-rail-manifest-transform-policy-v1".to_vec();
+        if let Some(package) = &self.workspace_package {
+            frame(&mut canonical, b"workspace-package", package.to_string().as_bytes());
+        }
+        if let Some(lints) = &self.workspace_lints {
+            frame(&mut canonical, b"workspace-lints", lints.to_string().as_bytes());
+        }
+        for (alias, dependency) in &self.dependencies {
+            frame(&mut canonical, b"dependency-alias", alias.as_bytes());
+            frame(
+                &mut canonical,
+                b"dependency-package",
+                dependency.package.as_deref().unwrap_or_default().as_bytes(),
+            );
+            frame(&mut canonical, b"dependency-version", dependency.version.as_bytes());
+        }
+        format!("sha256-{}", ContentDigest::sha256(&canonical))
     }
 
     /// Transform one captured Cargo manifest into standalone split form.

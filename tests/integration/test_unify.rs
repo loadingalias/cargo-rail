@@ -120,6 +120,74 @@ fn test_unify_check_json_emits_versioned_feature_target_coverage_views() {
 }
 
 #[test]
+fn test_unify_coverage_keeps_root_features_package_local() {
+    let result: Result<()> = (|| {
+        let workspace = TestWorkspace::new_named("unify-package-feature-isolation")?;
+        workspace.add_feature_isolation_crates()?;
+        std::fs::write(
+            workspace.path.join(".config/rail.toml"),
+            "[unify]\nmsrv_policy = { mode = \"disabled\" }\n",
+        )?;
+        workspace.commit("Add isolated std and alloc roots")?;
+
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--format", "json"])?;
+        assert_ne!(
+            output.status.code(),
+            Some(2),
+            "package-local coverage must be an exact semantic result: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let views = report["coverage"]["views"].as_array().expect("coverage views");
+        assert!(
+            views
+                .iter()
+                .all(|view| view["packages"].as_array().is_some_and(|packages| packages.len() == 1)),
+            "every coverage view must own exactly one package: {views:#?}"
+        );
+
+        let mut root_identities = std::collections::BTreeSet::new();
+        for package in ["std-root", "alloc-root"] {
+            let view = views
+                .iter()
+                .find(|view| {
+                    view["packages"] == serde_json::json!([package])
+                        && view["features"]["mode"] == "selected"
+                        && view["features"]["selected"] == serde_json::json!(["isolate"])
+                })
+                .unwrap_or_else(|| panic!("missing selected isolation view for {package}: {views:#?}"));
+            assert!(
+                root_identities.insert(view["id"].as_str().expect("coverage identity")),
+                "package identity must distinguish equal feature names"
+            );
+            let arguments = view["cargo"]["args"].as_array().expect("Cargo arguments");
+            let package_positions = arguments
+                .iter()
+                .enumerate()
+                .filter_map(|(index, argument)| (argument == "--package").then_some(index))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                package_positions.len(),
+                1,
+                "one package selector per view: {arguments:?}"
+            );
+            assert_eq!(
+                arguments.get(package_positions[0] + 1),
+                Some(&serde_json::json!(package))
+            );
+            let feature_values = arguments
+                .windows(2)
+                .filter_map(|pair| (pair[0] == "--features").then_some(&pair[1]))
+                .collect::<Vec<_>>();
+            assert_eq!(feature_values, vec![&serde_json::json!(format!("{package}/isolate"))]);
+        }
+        assert_eq!(root_identities.len(), 2);
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
 fn test_unify_apply_json_is_a_single_machine_envelope() {
     let result: Result<()> = (|| {
         let workspace = TestWorkspace::new_named("unify-json-apply")?;
@@ -570,10 +638,7 @@ fn test_unify_major_version_conflict_warns_and_skips() {
         // Configure rail.toml
         std::fs::write(
             workspace.path.join("rail.toml"),
-            r#"[workspace]
-root = "."
-
-[unify]
+            r#"[unify]
 "#,
         )?;
 
@@ -707,10 +772,7 @@ fn test_unify_inconsistent_default_features() {
         // Configure rail.toml
         std::fs::write(
             workspace.path.join("rail.toml"),
-            r#"[workspace]
-root = "."
-
-[unify]
+            r#"[unify]
 "#,
         )?;
 
@@ -929,10 +991,7 @@ fn test_unify_exclude_config_and_flag() {
         // Configure rail.toml with exclude
         std::fs::write(
             workspace.path.join("rail.toml"),
-            r#"[workspace]
-root = "."
-
-[unify]
+            r#"[unify]
 exclude = ["tokio"]
 "#,
         )?;
@@ -1613,10 +1672,7 @@ tokio = { version = "1.0", features = ["signal"] }
         // Configure rail.toml
         std::fs::write(
             workspace.path.join("rail.toml"),
-            r#"[workspace]
-root = "."
-
-[unify]
+            r#"[unify]
 "#,
         )?;
 
@@ -1684,10 +1740,7 @@ fn test_unify_workspace_member_version_deps_always_get_path() {
         // Critical: even with include_paths disabled, workspace member deps must still carry a path.
         std::fs::write(
             workspace.path.join(".config/rail.toml"),
-            r#"[workspace]
-root = "."
-
-[unify]
+            r#"[unify]
 include_paths = false
 "#,
         )?;
@@ -2852,10 +2905,7 @@ fn test_unify_toml_comments() {
         // Configure rail.toml with comment generation
         std::fs::write(
             workspace.path.join("rail.toml"),
-            r#"[workspace]
-root = "."
-
-[unify]
+            r#"[unify]
 # add_conflict_comments is now implicit (always true)
 "#,
         )?;
@@ -2902,10 +2952,7 @@ fn test_unify_backup_flag() {
         // Configure rail.toml
         std::fs::write(
             workspace.path.join("rail.toml"),
-            r#"[workspace]
-root = "."
-
-[unify]
+            r#"[unify]
 "#,
         )?;
 
@@ -3150,15 +3197,7 @@ edition = "2021"
         std::fs::write(workspace_root.join("target/debug/generated.rlib"), "generated\n")?;
         std::fs::write(root.path().join("outside-secret.txt"), "outside the Cargo workspace\n")?;
         std::fs::create_dir_all(workspace_root.join(".config"))?;
-        std::fs::write(
-            workspace_root.join(".config/rail.toml"),
-            r#"[workspace]
-root = "."
-
-[toolchain]
-channel = "stable"
-"#,
-        )?;
+        std::fs::write(workspace_root.join(".config/rail.toml"), "")?;
 
         let crate_root = workspace_root.join("crates").join("standalone");
         std::fs::create_dir_all(crate_root.join("src"))?;
@@ -3337,9 +3376,6 @@ fn test_unify_graph_verification_uses_the_same_platform_filter_before_and_after(
         std::fs::write(
             workspace.path.join(".config/rail.toml"),
             r#"targets = ["x86_64-unknown-linux-gnu"]
-
-[workspace]
-root = "."
 
 [unify]
 consumer_scope = "workspace"

@@ -11,7 +11,7 @@ use super::{ImpactDomain, ImpactFallback, ImpactPropagation, ImpactStep};
 use crate::error::{RailError, RailResult};
 use crate::source::ContentDigest;
 
-const DEPENDENCY_UNIVERSE_VERSION: u32 = 1;
+const DEPENDENCY_UNIVERSE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DeclaredEdge {
@@ -61,6 +61,16 @@ struct PortablePackageFacts {
     package: String,
     workspace_member: bool,
     proc_macro: bool,
+    features: BTreeMap<String, Vec<String>>,
+    targets: Vec<PortableTargetFacts>,
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+struct PortableTargetFacts {
+    name: String,
+    kind: Vec<String>,
+    required_features: Vec<String>,
+    src_path: String,
 }
 
 /// Every declared dependency edge that can resolve between captured packages.
@@ -111,10 +121,36 @@ impl DependencyUniverse {
             .iter()
             .map(|package| {
                 let facts = packages[&package.id];
+                let mut features = package.features.clone();
+                for edges in features.values_mut() {
+                    edges.sort_unstable();
+                    edges.dedup();
+                }
+                let mut targets = package
+                    .targets
+                    .iter()
+                    .map(|target| {
+                        let mut kind = target.kind.iter().map(ToString::to_string).collect::<Vec<_>>();
+                        kind.sort_unstable();
+                        kind.dedup();
+                        let mut required_features = target.required_features.clone();
+                        required_features.sort_unstable();
+                        required_features.dedup();
+                        PortableTargetFacts {
+                            name: target.name.clone(),
+                            kind,
+                            required_features,
+                            src_path: portable_source_path(target.src_path.as_std_path(), &source_root),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                targets.sort_unstable();
                 PortablePackageFacts {
                     package: portable_package_ids[&package.id].clone(),
                     workspace_member: facts.workspace_member,
                     proc_macro: facts.proc_macro,
+                    features,
+                    targets,
                 }
             })
             .collect::<Vec<_>>();
@@ -204,6 +240,11 @@ impl DependencyUniverse {
     /// Return the root-independent identity of all package facts, declarations, and matched destinations.
     pub(crate) fn identity(&self) -> &str {
         &self.identity
+    }
+
+    /// Return whether this declared universe contains one exact package.
+    pub(crate) fn contains_package(&self, package: &PackageId) -> bool {
+        self.packages.contains_key(package)
     }
 
     /// Propagate package changes through every potentially active declared edge.
@@ -343,6 +384,10 @@ fn portable_dependency_source(dependency: &Dependency, source_root: &Path) -> St
         .source
         .as_ref()
         .map_or_else(|| "registry:default".to_string(), |source| source.repr.clone())
+}
+
+fn portable_source_path(path: &Path, source_root: &Path) -> String {
+    portable_relative_path(path, source_root).unwrap_or_else(|| "<outside-source-root>".to_string())
 }
 
 fn portable_relative_path(path: &Path, source_root: &Path) -> Option<String> {

@@ -151,6 +151,9 @@ scripts/ci/verify-release-components.py "$(dirname "$binary")" \
   --target "$target" \
   --version "$version" \
   --surface "$surface"
+if [[ "$target" == *-unknown-linux-gnu ]]; then
+  python3 scripts/ci/verify-gnu-runtime.py "$(dirname "$binary")" --target "$target"
+fi
 
 observation_protocol="$("$observation" --cargo-rail-observation-protocol-version)"
 [[ "$observation_protocol" == "1" ]] ||

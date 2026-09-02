@@ -62,39 +62,13 @@ impl fmt::Display for ConfigPath {
     }
 }
 
-/// Why a configuration input exists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FieldClassification {
-    /// A competent repository may intentionally choose a different value.
-    ProjectPolicy,
-    /// An old spelling accepted only during a bounded migration window.
-    CompatibilityInput,
-    /// An internal behavior that should never have been configurable.
-    ImplementationDetail,
-}
-
-impl FieldClassification {
-    /// Stable text/JSON spelling.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::ProjectPolicy => "project_policy",
-            Self::CompatibilityInput => "compatibility_input",
-            Self::ImplementationDetail => "implementation_detail",
-        }
-    }
-}
-
-/// One leaf in the public or compatibility configuration schema.
+/// One leaf in the public configuration schema.
 #[derive(Debug, Clone, Copy)]
 pub struct FieldSpec {
     /// Dotted TOML path. `<name>` and `<index>` match dynamic map/array keys.
     pub path: &'static str,
-    /// Architectural classification.
-    pub classification: FieldClassification,
     /// Why changing the value changes observable behavior.
     pub why: &'static str,
-    /// Deprecation and migration guidance, when applicable.
-    pub deprecation: Option<&'static str>,
     /// Built-in work that consumes this exact effective field.
     pub consumers: &'static [&'static str],
 }
@@ -102,41 +76,13 @@ pub struct FieldSpec {
 const fn policy(path: &'static str, why: &'static str) -> FieldSpec {
     FieldSpec {
         path,
-        classification: FieldClassification::ProjectPolicy,
         why,
-        deprecation: None,
         consumers: &[],
     }
 }
 
 const fn subscribed_policy(path: &'static str, why: &'static str, consumers: &'static [&'static str]) -> FieldSpec {
-    FieldSpec {
-        path,
-        classification: FieldClassification::ProjectPolicy,
-        why,
-        deprecation: None,
-        consumers,
-    }
-}
-
-const fn compatibility(path: &'static str, why: &'static str, deprecation: &'static str) -> FieldSpec {
-    FieldSpec {
-        path,
-        classification: FieldClassification::CompatibilityInput,
-        why,
-        deprecation: Some(deprecation),
-        consumers: &[],
-    }
-}
-
-const fn implementation(path: &'static str, deprecation: &'static str) -> FieldSpec {
-    FieldSpec {
-        path,
-        classification: FieldClassification::ImplementationDetail,
-        why: "Correctness and deterministic output are cargo-rail responsibilities, not repository policy.",
-        deprecation: Some(deprecation),
-        consumers: &[],
-    }
+    FieldSpec { path, why, consumers }
 }
 
 /// Complete leaf-field inventory for `rail.toml`.
@@ -148,13 +94,9 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
         "targets",
         "Selects additional Cargo target-resolution views that the repository supports.",
     ),
-    implementation(
-        "workspace",
-        "Deprecated: this reserved table had no behavior. Run `cargo rail config migrate` to remove it.",
-    ),
-    implementation(
-        "toolchain",
-        "Deprecated: this reserved table had no behavior. Run `cargo rail config migrate` to remove it.",
+    policy(
+        "unify.compiler_targets",
+        "Selects the exact resolution-target subset where Unify acquires compiler diagnostics.",
     ),
     policy(
         "unify.include_paths",
@@ -167,16 +109,6 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
     policy(
         "unify.transitive_pinning.host",
         "Enables host-owned pins for fragmented transitive features and selects the owning manifest.",
-    ),
-    compatibility(
-        "unify.pin_transitives",
-        "Preserves the old enable boolean until the pinning policy is migrated.",
-        "Deprecated: migrate to `unify.transitive_pinning` with `cargo rail config migrate`.",
-    ),
-    compatibility(
-        "unify.transitive_host",
-        "Preserves the old host field until the pinning policy is migrated.",
-        "Deprecated: migrate to `unify.transitive_pinning` with `cargo rail config migrate`.",
     ),
     policy("unify.exclude", "Excludes named dependency cohorts from unification."),
     policy("unify.include", "Force-includes named dependencies in unification."),
@@ -204,26 +136,6 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
         "unify.msrv_policy.inherit",
         "Chooses whether members inherit the computed workspace rust-version.",
     ),
-    compatibility(
-        "unify.msrv",
-        "Preserves the old enable boolean until MSRV policy is migrated.",
-        "Deprecated: migrate to `unify.msrv_policy` with `cargo rail config migrate`.",
-    ),
-    compatibility(
-        "unify.enforce_msrv_inheritance",
-        "Preserves the old inheritance boolean until MSRV policy is migrated.",
-        "Deprecated: migrate to `unify.msrv_policy` with `cargo rail config migrate`.",
-    ),
-    compatibility(
-        "unify.msrv_source",
-        "Preserves the old source selector until MSRV policy is migrated.",
-        "Deprecated: migrate to `unify.msrv_policy` with `cargo rail config migrate`.",
-    ),
-    compatibility(
-        "unify.prune_dead_features",
-        "Preserves the old analysis toggle during its migration window.",
-        "Deprecated: dead-feature diagnostics are unconditional and deletion requires `consumer_scope = \"workspace\"`. Run `cargo rail config migrate` to remove this field.",
-    ),
     policy(
         "unify.consumer_scope",
         "Declares whether the workspace is the complete consumer universe for destructive pruning.",
@@ -244,56 +156,14 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
         "unify.major_version_conflict",
         "Chooses whether major-version conflicts remain split or are explicitly bumped.",
     ),
-    compatibility(
-        "unify.detect_unused",
-        "Preserves the old analysis toggle during its migration window.",
-        "Deprecated: unused-dependency diagnostics are unconditional. Run `cargo rail config migrate` to remove this field.",
-    ),
-    implementation(
-        "unify.compiler_diag_cache",
-        "Deprecated: compiler evidence caching is automatic. Run `cargo rail config migrate` to remove this field.",
-    ),
-    compatibility(
-        "unify.remove_unused",
-        "Preserves the old edit toggle during its migration window.",
-        "Deprecated: `unify --check` is read-only and unify apply owns proven edits. Run `cargo rail config migrate` to remove this field.",
-    ),
-    compatibility(
-        "unify.detect_undeclared_features",
-        "Preserves the old analysis toggle during its migration window.",
-        "Deprecated: borrowed-feature diagnostics are unconditional. Run `cargo rail config migrate` to remove this field.",
-    ),
-    compatibility(
-        "unify.fix_undeclared_features",
-        "Preserves the old edit toggle during its migration window.",
-        "Deprecated: `unify --check` is read-only and unify apply owns proven edits. Run `cargo rail config migrate` to remove this field.",
-    ),
     policy(
         "unify.skip_undeclared_patterns",
         "Declares borrowed-feature names that are intentionally non-actionable.",
-    ),
-    implementation(
-        "unify.sort_dependencies",
-        "Deprecated: dependency edits are always deterministic. Run `cargo rail config migrate` to remove this field.",
-    ),
-    policy(
-        "release.source",
-        "Selects reviewed changes or an explicit conventional-commit compatibility mode as release input.",
     ),
     policy("release.tag_prefix", "Defines the repository's release tag prefix."),
     policy(
         "release.tag_format",
         "Defines the repository's crate/version tag namespace.",
-    ),
-    compatibility(
-        "release.require_clean",
-        "Preserves old configuration while release apply moves to exact planned-input cleanliness.",
-        "Deprecated: previews permit dirt and apply always rejects paths outside the bound plan. Run `cargo rail config migrate` to remove this field.",
-    ),
-    compatibility(
-        "release.publish_delay",
-        "Preserves old configuration after cargo-rail stopped polling registry convergence.",
-        "Deprecated: release execution never delays between publishes; it stops at registry wait boundaries and resumes by reconciliation. Run `cargo rail config migrate` to remove this field.",
     ),
     policy(
         "release.remote_effects",
@@ -303,34 +173,7 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
         "release.registry_publication",
         "Selects an exact package-registry publication boundary independently from Git and forge effects.",
     ),
-    compatibility(
-        "release.create_github_release",
-        "Preserves the old forge-release boolean until its effect matrix is migrated.",
-        "Deprecated: migrate release remote effects to `release.remote_effects` with `cargo rail config migrate`.",
-    ),
-    compatibility(
-        "release.forge",
-        "Preserves the old provider selector until its effect matrix is migrated.",
-        "Deprecated: migrate release remote effects to `release.remote_effects` with `cargo rail config migrate`.",
-    ),
-    compatibility(
-        "release.push",
-        "Preserves the old push boolean until its effect matrix is migrated.",
-        "Deprecated: migrate release remote effects to `release.remote_effects` with `cargo rail config migrate`.",
-    ),
     policy("release.sign_tags", "Requires cryptographic signing of release tags."),
-    policy(
-        "release.require_changelog_entries",
-        "Requires generated changelog content for each released crate.",
-    ),
-    policy(
-        "release.require_release_notes",
-        "Requires reviewed release notes before remote effects.",
-    ),
-    policy(
-        "release.release_notes_dir",
-        "Selects the repository directory for manual release notes.",
-    ),
     policy(
         "release.change_dir",
         "Selects the repository directory containing reviewed release intent.",
@@ -339,18 +182,10 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
         "release.pre_1_breaking_bump",
         "Defines how reviewed breaking intent maps onto pre-1.0 versions.",
     ),
-    policy(
-        "release.unconventional_commits",
-        "Defines compatibility handling for commit messages outside the reviewed intent model.",
-    ),
     subscribed_policy(
         "release.semver_check",
         "Selects how cargo-semver-checks evidence gates a release.",
         &["release.semver"],
-    ),
-    policy(
-        "release.require_change_files",
-        "Selects crates that require reviewed change-file coverage.",
     ),
     policy(
         "release.version_groups",
@@ -368,62 +203,6 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
     policy(
         "release.changelog.relative_to",
         "Defines the root used to resolve changelog paths.",
-    ),
-    policy(
-        "release.changelog.entry_format",
-        "Defines the bounded changelog entry rendering shape.",
-    ),
-    policy(
-        "release.changelog.emoji",
-        "Chooses whether changelog section headings include emoji.",
-    ),
-    policy(
-        "release.changelog.group_order",
-        "Defines deterministic changelog section ordering.",
-    ),
-    policy(
-        "release.changelog.fallback",
-        "Defines handling for unlisted change types.",
-    ),
-    policy(
-        "release.changelog.groups",
-        "Defines project-specific changelog sections.",
-    ),
-    policy(
-        "release.changelog.groups.<index>.types",
-        "Maps project-specific change types to a section.",
-    ),
-    policy(
-        "release.changelog.groups.<index>.title",
-        "Defines a project-specific changelog section title.",
-    ),
-    policy(
-        "release.changelog.groups.<index>.emoji",
-        "Defines a project-specific changelog section emoji.",
-    ),
-    policy(
-        "release.changelog.filters.skip_types",
-        "Excludes reviewed change types from changelog output.",
-    ),
-    policy(
-        "release.changelog.filters.skip_scopes",
-        "Excludes reviewed scopes from changelog output.",
-    ),
-    policy(
-        "release.changelog.filters.include_paths",
-        "Narrows changelog attribution to repository path globs.",
-    ),
-    policy(
-        "release.changelog.filters.exclude_paths",
-        "Excludes repository path globs from changelog attribution.",
-    ),
-    policy(
-        "release.changelog.commit_url",
-        "Overrides the derived commit-link format.",
-    ),
-    policy(
-        "release.changelog.pr_url",
-        "Overrides the derived pull-request-link format.",
     ),
     policy(
         "surface.enabled",
@@ -677,11 +456,6 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
         "crates.<name>.split.members",
         "Names Cargo workspace members whose snapshot-derived roots are owned by a split.",
     ),
-    compatibility(
-        "crates.<name>.split.paths",
-        "Preserves legacy path-selected split members until explicit migration.",
-        "Deprecated: split ownership is derived from Cargo member names. Run `cargo rail config migrate` to replace `paths` with `members`.",
-    ),
     policy(
         "crates.<name>.split.include",
         "Declares explicit non-Cargo assets owned by a split.",
@@ -702,66 +476,6 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
     policy(
         "crates.<name>.changelog.skip",
         "Excludes a crate from changelog generation.",
-    ),
-    policy(
-        "crates.<name>.changelog.entry_format",
-        "Overrides a crate's changelog entry rendering.",
-    ),
-    policy(
-        "crates.<name>.changelog.emoji",
-        "Overrides emoji rendering for a crate changelog.",
-    ),
-    policy(
-        "crates.<name>.changelog.group_order",
-        "Overrides section order for a crate changelog.",
-    ),
-    policy(
-        "crates.<name>.changelog.fallback",
-        "Overrides unlisted-type handling for a crate changelog.",
-    ),
-    policy(
-        "crates.<name>.changelog.groups",
-        "Defines crate-specific changelog sections.",
-    ),
-    policy(
-        "crates.<name>.changelog.groups.<index>.types",
-        "Extends a crate's project-specific change types.",
-    ),
-    policy(
-        "crates.<name>.changelog.groups.<index>.title",
-        "Defines a crate-specific changelog section title.",
-    ),
-    policy(
-        "crates.<name>.changelog.groups.<index>.emoji",
-        "Defines a crate-specific changelog section emoji.",
-    ),
-    policy(
-        "crates.<name>.changelog.filters.skip_types",
-        "Overrides skipped change types for a crate.",
-    ),
-    policy(
-        "crates.<name>.changelog.filters.skip_scopes",
-        "Overrides skipped scopes for a crate.",
-    ),
-    policy(
-        "crates.<name>.changelog.filters.include_paths",
-        "Overrides included attribution paths for a crate.",
-    ),
-    policy(
-        "crates.<name>.changelog.filters.exclude_paths",
-        "Overrides excluded attribution paths for a crate.",
-    ),
-    policy(
-        "crates.<name>.changelog.commit_url",
-        "Overrides commit links for a crate changelog.",
-    ),
-    policy(
-        "crates.<name>.changelog.pr_url",
-        "Overrides pull-request links for a crate changelog.",
-    ),
-    implementation(
-        "crates.<name>.sync",
-        "Deprecated: the empty reserved table had no behavior. Run `cargo rail config migrate` to remove it.",
     ),
 ];
 
@@ -801,14 +515,7 @@ pub fn field_consumers(path: &str) -> &'static [&'static str] {
 }
 
 pub(crate) fn is_known_config_path(path: &ConfigPath) -> bool {
-    field_spec_path(path).is_some()
-        || FIELD_SPECS.iter().any(|spec| path_prefix_matches(spec.path, path))
-        || (1..path.segments().len()).any(|length| {
-            let ancestor = ConfigPath {
-                segments: path.segments()[..length].to_vec(),
-            };
-            field_spec_path(&ancestor).is_some_and(|spec| spec.deprecation.is_some())
-        })
+    field_spec_path(path).is_some() || FIELD_SPECS.iter().any(|spec| path_prefix_matches(spec.path, path))
 }
 
 fn path_matches(pattern: &str, path: &ConfigPath) -> bool {
@@ -829,50 +536,30 @@ fn path_prefix_matches(pattern: &str, path: &ConfigPath) -> bool {
             .all(|(actual, expected)| expected.starts_with('<') || actual == expected)
 }
 
-/// A deprecated field found in a concrete document.
-#[derive(Debug)]
-pub struct PresentDeprecation {
-    /// Concrete dotted path from the document.
-    pub(crate) path: ConfigPath,
-    /// Inventory entry that matched the path.
-    pub spec: &'static FieldSpec,
-}
-
-/// Find deprecated compatibility inputs without interpreting their values.
-pub fn present_deprecations(doc: &toml_edit::DocumentMut) -> Vec<PresentDeprecation> {
-    let mut paths = Vec::new();
-    collect_table_paths(doc.as_table(), &ConfigPath::root(), &mut paths);
-    paths.sort_unstable();
-    paths.dedup();
-    let mut deprecations: Vec<_> = paths
-        .into_iter()
-        .filter_map(|path| {
-            let spec = field_spec_path(&path)?;
-            spec.deprecation.map(|_| PresentDeprecation { path, spec })
-        })
-        .collect();
-    deprecations.sort_unstable_by(|left, right| left.path.cmp(&right.path));
-    deprecations
-}
-
 pub(crate) fn document_paths(doc: &toml_edit::DocumentMut) -> Vec<ConfigPath> {
     let mut paths = Vec::new();
-    collect_table_paths(doc.as_table(), &ConfigPath::root(), &mut paths);
+    collect_table_like_paths(doc.as_table(), &ConfigPath::root(), &mut paths);
     paths.sort_unstable();
     paths.dedup();
     paths
 }
 
-fn collect_table_paths(table: &toml_edit::Table, prefix: &ConfigPath, paths: &mut Vec<ConfigPath>) {
-    for (key, item) in table {
+fn collect_table_like_paths(table: &dyn toml_edit::TableLike, prefix: &ConfigPath, paths: &mut Vec<ConfigPath>) {
+    for (key, item) in table.iter() {
         let path = prefix.child(key);
         paths.push(path.clone());
 
-        if let Some(child) = item.as_table() {
-            collect_table_paths(child, &path, paths);
+        if let Some(child) = item.as_table_like() {
+            collect_table_like_paths(child, &path, paths);
         } else if let Some(array) = item.as_array_of_tables() {
             for (index, child) in array.iter().enumerate() {
-                collect_table_paths(child, &path.child(index.to_string()), paths);
+                collect_table_like_paths(child, &path.child(index.to_string()), paths);
+            }
+        } else if let Some(array) = item.as_array() {
+            for (index, value) in array.iter().enumerate() {
+                if let Some(child) = value.as_inline_table() {
+                    collect_table_like_paths(child, &path.child(index.to_string()), paths);
+                }
             }
         }
     }
@@ -887,10 +574,6 @@ mod tests {
         assert_eq!(
             field_spec("crates.demo.split.remote").map(|field| field.path),
             Some("crates.<name>.split.remote")
-        );
-        assert_eq!(
-            field_spec("release.changelog.groups.0.title").map(|field| field.path),
-            Some("release.changelog.groups.<index>.title")
         );
     }
 
@@ -917,6 +600,25 @@ publish = false
                 .any(|path| path.to_string() == "crates.cli-tools.release.publish")
         );
         assert!(paths.iter().all(is_known_config_path));
+    }
+
+    #[test]
+    fn structural_paths_descend_inline_tables_and_inline_table_arrays() {
+        let doc: toml_edit::DocumentMut = r#"
+release = { changelog = { path = "CHANGELOG.md", removed = true } }
+surface = { product = [{ package = "cargo-rail", bin = "cargo-rail", removed = true }] }
+"#
+        .parse()
+        .unwrap();
+        let paths = document_paths(&doc)
+            .into_iter()
+            .map(|path| path.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(paths.iter().any(|path| path == "release.changelog.path"));
+        assert!(paths.iter().any(|path| path == "release.changelog.removed"));
+        assert!(paths.iter().any(|path| path == "surface.product.0.package"));
+        assert!(paths.iter().any(|path| path == "surface.product.0.removed"));
     }
 
     #[test]
@@ -958,25 +660,5 @@ publish = false
         let mut missing = Vec::new();
         visit(&defaults, "", &mut missing);
         assert!(missing.is_empty(), "unclassified configuration fields: {missing:?}");
-    }
-
-    #[test]
-    fn deprecated_fields_are_found_in_concrete_documents() {
-        let doc: toml_edit::DocumentMut = r#"
-[unify]
-compiler_diag_cache = false
-
-[crates.demo.sync]
-"#
-        .parse()
-        .expect("valid fixture");
-        let paths: Vec<_> = present_deprecations(&doc)
-            .into_iter()
-            .map(|deprecation| deprecation.path.to_string())
-            .collect();
-        assert_eq!(
-            paths,
-            vec!["crates.demo.sync".to_string(), "unify.compiler_diag_cache".to_string()]
-        );
     }
 }

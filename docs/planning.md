@@ -40,7 +40,6 @@ config = ["targets"]
 [plan.work.compatibility]
 scope = "variants"
 paths = ["tests/compatibility/**"]
-cargo = ["cargo.build", "cargo.test"]
 variant_catalog = "distribution/compatibility-plan-variants.json"
 ```
 
@@ -54,10 +53,34 @@ variant_catalog = "distribution/compatibility-plan-variants.json"
 changed configuration input widens the declared work to the Cargo workspace because policy can affect every member.
 
 Variant catalog v2 models deliverable impact without subscribing the deliverable to conservative `cargo.build`.
-Each row declares `cargo_roots` containing exact workspace packages or targets and `external_paths` for inputs outside
-Cargo's graph. Cargo-Rail computes one structural reverse build closure for the plan and selects rows whose roots are
-affected. Root Cargo manifests, the lockfile, Cargo configuration, and the toolchain select every Cargo-rooted row.
-Unrelated external paths do not select a deliverable merely because compiler input evidence is incomplete.
+Each row declares `cargo_roots` containing exact packages or targets and `external_paths` for inputs outside Cargo's
+graph. A root may add `features` to name one exact no-default-feature set. Cargo-Rail expands member-local Cargo
+feature edges and follows ordinary external Rust modules from the captured target root. Only a source path proved
+active for that feature set narrows selection; malformed attributes, path overrides, inline modules, platform or
+custom cfgs, and unattributed Rust files widen to every row.
+
+An auxiliary root adds `manifest` with the exact repository-relative path of an entry in
+`release.auxiliary_cargo_manifests`. Cargo-Rail loads its locked metadata from the same captured source, keeps local
+packages inside that source root, and applies the normal structural reverse build closure. Auxiliary manifests,
+root lockfiles, shared inputs, and catalog changes remain all-row wideners. Root Cargo manifests, the primary
+lockfile, Cargo configuration, and the toolchain likewise select every Cargo-rooted row.
+
+```json
+{
+  "package": "crypto",
+  "features": ["signatures"]
+}
+```
+
+```json
+{
+  "manifest": "fuzz-packages/rsa/Cargo.toml",
+  "package": "fuzz-rsa"
+}
+```
+
+Cargo-Rail computes structural impact once across the captured Cargo domains and selects rows whose roots are
+affected. Unrelated external paths do not select a deliverable merely because compiler input evidence is incomplete.
 If a required path, configuration input, or Cargo input is not attributed by any selected catalog row, Cargo-Rail
 selects every row rather than treating the gap as evidence that a deliverable is unaffected.
 
@@ -97,12 +120,26 @@ Before each executor:
 1. Validate the complete plan and required-work projection.
 2. Select one known required work item.
 3. Lower only that item's typed scope.
-4. Run `scripts/plan/read.py verify-checkout PLAN` in the execution workspace.
+4. Run the matching reader's checkout verification in the execution workspace.
 5. Start the executor only after verification succeeds.
 
-`verify-checkout` delegates to the matching Cargo-Rail binary and binds the plan to the exact head plus either the
-captured worktree or a clean object-bound checkout. Comparing `HEAD` alone is insufficient. Drift exits `2` before
+For local and captured-worktree plans, `verify-checkout` delegates to the matching Cargo-Rail binary and binds the
+plan to the exact head plus captured Git provenance. Comparing `HEAD` alone is insufficient. Drift exits `2` before
 selectors are emitted or work starts.
+
+Cross-platform CI can transfer an object-bound plan as a portable bundle:
+
+```bash
+RAIL_SINCE=BASE_SHA RAIL_OBJECT_HEAD=HEAD_SHA scripts/plan/read.py create target/plan-v8.json
+scripts/plan/read.py bundle target/plan-v8.json target --producer-version 0.26.0
+python3 target/plan-read.py verify-bundle target/plan-bundle-v1.json
+```
+
+[`plan-bundle-v1.schema.json`](../schemas/plan-bundle-v1.schema.json) names the plan contract, producer version,
+platform limits, clean-object source authority, file roles, byte sizes, and SHA-256 hashes. The bundle contains the
+plan and its exact reader, not a host executable. The bundled reader verifies its own inventory, the complete plan,
+the exact plan identity, `HEAD`, and a clean tracked/untracked/submodule checkout. Portable verification requires Git
+and Python 3.10 or newer on Linux, macOS, or Windows; it deliberately rejects `WORKTREE` plans.
 
 `scripts/plan/read.py` is the strict reference consumer. It validates identities, projections, selector shapes,
 checkout binding, and workflow matrices before emitting NUL-delimited arguments. `cargo-scope` distinguishes
@@ -123,6 +160,9 @@ only when every relevant input class is complete and has no bypass. Missing, sta
 evidence widens only its owning work.
 
 A plan identity compares decisions. It is not a cache key and never authorizes compiler-result reuse.
+
+The current planner executes only variant catalog v2. The v1 schema remains available to validate stored artifacts;
+convert active catalogs to v2 before planning with the current release.
 
 ## Diagnose a decision
 

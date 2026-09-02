@@ -120,7 +120,7 @@ fn test_release_invalid_crate_name() {
         ws.commit("Add crate")?;
 
         // Try to release non-existent crate
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "run", "--check", "does-not-exist"])?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "does-not-exist"])?;
         assert!(!output.status.success(), "release with invalid crate should fail");
 
         Ok(())
@@ -140,10 +140,7 @@ fn test_split_invalid_crate() {
         // Configure split for real crate using new format
         fs::write(
             ws.path.join(".config/rail.toml"),
-            r#"[workspace]
-root = "."
-
-[crates.real-crate.split]
+            r#"[crates.real-crate.split]
 remote = "/tmp/fake-remote"
 branch = "main"
 mode = "single"
@@ -155,32 +152,6 @@ mode = "single"
         // Try to split non-existent crate
         let output = run_cargo_rail(&ws.path, &["rail", "split", "run", "nonexistent-crate"])?;
         assert!(!output.status.success(), "split with invalid crate should fail");
-
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-/// Test sync with no splits configured
-#[test]
-fn test_sync_no_splits_configured() {
-    let result: Result<()> = (|| {
-        let ws = TestWorkspace::new_named("error-sync-no-splits")?;
-        ws.add_crate("test-crate", "0.1.0", &[])?;
-
-        // Config without splits
-        fs::write(
-            ws.path.join(".config/rail.toml"),
-            r#"[workspace]
-root = "."
-"#,
-        )?;
-
-        ws.commit("Add crate without splits")?;
-
-        // Try to sync
-        let output = run_cargo_rail(&ws.path, &["rail", "sync", "--all"])?;
-        assert!(!output.status.success(), "sync with no splits should fail");
 
         Ok(())
     })();
@@ -326,12 +297,7 @@ edition.workspace = true
         fs::write(crate_path.join("src/lib.rs"), "// test")?;
 
         fs::create_dir_all(path_with_space.join(".config"))?;
-        fs::write(
-            path_with_space.join(".config/rail.toml"),
-            r#"[workspace]
-root = "."
-"#,
-        )?;
+        fs::write(path_with_space.join(".config/rail.toml"), "")?;
 
         super::helpers::git(&path_with_space, &["add", "."])?;
         super::helpers::git(&path_with_space, &["commit", "-m", "Initial"])?;

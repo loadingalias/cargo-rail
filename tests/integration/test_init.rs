@@ -181,28 +181,6 @@ fn test_init_generated_config_passes_strict_validate() {
 }
 
 #[test]
-fn test_init_generated_config_migrate_check_is_idempotent() {
-    let result: Result<()> = (|| {
-        let ws = TestWorkspace::new_named("init-migrate-idempotent")?;
-        ws.remove_config()?;
-
-        let init_output = run_cargo_rail(&ws.path, &["rail", "init"])?;
-        assert!(init_output.status.success(), "init should succeed");
-
-        let migrate_check_output = run_cargo_rail(&ws.path, &["rail", "config", "migrate", "--check", "-f", "json"])?;
-        assert!(
-            migrate_check_output.status.success(),
-            "fresh init config should need no migration. stdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&migrate_check_output.stdout),
-            String::from_utf8_lossy(&migrate_check_output.stderr)
-        );
-
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-#[test]
 fn test_init_omits_default_sections_and_templates() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("init-sparse")?;

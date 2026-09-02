@@ -47,11 +47,13 @@ const ACCESS_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const EVIDENCE_CANDIDATE_INDEX_VERSION: u32 = 1;
 const EVIDENCE_CANDIDATE_INDEX_DIRECTORY: &str = "compiler-evidence-candidates";
 const NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY: &str = "native-dynamic-input-selectors-v1";
-const LEGACY_NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY: &str = "native-environment-selectors-v1";
+const V025_NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY: &str = "native-environment-selectors-v1";
 const NATIVE_LINK_CANDIDATE_DIRECTORY: &str = "native-link-candidates-v1";
 const NATIVE_LINK_CANDIDATE_VERSION: u32 = 1;
 const MAX_NATIVE_LINK_CANDIDATES: usize = 64;
 const MAX_NATIVE_LINK_CANDIDATE_BYTES: u64 = 1024;
+const NATIVE_EXECUTION_CLAIM_DIRECTORY: &str = "native-execution-claims-v1";
+const NATIVE_EXECUTION_CLAIM_SHARDS: u8 = 64;
 const NATIVE_RESTORE_LOCK_DIRECTORY: &str = "native-restore-locks-v1";
 const NATIVE_RESTORE_LOCK_SHARDS: u8 = 64;
 const MAX_NATIVE_ENVIRONMENT_SELECTOR_BYTES: u64 = 1024 * 1024;
@@ -65,7 +67,7 @@ const PACKED_NATIVE_ACTION_PRELUDE_BYTES: u64 = 8 + 2 + 4;
 const PACKED_NATIVE_ACTION_PRELUDE_LEN: usize = 8 + 2 + 4;
 const MAX_PACKED_NATIVE_ACTION_HEADER_BYTES: u64 = 1024 * 1024;
 const MAX_PACKED_NATIVE_ACTION_BYTES: u64 = crate::compiler::native_cache::pack::MAX_PACK_BYTES + 1024 * 1024;
-const LEGACY_NATIVE_ACTION_STATE_DIRECTORY: &str = "native-actions";
+const V025_NATIVE_ACTION_STATE_DIRECTORY: &str = "native-actions";
 const CAPACITY_STATE_FILE: &str = "CAPACITY.json";
 const NATIVE_LEDGER_STATE_FILE: &str = "NATIVE_LEDGER.json";
 const MAX_NATIVE_TERMINAL_STATES: u64 = 32 * 1024;
@@ -262,7 +264,7 @@ struct SelectedCacheAuthority {
     trust_domain: String,
 }
 
-/// Read-only measurements for one validated shared local CAS.
+/// Read-only measurements for one validated profile-owned local CAS.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct LocalCasStatus {
     pub(crate) root: String,
@@ -316,6 +318,21 @@ pub(crate) struct NativeRestoreLock {
     // while cleanup is still excluded by the shared lifecycle authority.
     _file: File,
     _lifecycle: LocalCasLifecycleLock,
+}
+
+/// One fixed-shard compiler execution claim.
+///
+/// The claim suppresses work only. It grants no cache lookup, restore, or
+/// publication authority and therefore retains no CAS lifecycle lock while
+/// compiler execution or publication is active.
+pub(crate) struct NativeExecutionClaim {
+    _file: File,
+}
+
+/// Result of one non-blocking fixed-shard compiler execution claim attempt.
+pub(crate) enum NativeExecutionClaimAttempt {
+    Acquired(NativeExecutionClaim),
+    Contended,
 }
 
 impl NativeActionHit<'_> {
@@ -898,6 +915,54 @@ impl LocalCas {
         })
     }
 
+    /// Try to suppress duplicate compiler execution for one command-local
+    /// candidate identity without growing the synchronization namespace.
+    ///
+    /// This claim is deliberately weaker than cache authority. Callers must
+    /// repeat exact native-action and analysis-evidence lookup after acquiring
+    /// it, and must release it before starting any restore transaction.
+    pub(crate) fn try_native_execution_claim(
+        &self,
+        identity: &crate::source::ContentDigest,
+    ) -> RailResult<NativeExecutionClaimAttempt> {
+        let (file, path) = self.native_execution_claim_file(identity)?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => return Ok(NativeExecutionClaimAttempt::Contended),
+            Err(fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+        validate_native_execution_claim_file(&path)?;
+        Ok(NativeExecutionClaimAttempt::Acquired(NativeExecutionClaim {
+            _file: file,
+        }))
+    }
+
+    /// Wait for one fixed-shard compiler execution claim after the caller has
+    /// yielded its active-work permit.
+    pub(crate) fn native_execution_claim(
+        &self,
+        identity: &crate::source::ContentDigest,
+    ) -> RailResult<NativeExecutionClaim> {
+        let (file, path) = self.native_execution_claim_file(identity)?;
+        file.lock()?;
+        validate_native_execution_claim_file(&path)?;
+        Ok(NativeExecutionClaim { _file: file })
+    }
+
+    fn native_execution_claim_file(&self, identity: &crate::source::ContentDigest) -> RailResult<(File, PathBuf)> {
+        let claims = native_execution_claim_directory(&self.root)?;
+        validate_real_directory(&claims, "local CAS native execution claims")?;
+        let shard = identity.as_bytes()[0] % NATIVE_EXECUTION_CLAIM_SHARDS;
+        let path = claims.join(format!("{shard:02x}.lock"));
+        let file = crate::utils::open_cache_lock_file(&path, false)?;
+        if !crate::utils::private_file_matches_path(&file, &path, 0)? {
+            return Err(RailError::message(
+                "native execution-claim shard is not a private empty file",
+            ));
+        }
+        Ok((file, path))
+    }
+
     /// Load the compiler-selected dynamic inputs for one portable base action.
     pub(crate) fn native_environment_selector(
         &self,
@@ -1412,15 +1477,9 @@ impl LocalCas {
         ] {
             validate_real_directory(&root.join(name), "local CAS required directory")?;
         }
+        validate_native_execution_claim_directory(&native_execution_claim_directory(&root)?)?;
         validate_native_restore_lock_directory(&root.join(NATIVE_RESTORE_LOCK_DIRECTORY))?;
-        validate_optional_real_directory(
-            &root.join(LEGACY_NATIVE_ACTION_STATE_DIRECTORY),
-            "legacy local CAS native action state",
-        )?;
-        validate_optional_real_directory(
-            &root.join(LEGACY_NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY),
-            "legacy local CAS native environment selectors",
-        )?;
+        validate_v025_preserved_namespaces(&root)?;
         #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         validate_real_directory(
             &root.join(SYSROOT_IDENTITY_MEMO_DIRECTORY),
@@ -1451,6 +1510,7 @@ impl LocalCas {
         let root = create_real_directory(&cargo_rail, &authority.root_name)?;
         prove_local_cache_volume(&root)?;
         ensure_owner_marker(&root, &authority.trust_domain)?;
+        validate_v025_preserved_namespaces(&root)?;
         create_real_directory(&root, "staging")?;
         for name in [
             "results",
@@ -1464,15 +1524,8 @@ impl LocalCas {
         ] {
             create_real_directory(&root, name)?;
         }
+        initialize_native_execution_claims(&root)?;
         initialize_native_restore_locks(&root)?;
-        validate_optional_real_directory(
-            &root.join(LEGACY_NATIVE_ACTION_STATE_DIRECTORY),
-            "legacy local CAS native action state",
-        )?;
-        validate_optional_real_directory(
-            &root.join(LEGACY_NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY),
-            "legacy local CAS native environment selectors",
-        )?;
         #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         create_real_directory(&root, SYSROOT_IDENTITY_MEMO_DIRECTORY)?;
         validate_root_entries(&root)?;
@@ -2057,7 +2110,7 @@ impl LocalCas {
         Ok(CommittedNativeResult { validation, stats })
     }
 
-    /// Publish one deterministic compiler-evidence object through the shared local lifecycle.
+    /// Publish one deterministic compiler-evidence object through the profile-owned local lifecycle.
     pub(crate) fn store_compiler_evidence(&self, request: CompilerEvidenceStoreRequest<'_>) -> RailResult<StoreStats> {
         let _lock = self.lock()?;
         let CompilerEvidenceStoreRequest { validation, evidence } = request;
@@ -2175,6 +2228,7 @@ fn initialize_selected_root(
     let root = create_real_directory(cargo_rail, &authority.root_name)?;
     prove_local_cache_volume(&root)?;
     ensure_owner_marker(&root, &authority.trust_domain)?;
+    validate_v025_preserved_namespaces(&root)?;
     create_real_directory(&root, "staging")?;
     for name in [
         "results",
@@ -2187,15 +2241,8 @@ fn initialize_selected_root(
     ] {
         create_real_directory(&root, name)?;
     }
+    initialize_native_execution_claims(&root)?;
     initialize_native_restore_locks(&root)?;
-    validate_optional_real_directory(
-        &root.join(LEGACY_NATIVE_ACTION_STATE_DIRECTORY),
-        "legacy local CAS native action state",
-    )?;
-    validate_optional_real_directory(
-        &root.join(LEGACY_NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY),
-        "legacy local CAS native environment selectors",
-    )?;
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     create_real_directory(&root, SYSROOT_IDENTITY_MEMO_DIRECTORY)?;
     validate_root_entries(&root)?;
@@ -2211,6 +2258,85 @@ fn initialize_selected_root(
 
 fn native_restore_lock_name(shard: u8) -> String {
     format!("{shard:02x}.lock")
+}
+
+fn native_execution_claim_name(shard: u8) -> String {
+    format!("{shard:02x}.lock")
+}
+
+fn validate_native_execution_claim_file(path: &Path) -> RailResult<()> {
+    let file = crate::utils::open_cache_lock_file(path, false)?;
+    if !crate::utils::private_file_matches_path(&file, path, 0)? {
+        return Err(RailError::message(format!(
+            "native execution-claim shard '{}' is not a private empty file",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Establish the complete execution-claim shard set under exclusive CAS
+/// lifecycle authority. File presence never represents claim ownership.
+fn initialize_native_execution_claims(root: &Path) -> RailResult<()> {
+    let path = native_execution_claim_directory(root)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| RailError::message("native execution-claim directory has no owner"))?;
+    let name = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| RailError::message("native execution-claim directory name is not UTF-8"))?;
+    let directory = create_real_directory(parent, name)?;
+    let expected = (0..NATIVE_EXECUTION_CLAIM_SHARDS)
+        .map(native_execution_claim_name)
+        .collect::<BTreeSet<_>>();
+    for entry in bounded_directory_entries(&directory, "local CAS native execution claims")? {
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| RailError::message("native execution-claim shard has a non-UTF-8 name"))?;
+        if !expected.contains(&name) {
+            return Err(RailError::message(format!(
+                "native execution-claim directory contains unexpected entry '{name}'"
+            )));
+        }
+        validate_native_execution_claim_file(&entry.path())?;
+    }
+    for name in expected {
+        let path = directory.join(name);
+        match crate::utils::open_cache_lock_file(&path, true) {
+            Ok(file) if crate::utils::private_file_matches_path(&file, &path, 0)? => {}
+            Ok(_) => {
+                return Err(RailError::message(format!(
+                    "native execution-claim shard '{}' is not a private empty file",
+                    path.display()
+                )));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    sync_directory_before_commit(&directory)?;
+    validate_native_execution_claim_directory(&directory).map(|_| ())
+}
+
+fn validate_native_execution_claim_directory(directory: &Path) -> RailResult<u64> {
+    validate_real_directory(directory, "local CAS native execution claims")?;
+    let entries = bounded_directory_entries(directory, "local CAS native execution claims")?;
+    if entries.len() != usize::from(NATIVE_EXECUTION_CLAIM_SHARDS) {
+        return Err(RailError::message(format!(
+            "native execution-claim directory must contain exactly {NATIVE_EXECUTION_CLAIM_SHARDS} shards"
+        )));
+    }
+    for (shard, entry) in (0..NATIVE_EXECUTION_CLAIM_SHARDS).zip(entries) {
+        let expected = native_execution_claim_name(shard);
+        if entry.file_name() != OsStr::new(&expected) {
+            return Err(RailError::message(format!(
+                "native execution-claim directory is missing canonical shard '{expected}'"
+            )));
+        }
+        validate_native_execution_claim_file(&entry.path())?;
+    }
+    Ok(u64::from(NATIVE_EXECUTION_CLAIM_SHARDS))
 }
 
 fn validate_native_restore_lock_file(path: &Path) -> RailResult<()> {
@@ -2535,6 +2661,17 @@ fn validate_optional_real_directory(path: &Path, description: &str) -> RailResul
     }
 }
 
+fn validate_v025_preserved_namespaces(root: &Path) -> RailResult<()> {
+    validate_optional_real_directory(
+        &root.join(V025_NATIVE_ACTION_STATE_DIRECTORY),
+        "v0.25-preserved local CAS native action state",
+    )?;
+    validate_optional_real_directory(
+        &root.join(V025_NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY),
+        "v0.25-preserved local CAS native environment selectors",
+    )
+}
+
 fn ensure_owner_marker(root: &Path, trust_domain: &str) -> RailResult<()> {
     let marker = root.join("OWNER");
     match fs::symlink_metadata(&marker) {
@@ -2592,8 +2729,8 @@ fn validate_root_entries(root: &Path) -> RailResult<()> {
         NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY,
         NATIVE_LINK_CANDIDATE_DIRECTORY,
         NATIVE_RESTORE_LOCK_DIRECTORY,
-        LEGACY_NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY,
-        LEGACY_NATIVE_ACTION_STATE_DIRECTORY,
+        V025_NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY,
+        V025_NATIVE_ACTION_STATE_DIRECTORY,
         "pins",
         "results",
         "staging",
@@ -5679,6 +5816,20 @@ fn lifecycle_lock_path(root: &Path) -> RailResult<PathBuf> {
     Ok(parent.join(format!("{root_name}.lock")))
 }
 
+/// Stable execution-suppression infrastructure adjacent to, but outside, the
+/// mutable CAS lifecycle root.
+fn native_execution_claim_directory(root: &Path) -> RailResult<PathBuf> {
+    let parent = root
+        .parent()
+        .filter(|parent| parent.file_name() == Some(OsStr::new("cargo-rail")))
+        .ok_or_else(|| RailError::message("local CAS root has no canonical cargo-rail owner directory"))?;
+    let root_name = root
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| RailError::message("local CAS root name is not valid UTF-8"))?;
+    Ok(parent.join(format!("{NATIVE_EXECUTION_CLAIM_DIRECTORY}.{root_name}")))
+}
+
 fn lock_local_cas(path: &Path, create: bool, mode: LockMode) -> RailResult<Option<LocalCasLifecycleLock>> {
     let parent = path
         .parent()
@@ -5836,6 +5987,14 @@ pub(crate) fn existing_root_at(root: &Path) -> RailResult<Option<PathBuf>> {
     ] {
         validate_optional_real_directory(&root.join(name), "local CAS domain")?;
     }
+    let execution_claims = native_execution_claim_directory(root)?;
+    match fs::symlink_metadata(&execution_claims) {
+        Ok(_) => {
+            validate_native_execution_claim_directory(&execution_claims)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     let restore_locks = root.join(NATIVE_RESTORE_LOCK_DIRECTORY);
     match fs::symlink_metadata(&restore_locks) {
         Ok(_) => {
@@ -5844,14 +6003,7 @@ pub(crate) fn existing_root_at(root: &Path) -> RailResult<Option<PathBuf>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    validate_optional_real_directory(
-        &root.join(LEGACY_NATIVE_ACTION_STATE_DIRECTORY),
-        "legacy local CAS native action state",
-    )?;
-    validate_optional_real_directory(
-        &root.join(LEGACY_NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY),
-        "legacy local CAS native environment selectors",
-    )?;
+    validate_v025_preserved_namespaces(root)?;
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     validate_optional_real_directory(&root.join(SYSROOT_IDENTITY_MEMO_DIRECTORY), "local CAS domain")?;
     validate_capacity_state(root)?;
@@ -6077,6 +6229,10 @@ pub(crate) fn remove_owned_root_at(root: &Path) -> RailResult<Option<(PathBuf, u
     };
     let bytes = removable_tree_bytes(&root)?;
     safe_remove_tree(&root)?;
+    sync_directory_before_commit(
+        root.parent()
+            .ok_or_else(|| RailError::message("local CAS root has no owner directory"))?,
+    )?;
     Ok(Some((root, bytes)))
 }
 
@@ -6368,6 +6524,14 @@ mod tests {
     use super::*;
     use crate::source::ContentDigest;
 
+    const V025_NATIVE_LEDGER: &[u8] = include_bytes!("../../tests/fixtures/compat/v0.25.0/cache/NATIVE_LEDGER.json");
+    const V025_NATIVE_ACTION_STATE: &[u8] = include_bytes!(
+        "../../tests/fixtures/compat/v0.25.0/cache/native-actions/0000000000000000000000000000000000000000000000000000000000000001.json"
+    );
+    const V025_NATIVE_ENVIRONMENT_SELECTOR: &[u8] = include_bytes!(
+        "../../tests/fixtures/compat/v0.25.0/cache/native-environment-selectors-v1/0000000000000000000000000000000000000000000000000000000000000001.json"
+    );
+
     #[test]
     fn preverified_blob_generation_rejects_same_length_mutation() {
         let staging = tempfile::tempdir().expect("staging");
@@ -6408,6 +6572,10 @@ mod tests {
 
     fn base_action_key(value: u8) -> String {
         format!("{}{value:064x}", crate::compiler::native_cache::BASE_ACTION_KEY_PREFIX)
+    }
+
+    fn v025_fixture(bytes: &'static [u8]) -> &'static [u8] {
+        bytes.strip_suffix(b"\n").unwrap_or(bytes)
     }
 
     fn dynamic_selector(names: &[&str], paths: &[&str]) -> crate::compiler::native_cache::NativeDynamicInputSelector {
@@ -7360,11 +7528,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_native_action_state_is_upgraded_without_becoming_v6_authority() {
-        const LEGACY_STATE: &[u8] =
-      b"{\"action_key\":\"compiler-action-v5-sha256-legacy\",\"state\":{\"kind\":\"unique_result\"},\"version\":1}\n";
-        const LEGACY_LEDGER: &[u8] = b"{\"version\":1,\"terminal_states\":0,\"terminal_bytes\":0,\"disabled\":false}";
-
+    fn v025_namespaces_are_preserved_without_becoming_current_authority() {
         let cache = tempfile::tempdir().expect("cache base");
         let output = tempfile::tempdir().expect("output root");
         let (manifest, validation) = native_fixture(output.path());
@@ -7372,65 +7536,115 @@ mod tests {
         let root = initialized.root().to_path_buf();
         drop(initialized);
 
-        let current_directory = root.join(NATIVE_ACTION_STATE_DIRECTORY);
-        fs::remove_dir(&current_directory).expect("remove post-upgrade action directory from legacy fixture");
-        fs::write(root.join(NATIVE_LEDGER_STATE_FILE), LEGACY_LEDGER).expect("legacy terminal ledger");
-        let legacy_directory = root.join(LEGACY_NATIVE_ACTION_STATE_DIRECTORY);
-        fs::create_dir(&legacy_directory).expect("legacy native action directory");
+        let current_actions = root.join(NATIVE_ACTION_STATE_DIRECTORY);
+        fs::remove_dir(&current_actions).expect("v0.25 fixture omits the current action namespace");
+        fs::write(root.join(NATIVE_LEDGER_STATE_FILE), v025_fixture(V025_NATIVE_LEDGER)).expect("v0.25 native ledger");
+        let preserved_actions = root.join(V025_NATIVE_ACTION_STATE_DIRECTORY);
+        let preserved_selectors = root.join(V025_NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY);
+        fs::create_dir(&preserved_actions).expect("v0.25 native actions");
+        fs::create_dir(&preserved_selectors).expect("v0.25 native environment selectors");
+
         let action_hex = validated_action_key_hex(validation.action_key()).expect("current action key");
-        let legacy_state = legacy_directory.join(format!("{action_hex}.json"));
-        fs::write(&legacy_state, LEGACY_STATE).expect("legacy state fixture");
+        let preserved_action = preserved_actions.join(format!("{action_hex}.json"));
+        fs::write(&preserved_action, v025_fixture(V025_NATIVE_ACTION_STATE)).expect("v0.25 action state");
+        let base_action = base_action_key(1);
+        let base_hex = validated_id_hex(&base_action, crate::compiler::native_cache::BASE_ACTION_KEY_PREFIX)
+            .expect("base action key");
+        let preserved_selector = preserved_selectors.join(format!("{base_hex}.json"));
+        fs::write(&preserved_selector, v025_fixture(V025_NATIVE_ENVIRONMENT_SELECTOR))
+            .expect("v0.25 environment selector");
 
-        assert!(
-            !current_directory.exists(),
-            "fixture must begin without the v2 namespace"
-        );
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should upgrade around legacy state");
-        assert!(
-            current_directory.is_dir(),
-            "upgrade must create the v2 action namespace"
-        );
-        assert!(
-            root.join(NATIVE_LEDGER_STATE_FILE).is_file(),
-            "upgrade must retain a current ledger"
-        );
-        assert_eq!(fs::read(&legacy_state).expect("preserved legacy state"), LEGACY_STATE);
-        let NativeActionLookup::Miss(miss) = cas.native_action(validation.action_key()).expect("legacy-key lookup")
-        else {
-            panic!("legacy state must not grant current action authority");
-        };
-        assert_eq!(miss.reason, "action_not_found");
-        let ledger = validate_native_ledger(cas.root()).expect("current native ledger");
-        assert_eq!(ledger.terminal_states, 0);
-        assert_eq!(ledger.terminal_bytes, 0);
-        assert!(!ledger.disabled);
-        let status = cas.status().expect("CAS status");
-        assert_eq!(status.native_actions, 0);
-        assert_eq!(status.native_unique, 0);
-        assert_eq!(status.native_conflicted, 0);
-        assert_eq!(status.native_quarantined, 0);
+        let predecessor_status = status_at_with_max(&root, 1024 * 1024)
+            .expect("v0.25 root status")
+            .expect("v0.25 root should be present");
+        assert_eq!(predecessor_status.native_actions, 0);
+        assert_eq!(predecessor_status.index_files, 0);
+        assert!(!current_actions.exists());
 
-        store_native_fixture(&cas, output.path(), &manifest, &validation);
-        assert!(
-            cas.root()
-                .join(NATIVE_ACTION_STATE_DIRECTORY)
-                .join(format!("{action_hex}.json"))
-                .is_file(),
-            "new authority must use the v2 action-state namespace"
+        let upgraded = LocalCas::open_at(cache.path(), 1024 * 1024).expect("setup should upgrade around v0.25 state");
+        assert!(current_actions.is_dir(), "setup must create the current namespace");
+        assert_eq!(
+            fs::read(&preserved_action).expect("preserved action"),
+            v025_fixture(V025_NATIVE_ACTION_STATE)
         );
         assert_eq!(
-            fs::read(&legacy_state).expect("legacy bytes after publish"),
-            LEGACY_STATE
+            fs::read(&preserved_selector).expect("preserved selector"),
+            v025_fixture(V025_NATIVE_ENVIRONMENT_SELECTOR)
         );
-        let status = cas.status().expect("published CAS status");
-        assert_eq!(status.native_actions, 1);
-        assert_eq!(status.native_unique, 1);
-        assert_eq!(status.native_conflicted, 0);
-        assert_eq!(status.native_quarantined, 0);
-        let ledger = validate_native_ledger(cas.root()).expect("published native ledger");
+        let NativeActionLookup::Miss(miss) = upgraded
+            .native_action(validation.action_key())
+            .expect("predecessor action lookup")
+        else {
+            panic!("v0.25 state must not grant current native-action authority");
+        };
+        assert_eq!(miss.reason, "action_not_found");
+        assert_eq!(
+            upgraded
+                .native_environment_selector(&base_action)
+                .expect("predecessor selector lookup"),
+            None,
+            "v0.25 selectors must not grant current selector authority"
+        );
+        let ledger = validate_native_ledger(upgraded.root()).expect("upgraded native ledger");
+        assert_eq!(ledger.version, NATIVE_ACTION_STATE_VERSION);
         assert_eq!(ledger.terminal_states, 0);
         assert_eq!(ledger.terminal_bytes, 0);
         assert!(!ledger.disabled);
+        drop(upgraded);
+
+        let canonical_base = fs::canonicalize(cache.path()).expect("canonical cache base");
+        let wrapper = LocalCas::open_initialized_at(&canonical_base, 1024 * 1024, None)
+            .expect("wrapper should open the upgraded v0.25 root");
+        let selector = dynamic_selector(&["CARGO_CFG_TARGET_ARCH"], &[".config/target-matrix.json"]);
+        assert_eq!(
+            wrapper
+                .publish_native_environment_selector(&base_action, &selector)
+                .expect("current selector publication"),
+            NativeEnvironmentSelectorPublication::Created
+        );
+        store_native_fixture(&wrapper, output.path(), &manifest, &validation);
+        assert_eq!(
+            fs::read(&preserved_action).expect("preserved action"),
+            v025_fixture(V025_NATIVE_ACTION_STATE)
+        );
+        assert_eq!(
+            fs::read(&preserved_selector).expect("preserved selector"),
+            v025_fixture(V025_NATIVE_ENVIRONMENT_SELECTOR)
+        );
+        let status = wrapper.status().expect("upgraded CAS status");
+        assert_eq!(status.native_actions, 1);
+        assert_eq!(status.native_unique, 1);
+        assert_eq!(status.index_files, 1);
+        drop(wrapper);
+
+        assert!(remove_owned_root_at(&root).expect("v0.25-compatible cleanup").is_some());
+        assert!(!root.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v025_namespace_links_are_rejected_without_touching_their_targets() {
+        use std::os::unix::fs::symlink;
+
+        for namespace in [
+            V025_NATIVE_ACTION_STATE_DIRECTORY,
+            V025_NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY,
+        ] {
+            let cache = tempfile::tempdir().expect("cache base");
+            let outside = tempfile::tempdir().expect("outside root");
+            let sentinel = outside.path().join("keep");
+            fs::write(&sentinel, b"outside").expect("outside sentinel");
+            let initialized = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should initialize");
+            let root = initialized.root().to_path_buf();
+            drop(initialized);
+            symlink(outside.path(), root.join(namespace)).expect("v0.25 namespace link");
+
+            let error =
+                LocalCas::open_at(cache.path(), 1024 * 1024).expect_err("setup must reject a linked v0.25 namespace");
+
+            assert!(error.to_string().contains("is not a real directory"), "{error}");
+            assert_eq!(fs::read(&sentinel).expect("outside sentinel"), b"outside");
+        }
     }
 
     #[test]
@@ -7751,7 +7965,7 @@ mod tests {
     }
 
     #[test]
-    fn native_restore_locks_are_bounded_and_legacy_staging_locks_migrate() {
+    fn native_restore_locks_use_a_bounded_shard_set() {
         let cache = tempfile::tempdir().expect("cache base");
         let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
         for destination in 0..4096_u64 {
@@ -7761,22 +7975,181 @@ mod tests {
         let status = cas.status().expect("bounded restore-lock status");
         assert_eq!(status.native_restore_lock_files, u64::from(NATIVE_RESTORE_LOCK_SHARDS));
         assert_eq!(status.staging_entries, 0);
+    }
 
-        safe_remove_tree(&cas.root.join(NATIVE_RESTORE_LOCK_DIRECTORY)).expect("simulate legacy CAS layout");
-        let legacy = cas.root.join("staging").join(format!(
-            ".native-restore-{}.lock",
-            ContentDigest::sha256(b"legacy destination")
-        ));
-        fs::write(&legacy, b"").expect("legacy restore lock");
-
-        let migrated = LocalCas::open_at(cache.path(), 1024 * 1024).expect("legacy CAS should migrate");
+    #[test]
+    fn native_execution_claims_use_a_bounded_shard_set() {
+        let cache = tempfile::tempdir().expect("cache base");
+        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        for candidate in 0..4096_u64 {
+            let identity = ContentDigest::sha256(&candidate.to_le_bytes());
+            let NativeExecutionClaimAttempt::Acquired(claim) = cas
+                .try_native_execution_claim(&identity)
+                .expect("execution claim attempt")
+            else {
+                panic!("uncontended execution claim must be acquired");
+            };
+            drop(claim);
+        }
+        let claims = native_execution_claim_directory(&cas.root).expect("execution-claim directory");
         assert!(
-            !legacy.exists(),
-            "exclusive lifecycle migration must remove the legacy lock"
+            !claims
+                .file_name()
+                .expect("execution-claim directory name")
+                .to_string_lossy()
+                .starts_with(CAS_ROOT_NAME),
+            "execution-claim infrastructure must not impersonate a local CAS root"
         );
-        let status = migrated.status().expect("migrated restore-lock status");
-        assert_eq!(status.native_restore_lock_files, u64::from(NATIVE_RESTORE_LOCK_SHARDS));
-        assert_eq!(status.staging_entries, 0);
+        let entries =
+            bounded_directory_entries(&claims, "test execution claims").expect("bounded execution-claim directory");
+        assert_eq!(entries.len(), usize::from(NATIVE_EXECUTION_CLAIM_SHARDS));
+        assert_eq!(cas.status().expect("CAS status").staging_entries, 0);
+    }
+
+    #[test]
+    fn native_execution_claim_hash_collisions_only_serialize_work() {
+        let cache = tempfile::tempdir().expect("cache base");
+        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let first = ContentDigest::sha256(b"first unrelated compiler action");
+        let second = (0_u64..)
+            .map(|candidate| ContentDigest::sha256(&candidate.to_le_bytes()))
+            .find(|candidate| {
+                candidate != &first
+                    && candidate.as_bytes()[0] % NATIVE_EXECUTION_CLAIM_SHARDS
+                        == first.as_bytes()[0] % NATIVE_EXECUTION_CLAIM_SHARDS
+            })
+            .expect("a bounded shard set must have a collision");
+
+        let NativeExecutionClaimAttempt::Acquired(first_claim) =
+            cas.try_native_execution_claim(&first).expect("first execution claim")
+        else {
+            panic!("first execution claim must be uncontended");
+        };
+        assert!(matches!(
+            cas.try_native_execution_claim(&second)
+                .expect("colliding execution claim"),
+            NativeExecutionClaimAttempt::Contended
+        ));
+        drop(first_claim);
+        assert!(matches!(
+            cas.try_native_execution_claim(&second)
+                .expect("released colliding execution claim"),
+            NativeExecutionClaimAttempt::Acquired(_)
+        ));
+    }
+
+    #[test]
+    fn native_execution_claim_does_not_retain_cas_lifecycle_authority() {
+        let cache = tempfile::tempdir().expect("cache base");
+        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let identity = ContentDigest::sha256(b"publication must not self-deadlock");
+        let claim = cas.native_execution_claim(&identity).expect("execution claim");
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let writer = cas;
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(move || {
+                let lifecycle = writer.lock().expect("exclusive lifecycle lock");
+                finished_tx.send(()).expect("lifecycle signal");
+                drop(lifecycle);
+            });
+            finished_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("execution claim must not block native publication's lifecycle lock");
+            drop(claim);
+            handle.join().expect("lifecycle writer");
+        });
+    }
+
+    #[test]
+    fn cache_cleanup_preserves_the_fixed_execution_claim_namespace() {
+        let cache = tempfile::tempdir().expect("cache base");
+        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let root = cas.root;
+        let claims = native_execution_claim_directory(&root).expect("execution-claim directory");
+        validate_native_execution_claim_directory(&claims).expect("initial execution-claim namespace");
+
+        assert!(remove_owned_root_at(&root).expect("cache cleanup").is_some());
+        assert!(!root.exists());
+        assert_eq!(
+            validate_native_execution_claim_directory(&claims).expect("preserved execution-claim namespace"),
+            u64::from(NATIVE_EXECUTION_CLAIM_SHARDS)
+        );
+
+        let reopened = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should reopen");
+        assert_eq!(
+            native_execution_claim_directory(&reopened.root).expect("reopened execution-claim directory"),
+            claims
+        );
+    }
+
+    #[test]
+    fn native_execution_claim_serializes_across_processes() {
+        const CACHE_ENV: &str = "CARGO_RAIL_TEST_NATIVE_EXECUTION_CLAIM_CACHE";
+        const CONTROL_ENV: &str = "CARGO_RAIL_TEST_NATIVE_EXECUTION_CLAIM_CONTROL";
+
+        let root = tempfile::tempdir().expect("execution-claim test root");
+        let cache = root.path().join("cache");
+        let control = root.path().join("control");
+        fs::create_dir(&cache).expect("cache base");
+        fs::create_dir(&control).expect("control directory");
+        let cas = LocalCas::open_at(&cache, 1024 * 1024).expect("CAS should open");
+        let identity = ContentDigest::sha256(b"shared compiler candidate");
+        let claim = cas.native_execution_claim(&identity).expect("parent execution claim");
+        let mut child = std::process::Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "cache::cas::tests::native_execution_claim_contention_worker",
+                "--nocapture",
+            ])
+            .env(CACHE_ENV, &cache)
+            .env(CONTROL_ENV, &control)
+            .spawn()
+            .expect("execution-claim worker should start");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !control.join("waiting").is_file() {
+            assert!(
+                child.try_wait().expect("worker status").is_none(),
+                "execution-claim worker exited before contention"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "execution-claim worker did not start"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(control.join("contended").is_file());
+        assert!(!control.join("acquired").is_file());
+        drop(claim);
+
+        let status = child.wait().expect("execution-claim worker status");
+        assert!(status.success(), "execution-claim worker failed: {status}");
+        assert!(control.join("acquired").is_file());
+    }
+
+    #[test]
+    fn native_execution_claim_contention_worker() {
+        const CACHE_ENV: &str = "CARGO_RAIL_TEST_NATIVE_EXECUTION_CLAIM_CACHE";
+        const CONTROL_ENV: &str = "CARGO_RAIL_TEST_NATIVE_EXECUTION_CLAIM_CONTROL";
+        let (Some(cache), Some(control)) = (std::env::var_os(CACHE_ENV), std::env::var_os(CONTROL_ENV)) else {
+            return;
+        };
+        let cache = fs::canonicalize(cache).expect("canonical cache base");
+        let control = PathBuf::from(control);
+        let cas = LocalCas::open_initialized_at(&cache, 1024 * 1024, None).expect("initialized CAS should open");
+        let identity = ContentDigest::sha256(b"shared compiler candidate");
+        match cas
+            .try_native_execution_claim(&identity)
+            .expect("non-blocking execution claim")
+        {
+            NativeExecutionClaimAttempt::Contended => {
+                fs::write(control.join("contended"), b"contended\n").expect("contention signal");
+            }
+            NativeExecutionClaimAttempt::Acquired(_) => panic!("held execution claim must contend"),
+        }
+        fs::write(control.join("waiting"), b"waiting\n").expect("wait signal");
+        let _claim = cas.native_execution_claim(&identity).expect("blocking execution claim");
+        fs::write(control.join("acquired"), b"acquired\n").expect("acquisition signal");
     }
 
     #[test]

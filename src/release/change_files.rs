@@ -14,11 +14,6 @@ use std::path::{Component, Path, PathBuf};
 /// Default directory containing pending change files.
 pub const DEFAULT_CHANGE_DIR: &str = ".changes";
 
-/// Deprecated pre-v0.15 change-file directory. This is a migration guard only.
-pub const LEGACY_CHANGE_DIR: &str = ".rail/changes";
-
-const LEGACY_CHANGE_DIR_HINT: &str = "move files to .changes/ (git mv .rail/changes .changes)";
-
 /// Reviewed release intent for one crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -132,7 +127,6 @@ pub(crate) struct ChangeFileConsumption {
 impl PendingChangeSet {
     /// Load pending change files from the configured directory.
     pub fn load(workspace_root: &Path, change_dir: &str, workspace_members: &[String]) -> RailResult<Self> {
-        assert_no_legacy_change_files(workspace_root)?;
         validate_change_dir_value(change_dir)?;
         let dir = workspace_root.join(change_dir);
         if !dir.exists() {
@@ -263,19 +257,6 @@ impl PendingChangeSet {
     }
 }
 
-/// Fail if the removed `.rail/changes` directory still contains Markdown files.
-pub fn assert_no_legacy_change_files(workspace_root: &Path) -> RailResult<()> {
-    let legacy_dir = workspace_root.join(LEGACY_CHANGE_DIR);
-    if !directory_contains_markdown(&legacy_dir)? {
-        return Ok(());
-    }
-
-    Err(RailError::with_help(
-        format!("legacy change files found in {}", legacy_dir.display()),
-        LEGACY_CHANGE_DIR_HINT,
-    ))
-}
-
 /// Write a new pending change file using deterministic `{slug}-{hash4}.md` naming.
 pub fn write_change_file(
     workspace_root: &Path,
@@ -285,7 +266,6 @@ pub fn write_change_file(
     body: &str,
     name_override: Option<&str>,
 ) -> RailResult<ChangeFile> {
-    assert_no_legacy_change_files(workspace_root)?;
     validate_change_dir_value(change_dir)?;
 
     let member_set: FxHashSet<&str> = workspace_members.iter().map(String::as_str).collect();
@@ -423,22 +403,6 @@ fn validate_intents(intents: &BTreeMap<String, ChangeBump>, workspace_members: &
     ))
 }
 
-fn directory_contains_markdown(dir: &Path) -> RailResult<bool> {
-    if !dir.exists() {
-        return Ok(false);
-    }
-    for entry in
-        fs::read_dir(dir).map_err(|e| RailError::message(format!("failed to read {}: {}", dir.display(), e)))?
-    {
-        let entry = entry.map_err(|e| RailError::message(format!("failed to read {}: {}", dir.display(), e)))?;
-        let path = entry.path();
-        if path.is_file() && path.extension().is_some_and(|ext| ext == "md") {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 pub(crate) fn change_dir_validation_error(change_dir: &str) -> Option<&'static str> {
     let path = Path::new(change_dir);
     if change_dir.trim().is_empty() {
@@ -454,9 +418,6 @@ pub(crate) fn change_dir_validation_error(change_dir: &str) -> Option<&'static s
     {
         return Some("change_dir must be a workspace-relative path");
     }
-    if is_legacy_change_dir(change_dir) {
-        return Some("change_dir = \".rail/changes\" is removed; use \".changes\" or \"changes\"");
-    }
     None
 }
 
@@ -465,18 +426,7 @@ fn validate_change_dir_value(change_dir: &str) -> RailResult<()> {
         return Ok(());
     };
 
-    if is_legacy_change_dir(change_dir) {
-        return Err(RailError::with_help(
-            "change_dir = \".rail/changes\" is removed",
-            LEGACY_CHANGE_DIR_HINT,
-        ));
-    }
-
     Err(RailError::message(format!("invalid release.change_dir: {}", reason)))
-}
-
-fn is_legacy_change_dir(change_dir: &str) -> bool {
-    change_dir.trim_end_matches(['/', '\\']) == LEGACY_CHANGE_DIR
 }
 
 fn slugify_message(value: &str) -> String {

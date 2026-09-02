@@ -1,0 +1,121 @@
+# Repository policy. Omitted fields use cargo-rail's coded defaults.
+
+targets = [
+  "aarch64-apple-darwin",
+  "aarch64-pc-windows-msvc",
+  "aarch64-unknown-linux-gnu",
+  "aarch64-unknown-linux-musl",
+  "x86_64-pc-windows-msvc",
+  "x86_64-unknown-linux-gnu",
+  "x86_64-unknown-linux-musl",
+]
+
+[unify]
+include_renamed = true
+major_version_conflict = "bump"
+max_backups = 2
+msrv_policy = { mode = "compute", source = "workspace" }
+
+[surface]
+enabled = true
+
+[release]
+tag_format = "{prefix}{version}"
+remote_effects = "auto"
+registry_publication = "crates-io"
+sign_tags = true
+require_changelog_entries = true
+require_change_files = true
+semver_check = "off"
+unconventional_commits = "deny"
+
+[release.changelog]
+emoji = false
+group_order = ["breaking", "feat", "fix", "perf", "docs", "deps"]
+fallback = "skip"
+
+[release.changelog.filters]
+skip_types = ["build", "chore", "ci", "refactor", "style", "test"]
+
+# Repository work declarations contain positive inputs only. Cargo, rustfmt,
+# dependency policy, release-semver, and Surface semantics remain code-owned.
+[plan.work.cargo-command-policy]
+scope = "repository"
+paths = [
+  ".github/**/*.yaml",
+  ".github/**/*.yml",
+  "docs/**/*.md",
+  "scripts/**/*.sh",
+  "scripts/**/*.py",
+  "src/**/*.rs",
+  "tests/**/*.rs",
+  "justfile",
+]
+
+[plan.work.installers]
+scope = "repository"
+paths = [
+  "install.ps1",
+  "install.sh",
+  "scripts/ci/check-installers.sh",
+  "scripts/ci/fixtures/fake-ci-rustup.sh",
+  "scripts/ci/install-rust-toolchain*.sh",
+]
+
+[plan.work."docs.generated"]
+scope = "repository"
+paths = [
+  "scripts/docs/**",
+  "scripts/ci/support-matrix.py",
+  "src/compiler/native_cache.rs",
+  "tests/compatibility/manifest.json",
+  "distribution/release-targets.json",
+]
+
+[plan.work.compiler-fact-driver]
+scope = "repository"
+paths = [
+  "tools/compiler-fact-driver/**",
+  "scripts/check-compiler-fact-driver.sh",
+  "scripts/with-compiler-fact-driver.sh",
+  "src/compiler/**",
+  "rustfmt.toml",
+]
+
+[plan.work.compatibility]
+scope = "variants"
+cargo = ["cargo.build", "cargo.test"]
+paths = [
+  ".github/workflows/compatibility.yaml",
+  "scripts/ci/run-compatibility.py",
+  "scripts/ci/run-filesystem-compatibility.py",
+  "scripts/ci/install-rust-toolchain.sh",
+  "scripts/ci/support-matrix.py",
+  "tests/compatibility/**",
+]
+variant_catalog = "distribution/compatibility-plan-variants.json"
+
+[plan.work.release-archives]
+scope = "variants"
+paths = [
+  ".github/workflows/release-archives.yaml",
+  "distribution/release-targets.json",
+  "scripts/install.ps1",
+  "scripts/install.sh",
+  "scripts/package-release-archive.py",
+  "scripts/ci/install-rust-toolchain.sh",
+  "scripts/ci/support-matrix.py",
+  "scripts/ci/verify-release-components.py",
+  "src/main.rs",
+  "tools/compiler-fact-driver/**",
+]
+variant_catalog = "distribution/release-archive-plan-variants.json"
+
+[plan.work.action-pins]
+scope = "repository"
+paths = [
+  ".github/actions-lock.yaml",
+  ".github/**/*.yaml",
+  ".github/**/*.yml",
+  "scripts/ci/pin-actions.sh",
+]

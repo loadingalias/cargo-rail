@@ -40,7 +40,9 @@
             { "$ref": "#/$defs/target" },
             { "type": "null" }
           ]
-        }
+        },
+        "features": { "$ref": "#/$defs/string_array" },
+        "manifest": { "type": "string", "minLength": 1 }
       }
     },
     "variant": {

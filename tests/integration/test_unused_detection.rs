@@ -6,7 +6,7 @@
 //!
 //! This is critical - false positives would cause users to remove deps they need!
 
-use crate::helpers::{TestWorkspace, compiler_evidence_cache, run_cargo_rail, run_cargo_rail_with_env};
+use crate::helpers::{TestWorkspace, cargo_command, compiler_evidence_cache, run_cargo_rail, run_cargo_rail_with_env};
 use anyhow::Result;
 use std::collections::BTreeSet;
 use std::fs;
@@ -201,6 +201,104 @@ pub fn hello() -> u8 {
             "once_cell should NOT be flagged as unused when used by lib target\nstdout:\n{}\nstderr:\n{}",
             stdout,
             stderr
+        );
+
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_unused_detection_survives_workspace_warning_denial() {
+    let result: Result<()> = (|| {
+        let workspace = create_workspace_with_unused_detection()?;
+        fs::write(
+            workspace.path.join("Cargo.toml"),
+            r#"[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+authors = ["Test Author"]
+
+[workspace.lints.rust]
+warnings = "deny"
+"#,
+        )?;
+        add_crate_with_manifest(
+            &workspace,
+            "deny-warnings",
+            r#"[package]
+name = "deny-warnings"
+version = "0.1.0"
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+log = "0.4"
+once_cell = "1"
+"#,
+        )?;
+        fs::write(
+            workspace.path.join("crates/deny-warnings/src/lib.rs"),
+            r#"use once_cell::sync::Lazy;
+
+static VALUE: Lazy<u8> = Lazy::new(|| 7);
+
+pub fn value() -> u8 {
+    *VALUE
+}
+"#,
+        )?;
+        fs::write(
+            workspace.path.join("crates/deny-warnings/src/main.rs"),
+            "fn main() { println!(\"target-local view\"); }\n",
+        )?;
+        workspace.commit("Deny warnings with one target-local and one unused dependency")?;
+
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "-f", "json"])?;
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "a valid pending Unify decision must not become an acquisition error\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let certificates = report["proof_certificates"]
+            .as_array()
+            .expect("machine report proof certificates");
+        assert!(
+            certificates.iter().any(|certificate| {
+                certificate["subject"]["declaration"] == "log" && certificate["decision"] == "remove"
+            }),
+            "the genuinely unused dependency must remain removable: {report:#}"
+        );
+        assert!(
+            !certificates.iter().any(|certificate| {
+                certificate["subject"]["declaration"] == "once_cell" && certificate["decision"] == "remove"
+            }),
+            "usage by the library target must retain the dependency: {report:#}"
+        );
+
+        let repeated = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "-f", "json"])?;
+        assert_eq!(repeated.status.code(), Some(1));
+        let repeated_report: serde_json::Value = serde_json::from_slice(&repeated.stdout)?;
+        assert_eq!(
+            report["proof_certificates"], repeated_report["proof_certificates"],
+            "cold and reusable evidence must produce the same normalized decision"
+        );
+
+        let ordinary = cargo_command(&workspace.path).args(["check", "--workspace"]).output()?;
+        assert!(
+            ordinary.status.success(),
+            "Cargo-Rail's diagnostic lint level must not escape into ordinary Cargo\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&ordinary.stdout),
+            String::from_utf8_lossy(&ordinary.stderr)
         );
 
         Ok(())
@@ -547,6 +645,93 @@ log = "0.4"
         assert!(
             !stdout.contains("Unification Plan") && !stdout.contains("Remove log"),
             "failed compiler evidence escaped as a semantic result:\n{stdout}"
+        );
+
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_unused_detection_keeps_resolution_targets_outside_compiler_evidence() {
+    let result: Result<()> = (|| {
+        let workspace = create_workspace_with_unused_detection()?;
+        add_crate_with_manifest(
+            &workspace,
+            "test-crate",
+            r#"[package]
+name = "test-crate"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+log = "0.4"
+"#,
+        )?;
+        let rustc = std::process::Command::new("rustc").arg("-vV").output()?;
+        anyhow::ensure!(rustc.status.success(), "rustc -vV failed");
+        let host = String::from_utf8(rustc.stdout)?
+            .lines()
+            .find_map(|line| line.strip_prefix("host: "))
+            .ok_or_else(|| anyhow::anyhow!("rustc -vV did not report a host target"))?
+            .to_string();
+        fs::write(
+            workspace.path.join(".config/rail.toml"),
+            format!("targets = [\"{host}\", \"thumbv6m-none-eabi\"]\n\n[unify]\ncompiler_targets = [\"{host}\"]\n"),
+        )?;
+        workspace.commit("Separate resolution and compiler-evidence targets")?;
+
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--explain"])?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_ne!(
+            output.status.code(),
+            Some(2),
+            "an omitted compiler target must remain a resolution domain without becoming an acquisition error\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("target {host} /")),
+            "the selected compiler target was not acquired:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("target thumbv6m-none-eabi /"),
+            "the resolution-only target escaped into compiler acquisition:\n{stderr}"
+        );
+        assert!(
+            !stdout.contains("Remove log"),
+            "missing target evidence must conservatively retain the dependency:\n{stdout}"
+        );
+
+        let doctor = run_cargo_rail(&workspace.path, &["rail", "unify", "doctor", "--format", "json"])?;
+        anyhow::ensure!(doctor.status.success(), "unify doctor failed");
+        let doctor: serde_json::Value = serde_json::from_slice(&doctor.stdout)?;
+        assert_eq!(
+            doctor["compiler_evidence_targets"],
+            serde_json::json!([host]),
+            "the machine report must project the exact effective compiler subset"
+        );
+        assert_eq!(
+            doctor["target_domains"].as_array().map(Vec::len),
+            Some(2),
+            "dependency resolution must retain both top-level target domains"
+        );
+
+        let cache = compiler_evidence_cache(&workspace.path)?;
+        let cached_targets = cache["entries"]
+            .as_object()
+            .into_iter()
+            .flat_map(|entries| entries.values())
+            .filter(|entry| {
+                entry["key"]["package_id"]
+                    .as_str()
+                    .is_some_and(|package| package.contains("test-crate"))
+            })
+            .filter_map(|entry| entry["key"]["target"].as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            cached_targets,
+            BTreeSet::from([host.as_str()]),
+            "compiler evidence cache identities must remain inside the effective subset"
         );
 
         Ok(())
@@ -1761,14 +1946,6 @@ edition = "2021"
             String::from_utf8_lossy(&output.stderr)
         );
 
-        let cache_file = workspace.path.join("target/cargo-rail/cache/compiler-diags-v1.json");
-        assert!(
-            !cache_file.exists(),
-            "compiler evidence must not recreate the legacy monolith at {}\nstdout:\n{}\nstderr:\n{}",
-            cache_file.display(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
         let cache = compiler_evidence_cache(&workspace.path)?;
         assert!(
             cache["entries"].as_object().is_some_and(|entries| !entries.is_empty()),
@@ -1841,17 +2018,11 @@ edition = "2021"
         assert_eq!(observation["unit"]["target_kind"], "library");
         let observation_bypasses = observation["bypasses"].as_array().expect("observation bypass array");
         assert!(
-            observation_bypasses.iter().any(|reason| reason
+            !observation_bypasses.iter().any(|reason| reason
                 .as_str()
                 .is_some_and(|reason| reason.ends_with("dynamic_executable_inputs_unavailable"))),
-            "native tool runtime inputs must remain an explicit cache bypass: {observation}"
+            "the exact Rust distribution and host runtime contract must not be a categorical bypass: {observation}"
         );
-        let expected_observation_miss = observation_bypasses
-            .first()
-            .and_then(serde_json::Value::as_str)
-            .expect("at least one deterministic observation bypass")
-            .to_string();
-        let expected_observation_miss = format!("{expected_observation_miss}=");
         let baseline_source = compiler_key_fingerprints(&cache, "test-crate", "source_fingerprint");
         let baseline_manifest = compiler_key_fingerprints(&cache, "test-crate", "manifest_fingerprint");
         let baseline_config = compiler_key_fingerprints(&cache, "test-crate", "cargo_config_fingerprint");
@@ -1866,17 +2037,12 @@ edition = "2021"
             .and_then(|entries| entries.iter().find(|entry| entry["member"] == "test-crate"))
             .expect("unused dependency cache telemetry");
         assert_eq!(
-            warm_cache["hits"], 0,
-            "an executable with unmodeled dynamic inputs must never authorize evidence reuse"
+            warm_cache["misses"], 0,
+            "an unchanged exact compiler input set must not repeat compiler acquisition: {warm_cache}"
         );
         assert!(
-            warm_cache["misses"].as_u64().is_some_and(|misses| misses > 0)
-                && warm_cache["miss_reasons"]
-                    .as_array()
-                    .is_some_and(|reasons| reasons.iter().any(|reason| reason
-                        .as_str()
-                        .is_some_and(|reason| reason.starts_with(&expected_observation_miss)))),
-            "warm analysis must expose the precise fail-closed executable bypass\n{}",
+            warm_cache["hits"].as_u64().is_some_and(|hits| hits > 0),
+            "warm analysis must reuse exact compiler evidence\n{}",
             serde_json::to_string_pretty(&warm_json)?
         );
 
@@ -1922,7 +2088,10 @@ edition = "2021"
             .as_array()
             .and_then(|entries| entries.iter().find(|entry| entry["member"] == "test-crate"))
             .expect("unrelated-input cache telemetry");
-        assert_eq!(unrelated_cache["hits"], 0);
+        assert!(
+            unrelated_cache["hits"].as_u64().is_some_and(|hits| hits > 0) && unrelated_cache["misses"] == 0,
+            "unrelated package changes must retain selected-package evidence: {unrelated_cache}"
+        );
         let unrelated_cache_file = compiler_evidence_cache(&workspace.path)?;
         assert_eq!(
             compiler_key_fingerprints(&unrelated_cache_file, "test-crate", "source_fingerprint"),
@@ -2004,56 +2173,6 @@ edition = "2021"
     super::helpers::finish_test(result);
 }
 
-#[cfg(unix)]
-#[test]
-fn test_compiler_evidence_migration_does_not_follow_or_replace_a_legacy_symlink() {
-    let result: Result<()> = (|| {
-        use std::os::unix::fs::symlink;
-
-        let workspace = create_workspace_with_unused_detection()?;
-        add_crate_with_manifest(
-            &workspace,
-            "test-crate",
-            r#"[package]
-name = "test-crate"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-log = "0.4"
-"#,
-        )?;
-        workspace.commit("Add cache symlink fixture")?;
-
-        let cache_dir = workspace.path.join("target/cargo-rail/cache");
-        fs::create_dir_all(&cache_dir)?;
-        let sentinel = workspace.path.join("cache-write-sentinel");
-        fs::write(&sentinel, "must remain unchanged")?;
-        let cache_file = cache_dir.join("compiler-diags-v1.json");
-        symlink(&sentinel, &cache_file)?;
-
-        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
-        assert_eq!(output.status.code(), Some(1), "fixture should produce a unify plan");
-        assert_eq!(
-            fs::read_to_string(&sentinel)?,
-            "must remain unchanged",
-            "cache persistence must not follow a pre-positioned symlink"
-        );
-        assert!(
-            fs::symlink_metadata(&cache_file)?.file_type().is_symlink(),
-            "CAS persistence must leave an unowned legacy symlink untouched"
-        );
-        assert!(
-            compiler_evidence_cache(&workspace.path)?["entries"]
-                .as_object()
-                .is_some_and(|entries| !entries.is_empty()),
-            "new evidence should still publish through the safe local CAS"
-        );
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
 #[test]
 fn test_unused_detection_checks_only_members_requiring_source_evidence() {
     let result: Result<()> = (|| {
@@ -2101,65 +2220,6 @@ log = "0.4"
             stderr.contains("(1 package)"),
             "only source-check should require compiler diagnostics\nstderr:\n{}",
             stderr
-        );
-
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-#[test]
-fn test_deprecated_compiler_diag_cache_toggle_cannot_disable_correct_caching() {
-    let result: Result<()> = (|| {
-        let workspace = TestWorkspace::new()?;
-
-        let config = r#"[unify]
-compiler_diag_cache = false
-"#;
-        fs::write(workspace.path.join(".config/rail.toml"), config)?;
-
-        add_crate_with_manifest(
-            &workspace,
-            "test-crate",
-            r#"[package]
-name = "test-crate"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-log = "0.4"
-"#,
-        )?;
-
-        workspace.commit("Add crate for compiler diag cache disabled test")?;
-
-        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
-        assert_eq!(
-            output.status.code(),
-            Some(1),
-            "unify --check should exit with 1 when changes are detected\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-
-        let cache_file = workspace.path.join("target/cargo-rail/cache/compiler-diags-v1.json");
-        assert!(
-            !cache_file.exists(),
-            "deprecated implementation input must not recreate the legacy cache at {}\nstdout:\n{}\nstderr:\n{}",
-            cache_file.display(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            compiler_evidence_cache(&workspace.path)?["entries"]
-                .as_object()
-                .is_some_and(|entries| !entries.is_empty()),
-            "deprecated configuration must not disable shared local evidence caching"
-        );
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("config migrate"),
-            "compatibility parsing must emit an actionable warning\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stderr)
         );
 
         Ok(())

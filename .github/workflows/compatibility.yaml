@@ -155,7 +155,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           remote-url: ${{ inputs.native-cache-url }}
           remote-mode: ${{ inputs.native-cache-mode }}
-          remote-credentials-ready: ${{ inputs.native-cache-url == '' || (secrets.r2_access_key_id != '' && secrets.r2_secret_access_key != '') }}
+          remote-access-key-id: ${{ inputs.native-cache-url != '' && secrets.r2_access_key_id || '' }}
+          remote-secret-access-key: ${{ inputs.native-cache-url != '' && secrets.r2_secret_access_key || '' }}
 
       - name: Download exact plan
         if: inputs.plan-artifact != ''
@@ -170,8 +171,8 @@ jobs:
 
       - name: Build cargo-rail executables with selected toolchain
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.r2_access_key_id }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.r2_secret_access_key }}
+          AWS_ACCESS_KEY_ID: ${{ inputs.native-cache-url != '' && secrets.r2_access_key_id || '' }}
+          AWS_SECRET_ACCESS_KEY: ${{ inputs.native-cache-url != '' && secrets.r2_secret_access_key || '' }}
           AWS_EC2_METADATA_DISABLED: "true"
         run: cargo build --locked --bins
 
@@ -239,29 +240,29 @@ jobs:
       - name: Build all endpoint targets
         if: matrix.compatibility.full-suite
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.r2_access_key_id }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.r2_secret_access_key }}
+          AWS_ACCESS_KEY_ID: ${{ inputs.native-cache-url != '' && secrets.r2_access_key_id || '' }}
+          AWS_SECRET_ACCESS_KEY: ${{ inputs.native-cache-url != '' && secrets.r2_secret_access_key || '' }}
           AWS_EC2_METADATA_DISABLED: "true"
         run: just build-all
 
       - name: Run full endpoint suite
         if: matrix.compatibility.full-suite && runner.os != 'Windows'
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.r2_access_key_id }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.r2_secret_access_key }}
+          AWS_ACCESS_KEY_ID: ${{ inputs.native-cache-url != '' && secrets.r2_access_key_id || '' }}
+          AWS_SECRET_ACCESS_KEY: ${{ inputs.native-cache-url != '' && secrets.r2_secret_access_key || '' }}
           AWS_EC2_METADATA_DISABLED: "true"
         run: just test-all
 
       - name: Remove ambient Windows compiler-cache installation
         if: matrix.compatibility.full-suite && runner.os == 'Windows'
         shell: bash
-        run: target/debug/cargo-rail.exe rail cache remove --quiet
+        run: target/debug/cargo-rail.exe rail cache uninstall --quiet
 
       - name: Run full Windows endpoint suite
         if: matrix.compatibility.full-suite && runner.os == 'Windows'
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.r2_access_key_id }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.r2_secret_access_key }}
+          AWS_ACCESS_KEY_ID: ${{ inputs.native-cache-url != '' && secrets.r2_access_key_id || '' }}
+          AWS_SECRET_ACCESS_KEY: ${{ inputs.native-cache-url != '' && secrets.r2_secret_access_key || '' }}
           AWS_EC2_METADATA_DISABLED: "true"
           TEMP: ${{ runner.temp }}
           TMP: ${{ runner.temp }}
@@ -271,8 +272,8 @@ jobs:
       - name: Run doctests
         if: matrix.compatibility.full-suite
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.r2_access_key_id }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.r2_secret_access_key }}
+          AWS_ACCESS_KEY_ID: ${{ inputs.native-cache-url != '' && secrets.r2_access_key_id || '' }}
+          AWS_SECRET_ACCESS_KEY: ${{ inputs.native-cache-url != '' && secrets.r2_secret_access_key || '' }}
           AWS_EC2_METADATA_DISABLED: "true"
         run: cargo test --doc -p cargo-rail --all-features --locked
 
@@ -280,8 +281,8 @@ jobs:
         if: matrix.compatibility.full-suite
         shell: bash
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.r2_access_key_id }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.r2_secret_access_key }}
+          AWS_ACCESS_KEY_ID: ${{ inputs.native-cache-url != '' && secrets.r2_access_key_id || '' }}
+          AWS_SECRET_ACCESS_KEY: ${{ inputs.native-cache-url != '' && secrets.r2_secret_access_key || '' }}
           AWS_EC2_METADATA_DISABLED: "true"
         run: |
           rustup component add rustc-dev --toolchain "$RUSTUP_TOOLCHAIN"
@@ -359,7 +360,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           remote-url: ${{ inputs.native-cache-url }}
           remote-mode: ${{ inputs.native-cache-mode }}
-          remote-credentials-ready: ${{ inputs.native-cache-url == '' || (secrets.r2_access_key_id != '' && secrets.r2_secret_access_key != '') }}
+          remote-access-key-id: ${{ inputs.native-cache-url != '' && secrets.r2_access_key_id || '' }}
+          remote-secret-access-key: ${{ inputs.native-cache-url != '' && secrets.r2_secret_access_key || '' }}
 
       - name: Download exact plan
         if: inputs.plan-artifact != ''
@@ -375,8 +377,8 @@ jobs:
       - name: Build cargo-rail and filesystem tests outside the qualified volume
         shell: bash
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.r2_access_key_id }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.r2_secret_access_key }}
+          AWS_ACCESS_KEY_ID: ${{ inputs.native-cache-url != '' && secrets.r2_access_key_id || '' }}
+          AWS_SECRET_ACCESS_KEY: ${{ inputs.native-cache-url != '' && secrets.r2_secret_access_key || '' }}
           AWS_EC2_METADATA_DISABLED: "true"
         run: |
           cargo build --locked --bins

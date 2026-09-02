@@ -1,5 +1,6 @@
 //! Exact machine installation for transparent local compiler reuse.
 
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -8,13 +9,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use toml_edit::{DocumentMut, Item, Table, Value};
 
-use crate::cache::cas::{DEFAULT_CACHE_MAX_BYTES, LocalCacheSelection, LocalCas};
+use crate::cache::cas::{LocalCacheSelection, LocalCas};
 use crate::cargo::CargoConfigSnapshot;
 use crate::error::{RailError, RailResult};
 use crate::source::ContentDigest;
 
-const INSTALLATION_VERSION: u32 = 3;
+const INSTALLATION_VERSION: u32 = 4;
+const V0_25_INSTALLATION_VERSION: u32 = 3;
 const INSTALLATION_DIRECTORY: &str = "compiler-cache-v1";
+const INSTALLATION_LOCK_FILE: &str = "compiler-cache-v1.lock";
 const RECEIPT_FILE: &str = "setup.json";
 const SESSION_MEMO_FILE: &str = "session.json";
 const SESSION_LOCK_FILE: &str = "session.lock";
@@ -52,6 +55,7 @@ const DIRECT_LAUNCHER_ENV: &str = "CARGO_RAIL_DIRECT_CACHE_LAUNCHER";
 /// Requested machine policy. Omitted values preserve an existing installation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SetupRequest {
+    pub(crate) profile_id: Option<String>,
     pub(crate) distributed_local: bool,
     pub(crate) distributed_endpoint: Option<String>,
     pub(crate) distributed_server_name: Option<String>,
@@ -81,6 +85,7 @@ pub(crate) struct SetupPlan {
     worker: ExecutableSetup,
     distributed_worker: Option<ExecutableSetup>,
     source_distributed_identity: Option<SourceDistributedIdentity>,
+    profile: crate::cache::profile::ProfileSetupPlan,
     pending: bool,
 }
 
@@ -178,20 +183,15 @@ impl SetupPlan {
     }
 
     pub(crate) fn cache_base(&self) -> &Path {
-        self.receipt.cache.base()
+        self.profile.profile().cache().base()
     }
 
-    pub(crate) const fn max_bytes(&self) -> u64 {
-        self.receipt.cache.max_bytes()
+    pub(crate) fn max_bytes(&self) -> u64 {
+        self.profile.profile().cache().max_bytes()
     }
 
     pub(crate) fn remote_selection(&self) -> RailResult<Option<crate::remote_cache::RemoteCacheSelection>> {
-        self.receipt
-            .remote
-            .as_ref()
-            .map(crate::remote_cache::InstalledRemoteCache::selection)
-            .transpose()
-            .map_err(|error| RailError::message(format!("installed remote cache policy is invalid: {error}")))
+        self.profile.profile().remote_selection()
     }
 
     pub(crate) fn distributed_mode(&self) -> Option<&str> {
@@ -209,8 +209,12 @@ impl SetupPlan {
             .map(DistributedPlacementPolicy::as_str)
     }
 
-    pub(crate) const fn root_portability(&self) -> &'static str {
-        self.receipt.root_portability.as_str()
+    pub(crate) fn root_portability(&self) -> &'static str {
+        self.profile.profile().root_portability().as_str()
+    }
+
+    pub(crate) fn profile_id(&self) -> &str {
+        self.profile.profile().profile_id()
     }
 
     pub(crate) fn receipt_path(&self) -> RailResult<PathBuf> {
@@ -242,13 +246,18 @@ pub(crate) struct InstallationReceipt {
     worker_path: PathBuf,
     worker_digest: String,
     worker_generation: Vec<u8>,
-    cache: LocalCacheSelection,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    remote: Option<crate::remote_cache::InstalledRemoteCache>,
-    #[serde(default, skip_serializing_if = "InstalledRootPortability::is_physical")]
-    root_portability: InstalledRootPortability,
+    #[serde(default, rename = "cache", skip_serializing)]
+    v0_25_cache: Option<LocalCacheSelection>,
+    #[serde(default, rename = "remote", skip_serializing)]
+    v0_25_remote: Option<crate::remote_cache::InstalledRemoteCache>,
+    #[serde(default, rename = "root_portability", skip_serializing)]
+    v0_25_root_portability: Option<InstalledRootPortability>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     distributed: Option<InstalledDistributedQualification>,
+    #[serde(skip)]
+    active_profile: Option<crate::cache::profile::InstalledCacheProfile>,
+    #[serde(skip)]
+    active_profile_lock: Option<crate::cache::profile::ProfileLifecycleLock>,
 }
 
 /// Explicit machine authority for sharing remapped compiler results across checkout roots.
@@ -269,6 +278,24 @@ impl InstalledRootPortability {
         match self {
             Self::Physical => "physical",
             Self::Remap => "remap",
+        }
+    }
+}
+
+impl From<InstalledRootPortability> for crate::cache::profile::RootPortability {
+    fn from(value: InstalledRootPortability) -> Self {
+        match value {
+            InstalledRootPortability::Physical => Self::Physical,
+            InstalledRootPortability::Remap => Self::Remap,
+        }
+    }
+}
+
+impl From<crate::cache::profile::RootPortability> for InstalledRootPortability {
+    fn from(value: crate::cache::profile::RootPortability) -> Self {
+        match value {
+            crate::cache::profile::RootPortability::Physical => Self::Physical,
+            crate::cache::profile::RootPortability::Remap => Self::Remap,
         }
     }
 }
@@ -325,6 +352,38 @@ struct InstalledMutualTlsDirect {
 
 pub(crate) struct InstallationSessionLock {
     _file: File,
+}
+
+struct InstallationMutationLock {
+    _file: File,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct InstalledLocalSelection {
+    cache: LocalCacheSelection,
+    remote: Option<crate::remote_cache::InstalledRemoteCache>,
+    _profile: crate::cache::profile::ProfileLifecycleLock,
+}
+
+impl InstalledLocalSelection {
+    pub(crate) fn cache(&self) -> &LocalCacheSelection {
+        &self.cache
+    }
+
+    pub(crate) fn remote(&self) -> Option<&crate::remote_cache::InstalledRemoteCache> {
+        self.remote.as_ref()
+    }
+}
+
+pub(crate) struct InstalledRemoteSelection {
+    remote: Option<crate::remote_cache::InstalledRemoteCache>,
+    _profile: crate::cache::profile::ProfileLifecycleLock,
+}
+
+impl InstalledRemoteSelection {
+    pub(crate) fn remote(&self) -> Option<&crate::remote_cache::InstalledRemoteCache> {
+        self.remote.as_ref()
+    }
 }
 
 /// Stable fail-open classes retained by ordinary cache status.
@@ -420,8 +479,12 @@ impl InstallationReceipt {
         &self.authority
     }
 
-    pub(crate) fn cache(&self) -> &LocalCacheSelection {
-        &self.cache
+    pub(crate) fn cache(&self) -> RailResult<&LocalCacheSelection> {
+        self.active_profile
+            .as_ref()
+            .map(crate::cache::profile::InstalledCacheProfile::cache)
+            .or(self.v0_25_cache.as_ref())
+            .ok_or_else(|| RailError::message("no workspace cache profile is selected"))
     }
 
     pub(crate) fn wrapper_path(&self) -> &Path {
@@ -433,11 +496,36 @@ impl InstallationReceipt {
     }
 
     pub(crate) fn remote(&self) -> Option<&crate::remote_cache::InstalledRemoteCache> {
-        self.remote.as_ref()
+        self.active_profile
+            .as_ref()
+            .and_then(crate::cache::profile::InstalledCacheProfile::remote)
     }
 
-    pub(crate) const fn root_portability(&self) -> InstalledRootPortability {
-        self.root_portability
+    pub(crate) fn root_portability(&self) -> InstalledRootPortability {
+        self.active_profile.as_ref().map_or_else(
+            || self.v0_25_root_portability.unwrap_or_default(),
+            |profile| profile.root_portability().into(),
+        )
+    }
+
+    pub(crate) fn profile(&self) -> RailResult<&crate::cache::profile::InstalledCacheProfile> {
+        self.active_profile
+            .as_ref()
+            .ok_or_else(|| RailError::message("no workspace cache profile is selected"))
+    }
+
+    pub(crate) fn attach_profile(&mut self, profile: crate::cache::profile::InstalledCacheProfile) {
+        self.active_profile = Some(profile);
+        self.active_profile_lock = None;
+    }
+
+    fn attach_locked_profile(
+        &mut self,
+        profile: crate::cache::profile::InstalledCacheProfile,
+        lock: crate::cache::profile::ProfileLifecycleLock,
+    ) {
+        self.active_profile = Some(profile);
+        self.active_profile_lock = Some(lock);
     }
 
     pub(crate) fn local_distributed_worker(&self) -> Option<&Path> {
@@ -495,39 +583,50 @@ impl InstallationReceipt {
     }
 
     fn session_memo_path(&self) -> RailResult<PathBuf> {
-        Ok(self.installation_directory()?.join(SESSION_MEMO_FILE))
+        Ok(self.profile_state_directory()?.join(SESSION_MEMO_FILE))
     }
 
     fn session_lock_path(&self) -> RailResult<PathBuf> {
-        Ok(self.installation_directory()?.join(SESSION_LOCK_FILE))
+        Ok(self.profile_state_directory()?.join(SESSION_LOCK_FILE))
     }
 
     fn usage_path(&self) -> RailResult<PathBuf> {
-        Ok(self.installation_directory()?.join(USAGE_FILE))
+        Ok(self.profile_state_directory()?.join(USAGE_FILE))
     }
 
     fn early_bypass_path(&self) -> RailResult<PathBuf> {
-        Ok(self.installation_directory()?.join(EARLY_BYPASS_FILE))
+        Ok(self.profile_state_directory()?.join(EARLY_BYPASS_FILE))
     }
 
     fn failure_counters_path(&self) -> RailResult<PathBuf> {
-        Ok(self.installation_directory()?.join(FAILURE_COUNTERS_FILE))
+        Ok(self.profile_state_directory()?.join(FAILURE_COUNTERS_FILE))
     }
 
     fn failure_counters_lock_path(&self) -> RailResult<PathBuf> {
-        Ok(self.installation_directory()?.join(FAILURE_COUNTERS_LOCK_FILE))
+        Ok(self.profile_state_directory()?.join(FAILURE_COUNTERS_LOCK_FILE))
     }
 
     fn distributed_placement_history_path(&self) -> RailResult<PathBuf> {
-        Ok(self.installation_directory()?.join(DISTRIBUTED_PLACEMENT_HISTORY_FILE))
+        Ok(self.profile_state_directory()?.join(DISTRIBUTED_PLACEMENT_HISTORY_FILE))
     }
 
     fn distributed_placement_lock_path(&self) -> RailResult<PathBuf> {
-        Ok(self.installation_directory()?.join(DISTRIBUTED_PLACEMENT_LOCK_FILE))
+        Ok(self.profile_state_directory()?.join(DISTRIBUTED_PLACEMENT_LOCK_FILE))
+    }
+
+    pub(crate) fn profile_state_directory(&self) -> RailResult<PathBuf> {
+        self.active_profile.as_ref().map_or_else(
+            || self.installation_directory().map(Path::to_path_buf),
+            |profile| crate::cache::profile::state_directory(&self.cargo_home, profile.profile_id()),
+        )
     }
 
     fn validate(&self) -> RailResult<()> {
-        if self.version != INSTALLATION_VERSION
+        let predecessor = self.version == V0_25_INSTALLATION_VERSION;
+        if (!predecessor && self.version != INSTALLATION_VERSION)
+            || (predecessor && self.v0_25_cache.is_none())
+            || (!predecessor
+                && (self.v0_25_cache.is_some() || self.v0_25_remote.is_some() || self.v0_25_root_portability.is_some()))
             || !valid_hex_digest(&self.authority)
             || !valid_sha256(&self.wrapper_digest)
             || !valid_sha256(&self.worker_digest)
@@ -555,12 +654,14 @@ impl InstallationReceipt {
                 "transparent compiler-cache installation receipt is invalid",
             ));
         }
-        LocalCacheSelection::new(
-            self.cache.base().to_path_buf(),
-            self.cache.max_bytes(),
-            self.cache.trust_domain().map(str::to_string),
-        )?;
-        if let Some(remote) = &self.remote {
+        if let Some(cache) = &self.v0_25_cache {
+            LocalCacheSelection::new(
+                cache.base().to_path_buf(),
+                cache.max_bytes(),
+                cache.trust_domain().map(str::to_string),
+            )?;
+        }
+        if let Some(remote) = &self.v0_25_remote {
             remote
                 .selection()
                 .map_err(|error| RailError::message(format!("installed remote cache policy is invalid: {error}")))?;
@@ -655,6 +756,32 @@ pub(crate) fn lock_session(receipt: &InstallationReceipt) -> RailResult<Installa
     Ok(InstallationSessionLock { _file: file })
 }
 
+fn lock_installation(cargo_home: &Path) -> RailResult<InstallationMutationLock> {
+    ensure_real_directory(cargo_home)?;
+    let owner = cargo_home.join("cargo-rail");
+    create_private_directory(&owner)?;
+    let path = owner.join(INSTALLATION_LOCK_FILE);
+    let file = crate::utils::open_cache_lock_file(&path, true)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    if !crate::utils::private_file_matches_path(&file, &path, 0)? {
+        return Err(RailError::message(
+            "transparent compiler installation lock is not a private regular file",
+        ));
+    }
+    file.lock()?;
+    if !crate::utils::private_file_matches_path(&file, &path, 0)? {
+        return Err(RailError::message(
+            "transparent compiler installation lock changed while it was acquired",
+        ));
+    }
+    Ok(InstallationMutationLock { _file: file })
+}
+
 pub(crate) fn store_session_memo(receipt: &InstallationReceipt, bytes: &[u8]) -> RailResult<()> {
     if bytes.len() as u64 > MAX_SESSION_MEMO_BYTES {
         return Err(RailError::message(
@@ -721,6 +848,15 @@ pub(crate) struct InstallationStatus {
     pub(crate) config_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) wrapper_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) profile_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) bound_workspace_root: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) trust_domain: Option<String>,
+    pub(crate) selection_source: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) unbound_pre_profile_state: Option<crate::cache::profile::PreProfileStateStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) cache_base: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -830,12 +966,12 @@ fn encode_failure_counters(counters: &NativeCacheFailureCounters) -> RailResult<
     Ok(bytes)
 }
 
-/// Record an acquisition-free wrapper bypass beside the validated installed binaries.
+/// Record a pre-cache bypass in the exact selected workspace profile.
 ///
-/// This path deliberately does not load the installation receipt, compiler
-/// session, or CAS. The reason is a classifier-owned constant and never
-/// contains compiler arguments or environment values.
-pub(crate) fn record_early_bypass(reason: &'static str) -> RailResult<()> {
+/// This path selects and locks the profile but deliberately does not open the
+/// compiler session, local CAS, or remote. The reason is a classifier-owned
+/// constant and never contains compiler arguments or environment values.
+pub(crate) fn record_early_bypass(source_root: &Path, reason: &'static str) -> RailResult<()> {
     if reason.is_empty()
         || reason.len() > MAX_EARLY_BYPASS_REASON_BYTES
         || !reason
@@ -845,9 +981,6 @@ pub(crate) fn record_early_bypass(reason: &'static str) -> RailResult<()> {
         return Err(RailError::message("compiler-cache early bypass reason is invalid"));
     }
     let executable = std::env::current_exe()?;
-    let directory = executable
-        .parent()
-        .ok_or_else(|| RailError::message("installed compiler wrapper has no parent"))?;
     let executable_name = executable.file_name();
     if !matches!(
         executable_name,
@@ -857,7 +990,8 @@ pub(crate) fn record_early_bypass(reason: &'static str) -> RailResult<()> {
             "compiler-cache early bypass did not originate from an installed wrapper",
         ));
     }
-    let session_lock_path = directory.join(SESSION_LOCK_FILE);
+    let receipt = load_for_wrapper(&executable, source_root)?;
+    let session_lock_path = receipt.session_lock_path()?;
     let session_lock = crate::utils::open_cache_lock_file(&session_lock_path, false)?;
     if !crate::utils::private_file_matches_path(&session_lock, &session_lock_path, 0)? {
         return Err(RailError::message(
@@ -870,17 +1004,7 @@ pub(crate) fn record_early_bypass(reason: &'static str) -> RailResult<()> {
             "transparent compiler session lock changed while recording an early bypass",
         ));
     }
-    for name in [WRAPPER_FILE, WORKER_FILE] {
-        let path = directory.join(name);
-        let metadata = fs::symlink_metadata(&path)?;
-        if !metadata.is_file() || crate::utils::is_symlink_or_reparse(&metadata) {
-            return Err(RailError::message(
-                "compiler-cache early bypass installation binaries are invalid",
-            ));
-        }
-    }
-
-    let path = directory.join(EARLY_BYPASS_FILE);
+    let path = receipt.early_bypass_path()?;
     let mut file = crate::utils::open_cache_lock_file(&path, true)?;
     #[cfg(unix)]
     {
@@ -1101,7 +1225,7 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
     {
         return Err(RailError::with_help(
             "cannot replace an mTLS distributed installation with local qualification during setup",
-            "run `cargo rail cache remove`, then rerun setup with `--distributed-local`",
+            "run `cargo rail cache uninstall`, then rerun setup with `--distributed-local`",
         ));
     }
     let requested_placement = request
@@ -1201,58 +1325,11 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
     } else {
         None
     };
-    let cache_base = request
-        .local_dir
-        .as_deref()
-        .map(|path| resolve_requested_path(current_dir, path))
-        .transpose()?
-        .or_else(|| existing.as_ref().map(|receipt| receipt.cache.base().to_path_buf()))
-        .unwrap_or_else(|| cargo_home.clone());
-    let max_bytes = request
-        .max_bytes
-        .or_else(|| existing.as_ref().map(|receipt| receipt.cache.max_bytes()))
-        .unwrap_or(DEFAULT_CACHE_MAX_BYTES);
-    let cache = LocalCacheSelection::new(cache_base, max_bytes, None)?;
-    let remote = if request.local_only {
-        None
-    } else if let Some(remote_url) = request.remote_url.as_deref() {
-        let selection = crate::remote_cache::RemoteCacheSelection::parse(
-            remote_url,
-            request.remote_mode.as_deref(),
-            &request.remote_environment,
-        )
-        .map_err(|error| RailError::message(format!("remote cache URL is invalid: {error}")))?;
-        Some(crate::remote_cache::InstalledRemoteCache::from_selection(&selection))
-    } else if request.remote_mode.is_some() || !request.remote_environment.is_empty() {
-        return Err(RailError::message(
-            "remote cache mode and environment policy require --remote URL",
-        ));
-    } else {
-        existing.as_ref().and_then(|receipt| receipt.remote.clone())
-    };
-    let root_portability = match request.root_portability.as_deref() {
-        Some("physical") => InstalledRootPortability::Physical,
-        Some("remap") if remote.is_some() => InstalledRootPortability::Remap,
-        Some("remap") => {
-            return Err(RailError::message(
-                "root portability remapping requires an installed remote cache authority",
-            ));
-        }
-        Some(mode) => {
-            return Err(RailError::message(format!(
-                "unsupported root portability mode '{mode}'"
-            )));
-        }
-        None => existing.as_ref().map_or(
-            InstalledRootPortability::Physical,
-            InstallationReceipt::root_portability,
-        ),
-    };
     let authority = existing
         .as_ref()
         .map(|receipt| receipt.authority.clone())
         .map_or_else(random_authority, Ok)?;
-    let receipt = InstallationReceipt {
+    let mut receipt = InstallationReceipt {
         version: INSTALLATION_VERSION,
         authority,
         cargo_home: cargo_home.clone(),
@@ -1269,9 +1346,9 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
         worker_path,
         worker_digest: worker.source_digest.clone(),
         worker_generation,
-        cache,
-        remote,
-        root_portability,
+        v0_25_cache: None,
+        v0_25_remote: None,
+        v0_25_root_portability: None,
         distributed: distributed_worker
             .as_ref()
             .map(|worker| InstalledDistributedQualification {
@@ -1286,10 +1363,43 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
                 worker_generation: distributed_worker_generation,
                 mutual_tls,
             }),
+        active_profile: None,
+        active_profile_lock: None,
     };
+    let profile = crate::cache::profile::plan_setup(
+        &cargo_home,
+        current_dir,
+        &receipt.authority,
+        crate::cache::profile::ProfileSetupRequest {
+            requested_profile: request.profile_id.as_deref(),
+            local_dir: request.local_dir.as_deref(),
+            max_bytes: request.max_bytes,
+            remote_url: request.remote_url.as_deref(),
+            remote_mode: request.remote_mode.as_deref(),
+            remote_environment: &request.remote_environment,
+            root_portability: request.root_portability.as_deref(),
+            local_only: request.local_only,
+        },
+        existing
+            .as_ref()
+            .filter(|existing| existing.version == V0_25_INSTALLATION_VERSION)
+            .map(|existing| {
+                Ok::<_, RailError>(crate::cache::profile::PreProfileSetupInput {
+                    installation_authority: existing.authority.clone(),
+                    cache: existing
+                        .v0_25_cache
+                        .clone()
+                        .ok_or_else(|| RailError::message("validated v0.25 receipt has no local cache selection"))?,
+                    remote: existing.v0_25_remote.clone(),
+                    root_portability: existing.v0_25_root_portability.unwrap_or_default().into(),
+                })
+            })
+            .transpose()?,
+    )?;
+    receipt.attach_profile(profile.profile().clone());
     receipt.validate()?;
     let encoded_receipt = encode_receipt(&receipt)?;
-    let cache_ready = receipt.cache.configured_root()?.is_some();
+    let cache_ready = profile.profile().cache().configured_root()?.is_some();
     let distributed_identity_current = receipt
         .distributed
         .as_ref()
@@ -1319,7 +1429,8 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
                     || current[1].as_deref() != Some(mutual_tls.client_certificate_digest.as_str())
                     || current[2].as_deref() != Some(mutual_tls.client_private_key_digest.as_str())
             })
-        || !cache_ready;
+        || !cache_ready
+        || profile.pending();
     Ok(SetupPlan {
         cargo_home,
         config_path,
@@ -1331,12 +1442,16 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
         worker,
         distributed_worker,
         source_distributed_identity,
+        profile,
         pending,
     })
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn ensure_supported_installation_platform() -> RailResult<()> {
+    if let Some(reason) = crate::compiler::native_cache::unsupported_native_cache_host_reason() {
+        return Err(unsupported_native_cache_host_error(reason));
+    }
     Ok(())
 }
 
@@ -1347,11 +1462,19 @@ fn ensure_supported_installation_platform() -> RailResult<()> {
     ))
 }
 
+pub(crate) fn unsupported_native_cache_host_error(reason: &'static str) -> RailError {
+    RailError::with_help(
+        format!("transparent compiler-cache setup is unsupported on this unqualified host ({reason})"),
+        "continue using Cargo normally; compiler-result reuse remains disabled",
+    )
+}
+
 /// Apply one setup plan after revalidating every opened input.
 pub(crate) fn apply_setup(mut plan: SetupPlan) -> RailResult<()> {
     if !plan.pending {
         return Ok(());
     }
+    let _installation_lock = lock_installation(&plan.cargo_home)?;
     revalidate_optional(&plan.config_path, plan.config_before.as_deref(), 16 * 1024 * 1024)?;
     let receipt_path = plan
         .receipt
@@ -1423,7 +1546,11 @@ pub(crate) fn apply_setup(mut plan: SetupPlan) -> RailResult<()> {
         }
     }
     if let Some(existing) = plan.receipt_before.as_deref().map(parse_receipt).transpose()? {
-        crate::remote_cache::stop_installed_coordinators(&existing);
+        for profile in crate::cache::profile::load_all(&plan.cargo_home)? {
+            let mut selected = existing.clone();
+            selected.attach_profile(profile);
+            crate::remote_cache::stop_installed_coordinators(&selected);
+        }
     }
 
     ensure_real_directory(&plan.cargo_home)?;
@@ -1431,6 +1558,14 @@ pub(crate) fn apply_setup(mut plan: SetupPlan) -> RailResult<()> {
     create_private_directory(&owner)?;
     let install_directory = owner.join(INSTALLATION_DIRECTORY);
     create_private_directory(&install_directory)?;
+    let selected_profile = crate::cache::profile::apply_setup(&plan.profile)?;
+    plan.receipt.attach_profile(selected_profile);
+    for profile in crate::cache::profile::load_all(&plan.cargo_home)? {
+        let mut selected = plan.receipt.clone();
+        selected.attach_profile(profile);
+        crate::remote_cache::stop_installed_coordinators(&selected);
+    }
+    let _profile_lifecycles = crate::cache::profile::lock_all_exclusive(&plan.cargo_home)?;
     let _session_lock = lock_session(&plan.receipt)?;
     revalidate_executable_setup(&plan.receipt.wrapper_path, &plan.wrapper, "installed compiler wrapper")?;
     revalidate_executable_setup(&plan.receipt.worker_path, &plan.worker, "installed compiler worker")?;
@@ -1440,7 +1575,7 @@ pub(crate) fn apply_setup(mut plan: SetupPlan) -> RailResult<()> {
     if read_optional_regular(&plan.receipt.session_memo_path()?, MAX_SESSION_MEMO_BYTES)?.is_some() {
         fs::remove_file(plan.receipt.session_memo_path()?)?;
     }
-    LocalCas::open_selected(&plan.receipt.cache)?;
+    LocalCas::open_selected(plan.receipt.cache()?)?;
     install_planned_executable(&plan.wrapper, &plan.receipt.wrapper_path)?;
     install_planned_executable(&plan.worker, &plan.receipt.worker_path)?;
     if let (Some(setup), Some(distributed)) = (&plan.distributed_worker, &plan.receipt.distributed) {
@@ -1656,6 +1791,7 @@ pub(crate) fn apply_removal(plan: RemovalPlan) -> RailResult<()> {
     let Some(receipt) = plan.receipt else {
         return Ok(());
     };
+    let _installation_lock = lock_installation(&receipt.cargo_home)?;
     let install_directory = receipt
         .wrapper_path
         .parent()
@@ -1726,7 +1862,12 @@ pub(crate) fn apply_removal(plan: RemovalPlan) -> RailResult<()> {
             }
         }
     }
-    crate::remote_cache::stop_installed_coordinators(&receipt);
+    for profile in crate::cache::profile::load_all(&receipt.cargo_home)? {
+        let mut selected = receipt.clone();
+        selected.attach_profile(profile);
+        crate::remote_cache::stop_installed_coordinators(&selected);
+    }
+    let _profile_lifecycles = crate::cache::profile::lock_all_exclusive(&receipt.cargo_home)?;
 
     match plan.config_after {
         Some(contents) => crate::utils::write_file_atomic(&plan.config_path, &contents)?,
@@ -1854,7 +1995,7 @@ fn remove_distributed_placement_state(receipt: &InstallationReceipt) -> RailResu
 }
 
 /// Load and validate the receipt adjacent to one installed wrapper process.
-pub(crate) fn load_for_wrapper(invoked: &Path) -> RailResult<InstallationReceipt> {
+pub(crate) fn load_for_wrapper(invoked: &Path, workspace_root: &Path) -> RailResult<InstallationReceipt> {
     let invoked = absolute(invoked)?;
     let launcher = std::env::var_os(DIRECT_LAUNCHER_ENV)
         .map(PathBuf::from)
@@ -1864,7 +2005,7 @@ pub(crate) fn load_for_wrapper(invoked: &Path) -> RailResult<InstallationReceipt
         .parent()
         .ok_or_else(|| RailError::message("installed compiler wrapper has no parent directory"))?;
     let bytes = read_required_regular(&directory.join(RECEIPT_FILE), MAX_RECEIPT_BYTES)?;
-    let receipt = parse_receipt(&bytes)?;
+    let mut receipt = parse_receipt(&bytes)?;
     if crate::utils::canonicalize_existing(&receipt.worker_path)? != crate::utils::canonicalize_existing(&invoked)?
         || crate::utils::canonicalize_existing(&receipt.wrapper_path)?
             != crate::utils::canonicalize_existing(&launcher)?
@@ -1892,6 +2033,14 @@ pub(crate) fn load_for_wrapper(invoked: &Path) -> RailResult<InstallationReceipt
             "installed compiler launcher or worker changed after verified setup",
         ));
     }
+    let (profile, lock) =
+        crate::cache::profile::load_locked(&receipt.cargo_home, workspace_root)?.ok_or_else(|| {
+            RailError::with_help(
+                "the compiler workspace has no installed cache profile",
+                "run `cargo rail cache setup` from that exact Cargo workspace",
+            )
+        })?;
+    receipt.attach_locked_profile(profile, lock);
     Ok(receipt)
 }
 
@@ -1902,7 +2051,7 @@ pub(crate) fn load_for_coordinator(invoked: &Path) -> RailResult<InstallationRec
         .parent()
         .ok_or_else(|| RailError::message("installed compiler worker has no parent directory"))?;
     let bytes = read_required_regular(&directory.join(RECEIPT_FILE), MAX_RECEIPT_BYTES)?;
-    let receipt = parse_receipt(&bytes)?;
+    let mut receipt = parse_receipt(&bytes)?;
     if crate::utils::canonicalize_existing(&receipt.worker_path)? != crate::utils::canonicalize_existing(&invoked)?
         || crate::utils::stable_file_generation(&invoked).as_ref() != Some(&receipt.worker_generation)
         || file_digest(&invoked)? != receipt.worker_digest
@@ -1911,6 +2060,10 @@ pub(crate) fn load_for_coordinator(invoked: &Path) -> RailResult<InstallationRec
             "remote coordinator worker does not match its setup authority",
         ));
     }
+    let capability = std::env::var(crate::cache::profile::COORDINATOR_PROFILE_ENV)
+        .map_err(|_| RailError::message("remote coordinator has no cache profile capability"))?;
+    let (profile, lock) = crate::cache::profile::load_locked_coordinator_capability(&receipt.cargo_home, &capability)?;
+    receipt.attach_locked_profile(profile, lock);
     Ok(receipt)
 }
 
@@ -1923,7 +2076,7 @@ fn coordinator_state_path(receipt: &InstallationReceipt, identity: &str, suffix:
         return Err(RailError::message("remote coordinator identity is invalid"));
     }
     Ok(receipt
-        .installation_directory()?
+        .profile_state_directory()?
         .join(format!("{COORDINATOR_STATE_PREFIX}{identity}.{suffix}")))
 }
 
@@ -1959,8 +2112,8 @@ pub(crate) fn remove_coordinator_state_if(
     Ok(())
 }
 
-/// Load the optional non-secret remote policy selected by one installation.
-pub(crate) fn installed_remote(current_dir: &Path) -> RailResult<Option<crate::remote_cache::InstalledRemoteCache>> {
+/// Load the optional non-secret remote policy and retain its profile authority.
+pub(crate) fn installed_remote(current_dir: &Path) -> RailResult<Option<InstalledRemoteSelection>> {
     let cargo_home = resolve_cargo_home(current_dir)?;
     let config_path = selected_user_config(&cargo_home);
     let receipt_path = cargo_home
@@ -1976,7 +2129,81 @@ pub(crate) fn installed_remote(current_dir: &Path) -> RailResult<Option<crate::r
             "transparent compiler-cache setup authority does not match the selected Cargo home",
         ));
     }
-    Ok(receipt.remote)
+    Ok(
+        crate::cache::profile::load_locked(&cargo_home, current_dir)?.map(|(profile, lock)| InstalledRemoteSelection {
+            remote: profile.remote().cloned(),
+            _profile: lock,
+        }),
+    )
+}
+
+/// Load the local CAS selected for this exact workspace and retain its profile
+/// authority for the lifetime of the caller's compiler analysis.
+pub(crate) fn installed_local(current_dir: &Path) -> RailResult<Option<InstalledLocalSelection>> {
+    let cargo_home = resolve_cargo_home(current_dir)?;
+    let config_path = selected_user_config(&cargo_home);
+    let receipt_path = cargo_home
+        .join("cargo-rail")
+        .join(INSTALLATION_DIRECTORY)
+        .join(RECEIPT_FILE);
+    let Some(bytes) = read_optional_regular(&receipt_path, MAX_RECEIPT_BYTES)? else {
+        return Ok(None);
+    };
+    let receipt = parse_receipt(&bytes)?;
+    if receipt.cargo_home != cargo_home || receipt.config_path != config_path {
+        return Err(RailError::message(
+            "transparent compiler-cache setup authority does not match the selected Cargo home",
+        ));
+    }
+    Ok(
+        crate::cache::profile::load_locked(&cargo_home, current_dir)?.map(|(profile, lock)| InstalledLocalSelection {
+            cache: profile.cache().clone(),
+            remote: profile.remote().cloned(),
+            _profile: lock,
+        }),
+    )
+}
+
+/// Return the exact digest only when one selected program is the unchanged
+/// compiler wrapper owned by the canonical installation receipt.
+pub(crate) fn verified_installed_wrapper_digest(selection: &OsStr, current_dir: &Path) -> RailResult<Option<String>> {
+    let cargo_home = resolve_cargo_home(current_dir)?;
+    let config_path = selected_user_config(&cargo_home);
+    let receipt_path = cargo_home
+        .join("cargo-rail")
+        .join(INSTALLATION_DIRECTORY)
+        .join(RECEIPT_FILE);
+    let Some(bytes) = read_optional_regular(&receipt_path, MAX_RECEIPT_BYTES)? else {
+        return Ok(None);
+    };
+    let receipt = parse_receipt(&bytes)?;
+    let selected = crate::executable::resolve_executable_path(selection, current_dir)?;
+    if receipt.cargo_home != cargo_home
+        || receipt.config_path != config_path
+        || crate::utils::canonicalize_existing(&receipt.wrapper_path)? != selected
+        || crate::utils::stable_file_generation(&receipt.wrapper_path).as_ref() != Some(&receipt.wrapper_generation)
+        || file_digest(&receipt.wrapper_path)? != receipt.wrapper_digest
+    {
+        return Ok(None);
+    }
+    Ok(Some(receipt.wrapper_digest))
+}
+
+pub(crate) fn stop_current_profile_coordinator(current_dir: &Path) -> RailResult<()> {
+    let cargo_home = resolve_cargo_home(current_dir)?;
+    let receipt_path = cargo_home
+        .join("cargo-rail")
+        .join(INSTALLATION_DIRECTORY)
+        .join(RECEIPT_FILE);
+    let Some(bytes) = read_optional_regular(&receipt_path, MAX_RECEIPT_BYTES)? else {
+        return Ok(());
+    };
+    let mut receipt = parse_receipt(&bytes)?;
+    if let Some(profile) = crate::cache::profile::load(&cargo_home, current_dir)? {
+        receipt.attach_profile(profile);
+        crate::remote_cache::stop_installed_coordinators(&receipt);
+    }
+    Ok(())
 }
 
 /// Inspect installation health without creating Cargo or cache state.
@@ -1994,6 +2221,11 @@ pub(crate) fn status(current_dir: &Path) -> RailResult<InstallationStatus> {
             cargo_home: cargo_home.to_string_lossy().into_owned(),
             config_path: config_path.to_string_lossy().into_owned(),
             wrapper_path: None,
+            profile_id: None,
+            bound_workspace_root: None,
+            trust_domain: None,
+            selection_source: "none",
+            unbound_pre_profile_state: crate::cache::profile::pre_profile_state_status(&cargo_home)?,
             cache_base: None,
             max_bytes: None,
             root_portability: None,
@@ -2005,8 +2237,22 @@ pub(crate) fn status(current_dir: &Path) -> RailResult<InstallationStatus> {
             issues: Vec::new(),
         });
     };
-    let receipt = parse_receipt(&bytes)?;
+    let mut receipt = parse_receipt(&bytes)?;
     let mut issues = Vec::new();
+    let profile = match crate::cache::profile::load(&cargo_home, current_dir) {
+        Ok(Some(profile)) => {
+            receipt.attach_profile(profile.clone());
+            Some(profile)
+        }
+        Ok(None) => {
+            issues.push("the selected workspace is not enrolled in a cache profile".to_string());
+            None
+        }
+        Err(error) => {
+            issues.push(format!("workspace cache profile is unavailable: {error}"));
+            None
+        }
+    };
     if receipt.cargo_home != cargo_home || receipt.config_path != config_path {
         issues.push("selected Cargo home or active user config changed".to_string());
     }
@@ -2081,22 +2327,30 @@ pub(crate) fn status(current_dir: &Path) -> RailResult<InstallationStatus> {
             }
         }
     }
-    match receipt.cache.configured_root() {
-        Ok(Some(_)) => {}
-        Ok(None) => issues.push("local cache is unavailable; run cargo rail cache setup to repair it".to_string()),
-        Err(error) => issues.push(format!("local cache authority is invalid: {error}")),
+    if let Some(profile) = &profile {
+        match profile.cache().configured_root() {
+            Ok(Some(_)) => {}
+            Ok(None) => issues.push("local cache is unavailable; run cargo rail cache setup to repair it".to_string()),
+            Err(error) => issues.push(format!("local cache authority is invalid: {error}")),
+        }
     }
     if let Err(error) = reject_shadowing_global_wrapper(current_dir, &config_path) {
         issues.push(error.to_string());
     }
-    let mut usage = match usage_status(&receipt) {
-        Ok(usage) => usage,
-        Err(error) => {
-            issues.push(error.to_string());
-            InstallationUsageStatus::default()
+    let mut usage = if profile.is_some() {
+        match usage_status(&receipt) {
+            Ok(usage) => usage,
+            Err(error) => {
+                issues.push(error.to_string());
+                InstallationUsageStatus::default()
+            }
         }
+    } else {
+        empty_usage_status()
     };
-    populate_failure_reason_status(&receipt, &mut usage);
+    if profile.is_some() {
+        populate_failure_reason_status(&receipt, &mut usage);
+    }
     let distributed_placement_history = if receipt
         .distributed
         .as_ref()
@@ -2118,9 +2372,20 @@ pub(crate) fn status(current_dir: &Path) -> RailResult<InstallationStatus> {
         cargo_home: cargo_home.to_string_lossy().into_owned(),
         config_path: config_path.to_string_lossy().into_owned(),
         wrapper_path: Some(receipt.wrapper_path.to_string_lossy().into_owned()),
-        cache_base: Some(receipt.cache.base().to_string_lossy().into_owned()),
-        max_bytes: Some(receipt.cache.max_bytes()),
-        root_portability: Some(receipt.root_portability.as_str()),
+        profile_id: profile.as_ref().map(|profile| profile.profile_id().to_string()),
+        bound_workspace_root: profile
+            .as_ref()
+            .map(|profile| profile.selected_root().to_string_lossy().into_owned()),
+        trust_domain: profile
+            .as_ref()
+            .and_then(|profile| profile.cache().trust_domain().map(str::to_string)),
+        selection_source: if profile.is_some() { "installed_profile" } else { "none" },
+        unbound_pre_profile_state: crate::cache::profile::pre_profile_state_status(&cargo_home)?,
+        cache_base: profile
+            .as_ref()
+            .map(|profile| profile.cache().base().to_string_lossy().into_owned()),
+        max_bytes: profile.as_ref().map(|profile| profile.cache().max_bytes()),
+        root_portability: profile.as_ref().map(|profile| profile.root_portability().as_str()),
         distributed: receipt
             .distributed
             .as_ref()
@@ -2151,11 +2416,14 @@ pub(crate) fn local_cache_status(current_dir: &Path) -> RailResult<Option<crate:
     let Some(bytes) = read_optional_regular(&receipt_path, MAX_RECEIPT_BYTES)? else {
         return Ok(None);
     };
-    let receipt = parse_receipt(&bytes)?;
-    let Some(root) = receipt.cache.configured_root()? else {
+    parse_receipt(&bytes)?;
+    let Some((profile, _profile_lock)) = crate::cache::profile::load_locked(&cargo_home, current_dir)? else {
         return Ok(None);
     };
-    crate::cache::cas::status_at_with_max(&root, receipt.cache.max_bytes())
+    let Some(root) = profile.cache().configured_root()? else {
+        return Ok(None);
+    };
+    crate::cache::cas::status_at_with_max(&root, profile.cache().max_bytes())
 }
 
 /// Preview recovery using only the exact cache authority in the setup receipt.
@@ -2168,7 +2436,26 @@ pub(crate) fn plan_local_cache_recovery(
 
 /// Quarantine one selected markerless CAS and create a fresh owned authority.
 pub(crate) fn recover_local_cache(current_dir: &Path) -> RailResult<Option<crate::cache::cas::LocalCasRecoveryPlan>> {
-    let selection = recovery_cache_selection(current_dir)?;
+    let cargo_home = resolve_cargo_home(current_dir)?;
+    let receipt_path = cargo_home
+        .join("cargo-rail")
+        .join(INSTALLATION_DIRECTORY)
+        .join(RECEIPT_FILE);
+    let bytes = read_optional_regular(&receipt_path, MAX_RECEIPT_BYTES)?.ok_or_else(|| {
+        RailError::with_help(
+            "transparent compiler-cache setup receipt is unavailable",
+            "run `cargo rail cache setup --check` before attempting local CAS recovery",
+        )
+    })?;
+    let receipt = parse_receipt(&bytes)?;
+    if receipt.cargo_home != cargo_home || receipt.config_path != selected_user_config(&cargo_home) {
+        return Err(RailError::message(
+            "transparent compiler-cache recovery authority does not match the selected Cargo home",
+        ));
+    }
+    let (profile, _profile_lock) = crate::cache::profile::load_exclusive(&cargo_home, current_dir)?
+        .ok_or_else(|| RailError::message("the selected workspace has no installed cache profile"))?;
+    let selection = profile.cache().clone();
     crate::cache::cas::recover_markerless_selected(&selection)
 }
 
@@ -2190,7 +2477,9 @@ fn recovery_cache_selection(current_dir: &Path) -> RailResult<LocalCacheSelectio
             "transparent compiler-cache recovery authority does not match the selected Cargo home",
         ));
     }
-    Ok(receipt.cache)
+    crate::cache::profile::load(&cargo_home, current_dir)?
+        .map(|profile| profile.cache().clone())
+        .ok_or_else(|| RailError::message("the selected workspace has no installed cache profile"))
 }
 
 /// Remove only the CAS selected by an installation receipt, when one exists.
@@ -2211,7 +2500,10 @@ pub(crate) fn remove_local_cache(current_dir: &Path) -> RailResult<Option<Vec<(P
         ));
     }
     let mut removed = Vec::new();
-    if let Some(root) = receipt.cache.configured_root()?
+    let Some((profile, _profile_lock)) = crate::cache::profile::load_exclusive(&cargo_home, current_dir)? else {
+        return Ok(Some(removed));
+    };
+    if let Some(root) = profile.cache().configured_root()?
         && let Some(entry) = crate::cache::cas::remove_owned_root_at(&root)?
     {
         removed.push(entry);
@@ -2224,10 +2516,14 @@ fn resolve_cargo_home(current_dir: &Path) -> RailResult<PathBuf> {
     resolve_requested_path(current_dir, &selected)
 }
 
+pub(crate) fn selected_cargo_home(current_dir: &Path) -> RailResult<PathBuf> {
+    resolve_cargo_home(current_dir)
+}
+
 fn selected_user_config(cargo_home: &Path) -> PathBuf {
-    let legacy = cargo_home.join("config");
-    if legacy.is_file() {
-        legacy
+    let extensionless = cargo_home.join("config");
+    if extensionless.is_file() {
+        extensionless
     } else {
         cargo_home.join("config.toml")
     }
@@ -2374,7 +2670,7 @@ fn remove_wrapper_value(contents: &str, receipt: &InstallationReceipt) -> RailRe
     }
 }
 
-fn resolve_requested_path(current_dir: &Path, path: &Path) -> RailResult<PathBuf> {
+pub(super) fn resolve_requested_path(current_dir: &Path, path: &Path) -> RailResult<PathBuf> {
     let path = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -2383,7 +2679,7 @@ fn resolve_requested_path(current_dir: &Path, path: &Path) -> RailResult<PathBuf
     crate::utils::canonicalize_allow_missing(&path).map_err(Into::into)
 }
 
-fn create_private_directory(path: &Path) -> RailResult<()> {
+pub(super) fn create_private_directory(path: &Path) -> RailResult<()> {
     fs::create_dir_all(path)?;
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_dir() || crate::utils::is_symlink_or_reparse(&metadata) {
@@ -2522,7 +2818,7 @@ fn install_private_file_atomic(source: &Path, destination: &Path, expected_diges
     Ok(())
 }
 
-fn write_private_atomic(path: &Path, bytes: &[u8]) -> RailResult<()> {
+pub(super) fn write_private_atomic(path: &Path, bytes: &[u8]) -> RailResult<()> {
     let parent = path
         .parent()
         .ok_or_else(|| RailError::message("private installation file has no parent"))?;
@@ -2540,7 +2836,7 @@ fn write_private_atomic(path: &Path, bytes: &[u8]) -> RailResult<()> {
     Ok(())
 }
 
-fn read_optional_regular(path: &Path, max_bytes: u64) -> RailResult<Option<Vec<u8>>> {
+pub(super) fn read_optional_regular(path: &Path, max_bytes: u64) -> RailResult<Option<Vec<u8>>> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             if !metadata.is_file() || crate::utils::is_symlink_or_reparse(&metadata) || metadata.len() > max_bytes {
@@ -2590,7 +2886,7 @@ fn revalidate_optional(path: &Path, expected: Option<&[u8]>, max_bytes: u64) -> 
 fn parse_receipt(bytes: &[u8]) -> RailResult<InstallationReceipt> {
     let receipt: InstallationReceipt = serde_json::from_slice(bytes)?;
     receipt.validate()?;
-    if encode_receipt(&receipt)? != bytes {
+    if receipt.version == INSTALLATION_VERSION && encode_receipt(&receipt)? != bytes {
         return Err(RailError::message(
             "transparent compiler-cache installation receipt is not canonical",
         ));
@@ -2683,7 +2979,7 @@ fn absolute(path: &Path) -> RailResult<PathBuf> {
     }
 }
 
-fn random_authority() -> RailResult<String> {
+pub(super) fn random_authority() -> RailResult<String> {
     let mut bytes = [0_u8; 32];
     getrandom::fill(&mut bytes)
         .map_err(|error| RailError::message(format!("failed to acquire installation authority randomness: {error}")))?;

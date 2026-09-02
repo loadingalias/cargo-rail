@@ -66,6 +66,10 @@ fi
 printf '%s\n' '```console' '$ cargo package --locked' 'Packaging cargo-rail' '```' >"$TMP_ROOT/examples/package.md"
 "$CHECKER" --root "$TMP_ROOT" || fail "locked Markdown Cargo command was rejected"
 
+mkdir -p "$TMP_ROOT/scripts/ci/fixtures"
+printf '%s\n' 'Name: GLIBC_2.35' >"$TMP_ROOT/scripts/ci/fixtures/readelf.txt"
+"$CHECKER" --root "$TMP_ROOT" || fail "inert command fixture data was rejected"
+
 : >"$TMP_ROOT/scripts/ci/unknown.rb"
 if "$CHECKER" --root "$TMP_ROOT" >/dev/null 2>&1; then
   fail "unrecognized command-surface file type was accepted"

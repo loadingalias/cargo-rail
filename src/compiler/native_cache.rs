@@ -37,7 +37,6 @@ pub(crate) const CANDIDATE_SELECTOR_PREFIX: &str = "compiler-candidate-v7-sha256
 pub(crate) const SESSION_ENV: &str = "CARGO_RAIL_NATIVE_COMPILER_CACHE_SESSION";
 pub(crate) const DISPOSITION_ENV: &str = "CARGO_RAIL_NATIVE_COMPILER_CACHE_DISPOSITION";
 const BENCH_COVERAGE_DIRECTORY_ENV: &str = "CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY";
-const LEGACY_STORE_ENV: &str = "CARGO_RAIL_NATIVE_COMPILER_CACHE_STORE";
 pub(crate) const APPLE_LINK_ADAPTER_ENV: &str = "CARGO_RAIL_APPLE_LINK_ADAPTER";
 pub(crate) const APPLE_LINK_DRIVER_ENV: &str = "CARGO_RAIL_APPLE_LINK_DRIVER";
 pub(crate) const APPLE_LINK_CERTIFICATE_ENV: &str = "CARGO_RAIL_APPLE_LINK_CERTIFICATE";
@@ -64,7 +63,7 @@ const CAPTURE_PAUSE_DIRECTORY_ENV: &str = "CARGO_RAIL_TEST_NATIVE_CAPTURE_PAUSE_
 const BENCH_COVERAGE_FAULT_ENV: &str = "CARGO_RAIL_TEST_BENCH_COVERAGE_FAULT";
 #[cfg(debug_assertions)]
 const NATIVE_ACTION_FAULT_ENV: &str = "CARGO_RAIL_TEST_NATIVE_ACTION_FAULT";
-pub(crate) const DIAGNOSTIC_EXECUTION_CONTRACT: &str = "diagnostic-workspace-wrapper-v13";
+pub(crate) const DIAGNOSTIC_EXECUTION_CONTRACT: &str = "diagnostic-workspace-wrapper-v14";
 pub(crate) const DIRECT_EXECUTION_CONTRACT: &str = "direct-global-wrapper-v14";
 #[cfg(not(windows))]
 const DIRECT_WRAPPER_NAME: &str = "cargo-rail-native-rustc-wrapper";
@@ -74,6 +73,7 @@ const DIRECT_WRAPPER_NAME: &str = "cargo-rail-native-rustc-wrapper.exe";
 const DIRECT_WORKER_NAME: &str = "cargo-rail-native-rustc-worker";
 #[cfg(windows)]
 const DIRECT_WORKER_NAME: &str = "cargo-rail-native-rustc-worker.exe";
+pub(crate) const ANALYSIS_OUTER_OBSERVATION_ENV: &str = "CARGO_RAIL_ANALYSIS_OUTER_OBSERVATION";
 #[cfg(not(windows))]
 const DISTRIBUTED_WORKER_NAME: &str = "cargo-rail-distributed-worker";
 #[cfg(windows)]
@@ -136,6 +136,7 @@ const ELF_LINK_DRIVER_INPUTS_FILE: &str = "elf-linker-driver-inputs.json";
 const APPLE_LINK_DRIVER_EVIDENCE_VERSION: u32 = 2;
 const PORTABLE_SOURCE_ROOT: &str = "/cargo-rail/native-source/v2";
 const PORTABLE_PACKAGE_ROOT: &str = "/cargo-rail/native-package/v2";
+const PORTABLE_GENERATED_ROOT: &str = "/cargo-rail/native-generated/v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -199,6 +200,7 @@ impl NativeCompilerClass {
 
 pub(crate) struct NativeCacheContext {
     session: NativeCacheSession,
+    analysis_session: Option<crate::compiler::session::CompilerFactSession>,
     source_root: PathBuf,
     source_root_spelling: PathBuf,
     output_parent_authority: Option<PathBuf>,
@@ -384,6 +386,10 @@ pub(crate) const fn native_cache_capability_schema_version() -> u32 {
     NATIVE_CACHE_CAPABILITY_SCHEMA_VERSION
 }
 
+pub(crate) fn unsupported_native_cache_host_reason() -> Option<&'static str> {
+    crate::compiler::capability::unqualified_host_reason()
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct NativeCacheMetrics {
     bytes_hashed: u64,
@@ -409,6 +415,27 @@ impl NativeCacheMetrics {
     }
 }
 
+/// External result authorities available to one native cache miss.
+///
+/// Remote reuse may import the exact native-plus-analysis binding before it
+/// commits the native result locally. Distributed admission is also reachable,
+/// but the candidate constructor removes that path unless it can form the
+/// explicitly qualified analysis operation and validate its evidence response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExternalNativeMissAuthority {
+    remote_result_reuse: bool,
+    distributed_execution: bool,
+}
+
+impl ExternalNativeMissAuthority {
+    const fn derive(_analysis_bearing: bool) -> Self {
+        Self {
+            remote_result_reuse: true,
+            distributed_execution: true,
+        }
+    }
+}
+
 /// Complete pre-execution source namespace bound into one native action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -424,6 +451,19 @@ struct PortableNativeSourceState<'a> {
     version: u32,
     root: String,
     crate_root: &'a str,
+    entries: &'a [NativeSourceEntry],
+}
+
+/// Root-independent generated namespace used only for semantic action identity.
+///
+/// The physical `OUT_DIR` remains a live revalidation capability. If rustc
+/// selects its value, `ApprovedEnvState` binds that exact path into the final
+/// action; otherwise a randomized Cargo sandbox location is not a compiler
+/// input and must not partition an otherwise identical action.
+#[derive(Serialize)]
+struct PortableNativeGeneratedState<'a> {
+    version: u32,
+    root: &'static str,
     entries: &'a [NativeSourceEntry],
 }
 
@@ -1940,17 +1980,8 @@ impl NativeActionCapture {
                 package.spelling.as_os_str().as_encoded_bytes(),
             );
         }
-        if let Some(generated) = &self.generated {
-            append_frame(
-                &mut framed,
-                b"generated-root",
-                generated.root.as_os_str().as_encoded_bytes(),
-            );
-            append_frame(
-                &mut framed,
-                b"generated-root-spelling",
-                generated.root_spelling.as_os_str().as_encoded_bytes(),
-            );
+        if self.generated.is_some() {
+            append_frame(&mut framed, b"generated-root", PORTABLE_GENERATED_ROOT.as_bytes());
         }
         for native in &self.native_searches {
             append_frame(
@@ -2001,6 +2032,14 @@ impl NativeActionCapture {
             root: self.portable_source_root()?,
             crate_root: &self.crate_root,
             entries: &self.source_state.entries,
+        })
+    }
+
+    fn portable_generated_state(&self) -> Option<PortableNativeGeneratedState<'_>> {
+        self.generated.as_ref().map(|generated| PortableNativeGeneratedState {
+            version: 1,
+            root: PORTABLE_GENERATED_ROOT,
+            entries: &generated.state.entries,
         })
     }
 
@@ -4360,7 +4399,6 @@ fn private_compiler_environment(name: &OsStr) -> bool {
             SESSION_ENV
                 | DISPOSITION_ENV
                 | BENCH_COVERAGE_DIRECTORY_ENV
-                | LEGACY_STORE_ENV
                 | crate::remote_cache::REMOTE_URL_ENV
                 | crate::remote_cache::REMOTE_MODE_ENV
                 | crate::remote_cache::REMOTE_ENVIRONMENT_ENV
@@ -4478,6 +4516,7 @@ impl NativeCacheContext {
             std::env::var_os(crate::compiler::invocation::OBSERVATION_SOURCE_ROOT_ENV).map(PathBuf::from)?;
         Some(Self {
             session: NativeCacheSession::Persisted(std::env::var_os(SESSION_ENV).map(PathBuf::from)?),
+            analysis_session: load_analysis_session().ok().flatten(),
             source_root_spelling: source_root.clone(),
             source_root,
             output_parent_authority: None,
@@ -4510,6 +4549,19 @@ impl NativeCacheContext {
         )
     }
 
+    pub(crate) fn direct_invocation_source_root(rustc_arguments: &[OsString]) -> RailResult<PathBuf> {
+        let current_directory = std::env::current_dir()?;
+        let target_directory = std::env::var_os("CARGO_TARGET_DIR");
+        let build_directory = std::env::var_os("CARGO_BUILD_BUILD_DIR");
+        direct_compilation_root(
+            rustc_arguments,
+            &current_directory,
+            target_directory.as_deref(),
+            build_directory.as_deref(),
+        )
+        .map(|(_, source_root, _, _)| source_root)
+    }
+
     /// Load the direct wrapper context after acquisition-free controls are resolved.
     pub(crate) fn load_direct_invocation(
         rustc_program: &OsStr,
@@ -4526,20 +4578,29 @@ impl NativeCacheContext {
     ) -> Result<Self, &'static str> {
         let current_directory = std::env::current_dir().map_err(|_| "compiler_working_directory_unavailable")?;
         let target_directory = std::env::var_os("CARGO_TARGET_DIR");
+        let build_directory = std::env::var_os("CARGO_BUILD_BUILD_DIR");
         let (source_root_spelling, source_root, target_root_authority, output_parent_authority) =
-            direct_compilation_root(rustc_arguments, &current_directory, target_directory.as_deref())
-                .map_err(|_| "compiler_output_root_unavailable")?;
-        let receipt = crate::cache::installation::load_for_wrapper(invoked)
+            direct_compilation_root(
+                rustc_arguments,
+                &current_directory,
+                target_directory.as_deref(),
+                build_directory.as_deref(),
+            )
+            .map_err(|_| "compiler_output_root_unavailable")?;
+        let receipt = crate::cache::installation::load_for_wrapper(invoked, &source_root)
             .map_err(|_| "native_cache_installation_unavailable")?;
-        let local_cas = LocalCas::open_initialized_selected(receipt.cache()).map_err(|_| "local_cache_unavailable")?;
+        let local_cas = LocalCas::open_initialized_selected(receipt.cache().map_err(|_| "local_cache_unavailable")?)
+            .map_err(|_| "local_cache_unavailable")?;
         let session = installed_native_session(&receipt, &source_root, &target_root_authority, rustc_program)
             .map_err(|_| "native_cache_session_unavailable")?;
         let runtime = private_command_directory().map_err(|_| "native_cache_runtime_unavailable")?;
         let remote = crate::remote_cache::RemoteCacheSelection::from_environment_or_installed(receipt.remote())
             .ok()
             .flatten();
+        let analysis_session = load_analysis_session().map_err(|_| "analysis_session_unavailable")?;
         Ok(Self {
             session: NativeCacheSession::Prepared(session),
+            analysis_session,
             source_root,
             source_root_spelling,
             output_parent_authority: Some(output_parent_authority),
@@ -4558,6 +4619,7 @@ fn direct_compilation_root(
     arguments: &[OsString],
     current_directory: &Path,
     target_directory: Option<&OsStr>,
+    build_directory: Option<&OsStr>,
 ) -> RailResult<(PathBuf, PathBuf, PathBuf, PathBuf)> {
     let mut selected = None;
     let mut index = 0usize;
@@ -4583,17 +4645,27 @@ fn direct_compilation_root(
     };
     let canonical_output = crate::utils::canonicalize_existing(&output)?;
 
+    let explicit_roots = [target_directory, build_directory]
+        .into_iter()
+        .flatten()
+        .map(|root| {
+            let root = PathBuf::from(root);
+            let root = if root.is_absolute() {
+                root
+            } else {
+                current_directory.join(root)
+            };
+            crate::utils::canonicalize_existing(&root).map_err(RailError::from)
+        })
+        .collect::<RailResult<Vec<_>>>()?;
     let standard_target = output
         .ancestors()
         .find(|ancestor| ancestor.file_name() == Some(OsStr::new("target")));
-    let (spelling, canonical, canonical_target) = if let Some(target_directory) = target_directory {
-        let target = PathBuf::from(target_directory);
-        let target = if target.is_absolute() {
-            target
-        } else {
-            current_directory.join(target)
-        };
-        let canonical_target = crate::utils::canonicalize_existing(&target)?;
+    let (spelling, canonical, canonical_target) = if !explicit_roots.is_empty() {
+        let canonical_target = explicit_roots
+            .into_iter()
+            .find(|root| canonical_output.starts_with(root))
+            .ok_or_else(|| RailError::message("transparent compiler output escaped Cargo's selected output roots"))?;
         let (spelling, canonical) = direct_source_root(current_directory)?;
         (spelling, canonical, canonical_target)
     } else if let Some(target) = standard_target {
@@ -4610,7 +4682,7 @@ fn direct_compilation_root(
     };
     if !canonical_output.starts_with(&canonical_target) {
         return Err(RailError::message(
-            "transparent compiler output escaped Cargo's selected target root",
+            "transparent compiler output escaped Cargo's selected output root",
         ));
     }
     let manifest = canonical.join("Cargo.toml");
@@ -4691,7 +4763,7 @@ fn installed_native_session(
         source_root,
         target_root,
         rustc_program,
-        receipt.cache(),
+        receipt.cache()?,
         receipt.root_portability(),
     )?;
     crate::cache::installation::store_session_memo(receipt, &memo.encode()?)?;
@@ -4702,10 +4774,44 @@ fn active_context() -> Option<&'static NativeCacheContext> {
     ACTIVE_CONTEXT.get()
 }
 
+fn load_analysis_session() -> RailResult<Option<crate::compiler::session::CompilerFactSession>> {
+    let capability = std::env::var_os(crate::compiler::session::FACT_SESSION_ENV).map(PathBuf::from);
+    let observation_directory =
+        std::env::var_os(crate::compiler::invocation::OBSERVATION_DIRECTORY_ENV).map(PathBuf::from);
+    let source_root = std::env::var_os(crate::compiler::invocation::OBSERVATION_SOURCE_ROOT_ENV).map(PathBuf::from);
+    match (capability, observation_directory, source_root) {
+        (None, None, None) => Ok(None),
+        (Some(capability), Some(observation_directory), Some(source_root)) => {
+            crate::compiler::session::CompilerFactSession::load(&capability, &observation_directory, &source_root)
+                .map(Some)
+        }
+        _ => Err(RailError::message("compiler analysis session capability is incomplete")),
+    }
+}
+
 fn open_active_local_cas() -> RailResult<LocalCas> {
     active_context()
         .and_then(|context| context.local_cas.clone())
         .map_or_else(LocalCas::open_initialized, Ok)
+}
+
+fn resolve_analysis_evidence(
+    context: &NativeCacheContext,
+    action_key: &str,
+    result_key: &str,
+) -> RailResult<Option<crate::compiler::analysis::ResolvedNativeEvidence>> {
+    let Some(session) = context.analysis_session.as_ref() else {
+        return Ok(None);
+    };
+    let store = crate::compiler::analysis::AnalysisEvidenceStore::from_cas(open_active_local_cas()?);
+    let local = store.get(session.analysis_contract(), action_key, result_key)?;
+    if local.is_some() {
+        return Ok(local);
+    }
+    match open_active_remote_store() {
+        Ok(Some(remote)) => store.get_with_remote(session.analysis_contract(), action_key, result_key, remote),
+        Ok(None) | Err(_) => Ok(None),
+    }
 }
 
 fn active_remote_selection() -> Option<&'static crate::remote_cache::RemoteCacheSelection> {
@@ -5534,7 +5640,7 @@ fn base_action_key(
         &identity_inputs,
     ))?;
     let source_state = serde_json::to_vec(&capture.portable_source_state()?)?;
-    let generated_state = serde_json::to_vec(&capture.generated.as_ref().map(|generated| &generated.state))?;
+    let generated_state = serde_json::to_vec(&capture.portable_generated_state())?;
     let native_search_states = serde_json::to_vec(
         &capture
             .native_searches
@@ -5553,7 +5659,7 @@ fn base_action_key(
         BASE_ACTION_KEY_PREFIX,
         b"cargo-rail-native-compiler-base-action\0",
         &[
-            (b"version", &9_u32.to_le_bytes()),
+            (b"version", &10_u32.to_le_bytes()),
             (b"session", session_identity.as_bytes()),
             (b"class", &class),
             (
@@ -6901,12 +7007,8 @@ fn invocation_bypass_reason(
 /// recognizes shapes that cannot enter the graduated class, so it can never
 /// turn an eligible invocation into a cache hit or store under a second rule.
 pub(crate) fn fast_bypass_reason(program: &OsStr, arguments: &[OsString]) -> Option<&'static str> {
-    if Path::new(program)
-        .file_stem()
-        .and_then(OsStr::to_str)
-        .is_some_and(|name| name.eq_ignore_ascii_case("clippy-driver"))
-    {
-        return Some("clippy_diagnostic_result_authority_unavailable");
+    if let Some(reason) = crate::compiler::capability::native_reuse_program_bypass_reason(program) {
+        return Some(reason);
     }
     let mut crate_types = BTreeSet::new();
     let mut emit_seen = false;
@@ -7396,6 +7498,138 @@ pub(crate) struct OuterCacheStore {
     pub(crate) base_action_key: String,
     pub(crate) cache_bytes_read: u64,
     pub(crate) distributed_placement: Option<crate::compiler::distributed::PlacementObservation>,
+    pub(crate) coordination: Option<CoordinatedExecution>,
+}
+
+pub(crate) struct CoordinatedExecution {
+    leader: crate::compiler::acquisition::broker::BrokerLeader,
+    contract: String,
+}
+
+enum CoordinationClaim {
+    Leader(CoordinatedExecution),
+    Follower(crate::compiler::acquisition::broker::CandidateResult),
+}
+
+impl CoordinatedExecution {
+    fn candidate(
+        &self,
+        action: &str,
+        result: &str,
+    ) -> RailResult<crate::compiler::acquisition::broker::CandidateResult> {
+        let evidence_candidate = crate::compiler::diagnostics_store::NativeEvidenceBindingValidation::candidate_key(
+            action,
+            result,
+            &self.contract,
+        );
+        crate::compiler::acquisition::broker::CandidateResult::new(
+            action.to_string(),
+            result.to_string(),
+            evidence_candidate,
+        )
+    }
+
+    fn complete(self, action: &str, result: &str) -> RailResult<()> {
+        let candidate = self.candidate(action, result)?;
+        self.leader.complete(candidate)
+    }
+
+    fn fail(self, class: crate::compiler::acquisition::broker::BrokerFailureClass) -> RailResult<()> {
+        self.leader.fail(class)
+    }
+}
+
+fn coordinate_analysis_execution(
+    context: &NativeCacheContext,
+    execution: crate::compiler::acquisition::broker::ExecutionClaimKey,
+) -> RailResult<Option<CoordinationClaim>> {
+    let Some(session) = context.analysis_session.as_ref() else {
+        return Ok(None);
+    };
+    let Some(environment) = session.acquisition() else {
+        return Ok(None);
+    };
+    let contract = session.analysis_contract().identity()?;
+    let key = crate::compiler::acquisition::broker::CandidateFlightKey::new(execution, contract.clone())?;
+    match crate::compiler::acquisition::broker::BrokerClaim::connect(environment, key)? {
+        crate::compiler::acquisition::broker::BrokerClaim::Follower(follower) => {
+            let Some(candidate) = follower.wait()? else {
+                return Ok(None);
+            };
+            let expected = crate::compiler::diagnostics_store::NativeEvidenceBindingValidation::candidate_key(
+                candidate.action(),
+                candidate.result(),
+                &contract,
+            );
+            if candidate.evidence_candidate() != expected {
+                return Err(RailError::message(
+                    "compiler acquisition follower candidate does not match its exact analysis contract",
+                ));
+            }
+            Ok(Some(CoordinationClaim::Follower(candidate)))
+        }
+        crate::compiler::acquisition::broker::BrokerClaim::Leader(mut leader) => {
+            if !leader.acquire_execution_claim()? {
+                return Ok(None);
+            }
+            Ok(Some(CoordinationClaim::Leader(CoordinatedExecution {
+                leader,
+                contract,
+            })))
+        }
+        crate::compiler::acquisition::broker::BrokerClaim::Unavailable => Ok(None),
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "coordinated revalidation must retain the exact native selection authority"
+)]
+fn revalidated_coordinated_candidate(
+    context: &NativeCacheContext,
+    cas: &LocalCas,
+    session: &NativeCompilerSession,
+    lookup_key: &str,
+    pre_link_action: &str,
+    capture: &NativeActionCapture,
+    observation: &RawCompilerInvocation,
+    linked: bool,
+) -> Option<(String, String)> {
+    let (lookup, _) = lookup_native_action(
+        cas,
+        session,
+        lookup_key,
+        pre_link_action,
+        capture,
+        observation,
+        context
+            .installation
+            .as_ref()
+            .map(crate::cache::installation::InstallationReceipt::authority),
+    )
+    .ok()?;
+    let crate::cache::cas::NativeActionLookup::Hit(cached) = lookup else {
+        return None;
+    };
+    if cached.validation.session_identity != session.identity
+        || cached.validation.class != session.class
+        || (linked
+            && !platform_linker_witness_is_valid(
+                observation,
+                &cached.validation.witness,
+                cached.validation.linker_generations.as_ref(),
+            ))
+        || (!linked && cached.validation.action_key != pre_link_action)
+        || !capture.validates_witness(&cached.validation.witness, observation)
+        || !resolve_analysis_evidence(context, cached.validation.action_key(), cached.validation.result_key())
+            .is_ok_and(|evidence| evidence.is_some())
+    {
+        return None;
+    }
+    Some((
+        cached.validation.action_key().to_string(),
+        cached.validation.result_key().to_string(),
+    ))
 }
 
 /// Attempt native reuse and configure the cold child without changing Cargo's wrapper order.
@@ -7404,10 +7638,20 @@ pub(crate) struct OuterCacheStore {
 /// workspace-wrapper slot. A returned code means verified outputs and streams
 /// were already restored; `Execute` preserves the ordinary child execution.
 pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: &mut Command) -> OuterCacheAction {
+    configure_outer_inner(program, arguments, command, 0)
+}
+
+fn configure_outer_inner(
+    program: &OsStr,
+    arguments: &[OsString],
+    command: &mut Command,
+    coordination_depth: u8,
+) -> OuterCacheAction {
     command.env_remove(DISPOSITION_ENV);
     let Some(context) = active_context() else {
         return OuterCacheAction::Execute;
     };
+    let external_miss_authority = ExternalNativeMissAuthority::derive(context.analysis_session.is_some());
 
     let diagnostic_wrapper = is_diagnostic_workspace_wrapper(program);
     prepare_original_child(command, diagnostic_wrapper);
@@ -7442,7 +7686,11 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
     };
     let source_root = &context.source_root;
     let source_root_spelling = &context.source_root_spelling;
-    let observation_directory = &context.observation_directory;
+    let transaction_directory = &context.observation_directory;
+    let observation_directory = context.analysis_session.as_ref().map_or(
+        transaction_directory.as_path(),
+        crate::compiler::session::CompilerFactSession::observation_directory,
+    );
     let session = context.session.load(source_root);
     let session = match session {
         Ok(session) => session,
@@ -7507,7 +7755,7 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
         compiler_arguments
     };
     let mut recorder = match crate::compiler::observation::begin_invocation_in(
-        observation_directory,
+        transaction_directory,
         source_root,
         &original_current_dir,
         rustc,
@@ -7526,6 +7774,33 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
             return OuterCacheAction::Execute;
         }
     };
+    if let Some(typed) = context.analysis_session.as_ref().and_then(|session| session.typed()) {
+        match typed.authorize_invocation(
+            recorder.observation(),
+            context
+                .analysis_session
+                .as_ref()
+                .map(crate::compiler::session::CompilerFactSession::observation_directory)
+                .unwrap_or(observation_directory),
+            source_root,
+            false,
+            None,
+        ) {
+            Ok(Some(invocation)) => recorder.set_compiler_fact_unit(invocation.unit),
+            Ok(None) => {}
+            Err(_) => {
+                configure_cold(
+                    command,
+                    CompilerCacheWrapperStatus::Bypassed,
+                    "analysis_invocation_authority_unavailable",
+                    None,
+                    0,
+                    diagnostic_wrapper,
+                );
+                return OuterCacheAction::Execute;
+            }
+        }
+    }
     let initial_input_bytes = estimated_input_bytes(recorder.observation(), source_root);
     let bypass_reason = invocation_bypass_reason(recorder.observation(), false, &session.class.host_target);
     if let Some(reason) = bypass_reason {
@@ -7611,8 +7886,11 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
         .and_then(crate::cache::installation::InstallationReceipt::mutual_tls_distributed_worker);
     let mut normalized_compiler_arguments = None;
     let mut distributed_candidate = None;
+    let mut distributed_execution_qualified = false;
     let mut normalization_bytes = 0_u64;
-    if (distributed_worker.is_some() || distributed_remote.is_some()) && !diagnostic_wrapper {
+    if (distributed_worker.is_some() || distributed_remote.is_some())
+        && (!diagnostic_wrapper || context.analysis_session.is_some())
+    {
         let normalized = (|| -> Result<_, &'static str> {
             let initial_candidate = distributed_rust_library_input_candidate(
                 recorder.observation(),
@@ -7707,13 +7985,7 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
             return OuterCacheAction::Execute;
         }
     };
-    let distributed_placement = distributed_remote.as_ref().and_then(|(identity, _)| {
-        distributed_candidate.as_ref().and_then(|candidate| {
-            candidate
-                .placement_observation(identity.worker_capability_id, identity.endpoint)
-                .ok()
-        })
-    });
+    let mut distributed_placement = None;
     if capture_test_pause("after_initial_capture", observation).is_err() {
         configure_cold(
             command,
@@ -7808,8 +8080,17 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
         Some(selector) => selector,
         None => {
             if let Some(candidate) = distributed_candidate.as_ref()
-                && prepare_distributed_local_fallback(command, rustc, candidate, source_root, observation_directory)
-                    .is_err()
+                && prepare_distributed_local_fallback(
+                    command,
+                    program,
+                    rustc,
+                    candidate,
+                    source_root,
+                    observation_directory,
+                    diagnostic_wrapper,
+                    context.analysis_session.is_some(),
+                )
+                .is_err()
             {
                 configure_cold(
                     command,
@@ -7839,6 +8120,7 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
                     diagnostic_wrapper,
                     recorder.observation(),
                     observation_directory,
+                    context.analysis_session.is_some(),
                 );
             }
             return OuterCacheAction::Store(Box::new(OuterCacheStore {
@@ -7847,6 +8129,7 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
                 base_action_key: base_action,
                 cache_bytes_read: 0,
                 distributed_placement,
+                coordination: None,
             }));
         }
     };
@@ -7870,9 +8153,33 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
         }
     };
     if distributed_candidate.is_some() {
-        distributed_candidate =
+        if let Ok(mut candidate) =
             distributed_rust_library_candidate(observation, &capture, &output_paths, source_root, source_root_spelling)
-                .ok();
+        {
+            distributed_execution_qualified = if context.analysis_session.is_some() {
+                diagnostic_wrapper
+                    && qualify_distributed_analysis_candidate(
+                        context,
+                        &mut candidate,
+                        observation,
+                        observation_directory,
+                        source_root,
+                    )
+                    .is_ok()
+            } else {
+                true
+            };
+            distributed_candidate = Some(candidate);
+        }
+        if distributed_execution_qualified {
+            distributed_placement = distributed_remote.as_ref().and_then(|(identity, _)| {
+                distributed_candidate.as_ref().and_then(|candidate| {
+                    candidate
+                        .placement_observation(identity.worker_capability_id, identity.endpoint)
+                        .ok()
+                })
+            });
+        }
     }
     match capture_approved_environment(
         source_root,
@@ -7977,6 +8284,74 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
                 && capture.validates_witness(&cached.validation.witness, observation) =>
         {
             metrics.cache_bytes_read = metrics.cache_bytes_read.saturating_add(cached.bytes_read);
+            let analysis_resolution =
+                resolve_analysis_evidence(context, cached.validation.action_key(), cached.validation.result_key());
+            let analysis_miss_reason = match &analysis_resolution {
+                Ok(Some(_)) => None,
+                Ok(None) if context.analysis_session.is_none() => None,
+                Ok(None) => Some("analysis_evidence_binding_not_found"),
+                Err(_) => Some("analysis_evidence_binding_rejected"),
+            };
+            if let Some(reason) = analysis_miss_reason {
+                let action = cached.validation.action_key().to_string();
+                drop(cached);
+                let mut coordination = None;
+                if context
+                    .analysis_session
+                    .as_ref()
+                    .is_some_and(|session| session.acquisition().is_some())
+                {
+                    if coordination_depth >= 2 {
+                        return OuterCacheAction::OperationalFailure(RailError::message(
+                            "compiler acquisition candidate diverged repeatedly during coordinated revalidation",
+                        ));
+                    }
+                    match coordinate_analysis_execution(
+                        context,
+                        crate::compiler::acquisition::broker::ExecutionClaimKey::Selected(action),
+                    ) {
+                        Ok(Some(CoordinationClaim::Follower(candidate))) => {
+                            drop(candidate);
+                            return configure_outer_inner(program, arguments, command, coordination_depth + 1);
+                        }
+                        Ok(Some(CoordinationClaim::Leader(coordinated))) => {
+                            if let Some((action, result)) = revalidated_coordinated_candidate(
+                                context,
+                                &cas,
+                                &session,
+                                &lookup_key,
+                                &pre_link_action,
+                                &capture,
+                                observation,
+                                linked,
+                            ) {
+                                if let Err(error) = coordinated.complete(&action, &result) {
+                                    return OuterCacheAction::OperationalFailure(error);
+                                }
+                                return configure_outer_inner(program, arguments, command, coordination_depth + 1);
+                            }
+                            coordination = Some(coordinated);
+                        }
+                        Ok(None) => {}
+                        Err(error) => return OuterCacheAction::OperationalFailure(error),
+                    }
+                }
+                return configure_analysis_miss(
+                    command,
+                    recorder,
+                    capture,
+                    base_action,
+                    metrics.cache_bytes_read,
+                    rustc,
+                    compiler_arguments,
+                    diagnostic_wrapper,
+                    observation_directory,
+                    reason,
+                    distributed_placement,
+                    coordination,
+                );
+            }
+            let analysis = analysis_resolution.ok().flatten();
             match restore_and_publish(
                 context,
                 &cas,
@@ -7988,6 +8363,7 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
                 observation,
                 &output_paths,
                 &mut metrics,
+                analysis.as_ref(),
             ) {
                 Ok(()) => return OuterCacheAction::Hit(0),
                 Err(RestorePublishFailure::BeforeEffect(error)) => {
@@ -8030,7 +8406,53 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
             (miss.reason, true)
         }
     };
+    let mut coordination = None;
     if local_miss
+        && context
+            .analysis_session
+            .as_ref()
+            .is_some_and(|session| session.acquisition().is_some())
+    {
+        if coordination_depth >= 2 {
+            return OuterCacheAction::OperationalFailure(RailError::message(
+                "compiler acquisition candidate diverged repeatedly during coordinated revalidation",
+            ));
+        }
+        let execution = if linked {
+            crate::compiler::acquisition::broker::ExecutionClaimKey::LinkCandidate(lookup_key.clone())
+        } else {
+            crate::compiler::acquisition::broker::ExecutionClaimKey::Selected(pre_link_action.clone())
+        };
+        match coordinate_analysis_execution(context, execution) {
+            Ok(Some(CoordinationClaim::Follower(candidate))) => {
+                drop(candidate);
+                return configure_outer_inner(program, arguments, command, coordination_depth + 1);
+            }
+            Ok(Some(CoordinationClaim::Leader(coordinated))) => {
+                let complete = revalidated_coordinated_candidate(
+                    context,
+                    &cas,
+                    &session,
+                    &lookup_key,
+                    &pre_link_action,
+                    &capture,
+                    observation,
+                    linked,
+                );
+                if let Some((action, result)) = complete {
+                    if let Err(error) = coordinated.complete(&action, &result) {
+                        return OuterCacheAction::OperationalFailure(error);
+                    }
+                    return configure_outer_inner(program, arguments, command, coordination_depth + 1);
+                }
+                coordination = Some(coordinated);
+            }
+            Ok(None) => {}
+            Err(error) => return OuterCacheAction::OperationalFailure(error),
+        }
+    }
+    if local_miss
+        && external_miss_authority.remote_result_reuse
         && let Some(selection) = active_remote_selection()
         && selection.direct_transport_supported()
         && selection.approves_environment_names(&dynamic_selector.environment_names)
@@ -8063,6 +8485,8 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
         }
     }
     if local_miss
+        && external_miss_authority.distributed_execution
+        && distributed_execution_qualified
         && dynamic_selector.environment_names.is_empty()
         && let Some(candidate) = distributed_candidate.as_ref()
     {
@@ -8170,7 +8594,17 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
         }
     }
     if let Some(candidate) = distributed_candidate.as_ref()
-        && prepare_distributed_local_fallback(command, rustc, candidate, source_root, observation_directory).is_err()
+        && prepare_distributed_local_fallback(
+            command,
+            program,
+            rustc,
+            candidate,
+            source_root,
+            observation_directory,
+            diagnostic_wrapper,
+            context.analysis_session.is_some(),
+        )
+        .is_err()
     {
         configure_cold(
             command,
@@ -8202,6 +8636,7 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
             diagnostic_wrapper,
             recorder.observation(),
             observation_directory,
+            context.analysis_session.is_some(),
         );
     }
     OuterCacheAction::Store(Box::new(OuterCacheStore {
@@ -8210,6 +8645,56 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
         base_action_key: base_action,
         cache_bytes_read: metrics.cache_bytes_read,
         distributed_placement,
+        coordination,
+    }))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the cold handoff retains the exact native and analysis invocation authority"
+)]
+fn configure_analysis_miss(
+    command: &mut Command,
+    mut recorder: InvocationRecorder,
+    capture: NativeActionCapture,
+    base_action_key: String,
+    cache_bytes_read: u64,
+    rustc: &OsStr,
+    compiler_arguments: &[OsString],
+    diagnostic_wrapper: bool,
+    observation_directory: &Path,
+    reason: &'static str,
+    distributed_placement: Option<crate::compiler::distributed::PlacementObservation>,
+    coordination: Option<CoordinatedExecution>,
+) -> OuterCacheAction {
+    let metadata = configure_cold(
+        command,
+        CompilerCacheWrapperStatus::Miss,
+        reason,
+        Some(base_action_key.clone()),
+        estimated_input_bytes(
+            recorder.observation(),
+            active_context().map_or(observation_directory, |context| context.source_root.as_path()),
+        ),
+        diagnostic_wrapper,
+    );
+    recorder.set_cache_wrapper(metadata);
+    prepare_observed_cold_child(
+        command,
+        rustc,
+        compiler_arguments,
+        diagnostic_wrapper,
+        recorder.observation(),
+        observation_directory,
+        true,
+    );
+    OuterCacheAction::Store(Box::new(OuterCacheStore {
+        recorder,
+        capture,
+        base_action_key,
+        cache_bytes_read,
+        distributed_placement,
+        coordination,
     }))
 }
 
@@ -8297,17 +8782,66 @@ fn root_portable_action_class(
     distributed_rust_library_authority_with_remap(&authority, capture, output_paths, source_root, false).map(|_| ())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the fallback must retain the exact wrapper, compiler, candidate, roots, and analysis role"
+)]
 fn prepare_distributed_local_fallback(
     command: &mut Command,
+    wrapper: &OsStr,
     rustc: &OsStr,
     candidate: &crate::compiler::distributed::RustLibraryCandidate,
     source_root: &Path,
     observation_directory: &Path,
+    diagnostic_wrapper: bool,
+    analysis: bool,
 ) -> RailResult<()> {
     let temporary = observation_directory.join("distributed-local-tmp");
-    *command = candidate.normalized_local_command(rustc, source_root, &temporary)?;
+    let normalized = candidate.normalized_local_command(rustc, source_root, &temporary)?;
+    if analysis {
+        if !diagnostic_wrapper {
+            return Err(RailError::message(
+                "distributed analysis fallback has no local fact-wrapper authority",
+            ));
+        }
+        let arguments = normalized.get_args().map(OsStr::to_os_string).collect::<Vec<_>>();
+        *command = Command::new(wrapper);
+        command
+            .arg(rustc)
+            .args(arguments)
+            .env("TEMP", &temporary)
+            .env("TMP", &temporary)
+            .env("TMPDIR", &temporary)
+            .env(ANALYSIS_OUTER_OBSERVATION_ENV, "1");
+        return Ok(());
+    }
+    *command = normalized;
     suppress_nested_observation(command);
     Ok(())
+}
+
+fn qualify_distributed_analysis_candidate(
+    context: &NativeCacheContext,
+    candidate: &mut crate::compiler::distributed::RustLibraryCandidate,
+    observation: &RawCompilerInvocation,
+    observation_directory: &Path,
+    source_root: &Path,
+) -> Result<(), &'static str> {
+    let Some(session) = context.analysis_session.as_ref() else {
+        return Ok(());
+    };
+    let typed = session
+        .typed()
+        .filter(|typed| !typed.doctest && typed.host_platform == typed.target_platform)
+        .ok_or("distributed_analysis_typed_target_unsupported")?;
+    let invocation = typed
+        .authorize_invocation(observation, observation_directory, source_root, false, None)
+        .map_err(|_| "distributed_analysis_invocation_unauthorized")?
+        .filter(|invocation| invocation.unit.role == crate::compiler::facts::CompilerFactRole::Target)
+        .ok_or("distributed_analysis_compiler_role_unsupported")?;
+    candidate
+        .attach_analysis(session.analysis_contract().clone(), invocation, observation)
+        .map_err(|_| "distributed_analysis_operation_unavailable")
 }
 
 fn replay_distributed_compiler_failure(
@@ -8498,6 +9032,14 @@ fn attempt_local_packed_reuse(
         return PackedLocalReuse::Cold("packed_action_descriptor_incompatible");
     }
     metrics.cache_bytes_read = metrics.cache_bytes_read.saturating_add(pack_bytes);
+    let analysis = match resolve_analysis_evidence(context, validation.action_key(), validation.result_key()) {
+        Ok(Some(evidence)) => Some(evidence),
+        Ok(None) if context.analysis_session.is_some() => {
+            return PackedLocalReuse::Cold("analysis_evidence_binding_not_found");
+        }
+        Ok(None) => None,
+        Err(_) => return PackedLocalReuse::Cold("analysis_evidence_binding_rejected"),
+    };
     match restore_and_publish(
         context,
         cas,
@@ -8511,6 +9053,7 @@ fn attempt_local_packed_reuse(
         observation,
         output_paths,
         metrics,
+        analysis.as_ref(),
     ) {
         Ok(()) => PackedLocalReuse::Hit,
         Err(RestorePublishFailure::BeforeEffect(_)) => PackedLocalReuse::Cold("packed_result_materialization_failed"),
@@ -8639,6 +9182,14 @@ fn attempt_direct_remote_reuse(request: DirectRemoteReuseRequest<'_>) -> DirectR
     };
     metrics.remote_timing.validation.record(started);
     metrics.cache_bytes_read = metrics.cache_bytes_read.saturating_add(pack_bytes);
+    let analysis = match resolve_analysis_evidence(context, validation.action_key(), validation.result_key()) {
+        Ok(Some(evidence)) => Some(evidence),
+        Ok(None) if context.analysis_session.is_some() => {
+            return DirectRemoteReuse::Cold("analysis_evidence_binding_not_found");
+        }
+        Ok(None) => None,
+        Err(_) => return DirectRemoteReuse::Cold("analysis_evidence_binding_rejected"),
+    };
     let started = Instant::now();
     let mut recapture_bytes = 0_u64;
     if cas
@@ -8686,6 +9237,7 @@ fn attempt_direct_remote_reuse(request: DirectRemoteReuseRequest<'_>) -> DirectR
                 observation,
                 output_paths,
                 metrics,
+                analysis.as_ref(),
             )
         }
         Ok(crate::cache::cas::NativeActionLookup::Hit(cached)) if cached.validation == validation => {
@@ -8700,6 +9252,7 @@ fn attempt_direct_remote_reuse(request: DirectRemoteReuseRequest<'_>) -> DirectR
                 observation,
                 output_paths,
                 metrics,
+                analysis.as_ref(),
             )
         }
         Ok(crate::cache::cas::NativeActionLookup::Hit(_) | crate::cache::cas::NativeActionLookup::Miss(_)) | Err(_) => {
@@ -8741,7 +9294,11 @@ pub(crate) fn admit_distributed_rust_library_result(
     } = authority;
 
     let admission_started = Instant::now();
-    let live_candidate = match distributed_rust_library_candidate(
+    let observation_directory = context.analysis_session.as_ref().map_or(
+        context.observation_directory.as_path(),
+        crate::compiler::session::CompilerFactSession::observation_directory,
+    );
+    let mut live_candidate = match distributed_rust_library_candidate(
         current_observation,
         initial_capture,
         output_paths,
@@ -8751,9 +9308,27 @@ pub(crate) fn admit_distributed_rust_library_result(
         Ok(candidate) => candidate,
         Err(_) => return LocalAdmission::RejectedBeforeEffect("distributed_action_changed_before_admission"),
     };
+    if qualify_distributed_analysis_candidate(
+        context,
+        &mut live_candidate,
+        current_observation,
+        observation_directory,
+        &context.source_root,
+    )
+    .is_err()
+    {
+        return LocalAdmission::RejectedBeforeEffect("distributed_analysis_changed_before_admission");
+    }
     if !result.binds_candidate(candidate) || !result.binds_candidate(&live_candidate) {
         return LocalAdmission::RejectedBeforeEffect("distributed_result_action_mismatch");
     }
+    let distributed_analysis = match result.validated_analysis_evidence(candidate, current_observation) {
+        Ok(Some(evidence)) if context.analysis_session.is_some() && candidate.is_analysis() => Some(evidence),
+        Ok(None) if context.analysis_session.is_none() && !candidate.is_analysis() => None,
+        Ok(Some(_)) | Ok(None) | Err(_) => {
+            return LocalAdmission::RejectedBeforeEffect("distributed_analysis_evidence_rejected");
+        }
+    };
     let result_authority = NativeResultAuthority {
         session,
         initial_capture,
@@ -8804,6 +9379,36 @@ pub(crate) fn admit_distributed_rust_library_result(
         )
         | Err(_) => return LocalAdmission::RejectedBeforeEffect("distributed_local_authority_changed"),
     };
+    let analysis =
+        if let (Some(analysis_session), Some(evidence)) = (context.analysis_session.as_ref(), distributed_analysis) {
+            let store = crate::compiler::analysis::AnalysisEvidenceStore::from_cas(cas.clone());
+            let remote = open_active_remote_store().ok().flatten();
+            if store
+                .put_resolved(
+                    analysis_session.analysis_contract(),
+                    validation.action_key().to_string(),
+                    validation.result_key().to_string(),
+                    &evidence.observation,
+                    &evidence.facts,
+                    remote,
+                )
+                .is_err()
+            {
+                return LocalAdmission::RejectedBeforeEffect("distributed_analysis_publication_failed");
+            }
+            match store.get(
+                analysis_session.analysis_contract(),
+                validation.action_key(),
+                validation.result_key(),
+            ) {
+                Ok(Some(evidence)) => Some(evidence),
+                Ok(None) | Err(_) => {
+                    return LocalAdmission::RejectedBeforeEffect("distributed_analysis_publication_rejected");
+                }
+            }
+        } else {
+            None
+        };
     timing.record_admission(admission_started);
     let mut metrics = NativeCacheMetrics {
         bytes_hashed: recapture_bytes,
@@ -8824,6 +9429,7 @@ pub(crate) fn admit_distributed_rust_library_result(
         current_observation,
         output_paths,
         &mut metrics,
+        analysis.as_ref(),
     ) {
         Ok(()) => LocalAdmission::Committed(0),
         Err(RestorePublishFailure::BeforeEffect(_)) => {
@@ -8846,13 +9452,18 @@ fn prepare_observed_cold_child(
     diagnostic_wrapper: bool,
     observation: &RawCompilerInvocation,
     observation_directory: &Path,
+    analysis: bool,
 ) {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let _ = (observation, observation_directory);
+    if diagnostic_wrapper && analysis {
+        command.env(ANALYSIS_OUTER_OBSERVATION_ENV, "1");
+        return;
+    }
     *command = Command::new(rustc);
     command.args(compiler_arguments);
     if diagnostic_wrapper {
-        command.arg("--warn=unused-crate-dependencies");
+        command.arg(crate::compiler::invocation::UNUSED_CRATE_DEPENDENCIES_DIAGNOSTIC_ARGUMENT);
     }
     suppress_nested_observation(command);
     #[cfg(target_os = "macos")]
@@ -8968,6 +9579,11 @@ fn is_diagnostic_workspace_wrapper(program: &OsStr) -> bool {
     if std::env::var_os(crate::compiler::invocation::WRAPPER_MARKER).is_none() {
         return false;
     }
+    if std::env::var_os(crate::compiler::session::FACT_SESSION_ENV).is_some()
+        && std::env::var_os("RUSTC_WORKSPACE_WRAPPER").as_deref() == Some(program)
+    {
+        return true;
+    }
     let Ok(current) = std::env::current_exe().and_then(fs::canonicalize) else {
         return false;
     };
@@ -9068,6 +9684,10 @@ impl NativeHitSource<'_> {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "restore revalidation keeps each native, analysis, destination, and metrics authority explicit"
+)]
 fn restore_and_publish(
     context: &NativeCacheContext,
     cas: &LocalCas,
@@ -9076,6 +9696,7 @@ fn restore_and_publish(
     current_observation: &RawCompilerInvocation,
     output_paths: &NativeOutputPaths,
     metrics: &mut NativeCacheMetrics,
+    analysis: Option<&crate::compiler::analysis::ResolvedNativeEvidence>,
 ) -> Result<(), RestorePublishFailure> {
     let restore_started = Instant::now();
     let durability = native_durability_phase(NativeDurabilityPhase::RestoreTransaction);
@@ -9115,7 +9736,10 @@ fn restore_and_publish(
     let hit_source = source.hit_source();
     let source_root = &context.source_root;
     let source_root_spelling = &context.source_root_spelling;
-    let observation_directory = &context.observation_directory;
+    let observation_directory = context.analysis_session.as_ref().map_or(
+        context.observation_directory.as_path(),
+        crate::compiler::session::CompilerFactSession::observation_directory,
+    );
     validate_current_output_binding(&validation, output_paths, source_root).map_err(before)?;
     let mut transaction = begin_restore_transaction_in(
         cas,
@@ -9135,6 +9759,7 @@ fn restore_and_publish(
         source_root,
         source_root_spelling,
         observation_directory,
+        analysis,
     };
     let prepared = match prepare_registered_restore(source, &transaction, restore_authority, metrics) {
         Ok(prepared) => prepared,
@@ -9168,6 +9793,13 @@ fn restore_and_publish(
         visible_effects = visible_effects.saturating_add(1);
         crate::compiler::observation::publish_prepared_raw(observation)?;
         restore_commit_test_fault("after_observation", visible_effects, current_observation)?;
+        if let (Some(session), Some(analysis)) = (context.analysis_session.as_ref(), analysis) {
+            crate::compiler::analysis::publish_fact_imports(
+                session.observation_directory(),
+                session.analysis_contract(),
+                &analysis.facts,
+            )?;
+        }
         visible_effects = visible_effects.saturating_add(1);
         std::io::stdout().write_all(&stdout)?;
         restore_commit_test_fault("after_stdout", visible_effects, current_observation)?;
@@ -9226,6 +9858,7 @@ struct NativeRestoreAuthority<'a> {
     source_root: &'a Path,
     source_root_spelling: &'a Path,
     observation_directory: &'a Path,
+    analysis: Option<&'a crate::compiler::analysis::ResolvedNativeEvidence>,
 }
 
 fn prepare_registered_restore(
@@ -9241,6 +9874,7 @@ fn prepare_registered_restore(
         source_root,
         source_root_spelling,
         observation_directory,
+        analysis,
     } = authority;
     let validation = source.validation().clone();
     let restored = transaction.paths.transaction_directory.join(RESTORE_VERIFIED_DIRECTORY);
@@ -9324,7 +9958,10 @@ fn prepare_registered_restore(
         .iter()
         .map(|output| output.observation.clone())
         .collect::<Vec<_>>();
-    let mut raw = validation.observation.clone();
+    let mut raw = match analysis {
+        Some(evidence) => evidence.observation.restore_into(current_observation)?,
+        None => validation.observation.clone(),
+    };
     raw.compiler_arguments = current_observation.compiler_arguments.clone();
     raw.declared_inputs = current_observation.declared_inputs.clone();
     raw.dependency_artifacts = current_observation.dependency_artifacts.clone();
@@ -11440,10 +12077,10 @@ pub(crate) fn remove_cache_environment(command: &mut Command) {
         .env_remove(SESSION_ENV)
         .env_remove(DISPOSITION_ENV)
         .env_remove(BENCH_COVERAGE_DIRECTORY_ENV)
-        .env_remove(LEGACY_STORE_ENV)
         .env_remove(crate::cache::cas::CACHE_BASE_ENV)
         .env_remove(crate::cache::cas::CACHE_MAX_BYTES_ENV)
         .env_remove(crate::cache::cas::CACHE_TRUST_DOMAIN_ENV)
+        .env_remove(crate::cache::profile::COORDINATOR_PROFILE_ENV)
         .env_remove(crate::compiler::invocation::CACHE_CONTROL_ENV)
         .env_remove(crate::compiler::invocation::CACHE_WRAPPER_MARKER);
 }
@@ -11463,6 +12100,7 @@ pub(crate) fn remove_private_environment(command: &mut Command) {
         .env_remove(crate::compiler::invocation::FACT_DOCTEST_RUNNER_ENV)
         .env_remove(crate::compiler::facts::COMPILER_FACT_INVOCATION_ENV)
         .env_remove(crate::compiler::session::FACT_SESSION_ENV)
+        .env_remove(ANALYSIS_OUTER_OBSERVATION_ENV)
         .env_remove(APPLE_LINK_ADAPTER_ENV)
         .env_remove(APPLE_LINK_DRIVER_ENV)
         .env_remove(APPLE_LINK_CERTIFICATE_ENV)
@@ -11961,15 +12599,17 @@ fn publish_direct_remote_result(
     }
 }
 
-pub(crate) fn run_and_store(
-    command: Command,
-    recorder: InvocationRecorder,
-    mut capture: NativeActionCapture,
-    base_action_key: String,
-    cache_bytes_read: u64,
-    distributed_placement: Option<crate::compiler::distributed::PlacementObservation>,
-    context: &str,
-) -> i32 {
+pub(crate) fn run_and_store(command: Command, store: OuterCacheStore, context: &str) -> i32 {
+    let OuterCacheStore {
+        recorder,
+        capture,
+        base_action_key,
+        cache_bytes_read,
+        distributed_placement,
+        coordination,
+    } = store;
+    let mut capture = capture;
+    let mut coordination = coordination;
     let Some(cache_context) = active_context() else {
         eprintln!("{context}: native compiler cache context disappeared before execution");
         return 2;
@@ -12347,8 +12987,10 @@ pub(crate) fn run_and_store(
             Ok((validation, final_capture_bytes))
         })()
     });
+    let mut coordinated_result = None;
     match publication {
         Ok((validation, final_capture_bytes)) => {
+            coordinated_result = Some((validation.action_key.clone(), validation.result_key.clone()));
             let remote_reason = cas
                 .as_ref()
                 .ok()
@@ -12420,10 +13062,31 @@ pub(crate) fn run_and_store(
             );
         }
     }
-    drop(crate::compiler::observation::publish_raw(
-        &cache_context.observation_directory,
-        &raw,
-    ));
+    let publication_directory = cache_context.analysis_session.as_ref().map_or(
+        cache_context.observation_directory.as_path(),
+        crate::compiler::session::CompilerFactSession::observation_directory,
+    );
+    let publication_error = crate::compiler::observation::publish_raw(publication_directory, &raw).err();
+    let coordinated = coordination.is_some();
+    let coordination_failure =
+        coordination.take().and_then(
+            |coordination| match (publication_error.as_ref(), coordinated_result.as_ref()) {
+                (None, Some((action, result))) => coordination.complete(action, result).err(),
+                (Some(_), _) | (None, None) => coordination
+                    .fail(crate::compiler::acquisition::broker::BrokerFailureClass::Publication)
+                    .err(),
+            },
+        );
+    if coordinated && let Some(error) = publication_error {
+        record_active_failure();
+        eprintln!("{context}: coordinated compiler observation publication failed: {error}");
+        return 2;
+    }
+    if let Some(error) = coordination_failure {
+        record_active_failure();
+        eprintln!("{context}: coordinated compiler publication failed: {error}");
+        return 2;
+    }
     status.code().unwrap_or(1)
 }
 
@@ -12626,7 +13289,12 @@ fn publish_cold_observation(
         0,
     ));
     let directory = active_context()
-        .map(|context| &context.observation_directory)
+        .map(|context| {
+            context.analysis_session.as_ref().map_or(
+                context.observation_directory.as_path(),
+                crate::compiler::session::CompilerFactSession::observation_directory,
+            )
+        })
         .ok_or_else(|| RailError::message("compiler observation directory is unavailable"))?;
     crate::compiler::observation::publish_raw(directory, raw)
 }
@@ -13686,6 +14354,116 @@ pub(crate) mod tests {
     use crate::compiler::observation::EnvironmentObservation;
 
     #[test]
+    fn native_cache_host_gate_uses_the_declared_local_compiler_capability() {
+        assert_eq!(
+            unsupported_native_cache_host_reason(),
+            crate::compiler::capability::unqualified_host_reason()
+        );
+    }
+
+    #[test]
+    fn analysis_bearing_misses_admit_only_qualified_external_results() {
+        assert_eq!(
+            ExternalNativeMissAuthority::derive(true),
+            ExternalNativeMissAuthority {
+                remote_result_reuse: true,
+                distributed_execution: true,
+            }
+        );
+        assert_eq!(
+            ExternalNativeMissAuthority::derive(false),
+            ExternalNativeMissAuthority {
+                remote_result_reuse: true,
+                distributed_execution: true,
+            }
+        );
+    }
+
+    #[test]
+    fn analysis_distributed_fallback_reenters_the_local_fact_wrapper() {
+        let result: RailResult<()> = (|| {
+            use crate::compiler::distributed::{
+                RustLibraryCandidate, RustLibraryCandidateInput, RustLibraryEmission, RustLibraryExecutionOptions,
+                RustLibrarySourceInput,
+            };
+
+            let workspace = tempfile::tempdir()?;
+            let source_root = crate::utils::canonicalize_existing(workspace.path())?;
+            let source = source_root.join("src/lib.rs");
+            fs::create_dir(source.parent().expect("source parent"))?;
+            let source_bytes = b"pub fn local_fallback() -> bool { true }\n";
+            fs::write(&source, source_bytes)?;
+            let output = source_root.join("target/debug/deps");
+            fs::create_dir_all(&output)?;
+            let observation = source_root.join("observation");
+            fs::create_dir(&observation)?;
+            fs::create_dir(observation.join("distributed-local-tmp"))?;
+            let candidate = RustLibraryCandidate::from_captured_inputs(
+                RustLibraryCandidateInput {
+                    crate_name: "local_fallback".to_string(),
+                    crate_type: "rlib".to_string(),
+                    dep_info_name: "local_fallback-0123456789abcdef.d".to_string(),
+                    edition: "2024".to_string(),
+                    emission: RustLibraryEmission::MetadataAndLink,
+                    metadata: "0123456789abcdef".to_string(),
+                    metadata_name: "liblocal_fallback-0123456789abcdef.rmeta".to_string(),
+                    extra_filename: "-0123456789abcdef".to_string(),
+                    output_relative_directory: "target/debug/deps".to_string(),
+                    source_relative_path: "src/lib.rs".to_string(),
+                    test_mode: false,
+                    toolchain_proc_macro: false,
+                    rlib_name: Some("liblocal_fallback-0123456789abcdef.rlib".to_string()),
+                    options: RustLibraryExecutionOptions::default(),
+                },
+                vec![RustLibrarySourceInput {
+                    bytes: source_bytes.len() as u64,
+                    content_digest: digest(source_bytes),
+                    path: source,
+                    repository_relative_path: "src/lib.rs".to_string(),
+                }],
+                Vec::new(),
+                output,
+            )?;
+            let mut command = Command::new("unchanged");
+            prepare_distributed_local_fallback(
+                &mut command,
+                OsStr::new("/cargo-rail-fact-wrapper"),
+                OsStr::new("/exact/rustc"),
+                &candidate,
+                &source_root,
+                &observation,
+                true,
+                true,
+            )?;
+            assert_eq!(command.get_program(), OsStr::new("/cargo-rail-fact-wrapper"));
+            assert_eq!(command.get_args().next(), Some(OsStr::new("/exact/rustc")));
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(name, value)| { name == ANALYSIS_OUTER_OBSERVATION_ENV && value == Some(OsStr::new("1")) })
+            );
+
+            let mut unsupported = Command::new("unchanged");
+            assert!(
+                prepare_distributed_local_fallback(
+                    &mut unsupported,
+                    OsStr::new("/cargo-rail-fact-wrapper"),
+                    OsStr::new("/exact/rustc"),
+                    &candidate,
+                    &source_root,
+                    &observation,
+                    false,
+                    true,
+                )
+                .is_err()
+            );
+            assert_eq!(unsupported.get_program(), OsStr::new("unchanged"));
+            Ok(())
+        })();
+        result.unwrap();
+    }
+
+    #[test]
     fn benchmark_coverage_publication_preserves_events_after_a_name_collision() {
         let directory = tempfile::tempdir().expect("coverage directory");
         let mut temporary = tempfile::Builder::new()
@@ -14092,7 +14870,7 @@ pub(crate) mod tests {
             OsString::from("--crate-type=lib"),
         ];
         let (_, root, target_root, output_parent) =
-            direct_compilation_root(&arguments, workspace.path(), None).expect("standard Cargo target root");
+            direct_compilation_root(&arguments, workspace.path(), None, None).expect("standard Cargo target root");
         assert_eq!(
             root,
             crate::utils::canonicalize_existing(workspace.path()).expect("canonical workspace")
@@ -14111,7 +14889,7 @@ pub(crate) mod tests {
         fs::create_dir_all(&custom_output).expect("custom output directory");
         let custom = vec![OsString::from(format!("--out-dir={}", custom_output.display()))];
         let (_, root, target_root, output_parent) =
-            direct_compilation_root(&custom, workspace.path(), Some(custom_target.path().as_os_str()))
+            direct_compilation_root(&custom, workspace.path(), Some(custom_target.path().as_os_str()), None)
                 .expect("validated custom Cargo target root");
         assert_eq!(
             root,
@@ -14136,6 +14914,7 @@ pub(crate) mod tests {
             &escaped_arguments,
             workspace.path(),
             Some(custom_target.path().as_os_str()),
+            None,
         )
         .expect_err("output outside the selected custom target must be rejected");
     }
@@ -14189,6 +14968,7 @@ pub(crate) mod tests {
             compiler: None,
             wrappers: Vec::new(),
             cache_wrapper: None,
+            compiler_exit_code: Some(0),
             success: true,
             bypasses: BTreeSet::new(),
             compiler_fact_unit: None,
@@ -14925,6 +15705,7 @@ pub(crate) mod tests {
             ));
             let restore_context = NativeCacheContext {
                 session: NativeCacheSession::Prepared(session.clone()),
+                analysis_session: None,
                 source_root: workspace_root.clone(),
                 source_root_spelling: workspace_root.clone(),
                 output_parent_authority: None,
@@ -14950,6 +15731,7 @@ pub(crate) mod tests {
                     &observation,
                     &output_paths,
                     &mut metrics,
+                    None,
                 )
                 .map_err(|failure| match failure {
                     RestorePublishFailure::BeforeEffect(error)
@@ -15758,6 +16540,61 @@ pub(crate) mod tests {
         assert_ne!(
             action_key(&session.identity, &session.class, &observation, &changed).expect("changed action"),
             initial_action
+        );
+    }
+
+    #[test]
+    fn unselected_generated_namespace_location_is_not_an_action_input() {
+        let root = tempfile::tempdir().expect("source root");
+        fs::create_dir(root.path().join("src")).expect("source directory");
+        let source = root.path().join("src/lib.rs");
+        fs::write(&source, b"pub const VALUE: u8 = 1;\n").expect("source");
+        let first_generated = root.path().join("target/first/out");
+        let second_generated = root.path().join("target/second/out");
+        fs::create_dir_all(&first_generated).expect("first generated directory");
+        fs::create_dir_all(&second_generated).expect("second generated directory");
+        fs::write(first_generated.join("unused.rs"), b"pub const GENERATED: u8 = 1;\n").expect("first generated input");
+        fs::write(second_generated.join("unused.rs"), b"pub const GENERATED: u8 = 1;\n")
+            .expect("second generated input");
+
+        let source_observation =
+            FileObservation::capture(&source, root.path(), root.path()).expect("source observation");
+        let mut observation = graduated_observation();
+        observation.declared_inputs = vec![source_observation.clone()];
+        observation.observed_reads = vec![source_observation];
+        let session = graduated_session(path_identity(root.path()).expect("root identity"));
+        let mut first = NativeActionCapture::capture(&observation, root.path()).expect("first source capture");
+        attach_generated_capture(&mut first, root.path(), &first_generated);
+        let mut second = NativeActionCapture::capture(&observation, root.path()).expect("second source capture");
+        attach_generated_capture(&mut second, root.path(), &second_generated);
+
+        assert_eq!(
+            action_key(&session.identity, &session.class, &observation, &first).expect("first action"),
+            action_key(&session.identity, &session.class, &observation, &second).expect("second action"),
+            "a physical OUT_DIR that rustc did not select is only a live revalidation capability"
+        );
+
+        first.approved_environment = ApprovedEnvState {
+            version: 3,
+            entries: vec![ApprovedEnvEntry {
+                name: "OUT_DIR".to_string(),
+                value_digest: Some(digest(first_generated.as_os_str().as_encoded_bytes())),
+                root_mapped: false,
+            }],
+        };
+        second.approved_environment = ApprovedEnvState {
+            version: 3,
+            entries: vec![ApprovedEnvEntry {
+                name: "OUT_DIR".to_string(),
+                value_digest: Some(digest(second_generated.as_os_str().as_encoded_bytes())),
+                root_mapped: false,
+            }],
+        };
+        assert_ne!(
+            action_key(&session.identity, &session.class, &observation, &first).expect("first OUT_DIR-selected action"),
+            action_key(&session.identity, &session.class, &observation, &second)
+                .expect("second OUT_DIR-selected action"),
+            "an observed OUT_DIR remains an exact compiler input"
         );
     }
 
@@ -17192,6 +18029,7 @@ pub(crate) mod tests {
             false,
             &observation,
             directory.path(),
+            false,
         );
         let arguments = command.get_args().collect::<Vec<_>>();
         assert_eq!(arguments, [OsStr::new("src/lib.rs")]);

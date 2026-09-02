@@ -65,12 +65,10 @@ pub enum RailError {
         source: Box<RailError>,
     },
 
-    /// Generic error with message and optional context
+    /// Generic error with an optional recovery hint.
     Message {
         /// Error message
         message: String,
-        /// Additional context about the error
-        context: Option<String>,
         /// Help text to guide the user
         help: Option<String>,
     },
@@ -98,7 +96,6 @@ impl RailError {
     pub fn message(msg: impl Into<String>) -> Self {
         RailError::Message {
             message: msg.into(),
-            context: None,
             help: None,
         }
     }
@@ -107,7 +104,6 @@ impl RailError {
     pub fn with_help(msg: impl Into<String>, help: impl Into<String>) -> Self {
         RailError::Message {
             message: msg.into(),
-            context: None,
             help: Some(help.into()),
         }
     }
@@ -168,13 +164,10 @@ impl RailError {
             current = source;
         }
 
-        let (message, legacy_context) = match current {
-            RailError::Message { message, context, .. } => (message.clone(), context.as_deref()),
-            _ => (current.to_string(), None),
+        let message = match current {
+            RailError::Message { message, .. } => message.clone(),
+            _ => current.to_string(),
         };
-        if let Some(context) = legacy_context {
-            contexts.push(context);
-        }
 
         let context = (!contexts.is_empty()).then(|| contexts.join("\n"));
         (message, context)
@@ -189,13 +182,7 @@ impl fmt::Display for RailError {
             RailError::Io(e) => write!(f, "{}", e),
             RailError::External { message, source } => write!(f, "{}: {}", message, source),
             RailError::Context { context, source } => write!(f, "{}\n{}", source, context),
-            RailError::Message { message, context, .. } => {
-                write!(f, "{}", message)?;
-                if let Some(ctx) = context {
-                    write!(f, "\n{}", ctx)?;
-                }
-                Ok(())
-            }
+            RailError::Message { message, .. } => write!(f, "{}", message),
             RailError::CheckHasPendingChanges => Ok(()), // Silent - CI signal
             RailError::ExitWithCode { .. } => Ok(()),    // Silent - exit code only
         }
@@ -617,7 +604,7 @@ mod tests {
     #[test]
     fn context_retains_configuration_git_and_filesystem_sources() {
         let config = RailError::Config(ConfigError::MissingField {
-            field: "release.source".to_string(),
+            field: "release.change_dir".to_string(),
         })
         .context("validating release policy");
         let config = rail_source(&config);

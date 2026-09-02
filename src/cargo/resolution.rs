@@ -471,6 +471,28 @@ impl CargoConfigSnapshot {
         &self.environment
     }
 
+    /// Return Cargo's explicitly captured positive build-job limit.
+    ///
+    /// Invalid, negative, and symbolic values remain Cargo's authority and are
+    /// deliberately not interpreted here. Callers must retain a bounded safe
+    /// fallback when this returns `None`.
+    pub(crate) fn explicit_build_jobs(&self) -> Option<usize> {
+        if let Some((_, value)) = self
+            .environment
+            .iter()
+            .find(|(name, _)| environment_names_equal(name, "CARGO_BUILD_JOBS"))
+        {
+            return value
+                .parse::<std::num::NonZeroUsize>()
+                .ok()
+                .map(std::num::NonZeroUsize::get);
+        }
+        json_value_at(&self.effective_file_settings, &["build", "jobs"])
+            .and_then(JsonValue::as_u64)
+            .and_then(|jobs| usize::try_from(jobs).ok())
+            .filter(|jobs| *jobs > 0)
+    }
+
     /// Return sanitized configuration files in lowest-to-highest precedence order.
     pub fn provenance(&self) -> &[CargoConfigSource] {
         &self.provenance
@@ -2567,10 +2589,10 @@ fn capture_credential_capabilities(
     cargo_home: &Path,
     framed: &mut Vec<u8>,
 ) -> RailResult<(JsonValue, Option<PathBuf>)> {
-    let legacy = cargo_home.join("credentials");
+    let extensionless = cargo_home.join("credentials");
     let toml = cargo_home.join("credentials.toml");
-    let path = if legacy.is_file() {
-        Some(legacy)
+    let path = if extensionless.is_file() {
+        Some(extensionless)
     } else if toml.is_file() {
         Some(toml)
     } else {
@@ -2653,9 +2675,9 @@ fn validate_credential_token(value: &JsonValue, path: &str) -> RailResult<()> {
 }
 
 fn cargo_config_in(directory: &Path) -> Option<PathBuf> {
-    let legacy = directory.join("config");
-    if legacy.is_file() {
-        return Some(legacy);
+    let extensionless = directory.join("config");
+    if extensionless.is_file() {
+        return Some(extensionless);
     }
     let toml = directory.join("config.toml");
     toml.is_file().then_some(toml)
@@ -3280,6 +3302,49 @@ mod tests {
         "RUSTDOC",
     ];
 
+    fn cargo_config_with_jobs(file_jobs: JsonValue, environment_jobs: Option<&str>) -> CargoConfigSnapshot {
+        CargoConfigSnapshot {
+            digest: ContentDigest::sha256(b"test-config"),
+            effective_file_settings: serde_json::json!({"build": {"jobs": file_jobs}}),
+            environment: environment_jobs
+                .map(|jobs| BTreeMap::from([("CARGO_BUILD_JOBS".to_string(), jobs.to_string())]))
+                .unwrap_or_default(),
+            provenance: Vec::new(),
+            credential_capabilities: JsonValue::Object(JsonMap::new()),
+            credential_provenance: None,
+            unmodeled_settings: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn explicit_build_jobs_preserves_cargo_environment_precedence() {
+        let configured = cargo_config_with_jobs(serde_json::json!(7), None);
+        assert_eq!(configured.explicit_build_jobs(), Some(7));
+
+        let overridden = cargo_config_with_jobs(serde_json::json!(7), Some("3"));
+        assert_eq!(overridden.explicit_build_jobs(), Some(3));
+
+        for invalid in ["0", "-2", "default", "not-a-number"] {
+            let invalid_override = cargo_config_with_jobs(serde_json::json!(7), Some(invalid));
+            assert_eq!(
+                invalid_override.explicit_build_jobs(),
+                None,
+                "higher-precedence Cargo build jobs value '{invalid}' must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_build_jobs_rejects_nonpositive_or_symbolic_file_values() {
+        for invalid in [
+            serde_json::json!(0),
+            serde_json::json!(-2),
+            serde_json::json!("default"),
+        ] {
+            assert_eq!(cargo_config_with_jobs(invalid, None).explicit_build_jobs(), None);
+        }
+    }
+
     fn rustc_host() -> &'static str {
         static HOST: OnceLock<String> = OnceLock::new();
         HOST.get_or_init(|| {
@@ -3429,11 +3494,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_cargo_credentials_file_has_cargos_documented_precedence() {
+    fn extensionless_cargo_credentials_file_has_cargos_documented_precedence() {
         let cargo_home = tempfile::tempdir().expect("temporary Cargo home should be created");
-        let legacy = cargo_home.path().join("credentials");
-        fs::write(&legacy, "[registries.legacy]\ntoken = \"legacy-secret\"\n")
-            .expect("legacy credentials file should be written");
+        let extensionless = cargo_home.path().join("credentials");
+        fs::write(&extensionless, "[registries.private]\ntoken = \"private-secret\"\n")
+            .expect("extensionless credentials file should be written");
         fs::write(
             cargo_home.path().join("credentials.toml"),
             "[registries.toml]\ntoken = \"toml-secret\"\n",
@@ -3446,15 +3511,15 @@ mod tests {
         assert_eq!(
             provenance.as_deref(),
             Some(
-                canonicalize_existing(&legacy)
-                    .expect("legacy credentials should canonicalize")
+                canonicalize_existing(&extensionless)
+                    .expect("extensionless credentials should canonicalize")
                     .as_path()
             )
         );
-        assert!(capabilities.pointer("/registries/legacy/token").is_some());
+        assert!(capabilities.pointer("/registries/private/token").is_some());
         assert!(capabilities.pointer("/registries/toml/token").is_none());
         let encoded = String::from_utf8_lossy(&framed);
-        assert!(!encoded.contains("legacy-secret"));
+        assert!(!encoded.contains("private-secret"));
         assert!(!encoded.contains("toml-secret"));
     }
 

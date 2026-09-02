@@ -3,8 +3,8 @@
 //! Covers:
 //! - Tag pattern detection ({crate}-v*)
 //! - Compare URLs with GitHub remote
-//! - Commit/PR links and breaking markers
-//! - per-crate changelog skip and require_changelog_entries flags
+//! - reviewed change-file bump and prose projection
+//! - per-crate changelog paths and skips
 
 #[cfg(unix)]
 use crate::helpers::isolated_cargo_rail_command;
@@ -35,14 +35,38 @@ fn write_release_config(ws: &TestWorkspace, extras: &str) -> Result<()> {
     ws.write_release_config(&format!(
         r#"tag_prefix = "v"
 tag_format = "{{crate}}-v{{version}}"
-source = "both"
-require_changelog_entries = false
-require_clean = false
 semver_check = "off"
 {}
 "#,
         extras
     ))?;
+    Ok(())
+}
+
+fn write_publication_release_config(ws: &TestWorkspace, extras: &str) -> Result<()> {
+    write_release_config(
+        ws,
+        &format!("remote_effects = \"push\"\nregistry_publication = \"crates-io\"\n{extras}"),
+    )
+}
+
+fn write_test_change(workspace: &Path, crates: &[&str]) -> Result<()> {
+    let intents = crates
+        .iter()
+        .map(|crate_name| (*crate_name, "patch"))
+        .collect::<Vec<_>>();
+    write_test_change_levels(workspace, &intents)
+}
+
+fn write_test_change_levels(workspace: &Path, intents: &[(&str, &str)]) -> Result<()> {
+    let changes = workspace.join(".changes");
+    std::fs::create_dir_all(&changes)?;
+    let mut contents = String::from("---\n");
+    for (crate_name, bump) in intents {
+        contents.push_str(&format!("\"{crate_name}\" = \"{bump}\"\n"));
+    }
+    contents.push_str("---\n\nExercise the current release contract.\n");
+    std::fs::write(changes.join("release-test.md"), contents)?;
     Ok(())
 }
 
@@ -99,6 +123,71 @@ fn only_release_state(workspace: &Path) -> Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("missing release state"))
 }
 
+fn rewrite_release_state_as_v0_25(path: &Path) -> Result<()> {
+    let mut state: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    state["schema_version"] = serde_json::json!(5);
+    state
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("release state fixture is not an object"))?
+        .remove("predecessor_execution");
+    let plan = state
+        .get_mut("plan")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| anyhow::anyhow!("release state fixture has no plan object"))?;
+    plan.insert("plan_contract_version".to_string(), serde_json::json!(5));
+    plan.insert("source".to_string(), serde_json::json!("changes"));
+    for planned in plan
+        .get_mut("crates")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| anyhow::anyhow!("release state fixture has no plan crate array"))?
+    {
+        planned["commits"] = serde_json::json!([]);
+        planned["commit_diagnostics"] = serde_json::json!([]);
+        planned["changelog_entries"] = serde_json::json!([]);
+    }
+    let config = state
+        .get_mut("release_config")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| anyhow::anyhow!("release state fixture has no release configuration"))?;
+    config.insert("source".to_string(), serde_json::json!("changes"));
+    config.insert("require_changelog_entries".to_string(), serde_json::json!(false));
+    config.insert("require_release_notes".to_string(), serde_json::json!(true));
+    config.insert("release_notes_dir".to_string(), serde_json::json!("release-notes"));
+    config.insert("unconventional_commits".to_string(), serde_json::json!("warn"));
+    config.insert("require_change_files".to_string(), serde_json::json!(false));
+    let changelog = config
+        .get_mut("changelog")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| anyhow::anyhow!("release state fixture has no changelog configuration"))?;
+    changelog.insert(
+        "entry_format".to_string(),
+        serde_json::json!("- {scope}{breaking}{description}{prs} ({sha_link})"),
+    );
+    changelog.insert("emoji".to_string(), serde_json::json!(true));
+    changelog.insert(
+        "group_order".to_string(),
+        serde_json::json!([
+            "breaking", "feat", "fix", "build", "chore", "ci", "deps", "docs", "other", "perf", "refactor", "style",
+            "test"
+        ]),
+    );
+    changelog.insert("fallback".to_string(), serde_json::json!("other"));
+    changelog.insert("groups".to_string(), serde_json::json!([]));
+    changelog.insert(
+        "filters".to_string(),
+        serde_json::json!({
+            "skip_types": [],
+            "skip_scopes": [],
+            "include_paths": [],
+            "exclude_paths": []
+        }),
+    );
+    changelog.insert("commit_url".to_string(), serde_json::Value::Null);
+    changelog.insert("pr_url".to_string(), serde_json::Value::Null);
+    std::fs::write(path, serde_json::to_vec_pretty(&state)?)?;
+    Ok(())
+}
+
 fn add_auxiliary_cargo_workspace(ws: &TestWorkspace, name: &str, dependency: &str) -> Result<PathBuf> {
     add_auxiliary_cargo_workspace_with_dependencies(ws, name, &[(dependency, "..")])
 }
@@ -140,12 +229,11 @@ fn configured_auxiliary_release(crate_name: &str) -> Result<TestWorkspace> {
     // `aux` is a reserved DOS device name; keep this shared fixture portable.
     add_auxiliary_cargo_workspace(&ws, "auxiliary", crate_name)?;
     ws.write_release_config(
-        r#"source = "both"
-tag_format = "v{version}"
-require_release_notes = false
+        r#"tag_format = "v{version}"
 auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
 "#,
     )?;
+    write_test_change(&ws.path, &[crate_name])?;
     ws.commit("Configure auxiliary Cargo release projection")?;
     Ok(ws)
 }
@@ -153,17 +241,7 @@ auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
 fn check_auxiliary_release(ws: &TestWorkspace) -> Result<std::process::Output> {
     run_cargo_rail(
         &ws.path,
-        &[
-            "rail",
-            "release",
-            "run",
-            "--all",
-            "--bump",
-            "patch",
-            "--check",
-            "--skip-publish",
-            "--skip-tag",
-        ],
+        &["rail", "release", "check", "--all", "--bump", "patch", "--skip-tag"],
     )
 }
 
@@ -217,12 +295,11 @@ edition = "2021"
         .ok_or_else(|| anyhow::anyhow!("external package path is not UTF-8"))?;
     add_auxiliary_cargo_workspace_with_dependencies(&ws, "auxiliary", &[("external-path-package", dependency_path)])?;
     ws.write_release_config(
-        r#"source = "both"
-tag_format = "v{version}"
-require_release_notes = false
+        r#"tag_format = "v{version}"
 auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
 "#,
     )?;
+    write_test_change(&ws.path, &[if absolute { "aux-absolute" } else { "aux-escaping" }])?;
     let initial_head = ws.commit("Configure external auxiliary path dependency")?;
 
     let check = check_auxiliary_release(&ws)?;
@@ -263,12 +340,10 @@ fn push_release_workspace(crate_name: &str) -> Result<(TestWorkspace, tempfile::
     git(&ws.path, &["push", "-u", "origin", "main"])?;
     ws.write_release_config(
         r#"tag_format = "v{version}"
-source = "both"
-require_clean = false
-require_release_notes = false
 remote_effects = "push"
 "#,
     )?;
+    write_test_change(&ws.path, &[crate_name])?;
     Ok((ws, remote))
 }
 
@@ -296,14 +371,12 @@ fn release_plan_works_on_single_crate_repo() {
         ws.write_release_config(
             r#"tag_prefix = "v"
 tag_format = "v{version}"
-source = "commits"
-require_clean = false
-require_release_notes = false
 "#,
         )?;
+        write_test_change(&ws.path, &["private-tool"])?;
 
         // Run release plan
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "run", "--check", "--bump", "patch"])?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--bump", "patch"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         // Should show the crate in the plan
@@ -329,7 +402,7 @@ require_release_notes = false
 }
 
 #[test]
-fn release_source_defaults_to_reviewed_changes_only() {
+fn reviewed_changes_are_the_only_release_source() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("release-source-changes-default")?;
         ws.write_release_config(
@@ -349,17 +422,13 @@ semver_check = "off"
             "---\n\"lib-a\" = \"patch\"\n---\n\nReviewed patch intent.\n",
         )?;
 
-        let output = run_cargo_rail(
-            &ws.path,
-            &["rail", "release", "run", "lib-a", "--check", "--format", "json"],
-        )?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "lib-a", "--format", "json"])?;
         assert_eq!(output.status.code(), Some(1));
         let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
         let plan = &json["release_plan"];
-        assert_eq!(plan["source"], serde_json::json!("changes"));
         assert_eq!(plan["crates"][0]["new_version"], serde_json::json!("1.2.4"));
-        assert_eq!(plan["crates"][0]["commits"], serde_json::json!([]));
-        assert_eq!(plan["crates"][0]["commit_diagnostics"], serde_json::json!([]));
+        assert!(plan.get("source").is_none());
+        assert!(plan["crates"][0].get("commits").is_none());
         assert!(
             plan["crates"][0]["changelog_body"]
                 .as_str()
@@ -378,55 +447,12 @@ semver_check = "off"
 }
 
 #[test]
-fn release_commit_source_is_explicit_compatibility_mode() {
-    let result: Result<()> = (|| {
-        let ws = TestWorkspace::new_named("release-source-commits")?;
-        ws.write_release_config(
-            r#"source = "commits"
-tag_prefix = "v"
-tag_format = "{crate}-v{version}"
-require_clean = false
-semver_check = "off"
-"#,
-        )?;
-        ws.add_crate("lib-a", "1.2.3", &[])?;
-        ws.commit("Add lib-a")?;
-        tag_release(&ws, "lib-a", "1.2.3")?;
-        ws.modify_file("lib-a", "src/lib.rs", "pub fn fixed() {}\n")?;
-        ws.commit("fix: compatibility bump")?;
-        std::fs::create_dir_all(ws.path.join(".changes"))?;
-        std::fs::write(
-            ws.path.join(".changes/ignored.md"),
-            "---\n\"lib-a\" = \"major\"\n---\n\nIgnored by commits mode.\n",
-        )?;
-
-        let output = run_cargo_rail(
-            &ws.path,
-            &[
-                "rail", "release", "run", "lib-a", "--bump", "auto", "--check", "--format", "json",
-            ],
-        )?;
-        assert_eq!(output.status.code(), Some(1));
-        let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-        let plan = &json["release_plan"];
-        assert_eq!(plan["source"], serde_json::json!("commits"));
-        assert_eq!(plan["crates"][0]["new_version"], serde_json::json!("1.2.4"));
-        assert_eq!(plan["change_files_to_delete"], serde_json::json!([]));
-        assert_eq!(plan["crates"][0]["change_entries"], serde_json::json!([]));
-
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-#[test]
 fn no_release_change_intent_satisfies_default_coverage_without_a_bump() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("release-no-release-intent")?;
         ws.write_release_config(
             r#"tag_prefix = "v"
 tag_format = "{crate}-v{version}"
-require_clean = false
 semver_check = "off"
 "#,
         )?;
@@ -459,10 +485,7 @@ semver_check = "off"
             String::from_utf8_lossy(&check.stderr)
         );
 
-        let plan = run_cargo_rail(
-            &ws.path,
-            &["rail", "release", "run", "lib-a", "--bump", "auto", "--check"],
-        )?;
+        let plan = run_cargo_rail(&ws.path, &["rail", "release", "check", "lib-a", "--bump", "auto"])?;
         assert!(plan.status.success());
         let stdout = String::from_utf8_lossy(&plan.stdout);
         assert!(stdout.contains("No release-worthy changes detected."), "{}", stdout);
@@ -485,7 +508,6 @@ fn release_retains_unconsumed_no_release_intent_from_a_shared_file() {
         ws.write_release_config(
             r#"tag_prefix = "v"
 tag_format = "{crate}-v{version}"
-require_release_notes = false
 semver_check = "off"
 "#,
         )?;
@@ -504,11 +526,14 @@ semver_check = "off"
         )?;
         ws.commit("Add reviewed shared change")?;
 
-        let preview = run_cargo_rail(
-            &ws.path,
-            &["rail", "release", "run", "lib-a", "--check", "--format", "json"],
-        )?;
-        assert_eq!(preview.status.code(), Some(1));
+        let preview = run_cargo_rail(&ws.path, &["rail", "release", "check", "lib-a", "--format", "json"])?;
+        assert_eq!(
+            preview.status.code(),
+            Some(1),
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&preview.stdout),
+            String::from_utf8_lossy(&preview.stderr)
+        );
         let json: serde_json::Value = serde_json::from_slice(&preview.stdout)?;
         assert_eq!(json["release_plan"]["change_files_to_delete"], serde_json::json!([]));
         let retained = &json["release_plan"]["change_files_to_update"][0];
@@ -525,10 +550,7 @@ semver_check = "off"
             serde_json::json!("---\n\"lib-b\" = \"none\"\n---\n\nShared internal work with one released fix.\n")
         );
 
-        let apply = run_cargo_rail(
-            &ws.path,
-            &["rail", "release", "run", "lib-a", "--skip-publish", "--yes"],
-        )?;
+        let apply = run_cargo_rail(&ws.path, &["rail", "release", "run", "lib-a", "--yes"])?;
         assert!(
             apply.status.success(),
             "release should retain lib-b coverage\nstdout:\n{}\nstderr:\n{}",
@@ -560,7 +582,6 @@ fn reviewed_changes_require_repository_wide_coverage_by_default() {
         ws.write_release_config(
             r#"tag_prefix = "v"
 tag_format = "{crate}-v{version}"
-require_clean = false
 semver_check = "off"
 "#,
         )?;
@@ -592,7 +613,6 @@ fn release_apply_accepts_the_untracked_change_entry_bound_by_its_plan() {
         ws.write_release_config(
             r#"tag_prefix = "v"
 tag_format = "{crate}-v{version}"
-require_release_notes = false
 semver_check = "off"
 "#,
         )?;
@@ -608,16 +628,7 @@ semver_check = "off"
 
         let output = run_cargo_rail(
             &ws.path,
-            &[
-                "rail",
-                "release",
-                "run",
-                "lib-a",
-                "--bump",
-                "auto",
-                "--skip-publish",
-                "--yes",
-            ],
+            &["rail", "release", "run", "lib-a", "--bump", "auto", "--yes"],
         )?;
         assert!(
             output.status.success(),
@@ -641,7 +652,6 @@ fn release_abort_restores_untracked_reviewed_input_after_a_local_fault() {
         ws.write_release_config(
             r#"tag_prefix = "v"
 tag_format = "{crate}-v{version}"
-require_release_notes = false
 semver_check = "off"
 "#,
         )?;
@@ -656,11 +666,8 @@ semver_check = "off"
         let change_path = ws.path.join(".changes/recover.md");
         std::fs::write(&change_path, content)?;
 
-        let interrupted = run_release_with_before_fault(
-            &ws.path,
-            &["rail", "release", "run", "lib-a", "--skip-publish", "--yes"],
-            "commit:lib-a",
-        )?;
+        let interrupted =
+            run_release_with_before_fault(&ws.path, &["rail", "release", "run", "lib-a", "--yes"], "commit:lib-a")?;
         assert!(!interrupted.status.success());
         assert_eq!(
             std::fs::read_to_string(&change_path)?,
@@ -698,7 +705,6 @@ fn release_apply_rejects_unrelated_dirt_before_the_first_write() {
         ws.write_release_config(
             r#"tag_prefix = "v"
 tag_format = "{crate}-v{version}"
-require_release_notes = false
 semver_check = "off"
 "#,
         )?;
@@ -713,16 +719,7 @@ semver_check = "off"
 
         let output = run_cargo_rail(
             &ws.path,
-            &[
-                "rail",
-                "release",
-                "run",
-                "lib-a",
-                "--bump",
-                "auto",
-                "--skip-publish",
-                "--yes",
-            ],
+            &["rail", "release", "run", "lib-a", "--bump", "auto", "--yes"],
         )?;
         let combined = format!(
             "{}\n{}",
@@ -744,7 +741,7 @@ semver_check = "off"
 }
 
 #[test]
-fn release_plan_auto_infers_bumps_per_crate() {
+fn release_plan_auto_uses_reviewed_bumps_per_crate() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("release-auto-bump")?;
         write_release_config(&ws, "")?;
@@ -755,15 +752,9 @@ fn release_plan_auto_infers_bumps_per_crate() {
         tag_release(&ws, "lib-a", "0.1.0")?;
         tag_release(&ws, "lib-b", "1.2.3")?;
 
-        ws.modify_file("lib-a", "src/lib.rs", "pub fn breaking_api() {}\n")?;
-        ws.commit("feat!: redesign lib-a API")?;
-        ws.modify_file("lib-b", "src/lib.rs", "pub fn patched() {}\n")?;
-        ws.commit("fix: patch lib-b")?;
+        write_test_change_levels(&ws.path, &[("lib-a", "minor"), ("lib-b", "patch")])?;
 
-        let output = run_cargo_rail(
-            &ws.path,
-            &["rail", "release", "run", "--all", "--bump", "auto", "--check"],
-        )?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--all", "--bump", "auto"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -775,16 +766,16 @@ fn release_plan_auto_infers_bumps_per_crate() {
         );
         assert!(
             stdout.contains("0.1.0 → 0.2.0"),
-            "pre-1.0 breaking change should default to a minor bump\nstdout:\n{}",
+            "reviewed minor intent should produce a minor bump\nstdout:\n{}",
             stdout
         );
         assert!(
             stdout.contains("1.2.3 → 1.2.4"),
-            "fix commit should infer a patch bump\nstdout:\n{}",
+            "reviewed patch intent should produce a patch bump\nstdout:\n{}",
             stdout
         );
         assert!(
-            stdout.contains("auto: conventional commits"),
+            stdout.contains("auto: reviewed change files"),
             "plan should explain auto bump source\nstdout:\n{}",
             stdout
         );
@@ -803,13 +794,9 @@ fn release_plan_auto_honors_pre_1_major_policy() {
         ws.add_crate("lib-a", "0.3.1", &[])?;
         ws.commit("Add lib-a")?;
         tag_release(&ws, "lib-a", "0.3.1")?;
-        ws.modify_file("lib-a", "src/lib.rs", "pub fn new_api() {}\n")?;
-        ws.commit("feat!: replace public API")?;
+        write_test_change_levels(&ws.path, &[("lib-a", "major")])?;
 
-        let output = run_cargo_rail(
-            &ws.path,
-            &["rail", "release", "run", "lib-a", "--bump", "auto", "--check"],
-        )?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "lib-a", "--bump", "auto"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             stdout.contains("0.3.1 → 1.0.0"),
@@ -822,50 +809,9 @@ fn release_plan_auto_honors_pre_1_major_policy() {
     super::helpers::finish_test(result);
 }
 
-#[test]
-fn release_plan_auto_respects_changelog_path_filters() {
-    let result: Result<()> = (|| {
-        let ws = TestWorkspace::new_named("release-auto-path-filters")?;
-        write_release_config(
-            &ws,
-            r#"
-[release.changelog.filters]
-exclude_paths = ["crates/lib-a/src/**"]
-"#,
-        )?;
-
-        ws.add_crate("lib-a", "1.2.3", &[])?;
-        ws.commit("Add lib-a")?;
-        tag_release(&ws, "lib-a", "1.2.3")?;
-        ws.modify_file("lib-a", "src/lib.rs", "pub fn filtered_out() {}\n")?;
-        // Scoped subject on purpose: a crate-name scope must not resurrect a
-        // commit whose files were all excluded by path filters.
-        ws.commit("feat(lib-a): filtered lib-a feature")?;
-
-        let output = run_cargo_rail(
-            &ws.path,
-            &["rail", "release", "run", "lib-a", "--bump", "auto", "--check"],
-        )?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-
-        assert!(
-            stdout.contains("Summary: 0 crate(s)"),
-            "excluded paths should not drive auto bump planning\nstdout:\n{}",
-            stdout
-        );
-
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-/// Run cargo-rail with a shimmed `cargo` whose `semver-checks check-release`
-/// branch executes `check_release_script`; every other cargo call passes
-/// through to the real binary.
 #[cfg(unix)]
 fn run_with_semver_shim(ws: &TestWorkspace, check_release_script: &str, args: &[&str]) -> Result<std::process::Output> {
     use std::os::unix::fs::PermissionsExt;
-    use std::process::Command;
 
     let real_cargo = Command::new("sh").args(["-c", "command -v cargo"]).output()?;
     let real_cargo = String::from_utf8_lossy(&real_cargo.stdout).trim().to_string();
@@ -896,8 +842,7 @@ exec "{}" "$@"
         shim_dir.path().display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let output = cargo_rail_command(&ws.path)?.env("PATH", path).args(args).output()?;
-    Ok(output)
+    Ok(cargo_rail_command(&ws.path)?.env("PATH", path).args(args).output()?)
 }
 
 #[cfg(unix)]
@@ -951,9 +896,6 @@ if [ "$1" = "info" ]; then
       exit 101
       ;;
   esac
-
-  # Recreate Cargo's local-workspace shadowing: an unqualified lookup of the
-  # version being released succeeds even though the registry lacks it.
   exit 0
 fi
 
@@ -1084,12 +1026,8 @@ fn release_publish_ignores_local_workspace_shadow_and_targets_crates_io() {
         let ws = TestWorkspace::new_single_crate("registry-shadow", "0.1.0")?;
         ws.write_release_config(
             r#"tag_format = "v{version}"
-require_changelog_entries = false
-require_clean = false
-require_release_notes = false
 semver_check = "off"
 sign_tags = false
-publish_delay = 1
 remote_effects = "push"
 registry_publication = "crates-io"
 "#,
@@ -1097,6 +1035,7 @@ registry_publication = "crates-io"
         ws.set_remote("https://github.com/loadingalias/registry-shadow.git")?;
         ws.commit("Configure releases")?;
         ws.tag("v0.1.0", "Release registry-shadow 0.1.0")?;
+        write_test_change(&ws.path, &["registry-shadow"])?;
 
         let shim_state = tempfile::TempDir::new()?;
         let log_path = shim_state.path().join("cargo.log");
@@ -1169,8 +1108,8 @@ registry_publication = "crates-io"
         );
         assert!(published_path.exists(), "the registry shim should record a publication");
         let state: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
-        assert_eq!(state["schema_version"], 5);
-        assert_eq!(state["plan"]["plan_contract_version"], 5);
+        assert_eq!(state["schema_version"], 6);
+        assert_eq!(state["plan"]["plan_contract_version"], 6);
         assert_eq!(state["publish_registry"], "crates-io");
         assert_eq!(state["release_config"]["registry_publication"], "crates-io");
         assert_eq!(
@@ -1338,8 +1277,6 @@ fn semver_shim_workspace(name: &str) -> Result<TestWorkspace> {
     ws.write_release_config(
         r#"tag_prefix = "v"
 tag_format = "{crate}-v{version}"
-require_changelog_entries = false
-require_clean = false
 semver_check = "warn"
 "#,
     )?;
@@ -1367,7 +1304,7 @@ fn release_plan_blocks_when_semver_checks_exceeds_reviewed_intent() {
             &ws,
             r#"echo "Summary semver requires new major version: 1 major check failed" >&2
   exit 1"#,
-            &["rail", "release", "run", "lib-a", "--bump", "auto", "--check"],
+            &["rail", "release", "check", "lib-a", "--bump", "auto"],
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1398,7 +1335,7 @@ fn release_plan_accepts_semver_breakage_covered_by_reviewed_major_intent() {
             &ws,
             r#"echo "Summary semver requires new major version: 1 major check failed" >&2
   exit 1"#,
-            &["rail", "release", "run", "lib-a", "--check"],
+            &["rail", "release", "check", "lib-a"],
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert_eq!(output.status.code(), Some(1), "{}", stdout);
@@ -1427,7 +1364,7 @@ fn release_plan_auto_ignores_inconclusive_semver_checks() {
             &ws,
             r#"echo "error: the crate lib-a has no published versions to use as a baseline" >&2
   exit 1"#,
-            &["rail", "release", "run", "lib-a", "--bump", "auto", "--check"],
+            &["rail", "release", "check", "lib-a", "--bump", "auto"],
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -1457,8 +1394,6 @@ fn release_plan_auto_skips_semver_checks_for_unpublishable_crates() {
         ws.write_release_config(
             r#"tag_prefix = "v"
 tag_format = "{crate}-v{version}"
-require_changelog_entries = false
-require_clean = false
 semver_check = "warn"
 
 [crates.lib-a.release]
@@ -1471,7 +1406,7 @@ publish = false
             &ws,
             r#"echo "Summary semver requires new major version: 1 major check failed" >&2
   exit 1"#,
-            &["rail", "release", "run", "lib-a", "--bump", "auto", "--check"],
+            &["rail", "release", "check", "lib-a", "--bump", "auto"],
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -1500,11 +1435,9 @@ fn release_plan_auto_reports_skipped_crates_with_reason() {
 
         ws.modify_file("lib-a", "src/lib.rs", "pub fn only_a_changed() {}\n")?;
         ws.commit("feat: extend lib-a")?;
+        write_test_change_levels(&ws.path, &[("lib-a", "minor")])?;
 
-        let output = run_cargo_rail(
-            &ws.path,
-            &["rail", "release", "run", "--all", "--bump", "auto", "--check"],
-        )?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--all", "--bump", "auto"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         assert!(
@@ -1537,11 +1470,9 @@ fn release_plan_auto_noops_when_all_crates_are_skipped() {
         ws.add_crate("lib-a", "0.1.0", &[])?;
         ws.commit("Add lib-a")?;
         tag_release(&ws, "lib-a", "0.1.0")?;
+        write_test_change_levels(&ws.path, &[("lib-a", "none")])?;
 
-        let output = run_cargo_rail(
-            &ws.path,
-            &["rail", "release", "run", "--all", "--bump", "auto", "--check"],
-        )?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--all", "--bump", "auto"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         assert!(
@@ -1564,7 +1495,7 @@ fn release_plan_auto_noops_when_all_crates_are_skipped() {
         let output = run_cargo_rail(
             &ws.path,
             &[
-                "rail", "release", "run", "--all", "--bump", "auto", "--check", "--format", "json",
+                "rail", "release", "check", "--all", "--bump", "auto", "--format", "json",
             ],
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1581,50 +1512,17 @@ fn release_plan_auto_noops_when_all_crates_are_skipped() {
 }
 
 #[test]
-fn release_plan_does_not_print_removed_publish_delay() {
-    let result: Result<()> = (|| {
-        let ws = TestWorkspace::new_named("release-no-publish-delay")?;
-        write_release_config(&ws, "publish_delay = 37")?;
-        ws.add_crate("lib-a", "0.1.0", &[])?;
-        ws.add_crate("lib-b", "0.1.0", &[])?;
-        ws.commit("Add release crates")?;
-
-        let output = run_cargo_rail(
-            &ws.path,
-            &["rail", "release", "run", "--all", "--bump", "patch", "--check"],
-        )?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert_eq!(
-            output.status.code(),
-            Some(1),
-            "release preview should report pending changes\nstdout:\n{}\nstderr:\n{}",
-            stdout,
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            !stdout.contains("Publish delay"),
-            "inert publish_delay must not appear in release output\nstdout:\n{}",
-            stdout
-        );
-
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-#[test]
 fn release_plans_and_commits_exact_auxiliary_cargo_lockfiles() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_single_crate("aux-release", "0.1.0")?;
         add_auxiliary_cargo_workspace(&ws, "aux-one", "aux-release")?;
         add_auxiliary_cargo_workspace(&ws, "aux-two", "aux-release")?;
         ws.write_release_config(
-            r#"source = "both"
-tag_format = "v{version}"
-require_release_notes = false
+            r#"tag_format = "v{version}"
 auxiliary_cargo_manifests = ["aux-one/Cargo.toml", "aux-two/Cargo.toml"]
 "#,
         )?;
+        write_test_change(&ws.path, &["aux-release"])?;
         ws.commit("Add auxiliary Cargo release projections")?;
 
         let check = run_cargo_rail(
@@ -1632,12 +1530,10 @@ auxiliary_cargo_manifests = ["aux-one/Cargo.toml", "aux-two/Cargo.toml"]
             &[
                 "rail",
                 "release",
-                "run",
+                "check",
                 "--all",
                 "--bump",
                 "patch",
-                "--check",
-                "--skip-publish",
                 "--skip-tag",
                 "--format",
                 "json",
@@ -1651,7 +1547,7 @@ auxiliary_cargo_manifests = ["aux-one/Cargo.toml", "aux-two/Cargo.toml"]
             String::from_utf8_lossy(&check.stderr)
         );
         let check: serde_json::Value = serde_json::from_slice(&check.stdout)?;
-        assert_eq!(check["release_plan"]["plan_contract_version"], 5);
+        assert_eq!(check["release_plan"]["plan_contract_version"], 6);
         let projections = check["release_plan"]["auxiliary_lockfiles"]
             .as_array()
             .expect("auxiliary lockfile projections");
@@ -1693,7 +1589,6 @@ auxiliary_cargo_manifests = ["aux-one/Cargo.toml", "aux-two/Cargo.toml"]
                 "--all",
                 "--bump",
                 "patch",
-                "--skip-publish",
                 "--skip-tag",
                 "--yes",
             ],
@@ -1739,12 +1634,11 @@ fn release_updates_all_packages_in_one_auxiliary_cargo_invocation() {
             ],
         )?;
         ws.write_release_config(
-            r#"source = "both"
-tag_format = "{crate}-v{version}"
-require_release_notes = false
+            r#"tag_format = "{crate}-v{version}"
 auxiliary_cargo_manifests = ["aux-dual/Cargo.toml"]
 "#,
         )?;
+        write_test_change(&ws.path, &["dual-release-one", "dual-release-two"])?;
         ws.commit("Configure one auxiliary update for two releases")?;
 
         let wrapper_dir = tempfile::TempDir::new()?;
@@ -1767,12 +1661,10 @@ auxiliary_cargo_manifests = ["aux-dual/Cargo.toml"]
             .args([
                 "rail",
                 "release",
-                "run",
+                "check",
                 "--all",
                 "--bump",
                 "patch",
-                "--check",
-                "--skip-publish",
                 "--skip-tag",
                 "--format",
                 "json",
@@ -1809,12 +1701,11 @@ fn release_auxiliary_accepts_git_clean_crlf_checkout() {
         )?;
         add_auxiliary_cargo_workspace(&ws, "auxiliary", "aux-crlf")?;
         ws.write_release_config(
-            r#"source = "both"
-tag_format = "v{version}"
-require_release_notes = false
+            r#"tag_format = "v{version}"
 auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
 "#,
         )?;
+        write_test_change(&ws.path, &["aux-crlf"])?;
         ws.commit("Configure a CRLF auxiliary Cargo projection")?;
 
         for path in ["auxiliary/Cargo.toml", "auxiliary/Cargo.lock"] {
@@ -1841,12 +1732,10 @@ auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
             .args([
                 "rail",
                 "release",
-                "run",
+                "check",
                 "--all",
                 "--bump",
                 "patch",
-                "--check",
-                "--skip-publish",
                 "--skip-tag",
                 "--format",
                 "json",
@@ -1905,12 +1794,11 @@ nested-crlf = { path = "../crates/nested-crlf" }
         std::fs::write(
             ws.workspace_root.join(".config/rail.toml"),
             r#"[release]
-source = "both"
 tag_format = "v{version}"
-require_release_notes = false
 auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
 "#,
         )?;
+        write_test_change(&ws.workspace_root, &["nested-crlf"])?;
         ws.commit("Configure a nested CRLF auxiliary Cargo projection")?;
 
         for path in ["rust/auxiliary/Cargo.toml", "rust/auxiliary/Cargo.lock"] {
@@ -1940,12 +1828,10 @@ auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
             .args([
                 "rail",
                 "release",
-                "run",
+                "check",
                 "--all",
                 "--bump",
                 "patch",
-                "--check",
-                "--skip-publish",
                 "--skip-tag",
                 "--format",
                 "json",
@@ -2048,12 +1934,11 @@ fn release_auxiliary_manifest_rejects_intent_to_add() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_single_crate("aux-intent-manifest", "0.1.0")?;
         ws.write_release_config(
-            r#"source = "both"
-tag_format = "v{version}"
-require_release_notes = false
+            r#"tag_format = "v{version}"
 auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
 "#,
         )?;
+        write_test_change(&ws.path, &["aux-intent-manifest"])?;
         ws.commit("Configure an unmaterialized auxiliary workspace")?;
         add_auxiliary_cargo_workspace(&ws, "auxiliary", "aux-intent-manifest")?;
         git(
@@ -2119,12 +2004,11 @@ nested-release = { path = "../crates/nested-release" }
         std::fs::write(
             ws.workspace_root.join(".config/rail.toml"),
             r#"[release]
-source = "both"
 tag_format = "v{version}"
-require_release_notes = false
 auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
 "#,
         )?;
+        write_test_change(&ws.workspace_root, &["nested-release"])?;
         ws.commit("Configure nested auxiliary Cargo projection")?;
 
         let check = run_cargo_rail(
@@ -2132,12 +2016,10 @@ auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
             &[
                 "rail",
                 "release",
-                "run",
+                "check",
                 "--all",
                 "--bump",
                 "patch",
-                "--check",
-                "--skip-publish",
                 "--skip-tag",
                 "--format",
                 "json",
@@ -2171,24 +2053,21 @@ fn release_auxiliary_lockfile_plan_rejects_drift_before_mutation() {
         let ws = TestWorkspace::new_single_crate("aux-drift", "0.1.0")?;
         add_auxiliary_cargo_workspace(&ws, "auxiliary", "aux-drift")?;
         ws.write_release_config(
-            r#"source = "both"
-tag_format = "v{version}"
-require_release_notes = false
+            r#"tag_format = "v{version}"
 auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
 "#,
         )?;
+        write_test_change(&ws.path, &["aux-drift"])?;
         let initial_head = ws.commit("Configure auxiliary Cargo projection")?;
         let check = run_cargo_rail(
             &ws.path,
             &[
                 "rail",
                 "release",
-                "run",
+                "check",
                 "--all",
                 "--bump",
                 "patch",
-                "--check",
-                "--skip-publish",
                 "--skip-tag",
                 "--format",
                 "json",
@@ -2212,7 +2091,6 @@ auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
                 "--all",
                 "--bump",
                 "patch",
-                "--skip-publish",
                 "--skip-tag",
                 "--yes",
                 "--plan",
@@ -2244,29 +2122,18 @@ fn release_auxiliary_cargo_failure_leaves_the_worktree_untouched() {
         std::fs::write(ws.path.join("auxiliary/Cargo.toml"), "this is not Cargo TOML\n")?;
         std::fs::write(ws.path.join("auxiliary/Cargo.lock"), "version = 4\n")?;
         ws.write_release_config(
-            r#"source = "both"
-tag_format = "v{version}"
-require_release_notes = false
+            r#"tag_format = "v{version}"
 auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
 "#,
         )?;
+        write_test_change(&ws.path, &["aux-invalid"])?;
         let initial_head = ws.commit("Add invalid auxiliary Cargo projection")?;
         let manifest = std::fs::read(ws.path.join("Cargo.toml"))?;
         let lockfile = std::fs::read(ws.path.join("auxiliary/Cargo.lock"))?;
 
         let check = run_cargo_rail(
             &ws.path,
-            &[
-                "rail",
-                "release",
-                "run",
-                "--all",
-                "--bump",
-                "patch",
-                "--check",
-                "--skip-publish",
-                "--skip-tag",
-            ],
+            &["rail", "release", "check", "--all", "--bump", "patch", "--skip-tag"],
         )?;
         assert!(!check.status.success());
         assert!(String::from_utf8_lossy(&check.stderr).contains("cargo locate-project failed"));
@@ -2291,12 +2158,11 @@ fn release_auxiliary_cargo_rejects_undeclared_command_mutation() {
         let ws = TestWorkspace::new_single_crate("aux-command-boundary", "0.1.0")?;
         add_auxiliary_cargo_workspace(&ws, "auxiliary", "aux-command-boundary")?;
         ws.write_release_config(
-            r#"source = "both"
-tag_format = "v{version}"
-require_release_notes = false
+            r#"tag_format = "v{version}"
 auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
 "#,
         )?;
+        write_test_change(&ws.path, &["aux-command-boundary"])?;
         let initial_head = ws.commit("Configure bounded auxiliary Cargo projection")?;
         let manifest = std::fs::read(ws.path.join("Cargo.toml"))?;
         let lockfile = std::fs::read(ws.path.join("auxiliary/Cargo.lock"))?;
@@ -2315,17 +2181,7 @@ auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
 
         let check = cargo_rail_command(&ws.path)?
             .env("CARGO", &wrapper)
-            .args([
-                "rail",
-                "release",
-                "run",
-                "--all",
-                "--bump",
-                "patch",
-                "--check",
-                "--skip-publish",
-                "--skip-tag",
-            ])
+            .args(["rail", "release", "check", "--all", "--bump", "patch", "--skip-tag"])
             .output()?;
         assert!(!check.status.success());
         let stderr = String::from_utf8_lossy(&check.stderr);
@@ -2356,12 +2212,11 @@ fn release_auxiliary_cargo_rejects_late_mutation_of_bound_lockfile() {
         add_auxiliary_cargo_workspace(&ws, "aux-one", "aux-bound-candidate")?;
         add_auxiliary_cargo_workspace(&ws, "aux-two", "aux-bound-candidate")?;
         ws.write_release_config(
-            r#"source = "both"
-tag_format = "v{version}"
-require_release_notes = false
+            r#"tag_format = "v{version}"
 auxiliary_cargo_manifests = ["aux-one/Cargo.toml", "aux-two/Cargo.toml"]
 "#,
         )?;
+        write_test_change(&ws.path, &["aux-bound-candidate"])?;
         let initial_head = ws.commit("Configure exact auxiliary Cargo candidates")?;
         let manifest = std::fs::read(ws.path.join("Cargo.toml"))?;
         let first_lockfile = std::fs::read(ws.path.join("aux-one/Cargo.lock"))?;
@@ -2381,17 +2236,7 @@ auxiliary_cargo_manifests = ["aux-one/Cargo.toml", "aux-two/Cargo.toml"]
 
         let check = cargo_rail_command(&ws.path)?
             .env("CARGO", &wrapper)
-            .args([
-                "rail",
-                "release",
-                "run",
-                "--all",
-                "--bump",
-                "patch",
-                "--check",
-                "--skip-publish",
-                "--skip-tag",
-            ])
+            .args(["rail", "release", "check", "--all", "--bump", "patch", "--skip-tag"])
             .output()?;
         assert!(!check.status.success());
         let stderr = String::from_utf8_lossy(&check.stderr);
@@ -2418,12 +2263,11 @@ fn release_auxiliary_lockfile_recovers_before_the_first_commit() {
         let ws = TestWorkspace::new_single_crate("aux-recovery", "0.1.0")?;
         add_auxiliary_cargo_workspace(&ws, "auxiliary", "aux-recovery")?;
         ws.write_release_config(
-            r#"source = "both"
-tag_format = "v{version}"
-require_release_notes = false
+            r#"tag_format = "v{version}"
 auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
 "#,
         )?;
+        write_test_change(&ws.path, &["aux-recovery"])?;
         let initial_head = ws.commit("Configure auxiliary Cargo recovery")?;
         let before = std::fs::read(ws.path.join("auxiliary/Cargo.lock"))?;
 
@@ -2436,7 +2280,6 @@ auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
                 "--all",
                 "--bump",
                 "patch",
-                "--skip-publish",
                 "--skip-tag",
                 "--yes",
             ],
@@ -2448,8 +2291,8 @@ auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
 
         let state_path = only_release_state(&ws.path)?;
         let state: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
-        assert_eq!(state["schema_version"], 5);
-        assert_eq!(state["plan"]["plan_contract_version"], 5);
+        assert_eq!(state["schema_version"], 6);
+        assert_eq!(state["plan"]["plan_contract_version"], 6);
         assert_eq!(state["plan"]["auxiliary_lockfiles"].as_array().unwrap().len(), 1);
         let resumed = run_cargo_rail(&ws.path, &["rail", "release", "resume", state_path.to_str().unwrap()])?;
         assert!(resumed.status.success(), "{}", String::from_utf8_lossy(&resumed.stderr));
@@ -2466,31 +2309,20 @@ auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
 }
 
 #[test]
-fn release_plan_projects_exact_sha_checks_publication_and_tags_last() {
+fn release_plan_projects_exact_sha_checks_and_tags_last() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_single_crate("release-plan-order", "0.1.0")?;
         ws.write_release_config(
-            r#"source = "both"
-tag_format = "v{version}"
-require_clean = false
-require_release_notes = false
+            r#"tag_format = "v{version}"
 remote_effects = "gitlab"
 registry_publication = "crates-io"
 "#,
         )?;
+        write_test_change(&ws.path, &["release-plan-order"])?;
         let output = run_cargo_rail(
             &ws.path,
             &[
-                "rail",
-                "release",
-                "run",
-                "--all",
-                "--bump",
-                "patch",
-                "--check",
-                "--publish",
-                "--format",
-                "json",
+                "rail", "release", "check", "--all", "--bump", "patch", "--format", "json",
             ],
         )?;
         assert_eq!(output.status.code(), Some(1));
@@ -2504,24 +2336,17 @@ registry_publication = "crates-io"
         let position = |code: &str| codes.iter().position(|candidate| *candidate == code).unwrap();
         assert!(position("COMMIT_RELEASE") < position("PUSH_RELEASE_COMMIT"));
         assert!(position("PUSH_RELEASE_COMMIT") < position("AWAIT_EXACT_SHA_CHECKS"));
-        assert!(position("AWAIT_EXACT_SHA_CHECKS") < position("PUBLISH_CRATE"));
-        assert!(position("PUBLISH_CRATE") < position("CREATE_TAG"));
+        assert!(position("AWAIT_EXACT_SHA_CHECKS") < position("CREATE_TAG"));
         assert!(position("CREATE_TAG") < position("PUSH_RELEASE_TAGS"));
         assert!(position("PUSH_RELEASE_TAGS") < position("CREATE_FORGE_RELEASE"));
-        let publication = json["mutation_plan"]["actions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|action| action["code"] == "PUBLISH_CRATE")
-            .unwrap();
-        assert_eq!(publication["payload"]["registry"], "crates-io");
+        assert!(!codes.contains(&"PUBLISH_CRATE"));
         Ok(())
     })();
     super::helpers::finish_test(result);
 }
 
 #[test]
-fn release_plan_auto_rejects_shallow_clone_but_explicit_bump_works() {
+fn release_plan_uses_reviewed_intent_in_a_shallow_clone() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("release-auto-shallow-guard")?;
         write_release_config(&ws, "")?;
@@ -2530,76 +2355,30 @@ fn release_plan_auto_rejects_shallow_clone_but_explicit_bump_works() {
         ws.commit("Add lib-a")?;
         tag_release(&ws, "lib-a", "1.2.3")?;
         ws.modify_file("lib-a", "src/lib.rs", "pub fn changed() {}\n")?;
-        ws.commit("fix: change lib-a")?;
+        write_test_change(&ws.path, &["lib-a"])?;
+        ws.commit("Record reviewed lib-a change")?;
 
         let (_root, clone_path) = shallow_clone(&ws, "shallow")?;
 
-        let output = run_cargo_rail(
-            &clone_path,
-            &["rail", "release", "run", "lib-a", "--bump", "auto", "--check"],
-        )?;
+        let output = run_cargo_rail(&clone_path, &["rail", "release", "check", "lib-a", "--bump", "auto"])?;
         let combined = format!(
             "{}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(output.status.code(), Some(2), "auto bump should fail\n{}", combined);
-        assert!(
-            combined.contains("--bump auto cannot run in a shallow clone")
-                && combined.contains("git fetch --unshallow --tags"),
-            "output:\n{}",
-            combined
-        );
-
-        let output = run_cargo_rail(
-            &clone_path,
-            &["rail", "release", "run", "lib-a", "--bump", "patch", "--check"],
-        )?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = format!("{}\n{}", stdout, stderr);
         assert_eq!(
             output.status.code(),
             Some(1),
-            "explicit bump should still produce a normal check plan\n{}",
+            "reviewed intent should produce a normal check plan\n{}",
             combined
         );
-        assert!(stdout.contains("1.2.3 → 1.2.4"), "stdout:\n{}", stdout);
         assert!(
-            !combined.contains("cannot run in a shallow clone"),
+            combined.contains("1.2.3 → 1.2.4") && combined.contains("auto: reviewed change files -> patch"),
             "output:\n{}",
             combined
         );
-
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-#[test]
-fn release_check_reports_shallow_clone_in_failure_taxonomy() {
-    let result: Result<()> = (|| {
-        let ws = TestWorkspace::new_named("release-check-shallow-guard")?;
-        write_release_config(&ws, "")?;
-
-        ws.add_crate("lib-a", "1.2.3", &[])?;
-        ws.commit("Add lib-a")?;
-        tag_release(&ws, "lib-a", "1.2.3")?;
-        ws.modify_file("lib-a", "src/lib.rs", "pub fn changed() {}\n")?;
-        ws.commit("fix: change lib-a")?;
-
-        let (_root, clone_path) = shallow_clone(&ws, "shallow")?;
-        let output = run_cargo_rail(&clone_path, &["rail", "release", "check", "lib-a"])?;
-        let combined = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-
-        assert_eq!(output.status.code(), Some(2), "release check should fail\n{}", combined);
         assert!(
-            combined.contains("--bump auto cannot run in a shallow clone")
-                && combined.contains("git fetch --unshallow --tags"),
+            !combined.contains("cannot run in a shallow clone"),
             "output:\n{}",
             combined
         );
@@ -2617,11 +2396,9 @@ fn release_plan_auto_names_no_previous_tag_full_history() {
 
         ws.add_crate("lib-a", "0.1.0", &[])?;
         ws.commit("Add lib-a")?;
+        write_test_change(&ws.path, &["lib-a"])?;
 
-        let output = run_cargo_rail(
-            &ws.path,
-            &["rail", "release", "run", "lib-a", "--bump", "auto", "--check"],
-        )?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "lib-a", "--bump", "auto"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             stdout.contains("no previous tag: full history"),
@@ -2658,11 +2435,9 @@ core = ["lib-a", "lib-b", "lib-c"]
         ws.commit("fix: patch lib-a")?;
         ws.modify_file("lib-b", "src/lib.rs", "pub fn minor_signal() {}\n")?;
         ws.commit("feat: extend lib-b")?;
+        write_test_change_levels(&ws.path, &[("lib-a", "patch"), ("lib-b", "minor"), ("lib-c", "none")])?;
 
-        let output = run_cargo_rail(
-            &ws.path,
-            &["rail", "release", "run", "--all", "--bump", "auto", "--check"],
-        )?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--all", "--bump", "auto"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert_eq!(
             output.status.code(),
@@ -2685,12 +2460,12 @@ core = ["lib-a", "lib-b", "lib-c"]
         let output = run_cargo_rail(
             &ws.path,
             &[
-                "rail", "release", "run", "--all", "--bump", "auto", "--check", "--format", "json",
+                "rail", "release", "check", "--all", "--bump", "auto", "--format", "json",
             ],
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let json: serde_json::Value = serde_json::from_str(&stdout)?;
-        assert_eq!(json["release_plan"]["plan_contract_version"], 5);
+        assert_eq!(json["release_plan"]["plan_contract_version"], 6);
         assert!(
             json["release_plan"]["snapshot_id"]
                 .as_str()
@@ -2729,11 +2504,9 @@ core = ["lib-a", "lib-b"]
         tag_release(&ws, "lib-b", "0.1.0")?;
         ws.modify_file("lib-a", "src/lib.rs", "pub fn minor_signal() {}\n")?;
         ws.commit("feat: extend lib-a")?;
+        write_test_change_levels(&ws.path, &[("lib-a", "minor"), ("lib-b", "none")])?;
 
-        let rejected = run_cargo_rail(
-            &ws.path,
-            &["rail", "release", "run", "lib-a", "--bump", "auto", "--check"],
-        )?;
+        let rejected = run_cargo_rail(&ws.path, &["rail", "release", "check", "lib-a", "--bump", "auto"])?;
         let combined = format!(
             "{}\n{}",
             String::from_utf8_lossy(&rejected.stdout),
@@ -2756,11 +2529,10 @@ core = ["lib-a", "lib-b"]
             &[
                 "rail",
                 "release",
-                "run",
+                "check",
                 "lib-a",
                 "--bump",
                 "auto",
-                "--check",
                 "--include-dependents",
             ],
         )?;
@@ -2787,7 +2559,7 @@ core = ["lib-a", "lib-b"]
 fn release_pr_mode_round_trips_to_finalize_on_merge_commit() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("release-pr-mode")?;
-        write_release_config(&ws, "require_release_notes = false\nremote_effects = \"push\"")?;
+        write_release_config(&ws, "remote_effects = \"push\"")?;
         ws.add_crate("lib-a", "0.1.0", &[])?;
         ws.commit("Add lib-a")?;
         tag_release(&ws, "lib-a", "0.1.0")?;
@@ -2918,7 +2690,7 @@ done
         let output = run_with_path_prefix(
             &ws,
             gh_path.parent().unwrap(),
-            &["rail", "release", "finalize", "lib-a", "--skip-publish", "--yes"],
+            &["rail", "release", "finalize", "lib-a", "--yes"],
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2970,11 +2742,11 @@ done
 fn release_finalize_requires_explicit_target_or_all() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("release-finalize-target-required")?;
-        write_release_config(&ws, "require_release_notes = false")?;
+        write_release_config(&ws, "")?;
         ws.add_crate("lib-a", "0.1.0", &[])?;
         ws.commit("Add lib-a")?;
 
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "finalize", "--skip-publish", "--yes"])?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "finalize", "--yes"])?;
         let combined = format!(
             "{}\n{}",
             String::from_utf8_lossy(&output.stdout),
@@ -3000,10 +2772,7 @@ fn release_finalize_refuses_without_merged_release_notes() {
         ws.add_crate("lib-a", "0.1.0", &[])?;
         ws.commit("Add lib-a")?;
 
-        let output = run_cargo_rail(
-            &ws.path,
-            &["rail", "release", "finalize", "lib-a", "--skip-publish", "--yes"],
-        )?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "finalize", "lib-a", "--yes"])?;
         let combined = format!(
             "{}\n{}",
             String::from_utf8_lossy(&output.stdout),
@@ -3042,10 +2811,7 @@ fn release_rejects_partial_change_file_consumption() {
 
         // Releasing only lib-a would consume the file and silently destroy
         // lib-b's pending intent — the plan must refuse.
-        let output = run_cargo_rail(
-            &ws.path,
-            &["rail", "release", "run", "lib-a", "--bump", "auto", "--check"],
-        )?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "lib-a", "--bump", "auto"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let combined = format!("{}\n{}", stdout, stderr);
@@ -3066,16 +2832,7 @@ fn release_rejects_partial_change_file_consumption() {
         // Releasing both crates together consumes the file cleanly.
         let output = run_cargo_rail(
             &ws.path,
-            &[
-                "rail",
-                "release",
-                "run",
-                "--all",
-                "--bump",
-                "auto",
-                "--skip-publish",
-                "--yes",
-            ],
+            &["rail", "release", "run", "--all", "--bump", "auto", "--yes"],
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -3221,7 +2978,7 @@ fn change_status_names_only_lists_pending_change_paths() {
 }
 
 #[test]
-fn change_check_required_fails_when_changed_crate_lacks_change_file() {
+fn change_check_fails_when_changed_crate_lacks_change_file() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("change-check-missing")?;
         write_release_config(&ws, "")?;
@@ -3232,7 +2989,7 @@ fn change_check_required_fails_when_changed_crate_lacks_change_file() {
         ws.modify_file("lib-a", "src/lib.rs", "pub fn changed() -> bool { true }")?;
         ws.commit("Change lib-a source")?;
 
-        let output = run_cargo_rail(&ws.path, &["rail", "change", "check", "--merge-base", "--required"])?;
+        let output = run_cargo_rail(&ws.path, &["rail", "change", "check", "--merge-base"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(
@@ -3251,7 +3008,7 @@ fn change_check_required_fails_when_changed_crate_lacks_change_file() {
 }
 
 #[test]
-fn change_check_required_passes_when_changed_crate_has_change_file() {
+fn change_check_passes_when_changed_crate_has_change_file() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("change-check-covered")?;
         write_release_config(&ws, "")?;
@@ -3281,10 +3038,7 @@ fn change_check_required_passes_when_changed_crate_has_change_file() {
             String::from_utf8_lossy(&output.stdout)
         );
 
-        let output = run_cargo_rail(
-            &ws.path,
-            &["rail", "change", "check", "--since", "origin/main", "--required"],
-        )?;
+        let output = run_cargo_rail(&ws.path, &["rail", "change", "check", "--since", "origin/main"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(output.status.success(), "change check should pass\n{}", stdout);
         assert!(stdout.contains("change files: ok"), "stdout:\n{}", stdout);
@@ -3395,37 +3149,6 @@ fn change_add_uses_stable_slug_hash_names_and_rejects_duplicate_intent() {
 }
 
 #[test]
-fn legacy_change_directory_guard_reports_git_mv_hint() {
-    let result: Result<()> = (|| {
-        let ws = TestWorkspace::new_named("change-legacy-dir-guard")?;
-        write_release_config(&ws, "")?;
-        ws.add_crate("lib-a", "0.1.0", &[])?;
-        ws.commit("Add lib-a")?;
-        std::fs::create_dir_all(ws.path.join(".rail/changes"))?;
-        std::fs::write(
-            ws.path.join(".rail/changes/old.md"),
-            "---\n\"lib-a\" = \"patch\"\n---\n\nOld pending change.\n",
-        )?;
-
-        let output = run_cargo_rail(&ws.path, &["rail", "change", "status"])?;
-        let combined = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(output.status.code(), Some(2), "legacy guard should fail\n{}", combined);
-        assert!(
-            combined.contains("move files to .changes/ (git mv .rail/changes .changes)"),
-            "output:\n{}",
-            combined
-        );
-
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-#[test]
 fn change_add_rejects_change_dir_that_escapes_workspace() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("change-dir-escape")?;
@@ -3469,7 +3192,7 @@ fn change_add_rejects_change_dir_that_escapes_workspace() {
 fn change_dir_override_round_trips_through_release_consumption() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("change-dir-override")?;
-        write_release_config(&ws, "require_release_notes = false\nchange_dir = \"changes\"")?;
+        write_release_config(&ws, "change_dir = \"changes\"")?;
 
         ws.add_crate("lib-a", "0.1.0", &[])?;
         ws.commit("Add lib-a")?;
@@ -3512,10 +3235,7 @@ fn change_dir_override_round_trips_through_release_consumption() {
             status_stdout
         );
 
-        let plan = run_cargo_rail(
-            &ws.path,
-            &["rail", "release", "run", "lib-a", "--bump", "auto", "--check"],
-        )?;
+        let plan = run_cargo_rail(&ws.path, &["rail", "release", "check", "lib-a", "--bump", "auto"])?;
         let plan_stdout = String::from_utf8_lossy(&plan.stdout);
         assert!(
             plan_stdout.contains("0.1.0 → 0.2.0"),
@@ -3525,16 +3245,7 @@ fn change_dir_override_round_trips_through_release_consumption() {
 
         let release = run_cargo_rail(
             &ws.path,
-            &[
-                "rail",
-                "release",
-                "run",
-                "lib-a",
-                "--bump",
-                "auto",
-                "--skip-publish",
-                "--yes",
-            ],
+            &["rail", "release", "run", "lib-a", "--bump", "auto", "--yes"],
         )?;
         let stdout = String::from_utf8_lossy(&release.stdout);
         let stderr = String::from_utf8_lossy(&release.stderr);
@@ -3635,88 +3346,10 @@ fn change_add_without_message_errors_in_non_tty() {
 }
 
 #[test]
-fn release_changelog_uses_graph_attribution_for_cross_crate_commits() {
-    let result: Result<()> = (|| {
-        let ws = TestWorkspace::new_named("release-graph-attribution")?;
-        write_release_config(&ws, "require_release_notes = false")?;
-
-        ws.add_crate("lib-a", "0.1.0", &[])?;
-        ws.add_crate("lib-b", "0.1.0", &[])?;
-        ws.commit("Add crates")?;
-        tag_release(&ws, "lib-a", "0.1.0")?;
-        tag_release(&ws, "lib-b", "0.1.0")?;
-
-        ws.modify_file("lib-a", "src/lib.rs", "pub fn cross_a() {}\n")?;
-        ws.modify_file("lib-b", "src/lib.rs", "pub fn cross_b() {}\n")?;
-        ws.commit("fix: repair shared behavior")?;
-
-        let output = run_cargo_rail(
-            &ws.path,
-            &[
-                "rail",
-                "release",
-                "run",
-                "--all",
-                "--bump",
-                "patch",
-                "--skip-publish",
-                "--yes",
-            ],
-        )?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            output.status.success(),
-            "release should succeed\nstdout:\n{}\nstderr:\n{}",
-            stdout,
-            stderr
-        );
-
-        let changelog_a = std::fs::read_to_string(ws.path.join("crates/lib-a/CHANGELOG.md"))?;
-        let changelog_b = std::fs::read_to_string(ws.path.join("crates/lib-b/CHANGELOG.md"))?;
-        assert!(changelog_a.contains("repair shared behavior"));
-        assert!(changelog_b.contains("repair shared behavior"));
-
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-#[test]
-fn release_check_denies_unconventional_commits_when_configured() {
-    let result: Result<()> = (|| {
-        let ws = TestWorkspace::new_named("release-deny-unconventional")?;
-        write_release_config(&ws, "unconventional_commits = \"deny\"")?;
-
-        ws.add_crate("lib-a", "0.1.0", &[])?;
-        ws.commit("Add lib-a")?;
-        tag_release(&ws, "lib-a", "0.1.0")?;
-        ws.modify_file("lib-a", "src/lib.rs", "pub fn changed() {}\n")?;
-        ws.commit("Update lib-a")?;
-
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "lib-a"])?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = format!("{}\n{}", stdout, stderr);
-
-        assert!(
-            !output.status.success(),
-            "release check should fail for unconventional commits with deny policy\nstdout:\n{}\nstderr:\n{}",
-            stdout,
-            stderr
-        );
-        assert!(combined.contains("not a conventional commit"), "output:\n{}", combined);
-
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-#[test]
 fn change_file_drives_auto_bump_and_is_consumed_on_release() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("release-change-file-auto")?;
-        write_release_config(&ws, "require_release_notes = false")?;
+        write_release_config(&ws, "")?;
 
         ws.add_crate("lib-a", "0.1.0", &[])?;
         ws.commit("Add lib-a")?;
@@ -3752,16 +3385,7 @@ fn change_file_drives_auto_bump_and_is_consumed_on_release() {
 
         let output = run_cargo_rail(
             &ws.path,
-            &[
-                "rail",
-                "release",
-                "run",
-                "lib-a",
-                "--bump",
-                "auto",
-                "--skip-publish",
-                "--yes",
-            ],
+            &["rail", "release", "run", "lib-a", "--bump", "auto", "--yes"],
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -3795,7 +3419,7 @@ fn change_file_drives_auto_bump_and_is_consumed_on_release() {
 fn release_check_enforces_required_change_file_coverage() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("release-change-file-gate")?;
-        write_release_config(&ws, "require_change_files = true")?;
+        write_release_config(&ws, "")?;
 
         ws.add_crate("lib-a", "0.1.0", &[])?;
         ws.commit("Add lib-a")?;
@@ -3822,97 +3446,11 @@ fn release_check_enforces_required_change_file_coverage() {
 }
 
 #[test]
-fn release_changelog_generates_links_and_prs() {
-    let result: Result<()> = (|| {
-        let ws = TestWorkspace::new_named("release-links")?;
-        ws.set_remote("git@github.com:org/repo.git")?;
-        write_release_config(&ws, "")?;
-
-        // Create crate and initial tag
-        ws.add_crate("lib-a", "0.1.0", &[])?;
-        let initial_sha = ws.commit("Add lib-a")?;
-        // Single-crate tag format uses plain v{version}
-        ws.tag("v0.1.0", "Initial lib-a release")?;
-
-        // Feature commit with PR refs and breaking body
-        ws.modify_file("lib-a", "src/lib.rs", "pub fn api_v2() {}")?;
-        let feature_sha = ws.commit("feat(api)!: redesign REST endpoints (#123)\n\ncloses #456")?;
-
-        // Run release (skip crates.io but create tag/changelog)
-        let output = run_cargo_rail(
-            &ws.path,
-            &[
-                "rail",
-                "release",
-                "run",
-                "lib-a",
-                "--bump",
-                "patch",
-                "--skip-publish",
-                "--yes",
-            ],
-        )?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            output.status.success(),
-            "release publish should succeed\nstdout:\n{}\nstderr:\n{}",
-            stdout,
-            stderr
-        );
-
-        // Read changelog
-        let changelog = std::fs::read_to_string(ws.path.join("crates/lib-a/CHANGELOG.md"))?;
-
-        // Header with compare URL
-        let has_compare =
-            changelog.contains("compare/v0.1.0...v0.1.1") || changelog.contains("compare/lib-a-v0.1.0...lib-a-v0.1.1");
-        assert!(
-            has_compare,
-            "changelog should contain compare link. Content:\n{}",
-            changelog
-        );
-
-        // Breaking section and inline marker
-        assert!(changelog.contains("BREAKING CHANGES"));
-        assert!(changelog.contains("[**breaking**] redesign REST endpoints"));
-
-        // PR links and commit link
-        let short_sha = feature_sha
-            .get(..7)
-            .ok_or_else(|| anyhow::anyhow!("feature commit SHA is shorter than seven bytes"))?;
-        let initial_short_sha = initial_sha
-            .get(..7)
-            .ok_or_else(|| anyhow::anyhow!("initial commit SHA is shorter than seven bytes"))?;
-        assert!(changelog.contains("https://github.com/org/repo/pull/123"));
-        assert!(changelog.contains("https://github.com/org/repo/pull/456"));
-        assert!(
-            changelog.contains(&format!("https://github.com/org/repo/commit/{}", feature_sha)),
-            "should link commit {}",
-            feature_sha
-        );
-
-        // Ensure release commit didn't get tagged as the only change (initial sha should be excluded from range)
-        assert!(changelog.contains(short_sha), "should include feature commit");
-        assert!(
-            !changelog.contains(initial_short_sha),
-            "should not include pre-tag commits"
-        );
-
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-#[test]
 fn release_respects_skip_and_require_flags() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("release-skip-require")?;
         ws.set_remote("git@github.com:org/repo.git")?;
-        write_release_config(
-            &ws,
-            "require_changelog_entries = true\n\n[crates.internal.changelog]\nskip = true",
-        )?;
+        write_release_config(&ws, "\n[crates.internal.changelog]\nskip = true")?;
 
         // Crate with changes
         ws.add_crate("lib-a", "0.1.0", &[])?;
@@ -3933,23 +3471,14 @@ fn release_respects_skip_and_require_flags() {
 
         let output = run_cargo_rail(
             &ws.path,
-            &[
-                "rail",
-                "release",
-                "run",
-                "--all",
-                "--bump",
-                "patch",
-                "--skip-publish",
-                "--yes",
-            ],
+            &["rail", "release", "run", "--all", "--bump", "patch", "--yes"],
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
         assert!(
             !output.status.success(),
-            "release should fail because lib-b has no changelog entries and require_changelog_entries = true\nstdout:\n{}\nstderr:\n{}",
+            "release should fail because lib-b has no changelog entries and stdout:\n{}\nstderr:\n{}",
             stdout,
             stderr
         );
@@ -3972,9 +3501,6 @@ fn test_release_preflight_requires_release_notes_by_default() {
         ws.write_release_config(
             r#"tag_prefix = "v"
 tag_format = "v{version}"
-require_changelog_entries = false
-require_release_notes = true
-require_clean = false
 "#,
         )?;
 
@@ -4001,16 +3527,7 @@ require_clean = false
         // No commits since last tag -> generated changelog entries are empty.
         let output = run_cargo_rail(
             &ws.path,
-            &[
-                "rail",
-                "release",
-                "run",
-                "lib-a",
-                "--bump",
-                "patch",
-                "--skip-publish",
-                "--yes",
-            ],
+            &["rail", "release", "run", "lib-a", "--bump", "patch", "--yes"],
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -4034,85 +3551,6 @@ require_clean = false
     super::helpers::finish_test(result);
 }
 
-#[test]
-fn test_release_preflight_can_disable_release_notes_requirement() {
-    let result: Result<()> = (|| {
-        let ws = TestWorkspace::new_named("release-require-notes-disabled")?;
-        ws.write_release_config(
-            r#"tag_prefix = "v"
-tag_format = "v{version}"
-require_changelog_entries = false
-require_release_notes = false
-require_clean = false
-"#,
-        )?;
-
-        ws.add_crate("lib-a", "0.1.0", &[])?;
-        ws.commit("Add lib-a")?;
-        ws.tag("v0.1.0", "Initial lib-a")?;
-
-        // No commits since last tag, but opt-out should allow release apply.
-        let output = run_cargo_rail(
-            &ws.path,
-            &[
-                "rail",
-                "release",
-                "run",
-                "lib-a",
-                "--bump",
-                "patch",
-                "--skip-publish",
-                "--yes",
-            ],
-        )?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        assert!(
-            output.status.success(),
-            "release should succeed when require_release_notes=false\nstdout:\n{}\nstderr:\n{}",
-            stdout,
-            stderr
-        );
-
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-#[test]
-fn test_release_rejects_github_release_without_owned_push() {
-    let result: Result<()> = (|| {
-        let ws = TestWorkspace::new_single_crate("unsafe-gh-release", "0.1.0")?;
-        ws.write_release_config(
-            r#"require_clean = false
-create_github_release = true
-push = false
-"#,
-        )?;
-
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "run", "--check", "--bump", "patch"])?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        assert!(
-            !output.status.success(),
-            "unsafe GitHub release config should fail\nstdout:\n{}\nstderr:\n{}",
-            stdout,
-            stderr
-        );
-        assert!(
-            stdout.contains("requires release.push = true") || stderr.contains("requires release.push = true"),
-            "expected owned-push error\nstdout:\n{}\nstderr:\n{}",
-            stdout,
-            stderr
-        );
-
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
 #[cfg(unix)]
 #[test]
 fn test_release_creates_gitlab_release_with_glab() {
@@ -4121,15 +3559,13 @@ fn test_release_creates_gitlab_release_with_glab() {
         ws.write_release_config(
             r#"tag_prefix = "v"
 tag_format = "v{version}"
-source = "commits"
-require_clean = false
-require_release_notes = false
 remote_effects = "gitlab"
 "#,
         )?;
         ws.tag("v0.1.0", "Initial release")?;
         std::fs::write(ws.path.join("src/lib.rs"), "pub fn changed() {}\n")?;
         ws.commit("fix: update gitlab release test crate")?;
+        write_test_change(&ws.path, &["gitlab-release"])?;
 
         let remote = tempfile::TempDir::new()?;
         git(remote.path(), &["init", "--bare", "--initial-branch=main"])?;
@@ -4142,16 +3578,7 @@ remote_effects = "gitlab"
         let output = run_with_path_prefix(
             &ws,
             glab_path.parent().unwrap(),
-            &[
-                "rail",
-                "release",
-                "run",
-                "--all",
-                "--bump",
-                "patch",
-                "--skip-publish",
-                "--yes",
-            ],
+            &["rail", "release", "run", "--all", "--bump", "patch", "--yes"],
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -4192,29 +3619,16 @@ fn test_release_errors_when_gitlab_forge_binary_missing() {
         ws.write_release_config(
             r#"tag_prefix = "v"
 tag_format = "v{version}"
-source = "commits"
-require_clean = false
-require_release_notes = false
 remote_effects = "gitlab"
 "#,
         )?;
         ws.tag("v0.1.0", "Initial release")?;
         std::fs::write(ws.path.join("src/lib.rs"), "pub fn changed() {}\n")?;
         ws.commit("fix: update missing glab test crate")?;
+        write_test_change(&ws.path, &["missing-glab"])?;
 
-        let output = run_with_minimal_path_without_forge(
-            &ws,
-            &[
-                "rail",
-                "release",
-                "run",
-                "--all",
-                "--bump",
-                "patch",
-                "--skip-publish",
-                "--yes",
-            ],
-        )?;
+        let output =
+            run_with_minimal_path_without_forge(&ws, &["rail", "release", "run", "--all", "--bump", "patch", "--yes"])?;
         let combined = format!(
             "{}\n{}",
             String::from_utf8_lossy(&output.stdout),
@@ -4245,9 +3659,6 @@ fn test_release_pushes_commit_and_tag_when_push_enabled() {
         let (ws, _remote) = push_release_workspace("push-release")?;
         ws.write_release_config(
             r#"tag_format = "v{version}"
-source = "both"
-require_clean = false
-require_release_notes = false
 remote_effects = "gitlab"
 "#,
         )?;
@@ -4296,16 +3707,7 @@ echo "release hook context accepted"
             .env("CARGO_RAIL_TEST_INHERITED", "from-caller")
             .env("GIT_DIR", ws.path.join("ambient-wrong-repository"))
             .env("GIT_TRACE", &trace_path)
-            .args([
-                "rail",
-                "release",
-                "run",
-                "--all",
-                "--bump",
-                "patch",
-                "--skip-publish",
-                "--yes",
-            ])
+            .args(["rail", "release", "run", "--all", "--bump", "patch", "--yes"])
             .output()?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -4370,6 +3772,86 @@ echo "release hook context accepted"
     super::helpers::finish_test(result);
 }
 
+#[cfg(unix)]
+#[test]
+fn release_wait_keeps_one_transaction_attached_until_checks_pass() {
+    let result: Result<()> = (|| {
+        use std::os::unix::fs::PermissionsExt;
+
+        let ws = TestWorkspace::new_single_crate("release-wait", "0.1.0")?;
+        ws.write_release_config(
+            r#"tag_format = "v{version}"
+remote_effects = "push"
+"#,
+        )?;
+        ws.set_remote("https://github.com/loadingalias/release-wait.git")?;
+        ws.commit("Configure release wait")?;
+        ws.tag("v0.1.0", "Initial release")?;
+        write_test_change(&ws.path, &["release-wait"])?;
+
+        let shim_state = tempfile::TempDir::new()?;
+        let shim = registry_shadow_cargo_shim(
+            &shim_state.path().join("cargo.log"),
+            &shim_state.path().join("published"),
+        )?;
+        let gh = shim.path().join("gh");
+        let readiness_count = shim.path().join("readiness-count");
+        std::fs::write(
+            &gh,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
+  count=0
+  [ -f "{0}" ] && count=$(cat "{0}")
+  count=$((count + 1))
+  printf '%s' "$count" > "{0}"
+  if [ "$count" -eq 1 ]; then
+    state=PENDING
+  else
+    state=SUCCESS
+  fi
+  printf '%s\n' "{{\"data\":{{\"repository\":{{\"object\":{{\"statusCheckRollup\":{{\"contexts\":{{\"totalCount\":1,\"checkRunCount\":1,\"checkRunCountsByState\":[{{\"state\":\"$state\",\"count\":1}}],\"statusContextCount\":0,\"statusContextCountsByState\":[]}}}}}}}}}}}}"
+  exit 0
+fi
+exit 0
+"#,
+                readiness_count.display()
+            ),
+        )?;
+        let mut permissions = std::fs::metadata(&gh)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&gh, permissions)?;
+
+        let output = cargo_rail_command(&ws.path)?
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    shim.path().display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env("CARGO_RAIL_RELEASE_POLL_INTERVAL_MS", "1")
+            .args(["rail", "release", "run", "--all", "--wait", "--yes"])
+            .output()?;
+        assert!(
+            output.status.success(),
+            "waited release failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(readiness_count)?, "2");
+        assert!(
+            String::from_utf8_lossy(&git(&ws.path, &["tag", "--list", "v0.1.1"])?.stdout)
+                .lines()
+                .any(|tag| tag == "v0.1.1")
+        );
+
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
 #[test]
 fn test_release_rejects_a_different_origin_push_repository_before_mutation() {
     let result: Result<()> = (|| {
@@ -4391,7 +3873,6 @@ fn test_release_rejects_a_different_origin_push_repository_before_mutation() {
                 "--all",
                 "--bump",
                 "patch",
-                "--skip-publish",
                 "--skip-tag",
                 "--yes",
             ],
@@ -4441,7 +3922,6 @@ fn test_release_rejects_multiple_origin_push_repositories() {
                 "--all",
                 "--bump",
                 "patch",
-                "--skip-publish",
                 "--skip-tag",
                 "--yes",
             ],
@@ -4465,14 +3945,12 @@ fn release_reconstructs_missing_journal_from_git_in_a_second_checkout() {
         let ws = TestWorkspace::new_single_crate("cross-checkout", "0.1.0")?;
         ws.write_release_config(
             r#"tag_format = "v{version}"
-source = "both"
-require_clean = false
-require_release_notes = false
 remote_effects = "gitlab"
 "#,
         )?;
         ws.commit("Configure release reconstruction")?;
         ws.tag("v0.1.0", "Initial release")?;
+        write_test_change(&ws.path, &["cross-checkout"])?;
         let remote = tempfile::TempDir::new()?;
         git(remote.path(), &["init", "--bare", "--initial-branch=main"])?;
         ws.set_remote(remote.path().to_str().unwrap())?;
@@ -4484,16 +3962,7 @@ remote_effects = "gitlab"
         let interrupted = run_with_path_prefix(
             &ws,
             pending_glab.parent().unwrap(),
-            &[
-                "rail",
-                "release",
-                "run",
-                "--all",
-                "--bump",
-                "patch",
-                "--skip-publish",
-                "--yes",
-            ],
+            &["rail", "release", "run", "--all", "--bump", "patch", "--yes"],
         )?;
         assert!(!interrupted.status.success());
         assert!(String::from_utf8_lossy(&interrupted.stderr).contains("awaiting exact-SHA checks"));
@@ -4577,7 +4046,6 @@ exit 1
                 "--all",
                 "--bump",
                 "patch",
-                "--skip-publish",
                 "--skip-tag",
                 "--yes",
             ],
@@ -4627,7 +4095,6 @@ exit 1
                 "--all",
                 "--bump",
                 "patch",
-                "--skip-publish",
                 "--skip-tag",
                 "--yes",
                 "--json",
@@ -4665,12 +4132,10 @@ fn test_release_resume_reconciles_push_that_completed_before_failure() {
         git(&ws.path, &["push", "-u", "origin", "main"])?;
         ws.write_release_config(
             r#"tag_format = "v{version}"
-source = "commits"
-require_clean = false
-require_release_notes = false
 remote_effects = "push"
 "#,
         )?;
+        write_test_change(&ws.path, &["push-resume"])?;
 
         let interrupted = run_release_with_fault(
             &ws.path,
@@ -4681,7 +4146,6 @@ remote_effects = "push"
                 "--all",
                 "--bump",
                 "patch",
-                "--skip-publish",
                 "--skip-tag",
                 "--yes",
             ],
@@ -4722,7 +4186,6 @@ fn test_release_resume_rejects_remote_repository_drift() {
                 "--all",
                 "--bump",
                 "patch",
-                "--skip-publish",
                 "--skip-tag",
                 "--yes",
             ],
@@ -4764,7 +4227,6 @@ fn test_release_abort_remains_local_before_a_push_after_origin_drift() {
                 "--all",
                 "--bump",
                 "patch",
-                "--skip-publish",
                 "--skip-tag",
                 "--yes",
             ],
@@ -4818,12 +4280,10 @@ fn test_release_abort_reconciles_push_rejected_by_local_hook() {
         }
         ws.write_release_config(
             r#"tag_format = "v{version}"
-source = "commits"
-require_clean = false
-require_release_notes = false
 remote_effects = "push"
 "#,
         )?;
+        write_test_change(&ws.path, &["push-abort"])?;
 
         let interrupted = run_cargo_rail(
             &ws.path,
@@ -4834,7 +4294,6 @@ remote_effects = "push"
                 "--all",
                 "--bump",
                 "patch",
-                "--skip-publish",
                 "--skip-tag",
                 "--yes",
             ],
@@ -4867,69 +4326,20 @@ remote_effects = "push"
 }
 
 #[test]
-fn test_release_notes_override_satisfies_required_notes() {
-    let result: Result<()> = (|| {
-        let ws = TestWorkspace::new_single_crate("manual-notes", "0.1.0")?;
-        ws.write_release_config(
-            r#"tag_format = "v{version}"
-source = "commits"
-require_clean = false
-require_release_notes = true
-"#,
-        )?;
-        ws.tag("v0.1.0", "Initial manual-notes")?;
-        std::fs::create_dir_all(ws.path.join("release-notes"))?;
-        std::fs::write(
-            ws.path.join("release-notes/v0.1.1.md"),
-            "## manual-notes v0.1.1\n\n- curated release notes\n",
-        )?;
-
-        let output = run_cargo_rail(
-            &ws.path,
-            &[
-                "rail",
-                "release",
-                "run",
-                "--all",
-                "--bump",
-                "patch",
-                "--skip-publish",
-                "--yes",
-            ],
-        )?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        assert!(
-            output.status.success(),
-            "manual release notes should satisfy required release notes\nstdout:\n{}\nstderr:\n{}",
-            stdout,
-            stderr
-        );
-
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-/// Test release --json output format
-#[test]
 fn test_release_json_output() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_single_crate("json-release", "0.1.0")?;
 
         // Configure release
-        ws.write_release_config("source = \"commits\"\nrequire_clean = false\nrequire_release_notes = false\n")?;
+        ws.write_release_config("")?;
+        write_test_change(&ws.path, &["json-release"])?;
 
         // Run release plan with --json
-        let output = run_cargo_rail(
-            &ws.path,
-            &["rail", "release", "run", "--check", "--json", "--bump", "patch"],
-        )?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--json", "--bump", "patch"])?;
         assert_eq!(
             output.status.code(),
             Some(1),
-            "release run --check --json should exit 1 when changes are pending"
+            "release check --json should exit 1 when changes are pending"
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
         let json: serde_json::Value = serde_json::from_str(&stdout)
@@ -4954,13 +4364,11 @@ fn test_release_skip_tag_flag() {
         let ws = TestWorkspace::new_single_crate("skip-tag-crate", "0.1.0")?;
 
         // Configure release
-        ws.write_release_config("source = \"commits\"\nrequire_clean = false\nrequire_release_notes = false\n")?;
+        ws.write_release_config("")?;
+        write_test_change(&ws.path, &["skip-tag-crate"])?;
 
         // Run release plan with --skip-tag
-        let output = run_cargo_rail(
-            &ws.path,
-            &["rail", "release", "run", "--check", "--skip-tag", "--bump", "patch"],
-        )?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--skip-tag", "--bump", "patch"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         // Exit code 1 = check found pending changes (correct behavior)
@@ -4986,9 +4394,10 @@ fn test_release_publication_is_default_deny() {
         let ws = TestWorkspace::new_single_crate("skip-pub-crate", "0.1.0")?;
 
         // Configure release
-        ws.write_release_config("source = \"commits\"\nrequire_clean = false\nrequire_release_notes = false\n")?;
+        ws.write_release_config("")?;
+        write_test_change(&ws.path, &["skip-pub-crate"])?;
 
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "run", "--check", "--bump", "patch"])?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--bump", "patch"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         // Exit code 1 = check found pending changes (correct behavior)
@@ -5002,18 +4411,159 @@ fn test_release_publication_is_default_deny() {
             stdout
         );
 
-        ws.write_release_config(
-            "source = \"commits\"\nrequire_clean = false\nrequire_release_notes = false\nremote_effects = \"push\"\n",
+        let missing_remote_authority = run_cargo_rail(
+            &ws.path,
+            &["rail", "release", "check", "--publication", "--bump", "patch"],
+        )?;
+        assert_eq!(missing_remote_authority.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&missing_remote_authority.stderr)
+                .contains("--publish cannot be combined with release.remote_effects = \"none\"")
+        );
+
+        ws.write_release_config("remote_effects = \"push\"\n")?;
+        let missing_check_config_authority = run_cargo_rail(
+            &ws.path,
+            &["rail", "release", "check", "--publication", "--bump", "patch"],
         )?;
         let missing_config_authority = run_cargo_rail(
             &ws.path,
-            &["rail", "release", "run", "--check", "--bump", "patch", "--publish"],
+            &["rail", "release", "run", "--bump", "patch", "--publish", "--yes"],
         )?;
+        assert_eq!(missing_check_config_authority.status.code(), Some(2));
         assert_eq!(missing_config_authority.status.code(), Some(2));
-        assert!(
-            String::from_utf8_lossy(&missing_config_authority.stderr)
-                .contains("--publish requires release.registry_publication = \"crates-io\"")
+        let check_error = String::from_utf8_lossy(&missing_check_config_authority.stderr);
+        let run_error = String::from_utf8_lossy(&missing_config_authority.stderr);
+        let authority_error = "--publish requires release.registry_publication = \"crates-io\"";
+        assert!(check_error.contains(authority_error), "{check_error}");
+        assert!(run_error.contains(authority_error), "{run_error}");
+
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(unix)]
+#[test]
+fn publication_check_plan_is_accepted_by_the_matching_publish_run() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("publication-plan-parity")?;
+        write_publication_release_config(&ws, "")?;
+        ws.add_crate("publication-core", "0.1.0", &[])?;
+        ws.add_crate(
+            "publication-app",
+            "0.1.0",
+            &[(
+                "publication-core",
+                "{ version = \"^0.1.0\", path = \"../publication-core\" }",
+            )],
+        )?;
+        ws.set_remote("https://github.com/loadingalias/publication-plan-parity.git")?;
+        ws.commit("Configure publication preview parity")?;
+        write_test_change_levels(&ws.path, &[("publication-core", "patch"), ("publication-app", "patch")])?;
+
+        let preview = run_cargo_rail(
+            &ws.path,
+            &[
+                "rail",
+                "release",
+                "check",
+                "publication-core",
+                "--publication",
+                "--bump",
+                "minor",
+                "--skip-tag",
+                "--include-dependents",
+                "--format",
+                "json",
+            ],
+        )?;
+        assert_eq!(
+            preview.status.code(),
+            Some(1),
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&preview.stdout),
+            String::from_utf8_lossy(&preview.stderr)
         );
+        let preview: serde_json::Value = serde_json::from_slice(&preview.stdout)?;
+        assert_eq!(preview["command"], "release");
+        assert_eq!(preview["mode"], "check");
+        assert_eq!(preview["result"], "pending_changes");
+        assert_eq!(preview["release_plan"]["summary"]["total_crates"], 2);
+        let core = preview["release_plan"]["crates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|planned| planned["name"] == "publication-core")
+            .unwrap();
+        assert_eq!(core["new_version"], "0.2.0");
+        let codes = preview["mutation_plan"]["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|action| action["code"].as_str())
+            .collect::<Vec<_>>();
+        assert!(codes.contains(&"PUBLISH_CRATE"), "{codes:?}");
+        assert!(codes.contains(&"PUSH_RELEASE_COMMIT"), "{codes:?}");
+        assert!(codes.contains(&"AWAIT_EXACT_SHA_CHECKS"), "{codes:?}");
+        assert!(!codes.contains(&"CREATE_TAG"), "{codes:?}");
+        assert!(!codes.contains(&"PUSH_RELEASE_TAGS"), "{codes:?}");
+
+        let plan_path = ws.path.join("target/publication-preview-plan.json");
+        std::fs::create_dir_all(plan_path.parent().unwrap())?;
+        std::fs::write(&plan_path, serde_json::to_vec_pretty(&preview["mutation_plan"])?)?;
+        let shim_state = tempfile::TempDir::new()?;
+        let log_path = shim_state.path().join("cargo.log");
+        let published_path = shim_state.path().join("published");
+        let shim = registry_shadow_cargo_shim(&log_path, &published_path)?;
+        let path = format!(
+            "{}:{}",
+            shim.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let run = cargo_rail_command(&ws.path)?
+            .env("PATH", path)
+            .env("CARGO_RAIL_RELEASE_FAIL_BEFORE", "journal:planned")
+            .args([
+                "rail",
+                "release",
+                "run",
+                "publication-core",
+                "--bump",
+                "minor",
+                "--publish",
+                "--skip-tag",
+                "--include-dependents",
+                "--plan",
+                plan_path.to_str().unwrap(),
+                "--format",
+                "json",
+            ])
+            .output()?;
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert_eq!(run.status.code(), Some(2), "stdout:\n{}\nstderr:\n{stderr}", stdout);
+        assert!(
+            stdout.contains("injected release failure before journal:planned"),
+            "stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            !published_path.exists(),
+            "parity validation must stop before publication"
+        );
+        let persisted_journal = std::fs::read_dir(ws.path.join("target/cargo-rail/releases"))?
+            .filter_map(|entry| entry.ok())
+            .any(|entry| entry.path().extension().is_some_and(|extension| extension == "json"));
+        assert!(
+            !persisted_journal,
+            "parity validation must stop before journal persistence"
+        );
+        for crate_name in ["publication-core", "publication-app"] {
+            assert!(
+                std::fs::read_to_string(ws.path.join("crates").join(crate_name).join("Cargo.toml"))?
+                    .contains("version = \"0.1.0\"")
+            );
+        }
 
         Ok(())
     })();
@@ -5024,15 +4574,12 @@ fn test_release_publication_is_default_deny() {
 fn release_local_effects_never_plan_registry_or_remote_actions() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_single_crate("local-release-authority", "0.1.0")?;
-        ws.write_release_config(
-            "source = \"commits\"\nrequire_clean = false\nrequire_release_notes = false\nremote_effects = \"none\"\n",
-        )?;
+        ws.write_release_config("remote_effects = \"none\"\n")?;
+        write_test_change(&ws.path, &["local-release-authority"])?;
 
         let output = run_cargo_rail(
             &ws.path,
-            &[
-                "rail", "release", "run", "--check", "--bump", "patch", "--format", "json",
-            ],
+            &["rail", "release", "check", "--bump", "patch", "--format", "json"],
         )?;
         assert_eq!(output.status.code(), Some(1));
         let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
@@ -5058,7 +4605,7 @@ fn release_local_effects_never_plan_registry_or_remote_actions() {
 
         let rejected = run_cargo_rail(
             &ws.path,
-            &["rail", "release", "run", "--check", "--bump", "patch", "--publish"],
+            &["rail", "release", "run", "--bump", "patch", "--publish", "--yes"],
         )?;
         assert_eq!(rejected.status.code(), Some(2));
         assert!(
@@ -5085,7 +4632,7 @@ fn cargo_publish_authority_cannot_be_widened_by_rail_config() {
             anyhow::ensure!(manifest.contains(publish_line));
             std::fs::write(&manifest_path, manifest)?;
             ws.write_release_config(&format!(
-                "require_clean = false\nrequire_release_notes = false\nremote_effects = \"push\"\nregistry_publication = \"crates-io\"\n\n[crates.{name}.release]\npublish = true\n"
+                "remote_effects = \"push\"\nregistry_publication = \"crates-io\"\n\n[crates.{name}.release]\npublish = true\n"
             ))?;
             std::fs::create_dir_all(ws.path.join(".changes"))?;
             std::fs::write(
@@ -5098,26 +4645,20 @@ fn cargo_publish_authority_cannot_be_widened_by_rail_config() {
                 &[
                     "rail",
                     "release",
-                    "run",
+                    "check",
                     name,
-                    "--check",
                     "--bump",
                     "patch",
-                    "--publish",
+                    "--publication",
                     "--format",
                     "json",
                 ],
             )?;
             assert_eq!(output.status.code(), Some(1));
             let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-            let publishes = json["mutation_plan"]["actions"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|action| action["code"] == "PUBLISH_CRATE")
-                .count();
-            assert_eq!(publishes, 0, "Cargo registry authority was widened for {name}");
-            assert_eq!(json["release_plan"]["crates"][0]["publish"], false);
+            assert_eq!(json["release_plan"]["summary"]["total_crates"], 1);
+            assert_eq!(json["count"], 0, "Cargo registry authority was widened for {name}");
+            assert_eq!(json["crates"], serde_json::json!([]));
         }
 
         Ok(())
@@ -5132,10 +4673,11 @@ fn test_release_explicit_version() {
         let ws = TestWorkspace::new_single_crate("explicit-ver", "0.1.0")?;
 
         // Configure release
-        ws.write_release_config("source = \"commits\"\nrequire_clean = false\nrequire_release_notes = false\n")?;
+        ws.write_release_config("")?;
+        write_test_change(&ws.path, &["explicit-ver"])?;
 
         // Run release with explicit version
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "run", "--check", "--bump", "2.0.0"])?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--bump", "2.0.0"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         // Exit code 1 = check found pending changes (correct behavior)
@@ -5164,9 +4706,7 @@ fn test_changelog_relative_to_crate_default() {
 
         // Don't set relative_to - should default to "crate"
         ws.write_release_config(
-            r#"source = "commits"
-require_clean = false
-
+            r#"
 [release.changelog]
 path = "CHANGELOG.md"
 "#,
@@ -5178,20 +4718,12 @@ path = "CHANGELOG.md"
 
         ws.modify_file("lib-a", "src/lib.rs", "pub fn v2() {}")?;
         ws.commit("feat: add v2 function")?;
+        write_test_change(&ws.path, &["lib-a"])?;
 
         // Run release
         let output = run_cargo_rail(
             &ws.path,
-            &[
-                "rail",
-                "release",
-                "run",
-                "lib-a",
-                "--bump",
-                "patch",
-                "--skip-publish",
-                "--yes",
-            ],
+            &["rail", "release", "run", "lib-a", "--bump", "patch", "--yes"],
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -5230,9 +4762,7 @@ fn test_changelog_relative_to_workspace() {
 
         // Explicitly set relative_to = "workspace"
         ws.write_release_config(
-            r#"source = "commits"
-require_clean = false
-
+            r#"
 [release.changelog]
 path = "CHANGELOG.md"
 relative_to = "workspace"
@@ -5245,20 +4775,12 @@ relative_to = "workspace"
 
         ws.modify_file("lib-a", "src/lib.rs", "pub fn v2() {}")?;
         ws.commit("feat: add v2 function")?;
+        write_test_change(&ws.path, &["lib-a"])?;
 
         // Run release
         let output = run_cargo_rail(
             &ws.path,
-            &[
-                "rail",
-                "release",
-                "run",
-                "lib-a",
-                "--bump",
-                "patch",
-                "--skip-publish",
-                "--yes",
-            ],
+            &["rail", "release", "run", "lib-a", "--bump", "patch", "--yes"],
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -5303,9 +4825,7 @@ fn release_rejects_an_absolute_changelog_path_outside_the_workspace() {
         let outside = tempfile::TempDir::new()?;
         let outside_path = outside.path().join("CHANGELOG.md");
         ws.write_release_config(&format!(
-            r#"source = "commits"
-require_clean = false
-
+            r#"
 [release.changelog]
 path = "{}"
 relative_to = "workspace"
@@ -5317,11 +4837,9 @@ relative_to = "workspace"
         ws.tag("lib-a-v0.1.0", "Initial lib-a")?;
         ws.modify_file("lib-a", "src/lib.rs", "pub fn changed() {}")?;
         ws.commit("feat: change lib-a")?;
+        write_test_change(&ws.path, &["lib-a"])?;
 
-        let output = run_cargo_rail(
-            &ws.path,
-            &["rail", "release", "run", "lib-a", "--bump", "patch", "--check"],
-        )?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "lib-a", "--bump", "patch"])?;
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -5343,9 +4861,7 @@ fn release_rejects_a_symlink_changelog_path() {
 
         let ws = TestWorkspace::new_named("changelog-symlink")?;
         ws.write_release_config(
-            r#"source = "commits"
-require_clean = false
-
+            r#"
 [release.changelog]
 path = "CHANGELOG.md"
 relative_to = "workspace"
@@ -5360,11 +4876,9 @@ relative_to = "workspace"
         symlink(&victim, ws.path.join("CHANGELOG.md"))?;
         ws.modify_file("lib-a", "src/lib.rs", "pub fn changed() {}")?;
         ws.commit("feat: change lib-a")?;
+        write_test_change(&ws.path, &["lib-a"])?;
 
-        let output = run_cargo_rail(
-            &ws.path,
-            &["rail", "release", "run", "lib-a", "--bump", "patch", "--check"],
-        )?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "lib-a", "--bump", "patch"])?;
         assert!(!output.status.success());
         assert_eq!(std::fs::read_to_string(victim)?, "outside\n");
         Ok(())
@@ -5381,9 +4895,7 @@ fn test_changelog_parent_directories_auto_created() {
 
         // Use a nested path that doesn't exist
         ws.write_release_config(
-            r#"source = "commits"
-require_clean = false
-
+            r#"
 [release.changelog]
 path = "docs/changelogs/CHANGELOG.md"
 relative_to = "workspace"
@@ -5396,6 +4908,7 @@ relative_to = "workspace"
 
         ws.modify_file("lib-a", "src/lib.rs", "pub fn v2() {}")?;
         ws.commit("feat: add v2 function")?;
+        write_test_change(&ws.path, &["lib-a"])?;
 
         // docs/changelogs/ doesn't exist yet - should be auto-created
         assert!(!ws.path.join("docs/changelogs").exists());
@@ -5403,16 +4916,7 @@ relative_to = "workspace"
         // Run release
         let output = run_cargo_rail(
             &ws.path,
-            &[
-                "rail",
-                "release",
-                "run",
-                "lib-a",
-                "--bump",
-                "patch",
-                "--skip-publish",
-                "--yes",
-            ],
+            &["rail", "release", "run", "lib-a", "--bump", "patch", "--yes"],
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -5449,9 +4953,7 @@ fn test_changelog_relative_to_crate_custom_path() {
 
         // Use custom path with crate-relative
         ws.write_release_config(
-            r#"source = "commits"
-require_clean = false
-
+            r#"
 [release.changelog]
 path = "docs/CHANGES.md"
 relative_to = "crate"
@@ -5464,20 +4966,12 @@ relative_to = "crate"
 
         ws.modify_file("lib-a", "src/lib.rs", "pub fn v2() {}")?;
         ws.commit("feat: add v2 function")?;
+        write_test_change(&ws.path, &["lib-a"])?;
 
         // Run release
         let output = run_cargo_rail(
             &ws.path,
-            &[
-                "rail",
-                "release",
-                "run",
-                "lib-a",
-                "--bump",
-                "patch",
-                "--skip-publish",
-                "--yes",
-            ],
+            &["rail", "release", "run", "lib-a", "--bump", "patch", "--yes"],
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -5508,10 +5002,11 @@ relative_to = "crate"
 fn test_bump_prerelease_from_stable() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_single_crate("prerelease-test", "1.0.0")?;
-        ws.write_release_config("source = \"commits\"\nrequire_clean = false\nrequire_release_notes = false\n")?;
+        ws.write_release_config("")?;
+        write_test_change(&ws.path, &["prerelease-test"])?;
 
         // Run release plan with --bump prerelease
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "run", "--check", "--bump", "prerelease"])?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--bump", "prerelease"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         // Should show 1.0.0 -> 1.0.0-rc.1
@@ -5531,10 +5026,11 @@ fn test_bump_prerelease_from_stable() {
 fn test_bump_prerelease_increment() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_single_crate("prerelease-inc", "2.0.0-rc.1")?;
-        ws.write_release_config("source = \"commits\"\nrequire_clean = false\nrequire_release_notes = false\n")?;
+        ws.write_release_config("")?;
+        write_test_change(&ws.path, &["prerelease-inc"])?;
 
         // Run release plan with --bump prerelease
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "run", "--check", "--bump", "prerelease"])?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--bump", "prerelease"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         // Should show 2.0.0-rc.1 -> 2.0.0-rc.2
@@ -5554,10 +5050,11 @@ fn test_bump_prerelease_increment() {
 fn test_bump_release_strips_prerelease() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_single_crate("release-strip", "1.5.0-beta.3")?;
-        ws.write_release_config("source = \"commits\"\nrequire_clean = false\nrequire_release_notes = false\n")?;
+        ws.write_release_config("")?;
+        write_test_change(&ws.path, &["release-strip"])?;
 
         // Run release plan with --bump release
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "run", "--check", "--bump", "release"])?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--bump", "release"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         // Should show 1.5.0-beta.3 -> 1.5.0
@@ -5580,7 +5077,8 @@ fn test_bump_release_strips_prerelease() {
 fn test_release_check_extended_validates_publish() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_single_crate("ext-check", "0.1.0")?;
-        ws.write_release_config("require_clean = false\n")?;
+        ws.write_release_config("remote_effects = \"push\"\nregistry_publication = \"crates-io\"\n")?;
+        write_test_change(&ws.path, &["ext-check"])?;
 
         // Run release check with --extended --all (single-crate needs explicit crate name or --all)
         let output = run_cargo_rail(
@@ -5608,7 +5106,8 @@ fn test_release_check_extended_validates_publish() {
 fn test_release_check_extended_json() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_single_crate("ext-json", "0.1.0")?;
-        ws.write_release_config("require_clean = false\n")?;
+        ws.write_release_config("remote_effects = \"push\"\nregistry_publication = \"crates-io\"\n")?;
+        write_test_change(&ws.path, &["ext-json"])?;
 
         // Run release check with --extended --json --all
         let output = run_cargo_rail(
@@ -5636,11 +5135,13 @@ fn test_release_check_extended_json() {
         let json = parsed.unwrap();
         assert_eq!(json["schema_version"], serde_json::json!(1));
         assert_eq!(json["command"], serde_json::json!("release"));
-        assert_eq!(json["mode"], serde_json::json!("validate"));
-        assert!(json["result"] == serde_json::json!("success") || json["result"] == serde_json::json!("failed"));
+        assert_eq!(json["mode"], serde_json::json!("check"));
         assert!(
-            json["exit_code"] == serde_json::json!(0) || json["exit_code"] == serde_json::json!(2),
-            "release check extended should report exit_code 0 or 2"
+            json["result"] == serde_json::json!("pending_changes") || json["result"] == serde_json::json!("failed")
+        );
+        assert!(
+            json["exit_code"] == serde_json::json!(1) || json["exit_code"] == serde_json::json!(2),
+            "release check extended should report pending exit_code 1 or validation failure exit_code 2"
         );
         assert!(
             json.get("extended").is_some(),
@@ -5661,27 +5162,16 @@ fn release_rejects_unsafe_tag_names_before_mutation() {
         let ws = TestWorkspace::new_single_crate("unsafe-release-tag", "0.1.0")?;
         ws.write_release_config(
             r#"tag_prefix = "-"
-source = "both"
-require_clean = false
-require_release_notes = false
 "#,
         )?;
         ws.commit("Configure unsafe release tag")?;
         std::fs::write(ws.path.join("src/lib.rs"), "pub fn changed() {}")?;
         let initial_head = ws.commit("Change unsafe release tag crate")?;
+        write_test_change(&ws.path, &["unsafe-release-tag"])?;
 
         let output = run_cargo_rail(
             &ws.path,
-            &[
-                "rail",
-                "release",
-                "run",
-                "--all",
-                "--bump",
-                "patch",
-                "--skip-publish",
-                "--yes",
-            ],
+            &["rail", "release", "run", "--all", "--bump", "patch", "--yes"],
         )?;
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains("is not a safe Git ref name"));
@@ -5709,19 +5199,11 @@ fn test_release_resume_reconciles_tag_created_before_failure() {
         ws.tag("lib-a-v0.1.0", "Initial release")?;
         ws.modify_file("lib-a", "src/lib.rs", "pub fn resumed() {}")?;
         ws.commit("feat: resumable release")?;
+        write_test_change(&ws.path, &["lib-a"])?;
 
         let interrupted = run_release_with_fault(
             &ws.path,
-            &[
-                "rail",
-                "release",
-                "run",
-                "lib-a",
-                "--bump",
-                "patch",
-                "--skip-publish",
-                "--yes",
-            ],
+            &["rail", "release", "run", "lib-a", "--bump", "patch", "--yes"],
             "tag",
         )?;
         assert!(!interrupted.status.success());
@@ -5759,19 +5241,11 @@ fn release_resume_rejects_same_branch_head_movement() {
         ws.tag("lib-a-v0.1.0", "Initial release")?;
         ws.modify_file("lib-a", "src/lib.rs", "pub fn changed() {}")?;
         ws.commit("feat: prepare release")?;
+        write_test_change(&ws.path, &["lib-a"])?;
 
         let interrupted = run_release_with_fault(
             &ws.path,
-            &[
-                "rail",
-                "release",
-                "run",
-                "lib-a",
-                "--bump",
-                "patch",
-                "--skip-publish",
-                "--yes",
-            ],
+            &["rail", "release", "run", "lib-a", "--bump", "patch", "--yes"],
             "tag",
         )?;
         assert!(!interrupted.status.success());
@@ -5793,16 +5267,129 @@ fn release_resume_rejects_same_branch_head_movement() {
 }
 
 #[test]
-fn release_recovery_survives_invalid_metadata_and_clean_refuses_active_state() {
+fn release_resume_migrates_v0_25_journal_before_continuing() {
     let result: Result<()> = (|| {
-        let ws = TestWorkspace::new_single_crate("release-status-active", "0.1.0")?;
+        let ws = TestWorkspace::new_single_crate("v025-release-resume", "0.1.0")?;
         ws.write_release_config(
-            r#"source = "both"
-tag_format = "v{version}"
-require_clean = false
-require_release_notes = false
+            r#"tag_format = "v{version}"
 "#,
         )?;
+        write_test_change(&ws.path, &["v025-release-resume"])?;
+        let before = String::from_utf8_lossy(&git(&ws.path, &["rev-list", "--count", "HEAD"])?.stdout)
+            .trim()
+            .parse::<usize>()?;
+        let interrupted = run_release_with_fault_env(
+            &ws.path,
+            &[
+                "rail",
+                "release",
+                "run",
+                "--all",
+                "--bump",
+                "patch",
+                "--skip-tag",
+                "--yes",
+            ],
+            "CARGO_RAIL_RELEASE_FAIL_AFTER",
+            "journal:planned",
+        )?;
+        assert!(!interrupted.status.success());
+        let state_path = only_release_state(&ws.path)?;
+        std::fs::create_dir_all(ws.path.join("release-notes"))?;
+        std::fs::write(
+            ws.path.join("release-notes/v0.1.1.md"),
+            "Exact live v0.25 release-note override.\n",
+        )?;
+        rewrite_release_state_as_v0_25(&state_path)?;
+
+        let resumed = run_cargo_rail(&ws.path, &["rail", "release", "resume", state_path.to_str().unwrap()])?;
+        assert!(resumed.status.success(), "{}", String::from_utf8_lossy(&resumed.stderr));
+        let state: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
+        assert_eq!(state["schema_version"], 6);
+        assert_eq!(state["plan"]["plan_contract_version"], 6);
+        assert_eq!(state["status"], "complete");
+        assert_eq!(
+            state["predecessor_execution"]["release_note_bodies"]["v025-release-resume"],
+            "Exact live v0.25 release-note override.\n"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&git(&ws.path, &["rev-list", "--count", "HEAD"])?.stdout)
+                .trim()
+                .parse::<usize>()?,
+            before + 1,
+            "resume must create exactly one release commit"
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn release_abort_migrates_v0_25_journal_and_allows_terminal_cleanup() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_single_crate("v025-release-abort", "0.1.0")?;
+        ws.write_release_config(
+            r#"tag_format = "v{version}"
+"#,
+        )?;
+        write_test_change(&ws.path, &["v025-release-abort"])?;
+        let initial_head = String::from_utf8_lossy(&git(&ws.path, &["rev-parse", "HEAD"])?.stdout)
+            .trim()
+            .to_string();
+        let interrupted = run_release_with_fault_env(
+            &ws.path,
+            &[
+                "rail",
+                "release",
+                "run",
+                "--all",
+                "--bump",
+                "patch",
+                "--skip-tag",
+                "--yes",
+            ],
+            "CARGO_RAIL_RELEASE_FAIL_AFTER",
+            "journal:planned",
+        )?;
+        assert!(!interrupted.status.success());
+        let state_path = only_release_state(&ws.path)?;
+        rewrite_release_state_as_v0_25(&state_path)?;
+
+        let aborted = run_cargo_rail(
+            &ws.path,
+            &["rail", "release", "abort", state_path.to_str().unwrap(), "--yes"],
+        )?;
+        assert!(aborted.status.success(), "{}", String::from_utf8_lossy(&aborted.stderr));
+        let state: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
+        assert_eq!(state["schema_version"], 6);
+        assert_eq!(state["plan"]["plan_contract_version"], 6);
+        assert_eq!(state["status"], "aborted");
+        assert_eq!(
+            String::from_utf8_lossy(&git(&ws.path, &["rev-parse", "HEAD"])?.stdout).trim(),
+            initial_head,
+            "abort must not create a release commit"
+        );
+
+        let cleaned = run_cargo_rail(
+            &ws.path,
+            &["rail", "clean", "--release-journal", state_path.to_str().unwrap()],
+        )?;
+        assert!(cleaned.status.success(), "{}", String::from_utf8_lossy(&cleaned.stderr));
+        assert!(!state_path.exists(), "terminal predecessor journal should be removable");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn release_status_isolates_mixed_v5_v6_and_unreadable_journals() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_single_crate("mixed-release-status", "0.1.0")?;
+        ws.write_release_config(
+            r#"tag_format = "v{version}"
+"#,
+        )?;
+        write_test_change(&ws.path, &["mixed-release-status"])?;
         let interrupted = run_release_with_before_fault(
             &ws.path,
             &[
@@ -5812,7 +5399,125 @@ require_release_notes = false
                 "--all",
                 "--bump",
                 "patch",
-                "--skip-publish",
+                "--skip-tag",
+                "--yes",
+            ],
+            "commit:mixed-release-status",
+        )?;
+        assert!(!interrupted.status.success());
+
+        let directory = ws.path.join("target/cargo-rail/releases");
+        let active_state = only_release_state(&ws.path)?;
+        let active_state_bytes = std::fs::read(&active_state)?;
+        std::fs::write(
+            directory.join("release-v025-fixture.json"),
+            include_bytes!("../fixtures/release/v0.25.0/state-v5.json"),
+        )?;
+        std::fs::write(
+            directory.join("release-v025-renamed.json"),
+            include_bytes!("../fixtures/release/v0.25.0/state-v5.json"),
+        )?;
+        std::fs::write(directory.join("release-v6-renamed.json"), active_state_bytes)?;
+        std::fs::write(
+            directory.join("release-v025-unreadable.json"),
+            br#"{"schema_version":5,"transaction_id":"release-v025-unreadable"}"#,
+        )?;
+
+        let status = run_cargo_rail(&ws.path, &["rail", "release", "status", "--format", "json"])?;
+        assert!(status.status.success(), "{}", String::from_utf8_lossy(&status.stderr));
+        let status: serde_json::Value = serde_json::from_slice(&status.stdout)?;
+        let transactions = status["transactions"].as_array().unwrap();
+        assert_eq!(transactions.len(), 5, "{status:#}");
+        let predecessor = transactions
+            .iter()
+            .find(|transaction| transaction["transaction_id"] == "release-v025-fixture")
+            .unwrap();
+        assert_eq!(predecessor["state"], "publishing:active");
+        let unreadable = transactions
+            .iter()
+            .find(|transaction| transaction["transaction_id"] == "release-v025-unreadable")
+            .unwrap();
+        assert_eq!(unreadable["state"], "journal:ambiguous");
+        assert_eq!(unreadable["recoverability"], "unreadable");
+        assert_eq!(unreadable["ambiguity"], true);
+        for renamed in ["release-v025-renamed", "release-v6-renamed"] {
+            let renamed = transactions
+                .iter()
+                .find(|transaction| transaction["transaction_id"] == renamed)
+                .unwrap();
+            assert_eq!(renamed["state"], "journal:ambiguous");
+            assert_eq!(renamed["recoverability"], "unreadable");
+            assert_eq!(renamed["ambiguity"], true);
+            assert!(
+                renamed["observations"][0]
+                    .as_str()
+                    .unwrap()
+                    .contains("does not match transaction identity")
+            );
+        }
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn release_status_reconstructs_an_exact_v0_25_run_commit() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_single_crate("v025-release-history", "0.1.0")?;
+        let message = "chore(release): v025-release-history v0.1.1\n\n\
+Rail-Release: release-v025-history\n\
+Rail-Release-Mode: run\n\
+Rail-Release-Publish: false\n\
+Rail-Release-Publish-Registry: none\n\
+Rail-Release-Tag: false\n\
+Rail-Release-Remote: none\n\
+Rail-Release-Crate: v025-release-history@0.1.1\n\
+Rail-Release-Tag-Name: v025-release-history=v0.1.1\n\
+Rail-Release-Crate-Publish: v025-release-history=false";
+        git(&ws.path, &["commit", "--allow-empty", "-m", message])?;
+        let exact_sha = String::from_utf8_lossy(&git(&ws.path, &["rev-parse", "HEAD"])?.stdout)
+            .trim()
+            .to_string();
+
+        let status = run_cargo_rail(
+            &ws.path,
+            &["rail", "release", "status", "--history", "--format", "json"],
+        )?;
+        assert!(status.status.success(), "{}", String::from_utf8_lossy(&status.stderr));
+        let status: serde_json::Value = serde_json::from_slice(&status.stdout)?;
+        let predecessor = status["transactions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|transaction| transaction["transaction_id"] == "release-v025-history")
+            .unwrap();
+        assert_eq!(predecessor["state"], "released:git");
+        assert_eq!(predecessor["recoverability"], "terminal");
+        assert_eq!(predecessor["ambiguity"], false);
+        assert_eq!(predecessor["exact_sha"], exact_sha);
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn release_recovery_survives_invalid_metadata_and_clean_refuses_active_state() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_single_crate("release-status-active", "0.1.0")?;
+        ws.write_release_config(
+            r#"tag_format = "v{version}"
+"#,
+        )?;
+        write_test_change(&ws.path, &["release-status-active"])?;
+        let interrupted = run_release_with_before_fault(
+            &ws.path,
+            &[
+                "rail",
+                "release",
+                "run",
+                "--all",
+                "--bump",
+                "patch",
                 "--skip-tag",
                 "--yes",
             ],
@@ -5879,12 +5584,10 @@ fn release_resume_reconciles_a_journal_write_that_failed_after_persistence() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_single_crate("journal-fault", "0.1.0")?;
         ws.write_release_config(
-            r#"source = "both"
-tag_format = "v{version}"
-require_clean = false
-require_release_notes = false
+            r#"tag_format = "v{version}"
 "#,
         )?;
+        write_test_change(&ws.path, &["journal-fault"])?;
         let before = git(&ws.path, &["rev-list", "--count", "HEAD"])?;
         let interrupted = run_release_with_fault_env(
             &ws.path,
@@ -5895,7 +5598,6 @@ require_release_notes = false
                 "--all",
                 "--bump",
                 "patch",
-                "--skip-publish",
                 "--skip-tag",
                 "--yes",
             ],
@@ -5927,12 +5629,10 @@ fn clean_prunes_a_planned_journal_superseded_before_any_effect() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_single_crate("superseded-journal", "0.1.0")?;
         ws.write_release_config(
-            r#"source = "both"
-tag_format = "v{version}"
-require_clean = false
-require_release_notes = false
+            r#"tag_format = "v{version}"
 "#,
         )?;
+        write_test_change(&ws.path, &["superseded-journal"])?;
         let interrupted = run_release_with_fault_env(
             &ws.path,
             &[
@@ -5942,7 +5642,6 @@ require_release_notes = false
                 "--all",
                 "--bump",
                 "patch",
-                "--skip-publish",
                 "--skip-tag",
                 "--yes",
             ],
@@ -5973,24 +5672,13 @@ fn release_transaction_id_is_recorded_in_commits_and_terminal_status() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_single_crate("release-transaction", "0.1.0")?;
         ws.write_release_config(
-            r#"source = "both"
-tag_format = "v{version}"
-require_clean = false
-require_release_notes = false
+            r#"tag_format = "v{version}"
 "#,
         )?;
+        write_test_change(&ws.path, &["release-transaction"])?;
         let released = run_cargo_rail(
             &ws.path,
-            &[
-                "rail",
-                "release",
-                "run",
-                "--all",
-                "--bump",
-                "patch",
-                "--skip-publish",
-                "--yes",
-            ],
+            &["rail", "release", "run", "--all", "--bump", "patch", "--yes"],
         )?;
         assert!(
             released.status.success(),
@@ -6037,56 +5725,6 @@ require_release_notes = false
 }
 
 #[test]
-fn historical_prepare_with_merged_descendant_tag_is_terminal_not_finalizable() {
-    let result: Result<()> = (|| {
-        let ws = TestWorkspace::new_single_crate("historical-prepare", "0.1.0")?;
-        let manifest = std::fs::read_to_string(ws.path.join("Cargo.toml"))?.replace("0.1.0", "0.1.1");
-        std::fs::write(ws.path.join("Cargo.toml"), manifest)?;
-        let transaction = "release-historical-prepare";
-        let prepare_sha = ws.commit(&format!(
-            "chore(release): prepare\n\nRail-Release: {transaction}\nRail-Release-Mode: prepare\nRail-Release-Publish: false\nRail-Release-Tag: true\nRail-Release-Remote: none\nRail-Release-Crate: historical-prepare@0.1.1\nRail-Release-Tag-Name: historical-prepare=v0.1.1\nRail-Release-Crate-Publish: historical-prepare=false"
-        ))?;
-        std::fs::write(ws.path.join("merged-release-evidence"), "merged\n")?;
-        let merged_sha = ws.commit("Merge prepared release")?;
-        git(&ws.path, &["tag", "-a", "v0.1.1", "-m", "Release v0.1.1", &merged_sha])?;
-
-        let status = run_cargo_rail(
-            &ws.path,
-            &["rail", "release", "status", "--history", "--format", "json"],
-        )?;
-        assert!(status.status.success(), "{}", String::from_utf8_lossy(&status.stderr));
-        let status: serde_json::Value = serde_json::from_slice(&status.stdout)?;
-        let reconstructed = status["transactions"]
-            .as_array()
-            .ok_or_else(|| anyhow::anyhow!("release transactions are unavailable"))?
-            .iter()
-            .find(|entry| entry["transaction_id"] == transaction)
-            .ok_or_else(|| anyhow::anyhow!("historical prepare transaction is unavailable"))?;
-        assert_eq!(reconstructed["state"], "released:git");
-        assert_eq!(reconstructed["recoverability"], "terminal");
-        assert_eq!(reconstructed["ambiguity"], false);
-        assert_eq!(reconstructed["exact_sha"], merged_sha);
-        assert_eq!(
-            reconstructed["safe_operator_command"],
-            "none (transaction is terminal; no release journal exists)"
-        );
-        assert_ne!(prepare_sha, merged_sha);
-        assert!(
-            reconstructed["observations"]
-                .as_array()
-                .is_some_and(|observations| observations.iter().any(|value| {
-                    value
-                        .as_str()
-                        .is_some_and(|value| value == format!("prepare:merged_target={merged_sha}"))
-                })),
-            "merged release target was not retained in status: {reconstructed}"
-        );
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-#[test]
 fn test_release_abort_restores_local_state_before_remote_side_effects() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("release-abort-local")?;
@@ -6096,19 +5734,11 @@ fn test_release_abort_restores_local_state_before_remote_side_effects() {
         ws.tag("lib-a-v0.1.0", "Initial release")?;
         ws.modify_file("lib-a", "src/lib.rs", "pub fn abortable() {}")?;
         let initial = ws.commit("feat: abortable release")?;
+        write_test_change(&ws.path, &["lib-a"])?;
 
         let interrupted = run_release_with_fault(
             &ws.path,
-            &[
-                "rail",
-                "release",
-                "run",
-                "lib-a",
-                "--bump",
-                "patch",
-                "--skip-publish",
-                "--yes",
-            ],
+            &["rail", "release", "run", "lib-a", "--bump", "patch", "--yes"],
             "commit:lib-a",
         )?;
         assert!(!interrupted.status.success());
@@ -6144,11 +5774,9 @@ fn test_release_requires_explicit_confirmation_non_interactive() {
         ws.tag("lib-a-v0.1.0", "Initial release")?;
         ws.modify_file("lib-a", "src/lib.rs", "pub fn gate() {}")?;
         ws.commit("feat: add release-gated change")?;
+        write_test_change(&ws.path, &["lib-a"])?;
 
-        let output = run_cargo_rail(
-            &ws.path,
-            &["rail", "release", "run", "lib-a", "--bump", "patch", "--skip-publish"],
-        )?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "run", "lib-a", "--bump", "patch"])?;
         assert!(
             !output.status.success(),
             "release should fail without --yes/--plan in non-interactive mode"
@@ -6177,6 +5805,7 @@ fn release_confirmation_pty_accepts_only_yes_and_keeps_the_prompt_on_stderr() {
         ws.tag("lib-a-v0.1.0", "Initial release")?;
         ws.modify_file("lib-a", "src/lib.rs", "pub fn pty_confirmation() {}")?;
         ws.commit("feat: add PTY confirmation fixture")?;
+        write_test_change(&ws.path, &["lib-a"])?;
         Ok(ws)
     }
 
@@ -6193,7 +5822,7 @@ master, slave = pty.openpty()
 try:
     with open(stdout_path, "wb") as stdout, open(stderr_path, "wb") as stderr:
         child = subprocess.Popen(
-            [binary, "rail", "release", "run", "lib-a", "--bump", "patch", "--skip-publish", "--skip-tag"],
+            [binary, "rail", "release", "run", "lib-a", "--bump", "patch", "--skip-tag"],
             cwd=root,
             stdin=slave,
             stdout=stdout,
@@ -6315,16 +5944,14 @@ fn test_release_detached_head_fails() {
         write_release_config(&ws, "")?;
 
         ws.add_crate("lib-a", "0.1.0", &[])?;
+        write_test_change(&ws.path, &["lib-a"])?;
         let commit_sha = ws.commit("Add lib-a")?;
 
         // Checkout detached HEAD
         crate::helpers::git(&ws.path, &["checkout", &commit_sha])?;
 
         // Run release (should fail with detached HEAD error)
-        let output = run_cargo_rail(
-            &ws.path,
-            &["rail", "release", "run", "lib-a", "--bump", "patch", "--skip-publish"],
-        );
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "run", "lib-a", "--bump", "patch"]);
 
         // Should fail (non-zero exit)
         let output = output?;
@@ -6351,6 +5978,7 @@ fn test_release_non_default_branch_fails_without_branch_authority() {
 
         ws.add_crate("lib-a", "0.1.0", &[])?;
         ws.commit("Add lib-a")?;
+        write_test_change(&ws.path, &["lib-a"])?;
 
         // Create and switch to a feature branch
         crate::helpers::git(&ws.path, &["checkout", "-b", "feature-branch"])?;
@@ -6358,16 +5986,7 @@ fn test_release_non_default_branch_fails_without_branch_authority() {
         // --yes skips only the prompt; it does not authorize this branch.
         let output = run_cargo_rail(
             &ws.path,
-            &[
-                "rail",
-                "release",
-                "run",
-                "lib-a",
-                "--bump",
-                "patch",
-                "--skip-publish",
-                "--yes",
-            ],
+            &["rail", "release", "run", "lib-a", "--bump", "patch", "--yes"],
         )?;
 
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -6405,6 +6024,7 @@ fn test_release_non_default_branch_requires_confirmation_and_branch_flags() {
         // Make a change for the release
         ws.modify_file("lib-a", "src/lib.rs", "pub fn hotfix() {}")?;
         ws.commit("feat: add hotfix function")?;
+        write_test_change(&ws.path, &["lib-a"])?;
 
         // Run release with --yes (should succeed)
         let output = run_cargo_rail(
@@ -6416,7 +6036,6 @@ fn test_release_non_default_branch_requires_confirmation_and_branch_flags() {
                 "lib-a",
                 "--bump",
                 "patch",
-                "--skip-publish",
                 "--yes",
                 "--allow-non-default-branch",
             ],
@@ -6539,12 +6158,10 @@ fn release_check_uses_the_same_local_plan_for_an_unpublishable_workspace() {
         write_release_config(&ws, "remote_effects = \"none\"")?;
         add_unpublishable_crate(&ws, "internal", "0.1.0")?;
         ws.commit("feat: add internal release")?;
+        write_test_change(&ws.path, &["internal"])?;
 
         let check = run_cargo_rail(&ws.path, &["rail", "release", "check", "--all", "--format", "json"])?;
-        let run = run_cargo_rail(
-            &ws.path,
-            &["rail", "release", "run", "--all", "--check", "--format", "json"],
-        )?;
+        let run = run_cargo_rail(&ws.path, &["rail", "release", "check", "--all", "--format", "json"])?;
         assert_eq!(check.status.code(), Some(1));
         assert_eq!(run.status.code(), Some(1));
 
@@ -6576,28 +6193,40 @@ fn release_check_uses_the_same_local_plan_for_an_unpublishable_workspace() {
 }
 
 #[test]
-fn release_publication_check_names_its_publishable_only_scope() {
+fn release_publication_check_preserves_unpublishable_release_plan_authority() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("release-check-publication-unpublishable")?;
-        write_release_config(&ws, "")?;
+        write_publication_release_config(&ws, "")?;
         add_unpublishable_crate(&ws, "internal", "0.1.0")?;
         ws.commit("feat: add internal release")?;
+        write_test_change(&ws.path, &["internal"])?;
 
         let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--publication", "--all"])?;
-        assert_eq!(output.status.code(), Some(2));
-        assert!(String::from_utf8_lossy(&output.stderr).contains("no publishable crates found"));
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("internal: not publishable"));
 
         let json = run_cargo_rail(
             &ws.path,
             &["rail", "release", "check", "--publication", "--all", "--format", "json"],
         )?;
-        assert_eq!(json.status.code(), Some(2));
+        assert_eq!(json.status.code(), Some(1));
         let json: serde_json::Value = serde_json::from_slice(&json.stdout)?;
-        assert_eq!(json["result"], "failed");
-        assert_eq!(json["exit_code"], 2);
+        assert_eq!(json["result"], "pending_changes");
+        assert_eq!(json["exit_code"], 1);
         assert_eq!(json["readiness"]["scope"], "publication");
         assert_eq!(json["readiness"]["effects_executed"], serde_json::json!([]));
-        assert_eq!(json["error"], "no publishable crates found");
+        assert_eq!(json["release_plan"]["summary"]["total_crates"], 1);
+        assert_eq!(json["release_plan"]["summary"]["crates_to_publish"], 0);
+        assert_eq!(json["count"], 0);
+        assert_eq!(json["skipped"][0]["crate"], "internal");
+        assert_eq!(json["readiness"]["planned_effects"]["registry_publication"], false);
+        assert!(
+            json["mutation_plan"]["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|action| action["code"] != "PUBLISH_CRATE")
+        );
 
         Ok(())
     })();
@@ -6609,7 +6238,7 @@ fn release_publication_check_names_its_publishable_only_scope() {
 fn test_release_check_all_skips_unpublishable_cargo_toml() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("check-skip-unpub")?;
-        write_release_config(&ws, "")?;
+        write_publication_release_config(&ws, "")?;
 
         // Add a publishable crate
         ws.add_crate("lib-pub", "0.1.0", &[])?;
@@ -6618,19 +6247,14 @@ fn test_release_check_all_skips_unpublishable_cargo_toml() {
         add_unpublishable_crate(&ws, "lib-internal", "0.1.0")?;
 
         ws.commit("Add crates")?;
+        write_test_change(&ws.path, &["lib-pub", "lib-internal"])?;
 
         // Run release check --all
         let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--publication", "--all"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
-        // Should succeed
-        assert!(
-            output.status.success(),
-            "release check --all should succeed.\nstdout:\n{}\nstderr:\n{}",
-            stdout,
-            stderr
-        );
+        assert_eq!(output.status.code(), Some(1), "stdout:\n{stdout}\nstderr:\n{stderr}");
 
         // Should show lib-pub as ready
         assert!(
@@ -6639,18 +6263,18 @@ fn test_release_check_all_skips_unpublishable_cargo_toml() {
             stdout
         );
 
-        // Should report lib-internal as skipped (in stderr)
+        // The exact release plan retains lib-internal but excludes its publish action.
         assert!(
-            stderr.contains("skipped") && stderr.contains("lib-internal"),
-            "Should report lib-internal as skipped.\nstderr:\n{}",
-            stderr
+            stdout.contains("lib-internal: not publishable"),
+            "Should report lib-internal as not publishable.\nstdout:\n{}",
+            stdout
         );
 
         // Should mention publish = false
         assert!(
-            stderr.contains("publish = false"),
-            "Should explain why crate was skipped.\nstderr:\n{}",
-            stderr
+            stdout.contains("no release-worthy changes") || stdout.contains("publish = false"),
+            "Should explain why crate was skipped.\nstdout:\n{}",
+            stdout
         );
 
         Ok(())
@@ -6663,7 +6287,7 @@ fn test_release_check_all_skips_unpublishable_cargo_toml() {
 fn test_release_check_path_deps_allowed_for_unpublishable() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("path-dep-unpub")?;
-        write_release_config(&ws, "")?;
+        write_publication_release_config(&ws, "")?;
 
         // Add a publishable crate
         ws.add_crate("lib-core", "0.1.0", &[])?;
@@ -6672,19 +6296,14 @@ fn test_release_check_path_deps_allowed_for_unpublishable() {
         add_crate_with_path_dep(&ws, "wasm-bindings", "0.1.0", "lib-core", false)?;
 
         ws.commit("Add crates")?;
+        write_test_change(&ws.path, &["lib-core", "wasm-bindings"])?;
 
         // Run release check --all
         let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--publication", "--all"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
-        // Should succeed - NOT error on path-only dep
-        assert!(
-            output.status.success(),
-            "Should NOT error on path-only dep in unpublishable crate.\nstdout:\n{}\nstderr:\n{}",
-            stdout,
-            stderr
-        );
+        assert_eq!(output.status.code(), Some(1), "stdout:\n{stdout}\nstderr:\n{stderr}");
 
         // Should NOT contain the path-only dependency error
         assert!(
@@ -6703,11 +6322,12 @@ fn test_release_check_path_deps_allowed_for_unpublishable() {
 fn test_release_check_explicit_unpublishable_crate() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("explicit-unpub")?;
-        write_release_config(&ws, "")?;
+        write_publication_release_config(&ws, "")?;
 
         // Add an unpublishable crate
         add_unpublishable_crate(&ws, "internal-tool", "0.1.0")?;
         ws.commit("Add crates")?;
+        write_test_change(&ws.path, &["internal-tool"])?;
 
         // Run release check on the specific crate
         let output = run_cargo_rail(
@@ -6716,12 +6336,7 @@ fn test_release_check_explicit_unpublishable_crate() {
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
 
-        // Should succeed and report the crate as not publishable
-        assert!(
-            output.status.success(),
-            "Should succeed when explicitly checking unpublishable crate.\nstdout:\n{}",
-            stdout
-        );
+        assert_eq!(output.status.code(), Some(1), "stdout:\n{stdout}");
 
         assert!(
             stdout.contains("not publishable") || stdout.contains("publish = false"),
@@ -6739,18 +6354,20 @@ fn test_release_check_explicit_unpublishable_crate() {
 fn test_release_check_json_includes_skipped() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("json-skipped")?;
-        write_release_config(&ws, "")?;
+        write_publication_release_config(&ws, "")?;
 
         // Add publishable and unpublishable crates
         ws.add_crate("lib-pub", "0.1.0", &[])?;
         add_unpublishable_crate(&ws, "lib-internal", "0.1.0")?;
         ws.commit("Add crates")?;
+        write_test_change(&ws.path, &["lib-pub", "lib-internal"])?;
 
         // Run release check --all --json
         let output = run_cargo_rail(
             &ws.path,
             &["rail", "release", "check", "--publication", "--all", "--json"],
         )?;
+        assert_eq!(output.status.code(), Some(1));
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         // Parse JSON
@@ -6797,26 +6414,21 @@ fn test_release_check_respects_rail_toml_publish_false() {
 
         // Configure lib-b as non-publishable in rail.toml
         ws.write_release_config(
-            r#"source = "commits"
-require_clean = false
+            r#"remote_effects = "push"
+registry_publication = "crates-io"
 
 [crates.lib-b.release]
 publish = false
 "#,
         )?;
+        write_test_change(&ws.path, &["lib-a", "lib-b"])?;
 
         // Run release check --all
         let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--publication", "--all"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
-        // Should succeed
-        assert!(
-            output.status.success(),
-            "Should succeed.\nstdout:\n{}\nstderr:\n{}",
-            stdout,
-            stderr
-        );
+        assert_eq!(output.status.code(), Some(1), "stdout:\n{stdout}\nstderr:\n{stderr}");
 
         // Should show lib-a as ready
         assert!(
@@ -6827,9 +6439,9 @@ publish = false
 
         // Should report lib-b as skipped due to rail.toml
         assert!(
-            stderr.contains("lib-b") && stderr.contains("rail.toml"),
-            "lib-b should be skipped due to rail.toml.\nstderr:\n{}",
-            stderr
+            stdout.contains("lib-b"),
+            "lib-b should be skipped by the exact release plan.\nstdout:\n{}",
+            stdout
         );
 
         Ok(())
@@ -6860,8 +6472,10 @@ fn test_release_run_rejects_partial_dependent_closure() {
         tag_release(&ws, "lib-c", "0.1.0")?;
         ws.modify_file("lib-a", "src/lib.rs", "pub fn changed() {}\n")?;
         ws.commit("feat: change lib-a")?;
+        write_test_change(&ws.path, &["lib-a"])?;
+        write_test_change(&ws.path, &["lib-a"])?;
 
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "run", "lib-a", "--check"])?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "lib-a"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let combined = format!("{}\n{}", stdout, stderr);
@@ -6919,11 +6533,9 @@ fn test_release_run_include_dependents_expands_full_closure() {
         tag_release(&ws, "lib-c", "0.1.0")?;
         ws.modify_file("lib-a", "src/lib.rs", "pub fn changed() {}\n")?;
         ws.commit("feat: change lib-a")?;
+        write_test_change(&ws.path, &["lib-a"])?;
 
-        let output = run_cargo_rail(
-            &ws.path,
-            &["rail", "release", "run", "lib-a", "--check", "--include-dependents"],
-        )?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "lib-a", "--include-dependents"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -6957,7 +6569,7 @@ fn test_release_run_include_dependents_expands_full_closure() {
 fn test_subset_release_only_mutates_selected_closure_tags_and_changelogs() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("release-subset-apply")?;
-        write_release_config(&ws, "require_release_notes = false")?;
+        write_release_config(&ws, "")?;
 
         ws.add_crate("lib-a", "0.1.0", &[])?;
         ws.add_crate(
@@ -6972,6 +6584,7 @@ fn test_subset_release_only_mutates_selected_closure_tags_and_changelogs() {
         tag_release(&ws, "lib-c", "0.1.0")?;
         ws.modify_file("lib-a", "src/lib.rs", "pub fn changed() {}\n")?;
         ws.commit("feat: change lib-a")?;
+        write_test_change(&ws.path, &["lib-a"])?;
 
         let output = run_cargo_rail(
             &ws.path,
@@ -6983,7 +6596,6 @@ fn test_subset_release_only_mutates_selected_closure_tags_and_changelogs() {
                 "--include-dependents",
                 "--bump",
                 "patch",
-                "--skip-publish",
                 "--yes",
             ],
         )?;
@@ -7035,9 +6647,6 @@ fn test_release_run_apply_supports_publish_false_from_rail_toml() {
         ws.write_release_config(
             r#"tag_prefix = "v"
 tag_format = "{crate}-v{version}"
-source = "commits"
-require_clean = false
-require_release_notes = false
 
 [crates.internal-tool.release]
 publish = false
@@ -7046,6 +6655,7 @@ publish = false
         tag_release(&ws, "internal-tool", "0.1.0")?;
         ws.modify_file("internal-tool", "src/lib.rs", "pub fn changed() {}\n")?;
         ws.commit("feat: update internal-tool")?;
+        write_test_change(&ws.path, &["internal-tool"])?;
 
         let output = run_cargo_rail(
             &ws.path,
@@ -7080,7 +6690,7 @@ publish = false
 fn test_subset_release_updates_shared_workspace_dependency_versions() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("release-workspace-deps")?;
-        write_release_config(&ws, "require_release_notes = false")?;
+        write_release_config(&ws, "")?;
 
         ws.add_crate("lib-a", "0.1.0", &[])?;
         add_workspace_dependency(&ws, "lib-a", "0.1.0")?;
@@ -7090,6 +6700,7 @@ fn test_subset_release_updates_shared_workspace_dependency_versions() {
         tag_release(&ws, "lib-b", "0.1.0")?;
         ws.modify_file("lib-a", "src/lib.rs", "pub fn changed() {}\n")?;
         ws.commit("feat: change lib-a")?;
+        write_test_change(&ws.path, &["lib-a"])?;
 
         let output = run_cargo_rail(
             &ws.path,
@@ -7101,7 +6712,6 @@ fn test_subset_release_updates_shared_workspace_dependency_versions() {
                 "--include-dependents",
                 "--bump",
                 "patch",
-                "--skip-publish",
                 "--yes",
             ],
         )?;

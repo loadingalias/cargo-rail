@@ -103,14 +103,14 @@ test-all:
 build-all:
     cargo build --workspace --all-targets --all-features --locked
 
-bench-unify packages="25" runs="10":
+bench-unify packages="25" runs="10": build-release
     @scripts/bench/unify.sh "{{ packages }}" "{{ runs }}"
 
 bench-plan runs="20":
-    @if command -v python3 >/dev/null 2>&1; then python3 scripts/bench/plan.py run "{{ runs }}"; else python scripts/bench/plan.py run "{{ runs }}"; fi
+    @scripts/bench/plan.py run "{{ runs }}"
 
 bench-plan-smoke:
-    @if command -v python3 >/dev/null 2>&1; then python3 scripts/bench/plan.py smoke; else python scripts/bench/plan.py smoke; fi
+    @scripts/bench/plan.py smoke
 
 bench-native-cache runs:
     @scripts/bench/native-cache.sh run "{{ runs }}"
@@ -230,16 +230,16 @@ bench-native-cache-prune *run_ids:
     @scripts/bench/native-cache-prune.sh {{ run_ids }}
 
 bench-compiler-facts runs="20":
-    @if command -v python3 >/dev/null 2>&1; then python3 scripts/bench/compiler-facts.py run "{{ runs }}"; else python scripts/bench/compiler-facts.py run "{{ runs }}"; fi
+    @scripts/bench/compiler-facts.py run "{{ runs }}"
 
 bench-compiler-facts-smoke:
-    @if command -v python3 >/dev/null 2>&1; then python3 scripts/bench/compiler-facts.py smoke; else python scripts/bench/compiler-facts.py smoke; fi
+    @scripts/bench/compiler-facts.py smoke
 
 bench-compiler-facts-summarize results:
-    @if command -v python3 >/dev/null 2>&1; then python3 scripts/bench/compiler-facts.py summarize "{{ results }}"; else python scripts/bench/compiler-facts.py summarize "{{ results }}"; fi
+    @scripts/bench/compiler-facts.py summarize "{{ results }}"
 
 bench-compiler-facts-validate results:
-    @if command -v python3 >/dev/null 2>&1; then python3 scripts/bench/compiler-facts.py validate "{{ results }}"; else python scripts/bench/compiler-facts.py validate "{{ results }}"; fi
+    @scripts/bench/compiler-facts.py validate "{{ results }}"
 
 qualify-compiler-facts-remote mode runs run_id:
     @scripts/ci/qualify-compiler-facts.sh "{{ mode }}" "{{ runs }}" "{{ run_id }}"

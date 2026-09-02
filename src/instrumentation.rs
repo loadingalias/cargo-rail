@@ -5,13 +5,13 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
 use crate::error::{RailError, RailResult};
 
-const SCHEMA_VERSION: u32 = 12;
+const SCHEMA_VERSION: u32 = 15;
 
 static COUNTERS: OnceLock<Counters> = OnceLock::new();
 
@@ -36,6 +36,7 @@ struct Counters {
     cas_bytes_written: AtomicU64,
     cas_bytes_read: AtomicU64,
     cas_bytes_restored: AtomicU64,
+    compiler_acquisition: CompilerAcquisitionCounters,
 }
 
 impl Counters {
@@ -61,6 +62,7 @@ impl Counters {
             cas_bytes_written: AtomicU64::new(0),
             cas_bytes_read: AtomicU64::new(0),
             cas_bytes_restored: AtomicU64::new(0),
+            compiler_acquisition: CompilerAcquisitionCounters::new(),
         }
     }
 
@@ -87,6 +89,151 @@ impl Counters {
             cas_bytes_written: self.cas_bytes_written.load(Ordering::Relaxed),
             cas_bytes_read: self.cas_bytes_read.load(Ordering::Relaxed),
             cas_bytes_restored: self.cas_bytes_restored.load(Ordering::Relaxed),
+            compiler_acquisition: self.compiler_acquisition.snapshot(),
+        }
+    }
+}
+
+struct CompilerAcquisitionCounters {
+    plan_identity: OnceLock<String>,
+    plans: AtomicU64,
+    plan_build_elapsed_ns: AtomicU64,
+    packages: AtomicU64,
+    targets: AtomicU64,
+    features: AtomicU64,
+    candidates: AtomicU64,
+    views: AtomicU64,
+    cargo_views: AtomicU64,
+    cargo_elapsed_ns: AtomicU64,
+    configured_process_slots: AtomicU64,
+    configured_work_permits: AtomicU64,
+    live_cargo_processes: AtomicU64,
+    max_live_cargo_processes: AtomicU64,
+    max_nonwaiting_cargo_views: AtomicU64,
+    work_permit_start_waits: AtomicU64,
+    work_permit_yields: AtomicU64,
+    work_permit_resumes: AtomicU64,
+    compiler_actions: AtomicU64,
+    cargo_messages_read: AtomicU64,
+    stdout_bytes_read: AtomicU64,
+    stderr_bytes_read: AtomicU64,
+    stdout_bytes_retained: AtomicU64,
+    stderr_bytes_retained: AtomicU64,
+    output_retention_high_water_bytes: AtomicU64,
+    process_tree_terminations: AtomicU64,
+    process_tree_forced_terminations: AtomicU64,
+    process_tree_termination_elapsed_ns: AtomicU64,
+    sandboxes_created: AtomicU64,
+    sandboxes_reused: AtomicU64,
+    sandboxes_poisoned: AtomicU64,
+    sandboxes_deleted: AtomicU64,
+    artifact_tree_walks: AtomicU64,
+    artifact_tree_walk_elapsed_ns: AtomicU64,
+    evidence_cache_lookups: AtomicU64,
+    evidence_cache_hits: AtomicU64,
+    evidence_cache_writes: AtomicU64,
+    evidence_cache_elapsed_ns: AtomicU64,
+    journal_writes: AtomicU64,
+    journal_bytes_written: AtomicU64,
+    journal_flushes: AtomicU64,
+    journal_syncs: AtomicU64,
+    journal_elapsed_ns: AtomicU64,
+}
+
+impl CompilerAcquisitionCounters {
+    const fn new() -> Self {
+        Self {
+            plan_identity: OnceLock::new(),
+            plans: AtomicU64::new(0),
+            plan_build_elapsed_ns: AtomicU64::new(0),
+            packages: AtomicU64::new(0),
+            targets: AtomicU64::new(0),
+            features: AtomicU64::new(0),
+            candidates: AtomicU64::new(0),
+            views: AtomicU64::new(0),
+            cargo_views: AtomicU64::new(0),
+            cargo_elapsed_ns: AtomicU64::new(0),
+            configured_process_slots: AtomicU64::new(0),
+            configured_work_permits: AtomicU64::new(0),
+            live_cargo_processes: AtomicU64::new(0),
+            max_live_cargo_processes: AtomicU64::new(0),
+            max_nonwaiting_cargo_views: AtomicU64::new(0),
+            work_permit_start_waits: AtomicU64::new(0),
+            work_permit_yields: AtomicU64::new(0),
+            work_permit_resumes: AtomicU64::new(0),
+            compiler_actions: AtomicU64::new(0),
+            cargo_messages_read: AtomicU64::new(0),
+            stdout_bytes_read: AtomicU64::new(0),
+            stderr_bytes_read: AtomicU64::new(0),
+            stdout_bytes_retained: AtomicU64::new(0),
+            stderr_bytes_retained: AtomicU64::new(0),
+            output_retention_high_water_bytes: AtomicU64::new(0),
+            process_tree_terminations: AtomicU64::new(0),
+            process_tree_forced_terminations: AtomicU64::new(0),
+            process_tree_termination_elapsed_ns: AtomicU64::new(0),
+            sandboxes_created: AtomicU64::new(0),
+            sandboxes_reused: AtomicU64::new(0),
+            sandboxes_poisoned: AtomicU64::new(0),
+            sandboxes_deleted: AtomicU64::new(0),
+            artifact_tree_walks: AtomicU64::new(0),
+            artifact_tree_walk_elapsed_ns: AtomicU64::new(0),
+            evidence_cache_lookups: AtomicU64::new(0),
+            evidence_cache_hits: AtomicU64::new(0),
+            evidence_cache_writes: AtomicU64::new(0),
+            evidence_cache_elapsed_ns: AtomicU64::new(0),
+            journal_writes: AtomicU64::new(0),
+            journal_bytes_written: AtomicU64::new(0),
+            journal_flushes: AtomicU64::new(0),
+            journal_syncs: AtomicU64::new(0),
+            journal_elapsed_ns: AtomicU64::new(0),
+        }
+    }
+
+    fn snapshot(&self) -> CompilerAcquisitionSnapshot {
+        CompilerAcquisitionSnapshot {
+            plan_identity: self.plan_identity.get().cloned(),
+            plans: self.plans.load(Ordering::Relaxed),
+            plan_build_elapsed_ns: self.plan_build_elapsed_ns.load(Ordering::Relaxed),
+            packages: self.packages.load(Ordering::Relaxed),
+            targets: self.targets.load(Ordering::Relaxed),
+            features: self.features.load(Ordering::Relaxed),
+            candidates: self.candidates.load(Ordering::Relaxed),
+            views: self.views.load(Ordering::Relaxed),
+            cargo_views: self.cargo_views.load(Ordering::Relaxed),
+            cargo_elapsed_ns: self.cargo_elapsed_ns.load(Ordering::Relaxed),
+            configured_process_slots: self.configured_process_slots.load(Ordering::Relaxed),
+            configured_work_permits: self.configured_work_permits.load(Ordering::Relaxed),
+            live_cargo_processes: self.live_cargo_processes.load(Ordering::Relaxed),
+            max_live_cargo_processes: self.max_live_cargo_processes.load(Ordering::Relaxed),
+            max_nonwaiting_cargo_views: self.max_nonwaiting_cargo_views.load(Ordering::Relaxed),
+            work_permit_start_waits: self.work_permit_start_waits.load(Ordering::Relaxed),
+            work_permit_yields: self.work_permit_yields.load(Ordering::Relaxed),
+            work_permit_resumes: self.work_permit_resumes.load(Ordering::Relaxed),
+            compiler_actions: self.compiler_actions.load(Ordering::Relaxed),
+            cargo_messages_read: self.cargo_messages_read.load(Ordering::Relaxed),
+            stdout_bytes_read: self.stdout_bytes_read.load(Ordering::Relaxed),
+            stderr_bytes_read: self.stderr_bytes_read.load(Ordering::Relaxed),
+            stdout_bytes_retained: self.stdout_bytes_retained.load(Ordering::Relaxed),
+            stderr_bytes_retained: self.stderr_bytes_retained.load(Ordering::Relaxed),
+            output_retention_high_water_bytes: self.output_retention_high_water_bytes.load(Ordering::Relaxed),
+            process_tree_terminations: self.process_tree_terminations.load(Ordering::Relaxed),
+            process_tree_forced_terminations: self.process_tree_forced_terminations.load(Ordering::Relaxed),
+            process_tree_termination_elapsed_ns: self.process_tree_termination_elapsed_ns.load(Ordering::Relaxed),
+            sandboxes_created: self.sandboxes_created.load(Ordering::Relaxed),
+            sandboxes_reused: self.sandboxes_reused.load(Ordering::Relaxed),
+            sandboxes_poisoned: self.sandboxes_poisoned.load(Ordering::Relaxed),
+            sandboxes_deleted: self.sandboxes_deleted.load(Ordering::Relaxed),
+            artifact_tree_walks: self.artifact_tree_walks.load(Ordering::Relaxed),
+            artifact_tree_walk_elapsed_ns: self.artifact_tree_walk_elapsed_ns.load(Ordering::Relaxed),
+            evidence_cache_lookups: self.evidence_cache_lookups.load(Ordering::Relaxed),
+            evidence_cache_hits: self.evidence_cache_hits.load(Ordering::Relaxed),
+            evidence_cache_writes: self.evidence_cache_writes.load(Ordering::Relaxed),
+            evidence_cache_elapsed_ns: self.evidence_cache_elapsed_ns.load(Ordering::Relaxed),
+            journal_writes: self.journal_writes.load(Ordering::Relaxed),
+            journal_bytes_written: self.journal_bytes_written.load(Ordering::Relaxed),
+            journal_flushes: self.journal_flushes.load(Ordering::Relaxed),
+            journal_syncs: self.journal_syncs.load(Ordering::Relaxed),
+            journal_elapsed_ns: self.journal_elapsed_ns.load(Ordering::Relaxed),
         }
     }
 }
@@ -177,6 +324,54 @@ struct CounterSnapshot {
     cas_bytes_written: u64,
     cas_bytes_read: u64,
     cas_bytes_restored: u64,
+    compiler_acquisition: CompilerAcquisitionSnapshot,
+}
+
+#[derive(Serialize)]
+struct CompilerAcquisitionSnapshot {
+    plan_identity: Option<String>,
+    plans: u64,
+    plan_build_elapsed_ns: u64,
+    packages: u64,
+    targets: u64,
+    features: u64,
+    candidates: u64,
+    views: u64,
+    cargo_views: u64,
+    cargo_elapsed_ns: u64,
+    configured_process_slots: u64,
+    configured_work_permits: u64,
+    live_cargo_processes: u64,
+    max_live_cargo_processes: u64,
+    max_nonwaiting_cargo_views: u64,
+    work_permit_start_waits: u64,
+    work_permit_yields: u64,
+    work_permit_resumes: u64,
+    compiler_actions: u64,
+    cargo_messages_read: u64,
+    stdout_bytes_read: u64,
+    stderr_bytes_read: u64,
+    stdout_bytes_retained: u64,
+    stderr_bytes_retained: u64,
+    output_retention_high_water_bytes: u64,
+    process_tree_terminations: u64,
+    process_tree_forced_terminations: u64,
+    process_tree_termination_elapsed_ns: u64,
+    sandboxes_created: u64,
+    sandboxes_reused: u64,
+    sandboxes_poisoned: u64,
+    sandboxes_deleted: u64,
+    artifact_tree_walks: u64,
+    artifact_tree_walk_elapsed_ns: u64,
+    evidence_cache_lookups: u64,
+    evidence_cache_hits: u64,
+    evidence_cache_writes: u64,
+    evidence_cache_elapsed_ns: u64,
+    journal_writes: u64,
+    journal_bytes_written: u64,
+    journal_flushes: u64,
+    journal_syncs: u64,
+    journal_elapsed_ns: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -275,7 +470,15 @@ fn amount(value: usize) -> u64 {
 }
 
 fn duration_ns(started: Instant) -> u64 {
-    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    duration_value_ns(started.elapsed())
+}
+
+fn duration_value_ns(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn optional_duration_ns(started: Option<Instant>) -> u64 {
+    started.map_or(0, duration_ns)
 }
 
 fn add(counter: fn(&Counters) -> &AtomicU64, value: u64) {
@@ -363,6 +566,240 @@ pub(crate) fn record_cas_write(bytes: u64, objects: u64) {
 
 pub(crate) fn record_cas_read(bytes: u64) {
     add(|counters| &counters.cas_bytes_read, bytes);
+}
+
+pub(crate) fn compiler_acquisition_timer() -> Option<Instant> {
+    COUNTERS.get().map(|_| Instant::now())
+}
+
+pub(crate) fn record_compiler_acquisition_execution_policy(process_slots: usize, work_permits: usize) {
+    if let Some(counters) = COUNTERS.get() {
+        let acquisition = &counters.compiler_acquisition;
+        acquisition
+            .configured_process_slots
+            .fetch_max(amount(process_slots), Ordering::Relaxed);
+        acquisition
+            .configured_work_permits
+            .fetch_max(amount(work_permits), Ordering::Relaxed);
+    }
+}
+
+/// RAII ownership for one live Cargo process measured at the spawn boundary.
+pub(crate) struct CompilerAcquisitionProcessGuard {
+    measured: bool,
+}
+
+pub(crate) fn compiler_acquisition_process_started(
+    counts_as_nonwaiting_without_broker: bool,
+) -> CompilerAcquisitionProcessGuard {
+    let measured = if let Some(counters) = COUNTERS.get() {
+        let acquisition = &counters.compiler_acquisition;
+        let live = acquisition.live_cargo_processes.fetch_add(1, Ordering::Relaxed) + 1;
+        acquisition.max_live_cargo_processes.fetch_max(live, Ordering::Relaxed);
+        if counts_as_nonwaiting_without_broker {
+            acquisition
+                .max_nonwaiting_cargo_views
+                .fetch_max(live, Ordering::Relaxed);
+        }
+        true
+    } else {
+        false
+    };
+    CompilerAcquisitionProcessGuard { measured }
+}
+
+impl Drop for CompilerAcquisitionProcessGuard {
+    fn drop(&mut self) {
+        if self.measured
+            && let Some(counters) = COUNTERS.get()
+        {
+            let previous = counters
+                .compiler_acquisition
+                .live_cargo_processes
+                .fetch_sub(1, Ordering::Relaxed);
+            debug_assert!(previous > 0, "compiler acquisition live-process counter underflowed");
+        }
+    }
+}
+
+pub(crate) fn record_compiler_acquisition_nonwaiting_views(views: usize) {
+    if let Some(counters) = COUNTERS.get() {
+        counters
+            .compiler_acquisition
+            .max_nonwaiting_cargo_views
+            .fetch_max(amount(views), Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn record_compiler_acquisition_work_permit_wait() {
+    add(|counters| &counters.compiler_acquisition.work_permit_start_waits, 1);
+}
+
+pub(crate) fn record_compiler_acquisition_work_permit_yield() {
+    add(|counters| &counters.compiler_acquisition.work_permit_yields, 1);
+}
+
+pub(crate) fn record_compiler_acquisition_work_permit_resume() {
+    add(|counters| &counters.compiler_acquisition.work_permit_resumes, 1);
+}
+
+pub(crate) fn record_compiler_acquisition_plan(
+    started: Option<Instant>,
+    identity: &str,
+    packages: usize,
+    targets: usize,
+    features: usize,
+    candidates: usize,
+    views: usize,
+) {
+    let Some(counters) = COUNTERS.get() else {
+        return;
+    };
+    let acquisition = &counters.compiler_acquisition;
+    acquisition.plan_identity.get_or_init(|| identity.to_string());
+    acquisition.plans.fetch_add(1, Ordering::Relaxed);
+    acquisition
+        .plan_build_elapsed_ns
+        .fetch_add(optional_duration_ns(started), Ordering::Relaxed);
+    acquisition.packages.fetch_add(amount(packages), Ordering::Relaxed);
+    acquisition.targets.fetch_add(amount(targets), Ordering::Relaxed);
+    acquisition.features.fetch_add(amount(features), Ordering::Relaxed);
+    acquisition.candidates.fetch_add(amount(candidates), Ordering::Relaxed);
+    acquisition.views.fetch_add(amount(views), Ordering::Relaxed);
+}
+
+pub(crate) fn record_compiler_acquisition_cargo_view(
+    started: Option<Instant>,
+    cargo_messages: usize,
+    stdout_bytes_read: u64,
+    stderr_bytes_read: u64,
+    stdout_bytes_retained: usize,
+    stderr_bytes_retained: usize,
+) {
+    let Some(counters) = COUNTERS.get() else {
+        return;
+    };
+    let acquisition = &counters.compiler_acquisition;
+    acquisition.cargo_views.fetch_add(1, Ordering::Relaxed);
+    acquisition
+        .cargo_elapsed_ns
+        .fetch_add(optional_duration_ns(started), Ordering::Relaxed);
+    acquisition
+        .cargo_messages_read
+        .fetch_add(amount(cargo_messages), Ordering::Relaxed);
+    acquisition
+        .stdout_bytes_read
+        .fetch_add(stdout_bytes_read, Ordering::Relaxed);
+    acquisition
+        .stderr_bytes_read
+        .fetch_add(stderr_bytes_read, Ordering::Relaxed);
+    acquisition
+        .stdout_bytes_retained
+        .fetch_add(amount(stdout_bytes_retained), Ordering::Relaxed);
+    acquisition
+        .stderr_bytes_retained
+        .fetch_add(amount(stderr_bytes_retained), Ordering::Relaxed);
+    acquisition.output_retention_high_water_bytes.fetch_max(
+        amount(stdout_bytes_retained.saturating_add(stderr_bytes_retained)),
+        Ordering::Relaxed,
+    );
+}
+
+pub(crate) fn record_compiler_acquisition_process_termination(forced: bool, elapsed: Duration) {
+    if let Some(counters) = COUNTERS.get() {
+        let acquisition = &counters.compiler_acquisition;
+        acquisition.process_tree_terminations.fetch_add(1, Ordering::Relaxed);
+        if forced {
+            acquisition
+                .process_tree_forced_terminations
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        acquisition
+            .process_tree_termination_elapsed_ns
+            .fetch_add(duration_value_ns(elapsed), Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn record_compiler_acquisition_sandbox_create() {
+    add(|counters| &counters.compiler_acquisition.sandboxes_created, 1);
+}
+
+pub(crate) fn record_compiler_acquisition_sandbox_reuse() {
+    add(|counters| &counters.compiler_acquisition.sandboxes_reused, 1);
+}
+
+pub(crate) fn record_compiler_acquisition_sandbox_poison() {
+    add(|counters| &counters.compiler_acquisition.sandboxes_poisoned, 1);
+}
+
+pub(crate) fn record_compiler_acquisition_sandbox_delete() {
+    add(|counters| &counters.compiler_acquisition.sandboxes_deleted, 1);
+}
+
+pub(crate) fn record_compiler_acquisition_actions(actions: usize) {
+    if let Some(counters) = COUNTERS.get() {
+        counters
+            .compiler_acquisition
+            .compiler_actions
+            .fetch_add(amount(actions), Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn record_compiler_acquisition_artifact_tree_walk(started: Option<Instant>) {
+    if let Some(counters) = COUNTERS.get() {
+        let acquisition = &counters.compiler_acquisition;
+        acquisition.artifact_tree_walks.fetch_add(1, Ordering::Relaxed);
+        acquisition
+            .artifact_tree_walk_elapsed_ns
+            .fetch_add(optional_duration_ns(started), Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn record_compiler_acquisition_cache_lookup(started: Option<Instant>, hit: bool) {
+    if let Some(counters) = COUNTERS.get() {
+        let acquisition = &counters.compiler_acquisition;
+        acquisition.evidence_cache_lookups.fetch_add(1, Ordering::Relaxed);
+        if hit {
+            acquisition.evidence_cache_hits.fetch_add(1, Ordering::Relaxed);
+        }
+        acquisition
+            .evidence_cache_elapsed_ns
+            .fetch_add(optional_duration_ns(started), Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn record_compiler_acquisition_cache_write(started: Option<Instant>) {
+    if let Some(counters) = COUNTERS.get() {
+        let acquisition = &counters.compiler_acquisition;
+        acquisition.evidence_cache_writes.fetch_add(1, Ordering::Relaxed);
+        acquisition
+            .evidence_cache_elapsed_ns
+            .fetch_add(optional_duration_ns(started), Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn record_compiler_acquisition_journal_write(
+    started: Option<Instant>,
+    bytes: usize,
+    flushed: bool,
+    synced: bool,
+) {
+    if let Some(counters) = COUNTERS.get() {
+        let acquisition = &counters.compiler_acquisition;
+        acquisition.journal_writes.fetch_add(1, Ordering::Relaxed);
+        acquisition
+            .journal_bytes_written
+            .fetch_add(amount(bytes), Ordering::Relaxed);
+        if flushed {
+            acquisition.journal_flushes.fetch_add(1, Ordering::Relaxed);
+        }
+        if synced {
+            acquisition.journal_syncs.fetch_add(1, Ordering::Relaxed);
+        }
+        acquisition
+            .journal_elapsed_ns
+            .fetch_add(optional_duration_ns(started), Ordering::Relaxed);
+    }
 }
 
 #[cfg(any(unix, windows, test))]

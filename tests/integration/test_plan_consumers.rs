@@ -1,7 +1,7 @@
 //! Named-work local and CI consumer contract tests.
 
 use crate::helpers::{TestWorkspace, run_cargo_rail};
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use std::process::Command;
@@ -12,14 +12,20 @@ const ARCHIVE_WORKFLOW: &str = include_str!("../../.github/workflows/release-arc
 const RELEASE_WORKFLOW: &str = include_str!("../../.github/workflows/release.yaml");
 const CACHE_ACTION: &str = include_str!("../../.github/actions/cache/action.yaml");
 const SETUP_ACTION: &str = include_str!("../../.github/actions/setup/action.yaml");
+const RAIL_CONFIG: &str = include_str!("../../.config/rail.toml");
 const CARGO_SCRIPT: &str = include_str!("../../scripts/cargo/run.sh");
 const VERIFY_SCRIPT: &str = include_str!("../../scripts/plan/verify.sh");
+const PLAN_BUNDLE_V1_SCHEMA: &str = include_str!("../../schemas/plan-bundle-v1.schema.json");
 
 fn reader() -> Command {
+    reader_in(std::path::Path::new(env!("CARGO_MANIFEST_DIR")))
+}
+
+fn reader_in(workspace: &std::path::Path) -> Command {
     let mut command = Command::new(if cfg!(windows) { "python" } else { "python3" });
     command
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .arg("scripts/plan/read.py");
+        .current_dir(workspace)
+        .arg(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/plan/read.py"));
     command
 }
 
@@ -346,8 +352,12 @@ fn test_plan_reader_rejects_contract_or_projection_drift() {
 #[test]
 fn test_plan_reader_creates_one_valid_plan_on_stdout() {
     let result: Result<()> = (|| {
-        let output = reader()
+        let workspace = TestWorkspace::new_named("plan-reader-stdout")?;
+        workspace.add_crate("reader", "0.1.0", &[])?;
+        workspace.commit("establish plan reader stdout fixture")?;
+        let output = reader_in(&workspace.path)
             .env("CARGO_RAIL_BIN", env!("CARGO_BIN_EXE_cargo-rail"))
+            .env("RAIL_SINCE", "HEAD")
             .args(["create", "-", "--all"])
             .output()?;
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
@@ -391,6 +401,128 @@ fn test_plan_reader_delegates_final_authority_verification_to_cargo_rail() {
 }
 
 #[test]
+fn test_portable_plan_bundle_validates_integrity_contract_identity_and_checkout_before_execution() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("portable-plan-bundle")?;
+        let package = ws.add_crate("reader", "0.1.0", &[])?;
+        let base = ws.commit("establish portable plan base")?;
+        std::fs::write(package.join("src/lib.rs"), "pub fn head() {}\n")?;
+        let head = ws.commit("establish portable plan head")?;
+        let target = ws.path.join("target/portable-plan");
+        std::fs::create_dir_all(&target)?;
+        let source_plan = target.join("source-plan.json");
+        let planned = reader_at(&ws.path)
+            .env("RAIL_SINCE", &base)
+            .env("RAIL_OBJECT_HEAD", &head)
+            .args(["create"])
+            .arg(&source_plan)
+            .output()?;
+        assert!(planned.status.success(), "{}", String::from_utf8_lossy(&planned.stderr));
+        let bundled = reader_in(&ws.path)
+            .args(["bundle"])
+            .arg(&source_plan)
+            .arg(&target)
+            .args(["--producer-version", "0.26.0"])
+            .output()?;
+        assert!(bundled.status.success(), "{}", String::from_utf8_lossy(&bundled.stderr));
+
+        let manifest_path = target.join("plan-bundle-v1.json");
+        let plan_path = target.join("plan-v8.json");
+        let reader_path = target.join("plan-read.py");
+        let manifest: Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+        let schema: Value = serde_json::from_str(PLAN_BUNDLE_V1_SCHEMA)?;
+        let validator = jsonschema::validator_for(&schema)?;
+        assert!(
+            validator.iter_errors(&manifest).next().is_none(),
+            "portable plan bundle failed its published schema"
+        );
+        assert_eq!(manifest["plan_bundle_version"], 1);
+        assert_eq!(manifest["contract"]["version"], 8);
+        assert_eq!(manifest["producer"]["version"], "0.26.0");
+        assert_eq!(manifest["platform_limits"]["architectures"][0], "any");
+        let payload_bytes = manifest["files"]
+            .as_array()
+            .context("bundle files missing")?
+            .iter()
+            .filter_map(|file| file["size"].as_u64())
+            .sum::<u64>();
+        assert!(payload_bytes < 1024 * 1024, "portable verifier bundle is not compact");
+
+        let verify = || -> Result<std::process::Output> {
+            Ok(Command::new(if cfg!(windows) { "python" } else { "python3" })
+                .current_dir(&ws.path)
+                .arg(&reader_path)
+                .args(["verify-bundle"])
+                .arg(&manifest_path)
+                .output()?)
+        };
+        let accepted = verify()?;
+        assert!(
+            accepted.status.success(),
+            "{}",
+            String::from_utf8_lossy(&accepted.stderr)
+        );
+        assert!(accepted.stdout.is_empty());
+
+        std::fs::write(ws.path.join("dirty.txt"), "dirty\n")?;
+        let dirty = verify()?;
+        assert_eq!(dirty.status.code(), Some(2));
+        std::fs::remove_file(ws.path.join("dirty.txt"))?;
+
+        let original_manifest = std::fs::read(&manifest_path)?;
+        let original_plan = std::fs::read(&plan_path)?;
+        let mut incompatible: Value = serde_json::from_slice(&original_manifest)?;
+        incompatible["contract"]["version"] = 9.into();
+        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&incompatible)?)?;
+        assert_eq!(verify()?.status.code(), Some(2));
+        std::fs::write(&manifest_path, &original_manifest)?;
+
+        let bind_plan_file = || -> Result<()> {
+            let bytes = std::fs::read(&plan_path)?;
+            let mut manifest: Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+            let file = manifest["files"]
+                .as_array_mut()
+                .context("bundle files missing")?
+                .iter_mut()
+                .find(|file| file["role"] == "execution_plan")
+                .context("execution plan role missing")?;
+            file["size"] = (bytes.len() as u64).into();
+            file["sha256"] = Value::String(
+                Sha256::digest(&bytes)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect(),
+            );
+            std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+            Ok(())
+        };
+        std::fs::write(&plan_path, b"{")?;
+        bind_plan_file()?;
+        assert_eq!(verify()?.status.code(), Some(2));
+
+        std::fs::write(&plan_path, &original_plan)?;
+        std::fs::write(&manifest_path, &original_manifest)?;
+        let mut wrong_identity: Value = serde_json::from_slice(&original_plan)?;
+        let rejected_identity = format!("plan-v8:sha256:{}", "0".repeat(64));
+        wrong_identity["identity"] = Value::String(rejected_identity.clone());
+        std::fs::write(&plan_path, serde_json::to_vec(&wrong_identity)?)?;
+        let mut manifest: Value = serde_json::from_slice(&original_manifest)?;
+        manifest["plan_identity"] = Value::String(rejected_identity);
+        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+        bind_plan_file()?;
+        assert_eq!(verify()?.status.code(), Some(2));
+
+        std::fs::write(&plan_path, &original_plan)?;
+        std::fs::write(&manifest_path, &original_manifest)?;
+        std::fs::write(package.join("src/lib.rs"), "pub fn later_commit() {}\n")?;
+        ws.commit("move beyond portable plan head")?;
+        assert_eq!(verify()?.status.code(), Some(2));
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
 fn test_plan_reader_accepts_matching_checkout_from_another_planning_host() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("plan-reader-cross-host")?;
@@ -425,19 +557,21 @@ fn test_plan_reader_accepts_matching_checkout_from_another_planning_host() {
 fn test_source_reader_bootstrap_preserves_direct_binary_authority() {
     let result: Result<()> = (|| {
         let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace = TestWorkspace::new_named("source-reader-bootstrap")?;
+        workspace.add_crate("reader", "0.1.0", &[])?;
+        workspace.commit("establish source reader fixture")?;
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("saved-plan.json");
         let bootstrap_target = directory.path().join("bootstrap-target");
-        let planned = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
-            .current_dir(repository)
-            .args(["rail", "plan", "--since", "HEAD", "--json"])
-            .output()?;
+        let planned = run_cargo_rail(&workspace.path, &["rail", "plan", "--since", "HEAD", "--json"])?;
         assert!(planned.status.success(), "{}", String::from_utf8_lossy(&planned.stderr));
         std::fs::write(&path, planned.stdout)?;
 
-        let verified = reader()
+        let verified = Command::new(if cfg!(windows) { "python" } else { "python3" })
+            .current_dir(&workspace.path)
             .env_remove("CARGO_RAIL_BIN")
             .env("RAIL_BOOTSTRAP_TARGET_DIR", bootstrap_target)
+            .arg(repository.join("scripts/plan/read.py"))
             .args(["verify-checkout"])
             .arg(&path)
             .output()?;
@@ -458,6 +592,9 @@ fn test_repository_reader_prefers_the_installed_release_without_an_explicit_boot
     use std::os::unix::fs::PermissionsExt as _;
 
     let result: Result<()> = (|| {
+        let workspace = TestWorkspace::new_named("installed-reader-selection")?;
+        workspace.add_crate("reader", "0.1.0", &[])?;
+        workspace.commit("establish installed reader fixture")?;
         let directory = tempfile::tempdir()?;
         let bin = directory.path().join("bin");
         std::fs::create_dir(&bin)?;
@@ -473,9 +610,10 @@ fn test_repository_reader_prefers_the_installed_release_without_an_explicit_boot
             std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())),
         )?;
 
-        let output = reader()
+        let output = reader_in(&workspace.path)
             .env_remove("CARGO_RAIL_BIN")
             .env_remove("RAIL_BOOTSTRAP_TARGET_DIR")
+            .env("RAIL_SINCE", "HEAD")
             .env("PATH", path)
             .env("CARGO_RAIL_READER_MARKER", &marker)
             .env("CARGO_RAIL_READER_DELEGATE", env!("CARGO_BIN_EXE_cargo-rail"))
@@ -555,21 +693,57 @@ fn test_commit_workflow_consumes_every_builtin_cargo_execution_decision() {
         assert!(CARGO_SCRIPT.contains(&format!("run_cargo_work {work}")));
     }
     assert!(CARGO_SCRIPT.contains("scripts/plan/verify.sh \"$plan_file\""));
-    assert!(VERIFY_SCRIPT.contains("GITHUB_ACTIONS"));
-    assert!(VERIFY_SCRIPT.contains("target/debug/cargo-rail"));
+    assert!(VERIFY_SCRIPT.contains("plan-bundle-v1.json"));
+    assert!(VERIFY_SCRIPT.contains("verify-bundle"));
 }
 
 #[test]
 fn test_ci_dogfoods_released_cache_and_reuses_exact_source_authority() {
     assert!(CACHE_ACTION.contains("loadingalias/cargo-rail-action/cache@"));
-    assert!(CACHE_ACTION.contains("# v8.1.0"));
-    assert!(CACHE_ACTION.contains("version: 0.24.0"));
+    assert!(CACHE_ACTION.contains("# v8.2.0"));
+    assert!(CACHE_ACTION.contains("version: 0.25.0"));
     assert!(CACHE_ACTION.contains("root-portability: remap"));
     assert!(!CACHE_ACTION.contains("scripts/cache/setup.sh --max-size 10GiB"));
-    assert!(!CACHE_ACTION.contains("strict-probe: \"true\""));
+    assert!(CACHE_ACTION.contains("strict-probe: \"true\""));
     assert!(COMMIT_WORKFLOW.contains("target/debug/cargo-rail"));
+    assert!(COMMIT_WORKFLOW.contains("RAIL_OBJECT_HEAD: ${{ github.sha }}"));
+    assert!(COMMIT_WORKFLOW.contains("target/plan-read.py"));
+    assert!(COMMIT_WORKFLOW.contains("target/plan-bundle-v1.json"));
     assert!(COMMIT_WORKFLOW.contains("scripts/plan/verify.sh target/plan-v8.json"));
     assert!(COMMIT_WORKFLOW.contains("stage: ${{ github.event_name == 'push'"));
+    assert!(RAIL_CONFIG.contains(
+        "[plan.work.\"docs.generated\"]\nscope = \"repository\"\npaths = [\n  \"scripts/docs/**\",\n  \"scripts/ci/install-tools.sh\""
+    ));
+}
+
+#[test]
+fn test_ci_scopes_remote_cache_credentials_to_setup_and_compiler_steps() {
+    let commit_setup = r#"          native-cache-access-key-id: ${{ env.CARGO_RAIL_CACHE_URL != '' && secrets.CARGO_RAIL_R2_ACCESS_KEY_ID || '' }}
+          native-cache-secret-access-key: ${{ env.CARGO_RAIL_CACHE_URL != '' && secrets.CARGO_RAIL_R2_SECRET_ACCESS_KEY || '' }}"#;
+    assert_eq!(COMMIT_WORKFLOW.matches(commit_setup).count(), 4);
+
+    let reusable_setup = r#"          remote-access-key-id: ${{ inputs.native-cache-url != '' && secrets.r2_access_key_id || '' }}
+          remote-secret-access-key: ${{ inputs.native-cache-url != '' && secrets.r2_secret_access_key || '' }}"#;
+    assert_eq!(COMPATIBILITY_WORKFLOW.matches(reusable_setup).count(), 2);
+    assert_eq!(ARCHIVE_WORKFLOW.matches(reusable_setup).count(), 1);
+
+    let credential_environment = r#"      env:
+        AWS_ACCESS_KEY_ID: ${{ inputs.remote-access-key-id }}
+        AWS_SECRET_ACCESS_KEY: ${{ inputs.remote-secret-access-key }}
+        AWS_EC2_METADATA_DISABLED: "true"
+      uses: loadingalias/cargo-rail-action/cache@"#;
+    assert!(CACHE_ACTION.contains(credential_environment));
+    assert_eq!(CACHE_ACTION.matches("AWS_ACCESS_KEY_ID:").count(), 1);
+    assert_eq!(CACHE_ACTION.matches("AWS_SECRET_ACCESS_KEY:").count(), 1);
+    assert!(!SETUP_ACTION.contains("AWS_ACCESS_KEY_ID"));
+    assert!(!SETUP_ACTION.contains("AWS_SECRET_ACCESS_KEY"));
+
+    let commit_compiler =
+        "AWS_ACCESS_KEY_ID: ${{ env.CARGO_RAIL_CACHE_URL != '' && secrets.CARGO_RAIL_R2_ACCESS_KEY_ID || '' }}";
+    assert_eq!(COMMIT_WORKFLOW.matches(commit_compiler).count(), 5);
+    let reusable_compiler = "AWS_ACCESS_KEY_ID: ${{ inputs.native-cache-url != '' && secrets.r2_access_key_id || '' }}";
+    assert_eq!(COMPATIBILITY_WORKFLOW.matches(reusable_compiler).count(), 7);
+    assert_eq!(ARCHIVE_WORKFLOW.matches(reusable_compiler).count(), 2);
 }
 
 #[test]
@@ -593,14 +767,12 @@ fn test_ci_uses_one_r2_authority_with_bounded_credentials() {
     for source in [COMPATIBILITY_WORKFLOW, ARCHIVE_WORKFLOW] {
         assert!(source.contains("secrets:\n      r2_access_key_id:"));
         assert!(source.contains("r2_secret_access_key:"));
-        assert!(source.contains("remote-credentials-ready:"));
+        assert!(source.contains("remote-access-key-id:"));
+        assert!(source.contains("remote-secret-access-key:"));
     }
     assert!(CACHE_ACTION.contains("r2://*)"));
-    assert!(CACHE_ACTION.contains("CARGO_RAIL_CACHE_CREDENTIALS_READY"));
-    assert!(!CACHE_ACTION.contains("AWS_ACCESS_KEY_ID"));
-    assert!(!CACHE_ACTION.contains("AWS_SECRET_ACCESS_KEY"));
-    assert!(!SETUP_ACTION.contains("AWS_ACCESS_KEY_ID"));
-    assert!(!SETUP_ACTION.contains("AWS_SECRET_ACCESS_KEY"));
+    assert!(CACHE_ACTION.contains("inputs.remote-access-key-id == ''"));
+    assert!(CACHE_ACTION.contains("inputs.remote-secret-access-key == ''"));
 }
 
 #[test]
@@ -618,4 +790,28 @@ fn test_release_reuses_exact_sha_commit_archives_with_recovery_fallback() {
     }
     assert!(!RELEASE_WORKFLOW.contains("cargo nextest run"));
     assert!(!RELEASE_WORKFLOW.contains("Verify Clippy"));
+}
+
+#[test]
+fn test_release_tag_gate_requires_the_current_publication_contract() {
+    for fragment in [
+        "trailers:key=Rail-Release-Contract,valueonly)' \"$tag_sha\")\" = 1",
+        "trailers:key=Rail-Release-Mode,valueonly)' \"$tag_sha\")\" = run",
+        "trailers:key=Rail-Release-Publish,valueonly)' \"$tag_sha\")\" = true",
+        "trailers:key=Rail-Release-Publish-Registry,valueonly)' \"$tag_sha\")\" = crates-io",
+        "trailers:key=Rail-Release-Crate,valueonly)' \"$tag_sha\")\" = \"cargo-rail@${RELEASE_TAG#v}\"",
+        "trailers:key=Rail-Release-Crate-Publish,valueonly)' \"$tag_sha\")\" = cargo-rail=true",
+        "trailers:key=Rail-Release-Tag,valueonly)' \"$tag_sha\")\" = true",
+        "trailers:key=Rail-Release-Tag-Name,valueonly)' \"$tag_sha\")\" = \"cargo-rail=$RELEASE_TAG\"",
+    ] {
+        assert!(
+            RELEASE_WORKFLOW.contains(fragment),
+            "missing release trailer gate: {fragment}"
+        );
+        assert_eq!(
+            RELEASE_WORKFLOW.matches(fragment).count(),
+            1,
+            "release trailer gate must be exact and singular: {fragment}"
+        );
+    }
 }

@@ -15,6 +15,7 @@ fi
 
 machine="$(uname -m)"
 system="$(uname -s)"
+gnu_runtime=false
 case "$system-$machine" in
   Darwin-arm64) target="aarch64-apple-darwin"; surface=true ;;
   Linux-aarch64|Linux-arm64)
@@ -22,6 +23,7 @@ case "$system-$machine" in
       target="aarch64-unknown-linux-musl"; surface=true
     else
       target="aarch64-unknown-linux-gnu"; surface=true
+      gnu_runtime=true
     fi
     ;;
   Linux-x86_64)
@@ -29,10 +31,32 @@ case "$system-$machine" in
       target="x86_64-unknown-linux-musl"; surface=true
     else
       target="x86_64-unknown-linux-gnu"; surface=true
+      gnu_runtime=true
     fi
     ;;
   *) echo "no supported Cargo-Rail archive for $system $machine" >&2; exit 1 ;;
 esac
+
+gnu_minimum="2.35"
+if [ "$gnu_runtime" = true ]; then
+  command -v getconf >/dev/null 2>&1 || {
+    echo "Cargo-Rail GNU archives require glibc $gnu_minimum or newer; getconf is unavailable" >&2
+    exit 1
+  }
+  gnu_report="$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"
+  gnu_version="$(printf '%s\n' "$gnu_report" | awk '$1 == "glibc" && NF == 2 { print $2 }')"
+  printf '%s' "$gnu_version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' || {
+    echo "Cargo-Rail could not verify the host GNU libc version" >&2
+    exit 1
+  }
+  if ! awk -v actual="$gnu_version" -v minimum="$gnu_minimum" 'BEGIN {
+    split(actual, a, "."); split(minimum, m, ".");
+    exit !((a[1] + 0 > m[1] + 0) || (a[1] + 0 == m[1] + 0 && a[2] + 0 >= m[2] + 0))
+  }'; then
+    echo "Cargo-Rail GNU archives require glibc $gnu_minimum or newer; found $gnu_version" >&2
+    exit 1
+  fi
+fi
 
 sha256_file() {
   if command -v sha256sum >/dev/null 2>&1; then

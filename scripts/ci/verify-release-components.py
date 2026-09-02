@@ -41,17 +41,22 @@ def main() -> None:
 
   suffix = ".exe" if "-windows-" in arguments.target else ""
   expected = {
-    f"cargo-rail{suffix}",
-    f"cargo-rail-compiler-observation{suffix}",
-    f"cargo-rail-native-rustc-wrapper{suffix}",
-    f"cargo-rail-native-rustc-worker{suffix}",
-    f"cargo-rail-distributed-worker{suffix}",
+    f"cargo-rail{suffix}": "core",
+    f"cargo-rail-compiler-observation{suffix}": "analysis",
+    f"cargo-rail-native-rustc-wrapper{suffix}": "cache",
+    f"cargo-rail-native-rustc-worker{suffix}": "cache",
+    f"cargo-rail-distributed-worker{suffix}": "distributed",
   }
   if arguments.surface == "true":
-    expected.update({f"cargo-rail-fact-driver{suffix}", "cargo-rail-fact-driver-source-v1.json"})
+    expected.update({
+      f"cargo-rail-fact-driver{suffix}": "surface",
+      "cargo-rail-fact-driver-source-v1.json": "surface-source",
+    })
   if entries.keys() != expected:
     raise RuntimeError("release component manifest does not declare the exact platform inventory")
-  for name, (digest, size, _) in entries.items():
+  for name, (digest, size, capability) in entries.items():
+    if capability != expected[name]:
+      raise RuntimeError(f"release component capability does not match its name: {name}")
     path = directory / name
     if path.is_symlink() or not path.is_file() or path.stat().st_size != size:
       raise RuntimeError(f"release component is missing or changed: {name}")

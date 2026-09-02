@@ -1,11 +1,10 @@
-//! `cargo rail change` - intent-file management.
+//! Record and validate reviewed release intent in `.changes/`.
 
-use crate::change_detection::classify_path;
+use crate::change_detection::changed_code_crate_names;
 use crate::commands::common::ChangeOutputFormat;
-use crate::config::{ChangelogConfig, ChangelogFilters, ReleaseConfig, ReleaseSource};
+use crate::config::ReleaseConfig;
 use crate::error::{RailError, RailResult};
 use crate::git::detect_default_base_ref;
-use crate::release::attribution::{AttributedHistory, CommitAttributor};
 use crate::release::change_files::{
     ChangeBump, PendingChangeSet, parse_change_file, render_change_content, write_change_file,
 };
@@ -26,8 +25,6 @@ pub struct ChangeCheckOptions {
     pub merge_base: bool,
     /// Scan full reachable history.
     pub all: bool,
-    /// Require every changed crate to have a change file.
-    pub required: bool,
     /// Output format.
     pub format: ChangeOutputFormat,
 }
@@ -197,7 +194,7 @@ pub fn run_change_check(ctx: &WorkspaceContext, options: ChangeCheckOptions) -> 
     let workspace_members = ctx.graph().workspace_members();
     let base = resolve_change_check_base(ctx, &options)?;
     let pending = PendingChangeSet::load(ctx.workspace_root(), &release_config.change_dir, workspace_members)?;
-    let changed_code_crates = changed_code_crates(ctx, release_config, base.as_deref(), workspace_members)?;
+    let changed_code_crates = changed_code_crates(ctx, base.as_deref())?;
     let covered_crates: Vec<_> = changed_code_crates
         .iter()
         .filter(|crate_name| pending.covers(crate_name))
@@ -206,21 +203,18 @@ pub fn run_change_check(ctx: &WorkspaceContext, options: ChangeCheckOptions) -> 
     let missing_change_files: Vec<_> = changed_code_crates
         .iter()
         .filter(|crate_name| !pending.covers(crate_name))
-        .filter(|crate_name| options.required || release_config.requires_change_file(crate_name))
         .cloned()
         .collect();
 
     match options.format {
         ChangeOutputFormat::Text => print_change_check_text(
             base.as_deref(),
-            options.required,
             &changed_code_crates,
             &covered_crates,
             &missing_change_files,
         ),
         ChangeOutputFormat::Json => print_change_check_json(
             base.as_deref(),
-            options.required,
             &release_config.change_dir,
             &changed_code_crates,
             &covered_crates,
@@ -265,101 +259,14 @@ fn resolve_change_check_base(ctx: &WorkspaceContext, options: &ChangeCheckOption
     detect_default_base_ref(git).map(Some)
 }
 
-fn changed_code_crates(
-    ctx: &WorkspaceContext,
-    release_config: &ReleaseConfig,
-    base: Option<&str>,
-    workspace_members: &[String],
-) -> RailResult<Vec<String>> {
-    if release_config.source == ReleaseSource::Changes {
-        let mut changed = FxHashSet::default();
-        for repository_path in ctx.source_paths_since(base)? {
-            let Some(workspace_path) = ctx.to_workspace_path(&repository_path) else {
-                continue;
-            };
-            if !classify_path(&workspace_path).seeds_build_test_transitive() {
-                continue;
-            }
-            if let Some(owner) = ctx.graph().file_to_crate(&workspace_path) {
-                changed.insert(owner);
-            }
-        }
-        let mut changed: Vec<_> = changed.into_iter().collect();
-        changed.sort();
-        return Ok(changed);
-    }
-
-    let attributor = CommitAttributor::new(ctx);
-    let mut histories: BTreeMap<HistoryKey, AttributedHistory> = BTreeMap::new();
-    let mut changed = Vec::new();
-
-    for crate_name in workspace_members {
-        let changelog_config = ctx
-            .config()
-            .as_ref()
-            .and_then(|config| config.crates.get(crate_name))
-            .and_then(|crate_config| crate_config.changelog.as_ref());
-        let filters = effective_changelog_filters(&release_config.changelog.filters, changelog_config);
-        let history = history_for_change_check(&mut histories, &attributor, base, filters)?;
-        if history.has_code_changes(crate_name) {
-            changed.push(crate_name.clone());
-        }
-    }
-
+fn changed_code_crates(ctx: &WorkspaceContext, base: Option<&str>) -> RailResult<Vec<String>> {
+    let mut changed: Vec<_> = changed_code_crate_names(ctx, base)?.into_iter().collect();
     changed.sort();
     Ok(changed)
 }
 
-fn history_for_change_check<'a>(
-    histories: &'a mut BTreeMap<HistoryKey, AttributedHistory>,
-    attributor: &CommitAttributor<'_>,
-    base: Option<&str>,
-    filters: &ChangelogFilters,
-) -> RailResult<&'a AttributedHistory> {
-    let key = HistoryKey::new(base, filters);
-    if !histories.contains_key(&key) {
-        let history = attributor.history_with_filters(base, "HEAD", Some(filters))?;
-        histories.insert(key.clone(), history);
-    }
-
-    histories
-        .get(&key)
-        .ok_or_else(|| RailError::message("internal error: missing cached change-check history"))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct HistoryKey {
-    base: Option<String>,
-    skip_types: Vec<String>,
-    skip_scopes: Vec<String>,
-    include_paths: Vec<String>,
-    exclude_paths: Vec<String>,
-}
-
-impl HistoryKey {
-    fn new(base: Option<&str>, filters: &ChangelogFilters) -> Self {
-        Self {
-            base: base.map(str::to_string),
-            skip_types: filters.skip_types.clone(),
-            skip_scopes: filters.skip_scopes.clone(),
-            include_paths: filters.include_paths.clone(),
-            exclude_paths: filters.exclude_paths.clone(),
-        }
-    }
-}
-
-fn effective_changelog_filters<'a>(
-    workspace_filters: &'a ChangelogFilters,
-    overrides: Option<&'a ChangelogConfig>,
-) -> &'a ChangelogFilters {
-    overrides
-        .and_then(|config| config.filters.as_ref())
-        .unwrap_or(workspace_filters)
-}
-
 fn print_change_check_text(
     base: Option<&str>,
-    required_override: bool,
     changed_code_crates: &[String],
     covered_crates: &[String],
     missing_change_files: &[String],
@@ -374,14 +281,7 @@ fn print_change_check_text(
     }
     if crate::output::is_verbose() {
         println!("Base: {}", base.unwrap_or("all history"));
-        println!(
-            "Requirement: {}",
-            if required_override {
-                "all changed crates"
-            } else {
-                "release.require_change_files"
-            }
-        );
+        println!("Requirement: all changed crates");
         if !changed_code_crates.is_empty() {
             println!("Changed code crates: {}", changed_code_crates.join(", "));
         }
@@ -393,7 +293,6 @@ fn print_change_check_text(
 
 fn print_change_check_json(
     base: Option<&str>,
-    required_override: bool,
     change_dir: &str,
     changed_code_crates: &[String],
     covered_crates: &[String],
@@ -409,7 +308,6 @@ fn print_change_check_json(
       "action": "check",
       "base": base,
       "head": "HEAD",
-      "required": if required_override { "all" } else { "configured" },
       "change_dir": change_dir,
       "changed_code_crates": changed_code_crates,
       "covered_crates": covered_crates,

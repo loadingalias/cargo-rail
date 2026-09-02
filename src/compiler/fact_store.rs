@@ -1,10 +1,11 @@
-//! Exact, independently reusable compiler-fact objects in the shared local CAS.
+//! Exact, independently reusable compiler-fact objects in the selected profile's local CAS.
 //!
 //! One small set object proves completeness for a scheduled Cargo view. Each
 //! compiler-owned fact object is stored and authenticated separately, so an
 //! interrupted publication cannot turn a partial set into reuse authority.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use crate::cache::cas::{CompilerEvidenceStoreRequest, LocalCas};
 use crate::compiler::diagnostics_store::{
@@ -15,16 +16,22 @@ use crate::error::{RailError, RailResult};
 
 const MAX_FACT_OBJECTS_PER_VIEW: usize = 1_000_000;
 
-/// Optional shared-CAS authority for typed fact reuse.
+/// Optional profile-owned CAS authority for typed fact reuse.
 pub(crate) struct CompilerFactStore {
     cas: Option<LocalCas>,
+    remote: Option<Arc<crate::remote_cache::RemoteStore>>,
 }
 
 impl CompilerFactStore {
-    pub(crate) fn load() -> Self {
+    pub(crate) fn load_with_remote(remote: Option<Arc<crate::remote_cache::RemoteStore>>) -> Self {
         Self {
             cas: LocalCas::open().ok(),
+            remote,
         }
+    }
+
+    pub(crate) const fn durability_available(&self) -> bool {
+        self.cas.is_some()
     }
 
     /// Load one complete exact set. Any missing or mismatched object is a miss.
@@ -33,7 +40,13 @@ impl CompilerFactStore {
             return Ok(None);
         };
         let candidate_key = CompilerFactEvidenceValidation::set_candidate_key(key)?;
-        let candidates = cas.compiler_evidence_candidates(&candidate_key)?;
+        let mut candidates = cas.compiler_evidence_candidates(&candidate_key)?;
+        if candidates.is_empty()
+            && let Some(remote) = &self.remote
+            && remote.import_compiler_evidence(cas, &candidate_key).is_ok()
+        {
+            candidates = cas.compiler_evidence_candidates(&candidate_key)?;
+        }
         for candidate in candidates {
             let Some(validation) = candidate.validation.compiler_facts() else {
                 continue;
@@ -54,7 +67,7 @@ impl CompilerFactStore {
             let mut objects = Vec::with_capacity(references.len());
             let mut complete = true;
             for reference in references {
-                match load_object(cas, key, reference)? {
+                match load_object(cas, self.remote.as_deref(), key, reference)? {
                     Some(object) => objects.push(object),
                     None => {
                         complete = false;
@@ -108,8 +121,10 @@ impl CompilerFactStore {
             ));
         }
 
+        let mut remote_complete = self.remote.is_some();
         for (reference, object) in &objects_by_identity {
-            store_object(cas, key, object, reference)?;
+            let published = store_object(cas, self.remote.as_deref(), key, object, reference)?;
+            remote_complete &= published;
         }
 
         let validation = CompilerFactEvidenceValidation::set(key.clone(), references.clone())?;
@@ -118,16 +133,20 @@ impl CompilerFactStore {
             validation: &validation,
             evidence: &evidence,
         })?;
+        if remote_complete && let Some(remote) = &self.remote {
+            drop(remote.publish_compiler_evidence(&validation, &evidence));
+        }
         Ok(())
     }
 }
 
 fn store_object(
     cas: &LocalCas,
+    remote: Option<&crate::remote_cache::RemoteStore>,
     key: &CompilerFactCacheKey,
     object: &ValidatedCompilerFactObject,
     reference: &CompilerFactObjectReference,
-) -> RailResult<()> {
+) -> RailResult<bool> {
     let validation = CompilerFactEvidenceValidation::object(
         key.producer_authority().clone(),
         key.required_coverage().clone(),
@@ -138,11 +157,12 @@ fn store_object(
         validation: &validation,
         evidence: &evidence,
     })?;
-    Ok(())
+    Ok(remote.is_some_and(|remote| remote.publish_compiler_evidence(&validation, &evidence).is_ok()))
 }
 
 fn load_object(
     cas: &LocalCas,
+    remote: Option<&crate::remote_cache::RemoteStore>,
     key: &CompilerFactCacheKey,
     reference: &CompilerFactObjectReference,
 ) -> RailResult<Option<ValidatedCompilerFactObject>> {
@@ -151,7 +171,15 @@ fn load_object(
         key.required_coverage().clone(),
         reference.clone(),
     )?;
-    let candidates = cas.compiler_evidence_candidates(expected_validation.candidate_key())?;
+    let mut candidates = cas.compiler_evidence_candidates(expected_validation.candidate_key())?;
+    if candidates.is_empty()
+        && let Some(remote) = remote
+        && remote
+            .import_compiler_evidence(cas, expected_validation.candidate_key())
+            .is_ok()
+    {
+        candidates = cas.compiler_evidence_candidates(expected_validation.candidate_key())?;
+    }
     for candidate in candidates {
         let Some(validation) = candidate.validation.compiler_facts() else {
             continue;
@@ -212,7 +240,10 @@ mod tests {
     fn complete_fact_set_reopens_from_independent_cas_objects() {
         let cache = tempfile::tempdir().expect("cache root");
         let cas = LocalCas::open_at(cache.path(), 16 * 1024 * 1024).expect("local CAS");
-        let store = CompilerFactStore { cas: Some(cas) };
+        let store = CompilerFactStore {
+            cas: Some(cas),
+            remote: None,
+        };
         let (key, object) = fact_fixture();
         let identity = object.identity().to_string();
 
@@ -221,6 +252,7 @@ mod tests {
 
         let reopened = CompilerFactStore {
             cas: Some(LocalCas::open_at(cache.path(), 16 * 1024 * 1024).expect("reopen local CAS")),
+            remote: None,
         };
         let hit = reopened.get(&key).expect("fact lookup").expect("complete hit");
         assert_eq!(hit.len(), 1);
@@ -231,7 +263,10 @@ mod tests {
     fn empty_fact_set_is_a_complete_reusable_result() {
         let cache = tempfile::tempdir().expect("cache root");
         let cas = LocalCas::open_at(cache.path(), 16 * 1024 * 1024).expect("local CAS");
-        let store = CompilerFactStore { cas: Some(cas) };
+        let store = CompilerFactStore {
+            cas: Some(cas),
+            remote: None,
+        };
         let (key, _) = fact_fixture();
 
         store.put(&key, &[]).expect("publish empty fact set");
@@ -259,7 +294,10 @@ mod tests {
         })
         .expect("publish incomplete set fixture");
 
-        let store = CompilerFactStore { cas: Some(cas) };
+        let store = CompilerFactStore {
+            cas: Some(cas),
+            remote: None,
+        };
         assert!(store.get(&key).expect("fact lookup").is_none());
     }
 
@@ -267,7 +305,10 @@ mod tests {
     fn moved_workspace_root_reuses_the_same_exact_fact_set() {
         let cache = tempfile::tempdir().expect("cache root");
         let cas = LocalCas::open_at(cache.path(), 16 * 1024 * 1024).expect("local CAS");
-        let store = CompilerFactStore { cas: Some(cas) };
+        let store = CompilerFactStore {
+            cas: Some(cas),
+            remote: None,
+        };
         let (key, object) = fact_fixture();
         store.put(&key, &[object]).expect("publish complete fact set");
 
@@ -281,7 +322,10 @@ mod tests {
     fn every_fact_set_authority_change_is_a_cache_miss() {
         let cache = tempfile::tempdir().expect("cache root");
         let cas = LocalCas::open_at(cache.path(), 16 * 1024 * 1024).expect("local CAS");
-        let store = CompilerFactStore { cas: Some(cas) };
+        let store = CompilerFactStore {
+            cas: Some(cas),
+            remote: None,
+        };
         let (key, object) = fact_fixture();
         store.put(&key, &[object]).expect("publish complete fact set");
 
@@ -313,7 +357,10 @@ mod tests {
     fn corrupt_fact_object_cannot_authorize_a_hit() {
         let cache = tempfile::tempdir().expect("cache root");
         let cas = LocalCas::open_at(cache.path(), 16 * 1024 * 1024).expect("local CAS");
-        let store = CompilerFactStore { cas: Some(cas) };
+        let store = CompilerFactStore {
+            cas: Some(cas),
+            remote: None,
+        };
         let (key, object) = fact_fixture();
         store.put(&key, &[object]).expect("publish complete fact set");
 

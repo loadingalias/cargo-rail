@@ -90,7 +90,7 @@ struct BuildScriptInstructionSummary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InstructionSyntax {
     Modern,
-    Legacy,
+    Classic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,7 +142,7 @@ pub(crate) fn analyze_result(
     if let Some(instructions) = &instruction_stream {
         secret_capabilities.extend(instructions.iter().filter_map(|instruction| {
             let (syntax, name, value) = instruction_parts(instruction)?;
-            if syntax == InstructionSyntax::Legacy && !legacy_instruction_name(name) {
+            if syntax == InstructionSyntax::Classic && !classic_instruction_name(name) {
                 return None;
             }
             let (environment_name, _) = (name == "rustc-env").then_some(value)?.split_once('=')?;
@@ -287,7 +287,7 @@ fn summarize_instructions(instructions: &[String], reasons: &mut BTreeSet<String
             reasons.insert("build_script_instruction_stream_invalid".to_string());
             continue;
         };
-        if syntax == InstructionSyntax::Legacy && !legacy_instruction_name(name) {
+        if syntax == InstructionSyntax::Classic && !classic_instruction_name(name) {
             summary.metadata += 1;
             continue;
         }
@@ -331,13 +331,13 @@ fn instruction_parts(instruction: &str) -> Option<(InstructionSyntax, &str, &str
     let (syntax, body) = if let Some(body) = instruction.strip_prefix("cargo::") {
         (InstructionSyntax::Modern, body)
     } else {
-        (InstructionSyntax::Legacy, instruction.strip_prefix("cargo:")?)
+        (InstructionSyntax::Classic, instruction.strip_prefix("cargo:")?)
     };
     let (name, value) = body.split_once('=')?;
     (!name.is_empty()).then_some((syntax, name, value))
 }
 
-fn legacy_instruction_name(name: &str) -> bool {
+fn classic_instruction_name(name: &str) -> bool {
     matches!(
         name,
         "rustc-flags"
@@ -664,17 +664,17 @@ mod tests {
     }
 
     #[test]
-    fn result_analysis_matches_legacy_metadata_and_rustc_flags_semantics() {
+    fn result_analysis_matches_classic_metadata_and_rustc_flags_semantics() {
         let root = tempfile::tempdir().expect("source root");
         let mut inputs = complete_inputs();
         inputs.instruction_stream.as_mut().unwrap().extend([
             "cargo:include=output:include".to_string(),
-            "cargo:rustc-flags=-L legacy -llegacy".to_string(),
+            "cargo:rustc-flags=-L classic -lclassic".to_string(),
         ]);
         let analysis = analyze_result(root.path(), inputs, None);
         assert!(
             analysis.digest.is_some(),
-            "legacy Cargo instructions should remain valid"
+            "classic Cargo instructions should remain valid"
         );
         let summary = analysis.instructions.expect("instruction summary");
         assert_eq!(summary.total, 11);

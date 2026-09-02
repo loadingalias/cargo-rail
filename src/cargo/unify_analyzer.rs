@@ -1120,13 +1120,18 @@ impl UnifyAnalyzer {
                 .then_with(|| left.member.cmp(&right.member))
                 .then_with(|| left.target.cmp(&right.target))
         });
+        workspace_deps.sort_unstable_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then_with(|| left.package.cmp(&right.package))
+                .then_with(|| left.target.cmp(&right.target))
+        });
 
         Ok(UnificationPlan {
             workspace_deps,
             member_edits,
             member_paths,
             transitive_pins,
-            validation_results: Vec::new(),
             issues,
             computed_msrv,
             duplicates_cleaned,
@@ -1143,9 +1148,11 @@ impl UnifyAnalyzer {
 
     /// Derive executable feature/target inputs from this analyzer's captured graph.
     pub(crate) fn coverage_views(&self) -> RailResult<Vec<crate::compiler::CoverageView>> {
+        let resolution_targets = self.metadata.targets();
+        let compiler_targets = self.config.effective_compiler_targets(&resolution_targets);
         crate::compiler::scheduler::planned_coverage_views(
             &self.manifests.members,
-            &self.metadata.targets(),
+            &compiler_targets,
             &self.target_cfg_sets,
         )
     }

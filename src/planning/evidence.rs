@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
-use crate::graph::DependencyUniverse;
 use crate::workspace::WorkspaceContext;
 
 pub(super) struct EvidenceBindings<'a> {
@@ -122,7 +121,7 @@ impl PlanningEvidenceState {
     pub(super) fn load(
         path: Option<&Path>,
         bindings: EvidenceBindings<'_>,
-        dependency_universe: &DependencyUniverse,
+        cargo_identity: &str,
         ctx: &WorkspaceContext,
     ) -> Self {
         let Some(path) = path else {
@@ -146,7 +145,7 @@ impl PlanningEvidenceState {
                 };
             }
         };
-        match validate(manifest, bindings, dependency_universe, ctx) {
+        match validate(manifest, bindings, cargo_identity, ctx) {
             Ok(manifest) => Self::Compatible(Box::new(manifest)),
             Err((code, description)) => Self::Incompatible { code, description },
         }
@@ -191,7 +190,7 @@ impl PlanningEvidenceState {
 fn validate(
     mut manifest: PlanningEvidenceManifest,
     bindings: EvidenceBindings<'_>,
-    dependency_universe: &DependencyUniverse,
+    cargo_identity: &str,
     ctx: &WorkspaceContext,
 ) -> Result<PlanningEvidenceManifest, (String, String)> {
     if manifest.planning_evidence_version != EVIDENCE_VERSION {
@@ -254,7 +253,7 @@ fn validate(
             "planning evidence is bound to a different base source identity".to_string(),
         ));
     }
-    if manifest.cargo_identity != dependency_universe.identity() {
+    if manifest.cargo_identity != cargo_identity {
         return Err(incompatible(
             "planning_evidence_cargo_mismatch",
             "planning evidence is bound to a different Cargo resolution universe".to_string(),

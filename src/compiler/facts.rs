@@ -340,7 +340,6 @@ fn read_fragment_sidecar(path: &Path) -> RailResult<Vec<u8>> {
 pub(crate) struct ValidatedCompilerFactFragment {
     fragment: CompilerFactFragment,
     object_identity: String,
-    bytes: u64,
     object_bytes: u64,
 }
 
@@ -370,17 +369,12 @@ impl ValidatedCompilerFactFragment {
         Ok(Self {
             fragment,
             object_identity,
-            bytes: bytes.len() as u64,
             object_bytes,
         })
     }
 
     pub(crate) fn object_identity(&self) -> &str {
         &self.object_identity
-    }
-
-    pub(crate) const fn bytes(&self) -> u64 {
-        self.bytes
     }
 
     pub(crate) fn into_object(self) -> ValidatedCompilerFactObject {
@@ -1193,11 +1187,11 @@ mod tests {
         wrong_version.version += 1;
         assert!(decode(&wrong_version).is_err());
 
-        let mut legacy_v3 = fragment.clone();
-        legacy_v3.version = 3;
-        legacy_v3.object.version = 3;
-        assert!(decode(&legacy_v3).is_err());
-        decode_object(&legacy_v3).unwrap_err();
+        let mut unsupported_v3 = fragment.clone();
+        unsupported_v3.version = 3;
+        unsupported_v3.object.version = 3;
+        assert!(decode(&unsupported_v3).is_err());
+        decode_object(&unsupported_v3).unwrap_err();
 
         let mut incomplete = fragment;
         incomplete
@@ -1293,6 +1287,39 @@ mod tests {
         let mut counts = fragment();
         counts.object.completion.items += 1;
         assert!(decode(&counts).is_err());
+    }
+
+    #[test]
+    fn fragment_rejects_visibility_without_exact_declaration_binding() {
+        let mut unrelated = fragment();
+        unrelated.object.items[1].visibility_span = Some(CompilerFactSpan {
+            source: 0,
+            start: 0,
+            end: 3,
+        });
+        assert!(decode(&unrelated).is_err());
+
+        let mut cross_file = fragment();
+        cross_file.object.sources.push(CompilerFactSource {
+            path: CompilerFactSourcePath::Repository("src/z.rs".to_string()),
+            content_digest: format!("sha256:{}", "7".repeat(64)),
+            bytes: 22,
+        });
+        cross_file.object.completion.sources += 1;
+        cross_file.object.items[1]
+            .visibility_span
+            .as_mut()
+            .expect("fixture visibility")
+            .source = 1;
+        assert!(decode(&cross_file).is_err());
+
+        let mut incomplete = fragment();
+        incomplete.object.items[1].visibility_span = None;
+        assert!(decode(&incomplete).is_err());
+
+        let mut unexpected = fragment();
+        unexpected.object.items[1].written_visibility = CompilerFactVisibility::Private;
+        assert!(decode(&unexpected).is_err());
     }
 
     #[test]
@@ -1538,14 +1565,53 @@ mod tests {
         let expected_fragment = CompilerFactExpectation::new(run, producer, unit_identity, required_coverage);
         let fragment =
             load_announced_fragment(&output, &announcement, &expected_fragment).expect("admitted driver fragment");
-        assert!(!fragment.fragment.object.items.is_empty());
-        assert!(
-            fragment
-                .fragment
-                .object
-                .edges
+        let object = &fragment.fragment.object;
+        assert!(!object.items.is_empty());
+        assert!(object.edges.iter().any(|edge| edge.kind == CompilerFactEdgeKind::Body));
+
+        let diagnostic_path = |item: &CompilerItemFact| &object.strings[item.diagnostic_path.0 as usize];
+        let generated = object
+            .items
+            .iter()
+            .find(|item| diagnostic_path(item).ends_with("MacroGeneratedPublic"))
+            .expect("macro-generated public fixture item");
+        assert_eq!(generated.written_visibility, CompilerFactVisibility::Public);
+        let visibility = generated.visibility_span.expect("captured call-site visibility");
+        assert_eq!(visibility.source, generated.physical.span.source);
+        assert!(visibility.start >= generated.physical.span.start);
+        assert!(visibility.end <= generated.physical.span.end);
+        let CompilerFactMacroProvenance::Expansion(Some(call_site)) = &generated.macro_provenance else {
+            panic!("macro-generated fixture item must retain its call-site provenance");
+        };
+        assert_eq!(call_site.source, generated.physical.span.source);
+        assert!(call_site.start >= generated.physical.span.start);
+        assert!(call_site.end <= generated.physical.span.end);
+
+        let shared = object
+            .items
+            .iter()
+            .filter(|item| diagnostic_path(item).ends_with("namespace_coexistence::Shared"))
+            .collect::<Vec<_>>();
+        assert_eq!(shared.len(), 3, "type, value, and macro definitions must coexist");
+        assert_eq!(
+            shared
                 .iter()
-                .any(|edge| edge.kind == CompilerFactEdgeKind::Body)
+                .map(|item| item.physical.namespace)
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([
+                CompilerFactNamespace::Type,
+                CompilerFactNamespace::Value,
+                CompilerFactNamespace::Macro,
+            ])
+        );
+        assert_eq!(
+            shared
+                .iter()
+                .map(|item| &item.physical)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            3,
+            "co-located namespace definitions must retain distinct physical identities"
         );
     }
 }

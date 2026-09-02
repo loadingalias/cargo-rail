@@ -7,11 +7,19 @@ if [ "$#" -ne 1 ]; then
 fi
 
 plan_file="$1"
+bundle_manifest="$(dirname "$plan_file")/plan-bundle-v1.json"
+bundle_reader="$(dirname "$plan_file")/plan-read.py"
 
-# The Commit planner artifact carries the exact current-source Linux planner.
-# Other CI hosts rebuild that source in an isolated target because a foreign
-# executable cannot authenticate the checkout. Local use remains on the
-# installed release selected by read.py.
+if [ -f "$bundle_manifest" ] || [ -f "$bundle_reader" ]; then
+  if [ ! -f "$bundle_manifest" ] || [ ! -f "$bundle_reader" ]; then
+    echo "plan bundle is incomplete" >&2
+    exit 2
+  fi
+  exec python3 "$bundle_reader" verify-bundle "$bundle_manifest"
+fi
+
+# Legacy unbundled plans retain binary verification. Portable object-bound
+# artifacts take the manifest path above and never bootstrap a host binary.
 if [ -z "${CARGO_RAIL_BIN:-}" ] && [ -z "${RAIL_BOOTSTRAP_TARGET_DIR+x}" ] && \
   [ "${GITHUB_ACTIONS:-}" = true ]; then
   if [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ] && \

@@ -35,6 +35,14 @@ such as Git readiness or registry state, only when it revalidates that boundary 
 Incomplete evidence widens or bypasses only its owning decision. It never becomes permission to skip work or restore a
 result.
 
+Compiler-backed Unify and Surface work uses one acquisition engine:
+
+1. Build a deterministic target and feature schedule from the captured workspace.
+2. Admit only identity-matched, complete cached evidence.
+3. Run remaining views with bounded process slots, work permits, sandboxes, output, and artifact storage.
+4. Persist resumable progress before dispatch and cancel complete process trees after a failure.
+5. Integrate completed work in deterministic order, independent of worker completion order.
+
 ## Mutation boundary
 
 Every filesystem mutation follows the same sequence:

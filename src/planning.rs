@@ -15,6 +15,7 @@ use crate::source::{ChangeSet, SourceContentIdentity};
 use crate::workspace::WorkspaceContext;
 
 mod evidence;
+mod source_features;
 mod work;
 
 pub(crate) use work::{WorkPlan, WorkPlanAuthority, build_work_plan, format_work_plan};
@@ -273,10 +274,19 @@ fn config_at_ref(ctx: &WorkspaceContext, revision: &str, candidates: &[String]) 
     };
     let path = ctx.repository_path_from_workspace(PathBuf::from(selected).as_path())?;
     let bytes = ctx.git()?.git().read_files_bulk(&[(revision, path.as_path())])?;
-    RailConfig::parse_historical_planning_bytes(&bytes[0]).map_err(|message| {
+    crate::config::v0_25::normalize(&bytes[0], |package_root| {
+        let manifest = package_root.join("Cargo.toml");
+        let manifest = ctx.repository_path_from_workspace(&manifest)?;
+        let mut contents = ctx.git()?.git().read_files_bulk(&[(revision, manifest.as_path())])?;
+        contents
+            .pop()
+            .ok_or_else(|| RailError::message(format!("historical split member has no {}", manifest.display())))
+    })
+    .map(|normalized| normalized.config)
+    .map_err(|error| {
         RailError::with_help(
-            format!("failed to parse historical planning configuration '{selected}': {message}"),
-            "migrate the selected base configuration or choose a comparison ref using the current schema",
+            format!("failed to parse historical planning configuration '{selected}': {error}"),
+            "migrate the selected base configuration or choose a comparison ref with a supported configuration",
         )
     })
 }
@@ -334,5 +344,21 @@ mod tests {
         assert_eq!(deltas[0].path, "release.semver_check");
         assert_eq!(deltas[0].before, "warn");
         assert_eq!(deltas[0].after, "off");
+    }
+
+    #[test]
+    fn exact_v0_25_normalization_projects_only_current_configuration_facts() {
+        let tagged = include_bytes!("../tests/fixtures/config/v0.25.0/rail.toml");
+        let normalized = crate::config::v0_25::normalize(tagged, |_| {
+            Err(RailError::message("fixture unexpectedly requested a split manifest"))
+        })
+        .unwrap();
+        let reparsed = RailConfig::parse_bytes(&normalized.bytes).unwrap();
+        assert!(config_deltas(&normalized.config, &reparsed).unwrap().is_empty());
+
+        let encoded = serde_json::to_string(&normalized.config).unwrap();
+        assert!(!encoded.contains("require_change_files"));
+        assert!(!encoded.contains("unconventional_commits"));
+        assert!(!encoded.contains("skip_types"));
     }
 }

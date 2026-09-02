@@ -2,8 +2,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
-use cargo_metadata::{Package, PackageId};
+use cargo_metadata::{Metadata, MetadataCommand, Package, PackageId};
 use glob::Pattern;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -13,11 +14,12 @@ use super::evidence::{
     EvidenceBindings, ObservedInput, PlanningEvidenceState, PortableBaseEdgeDomain, PortableBaseModel,
     required_capabilities,
 };
+use super::source_features::{SourceActivation, expanded_features, source_activation};
 use super::{ConfigDelta, IndexedFileChange, PlanningIndex};
 use crate::change_detection::semantic::{SemanticFileChange, SemanticScope};
-use crate::config::{CargoPrerequisiteConfig, CargoRootConfig, PlanWorkConfig, PlanWorkScope};
+use crate::config::{CargoPrerequisiteConfig, CargoRootConfig, CargoTargetRootConfig, PlanWorkConfig, PlanWorkScope};
 use crate::error::{RailError, RailResult};
-use crate::graph::DependencyUniverse;
+use crate::graph::{DependencyUniverse, ImpactPropagation};
 use crate::workspace::WorkspaceContext;
 
 const PLAN_CONTRACT_VERSION: u32 = 8;
@@ -184,6 +186,13 @@ struct SelectedVariants {
     variants: Vec<SelectedVariant>,
     attributed_inputs: BTreeSet<String>,
     all_required_inputs_attributed: bool,
+}
+
+#[derive(Default)]
+struct CargoRootMatch {
+    selected: bool,
+    attributed_paths: BTreeSet<String>,
+    origins: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -366,17 +375,27 @@ struct VariantRow {
     id: String,
     dimensions: BTreeMap<String, ScalarDimension>,
     #[serde(default)]
-    paths: Vec<String>,
-    #[serde(default)]
     config: Vec<String>,
-    #[serde(default)]
-    cargo: Vec<String>,
     #[serde(default)]
     external_paths: Vec<String>,
     #[serde(default)]
-    cargo_roots: Vec<CargoRootConfig>,
+    cargo_roots: Vec<VariantCargoRoot>,
     #[serde(skip)]
     resolved_cargo_roots: Vec<ResolvedCargoRoot>,
+}
+
+/// A package/target root in the primary workspace or one configured auxiliary workspace.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VariantCargoRoot {
+    package: String,
+    target: Option<CargoTargetRootConfig>,
+    /// Exact no-default-feature roots. Absence preserves package-level v2 behavior.
+    #[serde(default)]
+    features: Option<Vec<String>>,
+    /// Registered `release.auxiliary_cargo_manifests` entry, when not the primary workspace.
+    #[serde(default)]
+    manifest: Option<String>,
 }
 
 #[derive(Debug)]
@@ -388,9 +407,11 @@ struct ResolvedCargoPrerequisite {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ResolvedCargoRoot {
+    domain: String,
     package: PackageId,
     package_key: String,
     target: Option<ResolvedCargoTarget>,
+    features: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -410,6 +431,235 @@ struct StructuralCargoImpact {
     current_development_origins: BTreeMap<PackageId, String>,
     historical_build_origins: BTreeMap<PackageId, String>,
     historical_development_origins: BTreeMap<PackageId, String>,
+    seed_paths: BTreeMap<PackageId, BTreeSet<String>>,
+    unattributed_seeds: BTreeSet<PackageId>,
+}
+
+struct CargoDomain {
+    metadata: Arc<Metadata>,
+    universe: DependencyUniverse,
+}
+
+struct PlanningCargoModel {
+    domains: BTreeMap<String, CargoDomain>,
+}
+
+const PRIMARY_CARGO_DOMAIN: &str = "workspace";
+
+impl PlanningCargoModel {
+    fn new(ctx: &WorkspaceContext) -> RailResult<Self> {
+        let metadata = ctx.cargo().shared_metadata();
+        let universe = DependencyUniverse::from_metadata(&metadata, ctx.planning_authority_source_root())?;
+        Ok(Self {
+            domains: BTreeMap::from([(PRIMARY_CARGO_DOMAIN.to_string(), CargoDomain { metadata, universe })]),
+        })
+    }
+
+    fn load_auxiliary(&mut self, ctx: &WorkspaceContext, manifest: &str) -> RailResult<()> {
+        if manifest == PRIMARY_CARGO_DOMAIN {
+            return Err(RailError::message(format!(
+                "variant Cargo root manifest '{manifest}' is not a repository-relative manifest path"
+            )));
+        }
+        if self.domains.contains_key(manifest) {
+            return Ok(());
+        }
+        crate::config::plan::validate_positive_path(manifest, "variant Cargo root manifest", false)
+            .map_err(RailError::Config)?;
+        let configured = ctx.config().is_some_and(|config| {
+            config
+                .release
+                .auxiliary_cargo_manifests
+                .iter()
+                .any(|path| crate::utils::path_to_git_format(path) == manifest)
+        });
+        if !configured {
+            return Err(RailError::message(format!(
+                "variant Cargo root manifest '{manifest}' is not registered in release.auxiliary_cargo_manifests"
+            )));
+        }
+
+        ctx.validate_planning_source_unchanged()?;
+        let source_root = ctx.planning_authority_source_root();
+        let manifest_path = source_root.join(manifest);
+        let mut command = MetadataCommand::new();
+        command
+            .current_dir(source_root)
+            .manifest_path(&manifest_path)
+            .other_options(vec!["--locked".to_string()]);
+        crate::instrumentation::record_cargo_metadata_load(false);
+        let metadata = Arc::new(command.exec().map_err(|error| {
+            RailError::message(format!(
+                "failed to load configured auxiliary Cargo manifest '{manifest}': {error}"
+            ))
+        })?);
+        for package in metadata.packages.iter().filter(|package| package.source.is_none()) {
+            let package_manifest = crate::utils::canonicalize_existing(package.manifest_path.as_std_path()).map_err(
+                |error| {
+                    RailError::message(format!(
+                        "failed to resolve local package manifest '{}' from auxiliary Cargo manifest '{manifest}': {error}",
+                        package.manifest_path
+                    ))
+                },
+            )?;
+            if package_manifest.strip_prefix(source_root).is_err() {
+                return Err(RailError::with_help(
+                    format!(
+                        "auxiliary Cargo manifest '{manifest}' resolves local package manifest '{}' outside the captured workspace",
+                        package.manifest_path
+                    ),
+                    "keep auxiliary path dependencies inside the captured workspace",
+                ));
+            }
+        }
+        let universe = DependencyUniverse::from_metadata(&metadata, ctx.planning_authority_source_root())?;
+        ctx.validate_planning_source_unchanged()?;
+        self.domains
+            .insert(manifest.to_string(), CargoDomain { metadata, universe });
+        Ok(())
+    }
+
+    fn identity(&self) -> RailResult<String> {
+        let domains = self
+            .domains
+            .iter()
+            .map(|(name, domain)| (name, domain.universe.identity()))
+            .collect::<Vec<_>>();
+        identity("resolution-universe-v3", &canonical_bytes(&domains)?)
+    }
+
+    fn domain(&self, name: &str) -> RailResult<&CargoDomain> {
+        self.domains
+            .get(name)
+            .ok_or_else(|| RailError::message(format!("Cargo domain '{name}' was not loaded")))
+    }
+
+    fn package<'a>(&'a self, root: &ResolvedCargoRoot) -> RailResult<&'a Package> {
+        self.domain(&root.domain)?
+            .metadata
+            .packages
+            .iter()
+            .find(|package| package.id == root.package)
+            .ok_or_else(|| RailError::message(format!("resolved Cargo package '{}' disappeared", root.package)))
+    }
+
+    fn package_in_domain<'a>(&'a self, domain: &str, package: &PackageId) -> Option<&'a Package> {
+        self.domains
+            .get(domain)?
+            .metadata
+            .packages
+            .iter()
+            .find(|candidate| &candidate.id == package)
+    }
+
+    fn active_features(&self, domain: &str, package: &PackageId) -> Option<BTreeSet<String>> {
+        self.domains
+            .get(domain)?
+            .metadata
+            .resolve
+            .as_ref()?
+            .nodes
+            .iter()
+            .find(|node| &node.id == package)
+            .map(|node| node.features.iter().map(ToString::to_string).collect())
+    }
+
+    fn root_affected_by(&self, root: &ResolvedCargoRoot, seed: &PackageId) -> RailResult<bool> {
+        let domain = self.domain(&root.domain)?;
+        if !domain.universe.contains_package(seed) {
+            return Ok(false);
+        }
+        if seed == &root.package {
+            return Ok(true);
+        }
+        Ok(domain
+            .universe
+            .propagate(&HashSet::from([seed.clone()]))?
+            .build
+            .contains(&root.package))
+    }
+
+    fn propagate(&self, seeds: &HashSet<PackageId>) -> RailResult<ImpactPropagation> {
+        let mut merged = ImpactPropagation::default();
+        for domain in self.domains.values() {
+            let known = seeds
+                .iter()
+                .filter(|seed| domain.universe.contains_package(seed))
+                .cloned()
+                .collect::<HashSet<_>>();
+            if known.is_empty() {
+                continue;
+            }
+            let propagation = domain.universe.propagate(&known)?;
+            merged.build.extend(propagation.build);
+            merged.development.extend(propagation.development);
+            for (package, origin) in propagation.build_origins {
+                let entry = merged.build_origins.entry(package).or_insert_with(|| origin.clone());
+                if origin < *entry {
+                    *entry = origin;
+                }
+            }
+            for (package, origin) in propagation.development_origins {
+                let entry = merged
+                    .development_origins
+                    .entry(package)
+                    .or_insert_with(|| origin.clone());
+                if origin < *entry {
+                    *entry = origin;
+                }
+            }
+        }
+        merged.development.retain(|package| !merged.build.contains(package));
+        merged
+            .development_origins
+            .retain(|package, _| !merged.build_origins.contains_key(package));
+        Ok(merged)
+    }
+
+    fn owning_packages(&self, ctx: &WorkspaceContext, path: &Path) -> BTreeSet<PackageId> {
+        let mut matches = Vec::new();
+        for domain in self.domains.values() {
+            for package in domain
+                .metadata
+                .packages
+                .iter()
+                .filter(|package| package.source.is_none())
+            {
+                let Some(root) = package.manifest_path.parent().and_then(|root| {
+                    root.as_std_path()
+                        .strip_prefix(ctx.planning_authority_source_root())
+                        .ok()
+                }) else {
+                    continue;
+                };
+                if path == root.join("Cargo.toml")
+                    || path
+                        .strip_prefix(root)
+                        .is_ok_and(|suffix| !suffix.as_os_str().is_empty())
+                {
+                    matches.push((root.components().count(), package.id.clone()));
+                }
+            }
+        }
+        let depth = matches.iter().map(|(depth, _)| *depth).max();
+        matches
+            .into_iter()
+            .filter_map(|(candidate_depth, package)| (Some(candidate_depth) == depth).then_some(package))
+            .collect()
+    }
+
+    fn package_key(&self, ctx: &WorkspaceContext, package: &PackageId) -> Option<String> {
+        self.domains
+            .values()
+            .find_map(|domain| {
+                domain
+                    .metadata
+                    .packages
+                    .iter()
+                    .find(|candidate| &candidate.id == package)
+            })
+            .map(|package| portable_package_key(ctx, package))
+    }
 }
 
 #[derive(Default)]
@@ -428,6 +678,7 @@ struct EvidenceIdentity<'a> {
 
 struct Evaluator<'a> {
     ctx: &'a WorkspaceContext,
+    cargo_model: &'a PlanningCargoModel,
     paths: &'a [&'a str],
     config_deltas: &'a [ConfigDelta],
     semantic_changes: &'a BTreeMap<String, SemanticFileChange>,
@@ -442,12 +693,13 @@ pub(crate) fn build_work_plan(
     ctx: &WorkspaceContext,
     index: PlanningIndex,
     authority: WorkPlanAuthority,
-    dependency_universe: &DependencyUniverse,
     semantic_changes: &BTreeMap<String, SemanticFileChange>,
     evidence_path: Option<&Path>,
     force_all: bool,
 ) -> RailResult<WorkPlan> {
-    let specs = build_catalog(ctx)?;
+    let mut cargo_model = PlanningCargoModel::new(ctx)?;
+    let specs = build_catalog(ctx, &mut cargo_model)?;
+    let cargo_identity = cargo_model.identity()?;
     let catalog = catalog_identity(&specs)?;
     let observed = PlanningEvidenceState::load(
         evidence_path,
@@ -457,21 +709,17 @@ pub(crate) fn build_work_plan(
             toolchain_identity: &authority.toolchain_identity,
             target_identity: &authority.target_identity,
         },
-        dependency_universe,
+        &cargo_identity,
         ctx,
     );
     let (work, required, evidence) = {
         let paths = index.paths().collect::<Vec<_>>();
-        let structural_impact = structural_cargo_impact(
-            ctx,
-            dependency_universe,
-            semantic_changes,
-            observed.base_model(),
-            &paths,
-        )?;
+        let structural_impact =
+            structural_cargo_impact(ctx, &cargo_model, semantic_changes, observed.base_model(), &paths)?;
         let prerequisite_source_roots = prerequisite_source_roots(&specs, &structural_impact);
         let mut evaluator = Evaluator {
             ctx,
+            cargo_model: &cargo_model,
             paths: &paths,
             config_deltas: index.config_deltas(),
             semantic_changes,
@@ -511,7 +759,7 @@ pub(crate) fn build_work_plan(
             head: authority.head,
             head_commit: authority.head_commit,
             capture: authority.capture,
-            cargo: dependency_universe.identity().to_string(),
+            cargo: cargo_identity,
             configuration: authority.cargo_configuration_identity,
             toolchain: authority.toolchain_identity,
             target: authority.target_identity,
@@ -537,7 +785,7 @@ pub(crate) fn build_work_plan(
     Ok(plan)
 }
 
-fn build_catalog(ctx: &WorkspaceContext) -> RailResult<Vec<WorkSpec>> {
+fn build_catalog(ctx: &WorkspaceContext, cargo_model: &mut PlanningCargoModel) -> RailResult<Vec<WorkSpec>> {
     let mut specs = BUILTIN_WORK
         .iter()
         .map(|(id, scope)| WorkSpec {
@@ -562,14 +810,19 @@ fn build_catalog(ctx: &WorkspaceContext) -> RailResult<Vec<WorkSpec>> {
                     "repository work ID '{id}' collides with a code-owned built-in"
                 )));
             }
-            specs.push(declared_spec(ctx, id, work)?);
+            specs.push(declared_spec(ctx, cargo_model, id, work)?);
         }
     }
     specs.sort_unstable_by(|left, right| left.id.cmp(&right.id));
     Ok(specs)
 }
 
-fn declared_spec(ctx: &WorkspaceContext, id: &str, work: &PlanWorkConfig) -> RailResult<WorkSpec> {
+fn declared_spec(
+    ctx: &WorkspaceContext,
+    cargo_model: &mut PlanningCargoModel,
+    id: &str,
+    work: &PlanWorkConfig,
+) -> RailResult<WorkSpec> {
     let mut paths = sorted_unique(work.paths.clone());
     let config = sorted_unique(work.config.clone());
     let cargo = sorted_unique(work.cargo.clone());
@@ -584,7 +837,7 @@ fn declared_spec(ctx: &WorkspaceContext, id: &str, work: &PlanWorkConfig) -> Rai
             .ok_or_else(|| RailError::message(format!("variant catalog '{path}' was not captured")))?;
         let mut catalog: VariantCatalog = serde_json::from_slice(&bytes)
             .map_err(|error| RailError::message(format!("invalid variant catalog '{path}': {error}")))?;
-        validate_variant_catalog(ctx, id, path, &cargo, &mut catalog)?;
+        validate_variant_catalog(ctx, cargo_model, id, path, &cargo, &mut catalog)?;
         let identity = identity(
             &format!("variant-catalog-v{}", catalog.variant_catalog_version),
             &canonical_bytes(&catalog)?,
@@ -619,12 +872,13 @@ fn declared_spec(ctx: &WorkspaceContext, id: &str, work: &PlanWorkConfig) -> Rai
 
 fn validate_variant_catalog(
     ctx: &WorkspaceContext,
+    cargo_model: &mut PlanningCargoModel,
     id: &str,
     path: &str,
     work_cargo: &[String],
     catalog: &mut VariantCatalog,
 ) -> RailResult<()> {
-    if !matches!(catalog.variant_catalog_version, 1 | 2) {
+    if catalog.variant_catalog_version != 2 {
         return Err(RailError::message(format!(
             "variant catalog '{path}' uses unsupported contract {}",
             catalog.variant_catalog_version
@@ -636,9 +890,9 @@ fn validate_variant_catalog(
             catalog.work
         )));
     }
-    if catalog.variant_catalog_version == 2 && !work_cargo.is_empty() {
+    if !work_cargo.is_empty() {
         return Err(RailError::message(format!(
-            "variant catalog '{path}' uses contract 2, so plan.work.{id}.cargo must be empty; v2 Cargo impact derives only from typed cargo_roots"
+            "variant catalog '{path}' requires plan.work.{id}.cargo to be empty; variant Cargo impact derives only from typed cargo_roots"
         )));
     }
     let mut ids = BTreeSet::new();
@@ -650,40 +904,16 @@ fn validate_variant_catalog(
                 row.id
             )));
         }
-        let has_v1_inputs = !row.paths.is_empty() || !row.config.is_empty() || !row.cargo.is_empty();
-        let has_v2_inputs = !row.external_paths.is_empty() || !row.config.is_empty() || !row.cargo_roots.is_empty();
-        if catalog.variant_catalog_version == 1 && (!row.external_paths.is_empty() || !row.cargo_roots.is_empty()) {
-            return Err(RailError::message(format!(
-                "variant '{}' in '{path}' uses v2 inputs under contract 1",
-                row.id
-            )));
-        }
-        if catalog.variant_catalog_version == 2 && (!row.paths.is_empty() || !row.cargo.is_empty()) {
-            return Err(RailError::message(format!(
-                "variant '{}' in '{path}' uses v1 inputs under contract 2",
-                row.id
-            )));
-        }
-        if !(catalog.variant_catalog_version == 1 && has_v1_inputs
-            || catalog.variant_catalog_version == 2 && has_v2_inputs)
-        {
+        if row.external_paths.is_empty() && row.config.is_empty() && row.cargo_roots.is_empty() {
             return Err(RailError::message(format!(
                 "variant '{}' in '{path}' has no input selectors",
                 row.id
             )));
         }
-        crate::config::plan::validate_unique(&row.paths, &format!("{path}.{}.paths", row.id))
-            .map_err(RailError::Config)?;
         crate::config::plan::validate_unique(&row.config, &format!("{path}.{}.config", row.id))
-            .map_err(RailError::Config)?;
-        crate::config::plan::validate_unique(&row.cargo, &format!("{path}.{}.cargo", row.id))
             .map_err(RailError::Config)?;
         crate::config::plan::validate_unique(&row.external_paths, &format!("{path}.{}.external_paths", row.id))
             .map_err(RailError::Config)?;
-        for pattern in &row.paths {
-            crate::config::plan::validate_positive_path(pattern, &format!("{path}.{}.paths", row.id), true)
-                .map_err(RailError::Config)?;
-        }
         for pattern in &row.external_paths {
             crate::config::plan::validate_positive_path(pattern, &format!("{path}.{}.external_paths", row.id), true)
                 .map_err(RailError::Config)?;
@@ -696,21 +926,18 @@ fn validate_variant_catalog(
                 )));
             }
         }
-        for cargo in &row.cargo {
-            if crate::config::plan::CARGO_WORK_IDS
-                .binary_search(&cargo.as_str())
-                .is_err()
-            {
-                return Err(RailError::message(format!(
-                    "variant '{}' in '{path}' names unknown Cargo work '{cargo}'",
-                    row.id
-                )));
+        row.config.sort_unstable();
+        row.external_paths.sort_unstable();
+        for (index, root) in row.cargo_roots.iter_mut().enumerate() {
+            if let Some(features) = &mut root.features {
+                crate::config::plan::validate_unique(
+                    features,
+                    &format!("{path}.{}.cargo_roots.{index}.features", row.id),
+                )
+                .map_err(RailError::Config)?;
+                features.sort_unstable();
             }
         }
-        row.paths.sort_unstable();
-        row.config.sort_unstable();
-        row.cargo.sort_unstable();
-        row.external_paths.sort_unstable();
         row.cargo_roots.sort_unstable();
         if row.cargo_roots.windows(2).any(|roots| roots[0] == roots[1]) {
             return Err(RailError::message(format!(
@@ -723,8 +950,9 @@ fn validate_variant_catalog(
             .iter()
             .enumerate()
             .map(|(index, root)| {
-                resolve_cargo_root(
+                resolve_variant_cargo_root(
                     ctx,
+                    cargo_model,
                     root,
                     &format!("variant '{}.cargo_roots.{index}' in '{path}'", row.id),
                 )
@@ -760,12 +988,55 @@ fn resolve_cargo_prerequisite(
 }
 
 fn resolve_cargo_root(ctx: &WorkspaceContext, root: &CargoRootConfig, subject: &str) -> RailResult<ResolvedCargoRoot> {
-    let matches = ctx
-        .cargo()
-        .metadata()
+    resolve_metadata_cargo_root(
+        ctx,
+        ctx.cargo().metadata(),
+        PRIMARY_CARGO_DOMAIN,
+        &root.package,
+        root.target.as_ref(),
+        None,
+        subject,
+    )
+}
+
+fn resolve_variant_cargo_root(
+    ctx: &WorkspaceContext,
+    cargo_model: &mut PlanningCargoModel,
+    root: &VariantCargoRoot,
+    subject: &str,
+) -> RailResult<ResolvedCargoRoot> {
+    let domain = root.manifest.as_deref().unwrap_or(PRIMARY_CARGO_DOMAIN);
+    if let Some(manifest) = &root.manifest {
+        cargo_model.load_auxiliary(ctx, manifest)?;
+    }
+    let resolved = resolve_metadata_cargo_root(
+        ctx,
+        &cargo_model.domain(domain)?.metadata,
+        domain,
+        &root.package,
+        root.target.as_ref(),
+        root.features.clone(),
+        subject,
+    )?;
+    if let Some(features) = &resolved.features {
+        expanded_features(cargo_model.package(&resolved)?, features)?;
+    }
+    Ok(resolved)
+}
+
+fn resolve_metadata_cargo_root(
+    ctx: &WorkspaceContext,
+    metadata: &Metadata,
+    domain: &str,
+    package_name: &str,
+    expected_target: Option<&CargoTargetRootConfig>,
+    features: Option<Vec<String>>,
+    subject: &str,
+) -> RailResult<ResolvedCargoRoot> {
+    let matches = metadata
         .workspace_packages()
         .iter()
-        .filter(|package| package.name == root.package)
+        .filter(|package| package.name == package_name)
         .copied()
         .collect::<Vec<_>>();
     let package = match matches.as_slice() {
@@ -773,19 +1044,17 @@ fn resolve_cargo_root(ctx: &WorkspaceContext, root: &CargoRootConfig, subject: &
         [] => {
             return Err(RailError::message(format!(
                 "{subject} names unknown workspace package '{}'",
-                root.package
+                package_name
             )));
         }
         _ => {
             return Err(RailError::message(format!(
                 "{subject} names ambiguous workspace package '{}'",
-                root.package
+                package_name
             )));
         }
     };
-    let target = root
-        .target
-        .as_ref()
+    let target = expected_target
         .map(|expected| {
             let matches = package
                 .targets
@@ -804,25 +1073,27 @@ fn resolve_cargo_root(ctx: &WorkspaceContext, root: &CargoRootConfig, subject: &
                 }),
                 [] => Err(RailError::message(format!(
                     "{subject} names unknown target '{}:{}' in package '{}'",
-                    expected.kind, expected.name, root.package
+                    expected.kind, expected.name, package_name
                 ))),
                 _ => Err(RailError::message(format!(
                     "{subject} names ambiguous target '{}:{}' in package '{}'",
-                    expected.kind, expected.name, root.package
+                    expected.kind, expected.name, package_name
                 ))),
             }
         })
         .transpose()?;
     Ok(ResolvedCargoRoot {
+        domain: domain.to_string(),
         package: package.id.clone(),
         package_key: portable_package_key(ctx, package),
         target,
+        features,
     })
 }
 
 fn structural_cargo_impact(
     ctx: &WorkspaceContext,
-    dependency_universe: &DependencyUniverse,
+    cargo_model: &PlanningCargoModel,
     semantic_changes: &BTreeMap<String, SemanticFileChange>,
     base_model: Option<&PortableBaseModel>,
     paths: &[&str],
@@ -832,16 +1103,30 @@ fn structural_cargo_impact(
     for path in paths {
         match semantic_changes.get(*path).map(|change| &change.scope) {
             Some(SemanticScope::None) | None if path.ends_with(".rs") => {
-                if let Some(package) = ctx
-                    .graph()
-                    .file_to_package(Path::new(path))
-                    .filter(|package| package.is_workspace_member)
-                {
-                    impact.seeds.insert(package.id.clone());
+                for package in cargo_model.owning_packages(ctx, Path::new(path)) {
+                    impact.seeds.insert(package.clone());
+                    impact
+                        .seed_paths
+                        .entry(package)
+                        .or_default()
+                        .insert((*path).to_string());
                 }
             }
             Some(SemanticScope::None) | None => {}
-            Some(SemanticScope::Packages(packages)) => impact.seeds.extend(packages.iter().cloned()),
+            Some(SemanticScope::Packages(packages)) => {
+                impact.seeds.extend(packages.iter().cloned());
+                if path.ends_with(".rs") {
+                    for package in packages {
+                        impact
+                            .seed_paths
+                            .entry(package.clone())
+                            .or_default()
+                            .insert((*path).to_string());
+                    }
+                } else {
+                    impact.unattributed_seeds.extend(packages.iter().cloned());
+                }
+            }
             Some(SemanticScope::Workspace) => {
                 unresolved_workspace_paths.insert(*path);
             }
@@ -849,19 +1134,12 @@ fn structural_cargo_impact(
     }
     impact.deliverables_workspace = paths.iter().any(|path| is_global_deliverable_cargo_input(path));
 
-    let propagation = dependency_universe.propagate(&impact.seeds)?;
-    let current_package_keys = ctx
-        .cargo()
-        .metadata()
-        .packages
-        .iter()
-        .map(|package| (package.id.clone(), portable_package_key(ctx, package)))
-        .collect::<BTreeMap<_, _>>();
+    let propagation = cargo_model.propagate(&impact.seeds)?;
     impact.build.extend(impact.seeds.iter().cloned());
     impact.build.extend(propagation.build);
     impact.development = propagation.development;
     for (package, origin) in propagation.build_origins {
-        let portable_origin = current_package_keys.get(&origin).cloned().ok_or_else(|| {
+        let portable_origin = cargo_model.package_key(ctx, &origin).ok_or_else(|| {
             RailError::message(format!(
                 "originating Cargo package '{origin}' is absent from captured metadata"
             ))
@@ -869,7 +1147,7 @@ fn structural_cargo_impact(
         impact.current_build_origins.insert(package, portable_origin);
     }
     for (package, origin) in propagation.development_origins {
-        let portable_origin = current_package_keys.get(&origin).cloned().ok_or_else(|| {
+        let portable_origin = cargo_model.package_key(ctx, &origin).ok_or_else(|| {
             RailError::message(format!(
                 "originating Cargo package '{origin}' is absent from captured metadata"
             ))
@@ -1014,6 +1292,97 @@ fn prerequisite_source_roots(
 }
 
 impl Evaluator<'_> {
+    fn match_cargo_root(&self, root: &ResolvedCargoRoot) -> RailResult<CargoRootMatch> {
+        if self.structural_impact.workspace || self.structural_impact.deliverables_workspace {
+            return Ok(CargoRootMatch {
+                selected: true,
+                attributed_paths: BTreeSet::new(),
+                origins: BTreeSet::new(),
+            });
+        }
+
+        let historical = self
+            .structural_impact
+            .historical_build_origins
+            .contains_key(&root.package);
+        let mut matched = CargoRootMatch {
+            selected: historical,
+            attributed_paths: BTreeSet::new(),
+            origins: [
+                self.structural_impact.current_build_origins.get(&root.package),
+                self.structural_impact.historical_build_origins.get(&root.package),
+            ]
+            .into_iter()
+            .flatten()
+            .filter(|_| historical)
+            .cloned()
+            .collect(),
+        };
+        for seed in &self.structural_impact.unattributed_seeds {
+            if self.cargo_model.root_affected_by(root, seed)? {
+                matched.selected = true;
+                if let Some(origin) = self.structural_impact.current_build_origins.get(&root.package) {
+                    matched.origins.insert(origin.clone());
+                }
+            }
+        }
+
+        for (seed, paths) in &self.structural_impact.seed_paths {
+            if !self.cargo_model.root_affected_by(root, seed)? {
+                continue;
+            }
+            let Some(package) = self.cargo_model.package_in_domain(&root.domain, seed) else {
+                matched.selected = true;
+                continue;
+            };
+            let selected_target = (seed == &root.package).then(|| {
+                root.target
+                    .as_ref()
+                    .map(|target| (target.name.as_str(), target.kinds.as_slice()))
+            });
+            let selected_target = selected_target.flatten();
+            let features = if seed == &root.package {
+                root.features
+                    .as_ref()
+                    .map(|features| expanded_features(package, features))
+                    .transpose()?
+            } else if root.domain != PRIMARY_CARGO_DOMAIN {
+                self.cargo_model.active_features(&root.domain, seed)
+            } else if root.features.is_none() {
+                None
+            } else {
+                matched.selected = true;
+                continue;
+            };
+            if features.is_none() && (root.domain == PRIMARY_CARGO_DOMAIN || seed == &root.package) {
+                matched.selected = true;
+                matched.attributed_paths.extend(paths.iter().cloned());
+                if let Some(origin) = self.structural_impact.current_build_origins.get(&root.package) {
+                    matched.origins.insert(origin.clone());
+                }
+                continue;
+            }
+            let Some(features) = features else {
+                matched.selected = true;
+                continue;
+            };
+            for path in paths {
+                match source_activation(self.ctx, package, selected_target, path, &features)? {
+                    SourceActivation::Active => {
+                        matched.selected = true;
+                        matched.attributed_paths.insert(path.clone());
+                        if let Some(origin) = self.structural_impact.current_build_origins.get(&root.package) {
+                            matched.origins.insert(origin.clone());
+                        }
+                    }
+                    SourceActivation::Inactive => {}
+                    SourceActivation::Unknown => matched.selected = true,
+                }
+            }
+        }
+        Ok(matched)
+    }
+
     fn cargo_selection(&self, work: &str, paths: &[&str]) -> RailResult<CargoSelection> {
         let selection = cargo_selection(self.ctx, self.structural_impact, work, paths)?;
         self.add_prerequisite_source_roots(work, selection)
@@ -1304,7 +1673,7 @@ impl Evaluator<'_> {
         // changed work input can require the family while the catalog still
         // proves an exact row subset; only an unmatched required input widens
         // to the explicit `all` selection.
-        let selected_variants = self.select_variants(spec, &path_inputs, &required_config, &selected_cargo)?;
+        let selected_variants = self.select_variants(spec, &path_inputs, &required_config)?;
         if !direct.is_empty()
             || selected_variants
                 .as_ref()
@@ -1419,23 +1788,16 @@ impl Evaluator<'_> {
         spec: &WorkSpec,
         required_paths: &[String],
         required_config: &[String],
-        required_cargo: &[String],
     ) -> RailResult<Option<SelectedVariants>> {
         let Some(catalog) = &spec.catalog else {
             return Ok(None);
         };
         let mut unmatched_paths = required_paths.iter().map(String::as_str).collect::<HashSet<_>>();
         let mut unmatched_config = required_config.iter().map(String::as_str).collect::<HashSet<_>>();
-        let mut unmatched_cargo = required_cargo.iter().map(String::as_str).collect::<HashSet<_>>();
         let mut selected = Vec::new();
         let mut attributed_inputs = BTreeSet::new();
         for row in &catalog.variants {
-            let row_paths = if catalog.variant_catalog_version == 1 {
-                &row.paths
-            } else {
-                &row.external_paths
-            };
-            let matched_paths = matching_paths(row_paths, self.paths)?;
+            let matched_paths = matching_paths(&row.external_paths, self.paths)?;
             for path in &matched_paths {
                 unmatched_paths.remove(path.as_str());
                 attributed_inputs.insert(format!("path:{path}->variant:{}", row.id));
@@ -1450,42 +1812,31 @@ impl Evaluator<'_> {
                 unmatched_config.remove(delta.path.as_str());
                 attributed_inputs.insert(format!("config:{}->variant:{}", delta.path, row.id));
             }
-            for id in row
-                .cargo
-                .iter()
-                .filter(|id| matches!(self.decisions.get(*id), Some(WorkDecision::Required { .. })))
-            {
-                matched = true;
-                unmatched_cargo.remove(id.as_str());
-                attributed_inputs.insert(format!("cargo:{id}->variant:{}", row.id));
-            }
-            if catalog.variant_catalog_version == 2 && !row.resolved_cargo_roots.is_empty() {
-                let cargo_origins = row
-                    .resolved_cargo_roots
-                    .iter()
-                    .flat_map(|root| {
-                        [
-                            self.structural_impact.current_build_origins.get(&root.package),
-                            self.structural_impact.historical_build_origins.get(&root.package),
-                        ]
-                        .into_iter()
-                        .flatten()
-                    })
-                    .collect::<BTreeSet<_>>();
-                let cargo_matched = self.structural_impact.workspace
-                    || self.structural_impact.deliverables_workspace
-                    || !cargo_origins.is_empty();
-                if cargo_matched {
-                    matched = true;
-                    if self.structural_impact.workspace || self.structural_impact.deliverables_workspace {
-                        attributed_inputs.insert(format!("cargo:workspace->variant:{}", row.id));
+            if !row.resolved_cargo_roots.is_empty() {
+                for root in &row.resolved_cargo_roots {
+                    let cargo_match = self.match_cargo_root(root)?;
+                    matched |= cargo_match.selected;
+                    for path in &cargo_match.attributed_paths {
+                        unmatched_paths.remove(path.as_str());
+                    }
+                    if cargo_match.origins.is_empty() {
+                        attributed_inputs.extend(
+                            cargo_match
+                                .attributed_paths
+                                .iter()
+                                .map(|path| format!("cargo:{path}->variant:{}", row.id)),
+                        );
                     } else {
                         attributed_inputs.extend(
-                            cargo_origins
+                            cargo_match
+                                .origins
                                 .iter()
                                 .map(|origin| format!("cargo:{origin}->variant:{}", row.id)),
                         );
                     }
+                }
+                if matched && (self.structural_impact.workspace || self.structural_impact.deliverables_workspace) {
+                    attributed_inputs.insert(format!("cargo:workspace->variant:{}", row.id));
                 }
             }
             if matched {
@@ -1498,9 +1849,7 @@ impl Evaluator<'_> {
         Ok(Some(SelectedVariants {
             variants: selected,
             attributed_inputs,
-            all_required_inputs_attributed: unmatched_paths.is_empty()
-                && unmatched_config.is_empty()
-                && unmatched_cargo.is_empty(),
+            all_required_inputs_attributed: unmatched_paths.is_empty() && unmatched_config.is_empty(),
         }))
     }
 
@@ -1990,7 +2339,11 @@ fn portable_package_key(ctx: &WorkspaceContext, package: &Package) -> String {
     let relative = package
         .manifest_path
         .parent()
-        .and_then(|root| root.as_std_path().strip_prefix(ctx.workspace_root()).ok())
+        .and_then(|root| {
+            root.as_std_path()
+                .strip_prefix(ctx.planning_authority_source_root())
+                .ok()
+        })
         .map(crate::utils::path_to_git_format)
         .unwrap_or_else(|| "<outside-workspace>".to_string());
     format!("{}@{}#path:{relative}", package.name, package.version)

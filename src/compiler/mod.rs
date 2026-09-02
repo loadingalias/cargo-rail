@@ -1,5 +1,8 @@
 //! Compiler diagnostics subsystem used by target-aware dependency analysis.
 
+pub(crate) mod acquisition;
+pub(crate) mod analysis;
+pub(crate) mod capability;
 pub mod cfg_eval;
 pub mod collector;
 pub mod diagnostics_store;

@@ -10,6 +10,15 @@ readonly manifest="$repository_root/tools/compiler-fact-driver/Cargo.toml"
   exit 2
 }
 
+python_command=python3
+if ! command -v "$python_command" >/dev/null 2>&1; then
+  python_command=python
+fi
+command -v "$python_command" >/dev/null 2>&1 || {
+  echo "compiler fact driver packaging requires Python 3" >&2
+  exit 2
+}
+
 sha256_file() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" | awk '{print $1}'
@@ -81,7 +90,7 @@ if [[ "$compiler_library_relative" == "$compiler_library" ]]; then
 fi
 compiler_library_digest="$(sha256_file "$compiler_library")"
 source_bundle="$repository_root/target/$profile/cargo-rail-fact-driver-source-v1.json"
-"$repository_root/scripts/package-compiler-fact-driver-source.py" "$source_bundle"
+"$python_command" "$repository_root/scripts/package-compiler-fact-driver-source.py" "$source_bundle"
 source_bundle_digest="$(sha256_file "$source_bundle")"
 
 # Reproduce release archive topology: the embedded authority selects exactly

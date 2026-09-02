@@ -399,7 +399,7 @@ impl SourceExclusions {
         self.0.sort_unstable();
     }
 
-    fn contains(&self, path: &RepositoryPath) -> bool {
+    pub(crate) fn contains(&self, path: &RepositoryPath) -> bool {
         self.0.iter().any(|root| path_is_within(path, root))
     }
 }
@@ -2186,9 +2186,13 @@ fn mark_provenance(
 }
 
 fn build_change_set(
-    final_changes: Vec<ParsedChange>,
+    mut final_changes: Vec<ParsedChange>,
     mut provenance: BTreeMap<RepositoryPath, ChangeProvenance>,
 ) -> ChangeSet {
+    // Rename and copy expansion can append a destination before an earlier
+    // source path. Canonicalize only after every expansion is complete so all
+    // capture backends expose the same ordered ChangeSet.
+    final_changes.sort_unstable_by(|left, right| left.path.cmp(&right.path));
     ChangeSet(
         final_changes
             .into_iter()
@@ -2499,5 +2503,21 @@ mod tests {
             ))
         );
         assert_eq!(parsed[5].kind, SourceChangeKind::Deleted);
+    }
+
+    #[test]
+    fn final_change_set_sorts_rename_destination_before_source() {
+        let parsed = parse_name_status(b"R100\0z-source.rs\0a-destination.rs\0").unwrap();
+        let changes = build_change_set(parsed, BTreeMap::new());
+        let changes = changes.entries();
+
+        assert_eq!(changes[0].path.as_str(), "a-destination.rs");
+        assert_eq!(changes[1].path.as_str(), "z-source.rs");
+        assert_eq!(
+            changes[0].relation,
+            Some(ChangeRelation::RenamedFrom(
+                RepositoryPath::new(Path::new("z-source.rs")).unwrap()
+            ))
+        );
     }
 }

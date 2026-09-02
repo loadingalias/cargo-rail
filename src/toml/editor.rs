@@ -425,7 +425,7 @@ infrastructure = [".github/**"]
 
     #[cfg(unix)]
     #[test]
-    fn test_write_does_not_follow_legacy_predictable_temp_symlink() {
+    fn test_write_does_not_follow_a_fixed_name_temp_symlink() {
         use std::os::unix::fs::symlink;
 
         let directory = tempfile::tempdir().unwrap();

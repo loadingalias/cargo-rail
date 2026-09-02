@@ -175,7 +175,6 @@ impl<'a> ReleaseValidator<'a> {
         skip_publish: bool,
         skip_tag: bool,
         require_clean: bool,
-        require_release_notes: bool,
     ) -> RailResult<()> {
         if require_clean {
             self.check_clean_working_directory()?;
@@ -218,9 +217,7 @@ impl<'a> ReleaseValidator<'a> {
             }
         }
 
-        if require_release_notes {
-            self.validate_release_notes(plan)?;
-        }
+        self.validate_release_notes(plan)?;
 
         Ok(())
     }
@@ -262,10 +259,6 @@ impl<'a> ReleaseValidator<'a> {
                 continue;
             }
 
-            if self.release_notes_override_exists(crate_plan) {
-                continue;
-            }
-
             if changelog_contains_version_entry(&crate_plan.changelog_path, &crate_plan.new_version.to_string()) {
                 continue;
             }
@@ -278,21 +271,12 @@ impl<'a> ReleaseValidator<'a> {
                         crate_plan.new_version,
                         crate_plan.changelog_path.display()
                     ),
-                    "add user-facing commits, pre-populate the version section, or set [release].require_release_notes = false",
+                    "add reviewed release intent under .changes or pre-populate the version section",
                 ));
             }
         }
 
         Ok(())
-    }
-
-    fn release_notes_override_exists(&self, crate_plan: &crate::release::planner::CrateReleasePlan) -> bool {
-        let Some(config) = self.ctx.config() else {
-            return false;
-        };
-        let dir = self.ctx.workspace_root().join(&config.release.release_notes_dir);
-        dir.join(format!("v{}.md", crate_plan.new_version)).exists()
-            || dir.join(format!("{}.md", crate_plan.tag_name)).exists()
     }
 
     /// Check for path dependencies (which block publishing)
@@ -584,15 +568,11 @@ impl<'a> ReleaseValidator<'a> {
         let semver_available =
             semver_policy == SemverCheckPolicy::Off || semver_checks::is_available(self.ctx.workspace_root());
         let mut emitted_semver_missing = false;
-        let pending_changes = if release_config.source.uses_changes() {
-            Some(PendingChangeSet::load(
-                self.ctx.workspace_root(),
-                &release_config.change_dir,
-                self.ctx.graph().workspace_members(),
-            )?)
-        } else {
-            None
-        };
+        let pending_changes = PendingChangeSet::load(
+            self.ctx.workspace_root(),
+            &release_config.change_dir,
+            self.ctx.graph().workspace_members(),
+        )?;
 
         Ok(crate_names
             .iter()
@@ -614,19 +594,12 @@ impl<'a> ReleaseValidator<'a> {
                     } else if self.is_publishable(crate_name) && semver_checks::has_library_target(self.ctx, crate_name)
                     {
                         // Unpublished crates have no crates.io baseline to compare against.
-                        let reviewed_level = pending_changes.as_ref().and_then(|changes| {
-                            changes
-                                .for_crate(crate_name)
-                                .iter()
-                                .filter_map(|intent| intent.bump.release_level())
-                                .max()
-                        });
-                        results.push(self.validate_semver_checks(
-                            crate_name,
-                            semver_policy,
-                            reviewed_level,
-                            release_config.source == crate::config::ReleaseSource::Changes,
-                        ));
+                        let reviewed_level = pending_changes
+                            .for_crate(crate_name)
+                            .iter()
+                            .filter_map(|intent| intent.bump.release_level())
+                            .max();
+                        results.push(self.validate_semver_checks(crate_name, semver_policy, reviewed_level, true));
                     }
                 }
 

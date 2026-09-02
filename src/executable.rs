@@ -89,19 +89,24 @@ impl ToolchainExecutableIdentities {
         current_dir: &Path,
         source_root: &Path,
     ) -> RailResult<Self> {
-        let mut captured = std::collections::BTreeMap::<PathBuf, ExecutableIdentity>::new();
+        let mut captured = std::collections::BTreeMap::<(PathBuf, std::ffi::OsString), ExecutableIdentity>::new();
         let mut capture = |program: &OsStr| -> RailResult<ExecutableIdentity> {
-            let resolved = resolve_program(program, current_dir)?.canonicalize().map_err(|error| {
+            let selected = resolve_program(program, current_dir)?;
+            selected.canonicalize().map_err(|error| {
                 RailError::message(format!(
                     "failed to resolve executable '{}': {error}",
                     program.to_string_lossy()
                 ))
             })?;
-            if let Some(identity) = captured.get(&resolved) {
+            // The exact argv[0] selection is behavior. Multicall programs such
+            // as rustup dispatch by basename, and arbitrary executables may
+            // distinguish different spellings of the same selected path.
+            let key = (selected, program.to_os_string());
+            if let Some(identity) = captured.get(&key) {
                 return Ok(identity.clone());
             }
             let identity = ExecutableIdentity::capture(program, current_dir, source_root)?;
-            captured.insert(resolved, identity.clone());
+            captured.insert(key, identity.clone());
             Ok(identity)
         };
         let cargo = capture(toolchain.cargo_program())?;

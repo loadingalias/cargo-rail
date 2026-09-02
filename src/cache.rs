@@ -2,6 +2,7 @@
 
 pub(crate) mod cas;
 pub(crate) mod installation;
+pub(crate) mod profile;
 pub(crate) mod result;
 
 use crate::error::{RailError, RailResult};
@@ -11,14 +12,24 @@ use std::path::{Path, PathBuf};
 
 const STATUS_SCAN_MAX_ENTRIES: usize = 1_000_000;
 const WORKSPACE_LOCK_BYTES: u64 = 0;
-const RETIRED_METADATA_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const V025_COMPILER_DIAGNOSTICS_MAX_BYTES: u64 = 256 * 1024 * 1024;
+const V025_COMPILER_DIAGNOSTICS_DIRECTORY: &str = "cache";
+const V025_COMPILER_DIAGNOSTICS_FILE: &str = "compiler-diags-v1.json";
+
+struct WorkspaceCachePaths {
+    state_root: PathBuf,
+    predecessor_cache: PathBuf,
+    predecessor_compiler_diagnostics: PathBuf,
+    compiler_artifacts: PathBuf,
+    lock: PathBuf,
+}
 
 /// Exclusive authority over cache-owned state inside one workspace.
 pub(crate) struct WorkspaceCacheLock {
     _file: File,
 }
 
-/// Serialize workspace cache mutation without serializing the shared local CAS.
+/// Serialize workspace cache mutation without serializing the selected profile's local CAS.
 pub(crate) fn lock_workspace(workspace_root: &Path) -> RailResult<WorkspaceCacheLock> {
     let workspace_root = crate::utils::canonicalize_existing(workspace_root)?;
     let mut directory = workspace_root.clone();
@@ -86,11 +97,11 @@ pub(crate) struct WorkspaceCacheStatus {
     pub(crate) artifacts: Vec<WorkspaceCacheArtifact>,
 }
 
-/// Read-only measurements for the shared local cache scope.
+/// Read-only measurements for the selected profile's local cache scope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct SharedCacheStatus {
     pub(crate) present: bool,
-    pub(crate) cross_workspace: bool,
+    pub(crate) profile_scoped: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) cache: Option<crate::cache::cas::LocalCasStatus>,
 }
@@ -130,6 +141,7 @@ impl CacheRemoval {
 pub(crate) fn status(workspace_root: &Path, workspace: bool, local: bool) -> RailResult<CacheStatus> {
     let installation = crate::cache::installation::status(workspace_root)?;
     let transparent_installed = installation.wrapper_path.is_some();
+    let profile_scoped = installation.profile_id.is_some();
     let remote = if local {
         crate::remote_cache::configuration_status(workspace_root)
             .map_err(|error| RailError::message(format!("remote cache configuration is unavailable: {error}")))?
@@ -137,7 +149,7 @@ pub(crate) fn status(workspace_root: &Path, workspace: bool, local: bool) -> Rai
         None
     };
     Ok(CacheStatus {
-        schema_version: 14,
+        schema_version: 15,
         installation,
         workspace: workspace.then(|| workspace_status(workspace_root)).transpose()?,
         local: local
@@ -154,7 +166,7 @@ pub(crate) fn status(workspace_root: &Path, workspace: bool, local: bool) -> Rai
                 };
                 Ok::<_, RailError>(SharedCacheStatus {
                     present: cache.is_some(),
-                    cross_workspace: true,
+                    profile_scoped,
                     cache,
                 })
             })
@@ -166,14 +178,11 @@ pub(crate) fn status(workspace_root: &Path, workspace: bool, local: bool) -> Rai
 /// Remove reconstructible cache state inside one workspace.
 pub(crate) fn remove_workspace(workspace_root: &Path) -> RailResult<CacheRemoval> {
     let _lock = lock_workspace(workspace_root)?;
-    let root = crate::workspace::cargo_rail_state_root(workspace_root);
-    let metadata = root.join("metadata.json");
-    let legacy = root.join("cache");
-    let compiler_artifacts = root.join("compiler-artifacts-v1");
+    let paths = workspace_cache_paths(workspace_root)?;
 
     // Validate and measure the complete owned scope before deleting any part of it.
     // The lifecycle lock keeps current cargo-rail processes from changing the view.
-    let status = workspace_status(workspace_root)?;
+    let status = workspace_status_for_paths(&paths)?;
     let bytes = status
         .artifacts
         .iter()
@@ -183,21 +192,37 @@ pub(crate) fn remove_workspace(workspace_root: &Path) -> RailResult<CacheRemoval
                 .checked_add(artifact.bytes)
                 .ok_or_else(|| RailError::message("workspace cache cleanup byte count overflow"))
         })?;
+    let expected_predecessor_diagnostics = status
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == "predecessor_compiler_diagnostics")
+        .map(|artifact| artifact.bytes);
     let mut paths = Vec::new();
 
-    if remove_owned_file(&metadata)? {
-        paths.push(metadata.to_string_lossy().into_owned());
+    let revalidated = workspace_cache_paths(workspace_root)?;
+    if remove_owned_file(
+        &revalidated.predecessor_compiler_diagnostics,
+        "v0.25 compiler diagnostics file",
+        expected_predecessor_diagnostics,
+    )? {
+        paths.push(
+            revalidated
+                .predecessor_compiler_diagnostics
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let revalidated = workspace_cache_paths(workspace_root)?;
+        remove_empty_owned_directory(&revalidated.predecessor_cache)?;
     }
-    if remove_owned_tree(&legacy)? {
-        paths.push(legacy.to_string_lossy().into_owned());
-    }
-    if remove_owned_tree(&compiler_artifacts)? {
-        paths.push(compiler_artifacts.to_string_lossy().into_owned());
+
+    let revalidated = workspace_cache_paths(workspace_root)?;
+    if remove_owned_tree(&revalidated.compiler_artifacts)? {
+        paths.push(revalidated.compiler_artifacts.to_string_lossy().into_owned());
     }
     Ok(CacheRemoval { paths, bytes })
 }
 
-/// Remove the validated shared local CAS in the selected local cache domain.
+/// Remove the validated local CAS in the selected profile's cache domain.
 pub(crate) fn remove_local(workspace_root: &Path) -> RailResult<CacheRemoval> {
     let removed = match crate::cache::installation::remove_local_cache(workspace_root)? {
         Some(removed) => removed,
@@ -225,28 +250,99 @@ pub(crate) fn remove_local(workspace_root: &Path) -> RailResult<CacheRemoval> {
 }
 
 fn workspace_status(workspace_root: &Path) -> RailResult<WorkspaceCacheStatus> {
-    let root = crate::workspace::cargo_rail_state_root(workspace_root);
-    let candidates = [
-        (
-            "cargo_metadata",
-            root.join("metadata.json"),
-            Some(RETIRED_METADATA_MAX_BYTES),
-        ),
-        (
-            "legacy_compiler_evidence",
-            root.join("cache"),
-            Some(crate::compiler::diagnostics_store::MAX_CACHE_BYTES as u64),
-        ),
-        ("compiler_artifacts", root.join("compiler-artifacts-v1"), None),
-        (
-            "workspace_cache_lock",
-            root.join("cache.lock"),
-            Some(WORKSPACE_LOCK_BYTES),
-        ),
-    ];
+    let paths = workspace_cache_paths(workspace_root)?;
+    workspace_status_for_paths(&paths)
+}
+
+fn workspace_cache_paths(workspace_root: &Path) -> RailResult<WorkspaceCachePaths> {
+    let workspace_root = crate::utils::canonicalize_existing(workspace_root)?;
+    let metadata = fs::symlink_metadata(&workspace_root)?;
+    if !metadata.is_dir() || crate::utils::is_symlink_or_reparse(&metadata) {
+        return Err(RailError::message(format!(
+            "workspace cache root '{}' is not a real directory",
+            workspace_root.display()
+        )));
+    }
+
+    let target = workspace_root.join("target");
+    let state_root = target.join("cargo-rail");
+    let predecessor_cache = state_root.join(V025_COMPILER_DIAGNOSTICS_DIRECTORY);
+    for (path, description) in [
+        (&target, "workspace target directory"),
+        (&state_root, "workspace cache state directory"),
+        (&predecessor_cache, "v0.25 compiler diagnostics directory"),
+    ] {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.is_dir() || crate::utils::is_symlink_or_reparse(&metadata) {
+            return Err(RailError::with_help(
+                format!("{description} '{}' is not a real directory", path.display()),
+                "remove the hostile path manually; cargo-rail will not inspect or reclaim linked cache state",
+            ));
+        }
+        let canonical = crate::utils::canonicalize_existing(path)?;
+        if canonical.as_path() != path.as_path() || !canonical.starts_with(&workspace_root) {
+            return Err(RailError::message(format!(
+                "{description} '{}' escaped the workspace",
+                path.display()
+            )));
+        }
+    }
+
+    Ok(WorkspaceCachePaths {
+        predecessor_compiler_diagnostics: predecessor_cache.join(V025_COMPILER_DIAGNOSTICS_FILE),
+        compiler_artifacts: state_root.join("compiler-artifacts-v1"),
+        lock: state_root.join("cache.lock"),
+        state_root,
+        predecessor_cache,
+    })
+}
+
+fn private_file_status(path: &Path, description: &str) -> RailResult<Option<u64>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file() || crate::utils::is_symlink_or_reparse(&metadata) {
+        return Err(RailError::with_help(
+            format!("{description} '{}' is not a private regular file", path.display()),
+            "remove the hostile path manually; cargo-rail will not inspect or reclaim linked cache state",
+        ));
+    }
+    let opened = File::open(path)?;
+    if !crate::utils::private_file_matches_path(&opened, path, metadata.len())? {
+        return Err(RailError::with_help(
+            format!("{description} '{}' is not a private regular file", path.display()),
+            "remove the hostile path manually; cargo-rail will not inspect or reclaim linked cache state",
+        ));
+    }
+    Ok(Some(metadata.len()))
+}
+
+fn workspace_status_for_paths(paths: &WorkspaceCachePaths) -> RailResult<WorkspaceCacheStatus> {
     let mut artifacts = Vec::new();
-    for (kind, path, max_bytes) in candidates {
-        let Some((bytes, files, directories)) = path_status(&path)? else {
+    if let Some(bytes) = private_file_status(
+        &paths.predecessor_compiler_diagnostics,
+        "v0.25 compiler diagnostics file",
+    )? {
+        artifacts.push(WorkspaceCacheArtifact {
+            kind: "predecessor_compiler_diagnostics",
+            path: paths.predecessor_compiler_diagnostics.to_string_lossy().into_owned(),
+            bytes,
+            files: 1,
+            directories: 0,
+            max_bytes: Some(V025_COMPILER_DIAGNOSTICS_MAX_BYTES),
+        });
+    }
+    for (kind, path, max_bytes) in [
+        ("compiler_artifacts", paths.compiler_artifacts.as_path(), None),
+        ("workspace_cache_lock", paths.lock.as_path(), Some(WORKSPACE_LOCK_BYTES)),
+    ] {
+        let Some((bytes, files, directories)) = path_status(path)? else {
             continue;
         };
         artifacts.push(WorkspaceCacheArtifact {
@@ -269,7 +365,7 @@ fn workspace_status(workspace_root: &Path) -> RailResult<WorkspaceCacheStatus> {
         .iter()
         .all(|artifact| artifact.max_bytes.is_some_and(|bound| artifact.bytes <= bound));
     Ok(WorkspaceCacheStatus {
-        root: root.to_string_lossy().into_owned(),
+        root: paths.state_root.to_string_lossy().into_owned(),
         bytes,
         files,
         directories,
@@ -334,20 +430,45 @@ pub(crate) fn path_status(root: &Path) -> RailResult<Option<(u64, u64, u64)>> {
     Ok(Some((bytes, files, directories)))
 }
 
-fn remove_owned_file(path: &Path) -> RailResult<bool> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.into()),
-    };
-    if !metadata.is_file() || crate::utils::is_symlink_or_reparse(&metadata) {
-        return Err(RailError::with_help(
-            format!("workspace cache file '{}' is not a real file", path.display()),
-            "remove the hostile path manually; cargo-rail will not reclaim linked cache state",
-        ));
+fn remove_owned_file(path: &Path, description: &str, expected_bytes: Option<u64>) -> RailResult<bool> {
+    let observed_bytes = private_file_status(path, description)?;
+    if observed_bytes != expected_bytes {
+        return Err(RailError::message(format!(
+            "{description} '{}' changed while workspace cache cleanup was planned",
+            path.display()
+        )));
+    }
+    if observed_bytes.is_none() {
+        return Ok(false);
     }
     fs::remove_file(path)?;
     Ok(true)
+}
+
+fn remove_empty_owned_directory(path: &Path) -> RailResult<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_dir() || crate::utils::is_symlink_or_reparse(&metadata) {
+        return Err(RailError::with_help(
+            format!("workspace cache directory '{}' is not a real directory", path.display()),
+            "remove the hostile path manually; cargo-rail will not reclaim linked cache state",
+        ));
+    }
+    match fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn remove_owned_tree(root: &Path) -> RailResult<bool> {
@@ -433,19 +554,27 @@ mod tests {
         let outside = tempfile::tempdir().expect("outside root");
         let sentinel = outside.path().join("keep");
         fs::write(&sentinel, b"outside").expect("outside sentinel");
-        let cache = workspace.path().join("target/cargo-rail/cache");
-        fs::create_dir_all(&cache).expect("workspace cache");
-        symlink(outside.path(), cache.join("hostile-link")).expect("hostile nested link");
+        let artifacts = workspace.path().join("target/cargo-rail/compiler-artifacts-v1");
+        fs::create_dir_all(&artifacts).expect("workspace cache");
+        symlink(outside.path(), artifacts.join("hostile-link")).expect("hostile nested link");
 
-        assert!(remove_owned_tree(&cache).expect("owned cleanup"));
+        assert!(remove_owned_tree(&artifacts).expect("owned cleanup"));
 
-        assert!(!cache.exists());
+        assert!(!artifacts.exists());
         assert_eq!(fs::read(&sentinel).expect("outside sentinel"), b"outside");
     }
 
     #[test]
     fn workspace_cleanup_waits_for_an_active_cache_owner() {
         let workspace = tempfile::tempdir().expect("workspace");
+        let diagnostics = workspace.path().join("target/cargo-rail/cache/compiler-diags-v1.json");
+        let expected_removed = crate::utils::canonicalize_existing(workspace.path())
+            .expect("canonical workspace")
+            .join("target/cargo-rail/cache/compiler-diags-v1.json")
+            .to_string_lossy()
+            .into_owned();
+        fs::create_dir_all(diagnostics.parent().expect("diagnostics parent")).expect("diagnostics parent");
+        fs::write(&diagnostics, b"{\"version\":10,\"entries\":{}}").expect("v0.25 compiler diagnostics");
         let owner = lock_workspace(workspace.path()).expect("workspace cache owner");
         let workspace_root = workspace.path().to_path_buf();
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
@@ -459,10 +588,13 @@ mod tests {
                 finished_rx.recv_timeout(std::time::Duration::from_millis(100)).is_err(),
                 "cleanup crossed the workspace cache lifecycle boundary"
             );
+            assert!(diagnostics.is_file(), "blocked cleanup must not remove diagnostics");
             drop(owner);
-            finished_rx
+            let removed = finished_rx
                 .recv_timeout(std::time::Duration::from_secs(10))
                 .expect("cleanup should finish");
+            assert!(!diagnostics.exists());
+            assert_eq!(removed.paths, vec![expected_removed]);
         });
     }
 }

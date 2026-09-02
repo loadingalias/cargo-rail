@@ -5,6 +5,19 @@ use cargo_rail::commands::{TextJsonOutputFormat, run_clean};
 use std::fs;
 use tempfile::TempDir;
 
+const V025_NATIVE_LEDGER: &[u8] = include_bytes!("../fixtures/compat/v0.25.0/cache/NATIVE_LEDGER.json");
+const V025_NATIVE_ACTION_STATE: &[u8] = include_bytes!(
+    "../fixtures/compat/v0.25.0/cache/native-actions/0000000000000000000000000000000000000000000000000000000000000001.json"
+);
+const V025_NATIVE_ENVIRONMENT_SELECTOR: &[u8] = include_bytes!(
+    "../fixtures/compat/v0.25.0/cache/native-environment-selectors-v1/0000000000000000000000000000000000000000000000000000000000000001.json"
+);
+const V025_COMPILER_DIAGNOSTICS: &[u8] = include_bytes!("../fixtures/compat/v0.25.0/cache/compiler-diags-v1.json");
+
+fn v025_fixture(bytes: &'static [u8]) -> &'static [u8] {
+    bytes.strip_suffix(b"\n").unwrap_or(bytes)
+}
+
 fn create_test_workspace() -> Result<TempDir> {
     let temp = TempDir::new()?;
     let workspace = temp.path();
@@ -35,12 +48,11 @@ fn create_test_workspace() -> Result<TempDir> {
 
     // Create target directories
     fs::create_dir_all(workspace.join("target/cargo-rail"))?;
-    fs::write(workspace.join("target/cargo-rail/metadata.json"), "{}")?;
     fs::write(workspace.join("target/cargo-rail/report.md"), "# Report")?;
-    fs::create_dir_all(workspace.join("target/cargo-rail/cache"))?;
+    fs::create_dir_all(workspace.join("target/cargo-rail/compiler-artifacts-v1"))?;
     fs::write(
-        workspace.join("target/cargo-rail/cache/compiler-diags-v1.json"),
-        "{\"version\":1,\"entries\":{}}",
+        workspace.join("target/cargo-rail/compiler-artifacts-v1/result"),
+        "compiled output",
     )?;
     // Initialize git repo
     super::helpers::git(workspace, &["init", "--initial-branch=main"])?;
@@ -91,20 +103,66 @@ fn create_empty_local_cas(cache: &TempDir) -> Result<std::path::PathBuf> {
     fs::write(root.join("CAPACITY.json"), b"{\"version\":2,\"result_bytes\":0}")?;
     fs::write(
         root.join("NATIVE_LEDGER.json"),
-        b"{\"version\":1,\"terminal_states\":0,\"terminal_bytes\":0,\"disabled\":false}",
+        b"{\"version\":2,\"terminal_states\":0,\"terminal_bytes\":0,\"disabled\":false}",
     )?;
     for directory in [
         "results",
         "pins",
         "leases",
         "staging",
-        "native-actions",
+        "native-actions-v2",
+        "native-dynamic-input-selectors-v1",
+        "native-link-candidates-v1",
+        "native-restore-locks-v1",
         "compiler-evidence-candidates",
     ] {
         fs::create_dir(root.join(directory))?;
     }
+    for shard in 0..64_u8 {
+        fs::write(
+            root.join("native-restore-locks-v1").join(format!("{shard:02x}.lock")),
+            b"",
+        )?;
+    }
     #[cfg(target_os = "macos")]
     fs::create_dir(root.join("sysroot-identities"))?;
+    fs::write(owner.join("local-cas-v2.lock"), b"")?;
+    Ok(root)
+}
+
+fn create_v025_preserved_local_cas(cache: &TempDir) -> Result<std::path::PathBuf> {
+    const TRUST_DOMAIN: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+    const FIXTURE_KEY: &str = "0000000000000000000000000000000000000000000000000000000000000001.json";
+
+    let owner = cache.path().join("cargo-rail");
+    let root = owner.join("local-cas-v2");
+    fs::create_dir_all(&root)?;
+    fs::write(owner.join("LOCAL_TRUST_DOMAIN"), format!("{TRUST_DOMAIN}\n"))?;
+    fs::write(
+        root.join("OWNER"),
+        format!("cargo-rail-local-cas\nschema=2\ntrust-domain={TRUST_DOMAIN}\n"),
+    )?;
+    fs::write(root.join("CAPACITY.json"), b"{\"version\":2,\"result_bytes\":0}")?;
+    fs::write(root.join("NATIVE_LEDGER.json"), v025_fixture(V025_NATIVE_LEDGER))?;
+    for directory in [
+        "results",
+        "pins",
+        "leases",
+        "staging",
+        "native-actions",
+        "native-environment-selectors-v1",
+        "compiler-evidence-candidates",
+    ] {
+        fs::create_dir(root.join(directory))?;
+    }
+    fs::write(
+        root.join("native-actions").join(FIXTURE_KEY),
+        v025_fixture(V025_NATIVE_ACTION_STATE),
+    )?;
+    fs::write(
+        root.join("native-environment-selectors-v1").join(FIXTURE_KEY),
+        v025_fixture(V025_NATIVE_ENVIRONMENT_SELECTOR),
+    )?;
     fs::write(owner.join("local-cas-v2.lock"), b"")?;
     Ok(root)
 }
@@ -158,36 +216,64 @@ fn local_status_and_cleanup_use_the_configured_domain_without_workspace_state() 
 }
 
 #[test]
-fn apply_cleanup_migrates_an_owned_pre_lifecycle_local_cas() {
+fn v025_preserved_local_cas_is_reported_and_reclaimed_without_hit_authority() {
     let result: Result<()> = (|| {
         let workspace = create_test_workspace()?;
-        let cache = TempDir::new().unwrap();
-        let root = create_empty_local_cas(&cache)?;
-        let lock = cache.path().join("cargo-rail/local-cas-v2.lock");
-        fs::remove_file(&lock).unwrap();
+        let cache = TempDir::new()?;
+        let root = create_v025_preserved_local_cas(&cache)?;
+        let preserved_action = root
+            .join("native-actions")
+            .join("0000000000000000000000000000000000000000000000000000000000000001.json");
+        let preserved_selector = root
+            .join("native-environment-selectors-v1")
+            .join("0000000000000000000000000000000000000000000000000000000000000001.json");
+
+        let status = run_cache_command(
+            &workspace,
+            &cache,
+            &["rail", "cache", "status", "--scope", "local", "-f", "json"],
+        );
+        assert!(status.status.success(), "v0.25 local status failed: {status:?}");
+        let status_json: serde_json::Value = serde_json::from_slice(&status.stdout)?;
+        let local = &status_json["status"]["local"]["cache"];
+        assert_eq!(local["native_actions"], 0);
+        assert_eq!(local["native_unique"], 0);
+        assert_eq!(local["index_files"], 0);
+        assert_eq!(fs::read(&preserved_action)?, v025_fixture(V025_NATIVE_ACTION_STATE));
+        assert_eq!(
+            fs::read(&preserved_selector)?,
+            v025_fixture(V025_NATIVE_ENVIRONMENT_SELECTOR)
+        );
+        assert!(!root.join("native-actions-v2").exists());
+
+        let preview = run_cache_command(
+            &workspace,
+            &cache,
+            &["rail", "cache", "clean", "--scope", "local", "--check", "-f", "json"],
+        );
+        assert_eq!(preview.status.code(), Some(1), "v0.25 cleanup preview: {preview:?}");
+        let preview_json: serde_json::Value = serde_json::from_slice(&preview.stdout)?;
+        assert!(root.is_dir(), "check mode must not mutate the predecessor root");
 
         let cleaned = run_cache_command(
             &workspace,
             &cache,
             &["rail", "cache", "clean", "--scope", "local", "-f", "json"],
         );
-
-        assert!(cleaned.status.success(), "transition cleanup failed: {cleaned:?}");
-        let cleaned_json: serde_json::Value = serde_json::from_slice(&cleaned.stdout).unwrap();
-        assert!(cleaned_json["reclaimed_bytes"].as_u64().unwrap() > 0);
+        assert!(cleaned.status.success(), "v0.25 cleanup failed: {cleaned:?}");
+        let cleaned_json: serde_json::Value = serde_json::from_slice(&cleaned.stdout)?;
+        assert_eq!(cleaned_json["reclaimed_bytes"], preview_json["would_reclaim_bytes"]);
         assert!(!root.exists());
-        assert!(
-            lock.is_file(),
-            "apply must establish the persistent lifecycle authority"
-        );
-        assert_eq!(fs::metadata(lock).unwrap().len(), 0);
+        let lifecycle_lock = cache.path().join("cargo-rail/local-cas-v2.lock");
+        assert!(lifecycle_lock.is_file());
+        assert_eq!(fs::metadata(lifecycle_lock)?.len(), 0);
         Ok(())
     })();
     super::helpers::finish_test(result);
 }
 
 #[test]
-fn compatibility_cleanup_never_removes_the_shared_local_cas() {
+fn workspace_cleanup_never_removes_the_shared_local_cas() {
     let result: Result<()> = (|| {
         for arguments in [&["rail", "clean", "--all"][..], &["rail", "clean", "--cache"][..]] {
             let workspace = create_test_workspace()?;
@@ -199,12 +285,16 @@ fn compatibility_cleanup_never_removes_the_shared_local_cas() {
 
             let cleaned = run_cache_command(&workspace, &cache, arguments);
 
-            assert!(cleaned.status.success(), "compatibility cleanup failed: {cleaned:?}");
+            assert!(cleaned.status.success(), "workspace cleanup failed: {cleaned:?}");
             assert_eq!(fs::read(&shared_result)?, b"shared across workspaces");
             assert!(lock.is_file());
             assert_eq!(fs::metadata(lock).unwrap().len(), 0);
-            assert!(!workspace.path().join("target/cargo-rail/metadata.json").exists());
-            assert!(!workspace.path().join("target/cargo-rail/cache").exists());
+            assert!(
+                !workspace
+                    .path()
+                    .join("target/cargo-rail/compiler-artifacts-v1")
+                    .exists()
+            );
         }
         Ok(())
     })();
@@ -228,7 +318,7 @@ fn cache_status_and_cleanup_keep_workspace_and_shared_scopes_explicit() {
         assert_eq!(status_json["scope"], "workspace");
         assert!(status_json["status"]["local"].is_null());
         assert!(status_json["status"]["workspace"]["bytes"].as_u64().unwrap() > 0);
-        assert_eq!(status_json["status"]["workspace"]["fully_bounded"], true);
+        assert_eq!(status_json["status"]["workspace"]["fully_bounded"], false);
 
         let missing_scope = run_cache_command(&workspace, &cache, &["rail", "cache", "clean"]);
         assert_eq!(missing_scope.status.code(), Some(2));
@@ -255,7 +345,12 @@ fn cache_status_and_cleanup_keep_workspace_and_shared_scopes_explicit() {
         let preview_json: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
         assert_eq!(preview_json["mode"], "clean_check");
         assert!(preview_json["would_reclaim_bytes"].as_u64().unwrap() > 0);
-        assert!(workspace.path().join("target/cargo-rail/metadata.json").exists());
+        assert!(
+            workspace
+                .path()
+                .join("target/cargo-rail/compiler-artifacts-v1")
+                .exists()
+        );
 
         let cleaned = run_cache_command(
             &workspace,
@@ -263,10 +358,103 @@ fn cache_status_and_cleanup_keep_workspace_and_shared_scopes_explicit() {
             &["rail", "cache", "clean", "--scope", "workspace", "-f", "json"],
         );
         assert!(cleaned.status.success(), "cleanup failed: {cleaned:?}");
-        assert!(!workspace.path().join("target/cargo-rail/metadata.json").exists());
-        assert!(!workspace.path().join("target/cargo-rail/cache").exists());
+        assert!(
+            !workspace
+                .path()
+                .join("target/cargo-rail/compiler-artifacts-v1")
+                .exists()
+        );
         assert!(workspace.path().join("target/cargo-rail/report.md").exists());
         assert!(workspace.path().join("target/cargo-rail/backups").exists());
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn v025_compiler_diagnostics_status_and_cleanup_preserve_unknown_siblings() {
+    let result: Result<()> = (|| {
+        let workspace = create_test_workspace()?;
+        let cache = TempDir::new()?;
+        fs::remove_dir_all(workspace.path().join("target/cargo-rail/compiler-artifacts-v1"))?;
+        let predecessor_cache = workspace.path().join("target/cargo-rail/cache");
+        fs::create_dir(&predecessor_cache)?;
+        let diagnostics = predecessor_cache.join("compiler-diags-v1.json");
+        let sibling = predecessor_cache.join("retained-by-another-owner");
+        fs::write(&diagnostics, v025_fixture(V025_COMPILER_DIAGNOSTICS))?;
+        fs::write(&sibling, b"not cargo-rail predecessor diagnostics")?;
+        let expected_diagnostics = fs::canonicalize(workspace.path())?
+            .join("target/cargo-rail/cache/compiler-diags-v1.json")
+            .display()
+            .to_string();
+
+        let status = run_cache_command(
+            &workspace,
+            &cache,
+            &["rail", "cache", "status", "--scope", "workspace", "-f", "json"],
+        );
+        assert!(status.status.success(), "v0.25 diagnostics status failed: {status:?}");
+        let status_json: serde_json::Value = serde_json::from_slice(&status.stdout)?;
+        let workspace_status = &status_json["status"]["workspace"];
+        let artifact = workspace_status["artifacts"]
+            .as_array()
+            .and_then(|artifacts| {
+                artifacts
+                    .iter()
+                    .find(|artifact| artifact["kind"] == "predecessor_compiler_diagnostics")
+            })
+            .expect("status must report the exact v0.25 diagnostics file");
+        assert_eq!(artifact["path"], expected_diagnostics);
+        assert_eq!(artifact["bytes"], v025_fixture(V025_COMPILER_DIAGNOSTICS).len() as u64);
+        assert_eq!(artifact["files"], 1);
+        assert_eq!(artifact["directories"], 0);
+        assert_eq!(artifact["max_bytes"], 256_u64 * 1024 * 1024);
+        assert_eq!(
+            workspace_status["bytes"],
+            v025_fixture(V025_COMPILER_DIAGNOSTICS).len() as u64
+        );
+        assert_eq!(workspace_status["fully_bounded"], true);
+
+        let preview = run_cache_command(
+            &workspace,
+            &cache,
+            &[
+                "rail",
+                "cache",
+                "clean",
+                "--scope",
+                "workspace",
+                "--check",
+                "-f",
+                "json",
+            ],
+        );
+        assert_eq!(preview.status.code(), Some(1), "v0.25 diagnostics preview: {preview:?}");
+        let preview_json: serde_json::Value = serde_json::from_slice(&preview.stdout)?;
+        assert_eq!(
+            preview_json["would_reclaim_bytes"],
+            v025_fixture(V025_COMPILER_DIAGNOSTICS).len() as u64
+        );
+        assert_eq!(fs::read(&diagnostics)?, v025_fixture(V025_COMPILER_DIAGNOSTICS));
+
+        let cleaned = run_cache_command(
+            &workspace,
+            &cache,
+            &["rail", "cache", "clean", "--scope", "workspace", "-f", "json"],
+        );
+        assert!(
+            cleaned.status.success(),
+            "v0.25 diagnostics cleanup failed: {cleaned:?}"
+        );
+        let cleaned_json: serde_json::Value = serde_json::from_slice(&cleaned.stdout)?;
+        assert_eq!(
+            cleaned_json["reclaimed_bytes"],
+            v025_fixture(V025_COMPILER_DIAGNOSTICS).len() as u64
+        );
+        assert_eq!(cleaned_json["removed"], serde_json::json!([expected_diagnostics]));
+        assert!(!diagnostics.exists());
+        assert_eq!(fs::read(&sibling)?, b"not cargo-rail predecessor diagnostics");
+        assert!(predecessor_cache.is_dir(), "a nonempty predecessor parent must survive");
         Ok(())
     })();
     super::helpers::finish_test(result);
@@ -279,10 +467,9 @@ fn test_clean_all() {
         let cache = TempDir::new().unwrap();
 
         // Verify artifacts exist
-        assert!(temp.path().join("target/cargo-rail/metadata.json").exists());
         assert!(
             temp.path()
-                .join("target/cargo-rail/cache/compiler-diags-v1.json")
+                .join("target/cargo-rail/compiler-artifacts-v1/result")
                 .exists()
         );
         assert!(temp.path().join("target/cargo-rail/report.md").exists());
@@ -294,8 +481,7 @@ fn test_clean_all() {
         assert!(output.status.success(), "clean all failed: {output:?}");
 
         // Verify artifacts removed
-        assert!(!temp.path().join("target/cargo-rail/metadata.json").exists());
-        assert!(!temp.path().join("target/cargo-rail/cache").exists());
+        assert!(!temp.path().join("target/cargo-rail/compiler-artifacts-v1").exists());
         assert!(!temp.path().join("target/cargo-rail/report.md").exists());
         assert_eq!(manager.list_backups().unwrap().len(), 0);
         Ok(())
@@ -314,8 +500,7 @@ fn test_clean_cache_only() {
         assert!(output.status.success(), "cache cleanup failed: {output:?}");
 
         // Verify cache removed, others remain
-        assert!(!temp.path().join("target/cargo-rail/metadata.json").exists());
-        assert!(!temp.path().join("target/cargo-rail/cache").exists());
+        assert!(!temp.path().join("target/cargo-rail/compiler-artifacts-v1").exists());
         assert!(temp.path().join("target/cargo-rail/report.md").exists());
         let manager = BackupManager::new(temp.path());
         assert_eq!(manager.list_backups().unwrap().len(), 5);
@@ -334,7 +519,7 @@ fn test_clean_refuses_to_follow_a_cache_state_symlink() {
         let cache = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
         fs::write(outside.path().join("keep"), "outside state\n").unwrap();
-        let cache_state = temp.path().join("target/cargo-rail/cache");
+        let cache_state = temp.path().join("target/cargo-rail/compiler-artifacts-v1");
         fs::remove_dir_all(&cache_state).unwrap();
         symlink(outside.path(), &cache_state).unwrap();
 
@@ -349,6 +534,65 @@ fn test_clean_refuses_to_follow_a_cache_state_symlink() {
             fs::read_to_string(outside.path().join("keep")).unwrap(),
             "outside state\n"
         );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(unix)]
+#[test]
+fn v025_compiler_diagnostics_reject_linked_parents_and_files_without_partial_cleanup() {
+    let result: Result<()> = (|| {
+        use std::os::unix::fs::symlink;
+
+        for linked_file in [false, true] {
+            let workspace = create_test_workspace()?;
+            let cache = TempDir::new()?;
+            let outside = TempDir::new()?;
+            let outside_diagnostics = outside.path().join("compiler-diags-v1.json");
+            fs::write(&outside_diagnostics, v025_fixture(V025_COMPILER_DIAGNOSTICS))?;
+            fs::write(outside.path().join("keep"), b"outside state")?;
+            let predecessor_cache = workspace.path().join("target/cargo-rail/cache");
+            if linked_file {
+                fs::create_dir(&predecessor_cache)?;
+                symlink(&outside_diagnostics, predecessor_cache.join("compiler-diags-v1.json"))?;
+            } else {
+                symlink(outside.path(), &predecessor_cache)?;
+            }
+
+            let status = run_cache_command(
+                &workspace,
+                &cache,
+                &["rail", "cache", "status", "--scope", "workspace", "-f", "json"],
+            );
+            assert_eq!(status.status.code(), Some(2), "linked status must fail: {status:?}");
+            let status_error = format!(
+                "{}{}",
+                String::from_utf8_lossy(&status.stdout),
+                String::from_utf8_lossy(&status.stderr)
+            );
+            assert!(
+                status_error.contains("v0.25 compiler diagnostics")
+                    && status_error.contains(if linked_file {
+                        "not a private regular file"
+                    } else {
+                        "not a real directory"
+                    }),
+                "{status_error}"
+            );
+
+            let cleaned = run_cache_command(&workspace, &cache, &["rail", "clean", "--cache"]);
+            assert_eq!(cleaned.status.code(), Some(2), "linked cleanup must fail: {cleaned:?}");
+            assert!(
+                workspace
+                    .path()
+                    .join("target/cargo-rail/compiler-artifacts-v1/result")
+                    .is_file(),
+                "complete-scope validation must precede every deletion"
+            );
+            assert_eq!(fs::read(&outside_diagnostics)?, v025_fixture(V025_COMPILER_DIAGNOSTICS));
+            assert_eq!(fs::read(outside.path().join("keep"))?, b"outside state");
+        }
         Ok(())
     })();
     super::helpers::finish_test(result);
@@ -377,8 +621,7 @@ fn test_clean_reports_only() {
         .unwrap();
 
         // Verify reports removed, others remain
-        assert!(temp.path().join("target/cargo-rail/metadata.json").exists());
-        assert!(temp.path().join("target/cargo-rail/cache").exists());
+        assert!(temp.path().join("target/cargo-rail/compiler-artifacts-v1").exists());
         assert!(!temp.path().join("target/cargo-rail/report.md").exists());
         let manager = BackupManager::new(temp.path());
         assert_eq!(manager.list_backups().unwrap().len(), 5);
@@ -427,8 +670,7 @@ fn test_clean_backups_prune() {
         .unwrap();
 
         // Verify backups pruned, others remain
-        assert!(temp.path().join("target/cargo-rail/metadata.json").exists());
-        assert!(temp.path().join("target/cargo-rail/cache").exists());
+        assert!(temp.path().join("target/cargo-rail/compiler-artifacts-v1").exists());
         assert!(temp.path().join("target/cargo-rail/report.md").exists());
         let manager = BackupManager::new(temp.path());
         assert_eq!(manager.list_backups().unwrap().len(), 3);
@@ -449,8 +691,7 @@ fn test_bare_clean_is_a_usage_error_without_mutation() {
         assert!(String::from_utf8_lossy(&output.stderr).contains("explicit artifact selector"));
 
         // Verify nothing was removed.
-        assert!(temp.path().join("target/cargo-rail/metadata.json").exists());
-        assert!(temp.path().join("target/cargo-rail/cache").exists());
+        assert!(temp.path().join("target/cargo-rail/compiler-artifacts-v1").exists());
         assert!(temp.path().join("target/cargo-rail/report.md").exists());
         let manager = BackupManager::new(temp.path());
         assert_eq!(manager.list_backups().unwrap().len(), 5);

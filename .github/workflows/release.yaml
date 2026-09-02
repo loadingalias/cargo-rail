@@ -81,7 +81,12 @@ jobs:
           fi
           echo "release_sha=$tag_sha" >> "$GITHUB_OUTPUT"
 
+          test "$(git show -s --format='%(trailers:key=Rail-Release-Contract,valueonly)' "$tag_sha")" = 1
+          test "$(git show -s --format='%(trailers:key=Rail-Release-Mode,valueonly)' "$tag_sha")" = run
           test "$(git show -s --format='%(trailers:key=Rail-Release-Publish,valueonly)' "$tag_sha")" = true
+          test "$(git show -s --format='%(trailers:key=Rail-Release-Publish-Registry,valueonly)' "$tag_sha")" = crates-io
+          test "$(git show -s --format='%(trailers:key=Rail-Release-Crate,valueonly)' "$tag_sha")" = "cargo-rail@${RELEASE_TAG#v}"
+          test "$(git show -s --format='%(trailers:key=Rail-Release-Crate-Publish,valueonly)' "$tag_sha")" = cargo-rail=true
           test "$(git show -s --format='%(trailers:key=Rail-Release-Tag,valueonly)' "$tag_sha")" = true
           test "$(git show -s --format='%(trailers:key=Rail-Release-Tag-Name,valueonly)' "$tag_sha")" = "cargo-rail=$RELEASE_TAG"
 

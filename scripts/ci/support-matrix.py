@@ -127,35 +127,36 @@ def load_ci_tool_archives() -> tuple[CiToolArchive, ...]:
             continue
         values = line.split("\t")
         require(
-            len(values) == 7,
-            f"ci-tool-archives.tsv line {index} must contain 7 tab columns",
+            len(values) == 4,
+            f"ci-tool-archives.tsv line {index} must contain 4 tab columns",
         )
         tool = require_string(values[0], f"ci-tool-archives.tsv:{index}:tool")
         version = require_string(values[1], f"ci-tool-archives.tsv:{index}:version")
-        os_name = require_string(values[2], f"ci-tool-archives.tsv:{index}:os")
-        arch = require_string(values[3], f"ci-tool-archives.tsv:{index}:arch")
-        filename = require_string(values[4], f"ci-tool-archives.tsv:{index}:filename")
-        url = require_string(values[5], f"ci-tool-archives.tsv:{index}:url")
-        digest = require_string(values[6], f"ci-tool-archives.tsv:{index}:sha256")
+        target = require_string(values[2], f"ci-tool-archives.tsv:{index}:target")
+        digest = require_string(values[3], f"ci-tool-archives.tsv:{index}:sha256")
         require(
             re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) is not None,
             f"ci-tool-archives.tsv:{index}:version must be semver",
         )
-        require(re.fullmatch(r"[0-9a-f]{64}", digest) is not None, f"ci-tool-archives.tsv:{index}:sha256 must be a hex digest")
         require(
-            url.startswith("https://"),
-            f"ci-tool-archives.tsv:{index}:url must be https",
+            re.fullmatch(
+                r"(?:aarch64|x86_64)-(?:pc-windows-msvc|unknown-linux-(?:gnu|musl))",
+                target,
+            )
+            is not None,
+            f"ci-tool-archives.tsv:{index}:target must be a supported Rust target",
         )
-        key = f"{tool}\t{version}\t{os_name}\t{arch}"
+        require(
+            re.fullmatch(r"[0-9a-f]{64}", digest) is not None,
+            f"ci-tool-archives.tsv:{index}:sha256 must be a hex digest",
+        )
+        key = f"{tool}\t{version}\t{target}"
         keys.append(key)
         entries.append(
             CiToolArchive(
                 tool=tool,
                 version=version,
-                os=os_name,
-                arch=arch,
-                filename=filename,
-                url=url,
+                target=target,
                 sha256=digest,
             )
         )
@@ -682,10 +683,7 @@ class NativeCacheContract:
 class CiToolArchive:
     tool: str
     version: str
-    os: str
-    arch: str
-    filename: str
-    url: str
+    target: str
     sha256: str
 
 
@@ -726,6 +724,7 @@ def load_native_cache_contract() -> NativeCacheContract:
     )
     bypass_source = (
         source
+        + (REPOSITORY_ROOT / "src/compiler/capability.rs").read_text(encoding="utf-8")
         + (REPOSITORY_ROOT / "src/compiler/collector.rs").read_text(encoding="utf-8")
         + (REPOSITORY_ROOT / "src/compiler/invocation.rs").read_text(encoding="utf-8")
     )
@@ -765,12 +764,26 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
     release_cross_targets = set(manifest.release_cross_targets)
     required_release_targets = native_targets | release_cross_targets
 
+    gnu_runtime = require_object(
+        load_json(REPOSITORY_ROOT / "distribution/gnu-runtime.json"),
+        "distribution/gnu-runtime.json",
+        {"contract_version", "family", "minimum"},
+    )
+    require(
+        gnu_runtime["contract_version"] == 1
+        and gnu_runtime["family"] == "glibc"
+        and isinstance(gnu_runtime["minimum"], str)
+        and re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", gnu_runtime["minimum"])
+        is not None,
+        "GNU runtime authority must declare canonical glibc contract 1",
+    )
     release_entries = load_json(REPOSITORY_ROOT / "distribution/release-targets.json")
     require(
         isinstance(release_entries, list) and release_entries,
         "release target registry must be a non-empty array",
     )
     release_targets: list[str] = []
+    release_by_target: dict[str, dict[str, Any]] = {}
     for index, value in enumerate(release_entries):
         entry = require_object(
             value,
@@ -778,7 +791,7 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
             {"target", "os", "archive", "surface", "commit_ci"},
         )
         target = require_string(entry["target"], f"release-targets[{index}].target")
-        require_string(entry["os"], f"release-targets[{index}].os")
+        runner = require_string(entry["os"], f"release-targets[{index}].os")
         require(
             entry["archive"] in {"tar", "zip"},
             f"release-targets[{index}].archive is invalid",
@@ -795,6 +808,15 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
                 entry["surface"] is True,
                 f"release-targets[{index}] must ship qualified musl Surface authority",
             )
+        if target.endswith("-unknown-linux-gnu"):
+            expected_runner = {
+                "aarch64-unknown-linux-gnu": "ubuntu-22.04-arm",
+                "x86_64-unknown-linux-gnu": "ubuntu-22.04",
+            }.get(target)
+            require(
+                runner == expected_runner,
+                f"release-targets[{index}] must build and run on the declared glibc {gnu_runtime['minimum']} floor",
+            )
         require(
             isinstance(entry["commit_ci"], bool),
             f"release-targets[{index}].commit_ci must be a boolean",
@@ -808,10 +830,62 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
             f"release-targets[{index}].commit_ci must exclude exactly locally qualified native hosts",
         )
         release_targets.append(target)
+        release_by_target[target] = entry
     require_unique_sorted(release_targets, "release target registry")
     require(
         set(release_targets) == required_release_targets,
         "release target registry must equal advertised native hosts plus required release cross targets",
+    )
+
+    archive_catalog = require_object(
+        load_json(
+            REPOSITORY_ROOT
+            / "distribution/release-archive-plan-variants.json"
+        ),
+        "distribution/release-archive-plan-variants.json",
+        {"variant_catalog_version", "work", "variants"},
+    )
+    require(
+        archive_catalog["variant_catalog_version"] == 2
+        and archive_catalog["work"] == "release-archives"
+        and isinstance(archive_catalog["variants"], list),
+        "release archive variant catalog must be contract 2 for release-archives",
+    )
+    catalog_targets: list[str] = []
+    for index, value in enumerate(archive_catalog["variants"]):
+        require(
+            isinstance(value, dict),
+            f"release archive variant {index} must be an object",
+        )
+        dimensions = require_object(
+            value.get("dimensions"),
+            f"release archive variant {index}.dimensions",
+            {"target", "os", "archive", "surface"},
+        )
+        target = require_string(
+            dimensions["target"],
+            f"release archive variant {index}.dimensions.target",
+        )
+        expected = release_by_target.get(target)
+        require(
+            expected is not None,
+            f"release archive variant {index} names unknown target {target}",
+        )
+        projection = {
+            key: expected[key] for key in ("target", "os", "archive", "surface")
+        }
+        require(
+            dimensions == projection,
+            f"release archive variant {index} disagrees with release-targets.json",
+        )
+        catalog_targets.append(target)
+    require_unique_sorted(catalog_targets, "release archive variant targets")
+    commit_ci_targets = [
+        target for target in release_targets if release_by_target[target]["commit_ci"]
+    ]
+    require(
+        catalog_targets == commit_ci_targets,
+        "release archive variant catalog must project every CI-qualified release target exactly once",
     )
 
     toolchain = load_toml(REPOSITORY_ROOT / "rust-toolchain.toml")
@@ -906,7 +980,6 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
     )
 
     ci_tool_archives = load_ci_tool_archives()
-    ci_tool_map = {(entry.tool, entry.version, entry.os, entry.arch): entry for entry in ci_tool_archives}
     install_tools = (REPOSITORY_ROOT / "scripts/ci/install-tools.sh").read_text(
         encoding="utf-8"
     )
@@ -930,13 +1003,11 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         *sorted((REPOSITORY_ROOT / ".github/workflows").glob("*.yaml")),
     ]
 
-    nextest_required_pairs = {
-        (entry.os, entry.arch)
-        for entry in ci_tool_archives
-        if entry.tool == "cargo-nextest"
+    nextest_targets = {
+        entry.target for entry in ci_tool_archives if entry.tool == "cargo-nextest"
     }
     require(
-        bool(nextest_required_pairs),
+        bool(nextest_targets),
         "ci-tool-archives.tsv must define cargo-nextest pins",
     )
     nextest_versions = {
@@ -952,27 +1023,19 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
     )
     require_action_tool_version(action_tool_paths, "cargo-nextest", nextest_version)
     expected_nextest_targets = {
-        ("unknown-linux-gnu", "x86_64"),
-        ("unknown-linux-gnu", "aarch64"),
-        ("pc-windows-msvc", "x86_64"),
-        ("pc-windows-msvc", "aarch64"),
-    }
-    require(nextest_required_pairs == expected_nextest_targets, "ci-tool-archives.tsv cargo-nextest targets are incomplete")
-    for os_name, arch in sorted(expected_nextest_targets):
-        entry = ci_tool_map[("cargo-nextest", nextest_version, os_name, arch)]
-        target = f"{arch}-{os_name}"
-        expected_filename = f"cargo-nextest-{nextest_version}-{target}.tar.gz"
-        expected_url = (
-            f"https://github.com/nextest-rs/nextest/releases/download/"
-            f"cargo-nextest-{nextest_version}/{expected_filename}"
-        )
-        require(entry.filename == expected_filename and entry.url == expected_url, f"invalid cargo-nextest archive row for {target}")
-
-    just_required_pairs = {
-        (entry.os, entry.arch) for entry in ci_tool_archives if entry.tool == "just"
+        "aarch64-pc-windows-msvc",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-pc-windows-msvc",
+        "x86_64-unknown-linux-gnu",
     }
     require(
-        bool(just_required_pairs),
+        nextest_targets == expected_nextest_targets,
+        "ci-tool-archives.tsv cargo-nextest targets are incomplete",
+    )
+
+    just_targets = {entry.target for entry in ci_tool_archives if entry.tool == "just"}
+    require(
+        bool(just_targets),
         "ci-tool-archives.tsv must define just pins",
     )
     just_versions = {entry.version for entry in ci_tool_archives if entry.tool == "just"}
@@ -1007,40 +1070,44 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
     )
     for fragment in (
         "loadingalias/cargo-rail-action/cache@",
-        "# v8.1.0",
+        "# v8.2.0",
         f"version: {cargo_rail_match.group(1)}",
         "root-portability: remap",
-        "remote-credentials-ready:",
+        "remote-access-key-id:",
+        "remote-secret-access-key:",
         "r2://*)",
     ):
         require(
             fragment in cache_action,
             f"repository cache action is missing {fragment}",
         )
+    credential_scope = """\
+      env:
+        AWS_ACCESS_KEY_ID: ${{ inputs.remote-access-key-id }}
+        AWS_SECRET_ACCESS_KEY: ${{ inputs.remote-secret-access-key }}
+        AWS_EC2_METADATA_DISABLED: "true"
+      uses: loadingalias/cargo-rail-action/cache@"""
     require(
         "configure-aws-credentials" not in cache_action
-        and "AWS_ACCESS_KEY_ID" not in cache_action
-        and "AWS_SECRET_ACCESS_KEY" not in cache_action,
-        "repository cache action must not receive or export provider credentials",
+        and credential_scope in cache_action
+        and cache_action.count("AWS_ACCESS_KEY_ID:") == 1
+        and cache_action.count("AWS_SECRET_ACCESS_KEY:") == 1,
+        "repository cache credentials must be scoped only to the pinned Cargo-Rail cache action",
     )
     require(
         "scripts/cache/setup.sh --max-size 10GiB" not in cache_action,
         "repository cache action must configure compiler reuse in one setup transaction",
     )
     expected_just_targets = {
-        ("unknown-linux-musl", "x86_64"),
-        ("unknown-linux-musl", "aarch64"),
-        ("pc-windows-msvc", "x86_64"),
-        ("pc-windows-msvc", "aarch64"),
+        "aarch64-pc-windows-msvc",
+        "aarch64-unknown-linux-musl",
+        "x86_64-pc-windows-msvc",
+        "x86_64-unknown-linux-musl",
     }
-    require(just_required_pairs == expected_just_targets, "ci-tool-archives.tsv just targets are incomplete")
-    for os_name, arch in sorted(expected_just_targets):
-        entry = ci_tool_map[("just", just_version, os_name, arch)]
-        target = f"{arch}-{os_name}"
-        suffix = "zip" if os_name == "pc-windows-msvc" else "tar.gz"
-        expected_filename = f"just-{just_version}-{target}.{suffix}"
-        expected_url = f"https://github.com/casey/just/releases/download/{just_version}/{expected_filename}"
-        require(entry.filename == expected_filename and entry.url == expected_url, f"invalid just archive row for {target}")
+    require(
+        just_targets == expected_just_targets,
+        "ci-tool-archives.tsv just targets are incomplete",
+    )
 
     corpus_runner = (REPOSITORY_ROOT / manifest.corpus_runner).read_text(
         encoding="utf-8"
@@ -1087,7 +1154,7 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
       - name: Remove ambient Windows compiler-cache installation
         if: matrix.compatibility.full-suite && runner.os == 'Windows'
         shell: bash
-        run: target/debug/cargo-rail.exe rail cache remove --quiet
+        run: target/debug/cargo-rail.exe rail cache uninstall --quiet
 """
     require(
         windows_cache_cleanup_step in compatibility_workflow,
@@ -1097,8 +1164,8 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
       - name: Run full Windows endpoint suite
         if: matrix.compatibility.full-suite && runner.os == 'Windows'
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.r2_access_key_id }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.r2_secret_access_key }}
+          AWS_ACCESS_KEY_ID: ${{ inputs.native-cache-url != '' && secrets.r2_access_key_id || '' }}
+          AWS_SECRET_ACCESS_KEY: ${{ inputs.native-cache-url != '' && secrets.r2_secret_access_key || '' }}
           AWS_EC2_METADATA_DISABLED: "true"
           TEMP: ${{ runner.temp }}
           TMP: ${{ runner.temp }}
@@ -1114,8 +1181,8 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         if: matrix.compatibility.full-suite
         shell: bash
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.r2_access_key_id }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.r2_secret_access_key }}
+          AWS_ACCESS_KEY_ID: ${{ inputs.native-cache-url != '' && secrets.r2_access_key_id || '' }}
+          AWS_SECRET_ACCESS_KEY: ${{ inputs.native-cache-url != '' && secrets.r2_secret_access_key || '' }}
           AWS_EC2_METADATA_DISABLED: "true"
         run: |
           rustup component add rustc-dev --toolchain "$RUSTUP_TOOLCHAIN"
@@ -1144,7 +1211,8 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         "vars.CARGO_RAIL_CACHE_REMOTE",
         "secrets.CARGO_RAIL_R2_ACCESS_KEY_ID",
         "secrets.CARGO_RAIL_R2_SECRET_ACCESS_KEY",
-        "native-cache-credentials-ready:",
+        "native-cache-access-key-id:",
+        "native-cache-secret-access-key:",
         "r2_access_key_id:",
         "r2_secret_access_key:",
     ):
@@ -1152,7 +1220,7 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
             fragment in commit_workflow,
             f"Commit workflow is missing R2 cache authority: {fragment}",
         )
-    for legacy in (
+    for forbidden in (
         "CACHE_QUALIFICATION_AWS_",
         "configure-aws-credentials",
         "native-cache-role:",
@@ -1160,8 +1228,8 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         "native-cache-account:",
     ):
         require(
-            legacy not in commit_workflow,
-            f"Commit workflow retains legacy AWS cache wiring: {legacy}",
+            forbidden not in commit_workflow,
+            f"Commit workflow retains unsupported AWS cache wiring: {forbidden}",
         )
 
     r2_qualification = (
@@ -1183,15 +1251,11 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
     cache_action = (
         REPOSITORY_ROOT / ".github/actions/cache/action.yaml"
     ).read_text(encoding="utf-8")
-    for fragment in ('root-portability: remap',):
+    for fragment in ('root-portability: remap', 'strict-probe: "true"'):
         require(
             fragment in cache_action,
-            f"repository cache setup is missing strict portable policy: {fragment}",
+            f"repository cache setup is missing strict remote policy: {fragment}",
         )
-    require(
-        'strict-probe: "true"' not in cache_action,
-        "repository cache setup cannot require probe before its pinned Cargo-Rail release provides that command",
-    )
     remote_qualification = (
         REPOSITORY_ROOT / "scripts/ci/qualify-native-cache-s3.sh"
     ).read_text(encoding="utf-8")
@@ -1279,6 +1343,14 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         "native-cache-url: ${{ vars.CARGO_RAIL_CACHE_REMOTE }}",
         "r2_access_key_id: ${{ secrets.CARGO_RAIL_R2_ACCESS_KEY_ID }}",
         "r2_secret_access_key: ${{ secrets.CARGO_RAIL_R2_SECRET_ACCESS_KEY }}",
+        "trailers:key=Rail-Release-Contract,valueonly)' \"$tag_sha\")\" = 1",
+        "trailers:key=Rail-Release-Mode,valueonly)' \"$tag_sha\")\" = run",
+        "trailers:key=Rail-Release-Publish,valueonly)' \"$tag_sha\")\" = true",
+        "trailers:key=Rail-Release-Publish-Registry,valueonly)' \"$tag_sha\")\" = crates-io",
+        "trailers:key=Rail-Release-Crate,valueonly)' \"$tag_sha\")\" = \"cargo-rail@${RELEASE_TAG#v}\"",
+        "trailers:key=Rail-Release-Crate-Publish,valueonly)' \"$tag_sha\")\" = cargo-rail=true",
+        "trailers:key=Rail-Release-Tag,valueonly)' \"$tag_sha\")\" = true",
+        "trailers:key=Rail-Release-Tag-Name,valueonly)' \"$tag_sha\")\" = \"cargo-rail=$RELEASE_TAG\"",
     ):
         require(
             fragment in release_workflow,
@@ -1307,6 +1379,7 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         toolchain_installer_path,
         "distribution/release-targets.json",
         "scripts/ci/smoke-release-tar.sh",
+        "scripts/ci/verify-gnu-runtime.py",
         "scripts/ci/manufacture-compiler-fact-driver.sh",
         "scripts/ci/install-musl-toolchain.sh",
         "Select exact native musl Rust host",
@@ -1316,7 +1389,8 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         "actions/upload-artifact@",
         "secrets.r2_access_key_id",
         "secrets.r2_secret_access_key",
-        "remote-credentials-ready:",
+        "remote-access-key-id:",
+        "remote-secret-access-key:",
     ):
         require(
             fragment in archive_workflow,
@@ -1329,6 +1403,7 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         worker_verifier,
         'smoke="$(mktemp -d',
         "--cargo-rail-fact-protocol-version",
+        "scripts/ci/verify-gnu-runtime.py",
         "capture_surface stable-prepare",
         "capture_surface stable-check",
         "capture_surface stable-warm",
@@ -1341,6 +1416,12 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
             fragment in archive_smoke,
             f"release archive smoke command is missing {fragment}",
         )
+    installer = (REPOSITORY_ROOT / "scripts/install.sh").read_text(encoding="utf-8")
+    require(
+        f'gnu_minimum="{gnu_runtime["minimum"]}"' in installer
+        and "getconf GNU_LIBC_VERSION" in installer,
+        "Unix installer GNU runtime projection does not match distribution/gnu-runtime.json",
+    )
     musl_qualifier_path = "scripts/ci/qualify-musl-surface.sh"
     musl_qualifier = (REPOSITORY_ROOT / musl_qualifier_path).read_text(
         encoding="utf-8"
@@ -1605,7 +1686,8 @@ path with a stable miss or bypass reason.
 
 ## Set up local reuse
 
-One setup enables L1 for ordinary Cargo, nextest, Just, IDE, and CI commands using the same effective Cargo home:
+Setup enrolls the current workspace for ordinary Cargo, nextest, Just, IDE, and CI commands. Workspaces that share
+one effective Cargo home share the installed wrapper, but each enrollment owns a separate cache profile:
 
 ```bash
 cargo rail cache setup --check
@@ -1614,9 +1696,11 @@ cargo rail cache status --scope local
 cargo rail doctor native-cache
 ```
 
-Setup previews and then owns one global `build.rustc-wrapper`, private launcher and worker bytes, a receipt, and a
-bounded CAS. It refuses another global wrapper, persistent shadowing, ambiguous Cargo homes, linked authority paths,
-or changed receipt-owned state. Repeating setup verifies or repairs only the same authority.
+Setup previews and then owns one global `build.rustc-wrapper`, private launcher and worker bytes, and an installation
+receipt. It also binds the exact physical workspace root to one private profile with its own bounded CAS trust domain.
+Running setup in another workspace creates another profile; it does not replace the first profile. An unenrolled
+workspace executes normally without L1 or L2 reuse. Setup refuses another global wrapper, persistent shadowing,
+ambiguous Cargo homes, linked authority paths, or changed owned state.
 
 Cargo freshness and incremental compilation remain L0. An L1 action binds the compiler, toolchain, arguments, target,
 environment, dependencies, source topology and bytes, native-search inputs, and declared outputs. Physical mode also
@@ -1640,7 +1724,8 @@ CARGO_RAIL_CACHE=off cargo check --locked
 
 ## Share results remotely
 
-Remote selection is machine state, never repository configuration. Persist L2 during setup, then use ordinary Cargo:
+Remote selection is workspace-bound machine state, never repository configuration. Persist L2 in the current
+workspace profile during setup, then use ordinary Cargo:
 
 ```bash
 cargo rail cache setup --check --remote \\
@@ -1770,21 +1855,32 @@ This store contains diagnostic evidence, not restorable Cargo artifacts.
 Check mode may update evidence under `target/cargo-rail/`. Inspect `evidence_cache` in JSON output for hits, misses,
 and reasons.
 
-## Inspect, clean, or remove
+## Inspect, clean, detach, or uninstall
 
 ```bash
 cargo rail cache status --scope local --json
+cargo rail cache profiles --json
 cargo rail cache clean --scope workspace --check
 cargo rail cache clean --scope local --check
-cargo rail cache remove --check
+cargo rail cache detach --check
+cargo rail cache drop-profile --profile PROFILE_ID --check
+cargo rail cache drop-unbound --check
+cargo rail cache uninstall --check
 ```
 
-Workspace cleanup removes reconstructible state for the current checkout. Local cleanup removes only the
-receipt-selected shared CAS after validating ownership and waiting for readers; rerun `cache setup` afterward.
-`cache remove` removes the owned Cargo field and private setup state but preserves CAS data. Every operation refuses
-changed, shadowed, linked, or unowned authority. Do not delete individual CAS objects or Cargo fingerprints by hand.
+Workspace cleanup removes reconstructible state for the current checkout. Local cleanup removes only the current
+profile's CAS after validating ownership and waiting for readers; rerun `cache setup` afterward. `cache detach`
+removes the current root binding but preserves the profile and CAS. `cache drop-profile` accepts an opaque ID from
+`cache profiles` and removes only a detached profile with no enrolled roots. `cache uninstall` removes the global
+wrapper, Cargo field, and installation receipt while preserving profiles and their CAS data.
 
-Status schema 14 reports stable native failure-reason counters separately from the bounded 65,536-event usage ledger,
+An upgrade from v0.25 retains its machine-global policy as unbound pre-profile state because that receipt cannot prove
+which workspace owned its remote. Runtime selection never uses that state. Enroll the intended workspace explicitly,
+then preview `cache drop-unbound` before removing the retained CAS. Every operation refuses changed, shadowed, linked,
+or unowned authority. Do not edit profile records, individual CAS objects, or Cargo fingerprints by hand.
+
+Status schema 15 reports the selected profile ID, workspace binding, trust domain, and redacted remote selection
+source. It reports stable native failure-reason counters separately from the bounded 65,536-event usage ledger,
 so capture, identity, and post-execution witness failures remain visible after that ledger fills. If the counter file
 cannot be validated, `failure_reason_counts_available` is `false` instead of reporting invented zeroes. Verbose status
 also reports the fixed 64-shard native restore-lock namespace and any staging residue.

@@ -24,18 +24,7 @@ tag_format = "{prefix}{version}"
 remote_effects = "auto"
 registry_publication = "crates-io"
 sign_tags = true
-require_changelog_entries = true
-require_change_files = true
 semver_check = "off"
-unconventional_commits = "deny"
-
-[release.changelog]
-emoji = false
-group_order = ["breaking", "feat", "fix", "perf", "docs", "deps"]
-fallback = "skip"
-
-[release.changelog.filters]
-skip_types = ["build", "chore", "ci", "refactor", "style", "test"]
 
 # Repository work declarations contain positive inputs only. Cargo, rustfmt,
 # dependency policy, release-semver, and Surface semantics remain code-owned.
@@ -66,6 +55,7 @@ paths = [
 scope = "repository"
 paths = [
   "scripts/docs/**",
+  "scripts/ci/install-tools.sh",
   "scripts/ci/support-matrix.py",
   "src/compiler/native_cache.rs",
   "tests/compatibility/manifest.json",
@@ -84,7 +74,6 @@ paths = [
 
 [plan.work.compatibility]
 scope = "variants"
-cargo = ["cargo.build", "cargo.test"]
 paths = [
   ".github/workflows/compatibility.yaml",
   "scripts/ci/run-compatibility.py",
@@ -99,12 +88,16 @@ variant_catalog = "distribution/compatibility-plan-variants.json"
 scope = "variants"
 paths = [
   ".github/workflows/release-archives.yaml",
+  "distribution/gnu-runtime.json",
   "distribution/release-targets.json",
   "scripts/install.ps1",
   "scripts/install.sh",
   "scripts/package-release-archive.py",
   "scripts/ci/install-rust-toolchain.sh",
   "scripts/ci/support-matrix.py",
+  "scripts/ci/test-gnu-runtime.py",
+  "scripts/ci/verify-gnu-runtime.py",
+  "scripts/ci/fixtures/readelf-glibc-*.txt",
   "scripts/ci/verify-release-components.py",
   "src/main.rs",
   "tools/compiler-fact-driver/**",

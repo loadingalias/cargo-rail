@@ -1,4 +1,4 @@
-//! `cargo rail unify` - Workspace dependency unification
+//! Analyze and apply deterministic workspace dependency repairs.
 //!
 //! Implements resolution-based unification:
 //! 1. Multi-target metadata for versions
@@ -760,6 +760,10 @@ pub fn run_unify_doctor(ctx: &WorkspaceContext, format: UnifyOutputFormat) -> Ra
     let metadata = ctx.multi_target_metadata()?;
     let host = snapshot.toolchain().host_target();
     let metadata_targets = metadata.targets();
+    let compiler_targets = ctx
+        .config()
+        .map(|config| config.unify.effective_compiler_targets(&metadata_targets))
+        .unwrap_or_else(|| metadata_targets.clone());
     let mut target_domains = Vec::with_capacity(metadata_targets.len());
     for target in metadata_targets {
         let resolved_nodes = metadata
@@ -823,6 +827,7 @@ pub fn run_unify_doctor(ctx: &WorkspaceContext, format: UnifyOutputFormat) -> Ra
                 "unify_policy": policy_overrides,
               },
               "target_domains": target_domains,
+              "compiler_evidence_targets": compiler_targets,
               "ambiguous_aliases": aliases,
               "recommended_action": {
                 "code": recommendation_code,
@@ -855,6 +860,9 @@ pub fn run_unify_doctor(ctx: &WorkspaceContext, format: UnifyOutputFormat) -> Ra
         rendered.push_str(&target["resolved_node_count"].as_u64().unwrap_or(0).to_string());
         rendered.push_str(" resolved nodes)\n");
     }
+    rendered.push_str("compiler evidence targets: ");
+    rendered.push_str(&format_preview_list(&compiler_targets, 8));
+    rendered.push('\n');
     rendered.push_str("cargo source overrides: ");
     rendered.push_str(&format_preview_list(&cargo_overrides, 8));
     rendered.push_str("\nunify policy overrides: ");
@@ -2961,7 +2969,6 @@ mod tests {
             member_edits: FxHashMap::default(),
             member_paths: FxHashMap::default(),
             transitive_pins: Vec::new(),
-            validation_results: Vec::new(),
             issues: Vec::new(),
             computed_msrv: None,
             duplicates_cleaned: Vec::new(),

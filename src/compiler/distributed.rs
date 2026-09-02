@@ -31,6 +31,7 @@ use crate::error::{RailError, RailResult};
 use crate::source::ContentDigest;
 
 const PROTOCOL_VERSION: u32 = 3;
+const ANALYSIS_OPERATION_VERSION: u32 = 1;
 const REQUEST_MAGIC: &[u8; 8] = b"CRXREQ3\0";
 const REQUEST_TRAILER: &[u8; 8] = b"CRXEND3\0";
 const RESPONSE_MAGIC: &[u8; 8] = b"CRXRES3\0";
@@ -92,6 +93,26 @@ const PLACEMENT_MINIMUM_MARGIN_NS: u64 = 25 * 1_000_000;
 
 static LOCAL_LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+fn supported_analysis_coverage() -> BTreeSet<crate::compiler::facts::CompilerFactCoverage> {
+    use crate::compiler::facts::CompilerFactCoverage;
+
+    BTreeSet::from([
+        CompilerFactCoverage::Definitions,
+        CompilerFactCoverage::Visibility,
+        CompilerFactCoverage::ExactSpans,
+        CompilerFactCoverage::MacroProvenance,
+        CompilerFactCoverage::BodyEdges,
+        CompilerFactCoverage::InterfaceEdges,
+        CompilerFactCoverage::ReexportEdges,
+        CompilerFactCoverage::PrivacyEdges,
+        CompilerFactCoverage::TraitDispatch,
+        CompilerFactCoverage::ForeignExports,
+        CompilerFactCoverage::GeneratedSources,
+        CompilerFactCoverage::EntryPoints,
+        CompilerFactCoverage::ConservativeRetention,
+    ])
+}
+
 const fn worker_execution_limits() -> ExecutionLimits {
     ExecutionLimits {
         cpu_period_micros: MAX_CPU_PERIOD_MICROS,
@@ -108,6 +129,8 @@ const fn worker_execution_limits() -> ExecutionLimits {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkerCapability {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    analysis: Option<AnalysisWorkerCapability>,
     architecture: String,
     capability_id: String,
     endianness: String,
@@ -138,9 +161,26 @@ enum WorkerIsolation {
 #[serde(rename_all = "snake_case")]
 enum OperationClass {
     RustLibrary,
+    RustAnalysisV1,
+}
+
+/// Exact compiler-private producer capability for the separately versioned
+/// analysis operation. The ordinary Rust library operation does not depend on
+/// this optional authority and retains its existing wire shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnalysisWorkerCapability {
+    compiler_library_digest: String,
+    coverage: BTreeSet<crate::compiler::facts::CompilerFactCoverage>,
+    driver_digest: String,
+    driver_identity: String,
+    fact_protocol: u32,
+    target: String,
+    version: u32,
 }
 
 struct CapturedWorkerCapability {
+    analysis_driver: Option<crate::compiler::driver::PreparedDistributedCompilerFactDriver>,
     capability: WorkerCapability,
     rustc: PathBuf,
     rustc_generation: Vec<u8>,
@@ -281,6 +321,8 @@ struct ExecutionLimits {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RustLibraryOperation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    analysis: Option<RustAnalysisOperationV1>,
     cap_lints: Option<String>,
     cargo_json_diagnostics: bool,
     check_cfg: Vec<String>,
@@ -305,6 +347,28 @@ struct RustLibraryOperation {
     source_virtual_path: String,
     test_mode: bool,
     toolchain_proc_macro: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RustAnalysisOperationV1 {
+    contract: crate::compiler::analysis::AnalysisContract,
+    fact_protocol: u32,
+    invocation: PortableCompilerFactInvocation,
+    observation: crate::compiler::analysis::AnalysisObservation,
+    target: String,
+    version: u32,
+}
+
+/// Path-free part of the one-run compiler fact capability. The worker creates
+/// its own private physical roots after validating this semantic authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortableCompilerFactInvocation {
+    producer_authority: crate::compiler::facts::CompilerFactProducerAuthority,
+    required_coverage: BTreeSet<crate::compiler::facts::CompilerFactCoverage>,
+    run_authority: crate::compiler::facts::CompilerFactRunAuthority,
+    unit: crate::compiler::facts::CompilerFactUnit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -499,6 +563,8 @@ struct ResponseFrame {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ResponseSlot {
+    AnalysisObservation,
+    CompilerFacts,
     DepInfo,
     Metadata,
     Rlib,
@@ -509,6 +575,8 @@ enum ResponseSlot {
 impl ResponseSlot {
     const fn file_name(self) -> &'static str {
         match self {
+            Self::AnalysisObservation => "analysis-observation",
+            Self::CompilerFacts => "compiler-facts",
             Self::DepInfo => "dep-info",
             Self::Metadata => "metadata",
             Self::Rlib => "rlib",
@@ -520,12 +588,24 @@ impl ResponseSlot {
     const fn is_stream(self) -> bool {
         matches!(self, Self::Stderr | Self::Stdout)
     }
+
+    const fn is_bytes(self) -> bool {
+        matches!(
+            self,
+            Self::AnalysisObservation | Self::CompilerFacts | Self::Stderr | Self::Stdout
+        )
+    }
 }
 
 struct RequestEnvelope {
     inputs: BTreeMap<String, PathBuf>,
     request: ExecutionRequest,
     _staging: tempfile::TempDir,
+}
+
+struct WorkerAnalysisInvocation {
+    capability: tempfile::TempPath,
+    observation_directory: PathBuf,
 }
 
 enum ResponsePayload {
@@ -588,19 +668,97 @@ impl StagedExecutionResult {
     }
 
     pub(crate) fn read_verified_frame(&self, slot: DistributedResultSlot) -> RailResult<Vec<u8>> {
-        let (path, expected_digest, expected_bytes, _) = self.verified_frame(slot)?;
+        self.read_verified_response_slot(slot.into())
+    }
+
+    fn read_verified_response_slot(&self, slot: ResponseSlot) -> RailResult<Vec<u8>> {
+        let path = self
+            .frames
+            .get(&slot)
+            .ok_or_else(|| RailError::message("distributed execution result slot is unavailable"))?;
+        let descriptor = self
+            .descriptors
+            .get(&slot)
+            .ok_or_else(|| RailError::message("distributed execution result descriptor is unavailable"))?;
+        let expected_digest = &descriptor.content_digest;
+        let expected_bytes = descriptor.bytes;
+        let metadata = fs::symlink_metadata(path)?;
+        if !path.starts_with(self.staging.path())
+            || !metadata.is_file()
+            || crate::utils::is_symlink_or_reparse(&metadata)
+            || metadata.len() != expected_bytes
+        {
+            return Err(RailError::message(
+                "distributed execution result changed after private staging",
+            ));
+        }
         let capacity = usize::try_from(expected_bytes)
             .map_err(|_| RailError::message("distributed execution result exceeds this platform"))?;
         let mut bytes = Vec::with_capacity(capacity);
         File::open(path)?
             .take(expected_bytes.saturating_add(1))
             .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 != expected_bytes || digest_bytes(&bytes) != expected_digest {
+        if bytes.len() as u64 != expected_bytes || digest_bytes(&bytes) != expected_digest.as_str() {
             return Err(RailError::message(
                 "distributed execution result changed while reading private staging",
             ));
         }
         Ok(bytes)
+    }
+
+    pub(crate) fn validated_analysis_evidence(
+        &self,
+        candidate: &RustLibraryCandidate,
+        current: &crate::compiler::observation::RawCompilerInvocation,
+    ) -> RailResult<Option<crate::compiler::analysis::ResolvedNativeEvidence>> {
+        if !self.binds_candidate(candidate) {
+            return Err(RailError::message(
+                "distributed analysis result does not bind its exact candidate",
+            ));
+        }
+        let Some(operation) = &candidate.operation.analysis else {
+            if self.frames.contains_key(&ResponseSlot::AnalysisObservation)
+                || self.frames.contains_key(&ResponseSlot::CompilerFacts)
+            {
+                return Err(RailError::message(
+                    "ordinary distributed operation returned analysis evidence",
+                ));
+            }
+            return Ok(None);
+        };
+        let observation_bytes = self.read_verified_response_slot(ResponseSlot::AnalysisObservation)?;
+        let observation =
+            crate::compiler::analysis::AnalysisObservation::from_distributed_bytes(&observation_bytes, current)?;
+        if observation != operation.observation {
+            return Err(RailError::message(
+                "distributed analysis observation changed from its request authority",
+            ));
+        }
+        let facts_bytes = self.read_verified_response_slot(ResponseSlot::CompilerFacts)?;
+        let objects: Vec<crate::compiler::facts::CompilerFactObject> = serde_json::from_slice(&facts_bytes)?;
+        if serde_json::to_vec(&objects)? != facts_bytes || objects.len() != 1 {
+            return Err(RailError::message(
+                "distributed analysis fact set is not one canonical qualified object",
+            ));
+        }
+        let expectation = crate::compiler::facts::CompilerFactObjectExpectation::new(
+            operation.invocation.producer_authority.clone(),
+            operation.invocation.unit.identity.clone(),
+            operation.invocation.required_coverage.clone(),
+        );
+        let facts = objects
+            .into_iter()
+            .map(|object| {
+                crate::compiler::facts::ValidatedCompilerFactObject::from_bytes(
+                    &serde_json::to_vec(&object)?,
+                    &expectation,
+                )
+            })
+            .collect::<RailResult<Vec<_>>>()?;
+        Ok(Some(crate::compiler::analysis::ResolvedNativeEvidence {
+            observation,
+            facts,
+        }))
     }
 
     pub(crate) fn move_verified_frame_to(
@@ -695,6 +853,40 @@ impl StagedExecutionResult {
             inputs: candidate.input_frames(),
             operation: candidate.operation.clone(),
         })
+    }
+
+    #[cfg(test)]
+    fn from_test_analysis_frames(
+        candidate: &RustLibraryCandidate,
+        observation: &[u8],
+        facts: &[u8],
+    ) -> RailResult<Self> {
+        let mut result = Self::from_test_frames(
+            candidate,
+            b"portable dep-info",
+            b"portable metadata",
+            b"portable rlib",
+            b"",
+            b"",
+        )?;
+        for (slot, bytes) in [
+            (ResponseSlot::AnalysisObservation, observation),
+            (ResponseSlot::CompilerFacts, facts),
+        ] {
+            let path = result.staging.path().join("distributed").join(slot.file_name());
+            write_private_file(&path, bytes)?;
+            result.frames.insert(slot, path);
+            result.descriptors.insert(
+                slot,
+                ResponseFrame {
+                    bytes: bytes.len() as u64,
+                    content_digest: digest_bytes(bytes),
+                    mode: 0,
+                    slot,
+                },
+            );
+        }
+        Ok(result)
     }
 }
 
@@ -828,6 +1020,62 @@ impl RustLibraryCandidate {
         self.operation == other.operation && self.input_frames() == other.input_frames()
     }
 
+    /// Upgrade this exact native operation into the separately qualified
+    /// analysis class. Failure leaves the caller on the ordinary local path.
+    pub(crate) fn with_analysis(
+        mut self,
+        contract: crate::compiler::analysis::AnalysisContract,
+        invocation: crate::compiler::facts::CompilerFactInvocation,
+        observation: &crate::compiler::observation::RawCompilerInvocation,
+    ) -> RailResult<Self> {
+        self.attach_analysis(contract, invocation, observation)?;
+        Ok(self)
+    }
+
+    pub(crate) fn attach_analysis(
+        &mut self,
+        contract: crate::compiler::analysis::AnalysisContract,
+        invocation: crate::compiler::facts::CompilerFactInvocation,
+        observation: &crate::compiler::observation::RawCompilerInvocation,
+    ) -> RailResult<()> {
+        contract.validate()?;
+        let portable = PortableCompilerFactInvocation {
+            producer_authority: invocation.producer_authority,
+            required_coverage: invocation.required_coverage,
+            run_authority: invocation.run_authority,
+            unit: invocation.unit,
+        };
+        if !contract.requires_typed_facts()
+            || contract.producer() != Some(&portable.producer_authority)
+            || contract.required_coverage() != &portable.required_coverage
+            || observation.compiler_fact_unit.as_ref() != Some(&portable.unit)
+            || portable.unit.role == crate::compiler::facts::CompilerFactRole::Host && portable.unit.platform.is_empty()
+        {
+            return Err(RailError::message(
+                "distributed analysis candidate does not match its contract and typed invocation",
+            ));
+        }
+        let target = portable.unit.platform.clone();
+        let analysis = RustAnalysisOperationV1 {
+            contract,
+            fact_protocol: crate::compiler::facts::COMPILER_FACT_PROTOCOL_VERSION,
+            invocation: portable,
+            observation: crate::compiler::analysis::AnalysisObservation::distributed_success(observation)?,
+            target,
+            version: ANALYSIS_OPERATION_VERSION,
+        };
+        validate_analysis_operation(&analysis)?;
+        self.operation.operation_class = OperationClass::RustAnalysisV1;
+        self.operation.analysis = Some(analysis);
+        validate_operation(&self.operation)?;
+        validate_inputs(&self.input_frames(), &self.operation)?;
+        Ok(())
+    }
+
+    pub(crate) fn is_analysis(&self) -> bool {
+        self.operation.analysis.is_some()
+    }
+
     pub(crate) fn placement_observation(
         &self,
         capability_identity: &str,
@@ -956,6 +1204,7 @@ impl RustLibraryCandidate {
             inputs,
             local_output_directory,
             operation: RustLibraryOperation {
+                analysis: None,
                 cap_lints: input.options.cap_lints,
                 cargo_json_diagnostics: input.options.cargo_json_diagnostics,
                 check_cfg: input.options.check_cfg,
@@ -1041,6 +1290,7 @@ impl RustLibraryCandidate {
             .collect::<RailResult<Vec<_>>>()?;
         compiler_command(CompilerCommandInput {
             rustc,
+            wrapper: None,
             operation: &self.operation,
             source_relative,
             outputs: &outputs,
@@ -1483,7 +1733,7 @@ fn execute_mutual_tls_worker_inner(
     timing: &mut DistributedTiming,
 ) -> RailResult<DecodedExecution> {
     let capability_started = Instant::now();
-    let expected = capture_worker_capability(rustc, cache)?;
+    let expected = capture_selected_worker_capability(rustc, cache)?;
     timing.capability_capture.record(capability_started);
     let connect_started = Instant::now();
     let socket = connect_worker_endpoint(identity.endpoint)?;
@@ -1518,7 +1768,11 @@ fn execute_mutual_tls_worker_inner(
             })?;
         timing.capability_exchange.record(capability_exchange_started);
         if capability.capability_id != identity.worker_capability_id
-            || !worker_execution_environment_matches(&capability, &expected.capability)?
+            || !worker_execution_environment_matches(
+                &capability,
+                &expected.capability,
+                candidate.operation.operation_class,
+            )?
             || !worker_isolation_allowed(&capability, allow_unqualified_isolation)
         {
             return Err(RailError::message(format!(
@@ -1702,7 +1956,7 @@ fn execute_local_worker_inner(
 ) -> RailResult<DecodedExecution> {
     let capability_started = Instant::now();
     let capability = query_local_worker_capability(worker, rustc)?;
-    let expected = capture_worker_capability(rustc, cache)?;
+    let expected = capture_selected_worker_capability(rustc, cache)?;
     timing.capability_capture.record(capability_started);
     if capability != expected.capability {
         return Err(RailError::message(
@@ -2949,7 +3203,131 @@ fn qualify_local_client(rustc: &OsStr) -> RailResult<()> {
             ));
         }
     }
+    drop(result);
+    let capability = query_local_worker_capability(&worker, rustc)?;
+    if let Some(analysis) = capability.analysis.as_ref() {
+        qualify_local_analysis_client(&worker, rustc, candidate, analysis)?;
+    }
     println!("{PROTOCOL_VERSION}");
+    Ok(())
+}
+
+fn qualify_local_analysis_client(
+    worker: &Path,
+    rustc: &OsStr,
+    candidate: RustLibraryCandidate,
+    capability: &AnalysisWorkerCapability,
+) -> RailResult<()> {
+    use crate::compiler::facts::{
+        COMPILER_IDENTITY_PREFIX, CompilerFactDomain, CompilerFactInvocation, CompilerFactPackage,
+        CompilerFactProducerAuthority, CompilerFactRole, CompilerFactRunAuthority, CompilerFactTargetKind,
+        CompilerFactUnit, INVOCATION_IDENTITY_PREFIX, RUN_IDENTITY_PREFIX, VIEW_IDENTITY_PREFIX,
+    };
+    use crate::compiler::model::FeatureSelection;
+    use crate::compiler::observation::{CompilerMode, RawCompilerInvocation};
+    use crate::compiler::scheduler::CompilerFactFamily;
+
+    let fixed = |prefix: &str, digit: char| format!("{prefix}{}", digit.to_string().repeat(64));
+    let producer = CompilerFactProducerAuthority {
+        compiler_identity: fixed(COMPILER_IDENTITY_PREFIX, '1'),
+        driver_identity: capability.driver_identity.clone(),
+    };
+    let unit = CompilerFactUnit {
+        identity: String::new(),
+        invocation_identity: fixed(INVOCATION_IDENTITY_PREFIX, '2'),
+        package: CompilerFactPackage {
+            name: "cargo_rail_distributed_qualification".to_string(),
+            version: "0.0.0".to_string(),
+            source: None,
+        },
+        cargo_target: "cargo_rail_distributed_qualification".to_string(),
+        crate_name: "cargo_rail_distributed_qualification".to_string(),
+        target_kind: CompilerFactTargetKind::Library,
+        domain: CompilerFactDomain::Production,
+        role: CompilerFactRole::Target,
+        platform: capability.target.clone(),
+        features: Vec::new(),
+        cfg: Vec::new(),
+    }
+    .bind_identity()?;
+    let run_authority = CompilerFactRunAuthority {
+        run_identity: fixed(RUN_IDENTITY_PREFIX, '3'),
+        view_identity: fixed(VIEW_IDENTITY_PREFIX, '4'),
+    };
+    let invocation = CompilerFactInvocation {
+        version: capability.fact_protocol,
+        observation_directory: "/cargo-rail/qualification/observation".to_string(),
+        source_root: "/cargo-rail/qualification/workspace".to_string(),
+        generated_roots: vec!["/cargo-rail/qualification/generated".to_string()],
+        run_authority,
+        producer_authority: producer.clone(),
+        unit: unit.clone(),
+        required_coverage: capability.coverage.clone(),
+    };
+    let observation = RawCompilerInvocation {
+        version: 6,
+        mode: CompilerMode::Rustc,
+        crate_name: Some("cargo_rail_distributed_qualification".to_string()),
+        crate_types: BTreeSet::from(["rlib".to_string()]),
+        target_argument: None,
+        cfg: BTreeSet::new(),
+        emit_modes: BTreeSet::from(["dep-info".to_string(), "link".to_string(), "metadata".to_string()]),
+        test_mode: false,
+        compiler_arguments: vec!["src/lib.rs".to_string()],
+        declared_inputs: Vec::new(),
+        observed_reads: Vec::new(),
+        dependency_artifacts: Vec::new(),
+        emitted_outputs: Vec::new(),
+        environment_reads: BTreeSet::new(),
+        compiler: None,
+        wrappers: Vec::new(),
+        cache_wrapper: None,
+        compiler_exit_code: None,
+        success: false,
+        bypasses: BTreeSet::new(),
+        compiler_fact_unit: Some(unit),
+    };
+    let contract = crate::compiler::analysis::AnalysisContract::new(
+        BTreeSet::from([CompilerFactFamily::TypedRustItems]),
+        "cargo_rail_distributed_qualification".to_string(),
+        "default".to_string(),
+        FeatureSelection::Default,
+        "distributed-analysis-qualification".to_string(),
+        fixed("sha256:", '5'),
+        Some(producer),
+        capability.coverage.clone(),
+    )?;
+    let candidate = candidate.with_analysis(contract, invocation, &observation)?;
+    let staging_parent = tempfile::Builder::new()
+        .prefix("cargo-rail-distributed-analysis-qualification-")
+        .tempdir()?;
+    let staging = NativeResultStaging::temporary_in(staging_parent.path())?;
+    let mut timing = DistributedTiming::default();
+    let LocalWorkerAttempt::Success(result) =
+        execute_local_worker(worker, rustc, &candidate, staging, None, &mut timing)
+    else {
+        return Err(RailError::message(
+            "local distributed analysis qualification did not produce a successful staged result",
+        ));
+    };
+    let evidence = result
+        .validated_analysis_evidence(&candidate, &observation)?
+        .ok_or_else(|| RailError::message("local distributed analysis qualification returned no evidence"))?;
+    if evidence.facts.len() != 1
+        || evidence.facts[0].object().unit.identity
+            != candidate
+                .operation
+                .analysis
+                .as_ref()
+                .ok_or_else(|| RailError::message("analysis qualification lost its operation"))?
+                .invocation
+                .unit
+                .identity
+    {
+        return Err(RailError::message(
+            "local distributed analysis qualification returned incomplete typed facts",
+        ));
+    }
     Ok(())
 }
 
@@ -2965,7 +3343,17 @@ fn capture_worker_capability(
     rustc: &OsStr,
     cache: Option<&crate::cache::cas::LocalCas>,
 ) -> RailResult<CapturedWorkerCapability> {
-    capture_worker_capability_for_runtime(rustc, WorkerRuntime::ProcessOnly, cache)
+    capture_worker_capability_for_runtime(rustc, WorkerRuntime::ProcessOnly, cache, true)
+}
+
+/// Capture client-side selection facts without staging or probing the fact
+/// driver on every cache miss. The worker must still advertise a separately
+/// authenticated matching capability before an analysis request can be sent.
+fn capture_selected_worker_capability(
+    rustc: &OsStr,
+    cache: Option<&crate::cache::cas::LocalCas>,
+) -> RailResult<CapturedWorkerCapability> {
+    capture_worker_capability_for_runtime(rustc, WorkerRuntime::ProcessOnly, cache, false)
 }
 
 #[cfg(target_os = "linux")]
@@ -3386,8 +3774,19 @@ fn capture_bubblewrap_worker_capability(rustc: &OsStr, bubblewrap: &OsStr) -> Ra
             worker_generation,
         },
         None,
+        true,
     )
     .and_then(|mut captured| {
+        // The v2 Bubblewrap filesystem contract does not bind the separately
+        // staged fact driver into the sandbox. Do not advertise analysis until
+        // that runtime has its own native qualification; native execution
+        // remains fully available and analysis safely stays local.
+        captured.analysis_driver = None;
+        captured.capability.analysis = None;
+        captured
+            .capability
+            .operation_classes
+            .retain(|class| *class == OperationClass::RustLibrary);
         captured.capability.isolation = WorkerIsolation::BubblewrapLinuxV2;
         captured.capability.isolation_identity = format!("isolation-v2:sha256:{}", ContentDigest::sha256(&isolation));
         captured.capability.filesystem_contract = "bubblewrap-bounded-tmpfs-v2".to_string();
@@ -3401,6 +3800,7 @@ fn capture_worker_capability_for_runtime(
     rustc: &OsStr,
     runtime: WorkerRuntime,
     cache: Option<&crate::cache::cas::LocalCas>,
+    authenticate_analysis_driver: bool,
 ) -> RailResult<CapturedWorkerCapability> {
     let current = std::env::current_dir()?;
     let rustc_selection = rustc;
@@ -3450,6 +3850,7 @@ fn capture_worker_capability_for_runtime(
         crate::compiler::collector::compiler_sysroot_fingerprint(&sysroot, &host_target, memo.as_deref())?;
     let rustc_content_digest = digest_file(&rustc, rustc_metadata.len())?;
     let mut capability = WorkerCapability {
+        analysis: None,
         architecture: std::env::consts::ARCH.to_string(),
         capability_id: String::new(),
         endianness: if cfg!(target_endian = "little") {
@@ -3468,13 +3869,43 @@ fn capture_worker_capability_for_runtime(
         protocol_version: PROTOCOL_VERSION,
         resource_limits: worker_execution_limits(),
         rustc_content_digest,
-        rustc_verbose_version: verbose,
+        rustc_verbose_version: verbose.clone(),
         sysroot_identity,
         working_directory_contract: "canonical-workspace-relative-remapped-v1".to_string(),
     };
+    let analysis_driver = authenticate_analysis_driver
+        .then(|| crate::compiler::driver::PreparedDistributedCompilerFactDriver::prepare(&verbose, &sysroot))
+        .transpose()
+        .ok()
+        .flatten()
+        .flatten();
+    let declared_readiness;
+    let readiness = if let Some(driver) = &analysis_driver {
+        Some(driver.readiness())
+    } else if authenticate_analysis_driver {
+        None
+    } else {
+        declared_readiness = crate::compiler::driver::CompilerFactDriverAuthority::distributed_readiness(&verbose)
+            .ok()
+            .flatten();
+        declared_readiness.as_ref()
+    };
+    if let Some(readiness) = readiness {
+        capability.analysis = Some(AnalysisWorkerCapability {
+            compiler_library_digest: readiness.compiler_library_digest.clone(),
+            coverage: supported_analysis_coverage(),
+            driver_digest: readiness.driver_digest.clone(),
+            driver_identity: readiness.driver_identity.clone(),
+            fact_protocol: readiness.protocol,
+            target: readiness.rustc_host.clone(),
+            version: ANALYSIS_OPERATION_VERSION,
+        });
+        capability.operation_classes.push(OperationClass::RustAnalysisV1);
+    }
     capability.capability_id = capability_identity(&capability)?;
     validate_capability(&capability)?;
     Ok(CapturedWorkerCapability {
+        analysis_driver,
         capability,
         rustc,
         rustc_generation,
@@ -3515,7 +3946,7 @@ fn worker_environment_identity() -> RailResult<String> {
 }
 
 fn capability_identity(capability: &WorkerCapability) -> RailResult<String> {
-    let encoded = canonical_json(&(
+    let native = (
         &capability.architecture,
         &capability.endianness,
         &capability.environment_contract,
@@ -3532,22 +3963,33 @@ fn capability_identity(capability: &WorkerCapability) -> RailResult<String> {
         &capability.rustc_verbose_version,
         &capability.sysroot_identity,
         &capability.working_directory_contract,
-    ))?;
+    );
+    let encoded = match &capability.analysis {
+        None => canonical_json(&native)?,
+        Some(analysis) => canonical_json(&("rust-analysis-v1", analysis, &native))?,
+    };
     Ok(format!(
         "worker-capability-v3:sha256:{}",
         ContentDigest::sha256(&encoded)
     ))
 }
 
-fn worker_execution_environment_matches(worker: &WorkerCapability, selected: &WorkerCapability) -> RailResult<bool> {
+fn worker_execution_environment_matches(
+    worker: &WorkerCapability,
+    selected: &WorkerCapability,
+    required: OperationClass,
+) -> RailResult<bool> {
     validate_capability(worker)?;
     validate_capability(selected)?;
-    Ok(worker.architecture == selected.architecture
+    let operation_matches = worker.operation_classes.contains(&required)
+        && selected.operation_classes.contains(&required)
+        && (required != OperationClass::RustAnalysisV1 || worker.analysis == selected.analysis);
+    Ok(operation_matches
+        && worker.architecture == selected.architecture
         && worker.endianness == selected.endianness
         && worker.environment_contract == selected.environment_contract
         && worker.host_target == selected.host_target
         && worker.operating_system == selected.operating_system
-        && worker.operation_classes == selected.operation_classes
         && worker.platform_family == selected.platform_family
         && worker.protocol_version == selected.protocol_version
         && worker.resource_limits == selected.resource_limits
@@ -3576,8 +4018,15 @@ fn validate_capability(capability: &WorkerCapability) -> RailResult<()> {
                 && valid_identity(&capability.isolation_identity, "isolation-v2:sha256:")
         }
     };
+    let analysis_valid = match &capability.analysis {
+        Some(analysis) => {
+            capability.operation_classes == [OperationClass::RustLibrary, OperationClass::RustAnalysisV1]
+                && validate_analysis_capability(analysis, &capability.host_target).is_ok()
+        }
+        None => capability.operation_classes == [OperationClass::RustLibrary],
+    };
     if capability.protocol_version != PROTOCOL_VERSION
-        || capability.operation_classes != [OperationClass::RustLibrary]
+        || !analysis_valid
         || !isolation_valid
         || validate_limits(capability.resource_limits).is_err()
         || capability.architecture.is_empty()
@@ -3593,6 +4042,23 @@ fn validate_capability(capability: &WorkerCapability) -> RailResult<()> {
         || capability.capability_id != capability_identity(capability)?
     {
         return Err(RailError::message("distributed worker capability is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_analysis_capability(capability: &AnalysisWorkerCapability, host_target: &str) -> RailResult<()> {
+    if capability.version != ANALYSIS_OPERATION_VERSION
+        || capability.fact_protocol != crate::compiler::facts::COMPILER_FACT_PROTOCOL_VERSION
+        || capability.target != host_target
+        || capability.coverage != supported_analysis_coverage()
+        || !valid_identity(&capability.driver_digest, "sha256:")
+        || !valid_identity(&capability.compiler_library_digest, "sha256:")
+        || !valid_identity(
+            &capability.driver_identity,
+            crate::compiler::facts::DRIVER_IDENTITY_PREFIX,
+        )
+    {
+        return Err(RailError::message("distributed analysis worker capability is invalid"));
     }
     Ok(())
 }
@@ -3728,12 +4194,17 @@ fn execute_sandboxed(rustc: &OsStr) -> RailResult<()> {
     drop(reader);
     validate_request(&envelope.request, &capability)?;
     let selected = capture_worker_capability(rustc, None)?;
-    if !worker_execution_environment_matches(&capability, &selected.capability)? {
+    if !worker_execution_environment_matches(
+        &capability,
+        &selected.capability,
+        envelope.request.operation.operation_class,
+    )? {
         return Err(RailError::message(
             "distributed sandbox compiler does not match its outer capability",
         ));
     }
     let captured = CapturedWorkerCapability {
+        analysis_driver: selected.analysis_driver,
         capability,
         rustc: selected.rustc,
         rustc_generation: selected.rustc_generation,
@@ -4072,15 +4543,24 @@ fn execute_request_in_process(
                 .ok_or_else(|| RailError::message("distributed execution dependency staging is incomplete"))
         })
         .collect::<RailResult<Vec<_>>>()?;
-    let command = worker_compiler_command(
+    let analysis_invocation = prepare_worker_analysis_invocation(
         captured,
         &envelope.request.operation,
-        Path::new(source_relative),
-        &outputs,
         &workspace_directory,
+        &output_directory,
         &temporary_directory,
-        &dependencies,
+        attempt,
     )?;
+    let command = worker_compiler_command(WorkerCompilerCommandInput {
+        captured,
+        operation: &envelope.request.operation,
+        source_relative: Path::new(source_relative),
+        outputs: &outputs,
+        workspace: &workspace_directory,
+        temporary: &temporary_directory,
+        dependencies: &dependencies,
+        analysis: analysis_invocation.as_ref(),
+    })?;
     timing.input_ns = elapsed_nanos(input_started);
     let compiler_started = Instant::now();
     let run = run_compiler(
@@ -4143,6 +4623,28 @@ fn execute_request_in_process(
             envelope.request.limits.max_output_bytes,
         )?);
     }
+    if let Some(analysis_invocation) = &analysis_invocation {
+        let operation = envelope
+            .request
+            .operation
+            .analysis
+            .as_ref()
+            .ok_or_else(|| RailError::message("distributed analysis invocation lost its operation"))?;
+        let facts =
+            extract_distributed_analysis_facts(operation, &analysis_invocation.observation_directory, &mut stderr)?;
+        frames.extend([
+            prepare_bytes_frame(
+                ResponseSlot::AnalysisObservation,
+                operation.observation.canonical_bytes()?,
+                envelope.request.limits.max_output_bytes,
+            )?,
+            prepare_bytes_frame(
+                ResponseSlot::CompilerFacts,
+                facts,
+                envelope.request.limits.max_output_bytes,
+            )?,
+        ]);
+    }
     frames.extend([
         prepare_bytes_frame(ResponseSlot::Stderr, stderr, envelope.request.limits.max_stream_bytes)?,
         prepare_bytes_frame(ResponseSlot::Stdout, stdout, envelope.request.limits.max_stream_bytes)?,
@@ -4194,6 +4696,7 @@ fn compiler_termination(status: &ExitStatus) -> CompilerTermination {
 
 struct CompilerCommandInput<'a> {
     rustc: &'a OsStr,
+    wrapper: Option<&'a OsStr>,
     operation: &'a RustLibraryOperation,
     source_relative: &'a Path,
     outputs: &'a OutputPaths,
@@ -4206,6 +4709,7 @@ struct CompilerCommandInput<'a> {
 fn compiler_command(input: CompilerCommandInput<'_>) -> RailResult<Command> {
     let CompilerCommandInput {
         rustc,
+        wrapper,
         operation,
         source_relative,
         outputs,
@@ -4218,7 +4722,14 @@ fn compiler_command(input: CompilerCommandInput<'_>) -> RailResult<Command> {
         .dep_info
         .parent()
         .ok_or_else(|| RailError::message("distributed compiler dep-info has no output directory"))?;
-    let mut command = Command::new(rustc);
+    let mut command = match wrapper {
+        Some(wrapper) => {
+            let mut command = Command::new(wrapper);
+            command.arg(rustc);
+            command
+        }
+        None => Command::new(rustc),
+    };
     command.arg(source_relative).args([
         "--crate-name",
         &operation.crate_name,
@@ -4345,31 +4856,229 @@ fn worker_runtime_generation_is_stable(captured: &CapturedWorkerCapability) -> b
     }
 }
 
-fn worker_compiler_command(
-    captured: &CapturedWorkerCapability,
-    operation: &RustLibraryOperation,
-    source_relative: &Path,
-    outputs: &OutputPaths,
-    workspace: &Path,
-    temporary: &Path,
-    dependencies: &[(&str, &Path)],
-) -> RailResult<Command> {
+struct WorkerCompilerCommandInput<'a> {
+    captured: &'a CapturedWorkerCapability,
+    operation: &'a RustLibraryOperation,
+    source_relative: &'a Path,
+    outputs: &'a OutputPaths,
+    workspace: &'a Path,
+    temporary: &'a Path,
+    dependencies: &'a [(&'a str, &'a Path)],
+    analysis: Option<&'a WorkerAnalysisInvocation>,
+}
+
+fn worker_compiler_command(input: WorkerCompilerCommandInput<'_>) -> RailResult<Command> {
+    let WorkerCompilerCommandInput {
+        captured,
+        operation,
+        source_relative,
+        outputs,
+        workspace,
+        temporary,
+        dependencies,
+        analysis,
+    } = input;
     match &captured.runtime {
-        WorkerRuntime::ProcessOnly => compiler_command(CompilerCommandInput {
-            rustc: captured.rustc.as_os_str(),
-            operation,
-            source_relative,
-            outputs,
-            workspace,
-            temporary,
-            dependencies,
-            inherit_environment: false,
-        }),
+        WorkerRuntime::ProcessOnly => {
+            let driver = match analysis {
+                Some(_) => Some(
+                    captured
+                        .analysis_driver
+                        .as_ref()
+                        .ok_or_else(|| RailError::message("distributed analysis driver is unavailable"))?,
+                ),
+                None => None,
+            };
+            let mut command = compiler_command(CompilerCommandInput {
+                rustc: captured.rustc.as_os_str(),
+                wrapper: driver.map(|driver| driver.program().as_os_str()),
+                operation,
+                source_relative,
+                outputs,
+                workspace,
+                temporary,
+                dependencies,
+                inherit_environment: false,
+            })?;
+            if let (Some(analysis), Some(driver)) = (analysis, driver) {
+                command
+                    .env(
+                        crate::compiler::facts::COMPILER_FACT_INVOCATION_ENV,
+                        &analysis.capability,
+                    )
+                    .env_remove("RUSTC_BOOTSTRAP");
+                #[cfg(target_os = "macos")]
+                command
+                    .env("DYLD_LIBRARY_PATH", driver.compiler_library_directory())
+                    .env_remove("DYLD_FALLBACK_LIBRARY_PATH")
+                    .env_remove("DYLD_INSERT_LIBRARIES");
+                #[cfg(all(unix, not(target_os = "macos")))]
+                command
+                    .env("LD_LIBRARY_PATH", driver.compiler_library_directory())
+                    .env_remove("LD_PRELOAD")
+                    .env_remove("LD_AUDIT");
+                #[cfg(windows)]
+                command.env("PATH", driver.compiler_library_directory());
+            }
+            Ok(command)
+        }
         #[cfg(target_os = "linux")]
         WorkerRuntime::Bubblewrap { .. } => Err(RailError::message(
             "distributed Bubblewrap execution bypassed its bounded supervisor",
         )),
     }
+}
+
+fn prepare_worker_analysis_invocation(
+    captured: &CapturedWorkerCapability,
+    operation: &RustLibraryOperation,
+    workspace: &Path,
+    output: &Path,
+    temporary: &Path,
+    attempt: &Path,
+) -> RailResult<Option<WorkerAnalysisInvocation>> {
+    let Some(analysis) = &operation.analysis else {
+        return Ok(None);
+    };
+    validate_operation_capability(operation, &captured.capability)?;
+    if captured.analysis_driver.is_none() {
+        return Err(RailError::message(
+            "distributed analysis operation has no retained driver authority",
+        ));
+    }
+    let observation_directory = attempt.join("analysis");
+    fs::create_dir(&observation_directory)?;
+    let observation_directory = crate::utils::canonicalize_existing(&observation_directory)?;
+    let workspace = crate::utils::canonicalize_existing(workspace)?;
+    let mut generated_roots = vec![
+        crate::utils::canonicalize_existing(output)?,
+        crate::utils::canonicalize_existing(temporary)?,
+    ]
+    .into_iter()
+    .map(|path| {
+        path.to_str()
+            .map(str::to_string)
+            .ok_or_else(|| RailError::message("distributed analysis root is not UTF-8"))
+    })
+    .collect::<RailResult<Vec<_>>>()?;
+    generated_roots.sort();
+    generated_roots.dedup();
+    let invocation = crate::compiler::facts::CompilerFactInvocation {
+        version: crate::compiler::facts::COMPILER_FACT_PROTOCOL_VERSION,
+        observation_directory: observation_directory
+            .to_str()
+            .ok_or_else(|| RailError::message("distributed analysis directory is not UTF-8"))?
+            .to_string(),
+        source_root: workspace
+            .to_str()
+            .ok_or_else(|| RailError::message("distributed analysis workspace is not UTF-8"))?
+            .to_string(),
+        generated_roots,
+        run_authority: analysis.invocation.run_authority.clone(),
+        producer_authority: analysis.invocation.producer_authority.clone(),
+        unit: analysis.invocation.unit.clone(),
+        required_coverage: analysis.invocation.required_coverage.clone(),
+    };
+    let encoded = canonical_json(&invocation)?;
+    if encoded.is_empty() || encoded.len() > MAX_HEADER_BYTES {
+        return Err(RailError::message(
+            "distributed compiler fact invocation exceeds its bound",
+        ));
+    }
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".cargo-rail-distributed-analysis-").suffix(".cap");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        builder.permissions(fs::Permissions::from_mode(0o600));
+    }
+    let mut capability = builder.tempfile_in(attempt)?;
+    capability.write_all(&encoded)?;
+    #[cfg(unix)]
+    capability
+        .as_file()
+        .set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o400))?;
+    Ok(Some(WorkerAnalysisInvocation {
+        capability: capability.into_temp_path(),
+        observation_directory,
+    }))
+}
+
+fn extract_distributed_analysis_facts(
+    operation: &RustAnalysisOperationV1,
+    directory: &Path,
+    stderr: &mut Vec<u8>,
+) -> RailResult<Vec<u8>> {
+    use crate::compiler::facts::{
+        COMPILER_FACT_ANNOUNCEMENT_CODE, CompilerFactAnnouncementExpectation, CompilerFactExpectation,
+        ValidatedCompilerFactAnnouncement,
+    };
+
+    let announcement_expectation = CompilerFactAnnouncementExpectation::new(
+        operation.invocation.run_authority.clone(),
+        operation.invocation.producer_authority.clone(),
+        operation.invocation.unit.identity.clone(),
+    );
+    let mut retained = Vec::with_capacity(stderr.len());
+    let mut announcement = None;
+    for segment in stderr.split_inclusive(|byte| *byte == b'\n') {
+        let line = segment.strip_suffix(b"\n").unwrap_or(segment);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let reserved = serde_json::from_slice::<serde_json::Value>(line)
+            .ok()
+            .and_then(|value| {
+                let code = value
+                    .get("code")
+                    .and_then(|code| code.get("code"))
+                    .and_then(serde_json::Value::as_str)?;
+                (code == COMPILER_FACT_ANNOUNCEMENT_CODE).then(|| {
+                    value
+                        .get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })?
+            });
+        let Some(message) = reserved else {
+            retained.extend_from_slice(segment);
+            continue;
+        };
+        if announcement.is_some() {
+            return Err(RailError::message(
+                "distributed compiler fact driver emitted more than one announcement",
+            ));
+        }
+        announcement = ValidatedCompilerFactAnnouncement::from_compiler_message(
+            Some(COMPILER_FACT_ANNOUNCEMENT_CODE),
+            &message,
+            &announcement_expectation,
+        )?;
+    }
+    let announcement = announcement
+        .ok_or_else(|| RailError::message("distributed compiler fact driver emitted no authenticated announcement"))?;
+    let expectation = CompilerFactExpectation::new(
+        operation.invocation.run_authority.clone(),
+        operation.invocation.producer_authority.clone(),
+        operation.invocation.unit.identity.clone(),
+        operation.invocation.required_coverage.clone(),
+    );
+    let object = crate::compiler::facts::load_announced_fragment(directory, &announcement, &expectation)?.into_object();
+    let sidecars = fs::read_dir(directory)?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("compiler-fact-fragment-sha256-") && name.ends_with(".json"))
+        })
+        .count();
+    if sidecars != 1 {
+        return Err(RailError::message(
+            "distributed compiler fact output contains an ambiguous sidecar set",
+        ));
+    }
+    *stderr = retained;
+    canonical_json(&vec![object.object().clone()])
 }
 
 #[cfg(target_os = "linux")]
@@ -5015,6 +5724,7 @@ fn output_paths(operation: &RustLibraryOperation, output_directory: &Path) -> Ra
 fn validate_request(request: &ExecutionRequest, capability: &WorkerCapability) -> RailResult<()> {
     validate_capability(capability)?;
     validate_operation(&request.operation)?;
+    validate_operation_capability(&request.operation, capability)?;
     validate_inputs(&request.inputs, &request.operation)?;
     validate_limits(request.limits)?;
     if request.protocol_version != PROTOCOL_VERSION
@@ -5027,6 +5737,32 @@ fn validate_request(request: &ExecutionRequest, capability: &WorkerCapability) -
         return Err(RailError::message("distributed execution request is invalid"));
     }
     Ok(())
+}
+
+fn validate_operation_capability(operation: &RustLibraryOperation, capability: &WorkerCapability) -> RailResult<()> {
+    match &operation.analysis {
+        None if operation.operation_class == OperationClass::RustLibrary => Ok(()),
+        Some(operation) if capability.operation_classes.contains(&OperationClass::RustAnalysisV1) => {
+            let worker = capability
+                .analysis
+                .as_ref()
+                .ok_or_else(|| RailError::message("distributed worker did not advertise analysis authority"))?;
+            if worker.version != operation.version
+                || worker.fact_protocol != operation.fact_protocol
+                || worker.target != operation.target
+                || worker.driver_identity != operation.invocation.producer_authority.driver_identity
+                || !operation.invocation.required_coverage.is_subset(&worker.coverage)
+            {
+                return Err(RailError::message(
+                    "distributed analysis operation does not match worker capability",
+                ));
+            }
+            Ok(())
+        }
+        None | Some(_) => Err(RailError::message(
+            "distributed operation class is unsupported by this worker",
+        )),
+    }
 }
 
 fn source_relative_path(virtual_path: &str) -> Option<&str> {
@@ -5240,7 +5976,12 @@ fn validate_operation(operation: &RustLibraryOperation) -> RailResult<()> {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b':'))
         });
-    if operation.operation_class != OperationClass::RustLibrary
+    let operation_class_valid = match (&operation.operation_class, &operation.analysis) {
+        (OperationClass::RustLibrary, None) => true,
+        (OperationClass::RustAnalysisV1, Some(analysis)) => validate_analysis_operation(analysis).is_ok(),
+        (OperationClass::RustLibrary | OperationClass::RustAnalysisV1, _) => false,
+    };
+    if !operation_class_valid
         || !crate_name_valid
         || !matches!(operation.edition.as_str(), "2015" | "2018" | "2021" | "2024")
         || !metadata_valid
@@ -5287,6 +6028,32 @@ fn validate_operation(operation: &RustLibraryOperation) -> RailResult<()> {
         || operation.toolchain_proc_macro && operation.crate_type != RustLibraryCrateType::ProcMacro
     {
         return Err(RailError::message("distributed Rust library operation is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_analysis_operation(operation: &RustAnalysisOperationV1) -> RailResult<()> {
+    operation.contract.validate()?;
+    operation.observation.validate()?;
+    let invocation = &operation.invocation;
+    if operation.version != ANALYSIS_OPERATION_VERSION
+        || operation.fact_protocol != crate::compiler::facts::COMPILER_FACT_PROTOCOL_VERSION
+        || !operation.contract.requires_typed_facts()
+        || operation.contract.producer() != Some(&invocation.producer_authority)
+        || operation.contract.required_coverage() != &invocation.required_coverage
+        || invocation.required_coverage.is_empty()
+        || operation.observation.compiler_fact_unit() != Some(&invocation.unit)
+        || operation.target != invocation.unit.platform
+    {
+        return Err(RailError::message(
+            "distributed analysis operation is incomplete or internally inconsistent",
+        ));
+    }
+    let encoded = canonical_json(operation)?;
+    if encoded.len() > MAX_HEADER_BYTES {
+        return Err(RailError::message(
+            "distributed analysis operation exceeds its header bound",
+        ));
     }
     Ok(())
 }
@@ -5827,27 +6594,22 @@ fn validate_response_header(response: &ExecutionResponse, operation: &RustLibrar
     }
     match response.status {
         ExecutionStatus::Success => {
-            let expected = match operation.emission {
-                RustLibraryEmission::Metadata => &[
-                    ResponseSlot::DepInfo,
-                    ResponseSlot::Metadata,
-                    ResponseSlot::Stderr,
-                    ResponseSlot::Stdout,
-                ][..],
-                RustLibraryEmission::MetadataAndLink => &[
-                    ResponseSlot::DepInfo,
-                    ResponseSlot::Metadata,
-                    ResponseSlot::Rlib,
-                    ResponseSlot::Stderr,
-                    ResponseSlot::Stdout,
-                ][..],
+            let mut expected = match operation.emission {
+                RustLibraryEmission::Metadata => vec![ResponseSlot::DepInfo, ResponseSlot::Metadata],
+                RustLibraryEmission::MetadataAndLink => {
+                    vec![ResponseSlot::DepInfo, ResponseSlot::Metadata, ResponseSlot::Rlib]
+                }
             };
+            if operation.analysis.is_some() {
+                expected.extend([ResponseSlot::AnalysisObservation, ResponseSlot::CompilerFacts]);
+            }
+            expected.extend([ResponseSlot::Stderr, ResponseSlot::Stdout]);
             if response.termination != Some(CompilerTermination::Exit { code: 0 }) || response.reason.is_some() {
                 return Err(RailError::message(
                     "distributed execution success response is incomplete",
                 ));
             }
-            validate_response_frames(response, expected)?;
+            validate_response_frames(response, &expected)?;
         }
         ExecutionStatus::CompilerFailed => {
             if response.termination.is_none()
@@ -5918,7 +6680,7 @@ fn validate_response_frames(response: &ExecutionResponse, expected: &[ResponseSl
                 } else {
                     MAX_OUTPUT_BYTES
                 }
-            || frame.mode != if frame.slot.is_stream() { 0 } else { 0o644 }
+            || frame.mode != if frame.slot.is_bytes() { 0 } else { 0o644 }
         {
             return Err(RailError::message("distributed execution response frame is invalid"));
         }
@@ -6087,6 +6849,7 @@ mod tests {
 
     fn capability() -> RailResult<WorkerCapability> {
         let mut capability = WorkerCapability {
+            analysis: None,
             architecture: "test-architecture".to_string(),
             capability_id: String::new(),
             endianness: "little".to_string(),
@@ -6123,6 +6886,7 @@ mod tests {
             lease_id: fixed_identity("execution-lease-v3:sha256:", '4'),
             limits: worker_execution_limits(),
             operation: RustLibraryOperation {
+                analysis: None,
                 cap_lints: None,
                 cargo_json_diagnostics: false,
                 check_cfg: Vec::new(),
@@ -6153,6 +6917,255 @@ mod tests {
         };
         request.action_id = action_identity(&request)?;
         Ok(request)
+    }
+
+    fn analysis_fixture() -> RailResult<(
+        WorkerCapability,
+        RustLibraryCandidate,
+        crate::compiler::observation::RawCompilerInvocation,
+        crate::compiler::facts::CompilerFactObject,
+    )> {
+        use crate::compiler::facts::{
+            COMPILER_FACT_PROTOCOL_VERSION, COMPILER_IDENTITY_PREFIX, CompilerFactCompletion, CompilerFactDomain,
+            CompilerFactInvocation, CompilerFactPackage, CompilerFactProducerAuthority, CompilerFactRole,
+            CompilerFactRunAuthority, CompilerFactTargetKind, CompilerFactUnit, DRIVER_IDENTITY_PREFIX,
+            INVOCATION_IDENTITY_PREFIX, RUN_IDENTITY_PREFIX, VIEW_IDENTITY_PREFIX,
+        };
+        use crate::compiler::model::FeatureSelection;
+        use crate::compiler::observation::{CompilerMode, RawCompilerInvocation};
+        use crate::compiler::scheduler::CompilerFactFamily;
+
+        let producer = CompilerFactProducerAuthority {
+            compiler_identity: fixed_identity(COMPILER_IDENTITY_PREFIX, '8'),
+            driver_identity: fixed_identity(DRIVER_IDENTITY_PREFIX, '9'),
+        };
+        let run = CompilerFactRunAuthority {
+            run_identity: fixed_identity(RUN_IDENTITY_PREFIX, 'a'),
+            view_identity: fixed_identity(VIEW_IDENTITY_PREFIX, 'b'),
+        };
+        let unit = CompilerFactUnit {
+            identity: String::new(),
+            invocation_identity: fixed_identity(INVOCATION_IDENTITY_PREFIX, 'c'),
+            package: CompilerFactPackage {
+                name: "placement_fixture".to_string(),
+                version: "0.1.0".to_string(),
+                source: None,
+            },
+            cargo_target: "placement_fixture".to_string(),
+            crate_name: "placement_fixture".to_string(),
+            target_kind: CompilerFactTargetKind::Library,
+            domain: CompilerFactDomain::Production,
+            role: CompilerFactRole::Target,
+            platform: "test-target".to_string(),
+            features: Vec::new(),
+            cfg: Vec::new(),
+        }
+        .bind_identity()?;
+        let coverage = supported_analysis_coverage();
+        let contract = crate::compiler::analysis::AnalysisContract::new(
+            BTreeSet::from([CompilerFactFamily::TypedRustItems]),
+            "placement_fixture".to_string(),
+            "default".to_string(),
+            FeatureSelection::Default,
+            "cargo-check".to_string(),
+            fixed_identity("sha256:", 'd'),
+            Some(producer.clone()),
+            coverage.clone(),
+        )?;
+        let invocation = CompilerFactInvocation {
+            version: COMPILER_FACT_PROTOCOL_VERSION,
+            observation_directory: "/worker/observation".to_string(),
+            source_root: "/worker/workspace".to_string(),
+            generated_roots: vec!["/worker/generated".to_string()],
+            run_authority: run,
+            producer_authority: producer.clone(),
+            unit: unit.clone(),
+            required_coverage: coverage.clone(),
+        };
+        let observation = RawCompilerInvocation {
+            version: 6,
+            mode: CompilerMode::Rustc,
+            crate_name: Some("placement_fixture".to_string()),
+            crate_types: BTreeSet::from(["rlib".to_string()]),
+            target_argument: None,
+            cfg: BTreeSet::new(),
+            emit_modes: BTreeSet::from(["dep-info".to_string(), "link".to_string(), "metadata".to_string()]),
+            test_mode: false,
+            compiler_arguments: vec!["src/lib.rs".to_string()],
+            declared_inputs: Vec::new(),
+            observed_reads: Vec::new(),
+            dependency_artifacts: Vec::new(),
+            emitted_outputs: Vec::new(),
+            environment_reads: BTreeSet::new(),
+            compiler: None,
+            wrappers: Vec::new(),
+            cache_wrapper: None,
+            compiler_exit_code: None,
+            success: false,
+            bypasses: BTreeSet::new(),
+            compiler_fact_unit: Some(unit.clone()),
+        };
+        let candidate = placement_candidate(SOURCE)?.with_analysis(contract, invocation, &observation)?;
+        let object = crate::compiler::facts::CompilerFactObject {
+            version: COMPILER_FACT_PROTOCOL_VERSION,
+            producer_authority: producer.clone(),
+            unit,
+            strings: Vec::new(),
+            sources: Vec::new(),
+            items: Vec::new(),
+            edges: Vec::new(),
+            entry_points: Vec::new(),
+            retentions: Vec::new(),
+            completion: CompilerFactCompletion {
+                complete: true,
+                coverage: coverage.clone(),
+                strings: 0,
+                sources: 0,
+                items: 0,
+                edges: 0,
+                entry_points: 0,
+                retentions: 0,
+            },
+        };
+        let mut capability = capability()?;
+        capability.analysis = Some(AnalysisWorkerCapability {
+            compiler_library_digest: fixed_identity("sha256:", 'e'),
+            coverage,
+            driver_digest: fixed_identity("sha256:", 'f'),
+            driver_identity: producer.driver_identity,
+            fact_protocol: COMPILER_FACT_PROTOCOL_VERSION,
+            target: "test-target".to_string(),
+            version: ANALYSIS_OPERATION_VERSION,
+        });
+        capability.operation_classes.push(OperationClass::RustAnalysisV1);
+        capability.capability_id = capability_identity(&capability)?;
+        validate_capability(&capability)?;
+        Ok((capability, candidate, observation, object))
+    }
+
+    #[test]
+    fn analysis_operation_requires_the_exact_qualified_worker_capability() {
+        let result: RailResult<()> = (|| {
+            let (qualified, candidate, _, _) = analysis_fixture()?;
+            local_execution_request(&qualified, &candidate)?;
+
+            let ordinary = capability()?;
+            local_execution_request(&ordinary, &candidate).expect_err("ordinary worker must reject analysis");
+
+            let mut wrong_driver = qualified.clone();
+            wrong_driver
+                .analysis
+                .as_mut()
+                .ok_or_else(|| RailError::message("analysis fixture lost capability"))?
+                .driver_identity = fixed_identity(crate::compiler::facts::DRIVER_IDENTITY_PREFIX, '0');
+            wrong_driver.capability_id = capability_identity(&wrong_driver)?;
+            local_execution_request(&wrong_driver, &candidate).expect_err("wrong driver must reject analysis");
+
+            let mut wrong_target = qualified;
+            wrong_target
+                .analysis
+                .as_mut()
+                .ok_or_else(|| RailError::message("analysis fixture lost capability"))?
+                .target = "another-target".to_string();
+            wrong_target.capability_id = capability_identity(&wrong_target)?;
+            validate_capability(&wrong_target).expect_err("wrong target must invalidate capability");
+            Ok(())
+        })();
+        result.unwrap();
+    }
+
+    #[test]
+    fn analysis_result_is_rebound_to_local_observation_and_typed_authority() {
+        let result: RailResult<()> = (|| {
+            let (_, candidate, observation, object) = analysis_fixture()?;
+            let observation_bytes =
+                crate::compiler::analysis::AnalysisObservation::distributed_success(&observation)?.canonical_bytes()?;
+            let fact_bytes = canonical_json(&vec![object.clone()])?;
+            let staged = StagedExecutionResult::from_test_analysis_frames(&candidate, &observation_bytes, &fact_bytes)?;
+            let evidence = staged
+                .validated_analysis_evidence(&candidate, &observation)?
+                .ok_or_else(|| RailError::message("analysis fixture produced no evidence"))?;
+            assert_eq!(evidence.facts.len(), 1);
+            assert_eq!(evidence.facts[0].object(), &object);
+
+            let mut wrong_object = object;
+            wrong_object.producer_authority.driver_identity =
+                fixed_identity(crate::compiler::facts::DRIVER_IDENTITY_PREFIX, '0');
+            let rejected = StagedExecutionResult::from_test_analysis_frames(
+                &candidate,
+                &observation_bytes,
+                &canonical_json(&vec![wrong_object])?,
+            )?;
+            assert!(rejected.validated_analysis_evidence(&candidate, &observation).is_err());
+
+            let mut changed = observation;
+            changed.test_mode = true;
+            assert!(staged.validated_analysis_evidence(&candidate, &changed).is_err());
+            Ok(())
+        })();
+        result.unwrap();
+    }
+
+    #[test]
+    fn worker_extracts_one_authenticated_fact_and_removes_its_private_announcement() {
+        let result: RailResult<()> = (|| {
+            use crate::compiler::facts::{
+                COMPILER_FACT_ANNOUNCEMENT_CODE, COMPILER_FACT_ANNOUNCEMENT_PREFIX, COMPILER_FACT_PROTOCOL_VERSION,
+                CompilerFactAnnouncement, CompilerFactFragment, FRAGMENT_OBJECT_IDENTITY_PREFIX,
+            };
+
+            let (_, candidate, _, object) = analysis_fixture()?;
+            let operation = candidate
+                .operation
+                .analysis
+                .as_ref()
+                .ok_or_else(|| RailError::message("analysis fixture lost operation"))?;
+            let fragment = CompilerFactFragment {
+                version: COMPILER_FACT_PROTOCOL_VERSION,
+                run_authority: operation.invocation.run_authority.clone(),
+                object: object.clone(),
+            };
+            let fragment_bytes = canonical_json(&fragment)?;
+            let content = ContentDigest::sha256(&fragment_bytes).to_string();
+            let object_bytes = canonical_json(&object)?;
+            let announcement = CompilerFactAnnouncement {
+                version: COMPILER_FACT_PROTOCOL_VERSION,
+                run_authority: operation.invocation.run_authority.clone(),
+                producer_authority: operation.invocation.producer_authority.clone(),
+                unit_identity: operation.invocation.unit.identity.clone(),
+                object_identity: format!(
+                    "{FRAGMENT_OBJECT_IDENTITY_PREFIX}{}",
+                    ContentDigest::sha256(&object_bytes)
+                ),
+                content_digest: format!("sha256:{content}"),
+                bytes: fragment_bytes.len() as u64,
+            };
+            let directory = tempfile::tempdir()?;
+            fs::write(
+                directory
+                    .path()
+                    .join(format!("compiler-fact-fragment-sha256-{content}.json")),
+                fragment_bytes,
+            )?;
+            let diagnostic = serde_json::json!({
+                "$message_type": "diagnostic",
+                "message": format!(
+                    "{COMPILER_FACT_ANNOUNCEMENT_PREFIX}{}",
+                    serde_json::to_string(&announcement)?
+                ),
+                "code": { "code": COMPILER_FACT_ANNOUNCEMENT_CODE, "explanation": null },
+                "level": "note",
+                "spans": [],
+                "children": [],
+                "rendered": null
+            });
+            let mut stderr = format!("ordinary warning\n{diagnostic}\nordinary note\n").into_bytes();
+            let facts = extract_distributed_analysis_facts(operation, directory.path(), &mut stderr)?;
+            assert_eq!(facts, canonical_json(&vec![object])?);
+            assert_eq!(stderr, b"ordinary warning\nordinary note\n");
+            Ok(())
+        })();
+        result.unwrap();
     }
 
     fn success_frames(root: &Path) -> RailResult<Vec<PreparedResponseFrame>> {
@@ -6445,15 +7458,27 @@ mod tests {
             let mut selected = process_only;
             selected.operating_system = "linux".to_string();
             selected.capability_id = capability_identity(&selected)?;
-            assert!(worker_execution_environment_matches(&sandboxed, &selected)?);
+            assert!(worker_execution_environment_matches(
+                &sandboxed,
+                &selected,
+                OperationClass::RustLibrary,
+            )?);
             sandboxed.rustc_content_digest = fixed_identity("sha256:", '9');
             sandboxed.capability_id = capability_identity(&sandboxed)?;
-            assert!(!worker_execution_environment_matches(&sandboxed, &selected)?);
+            assert!(!worker_execution_environment_matches(
+                &sandboxed,
+                &selected,
+                OperationClass::RustLibrary,
+            )?);
 
             let mut fewer_processes = selected.clone();
             fewer_processes.resource_limits.max_processes -= 1;
             fewer_processes.capability_id = capability_identity(&fewer_processes)?;
-            assert!(!worker_execution_environment_matches(&fewer_processes, &selected)?);
+            assert!(!worker_execution_environment_matches(
+                &fewer_processes,
+                &selected,
+                OperationClass::RustLibrary,
+            )?);
             Ok(())
         })();
         result.unwrap();

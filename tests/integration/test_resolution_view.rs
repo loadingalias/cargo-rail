@@ -175,7 +175,7 @@ fn resolution_view_rejects_inexact_package_and_credential_url_identity() {
         )?;
         std::fs::write(
             workspace.path.join(".config/rail.toml"),
-            "targets = [\"x86_64-unknown-linux-gnu\"]\n\n[unify]\nmsrv = false\n",
+            "targets = [\"x86_64-unknown-linux-gnu\"]\n\n[unify]\nmsrv_policy = { mode = \"disabled\" }\n",
         )?;
         workspace.commit("Add fail-closed resolution fixture")?;
 

@@ -2,7 +2,7 @@
 //!
 //! This module provides:
 //! - SystemGit backend using system git binary
-//! - Git-native commit-origin mapping with legacy note migration
+//! - Git-native commit-origin mapping in ordinary history
 //! - Low-level git operations (rev-parse, cat-file, push, pull, etc.)
 //! - Smart defaults for git references
 
@@ -11,7 +11,7 @@ use std::process::Command;
 
 /// Smart defaults for git references
 pub mod defaults;
-/// Git-native commit mapping storage and legacy note migration
+/// Git-native commit mapping storage
 pub mod mappings;
 /// Git operations (commit, branch, push, pull, etc.)
 pub mod ops;
@@ -37,6 +37,11 @@ pub(crate) fn git_cmd_for_path(repo_path: &Path) -> Command {
     let mut cmd = git_command();
     cmd.arg("-C").arg(repo_path);
     sanitize_git_environment(&mut cmd);
+    // Authority reads must never hydrate promisor objects implicitly. Explicit
+    // fetch operations remain explicit command effects, while rev-list,
+    // cat-file, ancestry, and exact-object checks fail closed when local
+    // history is incomplete.
+    cmd.env("GIT_NO_LAZY_FETCH", "1");
 
     // Stable machine-facing behavior without disabling user configuration.
     cmd.arg("-c").arg("protocol.version=2");

@@ -871,11 +871,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_witness_version_is_not_reinterpreted() {
+    fn unsupported_witness_version_is_not_reinterpreted() {
         let mut validation = super::super::tests::cas_validation_with_stdout(b"");
         validation.witness.version = 5;
 
-        descriptor_from_validation(&validation).expect_err("legacy witness must be rejected");
+        descriptor_from_validation(&validation).expect_err("unsupported witness must be rejected");
     }
 
     #[test]

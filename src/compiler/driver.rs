@@ -152,6 +152,18 @@ pub(crate) struct PreparedCompilerFactDriver {
     compiler_library_digest: String,
 }
 
+/// Authenticated fact-driver capability retained by one distributed worker.
+///
+/// This deliberately supports only an embedded release component. A worker
+/// has no workspace snapshot or authority to install/build a component while
+/// advertising a machine capability.
+pub(crate) struct PreparedDistributedCompilerFactDriver {
+    execution: CompilerFactDriverExecutionCapability,
+    readiness: CompilerFactDriverReadiness,
+    compiler_library_directory: PathBuf,
+    _compiler_library: AuthenticatedCompilerLibrary,
+}
+
 /// Private stable-rustdoc sysroot view whose test builder is cargo-rail.
 pub(crate) struct CompilerFactDoctestSysroot {
     root: PathBuf,
@@ -182,6 +194,32 @@ pub(crate) struct CompilerFactDoctestSysroot {
 }
 
 impl CompilerFactDriverAuthority {
+    /// Describe the embedded distributed-analysis producer without staging or
+    /// probing it. Client selection uses this immutable build authority; the
+    /// worker separately authenticates and retains the actual component before
+    /// it advertises the same capability.
+    pub(crate) fn distributed_readiness(rustc_verbose: &str) -> RailResult<Option<CompilerFactDriverReadiness>> {
+        let Some(authority) = Self::embedded()? else {
+            return Ok(None);
+        };
+        let selected = RustcVerboseIdentity::parse(rustc_verbose)?;
+        if selected.release != authority.rustc_release
+            || selected.commit != authority.rustc_commit
+            || selected.host != authority.rustc_host
+        {
+            return Ok(None);
+        }
+        Ok(Some(CompilerFactDriverReadiness {
+            protocol: COMPILER_FACT_PROTOCOL_VERSION,
+            driver_identity: authority.identity,
+            driver_digest: authority.content_digest,
+            compiler_library_digest: authority.compiler_library_digest,
+            rustc_release: authority.rustc_release,
+            rustc_commit: authority.rustc_commit,
+            rustc_host: authority.rustc_host,
+        }))
+    }
+
     /// Fail before workspace acquisition when an installed surface command
     /// cannot authenticate its companion producer.
     pub(crate) fn require_surface_installation() -> RailResult<()> {
@@ -1241,6 +1279,73 @@ impl PreparedCompilerFactDriver {
             &self.compiler_library,
             &self.compiler_library_digest,
         )
+    }
+}
+
+impl PreparedDistributedCompilerFactDriver {
+    /// Authenticate an already installed release component against the exact
+    /// compiler implementation selected by the worker.
+    pub(crate) fn prepare(rustc_verbose: &str, rustc_sysroot: &Path) -> RailResult<Option<Self>> {
+        let Some(authority) = CompilerFactDriverAuthority::embedded()? else {
+            return Ok(None);
+        };
+        let selected = RustcVerboseIdentity::parse(rustc_verbose)?;
+        if selected.release != authority.rustc_release
+            || selected.commit != authority.rustc_commit
+            || selected.host != authority.rustc_host
+        {
+            return Ok(None);
+        }
+        let rustc_sysroot = crate::utils::canonicalize_existing(rustc_sysroot)?;
+        let compiler_library_path = rustc_sysroot.join(&authority.compiler_library);
+        let compiler_library_directory = compiler_library_path
+            .parent()
+            .ok_or_else(|| RailError::message("distributed compiler fact runtime library has no parent"))?
+            .to_path_buf();
+        let executable = std::env::current_exe().map_err(|error| {
+            RailError::message(format!("failed to locate distributed cargo-rail executable: {error}"))
+        })?;
+        let component = CompilerFactDriverComponent::discover_with_authority(
+            &authority,
+            &executable,
+            compiler_library_directory.clone(),
+        )?;
+        let compiler_library =
+            authenticate_compiler_library(&compiler_library_path, &authority.compiler_library_digest)?;
+        let execution = component.stage()?;
+        if execution.identity() != authority.identity {
+            return Err(RailError::message(
+                "distributed compiler fact driver does not match embedded authority",
+            ));
+        }
+        probe_fact_driver_protocol(&execution, &compiler_library_directory)?;
+        let readiness = CompilerFactDriverReadiness {
+            protocol: COMPILER_FACT_PROTOCOL_VERSION,
+            driver_identity: authority.identity,
+            driver_digest: authority.content_digest,
+            compiler_library_digest: authority.compiler_library_digest,
+            rustc_release: authority.rustc_release,
+            rustc_commit: authority.rustc_commit,
+            rustc_host: authority.rustc_host,
+        };
+        Ok(Some(Self {
+            execution,
+            readiness,
+            compiler_library_directory,
+            _compiler_library: compiler_library,
+        }))
+    }
+
+    pub(crate) fn readiness(&self) -> &CompilerFactDriverReadiness {
+        &self.readiness
+    }
+
+    pub(crate) fn program(&self) -> &Path {
+        self.execution.program()
+    }
+
+    pub(crate) fn compiler_library_directory(&self) -> &Path {
+        &self.compiler_library_directory
     }
 }
 

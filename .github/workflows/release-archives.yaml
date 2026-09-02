@@ -161,7 +161,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           remote-url: ${{ inputs.native-cache-url }}
           remote-mode: ${{ inputs.native-cache-mode }}
-          remote-credentials-ready: ${{ inputs.native-cache-url == '' || (secrets.r2_access_key_id != '' && secrets.r2_secret_access_key != '') }}
+          remote-access-key-id: ${{ inputs.native-cache-url != '' && secrets.r2_access_key_id || '' }}
+          remote-secret-access-key: ${{ inputs.native-cache-url != '' && secrets.r2_secret_access_key || '' }}
 
       - name: Download exact plan
         if: inputs.plan-artifact != ''
@@ -173,6 +174,13 @@ jobs:
       - name: Verify checkout against plan
         if: inputs.plan-artifact != ''
         run: scripts/plan/verify.sh target/plan-v8.json
+
+      - name: Bind GNU runtime floor
+        if: endsWith(matrix.target, '-unknown-linux-gnu')
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: python3 scripts/ci/verify-gnu-runtime.py --target "$TARGET" --host-only
 
       - name: Setup target toolchain
         if: ${{ !contains(matrix.target, '-linux-musl') }}
@@ -204,8 +212,8 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.r2_access_key_id }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.r2_secret_access_key }}
+          AWS_ACCESS_KEY_ID: ${{ inputs.native-cache-url != '' && secrets.r2_access_key_id || '' }}
+          AWS_SECRET_ACCESS_KEY: ${{ inputs.native-cache-url != '' && secrets.r2_secret_access_key || '' }}
           AWS_EC2_METADATA_DISABLED: "true"
         run: |
           set -euo pipefail
@@ -238,8 +246,8 @@ jobs:
         id: build
         uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1.30.2
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.r2_access_key_id }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.r2_secret_access_key }}
+          AWS_ACCESS_KEY_ID: ${{ inputs.native-cache-url != '' && secrets.r2_access_key_id || '' }}
+          AWS_SECRET_ACCESS_KEY: ${{ inputs.native-cache-url != '' && secrets.r2_secret_access_key || '' }}
           AWS_EC2_METADATA_DISABLED: "true"
         with:
           bin: cargo-rail,cargo-rail-compiler-observation,cargo-rail-native-rustc-wrapper,cargo-rail-native-rustc-worker,cargo-rail-distributed-worker

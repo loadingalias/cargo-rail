@@ -1,4 +1,6 @@
-//! Rust monorepo orchestration: CI optimization, dependency unification, release automation.
+//! A library-backed Rust workspace engine for affected-work planning, verified
+//! compiler reuse, dependency repair, Surface analysis, releases, and crate
+//! split/sync.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 

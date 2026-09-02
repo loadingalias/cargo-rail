@@ -217,6 +217,31 @@ setup_lane() {
       -u CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER CARGO_HOME="$home" \
       "$binary" rail cache setup --local-dir "$cache" --max-size 10GiB >/dev/null
   )
+
+  local profile
+  profile="$({
+    cd "$setup_root"
+    env -u RUSTC_WRAPPER -u CARGO_BUILD_RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER \
+      -u CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER CARGO_HOME="$home" \
+      "$binary" rail cache status --scope local -f json
+  } | jq -er '.status.installation.profile_id | select(type == "string" and length == 64)')"
+  local workload
+  for workload in build test; do
+    (
+      cd "$state/fixtures/$workload-$lane"
+      env -u RUSTC_WRAPPER -u CARGO_BUILD_RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER \
+        -u CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER CARGO_HOME="$home" \
+        "$binary" rail cache setup --profile "$profile" --local-dir "$cache" --max-size 10GiB >/dev/null
+    )
+  done
+  if [[ "$lane" == transparent-warm ]]; then
+    (
+      cd "$compiler_mode_root"
+      env -u RUSTC_WRAPPER -u CARGO_BUILD_RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER \
+        -u CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER CARGO_HOME="$home" \
+        "$binary" rail cache setup --profile "$profile" --local-dir "$cache" --max-size 10GiB >/dev/null
+    )
+  fi
 }
 
 shared_git="$state/fixture-git-source"

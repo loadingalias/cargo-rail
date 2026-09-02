@@ -12,11 +12,9 @@ fn test_split_apply_from_plan_file() {
         ws.commit("Add mylib")?;
 
         let split_dir = TempDir::new()?;
+        git(split_dir.path(), &["init", "--initial-branch=main"])?;
         let config = format!(
-            r#"[workspace]
-root = "."
-
-[crates.mylib.split]
+            r#"[crates.mylib.split]
 remote = "{}"
 branch = "main"
 mode = "single"
@@ -32,8 +30,8 @@ mode = "single"
                 "split",
                 "run",
                 "mylib",
-                "--check",
                 "--allow-dirty",
+                "--check",
                 "-f",
                 "json",
             ],
@@ -75,11 +73,11 @@ fn test_sync_apply_from_plan_file() {
         ws.commit("Add mylib")?;
 
         let split_dir = TempDir::new()?;
+        git(split_dir.path(), &["init", "--initial-branch=main"])?;
+        git(split_dir.path(), &["config", "user.name", "Test User"])?;
+        git(split_dir.path(), &["config", "user.email", "test@example.com"])?;
         let config = format!(
-            r#"[workspace]
-root = "."
-
-[crates.mylib.split]
+            r#"[crates.mylib.split]
 remote = "{}"
 branch = "main"
 mode = "single"
@@ -101,8 +99,8 @@ mode = "single"
                 "sync",
                 "mylib",
                 "--to-remote",
-                "--check",
                 "--allow-dirty",
+                "--check",
                 "-f",
                 "json",
             ],
@@ -147,8 +145,6 @@ fn test_release_apply_from_plan_file() {
         ws.write_release_config(
             r#"tag_prefix = "v"
 tag_format = "v{version}"
-require_clean = false
-require_release_notes = false
 "#,
         )?;
         std::fs::create_dir_all(ws.path.join(".changes"))?;
@@ -163,12 +159,10 @@ require_release_notes = false
             &[
                 "rail",
                 "release",
-                "run",
+                "check",
                 "--all",
-                "--check",
                 "--bump",
                 "patch",
-                "--skip-publish",
                 "--skip-tag",
                 "--json",
             ],
@@ -186,7 +180,6 @@ require_release_notes = false
                 "--all",
                 "--bump",
                 "patch",
-                "--skip-publish",
                 "--skip-tag",
                 "--yes",
                 "--plan",
@@ -235,8 +228,6 @@ fn test_release_plan_rejects_unreviewed_file_before_mutation() {
         ws.write_release_config(
             r#"tag_prefix = "v"
 tag_format = "v{version}"
-require_clean = false
-require_release_notes = false
 "#,
         )?;
         std::fs::create_dir_all(ws.path.join(".changes"))?;
@@ -251,12 +242,10 @@ require_release_notes = false
             &[
                 "rail",
                 "release",
-                "run",
+                "check",
                 "--all",
-                "--check",
                 "--bump",
                 "patch",
-                "--skip-publish",
                 "--skip-tag",
                 "--json",
             ],
@@ -283,7 +272,6 @@ require_release_notes = false
                 "--all",
                 "--bump",
                 "patch",
-                "--skip-publish",
                 "--skip-tag",
                 "--yes",
                 "--plan",

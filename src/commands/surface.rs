@@ -321,7 +321,7 @@ pub fn run_surface(ctx: &WorkspaceContext, options: SurfaceOptions) -> RailResul
             ctx.snapshot()?.configuration_fingerprint(),
         )?;
     }
-    let mut initial = analyze_surface(ctx, &config, options.explain)?;
+    let mut initial = analyze_surface(ctx, &config, options.explain, options.resume.as_deref())?;
     ctx.validate_snapshot_unchanged()?;
     filter_findings(&mut initial.findings, &options.only);
 
@@ -370,7 +370,7 @@ pub fn run_surface(ctx: &WorkspaceContext, options: SurfaceOptions) -> RailResul
                 "surface configuration changed across post-mutation verification",
             ));
         }
-        let mut verified = analyze_surface(&verified_context, &verified_config, options.explain)?;
+        let mut verified = analyze_surface(&verified_context, &verified_config, options.explain, None)?;
         filter_findings(&mut verified.findings, &options.only);
         verified_context.validate_snapshot_unchanged()?;
         verify_surface_updates(&ctx.git()?.git().worktree_root, &updates)?;
@@ -457,7 +457,12 @@ fn filter_findings(findings: &mut Vec<SurfaceReportFinding>, only: &[String]) {
     }
 }
 
-fn analyze_surface(ctx: &WorkspaceContext, config: &SurfaceConfig, counterfactuals: bool) -> RailResult<SurfaceRun> {
+fn analyze_surface(
+    ctx: &WorkspaceContext,
+    config: &SurfaceConfig,
+    counterfactuals: bool,
+    resume_manifest: Option<&Path>,
+) -> RailResult<SurfaceRun> {
     let snapshot = ctx.snapshot()?;
     validate_workspace_policy(ctx, snapshot, config)?;
     let workspace_packages = ctx.cargo().workspace_members();
@@ -486,9 +491,12 @@ fn analyze_surface(ctx: &WorkspaceContext, config: &SurfaceConfig, counterfactua
         BTreeSet::new()
     };
     let acquisition = CompilerAcquisitionRequest {
+        workspace_identity: snapshot.id().to_string(),
+        checkout_identity: ctx.planning_snapshot_id().unwrap_or_else(|| snapshot.id().to_string()),
         snapshot_identity: snapshot.id().to_string(),
         configuration_fingerprint: snapshot.configuration_fingerprint().to_string(),
         products: acquisition_products(config, &workspace_packages),
+        resume_manifest: resume_manifest.map(Path::to_path_buf),
     };
     let collector =
         CompilerDiagnosticsCollector::with_identity(ctx.workspace_root(), &manifests, target_refs, &cache_identity)
@@ -962,11 +970,13 @@ fn finalize_surface_mutation(
 }
 
 fn surface_test_fault(point: &str) -> RailResult<()> {
+    #[cfg(debug_assertions)]
     if std::env::var("CARGO_RAIL_SURFACE_FAIL_AT").as_deref() == Ok(point) {
-        Err(RailError::message(format!("injected surface failure at {point}")))
-    } else {
-        Ok(())
+        return Err(RailError::message(format!("injected surface failure at {point}")));
     }
+    #[cfg(not(debug_assertions))]
+    let _ = point;
+    Ok(())
 }
 
 fn recover_failed_verification(
@@ -2171,13 +2181,13 @@ mod tests {
             identity: "surface-finding-v1-sha256-test".to_string(),
             item_identity: "surface-item-v1-sha256-test".to_string(),
             kind: SurfaceFindingKind::UnnecessaryPublic,
-            name: "legacy_entry".to_string(),
+            name: "private_entry".to_string(),
             item_kind: "function",
             packages: vec!["app-core".to_string()],
             compiler_crates: vec![compiler_crate()],
             target_observations: vec![target_observation()],
-            diagnostic_paths: vec!["app_core::migration::legacy_entry".to_string()],
-            source: "crates/app-core/src/migration.rs".to_string(),
+            diagnostic_paths: vec!["app_core::private::private_entry".to_string()],
+            source: "crates/app-core/src/private.rs".to_string(),
             source_generated: false,
             declaration_start: 20,
             declaration_end: 50,
@@ -2199,8 +2209,8 @@ mod tests {
                 packages: vec!["app-core".to_string()],
                 compiler_crates: vec![compiler_crate()],
                 target_observations: vec![target_observation()],
-                diagnostic_paths: vec!["app_core::migration::legacy_entry".to_string()],
-                source: "crates/app-core/src/migration.rs".to_string(),
+                diagnostic_paths: vec!["app_core::private::private_entry".to_string()],
+                source: "crates/app-core/src/private.rs".to_string(),
                 source_generated: false,
                 production_live: true,
                 non_production_live: false,
@@ -2255,17 +2265,17 @@ mod tests {
             lint: "unnecessary-public".to_string(),
             package: Some("app-core".to_string()),
             crate_name: None,
-            item: "migration::legacy_entry".to_string(),
+            item: "private::private_entry".to_string(),
             kind: Some("function".to_string()),
             target: None,
             level: SurfaceLintLevel::Expect,
-            reason: "migration compatibility".to_string(),
+            reason: "explicit test override".to_string(),
         });
         let result = apply_diagnostic_policy(&analysis(), &config).expect("policy should apply");
         assert!(result.findings.is_empty());
         assert!(result.configuration_diagnostics.is_empty());
 
-        config.r#override[0].item = "migration::gone".to_string();
+        config.r#override[0].item = "private::gone".to_string();
         let result = apply_diagnostic_policy(&analysis(), &config).expect("stale policy should be diagnosed");
         assert_eq!(result.configuration_diagnostics[0].code, "unknown-item");
     }
@@ -2273,7 +2283,7 @@ mod tests {
     #[test]
     fn overlapping_qualified_and_unqualified_overrides_are_rejected() {
         let mut config = SurfaceConfig::default();
-        for item in ["app_core::migration::legacy_entry", "migration::legacy_entry"] {
+        for item in ["app_core::private::private_entry", "private::private_entry"] {
             config.r#override.push(SurfaceOverride {
                 lint: "unnecessary-public".to_string(),
                 package: Some("app-core".to_string()),
@@ -2301,11 +2311,11 @@ mod tests {
         config.exclude.push(SurfaceExclude {
             package: Some("app-core".to_string()),
             crate_name: None,
-            module: Some("migration".to_string()),
+            module: Some("private".to_string()),
             file: None,
             target: None,
             level: SurfaceLintLevel::Expect,
-            reason: "generated migration surface".to_string(),
+            reason: "generated private surface".to_string(),
         });
         let result = apply_diagnostic_policy(&analysis(), &config).expect("finding should satisfy exclusion");
         assert!(result.findings.is_empty());

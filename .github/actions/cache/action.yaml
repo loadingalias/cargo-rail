@@ -21,10 +21,14 @@ inputs:
     description: Cargo-Rail remote authority
     required: false
     default: read
-  remote-credentials-ready:
-    description: Whether the caller proved that the selected R2 credential pair is present
+  remote-access-key-id:
+    description: R2 access key ID, mapped only to the pinned Cargo-Rail cache action
     required: false
-    default: "false"
+    default: ""
+  remote-secret-access-key:
+    description: R2 secret access key, mapped only to the pinned Cargo-Rail cache action
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -44,7 +48,6 @@ runs:
       shell: bash
       env:
         CARGO_RAIL_CACHE_REMOTE: ${{ inputs.remote-url }}
-        CARGO_RAIL_CACHE_CREDENTIALS_READY: ${{ inputs.remote-credentials-ready }}
       run: |
         set -euo pipefail
         case "$CARGO_RAIL_CACHE_REMOTE" in
@@ -54,17 +57,25 @@ runs:
             exit 2
             ;;
         esac
-        if [ "$CARGO_RAIL_CACHE_CREDENTIALS_READY" != true ]; then
-          echo "The selected R2 compiler cache requires both repository credentials." >&2
-          exit 2
-        fi
+
+    - name: Require R2 cache credentials
+      if: inputs.remote-url != '' && (inputs.remote-access-key-id == '' || inputs.remote-secret-access-key == '')
+      shell: bash
+      run: |
+        echo "The selected R2 compiler cache requires both repository credentials." >&2
+        exit 2
 
     - name: Enable Cargo-Rail compiler reuse
       if: inputs.remote-url != ''
-      uses: loadingalias/cargo-rail-action/cache@30ce9d2ae5ad48f0b95150f1810385e694ab9604 # v8.1.0
+      env:
+        AWS_ACCESS_KEY_ID: ${{ inputs.remote-access-key-id }}
+        AWS_SECRET_ACCESS_KEY: ${{ inputs.remote-secret-access-key }}
+        AWS_EC2_METADATA_DISABLED: "true"
+      uses: loadingalias/cargo-rail-action/cache@78ad385a85627484a5b634cf1bc3caa1de872c6a # v8.2.0
       with:
         url: ${{ inputs.remote-url }}
         mode: ${{ inputs.remote-mode }}
         max-size: 10GiB
         root-portability: remap
-        version: 0.24.0
+        strict-probe: "true"
+        version: 0.25.0

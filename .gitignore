@@ -27,3 +27,5 @@ notes/
 docs/tasks/
 docs/content/
 .ropeproject/
+docs/integration-contrib/
+tests/fixtures/surface_conformance/target/

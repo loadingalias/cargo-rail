@@ -78,7 +78,7 @@ or incomplete input evidence executes the original compiler. Physical-root mode 
 use `--root-portability remap` only for certified cross-root Rust metadata and library results. External
 `CARGO_TARGET_DIR` locations are supported for eligible native results. A bypass is safe fallback, not a failed hit.
 
-Status schema 14 keeps native failure-reason counters outside the bounded 65,536-event usage ledger. Inspect
+Status schema 15 keeps native failure-reason counters outside the bounded 65,536-event usage ledger. Inspect
 `usage.failure_reason_counts_available` before interpreting `usage.failure_reasons`; event eviction does not erase
 those counters. A strict `cache probe` verifies authenticated provider and protocol readiness without exposing the
 remote URL, object names, credentials, or local paths.
@@ -97,12 +97,17 @@ Preview cleanup before removing state:
 ```bash
 cargo rail cache clean --scope workspace --check
 cargo rail cache clean --scope local --check
-cargo rail cache remove --check
+cargo rail cache detach --check
+cargo rail cache profiles --json
+cargo rail cache uninstall --check
 ```
 
-Workspace cleanup removes reconstructible state for the current checkout. Local cleanup removes the receipt-selected
-shared CAS and requires `cargo rail cache setup` to repair it. `cache remove` removes owned setup but preserves CAS
-data. Resolve receipt, wrapper, or ownership drift instead of deleting cache files or Cargo configuration by hand.
+Workspace cleanup removes reconstructible state for the current checkout. Local cleanup removes the current profile's
+CAS and requires `cargo rail cache setup` to repair it. `cache detach` preserves the profile and CAS while removing the
+current root binding. `cache uninstall` removes the global wrapper and Cargo configuration while preserving every
+profile. Use `cache profiles`, `cache drop-profile --profile PROFILE_ID --check`, and `cache drop-unbound --check` for
+explicit machine-wide cleanup. Resolve receipt, wrapper, profile, or ownership drift instead of deleting cache files
+or Cargo configuration by hand.
 
 See [Caching](caching.md) for exact eligibility and support.
 
@@ -117,7 +122,8 @@ cargo rail release resume target/cargo-rail/releases/release-<id>.json
 ```
 
 `resume` reconciles Git, readiness checks, registry versions, tags, and forge state before advancing. It does not
-replan from mutated manifests. Waiting at an exact-SHA readiness or registry-convergence boundary is normal.
+replan from mutated manifests. Use `release run --wait` when the initiating process should stay attached until
+exact-SHA checks settle; an interrupted wait remains resumable from the same journal.
 
 Abort only while the status says no external side effect may exist:
 

@@ -7,7 +7,6 @@ use std::path::PathBuf;
 use serde::Deserialize;
 
 use crate::error::{RailError, RailResult};
-use crate::graph::DependencyUniverse;
 use crate::utils::toolchain_fingerprint;
 use crate::workspace::WorkspaceContext;
 
@@ -42,18 +41,11 @@ enum ResolvedComparison {
 }
 
 impl PlanComparison {
-    pub(crate) fn from_cli(
-        since: &Option<String>,
-        from: &Option<String>,
-        to: &Option<String>,
-        merge_base: bool,
-    ) -> RailResult<Self> {
+    pub(crate) fn from_cli(since: &Option<String>, from: &Option<String>, to: &Option<String>) -> RailResult<Self> {
         match (from, to) {
             (Some(from), Some(to)) => {
-                if since.is_some() || merge_base {
-                    return Err(RailError::message(
-                        "--from/--to cannot be combined with --since or --merge-base",
-                    ));
+                if since.is_some() {
+                    return Err(RailError::message("--from/--to cannot be combined with --since"));
                 }
                 return Ok(Self::Objects {
                     from: from.clone(),
@@ -244,8 +236,6 @@ pub fn run_plan(ctx: &WorkspaceContext, opts: PlanOptions) -> RailResult<()> {
 
 fn build_work_plan(ctx: &WorkspaceContext, opts: &PlanOptions) -> RailResult<crate::planning::WorkPlan> {
     let comparison = opts.comparison.clone().resolve(ctx)?;
-    let dependency_universe =
-        DependencyUniverse::from_metadata(ctx.cargo().metadata(), ctx.planning_authority_source_root())?;
     let planning_index = collect_planning_index(ctx, &comparison)?;
     let semantic_changes = crate::change_detection::semantic::analyze(
         ctx,
@@ -282,7 +272,6 @@ fn build_work_plan(ctx: &WorkspaceContext, opts: &PlanOptions) -> RailResult<cra
         ctx,
         planning_index,
         authority,
-        &dependency_universe,
         &semantic_changes,
         opts.evidence.as_deref(),
         opts.all,

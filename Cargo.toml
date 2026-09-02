@@ -51,6 +51,7 @@ aws-sdk-s3 = { version = "1.141.0", default-features = false, features = [
   "default-https-client",
   "rt-tokio",
 ] }
+aws-smithy-runtime-api = "1.15.0"
 aws-types = "1.5.0"
 async-trait = "0.1.92"
 azure_core = { version = "1.0.0", default-features = false, features = [
@@ -71,7 +72,6 @@ serde_json = "1.0.151"
 semver = "1.0.28"
 rayon = "1.12.0"
 rustls = { version = "0.23.43", default-features = false, features = ["aws_lc_rs", "std"] }
-winnow = "1.0.4"
 chrono = "0.4.45"
 glob = "0.3.4"
 getrandom = "0.4.3"
@@ -93,12 +93,20 @@ zeroize = "1.9.0"
 rustix = { version = "1.1.4", features = ["fs", "process"] }
 signal-hook = "0.3.18"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+exacl = "0.13.0"
+icu_normalizer = "2.3.0"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "=0.61.2", features = [
   "Win32_Foundation",
+  "Win32_Security",
   "Win32_Storage_FileSystem",
+  "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_IO",
   "Win32_System_Ioctl",
+  "Win32_System_JobObjects",
+  "Win32_System_Pipes",
   "Win32_System_SystemServices",
   "Win32_System_Threading",
 ] }

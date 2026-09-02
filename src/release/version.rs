@@ -2,7 +2,6 @@
 
 use crate::config::Pre1BreakingBump;
 use crate::error::{RailError, RailResult};
-use crate::release::changelog::ParsedSubject;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -199,22 +198,6 @@ impl FromStr for BumpLevel {
 impl std::fmt::Display for BumpLevel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
-    }
-}
-
-/// Semver impact of one conventional commit
-///
-/// Fixed semantics regardless of custom changelog groups: breaking → major,
-/// feat → minor, fix/perf → patch, everything else (including custom types
-/// and unconventional commits) → no bump.
-pub fn commit_bump_level(parsed: &ParsedSubject<'_>) -> Option<BumpLevel> {
-    if parsed.breaking {
-        return Some(BumpLevel::Major);
-    }
-    match parsed.commit_type? {
-        "feat" => Some(BumpLevel::Minor),
-        "fix" | "perf" => Some(BumpLevel::Patch),
-        _ => None,
     }
 }
 

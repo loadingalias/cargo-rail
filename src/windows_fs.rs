@@ -3,31 +3,572 @@
 //! This is the only production module allowed to use `unsafe`. Its crate-private
 //! API keeps Win32 pointer and handle contracts out of the rest of Cargo-Rail.
 
-use std::ffi::c_void;
+use std::ffi::{OsString, c_void};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::mem::{MaybeUninit, size_of};
-use std::os::windows::ffi::OsStrExt as _;
+use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::windows::fs::OpenOptionsExt as _;
-use std::os::windows::io::AsRawHandle as _;
+use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+use std::os::windows::process::CommandExt as _;
 use std::path::Path;
+use std::process::{Child, Command};
 
-use windows_sys::Win32::Foundation::{ERROR_NOT_SAME_DEVICE, FILETIME, HANDLE};
-use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TEMPORARY, FILE_BASIC_INFO,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_POSIX_SEMANTICS, FILE_FLAG_SEQUENTIAL_SCAN,
-    FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileBasicInfo,
-    GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
-    MAXIMUM_REPARSE_DATA_BUFFER_SIZE, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, VOLUME_NAME_GUID,
+use windows_sys::Win32::Foundation::{
+    ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_NO_MORE_FILES, ERROR_NOT_FOUND, ERROR_NOT_SAME_DEVICE,
+    ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_UNABLE_TO_MOVE_REPLACEMENT_2, FILETIME, GENERIC_READ, HANDLE,
+    INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
-use windows_sys::Win32::System::IO::DeviceIoControl;
+use windows_sys::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TEMPORARY, FILE_BASIC_INFO,
+    FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_FLAG_OVERLAPPED, FILE_FLAG_POSIX_SEMANTICS, FILE_FLAG_SEQUENTIAL_SCAN, FILE_NAME_NORMALIZED,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileBasicInfo, FileDispositionInfo,
+    GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
+    MAXIMUM_REPARSE_DATA_BUFFER_SIZE, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    PIPE_ACCESS_DUPLEX, ReadFile, ReplaceFileW, SetFileInformationByHandle, VOLUME_NAME_GUID, WriteFile,
+};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+};
+use windows_sys::Win32::System::IO::{CancelIoEx, DeviceIoControl, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Ioctl::{FSCTL_GET_REPARSE_POINT, FSCTL_SET_REPARSE_POINT};
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
+    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+};
+use windows_sys::Win32::System::Pipes::{
+    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+};
 use windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_MOUNT_POINT;
+use windows_sys::Win32::System::Threading::{
+    CREATE_SUSPENDED, CreateEventW, INFINITE, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME, WaitForSingleObject,
+};
 
 const FILE_SYSTEM_NAME_CAPACITY: usize = 32;
 const MAX_FINAL_PATH_UNITS: u32 = 32_768;
 const MAX_PATH_ARGUMENT_UNITS: usize = 32_766;
 const MOUNT_POINT_PATH_UNITS: usize = MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize / size_of::<u16>();
+const LOCAL_PIPE_PREFIX: &str = r"\\.\pipe\cargo-rail-acquisition-";
+const LOCAL_PIPE_BUFFER_BYTES: u32 = 16 * 1024;
+
+/// One kill-on-close Job Object owning a spawned process and all descendants.
+#[derive(Debug)]
+pub(crate) struct ProcessJob {
+    handle: OwnedHandle,
+}
+
+/// One overlapped, byte-oriented local named-pipe connection.
+///
+/// All I/O stays behind safe methods that keep each buffer, event, and
+/// `OVERLAPPED` value alive until Windows reports completion or cancellation.
+#[derive(Debug)]
+pub(crate) struct LocalNamedPipe {
+    handle: OwnedHandle,
+}
+
+impl LocalNamedPipe {
+    pub(crate) fn read_with_timeout(
+        &mut self,
+        buffer: &mut [u8],
+        timeout: Option<std::time::Duration>,
+    ) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        let length = u32::try_from(buffer.len().min(u32::MAX as usize))
+            .map_err(|_| invalid_data("Windows named-pipe read length exceeds 32 bits"))?;
+        run_overlapped(self.raw_handle(), timeout, |overlapped| {
+            // SAFETY: `self` owns an overlapped-capable duplex pipe handle;
+            // `buffer` is writable for `length` bytes and outlives the complete
+            // or cancelled operation; `overlapped` is initialized, unique to
+            // this operation, and remains live until `run_overlapped` returns.
+            unsafe {
+                ReadFile(
+                    self.raw_handle(),
+                    buffer.as_mut_ptr(),
+                    length,
+                    std::ptr::null_mut(),
+                    overlapped,
+                )
+            }
+        })
+        .and_then(|read| {
+            usize::try_from(read).map_err(|_| invalid_data("Windows named-pipe read length exceeds usize"))
+        })
+    }
+
+    pub(crate) fn write_with_timeout(&mut self, buffer: &[u8], timeout: std::time::Duration) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        let length = u32::try_from(buffer.len().min(u32::MAX as usize))
+            .map_err(|_| invalid_data("Windows named-pipe write length exceeds 32 bits"))?;
+        run_overlapped(self.raw_handle(), Some(timeout), |overlapped| {
+            // SAFETY: `self` owns an overlapped-capable duplex pipe handle;
+            // `buffer` is readable for `length` bytes and outlives the complete
+            // or cancelled operation; `overlapped` is initialized, unique to
+            // this operation, and remains live until `run_overlapped` returns.
+            unsafe {
+                WriteFile(
+                    self.raw_handle(),
+                    buffer.as_ptr(),
+                    length,
+                    std::ptr::null_mut(),
+                    overlapped,
+                )
+            }
+        })
+        .and_then(|written| {
+            usize::try_from(written).map_err(|_| invalid_data("Windows named-pipe write length exceeds usize"))
+        })
+    }
+
+    fn raw_handle(&self) -> HANDLE {
+        self.handle.as_raw_handle().cast()
+    }
+}
+
+/// One blocking-accept, overlapped-I/O local named-pipe listener.
+///
+/// The constructor accepts only Cargo-Rail's random endpoint namespace. The
+/// first-instance flag prevents an existing process from pre-creating that
+/// exact name, and every instance rejects remote clients.
+#[derive(Debug)]
+pub(crate) struct LocalNamedPipeListener {
+    name: Vec<u16>,
+    max_instances: u32,
+    first: Option<LocalNamedPipe>,
+}
+
+impl LocalNamedPipeListener {
+    pub(crate) fn bind(name: &str, max_instances: usize) -> io::Result<Self> {
+        let name = encode_local_pipe_name(name)?;
+        let max_instances = u32::try_from(max_instances)
+            .ok()
+            .filter(|instances| *instances > 0 && *instances <= 255)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Windows broker instance bound is invalid"))?;
+        let first = create_local_pipe_instance(&name, max_instances, true)?;
+        Ok(Self {
+            name,
+            max_instances,
+            first: Some(first),
+        })
+    }
+
+    pub(crate) fn accept(&mut self) -> io::Result<LocalNamedPipe> {
+        let pipe = match self.first.take() {
+            Some(first) => first,
+            None => create_local_pipe_instance(&self.name, self.max_instances, false)?,
+        };
+        // Heap ownership keeps the OVERLAPPED address stable for the complete
+        // asynchronous connect operation.
+        let mut operation = Box::new(OverlappedOperation::new()?);
+        // SAFETY: `pipe` owns an overlapped-capable server pipe; `operation`
+        // owns an initialized OVERLAPPED and event that remain live through the
+        // completion wait. Windows retains neither after completion.
+        let connected = unsafe { ConnectNamedPipe(pipe.raw_handle(), operation.overlapped_mut()) };
+        if connected == 0 {
+            let error = io::Error::last_os_error();
+            match windows_error_code(&error) {
+                Some(ERROR_PIPE_CONNECTED) => {}
+                Some(ERROR_IO_PENDING) => {
+                    operation.wait(pipe.raw_handle(), None)?;
+                }
+                _ => return Err(error),
+            }
+        }
+        Ok(pipe)
+    }
+}
+
+/// Connect to one local Cargo-Rail broker pipe within a bounded deadline.
+pub(crate) fn connect_local_named_pipe(name: &str, timeout: std::time::Duration) -> io::Result<LocalNamedPipe> {
+    drop(encode_local_pipe_name(name)?);
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(FILE_FLAG_OVERLAPPED)
+            .open(name)
+        {
+            Ok(pipe) => return Ok(LocalNamedPipe { handle: pipe.into() }),
+            Err(error)
+                if windows_error_code(&error)
+                    .is_some_and(|code| matches!(code, ERROR_PIPE_BUSY | ERROR_FILE_NOT_FOUND))
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn create_local_pipe_instance(name: &[u16], max_instances: u32, first: bool) -> io::Result<LocalNamedPipe> {
+    let open_mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | if first { FILE_FLAG_FIRST_PIPE_INSTANCE } else { 0 };
+    let pipe_mode = PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS;
+    // SAFETY: `name` is a nonempty NUL-terminated UTF-16 local pipe name with
+    // no interior NUL and remains live for the call. Buffer sizes and instance
+    // count are bounded above, security attributes are null for the process's
+    // default descriptor, and Windows retains no pointer.
+    let handle = unsafe {
+        CreateNamedPipeW(
+            name.as_ptr(),
+            open_mode,
+            pipe_mode,
+            max_instances,
+            LOCAL_PIPE_BUFFER_BYTES,
+            LOCAL_PIPE_BUFFER_BYTES,
+            5_000,
+            std::ptr::null(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `handle` is the unique valid server-end handle returned above;
+    // ownership transfers exactly once and closes on drop.
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle.cast()) };
+    Ok(LocalNamedPipe { handle })
+}
+
+struct OverlappedOperation {
+    _event: OwnedHandle,
+    overlapped: OVERLAPPED,
+}
+
+impl OverlappedOperation {
+    fn new() -> io::Result<Self> {
+        // SAFETY: all optional pointers are null, so Windows creates one
+        // unnamed manual-reset event and retains no caller-owned memory.
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if event.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `event` is the unique valid event handle returned above and
+        // ownership transfers exactly once to `OwnedHandle`.
+        let event = unsafe { OwnedHandle::from_raw_handle(event.cast()) };
+        let overlapped = OVERLAPPED {
+            hEvent: event.as_raw_handle().cast(),
+            ..OVERLAPPED::default()
+        };
+        Ok(Self {
+            _event: event,
+            overlapped,
+        })
+    }
+
+    fn overlapped_mut(&mut self) -> *mut OVERLAPPED {
+        &raw mut self.overlapped
+    }
+
+    fn wait(&mut self, handle: HANDLE, timeout: Option<std::time::Duration>) -> io::Result<u32> {
+        // SAFETY: the event handle is owned by `self` and remains live for the
+        // wait. The call retains no handle or pointer.
+        let waited = unsafe { WaitForSingleObject(self.overlapped.hEvent, wait_milliseconds(timeout)) };
+        if waited == WAIT_OBJECT_0 {
+            return self.result(handle, false);
+        }
+        if waited == WAIT_TIMEOUT {
+            // SAFETY: `handle` owns the still-live operation named by the exact
+            // OVERLAPPED pointer. `self` remains pinned on this stack through
+            // the cancellation drain below; Windows retains no pointer after
+            // the operation reaches a terminal state.
+            let cancelled = unsafe { CancelIoEx(handle, &raw const self.overlapped) };
+            if cancelled == 0 {
+                let error = io::Error::last_os_error();
+                if windows_error_code(&error) == Some(ERROR_NOT_FOUND) {
+                    // The operation won the timeout race. Preserve its bytes;
+                    // returning a timeout here would desynchronize the stream.
+                    return self.result(handle, true);
+                }
+                drop(self.result(handle, true));
+                return Err(error);
+            }
+            drop(self.result(handle, true));
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Windows named-pipe operation timed out",
+            ));
+        }
+
+        let error = io::Error::last_os_error();
+        // SAFETY: identical to the timeout cancellation above. Draining after
+        // cancellation is required before the stack OVERLAPPED or borrowed I/O
+        // buffer can cease to exist.
+        unsafe { CancelIoEx(handle, &raw const self.overlapped) };
+        drop(self.result(handle, true));
+        Err(error)
+    }
+
+    fn result(&mut self, handle: HANDLE, wait: bool) -> io::Result<u32> {
+        let mut transferred = 0_u32;
+        // SAFETY: `handle` owns the operation described by `self.overlapped`,
+        // which remains live and exclusive for this call. `transferred` is
+        // writable aligned storage, and Windows retains no pointer.
+        let succeeded = unsafe {
+            GetOverlappedResult(
+                handle,
+                &raw const self.overlapped,
+                &raw mut transferred,
+                i32::from(wait),
+            )
+        };
+        if succeeded == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(transferred)
+        }
+    }
+}
+
+fn run_overlapped(
+    handle: HANDLE,
+    timeout: Option<std::time::Duration>,
+    start: impl FnOnce(*mut OVERLAPPED) -> i32,
+) -> io::Result<u32> {
+    // Heap ownership keeps the OVERLAPPED address stable while Windows may
+    // retain it asynchronously.
+    let mut operation = Box::new(OverlappedOperation::new()?);
+    if start(operation.overlapped_mut()) != 0 {
+        return operation.result(handle, false);
+    }
+    let error = io::Error::last_os_error();
+    if windows_error_code(&error) != Some(ERROR_IO_PENDING) {
+        return Err(error);
+    }
+    operation.wait(handle, timeout)
+}
+
+fn wait_milliseconds(timeout: Option<std::time::Duration>) -> u32 {
+    let Some(timeout) = timeout else {
+        return INFINITE;
+    };
+    let milliseconds = timeout.as_nanos().div_ceil(1_000_000).max(1);
+    u32::try_from(milliseconds.min(u128::from(INFINITE - 1))).unwrap_or(INFINITE - 1)
+}
+
+fn windows_error_code(error: &io::Error) -> Option<u32> {
+    error.raw_os_error().and_then(|code| u32::try_from(code).ok())
+}
+
+fn encode_local_pipe_name(name: &str) -> io::Result<Vec<u16>> {
+    let _suffix = name
+        .strip_prefix(LOCAL_PIPE_PREFIX)
+        .filter(|suffix| suffix.len() == 64)
+        .filter(|suffix| {
+            suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Windows broker pipe name is not canonical"))?;
+    let mut encoded = name.encode_utf16().collect::<Vec<_>>();
+    encoded.push(0);
+    Ok(encoded)
+}
+
+/// Spawn `command` suspended, assign its process to a kill-on-close Job Object,
+/// and resume its one primary thread only after assignment succeeds.
+///
+/// `std::process::Command` owns quoting, environment construction, inherited
+/// standard handles, and executable lookup. The suspended-start protocol closes
+/// the otherwise unavoidable race between `spawn` and `AssignProcessToJobObject`.
+pub(crate) fn spawn_in_process_job(command: &mut Command) -> io::Result<(Child, ProcessJob)> {
+    let job = ProcessJob::new()?;
+    command.creation_flags(CREATE_SUSPENDED);
+    let mut child = command.spawn()?;
+    if let Err(error) = job.assign_and_resume(&child) {
+        let cleanup = terminate_failed_job_spawn(&mut child, &job);
+        return Err(match cleanup {
+            Ok(()) => error,
+            Err(cleanup_error) => io::Error::new(
+                error.kind(),
+                format!("{error}; suspended Windows process cleanup failed: {cleanup_error}"),
+            ),
+        });
+    }
+    Ok((child, job))
+}
+
+fn terminate_failed_job_spawn(child: &mut Child, job: &ProcessJob) -> io::Result<()> {
+    drop(job.terminate(1));
+    drop(child.kill());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::other(
+                "suspended Windows process remained live after forced termination",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+impl ProcessJob {
+    fn new() -> io::Result<Self> {
+        // SAFETY: null security attributes and name request one unnamed Job
+        // Object with default security. The returned owned handle is checked
+        // before conversion and Windows retains neither null pointer.
+        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `handle` is the unique non-null Job Object handle returned by
+        // CreateJobObjectW and ownership transfers exactly once to OwnedHandle.
+        let handle = unsafe { OwnedHandle::from_raw_handle(handle.cast()) };
+        let job = Self { handle };
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let limits_size = u32::try_from(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+            .map_err(|_| invalid_data("Windows Job Object limit structure exceeds 32 bits"))?;
+        // SAFETY: `job` owns a live Job Object handle. `limits` is a fully
+        // initialized value of the exact information-class type and remains
+        // alive for the synchronous call; Windows retains no pointer.
+        let succeeded = unsafe {
+            SetInformationJobObject(
+                job.raw_handle(),
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&limits).cast::<c_void>(),
+                limits_size,
+            )
+        };
+        if succeeded == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(job)
+    }
+
+    fn assign_and_resume(&self, child: &Child) -> io::Result<()> {
+        // SAFETY: both handles are live and borrowed for the call. `child` was
+        // created suspended, so it cannot create a descendant before the Job
+        // Object assignment becomes authoritative. Windows retains no handle.
+        let assigned = unsafe { AssignProcessToJobObject(self.raw_handle(), child.as_raw_handle().cast()) };
+        if assigned == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let thread_id = suspended_primary_thread(child.id())?;
+        // SAFETY: `thread_id` was obtained from a stable system snapshot for
+        // this still-suspended child. The requested access is only sufficient
+        // to resume it and the returned handle is checked before ownership.
+        let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, thread_id) };
+        if thread.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `thread` is the unique non-null handle returned by OpenThread
+        // and ownership transfers exactly once to OwnedHandle.
+        let thread = unsafe { OwnedHandle::from_raw_handle(thread.cast()) };
+        // SAFETY: `thread` owns the selected child's live primary thread handle.
+        // The child has not executed and no other Cargo-Rail code can mutate its
+        // suspend count. Windows retains no handle.
+        let previous = unsafe { ResumeThread(thread.as_raw_handle().cast()) };
+        if previous == u32::MAX {
+            return Err(io::Error::last_os_error());
+        }
+        if previous != 1 {
+            return Err(invalid_data(format!(
+                "Windows Cargo primary thread had unexpected suspend count {previous}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn terminate(&self, exit_code: u32) -> io::Result<()> {
+        // SAFETY: `self` owns a live Job Object handle. TerminateJobObject does
+        // not retain the handle and the numeric exit code has no pointer or
+        // lifetime contract.
+        let succeeded = unsafe { TerminateJobObject(self.raw_handle(), exit_code) };
+        if succeeded == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> io::Result<bool> {
+        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        let accounting_size = u32::try_from(size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>())
+            .map_err(|_| invalid_data("Windows Job Object accounting structure exceeds 32 bits"))?;
+        // SAFETY: `self` owns a live Job Object handle. `accounting` is aligned
+        // writable storage of the exact information-class size and Windows
+        // retains neither the handle nor the output pointer.
+        let succeeded = unsafe {
+            QueryInformationJobObject(
+                self.raw_handle(),
+                JobObjectBasicAccountingInformation,
+                (&raw mut accounting).cast::<c_void>(),
+                accounting_size,
+                std::ptr::null_mut(),
+            )
+        };
+        if succeeded == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(accounting.ActiveProcesses == 0)
+        }
+    }
+
+    fn raw_handle(&self) -> HANDLE {
+        self.handle.as_raw_handle().cast()
+    }
+}
+
+fn suspended_primary_thread(process_id: u32) -> io::Result<u32> {
+    // SAFETY: this call has no input pointers. The returned snapshot handle is
+    // checked against INVALID_HANDLE_VALUE before ownership transfer.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `snapshot` is the unique valid handle returned above and
+    // ownership transfers exactly once to OwnedHandle.
+    let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot.cast()) };
+    let mut entry = THREADENTRY32 {
+        dwSize: u32::try_from(size_of::<THREADENTRY32>())
+            .map_err(|_| invalid_data("Windows thread-entry structure exceeds 32 bits"))?,
+        ..THREADENTRY32::default()
+    };
+    let mut matching = None;
+
+    // SAFETY: `snapshot` owns a live thread snapshot and `entry` is writable,
+    // aligned storage with its required `dwSize` initialized. Windows retains
+    // neither the handle nor pointer.
+    let mut more = unsafe { Thread32First(snapshot.as_raw_handle().cast(), &raw mut entry) };
+    if more == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    loop {
+        if entry.th32OwnerProcessID == process_id && matching.replace(entry.th32ThreadID).is_some() {
+            return Err(invalid_data(
+                "suspended Windows Cargo process exposed more than one primary thread",
+            ));
+        }
+        entry.dwSize = u32::try_from(size_of::<THREADENTRY32>())
+            .map_err(|_| invalid_data("Windows thread-entry structure exceeds 32 bits"))?;
+        // SAFETY: the same snapshot and initialized output structure remain
+        // live and uniquely borrowed for this synchronous enumeration call.
+        more = unsafe { Thread32Next(snapshot.as_raw_handle().cast(), &raw mut entry) };
+        if more != 0 {
+            continue;
+        }
+        let error = io::Error::last_os_error();
+        if error
+            .raw_os_error()
+            .and_then(|code| u32::try_from(code).ok())
+            .is_some_and(|code| code == ERROR_NO_MORE_FILES)
+        {
+            break;
+        }
+        return Err(error);
+    }
+    matching.ok_or_else(|| invalid_data("suspended Windows Cargo process has no primary thread"))
+}
 
 #[repr(C)]
 #[expect(
@@ -103,6 +644,47 @@ pub(crate) fn open_for_stable_byte_observation(path: &Path) -> io::Result<File> 
         .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     options.open(path)
+}
+
+/// Open one file for stable byte observation and later handle-bound deletion.
+///
+/// DELETE access is bound to the returned handle. Namespace replacement after
+/// this open cannot redirect [`delete_file_by_handle`] to another file.
+pub(crate) fn open_for_stable_byte_observation_and_delete(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options
+        .access_mode(GENERIC_READ | DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    options.open(path)
+}
+
+/// Mark exactly the file bound to `file` for deletion, then close the handle.
+///
+/// The caller must first validate identity, bytes, and metadata through this
+/// same handle. A pathname is intentionally not accepted by this operation.
+pub(crate) fn delete_file_by_handle(file: File) -> io::Result<()> {
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    let buffer_size = u32::try_from(size_of::<FILE_DISPOSITION_INFO>())
+        .map_err(|_| invalid_data("Windows file disposition structure size exceeds 32 bits"))?;
+
+    // SAFETY: `file` owns a live kernel file handle opened with DELETE access.
+    // `disposition` is a fully initialized repr(C) FILE_DISPOSITION_INFO whose
+    // address and exact byte size remain valid for the synchronous call. The
+    // API borrows neither the handle nor the buffer after it returns.
+    let succeeded = unsafe {
+        SetFileInformationByHandle(
+            raw_handle(&file),
+            FileDispositionInfo,
+            std::ptr::from_ref(&disposition).cast::<c_void>(),
+            buffer_size,
+        )
+    };
+    if succeeded == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    drop(file);
+    Ok(())
 }
 
 /// Open one existing file or directory as an execution-path guard.
@@ -324,7 +906,7 @@ pub(crate) fn directory_junction_targets(junction: &File, target: &Path) -> io::
 /// Observe identity, topology, size, attributes, and mutation times through
 /// one already-open file or directory handle.
 ///
-/// The function brackets the legacy identity query with `FileBasicInfo`
+/// The function brackets the fallback identity query with `FileBasicInfo`
 /// queries. A concurrent change returns [`io::ErrorKind::WouldBlock`] instead
 /// of combining fields from different filesystem moments.
 pub(crate) fn observe_file(file: &File) -> io::Result<FileObservation> {
@@ -433,6 +1015,13 @@ pub(crate) fn prove_local_ntfs(file: &File, expected_volume_serial_number: u64) 
     Ok(())
 }
 
+/// Resolve the current volume-GUID path of one retained local file handle.
+pub(crate) fn opened_path(file: &File) -> io::Result<std::path::PathBuf> {
+    Ok(std::path::PathBuf::from(OsString::from_wide(&final_volume_guid_path(
+        file,
+    )?)))
+}
+
 /// Rename `from` to `to` and ask Windows to complete the move before returning.
 ///
 /// When `replace` is false, an existing destination is preserved and the call
@@ -452,6 +1041,61 @@ pub(crate) fn rename_write_through(from: &Path, to: &Path, replace: bool) -> io:
         Err(io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+/// Atomically replace `destination`, retaining its prior identity at `backup`.
+///
+/// No ignore flags are passed: Windows must merge the destination DACL,
+/// security resource attributes, encryption, compression, and named streams
+/// into the replacement or fail. If Windows reports its one documented
+/// partial-move state, this wrapper restores the destination name without
+/// overwriting any concurrently created entry. A failed restoration leaves
+/// the prior destination at `backup` and reports both errors.
+pub(crate) fn replace_file_with_backup(destination: &Path, replacement: &Path, backup: &Path) -> io::Result<()> {
+    let destination_wide = encode_path(destination)?;
+    let replacement_wide = encode_path(replacement)?;
+    let backup_wide = encode_path(backup)?;
+
+    // SAFETY: all three vectors are nonempty NUL-terminated UTF-16 path
+    // buffers that remain live for the call and contain no interior NUL.
+    // Both reserved pointers are null as required, no metadata-error ignore
+    // flags are used, and Windows retains none of the pointers.
+    let succeeded = unsafe {
+        ReplaceFileW(
+            destination_wide.as_ptr(),
+            replacement_wide.as_ptr(),
+            backup_wide.as_ptr(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if succeeded != 0 {
+        return Ok(());
+    }
+
+    // GetLastError must be captured before any other Win32 call.
+    let replace_error = io::Error::last_os_error();
+    let partial_move = replace_error
+        .raw_os_error()
+        .and_then(|code| u32::try_from(code).ok())
+        .is_some_and(|code| code == ERROR_UNABLE_TO_MOVE_REPLACEMENT_2);
+    if !partial_move {
+        return Err(replace_error);
+    }
+
+    // In ERROR_UNABLE_TO_MOVE_REPLACEMENT_2, Windows documents that the prior
+    // destination is at `backup` and the destination name is vacant. Restore
+    // it without REPLACE_EXISTING so a concurrent creator is never destroyed.
+    match rename_write_through(backup, destination, false) {
+        Ok(()) => Err(io::Error::other(format!(
+            "ReplaceFileW partially moved the destination but it was restored: {replace_error}"
+        ))),
+        Err(restore_error) => Err(io::Error::other(format!(
+            "ReplaceFileW partially moved the destination ({replace_error}); restoration from '{}' failed ({restore_error})",
+            backup.display()
+        ))),
     }
 }
 

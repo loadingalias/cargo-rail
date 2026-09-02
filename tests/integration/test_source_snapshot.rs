@@ -338,7 +338,7 @@ fn plan_excludes_ignored_and_default_generated_state_without_hiding_named_source
 
         for (path, content) in [
             ("target/debug/generated.rlib", "cargo output\n"),
-            ("target/cargo-rail/metadata.json", "cargo-rail output\n"),
+            ("target/cargo-rail/compiler-artifacts-v1/result", "cargo-rail output\n"),
             ("ignored-state/generated.txt", "ignored output\n"),
             ("docs/target/example.txt", "intentional source\n"),
         ] {
@@ -421,7 +421,10 @@ fn historical_plan_excludes_resolved_generated_roots_without_reading_worktree_st
 
         for (path, content) in [
             ("target/debug/generated.rlib", "committed Cargo output\n"),
-            ("target/cargo-rail/metadata.json", "committed cargo-rail output\n"),
+            (
+                "target/cargo-rail/compiler-artifacts-v1/result",
+                "committed cargo-rail output\n",
+            ),
             ("docs/target/example.txt", "committed intentional source\n"),
         ] {
             let path = ws.path.join(path);

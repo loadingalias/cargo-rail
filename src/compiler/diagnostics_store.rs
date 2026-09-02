@@ -1,24 +1,17 @@
 //! Persistent store for compiler diagnostics cache entries.
 
+use crate::compiler::analysis::NativeEvidenceBinding;
 use crate::compiler::facts::{
     CompilerFactCoverage, CompilerFactObject, CompilerFactProducerAuthority, FRAGMENT_OBJECT_IDENTITY_PREFIX,
 };
 use crate::compiler::model::{
-    COLLECTOR_VERSION, COMPILER_DIAG_CACHE_VERSION, CompilerDiagCacheFile, CompilerDiagEntry, CompilerDiagKey,
-    DiagnosticsCompleteness, MAX_COMPILER_DIAG_CACHE_ENTRIES, TargetEvidence,
+    COLLECTOR_VERSION, CompilerDiagEntry, CompilerDiagKey, DiagnosticsCompleteness, TargetEvidence,
 };
 use crate::error::{RailError, RailResult};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs::{self, File};
-use std::io::Read as _;
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-const MAX_CACHE_AGE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
-pub(crate) const MAX_CACHE_BYTES: usize = 256 * 1024 * 1024;
-const MAX_CACHE_ENTRY_BYTES: usize = 8 * 1024 * 1024;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 pub(crate) const EVIDENCE_CANDIDATE_KEY_PREFIX: &str = "compiler-evidence-candidate-v1-sha256-";
 pub(crate) const EVIDENCE_ACTION_KEY_PREFIX: &str = "compiler-evidence-action-v1-sha256-";
@@ -28,6 +21,10 @@ const EVIDENCE_VALIDATION_VERSION: u32 = 1;
 const EVIDENCE_OBJECT_VERSION: u32 = 1;
 const FACT_EVIDENCE_VALIDATION_VERSION: u32 = 1;
 const FACT_EVIDENCE_OBJECT_VERSION: u32 = 1;
+const OBSERVATION_EVIDENCE_VALIDATION_VERSION: u32 = 1;
+const OBSERVATION_EVIDENCE_OBJECT_VERSION: u32 = 1;
+const NATIVE_BINDING_VALIDATION_VERSION: u32 = 1;
+const NATIVE_BINDING_OBJECT_VERSION: u32 = 1;
 
 /// Fully observed authority for one compiler-evidence result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +32,8 @@ const FACT_EVIDENCE_OBJECT_VERSION: u32 = 1;
 pub(crate) enum CompilerEvidenceValidation {
     Diagnostics(CompilerDiagnosticsEvidenceValidation),
     CompilerFacts(CompilerFactEvidenceValidation),
+    Observation(CompilerObservationEvidenceValidation),
+    NativeBinding(NativeEvidenceBindingValidation),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +92,26 @@ pub(crate) struct CompilerFactEvidenceValidation {
     validation: CompilerFactEvidenceValidationKind,
 }
 
+/// CAS authority for one root-independent raw compiler observation object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CompilerObservationEvidenceValidation {
+    observation_validation_version: u32,
+    action_key: String,
+    candidate_key: String,
+    object_identity: String,
+}
+
+/// CAS authority for one native action/result and analysis-contract binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeEvidenceBindingValidation {
+    binding_validation_version: u32,
+    action_key: String,
+    candidate_key: String,
+    binding: NativeEvidenceBinding,
+}
+
 impl CompilerEvidenceValidation {
     fn from_entry(entry: &CompilerDiagEntry) -> RailResult<Self> {
         let key = canonical_evidence_key(&entry.key);
@@ -112,6 +131,8 @@ impl CompilerEvidenceValidation {
         match self {
             Self::Diagnostics(validation) => &validation.action_key,
             Self::CompilerFacts(validation) => &validation.action_key,
+            Self::Observation(validation) => &validation.action_key,
+            Self::NativeBinding(validation) => &validation.action_key,
         }
     }
 
@@ -119,13 +140,15 @@ impl CompilerEvidenceValidation {
         match self {
             Self::Diagnostics(validation) => &validation.candidate_key,
             Self::CompilerFacts(validation) => &validation.candidate_key,
+            Self::Observation(validation) => &validation.candidate_key,
+            Self::NativeBinding(validation) => &validation.candidate_key,
         }
     }
 
     fn diagnostics(&self) -> Option<&CompilerDiagnosticsEvidenceValidation> {
         match self {
             Self::Diagnostics(validation) => Some(validation),
-            Self::CompilerFacts(_) => None,
+            Self::CompilerFacts(_) | Self::Observation(_) | Self::NativeBinding(_) => None,
         }
     }
 
@@ -133,6 +156,21 @@ impl CompilerEvidenceValidation {
         match self {
             Self::Diagnostics(_) => None,
             Self::CompilerFacts(validation) => Some(validation),
+            Self::Observation(_) | Self::NativeBinding(_) => None,
+        }
+    }
+
+    pub(crate) fn observation(&self) -> Option<&CompilerObservationEvidenceValidation> {
+        match self {
+            Self::Observation(validation) => Some(validation),
+            Self::Diagnostics(_) | Self::CompilerFacts(_) | Self::NativeBinding(_) => None,
+        }
+    }
+
+    pub(crate) fn native_binding(&self) -> Option<&NativeEvidenceBindingValidation> {
+        match self {
+            Self::NativeBinding(validation) => Some(validation),
+            Self::Diagnostics(_) | Self::CompilerFacts(_) | Self::Observation(_) => None,
         }
     }
 
@@ -140,6 +178,8 @@ impl CompilerEvidenceValidation {
         match self {
             Self::Diagnostics(validation) => validation.validate_object(),
             Self::CompilerFacts(validation) => validation.validate_object(),
+            Self::Observation(validation) => validation.validate_object(),
+            Self::NativeBinding(validation) => validation.validate_object(),
         }
     }
 
@@ -153,6 +193,103 @@ impl CompilerEvidenceValidation {
             ],
         )
     }
+}
+
+impl CompilerObservationEvidenceValidation {
+    pub(crate) fn from_object_identity(object_identity: String) -> RailResult<CompilerEvidenceValidation> {
+        validate_evidence_object(&object_identity)?;
+        let candidate_key = framed_sha256(
+            EVIDENCE_CANDIDATE_KEY_PREFIX,
+            b"cargo-rail-compiler-observation-candidate-v1\0",
+            &[(b"object", object_identity.as_bytes())],
+        );
+        let action_key = framed_sha256(
+            EVIDENCE_ACTION_KEY_PREFIX,
+            b"cargo-rail-compiler-observation-action-v1\0",
+            &[(b"candidate", candidate_key.as_bytes())],
+        );
+        Ok(CompilerEvidenceValidation::Observation(Self {
+            observation_validation_version: OBSERVATION_EVIDENCE_VALIDATION_VERSION,
+            action_key,
+            candidate_key,
+            object_identity,
+        }))
+    }
+
+    pub(crate) fn object_identity(&self) -> &str {
+        &self.object_identity
+    }
+
+    fn validate_object(&self) -> RailResult<()> {
+        if self.observation_validation_version != OBSERVATION_EVIDENCE_VALIDATION_VERSION {
+            return Err(RailError::message(
+                "compiler observation evidence validation has an incompatible schema",
+            ));
+        }
+        let rebound = Self::from_object_identity(self.object_identity.clone())?;
+        if rebound.action_key() != self.action_key || rebound.candidate_key() != self.candidate_key {
+            return Err(RailError::message(
+                "compiler observation evidence validation identity does not match its object",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl NativeEvidenceBindingValidation {
+    pub(crate) fn from_binding(binding: NativeEvidenceBinding) -> RailResult<CompilerEvidenceValidation> {
+        let candidate_key =
+            native_binding_candidate_key(binding.native_action(), binding.native_result(), binding.contract());
+        let action_key = framed_sha256(
+            EVIDENCE_ACTION_KEY_PREFIX,
+            b"cargo-rail-native-evidence-binding-action-v1\0",
+            &[
+                (b"candidate", candidate_key.as_bytes()),
+                (b"binding", &serde_json::to_vec(&binding)?),
+            ],
+        );
+        Ok(CompilerEvidenceValidation::NativeBinding(Self {
+            binding_validation_version: NATIVE_BINDING_VALIDATION_VERSION,
+            action_key,
+            candidate_key,
+            binding,
+        }))
+    }
+
+    pub(crate) fn candidate_key(native_action: &str, native_result: &str, contract: &str) -> String {
+        native_binding_candidate_key(native_action, native_result, contract)
+    }
+
+    pub(crate) fn binding(&self) -> &NativeEvidenceBinding {
+        &self.binding
+    }
+
+    fn validate_object(&self) -> RailResult<()> {
+        if self.binding_validation_version != NATIVE_BINDING_VALIDATION_VERSION {
+            return Err(RailError::message(
+                "native evidence binding validation has an incompatible schema",
+            ));
+        }
+        let rebound = Self::from_binding(self.binding.clone())?;
+        if rebound.action_key() != self.action_key || rebound.candidate_key() != self.candidate_key {
+            return Err(RailError::message(
+                "native evidence binding validation identity does not match its binding",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn native_binding_candidate_key(native_action: &str, native_result: &str, contract: &str) -> String {
+    framed_sha256(
+        EVIDENCE_CANDIDATE_KEY_PREFIX,
+        b"cargo-rail-native-evidence-binding-candidate-v1\0",
+        &[
+            (b"native-action", native_action.as_bytes()),
+            (b"native-result", native_result.as_bytes()),
+            (b"contract", contract.as_bytes()),
+        ],
+    )
 }
 
 impl CompilerDiagnosticsEvidenceValidation {
@@ -446,8 +583,10 @@ fn validate_fact_references(objects: &[CompilerFactObjectReference]) -> RailResu
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum CompilerEvidenceObject {
-    Diagnostics(CompilerDiagnosticsEvidenceObject),
+    Diagnostics(Box<CompilerDiagnosticsEvidenceObject>),
     CompilerFacts(CompilerFactEvidenceObject),
+    Observation(Box<CompilerObservationEvidenceObject>),
+    NativeBinding(NativeEvidenceBindingObject),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -472,18 +611,32 @@ pub(crate) struct CompilerFactEvidenceObject {
     payload: CompilerFactEvidencePayload,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CompilerObservationEvidenceObject {
+    observation_object_version: u32,
+    observation: crate::compiler::analysis::AnalysisObservation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeEvidenceBindingObject {
+    binding_object_version: u32,
+    binding: NativeEvidenceBinding,
+}
+
 impl CompilerEvidenceObject {
     pub(crate) fn from_entry(entry: &CompilerDiagEntry) -> Self {
-        Self::Diagnostics(CompilerDiagnosticsEvidenceObject {
+        Self::Diagnostics(Box::new(CompilerDiagnosticsEvidenceObject {
             version: EVIDENCE_OBJECT_VERSION,
             evidence: entry.evidence.clone(),
-        })
+        }))
     }
 
     pub(crate) fn diagnostics_evidence(&self) -> Option<&TargetEvidence> {
         match self {
             Self::Diagnostics(object) => Some(&object.evidence),
-            Self::CompilerFacts(_) => None,
+            Self::CompilerFacts(_) | Self::Observation(_) | Self::NativeBinding(_) => None,
         }
     }
 
@@ -491,6 +644,35 @@ impl CompilerEvidenceObject {
         match self {
             Self::Diagnostics(_) => None,
             Self::CompilerFacts(object) => Some(object),
+            Self::Observation(_) | Self::NativeBinding(_) => None,
+        }
+    }
+
+    pub(crate) fn from_observation(observation: crate::compiler::analysis::AnalysisObservation) -> Self {
+        Self::Observation(Box::new(CompilerObservationEvidenceObject {
+            observation_object_version: OBSERVATION_EVIDENCE_OBJECT_VERSION,
+            observation,
+        }))
+    }
+
+    pub(crate) fn observation_evidence(&self) -> Option<&crate::compiler::analysis::AnalysisObservation> {
+        match self {
+            Self::Observation(object) => Some(&object.observation),
+            Self::Diagnostics(_) | Self::CompilerFacts(_) | Self::NativeBinding(_) => None,
+        }
+    }
+
+    pub(crate) fn from_native_binding(binding: NativeEvidenceBinding) -> Self {
+        Self::NativeBinding(NativeEvidenceBindingObject {
+            binding_object_version: NATIVE_BINDING_OBJECT_VERSION,
+            binding,
+        })
+    }
+
+    pub(crate) fn native_binding(&self) -> Option<&NativeEvidenceBinding> {
+        match self {
+            Self::NativeBinding(object) => Some(&object.binding),
+            Self::Diagnostics(_) | Self::CompilerFacts(_) | Self::Observation(_) => None,
         }
     }
 
@@ -519,6 +701,17 @@ impl CompilerEvidenceObject {
             Self::CompilerFacts(object) if object.fact_object_version != FACT_EVIDENCE_OBJECT_VERSION => {
                 return Err(RailError::message(
                     "compiler fact evidence object has an incompatible schema",
+                ));
+            }
+            Self::Observation(object) if object.observation_object_version != OBSERVATION_EVIDENCE_OBJECT_VERSION => {
+                return Err(RailError::message(
+                    "compiler observation evidence object has an incompatible schema",
+                ));
+            }
+            Self::Observation(object) => object.observation.validate()?,
+            Self::NativeBinding(object) if object.binding_object_version != NATIVE_BINDING_OBJECT_VERSION => {
+                return Err(RailError::message(
+                    "native evidence binding object has an incompatible schema",
                 ));
             }
             _ => {}
@@ -683,81 +876,67 @@ fn validate_identity(value: &str, prefix: &str) -> RailResult<()> {
 /// Persistent compiler diagnostics store.
 #[derive(Debug)]
 pub struct CompilerDiagnosticsStore {
-    path: PathBuf,
-    cache: CompilerDiagCacheFile,
+    entries: HashMap<String, CompilerDiagEntry>,
     cas: Option<crate::cache::cas::LocalCas>,
-    legacy_digest: Option<crate::source::ContentDigest>,
-    pending: HashSet<String>,
-    dirty: bool,
+    remote: Option<Arc<crate::remote_cache::RemoteStore>>,
+    pending: HashMap<String, CompilerDiagEntry>,
     prior_by_configuration: HashMap<String, (u64, CompilerDiagKey, u32)>,
     cached_packages: HashSet<String>,
     discarded_reason: Option<&'static str>,
 }
 
 impl CompilerDiagnosticsStore {
-    /// Load compiler evidence from the shared local CAS and any bounded legacy file.
-    pub fn load(workspace_root: &Path) -> Self {
+    /// Load compiler evidence from the selected profile's local CAS.
+    pub fn load() -> Self {
         let cas = crate::cache::cas::LocalCas::open().ok();
-        Self::load_with_cas(workspace_root, cas)
+        Self::load_with_cas_and_remote(cas, None)
     }
 
-    fn load_with_cas(workspace_root: &Path, cas: Option<crate::cache::cas::LocalCas>) -> Self {
-        let path = crate::workspace::cargo_rail_state_root(workspace_root)
-            .join("cache")
-            .join("compiler-diags-v1.json");
+    pub(crate) fn load_with_remote(remote: Option<Arc<crate::remote_cache::RemoteStore>>) -> Self {
+        let cas = crate::cache::cas::LocalCas::open().ok();
+        Self::load_with_cas_and_remote(cas, remote)
+    }
 
-        let (cache, legacy_digest, discarded_reason) = match read_cache(&path) {
-            Ok(Some(mut legacy)) if legacy.cache.version == COMPILER_DIAG_CACHE_VERSION => {
-                match prune_entries(
-                    std::mem::take(&mut legacy.cache.entries),
-                    now_unix_ms(),
-                    CacheLimits::PRODUCTION,
-                ) {
-                    Ok((entries, pruned)) => {
-                        let _ = pruned;
-                        legacy.cache.entries = entries;
-                        (legacy.cache, Some(legacy.digest), None)
-                    }
-                    Err(_) => (CompilerDiagCacheFile::default(), None, Some("cache_unreadable")),
-                }
-            }
-            Ok(Some(_)) => (CompilerDiagCacheFile::default(), None, Some("schema_changed")),
-            Ok(None) => (CompilerDiagCacheFile::default(), None, None),
-            Err(reason) => (CompilerDiagCacheFile::default(), None, Some(reason)),
-        };
-        let dirty = legacy_digest.is_some();
-        let discarded_reason = discarded_reason.or_else(|| store_unavailable_reason(dirty, &cas));
-        let mut store = Self {
-            path,
-            cache,
-            cas,
-            legacy_digest,
-            pending: HashSet::new(),
-            dirty,
-            prior_by_configuration: HashMap::new(),
-            cached_packages: HashSet::new(),
-            discarded_reason,
-        };
-        store.rebuild_index();
-        store
+    pub(crate) const fn durability_available(&self) -> bool {
+        self.cas.is_some()
     }
 
     #[cfg(test)]
-    fn load_legacy_only(workspace_root: &Path) -> Self {
-        Self::load_with_cas(workspace_root, None)
+    fn load_with_cas(cas: Option<crate::cache::cas::LocalCas>) -> Self {
+        Self::load_with_cas_and_remote(cas, None)
+    }
+
+    fn load_with_cas_and_remote(
+        cas: Option<crate::cache::cas::LocalCas>,
+        remote: Option<Arc<crate::remote_cache::RemoteStore>>,
+    ) -> Self {
+        let discarded_reason = cas.is_none().then_some("local_cache_unavailable");
+        Self {
+            entries: HashMap::new(),
+            cas,
+            remote,
+            pending: HashMap::new(),
+            prior_by_configuration: HashMap::new(),
+            cached_packages: HashSet::new(),
+            discarded_reason,
+        }
     }
 
     /// Return cached entry for the exact key.
     pub fn get(&mut self, key: &CompilerDiagKey) -> Option<&CompilerDiagEntry> {
         let id = key.stable_id();
-        let legacy_hit = self.cache.entries.get(&id).is_some_and(|entry| {
-            entry.collector_version == COLLECTOR_VERSION
-                && entry.evidence.completeness == DiagnosticsCompleteness::Complete
-                && semantic_key_bytes(&entry.key)
-                    .is_ok_and(|stored| semantic_key_bytes(key).is_ok_and(|current| stored == current))
-        });
-        if legacy_hit {
-            return self.cache.entries.get(&id);
+        let memory_hit = self
+            .pending
+            .get(&id)
+            .or_else(|| self.entries.get(&id))
+            .is_some_and(|entry| {
+                entry.collector_version == COLLECTOR_VERSION
+                    && entry.evidence.completeness == DiagnosticsCompleteness::Complete
+                    && semantic_key_bytes(&entry.key)
+                        .is_ok_and(|stored| semantic_key_bytes(key).is_ok_and(|current| stored == current))
+            });
+        if memory_hit {
+            return self.pending.get(&id).or_else(|| self.entries.get(&id));
         }
 
         let candidate_key = match evidence_candidate_key(key) {
@@ -770,7 +949,18 @@ impl CompilerDiagnosticsStore {
         let candidates = match self
             .cas
             .as_ref()
-            .map(|cas| cas.compiler_evidence_candidates(&candidate_key))
+            .map(|cas| {
+                let candidates = cas.compiler_evidence_candidates(&candidate_key)?;
+                if candidates.is_empty()
+                    && let Some(remote) = &self.remote
+                {
+                    match remote.import_compiler_evidence(cas, &candidate_key) {
+                        Ok(_) => return cas.compiler_evidence_candidates(&candidate_key),
+                        Err(error) => self.discarded_reason = Some(error.cold_reason()),
+                    }
+                }
+                Ok(candidates)
+            })
             .transpose()
         {
             Ok(Some(candidates)) => candidates,
@@ -804,9 +994,9 @@ impl CompilerDiagnosticsStore {
             }
         }
         if let Some(entry) = hit {
-            self.cache.entries.insert(id.clone(), entry);
+            self.entries.insert(id.clone(), entry);
         }
-        self.cache.entries.get(&id)
+        self.entries.get(&id)
     }
 
     /// Explain why an exact semantic key was not reusable.
@@ -853,68 +1043,32 @@ impl CompilerDiagnosticsStore {
         }
         let id = entry.key.stable_id();
         self.record_prior(entry.generated_at_unix_ms, &entry.key, entry.collector_version);
-        self.cache.entries.insert(id.clone(), entry);
-        self.pending.insert(id);
-        self.dirty = true;
+        self.pending.insert(id, entry);
     }
 
     /// Persist dirty cache state to disk.
     pub fn flush(&mut self) -> RailResult<()> {
-        if !self.dirty {
+        if self.pending.is_empty() {
             return Ok(());
         }
 
-        self.prune()?;
         let Some(cas) = &self.cas else {
-            self.dirty = false;
-            self.pending.clear();
+            self.entries.extend(self.pending.drain());
             return Ok(());
         };
-        let publish_all = self.legacy_digest.is_some();
-        for (id, entry) in &self.cache.entries {
-            if !publish_all && !self.pending.contains(id) {
-                continue;
-            }
+        for entry in self.pending.values() {
             let validation = CompilerEvidenceValidation::from_entry(entry)?;
             let evidence = CompilerEvidenceObject::from_entry(entry);
             cas.store_compiler_evidence(crate::cache::cas::CompilerEvidenceStoreRequest {
                 validation: &validation,
                 evidence: &evidence,
             })?;
+            if let Some(remote) = &self.remote {
+                drop(remote.publish_compiler_evidence(&validation, &evidence));
+            }
         }
-        if let Some(digest) = self.legacy_digest
-            && remove_legacy_if_unchanged(&self.path, digest)?
-        {
-            self.legacy_digest = None;
-        }
-        self.dirty = false;
-        self.pending.clear();
+        self.entries.extend(self.pending.drain());
         Ok(())
-    }
-
-    fn prune(&mut self) -> RailResult<()> {
-        let (entries, _) = prune_entries(
-            std::mem::take(&mut self.cache.entries),
-            now_unix_ms(),
-            CacheLimits::PRODUCTION,
-        )?;
-        self.cache.entries = entries;
-        self.rebuild_index();
-        Ok(())
-    }
-
-    fn rebuild_index(&mut self) {
-        self.prior_by_configuration.clear();
-        self.cached_packages.clear();
-        let entries = self
-            .cache
-            .entries
-            .values()
-            .map(|entry| (entry.generated_at_unix_ms, entry.key.clone(), entry.collector_version))
-            .collect::<Vec<_>>();
-        for (generated_at_unix_ms, key, collector_version) in entries {
-            self.record_prior(generated_at_unix_ms, &key, collector_version);
-        }
     }
 
     fn record_prior(&mut self, generated_at_unix_ms: u64, key: &CompilerDiagKey, collector_version: u32) {
@@ -931,181 +1085,6 @@ impl CompilerDiagnosticsStore {
     }
 }
 
-#[derive(Clone, Copy)]
-struct CacheLimits {
-    entries: usize,
-    age_ms: u64,
-    file_bytes: usize,
-    entry_bytes: usize,
-}
-
-impl CacheLimits {
-    const PRODUCTION: Self = Self {
-        entries: MAX_COMPILER_DIAG_CACHE_ENTRIES,
-        age_ms: MAX_CACHE_AGE_MS,
-        file_bytes: MAX_CACHE_BYTES,
-        entry_bytes: MAX_CACHE_ENTRY_BYTES,
-    };
-}
-
-struct LegacyCache {
-    cache: CompilerDiagCacheFile,
-    digest: crate::source::ContentDigest,
-}
-
-fn read_cache(path: &Path) -> Result<Option<LegacyCache>, &'static str> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err("cache_unreadable"),
-    };
-    if !metadata.is_file() || crate::utils::is_symlink_or_reparse(&metadata) || !has_single_link(&metadata) {
-        return Err("cache_not_bounded_regular_file");
-    }
-    if metadata.len() > MAX_CACHE_BYTES as u64 {
-        return Err("cache_too_large");
-    }
-
-    let mut file = File::open(path).map_err(|_| "cache_unreadable")?;
-    let opened = file.metadata().map_err(|_| "cache_unreadable")?;
-    if !opened.is_file() || !has_single_link(&opened) || opened.len() != metadata.len() {
-        return Err("cache_changed_before_read");
-    }
-
-    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-    (&mut file)
-        .take(metadata.len().saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|_| "cache_unreadable")?;
-    if bytes.len() as u64 != metadata.len() {
-        return Err("cache_changed_while_reading");
-    }
-    let digest = crate::source::ContentDigest::sha256(&bytes);
-    serde_json::from_slice(&bytes)
-        .map(|cache| Some(LegacyCache { cache, digest }))
-        .map_err(|_| "cache_unreadable")
-}
-
-fn remove_legacy_if_unchanged(path: &Path, expected: crate::source::ContentDigest) -> RailResult<bool> {
-    let Some(legacy) = read_cache(path).map_err(RailError::message)? else {
-        return Ok(true);
-    };
-    if legacy.digest != expected {
-        return Ok(false);
-    }
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_file() || crate::utils::is_symlink_or_reparse(&metadata) || !has_single_link(&metadata) {
-        return Ok(false);
-    }
-    fs::remove_file(path)?;
-    if let Some(parent) = path.parent() {
-        match fs::remove_dir(parent) {
-            Ok(()) => {}
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::NotFound
-                ) => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(true)
-}
-
-fn store_unavailable_reason(legacy_available: bool, cas: &Option<crate::cache::cas::LocalCas>) -> Option<&'static str> {
-    (!legacy_available && cas.is_none()).then_some("local_cache_unavailable")
-}
-
-fn prune_entries(
-    entries: BTreeMap<String, CompilerDiagEntry>,
-    now: u64,
-    limits: CacheLimits,
-) -> RailResult<(BTreeMap<String, CompilerDiagEntry>, bool)> {
-    let original_len = entries.len();
-    let mut candidates = entries
-        .into_iter()
-        .filter(|(id, entry)| {
-            id == &entry.key.stable_id()
-                && entry.evidence.completeness == DiagnosticsCompleteness::Complete
-                && now.saturating_sub(entry.generated_at_unix_ms) <= limits.age_ms
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_unstable_by(|(left_id, left), (right_id, right)| {
-        right
-            .generated_at_unix_ms
-            .cmp(&left.generated_at_unix_ms)
-            .then_with(|| left_id.cmp(right_id))
-    });
-
-    let mut retained = BTreeMap::new();
-    let mut retained_bytes = serialized_len(&CompilerDiagCacheFile::default())?;
-    for (id, entry) in candidates {
-        if retained.len() == limits.entries {
-            break;
-        }
-        let id_bytes = serialized_len(&id)?;
-        let entry_bytes = serialized_len(&entry)?;
-        let entry_record_bytes = id_bytes
-            .checked_add(1)
-            .and_then(|bytes| bytes.checked_add(entry_bytes))
-            .ok_or_else(|| RailError::message("compiler diagnostics cache size overflow"))?;
-        let file_bytes = entry_record_bytes
-            .checked_add(usize::from(!retained.is_empty()))
-            .ok_or_else(|| RailError::message("compiler diagnostics cache size overflow"))?;
-        let Some(total_bytes) = retained_bytes.checked_add(file_bytes) else {
-            continue;
-        };
-        if entry_record_bytes > limits.entry_bytes || total_bytes > limits.file_bytes {
-            continue;
-        }
-        retained_bytes = total_bytes;
-        retained.insert(id, entry);
-    }
-    let pruned = retained.len() != original_len;
-    Ok((retained, pruned))
-}
-
-fn serialized_len(value: &impl Serialize) -> RailResult<usize> {
-    #[derive(Default)]
-    struct Counter(usize);
-
-    impl std::io::Write for Counter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 = self
-                .0
-                .checked_add(bytes.len())
-                .ok_or_else(|| std::io::Error::other("serialized compiler diagnostics size overflow"))?;
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    let mut counter = Counter::default();
-    serde_json::to_writer(&mut counter, value)?;
-    Ok(counter.0)
-}
-
-fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
-}
-
-#[cfg(unix)]
-fn has_single_link(metadata: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-    metadata.nlink() == 1
-}
-
-#[cfg(not(unix))]
-fn has_single_link(_metadata: &fs::Metadata) -> bool {
-    true
-}
-
 fn configuration_id(key: &CompilerDiagKey) -> String {
     format!(
         "{}\u{1f}{}\u{1f}{}",
@@ -1120,7 +1099,16 @@ mod tests {
     use super::*;
     use crate::compiler::model::{DiagnosticsCompleteness, FeatureSelection, PlatformTarget, TargetEvidence};
     use cargo_metadata::PackageId;
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn now_unix_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0)
+    }
 
     fn key() -> CompilerDiagKey {
         CompilerDiagKey {
@@ -1163,57 +1151,21 @@ mod tests {
         }
     }
 
-    fn entry_map(entries: impl IntoIterator<Item = CompilerDiagEntry>) -> BTreeMap<String, CompilerDiagEntry> {
-        entries
-            .into_iter()
-            .map(|entry| (entry.key.stable_id(), entry))
-            .collect()
-    }
-
-    fn encoded_cache_bytes(entries: BTreeMap<String, CompilerDiagEntry>) -> usize {
-        serde_json::to_vec(&CompilerDiagCacheFile {
-            version: COMPILER_DIAG_CACHE_VERSION,
-            entries,
-        })
-        .expect("cache should serialize")
-        .len()
-    }
-
-    fn pair_bytes(id: &str, entry: &CompilerDiagEntry) -> usize {
-        serde_json::to_vec(id).expect("entry ID should serialize").len()
-            + 1
-            + serde_json::to_vec(entry).expect("entry should serialize").len()
-    }
-
     #[test]
     fn prior_collector_semantics_never_authorize_reuse() {
-        let root = tempfile::tempdir().expect("temporary workspace should be created");
-        let path = root.path().join("target/cargo-rail/cache/compiler-diags-v1.json");
-        std::fs::create_dir_all(path.parent().expect("cache path should have a parent"))
-            .expect("cache directory should be created");
+        let cache_root = tempfile::tempdir().expect("temporary cache should be created");
         let key = key();
-        let mut cache = CompilerDiagCacheFile::default();
-        cache.entries.insert(
-            key.stable_id(),
-            CompilerDiagEntry {
-                key: key.clone(),
-                evidence: TargetEvidence {
-                    platform: PlatformTarget::from("default"),
-                    features: FeatureSelection::Default,
-                    compiled_units: BTreeSet::new(),
-                    unused_crates: BTreeSet::new(),
-                    unit_evidence: Vec::new(),
-                    completeness: DiagnosticsCompleteness::Complete,
-                },
-                generated_at_unix_ms: now_unix_ms(),
-                collector_version: COLLECTOR_VERSION - 1,
-                observations: Vec::new(),
-            },
-        );
-        std::fs::write(&path, serde_json::to_vec(&cache).expect("cache should serialize"))
-            .expect("cache should be written");
-
-        let mut store = CompilerDiagnosticsStore::load_legacy_only(root.path());
+        let mut prior = entry("member", now_unix_ms(), 0);
+        prior.collector_version = COLLECTOR_VERSION - 1;
+        let validation = CompilerEvidenceValidation::from_entry(&prior).expect("validation should build");
+        let evidence = CompilerEvidenceObject::from_entry(&prior);
+        let cas = crate::cache::cas::LocalCas::open_at(cache_root.path(), 1024 * 1024).expect("local CAS should open");
+        cas.store_compiler_evidence(crate::cache::cas::CompilerEvidenceStoreRequest {
+            validation: &validation,
+            evidence: &evidence,
+        })
+        .expect("prior evidence should publish");
+        let mut store = CompilerDiagnosticsStore::load_with_cas(Some(cas));
         assert!(
             store.get(&key).is_none(),
             "prior collector evidence must not be returned"
@@ -1222,150 +1174,20 @@ mod tests {
     }
 
     #[test]
-    fn pruning_retains_the_newest_entries_within_the_exact_file_bound() {
-        let oldest = entry("oldest", 100, 0);
-        let middle = entry("middle", 200, 0);
-        let newest = entry("newest", 300, 0);
-        let expected = entry_map([middle.clone(), newest.clone()]);
-        let file_bytes = encoded_cache_bytes(expected.clone());
-        let limits = CacheLimits {
-            entries: usize::MAX,
-            age_ms: u64::MAX,
-            file_bytes,
-            entry_bytes: usize::MAX,
-        };
-
-        let (retained, pruned) = prune_entries(entry_map([oldest, middle, newest]), 300, limits).expect("prune cache");
-
-        assert!(pruned);
-        assert_eq!(retained.keys().collect::<Vec<_>>(), expected.keys().collect::<Vec<_>>());
-        assert_eq!(encoded_cache_bytes(retained), file_bytes);
-    }
-
-    #[test]
-    fn one_oversized_entry_does_not_displace_valid_evidence() {
-        let oversized = entry("oversized", 300, 2048);
-        let valid = entry("valid", 200, 0);
-        let valid_id = valid.key.stable_id();
-        let limits = CacheLimits {
-            entries: 1,
-            age_ms: u64::MAX,
-            file_bytes: usize::MAX,
-            entry_bytes: pair_bytes(&valid_id, &valid),
-        };
-
-        let (retained, pruned) =
-            prune_entries(entry_map([oversized, valid.clone()]), 300, limits).expect("prune cache");
-
-        assert!(pruned);
-        let expected = entry_map([valid]);
-        assert_eq!(retained.keys().collect::<Vec<_>>(), expected.keys().collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn per_entry_bound_is_independent_of_map_position() {
-        let first = entry("first", 300, 0);
-        let bounded = entry("bounded", 200, 32);
-        let bounded_id = bounded.key.stable_id();
-        let expected = entry_map([first.clone(), bounded.clone()]);
-        let limits = CacheLimits {
-            entries: 2,
-            age_ms: u64::MAX,
-            file_bytes: usize::MAX,
-            entry_bytes: pair_bytes(&bounded_id, &bounded),
-        };
-
-        let (retained, pruned) = prune_entries(entry_map([first, bounded]), 300, limits).expect("prune cache");
-
-        assert!(!pruned);
-        assert_eq!(retained.keys().collect::<Vec<_>>(), expected.keys().collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn pruning_enforces_age_and_count_before_persistence() {
-        let expired = entry("expired", 100, 0);
-        let older = entry("older", 250, 0);
-        let newest = entry("newest", 300, 0);
-        let expected = entry_map([newest.clone()]);
-        let limits = CacheLimits {
-            entries: 1,
-            age_ms: 100,
-            file_bytes: usize::MAX,
-            entry_bytes: usize::MAX,
-        };
-
-        let (retained, pruned) = prune_entries(entry_map([expired, older, newest]), 300, limits).expect("prune cache");
-
-        assert!(pruned);
-        assert_eq!(retained.keys().collect::<Vec<_>>(), expected.keys().collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn deserialization_stops_at_the_entry_count_bound() {
-        let entries = (0..=MAX_COMPILER_DIAG_CACHE_ENTRIES)
-            .map(|index| entry(&format!("member-{index}"), 1, 0))
-            .collect::<Vec<_>>();
-        let bytes = serde_json::to_vec(&CompilerDiagCacheFile {
-            version: COMPILER_DIAG_CACHE_VERSION,
-            entries: entry_map(entries),
-        })
-        .expect("oversized entry map should serialize");
-
-        let error = serde_json::from_slice::<CompilerDiagCacheFile>(&bytes)
-            .expect_err("entry count above the bound must be rejected");
-        assert!(
-            error.to_string().contains("4096-entry bound"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn malformed_entry_binding_never_authorizes_reuse() {
-        let root = tempfile::tempdir().expect("temporary workspace should be created");
-        let cache_root = tempfile::tempdir().expect("temporary cache should be created");
-        let path = root.path().join("target/cargo-rail/cache/compiler-diags-v1.json");
-        fs::create_dir_all(path.parent().expect("cache path should have a parent"))
-            .expect("cache directory should be created");
-        let entry = entry("member", now_unix_ms(), 0);
-        let key = entry.key.clone();
-        let cache = CompilerDiagCacheFile {
-            version: COMPILER_DIAG_CACHE_VERSION,
-            entries: BTreeMap::from([("substituted-key".to_string(), entry)]),
-        };
-        fs::write(&path, serde_json::to_vec(&cache).expect("cache should serialize")).expect("cache should be written");
-
-        let cas = crate::cache::cas::LocalCas::open_at(cache_root.path(), 1024 * 1024).expect("local CAS should open");
-        let mut store = CompilerDiagnosticsStore::load_with_cas(root.path(), Some(cas));
-        assert!(store.get(&key).is_none());
-        assert_eq!(store.miss_reason(&key), "cold_cache");
-        store.flush().expect("pruned cache should persist");
-        assert!(!path.exists(), "the fully migrated legacy file should be removed");
-    }
-
-    #[test]
-    fn compiler_evidence_round_trips_across_equivalent_workspace_roots() {
-        let first_root = tempfile::tempdir().expect("first workspace should be created");
-        let second_root = tempfile::tempdir().expect("second workspace should be created");
+    fn compiler_evidence_round_trips_across_equivalent_package_roots() {
         let cache_root = tempfile::tempdir().expect("temporary cache should be created");
         let first_cas =
             crate::cache::cas::LocalCas::open_at(cache_root.path(), 1024 * 1024).expect("local CAS should open");
         let original = entry("member", now_unix_ms(), 0);
-        let mut first = CompilerDiagnosticsStore::load_with_cas(first_root.path(), Some(first_cas));
+        let mut first = CompilerDiagnosticsStore::load_with_cas(Some(first_cas));
         first.put(original.clone());
         first.flush().expect("compiler evidence should publish");
-        assert!(
-            !first_root
-                .path()
-                .join("target/cargo-rail/cache/compiler-diags-v1.json")
-                .exists(),
-            "CAS publication must not recreate the monolithic legacy file"
-        );
 
         let second_cas =
             crate::cache::cas::LocalCas::open_at(cache_root.path(), 1024 * 1024).expect("local CAS should reopen");
         let mut equivalent_key = original.key.clone();
         equivalent_key.package_id.repr = "path+file:///different/root#member@0.1.0".to_string();
-        let mut second = CompilerDiagnosticsStore::load_with_cas(second_root.path(), Some(second_cas));
+        let mut second = CompilerDiagnosticsStore::load_with_cas(Some(second_cas));
         let reused = second
             .get(&equivalent_key)
             .expect("equivalent root should reuse evidence");
@@ -1377,14 +1199,13 @@ mod tests {
 
     #[test]
     fn incomplete_evidence_is_never_published_or_reused() {
-        let workspace = tempfile::tempdir().expect("workspace should be created");
         let cache_root = tempfile::tempdir().expect("temporary cache should be created");
         let cas = crate::cache::cas::LocalCas::open_at(cache_root.path(), 1024 * 1024).expect("local CAS should open");
         let mut incomplete = entry("member", now_unix_ms(), 0);
         incomplete.evidence.completeness = DiagnosticsCompleteness::Incomplete;
         let key = incomplete.key.clone();
 
-        let mut store = CompilerDiagnosticsStore::load_with_cas(workspace.path(), Some(cas));
+        let mut store = CompilerDiagnosticsStore::load_with_cas(Some(cas));
         store.put(incomplete);
         store
             .flush()
@@ -1402,49 +1223,11 @@ mod tests {
     }
 
     #[test]
-    fn valid_legacy_evidence_is_imported_once_before_the_monolith_is_removed() {
-        let workspace = tempfile::tempdir().expect("workspace should be created");
-        let cache_root = tempfile::tempdir().expect("temporary cache should be created");
-        let path = workspace.path().join("target/cargo-rail/cache/compiler-diags-v1.json");
-        fs::create_dir_all(path.parent().expect("legacy cache should have a parent"))
-            .expect("legacy cache directory should be created");
-        let original = entry("member", now_unix_ms(), 0);
-        fs::write(
-            &path,
-            serde_json::to_vec(&CompilerDiagCacheFile {
-                version: COMPILER_DIAG_CACHE_VERSION,
-                entries: entry_map([original.clone()]),
-            })
-            .expect("legacy cache should serialize"),
-        )
-        .expect("legacy cache should be written");
-
-        let cas = crate::cache::cas::LocalCas::open_at(cache_root.path(), 1024 * 1024).expect("local CAS should open");
-        let mut migrating = CompilerDiagnosticsStore::load_with_cas(workspace.path(), Some(cas));
-        assert!(
-            migrating.get(&original.key).is_some(),
-            "legacy evidence should remain warm"
-        );
-        migrating.flush().expect("legacy evidence should migrate");
-        assert!(!path.exists(), "legacy input should disappear only after publication");
-
-        let reopened =
-            crate::cache::cas::LocalCas::open_at(cache_root.path(), 1024 * 1024).expect("local CAS should reopen");
-        let mut store = CompilerDiagnosticsStore::load_with_cas(workspace.path(), Some(reopened));
-        assert_eq!(
-            store.get(&original.key).map(|entry| &entry.evidence),
-            Some(&original.evidence),
-            "migrated evidence should remain reusable"
-        );
-    }
-
-    #[test]
     fn corrupt_compiler_evidence_is_a_fail_closed_miss() {
-        let workspace = tempfile::tempdir().expect("workspace should be created");
         let cache_root = tempfile::tempdir().expect("temporary cache should be created");
         let original = entry("member", now_unix_ms(), 0);
         let cas = crate::cache::cas::LocalCas::open_at(cache_root.path(), 1024 * 1024).expect("local CAS should open");
-        let mut writer = CompilerDiagnosticsStore::load_with_cas(workspace.path(), Some(cas));
+        let mut writer = CompilerDiagnosticsStore::load_with_cas(Some(cas));
         writer.put(original.clone());
         writer.flush().expect("compiler evidence should publish");
 
@@ -1468,9 +1251,21 @@ mod tests {
 
         let reopened =
             crate::cache::cas::LocalCas::open_at(cache_root.path(), 1024 * 1024).expect("local CAS should reopen");
-        let mut reader = CompilerDiagnosticsStore::load_with_cas(workspace.path(), Some(reopened));
+        let mut reader = CompilerDiagnosticsStore::load_with_cas(Some(reopened));
         assert!(reader.get(&original.key).is_none());
         assert_eq!(reader.miss_reason(&original.key), "local_cache_unreadable");
+    }
+
+    #[test]
+    fn pending_evidence_remains_reusable_without_a_local_cas() {
+        let original = entry("member", now_unix_ms(), 0);
+        let mut store = CompilerDiagnosticsStore::load_with_cas(None);
+
+        store.put(original.clone());
+        assert!(store.get(&original.key).is_some());
+
+        store.flush().expect("memory-only evidence should flush");
+        assert!(store.get(&original.key).is_some());
     }
 
     #[test]
@@ -1520,48 +1315,5 @@ mod tests {
         assert_eq!(status.stale_leases, 0);
         assert_eq!(status.reclaimable_bytes, 0);
         assert!(status.bytes <= status.max_bytes);
-    }
-
-    #[test]
-    fn oversized_cache_is_rejected_before_deserialization() {
-        let root = tempfile::tempdir().expect("temporary workspace should be created");
-        let path = root.path().join("target/cargo-rail/cache/compiler-diags-v1.json");
-        fs::create_dir_all(path.parent().expect("cache path should have a parent"))
-            .expect("cache directory should be created");
-        File::create(&path)
-            .expect("oversized cache should be created")
-            .set_len(MAX_CACHE_BYTES as u64 + 1)
-            .expect("oversized cache length should be set");
-
-        let store = CompilerDiagnosticsStore::load_legacy_only(root.path());
-        assert_eq!(store.miss_reason(&key()), "cache_too_large");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn linked_cache_files_are_rejected_without_following_them() {
-        use std::os::unix::fs::symlink;
-
-        for hard_link in [false, true] {
-            let root = tempfile::tempdir().expect("temporary workspace should be created");
-            let outside = tempfile::tempdir().expect("outside directory should be created");
-            let path = root.path().join("target/cargo-rail/cache/compiler-diags-v1.json");
-            fs::create_dir_all(path.parent().expect("cache path should have a parent"))
-                .expect("cache directory should be created");
-            let outside_file = outside.path().join("compiler-diags-v1.json");
-            fs::write(
-                &outside_file,
-                serde_json::to_vec(&CompilerDiagCacheFile::default()).expect("serialize cache"),
-            )
-            .expect("outside cache should be written");
-            if hard_link {
-                fs::hard_link(&outside_file, &path).expect("hard link should be created");
-            } else {
-                symlink(&outside_file, &path).expect("symlink should be created");
-            }
-
-            let store = CompilerDiagnosticsStore::load_legacy_only(root.path());
-            assert_eq!(store.miss_reason(&key()), "cache_not_bounded_regular_file");
-        }
     }
 }

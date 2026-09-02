@@ -1,7 +1,7 @@
-//! `cargo rail release` - Release automation
+//! Plan, execute, and recover durable exact-SHA releases.
 
 use crate::commands::common::{TextJsonOutputFormat, enforce_safety_gate};
-use crate::config::{CommitPolicy, ReleaseRemoteEffects};
+use crate::config::ReleaseRemoteEffects;
 use crate::error::{RailError, RailResult};
 use crate::mutation::{
     self, ExpectedMutation, MutationAction, MutationEffect, MutationInput, MutationObject, MutationRisk, MutationTrace,
@@ -51,6 +51,7 @@ struct GitReleaseTransaction {
     tags: BTreeMap<String, String>,
     crate_publish: BTreeMap<String, bool>,
     commit_targets: BTreeMap<String, String>,
+    ambiguity: Option<String>,
 }
 
 enum PrepareReconciliation {
@@ -147,7 +148,7 @@ pub fn run_release_plan(
 
     // Validate changelog paths (catches path traversal issues early)
     validator.validate_changelog_paths(&target_crates, release_config)?;
-    validator.validate_apply_preconditions(&plan, true, skip_tag, false, release_config.require_release_notes)?;
+    validator.validate_apply_preconditions(&plan, true, skip_tag, false)?;
 
     if json {
         let payload = serde_json::json!({
@@ -196,6 +197,8 @@ pub struct ReleasePublishArgs {
     pub skip_tag: bool,
     /// Prepare a release PR branch without tags or publish.
     pub pr: bool,
+    /// Wait for exact-SHA remote checks to settle.
+    pub wait: bool,
     /// Expand explicit crate selection to include the full dependent closure.
     pub include_dependents: bool,
     /// Skip interactive confirmation prompts.
@@ -206,6 +209,45 @@ pub struct ReleasePublishArgs {
     pub plan_path: Option<std::path::PathBuf>,
     /// Output format.
     pub format: TextJsonOutputFormat,
+}
+
+struct ReleaseOperationOptions {
+    crate_names: Option<Vec<String>>,
+    all: bool,
+    bump: String,
+    skip_publish: bool,
+    skip_tag: bool,
+    pr: bool,
+    include_dependents: bool,
+}
+
+fn plan_release_operation(
+    ctx: &WorkspaceContext,
+    release_config: &crate::config::ReleaseConfig,
+    options: ReleaseOperationOptions,
+) -> RailResult<(crate::release::planner::ReleasePlan, mutation::MutationPlan)> {
+    let targets = if options.all {
+        None
+    } else if let Some(names) = options.crate_names {
+        Some(names)
+    } else {
+        return Err(RailError::with_help(
+            "must specify crate name(s) or --all",
+            "cargo rail release check my-crate\ncargo rail release check --all",
+        ));
+    };
+    let bump_request = options.bump.parse::<BumpRequest>()?;
+    let planner = ReleasePlanner::new(ctx, release_config);
+    let plan = planner.plan(targets, &bump_request, dependent_policy(options.include_dependents))?;
+    let mutation_plan = build_release_mutation_plan(
+        ctx,
+        &plan,
+        options.skip_publish,
+        options.skip_tag,
+        options.pr,
+        release_config,
+    )?;
+    Ok((plan, mutation_plan))
 }
 
 /// Execute a release
@@ -227,23 +269,21 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
     }
 
     let validator = ReleaseValidator::new(ctx);
-
-    let targets = if args.all {
-        None
-    } else if let Some(names) = args.crate_names {
-        Some(names)
-    } else {
-        return Err(RailError::with_help(
-            "must specify crate name(s) or --all",
-            "cargo rail release my-crate\ncargo rail release --all",
-        ));
-    };
-
-    let bump_request = args.bump.parse::<BumpRequest>()?;
-
-    let policy = dependent_policy(args.include_dependents);
-    let planner = ReleasePlanner::new(ctx, release_config);
-    let plan = planner.plan(targets, &bump_request, policy)?;
+    let effective_skip_publish = skip_publish || args.pr;
+    let effective_skip_tag = args.skip_tag || args.pr;
+    let (plan, expected_mutation_plan) = plan_release_operation(
+        ctx,
+        release_config,
+        ReleaseOperationOptions {
+            crate_names: args.crate_names.clone(),
+            all: args.all,
+            bump: args.bump.clone(),
+            skip_publish: effective_skip_publish,
+            skip_tag: effective_skip_tag,
+            pr: args.pr,
+            include_dependents: args.include_dependents,
+        },
+    )?;
     if plan.crates.is_empty() {
         if json {
             let payload = serde_json::json!({
@@ -263,8 +303,6 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
     }
 
     let target_crates = plan.canonical_crate_order.clone();
-    let effective_skip_publish = skip_publish || args.pr;
-    let effective_skip_tag = args.skip_tag || args.pr;
     validator.validate(&target_crates, false)?;
 
     if let Some(warning) = validator.validate_branch(args.allow_non_default_branch)? {
@@ -278,14 +316,6 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
     // Validate changelog paths
     validator.validate_changelog_paths(&target_crates, release_config)?;
 
-    let expected_mutation_plan = build_release_mutation_plan(
-        ctx,
-        &plan,
-        effective_skip_publish,
-        effective_skip_tag,
-        args.pr,
-        release_config,
-    )?;
     let mutation_plan = if let Some(path) = args.plan_path.as_ref() {
         let from_file = mutation::read_plan_file(path)?;
         if !from_file.operation_id.starts_with("release-") {
@@ -353,13 +383,7 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
         }
     }
 
-    validator.validate_apply_preconditions(
-        &plan,
-        effective_skip_publish,
-        effective_skip_tag,
-        false,
-        release_config.require_release_notes,
-    )?;
+    validator.validate_apply_preconditions(&plan, effective_skip_publish, effective_skip_tag, false)?;
     mutation::validate_pre_apply_with_allowed_paths(ctx, &mutation_plan, &plan_control_paths)?;
     mutation::validate_changed_paths_with_allowed_paths(ctx, &mutation_plan, &allowed_unstaged_paths)?;
     let plan_receipt = mutation::write_receipt(
@@ -386,6 +410,7 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
             &plan,
             skip_publish,
             args.skip_tag,
+            args.wait,
             &planned_paths,
             &allowed_unstaged_paths,
         )?;
@@ -437,181 +462,158 @@ pub fn run_release_publication_check(
     include_dependents: bool,
     format: TextJsonOutputFormat,
 ) -> RailResult<()> {
+    run_release_publication_check_with_plan_inputs(
+        ctx,
+        ReleasePublicationCheckArgs {
+            crate_names,
+            all,
+            bump: "auto".to_string(),
+            extended,
+            skip_tag: false,
+            include_dependents,
+            format,
+        },
+    )
+}
+
+pub(super) struct ReleasePublicationCheckArgs {
+    pub(super) crate_names: Option<Vec<String>>,
+    pub(super) all: bool,
+    pub(super) bump: String,
+    pub(super) extended: bool,
+    pub(super) skip_tag: bool,
+    pub(super) include_dependents: bool,
+    pub(super) format: TextJsonOutputFormat,
+}
+
+pub(super) fn run_release_publication_check_with_plan_inputs(
+    ctx: &WorkspaceContext,
+    args: ReleasePublicationCheckArgs,
+) -> RailResult<()> {
+    let ReleasePublicationCheckArgs {
+        crate_names,
+        all,
+        bump,
+        extended,
+        skip_tag,
+        include_dependents,
+        format,
+    } = args;
     ctx.snapshot()?;
     let json = format.is_json();
-
-    // JSON mode enables structured error output and suppresses progress
-
-    let config = ctx.config().map(|c| &c.release);
-    let release_config =
-        config.ok_or_else(|| RailError::with_help("no release configuration", "run 'cargo rail init' first"))?;
+    let release_config = ctx
+        .config()
+        .as_ref()
+        .map(|config| &config.release)
+        .ok_or_else(|| RailError::with_help("no release configuration", "run 'cargo rail init' first"))?;
+    let skip_publish = registry_publication_skipped(true, release_config)?;
+    debug_assert!(!skip_publish);
 
     let workspace_members = ctx.graph().workspace_members();
-    for warning in release_config.validate(workspace_members).map_err(RailError::Config)? {
-        if !json {
+    let warnings = release_config.validate(workspace_members).map_err(RailError::Config)?;
+    if !json {
+        for warning in &warnings {
             crate::warn!("{}", warning);
         }
     }
 
+    let (plan, mutation_plan) = plan_release_operation(
+        ctx,
+        release_config,
+        ReleaseOperationOptions {
+            crate_names,
+            all,
+            bump,
+            skip_publish: false,
+            skip_tag,
+            pr: false,
+            include_dependents,
+        },
+    )?;
+    let has_pending_changes = !mutation_plan.actions.is_empty();
+    let target_crates = plan.canonical_crate_order.clone();
     let validator = ReleaseValidator::new(ctx);
-
-    // Track skipped crates for reporting
-    let mut skipped_crates: Vec<(String, String)> = Vec::with_capacity(8);
-
-    let mut target_crates = if all {
-        // Filter to only publishable crates when using --all
-        let (publishable, skipped) = validator.publishable_members();
-        skipped_crates = skipped;
-
-        if publishable.is_empty() {
-            if json {
-                let payload = serde_json::json!({
-                  "action": "check",
-                  "readiness": publication_check_readiness(),
-                  "status": "failed",
-                  "crates": [],
-                  "count": 0,
-                  "skipped": skipped_crates
-                      .iter()
-                      .map(|(name, reason)| serde_json::json!({"crate": name, "reason": reason}))
-                      .collect::<Vec<_>>(),
-                  "error": "no publishable crates found",
-                  "help": "All workspace crates have publish = false. Check Cargo.toml or rail.toml settings."
-                });
-                let output = crate::output::machine_json_envelope("release", "validate", "failed", 2, payload);
-                println!("{}", serde_json::to_string_pretty(&output)?);
-                return Err(RailError::ExitWithCode { code: 2 });
-            }
-            return Err(RailError::with_help(
-                "no publishable crates found",
-                "All workspace crates have publish = false. Check Cargo.toml or rail.toml settings.",
-            ));
-        }
-
-        publishable
-    } else if let Some(names) = crate_names {
-        names
-    } else {
-        return Err(RailError::with_help(
-            "must specify crate name(s) or --all",
-            "cargo rail release check my-crate\ncargo rail release check --all",
-        ));
-    };
-
-    // Report skipped crates (non-JSON mode only, before validation output)
-    if !skipped_crates.is_empty() && !json {
-        crate::status!("skipped {} crate(s) (not publishable):", skipped_crates.len());
-        for (name, reason) in &skipped_crates {
-            crate::status!("  {}: {}", name, reason);
-        }
-        crate::status!("");
-    }
-
-    if !all {
-        let policy = dependent_policy(include_dependents);
-        let planner = ReleasePlanner::new(ctx, release_config);
-        target_crates = planner.resolve_targets(Some(target_crates), policy)?;
-    }
     validator.validate(&target_crates, false)?;
-
-    // Validate changelog paths
     validator.validate_changelog_paths(&target_crates, release_config)?;
+    // Match run's local/tag/release-note checks without performing registry
+    // lookups. Live publication checks remain opt-in under --extended.
+    validator.validate_apply_preconditions(&plan, true, skip_tag, false)?;
 
-    // One attribution pass covers commit diagnostics and change-file coverage.
     let insights = ReleasePlanner::new(ctx, release_config).release_check_insights(&target_crates)?;
-    let commit_diagnostics = insights.commit_diagnostics;
     let missing_change_files = insights.missing_change_files;
     let shallow_repository = insights.shallow_repository;
-    let has_commit_diagnostic_failures =
-        release_config.unconventional_commits == CommitPolicy::Deny && !commit_diagnostics.is_empty();
     let has_change_file_failures = !missing_change_files.is_empty();
     let has_shallow_failures = shallow_repository;
 
-    if !json && shallow_repository {
-        println!("\nrelease history:");
-        println!("  shallow clone: fetch tags: git fetch --unshallow --tags, or set fetch-depth: 0");
-    }
-
-    if !json && !commit_diagnostics.is_empty() {
-        let label = if has_commit_diagnostic_failures {
-            "commit diagnostics failed"
-        } else {
-            "commit diagnostics"
-        };
-        println!("\n{}:", label);
-        for (crate_name, diagnostics) in &commit_diagnostics {
-            for diagnostic in diagnostics {
-                println!("  {}: {}", crate_name, diagnostic.describe());
-            }
-        }
-    }
-    if !json && !missing_change_files.is_empty() {
-        println!("\nmissing change files:");
-        for crate_name in &missing_change_files {
-            println!(
-                "  {}: code changes require {} coverage",
-                crate_name, release_config.change_dir
-            );
-        }
-    }
-
-    let mut results = Vec::with_capacity(target_crates.len());
-    for crate_name in &target_crates {
-        // For explicitly named crates, check publishability and report
-        // (for --all, we already filtered, so this is a no-op)
-        if !validator.is_publishable(crate_name) {
-            if !json {
-                let reason = validator
-                    .unpublishable_reason(crate_name)
-                    .unwrap_or_else(|| "unknown".to_string());
-                println!("{}: not publishable ({})", crate_name, reason);
-            }
-            continue;
-        }
-
+    let publishable_crates = plan
+        .crates
+        .iter()
+        .filter(|crate_plan| crate_plan.publish)
+        .map(|crate_plan| crate_plan.name.clone())
+        .collect::<Vec<_>>();
+    let skipped_crates = plan
+        .crates
+        .iter()
+        .filter(|crate_plan| !crate_plan.publish)
+        .map(|crate_plan| {
+            let reason = validator
+                .unpublishable_reason(&crate_plan.name)
+                .unwrap_or_else(|| "release plan disables publication".to_string());
+            (crate_plan.name.clone(), reason)
+        })
+        .collect::<Vec<_>>();
+    for crate_name in &publishable_crates {
         validator.validate_publishable(crate_name)?;
-        results.push(crate_name.clone());
-        if !json {
-            println!("{}: ready", crate_name);
+    }
+
+    if !json {
+        println!("{}", plan.format_summary_with_flags(false, skip_tag));
+        for crate_name in &publishable_crates {
+            println!("{}: ready for crates-io publication", crate_name);
+        }
+        for (crate_name, reason) in &skipped_crates {
+            println!("{}: not publishable ({})", crate_name, reason);
+        }
+        if shallow_repository {
+            println!("\nrelease history:");
+            println!("  shallow clone: fetch tags: git fetch --unshallow --tags, or set fetch-depth: 0");
+        }
+        if !missing_change_files.is_empty() {
+            println!("\nmissing change files:");
+            for crate_name in &missing_change_files {
+                println!(
+                    "  {}: code changes require {} coverage",
+                    crate_name, release_config.change_dir
+                );
+            }
         }
     }
 
-    // Extended validation: cargo publish --dry-run and MSRV check
-    let mut extended_results = Vec::with_capacity(target_crates.len());
+    let mut extended_results = Vec::with_capacity(publishable_crates.len());
     let mut has_extended_failures = false;
-
     if extended {
         if !json {
             println!("\nrunning extended checks...");
         }
-
-        let ext_results = validator.validate_extended(&target_crates, release_config)?;
-
-        for (crate_name, checks) in ext_results {
+        for (crate_name, checks) in validator.validate_extended(&publishable_crates, release_config)? {
             let mut crate_checks = Vec::with_capacity(checks.len());
-
             for check in checks {
-                if check.is_skipped() {
-                    if !json {
+                if !json {
+                    if check.is_skipped() {
                         println!(
                             "  {}: {} - SKIPPED: {}",
                             crate_name,
                             check.check_name,
                             check.details.as_deref().unwrap_or("no evidence")
                         );
-                    }
-                } else if check.passed {
-                    if !json {
+                    } else if check.passed {
                         println!(
                             "  {}: {} - {}",
                             crate_name,
                             check.check_name,
                             check.details.as_deref().unwrap_or("ok")
                         );
-                    }
-                } else {
-                    has_extended_failures = true;
-                    if !json {
+                    } else {
                         crate::error!(
                             "  {}: {} - FAILED: {}",
                             crate_name,
@@ -620,7 +622,7 @@ pub fn run_release_publication_check(
                         );
                     }
                 }
-
+                has_extended_failures |= !check.passed && !check.is_skipped();
                 crate_checks.push(serde_json::json!({
                   "check": check.check_name,
                   "passed": check.passed,
@@ -629,7 +631,6 @@ pub fn run_release_publication_check(
                   "error": check.error
                 }));
             }
-
             extended_results.push(serde_json::json!({
               "crate": crate_name,
               "checks": crate_checks
@@ -637,36 +638,32 @@ pub fn run_release_publication_check(
         }
     }
 
+    let validation_failed = has_extended_failures || has_change_file_failures || has_shallow_failures;
     if json {
+        let (result, exit_code, status) = if validation_failed {
+            ("failed", 2, "failed")
+        } else if has_pending_changes {
+            ("pending_changes", 1, "pending")
+        } else {
+            ("no_changes", 0, "passed")
+        };
         let mut payload = serde_json::json!({
           "action": "check",
-          "readiness": publication_check_readiness(),
-          "status": if has_extended_failures || has_commit_diagnostic_failures || has_change_file_failures || has_shallow_failures { "failed" } else { "passed" },
-          "crates": results,
-          "count": results.len()
+          "check": true,
+          "release_plan": plan,
+          "mutation_plan": mutation_plan,
+          "readiness": publication_check_readiness(&mutation_plan),
+          "status": status,
+          "crates": publishable_crates,
+          "count": publishable_crates.len(),
+          "skipped": skipped_crates
+              .iter()
+              .map(|(name, reason)| serde_json::json!({"crate": name, "reason": reason}))
+              .collect::<Vec<_>>(),
+          "warnings": warnings,
         });
-
-        // Include skipped crates in JSON output
-        if !skipped_crates.is_empty() {
-            payload["skipped"] = serde_json::json!(
-                skipped_crates
-                    .iter()
-                    .map(|(name, reason)| serde_json::json!({"crate": name, "reason": reason}))
-                    .collect::<Vec<_>>()
-            );
-        }
-
         if extended {
             payload["extended"] = serde_json::json!(extended_results);
-        }
-
-        if !commit_diagnostics.is_empty() {
-            payload["commit_diagnostics"] = serde_json::json!(
-                commit_diagnostics
-                    .iter()
-                    .map(|(name, diagnostics)| serde_json::json!({"crate": name, "diagnostics": diagnostics}))
-                    .collect::<Vec<_>>()
-            );
         }
         if !missing_change_files.is_empty() {
             payload["missing_change_files"] = serde_json::json!(missing_change_files);
@@ -677,55 +674,31 @@ pub fn run_release_publication_check(
               "help": "fetch tags: git fetch --unshallow --tags, or set fetch-depth: 0"
             });
         }
+        let output = crate::output::machine_json_envelope("release", "check", result, exit_code, payload);
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    }
 
-        let exit_code = if has_extended_failures
-            || has_commit_diagnostic_failures
-            || has_change_file_failures
-            || has_shallow_failures
-        {
-            2
-        } else {
-            0
-        };
-        let result = if has_extended_failures
-            || has_commit_diagnostic_failures
-            || has_change_file_failures
-            || has_shallow_failures
-        {
-            "failed"
-        } else {
-            "success"
-        };
-        let output = crate::output::machine_json_envelope("release", "validate", result, exit_code, payload);
-
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&output).map_err(|e| RailError::message(format!("JSON error: {}", e)))?
-        );
-    } else if has_extended_failures
-        || has_commit_diagnostic_failures
-        || has_change_file_failures
-        || has_shallow_failures
-    {
+    if validation_failed {
+        if json {
+            return Err(RailError::ExitWithCode { code: 2 });
+        }
         return Err(RailError::message(if has_shallow_failures {
             "release history check failed"
         } else if has_change_file_failures {
             "change file coverage failed"
-        } else if has_commit_diagnostic_failures {
-            "commit diagnostics failed"
         } else {
             "extended validation failed"
         }));
-    } else {
-        println!("\nall checks passed");
     }
-
-    if (has_extended_failures || has_commit_diagnostic_failures || has_change_file_failures || has_shallow_failures)
-        && json
-    {
-        return Err(RailError::ExitWithCode { code: 2 });
+    if has_pending_changes {
+        if !json {
+            println!("\nPublication-ready changes detected. Run the matching release command to apply.");
+        }
+        return Err(RailError::CheckHasPendingChanges);
     }
-
+    if !json {
+        println!("\nNo release-worthy changes detected.");
+    }
     Ok(())
 }
 
@@ -757,7 +730,9 @@ fn release_check_readiness(
     })
 }
 
-fn publication_check_readiness() -> serde_json::Value {
+fn publication_check_readiness(plan: &mutation::MutationPlan) -> serde_json::Value {
+    let has_action = |code| plan.actions.iter().any(|action| action.code == code);
+    let workspace_mutation = plan.actions.iter().any(|action| !action.expected_mutations.is_empty());
     serde_json::json!({
       "scope": "publication",
       "effects_executed": [],
@@ -768,7 +743,15 @@ fn publication_check_readiness() -> serde_json::Value {
         "git_push",
         "forge_release",
         "registry_publication"
-      ]
+      ],
+      "planned_effects": {
+        "workspace_mutation": workspace_mutation,
+        "git_commit": has_action("COMMIT_RELEASE"),
+        "git_tag": has_action("CREATE_TAG"),
+        "git_push": has_action("PUSH_RELEASE_COMMIT") || has_action("PUSH_RELEASE_TAGS"),
+        "forge_release": has_action("CREATE_FORGE_RELEASE") || has_action("PUBLISH_FORGE_RELEASE"),
+        "registry_publication": has_action("PUBLISH_CRATE")
+      }
     })
 }
 
@@ -837,7 +820,13 @@ pub fn run_release_finalize(ctx: &WorkspaceContext, options: ReleaseFinalizeOpti
     let publisher = ReleasePublisher::new(ctx, release_config);
     let generated_transaction_id =
         build_release_mutation_plan(ctx, &plan, skip_publish, skip_tag, false, release_config)?.operation_id;
-    let transaction_id = prepared_release_transaction_id(ctx, &plan)?.unwrap_or(generated_transaction_id);
+    let prepared = prepared_release_transaction(ctx, &plan)?;
+    if let Some(transaction) = prepared.as_ref() {
+        validate_prepared_release_merge(ctx.workspace_root(), transaction)?;
+    }
+    let transaction_id = prepared
+        .map(|transaction| transaction.transaction_id)
+        .unwrap_or(generated_transaction_id);
     publisher.execute_finalize(&transaction_id, &plan, skip_publish, skip_tag)?;
 
     if json {
@@ -853,10 +842,10 @@ pub fn run_release_finalize(ctx: &WorkspaceContext, options: ReleaseFinalizeOpti
     Ok(())
 }
 
-fn prepared_release_transaction_id(
+fn prepared_release_transaction(
     ctx: &WorkspaceContext,
     plan: &crate::release::planner::ReleasePlan,
-) -> RailResult<Option<String>> {
+) -> RailResult<Option<GitReleaseTransaction>> {
     let expected = plan
         .crates
         .iter()
@@ -865,11 +854,13 @@ fn prepared_release_transaction_id(
     let mut candidates = Vec::new();
     for transaction in git_release_transactions(ctx.workspace_root())?
         .into_iter()
-        .filter(|transaction| transaction.mode == "prepare" && transaction.crates == expected)
+        .filter(|transaction| {
+            transaction.ambiguity.is_none() && transaction.mode == "prepare" && transaction.crates == expected
+        })
     {
         let mut observations = Vec::new();
         match reconcile_prepare_transaction(ctx.workspace_root(), &transaction, &mut observations) {
-            PrepareReconciliation::Incomplete => candidates.push(transaction.transaction_id),
+            PrepareReconciliation::Incomplete => candidates.push(transaction),
             PrepareReconciliation::Terminal(_) => {}
             PrepareReconciliation::Ambiguous => {
                 return Err(RailError::with_help(
@@ -890,6 +881,39 @@ fn prepared_release_transaction_id(
         ));
     }
     Ok(candidates.pop())
+}
+
+fn validate_prepared_release_merge(workspace_root: &Path, transaction: &GitReleaseTransaction) -> RailResult<()> {
+    let git = crate::git::SystemGit::open(workspace_root)?;
+    let head = git.head_commit()?;
+    let parents = git.run_git_stdout(&["show", "-s", "--format=%P", &head])?;
+    let parents = parents.split_whitespace().collect::<Vec<_>>();
+    if parents.len() < 2 {
+        return Err(RailError::with_help(
+            format!(
+                "release finalize expected HEAD {} to be the merge commit introducing prepared transaction '{}'",
+                head, transaction.transaction_id
+            ),
+            "merge the generated release PR with a merge commit, check out that exact commit, and retry",
+        ));
+    }
+
+    let prepared = transaction.exact_sha.as_str();
+    let first_parent_contains_prepare = git.run_git_check(&["merge-base", "--is-ancestor", prepared, parents[0]]);
+    let merged_parent_contains_prepare = parents[1..]
+        .iter()
+        .any(|parent| git.run_git_check(&["merge-base", "--is-ancestor", prepared, parent]));
+    if first_parent_contains_prepare || !merged_parent_contains_prepare {
+        return Err(RailError::with_help(
+            format!(
+                "HEAD {} is not the merge boundary introducing prepared transaction '{}' at {}",
+                head, transaction.transaction_id, prepared
+            ),
+            "check out the exact merge commit that introduced the generated release PR; do not finalize from a later commit",
+        ));
+    }
+
+    Ok(())
 }
 
 fn dependent_policy(include_dependents: bool) -> DependentPolicy {
@@ -962,8 +986,11 @@ pub fn run_release_status_standalone(
     };
     let mut reports = paths
         .into_iter()
-        .map(|path| ReleaseState::load(&path).map(|state| release_status_report(state, path)))
-        .collect::<RailResult<Vec<_>>>()?;
+        .map(|path| match ReleaseState::load(&path) {
+            Ok(state) => release_status_report(state, path),
+            Err(error) => unreadable_release_status_report(path, error),
+        })
+        .collect::<Vec<_>>();
     if let Some(requested) = requested_transaction.as_ref() {
         reports.retain(|report| &report.transaction_id == requested);
     }
@@ -1035,6 +1062,27 @@ pub fn run_release_status_standalone(
         }
     }
     Ok(())
+}
+
+fn unreadable_release_status_report(path: PathBuf, error: RailError) -> ReleaseStatusReport {
+    let transaction_id = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unreadable-journal")
+        .to_string();
+    ReleaseStatusReport {
+        transaction_id,
+        state: "journal:ambiguous".to_string(),
+        exact_sha: None,
+        completed_effect: None,
+        next_effect: None,
+        observations: vec![format!("journal:invalid={error}")],
+        ambiguity: true,
+        recoverability: "unreadable".to_string(),
+        safe_operator_command: format!("cargo rail release status {} --format json", path.display()),
+        journal: Some(path),
+    }
 }
 
 fn release_status_report(state: ReleaseState, path: PathBuf) -> ReleaseStatusReport {
@@ -1151,6 +1199,20 @@ fn release_status_report(state: ReleaseState, path: PathBuf) -> ReleaseStatusRep
 }
 
 fn reconstructed_status_report(workspace_root: &Path, transaction: GitReleaseTransaction) -> ReleaseStatusReport {
+    if let Some(reason) = transaction.ambiguity.clone() {
+        return ReleaseStatusReport {
+            transaction_id: transaction.transaction_id,
+            state: "reconstructed:ambiguous".to_string(),
+            exact_sha: Some(transaction.exact_sha),
+            completed_effect: Some("release_commit".to_string()),
+            next_effect: None,
+            observations: vec![format!("git:ambiguous={reason}")],
+            ambiguity: true,
+            recoverability: "unreadable".to_string(),
+            safe_operator_command: "inspect the conflicting Rail-Release commit trailers".to_string(),
+            journal: None,
+        };
+    }
     let prepare = transaction.mode == "prepare";
     let mut observations = transaction
         .crates
@@ -1581,7 +1643,15 @@ fn git_release_transactions(workspace_root: &Path) -> RailResult<Vec<GitReleaseT
         if !transaction_id.starts_with("release-") {
             continue;
         }
-        let mode = trailer_value(&message, "Rail-Release-Mode").unwrap_or_else(|| "legacy".to_string());
+        if !recognized_release_commit(&message) {
+            continue;
+        }
+        let Some(mode) = trailer_value(&message, "Rail-Release-Mode") else {
+            continue;
+        };
+        if !matches!(mode.as_str(), "prepare" | "run") {
+            continue;
+        }
         let index = transactions
             .iter()
             .position(|transaction| transaction.transaction_id == transaction_id);
@@ -1602,6 +1672,7 @@ fn git_release_transactions(workspace_root: &Path) -> RailResult<Vec<GitReleaseT
                 tags: BTreeMap::new(),
                 crate_publish: BTreeMap::new(),
                 commit_targets: BTreeMap::new(),
+                ambiguity: None,
             });
             transactions.len() - 1
         };
@@ -1615,33 +1686,259 @@ fn git_release_transactions(workspace_root: &Path) -> RailResult<Vec<GitReleaseT
             transaction.remote = trailer_value(&message, "Rail-Release-Remote");
             transaction.remote_repository = trailer_value(&message, "Rail-Release-Repository")
                 .and_then(|value| RemoteRepository::from_trailer(&value).ok());
+        } else if mode != "prepare"
+            && (transaction.publish != parse_bool_trailer(&message, "Rail-Release-Publish")
+                || transaction.publish_registry != trailer_value(&message, "Rail-Release-Publish-Registry")
+                || transaction.tag != parse_bool_trailer(&message, "Rail-Release-Tag")
+                || transaction.remote != trailer_value(&message, "Rail-Release-Remote")
+                || transaction.remote_repository
+                    != trailer_value(&message, "Rail-Release-Repository")
+                        .and_then(|value| RemoteRepository::from_trailer(&value).ok()))
+        {
+            transaction.ambiguity = Some("conflicting transaction authority".to_string());
         }
         for value in trailer_values(&message, "Rail-Release-Crate") {
             let Some((name, version)) = value.rsplit_once('@') else {
                 continue;
             };
-            transaction.crates.insert(name.to_string(), version.to_string());
-            transaction
+            if transaction
+                .crates
+                .insert(name.to_string(), version.to_string())
+                .is_some_and(|previous| previous != version)
+            {
+                transaction.ambiguity = Some(format!("conflicting crate identity for {name}"));
+            }
+            if transaction
                 .commit_targets
-                .entry(name.to_string())
-                .or_insert_with(|| sha.clone());
+                .insert(name.to_string(), sha.clone())
+                .is_some()
+            {
+                transaction.ambiguity = Some(format!("duplicate release commit for {name}"));
+            }
         }
         for value in trailer_values(&message, "Rail-Release-Tag-Name") {
             let Some((name, tag)) = value.split_once('=') else {
                 continue;
             };
-            transaction.tags.insert(name.to_string(), tag.to_string());
+            if transaction
+                .tags
+                .insert(name.to_string(), tag.to_string())
+                .is_some_and(|previous| previous != tag)
+            {
+                transaction.ambiguity = Some(format!("conflicting tag identity for {name}"));
+            }
         }
         for value in trailer_values(&message, "Rail-Release-Crate-Publish") {
             let Some((name, publish)) = value.split_once('=') else {
                 continue;
             };
-            if let Ok(publish) = publish.parse::<bool>() {
-                transaction.crate_publish.insert(name.to_string(), publish);
+            if let Ok(publish) = publish.parse::<bool>()
+                && transaction
+                    .crate_publish
+                    .insert(name.to_string(), publish)
+                    .is_some_and(|previous| previous != publish)
+            {
+                transaction.ambiguity = Some(format!("conflicting publication intent for {name}"));
             }
         }
     }
     Ok(transactions)
+}
+
+fn recognized_release_commit(message: &str) -> bool {
+    let contract = trailer_values(message, "Rail-Release-Contract");
+    if contract == ["1"] {
+        return true;
+    }
+    if !contract.is_empty() {
+        return false;
+    }
+    exact_v0_25_release_commit(message)
+}
+
+fn exact_v0_25_release_commit(message: &str) -> bool {
+    const KEYS: &[&str] = &[
+        "Rail-Release",
+        "Rail-Release-Mode",
+        "Rail-Release-Publish",
+        "Rail-Release-Publish-Registry",
+        "Rail-Release-Tag",
+        "Rail-Release-Remote",
+        "Rail-Release-Repository",
+        "Rail-Release-Crate",
+        "Rail-Release-Tag-Name",
+        "Rail-Release-Crate-Publish",
+    ];
+    if !exact_v0_25_message_shape(message)
+        || message
+            .lines()
+            .filter_map(|line| line.trim().split_once(": "))
+            .any(|(key, _)| key.starts_with("Rail-Release") && !KEYS.contains(&key))
+    {
+        return false;
+    }
+    let one = |key| trailer_values(message, key).len() == 1;
+    if !one("Rail-Release") || !one("Rail-Release-Mode") || !one("Rail-Release-Remote") {
+        return false;
+    }
+    let Some(transaction) = trailer_value(message, "Rail-Release") else {
+        return false;
+    };
+    if !transaction.starts_with("release-")
+        || !transaction
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return false;
+    }
+    let Some(remote) = trailer_value(message, "Rail-Release-Remote") else {
+        return false;
+    };
+    if !matches!(remote.as_str(), "none" | "push" | "auto" | "github" | "gitlab") {
+        return false;
+    }
+    let Some(mode) = trailer_value(message, "Rail-Release-Mode") else {
+        return false;
+    };
+    let repositories = trailer_values(message, "Rail-Release-Repository");
+    let repository_is_valid = |value: &String| RemoteRepository::from_trailer(value).is_ok();
+    let exact_repository_shape = match mode.as_str() {
+        "run" => {
+            (remote == "none" && repositories.is_empty())
+                || (remote != "none" && repositories.len() == 1 && repository_is_valid(&repositories[0]))
+        }
+        // v0.25 PR preparation always recorded the exact origin identity,
+        // independent of the configured post-merge remote-effects policy.
+        "prepare" => repositories.len() == 1 && repository_is_valid(&repositories[0]),
+        _ => false,
+    };
+    if !exact_repository_shape {
+        return false;
+    }
+    match mode.as_str() {
+        "run" => exact_v0_25_run_commit(message),
+        "prepare" => exact_v0_25_prepare_commit(message),
+        _ => false,
+    }
+}
+
+fn exact_v0_25_message_shape(message: &str) -> bool {
+    let message = message.trim_end_matches(['\r', '\n']);
+    let mut lines = message.lines();
+    let Some(subject) = lines.next() else {
+        return false;
+    };
+    if subject.is_empty() || lines.next() != Some("") {
+        return false;
+    }
+    let trailers = lines.collect::<Vec<_>>();
+    !trailers.is_empty()
+        && trailers.iter().all(|line| {
+            line.trim() == *line
+                && line
+                    .split_once(": ")
+                    .is_some_and(|(key, value)| key.starts_with("Rail-Release") && !value.is_empty())
+        })
+}
+
+fn exact_v0_25_run_commit(message: &str) -> bool {
+    for key in [
+        "Rail-Release-Publish",
+        "Rail-Release-Publish-Registry",
+        "Rail-Release-Tag",
+        "Rail-Release-Crate",
+        "Rail-Release-Tag-Name",
+        "Rail-Release-Crate-Publish",
+    ] {
+        if trailer_values(message, key).len() != 1 {
+            return false;
+        }
+    }
+    let Some(publish) = parse_bool_trailer(message, "Rail-Release-Publish") else {
+        return false;
+    };
+    if parse_bool_trailer(message, "Rail-Release-Tag").is_none() {
+        return false;
+    }
+    let registry = trailer_value(message, "Rail-Release-Publish-Registry");
+    if registry.as_deref() != Some(if publish { "crates-io" } else { "none" }) {
+        return false;
+    }
+    let Some((name, version)) = trailer_value(message, "Rail-Release-Crate").and_then(|value| {
+        let (name, version) = value.rsplit_once('@')?;
+        Some((name.to_string(), version.to_string()))
+    }) else {
+        return false;
+    };
+    if name.is_empty() || version.parse::<semver::Version>().is_err() {
+        return false;
+    }
+    let tag_matches = trailer_value(message, "Rail-Release-Tag-Name").and_then(|value| {
+        let (crate_name, tag) = value.split_once('=')?;
+        Some(crate_name == name && !tag.is_empty())
+    }) == Some(true);
+    let publish_matches = trailer_value(message, "Rail-Release-Crate-Publish").and_then(|value| {
+        let (crate_name, crate_publish) = value.split_once('=')?;
+        let crate_publish = crate_publish.parse::<bool>().ok()?;
+        Some(crate_name == name && (publish || !crate_publish))
+    }) == Some(true);
+    message.lines().next() == Some(format!("chore(release): {name} v{version}").as_str())
+        && tag_matches
+        && publish_matches
+}
+
+fn exact_v0_25_prepare_commit(message: &str) -> bool {
+    if [
+        "Rail-Release-Publish",
+        "Rail-Release-Publish-Registry",
+        "Rail-Release-Tag",
+    ]
+    .into_iter()
+    .any(|key| !trailer_values(message, key).is_empty())
+    {
+        return false;
+    }
+    let subject = message.lines().next().unwrap_or_default();
+    let branch_hash = subject.strip_prefix("chore(release): prepare rail/release-");
+    if !branch_hash.is_some_and(|hash| {
+        hash.len() == 8
+            && hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) {
+        return false;
+    }
+    let crates = trailer_values(message, "Rail-Release-Crate");
+    let tags = trailer_values(message, "Rail-Release-Tag-Name");
+    let publication = trailer_values(message, "Rail-Release-Crate-Publish");
+    if crates.is_empty() || crates.len() != tags.len() || crates.len() != publication.len() {
+        return false;
+    }
+    let crate_names = crates
+        .iter()
+        .filter_map(|value| {
+            let (name, version) = value.rsplit_once('@')?;
+            (!name.is_empty() && version.parse::<semver::Version>().is_ok()).then_some(name)
+        })
+        .collect::<BTreeSet<_>>();
+    if crate_names.len() != crates.len() {
+        return false;
+    }
+    let tag_names = tags
+        .iter()
+        .filter_map(|value| {
+            let (name, tag) = value.split_once('=')?;
+            (!tag.is_empty()).then_some(name)
+        })
+        .collect::<BTreeSet<_>>();
+    let publication_names = publication
+        .iter()
+        .filter_map(|value| {
+            let (name, publish) = value.split_once('=')?;
+            matches!(publish, "true" | "false").then_some(name)
+        })
+        .collect::<BTreeSet<_>>();
+    crate_names == tag_names && crate_names == publication_names
 }
 
 fn trailer_value(message: &str, key: &str) -> Option<String> {
@@ -1695,6 +1992,12 @@ pub fn run_release_resume(ctx: &WorkspaceContext, state: &std::path::Path) -> Ra
                 "fetch and check out the exact release commit before reconstructing its journal",
             )
         })?;
+    if let Some(reason) = transaction.ambiguity.as_deref() {
+        return Err(RailError::with_help(
+            format!("release transaction '{transaction_id}' is ambiguous: {reason}"),
+            "recover the original local journal; conflicting commit trailers are not execution authority",
+        ));
+    }
     if transaction.mode == "prepare" {
         return Err(RailError::with_help(
             format!("release transaction '{}' is prepared but not finalized", transaction_id),
@@ -1703,20 +2006,14 @@ pub fn run_release_resume(ctx: &WorkspaceContext, state: &std::path::Path) -> Ra
     }
     let publish = transaction.publish.ok_or_else(|| {
         RailError::with_help(
-            format!(
-                "release transaction '{}' predates reconstructable publish intent",
-                transaction_id
-            ),
-            "recover the original local journal; legacy trailers do not authorize irreversible effects",
+            format!("release transaction '{}' has no publish intent", transaction_id),
+            "recover the original local journal; incomplete trailers do not authorize irreversible effects",
         )
     })?;
     if publish {
         let registry = transaction.publish_registry.as_deref().ok_or_else(|| {
             RailError::with_help(
-                format!(
-                    "release transaction '{}' predates reconstructable registry authority",
-                    transaction_id
-                ),
+                format!("release transaction '{}' has no registry authority", transaction_id),
                 "recover the original local journal; cargo-rail will not guess an irreversible registry target",
             )
         })?;
@@ -1733,20 +2030,14 @@ pub fn run_release_resume(ctx: &WorkspaceContext, state: &std::path::Path) -> Ra
     }
     let tag = transaction.tag.ok_or_else(|| {
         RailError::with_help(
-            format!(
-                "release transaction '{}' predates reconstructable tag intent",
-                transaction_id
-            ),
-            "recover the original local journal; legacy trailers do not authorize irreversible effects",
+            format!("release transaction '{}' has no tag intent", transaction_id),
+            "recover the original local journal; incomplete trailers do not authorize irreversible effects",
         )
     })?;
     let remote = transaction.remote.as_deref().ok_or_else(|| {
         RailError::with_help(
-            format!(
-                "release transaction '{}' predates reconstructable remote intent",
-                transaction_id
-            ),
-            "recover the original local journal; legacy trailers do not authorize remote effects",
+            format!("release transaction '{}' has no remote intent", transaction_id),
+            "recover the original local journal; incomplete trailers do not authorize remote effects",
         )
     })?;
     if remote != release_config.remote_effects.as_str() {
@@ -2022,7 +2313,10 @@ fn build_release_mutation_plan(
         }
     }
 
-    if pr {
+    if plan.crates.is_empty() {
+        // Match `release run`: an empty release plan exits before any local or
+        // external action is authorized.
+    } else if pr {
         actions.push(
             MutationAction::new("COMMIT_RELEASE_PR", "release-pr", None)
                 .with_payload(serde_json::json!({ "crates": plan.canonical_crate_order })),
@@ -2131,37 +2425,15 @@ fn build_release_mutation_plan(
         ),
     )];
 
-    mutation::build_plan_with_inputs(
-        ctx,
-        "release",
-        actions,
-        release_declared_inputs(ctx, plan, release_config)?,
-        risks,
-        trace,
-    )
+    mutation::build_plan_with_inputs(ctx, "release", actions, release_declared_inputs(ctx)?, risks, trace)
 }
 
-fn release_declared_inputs(
-    ctx: &WorkspaceContext,
-    plan: &crate::release::planner::ReleasePlan,
-    release_config: &crate::config::ReleaseConfig,
-) -> RailResult<Vec<MutationInput>> {
+fn release_declared_inputs(ctx: &WorkspaceContext) -> RailResult<Vec<MutationInput>> {
     let git = ctx.git()?.git();
     let git_root = &git.worktree_root;
     let mut paths = Vec::new();
     if let Some(config_path) = crate::config::RailConfig::find_config_path(ctx.workspace_root()) {
         paths.push(config_path);
-    }
-
-    let notes_dir = ctx.workspace_root().join(&release_config.release_notes_dir);
-    for crate_plan in &plan.crates {
-        let version_path = notes_dir.join(format!("v{}.md", crate_plan.new_version));
-        let tag_path = notes_dir.join(format!("{}.md", crate_plan.tag_name));
-        if version_path.exists() {
-            paths.push(version_path);
-        } else if tag_path.exists() {
-            paths.push(tag_path);
-        }
     }
 
     paths.sort();
@@ -2340,8 +2612,6 @@ pub fn run_release_init(ctx: &WorkspaceContext, crates: Option<Vec<String>>, dry
     for name in &new_crates {
         println!("  {}", name);
     }
-    print_changelog_migration_hint(workspace_root);
-
     let config_toml = toml_edit::ser::to_string_pretty(&config)
         .map_err(|e| crate::error::RailError::message(format!("config serialization failed: {}", e)))?;
 
@@ -2362,18 +2632,142 @@ pub fn run_release_init(ctx: &WorkspaceContext, crates: Option<Vec<String>>, dry
     Ok(())
 }
 
-fn print_changelog_migration_hint(workspace_root: &std::path::Path) {
-    let existing: Vec<_> = ["cliff.toml", "release-plz.toml"]
-        .into_iter()
-        .filter(|path| workspace_root.join(path).exists())
-        .collect();
-    if existing.is_empty() {
-        return;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_git(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git").current_dir(root).args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
-    println!("\nfound existing changelog/release config: {}", existing.join(", "));
-    println!(
-        "migration: set release.source = \"commits\" and compare \
-         'cargo rail release check --all --bump auto' before removing existing automation"
-    );
+    fn prepared_transaction(exact_sha: String) -> GitReleaseTransaction {
+        GitReleaseTransaction {
+            transaction_id: "release-test-merge".to_string(),
+            exact_sha,
+            mode: "prepare".to_string(),
+            publish: None,
+            publish_registry: None,
+            tag: None,
+            remote: Some("push".to_string()),
+            remote_repository: None,
+            crates: BTreeMap::new(),
+            tags: BTreeMap::new(),
+            crate_publish: BTreeMap::new(),
+            commit_targets: BTreeMap::new(),
+            ambiguity: None,
+        }
+    }
+
+    fn prepared_merge_fixture() -> (tempfile::TempDir, GitReleaseTransaction) {
+        let root = tempfile::tempdir().unwrap();
+        test_git(root.path(), &["init", "-q", "-b", "main"]);
+        test_git(root.path(), &["config", "user.name", "Cargo-Rail Test"]);
+        test_git(root.path(), &["config", "user.email", "cargo-rail@example.invalid"]);
+        test_git(root.path(), &["commit", "--allow-empty", "-qm", "initial"]);
+        test_git(root.path(), &["switch", "-qc", "rail/release-test"]);
+        test_git(root.path(), &["commit", "--allow-empty", "-qm", "prepare"]);
+        let prepared = test_git(root.path(), &["rev-parse", "HEAD"]);
+        test_git(root.path(), &["switch", "-q", "main"]);
+        test_git(
+            root.path(),
+            &["merge", "--no-ff", "-qm", "Merge release PR", "rail/release-test"],
+        );
+        (root, prepared_transaction(prepared))
+    }
+
+    const V0_25_RUN: &str = "chore(release): fixture-crate v0.1.1\n\n\
+Rail-Release: release-v025-fixture\n\
+Rail-Release-Mode: run\n\
+Rail-Release-Publish: false\n\
+Rail-Release-Publish-Registry: none\n\
+Rail-Release-Tag: true\n\
+Rail-Release-Remote: none\n\
+Rail-Release-Crate: fixture-crate@0.1.1\n\
+Rail-Release-Tag-Name: fixture-crate=v0.1.1\n\
+Rail-Release-Crate-Publish: fixture-crate=false";
+
+    #[test]
+    fn exact_v0_25_run_trailers_are_reconstructable() {
+        assert!(recognized_release_commit(V0_25_RUN));
+    }
+
+    #[test]
+    fn incomplete_or_ambiguous_v0_25_trailers_are_not_authority() {
+        for message in [
+            V0_25_RUN.replace("Rail-Release-Tag: true\n", ""),
+            format!("{V0_25_RUN}\nRail-Release-Tag: false"),
+            format!("{V0_25_RUN}\nRail-Release-Future: value"),
+            V0_25_RUN.replace(
+                "Rail-Release-Publish-Registry: none",
+                "Rail-Release-Publish-Registry: crates-io",
+            ),
+            V0_25_RUN.replace(
+                "Rail-Release-Crate-Publish: fixture-crate=false",
+                "Rail-Release-Crate-Publish: fixture-crate=true",
+            ),
+            V0_25_RUN.replace(
+                "\n\nRail-Release: release-v025-fixture",
+                "\nrelease body\n\nRail-Release: release-v025-fixture",
+            ),
+        ] {
+            assert!(!recognized_release_commit(&message), "{message}");
+        }
+    }
+
+    #[test]
+    fn exact_v0_25_prepare_trailers_are_reconstructable() {
+        let message = "chore(release): prepare rail/release-deadbeef\n\n\
+Rail-Release: release-v025-prepare\n\
+Rail-Release-Mode: prepare\n\
+Rail-Release-Remote: github\n\
+Rail-Release-Repository: {\"host\":\"github.com\",\"path\":\"example/fixture\"}\n\
+        Rail-Release-Crate: fixture-crate@0.1.1\n\
+Rail-Release-Tag-Name: fixture-crate=v0.1.1\n\
+Rail-Release-Crate-Publish: fixture-crate=true";
+        assert!(recognized_release_commit(message));
+        assert!(recognized_release_commit(
+            &message.replace("Rail-Release-Remote: github", "Rail-Release-Remote: none")
+        ));
+        assert!(!recognized_release_commit(&message.replace(
+            "Rail-Release-Repository: {\"host\":\"github.com\",\"path\":\"example/fixture\"}\n",
+            ""
+        )));
+        assert!(!recognized_release_commit(&message.replacen(
+            "rail/release-",
+            "release-",
+            1
+        )));
+    }
+
+    #[test]
+    fn finalize_accepts_only_the_merge_that_introduces_the_prepare_transaction() {
+        let (root, transaction) = prepared_merge_fixture();
+        validate_prepared_release_merge(root.path(), &transaction).unwrap();
+
+        test_git(root.path(), &["commit", "--allow-empty", "-qm", "later"]);
+        let error = validate_prepared_release_merge(root.path(), &transaction).unwrap_err();
+        assert!(error.to_string().contains("merge commit introducing"), "{error}");
+    }
+
+    #[test]
+    fn finalize_rejects_a_later_unrelated_merge() {
+        let (root, transaction) = prepared_merge_fixture();
+        test_git(root.path(), &["switch", "-qc", "unrelated"]);
+        test_git(root.path(), &["commit", "--allow-empty", "-qm", "unrelated"]);
+        test_git(root.path(), &["switch", "-q", "main"]);
+        test_git(
+            root.path(),
+            &["merge", "--no-ff", "-qm", "Merge unrelated PR", "unrelated"],
+        );
+
+        let error = validate_prepared_release_merge(root.path(), &transaction).unwrap_err();
+        assert!(error.to_string().contains("not the merge boundary"), "{error}");
+    }
 }

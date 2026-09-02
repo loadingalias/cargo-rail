@@ -31,10 +31,21 @@ fn write_compiler_fact_capability(observation_directory: &Path, source_root: &Pa
     fs::create_dir_all(observation_directory)?;
     let capability = observation_directory.join("test-fact-session.cap");
     let encoded = serde_json::to_vec(&serde_json::json!({
-      "version": 4,
-      "observation_directory_identity": compiler_fact_path_identity(observation_directory)?,
-      "source_root_identity": compiler_fact_path_identity(source_root)?,
-      "fact_families": ["StableDiagnostics"],
+      "version": 5,
+      "contract": {
+        "version": 1,
+        "families": ["StableDiagnostics"],
+        "package": "test-package",
+        "platform": "default",
+        "features": "Default",
+        "variant": "test-analysis",
+        "configuration_identity": "test-configuration",
+        "required_coverage": [],
+      },
+      "session": {
+        "observation_directory_identity": compiler_fact_path_identity(observation_directory)?,
+        "source_root_identity": compiler_fact_path_identity(source_root)?,
+      },
     }))?;
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -220,30 +231,44 @@ fn stable_wrapper_typed_fixture(doctest: bool) -> Result<Vec<serde_json::Value>>
     } else {
         compiler_fact_corpus_targets()
     };
+    let producer_authority = serde_json::json!({
+      "compiler_identity": format!("compiler-fact-compiler-v1-sha256-{}", "3".repeat(64)),
+      "driver_identity": format!("compiler-fact-driver-v1-sha256-{}", "4".repeat(64)),
+    });
+    let host_platform = rustc_host()?;
     let encoded = serde_json::to_vec(&serde_json::json!({
-      "version": 4,
-      "observation_directory_identity": compiler_fact_path_identity(&observation_directory)?,
-      "source_root_identity": compiler_fact_path_identity(&source_root)?,
-      "fact_families": ["TypedRustItems"],
-      "typed": {
+      "version": 5,
+      "contract": {
+        "version": 1,
+        "families": ["TypedRustItems"],
+        "package": "fact-probe",
+        "platform": host_platform,
+        "features": "Default",
+        "variant": if doctest { "typed-doctest" } else { "typed-check" },
+        "configuration_identity": "typed-fixture-configuration",
+        "producer": producer_authority,
+        "required_coverage": coverage.clone(),
+      },
+      "session": {
+        "observation_directory_identity": compiler_fact_path_identity(&observation_directory)?,
+        "source_root_identity": compiler_fact_path_identity(&source_root)?,
+        "typed": {
         "run_authority": {
           "run_identity": format!("compiler-fact-run-v1-sha256-{}", "1".repeat(64)),
           "view_identity": format!("compiler-fact-view-v1-sha256-{}", "2".repeat(64)),
         },
-        "producer_authority": {
-          "compiler_identity": format!("compiler-fact-compiler-v1-sha256-{}", "3".repeat(64)),
-          "driver_identity": format!("compiler-fact-driver-v1-sha256-{}", "4".repeat(64)),
-        },
+        "producer_authority": producer_authority,
         "driver_program": fs::canonicalize(&driver)?,
         "rustc_program": fs::canonicalize(which_rustc()?)?,
         "compiler_library_directory": fs::canonicalize(&compiler_library_directory)?,
-        "host_platform": rustc_host()?,
-        "target_platform": rustc_host()?,
+        "host_platform": host_platform,
+        "target_platform": host_platform,
         "doctest": doctest,
         "doctest_sysroot": doctest_sysroot,
         "generated_roots": [source_root.join("target")],
         "required_coverage": coverage,
         "targets": targets,
+      },
       },
     }))?;
     let mut options = OpenOptions::new();
@@ -308,6 +333,21 @@ fn stable_wrapper_typed_fixture(doctest: bool) -> Result<Vec<serde_json::Value>>
             .collect::<std::collections::BTreeSet<_>>();
         anyhow::ensure!(announced_targets.contains("fact_macro"));
         anyhow::ensure!(announced_targets.contains("fact_probe"));
+        let shared_target_kinds = announcements
+            .iter()
+            .filter(|announcement| announcement["target"]["name"] == "shared")
+            .flat_map(|announcement| {
+                announcement["target"]["kind"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        anyhow::ensure!(
+            shared_target_kinds == std::collections::BTreeSet::from(["bench", "test"]),
+            "same-named Cargo envelopes lost their target kinds: {shared_target_kinds:?}"
+        );
     }
     let observation_files = fs::read_dir(&observation_directory)?.collect::<Result<Vec<_>, _>>()?;
     let sidecars = observation_files
@@ -361,7 +401,7 @@ fn write_compiler_fact_corpus(root: &Path) -> Result<()> {
     }
     fs::write(
         root.join("Cargo.toml"),
-        "[package]\nname = \"fact-probe\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\nbuild = \"build.rs\"\n\n[workspace]\nmembers = [\"fact-macro\"]\nresolver = \"3\"\n\n[features]\ndefault = []\nextra = []\n\n[dependencies]\nfact-macro = { path = \"fact-macro\" }\n\n[[bench]]\nname = \"fact_bench\"\nharness = false\n",
+        "[package]\nname = \"fact-probe\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\nbuild = \"build.rs\"\n\n[workspace]\nmembers = [\"fact-macro\"]\nresolver = \"3\"\n\n[features]\ndefault = []\nextra = []\n\n[dependencies]\nfact-macro = { path = \"fact-macro\" }\n\n[[test]]\nname = \"shared\"\npath = \"tests/shared.rs\"\n\n[[bench]]\nname = \"shared\"\npath = \"benches/shared.rs\"\nharness = false\n",
     )?;
     fs::write(
         root.join("src/lib.rs"),
@@ -376,7 +416,7 @@ fn write_compiler_fact_corpus(root: &Path) -> Result<()> {
         "fn helper() {}\nfn main() { helper(); }\n",
     )?;
     fs::write(
-        root.join("tests/fact_test.rs"),
+        root.join("tests/shared.rs"),
         "#[test]\nfn integration_entry() { assert_eq!(fact_probe::expanded(), 2); }\n",
     )?;
     fs::write(
@@ -384,7 +424,7 @@ fn write_compiler_fact_corpus(root: &Path) -> Result<()> {
         "fn main() { let _ = fact_probe::feature_item(); }\n",
     )?;
     fs::write(
-        root.join("benches/fact_bench.rs"),
+        root.join("benches/shared.rs"),
         "fn main() { let _ = fact_probe::platform_item(); }\n",
     )?;
     fs::write(
@@ -404,11 +444,11 @@ fn compiler_fact_corpus_targets() -> serde_json::Value {
     serde_json::json!([
       { "package": { "name": "fact-macro", "version": "0.0.0", "source": null }, "manifest_directory": "fact-macro", "cargo_target": "fact_macro", "crate_name": "fact_macro", "target_kind": { "kind": "proc_macro" }, "source": "fact-macro/src/lib.rs", "doctest": true },
       { "package": package(), "manifest_directory": "", "cargo_target": "build-script-build", "crate_name": "build_script_build", "target_kind": { "kind": "build_script" }, "source": "build.rs", "doctest": false },
-      { "package": package(), "manifest_directory": "", "cargo_target": "fact_bench", "crate_name": "fact_bench", "target_kind": { "kind": "benchmark" }, "source": "benches/fact_bench.rs", "doctest": false },
       { "package": package(), "manifest_directory": "", "cargo_target": "fact_bin", "crate_name": "fact_bin", "target_kind": { "kind": "binary" }, "source": "src/bin/fact_bin.rs", "doctest": false },
       { "package": package(), "manifest_directory": "", "cargo_target": "fact_example", "crate_name": "fact_example", "target_kind": { "kind": "example" }, "source": "examples/fact_example.rs", "doctest": false },
       { "package": package(), "manifest_directory": "", "cargo_target": "fact_probe", "crate_name": "fact_probe", "target_kind": { "kind": "library" }, "source": "src/lib.rs", "doctest": true },
-      { "package": package(), "manifest_directory": "", "cargo_target": "fact_test", "crate_name": "fact_test", "target_kind": { "kind": "test" }, "source": "tests/fact_test.rs", "doctest": false }
+      { "package": package(), "manifest_directory": "", "cargo_target": "shared", "crate_name": "shared", "target_kind": { "kind": "test" }, "source": "tests/shared.rs", "doctest": false },
+      { "package": package(), "manifest_directory": "", "cargo_target": "shared", "crate_name": "shared", "target_kind": { "kind": "benchmark" }, "source": "benches/shared.rs", "doctest": false }
     ])
 }
 
@@ -428,6 +468,16 @@ fn assert_compiler_fact_corpus(fragments: &[serde_json::Value]) {
             .as_array()
             .is_some_and(|features| features.iter().any(|feature| feature == "extra"))
     }));
+    let shared_target_kinds = objects
+        .iter()
+        .filter(|object| object["unit"]["cargo_target"] == "shared")
+        .filter_map(|object| object["unit"]["target_kind"]["kind"].as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        shared_target_kinds,
+        std::collections::BTreeSet::from(["benchmark", "test"]),
+        "same-named units must retain their Cargo target-kind authority"
+    );
 
     let item_kinds = object_nested_values(&objects, "items", "physical", "kind");
     for required in [

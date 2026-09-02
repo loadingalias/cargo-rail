@@ -144,21 +144,6 @@ pub enum IssueSeverity {
     Warning,
 }
 
-/// Legacy target-load observation retained for API compatibility.
-///
-/// Unification plans no longer populate this type: successful metadata loading
-/// is an analysis prerequisite, not post-analysis validation. Use the versioned
-/// coverage views in `unify --check -f json` for executable target inputs.
-#[derive(Debug)]
-pub struct ValidationResult {
-    /// Target platform that was observed.
-    pub target: Arc<str>,
-    /// Whether the observation succeeded.
-    pub success: bool,
-    /// Error reported by the observation.
-    pub error: Option<Arc<str>>,
-}
-
 /// Record of a duplicate version that was cleaned up
 #[derive(Debug, Clone)]
 pub struct DuplicateCleanup {
@@ -453,8 +438,6 @@ pub struct UnificationPlan {
     pub member_paths: FxHashMap<Arc<str>, PathBuf>,
     /// Transitive dependencies to pin (with version info)
     pub transitive_pins: Vec<TransitivePin>,
-    /// Legacy target-load observations; retained empty because metadata loading is a prerequisite.
-    pub validation_results: Vec<ValidationResult>,
     /// Issues detected during analysis
     pub issues: Vec<UnifyIssue>,
     /// Computed MSRV from the dependency graph when the configured policy enables it.
@@ -914,7 +897,6 @@ mod tests {
             member_edits: FxHashMap::default(),
             member_paths: FxHashMap::default(),
             transitive_pins: vec![],
-            validation_results: vec![],
             issues: vec![],
             computed_msrv: None,
             duplicates_cleaned: vec![],
@@ -950,7 +932,6 @@ mod tests {
             member_edits: FxHashMap::default(),
             member_paths: FxHashMap::default(),
             transitive_pins: vec![],
-            validation_results: vec![],
             issues: vec![],
             computed_msrv: None,
             duplicates_cleaned: vec![],
@@ -1004,7 +985,6 @@ mod tests {
             member_edits: FxHashMap::default(),
             member_paths: FxHashMap::default(),
             transitive_pins: vec![],
-            validation_results: vec![],
             issues: vec![],
             computed_msrv: None,
             duplicates_cleaned: vec![],
@@ -1110,7 +1090,6 @@ mod tests {
             member_edits,
             member_paths: FxHashMap::default(),
             transitive_pins: vec![],
-            validation_results: vec![],
             issues: vec![],
             computed_msrv: None,
             duplicates_cleaned: vec![],

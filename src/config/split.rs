@@ -24,9 +24,6 @@ pub struct CrateSplitConfig {
     /// splits name every member explicitly.
     #[serde(default)]
     pub members: Vec<String>,
-    /// Legacy path-based member selection accepted only by `config migrate`.
-    #[serde(default, rename = "paths", skip_serializing_if = "Vec::is_empty")]
-    pub legacy_paths: Vec<CratePath>,
     /// Additional non-Cargo files/directories to include.
     #[serde(default)]
     pub include: Vec<String>,
@@ -51,8 +48,6 @@ pub struct SplitConfig {
     pub workspace_mode: WorkspaceMode,
     /// Cargo workspace member names included in the split.
     pub members: Vec<String>,
-    /// Legacy path-based member selection awaiting explicit migration.
-    pub legacy_paths: Vec<CratePath>,
     /// Additional non-Cargo files/directories to include.
     #[serde(default)]
     pub include: Vec<String>,
@@ -75,15 +70,15 @@ impl SplitConfig {
     /// For local paths (testing), returns the path as-is.
     /// For remote URLs, extracts the repo name and places it adjacent to workspace root.
     pub fn target_repo_path(&self, workspace_root: &std::path::Path) -> PathBuf {
-        if crate::utils::is_local_path(&self.remote) {
-            PathBuf::from(&self.remote)
+        self.target_repo_path_for_remote(workspace_root, &self.remote)
+    }
+
+    /// Determine the target repository path for an effective CLI/config remote.
+    pub(crate) fn target_repo_path_for_remote(&self, workspace_root: &std::path::Path, remote: &str) -> PathBuf {
+        if crate::utils::is_local_path(remote) {
+            PathBuf::from(remote)
         } else {
-            let remote_name = self
-                .remote
-                .rsplit('/')
-                .next()
-                .unwrap_or(&self.name)
-                .trim_end_matches(".git");
+            let remote_name = remote.rsplit('/').next().unwrap_or(&self.name).trim_end_matches(".git");
             workspace_root.join("..").join(remote_name)
         }
     }
@@ -95,13 +90,6 @@ impl SplitConfig {
 
     /// Validate the split configuration
     pub fn validate(&self) -> RailResult<()> {
-        if !self.legacy_paths.is_empty() {
-            return Err(RailError::with_help(
-                format!("Split '{}' still selects Cargo members by path", self.name),
-                "run 'cargo rail config migrate' to replace split.paths with member names",
-            ));
-        }
-
         if self.members.is_empty() {
             return Err(RailError::with_help(
                 format!("Split '{}' must own at least one Cargo member", self.name),
@@ -170,14 +158,6 @@ impl SplitConfig {
     }
 }
 
-/// Path to a crate in the workspace
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CratePath {
-    /// Path to the crate directory
-    #[serde(rename = "crate")]
-    pub path: PathBuf,
-}
-
 /// Split mode: single crate or combined multi-crate
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -219,7 +199,6 @@ pub fn build_split_config(
         mode: split.mode.clone(),
         workspace_mode: split.workspace_mode.clone(),
         members,
-        legacy_paths: split.legacy_paths.clone(),
         include: split.include.clone(),
         exclude: split.exclude.clone(),
         publish: release_publish.unwrap_or(true),
@@ -242,7 +221,6 @@ mod tests {
             mode: SplitMode::Single,
             workspace_mode: WorkspaceMode::default(),
             members: vec![],
-            legacy_paths: vec![],
             include: vec![],
             exclude: vec![],
             publish: true,
@@ -264,7 +242,6 @@ mod tests {
             mode: SplitMode::Single,
             workspace_mode: WorkspaceMode::default(),
             members: vec!["test-crate".to_string()],
-            legacy_paths: vec![],
             include: vec![],
             exclude: vec![],
             publish: true,
@@ -286,7 +263,6 @@ mod tests {
             mode: SplitMode::Single,
             workspace_mode: WorkspaceMode::default(),
             members: vec!["a".to_string(), "b".to_string()],
-            legacy_paths: vec![],
             include: vec![],
             exclude: vec![],
             publish: true,
@@ -309,7 +285,6 @@ mod tests {
             mode: SplitMode::Combined,
             workspace_mode: WorkspaceMode::default(),
             members: vec!["a".to_string()],
-            legacy_paths: vec![],
             include: vec![],
             exclude: vec![],
             publish: true,
@@ -332,7 +307,6 @@ mod tests {
             mode: SplitMode::Single,
             workspace_mode: WorkspaceMode::default(),
             members: vec!["test-crate".to_string()],
-            legacy_paths: vec![],
             include: vec![],
             exclude: vec![],
             publish: true,

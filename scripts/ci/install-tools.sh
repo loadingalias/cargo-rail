@@ -11,7 +11,7 @@ case "$profile" in
 esac
 
 readonly CARGO_DENY_VERSION=0.20.2
-readonly CARGO_RAIL_VERSION=0.24.0
+readonly CARGO_RAIL_VERSION=0.25.0
 readonly HYPERFINE_VERSION=1.20.0
 readonly SCCACHE_VERSION=0.17.0
 readonly JQ_VERSION=1.8.2
@@ -40,12 +40,10 @@ ci_tool_version() {
 ci_tool_archive() {
   local tool="$1"
   local archive_target="$2"
-  local architecture="${archive_target%%-*}"
-  local os="${archive_target#*-}"
-  awk -F '\t' -v tool="$tool" -v os="$os" -v architecture="$architecture" '
+  awk -F '\t' -v tool="$tool" -v archive_target="$archive_target" '
     BEGIN { OFS = FS }
-    $0 !~ /^#/ && $1 == tool && $3 == os && $4 == architecture {
-      print $2, $5, $6, $7
+    $0 !~ /^#/ && $1 == tool && $3 == archive_target {
+      print $2, $4
       matches += 1
     }
     END { if (matches != 1) exit 1 }
@@ -87,6 +85,48 @@ install_cargo_tool() {
   }
 }
 
+extract_zip_member() {
+  local archive="$1"
+  local member="$2"
+  local destination="$3"
+  if [[ "${OS:-}" != Windows_NT ]]; then
+    tar -xOf "$archive" "$member" >"$destination"
+    return
+  fi
+
+  local archive_windows destination_windows
+  archive_windows="$(cygpath -w "$archive")"
+  destination_windows="$(cygpath -w "$destination")"
+  # shellcheck disable=SC2016 # PowerShell owns interpolation in this program.
+  CARGO_RAIL_TOOL_ARCHIVE="$archive_windows" \
+    CARGO_RAIL_TOOL_MEMBER="$member" \
+    CARGO_RAIL_TOOL_DESTINATION="$destination_windows" \
+    powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command '
+      $ErrorActionPreference = "Stop"
+      Add-Type -AssemblyName System.IO.Compression.FileSystem
+      $archive = [System.IO.Compression.ZipFile]::OpenRead($env:CARGO_RAIL_TOOL_ARCHIVE)
+      try {
+        $entries = @($archive.Entries | Where-Object { $_.FullName -ceq $env:CARGO_RAIL_TOOL_MEMBER })
+        if ($entries.Count -ne 1) {
+          throw "archive must contain exactly one $($env:CARGO_RAIL_TOOL_MEMBER) member"
+        }
+        $source = $entries[0].Open()
+        try {
+          $output = [System.IO.File]::Create($env:CARGO_RAIL_TOOL_DESTINATION)
+          try {
+            $source.CopyTo($output)
+          } finally {
+            $output.Dispose()
+          }
+        } finally {
+          $source.Dispose()
+        }
+      } finally {
+        $archive.Dispose()
+      }
+    '
+}
+
 install_release_binary() {
   local package="$1"
   local version="$2"
@@ -116,17 +156,7 @@ install_release_binary() {
   printf '%s  %s\n' "$digest" "$archive" | sha256sum --check --status
   case "$asset" in
     *.tar.gz | *.tgz) tar -xOzf "$archive" "$member" >"$staged" ;;
-    *.zip)
-      python.exe - "$archive" "$member" "$staged" <<'PY'
-import shutil
-import sys
-import zipfile
-
-with zipfile.ZipFile(sys.argv[1]) as archive:
-    with archive.open(sys.argv[2]) as source, open(sys.argv[3], "wb") as destination:
-        shutil.copyfileobj(source, destination)
-PY
-      ;;
+    *.zip) extract_zip_member "$archive" "$member" "$staged" ;;
     *)
       echo "$package archive has unsupported format: $asset" >&2
       exit 1
@@ -143,7 +173,7 @@ PY
 }
 
 install_just() {
-  local archive_target asset binary digest record source_url version
+  local archive_target asset binary digest record source_url suffix version
   case "$rust_host" in
     x86_64-unknown-linux-gnu)
       archive_target=x86_64-unknown-linux-musl
@@ -170,7 +200,11 @@ install_just() {
     echo "just has no unique archive pin for $archive_target" >&2
     exit 1
   }
-  IFS=$'\t' read -r version asset source_url digest <<<"$record"
+  IFS=$'\t' read -r version digest <<<"$record"
+  suffix=tar.gz
+  [[ "$archive_target" == *-pc-windows-msvc ]] && suffix=zip
+  asset="just-$version-$archive_target.$suffix"
+  source_url="https://github.com/casey/just/releases/download/$version/$asset"
   install_release_binary just "$version" casey/just "$version" "$asset" "$digest" "$binary" "$binary" just \
     "$source_url"
 }
@@ -290,7 +324,9 @@ install_cargo_nextest() {
     echo "cargo-nextest has no unique archive pin for $archive_target" >&2
     exit 1
   }
-  IFS=$'\t' read -r version asset source_url digest <<<"$record"
+  IFS=$'\t' read -r version digest <<<"$record"
+  asset="cargo-nextest-$version-$archive_target.tar.gz"
+  source_url="https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$version/$asset"
   path="$cargo_bin/$binary"
   if [[ -x "$path" ]] && "$path" --version 2>&1 | grep -Fq "$version"; then
     echo "cargo-nextest $version is already installed"
@@ -385,12 +421,8 @@ install_jq() {
 }
 
 install_cargo_rail() {
-  if command -v cargo-rail >/dev/null 2>&1 && \
-    [[ "$(cargo rail --version 2>&1)" == "cargo-rail $CARGO_RAIL_VERSION" ]]; then
-    echo "cargo-rail $CARGO_RAIL_VERSION is already installed"
-    return
-  fi
-
+  # The release installer validates and replaces the complete component set.
+  # A matching CLI version alone cannot prove companion component authority.
   if [[ "$rust_host" == *-pc-windows-msvc ]]; then
     powershell.exe -NoProfile -ExecutionPolicy Bypass \
       -File scripts/install.ps1 -Version "$CARGO_RAIL_VERSION"

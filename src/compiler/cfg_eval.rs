@@ -208,6 +208,26 @@ pub(crate) fn feature_selections_for_cfg(expression: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// Evaluate an exact Cargo feature set against a source cfg expression.
+///
+/// Platform and custom cfg predicates remain unresolved. Malformed expressions
+/// also return `None`, so callers can widen instead of treating them as proof.
+#[must_use]
+pub(crate) fn cfg_expression_feature_match(expression: &str, enabled_features: &BTreeSet<String>) -> Option<bool> {
+    let mut parser = CfgParser::new(expression);
+    let Ok(parsed) = parser.parse_expr() else {
+        return None;
+    };
+    if parser.has_remaining_tokens() {
+        return None;
+    }
+    match eval_feature_applicability(&parsed, enabled_features) {
+        CfgApplicability::Yes => Some(true),
+        CfgApplicability::No => Some(false),
+        CfgApplicability::Maybe => None,
+    }
+}
+
 fn assignments_for(expression: &CfgExpr, desired: bool) -> Vec<FeatureAssignment> {
     match expression {
         CfgExpr::Predicate { key, value } if key == "feature" => {
@@ -285,6 +305,48 @@ fn eval_applicability(expr: &CfgExpr, cfg: &TargetCfgSet) -> CfgApplicability {
             result
         }
         CfgExpr::Not(item) => match eval_applicability(item, cfg) {
+            CfgApplicability::No => CfgApplicability::Yes,
+            CfgApplicability::Maybe => CfgApplicability::Maybe,
+            CfgApplicability::Yes => CfgApplicability::No,
+        },
+    }
+}
+
+fn eval_feature_applicability(expr: &CfgExpr, enabled: &BTreeSet<String>) -> CfgApplicability {
+    match expr {
+        CfgExpr::Predicate { key, value } if key == "feature" => {
+            value.as_ref().map_or(CfgApplicability::Maybe, |feature| {
+                if enabled.contains(feature) {
+                    CfgApplicability::Yes
+                } else {
+                    CfgApplicability::No
+                }
+            })
+        }
+        CfgExpr::Predicate { .. } => CfgApplicability::Maybe,
+        CfgExpr::All(items) => {
+            let mut result = CfgApplicability::Yes;
+            for item in items {
+                match eval_feature_applicability(item, enabled) {
+                    CfgApplicability::No => return CfgApplicability::No,
+                    CfgApplicability::Maybe => result = CfgApplicability::Maybe,
+                    CfgApplicability::Yes => {}
+                }
+            }
+            result
+        }
+        CfgExpr::Any(items) => {
+            let mut result = CfgApplicability::No;
+            for item in items {
+                match eval_feature_applicability(item, enabled) {
+                    CfgApplicability::Yes => return CfgApplicability::Yes,
+                    CfgApplicability::Maybe => result = CfgApplicability::Maybe,
+                    CfgApplicability::No => {}
+                }
+            }
+            result
+        }
+        CfgExpr::Not(item) => match eval_feature_applicability(item, enabled) {
             CfgApplicability::No => CfgApplicability::Yes,
             CfgApplicability::Maybe => CfgApplicability::Maybe,
             CfgApplicability::Yes => CfgApplicability::No,
@@ -557,5 +619,23 @@ mod tests {
             r#"all(generated_backend, feature = "api")"#,
             [Some(&linux)].into_iter()
         ));
+    }
+
+    #[test]
+    fn exact_feature_match_distinguishes_inactive_from_unprovable_cfgs() {
+        let features = BTreeSet::from(["rsa".to_string()]);
+        assert_eq!(
+            cfg_expression_feature_match(r#"feature = "rsa""#, &features),
+            Some(true)
+        );
+        assert_eq!(
+            cfg_expression_feature_match(r#"feature = "sha2""#, &features),
+            Some(false)
+        );
+        assert_eq!(
+            cfg_expression_feature_match(r#"all(feature = "rsa", unix)"#, &features),
+            None
+        );
+        assert_eq!(cfg_expression_feature_match("all(", &features), None);
     }
 }

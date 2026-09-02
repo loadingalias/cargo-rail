@@ -28,6 +28,15 @@ def require(condition: bool, message: str) -> None:
 ID = re.compile(r"[a-z][a-z0-9.-]*")
 EVIDENCE_ID = re.compile(r"evidence:sha256:[0-9a-f]{64}")
 PLANNING_EVIDENCE_ID = re.compile(r"planning-evidence-v1:sha256:[0-9a-f]{64}")
+BUNDLE_NAME = "cargo-rail-plan-bundle"
+BUNDLE_VERSION = 1
+BUNDLE_MANIFEST = "plan-bundle-v1.json"
+BUNDLE_PLAN = "plan-v8.json"
+BUNDLE_READER = "plan-read.py"
+BUNDLE_MAX_MANIFEST_BYTES = 64 * 1024
+BUNDLE_MAX_READER_BYTES = 1024 * 1024
+SHA256 = re.compile(r"[0-9a-f]{64}")
+SEMVER = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?")
 
 
 def exact_keys(value: dict[str, Any], required: set[str], optional: set[str], subject: str) -> None:
@@ -305,10 +314,14 @@ def create_plan(path: pathlib.Path, force_all: bool) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     command = [*cargo_rail_command(), "plan"]
     since = os.environ.get("RAIL_SINCE")
+    object_head = os.environ.get("RAIL_OBJECT_HEAD")
     zero_before = bool(since) and set(since) == {"0"}
     if zero_before:
         since = None
-    if since:
+    require(not object_head or since is not None, "RAIL_OBJECT_HEAD requires a nonzero RAIL_SINCE base")
+    if object_head:
+        command.extend(["--from", since, "--to", object_head])
+    elif since:
         command.extend(["--since", since])
     command.append("--json")
     evidence = os.environ.get("CARGO_RAIL_PLANNING_EVIDENCE")
@@ -420,7 +433,36 @@ def matrix(plan: dict[str, Any], work_id: str, family: str | None) -> Any:
     return {"include": rows}
 
 
-def verify_checkout(path: pathlib.Path) -> None:
+def git_output(arguments: list[str], *, cwd: pathlib.Path | None = None) -> bytes:
+    result = subprocess.run(
+        ["git", *(str(argument) for argument in arguments)],
+        cwd=cwd,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    require(result.returncode == 0, f"Git checkout verification failed: {result.stderr.decode(errors='replace').strip()}")
+    return result.stdout
+
+
+def verify_object_checkout(plan: dict[str, Any]) -> None:
+    inputs = plan["inputs"]
+    require(inputs["head"] != "WORKTREE", "portable verification requires an object-bound plan")
+    require(inputs["head"] == inputs["head_commit"], "object-bound plan head disagrees with its head commit")
+    root = pathlib.Path(git_output(["rev-parse", "--show-toplevel"]).decode("utf-8").strip())
+    head = git_output(["rev-parse", "--verify", "HEAD^{commit}"], cwd=root).decode("ascii").strip()
+    require(head == inputs["head_commit"], f"saved head commit '{inputs['head_commit']}' does not match current authority '{head}'")
+    status = git_output(
+        ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"],
+        cwd=root,
+    )
+    require(not status, "object-bound execution checkout has non-generated source drift")
+
+
+def verify_checkout(path: pathlib.Path, plan: dict[str, Any]) -> None:
+    if plan["inputs"]["head"] != "WORKTREE":
+        verify_object_checkout(plan)
+        return
     command = cargo_rail_command()
     result = subprocess.run(
         [*command, "plan", "--verify", str(path.resolve())],
@@ -430,6 +472,122 @@ def verify_checkout(path: pathlib.Path) -> None:
     )
     require(result.returncode == 0, f"cargo-rail rejected current checkout binding: {result.stderr.decode(errors='replace').strip()}")
     require(not result.stdout, "cargo-rail saved-plan verification emitted unexpected stdout")
+
+
+def sha256_file(path: pathlib.Path, maximum: int) -> tuple[int, str]:
+    stat = path.stat()
+    require(path.is_file() and not path.is_symlink(), f"bundle file {path} must be a regular file")
+    require(stat.st_size <= maximum, f"bundle file {path} exceeds its size bound")
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return stat.st_size, digest.hexdigest()
+
+
+def create_bundle(plan_path: pathlib.Path, directory: pathlib.Path, producer_version: str) -> None:
+    require(SEMVER.fullmatch(producer_version) is not None, "bundle producer version must be exact SemVer")
+    plan = load_plan(plan_path)
+    require(plan["inputs"]["head"] != "WORKTREE", "portable bundles require an object-bound plan")
+    directory.mkdir(parents=True, exist_ok=True)
+    plan_target = directory / BUNDLE_PLAN
+    reader_target = directory / BUNDLE_READER
+    if plan_path.resolve() != plan_target.resolve():
+        shutil.copyfile(plan_path, plan_target)
+    shutil.copyfile(pathlib.Path(__file__).resolve(), reader_target)
+    plan_size, plan_hash = sha256_file(plan_target, 64 * 1024 * 1024)
+    reader_size, reader_hash = sha256_file(reader_target, BUNDLE_MAX_READER_BYTES)
+    manifest = {
+        "plan_bundle_version": BUNDLE_VERSION,
+        "name": BUNDLE_NAME,
+        "contract": {"name": "cargo-rail-plan", "version": plan["plan_contract_version"]},
+        "producer": {"name": "cargo-rail", "version": producer_version},
+        "plan_identity": plan["identity"],
+        "platform_limits": {
+            "architectures": ["any"],
+            "operating_systems": ["linux", "macos", "windows"],
+            "requires": ["git", "python>=3.10"],
+            "source_authority": "clean_git_object",
+        },
+        "files": [
+            {"path": BUNDLE_PLAN, "role": "execution_plan", "size": plan_size, "sha256": plan_hash},
+            {"path": BUNDLE_READER, "role": "portable_plan_reader", "size": reader_size, "sha256": reader_hash},
+        ],
+    }
+    encoded = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+    require(len(encoded) <= BUNDLE_MAX_MANIFEST_BYTES, "plan bundle manifest exceeds its size bound")
+    temporary = directory / f".{BUNDLE_MANIFEST}.tmp"
+    temporary.write_bytes(encoded)
+    temporary.replace(directory / BUNDLE_MANIFEST)
+
+
+def load_bundle(manifest_path: pathlib.Path) -> tuple[dict[str, Any], pathlib.Path]:
+    try:
+        require(manifest_path.stat().st_size <= BUNDLE_MAX_MANIFEST_BYTES, "plan bundle manifest exceeds its size bound")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise PlanError(f"cannot load plan bundle {manifest_path}: {error}") from error
+    require(isinstance(manifest, dict), "plan bundle manifest must be an object")
+    exact_keys(
+        manifest,
+        {"plan_bundle_version", "name", "contract", "producer", "plan_identity", "platform_limits", "files"},
+        set(),
+        "plan bundle manifest",
+    )
+    require(manifest["plan_bundle_version"] == BUNDLE_VERSION, "plan bundle contract is incompatible")
+    require(manifest["name"] == BUNDLE_NAME, "plan bundle name is incompatible")
+    contract = manifest["contract"]
+    require(isinstance(contract, dict), "plan bundle contract is malformed")
+    exact_keys(contract, {"name", "version"}, set(), "plan bundle contract")
+    require(contract == {"name": "cargo-rail-plan", "version": 8}, "plan bundle plan contract is incompatible")
+    producer = manifest["producer"]
+    require(isinstance(producer, dict), "plan bundle producer is malformed")
+    exact_keys(producer, {"name", "version"}, set(), "plan bundle producer")
+    require(producer["name"] == "cargo-rail", "plan bundle producer is unknown")
+    require(isinstance(producer["version"], str) and SEMVER.fullmatch(producer["version"]), "plan bundle producer version is malformed")
+    require(isinstance(manifest["plan_identity"], str), "plan bundle identity is malformed")
+    limits = manifest["platform_limits"]
+    require(isinstance(limits, dict), "plan bundle platform limits are malformed")
+    exact_keys(limits, {"architectures", "operating_systems", "requires", "source_authority"}, set(), "plan bundle platform limits")
+    require(
+        limits
+        == {
+            "architectures": ["any"],
+            "operating_systems": ["linux", "macos", "windows"],
+            "requires": ["git", "python>=3.10"],
+            "source_authority": "clean_git_object",
+        },
+        "plan bundle platform limits are incompatible",
+    )
+    files = manifest["files"]
+    require(isinstance(files, list) and len(files) == 2, "plan bundle file inventory is malformed")
+    inventory: dict[str, pathlib.Path] = {}
+    maximum_by_role = {"execution_plan": 64 * 1024 * 1024, "portable_plan_reader": BUNDLE_MAX_READER_BYTES}
+    path_by_role = {"execution_plan": BUNDLE_PLAN, "portable_plan_reader": BUNDLE_READER}
+    for file in files:
+        require(isinstance(file, dict), "plan bundle file entry is malformed")
+        exact_keys(file, {"path", "role", "size", "sha256"}, set(), "plan bundle file")
+        path = file["path"]
+        role = file["role"]
+        require(role in maximum_by_role and role not in inventory, "plan bundle file role is duplicated or unknown")
+        require(path == path_by_role[role], f"plan bundle {role} path is incompatible")
+        require(isinstance(file["size"], int) and file["size"] >= 0, "plan bundle file size is malformed")
+        require(isinstance(file["sha256"], str) and SHA256.fullmatch(file["sha256"]), "plan bundle file hash is malformed")
+        resolved = manifest_path.parent / path
+        size, digest = sha256_file(resolved, maximum_by_role[role])
+        require(size == file["size"], f"plan bundle file {path} size does not match its manifest")
+        require(digest == file["sha256"], f"plan bundle file {path} hash does not match its manifest")
+        inventory[role] = resolved
+    require(pathlib.Path(__file__).resolve() == inventory["portable_plan_reader"].resolve(), "verify-bundle must run the bundled plan reader")
+    plan = load_plan(inventory["execution_plan"])
+    require(plan["plan_contract_version"] == contract["version"], "plan disagrees with the bundle contract")
+    require(plan["identity"] == manifest["plan_identity"], "plan disagrees with the bundle identity")
+    return plan, inventory["execution_plan"]
+
+
+def verify_bundle(manifest_path: pathlib.Path) -> None:
+    plan, _ = load_bundle(manifest_path)
+    verify_object_checkout(plan)
 
 
 def emit_null(arguments: list[str]) -> None:
@@ -474,6 +632,12 @@ def main() -> int:
     variants.add_argument("--family")
     checkout = commands.add_parser("verify-checkout")
     checkout.add_argument("path", type=pathlib.Path)
+    bundle = commands.add_parser("bundle")
+    bundle.add_argument("path", type=pathlib.Path)
+    bundle.add_argument("directory", type=pathlib.Path)
+    bundle.add_argument("--producer-version", required=True)
+    bundle_verify = commands.add_parser("verify-bundle")
+    bundle_verify.add_argument("path", type=pathlib.Path)
     arguments = parser.parse_args()
 
     if arguments.command == "create":
@@ -481,6 +645,12 @@ def main() -> int:
             create_plan_stdout(arguments.all)
         else:
             create_plan(arguments.path, arguments.all)
+        return 0
+    if arguments.command == "bundle":
+        create_bundle(arguments.path, arguments.directory, arguments.producer_version)
+        return 0
+    if arguments.command == "verify-bundle":
+        verify_bundle(arguments.path)
         return 0
     plan = load_plan(arguments.path)
     if arguments.command == "validate":
@@ -503,7 +673,7 @@ def main() -> int:
         selected = matrix(plan, arguments.work, arguments.family)
         emit_line("all" if selected == "all" else json.dumps(selected, separators=(",", ":")))
     elif arguments.command == "verify-checkout":
-        verify_checkout(arguments.path)
+        verify_checkout(arguments.path, plan)
     return 0
 
 

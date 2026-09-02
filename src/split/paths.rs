@@ -3,6 +3,7 @@
 use crate::error::{GitError, RailError, RailResult};
 use crate::git::SystemGit;
 use crate::utils;
+use glob::Pattern;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -18,6 +19,8 @@ pub struct SplitPathCapabilities {
     temporary_root: PathBuf,
     crate_roots: Vec<PathBuf>,
     asset_paths: Vec<PathBuf>,
+    asset_includes: Vec<Pattern>,
+    asset_excludes: Vec<Pattern>,
 }
 
 impl SplitPathCapabilities {
@@ -81,6 +84,8 @@ impl SplitPathCapabilities {
             temporary_root,
             crate_roots,
             asset_paths: Vec::new(),
+            asset_includes: Vec::new(),
+            asset_excludes: Vec::new(),
         })
     }
 
@@ -102,6 +107,60 @@ impl SplitPathCapabilities {
         resolved.dedup();
         self.asset_paths = resolved;
         Ok(self)
+    }
+
+    /// Bind the stable configured asset selectors independently of the files
+    /// that happen to match them in the current checkout. Historical add,
+    /// delete, and rename commits must be authorized by policy, not by today's
+    /// resolved file list.
+    pub(crate) fn with_asset_policy(mut self, include: &[String], exclude: &[String]) -> RailResult<Self> {
+        let compile = |values: &[String]| {
+            values
+                .iter()
+                .map(|value| {
+                    Pattern::new(value)
+                        .map_err(|error| RailError::message(format!("invalid split asset glob '{value}': {error}")))
+                })
+                .collect::<RailResult<Vec<_>>>()
+        };
+        self.asset_includes = compile(include)?;
+        self.asset_excludes = compile(exclude)?;
+        Ok(self)
+    }
+
+    /// Whether one repository-relative source path is owned by the stable
+    /// Cargo-root or explicit-asset policy. This intentionally does not require
+    /// the path to exist in the current worktree.
+    pub(crate) fn owns_source_path(&self, path: &Path) -> RailResult<bool> {
+        let relative = self.logical_source_relative(path)?;
+        let absolute = self.source_workspace.join(&relative);
+        if self.crate_roots.iter().any(|root| absolute.starts_with(root)) {
+            return Ok(true);
+        }
+        Ok(self.asset_policy_matches(&relative))
+    }
+
+    /// Whether a repository-relative path is owned specifically by the stable
+    /// non-Cargo asset selectors.
+    pub(crate) fn owns_asset_path(&self, path: &Path) -> RailResult<bool> {
+        let relative = self.logical_source_relative(path)?;
+        Ok(self.asset_policy_matches(&relative))
+    }
+
+    fn asset_policy_matches(&self, relative: &Path) -> bool {
+        let path = utils::path_to_git_format(relative);
+        self.asset_includes.iter().any(|pattern| pattern.matches(&path))
+            && !self.asset_excludes.iter().any(|pattern| pattern.matches(&path))
+    }
+
+    fn logical_source_relative(&self, path: &Path) -> RailResult<PathBuf> {
+        let relative = if path.is_absolute() {
+            path.strip_prefix(&self.source_workspace)
+                .map_err(|_| boundary_error("split source path", path, "is outside the authorized source workspace"))?
+        } else {
+            path
+        };
+        Ok(crate::source::RepositoryPath::new(relative)?.as_path().to_path_buf())
     }
 
     /// Canonical source workspace root.
@@ -156,7 +215,10 @@ impl SplitPathCapabilities {
     /// Validate a possibly new source-workspace path immediately before mutation.
     pub fn authorize_source_mutation(&self, path: &Path) -> RailResult<PathBuf> {
         let resolved = self.logical_source_mutation_path(path)?;
-        if self.crate_roots.iter().any(|root| resolved.starts_with(root)) || self.asset_paths.contains(&resolved) {
+        if self.crate_roots.iter().any(|root| resolved.starts_with(root))
+            || self.asset_paths.contains(&resolved)
+            || self.owns_asset_path(path)?
+        {
             return Ok(resolved);
         }
         Err(boundary_error(

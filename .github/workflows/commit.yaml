@@ -55,12 +55,13 @@ jobs:
           install-nextest: "false"
           native-cache-url: ${{ env.CARGO_RAIL_CACHE_URL }}
           native-cache-mode: read-write
-          native-cache-credentials-ready: ${{ env.CARGO_RAIL_CACHE_URL == '' || (secrets.CARGO_RAIL_R2_ACCESS_KEY_ID != '' && secrets.CARGO_RAIL_R2_SECRET_ACCESS_KEY != '') }}
+          native-cache-access-key-id: ${{ env.CARGO_RAIL_CACHE_URL != '' && secrets.CARGO_RAIL_R2_ACCESS_KEY_ID || '' }}
+          native-cache-secret-access-key: ${{ env.CARGO_RAIL_CACHE_URL != '' && secrets.CARGO_RAIL_R2_SECRET_ACCESS_KEY || '' }}
 
       - name: Build named-work planner
         env:
-          AWS_ACCESS_KEY_ID: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && secrets.CARGO_RAIL_R2_ACCESS_KEY_ID || '' }}
-          AWS_SECRET_ACCESS_KEY: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && secrets.CARGO_RAIL_R2_SECRET_ACCESS_KEY || '' }}
+          AWS_ACCESS_KEY_ID: ${{ env.CARGO_RAIL_CACHE_URL != '' && secrets.CARGO_RAIL_R2_ACCESS_KEY_ID || '' }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.CARGO_RAIL_CACHE_URL != '' && secrets.CARGO_RAIL_R2_SECRET_ACCESS_KEY || '' }}
           AWS_EC2_METADATA_DISABLED: "true"
         run: cargo build --locked --bin cargo-rail
 
@@ -69,7 +70,17 @@ jobs:
         env:
           CARGO_RAIL_BIN: target/debug/cargo-rail
           RAIL_SINCE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          RAIL_OBJECT_HEAD: ${{ github.sha }}
         run: scripts/plan/read.py create target/plan-v8.json
+
+      - name: Bundle portable plan verifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          producer_version="$(target/debug/cargo-rail --version)"
+          producer_version="${producer_version##* }"
+          scripts/plan/read.py bundle target/plan-v8.json target --producer-version "$producer_version"
+          python3 target/plan-read.py verify-bundle target/plan-bundle-v1.json
 
       - name: Export plan projections
         id: outputs
@@ -90,7 +101,8 @@ jobs:
           name: cargo-rail-plan-v8
           path: |
             target/plan-v8.json
-            target/debug/cargo-rail
+            target/plan-read.py
+            target/plan-bundle-v1.json
           retention-days: 7
           if-no-files-found: error
 
@@ -126,7 +138,8 @@ jobs:
           install-nextest: "true"
           native-cache-url: ${{ env.CARGO_RAIL_CACHE_URL }}
           native-cache-mode: read-write
-          native-cache-credentials-ready: ${{ env.CARGO_RAIL_CACHE_URL == '' || (secrets.CARGO_RAIL_R2_ACCESS_KEY_ID != '' && secrets.CARGO_RAIL_R2_SECRET_ACCESS_KEY != '') }}
+          native-cache-access-key-id: ${{ env.CARGO_RAIL_CACHE_URL != '' && secrets.CARGO_RAIL_R2_ACCESS_KEY_ID || '' }}
+          native-cache-secret-access-key: ${{ env.CARGO_RAIL_CACHE_URL != '' && secrets.CARGO_RAIL_R2_SECRET_ACCESS_KEY || '' }}
 
       - name: Download exact plan
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -146,16 +159,16 @@ jobs:
       - name: Quality checks
         env:
           CARGO_RAIL_PLAN_FILE: target/plan-v8.json
-          AWS_ACCESS_KEY_ID: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && secrets.CARGO_RAIL_R2_ACCESS_KEY_ID || '' }}
-          AWS_SECRET_ACCESS_KEY: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && secrets.CARGO_RAIL_R2_SECRET_ACCESS_KEY || '' }}
+          AWS_ACCESS_KEY_ID: ${{ env.CARGO_RAIL_CACHE_URL != '' && secrets.CARGO_RAIL_R2_ACCESS_KEY_ID || '' }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.CARGO_RAIL_CACHE_URL != '' && secrets.CARGO_RAIL_R2_SECRET_ACCESS_KEY || '' }}
           AWS_EC2_METADATA_DISABLED: "true"
         run: just quality-affected
 
       - name: Exact compiler fact driver
         if: contains(fromJSON(needs.plan.outputs.required-work), 'compiler-fact-driver')
         env:
-          AWS_ACCESS_KEY_ID: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && secrets.CARGO_RAIL_R2_ACCESS_KEY_ID || '' }}
-          AWS_SECRET_ACCESS_KEY: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && secrets.CARGO_RAIL_R2_SECRET_ACCESS_KEY || '' }}
+          AWS_ACCESS_KEY_ID: ${{ env.CARGO_RAIL_CACHE_URL != '' && secrets.CARGO_RAIL_R2_ACCESS_KEY_ID || '' }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.CARGO_RAIL_CACHE_URL != '' && secrets.CARGO_RAIL_R2_SECRET_ACCESS_KEY || '' }}
           AWS_EC2_METADATA_DISABLED: "true"
         run: |
           rustup component add rustc-dev --toolchain "$RUSTUP_TOOLCHAIN"
@@ -186,7 +199,8 @@ jobs:
           install-nextest: "true"
           native-cache-url: ${{ env.CARGO_RAIL_CACHE_URL }}
           native-cache-mode: read-write
-          native-cache-credentials-ready: ${{ env.CARGO_RAIL_CACHE_URL == '' || (secrets.CARGO_RAIL_R2_ACCESS_KEY_ID != '' && secrets.CARGO_RAIL_R2_SECRET_ACCESS_KEY != '') }}
+          native-cache-access-key-id: ${{ env.CARGO_RAIL_CACHE_URL != '' && secrets.CARGO_RAIL_R2_ACCESS_KEY_ID || '' }}
+          native-cache-secret-access-key: ${{ env.CARGO_RAIL_CACHE_URL != '' && secrets.CARGO_RAIL_R2_SECRET_ACCESS_KEY || '' }}
 
       - name: Download exact plan
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -200,8 +214,8 @@ jobs:
       - name: Execute required Cargo work
         env:
           CARGO_RAIL_PLAN_FILE: target/plan-v8.json
-          AWS_ACCESS_KEY_ID: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && secrets.CARGO_RAIL_R2_ACCESS_KEY_ID || '' }}
-          AWS_SECRET_ACCESS_KEY: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && secrets.CARGO_RAIL_R2_SECRET_ACCESS_KEY || '' }}
+          AWS_ACCESS_KEY_ID: ${{ env.CARGO_RAIL_CACHE_URL != '' && secrets.CARGO_RAIL_R2_ACCESS_KEY_ID || '' }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.CARGO_RAIL_CACHE_URL != '' && secrets.CARGO_RAIL_R2_SECRET_ACCESS_KEY || '' }}
           AWS_EC2_METADATA_DISABLED: "true"
         run: |
           just build
@@ -268,7 +282,8 @@ jobs:
           cache-key: commit-surface
           native-cache-url: ${{ env.CARGO_RAIL_CACHE_URL }}
           native-cache-mode: read-write
-          native-cache-credentials-ready: ${{ env.CARGO_RAIL_CACHE_URL == '' || (secrets.CARGO_RAIL_R2_ACCESS_KEY_ID != '' && secrets.CARGO_RAIL_R2_SECRET_ACCESS_KEY != '') }}
+          native-cache-access-key-id: ${{ env.CARGO_RAIL_CACHE_URL != '' && secrets.CARGO_RAIL_R2_ACCESS_KEY_ID || '' }}
+          native-cache-secret-access-key: ${{ env.CARGO_RAIL_CACHE_URL != '' && secrets.CARGO_RAIL_R2_SECRET_ACCESS_KEY || '' }}
 
       - name: Download exact plan
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -281,8 +296,8 @@ jobs:
 
       - name: Enforce planner-selected surface
         env:
-          AWS_ACCESS_KEY_ID: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && secrets.CARGO_RAIL_R2_ACCESS_KEY_ID || '' }}
-          AWS_SECRET_ACCESS_KEY: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && secrets.CARGO_RAIL_R2_SECRET_ACCESS_KEY || '' }}
+          AWS_ACCESS_KEY_ID: ${{ env.CARGO_RAIL_CACHE_URL != '' && secrets.CARGO_RAIL_R2_ACCESS_KEY_ID || '' }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.CARGO_RAIL_CACHE_URL != '' && secrets.CARGO_RAIL_R2_SECRET_ACCESS_KEY || '' }}
           AWS_EC2_METADATA_DISABLED: "true"
         run: |
           rustup component add rustc-dev --toolchain "$RUSTUP_TOOLCHAIN"

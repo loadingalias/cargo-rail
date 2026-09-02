@@ -7,6 +7,17 @@ use crate::build_script::{
 use crate::cache::cas::{LocalCacheSelection, LocalCas};
 use crate::cargo::manifest_analyzer::ManifestAnalyzer;
 use crate::cargo::{CargoConfigSnapshot, DepKind, ToolchainIdentity};
+use crate::compiler::acquisition::journal::{
+    CompilerAcquisitionCargoTarget, CompilerAcquisitionJournal, EvidenceIdentity, FailureClass,
+};
+pub(crate) use crate::compiler::acquisition::journal::{
+    CompilerAcquisitionProduct, CompilerAcquisitionRequest, validate_compiler_acquisition_resume,
+};
+use crate::compiler::acquisition::output::{read_cargo_stderr_tail, read_cargo_stdout};
+use crate::compiler::acquisition::process::{ProcessTermination, ProcessTree};
+use crate::compiler::acquisition::runtime::{ExecutionPolicy, RuntimeState, RuntimeViewSpec};
+use crate::compiler::acquisition::sandbox::{SandboxCompatibility, SandboxLease, SandboxPool};
+use crate::compiler::analysis::AnalysisContract;
 use crate::compiler::diagnostics_store::{CompilerDiagnosticsStore, CompilerFactCacheKey};
 use crate::compiler::driver::{CompilerFactDoctestSysroot, CompilerFactDriverAuthority, PreparedCompilerFactDriver};
 use crate::compiler::fact_store::CompilerFactStore;
@@ -33,7 +44,9 @@ use crate::compiler::observation::{
     CompilerWrapperIdentity, CompilerWrapperRole, FileObservation, ObservationPath,
     attach_build_script_result_dependencies, attach_execution_identities, build_manifests, load_raw,
 };
-use crate::compiler::scheduler::{AnalysisSchedule, AnalysisView, CompilerCandidate};
+use crate::compiler::scheduler::{
+    AnalysisSchedule, CompilerAcquisitionPlan, CompilerAcquisitionView, CompilerCandidate, ViewIx,
+};
 use crate::compiler::session::{CompilerFactSession, CompilerFactTypedSession, FACT_SESSION_ENV};
 use crate::error::{RailError, RailResult, ResultExt};
 use crate::executable::{ExecutableIdentity, ToolchainExecutableIdentities};
@@ -43,18 +56,23 @@ use crate::workspace::WorkspaceSnapshot;
 use cargo_metadata::{Message, PackageId, TargetKind};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+use std::fs::{self, File};
+use std::io::{BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, ExitStatus};
+use std::sync::{Arc, atomic::AtomicBool, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
 static QUALIFICATION_CARGO_VIEWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 #[cfg(test)]
 static QUALIFICATION_COMPILER_INVOCATIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static QUALIFICATION_LIVE_CARGO_VIEWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static QUALIFICATION_MAX_LIVE_CARGO_VIEWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Compiler diagnostics collector and cache coordinator.
 pub(crate) struct CompilerDiagnosticsCollector<'a> {
@@ -64,356 +82,8 @@ pub(crate) struct CompilerDiagnosticsCollector<'a> {
     identity: CompilerCacheIdentity,
     artifact_budget: CompilerArtifactBudget,
     acquisition: Option<CompilerAcquisitionRequest>,
-}
-
-const SURFACE_ACQUISITION_CONTRACT_VERSION: u32 = 1;
-
-/// One Surface product whose policy depends on compiler acquisition.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct CompilerAcquisitionProduct {
-    pub(crate) package: String,
-    pub(crate) cargo_target: String,
-    pub(crate) kind: String,
-}
-
-/// Stable inputs needed to journal and resume one Surface acquisition.
-#[derive(Debug, Clone)]
-pub(crate) struct CompilerAcquisitionRequest {
-    pub(crate) snapshot_identity: String,
-    pub(crate) configuration_fingerprint: String,
-    pub(crate) products: Vec<CompilerAcquisitionProduct>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CompilerAcquisitionHeader {
-    record: String,
-    surface_acquisition_contract_version: u32,
-    acquisition_identity: String,
-    snapshot_identity: String,
-    configuration_fingerprint: String,
-    manifest: String,
-    resume_command: Vec<String>,
-    concurrency: usize,
-    artifact_soft_limit_bytes: u64,
-    artifact_hard_limit_bytes: u64,
-    cancellation: String,
-    interruption: String,
-    products: Vec<CompilerAcquisitionProduct>,
-    views: usize,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct CompilerAcquisitionViewRecord<'a> {
-    record: &'static str,
-    acquisition_identity: &'a str,
-    ordinal: usize,
-    view_identity: String,
-    status: &'static str,
-    selected_products: Vec<CompilerAcquisitionProduct>,
-    packages: &'a BTreeSet<String>,
-    cargo_targets: Vec<CompilerAcquisitionCargoTarget>,
-    feature_profile: String,
-    target_triple: &'a str,
-    command_class: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-struct CompilerAcquisitionCargoTarget {
-    package: String,
-    target: String,
-    kinds: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct CompilerAcquisitionSummary<'a> {
-    record: &'static str,
-    acquisition_identity: &'a str,
-    state: &'static str,
-    planned: usize,
-    reused: usize,
-    completed: usize,
-    failed: usize,
-    not_started: usize,
-    manifest: &'a str,
-    resume_command: &'a [String],
-}
-
-struct CompilerAcquisitionJournal {
-    path: PathBuf,
-    display_path: String,
-    header: CompilerAcquisitionHeader,
-    writer: File,
-    views: Vec<AnalysisView>,
-    status: Vec<&'static str>,
-}
-
-impl CompilerAcquisitionJournal {
-    fn begin(
-        workspace_root: &Path,
-        request: &CompilerAcquisitionRequest,
-        schedule: &AnalysisSchedule,
-        budget: CompilerArtifactBudget,
-    ) -> RailResult<Self> {
-        let mut views = schedule.views().to_vec();
-        views.sort_by(analysis_view_execution_order);
-        let identity_bytes = serde_json::to_vec(&(
-            &request.snapshot_identity,
-            &request.configuration_fingerprint,
-            views
-                .iter()
-                .map(|view| {
-                    (
-                        view.command_class(),
-                        view.platform(),
-                        view.features(),
-                        view.packages(),
-                        view.fact_families(),
-                    )
-                })
-                .collect::<Vec<_>>(),
-        ))?;
-        let acquisition_identity = format!(
-            "surface-acquisition-v1-sha256-{}",
-            ContentDigest::sha256(&identity_bytes)
-        );
-        let directory = crate::workspace::cargo_rail_state_root(workspace_root).join("surface-acquisitions-v1");
-        fs::create_dir_all(&directory).map_err(|error| {
-            RailError::message(format!(
-                "failed to create Surface acquisition journal directory '{}': {error}",
-                directory.display()
-            ))
-        })?;
-        let directory = crate::utils::canonicalize_existing(&directory)?;
-        let path = directory.join(format!("{acquisition_identity}.jsonl"));
-        let display_path = path
-            .strip_prefix(workspace_root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        let resume_command = vec![
-            "cargo".to_string(),
-            "rail".to_string(),
-            "surface".to_string(),
-            "--resume".to_string(),
-            display_path.clone(),
-            "--format".to_string(),
-            "json".to_string(),
-        ];
-        let header = CompilerAcquisitionHeader {
-            record: "manifest".to_string(),
-            surface_acquisition_contract_version: SURFACE_ACQUISITION_CONTRACT_VERSION,
-            acquisition_identity,
-            snapshot_identity: request.snapshot_identity.clone(),
-            configuration_fingerprint: request.configuration_fingerprint.clone(),
-            manifest: display_path.clone(),
-            resume_command,
-            concurrency: 1,
-            artifact_soft_limit_bytes: budget.soft_limit_bytes,
-            artifact_hard_limit_bytes: budget.hard_limit_bytes,
-            cancellation: "the active Cargo child is terminated before command return".to_string(),
-            interruption: "replay this journal, recapture the workspace, and trust only exact complete fact objects"
-                .to_string(),
-            products: request.products.clone(),
-            views: views.len(),
-        };
-
-        let mut initial = Vec::new();
-        serde_json::to_writer(&mut initial, &header)?;
-        initial.push(b'\n');
-        for (ordinal, view) in views.iter().enumerate() {
-            serde_json::to_writer(
-                &mut initial,
-                &Self::view_record(&header, ordinal, view, "planned", Vec::new(), None)?,
-            )?;
-            initial.push(b'\n');
-        }
-        crate::utils::write_file_atomic(&path, &initial)?;
-        let writer = OpenOptions::new().append(true).open(&path).map_err(|error| {
-            RailError::message(format!(
-                "failed to open Surface acquisition journal '{}': {error}",
-                path.display()
-            ))
-        })?;
-        progress!("  Surface acquisition manifest: {display_path}");
-        Ok(Self {
-            path,
-            display_path,
-            header,
-            writer,
-            status: vec!["planned"; views.len()],
-            views,
-        })
-    }
-
-    fn view_record<'a>(
-        header: &'a CompilerAcquisitionHeader,
-        ordinal: usize,
-        view: &'a AnalysisView,
-        status: &'static str,
-        cargo_targets: Vec<CompilerAcquisitionCargoTarget>,
-        error: Option<String>,
-    ) -> RailResult<CompilerAcquisitionViewRecord<'a>> {
-        let view_bytes = serde_json::to_vec(&(
-            view.command_class(),
-            view.platform(),
-            view.features(),
-            view.packages(),
-            view.fact_families(),
-        ))?;
-        let matching_targets = cargo_targets.iter().collect::<BTreeSet<_>>();
-        let selected_products = header
-            .products
-            .iter()
-            .filter(|product| {
-                view.packages().contains(&product.package)
-                    && (matching_targets.is_empty()
-                        || matching_targets.iter().any(|cargo_target| {
-                            (&cargo_target.package, &cargo_target.target) == (&product.package, &product.cargo_target)
-                        }))
-            })
-            .cloned()
-            .collect();
-        Ok(CompilerAcquisitionViewRecord {
-            record: "view",
-            acquisition_identity: &header.acquisition_identity,
-            ordinal,
-            view_identity: format!("compiler-view-v1-sha256-{}", ContentDigest::sha256(&view_bytes)),
-            status,
-            selected_products,
-            packages: view.packages(),
-            cargo_targets,
-            feature_profile: view.features().label(),
-            target_triple: view.platform().as_str(),
-            command_class: view.command_class(),
-            error,
-        })
-    }
-
-    fn transition(
-        &mut self,
-        ordinal: usize,
-        status: &'static str,
-        cargo_targets: Vec<CompilerAcquisitionCargoTarget>,
-        error: Option<String>,
-    ) -> RailResult<()> {
-        let view = self
-            .views
-            .get(ordinal)
-            .ok_or_else(|| RailError::message("Surface acquisition journal ordinal is out of bounds"))?;
-        self.status[ordinal] = status;
-        serde_json::to_writer(
-            &mut self.writer,
-            &Self::view_record(&self.header, ordinal, view, status, cargo_targets, error)?,
-        )?;
-        self.writer.write_all(b"\n").map_err(RailError::from)?;
-        self.writer.flush().map_err(RailError::from)
-    }
-
-    fn finish(&mut self, state: &'static str) -> RailResult<()> {
-        let count = |status| self.status.iter().filter(|candidate| **candidate == status).count();
-        let summary = CompilerAcquisitionSummary {
-            record: "summary",
-            acquisition_identity: &self.header.acquisition_identity,
-            state,
-            planned: count("planned"),
-            reused: count("reused"),
-            completed: count("completed"),
-            failed: count("failed"),
-            not_started: count("not-started"),
-            manifest: &self.display_path,
-            resume_command: &self.header.resume_command,
-        };
-        serde_json::to_writer(&mut self.writer, &summary)?;
-        self.writer.write_all(b"\n").map_err(RailError::from)?;
-        self.writer.sync_all().map_err(RailError::from)
-    }
-
-    fn fail(
-        &mut self,
-        ordinal: usize,
-        cargo_targets: Vec<CompilerAcquisitionCargoTarget>,
-        error: &RailError,
-    ) -> RailResult<()> {
-        self.transition(ordinal, "failed", cargo_targets, Some(error.to_string()))?;
-        for next in (ordinal + 1)..self.views.len() {
-            if self.status[next] == "planned" {
-                self.transition(next, "not-started", Vec::new(), None)?;
-            }
-        }
-        self.finish("partial")
-    }
-
-    fn resume_help(&self) -> String {
-        format!(
-            "resume with '{}' after correcting the source failure; Cargo-Rail will recapture the workspace and reuse only exact complete facts",
-            self.header.resume_command.join(" ")
-        )
-    }
-}
-
-/// Validate that a requested resume journal belongs to this workspace and
-/// still names the same effective Surface configuration.
-pub(crate) fn validate_compiler_acquisition_resume(
-    workspace_root: &Path,
-    path: &Path,
-    configuration_fingerprint: &str,
-) -> RailResult<()> {
-    let expected_directory = crate::workspace::cargo_rail_state_root(workspace_root).join("surface-acquisitions-v1");
-    let expected_directory = crate::utils::canonicalize_existing(&expected_directory).map_err(|error| {
-        RailError::with_help(
-            format!("the workspace has no Surface acquisition journal directory: {error}"),
-            "run 'cargo rail surface' once without --resume to create an acquisition manifest",
-        )
-    })?;
-    let candidate = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        workspace_root.join(path)
-    };
-    let metadata = fs::symlink_metadata(&candidate).map_err(|error| {
-        RailError::message(format!(
-            "failed to inspect Surface acquisition manifest '{}': {error}",
-            candidate.display()
-        ))
-    })?;
-    if !metadata.is_file() || crate::utils::is_symlink_or_reparse(&metadata) {
-        return Err(RailError::message(format!(
-            "Surface acquisition manifest '{}' is not a real regular file",
-            candidate.display()
-        )));
-    }
-    let candidate = crate::utils::canonicalize_existing(&candidate)?;
-    if !candidate.starts_with(&expected_directory) {
-        return Err(RailError::message(format!(
-            "Surface acquisition manifest '{}' is outside the current workspace's journal authority",
-            candidate.display()
-        )));
-    }
-    let file = File::open(&candidate).map_err(RailError::from)?;
-    let first = BufReader::new(file)
-        .lines()
-        .next()
-        .transpose()
-        .map_err(RailError::from)?
-        .ok_or_else(|| RailError::message("Surface acquisition manifest is empty"))?;
-    let header: CompilerAcquisitionHeader = serde_json::from_str(&first)?;
-    if header.record != "manifest"
-        || header.surface_acquisition_contract_version != SURFACE_ACQUISITION_CONTRACT_VERSION
-    {
-        return Err(RailError::message(
-            "Surface acquisition manifest has an unsupported contract",
-        ));
-    }
-    if header.configuration_fingerprint != configuration_fingerprint {
-        return Err(RailError::with_help(
-            "Surface acquisition resume configuration differs from the planned acquisition",
-            "rerun 'cargo rail surface' without --resume to plan the changed configuration",
-        ));
-    }
-    Ok(())
+    #[cfg(test)]
+    execution_policy: Option<ExecutionPolicy>,
 }
 
 /// Storage authority for the command-owned Cargo working set shared across evidence views.
@@ -460,182 +130,34 @@ pub(crate) struct CompilerAnalysisMetrics {
     pub(crate) fresh_fragment_bytes: u64,
     pub(crate) retained_fact_object_bytes: u64,
     pub(crate) artifact_high_water_bytes: u64,
-    pub(crate) artifact_views_reclaimed: usize,
-}
-
-struct CompilerArtifactAuthority {
-    root: PathBuf,
-    budget: CompilerArtifactBudget,
-    _workspace_lock: crate::cache::WorkspaceCacheLock,
-}
-
-const CARGO_CACHE_DIRECTORY_TAG: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55\n\
-# This file is a cache directory tag created by cargo.\n\
-# For information about cache directory tags see https://bford.info/cachedir/\n";
-
-fn ensure_compiler_artifact_root(root: &Path) -> RailResult<()> {
-    match fs::symlink_metadata(root) {
-        Ok(metadata) if metadata.is_dir() && !crate::utils::is_symlink_or_reparse(&metadata) => {}
-        Ok(_) => {
-            return Err(RailError::with_help(
-                format!("compiler artifact root '{}' is not a real directory", root.display()),
-                "remove the hostile path; cargo-rail will not follow compiler artifact links",
-            ));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir(root)?,
-        Err(error) => return Err(error.into()),
-    }
-    fs::write(root.join("CACHEDIR.TAG"), CARGO_CACHE_DIRECTORY_TAG)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
-}
-
-impl CompilerArtifactAuthority {
-    fn prepare(workspace_root: &Path, budget: CompilerArtifactBudget, planned_views: usize) -> RailResult<Self> {
-        let workspace_lock = crate::cache::lock_workspace(workspace_root)?;
-        let state_root = crate::workspace::cargo_rail_state_root(workspace_root);
-        let state_root = crate::utils::canonicalize_existing(&state_root)?;
-        let root = state_root.join("compiler-artifacts-v1");
-        match fs::symlink_metadata(&root) {
-            Ok(metadata) if metadata.is_dir() && !crate::utils::is_symlink_or_reparse(&metadata) => {
-                fs::remove_dir_all(&root)?;
-            }
-            Ok(_) => {
-                return Err(RailError::with_help(
-                    format!("compiler artifact root '{}' is not a real directory", root.display()),
-                    "remove the hostile path; cargo-rail will not follow compiler artifact links",
-                ));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        ensure_compiler_artifact_root(&root)?;
-        progress!(
-            "  Compiler artifact working set: {} ({} planned views; reused across feature views; 0 bytes current; {} bytes soft; {} bytes hard; target artifacts reclaimed after authenticated evidence)",
-            root.display(),
-            planned_views,
-            budget.soft_limit_bytes,
-            budget.hard_limit_bytes,
-        );
-        Ok(Self {
-            root,
-            budget,
-            _workspace_lock: workspace_lock,
-        })
-    }
-
-    fn target_dir(&self) -> &Path {
-        &self.root
-    }
-}
-
-impl Drop for CompilerArtifactAuthority {
-    fn drop(&mut self) {
-        drop(fs::remove_dir_all(&self.root));
-    }
-}
-
-fn reclaim_compiler_artifact_target(
-    metrics: &mut CompilerAnalysisMetrics,
-    workspace_root: &Path,
-    cargo_program: &OsStr,
-    authority: &CompilerArtifactAuthority,
-    target: &str,
-) -> RailResult<()> {
-    let before = compiler_artifact_bytes(authority.target_dir())?;
-    metrics.artifact_high_water_bytes = metrics.artifact_high_water_bytes.max(before);
-    if before > authority.budget.hard_limit_bytes {
-        return Err(RailError::with_help(
-            format!(
-                "compiler artifact working set reached {before} bytes and exceeded its {}-byte hard limit",
-                authority.budget.hard_limit_bytes
-            ),
-            "increase unify.compiler_artifact_hard_limit_bytes only after verifying the workspace's required target working set",
-        ));
-    }
-
-    if target == "default" {
-        progress!(
-            "    Compiler artifacts: {before} bytes retained for the default target; {} bytes high-water",
-            metrics.artifact_high_water_bytes
-        );
-        return Ok(());
-    }
-
-    let mut command = Command::new(cargo_program);
-    command
-        .current_dir(workspace_root)
-        .arg("clean")
-        .arg("--target")
-        .arg(target)
-        .arg("--target-dir")
-        .arg(authority.target_dir())
-        .env_remove("CARGO_TARGET_DIR")
-        .env_remove("RUSTC_WRAPPER")
-        .env_remove("RUSTC_WORKSPACE_WRAPPER")
-        .env_remove("RUSTDOC");
-    crate::remote_cache::scrub_child_environment(&mut command);
-    let output = command
-        .output()
-        .with_context(|| format!("reclaiming compiler artifacts for target '{target}'"))?;
-    if !output.status.success() {
-        return Err(RailError::message(format!(
-            "failed to reclaim compiler artifacts for target '{target}' with status {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-
-    // Cargo may remove an otherwise empty target directory after cleaning its
-    // final recognized slice. Re-establish the command-owned root and marker
-    // before measuring or advancing to the next target.
-    ensure_compiler_artifact_root(authority.target_dir())?;
-    let after = compiler_artifact_bytes(authority.target_dir())?;
-    if after > authority.budget.hard_limit_bytes {
-        return Err(RailError::with_help(
-            format!(
-                "compiler artifact working set retained {after} bytes after cleaning target '{target}' and exceeded its {}-byte hard limit",
-                authority.budget.hard_limit_bytes
-            ),
-            "increase unify.compiler_artifact_hard_limit_bytes only after verifying the workspace's required shared host working set",
-        ));
-    }
-    metrics.artifact_views_reclaimed = metrics.artifact_views_reclaimed.saturating_add(1);
-    progress!(
-        "    Compiler artifacts: {} bytes reclaimed for target '{target}'; {} bytes retained; {} bytes high-water",
-        before.saturating_sub(after),
-        after,
-        metrics.artifact_high_water_bytes,
-    );
-    Ok(())
 }
 
 fn compiler_artifact_bytes(root: &Path) -> RailResult<u64> {
-    let mut bytes = 0_u64;
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(path) = pending.pop() {
-        let metadata = fs::symlink_metadata(&path)?;
-        if metadata.is_dir() && !crate::utils::is_symlink_or_reparse(&metadata) {
-            for entry in fs::read_dir(&path)? {
-                pending.push(entry?.path());
+    let started = crate::instrumentation::compiler_acquisition_timer();
+    let result = (|| {
+        let mut bytes = 0_u64;
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(path) = pending.pop() {
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.is_dir() && !crate::utils::is_symlink_or_reparse(&metadata) {
+                for entry in fs::read_dir(&path)? {
+                    pending.push(entry?.path());
+                }
+            } else if metadata.is_file() && !crate::utils::is_symlink_or_reparse(&metadata) {
+                bytes = bytes
+                    .checked_add(metadata.len())
+                    .ok_or_else(|| RailError::message("compiler artifact byte count overflow"))?;
+            } else {
+                return Err(RailError::message(format!(
+                    "compiler artifact view contains unsupported path '{}'",
+                    path.display()
+                )));
             }
-        } else if metadata.is_file() && !crate::utils::is_symlink_or_reparse(&metadata) {
-            bytes = bytes
-                .checked_add(metadata.len())
-                .ok_or_else(|| RailError::message("compiler artifact byte count overflow"))?;
-        } else {
-            return Err(RailError::message(format!(
-                "compiler artifact view contains unsupported path '{}'",
-                path.display()
-            )));
         }
-    }
-    Ok(bytes)
+        Ok(bytes)
+    })();
+    crate::instrumentation::record_compiler_acquisition_artifact_tree_walk(started);
+    result
 }
 
 /// Exact snapshot-derived inputs shared by every compiler-evidence key.
@@ -652,6 +174,7 @@ pub(crate) struct CompilerCacheIdentity {
     cargo_program: OsString,
     rustc_program: OsString,
     rustdoc_program: OsString,
+    rustc_wrapper: Option<OsString>,
     rustc_workspace_wrapper: Option<OsString>,
     manifest_fingerprints: HashMap<PackageId, String>,
     source_fingerprints: HashMap<PackageId, String>,
@@ -663,8 +186,21 @@ pub(crate) struct CompilerCacheIdentity {
     rustc_executable: ExecutableIdentity,
     wrapper_chain: Vec<CompilerWrapperIdentity>,
     cache_wrapper: CompilerCacheWrapperMetadata,
+    analysis_cache: Option<CompilerAnalysisCache>,
+    explicit_build_jobs: Option<usize>,
     executable_bypasses: BTreeSet<String>,
     cache_bypass_reason: Option<CompilerCacheBypass>,
+}
+
+/// One installed local-cache domain held stable for a complete compiler
+/// analysis. Native wrappers independently validate the same profile before
+/// using it; retaining this authority prevents publication from drifting to a
+/// different profile generation between compiler invocations.
+#[derive(Debug, Clone)]
+struct CompilerAnalysisCache {
+    cas: LocalCas,
+    remote: Option<std::sync::Arc<crate::remote_cache::RemoteStore>>,
+    _selection: crate::cache::installation::InstalledLocalSelection,
 }
 
 #[derive(Debug, Clone)]
@@ -824,6 +360,7 @@ impl CompilerCacheIdentity {
         let cargo_program = snapshot.toolchain().cargo_program().to_owned();
         let rustc_program = snapshot.toolchain().rustc_program().to_owned();
         let rustdoc_program = snapshot.toolchain().rustdoc_program().to_owned();
+        let rustc_wrapper = snapshot.toolchain().rustc_wrapper_program().map(OsString::from);
         let rustc_workspace_wrapper = snapshot
             .toolchain()
             .rustc_workspace_wrapper_program()
@@ -849,11 +386,22 @@ impl CompilerCacheIdentity {
                 "remove cargo-rail from RUSTC_WRAPPER and RUSTC_WORKSPACE_WRAPPER; diagnostics injection is automatic",
             ));
         }
-        let mut executable_bypasses = executables.limitations().map(str::to_string).collect::<BTreeSet<_>>();
-        executable_bypasses.extend(
-            cargo_rail_executable
-                .limitations()
-                .map(|limitation| format!("compiler_wrapper_{limitation}")),
+        let verified_installed_rustc_wrapper = rustc_wrapper
+            .as_deref()
+            .and_then(|selection| {
+                crate::cache::installation::verified_installed_wrapper_digest(selection, snapshot.source_root())
+                    .ok()
+                    .flatten()
+            })
+            .is_some_and(|digest| {
+                executables
+                    .rustc_wrapper()
+                    .is_some_and(|wrapper| wrapper.content_digest() == digest)
+            });
+        let executable_bypasses = compiler_evidence_executable_bypasses(
+            executables,
+            &cargo_rail_executable,
+            verified_installed_rustc_wrapper,
         );
         let mut wrapper_chain = Vec::with_capacity(4);
         wrapper_chain.extend(
@@ -876,6 +424,29 @@ impl CompilerCacheIdentity {
             CompilerCacheWrapperStatus::Disabled,
             "transparent_cache_owned_by_cargo_configuration",
         );
+        let analysis_cache = crate::compiler::capability::host_is_qualified()
+            .then(|| {
+                crate::cache::installation::installed_local(snapshot.source_root())
+                    .ok()
+                    .flatten()
+            })
+            .flatten()
+            .and_then(|selection| {
+                let cas = LocalCas::open_initialized_selected(selection.cache()).ok()?;
+                let remote =
+                    crate::remote_cache::RemoteCacheSelection::from_environment_or_installed(selection.remote())
+                        .ok()
+                        .flatten()
+                        .filter(crate::remote_cache::RemoteCacheSelection::direct_transport_supported)
+                        .and_then(|remote| crate::remote_cache::RemoteStore::connect(&remote, None).ok())
+                        .map(std::sync::Arc::new);
+                Some(CompilerAnalysisCache {
+                    cas,
+                    remote,
+                    _selection: selection,
+                })
+            });
+        let explicit_build_jobs = snapshot.cargo_config().explicit_build_jobs();
 
         Ok(Self {
             rustc_version,
@@ -889,6 +460,7 @@ impl CompilerCacheIdentity {
             cargo_program,
             rustc_program,
             rustdoc_program,
+            rustc_wrapper,
             rustc_workspace_wrapper,
             manifest_fingerprints,
             source_fingerprints,
@@ -900,6 +472,8 @@ impl CompilerCacheIdentity {
             rustc_executable,
             wrapper_chain,
             cache_wrapper,
+            analysis_cache,
+            explicit_build_jobs,
             executable_bypasses,
             cache_bypass_reason,
         })
@@ -919,6 +493,26 @@ impl CompilerCacheIdentity {
             ));
         }
         Ok(wrapper.executable())
+    }
+
+    fn acquisition_compiler_set_identity(&self) -> RailResult<String> {
+        let local_compiler_set = crate::compiler::capability::local_compiler_set_identity()?;
+        let targets = self
+            .target_fingerprints
+            .iter()
+            .map(|(target, identity)| (target.as_str(), identity.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        let bytes = serde_json::to_vec(&(
+            &self.rustc_version,
+            &self.cargo_version,
+            &self.host_triple,
+            &self.toolchain_fingerprint,
+            targets,
+            &self.compiler_env_fingerprint,
+            &self.cargo_config_fingerprint,
+            local_compiler_set,
+        ))?;
+        Ok(format!("compiler-set-v2-sha256-{}", ContentDigest::sha256(&bytes)))
     }
 }
 
@@ -1142,6 +736,8 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
             identity: identity.clone(),
             artifact_budget: CompilerArtifactBudget::default(),
             acquisition: None,
+            #[cfg(test)]
+            execution_policy: None,
         }
     }
 
@@ -1152,6 +748,12 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
 
     pub(crate) fn with_acquisition_manifest(mut self, request: CompilerAcquisitionRequest) -> Self {
         self.acquisition = Some(request);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_execution_policy(mut self, policy: ExecutionPolicy) -> Self {
+        self.execution_policy = Some(policy);
         self
     }
 
@@ -1210,11 +812,25 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
             doctest_packages,
             features,
         )?;
+        let plan_started = crate::instrumentation::compiler_acquisition_timer();
+        let plan = CompilerAcquisitionPlan::from_schedule(&schedule, candidates, &self.targets)?;
+        crate::instrumentation::record_compiler_acquisition_plan(
+            plan_started,
+            plan.identity().as_str(),
+            plan.package_count(),
+            plan.target_count(),
+            plan.feature_count(),
+            plan.candidate_count(),
+            plan.view_count(),
+        );
         let mut metrics = CompilerAnalysisMetrics {
-            analysis_views: schedule.views().len(),
+            analysis_views: plan.view_count(),
             ..CompilerAnalysisMetrics::default()
         };
-        let members = schedule.packages().iter().map(String::as_str).collect::<HashSet<_>>();
+        let members = plan
+            .views()
+            .map(CompilerAcquisitionView::package)
+            .collect::<HashSet<_>>();
         if members.is_empty() {
             return Ok(CompilerAnalysisEvidence {
                 diagnostics: HashMap::new(),
@@ -1222,13 +838,20 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                 metrics,
             });
         }
-        let mut acquisition_journal = self
-            .acquisition
-            .as_ref()
-            .map(|request| {
-                CompilerAcquisitionJournal::begin(self.workspace_root, request, &schedule, self.artifact_budget)
-            })
-            .transpose()?;
+        let derived_policy = ExecutionPolicy::derive(
+            plan.view_count(),
+            self.identity.analysis_cache.is_some(),
+            self.identity.explicit_build_jobs,
+        );
+        #[cfg(test)]
+        let execution_policy = self.execution_policy.unwrap_or(derived_policy);
+        #[cfg(not(test))]
+        let execution_policy = derived_policy;
+        crate::instrumentation::record_compiler_acquisition_execution_policy(
+            execution_policy.process_slots(),
+            execution_policy.work_permits(),
+        );
+        let acquisition_request = self.acquisition.as_ref();
         let typed_snapshot = if typed_packages.is_empty() {
             None
         } else {
@@ -1241,13 +864,26 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                 CompilerFactDriverAuthority::producer_authority(snapshot, &self.identity.toolchain_fingerprint)
             })
             .transpose()?;
-        let artifact_authority =
-            CompilerArtifactAuthority::prepare(self.workspace_root, self.artifact_budget, schedule.views().len())?;
+        let mut sandbox_pool = SandboxPool::prepare(self.workspace_root, execution_policy.sandbox_count())?;
+        progress!(
+            "  Compiler sandbox pool: {} (up to {} Cargo processes; {} work permits; {} planned views; {} bytes soft; {} bytes hard)",
+            sandbox_pool.root().display(),
+            execution_policy.process_slots(),
+            execution_policy.work_permits(),
+            plan.view_count(),
+            self.artifact_budget.soft_limit_bytes,
+            self.artifact_budget.hard_limit_bytes,
+        );
         let mut prepared_driver = None;
         let mut prepared_doctest_sysroot = None;
 
-        let mut store = CompilerDiagnosticsStore::load(self.workspace_root);
-        let fact_store = CompilerFactStore::load();
+        let remote = self
+            .identity
+            .analysis_cache
+            .as_ref()
+            .and_then(|cache| cache.remote.clone());
+        let mut store = CompilerDiagnosticsStore::load_with_remote(remote.clone());
+        let fact_store = CompilerFactStore::load_with_remote(remote);
         let package_to_member = build_package_member_index(&self.manifests.members);
         let member_ids: HashMap<&str, &PackageId> = self
             .manifests
@@ -1260,154 +896,134 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
         let mut result: HashMap<PackageId, MemberEvidence> = HashMap::with_capacity(members.len());
         let mut compiler_facts = Vec::new();
         let mut cache_by_member: HashMap<String, EvidenceCacheSummary> = HashMap::with_capacity(members.len());
-        let mut stale_by_configuration: BTreeMap<AnalysisView, Vec<&str>> = BTreeMap::new();
+        let mut stale_by_view = vec![Vec::<&str>::new(); plan.view_count()];
+        let mut typed_view = vec![false; plan.view_count()];
         let mut retained_observations = HashMap::<String, CompilationObservationManifest>::new();
         let mut surviving_unused: HashMap<String, BTreeSet<CandidateId>> = candidate_targets
             .iter()
             .map(|(member, candidates)| (member.clone(), candidates.keys().cloned().collect()))
             .collect();
 
-        for view in schedule.views() {
-            let target = view.platform().as_str();
-            let collects_diagnostics = view
-                .fact_families()
-                .contains(&crate::compiler::scheduler::CompilerFactFamily::StableDiagnostics);
-            let collects_typed = view
-                .fact_families()
-                .contains(&crate::compiler::scheduler::CompilerFactFamily::TypedRustItems);
+        for view in plan.views() {
+            let target = view.platform();
+            let features = view.features();
+            let collects_diagnostics = view.requires(crate::compiler::scheduler::CompilerFactFamily::StableDiagnostics);
+            let collects_typed = view.requires(crate::compiler::scheduler::CompilerFactFamily::TypedRustItems);
             if collects_typed {
-                stale_by_configuration.entry(view.clone()).or_default();
+                typed_view[view.index().offset()] = true;
             }
-            for member in view.packages() {
-                let member = member.as_str();
-                if !collects_diagnostics {
-                    continue;
-                }
-                let package_id = member_ids
-                    .get(member)
-                    .ok_or_else(|| RailError::message(format!("missing package identity for member '{member}'")))?;
-                let manifest = self
-                    .manifests
-                    .members
-                    .iter()
-                    .find(|manifest| manifest.package_name == member)
-                    .ok_or_else(|| RailError::message(format!("missing manifest entry for member '{member}'")))?;
-                let key = self.key_for(manifest, target, view.features().clone())?;
-                let mut cache_hit = false;
-                let observation_miss = if self.identity.cache_bypass_reason.is_none() {
-                    store.get(&key).and_then(|entry| {
-                        let miss = compiler_observation_miss_reason(&entry.observations, self.workspace_root)
-                            .map(str::to_string);
-                        if miss.is_none() {
-                            cache_hit = true;
-                            metrics.diagnostic_cache_hits += 1;
-                            cache_by_member.entry(member.to_string()).or_default().hits += 1;
-                            update_candidate_survivors(
-                                &mut surviving_unused,
-                                &candidate_targets,
-                                member,
-                                target,
-                                &entry.evidence,
-                            );
-                            record_target_evidence(&mut result, package_id, &entry.evidence);
-                        }
-                        miss
-                    })
-                } else {
-                    None
-                };
-                if cache_hit {
-                    continue;
-                }
-
-                let reason = self
-                    .identity
-                    .cache_bypass_reason
-                    .map(|reason| reason.as_str().to_string())
-                    .or(observation_miss)
-                    .unwrap_or_else(|| store.miss_reason(&key).to_string());
-                let summary = cache_by_member.entry(member.to_string()).or_default();
-                metrics.diagnostic_cache_misses += 1;
-                summary.misses += 1;
-                *summary.miss_reasons.entry(reason).or_default() += 1;
-
-                stale_by_configuration.entry(view.clone()).or_default().push(member);
+            let member = view.package();
+            if !collects_diagnostics {
+                continue;
             }
+            let package_id = member_ids
+                .get(member)
+                .ok_or_else(|| RailError::message(format!("missing package identity for member '{member}'")))?;
+            let manifest = self
+                .manifests
+                .members
+                .iter()
+                .find(|manifest| manifest.package_name == member)
+                .ok_or_else(|| RailError::message(format!("missing manifest entry for member '{member}'")))?;
+            let key = self.key_for(manifest, target, features)?;
+            let mut cache_hit = false;
+            let cache_started = crate::instrumentation::compiler_acquisition_timer();
+            let observation_miss = if self.identity.cache_bypass_reason.is_none() {
+                store.get(&key).and_then(|entry| {
+                    let miss =
+                        compiler_observation_miss_reason(&entry.observations, self.workspace_root).map(str::to_string);
+                    if miss.is_none() {
+                        cache_hit = true;
+                        metrics.diagnostic_cache_hits += 1;
+                        cache_by_member.entry(member.to_string()).or_default().hits += 1;
+                        update_candidate_survivors(
+                            &mut surviving_unused,
+                            &candidate_targets,
+                            member,
+                            target,
+                            &entry.evidence,
+                        );
+                        record_target_evidence(&mut result, package_id, &entry.evidence);
+                    }
+                    miss
+                })
+            } else {
+                None
+            };
+            crate::instrumentation::record_compiler_acquisition_cache_lookup(cache_started, cache_hit);
+            if cache_hit {
+                continue;
+            }
+
+            let reason = self
+                .identity
+                .cache_bypass_reason
+                .map(|reason| reason.as_str().to_string())
+                .or(observation_miss)
+                .unwrap_or_else(|| store.miss_reason(&key).to_string());
+            let summary = cache_by_member.entry(member.to_string()).or_default();
+            metrics.diagnostic_cache_misses += 1;
+            summary.misses += 1;
+            *summary.miss_reasons.entry(reason).or_default() += 1;
+
+            stale_by_view[view.index().offset()].push(member);
         }
+
+        let stale_configurations = plan
+            .execution_order()
+            .filter(|view| typed_view[view.index().offset()] || !stale_by_view[view.index().offset()].is_empty())
+            .collect::<Vec<_>>();
 
         progress!(
             "  Compiler evidence plan: {} views; up to {} Cargo acquisitions; {} diagnostic cache hits; {} diagnostic cache misses",
             metrics.analysis_views,
-            stale_by_configuration.len(),
+            stale_configurations.len(),
             metrics.diagnostic_cache_hits,
             metrics.diagnostic_cache_misses
         );
 
-        let mut stale_configurations = stale_by_configuration.into_iter().collect::<Vec<_>>();
-        stale_configurations.sort_by(|(left, _), (right, _)| analysis_view_execution_order(left, right));
-
         let mut skipped_member_targets = 0usize;
-        let mut active_artifact_target = None::<String>;
-        let mut active_artifact_target_dirty = false;
         let acquisition_views = stale_configurations.len();
         let acquisition_progress_interval = acquisition_views.div_ceil(100).max(1);
-        for (acquisition_ordinal, (view, stale_members)) in stale_configurations.into_iter().enumerate() {
-            let target = view.platform().as_str();
-            let features = view.features();
-            if active_artifact_target.as_deref() != Some(target) {
-                if active_artifact_target_dirty {
-                    reclaim_compiler_artifact_target(
-                        &mut metrics,
-                        self.workspace_root,
-                        &self.identity.cargo_program,
-                        &artifact_authority,
-                        active_artifact_target.as_deref().ok_or_else(|| {
-                            RailError::message("active compiler artifact target disappeared before reclamation")
-                        })?,
-                    )?;
-                }
-                active_artifact_target = Some(target.to_string());
-                active_artifact_target_dirty = false;
-            }
-            let diagnostic_members: Vec<&str> = stale_members
-                .iter()
-                .copied()
-                .filter(|member| {
-                    has_applicable_survivor(&surviving_unused, &candidate_targets, member, target, features)
-                })
-                .collect();
-            skipped_member_targets += stale_members.len() - diagnostic_members.len();
-            let typed_members = if view
-                .fact_families()
-                .contains(&crate::compiler::scheduler::CompilerFactFamily::TypedRustItems)
+        let mut prepared_by_view = (0..plan.view_count())
+            .map(|_| None)
+            .collect::<Vec<Option<PreparedAcquisitionView<'_>>>>();
+        let mut journal_fact_keys = (0..plan.view_count())
+            .map(|_| None)
+            .collect::<Vec<Option<CompilerFactCacheKey>>>();
+        let mut runtime_specs = Vec::with_capacity(acquisition_views);
+        for (ordinal, view) in stale_configurations.into_iter().enumerate() {
+            let typed_members = if view.requires(crate::compiler::scheduler::CompilerFactFamily::TypedRustItems)
+                && typed_packages.contains(view.package())
             {
-                view.packages()
-                    .intersection(typed_packages)
-                    .cloned()
-                    .collect::<BTreeSet<_>>()
+                BTreeSet::from([view.package().to_string()])
             } else {
                 BTreeSet::new()
             };
-            let mut acquisition_members = diagnostic_members.iter().copied().collect::<BTreeSet<_>>();
-            acquisition_members.extend(typed_members.iter().map(String::as_str));
-            let fact_members = acquisition_members.iter().copied().collect::<Vec<_>>();
             let fact_cache_key = if typed_members.is_empty() || self.identity.cache_bypass_reason.is_some() {
                 None
             } else {
                 Some(
                     self.fact_cache_key(
-                        &view,
-                        &fact_members,
-                        &typed_members,
+                        view,
+                        typed_members
+                            .first()
+                            .ok_or_else(|| RailError::message("typed compiler package disappeared"))?,
                         producer_authority
                             .as_ref()
                             .ok_or_else(|| RailError::message("typed compiler fact producer authority disappeared"))?,
                     )?,
                 )
             };
-            let cached_facts = fact_cache_key
-                .as_ref()
-                .and_then(|key| fact_store.get(key).ok().flatten());
+            let cached_facts = if let Some(key) = fact_cache_key.as_ref() {
+                let cache_started = crate::instrumentation::compiler_acquisition_timer();
+                let cached = fact_store.get(key).ok().flatten();
+                crate::instrumentation::record_compiler_acquisition_cache_lookup(cache_started, cached.is_some());
+                cached
+            } else {
+                None
+            };
+            journal_fact_keys[view.index().offset()] = fact_cache_key.clone();
             if !typed_members.is_empty() {
                 if cached_facts.is_some() {
                     metrics.fact_cache_hits += 1;
@@ -1425,295 +1041,647 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
             if let Some(cached) = cached_facts {
                 compiler_facts.extend(cached);
             }
-            let active_members = if collect_typed {
-                fact_members
-            } else {
-                diagnostic_members.clone()
-            };
-            if active_members.is_empty() {
-                if let Some(journal) = acquisition_journal.as_mut() {
-                    journal.transition(acquisition_ordinal, "reused", Vec::new(), None)?;
-                }
+            let has_diagnostics = !stale_by_view[view.index().offset()].is_empty();
+            if !collect_typed && !has_diagnostics {
                 continue;
             }
-
-            let mut stale_set = HashSet::with_capacity(diagnostic_members.len());
-            for member in &diagnostic_members {
-                stale_set.insert(*member);
-            }
-
-            let report_progress = acquisition_ordinal == 0
-                || acquisition_ordinal + 1 == acquisition_views
-                || (acquisition_ordinal + 1).is_multiple_of(acquisition_progress_interval);
-            if report_progress {
-                progress!(
-                    "  Collecting compiler evidence view {}/{} for target {} ({} package{})...",
-                    acquisition_ordinal + 1,
-                    metrics.analysis_views,
-                    format_args!("{} / {}", target, features.label()),
-                    active_members.len(),
-                    if active_members.len() == 1 { "" } else { "s" }
-                );
-            }
-            let started = report_progress.then(Instant::now);
-            if collect_typed && prepared_driver.is_none() {
-                prepared_driver = Some(
-                    PreparedCompilerFactDriver::prepare(
-                        typed_snapshot.ok_or_else(|| RailError::message("typed compiler fact snapshot disappeared"))?,
-                        producer_authority
-                            .as_ref()
-                            .ok_or_else(|| RailError::message("typed compiler fact producer authority disappeared"))?,
-                    )
-                    .with_context(|| "preparing authenticated compiler fact driver".to_string())?,
-                );
-            }
-            if collect_typed && view.compiles_doctests() && prepared_doctest_sysroot.is_none() {
-                let snapshot =
-                    typed_snapshot.ok_or_else(|| RailError::message("typed compiler fact snapshot disappeared"))?;
-                let wrapper = compiler_observation_wrapper().map_err(|error| {
-                    RailError::message(format!("failed to locate the typed-doctest compiler wrapper: {error}"))
-                })?;
-                let rustdoc = crate::executable::resolve_executable_path(
-                    snapshot.toolchain().rustdoc_program(),
-                    snapshot.cargo_current_dir(),
-                )?;
-                let wrapper_digest = self.identity.diagnostic_wrapper_executable()?.content_digest();
-                let rustdoc_digest = snapshot
-                    .executable_identities()?
-                    .rustdoc()
-                    .ok_or_else(|| RailError::message("selected toolchain has no captured rustdoc authority"))?
-                    .content_digest();
-                prepared_doctest_sysroot = Some(
-                    prepared_driver
-                        .as_ref()
-                        .ok_or_else(|| {
-                            RailError::message("typed compiler fact driver disappeared before doctest staging")
-                        })?
-                        .stage_doctest_sysroot(snapshot, &wrapper, wrapper_digest, &rustdoc, rustdoc_digest)
-                        .map_err(|error| {
-                            RailError::message(format!(
-                                "failed to stage the private typed-doctest compiler sysroot: {error}"
-                            ))
-                        })?,
-                );
-            }
-            let typed_context = if collect_typed {
-                Some(TypedAcquisitionContext {
-                    snapshot: typed_snapshot
-                        .ok_or_else(|| RailError::message("typed compiler fact snapshot disappeared"))?,
-                    driver: prepared_driver
-                        .as_ref()
-                        .ok_or_else(|| RailError::message("typed compiler fact driver disappeared"))?,
-                    doctest_sysroot: prepared_doctest_sysroot.as_ref(),
-                    packages: &typed_members,
-                })
-            } else {
-                None
-            };
-            if let Err(error) = surface_acquisition_test_fault(acquisition_ordinal) {
-                if let Some(journal) = acquisition_journal.as_mut() {
-                    journal.fail(acquisition_ordinal, Vec::new(), &error)?;
-                    return Err(RailError::with_help(error.to_string(), journal.resume_help()));
-                }
-                return Err(error);
-            }
-            let mut failed_cargo_targets = Vec::new();
-            let run = run_workspace_check(
-                self.workspace_root,
-                &self.identity,
-                &view,
-                &active_members,
-                artifact_authority.target_dir(),
-                typed_context.as_ref(),
-                artifact_authority.budget,
-                &package_to_member,
-                &mut failed_cargo_targets,
-            );
-            let mut run = match run {
-                Ok(run) => run,
-                Err(error) => {
-                    let error = error.context(format!(
-                        "acquiring compiler evidence for target '{} / {}'",
-                        view.platform().as_str(),
-                        view.features().label()
-                    ));
-                    if let Some(journal) = acquisition_journal.as_mut() {
-                        if let Err(journal_error) = journal.fail(acquisition_ordinal, failed_cargo_targets, &error) {
-                            return Err(RailError::message(format!(
-                                "{error}; failed to finalize Surface acquisition manifest '{}': {journal_error}",
-                                journal.path.display()
-                            )));
-                        }
-                        return Err(RailError::with_help(error.to_string(), journal.resume_help()));
-                    }
-                    return Err(error);
-                }
-            };
-            if let Some(journal) = acquisition_journal.as_mut() {
-                journal.transition(acquisition_ordinal, "completed", Vec::new(), None)?;
-            }
-            active_artifact_target_dirty = true;
-            metrics.cargo_views_executed += 1;
-            metrics.compiler_invocations += run.invocations.len();
-            metrics.artifact_high_water_bytes = metrics.artifact_high_water_bytes.max(run.artifact_high_water_bytes);
-            if collect_typed {
-                metrics.fresh_fragment_bytes =
-                    run.compiler_facts
-                        .iter()
-                        .try_fold(metrics.fresh_fragment_bytes, |total, fragment| {
-                            total
-                                .checked_add(fragment.bytes())
-                                .ok_or_else(|| RailError::message("compiler fact fragment byte count overflow"))
-                        })?;
-                let fresh_facts = std::mem::take(&mut run.compiler_facts)
-                    .into_iter()
-                    .map(ValidatedCompilerFactFragment::into_object)
-                    .collect::<Vec<_>>();
-                if let Some(key) = &fact_cache_key {
-                    let bypasses = fact_invocation_cache_bypasses(&run.invocations);
-                    let complete_empty_view = fresh_facts.is_empty()
-                        && bypasses == BTreeSet::from(["no_typed_compiler_invocation".to_string()]);
-                    if bypasses.is_empty() || complete_empty_view {
-                        if let Err(error) = fact_store.put(key, &fresh_facts) {
-                            metrics.fact_cache_store_failures += 1;
-                            progress!("    Compiler fact cache store bypassed: {error}");
-                        }
-                    } else {
-                        for bypass in &bypasses {
-                            *metrics.fact_cache_bypass_reasons.entry(bypass.clone()).or_default() += 1;
-                        }
-                        progress!(
-                            "    Compiler fact cache bypassed: {}",
-                            bypasses.into_iter().collect::<Vec<_>>().join(", ")
-                        );
-                    }
-                }
-                compiler_facts.extend(fresh_facts);
-            }
-            if let Some(started) = started {
-                progress!(
-                    "    Finished target {} in {:.1}s",
-                    format_args!("{} / {}", target, features.label()),
-                    started.elapsed().as_secs_f64()
-                );
-            }
-            if !view
-                .fact_families()
-                .contains(&crate::compiler::scheduler::CompilerFactFamily::StableDiagnostics)
-            {
-                continue;
-            }
-            let parsed = parse_target_run(
-                &run.stdout,
-                self.workspace_root,
-                &package_to_member,
-                &stale_set,
-                candidates,
-            );
-            let invocations = std::mem::take(&mut run.invocations);
-            let mut compilation_observations =
-                parse_compilation_observations(&run.stdout, invocations, &self.identity, target)?;
-            reconcile_exact_artifact_observations(&mut compilation_observations, &mut retained_observations);
-            let completeness = DiagnosticsCompleteness::Complete;
-
-            for member in diagnostic_members {
-                let manifests_member = self
-                    .manifests
-                    .members
-                    .iter()
-                    .find(|m| m.package_name == member)
-                    .ok_or_else(|| RailError::message(format!("missing manifest entry for member '{member}'")))?;
-
-                let key = self.key_for(manifests_member, target, features.clone())?;
-
-                let mut unused = BTreeSet::new();
-                let mut compiled = BTreeSet::new();
-
-                if completeness == DiagnosticsCompleteness::Complete
-                    && let Some(parsed_member) = parsed.get(member)
-                {
-                    compiled = parsed_member.compiled_targets.clone();
-                }
-
-                let unit_evidence = parsed
-                    .get(member)
-                    .map(ParsedMemberTarget::unit_evidence)
-                    .unwrap_or_default();
-                let normal_units: Vec<_> = compiled
-                    .iter()
-                    .filter(|unit| !unit.test_mode && unit.kind != CargoTargetKind::CustomBuild)
-                    .collect();
-                if !normal_units.is_empty() {
-                    for candidate in candidates
-                        .iter()
-                        .filter(|candidate| candidate.member == member && candidate.kind == DepKind::Normal)
-                    {
-                        if normal_units.iter().all(|unit| {
-                            unit_evidence
-                                .iter()
-                                .find(|evidence| &evidence.unit == *unit)
-                                .is_some_and(|evidence| evidence.unused_crates.contains(&candidate.crate_name))
-                        }) {
-                            unused.insert(candidate.crate_name.clone());
-                        }
-                    }
-                }
-                let evidence = TargetEvidence {
-                    platform: PlatformTarget::from(target),
-                    features: features.clone(),
-                    compiled_units: compiled,
-                    unused_crates: unused,
-                    unit_evidence,
-                    completeness,
-                };
-                let observations: Vec<CompilationObservationManifest> = self
-                    .identity
-                    .package_observation_identities
-                    .get(&manifests_member.package_id)
-                    .map(|package| {
-                        compilation_observations
-                            .iter()
-                            .filter(|manifest| manifest.unit.package == *package)
-                            .cloned()
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let entry = CompilerDiagEntry {
-                    key,
-                    evidence: evidence.clone(),
-                    generated_at_unix_ms: now_unix_ms(),
-                    collector_version: COLLECTOR_VERSION,
-                    observations,
-                };
-
-                update_candidate_survivors(
-                    &mut surviving_unused,
-                    &candidate_targets,
-                    member,
-                    target,
-                    &entry.evidence,
-                );
-
-                record_target_evidence(&mut result, &manifests_member.package_id, &entry.evidence);
-                store.put(entry);
-            }
+            let runtime_candidates = has_diagnostics.then(|| view.candidates()).into_iter().flatten();
+            runtime_specs.push(RuntimeViewSpec::new(
+                view.index(),
+                ordinal,
+                collect_typed,
+                runtime_candidates,
+            ));
+            prepared_by_view[view.index().offset()] = Some(PreparedAcquisitionView {
+                ordinal,
+                view,
+                typed_members,
+                fact_cache_key,
+                evidence_identity: None,
+                collect_typed,
+            });
         }
-        if active_artifact_target_dirty {
-            reclaim_compiler_artifact_target(
-                &mut metrics,
-                self.workspace_root,
-                &self.identity.cargo_program,
-                &artifact_authority,
-                active_artifact_target.as_deref().ok_or_else(|| {
-                    RailError::message("active compiler artifact target disappeared before final reclamation")
-                })?,
+
+        let requires_typed = prepared_by_view.iter().flatten().any(|prepared| prepared.collect_typed);
+        if requires_typed {
+            prepared_driver = Some(
+                PreparedCompilerFactDriver::prepare(
+                    typed_snapshot.ok_or_else(|| RailError::message("typed compiler fact snapshot disappeared"))?,
+                    producer_authority
+                        .as_ref()
+                        .ok_or_else(|| RailError::message("typed compiler fact producer authority disappeared"))?,
+                )
+                .with_context(|| "preparing authenticated compiler fact driver".to_string())?,
+            );
+        }
+        let requires_doctest = prepared_by_view
+            .iter()
+            .flatten()
+            .any(|prepared| prepared.collect_typed && prepared.view.compiles_doctests());
+        if requires_doctest {
+            let snapshot =
+                typed_snapshot.ok_or_else(|| RailError::message("typed compiler fact snapshot disappeared"))?;
+            let wrapper = compiler_observation_wrapper().map_err(|error| {
+                RailError::message(format!("failed to locate the typed-doctest compiler wrapper: {error}"))
+            })?;
+            let rustdoc = crate::executable::resolve_executable_path(
+                snapshot.toolchain().rustdoc_program(),
+                snapshot.cargo_current_dir(),
             )?;
-        }
-        if let Some(journal) = acquisition_journal.as_mut() {
-            journal.finish("complete")?;
+            let wrapper_digest = self.identity.diagnostic_wrapper_executable()?.content_digest();
+            let rustdoc_digest = snapshot
+                .executable_identities()?
+                .rustdoc()
+                .ok_or_else(|| RailError::message("selected toolchain has no captured rustdoc authority"))?
+                .content_digest();
+            prepared_doctest_sysroot = Some(
+                prepared_driver
+                    .as_ref()
+                    .ok_or_else(|| RailError::message("typed compiler fact driver disappeared before doctest staging"))?
+                    .stage_doctest_sysroot(snapshot, &wrapper, wrapper_digest, &rustdoc, rustdoc_digest)
+                    .map_err(|error| {
+                        RailError::message(format!(
+                            "failed to stage the private typed-doctest compiler sysroot: {error}"
+                        ))
+                    })?,
+            );
         }
 
-        store.flush()?;
+        let acquisition_broker = if runtime_specs.is_empty() {
+            None
+        } else {
+            self.identity
+                .analysis_cache
+                .as_ref()
+                .map(|cache| {
+                    crate::compiler::acquisition::broker::AcquisitionBroker::start(
+                        execution_policy.work_permits(),
+                        cache.cas.clone(),
+                    )
+                })
+                .transpose()?
+        };
+        let mut runtime = RuntimeState::new(execution_policy, plan.view_count(), runtime_specs)?;
+        let mut acquisition_journal = acquisition_request
+            .map(|request| {
+                CompilerAcquisitionJournal::begin(
+                    self.workspace_root,
+                    request,
+                    &plan,
+                    self.identity.acquisition_compiler_set_identity()?,
+                    self.artifact_budget.soft_limit_bytes,
+                    self.artifact_budget.hard_limit_bytes,
+                    execution_policy.process_slots(),
+                    execution_policy.journal_batch(),
+                )
+            })
+            .transpose()?;
+        if let Some(journal) = acquisition_journal.as_mut() {
+            let revalidation = (|| -> RailResult<()> {
+                for view in plan.views() {
+                    let offset = view.index().offset();
+                    let evidence =
+                        self.acquisition_evidence_identity(journal, view, journal_fact_keys[offset].as_ref())?;
+                    if let Some(prepared) = prepared_by_view[offset].as_mut() {
+                        prepared.evidence_identity = Some(evidence);
+                        journal.revalidate(view.index(), None)?;
+                    } else {
+                        journal.revalidate(view.index(), Some(evidence))?;
+                    }
+                }
+                journal.seal_revalidation()
+            })();
+            if let Err(error) = revalidation {
+                return match journal.fail(None, FailureClass::Journal) {
+                    Ok(()) => Err(RailError::with_help(error.to_string(), journal.resume_help())),
+                    Err(journal_error) => Err(RailError::message(format!(
+                        "{error}; failed to terminally record journal revalidation failure: {journal_error}"
+                    ))),
+                };
+            }
+        }
+        let cancellation = AtomicBool::new(false);
+        let worker_count = execution_policy
+            .process_slots()
+            .min(prepared_by_view.iter().flatten().count());
+        let mut failures = Vec::<AcquisitionFailure>::new();
+        if worker_count > 0 {
+            let worker_context = AcquisitionWorkerContext {
+                workspace_root: self.workspace_root,
+                identity: &self.identity,
+                typed_snapshot,
+                driver: prepared_driver.as_ref(),
+                doctest_sysroot: prepared_doctest_sysroot.as_ref(),
+                artifact_budget: self.artifact_budget,
+                package_to_member: &package_to_member,
+                cancellation: &cancellation,
+                broker: acquisition_broker.as_ref(),
+            };
+            let execution = std::thread::scope(|scope| -> RailResult<()> {
+                let (outcome_tx, outcome_rx) = mpsc::sync_channel(worker_count.saturating_mul(2).max(1));
+                let mut job_senders = Vec::with_capacity(worker_count);
+                let mut workers = Vec::with_capacity(worker_count);
+                for worker in 0..worker_count {
+                    let (job_tx, job_rx) = mpsc::sync_channel(1);
+                    let outcome_tx = outcome_tx.clone();
+                    let worker_context = &worker_context;
+                    workers.push(
+                        std::thread::Builder::new()
+                            .name(format!("cargo-rail-acquisition-worker-{worker}"))
+                            .spawn_scoped(scope, move || {
+                                while let Ok(job) = job_rx.recv() {
+                                    let outcome = execute_acquisition_job(worker, worker_context, job);
+                                    if outcome_tx.send(outcome).is_err() {
+                                        break;
+                                    }
+                                }
+                            })?,
+                    );
+                    job_senders.push(job_tx);
+                }
+                drop(outcome_tx);
+                let coordinator = (|| -> RailResult<()> {
+                    let mut idle_workers = (0..worker_count).collect::<VecDeque<_>>();
+                    let mut diagnostic_dispatch_order = VecDeque::new();
+                    let mut diagnostic_completions = HashMap::<ViewIx, AcquisitionCompletion<'_>>::new();
+                    loop {
+                        let mut made_progress = false;
+                        if let Some(journal) = acquisition_journal.as_mut()
+                            && let Err(error) = journal.flush_if_due()
+                        {
+                            cancellation.store(true, std::sync::atomic::Ordering::Release);
+                            failures.push(AcquisitionFailure::global(FailureClass::Journal, error));
+                            break;
+                        }
+                        if !runtime.cancelled() {
+                            let skipped = runtime.refresh(|index| {
+                                let view = plan.view(index).expect("runtime view belongs to plan");
+                                let features = view.features();
+                                stale_by_view[index.offset()].iter().copied().any(|member| {
+                                    has_applicable_survivor(
+                                        &surviving_unused,
+                                        &candidate_targets,
+                                        member,
+                                        view.platform(),
+                                        &features,
+                                    )
+                                })
+                            })?;
+                            made_progress |= !skipped.is_empty();
+                            for index in skipped {
+                                skipped_member_targets += stale_by_view[index.offset()].len();
+                                prepared_by_view[index.offset()].take();
+                            }
+                        }
+
+                        while !runtime.cancelled()
+                            && diagnostic_dispatch_order
+                                .front()
+                                .is_some_and(|index| diagnostic_completions.contains_key(index))
+                        {
+                            let index = diagnostic_dispatch_order.pop_front().expect("checked diagnostic order");
+                            let completion = diagnostic_completions
+                                .remove(&index)
+                                .expect("checked diagnostic completion");
+                            match integrate_completed_acquisition(
+                                self,
+                                completion,
+                                acquisition_journal.is_some(),
+                                candidates,
+                                &package_to_member,
+                                &candidate_targets,
+                                &fact_store,
+                                &mut metrics,
+                                &mut compiler_facts,
+                                &mut retained_observations,
+                                &mut surviving_unused,
+                                &mut result,
+                                &mut store,
+                            ) {
+                                Ok((_, evidence_identity, durable)) => {
+                                    if let (Some(journal), Some(evidence)) =
+                                        (acquisition_journal.as_mut(), evidence_identity)
+                                        && let Err(error) = journal.complete(index, evidence, durable)
+                                    {
+                                        cancellation.store(true, std::sync::atomic::Ordering::Release);
+                                        runtime.fail_integration(index)?;
+                                        failures.push(AcquisitionFailure::view(
+                                            index.offset(),
+                                            index,
+                                            Vec::new(),
+                                            FailureClass::Journal,
+                                            error,
+                                        ));
+                                        diagnostic_completions.clear();
+                                        diagnostic_dispatch_order.clear();
+                                        break;
+                                    }
+                                    runtime.complete(index)?;
+                                    made_progress = true;
+                                }
+                                Err(error) => {
+                                    cancellation.store(true, std::sync::atomic::Ordering::Release);
+                                    runtime.fail_integration(index)?;
+                                    failures.push(AcquisitionFailure::view(
+                                        index.offset(),
+                                        index,
+                                        Vec::new(),
+                                        FailureClass::Integration,
+                                        error,
+                                    ));
+                                    diagnostic_completions.clear();
+                                    diagnostic_dispatch_order.clear();
+                                    break;
+                                }
+                            }
+                        }
+
+                        let mut staged_jobs = VecDeque::new();
+                        while !runtime.cancelled() && !idle_workers.is_empty() {
+                            let Some(index) = runtime.start_next()? else {
+                                break;
+                            };
+                            let worker = idle_workers.pop_front().expect("checked idle worker");
+                            let prepared = prepared_by_view[index.offset()]
+                                .take()
+                                .ok_or_else(|| RailError::message("compiler acquisition ready view lost its work"))?;
+                            let view = prepared.view;
+                            let features = view.features();
+                            let diagnostic_members = stale_by_view[index.offset()]
+                                .iter()
+                                .copied()
+                                .filter(|member| {
+                                    has_applicable_survivor(
+                                        &surviving_unused,
+                                        &candidate_targets,
+                                        member,
+                                        view.platform(),
+                                        &features,
+                                    )
+                                })
+                                .map(str::to_string)
+                                .collect::<Vec<_>>();
+                            skipped_member_targets += stale_by_view[index.offset()]
+                                .len()
+                                .saturating_sub(diagnostic_members.len());
+                            let active_members = diagnostic_members.len() + usize::from(prepared.collect_typed);
+                            if active_members == 0 {
+                                cancellation.store(true, std::sync::atomic::Ordering::Release);
+                                runtime.fail(index)?;
+                                failures.push(AcquisitionFailure::view(
+                                    prepared.ordinal,
+                                    index,
+                                    Vec::new(),
+                                    FailureClass::Coordinator,
+                                    RailError::message(
+                                        "compiler acquisition admitted a view with no unresolved requirement",
+                                    ),
+                                ));
+                                idle_workers.push_front(worker);
+                                break;
+                            }
+                            let report_progress = prepared.ordinal == 0
+                                || prepared.ordinal + 1 == acquisition_views
+                                || (prepared.ordinal + 1).is_multiple_of(acquisition_progress_interval);
+                            if report_progress {
+                                progress!(
+                                    "  Collecting compiler evidence view {}/{} for target {} ({} package{})...",
+                                    prepared.ordinal + 1,
+                                    metrics.analysis_views,
+                                    format_args!("{} / {}", view.platform(), features.label()),
+                                    active_members,
+                                    if active_members == 1 { "" } else { "s" }
+                                );
+                            }
+                            if let Err(error) = surface_acquisition_test_fault(prepared.ordinal) {
+                                cancellation.store(true, std::sync::atomic::Ordering::Release);
+                                runtime.fail(index)?;
+                                failures.push(AcquisitionFailure::view(
+                                    prepared.ordinal,
+                                    index,
+                                    Vec::new(),
+                                    FailureClass::Coordinator,
+                                    error,
+                                ));
+                                idle_workers.push_front(worker);
+                                break;
+                            }
+                            let sandbox = match sandbox_pool.lease(SandboxCompatibility::new(
+                                self.identity.toolchain_fingerprint.clone(),
+                                view.platform(),
+                                view.command_class(),
+                                format!(
+                                    "{}:{}",
+                                    self.identity.compiler_env_fingerprint, self.identity.cargo_config_fingerprint
+                                ),
+                                if prepared.collect_typed {
+                                    if view.compiles_doctests() {
+                                        "typed-doctest"
+                                    } else {
+                                        "typed"
+                                    }
+                                } else {
+                                    "diagnostic"
+                                },
+                            )) {
+                                Ok(sandbox) => sandbox,
+                                Err(error) => {
+                                    cancellation.store(true, std::sync::atomic::Ordering::Release);
+                                    runtime.fail(index)?;
+                                    failures.push(AcquisitionFailure::view(
+                                        prepared.ordinal,
+                                        index,
+                                        Vec::new(),
+                                        FailureClass::Sandbox,
+                                        error,
+                                    ));
+                                    idle_workers.push_front(worker);
+                                    break;
+                                }
+                            };
+                            let job = AcquisitionJob {
+                                prepared,
+                                diagnostic_members,
+                                sandbox,
+                                started: report_progress.then(Instant::now),
+                            };
+                            staged_jobs.push_back((worker, index, job));
+                        }
+
+                        if runtime.cancelled() {
+                            while let Some((_, index, job)) = staged_jobs.pop_front() {
+                                sandbox_pool.reclaim(job.sandbox.poison())?;
+                                runtime.discard_running(index)?;
+                            }
+                        } else if !staged_jobs.is_empty() {
+                            let running = staged_jobs.iter().map(|(_, index, _)| *index).collect::<Vec<_>>();
+                            if let Some(journal) = acquisition_journal.as_mut()
+                                && let Err(error) = journal.running_batch(&running)
+                            {
+                                cancellation.store(true, std::sync::atomic::Ordering::Release);
+                                let (_, primary_index, primary_job) =
+                                    staged_jobs.pop_front().expect("non-empty running batch");
+                                let primary_ordinal = primary_job.prepared.ordinal;
+                                sandbox_pool.reclaim(primary_job.sandbox.poison())?;
+                                runtime.fail(primary_index)?;
+                                while let Some((_, index, job)) = staged_jobs.pop_front() {
+                                    sandbox_pool.reclaim(job.sandbox.poison())?;
+                                    runtime.discard_running(index)?;
+                                }
+                                failures.push(AcquisitionFailure::view(
+                                    primary_ordinal,
+                                    primary_index,
+                                    Vec::new(),
+                                    FailureClass::Journal,
+                                    error,
+                                ));
+                            }
+                            while !runtime.cancelled()
+                                && let Some((worker, index, job)) = staged_jobs.pop_front()
+                            {
+                                let has_diagnostics = !job.diagnostic_members.is_empty();
+                                if let Err(send_error) = job_senders[worker].send(job) {
+                                    let job = send_error.0;
+                                    let ordinal = job.prepared.ordinal;
+                                    cancellation.store(true, std::sync::atomic::Ordering::Release);
+                                    sandbox_pool.reclaim(job.sandbox.poison())?;
+                                    runtime.fail(index)?;
+                                    while let Some((_, staged_index, staged_job)) = staged_jobs.pop_front() {
+                                        sandbox_pool.reclaim(staged_job.sandbox.poison())?;
+                                        runtime.discard_running(staged_index)?;
+                                    }
+                                    failures.push(AcquisitionFailure::view(
+                                        ordinal,
+                                        index,
+                                        Vec::new(),
+                                        FailureClass::Coordinator,
+                                        RailError::message(
+                                            "compiler acquisition worker stopped before accepting its view",
+                                        ),
+                                    ));
+                                    break;
+                                }
+                                if has_diagnostics {
+                                    diagnostic_dispatch_order.push_back(index);
+                                }
+                                made_progress = true;
+                            }
+                        }
+
+                        if runtime.all_terminal() {
+                            break;
+                        }
+                        if runtime.running() == 0 {
+                            if made_progress {
+                                continue;
+                            }
+                            return Err(RailError::message(
+                                "compiler acquisition runtime stalled with nonterminal views",
+                            ));
+                        }
+                        let outcome = if let Some(timeout) = acquisition_journal
+                            .as_ref()
+                            .and_then(CompilerAcquisitionJournal::completion_flush_timeout)
+                        {
+                            match outcome_rx.recv_timeout(timeout) {
+                                Ok(outcome) => outcome,
+                                Err(mpsc::RecvTimeoutError::Timeout) => {
+                                    if let Some(journal) = acquisition_journal.as_mut()
+                                        && let Err(error) = journal.flush_if_due()
+                                    {
+                                        cancellation.store(true, std::sync::atomic::Ordering::Release);
+                                        failures.push(AcquisitionFailure::global(FailureClass::Journal, error));
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                                    return Err(RailError::message(
+                                        "compiler acquisition workers stopped with live views",
+                                    ));
+                                }
+                            }
+                        } else {
+                            outcome_rx.recv().map_err(|_| {
+                                RailError::message("compiler acquisition workers stopped with live views")
+                            })?
+                        };
+                        idle_workers.push_back(outcome.worker);
+                        sandbox_pool.reclaim(outcome.sandbox)?;
+                        let completion = outcome.completion;
+                        let index = completion.prepared.view.index();
+                        if runtime.cancelled() {
+                            runtime.discard_running(index)?;
+                            if let Err(error) = completion.result {
+                                failures.push(AcquisitionFailure::view(
+                                    completion.prepared.ordinal,
+                                    index,
+                                    completion.failed_cargo_targets,
+                                    FailureClass::Cancelled,
+                                    error,
+                                ));
+                            }
+                            continue;
+                        }
+                        if completion.result.is_err() {
+                            cancellation.store(true, std::sync::atomic::Ordering::Release);
+                            runtime.fail(index)?;
+                            let AcquisitionCompletion {
+                                prepared,
+                                failed_cargo_targets,
+                                result,
+                                ..
+                            } = completion;
+                            let Err(error) = result else {
+                                return Err(RailError::message(
+                                    "compiler acquisition failure lost its failed outcome",
+                                ));
+                            };
+                            let error = error.context(format!(
+                                "acquiring compiler evidence for target '{} / {}'",
+                                prepared.view.platform(),
+                                prepared.view.features().label()
+                            ));
+                            failures.push(AcquisitionFailure::view(
+                                prepared.ordinal,
+                                index,
+                                failed_cargo_targets,
+                                FailureClass::Worker,
+                                error,
+                            ));
+                            diagnostic_completions.clear();
+                            diagnostic_dispatch_order.clear();
+                        } else {
+                            runtime.executed(index)?;
+                            if !completion.diagnostic_members.is_empty() {
+                                diagnostic_completions.insert(index, completion);
+                                continue;
+                            }
+                            match integrate_completed_acquisition(
+                                self,
+                                completion,
+                                acquisition_journal.is_some(),
+                                candidates,
+                                &package_to_member,
+                                &candidate_targets,
+                                &fact_store,
+                                &mut metrics,
+                                &mut compiler_facts,
+                                &mut retained_observations,
+                                &mut surviving_unused,
+                                &mut result,
+                                &mut store,
+                            ) {
+                                Ok((_, evidence_identity, durable)) => {
+                                    if let (Some(journal), Some(evidence)) =
+                                        (acquisition_journal.as_mut(), evidence_identity)
+                                        && let Err(error) = journal.complete(index, evidence, durable)
+                                    {
+                                        cancellation.store(true, std::sync::atomic::Ordering::Release);
+                                        runtime.fail_integration(index)?;
+                                        failures.push(AcquisitionFailure::view(
+                                            index.offset(),
+                                            index,
+                                            Vec::new(),
+                                            FailureClass::Journal,
+                                            error,
+                                        ));
+                                        diagnostic_completions.clear();
+                                        diagnostic_dispatch_order.clear();
+                                        continue;
+                                    }
+                                    runtime.complete(index)?;
+                                }
+                                Err(error) => {
+                                    cancellation.store(true, std::sync::atomic::Ordering::Release);
+                                    runtime.fail_integration(index)?;
+                                    failures.push(AcquisitionFailure::view(
+                                        index.offset(),
+                                        index,
+                                        Vec::new(),
+                                        FailureClass::Integration,
+                                        error,
+                                    ));
+                                    diagnostic_completions.clear();
+                                    diagnostic_dispatch_order.clear();
+                                }
+                            }
+                        }
+                    }
+                    Ok(())
+                })();
+                if coordinator.is_err() {
+                    cancellation.store(true, std::sync::atomic::Ordering::Release);
+                }
+
+                drop(job_senders);
+                let mut join_failure = None;
+                for worker in workers {
+                    if worker.join().is_err() && join_failure.is_none() {
+                        join_failure = Some(RailError::message("compiler acquisition worker panicked"));
+                    }
+                }
+                coordinator.and_then(|()| join_failure.map_or(Ok(()), Err))
+            });
+            if let Err(error) = execution {
+                cancellation.store(true, std::sync::atomic::Ordering::Release);
+                failures.push(AcquisitionFailure::coordinator(error));
+            }
+        }
+        if let Some(broker) = acquisition_broker
+            && let Err(error) = broker.close()
+        {
+            failures.push(AcquisitionFailure::global(FailureClass::Broker, error));
+        }
+        if let Err(error) = sandbox_pool.close() {
+            failures.push(AcquisitionFailure::global(FailureClass::Sandbox, error));
+        }
+        if !failures.is_empty() {
+            failures.sort_by_key(|failure| (failure.class == FailureClass::Cancelled, failure.ordinal, failure.view));
+            let primary = failures.remove(0);
+            let mut error = primary.error.to_string();
+            for secondary in failures {
+                error.push_str("; cleanup or concurrent failure: ");
+                error.push_str(&secondary.error.to_string());
+            }
+            if let Some(journal) = acquisition_journal.as_mut() {
+                let durable_primary = primary.view.map(|view| (view, primary.cargo_targets, primary.class));
+                if let Err(journal_error) = journal.fail(durable_primary, primary.class) {
+                    return Err(RailError::message(format!(
+                        "{error}; failed to finalize Surface acquisition manifest '{}': {journal_error}",
+                        journal.path().display()
+                    )));
+                }
+                return Err(RailError::with_help(error, journal.resume_help()));
+            }
+            return Err(RailError::message(error));
+        }
+
+        let cache_started = crate::instrumentation::compiler_acquisition_timer();
+        let flushed = store.flush();
+        crate::instrumentation::record_compiler_acquisition_cache_write(cache_started);
+        if let Err(error) = flushed {
+            if let Some(journal) = acquisition_journal.as_mut() {
+                return match journal.fail(None, FailureClass::Integration) {
+                    Ok(()) => Err(RailError::with_help(error.to_string(), journal.resume_help())),
+                    Err(journal_error) => Err(RailError::message(format!(
+                        "{error}; failed to terminally record compiler evidence publication failure: {journal_error}"
+                    ))),
+                };
+            }
+            return Err(error);
+        }
+        if let Some(journal) = acquisition_journal.as_mut()
+            && let Err(error) = journal.finish()
+        {
+            return Err(RailError::with_help(
+                format!(
+                    "failed to finalize Surface acquisition manifest '{}': {error}",
+                    journal.path().display()
+                ),
+                journal.resume_help(),
+            ));
+        }
         if skipped_member_targets > 0 {
             progress!(
                 "  Skipped {} target-package check{} after dependencies were proven used",
@@ -1784,30 +1752,49 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
 
     fn fact_cache_key(
         &self,
-        view: &AnalysisView,
-        cargo_members: &[&str],
-        typed_members: &BTreeSet<String>,
+        view: CompilerAcquisitionView<'_>,
+        typed_package: &str,
         producer_authority: &crate::compiler::facts::CompilerFactProducerAuthority,
     ) -> RailResult<CompilerFactCacheKey> {
-        let packages = cargo_members
+        let manifest = self
+            .manifests
+            .members
             .iter()
-            .map(|member| {
-                let manifest = self
-                    .manifests
-                    .members
-                    .iter()
-                    .find(|manifest| manifest.package_name == *member)
-                    .ok_or_else(|| RailError::message(format!("missing manifest entry for member '{member}'")))?;
-                self.key_for(manifest, view.platform().as_str(), view.features().clone())
-            })
-            .collect::<RailResult<Vec<_>>>()?;
+            .find(|manifest| manifest.package_name == typed_package)
+            .ok_or_else(|| RailError::message(format!("missing manifest entry for member '{typed_package}'")))?;
+        let packages = vec![self.key_for(manifest, view.platform(), view.features())?];
         CompilerFactCacheKey::new(
-            view.fact_cache_identity(cargo_members, typed_members)?,
+            view.fact_cache_identity(typed_package)?,
             packages,
-            typed_members.clone(),
+            BTreeSet::from([typed_package.to_string()]),
             producer_authority.clone(),
             required_compiler_fact_coverage(),
         )
+    }
+
+    fn acquisition_evidence_identity(
+        &self,
+        journal: &CompilerAcquisitionJournal,
+        view: CompilerAcquisitionView<'_>,
+        fact_cache_key: Option<&CompilerFactCacheKey>,
+    ) -> RailResult<EvidenceIdentity> {
+        let diagnostic_keys = if view.requires(crate::compiler::scheduler::CompilerFactFamily::StableDiagnostics) {
+            let manifest = self
+                .manifests
+                .members
+                .iter()
+                .find(|manifest| manifest.package_name == view.package())
+                .ok_or_else(|| {
+                    RailError::message(format!(
+                        "missing manifest entry for compiler acquisition member '{}'",
+                        view.package()
+                    ))
+                })?;
+            vec![self.key_for(manifest, view.platform(), view.features())?]
+        } else {
+            Vec::new()
+        };
+        journal.evidence_identity(view.index(), &diagnostic_keys, fact_cache_key)
     }
 }
 
@@ -1912,37 +1899,21 @@ type CandidateId = (
     Option<FeatureSelection>,
 );
 
-fn analysis_view_execution_order(left: &AnalysisView, right: &AnalysisView) -> std::cmp::Ordering {
-    left.platform()
-        .cmp(right.platform())
-        .then_with(|| left.compiles_doctests().cmp(&right.compiles_doctests()))
-        .then_with(|| feature_execution_priority(left.features()).cmp(&feature_execution_priority(right.features())))
-        .then_with(|| left.features().cmp(right.features()))
-}
-
-fn feature_execution_priority(features: &FeatureSelection) -> u8 {
-    match features {
-        // The default graph is ordinarily the smallest representative view.
-        // Acquire it first so an uncompilable workspace fails at the cheapest
-        // required boundary instead of materializing a maximal feature graph.
-        FeatureSelection::Default => 0,
-        FeatureSelection::NoDefaultFeatures => 1,
-        FeatureSelection::DefaultWith(_) => 2,
-        FeatureSelection::Selected(_) => 3,
-        FeatureSelection::AllFeatures => 4,
-    }
-}
-
 fn surface_acquisition_test_fault(ordinal: usize) -> RailResult<()> {
-    let requested = std::env::var("CARGO_RAIL_SURFACE_FAIL_ACQUISITION_VIEW")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok());
-    if requested == Some(ordinal + 1) {
-        return Err(RailError::message(format!(
-            "injected Surface compiler acquisition failure at view {}",
-            ordinal + 1
-        )));
+    #[cfg(debug_assertions)]
+    {
+        let requested = std::env::var("CARGO_RAIL_SURFACE_FAIL_ACQUISITION_VIEW")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok());
+        if requested == Some(ordinal + 1) {
+            return Err(RailError::message(format!(
+                "injected Surface compiler acquisition failure at view {}",
+                ordinal + 1
+            )));
+        }
     }
+    #[cfg(not(debug_assertions))]
+    let _ = ordinal;
     Ok(())
 }
 
@@ -2019,8 +1990,62 @@ fn update_candidate_survivors(
 struct WorkspaceCheckOutput {
     stdout: String,
     invocations: Vec<crate::compiler::observation::RawCompilerInvocation>,
-    compiler_facts: Vec<ValidatedCompilerFactFragment>,
+    compiler_facts: Vec<ValidatedCompilerFactObject>,
+    analysis_contract: AnalysisContract,
+    artifact_preflight: ArtifactPreflight,
     artifact_high_water_bytes: u64,
+}
+
+fn publish_native_analysis_bindings(
+    cache: Option<&CompilerAnalysisCache>,
+    contract: &AnalysisContract,
+    invocations: &[crate::compiler::observation::RawCompilerInvocation],
+    facts: &[ValidatedCompilerFactObject],
+) -> RailResult<()> {
+    let Some(cache) = cache else {
+        return Ok(());
+    };
+    let facts_by_unit = facts
+        .iter()
+        .map(|fact| (fact.object().unit.identity.as_str(), fact))
+        .collect::<BTreeMap<_, _>>();
+    let store = crate::compiler::analysis::AnalysisEvidenceStore::from_cas(cache.cas.clone());
+    for invocation in invocations {
+        let Some(wrapper) = invocation.cache_wrapper.as_ref() else {
+            continue;
+        };
+        let (Some(action), Some(result)) = (wrapper.action_key(), wrapper.result_key()) else {
+            continue;
+        };
+        let bound_facts = match invocation.compiler_fact_unit.as_ref() {
+            Some(unit) if contract.requires_typed_facts() => {
+                let Some(fact) = facts_by_unit.get(unit.identity.as_str()) else {
+                    continue;
+                };
+                vec![(**fact).clone()]
+            }
+            Some(_) => continue,
+            None => Vec::new(),
+        };
+        match cache.remote.as_deref() {
+            Some(remote) => store.put_with_remote(
+                contract,
+                action.to_string(),
+                result.to_string(),
+                invocation,
+                &bound_facts,
+                remote,
+            )?,
+            None => store.put(
+                contract,
+                action.to_string(),
+                result.to_string(),
+                invocation,
+                &bound_facts,
+            )?,
+        }
+    }
+    Ok(())
 }
 
 struct TypedAcquisitionContext<'a> {
@@ -2030,6 +2055,411 @@ struct TypedAcquisitionContext<'a> {
     packages: &'a BTreeSet<String>,
 }
 
+struct PreparedAcquisitionView<'plan> {
+    ordinal: usize,
+    view: CompilerAcquisitionView<'plan>,
+    typed_members: BTreeSet<String>,
+    fact_cache_key: Option<CompilerFactCacheKey>,
+    evidence_identity: Option<EvidenceIdentity>,
+    collect_typed: bool,
+}
+
+struct AcquisitionJob<'plan> {
+    prepared: PreparedAcquisitionView<'plan>,
+    diagnostic_members: Vec<String>,
+    sandbox: SandboxLease,
+    started: Option<Instant>,
+}
+
+struct AcquisitionWorkerContext<'a> {
+    workspace_root: &'a Path,
+    identity: &'a CompilerCacheIdentity,
+    typed_snapshot: Option<&'a WorkspaceSnapshot>,
+    driver: Option<&'a PreparedCompilerFactDriver>,
+    doctest_sysroot: Option<&'a CompilerFactDoctestSysroot>,
+    artifact_budget: CompilerArtifactBudget,
+    package_to_member: &'a HashMap<String, String>,
+    cancellation: &'a AtomicBool,
+    broker: Option<&'a crate::compiler::acquisition::broker::AcquisitionBroker>,
+}
+
+struct AcquisitionOutcome<'plan> {
+    worker: usize,
+    sandbox: crate::compiler::acquisition::sandbox::ReturnedSandbox,
+    completion: AcquisitionCompletion<'plan>,
+}
+
+struct AcquisitionCompletion<'plan> {
+    prepared: PreparedAcquisitionView<'plan>,
+    diagnostic_members: Vec<String>,
+    broker_view: Option<crate::compiler::acquisition::broker::BrokerView>,
+    started: Option<Instant>,
+    failed_cargo_targets: Vec<CompilerAcquisitionCargoTarget>,
+    result: RailResult<WorkspaceCheckOutput>,
+}
+
+struct AcquisitionFailure {
+    ordinal: usize,
+    view: Option<ViewIx>,
+    cargo_targets: Vec<CompilerAcquisitionCargoTarget>,
+    class: FailureClass,
+    error: RailError,
+}
+
+impl AcquisitionFailure {
+    fn view(
+        ordinal: usize,
+        view: ViewIx,
+        cargo_targets: Vec<CompilerAcquisitionCargoTarget>,
+        class: FailureClass,
+        error: RailError,
+    ) -> Self {
+        Self {
+            ordinal,
+            view: Some(view),
+            cargo_targets,
+            class,
+            error,
+        }
+    }
+
+    fn coordinator(error: RailError) -> Self {
+        Self::global(FailureClass::Coordinator, error)
+    }
+
+    fn global(class: FailureClass, error: RailError) -> Self {
+        Self {
+            ordinal: usize::MAX,
+            view: None,
+            cargo_targets: Vec::new(),
+            class,
+            error,
+        }
+    }
+}
+
+fn execute_acquisition_job<'plan>(
+    worker: usize,
+    context: &AcquisitionWorkerContext<'_>,
+    job: AcquisitionJob<'plan>,
+) -> AcquisitionOutcome<'plan> {
+    let AcquisitionJob {
+        prepared,
+        diagnostic_members,
+        sandbox,
+        started,
+    } = job;
+    let mut active_members = diagnostic_members.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    active_members.extend(prepared.typed_members.iter().map(String::as_str));
+    let active_members = active_members.into_iter().collect::<Vec<_>>();
+    let typed = prepared.collect_typed.then(|| TypedAcquisitionContext {
+        snapshot: context.typed_snapshot.expect("typed acquisition snapshot was prepared"),
+        driver: context.driver.expect("typed acquisition driver was prepared"),
+        doctest_sysroot: context.doctest_sysroot,
+        packages: &prepared.typed_members,
+    });
+    let mut failed_cargo_targets = Vec::new();
+    let broker_view = context
+        .broker
+        .map(|broker| broker.begin_view(prepared.view.index()))
+        .transpose();
+    let (broker_view, result) = match broker_view {
+        Ok(broker_view) if !context.cancellation.load(std::sync::atomic::Ordering::Acquire) => {
+            let result = run_workspace_check(
+                context.workspace_root,
+                context.identity,
+                prepared.view,
+                &active_members,
+                &sandbox,
+                typed.as_ref(),
+                context.artifact_budget,
+                context.package_to_member,
+                &mut failed_cargo_targets,
+                broker_view
+                    .as_ref()
+                    .map(crate::compiler::acquisition::broker::BrokerView::environment),
+                context.cancellation,
+            );
+            (broker_view, result)
+        }
+        Ok(broker_view) => (
+            broker_view,
+            Err(RailError::message(
+                "compiler acquisition was cancelled before Cargo started",
+            )),
+        ),
+        Err(error) => (None, Err(error)),
+    };
+    let sandbox = if result.is_ok() {
+        sandbox.finish()
+    } else {
+        sandbox.poison()
+    };
+    AcquisitionOutcome {
+        worker,
+        sandbox,
+        completion: AcquisitionCompletion {
+            prepared,
+            diagnostic_members,
+            broker_view,
+            started,
+            failed_cargo_targets,
+            result,
+        },
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one coordinator transition durably integrates a complete worker outcome"
+)]
+fn integrate_completed_acquisition(
+    collector: &CompilerDiagnosticsCollector<'_>,
+    completion: AcquisitionCompletion<'_>,
+    require_durability: bool,
+    candidates: &[CompilerCandidate],
+    package_to_member: &HashMap<String, String>,
+    candidate_targets: &HashMap<String, BTreeMap<CandidateId, BTreeSet<String>>>,
+    fact_store: &CompilerFactStore,
+    metrics: &mut CompilerAnalysisMetrics,
+    compiler_facts: &mut Vec<ValidatedCompilerFactObject>,
+    retained_observations: &mut HashMap<String, CompilationObservationManifest>,
+    surviving_unused: &mut HashMap<String, BTreeSet<CandidateId>>,
+    result: &mut HashMap<PackageId, MemberEvidence>,
+    store: &mut CompilerDiagnosticsStore,
+) -> RailResult<(ViewIx, Option<EvidenceIdentity>, bool)> {
+    let AcquisitionCompletion {
+        prepared,
+        diagnostic_members,
+        broker_view,
+        started,
+        failed_cargo_targets: _,
+        result: run,
+    } = completion;
+    let index = prepared.view.index();
+    let evidence_identity = prepared.evidence_identity.clone();
+    let durable = integrate_acquisition_outcome(
+        collector,
+        prepared,
+        diagnostic_members,
+        broker_view,
+        started,
+        run?,
+        candidates,
+        package_to_member,
+        candidate_targets,
+        fact_store,
+        metrics,
+        compiler_facts,
+        retained_observations,
+        surviving_unused,
+        result,
+        store,
+    )?;
+    if require_durability {
+        let cache_started = crate::instrumentation::compiler_acquisition_timer();
+        let flushed = store.flush();
+        crate::instrumentation::record_compiler_acquisition_cache_write(cache_started);
+        flushed?;
+    }
+    Ok((index, evidence_identity, durable))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one coordinator transition integrates a complete view into each owning evidence domain"
+)]
+fn integrate_acquisition_outcome(
+    collector: &CompilerDiagnosticsCollector<'_>,
+    prepared: PreparedAcquisitionView<'_>,
+    diagnostic_members: Vec<String>,
+    broker_view: Option<crate::compiler::acquisition::broker::BrokerView>,
+    started: Option<Instant>,
+    mut run: WorkspaceCheckOutput,
+    candidates: &[CompilerCandidate],
+    package_to_member: &HashMap<String, String>,
+    candidate_targets: &HashMap<String, BTreeMap<CandidateId, BTreeSet<String>>>,
+    fact_store: &CompilerFactStore,
+    metrics: &mut CompilerAnalysisMetrics,
+    compiler_facts: &mut Vec<ValidatedCompilerFactObject>,
+    retained_observations: &mut HashMap<String, CompilationObservationManifest>,
+    surviving_unused: &mut HashMap<String, BTreeSet<CandidateId>>,
+    result: &mut HashMap<PackageId, MemberEvidence>,
+    store: &mut CompilerDiagnosticsStore,
+) -> RailResult<bool> {
+    let view = prepared.view;
+    let diagnostics_must_publish = !diagnostic_members.is_empty();
+    let target = view.platform();
+    let features = view.features();
+    let preflight = run.artifact_preflight;
+    progress!(
+        "    Compiler artifact preflight: {} bytes available; {} bytes soft; {} bytes hard; {} bytes reserved",
+        preflight.initial_available_bytes,
+        preflight.soft_limit_bytes,
+        preflight.hard_limit_bytes,
+        preflight.free_reserve_bytes
+    );
+    if let Some(observed) = preflight.soft_limit_observed_bytes {
+        progress!(
+            "    Compiler artifacts: at least {observed} bytes allocated since sandbox creation; soft limit reached"
+        );
+    }
+    metrics.cargo_views_executed += 1;
+    metrics.compiler_invocations += run.invocations.len();
+    metrics.artifact_high_water_bytes = metrics.artifact_high_water_bytes.max(run.artifact_high_water_bytes);
+    let binding_invocations = run.invocations.clone();
+    let binding_facts = run.compiler_facts.clone();
+    let mut fact_set_published = !prepared.collect_typed;
+    if prepared.collect_typed {
+        metrics.fresh_fragment_bytes =
+            run.compiler_facts
+                .iter()
+                .try_fold(metrics.fresh_fragment_bytes, |total, fragment| {
+                    total
+                        .checked_add(fragment.bytes())
+                        .ok_or_else(|| RailError::message("compiler fact fragment byte count overflow"))
+                })?;
+        let fresh_facts = std::mem::take(&mut run.compiler_facts);
+        if let Some(key) = &prepared.fact_cache_key {
+            let bypasses = fact_invocation_cache_bypasses(&run.invocations, view.compiles_doctests());
+            let complete_empty_view =
+                fresh_facts.is_empty() && bypasses == BTreeSet::from(["no_typed_compiler_invocation".to_string()]);
+            if bypasses.is_empty() || complete_empty_view {
+                let cache_started = crate::instrumentation::compiler_acquisition_timer();
+                let stored = fact_store.put(key, &fresh_facts);
+                crate::instrumentation::record_compiler_acquisition_cache_write(cache_started);
+                match stored {
+                    Ok(()) => fact_set_published = true,
+                    Err(error) => {
+                        metrics.fact_cache_store_failures += 1;
+                        progress!("    Compiler fact cache store bypassed: {error}");
+                    }
+                }
+            } else {
+                for bypass in &bypasses {
+                    *metrics.fact_cache_bypass_reasons.entry(bypass.clone()).or_default() += 1;
+                }
+                progress!(
+                    "    Compiler fact cache bypassed: {}",
+                    bypasses.into_iter().collect::<Vec<_>>().join(", ")
+                );
+            }
+        }
+        compiler_facts.extend(fresh_facts);
+    }
+    if let Some(started) = started {
+        progress!(
+            "    Finished target {} in {:.1}s",
+            format_args!("{} / {}", target, features.label()),
+            started.elapsed().as_secs_f64()
+        );
+    }
+    if view.requires(crate::compiler::scheduler::CompilerFactFamily::StableDiagnostics)
+        && !diagnostic_members.is_empty()
+    {
+        let stale_set = diagnostic_members.iter().map(String::as_str).collect::<HashSet<_>>();
+        let parsed = parse_target_run(
+            &run.stdout,
+            collector.workspace_root,
+            package_to_member,
+            &stale_set,
+            candidates,
+        );
+        let invocations = std::mem::take(&mut run.invocations);
+        let mut compilation_observations =
+            parse_compilation_observations(&run.stdout, invocations, &collector.identity, target)?;
+        reconcile_exact_artifact_observations(&mut compilation_observations, retained_observations);
+        let completeness = DiagnosticsCompleteness::Complete;
+
+        for member in diagnostic_members {
+            let manifests_member = collector
+                .manifests
+                .members
+                .iter()
+                .find(|manifest| manifest.package_name == member)
+                .ok_or_else(|| RailError::message(format!("missing manifest entry for member '{member}'")))?;
+            let key = collector.key_for(manifests_member, target, features.clone())?;
+            let mut unused = BTreeSet::new();
+            let mut compiled = BTreeSet::new();
+            if completeness == DiagnosticsCompleteness::Complete
+                && let Some(parsed_member) = parsed.get(&member)
+            {
+                compiled = parsed_member.compiled_targets.clone();
+            }
+            let unit_evidence = parsed
+                .get(&member)
+                .map(ParsedMemberTarget::unit_evidence)
+                .unwrap_or_default();
+            let normal_units = compiled
+                .iter()
+                .filter(|unit| !unit.test_mode && unit.kind != CargoTargetKind::CustomBuild)
+                .collect::<Vec<_>>();
+            if !normal_units.is_empty() {
+                for candidate in candidates
+                    .iter()
+                    .filter(|candidate| candidate.member == member && candidate.kind == DepKind::Normal)
+                {
+                    if normal_units.iter().all(|unit| {
+                        unit_evidence
+                            .iter()
+                            .find(|evidence| &evidence.unit == *unit)
+                            .is_some_and(|evidence| evidence.unused_crates.contains(&candidate.crate_name))
+                    }) {
+                        unused.insert(candidate.crate_name.clone());
+                    }
+                }
+            }
+            let evidence = TargetEvidence {
+                platform: PlatformTarget::from(target),
+                features: features.clone(),
+                compiled_units: compiled,
+                unused_crates: unused,
+                unit_evidence,
+                completeness,
+            };
+            let observations = collector
+                .identity
+                .package_observation_identities
+                .get(&manifests_member.package_id)
+                .map(|package| {
+                    compilation_observations
+                        .iter()
+                        .filter(|manifest| manifest.unit.package == *package)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let entry = CompilerDiagEntry {
+                key,
+                evidence: evidence.clone(),
+                generated_at_unix_ms: now_unix_ms(),
+                collector_version: COLLECTOR_VERSION,
+                observations,
+            };
+            update_candidate_survivors(surviving_unused, candidate_targets, &member, target, &entry.evidence);
+            record_target_evidence(result, &manifests_member.package_id, &entry.evidence);
+            store.put(entry);
+        }
+    }
+    if fact_set_published
+        && let Err(error) = publish_native_analysis_bindings(
+            collector.identity.analysis_cache.as_ref(),
+            &run.analysis_contract,
+            &binding_invocations,
+            &binding_facts,
+        )
+    {
+        progress!("    Native analysis binding publication bypassed: {error}");
+    }
+    if let Some(broker_view) = broker_view {
+        broker_view.finish()?;
+    }
+    Ok(
+        (!prepared.collect_typed || fact_set_published && fact_store.durability_available())
+            && (!diagnostics_must_publish || store.durability_available()),
+    )
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "one compiler acquisition keeps its captured authority, exact view, output, and failure evidence together"
@@ -2037,15 +2467,24 @@ struct TypedAcquisitionContext<'a> {
 fn run_workspace_check(
     workspace_root: &Path,
     identity: &CompilerCacheIdentity,
-    view: &AnalysisView,
+    view: CompilerAcquisitionView<'_>,
     members: &[&str],
-    cargo_target: &Path,
+    sandbox: &SandboxLease,
     typed: Option<&TypedAcquisitionContext<'_>>,
     artifact_budget: CompilerArtifactBudget,
     package_to_member: &HashMap<String, String>,
     failed_cargo_targets: &mut Vec<CompilerAcquisitionCargoTarget>,
+    broker_environment: Option<&crate::compiler::acquisition::broker::BrokerEnvironment>,
+    cancellation: &AtomicBool,
 ) -> RailResult<WorkspaceCheckOutput> {
+    if members != [view.package()] {
+        return Err(RailError::message(
+            "compiler acquisition execution requires its exact one-package view",
+        ));
+    }
     let wrapper = compiler_observation_wrapper()?;
+    let cargo_target = sandbox.target_dir().to_path_buf();
+    let cargo_build = sandbox.build_dir().to_path_buf();
     let existing_workspace_wrapper = identity.rustc_workspace_wrapper.as_deref();
     let observation_directory = tempfile::Builder::new()
         .prefix("cargo-rail-compiler-observations-")
@@ -2074,24 +2513,45 @@ fn run_workspace_check(
                 view,
                 members,
                 observation_directory.path(),
-                cargo_target,
+                &cargo_target,
+                &cargo_build,
                 doctest_sysroot,
             )
         })
         .transpose()?;
     let fact_families = if typed.is_some() {
-        view.fact_families().clone()
+        view.fact_families()
     } else {
         BTreeSet::from([crate::compiler::scheduler::CompilerFactFamily::StableDiagnostics])
     };
     let source_root = typed.map_or(workspace_root, |typed| typed.snapshot.source_root());
+    let configuration_identity = format!(
+        "sha256:{}",
+        ContentDigest::sha256(&serde_json::to_vec(&(
+            &identity.compiler_env_fingerprint,
+            &identity.cargo_config_fingerprint,
+        ))?)
+    );
+    let analysis_contract = AnalysisContract::new(
+        fact_families,
+        view.package().to_string(),
+        view.platform().to_string(),
+        view.features(),
+        view.command_class().to_string(),
+        configuration_identity,
+        typed_session.as_ref().map(|session| session.producer_authority.clone()),
+        typed_session
+            .as_ref()
+            .map_or_else(BTreeSet::new, |session| session.required_coverage.clone()),
+    )?;
     let fact_session = CompilerFactSession::write_with_typed(
         observation_directory.path(),
         source_root,
-        &fact_families,
+        analysis_contract.clone(),
         typed_session.clone(),
+        broker_environment.cloned(),
     )?;
-    let args = view.cargo_arguments(members)?;
+    let args = view.cargo_arguments();
 
     let mut command = typed.map_or_else(
         || Command::new(&identity.cargo_program),
@@ -2104,14 +2564,18 @@ fn run_workspace_check(
         .env(OBSERVATION_DIRECTORY_ENV, observation_directory.path())
         .env(OBSERVATION_SOURCE_ROOT_ENV, source_root)
         .env(FACT_SESSION_ENV, fact_session)
-        .env("CARGO_TARGET_DIR", cargo_target)
+        .env("CARGO_TARGET_DIR", &cargo_target)
+        .env("CARGO_BUILD_BUILD_DIR", &cargo_build)
         .env_remove(CACHE_WRAPPER_MARKER)
-        .args(&args);
+        .args(&args)
+        .args(["--jobs", "1"]);
+    if let Some(wrapper) = identity.rustc_wrapper.as_ref() {
+        // Execute the global wrapper captured by the authoritative workspace
+        // snapshot instead of asking this later Cargo process to re-resolve it.
+        command.env("RUSTC_WRAPPER", wrapper);
+    }
     if typed.is_some() {
-        command
-            .env("RUSTC", &identity.rustc_program)
-            .env("RUSTC_WRAPPER", "")
-            .env("CARGO_BUILD_RUSTC_WRAPPER", "");
+        command.env("RUSTC", &identity.rustc_program);
     }
     if view.compiles_doctests() {
         command
@@ -2128,25 +2592,31 @@ fn run_workspace_check(
 
     #[cfg(test)]
     QUALIFICATION_CARGO_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let bounded = run_artifact_bounded_command(&mut command, cargo_target, artifact_budget).with_context(|| {
+    let bounded = run_artifact_bounded_command(
+        &mut command,
+        &cargo_target,
+        artifact_budget,
+        cancellation,
+        broker_environment.is_some(),
+    )
+    .with_context(|| {
         format!(
             "running cargo check for target '{target}' in {}",
             workspace_root.display(),
-            target = view.platform().as_str()
+            target = view.platform()
         )
     })?;
-    let output = bounded.output;
-    if !output.status.success() {
-        *failed_cargo_targets = compiler_error_targets(&output.stdout, package_to_member);
-        let diagnostics = cargo_failure_diagnostics(&output.stdout);
+    if !bounded.status.success() {
+        *failed_cargo_targets = compiler_error_targets(&bounded.stdout, package_to_member);
+        let diagnostics = cargo_failure_diagnostics(&bounded.stdout);
         let stderr = if diagnostics.is_empty() {
-            bounded_cargo_failure_stderr(&output.stderr)
+            bounded_cargo_failure_stderr(&bounded.stderr)
         } else {
             String::new()
         };
         return Err(RailError::message(format!(
             "compiler-evidence Cargo acquisition failed with status {}{}{}",
-            output.status,
+            bounded.status,
             if stderr.is_empty() {
                 String::new()
             } else {
@@ -2164,15 +2634,16 @@ fn run_workspace_check(
     }
 
     let invocations = load_raw(observation_directory.path())?;
+    crate::instrumentation::record_compiler_acquisition_actions(invocations.len());
     #[cfg(test)]
     QUALIFICATION_COMPILER_INVOCATIONS.fetch_add(invocations.len(), std::sync::atomic::Ordering::Relaxed);
-    let compiler_facts = typed_session.as_ref().map_or_else(
+    let compiler_fact_fragments = typed_session.as_ref().map_or_else(
     || Ok(Vec::new()),
     |typed| {
       let expected_artifacts =
-        selected_typed_artifact_count(&String::from_utf8_lossy(&output.stdout), source_root, typed)?;
+        selected_typed_artifact_count(&String::from_utf8_lossy(&bounded.stdout), source_root, typed)?;
       let fragments = load_compiler_fact_fragments(
-        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&bounded.stdout),
         observation_directory.path(),
         &invocations,
         typed,
@@ -2186,10 +2657,30 @@ fn run_workspace_check(
       Ok(fragments)
     },
   )?;
+    let mut compiler_facts = compiler_fact_fragments
+        .into_iter()
+        .map(ValidatedCompilerFactFragment::into_object)
+        .collect::<Vec<_>>();
+    compiler_facts.extend(crate::compiler::analysis::load_fact_imports(
+        observation_directory.path(),
+        &analysis_contract,
+        &invocations,
+    )?);
+    compiler_facts.sort_by(|left, right| left.identity().cmp(right.identity()));
+    if compiler_facts
+        .windows(2)
+        .any(|pair| pair[0].identity() == pair[1].identity())
+    {
+        return Err(RailError::message(
+            "compiler fact acquisition produced duplicate fresh and imported objects",
+        ));
+    }
     Ok(WorkspaceCheckOutput {
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stdout: String::from_utf8_lossy(&bounded.stdout).into_owned(),
         invocations,
         compiler_facts,
+        analysis_contract,
+        artifact_preflight: bounded.preflight,
         artifact_high_water_bytes: bounded.high_water_bytes,
     })
 }
@@ -2241,18 +2732,53 @@ fn compiler_artifact_free_reserve_bytes(total_space: u64) -> u64 {
 
 #[derive(Debug)]
 struct ArtifactBoundedCommandOutput {
-    output: Output,
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    preflight: ArtifactPreflight,
     high_water_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ArtifactPreflight {
+    initial_available_bytes: u64,
+    soft_limit_bytes: u64,
+    hard_limit_bytes: u64,
+    free_reserve_bytes: u64,
+    soft_limit_observed_bytes: Option<u64>,
+}
+
+#[cfg(test)]
+struct QualificationLiveCargoProcess;
+
+#[cfg(test)]
+impl QualificationLiveCargoProcess {
+    fn start() -> Self {
+        let live = QUALIFICATION_LIVE_CARGO_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        QUALIFICATION_MAX_LIVE_CARGO_VIEWS.fetch_max(live, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for QualificationLiveCargoProcess {
+    fn drop(&mut self) {
+        let previous = QUALIFICATION_LIVE_CARGO_VIEWS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        debug_assert!(previous > 0, "qualification live Cargo process counter underflowed");
+    }
 }
 
 fn run_artifact_bounded_command(
     command: &mut Command,
     artifact_root: &Path,
     budget: CompilerArtifactBudget,
+    cancellation: &AtomicBool,
+    broker_enabled: bool,
 ) -> RailResult<ArtifactBoundedCommandOutput> {
     if budget.soft_limit_bytes == 0 || budget.hard_limit_bytes < budget.soft_limit_bytes {
         return Err(RailError::message("compiler artifact storage budget is invalid"));
     }
+    let cargo_started = crate::instrumentation::compiler_acquisition_timer();
     let initial_available = fs2::available_space(artifact_root).with_context(|| {
         format!(
             "measuring filesystem capacity for compiler artifact root '{}'",
@@ -2278,29 +2804,62 @@ fn run_artifact_bounded_command(
         ));
     }
     let effective_soft_limit = budget.soft_limit_bytes.min(effective_hard_limit);
-    progress!(
-        "    Compiler artifact preflight: {initial_available} bytes available; {effective_soft_limit} bytes soft; {effective_hard_limit} bytes hard; {} bytes reserved",
-        free_reserve
-    );
-
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.spawn()?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| RailError::message("Cargo compiler acquisition has no stdout pipe"))?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| RailError::message("Cargo compiler acquisition has no stderr pipe"))?;
-    let stdout_reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).map(|_| bytes)
-    });
-    let stderr_reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stderr.read_to_end(&mut bytes).map(|_| bytes)
-    });
+    if cancellation.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(RailError::message(
+            "compiler acquisition was cancelled before Cargo started",
+        ));
+    }
+    let mut process = ProcessTree::spawn(command)?;
+    let _live_process = crate::instrumentation::compiler_acquisition_process_started(!broker_enabled);
+    #[cfg(test)]
+    let _qualification_live_process = QualificationLiveCargoProcess::start();
+    let stdout = process.take_stdout()?;
+    let stderr = process.take_stderr()?;
+    let stream_failed = Arc::new(AtomicBool::new(false));
+    let stdout_failed = Arc::clone(&stream_failed);
+    let stdout_reader = match std::thread::Builder::new()
+        .name("cargo-rail-cargo-stdout".to_string())
+        .spawn(move || {
+            let result = read_cargo_stdout(stdout);
+            if result.is_err() {
+                stdout_failed.store(true, std::sync::atomic::Ordering::Release);
+            }
+            result
+        }) {
+        Ok(reader) => reader,
+        Err(spawn_error) => {
+            let cleanup = terminate_process_tree(&mut process);
+            return Err(RailError::message(format!(
+                "failed to spawn Cargo stdout reader: {spawn_error}; process cleanup: {}",
+                cleanup
+                    .map(|termination| format!("complete after {:.3}s", termination.elapsed.as_secs_f64()))
+                    .unwrap_or_else(|error| format!("failed: {error}"))
+            )));
+        }
+    };
+    let stderr_failed = Arc::clone(&stream_failed);
+    let stderr_reader = match std::thread::Builder::new()
+        .name("cargo-rail-cargo-stderr".to_string())
+        .spawn(move || {
+            let result = read_cargo_stderr_tail(stderr);
+            if result.is_err() {
+                stderr_failed.store(true, std::sync::atomic::Ordering::Release);
+            }
+            result
+        }) {
+        Ok(reader) => reader,
+        Err(spawn_error) => {
+            let cleanup = terminate_process_tree(&mut process);
+            let stdout_join = stdout_reader.join();
+            return Err(RailError::message(format!(
+                "failed to spawn Cargo stderr reader: {spawn_error}; process cleanup: {}; stdout reader: {}",
+                cleanup
+                    .map(|termination| format!("complete after {:.3}s", termination.elapsed.as_secs_f64()))
+                    .unwrap_or_else(|error| format!("failed: {error}")),
+                if stdout_join.is_ok() { "joined" } else { "panicked" }
+            )));
+        }
+    };
 
     let probe_stride_bytes = (effective_hard_limit / 8).clamp(1024 * 1024, 8 * 1024 * 1024 * 1024);
     let mut next_probe_bytes = effective_soft_limit;
@@ -2308,45 +2867,46 @@ fn run_artifact_bounded_command(
     let mut soft_reported = false;
     let mut budget_breach = None;
     let mut monitor_error = None;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
+    let mut cancelled = false;
+    let mut status = None;
+    loop {
+        match process.try_wait() {
+            Ok(Some(completed)) => {
+                status = Some(completed);
+                break;
+            }
             Ok(None) => {}
             Err(error) => {
                 monitor_error = Some(error);
-                if let Err(error) = child.kill() {
-                    monitor_error = Some(error);
-                }
-                break child.wait()?;
+                break;
             }
+        }
+        if process.cancellation_requested() || cancellation.load(std::sync::atomic::Ordering::Acquire) {
+            cancelled = true;
+            break;
+        }
+        if stream_failed.load(std::sync::atomic::Ordering::Acquire) {
+            break;
         }
         match fs2::available_space(artifact_root) {
             Ok(available) => {
                 let filesystem_delta = initial_available.saturating_sub(available);
+                high_water_bytes = high_water_bytes.max(filesystem_delta);
+                if !soft_reported && filesystem_delta >= effective_soft_limit {
+                    soft_reported = true;
+                }
                 if filesystem_delta >= next_probe_bytes {
                     match compiler_artifact_bytes(artifact_root) {
                         Ok(current_bytes) => {
                             high_water_bytes = high_water_bytes.max(current_bytes);
-                            if !soft_reported && current_bytes >= effective_soft_limit {
-                                soft_reported = true;
-                                progress!(
-                                    "    Compiler artifacts: {current_bytes} bytes current; {high_water_bytes} bytes high-water; soft limit reached"
-                                );
-                            }
                             if current_bytes > effective_hard_limit {
                                 budget_breach = Some(current_bytes);
-                                if let Err(error) = child.kill() {
-                                    monitor_error = Some(error);
-                                }
-                                break child.wait()?;
+                                break;
                             }
                         }
                         Err(error) => {
                             monitor_error = Some(std::io::Error::other(error.to_string()));
-                            if let Err(error) = child.kill() {
-                                monitor_error = Some(error);
-                            }
-                            break child.wait()?;
+                            break;
                         }
                     }
                     next_probe_bytes = filesystem_delta.saturating_add(probe_stride_bytes);
@@ -2354,26 +2914,63 @@ fn run_artifact_bounded_command(
             }
             Err(error) => {
                 monitor_error = Some(error);
-                if let Err(error) = child.kill() {
-                    monitor_error = Some(error);
-                }
-                break child.wait()?;
+                break;
             }
         }
         std::thread::sleep(COMPILER_ARTIFACT_POLL_INTERVAL);
-    };
+    }
 
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| RailError::message("Cargo compiler acquisition stdout reader panicked"))??;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| RailError::message("Cargo compiler acquisition stderr reader panicked"))??;
+    if let Some(completed) = status {
+        if let Err(error) = process.finish(completed) {
+            monitor_error = Some(error);
+        }
+    } else {
+        match terminate_process_tree(&mut process) {
+            Ok(_) => {}
+            Err(error) => monitor_error = Some(error),
+        }
+    }
+    let stdout_join = stdout_reader.join();
+    let stderr_join = stderr_reader.join();
+    let stdout = stdout_join.map_err(|_| RailError::message("Cargo compiler acquisition stdout reader panicked"))?;
+    let stderr = stderr_join.map_err(|_| RailError::message("Cargo compiler acquisition stderr reader panicked"))?;
+    let stdout_bytes_read = stdout.as_ref().map_or(0, |output| output.bytes_read());
+    let stderr_bytes_read = stderr.as_ref().map_or(0, |output| output.bytes_read());
+    let stdout_bytes_retained = stdout.as_ref().map_or(0, |output| output.retained_bytes());
+    let stderr_bytes_retained = stderr.as_ref().map_or(0, |output| output.retained_bytes());
+    let cargo_messages = stdout.as_ref().map_or(0, |output| output.messages_read());
+    crate::instrumentation::record_compiler_acquisition_cargo_view(
+        cargo_started,
+        cargo_messages,
+        stdout_bytes_read,
+        stderr_bytes_read,
+        stdout_bytes_retained,
+        stderr_bytes_retained,
+    );
     if let Some(error) = monitor_error {
+        let trigger = if cancelled {
+            Some("cancellation was requested".to_string())
+        } else if let Err(stream_error) = &stdout {
+            Some(format!("Cargo stdout {}: {stream_error}", stream_error.class()))
+        } else if let Err(stream_error) = &stderr {
+            Some(format!("Cargo stderr reader failure: {stream_error}"))
+        } else {
+            budget_breach.map(|current_bytes| format!("artifact working set reached {current_bytes} bytes"))
+        };
         return Err(RailError::message(format!(
-            "compiler artifact storage monitor failed: {error}"
+            "compiler acquisition process ownership failed: {error}{}",
+            trigger.map_or_else(String::new, |trigger| format!("; triggering failure: {trigger}"))
         )));
     }
+    if cancelled {
+        return Err(RailError::message(
+            "compiler acquisition was cancelled by SIGINT or SIGTERM",
+        ));
+    }
+    let stdout = stdout
+        .map_err(|error| RailError::message(format!("Cargo compiler acquisition stdout {}: {error}", error.class())))?;
+    let stderr = stderr
+        .map_err(|error| RailError::message(format!("Cargo compiler acquisition stderr reader failure: {error}")))?;
     if let Some(current_bytes) = budget_breach {
         return Err(RailError::with_help(
             format!(
@@ -2393,10 +2990,24 @@ fn run_artifact_bounded_command(
             "increase unify.compiler_artifact_hard_limit_bytes only after verifying the workspace's required single-view working set",
         ));
     }
+    let status = status.ok_or_else(|| RailError::message("Cargo compiler acquisition exited without a status"))?;
     Ok(ArtifactBoundedCommandOutput {
-        output: Output { status, stdout, stderr },
+        status,
+        stdout: stdout.retained().to_vec(),
+        stderr: stderr.tail().to_vec(),
+        preflight: ArtifactPreflight {
+            initial_available_bytes: initial_available,
+            soft_limit_bytes: effective_soft_limit,
+            hard_limit_bytes: effective_hard_limit,
+            free_reserve_bytes: free_reserve,
+            soft_limit_observed_bytes: soft_reported.then_some(high_water_bytes),
+        },
         high_water_bytes,
     })
+}
+
+fn terminate_process_tree(process: &mut ProcessTree) -> std::io::Result<ProcessTermination> {
+    process.terminate()
 }
 
 fn stage_view_workspace_wrapper(wrapper: &Path, directory: &Path) -> RailResult<PathBuf> {
@@ -2445,6 +3056,7 @@ fn bounded_cargo_failure_stderr(stderr: &[u8]) -> String {
 
 fn fact_invocation_cache_bypasses(
     invocations: &[crate::compiler::observation::RawCompilerInvocation],
+    completed_doctest_view: bool,
 ) -> BTreeSet<String> {
     let mut observed = false;
     let mut bypasses = BTreeSet::new();
@@ -2453,15 +3065,49 @@ fn fact_invocation_cache_bypasses(
         .filter(|invocation| invocation.compiler_fact_unit.is_some())
     {
         observed = true;
-        if !invocation.success {
+        let expected_doctest_failure = is_expected_doctest_compile_failure(invocation, completed_doctest_view);
+        if !invocation.success && !expected_doctest_failure {
             bypasses.insert("compiler_invocation_failed".to_string());
         }
-        bypasses.extend(invocation.bypasses.iter().cloned());
+        bypasses.extend(
+            invocation
+                .bypasses
+                .iter()
+                .filter(|bypass| {
+                    !expected_doctest_failure
+                        || !matches!(
+                            bypass.as_str(),
+                            "dep_info_output_bytes_unavailable"
+                                | "dep_info_output_symlink_unavailable"
+                                | "dep_info_unavailable"
+                                | "emitted_output_bytes_unavailable"
+                                | "emitted_output_symlink_unavailable"
+                        )
+                })
+                .cloned(),
+        );
     }
     if !observed {
         bypasses.insert("no_typed_compiler_invocation".to_string());
     }
     bypasses
+}
+
+/// Rustdoc is the authority that classifies a builder failure as `compile_fail`:
+/// this helper is called only after the enclosing doctest command succeeded.
+/// Requiring an ordinary rustc exit code of one prevents a missing executable,
+/// signal, or wrapper setup failure from being accepted as an expected test.
+fn is_expected_doctest_compile_failure(
+    invocation: &crate::compiler::observation::RawCompilerInvocation,
+    completed_doctest_view: bool,
+) -> bool {
+    completed_doctest_view
+        && !invocation.success
+        && invocation.compiler_exit_code == Some(1)
+        && invocation
+            .compiler_fact_unit
+            .as_ref()
+            .is_some_and(|unit| unit.domain == crate::compiler::facts::CompilerFactDomain::Doctest)
 }
 
 fn selected_typed_artifact_count(
@@ -2523,22 +3169,25 @@ fn selected_typed_artifact_count_for(stdout: &str, selected: &BTreeSet<(String, 
 
 fn typed_session(
     context: &TypedAcquisitionContext<'_>,
-    view: &AnalysisView,
+    view: CompilerAcquisitionView<'_>,
     members: &[&str],
     observation_directory: &Path,
     typed_cargo_target: &Path,
+    typed_cargo_build: &Path,
     doctest_sysroot: Option<&CompilerFactDoctestSysroot>,
 ) -> RailResult<CompilerFactTypedSession> {
-    if !view
-        .fact_families()
-        .contains(&crate::compiler::scheduler::CompilerFactFamily::TypedRustItems)
-    {
+    if !view.requires(crate::compiler::scheduler::CompilerFactFamily::TypedRustItems) {
         return Err(RailError::message(
             "typed compiler driver was supplied to a view that does not request typed facts",
         ));
     }
+    if members != [view.package()] || context.packages != &BTreeSet::from([view.package().to_string()]) {
+        return Err(RailError::message(
+            "typed compiler acquisition requires its exact one-package view",
+        ));
+    }
     let targets = CompilerFactTypedSession::targets_from_snapshot(context.snapshot, context.packages)?;
-    let view_identity = view.fact_cache_identity(members, context.packages)?;
+    let view_identity = view.fact_cache_identity(view.package())?;
     let mut hasher = Sha256::new();
     hasher.update(b"cargo-rail-compiler-fact-run-v1\0");
     hasher.update((view_identity.len() as u64).to_le_bytes());
@@ -2550,10 +3199,10 @@ fn typed_session(
         ContentDigest::from_sha256_bytes(hasher.finalize().into())
     );
     let host_platform = context.snapshot.toolchain().host_target().to_string();
-    let target_platform = if view.platform().as_str() == "default" {
+    let target_platform = if view.platform() == "default" {
         host_platform.clone()
     } else {
-        view.platform().as_str().to_string()
+        view.platform().to_string()
     };
     let driver_program = context
         .driver
@@ -2574,7 +3223,7 @@ fn typed_session(
     .to_str()
     .ok_or_else(|| RailError::message("selected rustc path is not valid UTF-8"))?
     .to_string();
-    let generated_roots = vec![typed_cargo_target.to_path_buf()];
+    let generated_roots = vec![typed_cargo_target.to_path_buf(), typed_cargo_build.to_path_buf()];
     let mut generated_roots = generated_roots
         .into_iter()
         .map(|root| {
@@ -2623,10 +3272,13 @@ fn load_compiler_fact_fragments(
         let Some(unit) = &invocation.compiler_fact_unit else {
             continue;
         };
-        if !invocation.success {
+        if !invocation.success && !is_expected_doctest_compile_failure(invocation, session.doctest) {
             return Err(RailError::message(
                 "typed compiler fact invocation failed before publishing complete facts",
             ));
+        }
+        if !invocation.success {
+            continue;
         }
         if let Some(previous) = expected.insert(unit.identity.clone(), unit)
             && previous != unit
@@ -2790,7 +3442,11 @@ fn validate_compiler_fact_cargo_envelope(
     let target = session
         .targets
         .iter()
-        .find(|target| target.package == unit.package && target.cargo_target == unit.cargo_target)
+        .find(|target| {
+            target.package == unit.package
+                && target.cargo_target == unit.cargo_target
+                && target.target_kind == unit.target_kind
+        })
         .ok_or_else(|| RailError::message("compiler fact unit is outside its captured Cargo target authority"))?;
     if event["target"]["name"].as_str() != Some(unit.cargo_target.as_str()) {
         return Err(RailError::message(
@@ -2814,10 +3470,11 @@ fn validate_compiler_fact_cargo_envelope(
                 | (CompilerFactTargetKind::BuildScript, "custom-build")
         ) || matches!(&unit.target_kind, CompilerFactTargetKind::Other(other) if other == kind)
     });
-    if !kind_matches || target.target_kind != unit.target_kind {
-        return Err(RailError::message(
-            "compiler fact announcement does not match Cargo's target kind",
-        ));
+    if !kind_matches {
+        return Err(RailError::message(format!(
+            "compiler fact announcement for '{}:{}' has target kinds {kinds:?}, but the authorized unit is {:?} and the captured target is {:?}",
+            unit.package.name, unit.cargo_target, unit.target_kind, target.target_kind
+        )));
     }
     Ok(())
 }
@@ -3341,7 +3998,10 @@ fn executable_toolchain_fingerprint(
     executables: &ToolchainExecutableIdentities,
     cargo_rail_executable: &ExecutableIdentity,
 ) -> RailResult<String> {
-    let mut framed = Vec::from(&b"cargo-rail-executable-toolchain-v2\0"[..]);
+    let memo_path = compiler_sysroot_memo_path(toolchain.rustc_sysroot(), toolchain.host_target(), None);
+    let (sysroot_identity, _) =
+        compiler_sysroot_fingerprint(toolchain.rustc_sysroot(), toolchain.host_target(), memo_path.as_deref())?;
+    let mut framed = Vec::from(&b"cargo-rail-executable-toolchain-v3\0"[..]);
     append_identity_frame(&mut framed, b"executables", &executables.identity_bytes()?);
     append_identity_frame(
         &mut framed,
@@ -3362,6 +4022,12 @@ fn executable_toolchain_fingerprint(
     append_identity_frame(&mut framed, b"platform-family", std::env::consts::FAMILY.as_bytes());
     append_identity_frame(&mut framed, b"platform-os", std::env::consts::OS.as_bytes());
     append_identity_frame(&mut framed, b"platform-arch", std::env::consts::ARCH.as_bytes());
+    append_identity_frame(&mut framed, b"compiler-sysroot", sysroot_identity.as_bytes());
+    append_identity_frame(
+        &mut framed,
+        b"native-runtime-contract",
+        b"exact-rust-distribution-and-host-platform-v1",
+    );
     append_identity_frame(
         &mut framed,
         b"cargo-rail-diagnostic-wrapper",
@@ -3373,6 +4039,44 @@ fn executable_toolchain_fingerprint(
         b"transparent-cache-owned-by-cargo-configuration",
     );
     Ok(format!("sha256:{}", ContentDigest::sha256(&framed)))
+}
+
+fn compiler_evidence_executable_bypasses(
+    executables: &ToolchainExecutableIdentities,
+    cargo_rail_executable: &ExecutableIdentity,
+    verified_installed_rustc_wrapper: bool,
+) -> BTreeSet<String> {
+    executables
+        .limitations()
+        .filter(|limitation| {
+            !rust_distribution_native_runtime_limitation(limitation)
+                && !(verified_installed_rustc_wrapper
+                    && *limitation == "rustc_wrapper_dynamic_executable_inputs_unavailable")
+        })
+        .map(str::to_string)
+        .chain(
+            cargo_rail_executable
+                .limitations()
+                .filter(|limitation| *limitation != "dynamic_executable_inputs_unavailable")
+                .map(|limitation| format!("compiler_wrapper_{limitation}")),
+        )
+        .collect()
+}
+
+fn rust_distribution_native_runtime_limitation(limitation: &str) -> bool {
+    limitation
+        .strip_suffix("_dynamic_executable_inputs_unavailable")
+        .is_some_and(|role| {
+            matches!(
+                role,
+                "cargo"
+                    | "rustc"
+                    | "rustdoc"
+                    | "cargo_implementation"
+                    | "rustc_implementation"
+                    | "rustdoc_implementation"
+            )
+        })
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -4889,6 +5593,149 @@ fn is_relevant_target(target: &CargoTarget) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compiler::facts::{
+        CompilerFactCoverage, CompilerFactDomain, CompilerFactPackage, CompilerFactProducerAuthority, CompilerFactRole,
+        CompilerFactUnit,
+    };
+
+    #[test]
+    fn completed_compile_fail_doctest_ignores_only_its_absent_outputs() {
+        let package = CompilerFactPackage {
+            name: "member".to_string(),
+            version: "0.1.0".to_string(),
+            source: None,
+        };
+        let invocation = crate::compiler::observation::RawCompilerInvocation {
+            version: 1,
+            mode: CompilerMode::Rustc,
+            crate_name: Some("doctest".to_string()),
+            crate_types: BTreeSet::new(),
+            target_argument: None,
+            cfg: BTreeSet::new(),
+            emit_modes: BTreeSet::new(),
+            test_mode: true,
+            compiler_arguments: Vec::new(),
+            declared_inputs: Vec::new(),
+            observed_reads: Vec::new(),
+            dependency_artifacts: Vec::new(),
+            emitted_outputs: Vec::new(),
+            environment_reads: BTreeSet::new(),
+            compiler: None,
+            wrappers: Vec::new(),
+            cache_wrapper: None,
+            compiler_exit_code: Some(1),
+            success: false,
+            bypasses: BTreeSet::from([
+                "emitted_output_bytes_unavailable".to_string(),
+                "response_file_expansion_unavailable".to_string(),
+            ]),
+            compiler_fact_unit: Some(CompilerFactUnit {
+                identity: "doctest-unit".to_string(),
+                invocation_identity: format!("compiler-invocation-v1-sha256-{}", "5".repeat(64)),
+                package,
+                cargo_target: "member".to_string(),
+                crate_name: "doctest".to_string(),
+                target_kind: CompilerFactTargetKind::Library,
+                domain: CompilerFactDomain::Doctest,
+                role: CompilerFactRole::Target,
+                platform: "target".to_string(),
+                features: Vec::new(),
+                cfg: Vec::new(),
+            }),
+        };
+
+        assert_eq!(
+            fact_invocation_cache_bypasses(std::slice::from_ref(&invocation), true),
+            BTreeSet::from(["response_file_expansion_unavailable".to_string()])
+        );
+        assert_eq!(
+            fact_invocation_cache_bypasses(&[invocation], false),
+            BTreeSet::from([
+                "compiler_invocation_failed".to_string(),
+                "emitted_output_bytes_unavailable".to_string(),
+                "response_file_expansion_unavailable".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn compiler_fact_cargo_envelope_distinguishes_duplicate_target_names_by_kind() {
+        let package = CompilerFactPackage {
+            name: "member".to_string(),
+            version: "0.1.0".to_string(),
+            source: None,
+        };
+        let target = |target_kind| crate::compiler::session::CompilerFactTargetAuthority {
+            package: package.clone(),
+            manifest_directory: "member".to_string(),
+            cargo_target: "shared".to_string(),
+            crate_name: "shared".to_string(),
+            target_kind,
+            source: "member/shared.rs".to_string(),
+            doctest: false,
+        };
+        let session = CompilerFactTypedSession {
+            run_authority: CompilerFactRunAuthority {
+                run_identity: format!("{RUN_IDENTITY_PREFIX}{}", "1".repeat(64)),
+                view_identity: format!("compiler-view-v1-sha256-{}", "2".repeat(64)),
+            },
+            producer_authority: CompilerFactProducerAuthority {
+                compiler_identity: format!("compiler-v1-sha256-{}", "3".repeat(64)),
+                driver_identity: format!("compiler-fact-driver-v1-sha256-{}", "4".repeat(64)),
+            },
+            driver_program: "/driver".to_string(),
+            rustc_program: "/rustc".to_string(),
+            compiler_library_directory: "/lib".to_string(),
+            host_platform: "host".to_string(),
+            target_platform: "target".to_string(),
+            doctest: false,
+            doctest_sysroot: None,
+            generated_roots: vec!["/generated".to_string()],
+            required_coverage: BTreeSet::from([CompilerFactCoverage::Definitions]),
+            targets: vec![
+                target(CompilerFactTargetKind::Test),
+                target(CompilerFactTargetKind::Benchmark),
+            ],
+        };
+        let unit = |target_kind| CompilerFactUnit {
+            identity: format!("unit-{target_kind:?}"),
+            invocation_identity: format!("compiler-invocation-v1-sha256-{}", "5".repeat(64)),
+            package: package.clone(),
+            cargo_target: "shared".to_string(),
+            crate_name: "shared".to_string(),
+            target_kind,
+            domain: CompilerFactDomain::NonProduction,
+            role: CompilerFactRole::Target,
+            platform: "target".to_string(),
+            features: Vec::new(),
+            cfg: Vec::new(),
+        };
+        let benchmark_event = serde_json::json!({
+            "target": {
+                "name": "shared",
+                "kind": ["bench"],
+            }
+        });
+        let test_event = serde_json::json!({
+            "target": {
+                "name": "shared",
+                "kind": ["test"],
+            }
+        });
+
+        validate_compiler_fact_cargo_envelope(&benchmark_event, &unit(CompilerFactTargetKind::Benchmark), &session)
+            .expect("benchmark envelope");
+        validate_compiler_fact_cargo_envelope(&test_event, &unit(CompilerFactTargetKind::Test), &session)
+            .expect("test envelope");
+
+        let mismatch =
+            validate_compiler_fact_cargo_envelope(&test_event, &unit(CompilerFactTargetKind::Benchmark), &session)
+                .expect_err("same-named test envelope must not satisfy benchmark authority")
+                .to_string();
+        assert!(mismatch.contains("member:shared"), "{mismatch}");
+        assert!(mismatch.contains("Benchmark"), "{mismatch}");
+        assert!(mismatch.contains("test"), "{mismatch}");
+    }
 
     #[test]
     fn target_run_attributes_cargo_messages_by_package_identity() {
@@ -5230,6 +6077,132 @@ edition = "2024"
         result.unwrap();
     }
 
+    /// Compare equivalent serial and concurrent cold acquisitions in one
+    /// physical workspace. Cache reuse is disabled so both policies execute
+    /// the same three typed views and produce byte-identical fact objects.
+    #[cfg(any(unix, windows))]
+    #[test]
+    #[ignore = "requires the exact rustc-dev companion authority embedded by the qualification harness"]
+    fn compiler_fact_concurrent_acquisition_qualification_sample() {
+        let result: RailResult<()> = (|| {
+            let workspace = exact_reuse_workspace()?;
+            let context = crate::workspace::WorkspaceContext::build_with_snapshot(workspace.path())?;
+            let snapshot = context.snapshot()?;
+            let packages = context.cargo().workspace_members();
+            let manifests = ManifestAnalyzer::parse_snapshot(snapshot, &packages)?;
+            let mut identity = CompilerCacheIdentity::capture(snapshot)?;
+            identity.analysis_cache = None;
+            identity.cache_bypass_reason = Some(CompilerCacheBypass::CargoConfiguration);
+            let targets = vec!["default"];
+            let typed_packages = BTreeSet::from(["app".to_string()]);
+            let doctest_packages = BTreeSet::new();
+            let _installed_driver = InstalledTestFactDriver::install()?;
+
+            let run = |policy: ExecutionPolicy| -> RailResult<(Duration, usize, usize, Vec<Vec<u8>>)> {
+                assert_eq!(
+                    QUALIFICATION_LIVE_CARGO_VIEWS.load(std::sync::atomic::Ordering::Relaxed),
+                    0,
+                    "a prior acquisition retained a live Cargo process"
+                );
+                QUALIFICATION_CARGO_VIEWS.store(0, std::sync::atomic::Ordering::Relaxed);
+                QUALIFICATION_COMPILER_INVOCATIONS.store(0, std::sync::atomic::Ordering::Relaxed);
+                QUALIFICATION_MAX_LIVE_CARGO_VIEWS.store(0, std::sync::atomic::Ordering::Relaxed);
+                let collector = CompilerDiagnosticsCollector::with_identity(
+                    workspace.path(),
+                    &manifests,
+                    targets.clone(),
+                    &identity,
+                )
+                .with_execution_policy(policy);
+                let started = Instant::now();
+                let evidence = collector.collect_with_typed_items(snapshot, &[], &typed_packages, &doctest_packages)?;
+                let elapsed = started.elapsed();
+                let cargo_views = QUALIFICATION_CARGO_VIEWS.load(std::sync::atomic::Ordering::Relaxed);
+                let compiler_invocations =
+                    QUALIFICATION_COMPILER_INVOCATIONS.load(std::sync::atomic::Ordering::Relaxed);
+                let max_live = QUALIFICATION_MAX_LIVE_CARGO_VIEWS.load(std::sync::atomic::Ordering::Relaxed);
+                if cargo_views != 3 || compiler_invocations == 0 {
+                    return Err(RailError::message(format!(
+                        "compiler concurrency workload executed {cargo_views} Cargo views and {compiler_invocations} compiler invocations"
+                    )));
+                }
+                let objects = evidence
+                    .compiler_facts
+                    .iter()
+                    .map(|fact| serde_json::to_vec(fact.object()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if objects.is_empty() {
+                    return Err(RailError::message(
+                        "compiler concurrency workload returned no exact fact objects",
+                    ));
+                }
+                Ok((elapsed, compiler_invocations, max_live, objects))
+            };
+
+            let serial_policy = ExecutionPolicy::fixed(1, 1)?;
+            let concurrent_policy = ExecutionPolicy::fixed(3, 3)?;
+            let serial_first = run(serial_policy)?;
+            let concurrent_first = run(concurrent_policy)?;
+            let concurrent_second = run(concurrent_policy)?;
+            let serial_second = run(serial_policy)?;
+
+            let reference = &serial_first.3;
+            for objects in [&concurrent_first.3, &concurrent_second.3, &serial_second.3] {
+                if objects != reference {
+                    return Err(RailError::message(
+                        "serial and concurrent compiler acquisitions produced different exact fact objects",
+                    ));
+                }
+            }
+            if serial_first.1 != concurrent_first.1
+                || serial_first.1 != concurrent_second.1
+                || serial_first.1 != serial_second.1
+            {
+                return Err(RailError::message(
+                    "serial and concurrent compiler acquisitions executed different compiler work",
+                ));
+            }
+            if serial_first.2 != 1 || serial_second.2 != 1 {
+                return Err(RailError::message(
+                    "serial compiler acquisition exceeded one live Cargo process",
+                ));
+            }
+            if concurrent_first.2 < 2 || concurrent_second.2 < 2 {
+                return Err(RailError::message(
+                    "concurrent compiler acquisition did not overlap Cargo processes",
+                ));
+            }
+            let serial_wall = serial_first.0.saturating_add(serial_second.0);
+            let concurrent_wall = concurrent_first.0.saturating_add(concurrent_second.0);
+            if concurrent_wall >= serial_wall {
+                return Err(RailError::message(format!(
+                    "concurrent compiler acquisition ({concurrent_wall:?}) did not outperform equivalent serial work ({serial_wall:?})"
+                )));
+            }
+
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "schema_version": 1,
+                    "workload": "compiler-fact-concurrent-acquisition",
+                    "host": snapshot.toolchain().host_target(),
+                    "cargo_views_per_run": 3,
+                    "compiler_invocations_per_run": serial_first.1,
+                    "serial_wall_ns": u64::try_from(serial_wall.as_nanos()).unwrap_or(u64::MAX),
+                    "concurrent_wall_ns": u64::try_from(concurrent_wall.as_nanos()).unwrap_or(u64::MAX),
+                    "reduction_percent": 100.0 * (serial_wall.as_secs_f64() - concurrent_wall.as_secs_f64())
+                        / serial_wall.as_secs_f64(),
+                    "serial_max_live_cargo_processes": serial_first.2.max(serial_second.2),
+                    "concurrent_max_live_cargo_processes": concurrent_first.2.max(concurrent_second.2),
+                    "exact_fact_objects": reference.len(),
+                    "exact_fact_bytes": reference.iter().map(Vec::len).sum::<usize>(),
+                }))?
+            );
+            Ok(())
+        })();
+        result.unwrap();
+    }
+
     /// Execute one release-optimized acquisition sample for the retained Task 6
     /// qualification harness. The lane is explicit so the harness measures the
     /// real independent collectors instead of inferring their cost from a view
@@ -5488,86 +6461,6 @@ edition = "2024"
         );
     }
 
-    #[test]
-    fn compiler_artifact_authority_reclaims_interrupted_graphs_and_serializes_disk_owners() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let stale = workspace
-            .path()
-            .join("target/cargo-rail/compiler-artifacts-v1/interrupted/debug/deps");
-        fs::create_dir_all(&stale).expect("stale artifact tree");
-        fs::write(stale.join("artifact"), b"reconstructible").expect("stale artifact");
-
-        let authority = CompilerArtifactAuthority::prepare(workspace.path(), CompilerArtifactBudget::default(), 2)
-            .expect("artifact authority");
-        assert!(!stale.exists(), "interrupted artifact graph survived restart cleanup");
-        fs::write(authority.target_dir().join("artifact"), b"active").expect("active artifact");
-        let workspace_root = workspace.path().to_path_buf();
-        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
-        std::thread::scope(|scope| {
-            scope.spawn(move || {
-                let next = CompilerArtifactAuthority::prepare(&workspace_root, CompilerArtifactBudget::default(), 1)
-                    .expect("next authority");
-                drop(next);
-                finished_tx.send(()).expect("completion");
-            });
-            assert!(
-                finished_rx.recv_timeout(std::time::Duration::from_millis(100)).is_err(),
-                "a second compiler acquisition crossed the workspace disk authority"
-            );
-            drop(authority);
-            finished_rx
-                .recv_timeout(std::time::Duration::from_secs(10))
-                .expect("next authority should proceed after cleanup");
-        });
-        assert!(
-            !workspace
-                .path()
-                .join("target/cargo-rail/compiler-artifacts-v1")
-                .exists(),
-            "artifact authority left an empty working root"
-        );
-    }
-
-    #[test]
-    fn compiler_artifact_authority_uses_cargo_target_reclamation() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        fs::create_dir(workspace.path().join("src")).expect("source directory");
-        fs::write(
-            workspace.path().join("Cargo.toml"),
-            "[package]\nname = \"artifact-clean\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-        )
-        .expect("manifest");
-        fs::write(workspace.path().join("src/lib.rs"), "pub fn value() {}\n").expect("source");
-        let authority = CompilerArtifactAuthority::prepare(workspace.path(), CompilerArtifactBudget::default(), 1)
-            .expect("artifact authority");
-        let target_artifact = authority
-            .target_dir()
-            .join("aarch64-apple-darwin/debug/deps/target-artifact");
-        let host_artifact = authority.target_dir().join("debug/deps/host-artifact");
-        fs::create_dir_all(target_artifact.parent().expect("target artifact parent")).expect("target artifacts");
-        fs::create_dir_all(host_artifact.parent().expect("host artifact parent")).expect("host artifacts");
-        fs::write(&target_artifact, b"target").expect("target artifact");
-        fs::write(&host_artifact, b"host").expect("host artifact");
-        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
-        let mut metrics = CompilerAnalysisMetrics::default();
-
-        reclaim_compiler_artifact_target(
-            &mut metrics,
-            workspace.path(),
-            &cargo,
-            &authority,
-            "aarch64-apple-darwin",
-        )
-        .expect("target reclamation");
-
-        assert!(!target_artifact.exists(), "Cargo left the completed target slice");
-        assert!(
-            authority.target_dir().join("CACHEDIR.TAG").is_file(),
-            "Cargo Rail did not restore the owned target root after Cargo removed it"
-        );
-        assert_eq!(metrics.artifact_views_reclaimed, 1);
-    }
-
     #[cfg(unix)]
     #[test]
     fn compiler_artifact_hard_limit_terminates_an_active_view() {
@@ -5583,6 +6476,8 @@ edition = "2024"
             &mut command,
             root.path(),
             CompilerArtifactBudget::new(512 * 1024, 1024 * 1024),
+            &AtomicBool::new(false),
+            false,
         )
         .expect_err("artifact growth must exceed the hard limit");
 
@@ -5590,6 +6485,58 @@ edition = "2024"
         assert!(
             started.elapsed() < Duration::from_secs(8),
             "budget monitor did not terminate the active view"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malformed_cargo_stream_terminates_the_owned_process_tree() {
+        let root = tempfile::tempdir().expect("artifact root");
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf '{\"reason\":17}\\n'; exec sleep 10"]);
+        let started = Instant::now();
+        let error = run_artifact_bounded_command(
+            &mut command,
+            root.path(),
+            CompilerArtifactBudget::default(),
+            &AtomicBool::new(false),
+            false,
+        )
+        .expect_err("malformed Cargo output must fail");
+
+        assert!(error.to_string().contains("unexpected message shape"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "stream failure did not terminate the active process tree"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn noisy_cargo_stderr_is_drained_without_unbounded_retention() {
+        let root = tempfile::tempdir().expect("artifact root");
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "i=0; while [ \"$i\" -lt 20000 ]; do printf '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'; i=$((i + 1)); done >&2; printf '{\"reason\":\"build-finished\",\"success\":true}\\n'",
+        ]);
+        let output = run_artifact_bounded_command(
+            &mut command,
+            root.path(),
+            CompilerArtifactBudget::default(),
+            &AtomicBool::new(false),
+            false,
+        )
+        .expect("bounded noisy stderr");
+
+        assert!(output.status.success());
+        assert!(
+            output.stdout.is_empty(),
+            "build-finished message should not be retained"
+        );
+        assert_eq!(
+            output.stderr.len(),
+            crate::compiler::acquisition::output::MAX_RETAINED_STDERR_BYTES
         );
     }
 
@@ -5618,8 +6565,14 @@ edition = "2024"
             command.args(["-c", "exit 0"]);
             command
         };
-        let error = run_artifact_bounded_command(&mut command, root.path(), CompilerArtifactBudget::new(512, 1024))
-            .expect_err("final logical bytes must remain bounded");
+        let error = run_artifact_bounded_command(
+            &mut command,
+            root.path(),
+            CompilerArtifactBudget::new(512, 1024),
+            &AtomicBool::new(false),
+            false,
+        )
+        .expect_err("final logical bytes must remain bounded");
 
         assert!(error.to_string().contains("2048 bytes"), "{error}");
         assert!(error.to_string().contains("hard limit"), "{error}");
@@ -5834,27 +6787,6 @@ edition = "2024"
         assert!(
             survivors["member"].is_empty(),
             "one incomplete required view already makes an unused proof impossible"
-        );
-    }
-
-    #[test]
-    fn compiler_evidence_executes_cheapest_feature_view_first() {
-        let mut features = vec![
-            FeatureSelection::Selected(vec!["feature".to_string()]),
-            FeatureSelection::NoDefaultFeatures,
-            FeatureSelection::AllFeatures,
-            FeatureSelection::Default,
-        ];
-        features.sort_by_key(feature_execution_priority);
-
-        assert_eq!(
-            features,
-            vec![
-                FeatureSelection::Default,
-                FeatureSelection::NoDefaultFeatures,
-                FeatureSelection::Selected(vec!["feature".to_string()]),
-                FeatureSelection::AllFeatures,
-            ]
         );
     }
 

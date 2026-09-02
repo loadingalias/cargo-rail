@@ -17,14 +17,15 @@ use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_sdk_s3::primitives::{ByteStream, Length};
+use aws_smithy_runtime_api::client::dns::ResolveDnsError;
 use aws_types::service_config::ServiceConfigKey;
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 
 use super::object::{
     ENTRY_PRELUDE_BYTES, ENTRY_PRELUDE_LEN, EntryBody, EntryRecord, EntryState, PutCondition, PutOutcome,
-    STREAM_BUFFER_BYTES, StoredEntry, TransferMetrics,
+    STREAM_BUFFER_BYTES, StoredBytes, StoredEntry, TransferMetrics,
 };
-use super::{RemoteCacheSelection, RemoteStoreError, RemoteStoreResult};
+use super::{RemoteCacheSelection, RemoteProbeFailureCause, RemoteStoreError, RemoteStoreResult};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CREDENTIAL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -225,18 +226,23 @@ pub(super) fn connect(selection: &RemoteCacheSelection) -> RemoteStoreResult<S3B
         reject_loaded_endpoint_overrides(&shared)?;
     }
     if !target.loopback_credentials {
-        let credentials = shared
-            .credentials_provider()
-            .ok_or_else(|| RemoteStoreError::authentication("remote cache credentials are unavailable"))?;
+        let credentials = shared.credentials_provider().ok_or_else(|| {
+            RemoteStoreError::authentication_with_cause(
+                RemoteProbeFailureCause::CredentialProvider,
+                "remote cache credentials are unavailable",
+            )
+        })?;
         match block_on_timeout(&runtime, CREDENTIAL_TIMEOUT, credentials.as_ref().provide_credentials()) {
             Ok(Ok(_)) => {}
             Ok(Err(_)) => {
-                return Err(RemoteStoreError::authentication(
+                return Err(RemoteStoreError::authentication_with_cause(
+                    RemoteProbeFailureCause::CredentialProvider,
                     "remote cache credentials are unavailable",
                 ));
             }
             Err(_) => {
-                return Err(RemoteStoreError::unavailable(
+                return Err(RemoteStoreError::unavailable_with_cause(
+                    RemoteProbeFailureCause::CredentialProvider,
                     "remote cache credential resolution timed out",
                 ));
             }
@@ -356,6 +362,16 @@ impl S3Backend {
         ))
     }
 
+    pub(super) fn get_bytes(&self, key: &str, maximum: u64) -> RemoteStoreResult<Option<StoredBytes>> {
+        self.runtime.block_on(get_bytes_request(
+            self.client.clone(),
+            self.target.clone(),
+            key.to_string(),
+            maximum,
+            Arc::clone(&self.counters),
+        ))
+    }
+
     pub(super) fn put_bytes(&self, key: &str, body: &[u8], condition: PutCondition) -> RemoteStoreResult<PutOutcome> {
         self.put_body(key, ByteStream::from(body.to_vec()), condition)
     }
@@ -459,6 +475,55 @@ async fn get_marker(
         ));
     }
     Ok(Some(body))
+}
+
+async fn get_bytes_request(
+    client: aws_sdk_s3::Client,
+    target: S3Target,
+    key: String,
+    maximum: u64,
+    counters: Arc<TransferCounters>,
+) -> RemoteStoreResult<Option<StoredBytes>> {
+    let result = client
+        .get_object()
+        .bucket(&target.bucket)
+        .key(&key)
+        .set_expected_bucket_owner(target.expected_owner.clone())
+        .send()
+        .await;
+    let mut output = match result {
+        Ok(output) => output,
+        Err(error) => {
+            return match classify_get_error(&error, RequestKind::CacheGet) {
+                RequestFailure::Absent => Ok(None),
+                RequestFailure::Precondition => Err(RemoteStoreError::integrity(
+                    "remote object read returned a precondition",
+                )),
+                RequestFailure::Store(error) => Err(error),
+            };
+        }
+    };
+    let etag = super::object::parse_etag(output.e_tag())?;
+    let declared = super::object::exact_length(output.content_length(), maximum, "evidence object")?;
+    let capacity = usize::try_from(declared)
+        .map_err(|_| RemoteStoreError::integrity("remote evidence object length is invalid"))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    while let Some(chunk) = output.body.next().await {
+        let chunk = chunk.map_err(|_| RemoteStoreError::unavailable("remote evidence object stream failed"))?;
+        if bytes.len().saturating_add(chunk.len()) > capacity {
+            return Err(RemoteStoreError::integrity("remote evidence object is oversized"));
+        }
+        counters
+            .payload_bytes_read
+            .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.len() as u64 != declared {
+        return Err(RemoteStoreError::integrity(
+            "remote evidence object length changed while reading",
+        ));
+    }
+    Ok(Some(StoredBytes { bytes, etag }))
 }
 
 async fn get_entry_request(
@@ -572,33 +637,99 @@ fn classify_sdk_error<E>(error: &SdkError<E>, kind: RequestKind, typed_absence: 
         return RequestFailure::Absent;
     }
     if let SdkError::ServiceError(context) = error {
-        return match context.raw().status().as_u16() {
-            404 => RequestFailure::Absent,
-            403 if matches!(kind, RequestKind::Marker | RequestKind::CacheGet) => RequestFailure::Absent,
-            409 | 412 if kind == RequestKind::ConditionalPut => RequestFailure::Precondition,
-            401 | 403 => RequestFailure::Store(RemoteStoreError::authentication(
-                "remote cache authentication was rejected",
-            )),
-            408 | 425 | 429 | 500..=599 => {
-                RequestFailure::Store(RemoteStoreError::unavailable("remote cache service is unavailable"))
-            }
-            _ => RequestFailure::Store(RemoteStoreError::configuration(
-                "remote cache request was rejected by its pinned service",
-            )),
-        };
+        return classify_http_status(kind, context.raw().status().as_u16());
     }
     match error {
-        SdkError::ConstructionFailure(_) => RequestFailure::Store(RemoteStoreError::authentication(
+        SdkError::ConstructionFailure(_) => RequestFailure::Store(RemoteStoreError::authentication_with_cause(
+            RemoteProbeFailureCause::CredentialProvider,
             "remote cache credentials are unavailable",
         )),
-        SdkError::ResponseError(_) => RequestFailure::Store(RemoteStoreError::integrity(
+        SdkError::ResponseError(_) => RequestFailure::Store(RemoteStoreError::integrity_with_cause(
+            RemoteProbeFailureCause::Http,
             "remote cache service returned an invalid response",
         )),
-        SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) => {
-            RequestFailure::Store(RemoteStoreError::unavailable("remote cache service is unavailable"))
+        SdkError::TimeoutError(_) => RequestFailure::Store(RemoteStoreError::unavailable_with_cause(
+            RemoteProbeFailureCause::Timeout,
+            "remote cache request timed out",
+        )),
+        SdkError::DispatchFailure(context) => {
+            RequestFailure::Store(context.as_connector_error().map(dispatch_failure).unwrap_or_else(|| {
+                RemoteStoreError::unavailable_with_cause(
+                    RemoteProbeFailureCause::Connection,
+                    "remote cache connection failed",
+                )
+            }))
         }
         _ => RequestFailure::Store(RemoteStoreError::unavailable("remote cache request failed")),
     }
+}
+
+fn classify_http_status(kind: RequestKind, status: u16) -> RequestFailure {
+    match status {
+        404 => RequestFailure::Absent,
+        403 if matches!(kind, RequestKind::Marker | RequestKind::CacheGet) => RequestFailure::Absent,
+        409 | 412 if kind == RequestKind::ConditionalPut => RequestFailure::Precondition,
+        401 | 403 => RequestFailure::Store(RemoteStoreError::authentication_with_cause(
+            RemoteProbeFailureCause::Http,
+            "remote cache authentication was rejected",
+        )),
+        408 | 425 | 429 | 500..=599 => RequestFailure::Store(RemoteStoreError::unavailable_with_cause(
+            RemoteProbeFailureCause::Http,
+            "remote cache service is unavailable",
+        )),
+        _ => RequestFailure::Store(RemoteStoreError::configuration(
+            "remote cache request was rejected by its pinned service",
+        )),
+    }
+}
+
+fn dispatch_failure(error: &aws_sdk_s3::error::ConnectorError) -> RemoteStoreError {
+    let cause = classify_connector_error(error);
+    let message = match cause {
+        RemoteProbeFailureCause::Dns => "remote cache DNS resolution failed",
+        RemoteProbeFailureCause::Tls => "remote cache TLS handshake failed",
+        RemoteProbeFailureCause::RootStore => "remote cache TLS trust validation failed",
+        RemoteProbeFailureCause::Timeout => "remote cache request timed out",
+        RemoteProbeFailureCause::Connection => "remote cache connection failed",
+        RemoteProbeFailureCause::Http | RemoteProbeFailureCause::CredentialProvider => {
+            "remote cache request failed before receiving a response"
+        }
+    };
+    RemoteStoreError::unavailable_with_cause(cause, message)
+}
+
+fn classify_connector_error(error: &aws_sdk_s3::error::ConnectorError) -> RemoteProbeFailureCause {
+    if error.is_timeout() {
+        return RemoteProbeFailureCause::Timeout;
+    }
+    if find_error_source::<ResolveDnsError>(error).is_some() {
+        return RemoteProbeFailureCause::Dns;
+    }
+    if let Some(error) = find_error_source::<rustls::Error>(error) {
+        return match error {
+            rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer) => {
+                RemoteProbeFailureCause::RootStore
+            }
+            _ => RemoteProbeFailureCause::Tls,
+        };
+    }
+    if find_error_source::<std::io::Error>(error).is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut) {
+        return RemoteProbeFailureCause::Timeout;
+    }
+    RemoteProbeFailureCause::Connection
+}
+
+fn find_error_source<'a, E: std::error::Error + 'static>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a E> {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if let Some(error) = error.downcast_ref::<E>() {
+            return Some(error);
+        }
+        current = error.source();
+    }
+    None
 }
 
 fn io_unavailable(_error: std::io::Error) -> RemoteStoreError {
@@ -658,25 +789,60 @@ mod tests {
     #[test]
     fn request_statuses_preserve_conditional_and_fallback_classes() {
         assert!(matches!(
-            classify_sdk_status_for_test(RequestKind::ConditionalPut, 412),
+            classify_http_status(RequestKind::ConditionalPut, 412),
             RequestFailure::Precondition
         ));
         assert!(matches!(
-            classify_sdk_status_for_test(RequestKind::CacheGet, 403),
+            classify_http_status(RequestKind::CacheGet, 403),
             RequestFailure::Absent
         ));
         assert!(matches!(
-            classify_sdk_status_for_test(RequestKind::Marker, 403),
+            classify_http_status(RequestKind::Marker, 403),
             RequestFailure::Absent
         ));
+        let RequestFailure::Store(error) = classify_http_status(RequestKind::Marker, 503) else {
+            panic!("HTTP 503 must be an actionable store failure");
+        };
+        assert_eq!(error.probe_failure(), "transport_failure");
+        assert_eq!(error.probe_failure_cause(), Some(RemoteProbeFailureCause::Http));
     }
 
-    fn classify_sdk_status_for_test(kind: RequestKind, status: u16) -> RequestFailure {
-        match status {
-            404 => RequestFailure::Absent,
-            403 if matches!(kind, RequestKind::Marker | RequestKind::CacheGet) => RequestFailure::Absent,
-            409 | 412 if kind == RequestKind::ConditionalPut => RequestFailure::Precondition,
-            _ => RequestFailure::Store(RemoteStoreError::unavailable("test status")),
-        }
+    #[test]
+    fn dispatch_failures_retain_secret_safe_transport_causes() {
+        use aws_sdk_s3::error::ConnectorError;
+
+        let dns = ConnectorError::io(ResolveDnsError::new(std::io::Error::other("private DNS detail")).into());
+        assert_eq!(classify_connector_error(&dns), RemoteProbeFailureCause::Dns);
+
+        let root_store =
+            ConnectorError::io(rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer).into());
+        assert_eq!(
+            classify_connector_error(&root_store),
+            RemoteProbeFailureCause::RootStore
+        );
+
+        let tls = ConnectorError::io(rustls::Error::General("private TLS detail".to_string()).into());
+        assert_eq!(classify_connector_error(&tls), RemoteProbeFailureCause::Tls);
+
+        let connection = ConnectorError::io(
+            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "private endpoint detail").into(),
+        );
+        assert_eq!(
+            classify_connector_error(&connection),
+            RemoteProbeFailureCause::Connection
+        );
+
+        let timeout = ConnectorError::timeout(std::io::Error::other("private timeout detail").into());
+        assert_eq!(classify_connector_error(&timeout), RemoteProbeFailureCause::Timeout);
+
+        let credential_provider = RemoteStoreError::authentication_with_cause(
+            RemoteProbeFailureCause::CredentialProvider,
+            "remote cache credentials are unavailable",
+        );
+        assert_eq!(credential_provider.probe_failure(), "authentication_failure");
+        assert_eq!(
+            credential_provider.probe_failure_cause(),
+            Some(RemoteProbeFailureCause::CredentialProvider)
+        );
     }
 }

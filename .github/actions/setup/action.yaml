@@ -19,10 +19,14 @@ inputs:
     description: Cargo-Rail remote authority
     required: false
     default: read
-  native-cache-credentials-ready:
-    description: Whether the caller proved that the selected R2 credential pair is present
+  native-cache-access-key-id:
+    description: R2 access key ID forwarded only to Cargo-Rail cache setup
     required: false
-    default: "false"
+    default: ""
+  native-cache-secret-access-key:
+    description: R2 secret access key forwarded only to Cargo-Rail cache setup
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -49,4 +53,5 @@ runs:
         save-if: ${{ github.ref == 'refs/heads/main' }}
         remote-url: ${{ inputs.native-cache-url }}
         remote-mode: ${{ inputs.native-cache-mode }}
-        remote-credentials-ready: ${{ inputs.native-cache-credentials-ready }}
+        remote-access-key-id: ${{ inputs.native-cache-access-key-id }}
+        remote-secret-access-key: ${{ inputs.native-cache-secret-access-key }}

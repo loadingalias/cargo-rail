@@ -1,4 +1,4 @@
-//! `cargo rail clean` - Remove generated artifacts (cache, backups, reports).
+//! Preview or remove explicitly selected Cargo-Rail state.
 
 use crate::backup::BackupManager;
 use crate::commands::TextJsonOutputFormat;

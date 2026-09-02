@@ -268,6 +268,42 @@ mod tests {{
         Ok(crate_path)
     }
 
+    /// Add two roots that require mutually isolated feature shapes from one dependency.
+    pub fn add_feature_isolation_crates(&self) -> Result<()> {
+        let shared = self.add_crate("shared", "0.1.0", &[])?;
+        let shared_manifest = std::fs::read_to_string(shared.join("Cargo.toml"))?;
+        std::fs::write(
+            shared.join("Cargo.toml"),
+            format!("{shared_manifest}\n[features]\ndefault = []\nisolate = []\nstd = []\nalloc = []\n"),
+        )?;
+        std::fs::write(
+            shared.join("src/lib.rs"),
+            "#[cfg(feature = \"std\")]\npub fn std_value() -> usize { 1 }\n\n#[cfg(feature = \"alloc\")]\npub fn alloc_value() -> usize { 2 }\n",
+        )?;
+
+        for (package, dependency_feature, function) in
+            [("std-root", "std", "std_value"), ("alloc-root", "alloc", "alloc_value")]
+        {
+            let root = self.add_crate(
+                package,
+                "0.1.0",
+                &[("shared", r#"{ path = "../shared", default-features = false }"#)],
+            )?;
+            let manifest = std::fs::read_to_string(root.join("Cargo.toml"))?;
+            std::fs::write(
+                root.join("Cargo.toml"),
+                format!("{manifest}\n[features]\ndefault = []\nisolate = [\"shared/{dependency_feature}\"]\n"),
+            )?;
+            std::fs::write(
+                root.join("src/lib.rs"),
+                format!(
+                    "#[cfg(feature = \"isolate\")]\npub fn value() -> usize {{ shared::{function}() }}\n\n#[cfg(not(feature = \"isolate\"))]\npub fn value() -> usize {{ 0 }}\n"
+                ),
+            )?;
+        }
+        Ok(())
+    }
+
     /// Commit current changes
     pub fn commit(&self, message: &str) -> Result<String> {
         git(&self.path, &["add", "."])?;

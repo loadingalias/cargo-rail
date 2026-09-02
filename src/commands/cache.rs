@@ -72,6 +72,7 @@ pub(crate) fn run_probe(current_dir: &Path, format: TextJsonOutputFormat) -> Rai
         }
         Err(error) => {
             let failure = error.probe_failure();
+            let cause = error.probe_failure_cause();
             if format.is_json() {
                 let output = crate::output::machine_json_envelope(
                     "cache",
@@ -82,13 +83,20 @@ pub(crate) fn run_probe(current_dir: &Path, format: TextJsonOutputFormat) -> Rai
                       "ready": false,
                       "failure": {
                         "kind": failure,
+                        "cause": cause,
                         "message": error.to_string(),
+                        "retry": cause.map(crate::remote_cache::RemoteProbeFailureCause::retry_guidance),
                       },
                     }),
                 );
                 println!("{}", serde_json::to_string_pretty(&output)?);
             } else {
-                println!("Remote cache probe failed ({failure}): {error}");
+                if let Some(cause) = cause {
+                    println!("Remote cache probe failed ({failure}/{}): {error}", cause.as_str());
+                    println!("Next: {}", cause.retry_guidance());
+                } else {
+                    println!("Remote cache probe failed ({failure}): {error}");
+                }
             }
             Err(RailError::ExitWithCode { code: 2 })
         }
@@ -102,6 +110,27 @@ pub(crate) fn run_setup(
     check: bool,
     format: TextJsonOutputFormat,
 ) -> RailResult<()> {
+    if let Some(reason) = crate::compiler::native_cache::unsupported_native_cache_host_reason() {
+        if format.is_json() {
+            let output = crate::output::machine_json_envelope(
+                "cache",
+                if check { "setup_check" } else { "setup" },
+                "unsupported",
+                2,
+                serde_json::json!({
+                  "capability": "transparent_compiler_cache",
+                  "supported": false,
+                  "reason": reason,
+                  "host_os": std::env::consts::OS,
+                  "host_arch": std::env::consts::ARCH,
+                  "fallback": "cargo",
+                }),
+            );
+            println!("{}", serde_json::to_string_pretty(&output)?);
+            return Err(RailError::ExitWithCode { code: 2 });
+        }
+        return Err(crate::cache::installation::unsupported_native_cache_host_error(reason));
+    }
     if check && request == crate::cache::installation::SetupRequest::default() {
         let status = crate::cache::installation::status(current_dir)?;
         if status.healthy && status.state == "installed" {
@@ -134,6 +163,7 @@ pub(crate) fn run_setup(
       "wrapper_path": plan.wrapper_path(),
       "receipt_path": receipt_path,
       "private_state_action": if pending { "install_or_repair" } else { "verify" },
+      "profile_id": plan.profile_id(),
       "cache_base": plan.cache_base(),
       "max_bytes": plan.max_bytes(),
       "remote": remote,
@@ -173,7 +203,7 @@ fn cache_setup_source_error(current_dir: &Path, error: RailError) -> RailError {
 }
 
 /// Preview or apply removal of the exact receipt-owned installation.
-pub(crate) fn run_remove(current_dir: &Path, check: bool, format: TextJsonOutputFormat) -> RailResult<()> {
+pub(crate) fn run_uninstall(current_dir: &Path, check: bool, format: TextJsonOutputFormat) -> RailResult<()> {
     let plan = crate::cache::installation::plan_removal(current_dir)?;
     let pending = plan.pending();
     let details = serde_json::json!({
@@ -187,7 +217,7 @@ pub(crate) fn run_remove(current_dir: &Path, check: bool, format: TextJsonOutput
       "cache_preserved": true,
     });
     if check {
-        render_installation_operation("remove_check", pending, &details, format)?;
+        render_installation_operation("uninstall_check", pending, &details, format)?;
         return if pending {
             Err(RailError::CheckHasPendingChanges)
         } else {
@@ -195,7 +225,7 @@ pub(crate) fn run_remove(current_dir: &Path, check: bool, format: TextJsonOutput
         };
     }
     crate::cache::installation::apply_removal(plan)?;
-    render_installation_operation("remove", false, &details, format)
+    render_installation_operation("uninstall", false, &details, format)
 }
 
 fn render_installation_operation(
@@ -224,12 +254,14 @@ fn render_installation_operation(
             }
             ("setup_check", false, _) | ("setup", false, false) => println!("Cache already configured."),
             ("setup", false, true) => println!("Cache repaired."),
-            ("remove_check", true, _) => {
-                println!("Cache removal pending.");
-                println!("Next: cargo rail cache remove");
+            ("uninstall_check", true, _) => {
+                println!("Global cache-wrapper uninstall pending.");
+                println!("Next: cargo rail cache uninstall");
             }
-            ("remove_check", false, _) | ("remove", false, false) => println!("Cache already removed."),
-            ("remove", false, true) => println!("Cache removed."),
+            ("uninstall_check", false, _) | ("uninstall", false, false) => {
+                println!("Global cache wrapper already uninstalled.")
+            }
+            ("uninstall", false, true) => println!("Global cache wrapper uninstalled; profiles preserved."),
             _ => println!("Cache operation complete."),
         }
         if crate::output::is_verbose() {
@@ -261,6 +293,160 @@ pub(crate) fn run_status(workspace_root: &Path, scope: CacheScope, format: TextJ
         render_status(&status);
     }
     Ok(())
+}
+
+pub(crate) fn run_profiles(workspace_root: &Path, format: TextJsonOutputFormat) -> RailResult<()> {
+    let cargo_home = crate::cache::installation::selected_cargo_home(workspace_root)?;
+    let profiles = crate::cache::profile::list(&cargo_home)?;
+    let pre_profile_state = crate::cache::profile::pre_profile_state_status(&cargo_home)?;
+    if format.is_json() {
+        let output = crate::output::machine_json_envelope(
+            "cache",
+            "profiles",
+            "success",
+            0,
+            serde_json::json!({
+              "profiles": profiles,
+              "unbound_pre_profile_state": pre_profile_state,
+            }),
+        );
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("Installed cache profiles: {}", profiles.len());
+        for profile in profiles {
+            println!(
+                "  {}: {} root(s), {}, {}",
+                profile.profile_id,
+                profile.roots.len(),
+                profile.state,
+                profile.root_portability
+            );
+        }
+        if pre_profile_state.is_some() {
+            println!("Unbound pre-profile cache state: retained for explicit cleanup");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn run_detach(workspace_root: &Path, check: bool, format: TextJsonOutputFormat) -> RailResult<()> {
+    let cargo_home = crate::cache::installation::selected_cargo_home(workspace_root)?;
+    let plan = crate::cache::profile::plan_detach(&cargo_home, workspace_root)?;
+    let pending = plan.pending();
+    let profile_id = plan.profile_id().to_string();
+    if !check {
+        crate::cache::installation::stop_current_profile_coordinator(workspace_root)?;
+        crate::cache::profile::apply_detach(&plan)?;
+    }
+    if format.is_json() {
+        let output = crate::output::machine_json_envelope(
+            "cache",
+            if check { "detach_check" } else { "detach" },
+            if check && pending { "pending_changes" } else { "success" },
+            if check && pending { 1 } else { 0 },
+            serde_json::json!({
+              "pending": pending,
+              "profile_id": profile_id,
+              "cache_preserved": true,
+            }),
+        );
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else if pending {
+        println!(
+            "Workspace {} profile {}.",
+            if check { "would detach from" } else { "detached from" },
+            profile_id
+        );
+    } else {
+        println!("Workspace has no installed cache profile.");
+    }
+    if check && pending {
+        Err(RailError::CheckHasPendingChanges)
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn run_drop_profile(
+    workspace_root: &Path,
+    profile_id: &str,
+    check: bool,
+    format: TextJsonOutputFormat,
+) -> RailResult<()> {
+    let cargo_home = crate::cache::installation::selected_cargo_home(workspace_root)?;
+    let plan = crate::cache::profile::plan_removal(&cargo_home, profile_id)?;
+    let pending = plan.pending();
+    let details = serde_json::json!({
+      "pending": pending,
+      "profile_id": plan.profile_id(),
+      "cache_root": plan.cache_root(),
+      "state_root": plan.state_root(),
+      "bytes": plan.bytes(),
+    });
+    if !check {
+        crate::cache::profile::apply_removal(&plan)?;
+    }
+    if format.is_json() {
+        let output = crate::output::machine_json_envelope(
+            "cache",
+            if check { "drop_profile_check" } else { "drop_profile" },
+            if check && pending { "pending_changes" } else { "success" },
+            if check && pending { 1 } else { 0 },
+            details,
+        );
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else if pending {
+        println!(
+            "Profile {} {} ({} reclaimed).",
+            plan.profile_id(),
+            if check { "would be removed" } else { "removed" },
+            human_bytes(plan.bytes())
+        );
+    } else {
+        println!("Profile {} is not installed.", plan.profile_id());
+    }
+    if check && pending {
+        Err(RailError::CheckHasPendingChanges)
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn run_drop_unbound(workspace_root: &Path, check: bool, format: TextJsonOutputFormat) -> RailResult<()> {
+    let cargo_home = crate::cache::installation::selected_cargo_home(workspace_root)?;
+    let plan = crate::cache::profile::plan_pre_profile_state_removal(&cargo_home)?;
+    let pending = plan.pending();
+    let details = serde_json::json!({
+      "pending": pending,
+      "cache_root": plan.cache_root(),
+      "bytes": plan.bytes(),
+    });
+    if !check {
+        crate::cache::profile::apply_pre_profile_state_removal(&plan)?;
+    }
+    if format.is_json() {
+        let output = crate::output::machine_json_envelope(
+            "cache",
+            if check { "drop_unbound_check" } else { "drop_unbound" },
+            if check && pending { "pending_changes" } else { "success" },
+            if check && pending { 1 } else { 0 },
+            details,
+        );
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else if pending {
+        println!(
+            "Unbound pre-profile cache state {} ({} reclaimed).",
+            if check { "would be removed" } else { "removed" },
+            human_bytes(plan.bytes())
+        );
+    } else {
+        println!("No unbound pre-profile cache state is installed.");
+    }
+    if check && pending {
+        Err(RailError::CheckHasPendingChanges)
+    } else {
+        Ok(())
+    }
 }
 
 /// Preview or apply byte-preserving recovery of one selected markerless CAS.
@@ -342,7 +528,7 @@ pub(crate) fn run_clean(
     }
 
     // For a combined cleanup, validate the complete workspace scope before
-    // deleting the cross-workspace CAS. Each removal then measures and mutates
+    // deleting the selected profile's CAS. Each removal then measures and mutates
     // under its own lifecycle authority.
     if scope.includes_workspace() && scope.includes_local() {
         crate::cache::status(workspace_root, true, false)?;

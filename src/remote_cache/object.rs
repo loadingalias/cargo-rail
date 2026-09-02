@@ -92,6 +92,11 @@ pub(super) struct StoredEntry {
     pub(super) etag: String,
 }
 
+pub(super) struct StoredBytes {
+    pub(super) bytes: Vec<u8>,
+    pub(super) etag: String,
+}
+
 pub(crate) struct EntryBody {
     state: EntryBodyState,
     remaining: u64,
@@ -269,6 +274,13 @@ impl Backend {
         }
     }
 
+    fn get_bytes(&self, key: &str, maximum: u64) -> RemoteStoreResult<Option<StoredBytes>> {
+        match self {
+            Self::Azure(store) => store.get_bytes(key, maximum),
+            Self::S3(store) => store.get_bytes(key, maximum),
+        }
+    }
+
     fn put_bytes(&self, key: &str, body: &[u8], condition: PutCondition) -> RemoteStoreResult<PutOutcome> {
         match self {
             Self::Azure(store) => store.put_bytes(key, body, condition),
@@ -295,6 +307,14 @@ pub(super) fn connect(selection: &RemoteCacheSelection) -> RemoteStoreResult<Obj
     connect_with_marker(selection).map(|(store, _)| store)
 }
 
+pub(super) fn connect_transport(selection: &RemoteCacheSelection) -> RemoteStoreResult<ObjectStore> {
+    Ok(ObjectStore {
+        backend: Backend::connect(selection)?,
+        prefix: selection.authority.prefix().to_string(),
+        mode: selection.mode(),
+    })
+}
+
 pub(super) fn probe(selection: &RemoteCacheSelection) -> RemoteStoreResult<RemoteProtocolMarkerState> {
     connect_with_marker(selection).map(|(_, marker)| marker)
 }
@@ -302,11 +322,7 @@ pub(super) fn probe(selection: &RemoteCacheSelection) -> RemoteStoreResult<Remot
 fn connect_with_marker(
     selection: &RemoteCacheSelection,
 ) -> RemoteStoreResult<(ObjectStore, RemoteProtocolMarkerState)> {
-    let store = ObjectStore {
-        backend: Backend::connect(selection)?,
-        prefix: selection.authority.prefix().to_string(),
-        mode: selection.mode(),
-    };
+    let store = connect_transport(selection)?;
     let marker = store.ensure_protocol_marker()?;
     Ok((store, marker))
 }
@@ -320,7 +336,7 @@ impl ObjectStore {
         self.backend.take_metrics()
     }
 
-    fn can_write(&self) -> bool {
+    pub(super) fn can_write(&self) -> bool {
         self.mode == RemoteCacheMode::ReadWrite
     }
 
@@ -343,11 +359,36 @@ impl ObjectStore {
     }
 
     fn object_suffix(&self, suffix: &str) -> String {
+        self.namespaced_suffix(OBJECT_NAMESPACE, suffix)
+    }
+
+    pub(super) fn namespaced_suffix(&self, namespace: &str, suffix: &str) -> String {
         if self.prefix.is_empty() {
-            format!("{OBJECT_NAMESPACE}/{suffix}")
+            format!("{namespace}/{suffix}")
         } else {
-            format!("{}/{OBJECT_NAMESPACE}/{suffix}", self.prefix)
+            format!("{}/{namespace}/{suffix}", self.prefix)
         }
+    }
+
+    pub(super) fn get_namespaced(
+        &self,
+        namespace: &str,
+        suffix: &str,
+        maximum: u64,
+    ) -> RemoteStoreResult<Option<StoredBytes>> {
+        self.backend
+            .get_bytes(&self.namespaced_suffix(namespace, suffix), maximum)
+    }
+
+    pub(super) fn put_namespaced(
+        &self,
+        namespace: &str,
+        suffix: &str,
+        body: &[u8],
+        condition: PutCondition,
+    ) -> RemoteStoreResult<PutOutcome> {
+        self.backend
+            .put_bytes(&self.namespaced_suffix(namespace, suffix), body, condition)
     }
 
     fn ensure_protocol_marker(&self) -> RemoteStoreResult<RemoteProtocolMarkerState> {
@@ -738,11 +779,11 @@ mod tests {
         assert_eq!(OBJECT_NAMESPACE, "native-v6");
         assert_eq!(PROTOCOL_MARKER, b"cargo-rail-native-cache-v6\n");
 
-        let mut legacy = [0_u8; ENTRY_PRELUDE_LEN];
-        legacy[..8].copy_from_slice(ENTRY_MAGIC);
-        legacy[8..10].copy_from_slice(&1_u16.to_le_bytes());
-        legacy[10..14].copy_from_slice(&1_u32.to_le_bytes());
-        decode_entry_prelude(&legacy).expect_err("native-v5 prelude must be rejected");
+        let mut unsupported_v1 = [0_u8; ENTRY_PRELUDE_LEN];
+        unsupported_v1[..8].copy_from_slice(ENTRY_MAGIC);
+        unsupported_v1[8..10].copy_from_slice(&1_u16.to_le_bytes());
+        unsupported_v1[10..14].copy_from_slice(&1_u32.to_le_bytes());
+        decode_entry_prelude(&unsupported_v1).expect_err("native-v5 prelude must be rejected");
     }
 
     #[test]

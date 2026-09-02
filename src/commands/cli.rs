@@ -93,17 +93,17 @@ pub struct RailCli {
 }
 
 const PLAN_HELP: &str = "\
-Examples:
+Compare source:
   cargo rail plan                           # Changes since the default-branch merge base
-  cargo rail plan --json                    # Full machine-readable work contract
   cargo rail plan --since HEAD~5            # Changes in last 5 commits
   cargo rail plan --from abc --to def       # Changes between two SHAs
+  cargo rail plan --all                     # Require every registered work item
+
+Inspect or transfer the contract:
   cargo rail plan --explain                 # Explain required decisions
   cargo rail plan --explain-work cargo.test # Explain one decision, even when skipped
-  cargo rail plan --all                     # Safely require every registered work item
   cargo rail plan --evidence inputs.json    # Use compatible observed-input evidence
   cargo rail plan --verify plan.json        # Revalidate a saved plan without executing it
-  cargo rail plan --schema                  # Print the versioned JSON Schema
   cargo rail plan --json > plan.json        # Redirect the exact plan to a file";
 
 const SURFACE_HELP: &str = "\
@@ -111,43 +111,43 @@ Set `[surface] enabled = true` to include this gate in planner-selected CI.
 Set `[surface] consumer_scope = \"workspace\"` only when each closed compiler
 crate has no consumers outside the captured workspace.
 
-Examples:
+Inspect:
   cargo rail surface                        # Inspect and report without modifying source
   cargo rail surface --prepare              # Prove exact-toolchain producer readiness
   cargo rail surface --check --explain      # Inspect complete Rust reachability
   cargo rail surface --check --json         # Emit the versioned machine contract
+
+Resume or fix:
   cargo rail surface --resume MANIFEST --json  # Resume a partial compiler acquisition
   cargo rail surface --fix --dry-run --explain  # Preview exact visibility edits
-  cargo rail surface --fix --backup         # Apply verified edits with recovery evidence
-  cargo rail surface --schema               # Print the versioned JSON Schema";
+  cargo rail surface --fix --backup         # Apply verified edits with recovery evidence";
 
 const UNIFY_HELP: &str = "\
-Examples:
+Inspect:
   cargo rail unify                        # Preview dependency changes (exit 0)
   cargo rail unify --check                # Check for pending changes (exit 1)
   cargo rail unify --explain              # Show why each decision was made
   cargo rail unify --show-diff            # Show manifest changes
+
+Apply or restore:
   cargo rail unify apply                  # Apply the current decision
   cargo rail unify apply --backup         # Apply with backup
-  cargo rail unify undo                   # Restore from backup
-  cargo rail unify undo --list            # List available backups";
+  cargo rail unify undo --list            # Inspect available backups";
 
 const SPLIT_HELP: &str = "\
-This is an advanced feature for extracting crates to standalone repositories
-while preserving git history. Most teams should start with 'plan', 'cache',
-and 'unify' before using split/sync.
+Split extracts crates to standalone repositories while preserving Git history.
+Run `cargo rail split run --check` before granting mutation authority.
 
 Examples:
   cargo rail split init my-crate          # Configure split for my-crate
   cargo rail split init my-crate --dry-run  # Preview generated config
   cargo rail split run my-crate --check   # Check for a pending split (exit 1)
   cargo rail split run my-crate           # Execute the split
-  cargo rail split run my-crate --yes     # Non-interactive apply confirmation
   cargo rail split run --all              # Split all configured crates";
 
 const SYNC_HELP: &str = "\
-This is an advanced feature for bidirectional sync between monorepo and split
-repositories. Requires 'split' to be configured first.
+Sync requires an existing split configuration. Check mode reports the pending
+direction and exact mutation without changing either repository.
 
 Examples:
   cargo rail sync my-crate                # Bidirectional sync
@@ -158,32 +158,21 @@ Examples:
 
 const RELEASE_HELP: &str = "\
 Examples:
-  cargo rail release init my-crate              # Configure release for my-crate
-  cargo rail release init my-crate --dry-run    # Preview generated config
-  cargo rail release check my-crate                    # Validate the local release plan
-  cargo rail release check my-crate --publication     # Validate registry publication readiness
-  cargo rail release check my-crate --publication -e  # Run publish, MSRV, and semver checks
-  cargo rail release run my-crate               # Prepare a local release without registry publication
-  cargo rail release run my-crate --publish     # Match configured crates.io authority at invocation
-  cargo rail release run my-crate --include-dependents  # Release selected crate plus dependent closure
-  cargo rail release run my-crate --yes         # Non-interactive apply confirmation
-  cargo rail release run my-crate --bump auto   # Infer each bump from the configured release source
-  cargo rail release run --all --bump auto --pr # Open a release PR with bumps/changelogs only
-  cargo rail release finalize --all --publish   # Match configured crates.io authority after PR merge
-  cargo rail release run my-crate --bump minor
-  cargo rail release run my-crate --bump prerelease  # 1.0.0 -> 1.0.0-rc.1
-  cargo rail release run my-crate --bump release     # 1.0.0-rc.2 -> 1.0.0
-  cargo rail release run --all --bump patch     # Release all crates";
+  cargo rail release init my-crate --dry-run       # Preview release configuration
+  cargo rail release check --all --publication     # Validate publication authority
+  cargo rail release run my-crate --bump minor     # Execute one local release transaction
+  cargo rail release run --all --publish --wait --yes  # Publish and wait for exact-SHA checks
+  cargo rail release status --history              # Inspect current and terminal transactions";
 
 const CHANGE_HELP: &str = "\
-Examples:
+Record intent:
   cargo rail change add rail-core --bump minor --message \"Added auto bump planning\"
   cargo rail change add rail-core rail-cli --bump patch --message \"Fixed release notes\"
   cargo rail change add rail-core --bump patch --name fix-parser
+
+Inspect intent:
   cargo rail change status
-  cargo rail change status --format json
-  cargo rail change check --merge-base --required
-  cargo rail change check --since origin/main --format json
+  cargo rail change check --merge-base
 
 Omit --message in an interactive terminal to author in $VISUAL or $EDITOR.
 Change files are consumed (deleted in the release commit) when released.
@@ -201,41 +190,40 @@ Examples:
 const CLEAN_HELP: &str = "\
 Examples:
   cargo rail clean --all                # Clean every eligible current-workspace artifact
-  cargo rail clean --cache              # Clean current-workspace cache state
+  cargo rail clean --cache --check      # Preview current-workspace cache cleanup
   cargo rail clean --prune-backups      # Prune backups beyond configured retention
-  cargo rail clean --all-backups        # Delete every backup
   cargo rail clean --reports            # Clean generated reports
-  cargo rail clean --release-journal ID # Delete one terminal release journal
-  cargo rail clean --cache --check      # Check selected cleanup (exit 1 when pending)";
+  cargo rail clean --release-journal ID # Delete one terminal release journal";
 
 const CACHE_HELP: &str = "\
 Remote URLs, credentials, provider environments, and distributed execution are machine-owned authority. Use setup
 flags only after qualification has established the required trust domain, root portability, and worker identity.
 
-Examples:
+Set up and inspect:
   cargo rail cache setup --check                  # Preview transparent compiler reuse setup
   cargo rail cache setup                          # Install or repair the Cargo wrapper
-  cargo rail cache setup --remote URL --root-portability remap  # Qualify cross-root L2 reuse
-  cargo rail cache status                         # Inspect workspace and shared local cache state
-  cargo rail cache status --scope local --json   # Inspect the shared local CAS only
-  cargo rail cache recover --check                # Preview byte-preserving markerless CAS recovery
-  cargo rail cache recover                        # Quarantine the old tree and create a fresh CAS
+  cargo rail cache setup --remote URL --root-portability remap  # Configure cross-root L2 reuse
+  cargo rail cache status                         # Inspect workspace and selected-profile cache state
+  cargo rail cache probe --json                   # Verify persisted remote authority
+
+Reclaim state:
   cargo rail cache clean --scope workspace --check  # Preview workspace cache reclamation
-  cargo rail cache clean --scope local            # Remove the validated cross-workspace CAS
-  cargo rail cache remove --check                 # Preview exact setup-state removal
-  cargo rail cache remove                         # Remove setup state but preserve the CAS";
+  cargo rail cache clean --scope local --check    # Preview selected-profile CAS reclamation
+  cargo rail cache profiles                       # Inspect every installed workspace profile
+  cargo rail cache detach --check                 # Preview detaching the current workspace
+  cargo rail cache uninstall --check              # Preview global wrapper removal";
 
 const CONFIG_HELP: &str = "\
-Examples:
+Inspect:
   cargo rail config locate              # Show which config file is active
   cargo rail config print               # Show effective config with defaults
   cargo rail config validate            # Validate rail.toml
-  cargo rail config validate --json     # JSON output for CI
   cargo rail config explain             # Explain effective values and sources
-  cargo rail config explain targets     # Explain one field in full
   cargo rail config explain --all       # Explain the complete field inventory
-  cargo rail config migrate --check     # Check for pending semantic migrations
-  cargo rail config migrate             # Apply explicit semantic migrations";
+
+Normalize exact v0.25 input:
+  cargo rail config migrate --check     # Check for pending v0.25 migrations
+  cargo rail config migrate             # Apply the lossless v0.25 migration";
 
 const COMPLETIONS_HELP: &str = "\
 Examples:
@@ -267,7 +255,7 @@ pub enum Commands {
         command: DoctorCommand,
     },
 
-    /// Inspect or reclaim explicitly scoped cache state
+    /// Install, inspect, or reclaim explicitly scoped compiler-cache state
     #[command(after_long_help = CACHE_HELP)]
     Cache {
         /// Cache operation
@@ -287,9 +275,6 @@ pub enum Commands {
         /// End ref (for SHA pair mode)
         #[arg(long, requires = "from")]
         to: Option<String>,
-        /// Compatibility alias for the default merge-base comparison
-        #[arg(long, conflicts_with_all = ["since", "from", "to"], hide = true)]
-        merge_base: bool,
         /// Machine output selected by the global --json flag
         #[arg(skip)]
         json: bool,
@@ -309,11 +294,11 @@ pub enum Commands {
         #[arg(
             long,
             value_name = "PATH",
-            conflicts_with_all = ["since", "from", "to", "merge_base", "explain", "explain_work", "all", "evidence", "schema"]
+            conflicts_with_all = ["since", "from", "to", "explain", "explain_work", "all", "evidence", "schema"]
         )]
         verify: Option<PathBuf>,
         /// Print the versioned planner JSON Schema and exit
-        #[arg(long, conflicts_with_all = ["since", "from", "to", "merge_base", "explain", "explain_work", "all", "evidence", "verify"])]
+        #[arg(long, conflicts_with_all = ["since", "from", "to", "explain", "explain_work", "all", "evidence", "verify"])]
         schema: bool,
     },
 
@@ -404,7 +389,7 @@ pub enum Commands {
         explain: bool,
     },
 
-    /// Initialize configuration (rail.toml)
+    /// Create sparse repository policy in rail.toml
     #[command(after_long_help = INIT_HELP)]
     Init {
         /// Output path for rail.toml
@@ -424,7 +409,7 @@ pub enum Commands {
         detect_targets: bool,
     },
 
-    /// (Advanced) Split a crate to a standalone repository with git history
+    /// Split a crate to a standalone repository with Git history
     #[command(after_long_help = SPLIT_HELP)]
     Split {
         /// Split subcommand
@@ -432,7 +417,7 @@ pub enum Commands {
         command: SplitCommand,
     },
 
-    /// (Advanced) Sync changes between monorepo and split repos
+    /// Synchronize a monorepo with configured split repositories
     #[command(after_long_help = SYNC_HELP)]
     Sync {
         /// Crate name to sync (mutually exclusive with --all)
@@ -477,7 +462,7 @@ pub enum Commands {
         format: TextJsonOutputFormat,
     },
 
-    /// Publish releases (version bump, changelog, tag, publish)
+    /// Plan and execute exact-SHA releases
     #[command(after_long_help = RELEASE_HELP)]
     Release {
         /// Release subcommand
@@ -522,7 +507,7 @@ pub enum Commands {
         format: TextJsonOutputFormat,
     },
 
-    /// Configuration management
+    /// Inspect, validate, or migrate repository policy
     #[command(name = "config")]
     #[command(after_long_help = CONFIG_HELP)]
     Config {
@@ -592,9 +577,9 @@ pub enum DoctorCommand {
 pub enum CacheScope {
     /// Reconstructible cache state inside the selected workspace.
     Workspace,
-    /// The validated user-wide CAS shared by local workspaces.
+    /// The validated local CAS owned by the selected workspace profile.
     Local,
-    /// Both workspace state and the shared local CAS.
+    /// Both workspace state and the selected profile's local CAS.
     All,
 }
 
@@ -619,13 +604,16 @@ impl CacheScope {
 /// Arguments that install or repair transparent verified compiler reuse.
 #[derive(Debug, Args)]
 pub struct CacheSetupArgs {
+    /// Existing opaque profile ID to bind this workspace explicitly.
+    #[arg(long, value_name = "PROFILE_ID")]
+    pub profile: Option<String>,
     /// Local cache base directory (defaults to Cargo home).
     #[arg(long, value_name = "PATH")]
     pub local_dir: Option<PathBuf>,
     /// Positive binary byte size such as 10GiB.
     #[arg(long, value_name = "SIZE", value_parser = parse_cache_size)]
     pub max_size: Option<u64>,
-    /// Machine-owned remote cache URL to persist with this installation.
+    /// Machine-owned remote cache URL to persist with this workspace profile.
     #[arg(long, value_name = "URL", conflicts_with = "local_only")]
     pub remote: Option<String>,
     /// Maximum remote authority; explicit selection defaults to read-write.
@@ -724,6 +712,42 @@ pub enum CacheCommand {
         #[arg(long, short = 'f', default_value_t, value_enum)]
         format: TextJsonOutputFormat,
     },
+    /// Inspect every private workspace profile without selecting or mutating one.
+    Profiles {
+        /// Report format.
+        #[arg(long, short = 'f', default_value_t, value_enum)]
+        format: TextJsonOutputFormat,
+    },
+    /// Detach the current workspace while preserving its profile and CAS data.
+    Detach {
+        /// Preview the exact binding removal without modifying profile state.
+        #[arg(long, short = 'c')]
+        check: bool,
+        /// Report format.
+        #[arg(long, short = 'f', default_value_t, value_enum)]
+        format: TextJsonOutputFormat,
+    },
+    /// Permanently remove one detached workspace profile and its owned local state.
+    DropProfile {
+        /// Opaque profile identifier reported by `cargo rail cache profiles`.
+        #[arg(long)]
+        profile: String,
+        /// Preview the exact profile removal without modifying cache state.
+        #[arg(long, short = 'c')]
+        check: bool,
+        /// Report format.
+        #[arg(long, short = 'f', default_value_t, value_enum)]
+        format: TextJsonOutputFormat,
+    },
+    /// Permanently remove quarantined pre-profile CAS and migration state.
+    DropUnbound {
+        /// Preview the exact cleanup without modifying cache state.
+        #[arg(long, short = 'c')]
+        check: bool,
+        /// Report format.
+        #[arg(long, short = 'f', default_value_t, value_enum)]
+        format: TextJsonOutputFormat,
+    },
     /// Quarantine a selected markerless CAS and create a fresh owned authority.
     Recover {
         /// Preview the exact quarantine move without modifying cache state.
@@ -745,8 +769,8 @@ pub enum CacheCommand {
         #[arg(long, short = 'f', default_value_t, value_enum)]
         format: TextJsonOutputFormat,
     },
-    /// Remove only transparent compiler-cache state owned by the setup receipt.
-    Remove {
+    /// Uninstall the one global wrapper while preserving every workspace profile and CAS.
+    Uninstall {
         /// Preview exact Cargo configuration and private-state changes.
         #[arg(long, short = 'c')]
         check: bool,
@@ -800,8 +824,7 @@ pub enum ConfigCommand {
     /// Print canonical effective configuration with defaults
     ///
     /// Shows the merged repository policy: user settings plus defaults for
-    /// any unset fields. Text output is reusable `rail.toml` input and omits
-    /// deprecated compatibility-only fields.
+    /// any unset fields. Text output is reusable `rail.toml` input.
     Print {
         /// Output format
         #[arg(long, short = 'f', default_value_t, value_enum)]
@@ -823,7 +846,7 @@ pub enum ConfigCommand {
         #[arg(long, conflicts_with = "strict")]
         no_strict: bool,
     },
-    /// Explain effective values, defaults, sources, and deprecations
+    /// Explain effective values, defaults, and sources
     Explain {
         /// Exact configuration field path(s) to explain in full
         #[arg(value_name = "FIELD", conflicts_with = "all")]
@@ -835,10 +858,10 @@ pub enum ConfigCommand {
         #[arg(long, short = 'f', default_value_t, value_enum)]
         format: TextJsonOutputFormat,
     },
-    /// Apply explicit semantic configuration migrations
+    /// Normalize exact v0.25 repository policy into the current schema
     ///
-    /// This never adds coded defaults. It only performs reviewed migrations
-    /// for deprecated fields while preserving unrelated TOML formatting.
+    /// This never adds coded defaults. It only performs the frozen v0.25.0
+    /// migration while preserving unrelated TOML formatting.
     Migrate {
         /// Check for pending migrations without modifying rail.toml
         #[arg(long)]
@@ -943,7 +966,7 @@ pub enum ReleaseCommand {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Execute release (plan or publish)
+    /// Execute a durable release transaction
     Run {
         /// Crate name(s) to release (mutually exclusive with --all)
         #[arg(conflicts_with = "all", value_name = "CRATE")]
@@ -954,25 +977,21 @@ pub enum ReleaseCommand {
         /// Version bump [auto, major, minor, patch, prerelease, release, or "x.y.z"]
         #[arg(long, default_value = "auto")]
         bump: String,
-        /// Deprecated compatibility check spelling; use `release check`
-        #[arg(long, short = 'c')]
-        check: bool,
         /// Apply from a previously generated mutation plan file
-        #[arg(long, value_name = "PATH", conflicts_with = "check")]
+        #[arg(long, value_name = "PATH")]
         plan: Option<PathBuf>,
         /// Positively authorize irreversible publication to crates.io
-        #[arg(long, conflicts_with_all = ["skip_publish", "pr"])]
+        #[arg(long, conflicts_with = "pr")]
         publish: bool,
-        /// Deprecated compatibility spelling; publication is default-deny
-        #[arg(long)]
-        #[arg(hide = true, conflicts_with = "publish")]
-        skip_publish: bool,
         /// Skip git tag creation
         #[arg(long)]
         skip_tag: bool,
         /// Prepare a release PR branch instead of tagging or publishing
         #[arg(long)]
         pr: bool,
+        /// Wait for exact-SHA remote checks instead of stopping with a resume command
+        #[arg(long, conflicts_with = "pr")]
+        wait: bool,
         /// Expand explicit crate selection to include the full dependent closure
         #[arg(long)]
         include_dependents: bool,
@@ -997,14 +1016,14 @@ pub enum ReleaseCommand {
         /// Version bump [auto, major, minor, patch, prerelease, release, or "x.y.z"]
         #[arg(long, default_value = "auto")]
         bump: String,
-        /// Validate registry publication readiness instead of the local release plan
+        /// Validate publication authority for the same release plan
         #[arg(long)]
         publication: bool,
         /// Run extended publication validation (publish dry-run, MSRV, optional semver checks)
         #[arg(long, short = 'e', requires = "publication")]
         extended: bool,
-        /// Exclude git tag creation from the local release plan
-        #[arg(long, conflicts_with = "publication")]
+        /// Exclude git tag creation from the release plan
+        #[arg(long)]
         skip_tag: bool,
         /// Expand explicit crate selection to include the full dependent closure
         #[arg(long)]
@@ -1013,7 +1032,7 @@ pub enum ReleaseCommand {
         #[arg(long, short = 'f', default_value_t, value_enum)]
         format: TextJsonOutputFormat,
     },
-    /// Finalize a merged release PR (tag, push, publish)
+    /// Finalize the exact release transaction introduced by a merged release PR
     Finalize {
         /// Crate name(s) to finalize (required unless --all)
         #[arg(conflicts_with = "all", value_name = "CRATE")]
@@ -1022,12 +1041,8 @@ pub enum ReleaseCommand {
         #[arg(short, long)]
         all: bool,
         /// Positively authorize irreversible publication to crates.io
-        #[arg(long, conflicts_with = "skip_publish")]
-        publish: bool,
-        /// Deprecated compatibility spelling; publication is default-deny
         #[arg(long)]
-        #[arg(hide = true, conflicts_with = "publish")]
-        skip_publish: bool,
+        publish: bool,
         /// Skip git tag creation
         #[arg(long)]
         skip_tag: bool,
@@ -1111,9 +1126,6 @@ pub enum ChangeCommand {
         /// Scan the full reachable history
         #[arg(long, conflicts_with_all = ["since", "merge_base"])]
         all: bool,
-        /// Require coverage for every changed crate, ignoring release.require_change_files
-        #[arg(long)]
-        required: bool,
         /// Output format
         #[arg(long, short = 'f', default_value_t, value_enum)]
         format: ChangeOutputFormat,
@@ -1147,7 +1159,11 @@ impl Commands {
                 | CacheCommand::Status { format, .. }
                 | CacheCommand::Recover { format, .. }
                 | CacheCommand::Clean { format, .. }
-                | CacheCommand::Remove { format, .. } => text_json_protocol(format.is_json()),
+                | CacheCommand::Profiles { format }
+                | CacheCommand::Detach { format, .. }
+                | CacheCommand::DropProfile { format, .. }
+                | CacheCommand::DropUnbound { format, .. }
+                | CacheCommand::Uninstall { format, .. } => text_json_protocol(format.is_json()),
             },
             Commands::Sync { format, .. } | Commands::Clean { format, .. } => text_json_protocol(format.is_json()),
             Commands::Plan { schema: true, .. } => OutputProtocol::Raw,
@@ -1278,7 +1294,11 @@ impl Commands {
                 | CacheCommand::Status { format, .. }
                 | CacheCommand::Recover { format, .. }
                 | CacheCommand::Clean { format, .. }
-                | CacheCommand::Remove { format, .. } => {
+                | CacheCommand::Profiles { format }
+                | CacheCommand::Detach { format, .. }
+                | CacheCommand::DropProfile { format, .. }
+                | CacheCommand::DropUnbound { format, .. }
+                | CacheCommand::Uninstall { format, .. } => {
                     *format = TextJsonOutputFormat::Json;
                 }
             },

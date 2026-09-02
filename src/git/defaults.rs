@@ -10,8 +10,7 @@ use crate::progress;
 /// Tries in order:
 /// 1. origin/HEAD symref (most reliable)
 /// 2. origin/main (common convention)
-/// 3. origin/master (legacy convention)
-/// 4. HEAD~1 (fallback for local-only repos)
+/// 3. HEAD~1 (fallback for local-only repos)
 ///
 /// # Example
 ///
@@ -20,7 +19,7 @@ use crate::progress;
 /// # use cargo_rail::git::SystemGit;
 /// # let git = SystemGit::open(std::path::Path::new(".")).unwrap();
 /// let base_ref = detect_default_base_ref(&git);
-/// // Returns: "origin/main", "origin/master", or "HEAD~1"
+/// // Returns: the remote default, "origin/main", or "HEAD~1"
 /// ```
 pub fn detect_default_base_ref(git: &SystemGit) -> RailResult<String> {
     // Try 1: origin/HEAD symref (most reliable)
@@ -43,12 +42,7 @@ pub fn detect_default_base_ref(git: &SystemGit) -> RailResult<String> {
         return Ok("origin/main".to_string());
     }
 
-    // Try 3: origin/master
-    if git.resolve_reference("origin/master").is_ok() {
-        return Ok("origin/master".to_string());
-    }
-
-    // Try 4: Fallback to HEAD~1 (for local-only repos or fresh clones)
+    // Try 3: Fallback to HEAD~1 (for local-only repos or fresh clones)
     Ok("HEAD~1".to_string())
 }
 

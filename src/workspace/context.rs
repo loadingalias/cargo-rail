@@ -152,7 +152,7 @@ impl CargoState {
         self.package_index.get(name).map(|&idx| &self.metadata.packages[idx])
     }
 
-    /// Get the underlying metadata (for compatibility)
+    /// Get the authoritative Cargo metadata.
     pub fn metadata(&self) -> &Metadata {
         &self.metadata
     }
@@ -485,8 +485,8 @@ impl WorkspaceContext {
 
     /// Build a context with one complete immutable workspace snapshot.
     ///
-    /// Existing commands do not use this constructor until their ordered snapshot
-    /// migration. It performs exact source, Cargo configuration, Cargo/rustc/rustdoc
+    /// Commands adopt this constructor only when they consume its complete snapshot.
+    /// It performs exact source, Cargo configuration, Cargo/rustc/rustdoc
     /// and compiler-wrapper identity, target configuration, manifest, lockfile,
     /// and base-resolution capture without loading target metadata views.
     ///
@@ -951,13 +951,33 @@ impl WorkspaceContext {
     /// Return current non-generated source paths that differ from `HEAD`.
     pub(crate) fn changed_source_paths(&self) -> RailResult<Vec<PathBuf>> {
         let git = self.git()?.git();
-        Ok(self
-            .capture_worktree_source()?
+        let owned_capture;
+        let capture = if let Some(capture) = self.source_capture() {
+            capture
+        } else {
+            owned_capture = self.capture_worktree_source()?;
+            &owned_capture
+        };
+        Ok(capture
             .changes_from(git, "HEAD")?
             .entries()
             .iter()
             .map(|change| change.path.as_path().to_path_buf())
             .collect())
+    }
+
+    /// Remove workspace-generated paths from a repository-relative path set.
+    pub(crate) fn non_generated_source_paths(&self, paths: &[PathBuf]) -> RailResult<Vec<PathBuf>> {
+        let git = self.git()?;
+        let generated_roots = validated_generated_source_roots(git.repo_root(), &self.workspace_root, &self.cargo)?;
+        let exclusions = SourceExclusions::from_absolute_roots(git.git(), &generated_roots)?;
+        let mut source_paths = Vec::with_capacity(paths.len());
+        for path in paths {
+            if !exclusions.contains(&RepositoryPath::new(path)?) {
+                source_paths.push(path.clone());
+            }
+        }
+        Ok(source_paths)
     }
 
     /// Return final non-generated source paths that differ from `base`.
@@ -1056,7 +1076,7 @@ impl WorkspaceContext {
     /// Return the authoritative snapshot captured by [`Self::build_with_snapshot`].
     ///
     /// Other constructors intentionally avoid this work until command consumers
-    /// migrate in the ordered improvement program.
+    /// require the complete snapshot contract.
     ///
     /// # Errors
     ///

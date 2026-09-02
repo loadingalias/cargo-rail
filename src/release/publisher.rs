@@ -2,13 +2,12 @@
 
 use crate::config::{ReleaseConfig, ReleaseRemoteEffects};
 use crate::error::{RailError, RailResult};
-use crate::release::changelog::detect_github_repo;
 use crate::release::planner::{CrateReleasePlan, RELEASE_REGISTRY, ReleasePlan};
 use crate::release::process;
 use crate::release::remote::{RemoteRepository, release_repository};
 use crate::release::state::{
     BackupRestorePolicy, ReconstructedRelease, ReleaseMode, ReleasePhase, ReleaseState, ReleaseStateCreate,
-    ReleaseStatus, StepStatus, validate_state_path,
+    ReleaseStatus, StepStatus, normalize_release_path, normalize_release_paths, validate_state_path,
 };
 use crate::release::version::VersionBumper;
 use crate::source::ContentDigest;
@@ -223,12 +222,17 @@ impl<'a> ReleasePublisher<'a> {
     }
 
     /// Execute a release plan
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the irreversible release boundary keeps transaction and path authorities explicit"
+    )]
     pub fn execute(
         &self,
         transaction_id: &str,
         plan: &ReleasePlan,
         skip_publish: bool,
         skip_tag: bool,
+        wait_for_checks: bool,
         planned_paths: &[PathBuf],
         control_paths: &[PathBuf],
     ) -> RailResult<()> {
@@ -255,7 +259,7 @@ impl<'a> ReleasePublisher<'a> {
             reconstructed: None,
         })?;
         progress!("release state: {}", state_path.display());
-        if let Err(error) = self.execute_state(&mut state, &state_path) {
+        if let Err(error) = self.execute_state(&mut state, &state_path, wait_for_checks) {
             return Err(error.context(format!(
                 "release is recoverable from '{}'\nresume with: cargo rail release resume {}",
                 state_path.display(),
@@ -292,7 +296,7 @@ impl<'a> ReleasePublisher<'a> {
                 self.update_dependents(crate_plan)?;
             }
 
-            self.update_changelog(crate_plan)?;
+            self.update_changelog(crate_plan, false)?;
             if !consumed_change_files {
                 self.consume_change_files(plan)?;
                 consumed_change_files = true;
@@ -304,7 +308,7 @@ impl<'a> ReleasePublisher<'a> {
 
         self.stage_planned_paths(planned_paths, control_paths)?;
         let mut message = format!(
-            "chore(release): prepare {}\n\nRail-Release: {}\nRail-Release-Mode: prepare\nRail-Release-Remote: {}\nRail-Release-Repository: {}",
+            "chore(release): prepare {}\n\nRail-Release: {}\nRail-Release-Contract: 1\nRail-Release-Mode: prepare\nRail-Release-Remote: {}\nRail-Release-Repository: {}",
             branch,
             transaction_id,
             self.release_config.remote_effects.as_str(),
@@ -365,13 +369,13 @@ impl<'a> ReleasePublisher<'a> {
             reconstructed: None,
         })?;
         progress!("release state: {}", state_path.display());
-        self.execute_state(&mut state, &state_path)
+        self.execute_state(&mut state, &state_path, false)
     }
 
     /// Resume a previously interrupted release without replanning mutated inputs.
     pub fn resume(&self, state_path: &std::path::Path) -> RailResult<()> {
         let state_path = validate_state_path(self.ctx.workspace_root(), state_path)?;
-        let mut state = ReleaseState::load(&state_path)?;
+        let mut state = ReleaseState::load_for_recovery(&state_path)?;
         state.validate_recovery_paths(&self.ctx.git()?.git().worktree_root)?;
         if state.status != ReleaseStatus::Active {
             return Err(RailError::message(format!(
@@ -401,7 +405,7 @@ impl<'a> ReleasePublisher<'a> {
             self.validate_release_head(&state)?;
         }
         progress!("resuming release state: {}", state_path.display());
-        self.execute_state(&mut state, &state_path)
+        self.execute_state(&mut state, &state_path, false)
     }
 
     /// Rebuild a missing local journal from transaction trailers, then reconcile external truth.
@@ -432,13 +436,13 @@ impl<'a> ReleasePublisher<'a> {
             reconstructed: Some(reconstructed),
         })?;
         progress!("reconstructed release state: {}", state_path.display());
-        self.execute_state(&mut state, &state_path)
+        self.execute_state(&mut state, &state_path, false)
     }
 
     /// Abort an active release while it is still entirely local.
     pub fn abort(&self, state_path: &std::path::Path) -> RailResult<()> {
         let state_path = validate_state_path(self.ctx.workspace_root(), state_path)?;
-        let mut state = ReleaseState::load(&state_path)?;
+        let mut state = ReleaseState::load_for_recovery(&state_path)?;
         state.validate_recovery_paths(&self.ctx.git()?.git().worktree_root)?;
         if state.status != ReleaseStatus::Active {
             return Err(RailError::message(format!("release state is {:?}", state.status)));
@@ -494,14 +498,19 @@ impl<'a> ReleasePublisher<'a> {
         Ok(())
     }
 
-    fn execute_state(&self, state: &mut ReleaseState, state_path: &std::path::Path) -> RailResult<()> {
+    fn execute_state(
+        &self,
+        state: &mut ReleaseState,
+        state_path: &std::path::Path,
+        wait_for_checks: bool,
+    ) -> RailResult<()> {
         self.validate_remote_repository(state)?;
         self.reconcile_local_commits(state, state_path)?;
         self.validate_release_head(state)?;
         advance_phase(state, state_path, ReleasePhase::Prepared)?;
         self.reconcile_commit_push(state, state_path)?;
         advance_phase(state, state_path, ReleasePhase::AwaitingChecks)?;
-        self.reconcile_readiness(state, state_path)?;
+        self.reconcile_readiness(state, state_path, wait_for_checks)?;
         advance_phase(state, state_path, ReleasePhase::Ready)?;
         advance_phase(state, state_path, ReleasePhase::Publishing)?;
         self.reconcile_publications(state, state_path)?;
@@ -599,11 +608,22 @@ impl<'a> ReleasePublisher<'a> {
                         if !crate_plan.affected_dependents.is_empty() {
                             self.update_dependents(&crate_plan)?;
                         }
-                        self.update_changelog(&crate_plan)?;
+                        self.update_changelog(
+                            &crate_plan,
+                            state
+                                .predecessor_execution
+                                .as_ref()
+                                .is_some_and(|execution| execution.require_changelog_entries),
+                        )?;
+                        let predecessor_body = state
+                            .predecessor_execution
+                            .as_ref()
+                            .and_then(|execution| execution.release_note_body(&crate_plan.name));
                         self.validate_release_notes_size(
                             &crate_plan,
                             state.skip_tag,
                             state.remote_repository.as_ref(),
+                            predecessor_body,
                         )?;
                         if !state.crates.iter().any(|crate_state| crate_state.commit.is_complete()) {
                             self.consume_change_files(&state.plan)?;
@@ -638,25 +658,13 @@ impl<'a> ReleasePublisher<'a> {
         let git = self.ctx.git()?.git();
         let head = git.head_commit()?;
         if head != state.initial_head {
-            let message = git.run_git_stdout(&["log", "-1", "--format=%B"])?;
-            let transaction = format!("Rail-Release: {}", state.transaction_id);
-            if message.lines().any(|line| line.trim() == transaction)
-                && message.lines().any(|line| line.trim() == "Rail-Release-Mode: finalize")
-            {
-                for crate_state in &mut state.crates {
-                    crate_state.commit.status = StepStatus::Complete;
-                    crate_state.commit.object = Some(head.clone());
-                }
-                state.release_commit = Some(head);
-                return state.save(state_path, "legacy_finalize_commit_observed");
-            }
             return Err(RailError::with_help(
                 format!(
                     "release finalize started at {}, but the checkout is now at {}",
                     state.initial_head, head
                 ),
                 format!(
-                    "restore the merged release commit {}; if an older cargo-rail created an empty finalize commit, abort this local transaction before retrying",
+                    "restore the merged release commit {} before retrying",
                     state.initial_head
                 ),
             ));
@@ -748,7 +756,12 @@ impl<'a> ReleasePublisher<'a> {
         state.save(state_path, "commit_push_observed")
     }
 
-    fn reconcile_readiness(&self, state: &mut ReleaseState, state_path: &std::path::Path) -> RailResult<()> {
+    fn reconcile_readiness(
+        &self,
+        state: &mut ReleaseState,
+        state_path: &std::path::Path,
+        wait_for_checks: bool,
+    ) -> RailResult<()> {
         if state.readiness.is_complete() {
             return Ok(());
         }
@@ -768,25 +781,31 @@ impl<'a> ReleasePublisher<'a> {
             .remote_repository
             .as_ref()
             .ok_or_else(|| RailError::message("release readiness has no repository identity"))?;
-        let observation = self.observe_exact_sha_readiness(repository, release_commit)?;
-        match observation {
-            CheckReadiness::Green(detail) => {
-                state.readiness.status = StepStatus::Complete;
-                state.readiness.object = Some(detail);
-                state.save(state_path, "readiness_observed")
-            }
-            CheckReadiness::Waiting(detail) => {
-                state.readiness.object = Some(detail.clone());
-                state.save(state_path, "readiness_waiting")?;
-                Err(readiness_wait_error(state_path, release_commit, &detail))
-            }
-            CheckReadiness::Failed(detail) => {
-                state.readiness.object = Some(detail.clone());
-                state.save(state_path, "readiness_failed")?;
-                Err(RailError::with_help(
-                    format!("release checks failed for exact commit {}: {}", release_commit, detail),
-                    "fix the failing checks without moving or replacing the release commit; then resume the release",
-                ))
+        loop {
+            let observation = self.observe_exact_sha_readiness(repository, release_commit)?;
+            match observation {
+                CheckReadiness::Green(detail) => {
+                    state.readiness.status = StepStatus::Complete;
+                    state.readiness.object = Some(detail);
+                    return state.save(state_path, "readiness_observed");
+                }
+                CheckReadiness::Waiting(detail) => {
+                    state.readiness.object = Some(detail.clone());
+                    state.save(state_path, "readiness_waiting")?;
+                    if !wait_for_checks {
+                        return Err(readiness_wait_error(state_path, release_commit, &detail));
+                    }
+                    progress!("release commit {} is awaiting checks: {}", release_commit, detail);
+                    std::thread::sleep(release_readiness_poll_interval());
+                }
+                CheckReadiness::Failed(detail) => {
+                    state.readiness.object = Some(detail.clone());
+                    state.save(state_path, "readiness_failed")?;
+                    return Err(RailError::with_help(
+                        format!("release checks failed for exact commit {}: {}", release_commit, detail),
+                        "fix the failing checks without moving or replacing the release commit; then resume the release",
+                    ));
+                }
             }
         }
     }
@@ -860,7 +879,11 @@ impl<'a> ReleasePublisher<'a> {
             state.crates[index].forge_draft.object = Some(crate_plan.tag_name.clone());
             state.save(state_path, &format!("forge_intent:{}", crate_plan.tag_name))?;
             fault_before("forge_draft", &crate_plan.tag_name)?;
-            self.create_forge_release(forge, &repository, &crate_plan)?;
+            let predecessor_body = state
+                .predecessor_execution
+                .as_ref()
+                .and_then(|execution| execution.release_note_body(&crate_plan.name));
+            self.create_forge_release(forge, &repository, &crate_plan, predecessor_body)?;
             fault_after("forge_draft", &crate_plan.tag_name)?;
             state.crates[index].forge_draft.status = StepStatus::Complete;
             state.crates[index].forge_draft.object = Some(crate_plan.tag_name.clone());
@@ -1150,7 +1173,7 @@ impl<'a> ReleasePublisher<'a> {
     }
 
     /// Update or create CHANGELOG.md
-    fn update_changelog(&self, plan: &CrateReleasePlan) -> RailResult<()> {
+    fn update_changelog(&self, plan: &CrateReleasePlan, require_entries: bool) -> RailResult<()> {
         if !plan.generate_changelog {
             return Ok(());
         }
@@ -1175,7 +1198,7 @@ impl<'a> ReleasePublisher<'a> {
         release.push('\n');
 
         if new_entries.trim().is_empty() {
-            if self.release_config.require_changelog_entries {
+            if require_entries {
                 return Err(RailError::message(format!(
                     "no changelog entries for {} (enable commits or disable changelog)",
                     plan.name
@@ -1203,7 +1226,7 @@ impl<'a> ReleasePublisher<'a> {
     /// Commit version bump and changelog
     fn commit_version_bump(&self, state: &ReleaseState, plan: &CrateReleasePlan) -> RailResult<()> {
         let mut message = format!(
-            "chore(release): {} v{}\n\nRail-Release: {}\nRail-Release-Mode: run\nRail-Release-Publish: {}\nRail-Release-Publish-Registry: {}\nRail-Release-Tag: {}\nRail-Release-Remote: {}\nRail-Release-Crate: {}@{}\nRail-Release-Tag-Name: {}={}\nRail-Release-Crate-Publish: {}={}",
+            "chore(release): {} v{}\n\nRail-Release: {}\nRail-Release-Contract: 1\nRail-Release-Mode: run\nRail-Release-Publish: {}\nRail-Release-Publish-Registry: {}\nRail-Release-Tag: {}\nRail-Release-Remote: {}\nRail-Release-Crate: {}@{}\nRail-Release-Tag-Name: {}={}\nRail-Release-Crate-Publish: {}={}",
             plan.name,
             plan.new_version,
             state.transaction_id,
@@ -1235,22 +1258,14 @@ impl<'a> ReleasePublisher<'a> {
 
     fn stage_planned_paths(&self, planned_paths: &[PathBuf], control_paths: &[PathBuf]) -> RailResult<()> {
         let git = self.ctx.git()?.git();
-        let canonical_git_root = canonicalize_existing(&git.worktree_root)?;
-        let planned: BTreeSet<PathBuf> = planned_paths.iter().cloned().collect();
+        let planned = normalize_release_paths(&git.worktree_root, planned_paths, "planned")?;
         let mut allowed = planned.clone();
-        for path in control_paths {
-            let relative = if path.is_absolute() {
-                let canonical = canonicalize_existing(path)?;
-                let Ok(relative) = canonical.strip_prefix(&canonical_git_root) else {
-                    continue;
-                };
-                relative.to_path_buf()
-            } else {
-                path.clone()
-            };
-            allowed.insert(relative);
-        }
-        let changed_paths = self.ctx.changed_source_paths()?;
+        allowed.extend(normalize_release_paths(&git.worktree_root, control_paths, "control")?);
+        let mut changed_paths = self.ctx.changed_source_paths()?;
+        let git_changed_paths = git.changed_paths()?;
+        changed_paths.extend(self.ctx.non_generated_source_paths(&git_changed_paths)?);
+        changed_paths.sort();
+        changed_paths.dedup();
         let unexpected = changed_paths
             .iter()
             .filter(|path| !allowed.contains(*path))
@@ -1268,7 +1283,7 @@ impl<'a> ReleasePublisher<'a> {
                 "restore the unexpected paths, regenerate the release plan, and retry",
             ));
         }
-        let to_stage = changed_paths
+        let to_stage = git_changed_paths
             .into_iter()
             .filter(|path| planned.contains(path))
             .collect::<Vec<_>>();
@@ -1333,6 +1348,7 @@ impl<'a> ReleasePublisher<'a> {
         forge: ReleaseForge,
         repository: &RemoteRepository,
         plan: &CrateReleasePlan,
+        predecessor_body: Option<&str>,
     ) -> RailResult<()> {
         self.validate_expected_repository(repository)?;
         if self.forge_release_exists(forge, repository, &plan.tag_name) {
@@ -1344,15 +1360,20 @@ impl<'a> ReleasePublisher<'a> {
             return Ok(());
         }
         match forge {
-            ReleaseForge::Github => self.create_github_release_draft(repository, plan),
-            ReleaseForge::Gitlab => self.create_gitlab_release(repository, plan),
+            ReleaseForge::Github => self.create_github_release_draft(repository, plan, predecessor_body),
+            ReleaseForge::Gitlab => self.create_gitlab_release(repository, plan, predecessor_body),
         }
     }
 
     /// Create a draft GitHub release targeting the exact pushed commit.
-    fn create_github_release_draft(&self, repository: &RemoteRepository, plan: &CrateReleasePlan) -> RailResult<()> {
+    fn create_github_release_draft(
+        &self,
+        repository: &RemoteRepository,
+        plan: &CrateReleasePlan,
+        predecessor_body: Option<&str>,
+    ) -> RailResult<()> {
         let target = self.tag_target_commit(&plan.tag_name)?;
-        let notes_file = self.write_release_notes_temp(plan)?;
+        let notes_file = self.write_release_notes_temp(plan, predecessor_body)?;
         let selector = repository.selector();
         let output = process::run(
             "gh",
@@ -1387,8 +1408,13 @@ impl<'a> ReleasePublisher<'a> {
         Ok(())
     }
 
-    fn create_gitlab_release(&self, repository: &RemoteRepository, plan: &CrateReleasePlan) -> RailResult<()> {
-        let notes_file = self.write_release_notes_temp(plan)?;
+    fn create_gitlab_release(
+        &self,
+        repository: &RemoteRepository,
+        plan: &CrateReleasePlan,
+        predecessor_body: Option<&str>,
+    ) -> RailResult<()> {
+        let notes_file = self.write_release_notes_temp(plan, predecessor_body)?;
         let args = gitlab_release_create_args(
             &plan.tag_name,
             &format!("{} v{}", plan.name, plan.new_version),
@@ -1703,12 +1729,13 @@ impl<'a> ReleasePublisher<'a> {
     }
 
     fn ensure_only_release_paths_changed(&self, state: &ReleaseState) -> RailResult<()> {
-        let allowed = state
-            .planned_paths
-            .iter()
-            .chain(&state.control_paths)
-            .cloned()
-            .collect::<BTreeSet<_>>();
+        let git = self.ctx.git()?.git();
+        let mut allowed = normalize_release_paths(&git.worktree_root, &state.planned_paths, "planned")?;
+        allowed.extend(normalize_release_paths(
+            &git.worktree_root,
+            &state.control_paths,
+            "control",
+        )?);
         let unexpected = self
             .ctx
             .changed_source_paths()?
@@ -1741,18 +1768,20 @@ impl<'a> ReleasePublisher<'a> {
     }
 
     fn restore_local_input_backups(&self, state: &ReleaseState, include_consumed_inputs: bool) -> RailResult<()> {
+        let git = self.ctx.git()?.git();
         for backup in &state.local_input_backups {
             if !include_consumed_inputs && !matches!(backup.restore, BackupRestorePolicy::Always) {
                 continue;
             }
-            crate::utils::write_file_atomic(&backup.path, backup.content.as_bytes())?;
+            let relative = normalize_release_path(&git.worktree_root, &backup.path, "backup")?;
+            crate::utils::write_file_atomic(&git.worktree_root.join(relative), backup.content.as_bytes())?;
         }
         Ok(())
     }
 
     fn clean_untracked_planned_paths(&self, state: &ReleaseState) -> RailResult<()> {
         let git = self.ctx.git()?.git();
-        for path in &state.planned_paths {
+        for path in normalize_release_paths(&git.worktree_root, &state.planned_paths, "planned")? {
             let Some(path) = path.to_str() else {
                 return Err(RailError::message(format!(
                     "release path '{}' is not valid UTF-8",
@@ -1785,6 +1814,7 @@ impl<'a> ReleasePublisher<'a> {
         plan: &CrateReleasePlan,
         skip_tag: bool,
         repository: Option<&RemoteRepository>,
+        predecessor_body: Option<&str>,
     ) -> RailResult<()> {
         if !self.release_config.remote_effects.creates_forge_release()
             || skip_tag
@@ -1795,7 +1825,7 @@ impl<'a> ReleasePublisher<'a> {
             return Ok(());
         }
 
-        let notes = self.release_notes(plan)?;
+        let notes = self.release_notes(plan, predecessor_body)?;
         if notes.len() > GITHUB_RELEASE_NOTES_SOFT_LIMIT_BYTES {
             return Err(RailError::with_help(
                 format!(
@@ -1805,31 +1835,26 @@ impl<'a> ReleasePublisher<'a> {
                     notes.len(),
                     GITHUB_RELEASE_NOTES_SOFT_LIMIT_BYTES
                 ),
-                format!(
-                    "provide a shorter manual override at {}/v{}.md",
-                    self.release_config.release_notes_dir, plan.new_version
-                ),
+                "reduce the generated changelog section before creating the GitHub release",
             ));
         }
         Ok(())
     }
 
-    fn write_release_notes_temp(&self, plan: &CrateReleasePlan) -> RailResult<PathBuf> {
-        let dir = crate::workspace::cargo_rail_state_root(self.ctx.workspace_root()).join("release-notes");
+    fn write_release_notes_temp(&self, plan: &CrateReleasePlan, predecessor_body: Option<&str>) -> RailResult<PathBuf> {
+        let dir = crate::workspace::cargo_rail_state_root(self.ctx.workspace_root()).join("forge-release-bodies");
         fs::create_dir_all(&dir)
             .map_err(|e| RailError::message(format!("failed to create {}: {}", dir.display(), e)))?;
         let path = dir.join(format!("{}.md", sanitize_filename(&plan.tag_name)));
-        fs::write(&path, self.release_notes(plan)?)
+        fs::write(&path, self.release_notes(plan, predecessor_body)?)
             .map_err(|e| RailError::message(format!("failed to write {}: {}", path.display(), e)))?;
         Ok(path)
     }
 
-    fn release_notes(&self, plan: &CrateReleasePlan) -> RailResult<String> {
-        if let Some(path) = self.release_notes_override_path(plan) {
-            return fs::read_to_string(&path)
-                .map_err(|e| RailError::message(format!("failed to read {}: {}", path.display(), e)));
+    fn release_notes(&self, plan: &CrateReleasePlan, predecessor_body: Option<&str>) -> RailResult<String> {
+        if let Some(body) = predecessor_body {
+            return Ok(body.to_string());
         }
-
         if plan.changelog_path.exists() {
             let changelog = fs::read_to_string(&plan.changelog_path)
                 .map_err(|e| RailError::message(format!("failed to read {}: {}", plan.changelog_path.display(), e)))?;
@@ -1839,21 +1864,6 @@ impl<'a> ReleasePublisher<'a> {
         }
 
         Ok(format!("Release {} v{}\n", plan.name, plan.new_version))
-    }
-
-    fn release_notes_override_path(&self, plan: &CrateReleasePlan) -> Option<PathBuf> {
-        let dir = self.ctx.workspace_root().join(&self.release_config.release_notes_dir);
-        let version_path = dir.join(format!("v{}.md", plan.new_version));
-        if version_path.exists() {
-            return Some(version_path);
-        }
-
-        let tag_path = dir.join(format!("{}.md", plan.tag_name));
-        if tag_path.exists() {
-            return Some(tag_path);
-        }
-
-        None
     }
 
     /// Get current date in YYYY-MM-DD format
@@ -1914,6 +1924,15 @@ fn insert_changelog_release(existing: &str, release: &str) -> String {
     }
 
     updated
+}
+
+fn detect_github_repo(workspace_root: &Path) -> Option<(String, String)> {
+    let repository = crate::release::remote::fetch_repository(workspace_root).ok()?;
+    if repository.host() != Some("github.com") {
+        return None;
+    }
+    let (owner, name) = repository.github_owner_repo()?;
+    Some((owner.to_string(), name.to_string()))
 }
 
 fn extract_changelog_section(changelog: &str, version: &str) -> Option<String> {
@@ -2240,6 +2259,17 @@ fn readiness_wait_error(state_path: &std::path::Path, release_commit: &str, deta
     )
 }
 
+fn release_readiness_poll_interval() -> std::time::Duration {
+    const DEFAULT_SECONDS: u64 = 10;
+    std::env::var("CARGO_RAIL_RELEASE_POLL_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or_else(
+            || std::time::Duration::from_secs(DEFAULT_SECONDS),
+            std::time::Duration::from_millis,
+        )
+}
+
 fn registry_wait_error(plan: &CrateReleasePlan) -> RailError {
     RailError::with_help(
         format!(
@@ -2292,7 +2322,6 @@ mod tests {
         let plan = ReleasePlan {
             plan_contract_version: crate::release::planner::RELEASE_PLAN_CONTRACT_VERSION,
             snapshot_id: String::new(),
-            source: crate::config::ReleaseSource::Changes,
             canonical_crate_order: Vec::new(),
             crates: Vec::new(),
             summary: crate::release::planner::ReleaseSummary {

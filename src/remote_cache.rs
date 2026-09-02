@@ -6,6 +6,7 @@
 
 mod azure;
 mod coordinator;
+mod evidence;
 mod object;
 mod s3;
 mod url;
@@ -94,6 +95,7 @@ pub(crate) fn scrub_child_environment(command: &mut std::process::Command) {
 #[derive(Debug, Clone)]
 pub(crate) struct RemoteStoreError {
     kind: RemoteStoreErrorKind,
+    cause: Option<RemoteProbeFailureCause>,
     message: String,
 }
 
@@ -105,9 +107,56 @@ enum RemoteStoreErrorKind {
     Authentication,
 }
 
+/// One secret-safe cause retained for an actionable remote-cache probe failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RemoteProbeFailureCause {
+    Dns,
+    Tls,
+    RootStore,
+    Connection,
+    Timeout,
+    Http,
+    CredentialProvider,
+}
+
+impl RemoteProbeFailureCause {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Dns => "dns",
+            Self::Tls => "tls",
+            Self::RootStore => "root_store",
+            Self::Connection => "connection",
+            Self::Timeout => "timeout",
+            Self::Http => "http",
+            Self::CredentialProvider => "credential_provider",
+        }
+    }
+
+    pub(crate) const fn retry_guidance(self) -> &'static str {
+        match self {
+            Self::Dns => "verify DNS resolution for the selected remote host, then retry the probe",
+            Self::Tls => "verify system time and TLS interception policy, then retry the probe",
+            Self::RootStore => {
+                "repair the host root certificate store or server certificate chain, then retry the probe"
+            }
+            Self::Connection => {
+                "verify outbound HTTPS connectivity, proxy policy, and firewall rules, then retry the probe"
+            }
+            Self::Timeout => "verify network reachability and service health, then retry the probe",
+            Self::Http => "retry the probe after the remote service recovers",
+            Self::CredentialProvider => "refresh the selected machine credential provider, then retry the probe",
+        }
+    }
+}
+
 impl RemoteStoreError {
     pub(super) fn integrity(message: impl Into<String>) -> Self {
         Self::new(RemoteStoreErrorKind::Integrity, message)
+    }
+
+    pub(super) fn integrity_with_cause(cause: RemoteProbeFailureCause, message: impl Into<String>) -> Self {
+        Self::new_with_cause(RemoteStoreErrorKind::Integrity, cause, message)
     }
 
     pub(super) fn configuration(message: impl Into<String>) -> Self {
@@ -118,13 +167,30 @@ impl RemoteStoreError {
         Self::new(RemoteStoreErrorKind::Unavailable, message)
     }
 
+    pub(super) fn unavailable_with_cause(cause: RemoteProbeFailureCause, message: impl Into<String>) -> Self {
+        Self::new_with_cause(RemoteStoreErrorKind::Unavailable, cause, message)
+    }
+
     pub(super) fn authentication(message: impl Into<String>) -> Self {
         Self::new(RemoteStoreErrorKind::Authentication, message)
+    }
+
+    pub(super) fn authentication_with_cause(cause: RemoteProbeFailureCause, message: impl Into<String>) -> Self {
+        Self::new_with_cause(RemoteStoreErrorKind::Authentication, cause, message)
     }
 
     fn new(kind: RemoteStoreErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
+            cause: None,
+            message: message.into(),
+        }
+    }
+
+    fn new_with_cause(kind: RemoteStoreErrorKind, cause: RemoteProbeFailureCause, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            cause: Some(cause),
             message: message.into(),
         }
     }
@@ -145,6 +211,10 @@ impl RemoteStoreError {
             RemoteStoreErrorKind::Unavailable => "transport_failure",
             RemoteStoreErrorKind::Authentication => "authentication_failure",
         }
+    }
+
+    pub(crate) const fn probe_failure_cause(&self) -> Option<RemoteProbeFailureCause> {
+        self.cause
     }
 }
 
@@ -448,6 +518,17 @@ pub(crate) struct RemoteStore {
     coordinator_connect_error: Option<RemoteStoreError>,
     coordinator_failed: AtomicBool,
     direct: OnceLock<RemoteStoreResult<object::ObjectStore>>,
+    evidence: OnceLock<RemoteStoreResult<evidence::EvidenceStore>>,
+}
+
+impl fmt::Debug for RemoteStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RemoteStore")
+            .field("provider", &self.selection.provider_name())
+            .field("mode", &self.selection.mode().as_str())
+            .finish_non_exhaustive()
+    }
 }
 
 impl RemoteStore {
@@ -467,11 +548,22 @@ impl RemoteStore {
             coordinator_connect_error,
             coordinator_failed: AtomicBool::new(false),
             direct: OnceLock::new(),
+            evidence: OnceLock::new(),
         })
     }
 
     fn direct(&self) -> RemoteStoreResult<&object::ObjectStore> {
         match self.direct.get_or_init(|| object::connect(&self.selection)) {
+            Ok(store) => Ok(store),
+            Err(error) => Err(error.clone()),
+        }
+    }
+
+    fn evidence(&self) -> RemoteStoreResult<&evidence::EvidenceStore> {
+        match self
+            .evidence
+            .get_or_init(|| evidence::EvidenceStore::connect(&self.selection))
+        {
             Ok(store) => Ok(store),
             Err(error) => Err(error.clone()),
         }
@@ -483,18 +575,33 @@ impl RemoteStore {
             .get()
             .and_then(|store| store.as_ref().ok())
             .map_or_else(object::TransferMetrics::default, object::ObjectStore::metrics);
+        let evidence = self
+            .evidence
+            .get()
+            .and_then(|store| store.as_ref().ok())
+            .map_or_else(object::TransferMetrics::default, evidence::EvidenceStore::metrics);
         let coordinated = self
             .coordinator
             .as_ref()
             .map_or_else(coordinator::Metrics::default, coordinator::Client::metrics);
         RemoteTransferMetrics {
-            request_attempts: direct.request_attempts.saturating_add(coordinated.request_attempts),
+            request_attempts: direct
+                .request_attempts
+                .saturating_add(evidence.request_attempts)
+                .saturating_add(coordinated.request_attempts),
             coordinator_requests: coordinated.requests,
-            payload_bytes_read: direct.payload_bytes_read.saturating_add(coordinated.payload_bytes_read),
+            payload_bytes_read: direct
+                .payload_bytes_read
+                .saturating_add(evidence.payload_bytes_read)
+                .saturating_add(coordinated.payload_bytes_read),
             payload_bytes_written: direct
                 .payload_bytes_written
+                .saturating_add(evidence.payload_bytes_written)
                 .saturating_add(coordinated.payload_bytes_written),
-            service_elapsed_ns: direct.service_elapsed_ns.saturating_add(coordinated.service_elapsed_ns),
+            service_elapsed_ns: direct
+                .service_elapsed_ns
+                .saturating_add(evidence.service_elapsed_ns)
+                .saturating_add(coordinated.service_elapsed_ns),
         }
     }
 
@@ -573,6 +680,28 @@ impl RemoteStore {
         }
         self.direct()?.publish(association, base_action_key, selector, pack)
     }
+
+    /// Import every exact remote candidate through the ordinary local CAS
+    /// admission path. High-level evidence stores still decide whether the
+    /// imported candidates form one complete reusable result.
+    pub(crate) fn import_compiler_evidence(
+        &self,
+        cas: &crate::cache::cas::LocalCas,
+        candidate_key: &str,
+    ) -> RemoteStoreResult<usize> {
+        self.evidence()?.import(cas, candidate_key)
+    }
+
+    /// Publish one already-validated local evidence result. Callers own
+    /// dependency ordering: objects before sets, and all referenced evidence
+    /// before native bindings.
+    pub(crate) fn publish_compiler_evidence(
+        &self,
+        validation: &crate::compiler::diagnostics_store::CompilerEvidenceValidation,
+        evidence: &crate::compiler::diagnostics_store::CompilerEvidenceObject,
+    ) -> RemoteStoreResult<()> {
+        self.evidence()?.publish(validation, evidence)
+    }
 }
 
 pub(crate) fn run_coordinator_if_requested() -> Option<i32> {
@@ -592,10 +721,15 @@ pub(crate) struct RemoteCacheConfigurationStatus {
     pub(crate) mode: &'static str,
     pub(crate) shared_environment_names: usize,
     pub(crate) activation: &'static str,
+    pub(crate) selection_source: &'static str,
 }
 
 impl RemoteCacheConfigurationStatus {
     pub(crate) fn from_selection(selection: &RemoteCacheSelection) -> Self {
+        Self::from_selection_source(selection, "explicit_process")
+    }
+
+    pub(crate) fn from_selection_source(selection: &RemoteCacheSelection, selection_source: &'static str) -> Self {
         Self {
             provider: selection.provider_name(),
             protocol: selection.protocol_name(),
@@ -607,6 +741,7 @@ impl RemoteCacheConfigurationStatus {
             } else {
                 "authority_selected_transport_inactive"
             },
+            selection_source,
         }
     }
 }
@@ -615,24 +750,44 @@ pub(crate) fn configuration_status(
     current_dir: &std::path::Path,
 ) -> RemoteStoreResult<Option<RemoteCacheConfigurationStatus>> {
     if let Some(selection) = RemoteCacheSelection::from_environment()? {
-        return Ok(Some(RemoteCacheConfigurationStatus::from_selection(&selection)));
+        return Ok(Some(RemoteCacheConfigurationStatus::from_selection_source(
+            &selection,
+            "transient_environment",
+        )));
     }
     let installed = crate::cache::installation::installed_remote(current_dir)
         .map_err(|_| RemoteStoreError::configuration("installed remote cache policy is unavailable"))?;
     installed
         .as_ref()
+        .and_then(crate::cache::installation::InstalledRemoteSelection::remote)
         .map(InstalledRemoteCache::selection)
         .transpose()
-        .map(|selection| selection.as_ref().map(RemoteCacheConfigurationStatus::from_selection))
+        .map(|selection| {
+            selection
+                .as_ref()
+                .map(|selection| RemoteCacheConfigurationStatus::from_selection_source(selection, "installed_profile"))
+        })
 }
 
 /// Authenticate the selected direct object store and validate its exact protocol marker.
 pub(crate) fn probe(current_dir: &std::path::Path) -> RemoteStoreResult<RemoteCacheProbeStatus> {
-    let installed = crate::cache::installation::installed_remote(current_dir)
-        .map_err(|_| RemoteStoreError::configuration("installed remote cache policy is unavailable"))?;
-    let selection = RemoteCacheSelection::from_environment_or_installed(installed.as_ref())?
-        .ok_or_else(|| RemoteStoreError::configuration("no remote cache authority is selected"))?;
-    let remote = RemoteCacheConfigurationStatus::from_selection(&selection);
+    let transient = RemoteCacheSelection::from_environment()?;
+    let installed = if transient.is_none() {
+        crate::cache::installation::installed_remote(current_dir)
+            .map_err(|_| RemoteStoreError::configuration("installed remote cache policy is unavailable"))?
+    } else {
+        None
+    };
+    let (selection, source) = if let Some(selection) = transient {
+        (selection, "transient_environment")
+    } else {
+        let installed = installed
+            .as_ref()
+            .and_then(crate::cache::installation::InstalledRemoteSelection::remote)
+            .ok_or_else(|| RemoteStoreError::configuration("no remote cache authority is selected"))?;
+        (installed.selection()?, "installed_profile")
+    };
+    let remote = RemoteCacheConfigurationStatus::from_selection_source(&selection, source);
     let protocol_marker = object::probe(&selection)?;
     Ok(RemoteCacheProbeStatus {
         remote,

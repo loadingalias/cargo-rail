@@ -42,38 +42,3 @@ fn ordinary_clone_recovers_mapping_without_notes_ref() {
     })();
     super::helpers::finish_test(result);
 }
-
-#[test]
-fn legacy_note_and_history_divergence_is_rejected() {
-    let result: Result<()> = (|| {
-        let repo = tempfile::TempDir::new()?;
-        git(repo.path(), &["init", "-b", "main"])?;
-        git(repo.path(), &["config", "user.name", "Test User"])?;
-        git(repo.path(), &["config", "user.email", "test@example.com"])?;
-        let source_commit = commit(repo.path(), "source object")?;
-        let source_identity = repository_identity(repo.path())?;
-        let origin = OriginContext::new(source_identity.clone(), "demo", "v1-sha256-test")?;
-        let history_target = commit(repo.path(), &format!("split\n\n{}", origin.trailer(&source_commit)?))?;
-        let note_target = commit(repo.path(), "different target")?;
-        git(
-            repo.path(),
-            &[
-                "notes",
-                "--ref",
-                "refs/notes/rail/demo",
-                "add",
-                "-m",
-                &note_target,
-                &source_commit,
-            ],
-        )?;
-
-        let mut mappings = MappingStore::new("demo".to_string());
-        mappings.load_history(repo.path(), HistorySide::Target, &source_identity)?;
-        let error = mappings.load_legacy_notes(repo.path()).unwrap_err();
-        assert!(error.to_string().contains("maps to both"));
-        assert_ne!(history_target, note_target);
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}

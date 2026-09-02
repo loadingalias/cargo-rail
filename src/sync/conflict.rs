@@ -22,6 +22,17 @@ pub enum ConflictStrategy {
     Union,
 }
 
+impl ConflictStrategy {
+    pub(crate) fn authority_name(self) -> &'static str {
+        match self {
+            Self::Ours => "ours",
+            Self::Theirs => "theirs",
+            Self::Manual => "manual",
+            Self::Union => "union",
+        }
+    }
+}
+
 /// Information about a conflict
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -31,7 +42,7 @@ pub enum ConflictClass {
 }
 
 /// One unresolved conflict that requires operator resolution.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConflictInfo {
     /// Path to the conflicted file
     pub file_path: PathBuf,
@@ -84,10 +95,18 @@ impl ConflictResolver {
         base_content: &[u8],
         incoming_content: &[u8],
     ) -> RailResult<MergeResult> {
-        std::fs::create_dir_all(&self.work_dir).context("Failed to create conflict working directory")?;
-        let temp_base = self.work_dir.join("merge-base");
-        let temp_current = self.work_dir.join("merge-current");
-        let temp_incoming = self.work_dir.join("merge-incoming");
+        let (result, merged_content) = self.resolve_file_content(current_path, base_content, incoming_content)?;
+        crate::utils::write_file_atomic(current_path, &merged_content)?;
+        Ok(result)
+    }
+
+    /// Resolve one file without changing the real worktree.
+    pub(crate) fn resolve_file_content(
+        &self,
+        current_path: &Path,
+        base_content: &[u8],
+        incoming_content: &[u8],
+    ) -> RailResult<(MergeResult, Vec<u8>)> {
         let current_metadata = std::fs::symlink_metadata(current_path)?;
         if current_metadata.file_type().is_symlink() || !current_metadata.is_file() {
             return Err(crate::error::RailError::message(format!(
@@ -96,6 +115,23 @@ impl ConflictResolver {
             )));
         }
         let current_content = std::fs::read(current_path)?;
+
+        self.resolve_content(current_path, &current_content, base_content, incoming_content)
+    }
+
+    /// Resolve exact current, base, and incoming bytes without reading or
+    /// changing the real worktree. `path` is used only in diagnostics.
+    pub(crate) fn resolve_content(
+        &self,
+        path: &Path,
+        current_content: &[u8],
+        base_content: &[u8],
+        incoming_content: &[u8],
+    ) -> RailResult<(MergeResult, Vec<u8>)> {
+        std::fs::create_dir_all(&self.work_dir).context("Failed to create conflict working directory")?;
+        let temp_base = self.work_dir.join("merge-base");
+        let temp_current = self.work_dir.join("merge-current");
+        let temp_incoming = self.work_dir.join("merge-incoming");
 
         std::fs::write(&temp_base, base_content).context("Failed to write base file for merge")?;
         std::fs::write(&temp_current, current_content).context("Failed to write current file for merge")?;
@@ -120,6 +156,10 @@ impl ConflictResolver {
             }
         }
 
+        cmd.arg("-L")
+            .arg(path)
+            .args(["-L", "cargo-rail merge base", "-L", "incoming split commit"]);
+
         // Add file arguments: current base incoming
         cmd.arg(&temp_current);
         cmd.arg(&temp_base);
@@ -127,31 +167,25 @@ impl ConflictResolver {
 
         let output = cmd.output().context("Failed to run git merge-file")?;
 
+        let merged_content = std::fs::read(&temp_current)?;
         let result = match output.status.code() {
             Some(code @ (0 | 1)) => {
-                let merged_content = std::fs::read(&temp_current)?;
-                crate::utils::write_file_atomic(current_path, &merged_content)?;
                 if code == 0 {
-                    Ok(MergeResult::Success)
+                    MergeResult::Success
                 } else {
-                    Ok(MergeResult::Conflicts(vec![current_path.to_path_buf()]))
+                    MergeResult::Conflicts(vec![path.to_path_buf()])
                 }
             }
             Some(code) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                Ok(MergeResult::Failed(format!(
-                    "git merge-file failed with code {}: {}",
-                    code, stderr
-                )))
+                MergeResult::Failed(format!("git merge-file failed with code {}: {}", code, stderr))
             }
-            None => Ok(MergeResult::Failed(
-                "git merge-file was terminated by signal".to_string(),
-            )),
+            None => MergeResult::Failed("git merge-file was terminated by signal".to_string()),
         };
         std::fs::remove_file(&temp_base)?;
         std::fs::remove_file(&temp_current)?;
         std::fs::remove_file(&temp_incoming)?;
-        result
+        Ok((result, merged_content))
     }
 }
 

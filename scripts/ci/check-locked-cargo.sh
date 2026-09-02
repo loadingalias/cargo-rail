@@ -153,6 +153,7 @@ while IFS= read -r listed; do
   [[ -f "$path" ]] || continue
   case "$relative" in
     */__pycache__/* | *.pyc) continue ;;
+    scripts/ci/fixtures/*.txt) continue ;;
     justfile | README.md | CONTRIBUTING.md | docs/*.md | examples/*.md) ;;
     scripts/*.sh | scripts/*.ps1 | scripts/*.py | scripts/*.json)
       [[ "$relative" == *-test.sh ]] && continue

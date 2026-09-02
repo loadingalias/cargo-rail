@@ -1,5 +1,12 @@
 #![allow(dead_code, non_camel_case_types, non_snake_case, non_upper_case_globals)]
 
+#[macro_use]
+mod macro_definitions;
+
+tokio::task_local! {
+  pub static TASK_CONTEXT: usize;
+}
+
 pub struct PublicType {
   private_field: usize,
 }
@@ -61,6 +68,11 @@ pub mod same_name_reexports {
   pub fn use_all<T: Shared>() {
     Shared();
   }
+}
+
+define_public_unit! {
+  #[non_exhaustive]
+  pub struct MacroGeneratedPublic;
 }
 
 macro_rules! anonymous_definition {

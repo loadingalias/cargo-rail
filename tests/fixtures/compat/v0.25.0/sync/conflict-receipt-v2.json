@@ -1,0 +1,25 @@
+{
+  "schema_version": 2,
+  "status": "conflicted",
+  "crate_name": "demo",
+  "branch": "cargo-rail-sync-demo",
+  "expected_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "remote_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "message": "remote change\n\nRail-Origin: v1 source=sha256-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee commit=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb owner=64656d6f snapshot=v1-sha256-volatile-content transform=1",
+  "author": "Predecessor Author",
+  "author_email": "author@example.com",
+  "author_timestamp": 1700000000,
+  "author_timezone": "+0000",
+  "committer": "Predecessor Committer",
+  "committer_email": "committer@example.com",
+  "committer_timestamp": 1700000001,
+  "committer_timezone": "+0000",
+  "commit_paths": ["crates/demo/src/lib.rs"],
+  "conflicts": [
+    {
+      "file_path": "crates/demo/src/lib.rs",
+      "class": "content"
+    }
+  ],
+  "resulting_commit": null
+}

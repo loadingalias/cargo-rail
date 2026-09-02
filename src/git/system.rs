@@ -12,6 +12,14 @@ use crate::utils;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::{Mutex, OnceLock};
+
+const OPEN_ROOT_CACHE_CAPACITY: usize = 64;
+
+fn open_root_cache() -> &'static Mutex<std::collections::VecDeque<PathBuf>> {
+    static CACHE: OnceLock<Mutex<std::collections::VecDeque<PathBuf>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::VecDeque::new()))
+}
 
 /// Normalize a path from git output to a platform-native path.
 ///
@@ -47,6 +55,50 @@ fn parse_nul_paths(bytes: &[u8]) -> Vec<PathBuf> {
         .collect()
 }
 
+fn path_from_git_bytes(raw: &[u8]) -> RailResult<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt as _;
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(raw.to_vec())))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(PathBuf::from(String::from_utf8(raw.to_vec())?))
+    }
+}
+
+fn field_after_spaces(record: &[u8], spaces: usize) -> Option<&[u8]> {
+    let mut remaining = record;
+    for _ in 0..spaces {
+        let separator = remaining.iter().position(|byte| *byte == b' ')?;
+        remaining = &remaining[separator + 1..];
+    }
+    Some(remaining)
+}
+
+fn parse_obstructing_status_paths(bytes: &[u8]) -> RailResult<Vec<PathBuf>> {
+    bytes
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .map(|record| {
+            let path = match record.first().copied() {
+                Some(b'1') => field_after_spaces(record, 8),
+                Some(b'u') => field_after_spaces(record, 10),
+                Some(b'?') | Some(b'!') if record.get(1) == Some(&b' ') => record.get(2..),
+                Some(b'2') => {
+                    return Err(RailError::message(
+                        "git status reported a rename despite exact no-rename capture",
+                    ));
+                }
+                _ => None,
+            }
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| RailError::message("git status returned an invalid porcelain-v2 record"))?;
+            path_from_git_bytes(path)
+        })
+        .collect()
+}
+
 /// Information about a git commit
 #[derive(Debug, Clone)]
 pub struct CommitInfo {
@@ -75,7 +127,7 @@ pub struct CommitInfo {
 }
 
 /// Complete author and committer identity for a synthesized commit.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitMetadata {
     /// Author name.
     pub author: String,
@@ -119,6 +171,9 @@ pub struct SystemGit {
 
     /// Root directory of the git working tree
     pub(crate) worktree_root: PathBuf,
+
+    /// Git object format is immutable for the lifetime of a repository.
+    object_format: std::sync::Arc<OnceLock<String>>,
 }
 
 impl SystemGit {
@@ -131,6 +186,20 @@ impl SystemGit {
     /// Returns [`GitError::RepoNotFound`] if `path` is not inside a git repository.
     pub fn open(path: &Path) -> RailResult<Self> {
         let repo_path = utils::canonicalize_existing(path).unwrap_or_else(|_| path.to_path_buf());
+        if let Ok(mut cache) = open_root_cache().lock()
+            && let Some(index) = cache.iter().position(|root| root == &repo_path)
+        {
+            if std::fs::symlink_metadata(repo_path.join(".git")).is_ok() {
+                let worktree_root = cache.remove(index).expect("cached root index");
+                cache.push_back(worktree_root.clone());
+                return Ok(Self {
+                    repo_path,
+                    worktree_root,
+                    object_format: std::sync::Arc::new(OnceLock::new()),
+                });
+            }
+            cache.remove(index);
+        }
         // Get repo metadata in one subprocess call
         let output = git_cmd_for_path(&repo_path)
             .args(["rev-parse", "--show-toplevel"])
@@ -149,10 +218,28 @@ impl SystemGit {
         let reported_root = normalize_git_path(stdout.trim());
         let worktree_root = utils::canonicalize_existing(&reported_root).unwrap_or(reported_root);
 
-        Ok(Self {
+        let git = Self {
             repo_path,
             worktree_root,
-        })
+            object_format: std::sync::Arc::new(OnceLock::new()),
+        };
+        // Only exact roots are cached. A nested input can gain its own `.git`
+        // directory later, so caching its parent discovery would be stale.
+        // The root marker is checked on every hit; repository/ref identity is
+        // never cached and remains owned by each operation's drift boundary.
+        if git.repo_path == git.worktree_root
+            && std::fs::symlink_metadata(git.worktree_root.join(".git")).is_ok()
+            && let Ok(mut cache) = open_root_cache().lock()
+        {
+            if let Some(existing) = cache.iter().position(|root| root == &git.worktree_root) {
+                cache.remove(existing);
+            }
+            if cache.len() == OPEN_ROOT_CACHE_CAPACITY {
+                cache.pop_front();
+            }
+            cache.push_back(git.worktree_root.clone());
+        }
+        Ok(git)
     }
 
     /// Get HEAD commit SHA.
@@ -160,9 +247,24 @@ impl SystemGit {
         self.run_git_stdout(&["rev-parse", "HEAD"])
     }
 
+    /// Return the repository's immutable object format, shared by clones of
+    /// this already-open backend.
+    pub(crate) fn object_format(&self) -> RailResult<String> {
+        if let Some(format) = self.object_format.get() {
+            return Ok(format.clone());
+        }
+        let format = self.run_git_stdout(&["rev-parse", "--show-object-format"])?;
+        drop(self.object_format.set(format.clone()));
+        Ok(format)
+    }
+
     /// Get current branch name
     pub fn current_branch(&self) -> RailResult<String> {
-        self.run_git_stdout(&["rev-parse", "--abbrev-ref", "HEAD"])
+        let symbolic = self.run_git(&["symbolic-ref", "--short", "-q", "HEAD"]);
+        match symbolic {
+            Ok(output) => Ok(String::from_utf8(output.stdout)?.trim().to_string()),
+            Err(_) => self.run_git_stdout(&["rev-parse", "--abbrev-ref", "HEAD"]),
+        }
     }
 
     /// Check if HEAD is detached (not on any branch)
@@ -220,10 +322,113 @@ impl SystemGit {
     /// Paths are repository-relative and sorted. Ignored files are intentionally excluded:
     /// they are outside Git's mutation boundary unless a command declares them explicitly.
     pub fn changed_paths(&self) -> RailResult<Vec<PathBuf>> {
-        let tracked = self.run_git(&["diff", "--name-only", "-z", "HEAD"])?;
-        let mut paths = parse_nul_paths(&tracked.stdout);
-        let untracked = self.run_git(&["ls-files", "--others", "--exclude-standard", "-z"])?;
+        let mut paths = if self.head_commit().is_ok() {
+            let staged = self.run_git_read_only(&["diff", "--cached", "--name-only", "-z", "HEAD"])?;
+            let unstaged = self.run_git_read_only(&["diff-files", "--name-only", "-z"])?;
+            let mut paths = parse_nul_paths(&staged.stdout);
+            paths.extend(parse_nul_paths(&unstaged.stdout));
+            paths
+        } else {
+            let staged = self.run_git_read_only(&["ls-files", "--cached", "-z"])?;
+            parse_nul_paths(&staged.stdout)
+        };
+        let untracked = self.run_git_read_only(&["ls-files", "--others", "--exclude-standard", "-z"])?;
         paths.extend(parse_nul_paths(&untracked.stdout));
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+
+    /// Return every tracked, untracked, or ignored worktree path that could be
+    /// overwritten by a target history materialization. Git administrative
+    /// storage is excluded by Git itself. One porcelain-status stream owns
+    /// ordinary staged, unstaged, untracked, and ignored state. A second index
+    /// stream independently inspects only assume-unchanged/skip-worktree paths,
+    /// which status intentionally suppresses.
+    pub(crate) fn obstructing_worktree_paths(&self) -> RailResult<Vec<PathBuf>> {
+        let status = self.run_git_read_only(&[
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--no-renames",
+            "--untracked-files=all",
+            "--ignored=matching",
+        ])?;
+        let mut paths = parse_obstructing_status_paths(&status.stdout)?;
+        let index = self.run_git_read_only(&["ls-files", "-v", "--stage", "-z"])?;
+        for record in index
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|record| !record.is_empty())
+        {
+            let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
+                return Err(RailError::message("git ls-files returned an invalid staged entry"));
+            };
+            let flag = *record
+                .first()
+                .ok_or_else(|| RailError::message("git ls-files returned an index entry without a state flag"))?;
+            if record.get(1) != Some(&b' ') {
+                return Err(RailError::message("git ls-files returned an invalid index state flag"));
+            }
+            let header = std::str::from_utf8(&record[2..tab])?;
+            let mut fields = header.split_whitespace();
+            let mode = fields.next().unwrap_or_default();
+            let object_id = fields.next().unwrap_or_default();
+            let stage = fields.next().unwrap_or_default();
+            let path = path_from_git_bytes(&record[tab + 1..])?;
+            if stage != "0" {
+                paths.push(path);
+                continue;
+            }
+            if flag == b'H' {
+                continue;
+            }
+            let absolute = self.worktree_root.join(&path);
+            let metadata = match std::fs::symlink_metadata(&absolute) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    paths.push(path);
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let actual_id = match mode {
+                "100644" | "100755" if metadata.file_type().is_file() => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt as _;
+
+                        let executable = metadata.permissions().mode() & 0o111 != 0;
+                        if (mode == "100755") != executable {
+                            paths.push(path.clone());
+                            continue;
+                        }
+                    }
+                    let bytes = std::fs::read(&absolute)?;
+                    let git_path = path.to_string_lossy().replace('\\', "/");
+                    self.hash_path_bytes(&git_path, &bytes)?
+                }
+                "120000" if metadata.file_type().is_symlink() => {
+                    let target = std::fs::read_link(&absolute)?;
+                    #[cfg(unix)]
+                    let bytes = {
+                        use std::os::unix::ffi::OsStrExt as _;
+                        target.as_os_str().as_bytes().to_vec()
+                    };
+                    #[cfg(not(unix))]
+                    let bytes = target.to_string_lossy().as_bytes().to_vec();
+                    self.hash_bytes(&bytes)?
+                }
+                "160000" if metadata.file_type().is_dir() => continue,
+                _ => {
+                    paths.push(path);
+                    continue;
+                }
+            };
+            if actual_id != object_id {
+                paths.push(path);
+            }
+        }
         paths.sort();
         paths.dedup();
         Ok(paths)
@@ -297,6 +502,24 @@ impl SystemGit {
     /// Run a path-reporting Git command from the repository worktree root.
     pub(crate) fn run_git_at_worktree_root(&self, args: &[&str]) -> RailResult<std::process::Output> {
         self.run_git_in(&self.worktree_root, args)
+    }
+
+    fn run_git_read_only(&self, args: &[&str]) -> RailResult<std::process::Output> {
+        let mut command = git_cmd_for_path(&self.repo_path);
+        command
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .arg("--no-optional-locks")
+            .args(args);
+        let output = command
+            .output()
+            .with_context(|| format!("Failed to execute read-only git {}", args.join(" ")))?;
+        if !output.status.success() {
+            return Err(RailError::Git(GitError::CommandFailed {
+                command: format!("git {}", args.join(" ")),
+                stderr: git_command_diagnostics(&output.stdout, &output.stderr),
+            }));
+        }
+        Ok(output)
     }
 
     fn run_git_in(&self, path: &Path, args: &[&str]) -> RailResult<std::process::Output> {
@@ -517,13 +740,38 @@ impl SystemGit {
 
     /// Check if a remote URL has content (branches)
     pub fn ls_remote_has_content(&self, url: &str) -> RailResult<bool> {
-        let mut cmd = self.git_cmd();
-        cmd.args(["ls-remote", "--heads", url]);
+        Ok(!self.run_git(&["ls-remote", "--heads", url])?.stdout.is_empty())
+    }
 
-        match cmd.output() {
-            Ok(output) => Ok(output.status.success() && !output.stdout.is_empty()),
-            Err(e) => Err(RailError::message(format!("Failed to check remote: {}", e))),
+    /// Resolve one exact remote branch without mutating local refs.
+    pub(crate) fn remote_branch_head(&self, remote: &str, branch: &str) -> RailResult<Option<String>> {
+        let reference = format!("refs/heads/{branch}");
+        let output = self.run_git(&["ls-remote", "--heads", remote, &reference])?;
+        let stdout = String::from_utf8(output.stdout)?;
+        let mut lines = stdout.lines().filter(|line| !line.trim().is_empty());
+        let Some(line) = lines.next() else {
+            return Ok(None);
+        };
+        if lines.next().is_some() {
+            return Err(RailError::message(format!(
+                "remote branch '{}' resolved to multiple refs",
+                branch
+            )));
         }
+        let mut fields = line.split_whitespace();
+        let sha = fields
+            .next()
+            .ok_or_else(|| RailError::message("remote branch response has no object ID"))?;
+        let observed_reference = fields
+            .next()
+            .ok_or_else(|| RailError::message("remote branch response has no ref name"))?;
+        if fields.next().is_some() || observed_reference != reference {
+            return Err(RailError::message("remote branch response is malformed"));
+        }
+        if !matches!(sha.len(), 40 | 64) || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(RailError::message("remote branch response has an invalid object ID"));
+        }
+        Ok(Some(sha.to_ascii_lowercase()))
     }
 
     /// Get formatted git log output
@@ -638,6 +886,12 @@ mod tests {
                 key
             );
         }
+        assert!(
+            cmd.get_envs().any(|(configured, value)| {
+                configured == OsStr::new("GIT_NO_LAZY_FETCH") && value == Some(OsStr::new("1"))
+            }),
+            "authority reads must not lazily hydrate promisor objects"
+        );
     }
 
     #[test]
@@ -675,6 +929,81 @@ mod tests {
         assert_ne!(first, changed);
         assert!(first.len() >= 40);
         assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn obstructing_paths_ignore_assume_unchanged_and_skip_worktree_hints() {
+        let temp = tempfile::TempDir::new().unwrap();
+        init_repo(temp.path(), "main").unwrap();
+        let git = SystemGit::open(temp.path()).unwrap();
+        git.set_config("user.name", "Test User").unwrap();
+        git.set_config("user.email", "test@example.com").unwrap();
+        fs::write(temp.path().join("tracked.txt"), "before\n").unwrap();
+        git.stage_all().unwrap();
+        git.commit("initial").unwrap();
+
+        git.run_git(&["update-index", "--assume-unchanged", "tracked.txt"])
+            .unwrap();
+        fs::write(temp.path().join("tracked.txt"), "assume-unchanged edit\n").unwrap();
+        assert_eq!(
+            git.obstructing_worktree_paths().unwrap(),
+            vec![PathBuf::from("tracked.txt")]
+        );
+
+        git.run_git(&["update-index", "--no-assume-unchanged", "tracked.txt"])
+            .unwrap();
+        git.run_git(&["checkout", "--", "tracked.txt"]).unwrap();
+        git.run_git(&["update-index", "--skip-worktree", "tracked.txt"])
+            .unwrap();
+        fs::write(temp.path().join("tracked.txt"), "skip-worktree edit\n").unwrap();
+        assert_eq!(
+            git.obstructing_worktree_paths().unwrap(),
+            vec![PathBuf::from("tracked.txt")]
+        );
+    }
+
+    #[test]
+    fn obstructing_paths_capture_staged_unstaged_untracked_and_ignored_state() {
+        let temp = tempfile::TempDir::new().unwrap();
+        init_repo(temp.path(), "main").unwrap();
+        let git = SystemGit::open(temp.path()).unwrap();
+        git.set_config("user.name", "Test User").unwrap();
+        git.set_config("user.email", "test@example.com").unwrap();
+        fs::write(temp.path().join("staged.txt"), "before\n").unwrap();
+        fs::write(temp.path().join("unstaged.txt"), "before\n").unwrap();
+        fs::write(temp.path().join(".gitignore"), "ignored.txt\n").unwrap();
+        git.stage_all().unwrap();
+        git.commit("initial").unwrap();
+
+        fs::write(temp.path().join("staged.txt"), "after\n").unwrap();
+        git.stage_paths(&[PathBuf::from("staged.txt")]).unwrap();
+        fs::write(temp.path().join("unstaged.txt"), "after\n").unwrap();
+        fs::write(temp.path().join("untracked.txt"), "new\n").unwrap();
+        fs::write(temp.path().join("ignored.txt"), "ignored\n").unwrap();
+
+        assert_eq!(
+            git.obstructing_worktree_paths().unwrap(),
+            vec![
+                PathBuf::from("ignored.txt"),
+                PathBuf::from("staged.txt"),
+                PathBuf::from("unstaged.txt"),
+                PathBuf::from("untracked.txt"),
+            ]
+        );
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn obstructing_paths_preserve_non_utf8_git_names() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        init_repo(temp.path(), "main").unwrap();
+        let git = SystemGit::open(temp.path()).unwrap();
+        let name = std::ffi::OsString::from_vec(b"non-utf8-\xff".to_vec());
+        fs::write(temp.path().join(&name), "untracked\n").unwrap();
+
+        assert_eq!(git.obstructing_worktree_paths().unwrap(), vec![PathBuf::from(name)]);
     }
 
     #[cfg(windows)]

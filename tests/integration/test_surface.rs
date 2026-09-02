@@ -4,7 +4,10 @@ use std::fs;
 
 use crate::helpers::{NestedWorkspace, TestWorkspace, run_cargo_rail, run_cargo_rail_with_env};
 use anyhow::{Result, anyhow};
+use sha2::{Digest as _, Sha256};
 
+const SURFACE_V1_SCHEMA: &str = include_str!("../../schemas/surface-v1.schema.json");
+const SURFACE_V2_SCHEMA: &str = include_str!("../../schemas/surface-v2.schema.json");
 const SURFACE_V3_SCHEMA: &str = include_str!("../../schemas/surface-v3.schema.json");
 
 #[test]
@@ -39,6 +42,30 @@ fn surface_schema_is_pre_context_and_matches_the_published_contract() {
         Ok(())
     })();
     super::helpers::finish_test(result);
+}
+
+#[test]
+fn historical_surface_schemas_remain_exactly_available() {
+    for (schema, digest) in [
+        (
+            SURFACE_V1_SCHEMA,
+            "3e74e75a833ee7cf1c7d504bd1541ee5311d2a070967e322552e1a9a43535145",
+        ),
+        (
+            SURFACE_V2_SCHEMA,
+            "101316fd270606ce5b8d9b1563c0a24cfa4648e61a68c109317b82b4dd3572dd",
+        ),
+    ] {
+        let parsed: serde_json::Value = serde_json::from_str(schema).expect("valid historical schema");
+        jsonschema::validator_for(&parsed).expect("valid historical JSON Schema");
+        assert_eq!(
+            Sha256::digest(schema.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            digest
+        );
+    }
 }
 
 #[test]
@@ -129,15 +156,40 @@ fn surface_check_collects_production_tests_and_doctests_once() {
         );
         fs::write(package.join("Cargo.toml"), manifest)?;
         fs::write(
+            package.join("src/macros.rs"),
+            r#"macro_rules! define_public_unit {
+  (
+    $(#[$meta:meta])*
+    $vis:vis struct $name:ident;
+  ) => {
+    $(#[$meta])*
+    $vis struct $name;
+  };
+}
+"#,
+        )?;
+        fs::write(
             package.join("src/lib.rs"),
             r#"//! Library API.
+
+#[macro_use]
+mod macros;
 
 /// Return the fixture value.
 ///
 /// ```
 /// assert_eq!(surface_app::exported(), 7);
 /// ```
+///
+/// ```compile_fail,E0308
+/// let _: usize = "this doctest must fail to compile";
+/// ```
 pub fn exported() -> usize { 7 }
+
+define_public_unit! {
+  #[non_exhaustive]
+  pub struct MacroGeneratedPublic;
+}
 "#,
         )?;
         fs::write(
@@ -267,6 +319,34 @@ reason = "fixture product"
         assert!(
             finding("exported").is_none(),
             "cross-crate product API must remain public"
+        );
+
+        let repeated_check = run_cargo_rail(&workspace.path, &["rail", "surface", "--check", "--format", "json"])?;
+        assert_eq!(
+            repeated_check.status.code(),
+            Some(1),
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&repeated_check.stdout),
+            String::from_utf8_lossy(&repeated_check.stderr)
+        );
+        let mut repeated_report: serde_json::Value = serde_json::from_slice(&repeated_check.stdout)?;
+        let repeated_acquisition = &repeated_report["metrics"]["acquisition"];
+        assert_eq!(
+            repeated_acquisition["cargo_views_executed"], 0,
+            "repeated acquisition metrics: {repeated_acquisition:#}"
+        );
+        assert_eq!(repeated_acquisition["compiler_invocations"], 0);
+        assert_eq!(repeated_acquisition["fact_cache_hits"], 2);
+        assert_eq!(repeated_acquisition["fact_cache_misses"], 0);
+        let mut cold_report = report.clone();
+        for normalized in [&mut cold_report, &mut repeated_report] {
+            normalized["metrics"] = serde_json::Value::Null;
+            normalized["cache"] = serde_json::Value::Null;
+            normalized["fragments"] = serde_json::Value::Null;
+        }
+        assert_eq!(
+            cold_report, repeated_report,
+            "exact complete fact reuse must preserve the normalized Surface result"
         );
 
         let inspected = run_cargo_rail(&workspace.path, &["rail", "surface", "--format", "json"])?;
@@ -399,7 +479,13 @@ reason = "fixture product"
             format!("[build]\nrustflags = ['@{}']\n", response_file.display()),
         )?;
         let configured_response = run_cargo_rail(&workspace.path, &["rail", "surface", "--check", "--format", "json"])?;
-        assert_eq!(configured_response.status.code(), Some(1));
+        assert_eq!(
+            configured_response.status.code(),
+            Some(1),
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&configured_response.stdout),
+            String::from_utf8_lossy(&configured_response.stderr)
+        );
         let configured_report: serde_json::Value = serde_json::from_slice(&configured_response.stdout)?;
         let configured_acquisition = &configured_report["metrics"]["acquisition"];
         assert_eq!(configured_acquisition["cargo_views_executed"], 2);
@@ -463,7 +549,10 @@ reason = "resume fixture product"
         let failed = run_cargo_rail_with_env(
             &workspace.path,
             &["rail", "surface", "--format", "json"],
-            &[("CARGO_RAIL_SURFACE_FAIL_ACQUISITION_VIEW", "10")],
+            &[
+                ("CARGO_BUILD_JOBS", "1"),
+                ("CARGO_RAIL_SURFACE_FAIL_ACQUISITION_VIEW", "10"),
+            ],
         )?;
         assert_eq!(failed.status.code(), Some(2));
         assert!(
@@ -474,47 +563,48 @@ reason = "resume fixture product"
         let failure: serde_json::Value = serde_json::from_slice(&failed.stdout)?;
         assert!(failure["help"].as_str().is_some_and(|help| help.contains("--resume")));
 
-        let journal_directory = workspace.path.join("target/cargo-rail/surface-acquisitions-v1");
+        let journal_directory = workspace.path.join("target/cargo-rail/surface-acquisitions-v2");
         let journals = fs::read_dir(&journal_directory)?.collect::<Result<Vec<_>, _>>()?;
         assert_eq!(journals.len(), 1);
         let journal = journals[0].path();
-        let records = fs::read_to_string(&journal)?
-            .lines()
-            .map(serde_json::from_str)
-            .collect::<Result<Vec<serde_json::Value>, _>>()?;
-        let header = &records[0];
-        assert_eq!(header["surface_acquisition_contract_version"], 1);
-        assert_eq!(header["views"], 12);
+        let document: serde_json::Value = serde_json::from_slice(&fs::read(&journal)?)?;
+        let header = &document["header"];
+        assert_eq!(header["surface_acquisition_contract_version"], 2);
+        assert_eq!(header["view_count"], 12);
         assert_eq!(header["concurrency"], 1);
         assert_eq!(header["products"][0]["package"], "surface-resume-app");
-        let failed_view = records
+        let failed_view = document["views"]
+            .as_array()
+            .ok_or_else(|| anyhow!("v2 journal has no view array"))?
             .iter()
-            .find(|record| record["status"] == "failed")
+            .find(|record| record["durable"]["state"] == "failed")
             .ok_or_else(|| anyhow!("partial journal has no failed view"))?;
-        assert_eq!(failed_view["ordinal"], 9);
+        assert!(
+            failed_view["ordinal"].is_null(),
+            "new v2 journals must not emit legacy ordinals"
+        );
+        assert_eq!(failed_view["view_index"], 9);
         assert_eq!(failed_view["target_triple"], "default");
         assert_eq!(failed_view["command_class"], "cargo-check-all-targets");
         assert_eq!(
             failed_view["selected_products"][0]["cargo_target"],
             "surface-resume-app"
         );
-        let partial = records
-            .iter()
-            .find(|record| record["record"] == "summary")
-            .ok_or_else(|| anyhow!("partial journal has no summary"))?;
+        let partial = &document["summary"];
         assert_eq!(partial["state"], "partial");
         assert_eq!(partial["completed"], 9);
         assert_eq!(partial["failed"], 1);
-        assert_eq!(partial["not_started"], 2);
-        assert_eq!(partial["planned"], 0);
+        assert_eq!(partial["pending"], 2);
+        assert_eq!(partial["running"], 0);
 
         let journal_argument = journal
             .strip_prefix(&workspace.path)?
             .to_str()
             .ok_or_else(|| anyhow!("journal path is not UTF-8"))?;
-        let resumed = run_cargo_rail(
+        let resumed = run_cargo_rail_with_env(
             &workspace.path,
             &["rail", "surface", "--resume", journal_argument, "--format", "json"],
+            &[("CARGO_BUILD_JOBS", "1")],
         )?;
         assert!(
             resumed.status.success(),
@@ -528,7 +618,11 @@ reason = "resume fixture product"
         assert_eq!(resumed_report["metrics"]["acquisition"]["cargo_views_executed"], 3);
 
         fs::remove_dir_all(workspace.path.join("target/cargo-rail-test-cache"))?;
-        let cold = run_cargo_rail(&workspace.path, &["rail", "surface", "--format", "json"])?;
+        let cold = run_cargo_rail_with_env(
+            &workspace.path,
+            &["rail", "surface", "--format", "json"],
+            &[("CARGO_BUILD_JOBS", "1")],
+        )?;
         assert!(cold.status.success());
         let mut cold_report: serde_json::Value = serde_json::from_slice(&cold.stdout)?;
         for report in [&mut resumed_report, &mut cold_report] {
@@ -540,6 +634,220 @@ reason = "resume fixture product"
             resumed_report, cold_report,
             "resume and cold analysis must produce the same complete policy report"
         );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires the exact rustc-dev companion authority embedded by the protocol harness"]
+fn surface_keeps_std_and_alloc_roots_package_local_across_resume_and_reuse() {
+    let result: Result<()> = (|| {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let workspace = TestWorkspace::new_named("surface-package-feature-isolation")?;
+        workspace.add_feature_isolation_crates()?;
+        fs::write(
+            workspace.path.join(".config/rail.toml"),
+            r#"[surface]
+consumer_scope = "workspace"
+doctest_coverage = "disabled"
+
+[[surface.product]]
+package = "std-root"
+lib = "std_root"
+reason = "std feature root"
+
+[[surface.product]]
+package = "alloc-root"
+lib = "alloc_root"
+reason = "alloc-only feature root"
+
+[[surface.feature-profile]]
+name = "isolation"
+features = ["isolate"]
+"#,
+        )?;
+        fs::write(
+            workspace.path.join("rust-toolchain.toml"),
+            include_str!("../../rust-toolchain.toml"),
+        )?;
+        workspace.commit("Add package-local Surface feature roots")?;
+
+        let trace_directory = workspace.path.join("target/cargo-rail-cargo-argv");
+        fs::create_dir_all(&trace_directory)?;
+        let cargo_recorder = workspace.path.join("target/cargo-rail-cargo-recorder");
+        fs::write(
+            &cargo_recorder,
+            r#"#!/bin/sh
+set -eu
+trace="$(mktemp "$CARGO_RAIL_TEST_CARGO_LOG/argv.XXXXXX")"
+printf '%s\0' "$@" > "$trace"
+exec cargo "$@"
+"#,
+        )?;
+        let mut permissions = fs::metadata(&cargo_recorder)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&cargo_recorder, permissions)?;
+        let cargo_recorder = cargo_recorder
+            .to_str()
+            .ok_or_else(|| anyhow!("Cargo recorder path is not UTF-8"))?;
+        let trace_directory_value = trace_directory
+            .to_str()
+            .ok_or_else(|| anyhow!("Cargo trace path is not UTF-8"))?;
+
+        let failed = run_cargo_rail_with_env(
+            &workspace.path,
+            &["rail", "surface", "--format", "json"],
+            &[
+                ("CARGO", cargo_recorder),
+                ("CARGO_BUILD_JOBS", "1"),
+                ("CARGO_RAIL_TEST_CARGO_LOG", trace_directory_value),
+                ("CARGO_RAIL_SURFACE_FAIL_ACQUISITION_VIEW", "2"),
+            ],
+        )?;
+        assert_eq!(failed.status.code(), Some(2));
+
+        let journal_directory = workspace.path.join("target/cargo-rail/surface-acquisitions-v2");
+        let journals = fs::read_dir(&journal_directory)?.collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(journals.len(), 1);
+        let journal = journals[0].path();
+        let partial: serde_json::Value = serde_json::from_slice(&fs::read(&journal)?)?;
+        let views = partial["views"].as_array().ok_or_else(|| anyhow!("journal views"))?;
+        assert_eq!(views.len(), 3);
+        let mut identities = std::collections::BTreeMap::new();
+        for view in views {
+            let packages = view["packages"]
+                .as_array()
+                .ok_or_else(|| anyhow!("journal package authority"))?;
+            assert_eq!(packages.len(), 1, "journal view must bind one package: {view:#}");
+            let package = packages[0]
+                .as_str()
+                .ok_or_else(|| anyhow!("journal package is not text"))?;
+            assert!(
+                identities
+                    .insert(package, view["view_identity"].as_str().expect("view identity"))
+                    .is_none(),
+                "one configured Surface profile should produce one view per package"
+            );
+        }
+        assert_eq!(
+            identities.keys().copied().collect::<Vec<_>>(),
+            vec!["alloc-root", "shared", "std-root"]
+        );
+        assert_eq!(
+            identities
+                .values()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            3,
+            "package authority must bind otherwise equal target and feature selections"
+        );
+
+        let journal_argument = journal
+            .strip_prefix(&workspace.path)?
+            .to_str()
+            .ok_or_else(|| anyhow!("journal path is not UTF-8"))?;
+        let resumed = run_cargo_rail_with_env(
+            &workspace.path,
+            &["rail", "surface", "--resume", journal_argument, "--format", "json"],
+            &[
+                ("CARGO", cargo_recorder),
+                ("CARGO_BUILD_JOBS", "1"),
+                ("CARGO_RAIL_TEST_CARGO_LOG", trace_directory_value),
+            ],
+        )?;
+        assert!(
+            resumed.status.success(),
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&resumed.stdout),
+            String::from_utf8_lossy(&resumed.stderr)
+        );
+        let resumed_report: serde_json::Value = serde_json::from_slice(&resumed.stdout)?;
+        let acquisition = &resumed_report["metrics"]["acquisition"];
+        assert_eq!(acquisition["analysis_views"], 3);
+        assert_eq!(acquisition["fact_cache_hits"], 1);
+        assert_eq!(acquisition["cargo_views_executed"], 2);
+
+        let completed: serde_json::Value = serde_json::from_slice(&fs::read(&journal)?)?;
+        assert_eq!(completed["summary"]["state"], "complete");
+        let evidence = completed["views"]
+            .as_array()
+            .expect("completed views")
+            .iter()
+            .map(|view| view["durable"]["evidence"].as_str().expect("completed evidence"))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(evidence.len(), 3, "resume evidence must remain package-bound");
+
+        let recorded_acquisitions = || -> Result<Vec<Vec<String>>> {
+            let mut invocations = fs::read_dir(&trace_directory)?
+                .map(|entry| {
+                    let bytes = fs::read(entry?.path())?;
+                    bytes
+                        .split(|byte| *byte == 0)
+                        .filter(|argument| !argument.is_empty())
+                        .map(|argument| String::from_utf8(argument.to_vec()).map_err(Into::into))
+                        .collect::<Result<Vec<_>>>()
+                })
+                .collect::<Result<Vec<_>>>()?;
+            invocations.retain(|arguments| {
+                arguments.first().is_some_and(|argument| argument == "check")
+                    && arguments.iter().any(|argument| argument == "--all-targets")
+                    && arguments.iter().any(|argument| argument == "--message-format=json")
+            });
+            Ok(invocations)
+        };
+        let acquisitions = recorded_acquisitions()?;
+        assert_eq!(
+            acquisitions.len(),
+            3,
+            "each package should execute exactly once: {acquisitions:#?}"
+        );
+        let mut acquired_packages = std::collections::BTreeSet::new();
+        for arguments in &acquisitions {
+            let package_positions = arguments
+                .iter()
+                .enumerate()
+                .filter_map(|(index, argument)| (argument == "--package").then_some(index))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                package_positions.len(),
+                1,
+                "one package selector per Cargo view: {arguments:?}"
+            );
+            let package = arguments
+                .get(package_positions[0] + 1)
+                .ok_or_else(|| anyhow!("Cargo package selector has no value"))?;
+            assert!(acquired_packages.insert(package.as_str()));
+            let feature_values = arguments
+                .windows(2)
+                .filter_map(|pair| (pair[0] == "--features").then_some(pair[1].as_str()))
+                .collect::<Vec<_>>();
+            assert_eq!(feature_values, vec![format!("{package}/isolate")]);
+        }
+        assert_eq!(
+            acquired_packages,
+            std::collections::BTreeSet::from(["alloc-root", "shared", "std-root"])
+        );
+
+        let warm = run_cargo_rail_with_env(
+            &workspace.path,
+            &["rail", "surface", "--format", "json"],
+            &[
+                ("CARGO", cargo_recorder),
+                ("CARGO_BUILD_JOBS", "1"),
+                ("CARGO_RAIL_TEST_CARGO_LOG", trace_directory_value),
+            ],
+        )?;
+        assert!(warm.status.success());
+        let warm_report: serde_json::Value = serde_json::from_slice(&warm.stdout)?;
+        let warm_acquisition = &warm_report["metrics"]["acquisition"];
+        assert_eq!(warm_acquisition["cargo_views_executed"], 0);
+        assert_eq!(warm_acquisition["compiler_invocations"], 0);
+        assert_eq!(warm_acquisition["fact_cache_hits"], 3);
+        assert_eq!(recorded_acquisitions()?.len(), 3, "warm Surface must not invoke Cargo");
         Ok(())
     })();
     super::helpers::finish_test(result);

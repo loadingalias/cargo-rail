@@ -376,6 +376,13 @@ pub(super) fn connect(
     let mut coordinator = Command::new(receipt.worker_path());
     coordinator
         .env(MARKER_ENV, &identity)
+        .env(
+            crate::cache::profile::COORDINATOR_PROFILE_ENV,
+            receipt
+                .profile()
+                .map_err(|_| RemoteStoreError::integrity("remote coordinator has no cache profile"))?
+                .coordinator_capability(),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         // The coordinator outlives the compiler wrapper that starts it. Inheriting
@@ -443,7 +450,7 @@ pub(crate) fn run_if_requested() -> Option<i32> {
 }
 
 pub(super) fn stop_all(receipt: &InstallationReceipt) {
-    let Ok(directory) = receipt.installation_directory() else {
+    let Ok(directory) = receipt.profile_state_directory() else {
         return;
     };
     let Ok(entries) = std::fs::read_dir(directory) else {
@@ -781,6 +788,7 @@ fn coordinator_identity(
 ) -> RemoteStoreResult<Option<String>> {
     let cache_base = receipt
         .cache()
+        .map_err(|_| RemoteStoreError::configuration("remote coordinator has no local cache profile"))?
         .base()
         .to_str()
         .ok_or_else(|| RemoteStoreError::configuration("local cache path is not valid UTF-8"))?;
@@ -789,6 +797,12 @@ fn coordinator_identity(
     hash_field(&mut hasher, selection.authority().as_str());
     hash_field(&mut hasher, selection.mode().as_str());
     hash_field(&mut hasher, receipt.authority());
+    let profile = receipt
+        .profile()
+        .map_err(|_| RemoteStoreError::configuration("remote coordinator has no cache profile"))?;
+    hash_field(&mut hasher, profile.profile_id());
+    hash_field(&mut hasher, profile.generation());
+    hash_field(&mut hasher, profile.selected_root_identity());
     hash_field(&mut hasher, receipt.worker_digest());
     hash_field(&mut hasher, cache_base);
     for name in selection.approved_environment_names() {

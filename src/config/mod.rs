@@ -6,16 +6,16 @@ pub(crate) mod schema;
 mod split;
 mod surface;
 mod unify;
+pub(crate) mod v0_25;
 
 pub use plan::{
     CargoPrerequisiteConfig, CargoRootConfig, CargoTargetRootConfig, PlanConfig, PlanWorkConfig, PlanWorkScope,
 };
 pub use release::{
-    ChangelogConfig, ChangelogFilters, ChangelogRelativeTo, ChangelogShape, CommitPolicy, CrateReleaseConfig,
-    GroupSpec, Pre1BreakingBump, ReleaseConfig, ReleaseRegistryPublication, ReleaseRemoteEffects, ReleaseSource,
-    RequireChangeFiles, SemverCheckPolicy,
+    ChangelogConfig, ChangelogRelativeTo, ChangelogShape, CrateReleaseConfig, Pre1BreakingBump, ReleaseConfig,
+    ReleaseRegistryPublication, ReleaseRemoteEffects, SemverCheckPolicy,
 };
-pub use split::{CratePath, CrateSplitConfig, SplitConfig, SplitMode, WorkspaceMode};
+pub use split::{CrateSplitConfig, SplitConfig, SplitMode, WorkspaceMode};
 pub use surface::{
     SurfaceConfig, SurfaceConsumerScope, SurfaceCrateVisibility, SurfaceDoctest, SurfaceDoctestCoverage,
     SurfaceExclude, SurfaceExternal, SurfaceFeatureProfile, SurfaceLintDirective, SurfaceLintLevel, SurfaceOverride,
@@ -31,23 +31,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-
-pub(crate) const REMOVED_RUN_CONFIG_MESSAGE: &str = "[run] configuration is no longer supported; execute Cargo and cargo-nextest directly, keep repository tasks in Just or CI, and consume typed package scope from `cargo rail plan`";
-pub(crate) const REMOVED_CACHE_CONFIG_MESSAGE: &str = "[cache] repository configuration is no longer supported; select optional L2 authority from machine or CI state with CARGO_RAIL_CACHE_REMOTE";
-pub(crate) const REMOVED_CHANGE_DETECTION_CONFIG_MESSAGE: &str = "[change-detection] configuration is no longer supported; declare positive inputs for repository-owned work under [plan.work.NAME], use per-work evidence completeness for Cargo work, then run `cargo rail config migrate` to remove the retired table";
-
-pub(crate) fn reject_removed_configuration(doc: &toml_edit::DocumentMut) -> Result<(), String> {
-    for (name, message) in [
-        ("run", REMOVED_RUN_CONFIG_MESSAGE),
-        ("cache", REMOVED_CACHE_CONFIG_MESSAGE),
-        ("change-detection", REMOVED_CHANGE_DETECTION_CONFIG_MESSAGE),
-    ] {
-        if doc.as_table().contains_key(name) {
-            return Err(message.to_string());
-        }
-    }
-    Ok(())
-}
 
 /// Configuration for cargo-rail
 /// Searched in order: rail.toml, .rail.toml, .cargo/rail.toml, .config/rail.toml
@@ -103,7 +86,6 @@ pub enum ConfigLoadResult {
 
 impl RailConfig {
     fn from_document(doc: toml_edit::DocumentMut) -> Result<Self, String> {
-        reject_removed_configuration(&doc)?;
         if let Some(path) = schema::document_paths(&doc)
             .into_iter()
             .find(|path| !schema::is_known_config_path(path))
@@ -121,30 +103,12 @@ impl RailConfig {
         Self::from_document(doc)
     }
 
-    /// Parse a captured historical configuration after removing tables that
-    /// have no authority in the current planner contract.
-    pub(crate) fn parse_historical_planning_bytes(bytes: &[u8]) -> Result<Self, String> {
-        let content = std::str::from_utf8(bytes).map_err(|error| format!("file is not valid UTF-8: {error}"))?;
-        let mut doc: toml_edit::DocumentMut = content
-            .parse()
-            .map_err(|error: toml_edit::TomlError| error.to_string())?;
-        for retired in ["run", "cache", "change-detection"] {
-            doc.as_table_mut().remove(retired);
-        }
-        Self::parse_bytes(doc.to_string().as_bytes())
-    }
-
     fn parse_path(path: &Path) -> Result<(Self, Vec<u8>), String> {
         let bytes = fs::read(path).map_err(|error| format!("failed to read file: {error}"))?;
         let content = std::str::from_utf8(&bytes).map_err(|error| format!("file is not valid UTF-8: {error}"))?;
         let doc: toml_edit::DocumentMut = content
             .parse()
             .map_err(|error: toml_edit::TomlError| error.to_string())?;
-        for deprecation in schema::present_deprecations(&doc) {
-            if let Some(message) = deprecation.spec.deprecation {
-                crate::warn!("{} in {}: {}", deprecation.path, path.display(), message);
-            }
-        }
         let config = Self::from_document(doc)?;
         Ok((config, bytes))
     }
@@ -160,24 +124,10 @@ impl RailConfig {
         self.surface
             .validate_workspace_targets(&self.targets)
             .map_err(RailError::Config)?;
-        self.unify.validate(workspace_root).map_err(RailError::Config)?;
-        self.release
-            .changelog
-            .filters
-            .validate("release.changelog.filters")
+        self.unify
+            .validate_workspace_targets(&self.targets)
             .map_err(RailError::Config)?;
-
-        for (crate_name, crate_config) in &self.crates {
-            if let Some(filters) = crate_config
-                .changelog
-                .as_ref()
-                .and_then(|changelog| changelog.filters.as_ref())
-            {
-                filters
-                    .validate(&format!("crates.{crate_name}.changelog.filters"))
-                    .map_err(RailError::Config)?;
-            }
-        }
+        self.unify.validate(workspace_root).map_err(RailError::Config)?;
         for split in self.build_split_configs() {
             split.validate()?;
         }

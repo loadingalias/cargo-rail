@@ -8,7 +8,7 @@ captured workspace model and exact scope.
 [![CI](https://img.shields.io/github/actions/workflow/status/loadingalias/cargo-rail/commit.yaml?branch=main)](https://github.com/loadingalias/cargo-rail/actions/workflows/commit.yaml)
 [![MSRV](https://img.shields.io/crates/msrv/cargo-rail)](https://github.com/loadingalias/cargo-rail/blob/main/Cargo.toml)
 
-## One engine. Less work. Fewer resources.
+## What Cargo-Rail removes
 
 | Stop paying for | Cargo-Rail |
 |---|---|
@@ -40,6 +40,8 @@ The installer verifies the native archive and every selected component. Native a
 Linux, musl Linux, and Windows include cache helpers and authenticated Surface authority. Linux musl archives use a
 static core CLI and a native dynamically loaded compiler-fact driver.
 The driver relies on the host's standard musl `libgcc_s` runtime, as rustc host tools do.
+GNU Linux archives require glibc 2.35 or newer. The installer verifies that floor before it downloads an archive or
+replaces an existing installation.
 
 `cargo install cargo-rail --locked` and `cargo binstall cargo-rail` remain available. They cannot prepare or run Surface
 analysis; `surface --schema` still works. The native installer supplies Cargo-Rail's authenticated Surface driver and
@@ -70,9 +72,16 @@ through `rustup`; non-rustup toolchains work when the matching compiler developm
    cargo rail surface --fix --dry-run --explain
    ```
 
-`cache setup --check` does not write and exits 1 when setup or repair is pending. Applying setup owns Cargo's global `build.rustc-wrapper` and refuses an existing sccache or other wrapper selection, including environment or workspace configuration that would shadow it. Disable that selection—not necessarily the executable—or use an isolated Cargo home. An existing `rustc-workspace-wrapper` is preserved, but Cargo-Rail reuse bypasses that composition. `surface --prepare` may install `rustc-dev` for the exact workspace-selected toolchain. It creates authenticated machine state but never changes the default toolchain. The other commands above do not modify source.
+The commands above have different effects:
 
-## Rust Compilation is Expensive. Stop Compiling Work Already Paid For.
+- `cache setup --check` does not write and exits `1` when setup or repair is pending.
+- `cache setup` owns Cargo's global `build.rustc-wrapper` and enrolls this workspace in a private cache profile. It
+  rejects another global wrapper or any environment or workspace setting that would shadow it.
+- `surface --prepare` may install `rustc-dev` for the selected rustup toolchain. It does not change the default
+  toolchain.
+- `plan` and the Surface inspection commands do not edit tracked source.
+
+## Reuse verified compiler work
 
 Cargo-Rail caches compiler results, not copied target directories. Each hit revalidates the compiler action, inputs, environment, deps, outputs, and stored bytes before Cargo sees a result.
 
@@ -90,16 +99,16 @@ persists only that bounded selector, and revalidates exact bytes and metadata be
 `CARGO_TARGET_DIR` locations stay executor-local, so eligible work can reuse across independent roots without making
 a same-size input mutation look unchanged.
 
-`cargo clean` intentionally leaves Cargo-Rail's shared local CAS intact, so an empty target tree can still reuse
+`cargo clean` intentionally leaves the selected profile's local CAS intact, so an empty target tree can still reuse
 verified compiler work. Local result storage has a 10 GiB default byte bound. Before an incoming result would exceed
 it, Cargo-Rail removes the oldest eligible action authorities while protecting leased or in-flight results.
 `CARGO_RAIL_CACHE=off` provides a cold baseline without touching the CAS. Inspect
 `cargo rail cache status --scope local --json` and preview complete CAS removal with
 `cargo rail cache clean --scope local --check`; after local cleanup, rerun `cargo rail cache setup` to repair the
-empty authority. See the [cache contract and cleanup policy](docs/caching.md#inspect-clean-or-remove) and the
+empty authority. See the [cache contract and cleanup policy](docs/caching.md#inspect-clean-detach-or-uninstall) and the
 [benchmark contract](docs/benchmarking.md#claim-requirements).
 
-## Know the Code Your Products Reach
+## Audit product reachability
 
 `cargo rail surface` merges real compiler facts across products, libraries, build scripts, proc macros, doctests, features, and configured targets. It reports dead public declarations and visibility wider than actual consumers need.
 
@@ -108,7 +117,7 @@ contract v3 separates raw observations from merged declarations, shows bounded r
 findings suppressed by one conservative reason without adding that graph work to the normal path. `rail.toml` defines
 analysis policy, while source mutation always requires explicit CLI authorization.
 
-## Give Every Executor Exact Work
+## Give each executor exact work
 
 `cargo rail plan` combines semantic source and configuration changes, Cargo target ownership, declared dependency edges, observed inputs, and repository-owned work declarations. Incomplete evidence widens only its owning work item instead of skipping it.
 
@@ -148,10 +157,10 @@ The v8 Action runs the planner once and exposes the validated plan, required wor
     PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
     PLAN_READER: ${{ steps.rail.outputs.plan-reader }}
   run: |
+    python3 "$PLAN_READER" verify-checkout "$PLAN_FILE"
     CARGO_ARGS=()
     while IFS= read -r -d '' arg; do CARGO_ARGS+=("$arg"); done \
       < <(python3 "$PLAN_READER" cargo-args "$PLAN_FILE" cargo.test)
-    python3 "$PLAN_READER" verify-checkout "$PLAN_FILE"
     cargo nextest run "${CARGO_ARGS[@]}" --locked
 ```
 
@@ -169,7 +178,7 @@ binary to fail-closed consumers. A release tag reuses the archives already built
 exact-SHA Commit run, building only release-only targets unless an explicit recovery run must reconstruct the full
 set.
 
-## Carry Intent Through Release Workflow
+## Carry release intent through the workflow
 
 - `cargo rail unify --check` derives one reviewable dependency repair from the captured workspace; `cargo rail unify apply --backup` applies it reversibly.
 - `cargo rail change` records bump and release-note intent in `.changes/` during the change itself.
@@ -183,7 +192,7 @@ Registry publication is denied by default. Mutations bind the captured snapshot,
 [Apache Iggy](https://github.com/apache/iggy/pull/3095) replaced a custom affected-crates script with Cargo-Rail and uses the planner to scope Cargo, nextest, and Docker work while retaining conservative fallbacks.
 [Prosody](https://github.com/prosody-events/prosody/blob/fd622e78e9b60a7535321c5966e20e6248089192/.github/workflows/quality.yaml) uses `cargo-rail-action` to route build, test, and infrastructure jobs.
 
-## Status & Direction
+## Status and direction
 
 Cargo-Rail is under active pre-1.0 development. Breaking CLI, configuration, and machine-contract changes should be
 expected. Security fixes target the latest release; keep Cargo-Rail and its GitHub Action current and compatible.
@@ -192,11 +201,12 @@ Current priorities are stable/nightly release lines, smaller configuration and C
 dependencies. Report cache hit/miss/bypass evidence and minimized failures from real workspaces. Contributions that
 remove complexity or strengthen evidence are welcome.
 
-## Docs & Support
+## Documentation and support
 
 Start with [Planning](docs/planning.md), the [cache contract](docs/caching.md), or
 [Troubleshooting](docs/troubleshooting.md). [Configuration](docs/config.md) explains the repository policy boundary;
-use `cargo rail <command> --help` for the exact CLI. Contributors can start with [Architecture](docs/architecture.md).
+[the v0.26 migration guide](docs/migration-v0.26.md) covers the bounded v0.25 upgrade. Use
+`cargo rail <command> --help` for the exact CLI. Contributors can start with [Architecture](docs/architecture.md).
 
 Cargo-Rail is licensed under [MIT](LICENSE). See [Contributing](CONTRIBUTING.md), the
 [security policy](SECURITY.md), [releases](https://github.com/loadingalias/cargo-rail/releases), and the [issue tracker](https://github.com/loadingalias/cargo-rail/issues).

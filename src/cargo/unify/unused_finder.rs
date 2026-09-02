@@ -31,6 +31,7 @@ pub struct UnusedDepFinder<'a> {
     workspace_is_consumer_scope: bool,
     compiler_cache_identity: &'a CompilerCacheIdentity,
     compiler_artifact_budget: CompilerArtifactBudget,
+    compiler_targets: Vec<String>,
 }
 
 struct DependencyDeclaration<'a> {
@@ -69,6 +70,7 @@ impl<'a> UnusedDepFinder<'a> {
                 config.compiler_artifact_soft_limit_bytes,
                 config.compiler_artifact_hard_limit_bytes,
             ),
+            compiler_targets: config.compiler_targets.clone(),
         }
     }
 
@@ -77,7 +79,16 @@ impl<'a> UnusedDepFinder<'a> {
         let mut unused = Vec::new();
         let declarations = self.dependency_declarations();
         let configured_targets: Vec<&str> = self.metadata.targets();
-        let source_unused = self.detect_source_unused_deps(&declarations, &configured_targets, self.target_cfg_sets)?;
+        let compiler_targets = if self.compiler_targets.is_empty() {
+            configured_targets.clone()
+        } else {
+            configured_targets
+                .iter()
+                .copied()
+                .filter(|target| self.compiler_targets.iter().any(|configured| configured == target))
+                .collect()
+        };
+        let source_unused = self.detect_source_unused_deps(&declarations, &compiler_targets, self.target_cfg_sets)?;
 
         for declaration in declarations {
             if let Some(resolved) = declaration.resolved {
@@ -374,11 +385,10 @@ impl<'a> UnusedDepFinder<'a> {
             return Ok(HashMap::new());
         }
 
-        let targets = self.metadata.targets();
         let collector = CompilerDiagnosticsCollector::with_identity(
             self.workspace_root,
             self.manifests,
-            targets,
+            configured_targets.to_vec(),
             self.compiler_cache_identity,
         )
         .with_artifact_budget(self.compiler_artifact_budget);

@@ -74,7 +74,8 @@ chmod +x "$installer"
 mkdir "$temporary/bin"
 cp scripts/ci/fixtures/fake-uname.sh "$temporary/bin/uname"
 cp scripts/ci/fixtures/fake-ldd.sh "$temporary/bin/ldd"
-chmod +x "$temporary/bin/uname" "$temporary/bin/ldd"
+cp scripts/ci/fixtures/fake-getconf.sh "$temporary/bin/getconf"
+chmod +x "$temporary/bin/uname" "$temporary/bin/ldd" "$temporary/bin/getconf"
 
 for specification in "${targets[@]}"; do
   read -r system machine libc target surface <<< "$specification"
@@ -110,6 +111,18 @@ for specification in "${targets[@]}"; do
       "$cargo_home/bin/cargo-rail-fact-driver-source-v1.json"
   fi
 done
+
+unsupported_gnu_home="$temporary/unsupported-gnu-home"
+mkdir -p "$unsupported_gnu_home/bin"
+printf 'preserved installation\n' > "$unsupported_gnu_home/bin/cargo-rail"
+if INSTALLER_TEST_SYSTEM=Linux INSTALLER_TEST_MACHINE=x86_64 INSTALLER_TEST_LIBC=gnu \
+  INSTALLER_TEST_GLIBC_VERSION=2.34 PATH="$temporary/bin:$PATH" CARGO_HOME="$unsupported_gnu_home" \
+  "$installer" "$version" > /dev/null 2> "$temporary/unsupported-gnu-stderr"; then
+  echo "installer accepted an unsupported GNU runtime" >&2
+  exit 1
+fi
+grep -Fq "require glibc 2.35 or newer; found 2.34" "$temporary/unsupported-gnu-stderr"
+grep -Fxq "preserved installation" "$unsupported_gnu_home/bin/cargo-rail"
 
 if INSTALLER_TEST_SYSTEM=Darwin INSTALLER_TEST_MACHINE=x86_64 INSTALLER_TEST_LIBC=native \
   PATH="$temporary/bin:$PATH" CARGO_HOME="$temporary/unsupported-macos-home" \

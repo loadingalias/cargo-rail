@@ -34,5 +34,5 @@ pub use unify_types::{
     DependencyProof, DuplicateCleanup, FeatureEnablingPath, IssueSeverity, MemberEdit, OptionalFeature,
     PackageInheritanceField, PrunedFeature, ReachableFeature, TransitivePin, UndeclaredFeature, UnificationPlan,
     UnifiedDep, UnifyDecision, UnifyDecisionCode, UnifyDecisionReason, UnifyDecisionSubject, UnifyIssue, UnusedDep,
-    UnusedReason, ValidationResult, VersionMismatch,
+    UnusedReason, VersionMismatch,
 };

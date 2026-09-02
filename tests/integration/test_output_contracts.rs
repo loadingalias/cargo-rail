@@ -253,7 +253,7 @@ fn test_clean_check_json_has_stable_stream_and_exit_contract() {
         let ws = TestWorkspace::new_named("clean-json-contract")?;
         ws.add_crate("lib-a", "0.1.0", &[])?;
         ws.commit("Add lib-a")?;
-        let artifact = ws.path.join("target").join("cargo-rail").join("metadata.json");
+        let artifact = ws.path.join("target/cargo-rail/compiler-artifacts-v1/result");
         std::fs::create_dir_all(artifact.parent().expect("artifact has parent"))?;
         std::fs::write(&artifact, "{}")?;
 
@@ -339,24 +339,25 @@ fn test_bare_unify_previews_and_explicit_apply_mutates() {
 fn test_clean_text_uses_iec_units_and_verbose_owns_paths() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("clean-text-detail")?;
-        let artifact = ws.path.join("target").join("cargo-rail").join("metadata.json");
+        let artifact_root = ws.path.join("target/cargo-rail/compiler-artifacts-v1");
+        let artifact = artifact_root.join("result");
         std::fs::create_dir_all(artifact.parent().expect("artifact parent"))?;
         std::fs::write(&artifact, vec![b'x'; 2048])?;
-        let artifact = cargo_rail::utils::canonicalize_existing(&artifact)?;
+        let artifact_root = cargo_rail::utils::canonicalize_existing(&artifact_root)?;
 
         let normal = run_cargo_rail(&ws.path, &["rail", "clean", "--cache", "--check"])?;
         assert_eq!(normal.status.code(), Some(1));
         let normal = String::from_utf8(normal.stdout)?;
         assert!(normal.contains("2.0 KiB"), "{normal}");
-        assert!(!normal.contains(artifact.to_string_lossy().as_ref()), "{normal}");
+        assert!(!normal.contains(artifact_root.to_string_lossy().as_ref()), "{normal}");
 
         let verbose = run_cargo_rail(&ws.path, &["rail", "--verbose", "clean", "--cache", "--check"])?;
         assert_eq!(verbose.status.code(), Some(1));
         let verbose = String::from_utf8(verbose.stdout)?;
         assert!(
-            verbose.contains(artifact.to_string_lossy().as_ref()),
+            verbose.contains(artifact_root.to_string_lossy().as_ref()),
             "expected {} in:\n{verbose}",
-            artifact.display()
+            artifact_root.display()
         );
         Ok(())
     })();

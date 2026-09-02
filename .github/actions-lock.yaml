@@ -65,10 +65,10 @@ Swatinem/rust-cache:
   updated: "2026-07-25T14:41:50Z"
   notes: "GitHub runner Rust cache"
 loadingalias/cargo-rail-action/cache:
-  ref: v8.1.0
-  sha: "30ce9d2ae5ad48f0b95150f1810385e694ab9604"
-  updated: "2026-08-29T00:00:00Z"
-  notes: "Cargo-Rail compiler cache integration with typed root portability and strict probing"
+  ref: v8.2.0
+  sha: "78ad385a85627484a5b634cf1bc3caa1de872c6a"
+  updated: "2026-08-30T17:08:27Z"
+  notes: "Cargo-Rail compiler cache integration with typed root portability and authenticated strict probing"
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Release Workflow Actions
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

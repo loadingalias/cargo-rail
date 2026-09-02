@@ -203,6 +203,19 @@ fn test_plan_schema_command_matches_published_schema() {
 }
 
 #[test]
+fn test_published_plan_variants_v1_schema_remains_exactly_available() {
+    let schema: Value = serde_json::from_str(PLAN_VARIANTS_V1_SCHEMA).expect("valid historical schema");
+    jsonschema::validator_for(&schema).expect("valid historical JSON Schema");
+    assert_eq!(
+        Sha256::digest(PLAN_VARIANTS_V1_SCHEMA.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+        "e25351a0a1d6872a3ce83ccc589faa0b724cabdeecd87da86908d7466ad8903f"
+    );
+}
+
+#[test]
 fn test_plan_v8_is_the_canonical_global_json_contract() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("plan-v8-canonical-json")?;
@@ -235,6 +248,33 @@ fn test_plan_surface_work_requires_explicit_enablement() {
         std::fs::create_dir_all(ws.path.join(".config"))?;
         std::fs::write(ws.path.join(".config/rail.toml"), "[surface]\nenabled = true\n")?;
         assert_eq!(plan(&ws, &["--since", "HEAD"])?["work"]["surface"]["state"], "required");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_plan_decodes_exact_v0_25_configuration_from_git_history() {
+    let result: Result<()> = (|| {
+        const TAGGED_CONFIG: &[u8] = include_bytes!("../fixtures/config/v0.25.0/rail.toml");
+
+        let ws = TestWorkspace::new_named("plan-v0-25-config")?;
+        ws.add_crate("historical-config", "0.1.0", &[])?;
+        std::fs::write(ws.path.join(".config/rail.toml"), TAGGED_CONFIG)?;
+        ws.commit("record exact v0.25 configuration")?;
+
+        std::fs::write(ws.path.join(".config/rail.toml"), "")?;
+        let planned = plan(&ws, &["--since", "HEAD"])?;
+        assert_eq!(planned["plan_contract_version"], 8);
+        assert!(
+            planned["changes"]["files"]
+                .as_array()
+                .is_some_and(|changed| changed.iter().any(|entry| entry["path"] == ".config/rail.toml"))
+        );
+        let rendered = serde_json::to_string(&planned)?;
+        assert!(!rendered.contains("require_change_files"));
+        assert!(!rendered.contains("unconventional_commits"));
+
         Ok(())
     })();
     super::helpers::finish_test(result);
@@ -294,25 +334,6 @@ paths = ["distribution/**"]
         let schema: Value = serde_json::from_str(PLANNING_EVIDENCE_V1_SCHEMA)?;
         let validator = jsonschema::validator_for(&schema).map_err(|error| anyhow!("invalid schema: {error}"))?;
         assert!(validator.is_valid(&evidence));
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-#[test]
-fn test_plan_normalizes_retired_policy_only_in_historical_configuration() {
-    let result: Result<()> = (|| {
-        let ws = TestWorkspace::new_named("plan-historical-retired-policy")?;
-        ws.add_crate("historical-policy", "0.1.0", &[])?;
-        std::fs::write(
-            ws.path.join(".config/rail.toml"),
-            "[change-detection]\nconfidence_profile = \"strict\"\n",
-        )?;
-        ws.commit("establish retired planner policy")?;
-        std::fs::write(ws.path.join(".config/rail.toml"), "")?;
-
-        let planned = plan(&ws, &["--since", "HEAD"])?;
-        assert!(planned["changes"]["config"].as_array().is_some_and(Vec::is_empty));
         Ok(())
     })();
     super::helpers::finish_test(result);
@@ -464,9 +485,7 @@ fn test_plan_all_is_monotonic_and_variant_fallback_is_explicit() {
 #[test]
 fn test_plan_variant_catalogs_validate_against_published_schema() {
     let result: Result<()> = (|| {
-        let v2: Value = serde_json::from_str(PLAN_VARIANTS_V2_SCHEMA)?;
-        jsonschema::validator_for(&v2).map_err(|error| anyhow!("invalid v2 schema: {error}"))?;
-        let schema: Value = serde_json::from_str(PLAN_VARIANTS_V1_SCHEMA)?;
+        let schema: Value = serde_json::from_str(PLAN_VARIANTS_V2_SCHEMA)?;
         let validator = jsonschema::validator_for(&schema).map_err(|error| anyhow!("invalid schema: {error}"))?;
         for path in [
             "distribution/compatibility-plan-variants.json",
@@ -495,11 +514,11 @@ fn test_plan_variant_catalog_identity_is_order_and_format_independent() {
             "[plan.work.compatibility]\nscope = 'variants'\npaths = ['tests/compatibility/**']\nvariant_catalog = 'distribution/variants.json'\n",
         )?;
         let left = serde_json::json!({
-            "variant_catalog_version": 1,
+            "variant_catalog_version": 2,
             "work": "compatibility",
             "variants": [
-                {"id": "linux", "dimensions": {"runner": "ubuntu-latest", "family": "compatibility"}, "paths": ["src/**", "Cargo.toml"]},
-                {"id": "windows", "dimensions": {"family": "compatibility", "runner": "windows-latest"}, "paths": ["Cargo.toml"]}
+                {"id": "linux", "dimensions": {"runner": "ubuntu-latest", "family": "compatibility"}, "external_paths": ["src/**", "Cargo.toml"]},
+                {"id": "windows", "dimensions": {"family": "compatibility", "runner": "windows-latest"}, "external_paths": ["Cargo.toml"]}
             ]
         });
         std::fs::write(
@@ -512,10 +531,10 @@ fn test_plan_variant_catalog_identity_is_order_and_format_independent() {
         let right = serde_json::json!({
             "work": "compatibility",
             "variants": [
-                {"paths": ["Cargo.toml"], "dimensions": {"runner": "windows-latest", "family": "compatibility"}, "id": "windows"},
-                {"paths": ["Cargo.toml", "src/**"], "id": "linux", "dimensions": {"family": "compatibility", "runner": "ubuntu-latest"}}
+                {"external_paths": ["Cargo.toml"], "dimensions": {"runner": "windows-latest", "family": "compatibility"}, "id": "windows"},
+                {"external_paths": ["Cargo.toml", "src/**"], "id": "linux", "dimensions": {"family": "compatibility", "runner": "ubuntu-latest"}}
             ],
-            "variant_catalog_version": 1
+            "variant_catalog_version": 2
         });
         std::fs::write(ws.path.join("distribution/variants.json"), serde_json::to_vec(&right)?)?;
         let reordered = plan(&ws, &["--since", "HEAD"])?;
@@ -533,16 +552,16 @@ fn test_plan_variant_catalog_selects_exact_rows_for_changed_cargo_work() {
         std::fs::create_dir_all(ws.path.join("distribution"))?;
         std::fs::write(
             ws.path.join(".config/rail.toml"),
-            "[plan.work.compatibility]\nscope = 'variants'\ncargo = ['cargo.build']\nvariant_catalog = 'distribution/variants.json'\n",
+            "[plan.work.compatibility]\nscope = 'variants'\nvariant_catalog = 'distribution/variants.json'\n",
         )?;
         std::fs::write(
             ws.path.join("distribution/variants.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
-                "variant_catalog_version": 1,
+                "variant_catalog_version": 2,
                 "work": "compatibility",
                 "variants": [
-                    {"id": "build", "dimensions": {"family": "compatibility", "runner": "ubuntu-latest"}, "cargo": ["cargo.build"]},
-                    {"id": "filesystem", "dimensions": {"family": "filesystem", "runner": "ubuntu-latest"}, "paths": ["scripts/filesystem/**"]}
+                    {"id": "build", "dimensions": {"family": "compatibility", "runner": "ubuntu-latest"}, "cargo_roots": [{"package": "exact-variant"}]},
+                    {"id": "filesystem", "dimensions": {"family": "filesystem", "runner": "ubuntu-latest"}, "external_paths": ["scripts/filesystem/**"]}
                 ]
             }))?,
         )?;
@@ -575,11 +594,11 @@ fn test_plan_variant_catalog_widens_only_for_unattributed_required_inputs() {
         std::fs::write(
             ws.path.join("distribution/variants.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
-                "variant_catalog_version": 1,
+                "variant_catalog_version": 2,
                 "work": "ci-suite",
                 "variants": [
-                    {"id": "linux", "dimensions": {"runner": "ubuntu-latest"}, "paths": ["ci/linux/**"]},
-                    {"id": "windows", "dimensions": {"runner": "windows-latest"}, "paths": ["ci/windows/**"]}
+                    {"id": "linux", "dimensions": {"runner": "ubuntu-latest"}, "external_paths": ["ci/linux/**"]},
+                    {"id": "windows", "dimensions": {"runner": "windows-latest"}, "external_paths": ["ci/windows/**"]}
                 ]
             }))?,
         )?;
@@ -940,17 +959,17 @@ fn test_plan_object_pair_uses_only_to_tree_authority() {
         std::fs::create_dir_all(ws.path.join(".cargo"))?;
         std::fs::write(
             ws.path.join(".config/rail.toml"),
-            "[plan.work.historical]\nscope = 'variants'\ncargo = ['cargo.test']\nvariant_catalog = 'distribution/historical.json'\n",
+            "[plan.work.historical]\nscope = 'variants'\nvariant_catalog = 'distribution/historical.json'\n",
         )?;
         std::fs::write(
             ws.path.join("distribution/historical.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
-                "variant_catalog_version": 1,
+                "variant_catalog_version": 2,
                 "work": "historical",
                 "variants": [{
                     "id": "head",
                     "dimensions": {"runner": "head-runner"},
-                    "cargo": ["cargo.test"]
+                    "cargo_roots": [{"package": "head-member"}]
                 }]
             }))?,
         )?;
@@ -1232,7 +1251,7 @@ fn test_plan_variant_catalog_v2_rejects_work_level_cargo_subscriptions() {
         let error: Value = serde_json::from_slice(&output.stdout)?;
         assert_eq!(
             error["message"],
-            "variant catalog 'distribution/deliverables.json' uses contract 2, so plan.work.deliverables.cargo must be empty; v2 Cargo impact derives only from typed cargo_roots"
+            "variant catalog 'distribution/deliverables.json' requires plan.work.deliverables.cargo to be empty; variant Cargo impact derives only from typed cargo_roots"
         );
         assert!(error.get("plan_contract_version").is_none());
         Ok(())
@@ -1296,6 +1315,193 @@ fn test_plan_variant_catalog_v2_resolves_cargo_roots_fail_closed() {
                 .as_str()
                 .is_some_and(|message| message.contains("duplicate Cargo roots"))
         );
+
+        write_catalog(serde_json::json!([{"package": "demo", "features": ["missing"]}]))?;
+        let unknown_feature = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--json"])?;
+        assert_eq!(unknown_feature.status.code(), Some(2));
+        let unknown_feature: Value = serde_json::from_slice(&unknown_feature.stdout)?;
+        assert!(
+            unknown_feature["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("does not declare feature 'missing'"))
+        );
+
+        write_catalog(serde_json::json!([{"package": "demo", "features": ["one", "one"]}]))?;
+        let duplicate_feature = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--json"])?;
+        assert_eq!(duplicate_feature.status.code(), Some(2));
+        let duplicate_feature: Value = serde_json::from_slice(&duplicate_feature.stdout)?;
+        assert!(
+            duplicate_feature["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("duplicate selector 'one'"))
+        );
+
+        write_catalog(serde_json::json!([{
+            "package": "demo",
+            "manifest": "fuzz/demo/Cargo.toml"
+        }]))?;
+        let unregistered_manifest = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--json"])?;
+        assert_eq!(unregistered_manifest.status.code(), Some(2));
+        let unregistered_manifest: Value = serde_json::from_slice(&unregistered_manifest.stdout)?;
+        assert!(
+            unregistered_manifest["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("is not registered in release.auxiliary_cargo_manifests"))
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_plan_variant_feature_roots_select_exact_source_profiles_and_widen_unknowns() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("plan-feature-root-profiles")?;
+        let package = ws.add_crate("demo", "0.1.0", &[])?;
+        let manifest = std::fs::read_to_string(package.join("Cargo.toml"))?;
+        std::fs::write(
+            package.join("Cargo.toml"),
+            format!("{manifest}\n[features]\ndefault = []\nrsa = []\nsha2 = []\nsignatures = [\"rsa\"]\n"),
+        )?;
+        std::fs::write(
+            package.join("src/lib.rs"),
+            "#[cfg(feature = \"rsa\")]\npub mod rsa;\n#[cfg(feature = \"sha2\")]\npub mod sha2;\n",
+        )?;
+        std::fs::write(package.join("src/rsa.rs"), "pub fn value() -> usize { 1 }\n")?;
+        std::fs::write(package.join("src/sha2.rs"), "pub fn value() -> usize { 2 }\n")?;
+        std::fs::create_dir_all(ws.path.join("distribution"))?;
+        std::fs::write(
+            ws.path.join(".config/rail.toml"),
+            "[plan.work.profiles]\nscope = 'variants'\npaths = ['crates/demo/**']\nvariant_catalog = 'distribution/profiles.json'\n",
+        )?;
+        std::fs::write(
+            ws.path.join("distribution/profiles.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "variant_catalog_version": 2,
+                "work": "profiles",
+                "variants": [
+                    {"id": "hashes", "dimensions": {}, "cargo_roots": [{"package": "demo", "features": ["sha2"]}]},
+                    {"id": "minimal", "dimensions": {}, "cargo_roots": [{"package": "demo", "features": []}]},
+                    {"id": "signatures", "dimensions": {}, "cargo_roots": [{"package": "demo", "features": ["signatures"]}]}
+                ]
+            }))?,
+        )?;
+        ws.commit("establish exact feature profiles")?;
+
+        ws.modify_file("demo", "src/rsa.rs", "pub fn value() -> usize { 3 }\n")?;
+        let exact = plan(&ws, &["--since", "HEAD"])?;
+        let selection = &exact["work"]["profiles"]["scope"]["selection"];
+        assert_eq!(selection["kind"], "selected");
+        assert_eq!(
+            selection["variants"]
+                .as_array()
+                .context("feature variants missing")?
+                .iter()
+                .filter_map(|variant| variant["id"].as_str())
+                .collect::<Vec<_>>(),
+            ["signatures"]
+        );
+
+        ws.commit("change exact feature source")?;
+        std::fs::write(package.join("src/generated.rs"), "pub fn generated() {}\n")?;
+        let unknown = plan(&ws, &["--since", "HEAD"])?;
+        assert_eq!(unknown["work"]["profiles"]["scope"]["selection"]["kind"], "all");
+
+        ws.commit("add unattributed Rust source")?;
+        let manifest = std::fs::read_to_string(package.join("Cargo.toml"))?;
+        std::fs::write(package.join("Cargo.toml"), format!("{manifest}\n# policy change\n"))?;
+        let manifest = plan(&ws, &["--since", "HEAD"])?;
+        assert_eq!(manifest["work"]["profiles"]["scope"]["selection"]["kind"], "all");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_plan_variant_auxiliary_cargo_roots_follow_registered_feature_resolutions() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("plan-auxiliary-roots")?;
+        let package = ws.add_crate("demo", "0.1.0", &[])?;
+        let manifest = std::fs::read_to_string(package.join("Cargo.toml"))?;
+        std::fs::write(
+            package.join("Cargo.toml"),
+            format!("{manifest}\n[features]\ndefault = []\nrsa = []\nsha2 = []\n"),
+        )?;
+        std::fs::write(
+            package.join("src/lib.rs"),
+            "#[cfg(feature = \"rsa\")]\npub mod rsa;\n#[cfg(feature = \"sha2\")]\npub mod sha2;\n",
+        )?;
+        std::fs::write(package.join("src/rsa.rs"), "pub fn value() -> usize { 1 }\n")?;
+        std::fs::write(package.join("src/sha2.rs"), "pub fn value() -> usize { 2 }\n")?;
+
+        for (name, feature) in [("fuzz-rsa", "rsa"), ("fuzz-sha2", "sha2")] {
+            let root = ws.path.join("fuzz-packages").join(name);
+            std::fs::create_dir_all(root.join("src"))?;
+            std::fs::write(
+                root.join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ndemo = {{ path = \"../../crates/demo\", default-features = false, features = [\"{feature}\"] }}\n\n[workspace]\n"
+                ),
+            )?;
+            std::fs::write(root.join("src/lib.rs"), "pub fn harness() {}\n")?;
+            let output = Command::new("cargo")
+                .args(["generate-lockfile", "--manifest-path"])
+                .arg(root.join("Cargo.toml"))
+                .output()?;
+            ensure!(
+                output.status.success(),
+                "auxiliary lockfile generation failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        std::fs::create_dir_all(ws.path.join("distribution"))?;
+        std::fs::write(
+            ws.path.join(".config/rail.toml"),
+            "[release]\nauxiliary_cargo_manifests = ['fuzz-packages/fuzz-rsa/Cargo.toml', 'fuzz-packages/fuzz-sha2/Cargo.toml']\n\n[plan.work.assurance]\nscope = 'variants'\npaths = ['crates/demo/**', 'fuzz-packages/**']\nvariant_catalog = 'distribution/assurance.json'\n",
+        )?;
+        std::fs::write(
+            ws.path.join("distribution/assurance.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "variant_catalog_version": 2,
+                "work": "assurance",
+                "variants": [
+                    {"id": "rsa", "dimensions": {}, "cargo_roots": [{"manifest": "fuzz-packages/fuzz-rsa/Cargo.toml", "package": "fuzz-rsa"}]},
+                    {"id": "sha2", "dimensions": {}, "cargo_roots": [{"manifest": "fuzz-packages/fuzz-sha2/Cargo.toml", "package": "fuzz-sha2"}]}
+                ]
+            }))?,
+        )?;
+        ws.commit("establish auxiliary Cargo roots")?;
+
+        ws.modify_file("demo", "src/rsa.rs", "pub fn value() -> usize { 3 }\n")?;
+        let product = plan(&ws, &["--since", "HEAD"])?;
+        let selected = &product["work"]["assurance"]["scope"]["selection"];
+        assert_eq!(selected["kind"], "selected");
+        assert_eq!(selected["variants"][0]["id"], "rsa");
+
+        ws.commit("change RSA product source")?;
+        std::fs::write(
+            ws.path.join("fuzz-packages/fuzz-rsa/src/lib.rs"),
+            "pub fn harness() { let _ = 1; }\n",
+        )?;
+        let harness = plan(&ws, &["--since", "HEAD"])?;
+        let selected = &harness["work"]["assurance"]["scope"]["selection"];
+        assert_eq!(selected["kind"], "selected");
+        assert_eq!(selected["variants"][0]["id"], "rsa");
+
+        ws.commit("change scoped auxiliary harness")?;
+        let lock = ws.path.join("fuzz-packages/fuzz-rsa/Cargo.lock");
+        let lock_contents = std::fs::read_to_string(&lock)?;
+        std::fs::write(&lock, format!("{lock_contents}\n"))?;
+        let root_lock = plan(&ws, &["--since", "HEAD"])?;
+        assert_eq!(root_lock["work"]["assurance"]["scope"]["selection"]["kind"], "all");
+
+        ws.commit("change auxiliary root lock")?;
+        let auxiliary_manifest = ws.path.join("fuzz-packages/fuzz-rsa/Cargo.toml");
+        let manifest = std::fs::read_to_string(&auxiliary_manifest)?;
+        std::fs::write(&auxiliary_manifest, format!("{manifest}\n# manifest policy\n"))?;
+        let manifest = plan(&ws, &["--since", "HEAD"])?;
+        assert_eq!(manifest["work"]["assurance"]["scope"]["selection"]["kind"], "all");
         Ok(())
     })();
     super::helpers::finish_test(result);

@@ -241,7 +241,7 @@ impl Usage {
     }
 }
 
-fn cache_usage(fixture: &Path, cargo_home: &Path) -> Result<Usage> {
+fn cache_status(fixture: &Path, cargo_home: &Path) -> Result<serde_json::Value> {
     let output = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
         .current_dir(fixture)
         .args(["rail", "cache", "status", "--scope", "local", "-f", "json"])
@@ -252,7 +252,11 @@ fn cache_usage(fixture: &Path, cargo_home: &Path) -> Result<Usage> {
         .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
         .output()?;
     ensure!(output.status.success(), "cache status failed");
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    serde_json::from_slice(&output.stdout).map_err(Into::into)
+}
+
+fn cache_usage(fixture: &Path, cargo_home: &Path) -> Result<Usage> {
+    let value = cache_status(fixture, cargo_home)?;
     let usage = &value["status"]["installation"]["usage"];
     Ok(Usage {
         hits: usage["hits"].as_u64().context("usage hits")?,
@@ -260,6 +264,14 @@ fn cache_usage(fixture: &Path, cargo_home: &Path) -> Result<Usage> {
         bypasses: usage["bypasses"].as_u64().context("usage bypasses")?,
         failures: usage["failures"].as_u64().context("usage failures")?,
     })
+}
+
+fn profile_cache_root(fixture: &Path, cargo_home: &Path) -> Result<PathBuf> {
+    let value = cache_status(fixture, cargo_home)?;
+    value["status"]["local"]["cache"]["root"]
+        .as_str()
+        .map(PathBuf::from)
+        .context("selected profile cache root")
 }
 
 fn run_cargo(
@@ -361,8 +373,8 @@ fn reusable_outputs(target: &Path) -> Result<BTreeMap<PathBuf, String>> {
     Ok(outputs)
 }
 
-fn native_action_keys(cache_base: &Path) -> Result<BTreeSet<String>> {
-    let directory = cache_base.join("cargo-rail/local-cas-v2/native-actions-v2");
+fn native_action_keys(cache_root: &Path) -> Result<BTreeSet<String>> {
+    let directory = cache_root.join("native-actions-v2");
     let mut keys = BTreeSet::new();
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
@@ -612,14 +624,16 @@ fn real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority() ->
     seed_isolated_cargo_home(&second, &second_cargo_home)?;
     setup_cache(&first, &first_cargo_home, &first_cache)?;
     setup_cache(&second, &second_cargo_home, &second_cache)?;
+    let first_cache_root = profile_cache_root(&first, &first_cargo_home)?;
+    let second_cache_root = profile_cache_root(&second, &second_cargo_home)?;
 
     let (_, first_cold) = run_cargo(&first, &first_cargo_home, "check", &[])?;
     let (second_cold_output, second_cold) = run_cargo(&second, &second_cargo_home, "check", &[])?;
     ensure!(first_cold.hits == 0 && first_cold.misses >= 12, "{first_cold:?}");
     ensure!(second_cold.hits == 0 && second_cold.misses >= 12, "{second_cold:?}");
     ensure!(first_cold.failures == 0 && second_cold.failures == 0);
-    let first_keys = native_action_keys(&first_cache)?;
-    let second_keys = native_action_keys(&second_cache)?;
+    let first_keys = native_action_keys(&first_cache_root)?;
+    let second_keys = native_action_keys(&second_cache_root)?;
     ensure!(!first_keys.is_empty() && !second_keys.is_empty());
     ensure!(
         first_keys.is_disjoint(&second_keys),
@@ -629,6 +643,7 @@ fn real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority() ->
     let second_diagnostic = current_root_diagnostic(&second_cold_output)?;
 
     setup_cache(&second, &second_cargo_home, &first_cache)?;
+    let reconstructed_cache_root = profile_cache_root(&second, &second_cargo_home)?;
     fs::remove_dir_all(second.join("target"))?;
     let root_bound_events = fs::canonicalize(root.path())?.join("root-bound-events");
     create_private_directory(&root_bound_events)?;
@@ -662,7 +677,7 @@ fn real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority() ->
         root_bound_cold.hits.saturating_add(root_bound_cold.misses) == second_cold.misses,
         "root-bound reconstruction changed the eligible action count: {root_bound_cold:?}"
     );
-    let reconstructed_keys = native_action_keys(&first_cache)?;
+    let reconstructed_keys = native_action_keys(&reconstructed_cache_root)?;
     ensure!(
         root_bound_misses.len() as u64 == root_bound_cold.misses
             && root_bound_misses.iter().all(|key| reconstructed_keys.contains(key)),

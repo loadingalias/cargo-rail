@@ -10,6 +10,7 @@ path = "../basic.rs"
 [dependencies]
 same_dependency_v1 = { package = "same-dependency", path = "same-dependency-v1" }
 same_dependency_v2 = { package = "same-dependency", path = "same-dependency-v2" }
+tokio = { version = "=1.53.1", default-features = false, features = ["rt"] }
 unused = { path = "unused" }
 
 [workspace]

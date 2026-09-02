@@ -4,7 +4,7 @@ use std::process::Command;
 use anyhow::{Context, Result, ensure};
 use tempfile::TempDir;
 
-use crate::helpers::{TestWorkspace, run_cargo_rail, rustc_host_target};
+use crate::helpers::{TestWorkspace, cargo_command, git, run_cargo_rail, rustc_host_target};
 
 fn read_counters(path: &Path) -> Result<serde_json::Value> {
     let bytes = std::fs::read(path).with_context(|| format!("reading diagnostics from {}", path.display()))?;
@@ -54,7 +54,7 @@ fn plan_diagnostics_are_out_of_band_and_count_real_boundaries() {
         assert_eq!(measured.stderr, expected.stderr, "diagnostics changed normal stderr");
 
         let counters = read_counters(&diagnostics)?;
-        assert_eq!(counters["schema_version"], 12);
+        assert_eq!(counters["schema_version"], 15);
         assert_eq!(counters["phases"]["cli_pre_context_preparation"]["invocations"], 1);
         assert!(
             counters["phases"]["cli_pre_context_preparation"]["elapsed_ns"]
@@ -114,10 +114,11 @@ fn split_diagnostics_prove_bounded_git_object_streams() {
             ws.commit(&format!("Streamed revision {revision}"))?;
         }
         let target = TempDir::new()?;
+        git(target.path(), &["init", "--initial-branch=main"])?;
         std::fs::write(
             ws.path.join("rail.toml"),
             format!(
-                "[workspace]\nroot = \".\"\n\n[crates.streamed.split]\nremote = \"{}\"\nbranch = \"main\"\nmode = \"single\"\n",
+                "[crates.streamed.split]\nremote = \"{}\"\nbranch = \"main\"\nmode = \"single\"\n",
                 target.path().display().to_string().replace('\\', "\\\\")
             ),
         )?;
@@ -149,6 +150,9 @@ fn split_diagnostics_prove_bounded_git_object_streams() {
         let subprocesses = counters["git_subprocesses"]
             .as_u64()
             .context("missing Git subprocess count")?;
+        eprintln!(
+            "P5 split measurement: git_subprocesses={subprocesses}, object_reads={objects}, object_batches={batches}"
+        );
         ensure!(objects > 0 && batches > 0);
         assert!(
             batches < objects,
@@ -159,9 +163,6 @@ fn split_diagnostics_prove_bounded_git_object_streams() {
         assert!(
             subprocesses <= 170,
             "bounded split Git subprocess baseline regressed: {subprocesses}"
-        );
-        eprintln!(
-            "P5 split measurement: git_subprocesses={subprocesses}, object_reads={objects}, object_batches={batches}"
         );
         Ok(())
     })();
@@ -252,7 +253,10 @@ fn unify_diagnostics_distinguish_base_and_target_metadata_loads() {
         ws.add_crate("demo", "0.1.0", &[])?;
         std::fs::write(
             ws.path.join(".config/rail.toml"),
-            format!("targets = [\"{}\"]\n\n[unify]\nmsrv = false\n", rustc_host_target()?),
+            format!(
+                "targets = [\"{}\"]\n\n[unify]\nmsrv_policy = {{ mode = \"disabled\" }}\n",
+                rustc_host_target()?
+            ),
         )?;
         ws.commit("Add target fixture")?;
 
@@ -279,6 +283,189 @@ fn unify_diagnostics_distinguish_base_and_target_metadata_loads() {
         assert_eq!(counters["cargo_metadata_loads"], 2);
         assert_eq!(counters["cargo_metadata_cache_hits"], 0);
         assert_eq!(counters["target_view_loads"], 1);
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn unify_diagnostics_measure_bounded_compiler_acquisition_and_warm_outcome() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("diagnostic-compiler-acquisition")?;
+        let root_manifest_path = ws.path.join("Cargo.toml");
+        let root_manifest = std::fs::read_to_string(&root_manifest_path)?.replace(
+            "members = [\"crates/*\"]",
+            "members = [\"crates/*\"]\nexclude = [\"dependency\"]",
+        );
+        std::fs::write(root_manifest_path, root_manifest)?;
+        let dependency = ws.path.join("dependency");
+        std::fs::create_dir_all(dependency.join("src"))?;
+        std::fs::write(
+            dependency.join("Cargo.toml"),
+            "[package]\nname = \"measured-dependency\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )?;
+        std::fs::write(dependency.join("src/lib.rs"), "pub fn unused() {}\n")?;
+        let package = ws.add_crate(
+            "measured",
+            "0.1.0",
+            &[("measured-dependency", "{ path = \"../../dependency\" }")],
+        )?;
+        let manifest_path = package.join("Cargo.toml");
+        let mut manifest = std::fs::read_to_string(&manifest_path)?;
+        manifest.push_str("\n[features]\nextra = []\n");
+        std::fs::write(manifest_path, manifest)?;
+        let lockfile = cargo_command(&ws.path)
+            .args(["generate-lockfile", "--offline"])
+            .output()?;
+        ensure!(
+            lockfile.status.success(),
+            "offline lockfile generation failed: {}",
+            String::from_utf8_lossy(&lockfile.stderr)
+        );
+        ws.commit("Add compiler acquisition fixture")?;
+
+        let cold_path = ws.path.join("cold-acquisition.json");
+        let warm_path = ws.path.join("warm-acquisition.json");
+        let run = |diagnostics: &Path| -> Result<std::process::Output> {
+            run_cargo_rail(
+                &ws.path,
+                &[
+                    "rail",
+                    "--diagnostics-file",
+                    diagnostics.to_str().context("non-UTF-8 diagnostics path")?,
+                    "unify",
+                    "--check",
+                    "--json",
+                ],
+            )
+        };
+
+        let cold = run(&cold_path)?;
+        ensure!(
+            cold.status.success() || cold.status.code() == Some(1),
+            "cold compiler acquisition failed: {}",
+            String::from_utf8_lossy(&cold.stderr)
+        );
+        let cold = read_counters(&cold_path)?;
+        let acquisition = &cold["compiler_acquisition"];
+        assert_eq!(cold["schema_version"], 15);
+        assert_eq!(acquisition["plans"], 1);
+        assert!(
+            acquisition["plan_identity"]
+                .as_str()
+                .is_some_and(|identity| identity.starts_with("compiler-acquisition-plan-v1-sha256-"))
+        );
+        assert!(acquisition["views"].as_u64().is_some_and(|views| views >= 3));
+        assert!(acquisition["cargo_views"].as_u64().is_some_and(|views| views > 0));
+        assert!(
+            acquisition["configured_process_slots"]
+                .as_u64()
+                .is_some_and(|slots| slots > 0)
+        );
+        assert!(
+            acquisition["configured_work_permits"]
+                .as_u64()
+                .is_some_and(|permits| permits > 0)
+        );
+        assert_eq!(acquisition["live_cargo_processes"], 0);
+        assert!(
+            acquisition["max_live_cargo_processes"]
+                .as_u64()
+                .is_some_and(|processes| processes > 0)
+        );
+        assert!(
+            acquisition["max_nonwaiting_cargo_views"]
+                .as_u64()
+                .is_some_and(|views| views > 0)
+        );
+        assert!(acquisition["max_live_cargo_processes"].as_u64() <= acquisition["configured_process_slots"].as_u64());
+        assert!(acquisition["max_nonwaiting_cargo_views"].as_u64() <= acquisition["configured_work_permits"].as_u64());
+        assert!(
+            acquisition["compiler_actions"]
+                .as_u64()
+                .is_some_and(|actions| actions > 0)
+        );
+        assert!(
+            acquisition["stdout_bytes_retained"]
+                .as_u64()
+                .is_some_and(|bytes| bytes > 0)
+        );
+        assert!(
+            acquisition["stdout_bytes_read"].as_u64() >= acquisition["stdout_bytes_retained"].as_u64(),
+            "streaming cannot retain more Cargo stdout than it read"
+        );
+        assert!(
+            acquisition["output_retention_high_water_bytes"]
+                .as_u64()
+                .is_some_and(|bytes| bytes <= 64 * 1024 * 1024 + 16 * 1024),
+            "Cargo output retention exceeded its fixed stdout/stderr bounds"
+        );
+        assert!(
+            acquisition["cargo_messages_read"]
+                .as_u64()
+                .is_some_and(|messages| messages > 0)
+        );
+        let sandboxes_created = acquisition["sandboxes_created"]
+            .as_u64()
+            .context("sandbox create count is not an integer")?;
+        let sandboxes_reused = acquisition["sandboxes_reused"]
+            .as_u64()
+            .context("sandbox reuse count is not an integer")?;
+        assert!(sandboxes_created > 0);
+        assert_eq!(sandboxes_created + sandboxes_reused, acquisition["cargo_views"]);
+        assert_eq!(acquisition["sandboxes_deleted"], sandboxes_created);
+        assert_eq!(acquisition["sandboxes_poisoned"], 0);
+        assert_eq!(acquisition["process_tree_terminations"], 0);
+        assert!(
+            acquisition["artifact_tree_walks"]
+                .as_u64()
+                .is_some_and(|walks| walks > 0)
+        );
+        assert!(
+            acquisition["evidence_cache_lookups"]
+                .as_u64()
+                .is_some_and(|lookups| lookups > 0)
+        );
+        assert_eq!(acquisition["journal_writes"], 0, "Unify does not own a Surface journal");
+
+        let warm_output = run(&warm_path)?;
+        ensure!(
+            warm_output.status.success() || warm_output.status.code() == Some(1),
+            "warm compiler acquisition failed: {}",
+            String::from_utf8_lossy(&warm_output.stderr)
+        );
+        let warm = read_counters(&warm_path)?;
+        let warm_acquisition = &warm["compiler_acquisition"];
+        assert_eq!(warm_acquisition["plan_identity"], acquisition["plan_identity"]);
+        assert_eq!(warm_acquisition["views"], acquisition["views"]);
+        let warm_views = warm_acquisition["cargo_views"]
+            .as_u64()
+            .context("warm Cargo view count is not an integer")?;
+        let warm_hits = warm_acquisition["evidence_cache_hits"]
+            .as_u64()
+            .context("warm evidence hit count is not an integer")?;
+        assert_eq!(
+            warm_views + warm_hits,
+            warm_acquisition["views"]
+                .as_u64()
+                .context("planned view count is not an integer")?,
+            "each warm view must be an exact hit or execute normally"
+        );
+        let warm_actions = warm_acquisition["compiler_actions"]
+            .as_u64()
+            .context("warm compiler action count is not an integer")?;
+        if warm_views == 0 {
+            assert_eq!(warm_actions, 0, "an exact warm hit must start no compiler action");
+        } else {
+            assert!(
+                warm_actions > 0,
+                "a fail-closed warm bypass must measure its compiler work"
+            );
+            assert!(
+                String::from_utf8_lossy(&warm_output.stdout).contains("miss_reasons"),
+                "a repeated warm acquisition must explain why reuse was unavailable"
+            );
+        }
         Ok(())
     })();
     super::helpers::finish_test(result);
@@ -337,7 +524,7 @@ fn pre_context_diagnostics_have_one_fixed_phase_schema() {
         ensure!(measured.status.success(), "schema output failed");
 
         let counters = read_counters(&diagnostics)?;
-        assert_eq!(counters["schema_version"], 12);
+        assert_eq!(counters["schema_version"], 15);
         assert_eq!(counters["phases"]["cli_pre_context_preparation"]["invocations"], 1);
         assert_eq!(counters["phases"]["workspace_capture_cargo_metadata"]["invocations"], 0);
         assert_eq!(
@@ -345,6 +532,9 @@ fn pre_context_diagnostics_have_one_fixed_phase_schema() {
             Some(3),
             "phase keys are a versioned fixed contract"
         );
+        assert_eq!(counters["compiler_acquisition"]["plans"], 0);
+        assert_eq!(counters["compiler_acquisition"]["cargo_views"], 0);
+        assert_eq!(counters["compiler_acquisition"]["journal_writes"], 0);
         Ok(())
     })();
     super::helpers::finish_test(result);

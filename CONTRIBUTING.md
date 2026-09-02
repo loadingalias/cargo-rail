@@ -104,14 +104,19 @@ From `main`, build and use the current checkout's binary:
 ```bash
 cargo build --locked --bin cargo-rail
 release_cli="$PWD/target/debug/cargo-rail"
-"$release_cli" rail release check --all --bump auto
-"$release_cli" rail release run --all --bump auto --yes
+set +e
+"$release_cli" rail release check --all --bump auto --publication
+release_check_status=$?
+set -e
+test "$release_check_status" -eq 1
+"$release_cli" rail release run --all --publish --wait --yes
 ```
 
-`release check` exits `1` when it finds a pending release; that is the expected preview result. `release run` pushes one
-exact release commit and stops while its GitHub checks, including release archives, are pending. After the checks pass,
-run the exact `"$release_cli" rail release resume <STATE>` command printed by Cargo-Rail. Do not rerun `release run`,
-move a published tag, or replace a release asset.
+`release check --publication` proves the same positive registry and remote authority that `release run --publish`
+requires, but executes no effects. It exits `1` when it finds a pending release; that is the expected preview result.
+`release run --publish --wait` pushes one exact release commit, waits for its GitHub checks, including release
+archives, and then completes the same durable transaction. Interrupting the wait is safe: resume the exact journal
+reported by Cargo-Rail. Do not rerun `release run`, move a published tag, or replace a release asset.
 
 ## Report security issues privately
 

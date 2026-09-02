@@ -646,6 +646,10 @@ pub(crate) struct RawCompilerInvocation {
     pub(crate) wrappers: Vec<CompilerWrapperIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) cache_wrapper: Option<CompilerCacheWrapperMetadata>,
+    /// Exact ordinary process exit code when the compiler executable ran.
+    /// Absence means process creation failed or the process ended by signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) compiler_exit_code: Option<i32>,
     pub(crate) success: bool,
     pub(crate) bypasses: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -807,9 +811,10 @@ pub(crate) fn build_manifests(
         {
             if let Some(producer) = producer_by_output.get(&artifact.path) {
                 edge.producer_unit = Some(base_identities[*producer].clone());
-            } else {
-                manifest.bypasses.insert("dependency_unit_unresolved".to_string());
             }
+            // The collector intentionally excludes non-workspace Cargo artifacts.
+            // Their exact dependency bytes remain authoritative even though no
+            // local compilation-unit identity exists to attach here.
         }
         manifest.unit_identity = manifest.unit.identity()?;
     }
@@ -1390,6 +1395,7 @@ fn begin_compiler_invocation(
             compiler: None,
             wrappers: Vec::new(),
             cache_wrapper: crate::compiler::native_cache::metadata_from_environment(),
+            compiler_exit_code: None,
             success: false,
             bypasses,
             compiler_fact_unit: None,
@@ -1465,6 +1471,11 @@ impl InvocationRecorder {
 
     pub(crate) fn set_compiler_fact_unit(&mut self, unit: crate::compiler::facts::CompilerFactUnit) {
         self.raw.compiler_fact_unit = Some(unit);
+    }
+
+    /// Record proof that the selected compiler process ran to an ordinary exit.
+    pub(crate) fn set_compiler_exit_code(&mut self, exit_code: Option<i32>) {
+        self.raw.compiler_exit_code = exit_code;
     }
 
     /// Capture dep-info and emitted bytes after the compiler exits, then atomically publish raw evidence.
@@ -3168,6 +3179,7 @@ mod tests {
             compiler: None,
             wrappers: Vec::new(),
             cache_wrapper: None,
+            compiler_exit_code: Some(0),
             success: true,
             bypasses: BTreeSet::new(),
             compiler_fact_unit: None,

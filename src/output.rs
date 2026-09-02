@@ -6,7 +6,7 @@
 //!
 //! **Critical** (always shown):
 //! - [`error!`] - Error messages: `error: something went wrong`
-//! - [`warn!`] - Warnings: `warning: deprecated option`
+//! - [`warn!`] - Warnings: `warning: configuration needs attention`
 //! - [`help!`] - Help hints: `help: try --force`
 //!
 //! **Informational** (suppressed with `--quiet`):
@@ -229,8 +229,8 @@ macro_rules! error {
 ///
 /// ```no_run
 /// # fn main() {
-/// cargo_rail::warn!("deprecated option will be removed in v2.0");
-/// // Output: warning: deprecated option will be removed in v2.0
+/// cargo_rail::warn!("configuration needs attention");
+/// // Output: warning: configuration needs attention
 /// # }
 /// ```
 #[macro_export]

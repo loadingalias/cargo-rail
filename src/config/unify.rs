@@ -1,6 +1,6 @@
 //! Unify configuration - controls workspace dependency unification behavior
 
-use serde::{Deserialize, Deserializer, Serialize, de};
+use serde::{Deserialize, Serialize};
 
 /// Defines which consumers may activate private workspace configuration.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,8 +25,19 @@ impl ConsumerScope {
 }
 
 /// Unify configuration - controls workspace dependency unification behavior
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UnifyConfig {
+    /// Exact subset of top-level target-resolution domains used for compiler evidence.
+    ///
+    /// An empty list inherits every top-level target. Repositories whose full
+    /// workspace does not compile under one Cargo package/feature shape on every
+    /// resolution target can select only the domains where Unify's compiler
+    /// evidence command is valid. Omitted domains remain part of dependency
+    /// resolution and conservatively prevent edits that require missing evidence.
+    #[serde(default)]
+    pub compiler_targets: Vec<String>,
+
     /// Handle path dependencies? (default: true)
     /// If false, path dependencies are excluded from unification
     #[serde(default = "default_include_paths")]
@@ -117,6 +128,7 @@ pub struct UnifyConfig {
 impl Default for UnifyConfig {
     fn default() -> Self {
         Self {
+            compiler_targets: Vec::new(),
             include_paths: default_include_paths(),
             include_renamed: false,
             transitive_pinning: None,
@@ -137,6 +149,44 @@ impl Default for UnifyConfig {
 }
 
 impl UnifyConfig {
+    /// Resolve compiler-evidence targets from the captured resolution domains.
+    pub fn effective_compiler_targets<'a>(&self, workspace_targets: &[&'a str]) -> Vec<&'a str> {
+        if self.compiler_targets.is_empty() {
+            return workspace_targets.to_vec();
+        }
+        workspace_targets
+            .iter()
+            .copied()
+            .filter(|target| self.compiler_targets.iter().any(|configured| configured == target))
+            .collect()
+    }
+
+    /// Validate compiler-evidence targets against the top-level resolution authority.
+    pub fn validate_workspace_targets(&self, workspace_targets: &[String]) -> Result<(), crate::error::ConfigError> {
+        let mut unique = std::collections::BTreeSet::new();
+        for target in &self.compiler_targets {
+            if target.trim().is_empty() || target != target.trim() {
+                return Err(crate::error::ConfigError::InvalidValue {
+                    field: "unify.compiler_targets".to_string(),
+                    message: "targets must be non-empty and have no surrounding whitespace".to_string(),
+                });
+            }
+            if !unique.insert(target) {
+                return Err(crate::error::ConfigError::InvalidValue {
+                    field: "unify.compiler_targets".to_string(),
+                    message: format!("contains duplicate target '{target}'"),
+                });
+            }
+            if !workspace_targets.contains(target) {
+                return Err(crate::error::ConfigError::InvalidValue {
+                    field: "unify.compiler_targets".to_string(),
+                    message: format!("target '{target}' is not declared in top-level targets"),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Check if a dependency should be excluded from unification
     pub fn should_exclude(&self, dep_name: &str) -> bool {
         self.exclude.iter().any(|e| e == dep_name)
@@ -416,124 +466,6 @@ impl MsrvPolicy {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(default)]
-struct UnifyConfigInput {
-    include_paths: bool,
-    include_renamed: bool,
-    transitive_pinning: Option<TransitivePinning>,
-    pin_transitives: Option<bool>,
-    transitive_host: Option<TransitiveFeatureHost>,
-    exclude: Vec<String>,
-    include: Vec<String>,
-    max_backups: usize,
-    compiler_artifact_soft_limit_bytes: u64,
-    compiler_artifact_hard_limit_bytes: u64,
-    msrv_policy: Option<MsrvPolicy>,
-    msrv: Option<bool>,
-    enforce_msrv_inheritance: Option<bool>,
-    msrv_source: Option<MsrvSource>,
-    consumer_scope: ConsumerScope,
-    preserve_features: Vec<String>,
-    strict_version_compat: bool,
-    exact_pin_handling: ExactPinHandling,
-    major_version_conflict: MajorVersionConflict,
-    skip_undeclared_patterns: Vec<String>,
-}
-
-impl Default for UnifyConfigInput {
-    fn default() -> Self {
-        let config = UnifyConfig::default();
-        Self {
-            include_paths: config.include_paths,
-            include_renamed: config.include_renamed,
-            transitive_pinning: None,
-            pin_transitives: None,
-            transitive_host: None,
-            exclude: config.exclude,
-            include: config.include,
-            max_backups: config.max_backups,
-            compiler_artifact_soft_limit_bytes: config.compiler_artifact_soft_limit_bytes,
-            compiler_artifact_hard_limit_bytes: config.compiler_artifact_hard_limit_bytes,
-            msrv_policy: None,
-            msrv: None,
-            enforce_msrv_inheritance: None,
-            msrv_source: None,
-            consumer_scope: config.consumer_scope,
-            preserve_features: config.preserve_features,
-            strict_version_compat: config.strict_version_compat,
-            exact_pin_handling: config.exact_pin_handling,
-            major_version_conflict: config.major_version_conflict,
-            skip_undeclared_patterns: config.skip_undeclared_patterns,
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for UnifyConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let input = UnifyConfigInput::deserialize(deserializer)?;
-        let has_legacy_transitive = input.pin_transitives.is_some() || input.transitive_host.is_some();
-        if input.transitive_pinning.is_some() && has_legacy_transitive {
-            return Err(de::Error::custom(
-                "unify.transitive_pinning cannot be combined with deprecated pin_transitives or transitive_host; run `cargo rail config migrate`",
-            ));
-        }
-        let transitive_pinning = input.transitive_pinning.or_else(|| {
-            input.pin_transitives.unwrap_or(false).then(|| TransitivePinning {
-                host: input.transitive_host.unwrap_or_default(),
-            })
-        });
-
-        let has_legacy_msrv =
-            input.msrv.is_some() || input.enforce_msrv_inheritance.is_some() || input.msrv_source.is_some();
-        if input.msrv_policy.is_some() && has_legacy_msrv {
-            return Err(de::Error::custom(
-                "unify.msrv_policy cannot be combined with deprecated msrv, msrv_source, or enforce_msrv_inheritance; run `cargo rail config migrate`",
-            ));
-        }
-        let msrv_policy = if let Some(policy) = input.msrv_policy {
-            policy
-        } else {
-            let enabled = input.msrv.unwrap_or(true);
-            let inherit = input.enforce_msrv_inheritance.unwrap_or(false);
-            if !enabled && inherit {
-                return Err(de::Error::custom(
-                    "deprecated enforce_msrv_inheritance = true cannot be combined with msrv = false",
-                ));
-            }
-            if enabled {
-                MsrvPolicy::Compute {
-                    source: input.msrv_source.unwrap_or_default(),
-                    inherit,
-                }
-            } else {
-                MsrvPolicy::Disabled
-            }
-        };
-
-        Ok(Self {
-            include_paths: input.include_paths,
-            include_renamed: input.include_renamed,
-            transitive_pinning,
-            exclude: input.exclude,
-            include: input.include,
-            max_backups: input.max_backups,
-            compiler_artifact_soft_limit_bytes: input.compiler_artifact_soft_limit_bytes,
-            compiler_artifact_hard_limit_bytes: input.compiler_artifact_hard_limit_bytes,
-            msrv_policy,
-            consumer_scope: input.consumer_scope,
-            preserve_features: input.preserve_features,
-            strict_version_compat: input.strict_version_compat,
-            exact_pin_handling: input.exact_pin_handling,
-            major_version_conflict: input.major_version_conflict,
-            skip_undeclared_patterns: input.skip_undeclared_patterns,
-        })
-    }
-}
-
 // Default Functions
 
 fn default_max_backups() -> usize {
@@ -570,6 +502,7 @@ mod tests {
     #[test]
     fn test_unify_config_defaults() {
         let config = UnifyConfig::default();
+        assert!(config.compiler_targets.is_empty());
         assert!(config.include_paths); // Default: true
         assert!(!config.include_renamed); // Default: false
         assert!(config.transitive_pinning.is_none());
@@ -579,6 +512,30 @@ mod tests {
         assert_eq!(config.consumer_scope, ConsumerScope::Open);
         assert_eq!(config.compiler_artifact_soft_limit_bytes, 32 * 1024 * 1024 * 1024);
         assert_eq!(config.compiler_artifact_hard_limit_bytes, 64 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn compiler_targets_are_an_exact_resolution_subset() {
+        let config: UnifyConfig =
+            toml_edit::de::from_str(r#"compiler_targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]"#)
+                .unwrap();
+        let workspace_targets = [
+            "aarch64-apple-darwin".to_string(),
+            "thumbv6m-none-eabi".to_string(),
+            "x86_64-unknown-linux-gnu".to_string(),
+        ];
+        config.validate_workspace_targets(&workspace_targets).unwrap();
+        let resolution_targets = workspace_targets.iter().map(String::as_str).collect::<Vec<_>>();
+        assert_eq!(
+            config.effective_compiler_targets(&resolution_targets),
+            ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
+        );
+
+        let outside: UnifyConfig = toml_edit::de::from_str(r#"compiler_targets = ["wasm32-wasip1"]"#).unwrap();
+        assert!(outside.validate_workspace_targets(&workspace_targets).is_err());
+        let duplicate: UnifyConfig =
+            toml_edit::de::from_str(r#"compiler_targets = ["aarch64-apple-darwin", "aarch64-apple-darwin"]"#).unwrap();
+        assert!(duplicate.validate_workspace_targets(&workspace_targets).is_err());
     }
 
     #[test]
@@ -631,27 +588,6 @@ mod tests {
     }
 
     #[test]
-    fn test_transitive_feature_host_in_full_config() {
-        let toml = r#"
-      include_paths = true
-      include_renamed = false
-      pin_transitives = true
-      transitive_host = "root"
-      exclude = []
-      include = []
-    "#;
-
-        let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
-        assert_eq!(
-            config.transitive_pinning,
-            Some(TransitivePinning {
-                host: TransitiveFeatureHost::Root
-            })
-        );
-        assert!(config.include_paths);
-    }
-
-    #[test]
     fn test_unify_config_default_transitive_host() {
         let config = UnifyConfig::default();
         assert!(config.transitive_pinning.is_none());
@@ -679,13 +615,6 @@ mod tests {
                 inherit: true
             }
         );
-    }
-
-    #[test]
-    fn invalid_legacy_msrv_combination_cannot_be_constructed() {
-        let error =
-            toml_edit::de::from_str::<UnifyConfig>("msrv = false\nenforce_msrv_inheritance = true\n").unwrap_err();
-        assert!(error.to_string().contains("cannot be combined"));
     }
 
     #[test]
@@ -949,47 +878,6 @@ mod tests {
     fn test_msrv_source_default() {
         let config = UnifyConfig::default();
         assert_eq!(config.msrv_policy.source(), Some(MsrvSource::Max));
-    }
-
-    #[test]
-    fn test_msrv_source_parsing_deps() {
-        let toml = r#"msrv_source = "deps""#;
-        let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
-        assert_eq!(config.msrv_policy.source(), Some(MsrvSource::Deps));
-    }
-
-    #[test]
-    fn test_msrv_source_parsing_workspace() {
-        let toml = r#"msrv_source = "workspace""#;
-        let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
-        assert_eq!(config.msrv_policy.source(), Some(MsrvSource::Workspace));
-    }
-
-    #[test]
-    fn test_msrv_source_parsing_max() {
-        let toml = r#"msrv_source = "max""#;
-        let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
-        assert_eq!(config.msrv_policy.source(), Some(MsrvSource::Max));
-    }
-
-    #[test]
-    fn test_msrv_source_with_msrv_enabled() {
-        let toml = r#"
-      msrv = true
-      msrv_source = "workspace"
-    "#;
-        let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
-        assert_eq!(config.msrv_policy.source(), Some(MsrvSource::Workspace));
-    }
-
-    #[test]
-    fn test_msrv_source_with_msrv_disabled() {
-        let toml = r#"
-      msrv = false
-      msrv_source = "deps"
-    "#;
-        let config: UnifyConfig = toml_edit::de::from_str(toml).unwrap();
-        assert_eq!(config.msrv_policy, MsrvPolicy::Disabled);
     }
 
     // skip_undeclared_patterns Tests

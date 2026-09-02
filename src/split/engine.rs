@@ -5,19 +5,24 @@
 
 use crate::cargo::ManifestTransformPolicy;
 use crate::config::{SplitMode, WorkspaceMode};
-use crate::error::{GitError, RailError, RailResult, ResultExt, git_command_diagnostics};
-use crate::git::git_cmd_for_path;
-use crate::git::mappings::{HistorySide, MappingStore, OriginContext, append_origin_trailers, repository_identity};
+use crate::error::{RailError, RailResult};
+use crate::git::mappings::{
+    MappingAuthoritySnapshot, MappingStore, OriginContext, TargetPublicationSnapshot, append_origin_trailers,
+    is_ancestor, observe_target_branch, remote_endpoint_identity, remote_repository_identity, repository_identity,
+};
+use crate::git::ops::{GitObjectQuarantine, GitTreeEntry};
 use crate::git::{CommitInfo, CommitMetadata, SystemGit};
+use crate::mutation::git_effect::{
+    GitCommitEffect, GitEffectCommitMetadata, GitEffectIntent, GitEffectJournal, GitEffectRecord, GitEffectStore,
+    GitMappingBinding, GitPathImage, GitPathTransition, GitPublicationEffect,
+};
 use crate::split::SplitPathCapabilities;
 use crate::utils;
 use crate::verbose_progress as progress;
 use crate::workspace::WorkspaceContext;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 
 /// One release boundary intersecting a split's owned Cargo members.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +80,7 @@ type PrefetchedFiles = Vec<crate::git::ops::GitTreeEntry>;
 struct PrefetchedWindow {
     entries: FxHashMap<String, PrefetchedFiles>,
     blobs: FxHashMap<String, Vec<u8>>,
+    imported_objects: Vec<String>,
 }
 
 /// Maximum number of commits to prefetch at once
@@ -92,29 +98,27 @@ const fn split_mode_name(mode: &SplitMode) -> &'static str {
 /// Parameters for recreating a commit in the target repository
 struct RecreateCommitParams<'a> {
     commit: &'a CommitInfo,
-    source_paths: &'a [PathBuf],
     crate_paths: &'a [PathBuf],
-    target_repo_path: &'a Path,
     mode: &'a SplitMode,
     workspace_mode: &'a WorkspaceMode,
     mapping_store: &'a MappingStore,
     origin: &'a OriginContext,
     last_recreated_sha: Option<&'a str>,
+    quarantine: &'a GitObjectQuarantine,
     /// Pre-fetched files (if available from parallel prefetch)
     prefetched_files: Option<&'a PrefetchedFiles>,
-    /// Pre-fetched transform inputs keyed by blob object ID.
-    prefetched_blobs: &'a FxHashMap<String, Vec<u8>>,
+    /// Pre-written transformed manifest objects keyed by source blob ID.
+    prefetched_manifest_objects: &'a FxHashMap<String, String>,
     path_capabilities: &'a SplitPathCapabilities,
 }
 
-/// Parameters for creating a git commit
-struct CommitParams<'a> {
-    repo_path: &'a Path,
-    tree_sha: &'a str,
-    message: &'a str,
-    metadata: &'a CommitMetadata,
-    parent_shas: &'a [String],
-    expected_head: Option<&'a str>,
+struct PreparedSplitCommit {
+    oid: String,
+    tree: String,
+    message: String,
+    metadata: CommitMetadata,
+    parents: Vec<String>,
+    entries: Vec<GitTreeEntry>,
 }
 
 /// Split engine - extracts crates with full history
@@ -138,6 +142,24 @@ impl<'a> SplitEngine<'a> {
         })
     }
 
+    fn revalidate_clean_target(&self, target_repo_path: &Path) -> RailResult<()> {
+        let obstructing = SystemGit::open(target_repo_path)?.obstructing_worktree_paths()?;
+        if obstructing.is_empty() {
+            return Ok(());
+        }
+        Err(RailError::with_help(
+            format!(
+                "split target became dirty or obstructed before materialization: {}",
+                obstructing
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            "commit, restore, or remove staged, unstaged, untracked, and ignored target paths before retrying",
+        ))
+    }
+
     /// Return whether committed source history lacks target mapping evidence.
     pub fn has_pending_changes(ctx: &WorkspaceContext, config: &SplitParams) -> RailResult<bool> {
         Ok(Self::pending_commit_count(ctx, config)? > 0)
@@ -145,45 +167,40 @@ impl<'a> SplitEngine<'a> {
 
     /// Count committed source-history entries lacking target mapping evidence.
     pub fn pending_commit_count(ctx: &WorkspaceContext, config: &SplitParams) -> RailResult<usize> {
+        let source_head = ctx.git()?.git().head_commit()?;
+        Self::pending_commit_count_at_source_head(ctx, config, &source_head)
+    }
+
+    pub(crate) fn pending_commit_count_at_source_head(
+        ctx: &WorkspaceContext,
+        config: &SplitParams,
+        source_head: &str,
+    ) -> RailResult<usize> {
         if !config.target_repo_path.join(".git").exists() {
-            let mut owned_paths = config.crate_paths.clone();
-            owned_paths.extend(config.asset_paths.iter().cloned());
-            owned_paths.sort();
-            owned_paths.dedup();
-            return Ok(ctx
-                .git()?
-                .git()
-                .get_commits_touching_paths(&owned_paths, None, "HEAD")?
-                .len());
+            return Ok(source_commits_matching_policy(ctx, &config.path_capabilities, &[], source_head)?.len());
         }
         config.path_capabilities.validate_target_repository()?;
         let target_git = SystemGit::open(&config.target_repo_path)?;
+        let target_ref = format!("refs/heads/{}", config.branch);
+        if target_git.exact_branch_ref_oid(&target_ref)?.is_none() {
+            return Ok(source_commits_matching_policy(ctx, &config.path_capabilities, &[], source_head)?.len());
+        }
         let target_identity = repository_identity(&config.target_repo_path)?;
         let origin = OriginContext::discover(ctx.workspace_root(), &config.crate_name, &config.ownership.snapshot_id)?;
-        let mut mappings = MappingStore::new(config.crate_name.clone());
-        mappings.load_history(ctx.workspace_root(), HistorySide::Source, &target_identity)?;
-        mappings.load_history(
+        let mappings = MappingStore::capture_v025_evidence(
+            ctx.workspace_root(),
             &config.target_repo_path,
-            HistorySide::Target,
-            origin.source_repository(),
+            &origin,
+            &target_identity,
         )?;
-        mappings.load_legacy_notes(ctx.workspace_root())?;
-        mappings.load_legacy_notes(&config.target_repo_path)?;
         if target_git.head_commit().is_ok() && mappings.count() == 0 {
             return Err(RailError::with_help(
                 "existing split target has no cargo-rail origin evidence",
-                "choose an empty target or migrate the target's legacy trailers/notes before splitting",
+                "choose an empty target or initialize it with current Rail-Origin history before splitting",
             ));
         }
 
-        let mut owned_paths = config.crate_paths.clone();
-        owned_paths.extend(config.asset_paths.iter().cloned());
-        owned_paths.sort();
-        owned_paths.dedup();
-        let commits = ctx
-            .git()?
-            .git()
-            .get_commits_touching_paths(&owned_paths, None, "HEAD")?;
+        let commits = source_commits_matching_policy(ctx, &config.path_capabilities, &[], source_head)?;
         if commits.is_empty() {
             return Err(RailError::with_help(
                 "split ownership has no committed Git history",
@@ -198,11 +215,10 @@ impl<'a> SplitEngine<'a> {
 
     /// Walk commit history and filter commits that touch the given paths
     /// Returns commits in chronological order (oldest first)
-    fn walk_filtered_history(&self, paths: &[PathBuf]) -> RailResult<Vec<CommitInfo>> {
+    fn walk_filtered_history(&self, paths: &SplitPathCapabilities, source_head: &str) -> RailResult<Vec<CommitInfo>> {
         progress!("   Walking commit history to find commits touching crate...");
 
-        // Use one batched Git command for all paths.
-        let filtered_commits = self.ctx.git()?.git().get_commits_touching_paths(paths, None, "HEAD")?;
+        let filtered_commits = source_commits_matching_policy(self.ctx, paths, &[], source_head)?;
 
         progress!(
             "   Found {} total commits that touch the crate paths",
@@ -216,16 +232,17 @@ impl<'a> SplitEngine<'a> {
     ///
     /// Returns a map from commit SHA to its prefetched files.
     /// Accepts references to avoid cloning CommitInfo structs.
-    fn prefetch_commit_files(&self, commits: &[&CommitInfo], crate_paths: &[PathBuf]) -> RailResult<PrefetchedWindow> {
+    fn prefetch_commit_files(
+        &self,
+        commits: &[&CommitInfo],
+        paths: &SplitPathCapabilities,
+    ) -> RailResult<PrefetchedWindow> {
         let git_state = self.ctx.git()?;
         let git = git_state.git();
         let entries = commits
             .par_iter()
             .map(|commit| {
-                let mut all_files = Vec::with_capacity(32);
-                for crate_path in crate_paths {
-                    all_files.extend(git.collect_tree_entries(&commit.sha, crate_path)?);
-                }
+                let all_files = collect_owned_source_entries(git, &commit.sha, paths)?;
                 Ok((commit.sha.clone(), all_files))
             })
             .collect::<RailResult<FxHashMap<_, _>>>()?;
@@ -239,32 +256,40 @@ impl<'a> SplitEngine<'a> {
         let contents = git.read_blobs_bulk(&requests)?;
         drop(requests);
         let blobs = object_ids.into_iter().zip(contents).collect();
-        Ok(PrefetchedWindow { entries, blobs })
+        let imported_objects = entries
+            .values()
+            .flat_map(|files| files.iter())
+            .filter(|entry| entry.path.file_name() != Some(std::ffi::OsStr::new("Cargo.toml")))
+            .map(|entry| entry.object_id.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        Ok(PrefetchedWindow {
+            entries,
+            blobs,
+            imported_objects,
+        })
     }
 
     /// Recreate one commit in the target repository with split transforms applied.
     ///
     /// Returns `Some(new_sha)` when a commit is materialized, or `None` when the
     /// source commit should be skipped (for example, path was deleted at that point).
-    fn recreate_commit_in_target(&self, params: &RecreateCommitParams) -> RailResult<Option<String>> {
+    fn prepare_commit_in_quarantine(&self, params: &RecreateCommitParams) -> RailResult<Option<PreparedSplitCommit>> {
         // Use pre-fetched files if available, otherwise collect them now
         // Use Cow to avoid cloning the prefetched Vec when it's already available
         let all_files: std::borrow::Cow<'_, PrefetchedFiles> = if let Some(prefetched) = params.prefetched_files {
             std::borrow::Cow::Borrowed(prefetched)
         } else {
-            let mut files = Vec::with_capacity(params.source_paths.len() * 32);
-            for crate_path in params.source_paths {
-                let collected = self
-                    .ctx
-                    .git()?
-                    .git()
-                    .collect_tree_entries(&params.commit.sha, crate_path)?;
-                files.extend(collected);
-            }
-            std::borrow::Cow::Owned(files)
+            std::borrow::Cow::Owned(collect_owned_source_entries(
+                self.ctx.git()?.git(),
+                &params.commit.sha,
+                params.path_capabilities,
+            )?)
         };
 
         let mut target_entries = Vec::with_capacity(all_files.len());
+        let mut target_sources = std::collections::BTreeMap::<PathBuf, PathBuf>::new();
         for entry in all_files.iter() {
             let target_path = match params.mode {
                 SplitMode::Single => params
@@ -275,10 +300,23 @@ impl<'a> SplitEngine<'a> {
                 SplitMode::Combined => entry.path.clone(),
             };
             params.path_capabilities.authorize_target(&target_path)?;
+            if let Some(previous) = target_sources.insert(target_path.clone(), entry.path.clone())
+                && previous != entry.path
+            {
+                return Err(RailError::with_help(
+                    format!(
+                        "split ownership maps '{}' and '{}' to target path '{}'",
+                        previous.display(),
+                        entry.path.display(),
+                        target_path.display()
+                    ),
+                    "narrow split.include/exclude so each historical source path has one injective target projection",
+                ));
+            }
 
             let object_id = if entry.path.file_name() == Some(std::ffi::OsStr::new("Cargo.toml")) {
-                let content = if let Some(content) = params.prefetched_blobs.get(&entry.object_id) {
-                    std::borrow::Cow::Borrowed(content.as_slice())
+                if let Some(object_id) = params.prefetched_manifest_objects.get(&entry.object_id) {
+                    object_id.clone()
                 } else {
                     let content = self
                         .ctx
@@ -290,24 +328,27 @@ impl<'a> SplitEngine<'a> {
                         .ok_or_else(|| {
                             RailError::message(format!("manifest '{}' has no blob", entry.path.display()))
                         })?;
-                    std::borrow::Cow::Owned(content)
-                };
-                let content = std::str::from_utf8(&content).map_err(|_| {
-                    RailError::message(format!("manifest '{}' is not valid UTF-8", entry.path.display()))
-                })?;
-                let target_has_workspace =
-                    *params.mode == SplitMode::Combined && *params.workspace_mode == WorkspaceMode::Workspace;
-                let transformed = self.transform.transform_to_split(content, target_has_workspace)?;
-                self.write_target_blob(params.target_repo_path, transformed.as_bytes())?
+                    let content = std::str::from_utf8(&content).map_err(|_| {
+                        RailError::message(format!("manifest '{}' is not valid UTF-8", entry.path.display()))
+                    })?;
+                    let target_has_workspace =
+                        *params.mode == SplitMode::Combined && *params.workspace_mode == WorkspaceMode::Workspace;
+                    let transformed = self.transform.transform_to_split(content, target_has_workspace)?;
+                    params.quarantine.write_blob(transformed.as_bytes())?
+                }
             } else {
                 entry.object_id.clone()
             };
-            target_entries.push((entry.mode.clone(), object_id, target_path));
+            target_entries.push(GitTreeEntry {
+                mode: entry.mode.clone(),
+                object_id,
+                path: target_path,
+            });
         }
 
         // A fresh index per snapshot makes absence authoritative: deleted and
         // renamed files cannot leak forward from the previous worktree.
-        let tree_sha = self.write_exact_tree(params.target_repo_path, &target_entries)?;
+        let tree_sha = params.quarantine.write_exact_tree(&target_entries)?;
 
         // Create commit using git command for determinism
         // Map parent SHAs from monorepo to split repo
@@ -318,208 +359,357 @@ impl<'a> SplitEngine<'a> {
             .filter_map(|parent_sha| params.mapping_store.get_mapping(parent_sha))
             .collect();
 
-        // Keep every ordinary target commit reachable, including provenance and
-        // migration commits that do not define a one-to-one source mapping.
+        // Keep every ordinary target commit reachable, including provenance commits
+        // that do not define a one-to-one source mapping.
         if let Some(last) = params.last_recreated_sha
             && !mapped_parents.iter().any(|parent| parent == last)
         {
             mapped_parents.insert(0, last.to_string());
         }
 
-        params.path_capabilities.validate_target_repository()?;
         let metadata = params.commit.metadata();
         let message = append_origin_trailers(&params.commit.message, &[params.origin.trailer(&params.commit.sha)?]);
-        let sha = self.create_git_commit(&CommitParams {
-            repo_path: params.target_repo_path,
-            tree_sha: &tree_sha,
-            message: &message,
-            metadata: &metadata,
-            parent_shas: &mapped_parents,
-            expected_head: params.last_recreated_sha,
-        })?;
-        Ok(Some(sha))
+        let sha = params
+            .quarantine
+            .write_commit(&tree_sha, &mapped_parents, &message, &metadata)?;
+        Ok(Some(PreparedSplitCommit {
+            oid: sha,
+            tree: tree_sha,
+            message,
+            metadata,
+            parents: mapped_parents,
+            entries: target_entries,
+        }))
     }
 
-    /// Create a git commit using git commands for determinism
-    /// Uses git commit-tree for full control over parents
-    fn create_git_commit(&self, params: &CommitParams) -> RailResult<String> {
-        if let Some(expected) = params.expected_head
-            && !params.parent_shas.iter().any(|parent| parent == expected)
+    fn capture_publication(
+        &self,
+        config: &SplitParams,
+        mappings: Option<&MappingStore>,
+    ) -> RailResult<Option<TargetPublicationSnapshot>> {
+        let Some(remote_url) = config
+            .remote_url
+            .as_deref()
+            .filter(|remote| !utils::is_local_path(remote))
+        else {
+            return Ok(None);
+        };
+        let observation = observe_target_branch(
+            self.ctx.workspace_root(),
+            &config.target_repo_path,
+            remote_url,
+            &config.branch,
+        )?;
+        TargetPublicationSnapshot::capture(observation, &config.target_repo_path, mappings).map(Some)
+    }
+
+    fn revalidate_publication_before_target_effect(
+        &self,
+        config: &SplitParams,
+        expected: Option<&TargetPublicationSnapshot>,
+        mappings: Option<&MappingStore>,
+    ) -> RailResult<Option<TargetPublicationSnapshot>> {
+        let actual = self.capture_publication(config, mappings)?;
+        if expected.is_some()
+            && actual.as_ref() != expected
+            && !self.matches_completed_prepared_publication(config, expected, actual.as_ref())?
         {
-            return Err(RailError::message(
-                "split commit parents do not contain the current target head",
+            return Err(RailError::with_help(
+                "split target publication authority changed after the operation was planned",
+                "fetch and retry; cargo-rail will not mutate a target bound to changed local or remote branch authority",
             ));
         }
-        // Prepare environment for deterministic commit
-        let author_date = format!(
-            "{} {}",
-            params.metadata.author_timestamp, params.metadata.author_timezone
-        );
-        let commit_date = format!(
-            "{} {}",
-            params.metadata.committer_timestamp, params.metadata.committer_timezone
-        );
-
-        // Build commit-tree command
-        let mut cmd = git_cmd_for_path(params.repo_path);
-        cmd.env("GIT_AUTHOR_NAME", &params.metadata.author)
-            .env("GIT_AUTHOR_EMAIL", &params.metadata.author_email)
-            .env("GIT_AUTHOR_DATE", &author_date)
-            .env("GIT_COMMITTER_NAME", &params.metadata.committer)
-            .env("GIT_COMMITTER_EMAIL", &params.metadata.committer_email)
-            .env("GIT_COMMITTER_DATE", &commit_date)
-            .arg("commit-tree")
-            .arg(params.tree_sha)
-            .arg("-m")
-            .arg(params.message);
-
-        // Add parent arguments
-        for parent in params.parent_shas {
-            cmd.arg("-p").arg(parent);
+        if actual
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot.permits_target_mutation())
+        {
+            return Err(RailError::with_help(
+                "local split target is behind its configured remote branch",
+                "fast-forward the local target branch before splitting or publishing",
+            ));
         }
+        Ok(actual)
+    }
 
-        // Execute commit-tree
-        let output = cmd.output().context("Failed to run git commit-tree")?;
-
-        if !output.status.success() {
-            return Err(RailError::Git(GitError::CommandFailed {
-                command: "git commit-tree".to_string(),
-                stderr: git_command_diagnostics(&output.stdout, &output.stderr),
-            }));
-        }
-
-        let commit_sha = String::from_utf8(output.stdout)?.trim().to_string();
-
-        // Update the branch reference
-        let update_output = if let Some(expected) = params.expected_head {
-            Self::run_git_in_repo(params.repo_path, &["update-ref", "HEAD", &commit_sha, expected])?
-        } else {
-            Self::run_git_in_repo(params.repo_path, &["update-ref", "HEAD", &commit_sha])?
+    fn matches_completed_prepared_publication(
+        &self,
+        config: &SplitParams,
+        expected: Option<&TargetPublicationSnapshot>,
+        actual: Option<&TargetPublicationSnapshot>,
+    ) -> RailResult<bool> {
+        let (Some(expected), Some(actual), Some(remote_url)) = (
+            expected,
+            actual,
+            config
+                .remote_url
+                .as_deref()
+                .filter(|remote| !utils::is_local_path(remote)),
+        ) else {
+            return Ok(false);
         };
-        if !update_output.status.success() {
-            return Err(RailError::Git(GitError::CommandFailed {
-                command: "git update-ref HEAD".to_string(),
-                stderr: git_command_diagnostics(&update_output.stdout, &update_output.stderr),
-            }));
+        let target = SystemGit::open(&config.target_repo_path)?;
+        let ref_name = format!("refs/heads/{}", config.branch);
+        let mut journals = GitEffectStore::discover_unacknowledged_read_only(&target)?
+            .into_iter()
+            .filter(|journal| journal.repository().ref_name == ref_name && journal.publication().is_some())
+            .collect::<Vec<_>>();
+        if journals.len() != 1 {
+            return Ok(false);
         }
-
-        let reset_output = Self::run_git_in_repo(params.repo_path, &["reset", "--hard", &commit_sha])?;
-        if !reset_output.status.success() {
-            return Err(RailError::Git(GitError::CommandFailed {
-                command: "git reset --hard".to_string(),
-                stderr: git_command_diagnostics(&reset_output.stdout, &reset_output.stderr),
-            }));
+        let journal = journals.pop().expect("one prepared publication");
+        if !journal.permits_local_recovery_state(&target)? {
+            return Ok(false);
         }
-
-        Ok(commit_sha)
+        let publication = journal.publication().expect("filtered publication journal");
+        let repository = journal.repository();
+        Ok(
+            remote_endpoint_identity(remote_url)? == publication.exact_endpoint_digest()
+                && expected.remote_repository() == publication.logical_remote()
+                && expected.remote_head() == publication.expected_oid()
+                && expected.local_head() == repository.expected_oid.as_deref()
+                && actual.remote_repository() == publication.logical_remote()
+                && actual.remote_head() == Some(publication.desired_oid())
+                && actual.local_head() == Some(repository.result_oid.as_str())
+                && publication.desired_oid() == repository.result_oid
+                && actual.count() == 0,
+        )
     }
 
-    fn write_target_blob(&self, repo_path: &Path, content: &[u8]) -> RailResult<String> {
-        let mut child = git_cmd_for_path(repo_path)
-            .args(["hash-object", "-w", "--stdin"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("Failed to start git hash-object")?;
-        child
-            .stdin
-            .take()
-            .ok_or_else(|| RailError::message("git hash-object stdin was unavailable"))?
-            .write_all(content)
-            .context("Failed to write transformed blob")?;
-        let output = child.wait_with_output().context("Failed to finish git hash-object")?;
-        if !output.status.success() {
-            return Err(RailError::Git(GitError::CommandFailed {
-                command: "git hash-object -w --stdin".to_string(),
-                stderr: git_command_diagnostics(&output.stdout, &output.stderr),
-            }));
+    fn validate_unproven_source_ancestry(
+        &self,
+        config: &SplitParams,
+        mappings: &MappingStore,
+        source_head: &str,
+    ) -> RailResult<()> {
+        let pairs = mappings.unproven_mapping_pairs();
+        if pairs.is_empty() {
+            return Ok(());
         }
-        Ok(String::from_utf8(output.stdout)?.trim().to_string())
-    }
-
-    fn write_exact_tree(&self, repo_path: &Path, entries: &[(String, String, PathBuf)]) -> RailResult<String> {
-        let index_path = tempfile::Builder::new()
-            .prefix("cargo-rail-index-")
-            .tempfile()
-            .context("Failed to allocate split Git index")?
-            .into_temp_path();
-        std::fs::remove_file(&index_path).context("Failed to initialize split Git index path")?;
-        let mut read_tree = git_cmd_for_path(repo_path);
-        let output = read_tree
-            .env("GIT_INDEX_FILE", &index_path)
-            .args(["read-tree", "--empty"])
-            .output()
-            .context("Failed to initialize exact-tree index")?;
-        if !output.status.success() {
-            return Err(RailError::message(format!(
-                "git read-tree --empty failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
-        }
-
-        if !entries.is_empty() {
-            let mut child = git_cmd_for_path(repo_path)
-                .env("GIT_INDEX_FILE", &index_path)
-                .args(["update-index", "-z", "--index-info"])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .context("Failed to start git update-index")?;
-            let mut stdin = child
-                .stdin
-                .take()
-                .ok_or_else(|| RailError::message("git update-index stdin was unavailable"))?;
-            for (mode, object_id, path) in entries {
-                let path = path
-                    .to_str()
-                    .ok_or_else(|| RailError::message(format!("split path '{}' is not valid UTF-8", path.display())))?;
-                write!(stdin, "{} {}\t{}\0", mode, object_id, path).context("Failed to populate exact-tree index")?;
-            }
-            drop(stdin);
-            let output = child.wait_with_output().context("Failed to finish git update-index")?;
-            if !output.status.success() {
-                return Err(RailError::message(format!(
-                    "git update-index --index-info failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                )));
+        let pending = source_commits_matching_policy(
+            self.ctx,
+            &config.path_capabilities,
+            &mappings.source_frontier_commits(),
+            source_head,
+        )?
+        .into_iter()
+        .filter(|commit| !mappings.has_mapping(&commit.sha))
+        .collect::<Vec<_>>();
+        for (source, _) in pairs {
+            for ancestor in &pending {
+                if is_ancestor(self.ctx.workspace_root(), &ancestor.sha, &source)? {
+                    return Err(RailError::with_help(
+                        format!(
+                            "exact predecessor mapping endpoint '{}' has unmatched source ancestor '{}' without directional frontier proof",
+                            source, ancestor.sha
+                        ),
+                        "restore authoritative directional origin history or resolve the mapping topology manually; cargo-rail will not guess ancestry or replay an ancestor after its mapped descendant",
+                    ));
+                }
             }
         }
+        Ok(())
+    }
 
-        let output = git_cmd_for_path(repo_path)
-            .env("GIT_INDEX_FILE", &index_path)
-            .arg("write-tree")
-            .output()
-            .context("Failed to write exact split tree")?;
-        if !output.status.success() {
-            return Err(RailError::message(format!(
-                "git write-tree failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
+    fn reconcile_publication(
+        &self,
+        config: &SplitParams,
+        expected: Option<&TargetPublicationSnapshot>,
+        origin: &OriginContext,
+    ) -> RailResult<usize> {
+        let Some(expected) = expected else {
+            return Ok(0);
+        };
+        let remote_url = config
+            .remote_url
+            .as_deref()
+            .ok_or_else(|| RailError::message("split publication authority has no configured remote URL"))?;
+        let target_git = SystemGit::open(&config.target_repo_path)?;
+        let target_identity = repository_identity(&config.target_repo_path)?;
+        let selected_head = target_git.head_commit()?;
+        let selected_source_head = self.ctx.git()?.git().head_commit()?;
+        let selected_source_heads = vec![selected_source_head];
+        let mappings = MappingStore::capture_v025_evidence_at(
+            self.ctx.workspace_root(),
+            &config.target_repo_path,
+            origin,
+            &target_identity,
+            &selected_head,
+            &selected_source_heads,
+        )?;
+        let actual = self
+            .capture_publication(config, Some(&mappings))?
+            .ok_or_else(|| RailError::message("split lost its configured publication authority"))?;
+        if !expected.same_remote_authority(&actual) {
+            return Err(RailError::with_help(
+                "configured remote branch advanced during split",
+                "fetch and retry; cargo-rail will not publish against a remote head different from the checked authority",
+            ));
         }
-        Ok(String::from_utf8(output.stdout)?.trim().to_string())
+        if !actual.permits_target_mutation() {
+            return Err(RailError::with_help(
+                "local split target is behind its configured remote branch",
+                "fast-forward the local target branch before splitting or publishing",
+            ));
+        }
+        let pending = actual.count();
+        if pending == 0 {
+            return Ok(0);
+        }
+        let desired = actual
+            .local_head()
+            .ok_or_else(|| RailError::message("split publication has no exact local commit"))?;
+        let store = GitEffectStore::open(&target_git)?;
+        let ref_name = format!("refs/heads/{}", config.branch);
+        let repository = store.capture_repository_authority(
+            &target_git,
+            repository_identity(&config.target_repo_path)?,
+            ref_name.clone(),
+            Some(desired.to_string()),
+            desired.to_string(),
+        )?;
+        let publication = GitPublicationEffect::new(
+            actual.remote_repository().to_string(),
+            remote_endpoint_identity(remote_url)?,
+            ref_name,
+            actual.remote_head().map(str::to_string),
+            desired.to_string(),
+        );
+        let intent = GitEffectIntent::new(
+            format!("split-publication-{}-{}", config.crate_name, actual.digest()),
+            repository,
+            None,
+            Vec::new(),
+            None,
+            Some(publication),
+            None,
+        )?;
+        let record = store.prepare(intent)?;
+        self.reconcile_split_publication_record(config, origin, &store, record)?;
+        Ok(pending)
     }
 
-    fn run_git_in_repo(repo_path: &Path, args: &[&str]) -> RailResult<std::process::Output> {
-        let mut cmd = git_cmd_for_path(repo_path);
-        cmd.args(args);
-        cmd.output()
-            .with_context(|| format!("Failed to execute git {}", args.join(" ")))
+    fn reconcile_split_publication_record(
+        &self,
+        config: &SplitParams,
+        origin: &OriginContext,
+        store: &GitEffectStore,
+        record: GitEffectRecord,
+    ) -> RailResult<()> {
+        match record {
+            GitEffectRecord::Active(mut active) => {
+                active.mark_local_applied()?;
+                self.reconcile_split_publication_journal(config, origin, store, active.journal())?;
+                active.mark_published()?;
+                let _completed = active.finish()?;
+                Ok(())
+            }
+            GitEffectRecord::Completed(completed) => {
+                self.reconcile_split_publication_journal(config, origin, store, completed.journal())
+            }
+        }
     }
 
-    /// Check if remote repository exists and has content
-    fn check_remote_exists(&self, remote_url: &str) -> RailResult<bool> {
-        self.ctx.git()?.git().ls_remote_has_content(remote_url)
+    fn reconcile_split_publication_journal(
+        &self,
+        config: &SplitParams,
+        origin: &OriginContext,
+        store: &GitEffectStore,
+        journal: &GitEffectJournal,
+    ) -> RailResult<()> {
+        let publication = journal
+            .publication()
+            .ok_or_else(|| RailError::message("prepared split publication has no remote authority"))?;
+        let remote_url = config
+            .remote_url
+            .as_deref()
+            .filter(|remote| !utils::is_local_path(remote))
+            .ok_or_else(|| RailError::message("prepared split publication lost its configured remote endpoint"))?;
+        let ref_name = format!("refs/heads/{}", config.branch);
+        if journal.repository().ref_name != ref_name
+            || publication.ref_name() != ref_name
+            || publication.desired_oid() != journal.repository().result_oid
+            || publication.logical_remote() != remote_repository_identity(remote_url)?
+            || publication.exact_endpoint_digest() != remote_endpoint_identity(remote_url)?
+        {
+            return Err(RailError::with_help(
+                "prepared split publication authority changed before publication",
+                "restore the exact target repository, branch, and configured endpoint before retrying",
+            ));
+        }
+        let target = SystemGit::open(&config.target_repo_path)?;
+        if target.exact_branch_ref_oid(&ref_name)?.as_deref() != Some(publication.desired_oid()) {
+            return Err(RailError::message(
+                "prepared split publication local branch is not at its exact desired commit",
+            ));
+        }
+        let target_identity = repository_identity(&config.target_repo_path)?;
+        let source_head = self.ctx.git()?.git().head_commit()?;
+        let mappings = MappingStore::capture_v025_evidence_at(
+            self.ctx.workspace_root(),
+            &config.target_repo_path,
+            origin,
+            &target_identity,
+            publication.desired_oid(),
+            &[source_head],
+        )?;
+        let actual = self
+            .capture_publication(config, Some(&mappings))?
+            .ok_or_else(|| RailError::message("prepared split publication lost remote authority"))?;
+        if actual.remote_repository() != publication.logical_remote()
+            || actual.local_head() != Some(publication.desired_oid())
+        {
+            return Err(RailError::message(
+                "prepared split publication no longer matches its exact local or remote repository",
+            ));
+        }
+        if actual.remote_head() == Some(publication.desired_oid()) {
+            return Ok(());
+        }
+        if actual.remote_head() != publication.expected_oid() {
+            return Err(RailError::with_help(
+                "prepared split publication found a third remote ref state",
+                "preserve the remote branch and reconcile it manually; cargo-rail will not overwrite an unjournaled commit",
+            ));
+        }
+        if !journal.matches_repository_authority(store, &target, Some(publication.desired_oid().to_string()))? {
+            return Err(RailError::message(
+                "prepared split publication repository authority changed before push",
+            ));
+        }
+        target.push_commit_to_url_with_lease(
+            remote_url,
+            publication.ref_name(),
+            publication.desired_oid(),
+            publication.expected_oid(),
+        )?;
+        let published = self
+            .capture_publication(config, Some(&mappings))?
+            .ok_or_else(|| RailError::message("prepared split publication lost authority after push"))?;
+        if published.remote_repository() != publication.logical_remote()
+            || published.remote_head() != Some(publication.desired_oid())
+            || published.local_head() != Some(publication.desired_oid())
+            || published.count() != 0
+        {
+            return Err(RailError::with_help(
+                "prepared split publication did not converge to its exact desired commit",
+                "inspect the local and remote branch heads before retrying",
+            ));
+        }
+        Ok(())
     }
 
     /// Execute a split operation (idempotent - re-runs sync new commits only)
     pub fn split(&self, config: &SplitParams) -> RailResult<()> {
-        self.split_with_pending_count(config).map(|_| ())
+        self.split_with_pending_count(config, None, None).map(|_| ())
     }
 
     /// Execute a split and return the exact pre-apply pending commit count.
-    pub(crate) fn split_with_pending_count(&self, config: &SplitParams) -> RailResult<usize> {
+    pub(crate) fn split_with_pending_count(
+        &self,
+        config: &SplitParams,
+        expected_origin_migration: Option<&MappingAuthoritySnapshot>,
+        expected_publication: Option<&TargetPublicationSnapshot>,
+    ) -> RailResult<usize> {
         let target = config.path_capabilities.authorize_target(&config.target_repo_path)?;
         if target != config.path_capabilities.target_root() {
             return Err(RailError::message(
@@ -541,6 +731,7 @@ impl<'a> SplitEngine<'a> {
             }
         }
         config.path_capabilities.validate_target_repository()?;
+        self.validate_target_repo(&config.path_capabilities, &config.branch)?;
         progress!("Splitting crate: {}", config.crate_name);
         progress!("   Mode: {}", split_mode_name(&config.mode));
         progress!("   Target: {}", config.target_repo_path.display());
@@ -549,68 +740,172 @@ impl<'a> SplitEngine<'a> {
             progress!("   Explicit non-Cargo assets: {}", config.asset_paths.len());
         }
 
-        // Check if target repo already exists (for idempotency)
-        let target_exists = config.target_repo_path.join(".git").exists();
+        let origin = if let Some(expected) = expected_origin_migration {
+            OriginContext::new(
+                expected.source_repository().to_string(),
+                &config.crate_name,
+                &config.ownership.snapshot_id,
+            )?
+        } else {
+            OriginContext::discover(
+                self.ctx.workspace_root(),
+                &config.crate_name,
+                &config.ownership.snapshot_id,
+            )?
+        };
+        let recovered_pre_authority = self
+            .resume_active_split_effect(config, &origin, expected_origin_migration)
+            .map_err(|error| {
+                if !config.target_repo_path.join(".git").exists() {
+                    split_mapping_authority_changed_error("target repository disappearance")
+                } else {
+                    error
+                }
+            })?;
+        let target_ref = format!("refs/heads/{}", config.branch);
 
-        // Check if remote already exists - warn but allow re-run for idempotency
-        if let Some(ref remote_url) = config.remote_url {
-            let remote_exists = self.check_remote_exists(remote_url)?;
-            if remote_exists && !target_exists {
-                // Remote exists but no local target - user probably wants to use sync instead
-                return Err(RailError::with_help(
-                    format!("Split already exists at {}", remote_url),
-                    format!(
-                        "Split is a one-time operation. To update the split repo, use:\n  \
-             cargo rail sync {}\n\n\
-             This will sync new commits from the monorepo to the split repo.",
-                        config.crate_name
-                    ),
-                ));
+        // Reuse an exact zero-migration authority captured by the command.
+        // The source and target scalar refs are checked again immediately
+        // before the prepared effect is journaled; recapturing them here would
+        // only repeat the same probes before any mutation is possible.
+        let (captured_store, captured_origin) = if let Some(expected) = expected_origin_migration
+            && expected.count() == 0
+            && recovered_pre_authority.is_none()
+        {
+            (MappingStore::from_current_snapshot(expected)?, expected.clone())
+        } else {
+            // Recapture both mapping and publication authority before the
+            // first target effect when no checked authority can be reused.
+            // The read-only store also proves every commit in an ahead
+            // publication retry is Cargo-Rail-owned.
+            let target_git = SystemGit::open(&config.target_repo_path)?;
+            let selected_target_head = target_git.exact_branch_ref_oid(&target_ref)?;
+            if selected_target_head.is_none() {
+                (
+                    MappingStore::new(config.crate_name.clone()),
+                    MappingAuthoritySnapshot::empty_initialized(
+                        self.ctx.workspace_root(),
+                        &origin,
+                        &config.target_repo_path,
+                        config.path_capabilities.target_root(),
+                        &config.branch,
+                        "mono_to_remote",
+                    )?,
+                )
+            } else {
+                let target_identity =
+                    crate::git::mappings::repository_identity_from_git(&target_git, selected_target_head.as_deref())
+                        .map_err(|error| {
+                            if expected_origin_migration.is_some() && !config.target_repo_path.join(".git").exists() {
+                                split_mapping_authority_changed_error("target initialization")
+                            } else {
+                                error
+                            }
+                        })?;
+                if let Some(selected_target_head) =
+                    expected_origin_migration.and_then(MappingAuthoritySnapshot::target_selected_head)
+                {
+                    MappingStore::capture_v025_authority_at(
+                        self.ctx.workspace_root(),
+                        &config.target_repo_path,
+                        &origin,
+                        &target_identity,
+                        config.path_capabilities.target_root(),
+                        &config.branch,
+                        "mono_to_remote",
+                        selected_target_head,
+                    )?
+                } else {
+                    MappingStore::capture_v025_authority(
+                        self.ctx.workspace_root(),
+                        &config.target_repo_path,
+                        &origin,
+                        &target_identity,
+                        config.path_capabilities.target_root(),
+                        &config.branch,
+                        "mono_to_remote",
+                    )?
+                }
             }
-            // If both remote and target exist, we'll check mappings below for idempotency
+        };
+        if expected_origin_migration.is_some_and(|expected| {
+            expected != &captured_origin && recovered_pre_authority.as_deref() != Some(expected.digest().as_str())
+        }) {
+            return Err(split_mapping_authority_changed_error("checked predecessor capture"));
         }
-
-        // Create or reuse target repo
-        self.ensure_target_repo(&config.path_capabilities, &config.branch)?;
-        self.import_source_objects(&config.target_repo_path)?;
-        let origin = OriginContext::discover(
-            self.ctx.workspace_root(),
-            &config.crate_name,
-            &config.ownership.snapshot_id,
+        validate_predecessor_mapping_projections(
+            self.ctx,
+            &self.transform,
+            &config.crate_paths,
+            &config.path_capabilities,
+            &config.target_repo_path,
+            &config.mode,
+            &config.workspace_mode,
+            &captured_origin,
         )?;
-
-        // Ordinary history is authoritative. Legacy notes are read only so a later
-        // migration commit can carry their exact mappings into normal history.
-        let mut mapping_store = MappingStore::new(config.crate_name.clone());
-        if target_exists {
-            let target_identity = repository_identity(&config.target_repo_path)?;
-            mapping_store.load_history(self.ctx.workspace_root(), HistorySide::Source, &target_identity)?;
-            mapping_store.load_history(
-                &config.target_repo_path,
-                HistorySide::Target,
-                origin.source_repository(),
-            )?;
+        self.validate_unproven_source_ancestry(config, &captured_store, captured_origin.source_head())?;
+        let bound_publication =
+            self.revalidate_publication_before_target_effect(config, expected_publication, Some(&captured_store))?;
+        let dirty_target_paths = SystemGit::open(&config.target_repo_path)?.obstructing_worktree_paths()?;
+        if !dirty_target_paths.is_empty() {
+            return Err(RailError::with_help(
+                format!(
+                    "split target became dirty after planning: {}",
+                    dirty_target_paths
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                "commit or restore target work and restart; cargo-rail will not reset staged, unstaged, or untracked target bytes",
+            ));
         }
-        mapping_store.load_legacy_notes(self.ctx.workspace_root())?;
-        mapping_store.load_legacy_notes(&config.target_repo_path)?;
-        if target_exists
-            && SystemGit::open(&config.target_repo_path)
-                .and_then(|git| git.head_commit())
-                .is_ok()
-            && mapping_store.count() == 0
+        if SystemGit::open(&config.target_repo_path)?
+            .exact_branch_ref_oid(&target_ref)?
+            .is_some()
+            && captured_store.count() == 0
         {
             return Err(RailError::with_help(
                 "existing split target has no cargo-rail origin evidence",
-                "choose an empty target or migrate the target's legacy trailers/notes before splitting",
+                "choose an empty target or initialize it with a validated current Rail-Origin pair before splitting",
             ));
         }
 
+        // Migrate only the exact checked predecessor set before importing
+        // objects or changing any reconstructed target history.
+        let migration_required =
+            captured_origin.count() > 0 || expected_origin_migration.is_some_and(|expected| expected.count() > 0);
+        let mut mapping_store = if captured_origin.target_head().is_some() && migration_required {
+            let target_identity = repository_identity(&config.target_repo_path)?;
+            let mut store = captured_store;
+            let migrated = store
+                .migrate_v025_evidence_bound(
+                    self.ctx.workspace_root(),
+                    &config.target_repo_path,
+                    &origin,
+                    &target_identity,
+                    config.path_capabilities.target_root(),
+                    &config.branch,
+                    "mono_to_remote",
+                    expected_origin_migration,
+                )
+                .map_err(|error| {
+                    if expected_origin_migration.is_some() && !config.target_repo_path.join(".git").exists() {
+                        split_mapping_authority_changed_error("predecessor migration")
+                    } else {
+                        error
+                    }
+                })?;
+            if migrated.is_some() {
+                progress!("   Migrated predecessor mappings into ordinary Git history");
+            }
+            store
+        } else {
+            captured_store
+        };
+
         // Walk filtered history to find commits touching the crate
-        let mut owned_paths = config.crate_paths.clone();
-        owned_paths.extend(config.asset_paths.iter().cloned());
-        owned_paths.sort();
-        owned_paths.dedup();
-        let filtered_commits = self.walk_filtered_history(&owned_paths)?;
+        let filtered_commits = self.walk_filtered_history(&config.path_capabilities, captured_origin.source_head())?;
 
         // Count how many commits are already mapped (for idempotency)
         let already_mapped_count = filtered_commits
@@ -625,11 +920,10 @@ impl<'a> SplitEngine<'a> {
 
         // Check if all commits are already mapped - nothing to do
         if already_mapped_count == filtered_commits.len() && !filtered_commits.is_empty() {
-            config.path_capabilities.validate_target_repository()?;
-            mapping_store.migrate_legacy_mappings(&config.target_repo_path, &origin)?;
             progress!("Split already up to date.");
             progress!("   All {} commits have been split previously.", filtered_commits.len());
             progress!("   Target repo: {}", config.target_repo_path.display());
+            self.reconcile_publication(config, bound_publication.as_ref(), &origin)?;
             return Ok(0);
         }
 
@@ -639,20 +933,39 @@ impl<'a> SplitEngine<'a> {
                 "commit the Cargo members and explicit assets before splitting",
             ));
         } else {
-            // Recreate history in target repo
+            // Prepare the complete pending history in one private object view.
+            // No target object, ref, index, or worktree state changes until the
+            // exact chain, path transitions, and post-mapping authority are
+            // durably journaled together.
             progress!("   Processing {} commits...", filtered_commits.len());
 
-            let mut last_recreated_sha: Option<String> = None;
+            let target_git = SystemGit::open(&config.target_repo_path)?;
+            let target_ref = format!("refs/heads/{}", config.branch);
+            let expected_target_head = target_git.exact_branch_ref_oid(&target_ref)?;
+            let pre_authority = if expected_target_head.is_some() {
+                mapping_store.mapping_authority_snapshot(
+                    "mono_to_remote",
+                    config.path_capabilities.target_root(),
+                    &config.branch,
+                )?
+            } else {
+                captured_origin.clone()
+            };
+            if pre_authority.target_head() != expected_target_head.as_deref() {
+                return Err(split_mapping_authority_changed_error("prepared target HEAD"));
+            }
+            let quarantine = target_git.object_quarantine()?;
+            if let Some(expected) = expected_target_head.as_deref() {
+                quarantine.import_object_closure(&target_git, &[expected])?;
+            }
+
+            let mut last_recreated_sha = expected_target_head.clone();
             let mut skipped_commits = 0usize;
             let skipped_already_mapped = already_mapped_count;
-
-            // Incremental history continues from the actual target head so migration
-            // and evidence commits remain reachable.
-            if target_exists {
-                last_recreated_sha = SystemGit::open(&config.target_repo_path)
-                    .and_then(|git| git.head_commit())
-                    .ok();
-            }
+            let mut prepared_last = None::<PreparedSplitCommit>;
+            let mut final_entries = Vec::<GitTreeEntry>::new();
+            let mut new_mappings = Vec::<(String, String)>::new();
+            let mut new_target_evidence = Vec::<(String, String)>::new();
 
             // Filter out already-mapped commits upfront for accurate counting and windowing
             let commits_to_process: Vec<&CommitInfo> = filtered_commits
@@ -677,7 +990,34 @@ impl<'a> SplitEngine<'a> {
                         progress!("   Prefetching exact trees and transform inputs in parallel...");
                     }
                 }
-                let prefetched = self.prefetch_commit_files(window, &owned_paths)?;
+                let prefetched = self.prefetch_commit_files(window, &config.path_capabilities)?;
+                let imported_objects = prefetched
+                    .imported_objects
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                quarantine.import_object_closure(self.ctx.git()?.git(), &imported_objects)?;
+                let mut manifest_inputs = prefetched.blobs.iter().collect::<Vec<_>>();
+                manifest_inputs.sort_by(|left, right| left.0.cmp(right.0));
+                let target_has_workspace =
+                    config.mode == SplitMode::Combined && config.workspace_mode == WorkspaceMode::Workspace;
+                let transformed = manifest_inputs
+                    .iter()
+                    .map(|(_, content)| {
+                        let content = std::str::from_utf8(content)
+                            .map_err(|_| RailError::message("prefetched split manifest is not valid UTF-8"))?;
+                        Ok(self
+                            .transform
+                            .transform_to_split(content, target_has_workspace)?
+                            .into_bytes())
+                    })
+                    .collect::<RailResult<Vec<_>>>()?;
+                let manifest_objects = quarantine.write_blobs(&transformed)?;
+                let prefetched_manifest_objects = manifest_inputs
+                    .into_iter()
+                    .map(|(object_id, _)| object_id.clone())
+                    .zip(manifest_objects)
+                    .collect::<FxHashMap<_, _>>();
 
                 // Process this window's commits
                 for (idx_in_window, commit) in window.iter().enumerate() {
@@ -690,32 +1030,34 @@ impl<'a> SplitEngine<'a> {
                     // Use prefetched files if available
                     let prefetched_files = prefetched.entries.get(&commit.sha);
 
-                    let maybe_sha = self.recreate_commit_in_target(&RecreateCommitParams {
+                    let maybe_prepared = self.prepare_commit_in_quarantine(&RecreateCommitParams {
                         commit,
-                        source_paths: &owned_paths,
                         crate_paths: &config.crate_paths,
-                        target_repo_path: &config.target_repo_path,
                         mode: &config.mode,
                         workspace_mode: &config.workspace_mode,
                         mapping_store: &mapping_store,
                         origin: &origin,
                         last_recreated_sha: last_recreated_sha.as_deref(),
+                        quarantine: &quarantine,
                         prefetched_files,
-                        prefetched_blobs: &prefetched.blobs,
+                        prefetched_manifest_objects: &prefetched_manifest_objects,
                         path_capabilities: &config.path_capabilities,
                     })?;
 
                     // Handle skipped commits (dirty history - path didn't exist at this commit)
-                    let Some(new_sha) = maybe_sha else {
+                    let Some(prepared) = maybe_prepared else {
                         skipped_commits += 1;
                         continue;
                     };
 
-                    // Record mapping
-                    mapping_store.record_mapping(&commit.sha, &new_sha)?;
+                    // Advance only the private preparation view. The ordinary
+                    // history remains the durable authority after reconciliation.
+                    mapping_store.record_source_frontier_mapping(&commit.sha, &prepared.oid)?;
+                    new_mappings.push((commit.sha.clone(), prepared.oid.clone()));
 
-                    // Track last recreated commit
-                    last_recreated_sha = Some(new_sha);
+                    last_recreated_sha = Some(prepared.oid.clone());
+                    final_entries.clone_from(&prepared.entries);
+                    prepared_last = Some(prepared);
                 }
 
                 // The bounded prefetch window is dropped here,
@@ -740,54 +1082,77 @@ impl<'a> SplitEngine<'a> {
             // Create workspace Cargo.toml if in workspace mode
             if config.mode == SplitMode::Combined && config.workspace_mode == WorkspaceMode::Workspace {
                 progress!("   Creating workspace Cargo.toml...");
-                self.create_workspace_cargo_toml(
-                    &config.crate_paths,
-                    &config.target_repo_path,
-                    &config.path_capabilities,
-                )?;
+                let bytes = self.render_workspace_cargo_toml(&config.crate_paths, captured_origin.source_head())?;
+                let object_id = quarantine.write_blob(&bytes)?;
+                let path = PathBuf::from("Cargo.toml");
+                config.path_capabilities.authorize_target(&path)?;
+                final_entries.retain(|entry| entry.path != path);
+                final_entries.push(GitTreeEntry {
+                    mode: "100644".to_string(),
+                    object_id,
+                    path,
+                });
+                final_entries.sort_by(|left, right| left.path.cmp(&right.path));
+                let tree = quarantine.write_exact_tree(&final_entries)?;
+                let source_head = self.ctx.git()?.git().get_commit(captured_origin.source_head())?;
+                let message = append_origin_trailers(
+                    "Add split-owned repository files",
+                    &[origin.evidence_trailer(&source_head.sha)?],
+                );
+                let parents = last_recreated_sha.into_iter().collect::<Vec<_>>();
+                let metadata = source_head.metadata();
+                let oid = quarantine.write_commit(&tree, &parents, &message, &metadata)?;
+                new_target_evidence.push((source_head.sha, oid.clone()));
+                prepared_last = Some(PreparedSplitCommit {
+                    oid,
+                    tree,
+                    message,
+                    metadata,
+                    parents,
+                    entries: final_entries.clone(),
+                });
             }
-        }
 
-        config.path_capabilities.validate_target_repository()?;
-        let target_git = SystemGit::open(&config.target_repo_path)?;
-        let changed_paths = target_git.changed_paths()?;
-        if !changed_paths.is_empty() {
-            for path in &changed_paths {
-                config.path_capabilities.authorize_target(path)?;
-            }
-            let source_head = self.ctx.git()?.git().get_commit("HEAD")?;
-            let message = append_origin_trailers(
-                "Add split-owned repository files",
-                &[origin.evidence_trailer(&source_head.sha)?],
-            );
-            let parent_shas = target_git.head_commit().ok().into_iter().collect::<Vec<_>>();
-            target_git.create_commit_with_metadata(&message, &source_head.metadata(), &parent_shas, &changed_paths)?;
-        }
-
-        config.path_capabilities.validate_target_repository()?;
-        mapping_store.migrate_legacy_mappings(&config.target_repo_path, &origin)?;
-
-        // Push to remote if URL is configured and is not a local file path
-        if let Some(ref remote_url) = config.remote_url {
-            if !remote_url.is_empty() && !utils::is_local_path(remote_url) {
-                progress!("Pushing to remote...");
-
-                // Open the target repo
-                let target_git = SystemGit::open(&config.target_repo_path)?;
-
-                // Add or update remote
-                if !target_git.has_remote("origin")? {
-                    progress!("   Adding remote 'origin': {}", remote_url);
-                    target_git.add_remote("origin", remote_url)?;
-                } else {
-                    progress!("   Remote 'origin' already exists");
-                }
-
-                // Push to remote
-                target_git.push_to_remote("origin", &config.branch)?;
-
-                progress!("   Pushed to {}", remote_url);
+            let prepared = prepared_last
+                .ok_or_else(|| RailError::message("split preparation produced no ordinary-history commit"))?;
+            let result_repository = if expected_target_head.is_none()
+                && config.remote_url.as_deref().is_none_or(crate::utils::is_local_path)
+            {
+                let root = new_mappings
+                    .first()
+                    .map(|(_, target)| target.clone())
+                    .ok_or_else(|| RailError::message("prepared split chain has no root mapping"))?;
+                crate::git::mappings::repository_identity_from_roots([root])?
             } else {
+                pre_authority
+                    .target_repository()
+                    .ok_or_else(|| RailError::message("prepared split authority lost its target repository"))?
+                    .to_string()
+            };
+            let post_authority = pre_authority.after_split_chain(
+                &new_mappings,
+                &new_target_evidence,
+                &prepared.oid,
+                result_repository,
+            )?;
+            let transitions =
+                self.split_path_transitions(&target_git, expected_target_head.as_deref(), &prepared.entries)?;
+            self.apply_prepared_split_chain(
+                config,
+                &origin,
+                &pre_authority,
+                &post_authority,
+                &quarantine,
+                &prepared,
+                transitions,
+                &mut mapping_store,
+                bound_publication.as_ref(),
+            )?;
+        }
+
+        config.path_capabilities.validate_target_repository()?;
+        if let Some(ref remote_url) = config.remote_url {
+            if remote_url.is_empty() || utils::is_local_path(remote_url) {
                 progress!("Split repository created locally.");
                 if utils::is_local_path(remote_url) {
                     progress!("   Note: Remote is a local path, skipping push");
@@ -817,100 +1182,712 @@ impl<'a> SplitEngine<'a> {
         Ok(pending_commits)
     }
 
-    /// Ensure target repository exists and is initialized
-    fn ensure_target_repo(&self, paths: &SplitPathCapabilities, branch: &str) -> RailResult<()> {
-        let target_path = paths.authorize_target(paths.target_root())?;
-        if !target_path.exists() {
-            std::fs::create_dir_all(&target_path)
-                .with_context(|| format!("Failed to create target directory: {}", target_path.display()))?;
+    /// Reconcile the one durable target-branch effect before deriving fresh
+    /// pending work. Returning the pre-effect digest lets an exact saved plan
+    /// complete recovery even when the branch ref already reached the bound
+    /// post-effect commit before the previous process stopped.
+    fn resume_active_split_effect(
+        &self,
+        config: &SplitParams,
+        origin: &OriginContext,
+        expected_plan: Option<&MappingAuthoritySnapshot>,
+    ) -> RailResult<Option<String>> {
+        let target = SystemGit::open(&config.target_repo_path)?;
+        let ref_name = format!("refs/heads/{}", config.branch);
+        let mut matching = GitEffectStore::discover_unacknowledged_read_only(&target)?
+            .into_iter()
+            .filter(|journal| journal.repository().ref_name == ref_name)
+            .collect::<Vec<_>>();
+        if matching.is_empty() {
+            return Ok(None);
+        }
+        if matching.len() != 1 {
+            return Err(RailError::message(format!(
+                "split target branch '{ref_name}' has multiple active prepared effects"
+            )));
+        }
+        let journal = matching.pop().expect("one active split effect");
+        if journal
+            .operation_id()
+            .starts_with(&format!("split-publication-{}-sha256-", config.crate_name))
+            && journal.mapping().is_none()
+            && journal.publication().is_some()
+        {
+            let store = GitEffectStore::open(&target)?;
+            let record = store.resume(journal.effect_id())?;
+            self.reconcile_split_publication_record(config, origin, &store, record)?;
+            return Ok(None);
+        }
+        let mapping = journal
+            .mapping()
+            .ok_or_else(|| RailError::message("active split target effect has no mapping authority"))?;
+        let pre_digest = mapping.pre_authority().to_string();
+        if mapping.migration_count() > 0 {
+            let target_identity = repository_identity(&config.target_repo_path)?;
+            let mut mappings = MappingStore::new(config.crate_name.clone());
+            mappings.migrate_v025_evidence_bound(
+                self.ctx.workspace_root(),
+                &config.target_repo_path,
+                origin,
+                &target_identity,
+                config.path_capabilities.target_root(),
+                &config.branch,
+                "mono_to_remote",
+                expected_plan,
+            )?;
+            return Ok(Some(pre_digest));
+        }
+        if !journal.operation_id().starts_with("split-chain-sha256-") {
+            return Err(RailError::with_help(
+                format!(
+                    "split target branch '{ref_name}' has unrelated active effect '{}'",
+                    journal.effect_id()
+                ),
+                "finish or reconcile that exact prepared effect before starting split",
+            ));
+        }
+        let store = GitEffectStore::open(&target)?;
+        let record = store.resume(journal.effect_id())?;
+        self.reconcile_resumed_split_record(config, origin, expected_plan, &store, record)?;
+        Ok(Some(pre_digest))
+    }
+
+    fn reconcile_resumed_split_record(
+        &self,
+        config: &SplitParams,
+        origin: &OriginContext,
+        expected_plan: Option<&MappingAuthoritySnapshot>,
+        store: &GitEffectStore,
+        record: GitEffectRecord,
+    ) -> RailResult<()> {
+        match record {
+            GitEffectRecord::Active(mut active) => {
+                self.reconcile_resumed_split_journal(config, origin, expected_plan, store, active.journal())?;
+                active.mark_local_applied()?;
+                if active.journal().publication().is_some() {
+                    self.reconcile_split_publication_journal(config, origin, store, active.journal())?;
+                    active.mark_published()?;
+                }
+                let _completed = active.finish()?;
+                Ok(())
+            }
+            GitEffectRecord::Completed(completed) => {
+                self.reconcile_resumed_split_journal(config, origin, expected_plan, store, completed.journal())?;
+                if completed.journal().publication().is_some() {
+                    self.reconcile_split_publication_journal(config, origin, store, completed.journal())?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn reconcile_resumed_split_journal(
+        &self,
+        config: &SplitParams,
+        origin: &OriginContext,
+        _expected_plan: Option<&MappingAuthoritySnapshot>,
+        store: &GitEffectStore,
+        journal: &GitEffectJournal,
+    ) -> RailResult<()> {
+        let target = SystemGit::open(&config.target_repo_path)?;
+        let repository = journal.repository();
+        let mapping = journal
+            .mapping()
+            .ok_or_else(|| RailError::message("prepared split effect has no mapping authority"))?;
+        let commit = journal
+            .commit()
+            .ok_or_else(|| RailError::message("prepared split effect has no commit"))?;
+        let bundle_digest = journal
+            .object_bundle_digest()
+            .ok_or_else(|| RailError::message("prepared split effect has no object bundle"))?;
+        let target_identity = repository_identity(&config.target_repo_path)?;
+        let expected_ref = format!("refs/heads/{}", config.branch);
+        let mut mismatches = Vec::new();
+        if !journal.operation_id().starts_with("split-chain-sha256-") {
+            mismatches.push("operation");
+        }
+        if mapping.owner() != config.crate_name {
+            mismatches.push("owner");
+        }
+        if mapping.ownership_snapshot() != config.ownership.snapshot_id {
+            mismatches.push("ownership");
+        }
+        if mapping.migration_count() != 0 || mapping.migration_digest().is_some() {
+            mismatches.push("migration");
+        }
+        if repository.ref_name != expected_ref {
+            mismatches.push("branch");
+        }
+        if repository.result_oid != commit.oid() {
+            mismatches.push("result");
+        }
+        if !mismatches.is_empty() {
+            return Err(RailError::message(format!(
+                "active prepared split journal does not match the current split authority: {}",
+                mismatches.join(", ")
+            )));
+        }
+        for transition in journal.paths() {
+            config.path_capabilities.authorize_target(transition.path())?;
+        }
+        let current_head = target.exact_branch_ref_oid(&repository.ref_name)?;
+        if current_head.as_deref() != repository.expected_oid.as_deref()
+            && current_head.as_deref() != Some(repository.result_oid.as_str())
+        {
+            return Err(RailError::message("prepared split branch changed to a third ref state"));
+        }
+        if current_head.as_deref() == repository.expected_oid.as_deref()
+            && repository.logical_repository != target_identity
+        {
+            return Err(RailError::message(
+                "active prepared split journal old repository identity changed",
+            ));
+        }
+        let current_repository = store.capture_repository_authority(
+            &target,
+            repository.logical_repository.clone(),
+            repository.ref_name.clone(),
+            current_head.clone(),
+            repository.result_oid.clone(),
+        )?;
+        if current_repository.common_dir_identity != repository.common_dir_identity
+            || current_repository.worktree_identity != repository.worktree_identity
+            || current_repository.object_format != repository.object_format
+            || current_repository.ref_name != repository.ref_name
+            || current_repository.symbolic_head != repository.symbolic_head
+        {
+            return Err(RailError::message(
+                "prepared split repository authority changed during recovery",
+            ));
+        }
+        let current_authority = self.capture_current_split_authority(config, origin)?.1;
+        let expected_digest = if current_head.as_deref() == repository.expected_oid.as_deref() {
+            self.validate_split_path_images(&target, journal, true)?;
+            mapping.pre_authority()
+        } else {
+            mapping.post_authority()
+        };
+        if current_authority.digest() != expected_digest {
+            return Err(RailError::with_help(
+                format!(
+                    "active prepared split mapping authority is '{}', expected '{}' for the observed ref state",
+                    current_authority.digest(),
+                    expected_digest
+                ),
+                "restore the exact prepared ref and ordinary-history authority before retrying",
+            ));
         }
 
-        // Check if it's already a git repo
-        let git_dir = target_path.join(".git");
-        if !git_dir.exists() {
-            progress!("   Initializing git repository at {}", target_path.display());
+        let bundle = store
+            .open_object_bundle(journal.effect_id(), bundle_digest)?
+            .ok_or_else(|| RailError::message("prepared split object bundle disappeared"))?;
+        target.install_prepared_object_pack_and_update_ref(
+            bundle.into_file(),
+            &store.object_bundle_path(journal.effect_id())?,
+            bundle_digest,
+            commit,
+            &repository.ref_name,
+            repository.expected_oid.as_deref(),
+            journal.effect_id(),
+        )?;
+        #[cfg(test)]
+        {
+            fail_split_after_ref_cas()?;
+        }
+        if !journal.matches_repository_authority(store, &target, Some(repository.result_oid.clone()))? {
+            return Err(RailError::message(
+                "prepared split repository authority changed before final materialization",
+            ));
+        }
+        self.validate_split_journal_tree_images(&target, journal)?;
+        let paths = journal
+            .paths()
+            .iter()
+            .map(|transition| transition.path().to_path_buf())
+            .collect::<Vec<_>>();
+        target.reconcile_prepared_commit_paths(repository.expected_oid.as_deref(), &repository.result_oid, &paths)?;
+        let actual_post = self.capture_current_split_authority(config, origin)?.1;
+        if actual_post.digest() != mapping.post_authority() {
+            return Err(RailError::with_help(
+                format!(
+                    "recovered split mapping authority is '{}', expected '{}'",
+                    actual_post.digest(),
+                    mapping.post_authority()
+                ),
+                "do not start new split work until the prepared effect is exactly reconciled",
+            ));
+        }
+        Ok(())
+    }
 
-            paths.validate_target_repository()?;
-            crate::git::init_repo(&target_path, branch)?;
+    fn split_path_transitions(
+        &self,
+        target: &SystemGit,
+        expected: Option<&str>,
+        result_entries: &[GitTreeEntry],
+    ) -> RailResult<Vec<GitPathTransition>> {
+        let old_entries = expected.map_or_else(
+            || Ok(Vec::new()),
+            |expected| target.collect_tree_entries(expected, Path::new(".")),
+        )?;
+        let old = old_entries
+            .into_iter()
+            .map(|entry| (entry.path, GitPathImage::entry(entry.mode, entry.object_id)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut new = std::collections::BTreeMap::new();
+        for entry in result_entries {
+            if entry.mode == "160000" {
+                return Err(RailError::message(format!(
+                    "split result path '{}' is an unsupported gitlink",
+                    entry.path.display()
+                )));
+            }
+            if new
+                .insert(
+                    entry.path.clone(),
+                    GitPathImage::entry(entry.mode.clone(), entry.object_id.clone()),
+                )
+                .is_some()
+            {
+                return Err(RailError::message(format!(
+                    "split result repeats target path '{}'",
+                    entry.path.display()
+                )));
+            }
+        }
+        let paths = old
+            .keys()
+            .chain(new.keys())
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        paths
+            .into_iter()
+            .filter_map(|path| {
+                let old = old.get(&path).cloned().unwrap_or(GitPathImage::Absent);
+                let new = new.get(&path).cloned().unwrap_or(GitPathImage::Absent);
+                (old != new).then(|| GitPathTransition::new(&path, old, new))
+            })
+            .collect()
+    }
 
-            paths.validate_target_repository()?;
-            self.configure_git_identity(&target_path)?;
-        } else {
-            paths.validate_target_repository()?;
-            let current_branch = SystemGit::open(&target_path)?.current_branch()?;
-            if current_branch != branch {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "split recovery validates each persisted and live authority independently"
+    )]
+    fn apply_prepared_split_chain(
+        &self,
+        config: &SplitParams,
+        origin: &OriginContext,
+        pre_authority: &MappingAuthoritySnapshot,
+        post_authority: &MappingAuthoritySnapshot,
+        quarantine: &GitObjectQuarantine,
+        prepared: &PreparedSplitCommit,
+        transitions: Vec<GitPathTransition>,
+        mapping_store: &mut MappingStore,
+        publication: Option<&TargetPublicationSnapshot>,
+    ) -> RailResult<()> {
+        let target = SystemGit::open(&config.target_repo_path)?;
+        let target_identity = crate::git::mappings::repository_identity_from_git(&target, pre_authority.target_head())?;
+        if pre_authority.target_repository() != Some(target_identity.as_str()) {
+            return Err(split_mapping_authority_changed_error("target repository identity"));
+        }
+        let store = GitEffectStore::open(&target)?;
+        let ref_name = format!("refs/heads/{}", config.branch);
+        let repository = store.capture_repository_authority(
+            &target,
+            target_identity,
+            ref_name,
+            pre_authority.target_head().map(str::to_string),
+            prepared.oid.clone(),
+        )?;
+        let mapping = GitMappingBinding::new(
+            pre_authority.owner().to_string(),
+            pre_authority.ownership_snapshot().to_string(),
+            pre_authority.digest(),
+            post_authority.digest(),
+            None,
+            0,
+        );
+        let commit = GitCommitEffect::new(
+            prepared.oid.clone(),
+            prepared.tree.clone(),
+            prepared.parents.clone(),
+            prepared.message.clone(),
+            GitEffectCommitMetadata::from(&prepared.metadata),
+        );
+        let publication = publication
+            .map(|publication| -> RailResult<GitPublicationEffect> {
+                let remote_url = config
+                    .remote_url
+                    .as_deref()
+                    .ok_or_else(|| RailError::message("checked split publication has no configured remote endpoint"))?;
+                Ok(GitPublicationEffect::new(
+                    publication.remote_repository().to_string(),
+                    remote_endpoint_identity(remote_url)?,
+                    format!("refs/heads/{}", config.branch),
+                    publication.remote_head().map(str::to_string),
+                    prepared.oid.clone(),
+                ))
+            })
+            .transpose()?;
+        let mut bundle = store.create_object_bundle_temp()?;
+        let bundle_digest = quarantine.write_pack(&prepared.oid, pre_authority.target_head(), bundle.file_mut()?)?;
+        let intent = GitEffectIntent::new(
+            format!("split-chain-{}", post_authority.digest()),
+            repository,
+            Some(commit),
+            transitions,
+            Some(mapping),
+            publication,
+            Some(bundle_digest.clone()),
+        )?;
+        let effect_id = intent.effect_id()?;
+        drop(bundle.persist(&effect_id, &bundle_digest)?);
+
+        pre_authority
+            .revalidate_split_repository_state(self.ctx.workspace_root(), &config.target_repo_path)
+            .map_err(|error| {
+                RailError::with_help(
+                    format!("split mapping authority changed after it was checked: {error}"),
+                    "retry after the source and target repositories stop changing",
+                )
+            })?;
+        self.revalidate_clean_target(&config.target_repo_path)?;
+        let record = store.prepare(intent)?;
+        self.reconcile_prepared_split_record(
+            config,
+            origin,
+            pre_authority,
+            post_authority,
+            &store,
+            record,
+            mapping_store,
+        )?;
+        Ok(())
+    }
+
+    fn capture_current_split_authority(
+        &self,
+        config: &SplitParams,
+        origin: &OriginContext,
+    ) -> RailResult<(MappingStore, MappingAuthoritySnapshot)> {
+        let target = SystemGit::open(&config.target_repo_path)?;
+        let target_ref = format!("refs/heads/{}", config.branch);
+        if target.exact_branch_ref_oid(&target_ref)?.is_none() {
+            return Ok((
+                MappingStore::new(config.crate_name.clone()),
+                MappingAuthoritySnapshot::empty_initialized(
+                    self.ctx.workspace_root(),
+                    origin,
+                    &config.target_repo_path,
+                    config.path_capabilities.target_root(),
+                    &config.branch,
+                    "mono_to_remote",
+                )?,
+            ));
+        }
+        let target_identity = repository_identity(&config.target_repo_path)?;
+        MappingStore::capture_v025_authority(
+            self.ctx.workspace_root(),
+            &config.target_repo_path,
+            origin,
+            &target_identity,
+            config.path_capabilities.target_root(),
+            &config.branch,
+            "mono_to_remote",
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "split commit preparation binds every exact repository transition"
+    )]
+    fn reconcile_prepared_split_record(
+        &self,
+        config: &SplitParams,
+        origin: &OriginContext,
+        pre_authority: &MappingAuthoritySnapshot,
+        post_authority: &MappingAuthoritySnapshot,
+        store: &GitEffectStore,
+        record: GitEffectRecord,
+        mapping_store: &mut MappingStore,
+    ) -> RailResult<()> {
+        match record {
+            GitEffectRecord::Active(mut active) => {
+                self.reconcile_prepared_split_journal(
+                    config,
+                    origin,
+                    pre_authority,
+                    post_authority,
+                    store,
+                    active.journal(),
+                    mapping_store,
+                )?;
+                active.mark_local_applied()?;
+                if active.journal().publication().is_some() {
+                    self.reconcile_split_publication_journal(config, origin, store, active.journal())?;
+                    active.mark_published()?;
+                }
+                let _completed = active.finish()?;
+                Ok(())
+            }
+            GitEffectRecord::Completed(completed) => {
+                self.reconcile_prepared_split_journal(
+                    config,
+                    origin,
+                    pre_authority,
+                    post_authority,
+                    store,
+                    completed.journal(),
+                    mapping_store,
+                )?;
+                if completed.journal().publication().is_some() {
+                    self.reconcile_split_publication_journal(config, origin, store, completed.journal())?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "split journal reconciliation compares every captured authority"
+    )]
+    fn reconcile_prepared_split_journal(
+        &self,
+        config: &SplitParams,
+        origin: &OriginContext,
+        pre_authority: &MappingAuthoritySnapshot,
+        post_authority: &MappingAuthoritySnapshot,
+        store: &GitEffectStore,
+        journal: &GitEffectJournal,
+        mapping_store: &mut MappingStore,
+    ) -> RailResult<()> {
+        let target = SystemGit::open(&config.target_repo_path)?;
+        let repository = journal.repository();
+        let mapping = journal
+            .mapping()
+            .ok_or_else(|| RailError::message("prepared split effect has no mapping authority"))?;
+        let commit = journal
+            .commit()
+            .ok_or_else(|| RailError::message("prepared split effect has no commit"))?;
+        let bundle_digest = journal
+            .object_bundle_digest()
+            .ok_or_else(|| RailError::message("prepared split effect has no object bundle"))?;
+        let contract_changed = [
+            !journal.operation_id().starts_with("split-chain-sha256-"),
+            mapping.owner() != pre_authority.owner(),
+            mapping.ownership_snapshot() != pre_authority.ownership_snapshot(),
+            mapping.pre_authority() != pre_authority.digest(),
+            mapping.post_authority() != post_authority.digest(),
+            mapping.migration_count() != 0,
+            mapping.migration_digest().is_some(),
+            repository.ref_name != format!("refs/heads/{}", config.branch),
+            repository.logical_repository != pre_authority.target_repository().unwrap_or_default(),
+            repository.expected_oid.as_deref() != pre_authority.target_head(),
+            repository.result_oid != commit.oid(),
+            post_authority.target_head() != Some(commit.oid()),
+        ]
+        .into_iter()
+        .any(|changed| changed);
+        if contract_changed {
+            return Err(RailError::message(
+                "prepared split journal does not match the checked split authority",
+            ));
+        }
+        for transition in journal.paths() {
+            config.path_capabilities.authorize_target(transition.path())?;
+        }
+
+        let current_head = target.exact_branch_ref_oid(&repository.ref_name)?;
+        if current_head.as_deref() != repository.expected_oid.as_deref()
+            && current_head.as_deref() != Some(repository.result_oid.as_str())
+        {
+            return Err(RailError::message("prepared split branch changed to a third ref state"));
+        }
+        let current_repository = store.capture_repository_authority(
+            &target,
+            repository.logical_repository.clone(),
+            repository.ref_name.clone(),
+            current_head.clone(),
+            repository.result_oid.clone(),
+        )?;
+        if current_repository.common_dir_identity != repository.common_dir_identity
+            || current_repository.worktree_identity != repository.worktree_identity
+            || current_repository.object_format != repository.object_format
+            || current_repository.ref_name != repository.ref_name
+            || current_repository.symbolic_head != repository.symbolic_head
+        {
+            return Err(RailError::message(
+                "prepared split repository authority changed during recovery",
+            ));
+        }
+        let actual_authority = self.capture_current_split_authority(config, origin)?;
+        if current_head.as_deref() == repository.expected_oid.as_deref() {
+            if actual_authority.1 != *pre_authority {
+                return Err(split_mapping_authority_changed_error("prepared pre-effect recovery"));
+            }
+            self.validate_split_path_images(&target, journal, true)?;
+        } else if actual_authority.1 != *post_authority {
+            return Err(split_mapping_authority_changed_error("prepared post-ref recovery"));
+        }
+
+        let bundle = store
+            .open_object_bundle(journal.effect_id(), bundle_digest)?
+            .ok_or_else(|| RailError::message("prepared split object bundle disappeared"))?;
+        target.install_prepared_object_pack_and_update_ref(
+            bundle.into_file(),
+            &store.object_bundle_path(journal.effect_id())?,
+            bundle_digest,
+            commit,
+            &repository.ref_name,
+            repository.expected_oid.as_deref(),
+            journal.effect_id(),
+        )?;
+        #[cfg(test)]
+        {
+            fail_split_after_ref_cas()?;
+        }
+        if !journal.matches_repository_authority(store, &target, Some(repository.result_oid.clone()))? {
+            return Err(RailError::message(
+                "prepared split repository authority changed before final materialization",
+            ));
+        }
+        self.validate_split_journal_tree_images(&target, journal)?;
+        let paths = journal
+            .paths()
+            .iter()
+            .map(|transition| transition.path().to_path_buf())
+            .collect::<Vec<_>>();
+        target.reconcile_prepared_commit_paths(repository.expected_oid.as_deref(), &repository.result_oid, &paths)?;
+        post_authority
+            .revalidate_split_repository_state(self.ctx.workspace_root(), &config.target_repo_path)
+            .map_err(|error| {
+                RailError::with_help(
+                    format!("split mapping authority changed after materialization: {error}"),
+                    "retry after the source and target repositories stop changing",
+                )
+            })?;
+        *mapping_store = MappingStore::from_current_snapshot(post_authority)?;
+        Ok(())
+    }
+
+    fn validate_split_path_images(
+        &self,
+        target: &SystemGit,
+        journal: &GitEffectJournal,
+        require_old: bool,
+    ) -> RailResult<()> {
+        let paths = journal
+            .paths()
+            .iter()
+            .map(|transition| transition.path().to_path_buf())
+            .collect::<Vec<_>>();
+        let images = target.exact_path_images(&paths)?;
+        for (transition, images) in journal.paths().iter().zip(images) {
+            let index_old = git_entry_matches_image(images.index.as_ref(), transition.old());
+            let worktree_old = git_entry_matches_image(images.worktree.as_ref(), transition.old());
+            let index_new = git_entry_matches_image(images.index.as_ref(), transition.new_image());
+            let worktree_new = git_entry_matches_image(images.worktree.as_ref(), transition.new_image());
+            let accepted = if require_old {
+                index_old && worktree_old
+            } else {
+                (index_old || index_new) && (worktree_old || worktree_new)
+            };
+            if !accepted {
                 return Err(RailError::with_help(
                     format!(
-                        "split target is on branch '{}', but configuration requires '{}'",
-                        current_branch, branch
+                        "prepared split path '{}' changed to an unauthorized state",
+                        transition.path().display()
                     ),
-                    format!("switch the target repository to '{}' and retry", branch),
+                    "cargo-rail preserved the target bytes; restore the exact old or prepared path image before retrying",
                 ));
             }
         }
-
         Ok(())
     }
 
-    /// Import the source object graph once so reconstructed trees can reuse blob
-    /// object IDs directly. This replaces per-file copy/hash subprocesses.
-    fn import_source_objects(&self, target_path: &Path) -> RailResult<()> {
-        let source = self
-            .ctx
-            .workspace_root()
-            .to_str()
-            .ok_or_else(|| RailError::message("source repository path is not valid UTF-8"))?;
-        let output = Self::run_git_in_repo(target_path, &["fetch", "--quiet", "--no-tags", source, "HEAD"])?;
-        if !output.status.success() {
-            return Err(RailError::Git(GitError::CommandFailed {
-                command: "git fetch source objects".to_string(),
-                stderr: git_command_diagnostics(&output.stdout, &output.stderr),
-            }));
+    fn validate_split_journal_tree_images(&self, target: &SystemGit, journal: &GitEffectJournal) -> RailResult<()> {
+        let repository = journal.repository();
+        let paths = journal
+            .paths()
+            .iter()
+            .map(|transition| transition.path().to_path_buf())
+            .collect::<Vec<_>>();
+        let old = repository
+            .expected_oid
+            .as_deref()
+            .map(|expected| target.collect_tree_entries_for_paths(expected, &paths))
+            .transpose()?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| (entry.path.clone(), entry))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let new = target
+            .collect_tree_entries_for_paths(&repository.result_oid, &paths)?
+            .into_iter()
+            .map(|entry| (entry.path.clone(), entry))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for transition in journal.paths() {
+            if !git_entry_matches_image(old.get(transition.path()), transition.old())
+                || !git_entry_matches_image(new.get(transition.path()), transition.new_image())
+            {
+                return Err(RailError::message(format!(
+                    "prepared split journal path '{}' disagrees with its exact old or result tree",
+                    transition.path().display()
+                )));
+            }
         }
         Ok(())
     }
 
-    /// Configure git identity in the target repository by copying from source
-    fn configure_git_identity(&self, target_path: &Path) -> RailResult<()> {
-        // Get identity from source repository
-        let user_name = self.ctx.git()?.git().get_config("user.name")?.unwrap_or_default();
-        let user_email = self.ctx.git()?.git().get_config("user.email")?.unwrap_or_default();
-
-        // Set identity in target repository
-        // Use a fallback if source doesn't have identity configured
-        let name = if user_name.is_empty() { "Cargo-Rail" } else { &user_name };
-        let email = if user_email.is_empty() {
-            "cargo-rail@localhost"
-        } else {
-            &user_email
-        };
-
-        // Open target repo and set config
-        let target_git = SystemGit::open(target_path)?;
-        target_git.set_config("user.name", name)?;
-        target_git.set_config("user.email", email)?;
+    fn validate_target_repo(&self, paths: &SplitPathCapabilities, branch: &str) -> RailResult<()> {
+        let target_path = paths.authorize_target(paths.target_root())?;
+        let git_dir = target_path.join(".git");
+        if !git_dir.exists() {
+            return Err(RailError::with_help(
+                format!(
+                    "split target '{}' is not an initialized Git repository",
+                    target_path.display()
+                ),
+                format!(
+                    "initialize it explicitly with: git init -b {branch} '{}'",
+                    target_path.display()
+                ),
+            ));
+        }
+        paths.validate_target_repository()?;
+        let current_branch = SystemGit::open(&target_path)?.current_branch()?;
+        if current_branch != branch {
+            return Err(RailError::with_help(
+                format!(
+                    "split target is on branch '{}', but configuration requires '{}'",
+                    current_branch, branch
+                ),
+                format!("switch the target repository to '{}' and retry", branch),
+            ));
+        }
 
         Ok(())
     }
 
-    /// Create a workspace Cargo.toml for combined mode with workspace_mode = Workspace
-    fn create_workspace_cargo_toml(
-        &self,
-        crate_paths: &[PathBuf],
-        target_repo_path: &Path,
-        path_capabilities: &SplitPathCapabilities,
-    ) -> RailResult<()> {
+    /// Render the auxiliary combined-workspace manifest from the exact bound
+    /// source commit without touching the target worktree.
+    fn render_workspace_cargo_toml(&self, crate_paths: &[PathBuf], source_head: &str) -> RailResult<Vec<u8>> {
         // Extract workspace members from crate paths
         let members: Vec<String> = crate_paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
 
-        // Read workspace Cargo.toml from source monorepo
-        let source_workspace_toml = self.ctx.workspace_root().join("Cargo.toml");
-        let source_content = std::fs::read_to_string(&source_workspace_toml).with_context(|| {
-            format!(
-                "Failed to read workspace Cargo.toml from {}",
-                source_workspace_toml.display()
-            )
-        })?;
+        let source_git = self.ctx.git()?.git();
+        let source_manifest = source_git
+            .tree_entry(source_head, Path::new("Cargo.toml"))?
+            .ok_or_else(|| RailError::message("bound source commit has no workspace Cargo.toml"))?;
+        let source_bytes = source_git
+            .read_blobs_bulk(&[source_manifest.object_id.as_str()])?
+            .into_iter()
+            .next()
+            .ok_or_else(|| RailError::message("bound workspace Cargo.toml blob is unavailable"))?;
+        let source_content = std::str::from_utf8(&source_bytes)
+            .map_err(|_| RailError::message("bound workspace Cargo.toml is not valid UTF-8"))?;
 
         // Parse the source Cargo.toml
         let mut doc: toml_edit::DocumentMut = source_content
@@ -984,12 +1961,194 @@ impl<'a> SplitEngine<'a> {
         doc.remove("dev-dependencies");
         doc.remove("build-dependencies");
 
-        // Write to target repo
-        let target_toml = path_capabilities.authorize_target(&target_repo_path.join("Cargo.toml"))?;
-        std::fs::write(&target_toml, doc.to_string())?;
-
         progress!("   Created workspace Cargo.toml with {} members", members.len());
+        Ok(doc.to_string().into_bytes())
+    }
+}
 
+fn git_entry_matches_image(entry: Option<&GitTreeEntry>, image: &GitPathImage) -> bool {
+    match (entry, image.entry_parts()) {
+        (None, None) => true,
+        (Some(entry), Some((mode, object_id))) => entry.mode == mode && entry.object_id == object_id,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_SPLIT_AFTER_REF_CAS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn fail_split_after_ref_cas() -> RailResult<()> {
+    if FAIL_SPLIT_AFTER_REF_CAS.replace(false) {
+        Err(RailError::message("injected interruption after prepared split ref CAS"))
+    } else {
         Ok(())
     }
+}
+
+fn source_commits_matching_policy(
+    ctx: &WorkspaceContext,
+    paths: &SplitPathCapabilities,
+    excluded: &[&str],
+    source_head: &str,
+) -> RailResult<Vec<CommitInfo>> {
+    let git = ctx.git()?.git();
+    let commits = git.get_commits_excluding(excluded, source_head)?;
+    let shas = commits.iter().map(|commit| commit.sha.clone()).collect::<Vec<_>>();
+    let changes = git.get_changed_files_bulk(&shas)?;
+    let mut selected = Vec::new();
+    for (commit, changed) in commits.into_iter().zip(changes) {
+        let mut owned = changes_include_owned_path(paths, changed)?;
+        if !owned && commit.parent_shas.len() > 1 {
+            for parent in &commit.parent_shas {
+                if merge_parent_changes_include_owned_path(git, parent, &commit.sha, paths)? {
+                    owned = true;
+                    break;
+                }
+            }
+        }
+        if owned {
+            selected.push(commit);
+        }
+    }
+    Ok(selected)
+}
+
+fn changes_include_owned_path(paths: &SplitPathCapabilities, changed: Vec<(PathBuf, char)>) -> RailResult<bool> {
+    for (path, _) in changed {
+        if paths.owns_source_path(&path)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn merge_parent_changes_include_owned_path(
+    git: &SystemGit,
+    parent: &str,
+    commit: &str,
+    paths: &SplitPathCapabilities,
+) -> RailResult<bool> {
+    changes_include_owned_path(paths, git.get_changed_files_between(parent, Some(commit))?)
+}
+
+fn collect_owned_source_entries(
+    git: &SystemGit,
+    commit: &str,
+    paths: &SplitPathCapabilities,
+) -> RailResult<Vec<GitTreeEntry>> {
+    let mut entries = Vec::new();
+    for entry in git.collect_tree_entries(commit, Path::new("."))? {
+        if paths.owns_source_path(&entry.path)? {
+            entries.push(entry);
+        }
+    }
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(entries)
+}
+
+/// Prove that every ownership-less/predecessor exact mapping still represents
+/// the current split projection before it can be stamped with current v2
+/// ownership authority. This is read-only and covers notes, weak trailers, and
+/// exact v1 pairs alike.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "projection validation binds each captured transform and path authority explicitly"
+)]
+pub(crate) fn validate_predecessor_mapping_projections(
+    ctx: &WorkspaceContext,
+    transform: &ManifestTransformPolicy,
+    crate_paths: &[PathBuf],
+    path_capabilities: &SplitPathCapabilities,
+    target_repo_path: &Path,
+    mode: &SplitMode,
+    workspace_mode: &WorkspaceMode,
+    authority: &MappingAuthoritySnapshot,
+) -> RailResult<()> {
+    use std::collections::BTreeMap;
+
+    if authority.count() == 0 {
+        return Ok(());
+    }
+    let source_git = ctx.git()?.git();
+    let target_git = SystemGit::open(target_repo_path)?;
+    for (source, target) in authority.migration_candidate_pairs() {
+        let mut expected = BTreeMap::new();
+        for entry in collect_owned_source_entries(source_git, &source, path_capabilities)? {
+            let target_path = match mode {
+                SplitMode::Single => crate_paths
+                    .iter()
+                    .find_map(|crate_path| entry.path.strip_prefix(crate_path).ok().map(Path::to_path_buf))
+                    .unwrap_or_else(|| entry.path.clone()),
+                SplitMode::Combined => entry.path.clone(),
+            };
+            let expected_content = if entry.path.file_name() == Some(std::ffi::OsStr::new("Cargo.toml")) {
+                let content = source_git
+                    .read_blobs_bulk(&[entry.object_id.as_str()])?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| RailError::message("predecessor source manifest has no blob"))?;
+                let content = std::str::from_utf8(&content)
+                    .map_err(|_| RailError::message("predecessor source manifest is not valid UTF-8"))?;
+                let target_has_workspace = *mode == SplitMode::Combined && *workspace_mode == WorkspaceMode::Workspace;
+                Some(
+                    transform
+                        .transform_to_split(content, target_has_workspace)?
+                        .into_bytes(),
+                )
+            } else {
+                None
+            };
+            if expected
+                .insert(target_path, (entry.mode, entry.object_id, expected_content))
+                .is_some()
+            {
+                return Err(RailError::message(
+                    "current split ownership maps multiple source paths to one predecessor target path",
+                ));
+            }
+        }
+
+        let actual_entries = target_git.collect_tree_entries(&target, Path::new("."))?;
+        let actual = actual_entries
+            .iter()
+            .map(|entry| (entry.path.clone(), entry))
+            .collect::<BTreeMap<_, _>>();
+        if actual.len() != expected.len() || actual.keys().ne(expected.keys()) {
+            return Err(RailError::with_help(
+                "predecessor mapping does not match the current owned split projection",
+                "restore the ownership policy used by the predecessor mapping or rebuild the split history explicitly; cargo-rail will not stamp guessed v2 authority",
+            ));
+        }
+        for (path, (expected_mode, expected_object, expected_content)) in expected {
+            let entry = actual[&path];
+            let content_matches = if let Some(expected_content) = expected_content {
+                target_git
+                    .read_blobs_bulk(&[entry.object_id.as_str()])?
+                    .first()
+                    .is_some_and(|actual_content| actual_content == &expected_content)
+            } else {
+                entry.object_id == expected_object
+            };
+            if entry.mode != expected_mode || !content_matches {
+                return Err(RailError::with_help(
+                    format!(
+                        "predecessor mapping has a different current-owned projection at '{}'",
+                        path.display()
+                    ),
+                    "restore the ownership and transform policy used by the predecessor mapping or rebuild the split history explicitly",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn split_mapping_authority_changed_error(boundary: &str) -> RailError {
+    RailError::with_help(
+        format!("split mapping authority changed after it was checked at the {boundary} boundary"),
+        "retry after the source and target repositories stop changing",
+    )
 }
