@@ -112,3 +112,12 @@ report-skipped = "none"
 flaky-fail-status = "failure"
 store-success-output = false
 store-failure-output = true
+
+[profile.riscv-ci]
+inherits = "commit"
+
+[[profile.riscv-ci.overrides]]
+filter = "all()"
+# Native RISC-V runs Cargo-heavy fixtures substantially slower than the other
+# compatibility hosts. Retain a finite watchdog without weakening their limits.
+slow-timeout = { period = "2m", terminate-after = 10 }

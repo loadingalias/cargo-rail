@@ -27,7 +27,8 @@ const IPC_MAX_IDENTITY_BYTES: usize = 128;
 const IPC_MAX_AUTHORITY_BYTES: usize = super::url::MAX_URL_BYTES;
 const IPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const IPC_TRANSFER_TIMEOUT: Duration = Duration::from_secs(20 * 60);
-const START_TIMEOUT: Duration = Duration::from_secs(5);
+const START_TIMEOUT: Duration = Duration::from_secs(30);
+const LOCK_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 const ACCEPT_POLL: Duration = Duration::from_millis(1);
 #[cfg(debug_assertions)]
 const IDLE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -406,15 +407,39 @@ pub(super) fn connect(
     };
     #[cfg(not(windows))]
     let child = coordinator.spawn();
-    child.map_err(io_unavailable)?;
+    let mut child = child.map_err(io_unavailable)?;
     let started = Instant::now();
-    while started.elapsed() < START_TIMEOUT {
+    loop {
         if let Some(client) = load_client(selection, receipt, &identity)? {
             return Ok(Some(client));
         }
+        if child.try_wait().map_err(io_unavailable)?.is_some() {
+            retire_coordinator_state(receipt, &identity)?;
+            return Err(RemoteStoreError::unavailable("remote coordinator did not become ready"));
+        }
+        if started.elapsed() >= START_TIMEOUT {
+            break;
+        }
         std::thread::sleep(ACCEPT_POLL);
     }
+    if let Err(error) = child.kill()
+        && child.try_wait().map_err(io_unavailable)?.is_none()
+    {
+        return Err(io_unavailable(error));
+    }
+    child.wait().map_err(io_unavailable)?;
+    retire_coordinator_state(receipt, &identity)?;
     Err(RemoteStoreError::unavailable("remote coordinator did not become ready"))
+}
+
+fn retire_coordinator_state(receipt: &InstallationReceipt, identity: &str) -> RemoteStoreResult<()> {
+    if let Some(bytes) = crate::cache::installation::read_coordinator_state(receipt, identity, STATE_MAX_BYTES)
+        .map_err(|_| RemoteStoreError::unavailable("remote coordinator state is unavailable"))?
+    {
+        crate::cache::installation::remove_coordinator_state_if(receipt, identity, &bytes)
+            .map_err(|_| RemoteStoreError::unavailable("remote coordinator state could not be retired"))?;
+    }
+    Ok(())
 }
 
 fn load_client(
@@ -482,7 +507,7 @@ pub(super) fn stop_all(receipt: &InstallationReceipt) {
                 receipt, &identity, &bytes,
             ));
         }
-        remove_coordinator_lock(receipt, &identity, START_TIMEOUT);
+        remove_coordinator_lock(receipt, &identity, LOCK_RELEASE_TIMEOUT);
     }
 }
 

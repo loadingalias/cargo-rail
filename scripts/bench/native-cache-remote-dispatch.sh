@@ -44,11 +44,6 @@ case "$target" in
     expected_filesystem=ntfs
     expected_case_sensitive=false
     ;;
-  azure-windows-arm64-profile)
-    expected_host=aarch64-pc-windows-msvc
-    expected_filesystem=ntfs
-    expected_case_sensitive=false
-    ;;
   *)
     echo "native-cache host qualification does not authorize target '$target'" >&2
     exit 2

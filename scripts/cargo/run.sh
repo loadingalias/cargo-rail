@@ -23,10 +23,15 @@ case "$operation" in
 esac
 
 mode="${CARGO_RAIL_TEST_MODE:-local}"
-nextest_profile=default
-if [ "$mode" = commit ]; then
-  nextest_profile=commit
-fi
+case "$mode" in
+  local) nextest_profile=default ;;
+  commit) nextest_profile=commit ;;
+  riscv-ci) nextest_profile=riscv-ci ;;
+  *)
+    echo "unsupported Cargo-Rail test mode: $mode" >&2
+    exit 2
+    ;;
+esac
 
 if [ "$operation" = test ] && [ "$argument" = --all ]; then
   cargo nextest run --workspace -P "$nextest_profile" --all-features --locked \

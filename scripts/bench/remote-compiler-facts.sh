@@ -14,7 +14,7 @@ usage:
   remote-compiler-facts.sh run <target> <runs> --execute
 
 Targets: aws-linux-x64-bench, aws-linux-arm64-bench,
-         aws-windows-x64-bench, azure-windows-arm64-profile
+         aws-windows-x64-bench
 USAGE
   exit 2
 }
@@ -23,7 +23,7 @@ case "$target" in
   aws-linux-x64-bench | aws-linux-arm64-bench)
     tool_profile=linux-qualification
     ;;
-  aws-windows-x64-bench | azure-windows-arm64-profile)
+  aws-windows-x64-bench)
     tool_profile=windows-qualification
     ;;
   *) usage ;;

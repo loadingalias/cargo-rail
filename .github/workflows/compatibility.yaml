@@ -111,8 +111,9 @@ jobs:
     permissions:
       contents: read
       checks: write
-    # Native RISC-V cold builds exceed the default budget on GitHub's runner.
-    timeout-minutes: ${{ matrix.compatibility.target == 'riscv64gc-unknown-linux-gnu' && 120 || 60 }}
+    # Native RISC-V cold builds and Cargo-heavy fixtures exceed the default
+    # budget on GitHub's runner. The dedicated nextest profile remains bounded.
+    timeout-minutes: ${{ matrix.compatibility.target == 'riscv64gc-unknown-linux-gnu' && 240 || 60 }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.support.outputs.compatibility-matrix) }}
@@ -269,11 +270,18 @@ jobs:
 
       - name: Run full endpoint suite
         if: matrix.compatibility.full-suite && runner.os != 'Windows'
+        shell: bash
         env:
           AWS_ACCESS_KEY_ID: ${{ inputs.native-cache-url != '' && secrets.r2_access_key_id || '' }}
           AWS_SECRET_ACCESS_KEY: ${{ inputs.native-cache-url != '' && secrets.r2_secret_access_key || '' }}
           AWS_EC2_METADATA_DISABLED: "true"
-        run: just test-all
+          COMPATIBILITY_TARGET: ${{ matrix.compatibility.target }}
+        run: |
+          if [ "$COMPATIBILITY_TARGET" = riscv64gc-unknown-linux-gnu ]; then
+            just test-all-riscv
+          else
+            just test-all
+          fi
 
       - name: Remove ambient Windows compiler-cache installation
         if: matrix.compatibility.full-suite && runner.os == 'Windows'
@@ -291,8 +299,8 @@ jobs:
           TMPDIR: ${{ runner.temp }}
         run: cargo nextest run --workspace -P commit --all-features --locked --config-file .config/nextest.toml
 
-      - name: Run doctests
-        if: matrix.compatibility.full-suite
+      - name: Run Windows doctests
+        if: matrix.compatibility.full-suite && runner.os == 'Windows'
         env:
           AWS_ACCESS_KEY_ID: ${{ inputs.native-cache-url != '' && secrets.r2_access_key_id || '' }}
           AWS_SECRET_ACCESS_KEY: ${{ inputs.native-cache-url != '' && secrets.r2_secret_access_key || '' }}
@@ -315,7 +323,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: junit-${{ matrix.compatibility.target }}-rust-${{ matrix.compatibility.release }}
-          path: target/nextest/commit/junit.xml
+          path: target/nextest/${{ matrix.compatibility.target == 'riscv64gc-unknown-linux-gnu' && 'riscv-ci' || 'commit' }}/junit.xml
           retention-days: 7
           if-no-files-found: ignore
 
@@ -323,8 +331,10 @@ jobs:
         if: always() && matrix.compatibility.full-suite
         id: junit
         shell: bash
+        env:
+          JUNIT_PATH: target/nextest/${{ matrix.compatibility.target == 'riscv64gc-unknown-linux-gnu' && 'riscv-ci' || 'commit' }}/junit.xml
         run: |
-          if [ -f target/nextest/commit/junit.xml ]; then
+          if [ -f "$JUNIT_PATH" ]; then
             echo "found=true" >> "$GITHUB_OUTPUT"
           else
             echo "found=false" >> "$GITHUB_OUTPUT"
@@ -334,7 +344,7 @@ jobs:
         if: always() && steps.junit.outputs.found == 'true'
         uses: mikepenz/action-junit-report@d9f48fc87bc235f7e214acf696ca5abc0a986f16 # v6.4.2
         with:
-          report_paths: "target/nextest/commit/junit.xml"
+          report_paths: "target/nextest/${{ matrix.compatibility.target == 'riscv64gc-unknown-linux-gnu' && 'riscv-ci' || 'commit' }}/junit.xml"
           check_name: "Tests (${{ matrix.compatibility.target }}, Rust ${{ matrix.compatibility.release }})"
           detailed_summary: true
           include_passed: false

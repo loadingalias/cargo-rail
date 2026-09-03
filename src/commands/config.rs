@@ -2201,9 +2201,11 @@ impl MigrationDestination {
                     "published destination",
                 ));
             }
-            if crate::windows_fs::observe_file(&state.backup)? != state.backup_observation
-                || read_opened_migration_input(&mut state.backup, state.backup_observation.size, &guard.backup_path)?
+            let backup_observation = crate::windows_fs::observe_file(&state.backup)?;
+            if !backup_observation.same_generation_after_rename(state.backup_observation)
+                || read_opened_migration_input(&mut state.backup, backup_observation.size, &guard.backup_path)?
                     != state.backup_bytes
+                || crate::windows_fs::observe_file(&state.backup)? != backup_observation
             {
                 return Err(migration_destination_changed(
                     &self.config_path,
@@ -2214,7 +2216,10 @@ impl MigrationDestination {
                 .input
                 .as_ref()
                 .ok_or_else(|| RailError::message("configuration input authority is unavailable"))?;
-            if crate::windows_fs::observe_file(retained_input)? != self.input_observation {
+            let retained_observation = crate::windows_fs::observe_file(retained_input)?;
+            if retained_observation != backup_observation
+                || !retained_observation.same_generation_after_rename(self.input_observation)
+            {
                 return Err(migration_destination_changed(
                     &self.config_path,
                     "previous configuration metadata",

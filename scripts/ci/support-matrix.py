@@ -1139,6 +1139,7 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         "if: fromJSON(needs.support.outputs.filesystem-matrix).include[0] != null",
         "just build-all",
         "just test-all",
+        "just test-all-riscv",
         "cargo nextest run --workspace -P commit --all-features --locked --config-file .config/nextest.toml",
         "cargo test --doc -p cargo-rail --all-features --locked",
     ):

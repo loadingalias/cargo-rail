@@ -100,6 +100,9 @@ build-release:
 test-all:
     @scripts/cargo/run.sh test --all
 
+test-all-riscv:
+    @CARGO_RAIL_TEST_MODE=riscv-ci scripts/cargo/run.sh test --all
+
 build-all:
     cargo build --workspace --all-targets --all-features --locked
 
