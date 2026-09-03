@@ -1139,7 +1139,7 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         "if: fromJSON(needs.support.outputs.filesystem-matrix).include[0] != null",
         "just build-all",
         "just test-all",
-        "just test-all-riscv",
+        "just test-riscv",
         "cargo nextest run --workspace -P commit --all-features --locked --config-file .config/nextest.toml",
         "cargo test --doc -p cargo-rail --all-features --locked",
     ):
@@ -1150,6 +1150,31 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
     require(
         compatibility_workflow.count(toolchain_installer_path) == 2,
         "compatibility workflow must install Rust in both execution jobs",
+    )
+    nextest_config = load_toml(REPOSITORY_ROOT / ".config/nextest.toml")
+    riscv_profile = require_object(
+        nextest_config.get("profile", {}).get("riscv-ci"),
+        "nextest.toml [profile.riscv-ci]",
+        {"inherits", "default-filter", "overrides"},
+    )
+    require(
+        riscv_profile["inherits"] == "commit"
+        and riscv_profile["default-filter"]
+        == "not test(=test_plan_consumers::test_source_reader_bootstrap_preserves_direct_binary_authority)",
+        "the RISC-V profile must inherit commit policy and exclude only the redundant cold source bootstrap",
+    )
+    riscv_overrides = riscv_profile["overrides"]
+    require(
+        isinstance(riscv_overrides, list)
+        and len(riscv_overrides) == 2
+        and riscv_overrides[0].get("filter")
+        == "binary(integration) & test(/test_native_cache_fixture::real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority$/)"
+        and riscv_overrides[0].get("slow-timeout")
+        == {"period": "5m", "terminate-after": 10}
+        and riscv_overrides[1].get("filter") == "all()"
+        and riscv_overrides[1].get("slow-timeout")
+        == {"period": "2m", "terminate-after": 10},
+        "the RISC-V profile must retain bounded general and exhaustive-cache watchdogs",
     )
     require(
         '$RUNNER_TEMP/cargo-rail-tmpfs' not in compatibility_workflow,

@@ -100,7 +100,7 @@ build-release:
 test-all:
     @scripts/cargo/run.sh test --all
 
-test-all-riscv:
+test-riscv:
     @CARGO_RAIL_TEST_MODE=riscv-ci scripts/cargo/run.sh test --all
 
 build-all:

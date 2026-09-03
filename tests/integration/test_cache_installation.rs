@@ -3676,7 +3676,7 @@ exec "$REAL_RUSTC" "$@"
             ("test", &["test", "--quiet"]),
             ("run", &["run", "--quiet"]),
             ("bench", &["bench", "--quiet", "--no-run"]),
-            ("nextest", &["nextest", "run"]),
+            ("nextest", &["nextest", "run", "--profile", "commit"]),
         ];
         for (name, arguments) in lanes {
             let seed = Command::new("cargo")

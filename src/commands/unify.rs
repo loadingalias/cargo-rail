@@ -1504,6 +1504,16 @@ impl ManifestTransaction {
     }
 }
 
+fn unify_test_fault(point: &str) -> RailResult<()> {
+    #[cfg(debug_assertions)]
+    if std::env::var("CARGO_RAIL_UNIFY_FAIL_AT").as_deref() == Ok(point) {
+        return Err(RailError::message(format!("injected unify failure at {point}")));
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = point;
+    Ok(())
+}
+
 fn verify_applied_unify_graph(
     ctx: &WorkspaceContext,
     plan: &crate::cargo::UnificationPlan,
@@ -2127,6 +2137,7 @@ pub fn run_unify_apply(
                         .map_or_else(|| "disabled".to_string(), |current| current.display().to_string())
                 )));
             }
+            unify_test_fault("report-write")?;
             UnifyReport::write_to_file(&plan, path)?;
             progress!("report: {}", path.display());
         }

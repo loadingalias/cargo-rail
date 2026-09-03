@@ -8,7 +8,7 @@
 //! - dep_kinds display
 //! - End-to-end analyze → apply workflow
 
-use crate::helpers::{TestWorkspace, run_cargo_rail, rustc_host_target};
+use crate::helpers::{TestWorkspace, run_cargo_rail, run_cargo_rail_with_env, rustc_host_target};
 use anyhow::Result;
 use cargo_rail::source::SourceSnapshot;
 use cargo_rail::workspace::WorkspaceContext;
@@ -379,24 +379,7 @@ fn test_unify_apply_restores_manifests_and_lockfile_when_a_late_output_fails() {
             .collect::<std::io::Result<Vec<_>>>()?;
         let original_lockfile = std::fs::read(&lockfile)?;
 
-        let report_parent = workspace.path.join("late-report");
-        std::fs::create_dir(&report_parent)?;
-        let watched_manifest = root_manifest.clone();
-        let blocked_parent = report_parent;
-        let sabotage = std::thread::spawn(move || -> std::io::Result<bool> {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            while std::time::Instant::now() < deadline {
-                if std::fs::read_to_string(&watched_manifest).is_ok_and(|manifest| manifest.contains("tempfile =")) {
-                    std::fs::remove_dir(&blocked_parent)?;
-                    std::fs::write(&blocked_parent, "block report directory creation")?;
-                    return Ok(true);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            Ok(false)
-        });
-
-        let apply = run_cargo_rail(
+        let apply = run_cargo_rail_with_env(
             &workspace.path,
             &[
                 "rail",
@@ -408,10 +391,16 @@ fn test_unify_apply_restores_manifests_and_lockfile_when_a_late_output_fails() {
                 "--report-path",
                 "late-report/report.md",
             ],
+            &[("CARGO_RAIL_UNIFY_FAIL_AT", "report-write")],
         )?;
-        assert!(sabotage.join().expect("report sabotage thread")?);
         assert!(!apply.status.success(), "late report failure must fail apply");
         let error: serde_json::Value = serde_json::from_slice(&apply.stdout)?;
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("injected unify failure at report-write")),
+            "the report-write fault must be the late failure: {error:#?}"
+        );
         assert!(
             error["help"]
                 .as_str()

@@ -113,7 +113,7 @@ jobs:
       checks: write
     # Native RISC-V cold builds and Cargo-heavy fixtures exceed the default
     # budget on GitHub's runner. The dedicated nextest profile remains bounded.
-    timeout-minutes: ${{ matrix.compatibility.target == 'riscv64gc-unknown-linux-gnu' && 240 || 60 }}
+    timeout-minutes: ${{ matrix.compatibility.target == 'riscv64gc-unknown-linux-gnu' && 300 || 60 }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.support.outputs.compatibility-matrix) }}
@@ -268,7 +268,7 @@ jobs:
           AWS_EC2_METADATA_DISABLED: "true"
         run: just build-all
 
-      - name: Run full endpoint suite
+      - name: Run native endpoint suite
         if: matrix.compatibility.full-suite && runner.os != 'Windows'
         shell: bash
         env:
@@ -278,7 +278,7 @@ jobs:
           COMPATIBILITY_TARGET: ${{ matrix.compatibility.target }}
         run: |
           if [ "$COMPATIBILITY_TARGET" = riscv64gc-unknown-linux-gnu ]; then
-            just test-all-riscv
+            just test-riscv
           else
             just test-all
           fi
