@@ -811,6 +811,8 @@ fn real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority() ->
     )?;
     ensure_typed_benchmark_events(&build_cold_events)?;
     let build_cold_hits = benchmark_action_crates(&build_cold_events, "hit")?;
+    #[cfg(not(windows))]
+    let build_cold_miss_keys = benchmark_action_keys(&build_cold_events, "miss")?;
     ensure!(
         build_cold.hits == 0 && build_cold.misses >= 8 && build_cold.failures == 0,
         "release build crossed a non-cold cache boundary: \
@@ -845,8 +847,6 @@ fn real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority() ->
             ),
         ],
     )?;
-    #[cfg(not(windows))]
-    let (cold_actions, warm_actions) = (build_cold.misses, build_warm.hits.saturating_add(build_warm.misses));
     #[cfg(windows)]
     let (cold_actions, warm_actions) = (
         build_cold
@@ -858,15 +858,33 @@ fn real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority() ->
             .saturating_add(build_warm.misses)
             .saturating_add(build_warm.bypasses),
     );
+    #[cfg(windows)]
     ensure!(
         warm_actions == cold_actions,
         "warm build changed the classified action count: cold={build_cold:?}, warm={build_warm:?}"
     );
     #[cfg(not(windows))]
-    ensure!(
-        build_warm.hits == build_cold.misses && build_warm.misses == 0,
-        "warm build was not clean: {build_warm:?}"
-    );
+    {
+        let build_warm_hit_keys = benchmark_action_keys(&build_warm_events, "hit")?;
+        ensure!(
+            build_cold_miss_keys.len() as u64 == build_cold.misses
+                && build_warm_hit_keys.len() as u64 == build_warm.hits,
+            "release-build usage and action ledgers disagree: cold={build_cold:?}, warm={build_warm:?}"
+        );
+        let cold_keys = build_cold_miss_keys.into_iter().collect::<BTreeSet<_>>();
+        let warm_keys = build_warm_hit_keys.into_iter().collect::<BTreeSet<_>>();
+        let unexpected = warm_keys.difference(&cold_keys).collect::<Vec<_>>();
+        // Cargo owns unit scheduling and freshness. Earlier restores can make a
+        // cold-equivalent unit fresh before it reaches the wrapper, so the warm
+        // invocation census may be smaller. Every invocation that does reach L1
+        // must still use authority published by this cold build.
+        ensure!(
+            !warm_keys.is_empty() && unexpected.is_empty(),
+            "warm build used unexpected action authority: unexpected={unexpected:?}, cold={build_cold:?}, \
+             warm={build_warm:?}"
+        );
+        ensure!(build_warm.misses == 0, "warm build was not clean: {build_warm:?}");
+    }
     #[cfg(windows)]
     let build_warm_miss_crates = benchmark_action_crates(&build_warm_events, "miss")?;
     #[cfg(windows)]
