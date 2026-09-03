@@ -2,7 +2,7 @@
 
 #[cfg(unix)]
 use crate::helpers::cargo_rail_command;
-use crate::helpers::{TestWorkspace, git, run_cargo_rail};
+use crate::helpers::{TestWorkspace, file_url, git, run_cargo_rail};
 use anyhow::Result;
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
@@ -1472,7 +1472,7 @@ fn test_split_saved_plan_recovers_after_exact_publication() {
             remote_parent.path(),
             &["init", "--bare", "--initial-branch=main", remote.to_str().unwrap()],
         )?;
-        let remote_url = format!("file://{}", remote.display());
+        let remote_url = file_url(&remote);
         git(target.path(), &["init", "--initial-branch=main"])?;
         git(target.path(), &["remote", "add", "origin", &remote_url])?;
         std::fs::write(
@@ -1699,7 +1699,7 @@ fn test_split_initialized_unborn_target_publishes_by_exact_url_and_rechecks_with
             remote_parent.path(),
             &["init", "--bare", "--initial-branch=main", remote.to_str().unwrap()],
         )?;
-        let remote_url = format!("file://{}", remote.display());
+        let remote_url = file_url(&remote);
         git(target.path(), &["init", "--initial-branch=main"])?;
         git(target.path(), &["remote", "add", "origin", &remote_url])?;
         std::fs::write(

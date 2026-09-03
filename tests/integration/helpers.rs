@@ -29,6 +29,35 @@ fn isolated_git_config() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/isolated.gitconfig")
 }
 
+/// Build a Git command isolated from ambient identity and line-ending policy.
+pub fn git_command(cwd: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .current_dir(cwd)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", isolated_git_config())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
+        .env("GIT_CONFIG_VALUE_0", "false")
+        .env("GIT_CONFIG_KEY_1", "tag.gpgsign")
+        .env("GIT_CONFIG_VALUE_1", "false")
+        .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"]);
+    command
+}
+
+/// Render a local path as a Git file URL on every supported host.
+pub fn file_url(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        format!("file:///{}", path.display().to_string().replace('\\', "/"))
+    }
+    #[cfg(not(windows))]
+    {
+        format!("file://{}", path.display())
+    }
+}
+
 fn disable_ambient_cargo_wrappers(command: &mut Command) {
     for name in [
         "RUSTC_WRAPPER",
@@ -489,18 +518,7 @@ edition.workspace = true
 
 /// Run git command in a directory
 pub fn git(cwd: &Path, args: &[&str]) -> Result<Output> {
-    let git_config = isolated_git_config();
-    let output = Command::new("git")
-        .current_dir(cwd)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", git_config)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_CONFIG_COUNT", "2")
-        .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
-        .env("GIT_CONFIG_VALUE_0", "false")
-        .env("GIT_CONFIG_KEY_1", "tag.gpgsign")
-        .env("GIT_CONFIG_VALUE_1", "false")
-        .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
+    let output = git_command(cwd)
         .args(args)
         .output()
         .context("Failed to run git command")?;

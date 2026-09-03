@@ -1625,6 +1625,11 @@ struct UnixSecurityMetadata {
     flags: u32,
 }
 
+#[cfg(target_os = "linux")]
+// FS_EXTENT_FL is filesystem-maintained layout state on ordinary ext4 files,
+// not user-owned metadata that migration can or should reproduce.
+const LINUX_KERNEL_MANAGED_EXTENT_FLAG: u32 = 0x0008_0000;
+
 #[cfg(unix)]
 impl UnixSecurityMetadata {
     fn capture(file: &std::fs::File, config_path: &Path) -> RailResult<Self> {
@@ -1653,7 +1658,8 @@ impl UnixSecurityMetadata {
                     config_path.display()
                 ))
             })?
-            .bits();
+            .bits()
+            & !LINUX_KERNEL_MANAGED_EXTENT_FLAG;
         #[cfg(target_os = "macos")]
         let flags = {
             use std::os::macos::fs::MetadataExt as _;
@@ -2293,7 +2299,7 @@ impl MigrationDestination {
             })?;
         let backup_observation = crate::windows_fs::observe_file(&backup)?;
         let backup_bytes = read_opened_migration_input(&mut backup, backup_observation.size, &guard.backup_path)?;
-        if backup_observation != self.input_observation
+        if !backup_observation.same_generation_after_rename(self.input_observation)
             || backup_bytes != original
             || backup_observation.size != self.expected_len
             || crate::windows_fs::observe_file(&backup)? != backup_observation
@@ -2304,23 +2310,41 @@ impl MigrationDestination {
                 "previous configuration",
             ));
         }
+        let retained_observation = {
+            let retained_input = self
+                .input
+                .as_mut()
+                .ok_or_else(|| RailError::message("configuration input authority is unavailable"))?;
+            let observation = crate::windows_fs::observe_file(retained_input)?;
+            if !observation.same_generation_after_rename(self.input_observation)
+                || !crate::utils::opened_file_matches_path(retained_input, &guard.backup_path, self.expected_len)?
+                || read_opened_migration_input(retained_input, self.expected_len, &guard.backup_path)? != original
+            {
+                return Err(migration_destination_changed(
+                    &self.config_path,
+                    "previous configuration",
+                ));
+            }
+            observation
+        };
+        if !self.parent_path_matches_retained()? {
+            return Err(migration_destination_changed(&self.config_path, "destination parent"));
+        }
+        validate_inputs()?;
         let retained_input = self
             .input
-            .as_mut()
+            .as_ref()
             .ok_or_else(|| RailError::message("configuration input authority is unavailable"))?;
-        if crate::windows_fs::observe_file(retained_input)? != self.input_observation
-            || !crate::utils::opened_file_matches_path(retained_input, &guard.backup_path, self.expected_len)?
-            || read_opened_migration_input(retained_input, self.expected_len, &guard.backup_path)? != original
-        {
+        if crate::windows_fs::observe_file(retained_input)? != retained_observation {
             return Err(migration_destination_changed(
                 &self.config_path,
                 "previous configuration",
             ));
         }
-        if !self.parent_path_matches_retained()? {
-            return Err(migration_destination_changed(&self.config_path, "destination parent"));
-        }
-        validate_inputs()?;
+        // ReplaceFileW may advance ChangeTime while moving this exact file to
+        // the backup name. Exact bytes and every stable generation field have
+        // now been revalidated, so subsequent checks can use full equality.
+        self.input_observation = retained_observation;
         Ok(WindowsPublishedState {
             published,
             published_observation,
@@ -2361,10 +2385,11 @@ impl MigrationDestination {
                 .as_mut()
                 .ok_or_else(|| RailError::message("configuration input authority is unavailable"))?;
             let backup_path = crate::windows_fs::opened_path(retained_input)?;
-            if crate::windows_fs::observe_file(retained_input)? != self.input_observation
+            if !crate::windows_fs::observe_file(retained_input)?.same_generation_after_rename(self.input_observation)
                 || !crate::utils::opened_file_matches_path(retained_input, &backup_path, self.expected_len)?
                 || read_opened_migration_input(retained_input, self.expected_len, &backup_path)? != original
-                || crate::windows_fs::observe_file(retained_input)? != self.input_observation
+                || !crate::windows_fs::observe_file(retained_input)?
+                    .same_generation_after_rename(self.input_observation)
             {
                 return Err(migration_destination_changed(
                     &self.config_path,
@@ -2438,9 +2463,9 @@ impl MigrationDestination {
         let validation_message = validation_error.to_string();
         let validation = (|| {
             let mut restored = crate::windows_fs::open_for_stable_byte_observation(&self.config_path)?;
-            if crate::windows_fs::observe_file(&restored)? != self.input_observation
+            if !crate::windows_fs::observe_file(&restored)?.same_generation_after_rename(self.input_observation)
                 || read_opened_migration_input(&mut restored, self.expected_len, &self.config_path)? != original
-                || crate::windows_fs::observe_file(&restored)? != self.input_observation
+                || !crate::windows_fs::observe_file(&restored)?.same_generation_after_rename(self.input_observation)
                 || !crate::utils::opened_file_matches_path(&restored, &self.config_path, self.expected_len)?
             {
                 return Err(migration_destination_changed(&self.config_path, "restored destination"));

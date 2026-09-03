@@ -8,9 +8,12 @@
 
 #[cfg(unix)]
 use crate::helpers::isolated_cargo_rail_command;
-use crate::helpers::{NestedWorkspace, TestWorkspace, cargo_command, cargo_rail_command, git, run_cargo_rail};
+use crate::helpers::{
+    NestedWorkspace, TestWorkspace, cargo_command, cargo_rail_command, file_url, git, git_command, run_cargo_rail,
+};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Command;
 
 fn generate_lockfile(workspace: &Path) -> Result<()> {
@@ -73,7 +76,7 @@ fn write_test_change_levels(workspace: &Path, intents: &[(&str, &str)]) -> Resul
 fn shallow_clone(ws: &TestWorkspace, name: &str) -> Result<(tempfile::TempDir, PathBuf)> {
     let root = tempfile::TempDir::new()?;
     let clone_path = root.path().join(name);
-    let output = Command::new("git")
+    let output = git_command(root.path())
         .args([
             "clone",
             "--depth",
@@ -91,17 +94,6 @@ fn shallow_clone(ws: &TestWorkspace, name: &str) -> Result<(tempfile::TempDir, P
         String::from_utf8_lossy(&output.stderr)
     );
     Ok((root, clone_path))
-}
-
-fn file_url(path: &Path) -> String {
-    #[cfg(windows)]
-    {
-        format!("file:///{}", path.display().to_string().replace('\\', "/"))
-    }
-    #[cfg(not(windows))]
-    {
-        format!("file://{}", path.display())
-    }
 }
 
 fn run_release_with_fault(cwd: &Path, args: &[&str], fault: &str) -> Result<std::process::Output> {

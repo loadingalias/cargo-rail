@@ -498,12 +498,6 @@ pub(crate) struct BrokerFollower {
 
 impl BrokerFollower {
     pub(crate) fn wait(mut self) -> RailResult<Option<CandidateResult>> {
-        write_transition(&mut self.stream, &self.capability, ClientTransition::Yielded)?;
-        expect_ack(
-            &mut self.stream,
-            &self.capability,
-            "yielding follower compiler acquisition work permit",
-        )?;
         match read_server_transition(&mut self.stream, &self.capability)? {
             ServerTransition::Resume {
                 candidate: Some(candidate),
@@ -596,6 +590,7 @@ enum ActorEvent {
         session: u64,
         view: u32,
         key: CandidateFlightKey,
+        follower_resume: mpsc::SyncSender<Result<CandidateResult, BrokerFailureClass>>,
         reply: mpsc::SyncSender<Result<ClaimDisposition, String>>,
     },
     YieldLeader {
@@ -606,13 +601,6 @@ enum ActorEvent {
     ResumeLeader {
         session: u64,
         view: u32,
-        reply: mpsc::SyncSender<Result<(), String>>,
-    },
-    YieldFollower {
-        session: u64,
-        view: u32,
-        key: CandidateFlightKey,
-        resume: mpsc::SyncSender<Result<CandidateResult, BrokerFailureClass>>,
         reply: mpsc::SyncSender<Result<(), String>>,
     },
     Complete {
@@ -1178,17 +1166,19 @@ fn run_actor(receiver: mpsc::Receiver<ActorEvent>, work_permits: usize) -> RailR
                 session,
                 view,
                 key,
+                follower_resume,
                 reply,
-            } => drop(reply.send(state.claim(session, view, key))),
+            } => {
+                let disposition = state.claim(session, view, key.clone()).and_then(|disposition| {
+                    if matches!(disposition, ClaimDisposition::Wait) {
+                        state.yield_follower(session, view, key, follower_resume)?;
+                    }
+                    Ok(disposition)
+                });
+                drop(reply.send(disposition));
+            }
             ActorEvent::YieldLeader { session, view, reply } => drop(reply.send(state.yield_leader(session, view))),
             ActorEvent::ResumeLeader { session, view, reply } => state.resume_leader(session, view, reply),
-            ActorEvent::YieldFollower {
-                session,
-                view,
-                key,
-                resume,
-                reply,
-            } => drop(reply.send(state.yield_follower(session, view, key, resume))),
             ActorEvent::Complete {
                 session,
                 candidate,
@@ -1276,12 +1266,14 @@ fn handle_connection(
         ));
     };
     key.validate()?;
+    let (follower_resume, resumed) = mpsc::sync_channel(1);
     let (reply, response) = mpsc::sync_channel(1);
     event_tx
         .send(ActorEvent::Claim {
             session,
             view,
             key: key.clone(),
+            follower_resume,
             reply,
         })
         .map_err(|_| RailError::message("compiler acquisition broker coordinator stopped"))?;
@@ -1335,9 +1327,12 @@ fn handle_connection(
             handle_leader(stream, event_tx, capability, session, claim)
         }
         ClaimDisposition::Wait => {
+            // The actor registered the follower and yielded its view in the
+            // same event that selected Wait, before this disposition became
+            // observable to either participant.
             write_server_transition(stream, capability, ServerTransition::Wait)?;
             stream.enter_live()?;
-            handle_follower(stream, event_tx, capability, session, view, key)
+            handle_follower(stream, capability, resumed)
         }
         ClaimDisposition::Reject => write_server_transition(
             stream,
@@ -1477,30 +1472,9 @@ fn handle_leader(
 
 fn handle_follower(
     stream: &mut BrokerStream,
-    event_tx: &mpsc::SyncSender<ActorEvent>,
     capability: &str,
-    session: u64,
-    view: u32,
-    key: CandidateFlightKey,
+    resumed: mpsc::Receiver<Result<CandidateResult, BrokerFailureClass>>,
 ) -> RailResult<()> {
-    if !matches!(read_client_transition(stream, capability)?, ClientTransition::Yielded) {
-        return Err(RailError::message(
-            "compiler acquisition follower did not yield its work permit",
-        ));
-    }
-    let (resume, resumed) = mpsc::sync_channel(1);
-    send_unit_event(
-        event_tx,
-        |reply| ActorEvent::YieldFollower {
-            session,
-            view,
-            key,
-            resume,
-            reply,
-        },
-        "yielding compiler acquisition follower",
-    )?;
-    write_server_transition(stream, capability, ServerTransition::Ack)?;
     match resumed
         .recv()
         .map_err(|_| RailError::message("compiler acquisition follower resume disappeared"))?

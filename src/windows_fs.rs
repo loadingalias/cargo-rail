@@ -610,6 +610,22 @@ pub(crate) struct FileObservation {
     pub(crate) number_of_links: u64,
 }
 
+impl FileObservation {
+    /// Compare handle-bound generation evidence across an intentional NTFS rename.
+    ///
+    /// NTFS may advance ChangeTime for a namespace-only change. Callers must
+    /// separately revalidate exact bytes before adopting the new observation.
+    pub(crate) fn same_generation_after_rename(self, other: Self) -> bool {
+        self.volume_serial_number == other.volume_serial_number
+            && self.file_id == other.file_id
+            && self.creation_time == other.creation_time
+            && self.last_write_time == other.last_write_time
+            && self.file_attributes == other.file_attributes
+            && self.size == other.size
+            && self.number_of_links == other.number_of_links
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BasicObservation {
     creation_time: u64,
@@ -1353,13 +1369,33 @@ fn unsupported_with_source(message: &str, source: io::Error) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        create_directory_junction, directory_junction_targets, observe_file, open_for_execution_guard,
+        FileObservation, create_directory_junction, directory_junction_targets, observe_file, open_for_execution_guard,
         open_for_execution_guard_following_reparse, open_for_mutable_directory_guard, open_for_observation,
         open_for_stable_byte_observation, prove_local_ntfs, rename_write_through,
     };
     use std::fs::{self, File};
     use std::io;
     use std::time::Duration;
+
+    #[test]
+    fn rename_generation_ignores_only_change_time() {
+        let observation = FileObservation {
+            volume_serial_number: 1,
+            file_id: 2,
+            creation_time: 3,
+            last_write_time: 4,
+            change_time: 5,
+            file_attributes: 6,
+            size: 7,
+            number_of_links: 1,
+        };
+        let mut renamed = observation;
+        renamed.change_time = 8;
+        assert!(observation.same_generation_after_rename(renamed));
+
+        renamed.last_write_time = 9;
+        assert!(!observation.same_generation_after_rename(renamed));
+    }
 
     #[test]
     #[expect(

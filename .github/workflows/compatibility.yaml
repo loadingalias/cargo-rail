@@ -111,7 +111,8 @@ jobs:
     permissions:
       contents: read
       checks: write
-    timeout-minutes: 60
+    # Native RISC-V cold builds exceed the default budget on GitHub's runner.
+    timeout-minutes: ${{ matrix.compatibility.target == 'riscv64gc-unknown-linux-gnu' && 120 || 60 }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.support.outputs.compatibility-matrix) }}

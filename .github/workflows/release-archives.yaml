@@ -133,7 +133,8 @@ jobs:
       contents: read
       id-token: write
       attestations: write
-    timeout-minutes: 60
+    # Native RISC-V cold archive builds exceed the default budget.
+    timeout-minutes: ${{ matrix.target == 'riscv64gc-unknown-linux-gnu' && 120 || 60 }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
