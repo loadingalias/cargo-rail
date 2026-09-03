@@ -724,8 +724,11 @@ fn test_ci_scopes_remote_cache_credentials_to_setup_and_compiler_steps() {
 
     let reusable_setup = r#"          remote-access-key-id: ${{ inputs.native-cache-url != '' && secrets.r2_access_key_id || '' }}
           remote-secret-access-key: ${{ inputs.native-cache-url != '' && secrets.r2_secret_access_key || '' }}"#;
-    assert_eq!(COMPATIBILITY_WORKFLOW.matches(reusable_setup).count(), 2);
+    assert_eq!(COMPATIBILITY_WORKFLOW.matches(reusable_setup).count(), 1);
     assert_eq!(ARCHIVE_WORKFLOW.matches(reusable_setup).count(), 1);
+    let riscv_setup = r#"          remote-access-key-id: ${{ matrix.compatibility.target != 'riscv64gc-unknown-linux-gnu' && inputs.native-cache-url != '' && secrets.r2_access_key_id || '' }}
+          remote-secret-access-key: ${{ matrix.compatibility.target != 'riscv64gc-unknown-linux-gnu' && inputs.native-cache-url != '' && secrets.r2_secret_access_key || '' }}"#;
+    assert_eq!(COMPATIBILITY_WORKFLOW.matches(riscv_setup).count(), 1);
 
     let credential_environment = r#"      env:
         AWS_ACCESS_KEY_ID: ${{ inputs.remote-access-key-id }}
@@ -742,8 +745,25 @@ fn test_ci_scopes_remote_cache_credentials_to_setup_and_compiler_steps() {
         "AWS_ACCESS_KEY_ID: ${{ env.CARGO_RAIL_CACHE_URL != '' && secrets.CARGO_RAIL_R2_ACCESS_KEY_ID || '' }}";
     assert_eq!(COMMIT_WORKFLOW.matches(commit_compiler).count(), 5);
     let reusable_compiler = "AWS_ACCESS_KEY_ID: ${{ inputs.native-cache-url != '' && secrets.r2_access_key_id || '' }}";
-    assert_eq!(COMPATIBILITY_WORKFLOW.matches(reusable_compiler).count(), 7);
+    assert_eq!(COMPATIBILITY_WORKFLOW.matches(reusable_compiler).count(), 6);
     assert_eq!(ARCHIVE_WORKFLOW.matches(reusable_compiler).count(), 0);
+    let riscv_bootstrap = "AWS_ACCESS_KEY_ID: ${{ matrix.compatibility.target != 'riscv64gc-unknown-linux-gnu' && inputs.native-cache-url != '' && secrets.r2_access_key_id || '' }}";
+    assert_eq!(COMPATIBILITY_WORKFLOW.matches(riscv_bootstrap).count(), 1);
+    assert_eq!(
+        COMPATIBILITY_WORKFLOW
+            .matches("AWS_ACCESS_KEY_ID: ${{ secrets.r2_access_key_id }}")
+            .count(),
+        1
+    );
+    assert!(COMPATIBILITY_WORKFLOW.contains("- name: Enable source-built RISC-V compiler cache"));
+    assert!(
+        COMPATIBILITY_WORKFLOW.contains(
+            "if: matrix.compatibility.target == 'riscv64gc-unknown-linux-gnu' && inputs.native-cache-url != ''"
+        )
+    );
+    assert!(
+        COMPATIBILITY_WORKFLOW.contains("PATH=\"$PWD/target/debug:$PATH\" scripts/cache/setup.sh --max-size 10GiB")
+    );
     let archive_compiler = "AWS_ACCESS_KEY_ID: ${{ !endsWith(matrix.target, '-unknown-linux-gnu') && inputs.native-cache-url != '' && secrets.r2_access_key_id || '' }}";
     assert_eq!(ARCHIVE_WORKFLOW.matches(archive_compiler).count(), 2);
 }

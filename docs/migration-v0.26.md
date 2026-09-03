@@ -78,7 +78,7 @@ selector. Worktree plans still require matching Cargo-Rail verification.
 
 ## Review other contract changes
 
-- GNU Linux archives require glibc 2.35 or newer; installers reject an unsupported host before replacement.
+- GNU Linux archives require glibc 2.39 or newer; installers reject an unsupported host before replacement.
 - `unify.compiler_targets` may select the exact subset of top-level resolution targets valid for workspace-wide
   compiler evidence. It never narrows dependency resolution.
 - Surface analyzes the host by default; use `surface.targets = "workspace"` or an explicit non-empty list for more

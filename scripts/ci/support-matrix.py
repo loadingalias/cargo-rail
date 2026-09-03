@@ -140,7 +140,7 @@ def load_ci_tool_archives() -> tuple[CiToolArchive, ...]:
         )
         require(
             re.fullmatch(
-                r"(?:aarch64|x86_64)-(?:pc-windows-msvc|unknown-linux-(?:gnu|musl))",
+                r"(?:aarch64|x86_64)-(?:pc-windows-msvc|unknown-linux-(?:gnu|musl))|riscv64gc-unknown-linux-(?:gnu|musl)",
                 target,
             )
             is not None,
@@ -810,12 +810,13 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
             )
         if target.endswith("-unknown-linux-gnu"):
             expected_runner = {
-                "aarch64-unknown-linux-gnu": "ubuntu-22.04-arm",
-                "x86_64-unknown-linux-gnu": "ubuntu-22.04",
+                "aarch64-unknown-linux-gnu": "ubuntu-24.04-arm",
+                "riscv64gc-unknown-linux-gnu": "ubuntu-24.04-riscv",
+                "x86_64-unknown-linux-gnu": "ubuntu-24.04",
             }.get(target)
             require(
                 runner == expected_runner,
-                f"release-targets[{index}] must build and run on the declared glibc {gnu_runtime['minimum']} floor",
+                f"release-targets[{index}] must run natively on the declared glibc {gnu_runtime['minimum']} floor",
             )
         require(
             isinstance(entry["commit_ci"], bool),
@@ -1025,6 +1026,7 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
     expected_nextest_targets = {
         "aarch64-pc-windows-msvc",
         "aarch64-unknown-linux-gnu",
+        "riscv64gc-unknown-linux-gnu",
         "x86_64-pc-windows-msvc",
         "x86_64-unknown-linux-gnu",
     }
@@ -1101,6 +1103,7 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
     expected_just_targets = {
         "aarch64-pc-windows-msvc",
         "aarch64-unknown-linux-musl",
+        "riscv64gc-unknown-linux-musl",
         "x86_64-pc-windows-msvc",
         "x86_64-unknown-linux-musl",
     }
@@ -1130,6 +1133,7 @@ def validate_inventories(manifest: CompatibilityManifest) -> None:
         '"${temporary_root_args[@]}"',
         manifest.corpus_runner,
         "scripts/ci/run-filesystem-compatibility.py",
+        "scripts/ci/install-tools.sh ci-endpoint-tools",
         'mount="/mnt/cargo-rail-tmpfs"',
         "if: fromJSON(needs.support.outputs.compatibility-matrix).include[0] != null",
         "if: fromJSON(needs.support.outputs.filesystem-matrix).include[0] != null",

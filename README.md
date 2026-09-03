@@ -36,11 +36,11 @@ Windows PowerShell:
 irm https://github.com/loadingalias/cargo-rail/releases/latest/download/cargo-rail-installer.ps1 | iex
 ```
 
-The installer verifies the native archive and every selected component. Native archives for Apple silicon, GNU
-Linux, musl Linux, and Windows include cache helpers and authenticated Surface authority. Linux musl archives use a
-static core CLI and a native dynamically loaded compiler-fact driver.
+The installer verifies the native archive and every selected component. Native archives include cache helpers;
+Apple silicon, x86-64 and Arm64 GNU Linux, musl Linux, and Windows also include authenticated Surface authority.
+Linux musl archives use a static core CLI and a native dynamically loaded compiler-fact driver.
 The driver relies on the host's standard musl `libgcc_s` runtime, as rustc host tools do.
-GNU Linux archives require glibc 2.35 or newer. The installer verifies that floor before it downloads an archive or
+GNU Linux archives require glibc 2.39 or newer. The installer verifies that floor before it downloads an archive or
 replaces an existing installation.
 
 `cargo install cargo-rail --locked` and `cargo binstall cargo-rail` remain available. They cannot prepare or run Surface

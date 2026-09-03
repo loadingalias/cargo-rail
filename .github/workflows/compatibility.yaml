@@ -136,16 +136,21 @@ jobs:
           --targets "$TARGETS"
 
       - name: Install just for endpoint suites
-        if: matrix.compatibility.full-suite
+        if: matrix.compatibility.full-suite && matrix.compatibility.target != 'riscv64gc-unknown-linux-gnu'
         uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9
         with:
           tool: just@1.58.0
 
       - name: Install cargo-nextest for endpoint suites
-        if: matrix.compatibility.full-suite
+        if: matrix.compatibility.full-suite && matrix.compatibility.target != 'riscv64gc-unknown-linux-gnu'
         uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2.85.9
         with:
           tool: cargo-nextest@0.9.143
+
+      - name: Install checksum-pinned RISC-V endpoint tools
+        if: matrix.compatibility.full-suite && matrix.compatibility.target == 'riscv64gc-unknown-linux-gnu'
+        shell: bash
+        run: scripts/ci/install-tools.sh ci-endpoint-tools
 
       - name: Setup Cargo and compiler caches
         uses: ./.github/actions/cache
@@ -153,10 +158,12 @@ jobs:
           shared-key: cargo-rail-compatibility-v2
           cache-key: ${{ inputs.cache-prefix }}-${{ matrix.compatibility.cache-key }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
-          remote-url: ${{ inputs.native-cache-url }}
+          # The current source builds the first RISC-V cache component set; no
+          # previously released companion archive can bootstrap that boundary.
+          remote-url: ${{ matrix.compatibility.target != 'riscv64gc-unknown-linux-gnu' && inputs.native-cache-url || '' }}
           remote-mode: ${{ inputs.native-cache-mode }}
-          remote-access-key-id: ${{ inputs.native-cache-url != '' && secrets.r2_access_key_id || '' }}
-          remote-secret-access-key: ${{ inputs.native-cache-url != '' && secrets.r2_secret_access_key || '' }}
+          remote-access-key-id: ${{ matrix.compatibility.target != 'riscv64gc-unknown-linux-gnu' && inputs.native-cache-url != '' && secrets.r2_access_key_id || '' }}
+          remote-secret-access-key: ${{ matrix.compatibility.target != 'riscv64gc-unknown-linux-gnu' && inputs.native-cache-url != '' && secrets.r2_secret_access_key || '' }}
 
       - name: Download exact plan
         if: inputs.plan-artifact != ''
@@ -171,10 +178,24 @@ jobs:
 
       - name: Build cargo-rail executables with selected toolchain
         env:
-          AWS_ACCESS_KEY_ID: ${{ inputs.native-cache-url != '' && secrets.r2_access_key_id || '' }}
-          AWS_SECRET_ACCESS_KEY: ${{ inputs.native-cache-url != '' && secrets.r2_secret_access_key || '' }}
+          AWS_ACCESS_KEY_ID: ${{ matrix.compatibility.target != 'riscv64gc-unknown-linux-gnu' && inputs.native-cache-url != '' && secrets.r2_access_key_id || '' }}
+          AWS_SECRET_ACCESS_KEY: ${{ matrix.compatibility.target != 'riscv64gc-unknown-linux-gnu' && inputs.native-cache-url != '' && secrets.r2_secret_access_key || '' }}
           AWS_EC2_METADATA_DISABLED: "true"
         run: cargo build --locked --bins
+
+      - name: Enable source-built RISC-V compiler cache
+        if: matrix.compatibility.target == 'riscv64gc-unknown-linux-gnu' && inputs.native-cache-url != ''
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.r2_access_key_id }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.r2_secret_access_key }}
+          AWS_EC2_METADATA_DISABLED: "true"
+          CARGO_RAIL_CACHE_REMOTE: ${{ inputs.native-cache-url }}
+          CARGO_RAIL_CACHE_MODE: ${{ inputs.native-cache-mode }}
+        run: |
+          echo "$PWD/target/debug" >> "$GITHUB_PATH"
+          PATH="$PWD/target/debug:$PATH" scripts/cache/setup.sh --max-size 10GiB
+          PATH="$PWD/target/debug:$PATH" cargo rail cache probe -f json
 
       - name: Verify Windows installer
         if: matrix.compatibility.full-suite && runner.os == 'Windows'

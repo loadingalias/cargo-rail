@@ -30,14 +30,22 @@ class GnuRuntimeRequirementTests(unittest.TestCase):
         )
         self.assertEqual(versions, {(2, 2), (2, 35)})
 
-    def test_dt_relr_loader_requirement_fails_closed(self) -> None:
+    def test_dt_relr_loader_requirement_is_below_current_floor(self) -> None:
         versions = VERIFIER.parse_required_glibc_versions(
             self.fixture("readelf-glibc-abi-dt-relr.txt"), "fixture"
         )
         self.assertIn((2, 36), versions)
-        with self.assertRaisesRegex(RuntimeError, r"requires GLIBC_2.36"):
+        minimum_text, minimum = VERIFIER.runtime_authority()
+        self.assertEqual((minimum_text, minimum), ("2.39", (2, 39)))
+        VERIFIER.verify_required_glibc_floor(
+            "fixture", versions, minimum, minimum_text
+        )
+
+    def test_requirement_above_current_floor_fails_closed(self) -> None:
+        minimum_text, minimum = VERIFIER.runtime_authority()
+        with self.assertRaisesRegex(RuntimeError, r"requires GLIBC_2.40"):
             VERIFIER.verify_required_glibc_floor(
-                "fixture", versions, (2, 35), "2.35"
+                "fixture", {(2, 40)}, minimum, minimum_text
             )
 
     def test_unknown_glibc_namespace_fails_closed(self) -> None:

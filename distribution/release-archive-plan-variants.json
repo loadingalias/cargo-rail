@@ -10,7 +10,7 @@
     },
     {
       "id": "aarch64-unknown-linux-gnu",
-      "dimensions": { "target": "aarch64-unknown-linux-gnu", "os": "ubuntu-22.04-arm", "archive": "tar", "surface": true },
+      "dimensions": { "target": "aarch64-unknown-linux-gnu", "os": "ubuntu-24.04-arm", "archive": "tar", "surface": true },
       "external_paths": ["src/main.rs", "tools/compiler-fact-driver/**"],
       "cargo_roots": [{"package": "cargo-rail"}]
     },
@@ -21,6 +21,12 @@
       "cargo_roots": [{"package": "cargo-rail"}]
     },
     {
+      "id": "riscv64gc-unknown-linux-gnu",
+      "dimensions": { "target": "riscv64gc-unknown-linux-gnu", "os": "ubuntu-24.04-riscv", "archive": "tar", "surface": false },
+      "external_paths": ["src/main.rs"],
+      "cargo_roots": [{"package": "cargo-rail"}]
+    },
+    {
       "id": "x86-64-pc-windows-msvc",
       "dimensions": { "target": "x86_64-pc-windows-msvc", "os": "windows-2022", "archive": "zip", "surface": true },
       "external_paths": ["src/main.rs", "tools/compiler-fact-driver/**"],
@@ -28,7 +34,7 @@
     },
     {
       "id": "x86-64-unknown-linux-gnu",
-      "dimensions": { "target": "x86_64-unknown-linux-gnu", "os": "ubuntu-22.04", "archive": "tar", "surface": true },
+      "dimensions": { "target": "x86_64-unknown-linux-gnu", "os": "ubuntu-24.04", "archive": "tar", "surface": true },
       "external_paths": ["src/main.rs", "tools/compiler-fact-driver/**"],
       "cargo_roots": [{"package": "cargo-rail"}]
     },

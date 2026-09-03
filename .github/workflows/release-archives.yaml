@@ -197,7 +197,7 @@ jobs:
         run: python3 scripts/ci/verify-gnu-runtime.py --target "$TARGET" --host-only
 
       - name: Setup target toolchain
-        if: ${{ !contains(matrix.target, '-linux-musl') }}
+        if: ${{ !contains(matrix.target, '-linux-musl') && matrix.target != 'riscv64gc-unknown-linux-gnu' }}
         uses: taiki-e/setup-cross-toolchain-action@12b7ad4acfa95a1476779d6c06699b96ec1691f8 # v1.42.0
         with:
           target: ${{ matrix.target }}
@@ -420,7 +420,7 @@ jobs:
           Pop-Location
           Remove-Item Env:RUSTUP_TOOLCHAIN, Env:CARGO, Env:RUSTC, Env:RUSTDOC
           if ($nightlyExit -ne 1 -or $nightlyReport.surface_contract_version -ne 3 -or $nightlyReport.toolchain.rustc -notmatch '1\.99\.0-nightly' -or $nightlyReport.authority.audited_targets.Count -eq 0) {
-            throw "archive dated-nightly Surface qualification failed"
+            throw "archive dated-nightly Surface qualification failed (exit $nightlyExit): $($nightlyJson | Out-String)"
           }
           $actual = (& $binary.FullName rail --version).Trim()
           if ($LASTEXITCODE -ne 0 -or $actual -ne "cargo-rail $env:VERSION") {

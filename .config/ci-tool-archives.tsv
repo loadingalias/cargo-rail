@@ -1,9 +1,11 @@
 # Tool	version	target	sha256
 cargo-nextest	0.9.143	aarch64-pc-windows-msvc	c89ca8168a6cb1aff6e38b3551bedc9b924477aa983d947b99038c5bed6438ba
 cargo-nextest	0.9.143	aarch64-unknown-linux-gnu	2a64b3566a92508550a7ab29c3e8db25472ca37730ecb4d22100b6aa440c2a68
+cargo-nextest	0.9.143	riscv64gc-unknown-linux-gnu	cb5035deced2353e6e03a8408dd7cddaa82ddf0a22238566254617f59f25cb42
 cargo-nextest	0.9.143	x86_64-pc-windows-msvc	c42a1dbde532da06dc9b4a43d44fd0ce668b836c2ab7388410f10ff9834476a2
 cargo-nextest	0.9.143	x86_64-unknown-linux-gnu	66786b9abe23920d022a182d1416b1bbc8130dd4872a9553d76985a1708dcd1e
 just	1.58.0	aarch64-pc-windows-msvc	3a39ed629eb67678976c811a4da46f7985a2c22f4dbabe017b8b2eb5ceb5d01c
 just	1.58.0	aarch64-unknown-linux-musl	748237128c4c40cbdabc65e841d05ceba13cc23a91eaba395495894c1d9764df
+just	1.58.0	riscv64gc-unknown-linux-musl	1cbca0ce9880d5d1050115a6e2ced510927f85d1797a204ef6bccb319d923d8d
 just	1.58.0	x86_64-pc-windows-msvc	759f16fb7aa17c5c8b9594b6d4a8c1a6630dfd042cf2b3ff84841454d3d188dc
 just	1.58.0	x86_64-unknown-linux-musl	4a5cc2f53e6f0f8c59092a6cc38291eb729d46a7dd95d3ae582008881b84931d

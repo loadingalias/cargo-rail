@@ -20,6 +20,12 @@
       "external_paths": ["scripts/ci/run-filesystem-compatibility.py"]
     },
     {
+      "id": "riscv64gc-unknown-linux-gnu",
+      "dimensions": { "family": "compatibility", "name": "riscv64gc-unknown-linux-gnu / Rust 1.98.0", "target": "riscv64gc-unknown-linux-gnu", "runner": "ubuntu-24.04-riscv", "cache-key": "linux-riscv64-rust-1.98.0", "toolchain": "1.98.0", "targets": "thumbv7em-none-eabihf,wasm32-unknown-unknown,wasm32-wasip1,wasm32v1-none", "release": "1.98.0", "full-suite": true, "selection-probes": true, "cross-target-mutation-probes": true, "filesystem": "overlay", "case-sensitive": true },
+      "external_paths": ["tests/compatibility/fixtures/front-door/**"],
+      "cargo_roots": [{"package": "cargo-rail"}]
+    },
+    {
       "id": "windows-ntfs-vhd",
       "dimensions": { "family": "filesystem", "name": "windows-ntfs-vhd", "target": "x86_64-pc-windows-msvc", "runner": "windows-2022", "setup": "windows-ntfs-vhd", "kind": "ntfs", "case-sensitive": false, "toolchain": "1.98.0", "release": "1.98.0" },
       "external_paths": ["scripts/ci/run-filesystem-compatibility.py"]

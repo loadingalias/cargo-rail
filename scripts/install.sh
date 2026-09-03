@@ -26,6 +26,15 @@ case "$system-$machine" in
       gnu_runtime=true
     fi
     ;;
+  Linux-riscv64)
+    if ldd --version 2>&1 | grep -qi musl; then
+      echo "no supported Cargo-Rail archive for $system $machine on musl" >&2
+      exit 1
+    fi
+    target="riscv64gc-unknown-linux-gnu"
+    surface=false
+    gnu_runtime=true
+    ;;
   Linux-x86_64)
     if ldd --version 2>&1 | grep -qi musl; then
       target="x86_64-unknown-linux-musl"; surface=true
@@ -37,7 +46,7 @@ case "$system-$machine" in
   *) echo "no supported Cargo-Rail archive for $system $machine" >&2; exit 1 ;;
 esac
 
-gnu_minimum="2.35"
+gnu_minimum="2.39"
 if [ "$gnu_runtime" = true ]; then
   command -v getconf >/dev/null 2>&1 || {
     echo "Cargo-Rail GNU archives require glibc $gnu_minimum or newer; getconf is unavailable" >&2

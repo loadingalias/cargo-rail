@@ -21,6 +21,7 @@ targets=(
   "Darwin arm64 native aarch64-apple-darwin true"
   "Linux aarch64 gnu aarch64-unknown-linux-gnu true"
   "Linux aarch64 musl aarch64-unknown-linux-musl true"
+  "Linux riscv64 gnu riscv64gc-unknown-linux-gnu false"
   "Linux x86_64 gnu x86_64-unknown-linux-gnu true"
   "Linux x86_64 musl x86_64-unknown-linux-musl true"
 )
@@ -116,13 +117,23 @@ unsupported_gnu_home="$temporary/unsupported-gnu-home"
 mkdir -p "$unsupported_gnu_home/bin"
 printf 'preserved installation\n' > "$unsupported_gnu_home/bin/cargo-rail"
 if INSTALLER_TEST_SYSTEM=Linux INSTALLER_TEST_MACHINE=x86_64 INSTALLER_TEST_LIBC=gnu \
-  INSTALLER_TEST_GLIBC_VERSION=2.34 PATH="$temporary/bin:$PATH" CARGO_HOME="$unsupported_gnu_home" \
+  INSTALLER_TEST_GLIBC_VERSION=2.38 PATH="$temporary/bin:$PATH" CARGO_HOME="$unsupported_gnu_home" \
   "$installer" "$version" > /dev/null 2> "$temporary/unsupported-gnu-stderr"; then
   echo "installer accepted an unsupported GNU runtime" >&2
   exit 1
 fi
-grep -Fq "require glibc 2.35 or newer; found 2.34" "$temporary/unsupported-gnu-stderr"
+grep -Fq "require glibc 2.39 or newer; found 2.38" "$temporary/unsupported-gnu-stderr"
 grep -Fxq "preserved installation" "$unsupported_gnu_home/bin/cargo-rail"
+
+if INSTALLER_TEST_SYSTEM=Linux INSTALLER_TEST_MACHINE=riscv64 INSTALLER_TEST_LIBC=musl \
+  PATH="$temporary/bin:$PATH" CARGO_HOME="$temporary/unsupported-riscv-musl-home" \
+  "$installer" "$version" > /dev/null 2> "$temporary/unsupported-riscv-musl-stderr"; then
+  echo "installer accepted unsupported RISC-V musl" >&2
+  exit 1
+fi
+grep -Fq "no supported Cargo-Rail archive for Linux riscv64 on musl" \
+  "$temporary/unsupported-riscv-musl-stderr"
+test ! -e "$temporary/unsupported-riscv-musl-home/bin/cargo-rail"
 
 if INSTALLER_TEST_SYSTEM=Darwin INSTALLER_TEST_MACHINE=x86_64 INSTALLER_TEST_LIBC=native \
   PATH="$temporary/bin:$PATH" CARGO_HOME="$temporary/unsupported-macos-home" \

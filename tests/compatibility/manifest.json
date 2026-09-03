@@ -64,6 +64,15 @@
       "case_sensitive": true
     },
     {
+      "target": "riscv64gc-unknown-linux-gnu",
+      "qualification": "ci",
+      "runner": "ubuntu-24.04-riscv",
+      "cache_key": "linux-riscv64",
+      "full_suite": true,
+      "filesystem": "overlay",
+      "case_sensitive": true
+    },
+    {
       "target": "x86_64-pc-windows-msvc",
       "qualification": "ci",
       "runner": "windows-2022",
@@ -113,11 +122,6 @@
       "evidence_gate": "native_powerpc64le_hardware_access_unavailable",
       "name": "IBM Power",
       "target": "powerpc64le-unknown-linux-gnu"
-    },
-    {
-      "evidence_gate": "native_riscv64gc_hardware_access_unavailable",
-      "name": "RISC-V 64",
-      "target": "riscv64gc-unknown-linux-gnu"
     },
     {
       "evidence_gate": "native_s390x_hardware_access_unavailable",

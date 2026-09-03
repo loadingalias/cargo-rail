@@ -74,7 +74,7 @@ pub(crate) fn unqualified_host_reason_for(host_os: &str, host_arch: &str) -> Opt
     if !matches!(host_os, "linux" | "macos" | "windows") {
         return Some("native_cache_platform_qualification_unavailable");
     }
-    if !matches!(host_arch, "x86_64" | "aarch64") {
+    if !matches!(host_arch, "x86_64" | "aarch64") && !(host_os == "linux" && host_arch == "riscv64") {
         return Some("native_cache_hardware_qualification_unavailable");
     }
     None
@@ -131,10 +131,11 @@ mod tests {
                 assert_eq!(unqualified_host_reason_for(os, arch), None, "{os}/{arch}");
             }
         }
+        assert_eq!(unqualified_host_reason_for("linux", "riscv64"), None);
         for (os, arch, reason) in [
             ("linux", "powerpc64", "native_cache_hardware_qualification_unavailable"),
             ("linux", "s390x", "native_cache_hardware_qualification_unavailable"),
-            ("linux", "riscv64", "native_cache_hardware_qualification_unavailable"),
+            ("macos", "riscv64", "native_cache_hardware_qualification_unavailable"),
             ("macos", "powerpc64", "native_cache_hardware_qualification_unavailable"),
             ("windows", "x86", "native_cache_hardware_qualification_unavailable"),
             ("freebsd", "x86_64", "native_cache_platform_qualification_unavailable"),

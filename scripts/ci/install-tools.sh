@@ -3,9 +3,9 @@ set -euo pipefail
 
 profile="${1:-}"
 case "$profile" in
-  bench | linux-* | windows-*) ;;
+  bench | ci-endpoint-tools | linux-* | windows-*) ;;
   *)
-    echo "usage: $0 <bench|linux-*|windows-* dev-machines profile>" >&2
+    echo "usage: $0 <bench|ci-endpoint-tools|linux-*|windows-* dev-machines profile>" >&2
     exit 2
     ;;
 esac
@@ -183,6 +183,10 @@ install_just() {
       archive_target=aarch64-unknown-linux-musl
       binary=just
       ;;
+    riscv64gc-unknown-linux-gnu)
+      archive_target=riscv64gc-unknown-linux-musl
+      binary=just
+      ;;
     x86_64-pc-windows-msvc)
       archive_target=x86_64-pc-windows-msvc
       binary=just.exe
@@ -307,7 +311,7 @@ install_cargo_nextest() {
   [[ "$rust_host" == *-pc-windows-msvc ]] && binary=cargo-nextest.exe
 
   case "$rust_host" in
-    x86_64-unknown-linux-gnu | aarch64-unknown-linux-gnu | x86_64-pc-windows-msvc | aarch64-pc-windows-msvc)
+    x86_64-unknown-linux-gnu | aarch64-unknown-linux-gnu | riscv64gc-unknown-linux-gnu | x86_64-pc-windows-msvc | aarch64-pc-windows-msvc)
       archive_target="$rust_host"
       ;;
     *)
@@ -434,6 +438,14 @@ install_cargo_rail() {
     exit 1
   }
 }
+
+if [[ "$profile" == ci-endpoint-tools ]]; then
+  install_just
+  install_cargo_nextest
+  just --version
+  cargo nextest --version
+  exit 0
+fi
 
 install_just
 install_jq

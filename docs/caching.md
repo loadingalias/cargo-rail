@@ -231,6 +231,7 @@ Execution support and cache reuse are independent. A bypass still executes Cargo
 | `aarch64-pc-windows-msvc` | Advertised; full-suite CI required (`windows-11-arm`) | — | Native artifact required | Active for eligible `exact_rustc_result` units; exact compiler identity is part of every key |
 | `aarch64-unknown-linux-gnu` | Advertised; full-suite CI required (`ubuntu-24.04-arm`) | — | Native artifact required | Active for eligible `exact_rustc_result` units; certified default-ELF linked outputs are also active; exact compiler identity is part of every key |
 | `aarch64-unknown-linux-musl` | Not a native host | Required compatibility build | Cross-built artifact required | Bypass: `cross_target_toolchain_evidence_unavailable` |
+| `riscv64gc-unknown-linux-gnu` | Advertised; full-suite CI required (`ubuntu-24.04-riscv`) | — | Native artifact required | Active for eligible `exact_rustc_result` units; certified default-ELF linked outputs are also active; exact compiler identity is part of every key |
 | `thumbv7em-none-eabihf` | Not a native host | Required compatibility build | Fixture artifact required | Bypass: `cross_target_toolchain_evidence_unavailable` |
 | `wasm32-unknown-unknown` | Not a native host | Required compatibility build | Fixture artifact required | Bypass: `cross_target_toolchain_evidence_unavailable` |
 | `wasm32-wasip1` | Not a native host | Required compatibility build | Fixture artifact required | Bypass: `cross_target_toolchain_evidence_unavailable` |
@@ -248,6 +249,7 @@ Linux musl rows are release cross-builds, not native Linux host evidence.
 | Default `aarch64-apple-darwin` | Local native host | `apfs` | Insensitive | Local full endpoint suite, native probe, and benchmarks |
 | Default `aarch64-pc-windows-msvc` | `windows-11-arm` | `ntfs` | Insensitive | Full endpoint suite and native probe |
 | Default `aarch64-unknown-linux-gnu` | `ubuntu-24.04-arm` | `ext4` | Sensitive | Full endpoint suite and native probe |
+| Default `riscv64gc-unknown-linux-gnu` | `ubuntu-24.04-riscv` | `overlay` | Sensitive | Full endpoint suite and native probe |
 | Default `x86_64-pc-windows-msvc` | `windows-2022` | `ntfs` | Insensitive | Full endpoint suite and native probe |
 | Default `x86_64-unknown-linux-gnu` | `ubuntu-24.04` | `ext4` | Sensitive | Full endpoint suite and native probe |
 | linux-tmpfs | `ubuntu-24.04` | `tmpfs` | Sensitive | Front-door corpus, CAS/atomicity suite, ENOSPC, and cleanup |
@@ -258,7 +260,6 @@ Linux musl rows are release cross-builds, not native Linux host evidence.
 | Platform | Target | Execution status | Cache status |
 |---|---|---|---|
 | IBM Power | `powerpc64le-unknown-linux-gnu` | Blocked: `native_powerpc64le_hardware_access_unavailable` | Structurally active when the exact compiler identity is captured |
-| RISC-V 64 | `riscv64gc-unknown-linux-gnu` | Blocked: `native_riscv64gc_hardware_access_unavailable` | Structurally active when the exact compiler identity is captured |
 | IBM Z | `s390x-unknown-linux-gnu` | Blocked: `native_s390x_hardware_access_unavailable` | Structurally active when the exact compiler identity is captured |
 
 Deferred hosts need native hardware before Cargo-Rail can claim tested execution.
