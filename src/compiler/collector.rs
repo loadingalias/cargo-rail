@@ -4094,7 +4094,10 @@ const WINDOWS_FILETIME_UNIX_EPOCH_SECONDS: u64 = 11_644_473_600;
 #[cfg(windows)]
 const WINDOWS_FILETIME_TICKS_PER_SECOND: u64 = 10_000_000;
 const MAX_SYSROOT_FILES: usize = 4096;
-const MAX_SYSROOT_BYTES: u64 = 1024 * 1024 * 1024;
+// rustc-dev is an input to runtime fact-driver manufacturing and expands some
+// supported host sysroots beyond 1 GiB. Keep the identity operation bounded,
+// but size that bound for the complete supported compiler inventory.
+const MAX_SYSROOT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 struct CompilerSysrootInventory {
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -4459,6 +4462,13 @@ fn sysroot_relative_path(sysroot: &Path, path: &Path) -> RailResult<String> {
 }
 
 fn hash_compiler_sysroot(inventory: &CompilerSysrootInventory) -> RailResult<(String, u64)> {
+    hash_compiler_sysroot_with_limit(inventory, MAX_SYSROOT_BYTES)
+}
+
+fn hash_compiler_sysroot_with_limit(
+    inventory: &CompilerSysrootInventory,
+    maximum_bytes: u64,
+) -> RailResult<(String, u64)> {
     let mut total = 0u64;
     let mut framed = Vec::from(&b"cargo-rail-compiler-sysroot-v1\0"[..]);
     for (relative, path) in &inventory.files {
@@ -4469,8 +4479,10 @@ fn hash_compiler_sysroot(inventory: &CompilerSysrootInventory) -> RailResult<(St
             ));
         }
         total = total.saturating_add(metadata.len());
-        if total > MAX_SYSROOT_BYTES {
-            return Err(RailError::message("compiler sysroot identity exceeds its byte limit"));
+        if total > maximum_bytes {
+            return Err(RailError::message(format!(
+                "compiler sysroot identity exceeds its {maximum_bytes}-byte limit after {total} bytes"
+            )));
         }
         let mut file = File::open(path)?;
         let mut hasher = Sha256::new();
@@ -6855,6 +6867,13 @@ edition = "2024"
 
         let baseline = compiler_sysroot_fingerprint(sysroot.path(), "test-host", None).expect("baseline fingerprint");
         assert_eq!(baseline.1, 31);
+        let inventory = compiler_sysroot_inventory(sysroot.path(), "test-host").expect("sysroot inventory");
+        hash_compiler_sysroot_with_limit(&inventory, baseline.1).expect("exact byte limit");
+        let error = hash_compiler_sysroot_with_limit(&inventory, baseline.1 - 1).expect_err("byte limit +1 must fail");
+        assert!(
+            error.to_string().contains("30-byte limit after 31 bytes"),
+            "unexpected byte-limit diagnostic: {error}"
+        );
         std::fs::write(target_lib.join("libcore-test.rlib"), b"target-two").expect("target mutation");
         let target_changed =
             compiler_sysroot_fingerprint(sysroot.path(), "test-host", None).expect("target fingerprint");

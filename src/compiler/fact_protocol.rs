@@ -167,8 +167,8 @@ pub(crate) struct CompilerFactSource {
 pub(crate) enum CompilerFactSourceIdentity {
     /// SHA-256 of the exact, independently readable source bytes.
     Exact(String),
-    /// SHA-256 of rustc's content-addressed virtual-file identity.
-    CompilerGenerated(String),
+    /// SHA-256 of rustc's stable source identity when bytes are unavailable.
+    CompilerOwned(String),
 }
 
 /// UTF-8 byte range in one source-table entry.

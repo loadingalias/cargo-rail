@@ -655,11 +655,11 @@ impl CompilerFactSource {
             CompilerFactSourceIdentity::Exact(digest) => {
                 validate_sha256(digest, "compiler fact exact-source digest")?;
             }
-            CompilerFactSourceIdentity::CompilerGenerated(identity) => {
-                validate_sha256(identity, "compiler fact generated-source identity")?;
+            CompilerFactSourceIdentity::CompilerOwned(identity) => {
+                validate_sha256(identity, "compiler fact compiler-owned source identity")?;
                 if !matches!(self.path, CompilerFactSourcePath::Generated(_)) {
                     return Err(RailError::message(
-                        "compiler-generated source identity names a repository path",
+                        "compiler-owned source identity names a repository path",
                     ));
                 }
             }
@@ -1282,17 +1282,17 @@ mod tests {
 
         let mut opaque_repository = fragment();
         opaque_repository.object.sources[0].identity =
-            CompilerFactSourceIdentity::CompilerGenerated(format!("sha256:{}", "a".repeat(64)));
+            CompilerFactSourceIdentity::CompilerOwned(format!("sha256:{}", "a".repeat(64)));
         assert!(decode(&opaque_repository).is_err());
     }
 
     #[test]
-    fn fragment_accepts_compiler_generated_source_identity_for_expansions() {
+    fn fragment_accepts_compiler_owned_source_identity_for_expansions() {
         let mut generated = fragment();
         generated.object.sources[0].path =
             CompilerFactSourcePath::Generated(format!("/cargo-rail/generated/{}.rs", "a".repeat(64)));
         generated.object.sources[0].identity =
-            CompilerFactSourceIdentity::CompilerGenerated(format!("sha256:{}", "a".repeat(64)));
+            CompilerFactSourceIdentity::CompilerOwned(format!("sha256:{}", "a".repeat(64)));
         for item in &mut generated.object.items {
             item.macro_provenance = CompilerFactMacroProvenance::Expansion(None);
         }

@@ -472,10 +472,10 @@ impl<'tcx> Collector<'tcx> {
                 bytes: bytes.len() as u64,
             }
         } else {
-            let identity = compiler_generated_source_identity(&source_file)?;
+            let identity = compiler_owned_source_identity(&source_file)?;
             SourceData {
-                path: compiler_generated_source_path(&identity),
-                identity: CompilerFactSourceIdentity::CompilerGenerated(identity),
+                path: compiler_owned_source_path(&identity),
+                identity: CompilerFactSourceIdentity::CompilerOwned(identity),
                 bytes: source_file.unnormalized_source_len as u64,
             }
         };
@@ -718,37 +718,47 @@ fn generated_source_path(identity: &str) -> CompilerFactSourcePath {
     CompilerFactSourcePath::Generated(format!("{root}/{digest}.rs"))
 }
 
-fn compiler_generated_source_path(identity: &str) -> CompilerFactSourcePath {
+fn compiler_owned_source_path(identity: &str) -> CompilerFactSourcePath {
     let root = if cfg!(windows) {
-        "C:/cargo-rail/compiler-generated"
+        "C:/cargo-rail/compiler-owned"
     } else {
-        "/cargo-rail/compiler-generated"
+        "/cargo-rail/compiler-owned"
     };
     let digest = identity.strip_prefix("sha256:").unwrap_or(identity);
     CompilerFactSourcePath::Generated(format!("{root}/{digest}.rs"))
 }
 
-fn compiler_generated_source_identity(source: &rustc_span::SourceFile) -> Result<String, String> {
-    let (kind, name_hash) = match &source.name {
-        FileName::MacroExpansion(hash) => (b"macro-expansion".as_slice(), hash.as_u64()),
-        FileName::ProcMacroSourceCode(hash) => (b"proc-macro-source".as_slice(), hash.as_u64()),
-        FileName::Anon(hash) => (b"anonymous-source".as_slice(), hash.as_u64()),
-        FileName::CliCrateAttr(hash) => (b"cli-crate-attribute".as_slice(), hash.as_u64()),
-        FileName::CfgSpec(hash) => (b"cfg-specification".as_slice(), hash.as_u64()),
-        FileName::InlineAsm(hash) => (b"inline-assembly".as_slice(), hash.as_u64()),
+fn compiler_owned_source_identity(source: &rustc_span::SourceFile) -> Result<String, String> {
+    let (kind, name_identity) = match &source.name {
+        FileName::MacroExpansion(hash) => (b"macro-expansion".as_slice(), hash.as_u64().to_le_bytes().to_vec()),
+        FileName::ProcMacroSourceCode(hash) => (b"proc-macro-source".as_slice(), hash.as_u64().to_le_bytes().to_vec()),
+        FileName::Anon(hash) => (b"anonymous-source".as_slice(), hash.as_u64().to_le_bytes().to_vec()),
+        FileName::CliCrateAttr(hash) => (b"cli-crate-attribute".as_slice(), hash.as_u64().to_le_bytes().to_vec()),
+        FileName::CfgSpec(hash) => (b"cfg-specification".as_slice(), hash.as_u64().to_le_bytes().to_vec()),
+        FileName::InlineAsm(hash) => (b"inline-assembly".as_slice(), hash.as_u64().to_le_bytes().to_vec()),
+        FileName::Real(name) if name.local_path().is_none() => (
+            b"external-real-source".as_slice(),
+            source
+                .name
+                .prefer_remapped_unconditionally()
+                .to_string_lossy()
+                .as_bytes()
+                .to_vec(),
+        ),
         FileName::Real(_) | FileName::Custom(_) | FileName::DocTest(_, _) => {
             return Err(format!(
-                "compiler-generated source '{:?}' has neither readable bytes nor a content-addressed virtual filename",
+                "source '{:?}' has neither readable bytes nor a stable compiler-owned identity",
                 source.name
             ));
         }
     };
     let source_hash_kind = source.src_hash.kind.to_string();
     let mut hasher = Sha256::new();
-    hasher.update(b"cargo-rail-compiler-generated-source-v1\0");
+    hasher.update(b"cargo-rail-compiler-owned-source-v1\0");
     hasher.update((kind.len() as u64).to_le_bytes());
     hasher.update(kind);
-    hasher.update(name_hash.to_le_bytes());
+    hasher.update((name_identity.len() as u64).to_le_bytes());
+    hasher.update(name_identity);
     hasher.update(source.unnormalized_source_len.to_le_bytes());
     hasher.update((source_hash_kind.len() as u64).to_le_bytes());
     hasher.update(source_hash_kind.as_bytes());
@@ -1123,7 +1133,7 @@ mod tests {
     }
 
     #[test]
-    fn compiler_generated_virtual_source_without_bytes_has_stable_identity() {
+    fn compiler_owned_source_without_bytes_has_stable_identity() {
         let text = "const __RUST_STD_INTERNAL_INIT: bool = false;";
         let make_source = || {
             let mut source = rustc_span::SourceFile::new(
@@ -1139,25 +1149,37 @@ mod tests {
 
         let first = make_source();
         let second = make_source();
-        let identity = compiler_generated_source_identity(&first).expect("compiler-generated identity");
+        let identity = compiler_owned_source_identity(&first).expect("compiler-owned identity");
         assert_eq!(
-            compiler_generated_source_identity(&second).expect("equivalent identity"),
+            compiler_owned_source_identity(&second).expect("equivalent identity"),
             identity
         );
         assert!(identity.starts_with("sha256:"));
         let root = if cfg!(windows) {
-            "C:/cargo-rail/compiler-generated"
+            "C:/cargo-rail/compiler-owned"
         } else {
-            "/cargo-rail/compiler-generated"
+            "/cargo-rail/compiler-owned"
         };
         assert_eq!(
-            compiler_generated_source_path(&identity),
+            compiler_owned_source_path(&identity),
             CompilerFactSourcePath::Generated(format!(
                 "{root}/{}.rs",
                 identity.strip_prefix("sha256:").expect("identity digest")
             ))
         );
         assert_eq!(first.unnormalized_source_len as usize, text.len());
+
+        let mut external = rustc_span::SourceFile::new(
+            FileName::Real(rustc_span::RealFileName::from_virtual_path(Path::new(
+                "/rustc/toolchain/library/std/src/thread/local.rs",
+            ))),
+            text.to_string(),
+            SourceFileHashAlgorithm::Md5,
+            None,
+        )
+        .expect("external source");
+        external.src = None;
+        assert!(compiler_owned_source_identity(&external).is_ok());
     }
 
     #[test]

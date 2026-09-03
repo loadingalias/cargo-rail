@@ -107,7 +107,12 @@ fn matched_driver_emits_canonical_typed_fragment() {
             command.env("PATH", std::env::join_paths(paths).expect("compiler driver PATH"));
         }
         let result = command.output().expect("run Cargo through driver");
-        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        assert!(
+            result.status.success(),
+            "Cargo fact acquisition failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
         let stdout = String::from_utf8(result.stdout).expect("UTF-8 Cargo messages");
         let diagnostic = stdout
             .lines()
@@ -230,7 +235,7 @@ fn assert_std_thread_local_expansion(fragment: &CompilerFactFragment) {
     assert!(matches!(source.path, CompilerFactSourcePath::Generated(_)));
     assert!(matches!(
         source.identity,
-        CompilerFactSourceIdentity::Exact(_) | CompilerFactSourceIdentity::CompilerGenerated(_)
+        CompilerFactSourceIdentity::Exact(_) | CompilerFactSourceIdentity::CompilerOwned(_)
     ));
     assert!(generated.physical.span.start < generated.physical.span.end);
     assert!(generated.physical.span.end <= source.bytes);
