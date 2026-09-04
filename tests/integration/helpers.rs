@@ -10,13 +10,6 @@ status-level = "pass"
 success-output = "never"
 failure-output = "immediate"
 fail-fast = false
-
-[profile.commit]
-status-level = "fail"
-success-output = "never"
-failure-output = "immediate-final"
-fail-fast = false
-retries = { backoff = "exponential", count = 2, delay = "1s", jitter = true }
 "#;
 
 /// Finish a fallible integration-test body without discarding its error chain.
@@ -161,7 +154,7 @@ serde = { version = "1.0", features = ["derive"] }
         std::fs::create_dir_all(path.join(".config"))?;
         std::fs::write(path.join(".config/rail.toml"), "")?;
 
-        // Create .config/nextest.toml with commit profile for CI compatibility.
+        // Create the nextest configuration used by fixture commands.
         std::fs::write(path.join(".config/nextest.toml"), NEXTEST_CONFIG)?;
 
         git(&path, &["add", "."])?;

@@ -20,51 +20,8 @@ msrv_policy = { mode = "compute", source = "workspace" }
 [surface]
 enabled = true
 
-[release]
-tag_format = "{prefix}{version}"
-remote_effects = "auto"
-registry_publication = "crates-io"
-sign_tags = true
-semver_check = "off"
-
 # Repository work declarations contain positive inputs only. Cargo, rustfmt,
 # dependency policy, release-semver, and Surface semantics remain code-owned.
-[plan.work.cargo-command-policy]
-scope = "repository"
-paths = [
-  ".github/**/*.yaml",
-  ".github/**/*.yml",
-  "docs/**/*.md",
-  "scripts/**/*.sh",
-  "scripts/**/*.py",
-  "src/**/*.rs",
-  "tests/**/*.rs",
-  "justfile",
-]
-
-[plan.work.installers]
-scope = "repository"
-paths = [
-  "install.ps1",
-  "install.sh",
-  "scripts/ci/check-installers.sh",
-  "scripts/ci/fixtures/fake-ci-rustup.sh",
-  "scripts/ci/install-rust-toolchain*.sh",
-  "scripts/ci/test-release-components.py",
-  "scripts/ci/verify-release-components.py",
-]
-
-[plan.work."docs.generated"]
-scope = "repository"
-paths = [
-  "scripts/docs/**",
-  "scripts/ci/install-tools.sh",
-  "scripts/ci/support-matrix.py",
-  "src/compiler/native_cache.rs",
-  "tests/compatibility/manifest.json",
-  "distribution/release-targets.json",
-]
-
 [plan.work.compiler-fact-driver]
 scope = "repository"
 paths = [
@@ -73,46 +30,4 @@ paths = [
   "scripts/with-compiler-fact-driver.sh",
   "src/compiler/**",
   "rustfmt.toml",
-]
-
-[plan.work.compatibility]
-scope = "variants"
-paths = [
-  ".github/workflows/compatibility.yaml",
-  "scripts/ci/run-compatibility.py",
-  "scripts/ci/run-filesystem-compatibility.py",
-  "scripts/ci/install-rust-toolchain.sh",
-  "scripts/ci/support-matrix.py",
-  "tests/compatibility/**",
-]
-variant_catalog = "distribution/compatibility-plan-variants.json"
-
-[plan.work.release-archives]
-scope = "variants"
-paths = [
-  ".github/workflows/release-archives.yaml",
-  "distribution/gnu-runtime.json",
-  "distribution/release-targets.json",
-  "scripts/install.ps1",
-  "scripts/install.sh",
-  "scripts/package-release-archive.py",
-  "scripts/ci/install-rust-toolchain.sh",
-  "scripts/ci/support-matrix.py",
-  "scripts/ci/test-gnu-runtime.py",
-  "scripts/ci/test-release-components.py",
-  "scripts/ci/verify-gnu-runtime.py",
-  "scripts/ci/fixtures/readelf-glibc-*.txt",
-  "scripts/ci/verify-release-components.py",
-  "src/main.rs",
-  "tools/compiler-fact-driver/**",
-]
-variant_catalog = "distribution/release-archive-plan-variants.json"
-
-[plan.work.action-pins]
-scope = "repository"
-paths = [
-  ".github/actions-lock.yaml",
-  ".github/**/*.yaml",
-  ".github/**/*.yml",
-  "scripts/ci/pin-actions.sh",
 ]

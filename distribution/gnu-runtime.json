@@ -1,5 +1,0 @@
-{
-  "contract_version": 1,
-  "family": "glibc",
-  "minimum": "2.39"
-}

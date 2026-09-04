@@ -137,11 +137,11 @@ Cargo-Rail uses fixed changelog structure rather than a template engine; put rel
 `[plan.work.NAME]` declares inputs, not commands:
 
 ```toml
-[plan.work.compatibility]
+[plan.work.deliverables]
 scope = "variants"
-paths = ["tests/compatibility/**"]
+paths = ["deliverables/**"]
 config = ["targets"]
-variant_catalog = "distribution/compatibility-plan-variants.json"
+variant_catalog = "variants.json"
 ```
 
 `scope` is `repository`, `cargo`, or `variants`. Paths are positive repository-relative globs. `config` names exact

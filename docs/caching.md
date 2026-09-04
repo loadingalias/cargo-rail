@@ -1,10 +1,5 @@
 # Caching
 
-> Auto-generated from executable support registries and native-cache gates. Do not edit manually.
->
-> Regenerate with `just gen-docs`. Support manifest schema: `9`;
-> native-cache compiler-identity schema: `11`.
-
 Cargo-Rail preserves Cargo as the executor. Each layer may remove only the work it can prove reusable.
 
 | Layer | Authority | Result |
@@ -172,10 +167,9 @@ Run setup without `--check` only after reviewing the authority. The default `aut
 fresh class-specific measurements predict a critical-path win. `qualification` sends every eligible miss to collect
 evidence and may be slower.
 
-Deploy the direct worker only on a dedicated single-tenant host or ephemeral VM. The qualified Linux mode pins the
-compiler and worker capability, uses mutual TLS, runs each attempt inside a resource-bounded cgroup and Bubblewrap
-sandbox, and inherits no operator or provider credentials. Use the repository's
-`qualify-distributed-execution-*` recipes before serving a worker.
+Deploy the direct worker only on a dedicated single-tenant host or ephemeral VM. Pin the compiler and worker
+capability, use mutual TLS, run each attempt inside a resource-bounded sandbox, and inherit no operator or provider
+credentials.
 
 A transport, worker, lease, sandbox, or pre-commit validation failure executes the normalized operation locally once.
 A successful response still passes the native-cache validation and restore transaction before Cargo sees output.
@@ -219,73 +213,7 @@ so capture, identity, and post-execution witness failures remain visible after t
 cannot be validated, `failure_reason_counts_available` is `false` instead of reporting invented zeroes. Verbose status
 also reports the fixed 64-shard native restore-lock namespace and any staging residue.
 
-## Execution and reuse support
-
-Execution support and cache reuse are independent. A bypass still executes Cargo normally.
-
-### Hosts and targets
-
-| Target | Native execution | Cross-target compilation | Release artifact | Native compiler-result cache |
-|---|---|---|---|---|
-| `aarch64-apple-darwin` | Advertised; local full-suite qualification required | — | Native artifact required | Active for eligible `exact_rustc_result` units; exact compiler identity is part of every key |
-| `aarch64-pc-windows-msvc` | Advertised; full-suite CI required (`windows-11-arm`) | — | Native artifact required | Active for eligible `exact_rustc_result` units; exact compiler identity is part of every key |
-| `aarch64-unknown-linux-gnu` | Advertised; full-suite CI required (`ubuntu-24.04-arm`) | — | Native artifact required | Active for eligible `exact_rustc_result` units; certified default-ELF linked outputs are also active; exact compiler identity is part of every key |
-| `aarch64-unknown-linux-musl` | Not a native host | Required compatibility build | Cross-built artifact required | Bypass: `cross_target_toolchain_evidence_unavailable` |
-| `riscv64gc-unknown-linux-gnu` | Advertised; full-suite CI required (`ubuntu-24.04-riscv`) | — | Native artifact required | Active for eligible `exact_rustc_result` units; certified default-ELF linked outputs are also active; exact compiler identity is part of every key |
-| `thumbv7em-none-eabihf` | Not a native host | Required compatibility build | Fixture artifact required | Bypass: `cross_target_toolchain_evidence_unavailable` |
-| `wasm32-unknown-unknown` | Not a native host | Required compatibility build | Fixture artifact required | Bypass: `cross_target_toolchain_evidence_unavailable` |
-| `wasm32-wasip1` | Not a native host | Required compatibility build | Fixture artifact required | Bypass: `cross_target_toolchain_evidence_unavailable` |
-| `wasm32v1-none` | Not a native host | Required compatibility build | Fixture artifact required | Bypass: `cross_target_toolchain_evidence_unavailable` |
-| `x86_64-pc-windows-msvc` | Advertised; full-suite CI required (`windows-2022`) | — | Native artifact required | Active for eligible `exact_rustc_result` units; exact compiler identity is part of every key |
-| `x86_64-unknown-linux-gnu` | Advertised; full-suite CI required (`ubuntu-24.04`) | — | Native artifact required | Active for eligible `exact_rustc_result` units; certified default-ELF linked outputs are also active; exact compiler identity is part of every key |
-| `x86_64-unknown-linux-musl` | Not a native host | Required compatibility build | Cross-built artifact required | Bypass: `cross_target_toolchain_evidence_unavailable` |
-
-Linux musl rows are release cross-builds, not native Linux host evidence.
-
-### Filesystems
-
-| Profile | Runner | Filesystem | Case behavior | Required evidence |
-|---|---|---|---|---|
-| Default `aarch64-apple-darwin` | Local native host | `apfs` | Insensitive | Local full endpoint suite, native probe, and benchmarks |
-| Default `aarch64-pc-windows-msvc` | `windows-11-arm` | `ntfs` | Insensitive | Full endpoint suite and native probe |
-| Default `aarch64-unknown-linux-gnu` | `ubuntu-24.04-arm` | `ext4` | Sensitive | Full endpoint suite and native probe |
-| Default `riscv64gc-unknown-linux-gnu` | `ubuntu-24.04-riscv` | `overlay` | Sensitive | Full endpoint suite and native probe |
-| Default `x86_64-pc-windows-msvc` | `windows-2022` | `ntfs` | Insensitive | Full endpoint suite and native probe |
-| Default `x86_64-unknown-linux-gnu` | `ubuntu-24.04` | `ext4` | Sensitive | Full endpoint suite and native probe |
-| linux-tmpfs | `ubuntu-24.04` | `tmpfs` | Sensitive | Front-door corpus, CAS/atomicity suite, ENOSPC, and cleanup |
-| windows-ntfs-vhd | `windows-2022` | `ntfs` | Insensitive | Front-door corpus, CAS/atomicity suite, cross-volume staging, ENOSPC, and cleanup |
-
-### Deferred native hosts
-
-| Platform | Target | Execution status | Cache status |
-|---|---|---|---|
-| IBM Power | `powerpc64le-unknown-linux-gnu` | Blocked: `native_powerpc64le_hardware_access_unavailable` | Structurally active when the exact compiler identity is captured |
-| IBM Z | `s390x-unknown-linux-gnu` | Blocked: `native_s390x_hardware_access_unavailable` | Structurally active when the exact compiler identity is captured |
-
-Deferred hosts need native hardware before Cargo-Rail can claim tested execution.
-
-### Compiler classes
-
-| Class | Reuse boundary |
-|---|---|
-| Metadata and Rust libraries | Active with exact toolchain, source, dependency, environment, and output identity |
-| Certified Apple and Linux linked outputs | Active only with complete default-linker input evidence and byte-stable output |
-| Tests, examples, benchmarks, `dylib`, and `cdylib` | Active only through a certified linker path |
-| `staticlib` | Active as an exact compiler-owned archive result |
-| Proc-macro producers | Metadata is active; linked producer output needs a certified linker; later macro execution is not covered |
-| Native proc-macro consumers | Bypass because compile-time external reads are incomplete |
-| Build-script compilation | Compiler result may reuse; script execution and generated output remain Cargo-owned cold work |
-| Native dependencies and `links` | Rust consumers may reuse only with complete native-search evidence; native tools execute cold |
-| Incremental, Clippy, rustdoc, and doctests | Bypass before result acquisition |
-| External target directories | Active for eligible native units; Cargo's physical output parent remains executor-local |
-| Cross targets, custom targets, and unsupported wrappers | Execute through the selected compiler chain |
-
-The default Apple linker chain and a Linux `cc`-selected ELF linker with GNU-compatible dependency evidence are
-certified. Bare and boolean `linker-plugin-lto` forms use rustc's boolean grammar; explicit plugin library paths remain
-unsupported. Windows COFF linking, explicit linker selection, custom linker arguments, and external codegen backends
-execute normally until their complete input boundary is graduated.
-
 ## Benchmark evidence
 
 Use [the benchmarking contract](benchmarking.md) for smoke, qualification, correctness, evidence retention, and claim
-requirements. Generated support rows describe tested authority; they are not performance claims.
+requirements.

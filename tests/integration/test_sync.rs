@@ -1460,25 +1460,30 @@ fn test_sync_to_remote_preserves_exact_tree_and_commit_metadata() {
     super::helpers::finish_test(result);
 }
 
-#[test]
-fn test_explicit_non_cargo_asset_roundtrips_at_its_owned_path() {
-    let result: Result<()> = (|| {
-        let ws = TestWorkspace::new()?;
-        ws.add_crate("asset-sync", "0.1.0", &[])?;
-        std::fs::write(ws.path.join("NOTICE"), "initial\n")?;
-        ws.commit("Add crate and explicit asset")?;
-        let split_dir = TempDir::new()?;
-        git(split_dir.path(), &["init", "--initial-branch=main"])?;
-        let config = format!(
-            r#"[crates.asset-sync.split]
+fn setup_explicit_non_cargo_asset_sync() -> Result<(TestWorkspace, TempDir)> {
+    let ws = TestWorkspace::new()?;
+    ws.add_crate("asset-sync", "0.1.0", &[])?;
+    std::fs::write(ws.path.join("NOTICE"), "initial\n")?;
+    ws.commit("Add crate and explicit asset")?;
+    let split_dir = TempDir::new()?;
+    git(split_dir.path(), &["init", "--initial-branch=main"])?;
+    let config = format!(
+        r#"[crates.asset-sync.split]
 remote = "{}"
 branch = "main"
 mode = "single"
 include = ["NOTICE", "assets/**"]
 "#,
-            split_dir.path().display().to_string().replace('\\', "\\\\")
-        );
-        std::fs::write(ws.path.join("rail.toml"), config)?;
+        split_dir.path().display().to_string().replace('\\', "\\\\")
+    );
+    std::fs::write(ws.path.join("rail.toml"), config)?;
+    Ok((ws, split_dir))
+}
+
+#[test]
+fn test_explicit_non_cargo_asset_syncs_to_its_owned_path() {
+    let result: Result<()> = (|| {
+        let (ws, split_dir) = setup_explicit_non_cargo_asset_sync()?;
         run_cargo_rail(
             &ws.path,
             &["rail", "split", "run", "asset-sync", "--yes", "--allow-dirty"],
@@ -1526,6 +1531,22 @@ include = ["NOTICE", "assets/**"]
             &["rail", "sync", "asset-sync", "--to-remote", "--yes", "--allow-dirty"],
         )?;
         assert!(!split_dir.path().join("assets/renamed.txt").exists());
+
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_explicit_non_cargo_asset_syncs_from_its_owned_path() {
+    let result: Result<()> = (|| {
+        let (ws, split_dir) = setup_explicit_non_cargo_asset_sync()?;
+        run_cargo_rail(
+            &ws.path,
+            &["rail", "split", "run", "asset-sync", "--yes", "--allow-dirty"],
+        )?;
+        assert_eq!(git(split_dir.path(), &["show", "HEAD:NOTICE"])?.stdout, b"initial\n");
+        git(split_dir.path(), &["diff", "--quiet", "--", "NOTICE"])?;
 
         std::fs::write(split_dir.path().join("NOTICE"), "from split\n")?;
         git(split_dir.path(), &["add", "NOTICE"])?;

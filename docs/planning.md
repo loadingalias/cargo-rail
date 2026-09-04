@@ -32,15 +32,15 @@ release-semver, and Surface decisions.
 Register only positive inputs for repository-specific work. Keep commands in Just, scripts, or CI:
 
 ```toml
-[plan.work.workflow-policy]
+[plan.work.verification]
 scope = "repository"
-paths = [".github/**", "scripts/ci/**"]
+paths = ["verification/**"]
 config = ["targets"]
 
-[plan.work.compatibility]
+[plan.work.deliverables]
 scope = "variants"
-paths = ["tests/compatibility/**"]
-variant_catalog = "distribution/compatibility-plan-variants.json"
+paths = ["deliverables/**"]
+variant_catalog = "variants.json"
 ```
 
 | Scope | Plan output | Use |

@@ -22,26 +22,15 @@ case "$operation" in
     ;;
 esac
 
-mode="${CARGO_RAIL_TEST_MODE:-local}"
-case "$mode" in
-  local) nextest_profile=default ;;
-  commit) nextest_profile=commit ;;
-  riscv-ci) nextest_profile=riscv-ci ;;
-  *)
-    echo "unsupported Cargo-Rail test mode: $mode" >&2
-    exit 2
-    ;;
-esac
-
 if [ "$operation" = test ] && [ "$argument" = --all ]; then
-  cargo nextest run --workspace -P "$nextest_profile" --all-features --locked \
+  cargo nextest run --workspace -P default --all-features --locked \
     --config-file .config/nextest.toml
   cargo test --doc -p cargo-rail --all-features --locked
   exit 0
 fi
 
 if [ "$operation" = test ] && [ -n "$argument" ]; then
-  cargo nextest run -p "$argument" -P "$nextest_profile" --all-features --locked \
+  cargo nextest run -p "$argument" -P default --all-features --locked \
     --config-file .config/nextest.toml
   exit 0
 fi
@@ -90,6 +79,6 @@ if [ "$operation" = build ]; then
   exit 0
 fi
 
-run_cargo_work cargo.test nextest run -P "$nextest_profile" --all-features --locked \
+run_cargo_work cargo.test nextest run -P default --all-features --locked \
   --config-file .config/nextest.toml
 run_cargo_work cargo.doctest test --doc --all-features --locked

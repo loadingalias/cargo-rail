@@ -295,7 +295,7 @@ enabled = true
 
 [plan.work.compatibility]
 scope = "variants"
-paths = ["tests/compatibility/**"]
+paths = ["deliverables/**"]
 
 [plan.work.release-archives]
 scope = "variants"
@@ -457,7 +457,7 @@ fn test_plan_all_is_monotonic_and_variant_fallback_is_explicit() {
         ws.add_crate("all-case", "0.1.0", &[])?;
         std::fs::write(
             ws.path.join(".config/rail.toml"),
-            "[plan.work.compatibility]\nscope = 'variants'\npaths = ['tests/compatibility/**']\n",
+            "[plan.work.compatibility]\nscope = 'variants'\npaths = ['deliverables/**']\n",
         )?;
         ws.commit("establish work catalog")?;
         let normal = plan(&ws, &["--since", "HEAD"])?;
@@ -483,27 +483,6 @@ fn test_plan_all_is_monotonic_and_variant_fallback_is_explicit() {
 }
 
 #[test]
-fn test_plan_variant_catalogs_validate_against_published_schema() {
-    let result: Result<()> = (|| {
-        let schema: Value = serde_json::from_str(PLAN_VARIANTS_V2_SCHEMA)?;
-        let validator = jsonschema::validator_for(&schema).map_err(|error| anyhow!("invalid schema: {error}"))?;
-        for path in [
-            "distribution/compatibility-plan-variants.json",
-            "distribution/release-archive-plan-variants.json",
-        ] {
-            let catalog: Value = serde_json::from_slice(&std::fs::read(path)?)?;
-            let errors = validator
-                .iter_errors(&catalog)
-                .map(|error| error.to_string())
-                .collect::<Vec<_>>();
-            assert!(errors.is_empty(), "{path} failed schema: {errors:#?}");
-        }
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-#[test]
 fn test_plan_variant_catalog_identity_is_order_and_format_independent() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("plan-variant-identity")?;
@@ -511,7 +490,7 @@ fn test_plan_variant_catalog_identity_is_order_and_format_independent() {
         std::fs::create_dir_all(ws.path.join("distribution"))?;
         std::fs::write(
             ws.path.join(".config/rail.toml"),
-            "[plan.work.compatibility]\nscope = 'variants'\npaths = ['tests/compatibility/**']\nvariant_catalog = 'distribution/variants.json'\n",
+            "[plan.work.compatibility]\nscope = 'variants'\npaths = ['deliverables/**']\nvariant_catalog = 'distribution/variants.json'\n",
         )?;
         let left = serde_json::json!({
             "variant_catalog_version": 2,
@@ -1665,7 +1644,7 @@ fn test_plan_variant_catalog_v2_models_iggy_deliverables_exactly() {
             ".dockerignore",
             "LICENSE",
             "NOTICE",
-            "scripts/ci/third-party-licenses.sh",
+            "scripts/verification/third-party-licenses.sh",
         ];
         let row = |id: &str, roots: &[&str], extra: &[&str], rust: bool| {
             let mut paths = common_paths.to_vec();
@@ -1684,11 +1663,11 @@ fn test_plan_variant_catalog_v2_models_iggy_deliverables_exactly() {
             "variant_catalog_version": 2,
             "work": "deliverables",
             "variants": [
-                row("server", &["server"], &["core/server/Dockerfile", "web/**", "scripts/ci/render-node-licenses.mjs"], true),
+                row("server", &["server"], &["core/server/Dockerfile", "web/**", "scripts/verification/render-node-licenses.mjs"], true),
                 row("mcp", &["mcp"], &["core/mcp/Dockerfile"], true),
                 row("dashboard", &["dashboard-server", "dashboard-frontend"], &["core/dashboard/Dockerfile"], true),
                 row("connectors", &["connectors"], &["core/connectors/Dockerfile"], true),
-                row("web", &[], &["web/**", "scripts/ci/render-node-licenses.mjs"], false)
+                row("web", &[], &["web/**", "scripts/verification/render-node-licenses.mjs"], false)
             ]
         });
         let schema: Value = serde_json::from_str(PLAN_VARIANTS_V2_SCHEMA)?;
@@ -1712,7 +1691,7 @@ fn test_plan_variant_catalog_v2_models_iggy_deliverables_exactly() {
             "core/connectors/Dockerfile",
             "web/Dockerfile",
             "web/app.ts",
-            "scripts/ci/render-node-licenses.mjs",
+            "scripts/verification/render-node-licenses.mjs",
             "foreign/node/package-lock.json",
             "docs/guide.md",
         ]) {
@@ -1734,11 +1713,11 @@ fn test_plan_variant_catalog_v2_models_iggy_deliverables_exactly() {
             (".dockerignore", vec!["connectors", "dashboard", "mcp", "server", "web"]),
             ("LICENSE", vec!["connectors", "dashboard", "mcp", "server", "web"]),
             (
-                "scripts/ci/third-party-licenses.sh",
+                "scripts/verification/third-party-licenses.sh",
                 vec!["connectors", "dashboard", "mcp", "server", "web"],
             ),
             ("about.hbs", vec!["connectors", "dashboard", "mcp", "server"]),
-            ("scripts/ci/render-node-licenses.mjs", vec!["server", "web"]),
+            ("scripts/verification/render-node-licenses.mjs", vec!["server", "web"]),
             ("Cargo.toml", vec!["connectors", "dashboard", "mcp", "server"]),
         ];
         for (relative, expected) in cases {

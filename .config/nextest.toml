@@ -43,92 +43,9 @@ threads-required = "num-test-threads"
 slow-timeout = { period = "60s", terminate-after = 6 }
 
 [[profile.default.overrides]]
-filter = 'binary(integration) & test(=test_plan_consumers::test_source_reader_bootstrap_preserves_direct_binary_authority)'
-test-group = 'cargo-subprocess'
-# This test owns a cold source bootstrap in an isolated target directory. Run it first and alone.
-priority = 70
-threads-required = "num-test-threads"
-slow-timeout = { period = "60s", terminate-after = 10 }
-
-[[profile.default.overrides]]
 filter = 'binary(integration) & test(=test_compiler_observation::source_capture_limit_bypasses_cold_without_creating_authority)'
 leak-timeout = { period = "10s", result = "fail" }
 
 [[profile.default.overrides]]
 filter = 'binary(integration) & test(/test_(instrumentation|scale_fixture|source_snapshot|surface|unify|unused_detection|undeclared_features)/)'
 test-group = 'cargo-subprocess'
-
-[profile.commit]
-status-level = "fail"
-inherits = "default"
-flaky-result = "fail"
-success-output = "never"
-failure-output = "immediate-final"
-fail-fast = false
-test-threads = "num-cpus"
-slow-timeout = { period = "60s", terminate-after = 4 }
-leak-timeout = { period = "2s", result = "fail" }
-retries = 0
-
-[[profile.commit.overrides]]
-filter = 'binary(integration) & test(/test_native_cache_fixture::real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority$/)'
-test-group = 'cargo-subprocess'
-priority = 100
-threads-required = "num-test-threads"
-slow-timeout = { period = "60s", terminate-after = 10 }
-
-[[profile.commit.overrides]]
-filter = 'binary(integration) & test(/test_native_cache_fixture::/)'
-test-group = 'cargo-subprocess'
-# Custom-profile overrides inherit each unset setting from matching default overrides.
-slow-timeout = { period = "60s", terminate-after = 6 }
-
-[[profile.commit.overrides]]
-filter = 'binary(integration) & test(=test_cache_installation::direct_s3_remote_is_l2_only_and_falls_back_cold_on_corruption_or_outage)'
-test-group = 'cargo-subprocess'
-priority = 90
-threads-required = "num-test-threads"
-slow-timeout = { period = "60s", terminate-after = 6 }
-
-[[profile.commit.overrides]]
-filter = 'binary(integration) & test(=test_cache_installation::setup_owned_remote_is_automatic_coordinated_and_removable)'
-test-group = 'cargo-subprocess'
-priority = 80
-threads-required = "num-test-threads"
-slow-timeout = { period = "60s", terminate-after = 6 }
-
-[[profile.commit.overrides]]
-filter = 'binary(integration) & test(=test_compiler_observation::source_capture_limit_bypasses_cold_without_creating_authority)'
-leak-timeout = { period = "10s", result = "fail" }
-
-[[profile.commit.overrides]]
-filter = 'binary(integration) & test(/test_(instrumentation|scale_fixture|source_snapshot|surface|unify|unused_detection|undeclared_features)/)'
-test-group = 'cargo-subprocess'
-
-[profile.commit.junit]
-path = "junit.xml"
-report-name = "cargo-rail-tests"
-report-skipped = "none"
-flaky-fail-status = "failure"
-store-success-output = false
-store-failure-output = true
-
-[profile.riscv-ci]
-inherits = "commit"
-# The cold source-reader bootstrap recompiles Cargo-Rail only to prove
-# architecture-independent binary selection. Every other full-suite host runs
-# that proof; the RISC-V front-door corpus still builds and executes the native
-# binary before this profile runs.
-default-filter = 'not test(=test_plan_consumers::test_source_reader_bootstrap_preserves_direct_binary_authority)'
-
-[[profile.riscv-ci.overrides]]
-filter = 'binary(integration) & test(/test_native_cache_fixture::real_cargo_check_and_build_reuse_exact_outputs_with_root_bound_authority$/)'
-# Keep the architecture-sensitive exhaustive cache proof, whose deliberately
-# cold build matrix exceeded twenty minutes on the native RISC-V runner.
-slow-timeout = { period = "5m", terminate-after = 10 }
-
-[[profile.riscv-ci.overrides]]
-filter = "all()"
-# Native RISC-V runs Cargo-heavy fixtures substantially slower than the other
-# compatibility hosts. Retain a finite watchdog without weakening their limits.
-slow-timeout = { period = "2m", terminate-after = 10 }

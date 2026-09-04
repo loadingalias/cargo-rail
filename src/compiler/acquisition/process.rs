@@ -100,9 +100,9 @@ impl ProcessTree {
         }
     }
 
-    /// Resolve a normally exited direct child and reject surviving descendants.
+    /// Resolve a normally exited direct child after its process tree drains.
     pub(crate) fn finish(&mut self, status: ExitStatus) -> io::Result<ExitStatus> {
-        if self.tree_is_empty()? {
+        if self.wait_tree_empty(GRACEFUL_TERMINATION)? {
             self.resolved = true;
             return Ok(status);
         }
@@ -286,6 +286,43 @@ mod tests {
             std::thread::yield_now();
         };
         assert!(tree.finish(status).expect("finish process tree").success());
+    }
+
+    #[test]
+    fn normally_exited_process_tree_allows_short_lived_descendants_to_drain() {
+        #[cfg(windows)]
+        let directory = tempfile::tempdir().expect("Windows process-tree fixture");
+        #[cfg(windows)]
+        let mut command = {
+            let script = directory.path().join("draining-descendant.cmd");
+            std::fs::write(
+                &script,
+                "@echo off\r\nstart \"\" /b ping -n 2 127.0.0.1 >nul\r\nexit /b 0\r\n",
+            )
+            .expect("Windows draining-descendant script");
+            Command::new(script)
+        };
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = Command::new("sh");
+            command.args(["-c", "(sleep 1) &"]);
+            command
+        };
+        #[cfg(not(any(unix, windows)))]
+        let mut command = {
+            let mut command = Command::new("sh");
+            command.args(["-c", "exit 0"]);
+            command
+        };
+
+        let mut tree = ProcessTree::spawn(&mut command).expect("spawn draining process tree");
+        let status = loop {
+            if let Some(status) = tree.try_wait().expect("wait for direct process") {
+                break status;
+            }
+            std::thread::yield_now();
+        };
+        assert!(tree.finish(status).expect("drain process tree").success());
     }
 
     #[cfg(unix)]

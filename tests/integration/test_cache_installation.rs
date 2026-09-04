@@ -2961,7 +2961,7 @@ fn compiler_analysis_reuses_native_result_only_after_an_exact_binding() {
 
 #[cfg(unix)]
 #[test]
-#[ignore = "blocked by the known process-tree descendant ownership failure tracked in docs/tasks/improve.md"]
+#[ignore = "blocked by a known process-tree descendant ownership failure"]
 fn remote_analysis_imports_evidence_before_reusing_the_native_result() {
     let result: Result<()> = (|| {
         use std::os::unix::fs::PermissionsExt as _;
@@ -3676,7 +3676,7 @@ exec "$REAL_RUSTC" "$@"
             ("test", &["test", "--quiet"]),
             ("run", &["run", "--quiet"]),
             ("bench", &["bench", "--quiet", "--no-run"]),
-            ("nextest", &["nextest", "run", "--profile", "commit"]),
+            ("nextest", &["nextest", "run", "--profile", "default"]),
         ];
         for (name, arguments) in lanes {
             let seed = Command::new("cargo")

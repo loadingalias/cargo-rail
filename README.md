@@ -5,7 +5,6 @@ analysis, releases, and crate split/sync. Cargo, nextest, Just, and CI remain th
 captured workspace model and exact scope.
 
 [![Crates.io](https://img.shields.io/crates/v/cargo-rail.svg)](https://crates.io/crates/cargo-rail)
-[![CI](https://img.shields.io/github/actions/workflow/status/loadingalias/cargo-rail/commit.yaml?branch=main)](https://github.com/loadingalias/cargo-rail/actions/workflows/commit.yaml)
 [![MSRV](https://img.shields.io/crates/msrv/cargo-rail)](https://github.com/loadingalias/cargo-rail/blob/main/Cargo.toml)
 
 ## What Cargo-Rail removes
@@ -139,8 +138,8 @@ changed source
 Cross-process consumers must validate contract v8 and its content-derived identity, then verify that the current head
 and captured source match the saved plan before executing typed selectors. Comparing `HEAD` alone is insufficient.
 Planner machine identities remain provenance; executor-local Cargo, toolchain, and platform state cannot rewrite the
-decision. This repository's Commit workflow transfers one plan artifact and validates it with
-[`scripts/plan/read.py`](scripts/plan/read.py). See [Planning](docs/planning.md).
+decision. [`scripts/plan/read.py`](scripts/plan/read.py) is the strict reference consumer. See
+[Planning](docs/planning.md).
 
 ### GitHub Actions
 
@@ -168,15 +167,6 @@ Use `loadingalias/cargo-rail-action/cache@v8` separately in each execution job t
 Its `mode` input is required: use `read` for untrusted jobs and grant `read-write` only to trusted seed jobs. The
 Action exposes typed root portability and an optional strict authenticated provider probe. See the [Action
 guide](https://github.com/loadingalias/cargo-rail-action).
-
-This repository dogfoods the same boundary. Local Just commands use the installed release; trusted `main` and release
-jobs use the v8 cache action against one private Cloudflare R2 authority. Pull requests remain local-only. R2
-credentials are attached only to steps that execute compiler work, while CI and developer machines use distinct
-bucket-scoped credentials for the same remote authority. The Commit workflow builds the checked-out planner once—
-necessary because that source may introduce the next plan contract—then transfers both its exact v8 plan and planner
-binary to fail-closed consumers. A release tag reuses the archives already built, smoke-tested, and attested by that
-exact-SHA Commit run, building only release-only targets unless an explicit recovery run must reconstruct the full
-set.
 
 ## Carry release intent through the workflow
 

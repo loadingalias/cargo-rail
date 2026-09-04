@@ -11,9 +11,6 @@ __pycache__
 Thumbs.db
 .DS_Store
 
-# Claude
-.claude
-
 # Codex
 .agents
 AGENTS.md

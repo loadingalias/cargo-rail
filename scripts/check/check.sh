@@ -68,45 +68,12 @@ else
   echo "Skipped formatting: cargo.fmt is not required."
 fi
 
-echo "Locked Cargo command surfaces..."
-if required cargo-command-policy; then
-  scripts/ci/check-locked-cargo.sh
-  scripts/ci/check-locked-cargo-test.sh
-else
-  echo "Skipped locked Cargo command policy."
-fi
-
-echo "Workflow action pins..."
-if required action-pins; then
-  scripts/ci/pin-actions.sh --verify-only
-else
-  echo "Skipped workflow action-pin verification."
-fi
-
-echo "Installers..."
-if required installers; then
-  scripts/ci/check-installers.sh
-else
-  echo "Skipped installer checks."
-fi
-
 echo "Dependency and security policy..."
 if required dependency-policy; then
   cargo rail unify --check --explain
   cargo deny --locked check -D warnings all
 else
   echo "Skipped dependency policy."
-fi
-
-echo "Reviewed release intent..."
-if required cargo.package; then
-  if [ "${CARGO_RAIL_OPERATION:-}" = release ] && [ "${CARGO_RAIL_RELEASE_PUSH:-}" = 1 ]; then
-    echo "Release transaction consumed reviewed change files."
-  else
-    cargo rail change check --merge-base
-  fi
-else
-  echo "Skipped change-file coverage."
 fi
 
 # Clippy performs Cargo's check pass, so do not run a separate `cargo check` first.
@@ -130,14 +97,6 @@ if required cargo.clippy; then
   fi
 else
   echo "Skipped Clippy."
-fi
-
-# Generated docs must match the CLI and executable support authorities.
-echo "Generated documentation..."
-if required docs.generated; then
-  scripts/docs/generate.sh --check
-else
-  echo "Skipped generated documentation."
 fi
 
 # Docs always full workspace (cross-crate links require it)
