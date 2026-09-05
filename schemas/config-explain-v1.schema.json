@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/loadingalias/cargo-rail/main/schemas/config-explain-v1.schema.json",
+  "title": "Cargo-Rail effective configuration explanation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "command",
+    "action",
+    "mode",
+    "result",
+    "exit_code",
+    "config_path",
+    "fields",
+    "compatibility"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "command": {
+      "const": "config"
+    },
+    "action": {
+      "const": "explain"
+    },
+    "mode": {
+      "const": "explain"
+    },
+    "result": {
+      "const": "success"
+    },
+    "exit_code": {
+      "const": 0
+    },
+    "config_path": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "fields": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/field"
+      }
+    },
+    "compatibility": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/compatibility"
+      }
+    }
+  },
+  "$defs": {
+    "field": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "configured",
+        "effective",
+        "default",
+        "source",
+        "classification",
+        "why"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "configured": {},
+        "effective": {},
+        "default": {},
+        "source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "classification": {
+          "const": "project_policy"
+        },
+        "why": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "compatibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "path",
+        "message"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "inert",
+            "merge",
+            "replace"
+          ]
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "replacement": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

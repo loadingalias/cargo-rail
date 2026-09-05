@@ -647,7 +647,7 @@ fn setup_check_in_a_source_checkout_reports_the_missing_component_recovery() {
             stderr.contains("native compiler cache worker executable is unavailable"),
             "{stderr}"
         );
-        assert!(stderr.contains("just build-all"), "{stderr}");
+        assert!(stderr.contains("just build"), "{stderr}");
         assert!(stderr.contains("cargo rail cache setup --check"), "{stderr}");
         Ok(())
     })();
@@ -3729,4 +3729,69 @@ fn directory_snapshot(root: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
     let mut snapshot = BTreeMap::new();
     visit(root, root, &mut snapshot)?;
     Ok(snapshot)
+}
+
+#[test]
+fn cache_reporting_intervals_capture_cold_and_warm_production_outcomes() {
+    let result: Result<()> = (|| {
+        let workspace = TestWorkspace::new_single_crate("cache-reporting", "0.1.0")?;
+        let cargo_home = tempfile::tempdir()?;
+        let reports = tempfile::tempdir()?;
+        let setup = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "setup"])?;
+        assert!(setup.status.success(), "{setup:?}");
+        let mut measurements = Vec::new();
+        for name in ["cold", "warm"] {
+            let recording = reports.path().join(format!("{name}.json"));
+            let path = recording.to_str().context("report path")?;
+            let started = rail(
+                &workspace.path,
+                cargo_home.path(),
+                &["rail", "cache", "report", "--start", path, "-f", "json"],
+            )?;
+            assert!(started.status.success(), "{started:?}");
+            if name == "warm" {
+                fs::remove_dir_all(workspace.path.join("target"))?;
+            }
+            let compiled = Command::new("cargo")
+                .current_dir(&workspace.path)
+                .args(["check", "--quiet"])
+                .env("CARGO_HOME", cargo_home.path())
+                .env("CARGO_INCREMENTAL", "0")
+                .env("CARGO_RAIL_CACHE_REPORT", &recording)
+                .env_remove("RUSTC_WRAPPER")
+                .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .output()?;
+            assert!(compiled.status.success(), "{compiled:?}");
+            let finished = rail(
+                &workspace.path,
+                cargo_home.path(),
+                &["rail", "cache", "report", "--finish", path, "-f", "json"],
+            )?;
+            assert!(finished.status.success(), "{finished:?}");
+            let output = json(&finished)?;
+            let schema: serde_json::Value =
+                serde_json::from_str(include_str!("../../schemas/cache-report-v1.schema.json"))?;
+            assert!(
+                jsonschema::validator_for(&schema)
+                    .map_err(|error| anyhow::anyhow!("invalid report schema: {error}"))?
+                    .is_valid(&output)
+            );
+            assert_eq!(output["measurements"]["incomplete"], false, "{output}");
+            assert!(fs::metadata(&recording)?.len() < 4096);
+            measurements.push(output["measurements"].clone());
+        }
+        assert!(
+            measurements[0]["misses"].as_u64().unwrap_or_default() >= 1,
+            "cold: {}",
+            measurements[0]
+        );
+        assert!(
+            measurements[1]["hits"].as_u64().unwrap_or_default() >= 1,
+            "warm: {}",
+            measurements[1]
+        );
+        assert_eq!(measurements[1]["misses"], 0, "report path changed cache identity");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
 }

@@ -1,7 +1,0 @@
-[package]
-name = "surface-release-smoke"
-version = "0.1.0"
-edition = "2024"
-publish = false
-
-[workspace]

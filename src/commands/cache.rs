@@ -196,7 +196,7 @@ fn cache_setup_source_error(current_dir: &Path, error: RailError) -> RailError {
         .zip(current_dir.canonicalize().ok())
         .is_some_and(|(executable, root)| executable.starts_with(root.join("target")));
     if source_checkout {
-        error.context("run `just build-all`, then rerun `cargo rail cache setup --check`")
+        error.context("run `just build`, then rerun `cargo rail cache setup --check`")
     } else {
         error.context("reinstall the complete cargo-rail component set, then rerun `cargo rail cache setup --check`")
     }
@@ -291,6 +291,44 @@ pub(crate) fn run_status(workspace_root: &Path, scope: CacheScope, format: TextJ
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         render_status(&status);
+    }
+    Ok(())
+}
+
+pub(crate) fn run_report(start: Option<&Path>, finish: Option<&Path>, format: TextJsonOutputFormat) -> RailResult<()> {
+    let (mode, measurements) = match (start, finish) {
+        (Some(path), None) => {
+            crate::cache::report::start(path)?;
+            ("start", None)
+        }
+        (None, Some(path)) => ("finish", Some(crate::cache::report::finish(path)?)),
+        _ => {
+            return Err(RailError::message(
+                "choose exactly one cache report operation: --start or --finish",
+            ));
+        }
+    };
+    if format.is_json() {
+        println!(
+            "{}",
+            serde_json::to_string(&crate::output::machine_json_envelope(
+                "cache",
+                "report",
+                "success",
+                0,
+                serde_json::json!({"operation": mode, "measurements": measurements})
+            ))?
+        );
+    } else if let Some(counts) = measurements {
+        println!(
+            "Cache: {} reused, {} misses, {} bypasses, {} failures",
+            counts.hits, counts.misses, counts.bypasses, counts.failures
+        );
+        if counts.incomplete {
+            println!("Measurements are incomplete.");
+        }
+    } else {
+        println!("Cache recording started. Set CARGO_RAIL_CACHE_REPORT to the recording path for subsequent commands.");
     }
     Ok(())
 }

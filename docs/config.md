@@ -1,7 +1,7 @@
 # Configuration
 
-`rail.toml` contains sparse repository policy. An empty file is valid; omitted fields use coded defaults. Keep
-commands, credentials, timeouts, setup, and execution in their owning tools.
+`rail.toml` contains sparse repository policy. Omitted settings and absent files use coded defaults. Keep commands,
+credentials, timeouts, setup, and execution in their owning tools.
 
 ## Find and inspect configuration
 
@@ -17,22 +17,38 @@ Cargo-Rail uses the first file found:
 ```bash
 cargo rail init --dry-run
 cargo rail init
+cargo rail config
 cargo rail config locate
 cargo rail config print
 cargo rail config explain --all --json
 cargo rail config validate --strict
-cargo rail config migrate --check
 ```
 
-`config print` emits canonical effective TOML, including defaults. `config explain` reports each configured and
-effective value, its default, source, classification, and reason. Use those commands instead of
-copying defaults from documentation.
+Bare `cargo rail config` shows configured overrides and the active source, or reports that coded defaults apply.
+`config explain --all` reports configured and effective values, defaults, sources, and field rationale. Both validate
+policy before reporting success. Unknown keys, unreadable files, and failed Cargo workspace discovery are errors;
+a missing explicit `--config PATH` never falls back to defaults.
 
-`config migrate --check` previews the frozen v0.25 normalization and exits `1` when changes are pending. Review its
-field actions before running `cargo rail config migrate`. Apply mode edits only recognized v0.25 fields, preserves
-unrelated TOML, revalidates the file, and replaces it atomically without adding coded defaults. On Unix, success
-reports the preserved previous file as `Previous configuration` (`previous_config` in JSON). A failure reports every
-recovery path that remains.
+`config print` exports canonical TOML with defaults. It preserves policy such as `surface.targets = "workspace"`, so
+saved output continues inheriting future changes to top-level targets. Explanation shows the resolved targets.
+Use `-f json` or `--json` for machine inspection. Explanation conforms to
+[`config-explain-v1.schema.json`](../schemas/config-explain-v1.schema.json).
+
+Supported v0.25 spellings are interpreted automatically in memory, including MSRV and transitive-pinning booleans,
+release remote-effect settings, and split member paths. Commands preserve the file's bytes and effective policy;
+there is no configuration upgrade operation. Accepted older spelling produces no warning, including under strict
+CI validation. `config explain --all` includes informational compatibility provenance. Unknown or conflicting declarations
+still fail before command decisions.
+
+Canonical output can be validated through stdin:
+
+```bash
+cargo rail config print | cargo rail --config - config validate --strict
+```
+
+Stdin validation is independent of the checkout. Policy requiring workspace facts, such as split paths, package
+selections, or a transitive host path, reports the missing context; inspect that policy from a file in its owning
+workspace. Ordinary file inspection validates against the selected Cargo workspace.
 
 ## Start sparse
 
@@ -130,7 +146,10 @@ This is a Cargo-only projection, not a general command hook.
 auxiliary_cargo_manifests = ["fuzz/Cargo.toml", "tools/check/Cargo.toml"]
 ```
 
-Cargo-Rail uses fixed changelog structure rather than a template engine; put release prose in reviewed change files.
+Release changelogs use a small fixed-placeholder formatter for commit sourced releases. Reviewed change files remain
+the default release source and may carry optional presentation metadata for authored Markdown. Configure section order,
+labels, filters, links, and per-crate changelog paths under `[release.changelog]` or
+`[crates.NAME.changelog]`; configure an independently authored forge body with files in `release_notes_dir`.
 
 ### Repository work
 
@@ -193,7 +212,6 @@ CI, and register only their positive inputs under `[plan.work.NAME]`.
 
 | Command | Exit `0` | Exit `1` | Exit `2` |
 |---|---|---|---|
-| `config migrate --check` | No migration | Migration pending | Invalid input or operation |
 | Mutation command `--check` | No mutation | Mutation pending | Invalid input or operation |
 | `config validate` | Valid at selected strictness | — | Invalid or unreadable configuration |
 

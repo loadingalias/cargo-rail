@@ -11,7 +11,7 @@ use std::io::{Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use sha2::{Digest as _, Sha256};
+use rscrypto::Sha256;
 
 use crate::compiler::capability::LocalCompilerRole as InvocationRole;
 use crate::source::ContentDigest;
@@ -469,6 +469,7 @@ fn run_direct_cache() -> i32 {
 }
 
 fn record_early_cache_bypass(invocation: &CompilerInvocation, reason: &'static str) {
+    crate::cache::report::record(b'B', reason, 0, 0, 0);
     let trace = std::env::var_os("CARGO_RAIL_CACHE_TRACE").as_deref() == Some(std::ffi::OsStr::new("1"));
     let result =
         crate::compiler::native_cache::NativeCacheContext::direct_invocation_source_root(&invocation.arguments)
@@ -708,7 +709,7 @@ fn capture_doctest_input_from(mut source: impl std::io::Read) -> crate::error::R
     file.seek(std::io::SeekFrom::Start(0))?;
     Ok(CapturedDoctestInput {
         file,
-        identity: format!("sha256:{}", ContentDigest::from_sha256_bytes(hasher.finalize().into())),
+        identity: format!("sha256:{}", ContentDigest::from_sha256_bytes(hasher.finalize())),
     })
 }
 

@@ -34,6 +34,56 @@ fn generate_lockfile(workspace: &Path) -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn automatic_configuration_compatibility_preserves_release_sources_and_presentation() {
+    let result: Result<()> = (|| {
+        for source in ["commits", "both"] {
+            for predecessor in [false, true] {
+                let ws = TestWorkspace::new_named("release-config-compatibility")?;
+                ws.add_crate("lib-a", "1.2.3", &[])?;
+                let authority = if predecessor {
+                    "push = false\nrequire_clean = false\npublish_delay = 27"
+                } else {
+                    "remote_effects = 'none'"
+                };
+                write_release_config(
+                    &ws,
+                    &format!(
+                        "source = '{source}'\nrequire_change_files = false\nrequire_release_notes = true\n{authority}\n[release.changelog]\nemoji = false\nentry_format = '- CUSTOM: {{description}}'\n[release.changelog.filters]\nskip_types = ['docs']\n"
+                    ),
+                )?;
+                ws.commit("fixture")?;
+                tag_release(&ws, "lib-a", "1.2.3")?;
+                ws.modify_file("lib-a", "src/lib.rs", "pub fn added() {}\n")?;
+                ws.commit("feat: add the API")?;
+                if source == "both" {
+                    std::fs::create_dir_all(ws.path.join(".changes"))?;
+                    std::fs::write(
+                        ws.path.join(".changes/reviewed.md"),
+                        "---\n\"lib-a\" = \"patch\"\n---\n\nReviewed addition.\n",
+                    )?;
+                }
+                let config_path = ws.path.join(".config/rail.toml");
+                let original = std::fs::read(&config_path)?;
+                let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "lib-a", "--format", "json"])?;
+                assert_eq!(output.status.code(), Some(1), "{source}/{predecessor}: {output:?}");
+                let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+                let plan = &value["release_plan"];
+                assert_eq!(plan["source"], source);
+                assert_eq!(plan["crates"][0]["new_version"], "1.3.0");
+                let body = plan["crates"][0]["changelog_body"].as_str().unwrap();
+                assert!(body.contains("CUSTOM: add the API"), "{body}");
+                if source == "both" {
+                    assert!(body.contains("Reviewed addition."), "{body}");
+                }
+                assert_eq!(std::fs::read(config_path)?, original);
+            }
+        }
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
 fn write_release_config(ws: &TestWorkspace, extras: &str) -> Result<()> {
     ws.write_release_config(&format!(
         r#"tag_prefix = "v"
@@ -419,8 +469,12 @@ semver_check = "off"
         let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
         let plan = &json["release_plan"];
         assert_eq!(plan["crates"][0]["new_version"], serde_json::json!("1.2.4"));
-        assert!(plan.get("source").is_none());
-        assert!(plan["crates"][0].get("commits").is_none());
+        assert_eq!(plan["source"], "changes");
+        assert!(
+            plan["crates"][0]["commits"]
+                .as_array()
+                .is_some_and(|commits| commits.is_empty())
+        );
         assert!(
             plan["crates"][0]["changelog_body"]
                 .as_str()
@@ -1100,8 +1154,8 @@ registry_publication = "crates-io"
         );
         assert!(published_path.exists(), "the registry shim should record a publication");
         let state: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
-        assert_eq!(state["schema_version"], 6);
-        assert_eq!(state["plan"]["plan_contract_version"], 6);
+        assert_eq!(state["schema_version"], 7);
+        assert_eq!(state["plan"]["plan_contract_version"], 7);
         assert_eq!(state["publish_registry"], "crates-io");
         assert_eq!(state["release_config"]["registry_publication"], "crates-io");
         assert_eq!(
@@ -1539,7 +1593,7 @@ auxiliary_cargo_manifests = ["aux-one/Cargo.toml", "aux-two/Cargo.toml"]
             String::from_utf8_lossy(&check.stderr)
         );
         let check: serde_json::Value = serde_json::from_slice(&check.stdout)?;
-        assert_eq!(check["release_plan"]["plan_contract_version"], 6);
+        assert_eq!(check["release_plan"]["plan_contract_version"], 7);
         let projections = check["release_plan"]["auxiliary_lockfiles"]
             .as_array()
             .expect("auxiliary lockfile projections");
@@ -2283,8 +2337,8 @@ auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
 
         let state_path = only_release_state(&ws.path)?;
         let state: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
-        assert_eq!(state["schema_version"], 6);
-        assert_eq!(state["plan"]["plan_contract_version"], 6);
+        assert_eq!(state["schema_version"], 7);
+        assert_eq!(state["plan"]["plan_contract_version"], 7);
         assert_eq!(state["plan"]["auxiliary_lockfiles"].as_array().unwrap().len(), 1);
         let resumed = run_cargo_rail(&ws.path, &["rail", "release", "resume", state_path.to_str().unwrap()])?;
         assert!(resumed.status.success(), "{}", String::from_utf8_lossy(&resumed.stderr));
@@ -2457,7 +2511,7 @@ core = ["lib-a", "lib-b", "lib-c"]
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let json: serde_json::Value = serde_json::from_str(&stdout)?;
-        assert_eq!(json["release_plan"]["plan_contract_version"], 6);
+        assert_eq!(json["release_plan"]["plan_contract_version"], 7);
         assert!(
             json["release_plan"]["snapshot_id"]
                 .as_str()
@@ -5297,8 +5351,8 @@ fn release_resume_migrates_v0_25_journal_before_continuing() {
         let resumed = run_cargo_rail(&ws.path, &["rail", "release", "resume", state_path.to_str().unwrap()])?;
         assert!(resumed.status.success(), "{}", String::from_utf8_lossy(&resumed.stderr));
         let state: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
-        assert_eq!(state["schema_version"], 6);
-        assert_eq!(state["plan"]["plan_contract_version"], 6);
+        assert_eq!(state["schema_version"], 7);
+        assert_eq!(state["plan"]["plan_contract_version"], 7);
         assert_eq!(state["status"], "complete");
         assert_eq!(
             state["predecessor_execution"]["release_note_bodies"]["v025-release-resume"],
@@ -5353,8 +5407,8 @@ fn release_abort_migrates_v0_25_journal_and_allows_terminal_cleanup() {
         )?;
         assert!(aborted.status.success(), "{}", String::from_utf8_lossy(&aborted.stderr));
         let state: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
-        assert_eq!(state["schema_version"], 6);
-        assert_eq!(state["plan"]["plan_contract_version"], 6);
+        assert_eq!(state["schema_version"], 7);
+        assert_eq!(state["plan"]["plan_contract_version"], 7);
         assert_eq!(state["status"], "aborted");
         assert_eq!(
             String::from_utf8_lossy(&git(&ws.path, &["rev-parse", "HEAD"])?.stdout).trim(),
@@ -5802,70 +5856,76 @@ fn release_confirmation_pty_accepts_only_yes_and_keeps_the_prompt_on_stderr() {
     }
 
     fn run_in_pty(ws: &TestWorkspace, answer: &[u8]) -> Result<(String, String)> {
-        const PTY_RUNNER: &str = r#"
-import os
-import pty
-import subprocess
-import sys
-import time
+        use std::ffi::OsStr;
+        use std::io::Write as _;
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::process::Stdio;
+        use std::thread;
+        use std::time::{Duration, Instant};
 
-binary, root, stdout_path, stderr_path, answer_hex = sys.argv[1:]
-master, slave = pty.openpty()
-try:
-    with open(stdout_path, "wb") as stdout, open(stderr_path, "wb") as stderr:
-        child = subprocess.Popen(
-            [binary, "rail", "release", "run", "lib-a", "--bump", "patch", "--skip-tag"],
-            cwd=root,
-            stdin=slave,
-            stdout=stdout,
-            stderr=stderr,
-            close_fds=True,
-        )
-    os.close(slave)
-    slave = -1
-    deadline = time.monotonic() + 30
-    prompt = b"Proceed? [y/N] "
-    while time.monotonic() < deadline:
-        try:
-            with open(stderr_path, "rb") as stderr:
-                if prompt in stderr.read():
-                    break
-        except FileNotFoundError:
-            pass
-        if child.poll() is not None:
-            raise RuntimeError(f"command exited before prompting: {child.returncode}")
-        time.sleep(0.02)
-    else:
-        child.kill()
-        child.wait()
-        raise RuntimeError("command did not reach its confirmation prompt")
-    os.write(master, bytes.fromhex(answer_hex))
-    returncode = child.wait(timeout=60)
-    if returncode != 0:
-        raise RuntimeError(f"command failed after prompting: {returncode}")
-finally:
-    if slave >= 0:
-        os.close(slave)
-    os.close(master)
-"#;
+        use rustix::fs::{Mode, OFlags, open};
+        use rustix::io::{FdFlags, fcntl_setfd};
+        use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
 
         let stdout = ws.path.join("target/pty-stdout");
         let stderr = ws.path.join("target/pty-stderr");
         std::fs::create_dir_all(ws.path.join("target"))?;
-        let answer_hex = answer.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-        let runner = Command::new("python3")
-            .args(["-c", PTY_RUNNER])
-            .arg(env!("CARGO_BIN_EXE_cargo-rail"))
-            .arg(&ws.path)
-            .arg(&stdout)
-            .arg(&stderr)
-            .arg(answer_hex)
-            .output()?;
-        anyhow::ensure!(
-            runner.status.success(),
-            "PTY runner failed: {}",
-            String::from_utf8_lossy(&runner.stderr)
-        );
+        let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)?;
+        fcntl_setfd(&master, FdFlags::CLOEXEC)?;
+        grantpt(&master)?;
+        unlockpt(&master)?;
+        let slave_name = ptsname(&master, Vec::new())?;
+        let slave = open(
+            OsStr::from_bytes(slave_name.to_bytes()),
+            OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let mut master = std::fs::File::from(master);
+        let mut child = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+            .args(["rail", "release", "run", "lib-a", "--bump", "patch", "--skip-tag"])
+            .current_dir(&ws.path)
+            .stdin(Stdio::from(std::fs::File::from(slave)))
+            .stdout(Stdio::from(std::fs::File::create(&stdout)?))
+            .stderr(Stdio::from(std::fs::File::create(&stderr)?))
+            .spawn()?;
+
+        let outcome = (|| -> Result<()> {
+            let prompt_deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                if Instant::now() >= prompt_deadline {
+                    anyhow::bail!("command did not reach its confirmation prompt");
+                }
+                if std::fs::read(&stderr)?
+                    .windows(b"Proceed? [y/N] ".len())
+                    .any(|window| window == b"Proceed? [y/N] ")
+                {
+                    break;
+                }
+                if let Some(status) = child.try_wait()? {
+                    anyhow::bail!("command exited before prompting: {status}");
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+
+            master.write_all(answer)?;
+            let exit_deadline = Instant::now() + Duration::from_secs(60);
+            let status = loop {
+                if let Some(status) = child.try_wait()? {
+                    break status;
+                }
+                if Instant::now() >= exit_deadline {
+                    anyhow::bail!("command did not exit after confirmation");
+                }
+                thread::sleep(Duration::from_millis(20));
+            };
+            anyhow::ensure!(status.success(), "command failed after prompting: {status}");
+            Ok(())
+        })();
+        if let Err(error) = outcome {
+            drop(child.kill());
+            drop(child.wait());
+            return Err(error);
+        }
         Ok((std::fs::read_to_string(stdout)?, std::fs::read_to_string(stderr)?))
     }
 

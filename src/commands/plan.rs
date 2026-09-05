@@ -1,6 +1,6 @@
-//! `cargo rail plan` comparison validation and v8 rendering.
+//! `cargo rail plan` comparison validation and v9 rendering.
 
-use std::io::Write as _;
+use std::io::{Read, Write as _};
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -110,7 +110,7 @@ impl ResolvedComparison {
 
 /// Print the JSON Schema for the current planner contract.
 pub fn print_plan_schema() {
-    print!("{}", include_str!("../../schemas/plan-v8.schema.json"));
+    print!("{}", include_str!("../../schemas/plan-v9.schema.json"));
 }
 
 #[derive(Debug, Deserialize)]
@@ -133,22 +133,42 @@ pub(crate) fn verify_saved_plan(
 ) -> RailResult<()> {
     const MAX_PLAN_BYTES: u64 = 64 * 1024 * 1024;
 
-    let metadata = std::fs::metadata(plan_file).map_err(|error| {
-        RailError::message(format!(
-            "failed to inspect saved plan '{}': {error}",
-            plan_file.display()
-        ))
-    })?;
-    if !metadata.is_file() || metadata.len() > MAX_PLAN_BYTES {
-        return Err(RailError::message(format!(
-            "saved plan '{}' must be a regular file no larger than {MAX_PLAN_BYTES} bytes",
-            plan_file.display()
-        )));
-    }
-    let saved: SavedPlanBinding = serde_json::from_slice(&std::fs::read(plan_file)?).map_err(|error| {
-        RailError::message(format!("failed to parse saved plan '{}': {error}", plan_file.display()))
-    })?;
-    if saved.plan_contract_version != 8 {
+    let (bytes, subject) = if plan_file == Path::new("-") {
+        (
+            read_saved_plan(std::io::stdin().lock(), MAX_PLAN_BYTES, 0, "standard input")?,
+            "standard input".to_string(),
+        )
+    } else {
+        let metadata = std::fs::metadata(plan_file).map_err(|error| {
+            RailError::message(format!(
+                "failed to inspect saved plan '{}': {error}",
+                plan_file.display()
+            ))
+        })?;
+        if !metadata.is_file() || metadata.len() > MAX_PLAN_BYTES {
+            return Err(RailError::message(format!(
+                "saved plan '{}' must be a regular file no larger than {MAX_PLAN_BYTES} bytes",
+                plan_file.display()
+            )));
+        }
+        let file = std::fs::File::open(plan_file).map_err(|error| {
+            RailError::message(format!("failed to read saved plan '{}': {error}", plan_file.display()))
+        })?;
+        let capacity = usize::try_from(metadata.len())
+            .map_err(|_| RailError::message("saved plan size cannot be represented on this host"))?;
+        (
+            read_saved_plan(
+                file,
+                MAX_PLAN_BYTES,
+                capacity,
+                &format!("saved plan '{}'", plan_file.display()),
+            )?,
+            format!("saved plan '{}'", plan_file.display()),
+        )
+    };
+    let saved: SavedPlanBinding = serde_json::from_slice(&bytes)
+        .map_err(|error| RailError::message(format!("failed to parse {subject}: {error}")))?;
+    if saved.plan_contract_version != 9 {
         return Err(RailError::message(format!(
             "saved plan uses unsupported contract version {}",
             saved.plan_contract_version
@@ -191,6 +211,21 @@ pub(crate) fn verify_saved_plan(
         }
     }
     Ok(())
+}
+
+fn read_saved_plan(mut reader: impl Read, maximum: u64, capacity: usize, subject: &str) -> RailResult<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(capacity);
+    reader
+        .by_ref()
+        .take(maximum + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| RailError::message(format!("failed to read {subject}: {error}")))?;
+    if bytes.len() as u64 > maximum {
+        return Err(RailError::message(format!(
+            "{subject} must be no larger than {maximum} bytes"
+        )));
+    }
+    Ok(bytes)
 }
 
 fn verify_saved_binding(name: &str, expected: &str, current: &str) -> RailResult<()> {
@@ -319,4 +354,23 @@ fn planning_target_identity(configuration: &str, toolchain: &str) -> String {
         "planning-target-v1:sha256:{}",
         crate::source::ContentDigest::sha256(input.as_bytes())
     )
+}
+
+#[cfg(test)]
+mod saved_plan_input_tests {
+    use super::read_saved_plan;
+
+    #[test]
+    fn bounded_saved_plan_input_rejects_one_excess_byte() {
+        assert_eq!(
+            read_saved_plan(std::io::Cursor::new(b"plan"), 4, 0, "fixture").expect("bounded input"),
+            b"plan"
+        );
+        assert!(
+            read_saved_plan(std::io::Cursor::new(b"plans"), 4, 0, "fixture")
+                .expect_err("oversized input")
+                .to_string()
+                .contains("no larger than 4 bytes")
+        );
+    }
 }

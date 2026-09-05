@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use rscrypto::Sha256;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 use super::{RemoteCacheSelection, RemoteStoreError, RemoteStoreResult, object};
 use crate::cache::installation::InstallationReceipt;
@@ -847,14 +847,14 @@ fn coordinator_identity(
         };
         hash_field(&mut hasher, value);
     }
-    let digest: [u8; 32] = hasher.finalize().into();
+    let digest: [u8; 32] = hasher.finalize();
     Ok(Some(
         crate::source::ContentDigest::from_sha256_bytes(digest).to_string(),
     ))
 }
 
 fn hash_field(hasher: &mut Sha256, value: &str) {
-    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(&(value.len() as u64).to_le_bytes());
     hasher.update(value.as_bytes());
 }
 

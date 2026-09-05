@@ -1,9 +1,0 @@
-[package]
-name = "surface-conformance-app"
-version = "0.1.0"
-edition.workspace = true
-rust-version.workspace = true
-publish = false
-
-[dependencies]
-surface-conformance-core = { path = "../core", features = ["extra"] }

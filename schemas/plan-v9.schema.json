@@ -1,0 +1,670 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/loadingalias/cargo-rail/main/schemas/plan-v9.schema.json",
+  "title": "cargo-rail named-work planner contract v9",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "plan_contract_version",
+    "identity",
+    "inputs",
+    "changes",
+    "work",
+    "required",
+    "evidence",
+    "attribution"
+  ],
+  "properties": {
+    "plan_contract_version": {
+      "const": 9
+    },
+    "identity": {
+      "type": "string",
+      "pattern": "^plan-v9:sha256:[0-9a-f]{64}$"
+    },
+    "inputs": {
+      "$ref": "#/$defs/inputs"
+    },
+    "changes": {
+      "$ref": "#/$defs/changes"
+    },
+    "work": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/id"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/decision"
+      }
+    },
+    "required": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/id"
+      },
+      "uniqueItems": true
+    },
+    "evidence": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^evidence:sha256:[0-9a-f]{64}$"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/evidence"
+      }
+    },
+    "attribution": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/id"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/attribution"
+      }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9.-]*$"
+    },
+    "string_array": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "evidence_refs": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^evidence:sha256:[0-9a-f]{64}$"
+      }
+    },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "base",
+        "head",
+        "head_commit",
+        "capture",
+        "cargo",
+        "configuration",
+        "toolchain",
+        "target",
+        "platform",
+        "catalog",
+        "evidence",
+        "override"
+      ],
+      "properties": {
+        "base": {
+          "type": "string"
+        },
+        "head": {
+          "type": "string"
+        },
+        "head_commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40,64}$"
+        },
+        "capture": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cargo": {
+          "type": "string",
+          "pattern": "^resolution-universe-v[0-9]+:sha256:[0-9a-f]{64}$"
+        },
+        "configuration": {
+          "type": "string",
+          "pattern": "^cargo-configuration-v1:sha256:[0-9a-f]{64}$"
+        },
+        "toolchain": {
+          "type": "string",
+          "minLength": 1
+        },
+        "target": {
+          "type": "string",
+          "pattern": "^planning-target-v1:sha256:[0-9a-f]{64}$"
+        },
+        "platform": {
+          "type": "string",
+          "minLength": 1
+        },
+        "catalog": {
+          "type": "string",
+          "pattern": "^work-catalog-v1:sha256:[0-9a-f]{64}$"
+        },
+        "evidence": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^planning-evidence-v1:sha256:[0-9a-f]{64}$"
+          }
+        },
+        "override": {
+          "enum": [
+            "none",
+            "all"
+          ]
+        }
+      }
+    },
+    "changes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "files",
+        "cargo",
+        "config"
+      ],
+      "properties": {
+        "files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/file_change"
+          }
+        },
+        "cargo": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/cargo_change"
+          }
+        },
+        "config": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/config_change"
+          }
+        }
+      }
+    },
+    "file_change": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "kind",
+        "provenance"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kind": {
+          "enum": [
+            "added",
+            "modified",
+            "type_changed",
+            "deleted"
+          ]
+        },
+        "relation": {
+          "type": "string"
+        },
+        "provenance": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "committed",
+              "staged",
+              "unstaged",
+              "untracked"
+            ]
+          },
+          "uniqueItems": true
+        },
+        "before": {
+          "type": "string"
+        },
+        "after": {
+          "type": "string"
+        }
+      }
+    },
+    "cargo_change": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "package",
+        "target",
+        "kind"
+      ],
+      "properties": {
+        "package": {
+          "type": "string"
+        },
+        "target": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "type": "string"
+        }
+      }
+    },
+    "config_change": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "before",
+        "after"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "before": true,
+        "after": true
+      }
+    },
+    "decision": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "state",
+            "evidence"
+          ],
+          "properties": {
+            "state": {
+              "const": "skipped"
+            },
+            "evidence": {
+              "$ref": "#/$defs/evidence_refs"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "state",
+            "cause",
+            "scope",
+            "evidence"
+          ],
+          "properties": {
+            "state": {
+              "const": "required"
+            },
+            "cause": {
+              "enum": [
+                "changed_input",
+                "incomplete_evidence",
+                "forced_all"
+              ]
+            },
+            "scope": {
+              "$ref": "#/$defs/work_scope"
+            },
+            "evidence": {
+              "$ref": "#/$defs/evidence_refs"
+            }
+          }
+        }
+      ]
+    },
+    "work_scope": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "const": "repository"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "selection"
+          ],
+          "properties": {
+            "kind": {
+              "const": "cargo"
+            },
+            "selection": {
+              "$ref": "#/$defs/cargo_selection"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "selection"
+          ],
+          "properties": {
+            "kind": {
+              "const": "variants"
+            },
+            "selection": {
+              "$ref": "#/$defs/variant_selection"
+            }
+          }
+        }
+      ]
+    },
+    "cargo_selection": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "cargo_args",
+            "targets"
+          ],
+          "properties": {
+            "kind": {
+              "const": "workspace"
+            },
+            "cargo_args": {
+              "$ref": "#/$defs/string_array"
+            },
+            "targets": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/cargo_target"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "packages",
+            "cargo_args",
+            "targets"
+          ],
+          "properties": {
+            "kind": {
+              "const": "packages"
+            },
+            "packages": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/package_selector"
+              }
+            },
+            "cargo_args": {
+              "$ref": "#/$defs/string_array"
+            },
+            "targets": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/cargo_target"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "package_selector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "name",
+        "cargo_spec"
+      ],
+      "properties": {
+        "key": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cargo_spec": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "cargo_target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "package",
+        "name",
+        "kind"
+      ],
+      "properties": {
+        "package": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kind": {
+          "$ref": "#/$defs/string_array"
+        }
+      }
+    },
+    "variant_selection": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "evidence"
+          ],
+          "properties": {
+            "kind": {
+              "const": "all"
+            },
+            "evidence": {
+              "type": "string",
+              "pattern": "^evidence:sha256:[0-9a-f]{64}$"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "variants",
+            "evidence"
+          ],
+          "properties": {
+            "kind": {
+              "const": "selected"
+            },
+            "variants": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/variant"
+              }
+            },
+            "evidence": {
+              "type": "string",
+              "pattern": "^evidence:sha256:[0-9a-f]{64}$"
+            }
+          }
+        }
+      ]
+    },
+    "variant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "dimensions"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "dimensions": {
+          "type": "object",
+          "additionalProperties": {
+            "type": [
+              "string",
+              "integer",
+              "boolean"
+            ]
+          }
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "subject",
+        "description",
+        "input",
+        "complete"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "minLength": 1
+        },
+        "subject": {
+          "$ref": "#/$defs/id"
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        },
+        "input": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "complete": {
+          "type": "boolean"
+        }
+      }
+    },
+    "attribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "inputs",
+        "selections"
+      ],
+      "properties": {
+        "inputs": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "value"
+            ],
+            "properties": {
+              "kind": {
+                "enum": [
+                  "path",
+                  "configuration",
+                  "package",
+                  "dependency",
+                  "work",
+                  "prerequisite"
+                ]
+              },
+              "value": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "selections": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "subject",
+              "relation",
+              "origin"
+            ],
+            "properties": {
+              "subject": {
+                "type": "string",
+                "minLength": 1
+              },
+              "relation": {
+                "enum": [
+                  "direct",
+                  "dependency",
+                  "unattributed"
+                ]
+              },
+              "origin": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "relation": {
+                      "const": "dependency"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "origin": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  }
+                },
+                "else": {
+                  "properties": {
+                    "origin": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

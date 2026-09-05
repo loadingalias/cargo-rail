@@ -51,6 +51,36 @@ Disable reuse for one process tree without changing setup:
 CARGO_RAIL_CACHE=off cargo check --locked
 ```
 
+## Native host eligibility
+
+Cache setup accepts these operating-system and architecture pairs:
+
+| Operating system | Native architecture | Rust architecture |
+|---|---|---|
+| Linux | x86-64 | `x86_64` |
+| Linux | Arm64 | `aarch64` |
+| Linux | RISC-V 64 | `riscv64` |
+| Linux | IBM Z | `s390x` |
+| Linux | IBM POWER | `powerpc64` |
+| macOS | x86-64 | `x86_64` |
+| macOS | Apple silicon | `aarch64` |
+| Windows | x86-64 | `x86_64` |
+| Windows | Arm64 | `aarch64` |
+
+Rust reports the architecture of a `powerpc64le-unknown-linux-gnu` host as `powerpc64`. The exact rustc host target
+remains part of cache identity, and distributed-worker identity also binds endianness. Every other operating-system
+and architecture pair fails cache setup closed and leaves Cargo execution unchanged.
+
+This eligibility applies to local L1, remote L2, and the distributed client. It does not provide a release archive:
+the runner still needs a native Cargo-Rail build with the cache component binaries required by the selected mode.
+Remote objects also remain bound to the exact compiler action and platform identity.
+
+Compiler-result reuse is native-target only. If Cargo passes an explicit `--target` that differs from rustc's host
+target, Cargo-Rail records `cross_target_toolchain_evidence_unavailable` and executes rustc normally. A native RISC-V,
+IBM Z, or IBM POWER runner is therefore eligible for L1 and L2; an x86-64 runner cross-compiling to one of those
+targets is not. A distributed worker must match the client's architecture, endianness, operating system, rustc host
+target, compiler, and sysroot.
+
 ## Share results remotely
 
 Remote selection is workspace-bound machine state, never repository configuration. Persist L2 in the current
@@ -217,3 +247,21 @@ also reports the fixed 64-shard native restore-lock namespace and any staging re
 
 Use [the benchmarking contract](benchmarking.md) for smoke, qualification, correctness, evidence retention, and claim
 requirements.
+
+### Aggregate cache measurements
+
+`cargo rail cache report --start /absolute/recording.json -f json` creates a new private recording. Set the
+machine-owned `CARGO_RAIL_CACHE_REPORT` environment variable to that path for the commands in the reporting interval.
+After their compiler processes exit, `cargo rail cache report --finish /absolute/recording.json -f json` closes the
+interval and emits the [`cache-report-v1` contract](../schemas/cache-report-v1.schema.json). Finishing again returns
+the recorded totals; starting over an existing file is rejected.
+
+The recording contains bounded aggregate counters and reason counts. Concurrent wrapper outcomes are serialized;
+report storage never authorizes a restore or changes a cache key. Known recording errors and counter overflow mark
+the measurements incomplete. Corrupt or unreadable recordings fail collection. These are observed wrapper outcomes,
+not Cargo freshness counts or an estimate of time saved. Cache problems can cause fallback within a miss or bypass;
+wrapper failures are a separate outcome and must not be added to reason counts as disjoint categories.
+
+The companion Action opens the interval during cache setup, collects one small record per job after compilation,
+and publishes one final workflow report. The final report requires the expected job labels and identifies missing
+jobs and incomplete measurements. Local storage remains per job; shared storage is not summed across runners.

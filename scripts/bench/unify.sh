@@ -60,7 +60,7 @@ jq -n \
     machine: $machine
   }' >"$results/environment.json"
 
-"$repo_root/scripts/fixtures/generate-workspace.sh" "$packages" "$fixture"
+"$repo_root/tests/support/generate-workspace.sh" "$packages" "$fixture"
 cp "$repo_root/rust-toolchain.toml" "$fixture/rust-toolchain.toml"
 
 mkdir -p "$dependency_root/src"

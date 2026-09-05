@@ -5,8 +5,8 @@ use std::fs::{self, File};
 use std::io::Read as _;
 use std::path::{Component, Path};
 
+use rscrypto::Sha256;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 use crate::error::{RailError, RailResult};
 use crate::source::{ContentDigest, RepositoryPath};
@@ -209,14 +209,14 @@ pub(crate) fn output_manifest_digest(entries: &[OutputEntry]) -> RailResult<Stri
         frame_hash(&mut hasher, &mut input_bytes, b"entry", &serde_json::to_vec(entry)?);
     }
     crate::instrumentation::record_hash(input_bytes);
-    let digest = ContentDigest::from_sha256_bytes(hasher.finalize().into());
+    let digest = ContentDigest::from_sha256_bytes(hasher.finalize());
     Ok(format!("output-manifest-v{OUTPUT_MANIFEST_VERSION}-sha256-{digest}"))
 }
 
 fn frame_hash(hasher: &mut Sha256, input_bytes: &mut usize, tag: &[u8], value: &[u8]) {
-    hasher.update((tag.len() as u64).to_le_bytes());
+    hasher.update(&(tag.len() as u64).to_le_bytes());
     hasher.update(tag);
-    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(&(value.len() as u64).to_le_bytes());
     hasher.update(value);
     *input_bytes = input_bytes
         .saturating_add(16)
@@ -242,7 +242,7 @@ fn digest_file(path: &Path) -> RailResult<(ContentDigest, u64)> {
     }
     crate::instrumentation::record_hash(usize::try_from(bytes).unwrap_or(usize::MAX));
     crate::instrumentation::record_hashed_file_bytes_read(usize::try_from(bytes).unwrap_or(usize::MAX));
-    Ok((ContentDigest::from_sha256_bytes(hasher.finalize().into()), bytes))
+    Ok((ContentDigest::from_sha256_bytes(hasher.finalize()), bytes))
 }
 
 pub(crate) fn symlink_target_escapes(path: &RepositoryPath, target: &str) -> bool {

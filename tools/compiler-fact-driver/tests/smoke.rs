@@ -8,7 +8,7 @@ use std::process::Command;
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
 
-use sha2::{Digest as _, Sha256};
+use rscrypto::Sha256;
 #[path = "../../../src/compiler/fact_protocol.rs"]
 mod fact_protocol;
 
@@ -428,7 +428,7 @@ fn bind_unit_identity(mut unit: CompilerFactUnit) -> CompilerFactUnit {
         &unit.cfg,
     ))
     .expect("serialize unit identity");
-    let digest = Sha256::digest(bytes)
+    let digest = Sha256::digest(&bytes)
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();

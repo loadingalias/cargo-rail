@@ -107,6 +107,11 @@ it, Cargo-Rail removes the oldest eligible action authorities while protecting l
 empty authority. See the [cache contract and cleanup policy](docs/caching.md#inspect-clean-detach-or-uninstall) and the
 [benchmark contract](docs/benchmarking.md#claim-requirements).
 
+Native compiler caching accepts x86-64 and Apple Silicon macOS; x86-64 and Arm64 Windows; and x86-64, Arm64, RISC-V
+64, IBM Z, and IBM POWER Linux. Each compiler invocation must target rustc's native host; cross-target work runs
+normally without compiler-result reuse. Runtime eligibility does not imply that a release archive exists for that
+host. See [native host eligibility](docs/caching.md#native-host-eligibility).
+
 ## Audit product reachability
 
 `cargo rail surface` merges real compiler facts across products, libraries, build scripts, proc macros, doctests, features, and configured targets. It reports dead public declarations and visibility wider than actual consumers need.
@@ -135,38 +140,38 @@ changed source
   → Cargo, nextest, Just, CI, etc.
 ```
 
-Cross-process consumers must validate contract v8 and its content-derived identity, then verify that the current head
+Cross-process consumers must validate contract v9 and its content-derived identity, then verify that the current head
 and captured source match the saved plan before executing typed selectors. Comparing `HEAD` alone is insufficient.
 Planner machine identities remain provenance; executor-local Cargo, toolchain, and platform state cannot rewrite the
-decision. [`scripts/plan/read.py`](scripts/plan/read.py) is the strict reference consumer. See
-[Planning](docs/planning.md).
+decision. The companion GitHub Action owns the independent strict consumer. See [Planning](docs/planning.md).
 
 ### GitHub Actions
 
-The v8 Action runs the planner once and exposes the validated plan, required work IDs, and strict reader:
+The native v9 Action installs Cargo-Rail 0.26, runs the planner once, and exposes the validated plan plus exact
+required-work selectors:
 
 ```yaml
-- uses: loadingalias/cargo-rail-action@v8
+- uses: loadingalias/cargo-rail-action@v9
   id: rail
+  with:
+    version: 0.26.0
 
 - name: Test affected packages
   if: contains(fromJSON(steps.rail.outputs.required-work), 'cargo.test')
   shell: bash
   env:
     PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
-    PLAN_READER: ${{ steps.rail.outputs.plan-reader }}
   run: |
-    python3 "$PLAN_READER" verify-checkout "$PLAN_FILE"
     CARGO_ARGS=()
     while IFS= read -r -d '' arg; do CARGO_ARGS+=("$arg"); done \
-      < <(python3 "$PLAN_READER" cargo-args "$PLAN_FILE" cargo.test)
+      < <(cargo-rail-action plan cargo-args "$PLAN_FILE" cargo.test)
     cargo nextest run "${CARGO_ARGS[@]}" --locked
 ```
 
-Use `loadingalias/cargo-rail-action/cache@v8` separately in each execution job that needs remote compiler reuse.
-Its `mode` input is required: use `read` for untrusted jobs and grant `read-write` only to trusted seed jobs. The
-Action exposes typed root portability and an optional strict authenticated provider probe. See the [Action
-guide](https://github.com/loadingalias/cargo-rail-action).
+Use `loadingalias/cargo-rail-action/cache@v9` with `version: 0.26.0` separately in each execution job that needs
+remote compiler reuse. Its `mode` input is required: use `read` for untrusted jobs and grant `read-write` only to
+trusted seed jobs. The Action exposes typed root portability and an optional strict authenticated provider probe. See
+the [Action guide](https://github.com/loadingalias/cargo-rail-action).
 
 ## Carry release intent through the workflow
 

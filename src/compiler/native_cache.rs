@@ -14,8 +14,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
+use rscrypto::Sha256;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 use crate::cache::cas::LocalCas;
 use crate::cache::cas::NativeCacheLookup;
@@ -4113,7 +4113,7 @@ fn capture_guarded_file(
     crate::instrumentation::record_hash_input_bytes(usize::try_from(bytes).unwrap_or(usize::MAX));
     crate::instrumentation::record_hashed_file_bytes_read(usize::try_from(bytes).unwrap_or(usize::MAX));
     Ok((
-        format!("sha256:{}", ContentDigest::from_sha256_bytes(hasher.finalize().into())),
+        format!("sha256:{}", ContentDigest::from_sha256_bytes(hasher.finalize())),
         before,
         bytes,
     ))
@@ -10237,10 +10237,10 @@ fn restore_commit_paths(outputs: &NativeOutputPaths, source_root: &Path) -> Rail
     let mut hasher = Sha256::new();
     hasher.update(b"cargo-rail-native-restore-destinations-v1\0");
     for path in encoded {
-        hasher.update((path.len() as u64).to_le_bytes());
+        hasher.update(&(path.len() as u64).to_le_bytes());
         hasher.update(path);
     }
-    let identity = ContentDigest::from_sha256_bytes(hasher.finalize().into());
+    let identity = ContentDigest::from_sha256_bytes(hasher.finalize());
     let marker = output_parent.join(format!(".cargo-rail-restore-{identity}.json"));
     let transaction_directory = output_parent.join(format!(".cargo-rail-restore-{identity}"));
     let output_sources = bindings
@@ -10860,7 +10860,7 @@ fn restore_file_matches_digest(
         bytes = bytes.saturating_add(read as u64);
         hasher.update(&buffer[..read]);
     }
-    let actual = format!("sha256:{}", ContentDigest::from_sha256_bytes(hasher.finalize().into()));
+    let actual = format!("sha256:{}", ContentDigest::from_sha256_bytes(hasher.finalize()));
     Ok(bytes == expected_identity.bytes
         && actual == expected_digest
         && native_restore_file_identity(&file)? == *expected_identity
@@ -13998,6 +13998,21 @@ fn write_cache_event(
         CompilerCacheWrapperStatus::Bypassed | CompilerCacheWrapperStatus::Disabled => b'B',
     };
     let failure_reason = crate::cache::installation::NativeCacheFailureReason::from_reason(reason);
+    if std::env::var_os(crate::cache::report::REPORT_ENV).is_some() {
+        let remote = active_context()
+            .and_then(|context| context.remote_store.get())
+            .and_then(|store| store.as_ref().ok())
+            .map_or_else(crate::remote_cache::RemoteTransferMetrics::default, |store| {
+                store.metrics()
+            });
+        crate::cache::report::record(
+            outcome,
+            reason,
+            metrics.cache_bytes_read,
+            remote.payload_bytes_read,
+            remote.payload_bytes_written,
+        );
+    }
     let usage = crate::cache::installation::record_usage(receipt, outcome, failure_reason);
     let coverage =
         write_benchmark_coverage_event(status, reason, action_key, result_key, remote_base_action_key, metrics);
@@ -14306,6 +14321,7 @@ fn validate_benchmark_coverage_directory(directory: &Path) -> RailResult<()> {
 
 /// Record an operational wrapper failure after an installed context was authenticated.
 pub(crate) fn record_active_failure() {
+    crate::cache::report::record(b'F', "wrapper_failure", 0, 0, 0);
     if let Some(receipt) = active_context().and_then(|context| context.installation.as_ref()) {
         drop(crate::cache::installation::record_usage(receipt, b'F', None));
     }

@@ -5,8 +5,8 @@ use std::fs::{self, File};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
+use rscrypto::Sha256;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 use crate::compiler::analysis::AnalysisContract;
 use crate::compiler::facts::{
@@ -517,9 +517,9 @@ fn target_kind(kinds: &[cargo_metadata::TargetKind]) -> CompilerFactTargetKind {
 fn path_identity(path: &Path) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"cargo-rail-compiler-fact-path-v1\0");
-    hasher.update((path.as_os_str().as_encoded_bytes().len() as u64).to_le_bytes());
+    hasher.update(&(path.as_os_str().as_encoded_bytes().len() as u64).to_le_bytes());
     hasher.update(path.as_os_str().as_encoded_bytes());
-    let digest = ContentDigest::from_sha256_bytes(hasher.finalize().into());
+    let digest = ContentDigest::from_sha256_bytes(hasher.finalize());
     format!("sha256:{digest}")
 }
 

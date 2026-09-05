@@ -19,15 +19,3 @@ msrv_policy = { mode = "compute", source = "workspace" }
 
 [surface]
 enabled = true
-
-# Repository work declarations contain positive inputs only. Cargo, rustfmt,
-# dependency policy, release-semver, and Surface semantics remain code-owned.
-[plan.work.compiler-fact-driver]
-scope = "repository"
-paths = [
-  "tools/compiler-fact-driver/**",
-  "scripts/check-compiler-fact-driver.sh",
-  "scripts/with-compiler-fact-driver.sh",
-  "src/compiler/**",
-  "rustfmt.toml",
-]

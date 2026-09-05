@@ -7,8 +7,8 @@ use std::io::{Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use rscrypto::Sha256;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 use crate::cache::result::{
     OUTPUT_MANIFEST_VERSION, OutputEntry, OutputEntryKind, OutputManifest, output_manifest_digest,
@@ -2976,9 +2976,9 @@ fn framed_identity(domain: &[u8], frames: &[(&[u8], &[u8])]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(domain);
     for (tag, value) in frames {
-        hasher.update((tag.len() as u64).to_le_bytes());
+        hasher.update(&(tag.len() as u64).to_le_bytes());
         hasher.update(tag);
-        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(&(value.len() as u64).to_le_bytes());
         hasher.update(value);
     }
     crate::instrumentation::record_hash_operation();
@@ -5221,7 +5221,7 @@ fn unix_seconds() -> u64 {
 }
 
 fn sha256_hex(hasher: Sha256) -> String {
-    crate::source::ContentDigest::from_sha256_bytes(hasher.finalize().into()).to_string()
+    crate::source::ContentDigest::from_sha256_bytes(hasher.finalize()).to_string()
 }
 
 fn unix_nanos() -> u128 {
@@ -6355,9 +6355,9 @@ fn markerless_recovery_plan_locked(
     let mut identity = Sha256::new();
     identity.update(b"cargo-rail-local-cas-recovery-v1\0");
     identity.update(root.as_os_str().as_encoded_bytes());
-    identity.update(bytes.to_le_bytes());
-    identity.update(crate::utils::stable_file_generation(root).unwrap_or_default());
-    let identity = ContentDigest::from_sha256_bytes(identity.finalize().into()).to_string();
+    identity.update(&bytes.to_le_bytes());
+    identity.update(&crate::utils::stable_file_generation(root).unwrap_or_default());
+    let identity = ContentDigest::from_sha256_bytes(identity.finalize()).to_string();
     let root_name = root
         .file_name()
         .and_then(OsStr::to_str)

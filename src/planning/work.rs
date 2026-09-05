@@ -1,4 +1,4 @@
-//! Evidence-backed named-work decisions for the v8 planner contract.
+//! Evidence-backed named-work decisions for the v9 planner contract.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 use cargo_metadata::{Metadata, MetadataCommand, Package, PackageId};
 use glob::Pattern;
+use rscrypto::Sha256;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest as _, Sha256};
 
 use super::evidence::{
     EvidenceBindings, ObservedInput, PlanningEvidenceState, PortableBaseEdgeDomain, PortableBaseModel,
@@ -22,7 +22,7 @@ use crate::error::{RailError, RailResult};
 use crate::graph::{DependencyUniverse, ImpactPropagation};
 use crate::workspace::WorkspaceContext;
 
-const PLAN_CONTRACT_VERSION: u32 = 8;
+const PLAN_CONTRACT_VERSION: u32 = 9;
 const WORK_CATALOG_VERSION: u32 = 1;
 
 const BUILTIN_CARGO_WORK: &[&str] = &[
@@ -47,7 +47,7 @@ const BUILTIN_WORK: &[(&str, WorkSpecScope)] = &[
     ("surface", WorkSpecScope::Repository),
 ];
 
-/// Complete v8 named-work plan.
+/// Complete v9 named-work plan.
 #[derive(Debug, Serialize)]
 pub(crate) struct WorkPlan {
     pub(crate) plan_contract_version: u32,
@@ -57,6 +57,70 @@ pub(crate) struct WorkPlan {
     pub(crate) work: BTreeMap<String, WorkDecision>,
     pub(crate) required: Vec<String>,
     pub(crate) evidence: BTreeMap<String, EvidenceRecord>,
+    pub(crate) attribution: BTreeMap<String, WorkAttribution>,
+}
+
+/// Explanatory facts captured at the same boundary that selects executable work.
+#[derive(Debug, Clone, Default, Serialize)]
+pub(crate) struct WorkAttribution {
+    pub(crate) inputs: BTreeSet<WorkInput>,
+    pub(crate) selections: Vec<SelectionAttribution>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub(crate) struct WorkInput {
+    pub(crate) kind: WorkInputKind,
+    pub(crate) value: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WorkInputKind {
+    Path,
+    Configuration,
+    Package,
+    Dependency,
+    Work,
+    Prerequisite,
+}
+
+impl WorkInput {
+    fn new(kind: WorkInputKind, value: impl Into<String>) -> Self {
+        Self {
+            kind,
+            value: value.into(),
+        }
+    }
+    fn path(value: impl Into<String>) -> Self {
+        Self::new(WorkInputKind::Path, value)
+    }
+    fn evidence_text(&self) -> String {
+        let prefix = match self.kind {
+            WorkInputKind::Path => "path",
+            WorkInputKind::Configuration => "config",
+            WorkInputKind::Package | WorkInputKind::Dependency => "cargo",
+            WorkInputKind::Work => "cargo",
+            WorkInputKind::Prerequisite => "prerequisite",
+        };
+        format!("{prefix}:{}", self.value)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SelectionAttribution {
+    /// A package key or variant ID from this work item's exact scope.
+    pub(crate) subject: String,
+    pub(crate) relation: ImpactRelation,
+    /// One captured originating package when dependency propagation selected this subject.
+    pub(crate) origin: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ImpactRelation {
+    Direct,
+    Dependency,
+    Unattributed,
 }
 
 #[derive(Debug, Serialize)]
@@ -183,6 +247,8 @@ pub(crate) struct SelectedVariant {
 }
 
 struct SelectedVariants {
+    report_inputs: BTreeSet<WorkInput>,
+    relations: Vec<SelectionAttribution>,
     variants: Vec<SelectedVariant>,
     attributed_inputs: BTreeSet<String>,
     all_required_inputs_attributed: bool,
@@ -235,11 +301,50 @@ pub(crate) fn format_work_plan(
         output.push_str("No work required.\n");
     } else {
         output.push_str("Required work:\n");
+        let mut indirect = 0;
         for id in &plan.required {
-            let WorkDecision::Required { scope, .. } = &plan.work[id] else {
+            let WorkDecision::Required { scope, cause, evidence } = &plan.work[id] else {
                 continue;
             };
-            output.push_str(&format!("  {id} [{}]\n", human_scope(scope)));
+            let attribution = &plan.attribution[id];
+            if !explain
+                && explain_work.is_none()
+                && *cause == WorkCause::ChangedInput
+                && !attribution.inputs.is_empty()
+                && attribution.inputs.iter().all(|input| {
+                    matches!(
+                        input.kind,
+                        WorkInputKind::Dependency | WorkInputKind::Work | WorkInputKind::Prerequisite
+                    )
+                })
+            {
+                indirect += 1;
+                continue;
+            }
+            let scope_text = if explain || explain_work.is_some() {
+                human_scope(scope)
+            } else {
+                human_attributed_scope(scope, attribution)
+            };
+            output.push_str(&format!("  {id} [{scope_text}]\n"));
+            match cause {
+                WorkCause::IncompleteEvidence => {
+                    for record in evidence
+                        .iter()
+                        .filter_map(|key| plan.evidence.get(key))
+                        .filter(|record| !record.complete)
+                    {
+                        output.push_str(&format!("    Scope expanded: {}\n", record.description));
+                    }
+                }
+                WorkCause::ForcedAll => output.push_str("    Required by --all.\n"),
+                WorkCause::ChangedInput => {}
+            }
+        }
+        if indirect > 0 {
+            output.push_str(&format!(
+                "Also required: {indirect} dependency work item(s). Use --explain for details.\n"
+            ));
         }
     }
 
@@ -284,6 +389,41 @@ pub(crate) fn format_work_plan(
         }
     }
     Ok(output)
+}
+
+fn human_attributed_scope(scope: &WorkScope, attribution: &WorkAttribution) -> String {
+    let names = match scope {
+        WorkScope::Cargo {
+            selection: CargoSelection::Packages { packages, .. },
+        } => packages
+            .iter()
+            .map(|package| (package.key.as_str(), package.name.as_str()))
+            .collect::<BTreeMap<_, _>>(),
+        WorkScope::Variants {
+            selection: VariantSelection::Selected { variants, .. },
+        } => variants
+            .iter()
+            .map(|variant| (variant.id.as_str(), variant.id.as_str()))
+            .collect(),
+        _ => return human_scope(scope),
+    };
+    let mut shown = Vec::new();
+    let mut dependent = 0;
+    for selection in &attribution.selections {
+        let name = names
+            .get(selection.subject.as_str())
+            .copied()
+            .unwrap_or(&selection.subject);
+        match selection.relation {
+            ImpactRelation::Dependency => dependent += 1,
+            ImpactRelation::Direct => shown.push(name.to_string()),
+            ImpactRelation::Unattributed => shown.push(format!("{name} (attribution unavailable)")),
+        }
+    }
+    if dependent > 0 {
+        shown.push(format!("{dependent} dependent selection(s); --explain for details"));
+    }
+    shown.join(", ")
 }
 
 fn human_scope(scope: &WorkScope) -> String {
@@ -687,6 +827,8 @@ struct Evaluator<'a> {
     prerequisite_source_roots: &'a BTreeMap<String, PrerequisiteSourceImpact>,
     evidence: BTreeMap<String, EvidenceRecord>,
     decisions: BTreeMap<String, WorkDecision>,
+    report_inputs: BTreeMap<String, BTreeSet<WorkInput>>,
+    variant_relations: BTreeMap<String, Vec<SelectionAttribution>>,
 }
 
 pub(crate) fn build_work_plan(
@@ -712,7 +854,7 @@ pub(crate) fn build_work_plan(
         &cargo_identity,
         ctx,
     );
-    let (work, required, evidence) = {
+    let (work, required, evidence, attribution) = {
         let paths = index.paths().collect::<Vec<_>>();
         let structural_impact =
             structural_cargo_impact(ctx, &cargo_model, semantic_changes, observed.base_model(), &paths)?;
@@ -728,6 +870,8 @@ pub(crate) fn build_work_plan(
             prerequisite_source_roots: &prerequisite_source_roots,
             evidence: BTreeMap::new(),
             decisions: BTreeMap::new(),
+            report_inputs: BTreeMap::new(),
+            variant_relations: BTreeMap::new(),
         };
 
         for spec in specs.iter().filter(|spec| spec.origin == "builtin") {
@@ -746,7 +890,8 @@ pub(crate) fn build_work_plan(
             .filter_map(|(id, decision)| matches!(decision, WorkDecision::Required { .. }).then_some(id.clone()))
             .collect::<Vec<_>>();
         validate_decisions(&specs, &evaluator.decisions, &required, &evaluator.evidence)?;
-        (evaluator.decisions, required, evaluator.evidence)
+        let attribution = evaluator.attribution()?;
+        (evaluator.decisions, required, evaluator.evidence, attribution)
     };
 
     let PlanningIndex { file_changes, config } = index;
@@ -780,6 +925,7 @@ pub(crate) fn build_work_plan(
         work,
         required,
         evidence,
+        attribution,
     };
     plan.identity = plan_identity(&plan)?;
     Ok(plan)
@@ -1292,6 +1438,76 @@ fn prerequisite_source_roots(
 }
 
 impl Evaluator<'_> {
+    fn attribution(&self) -> RailResult<BTreeMap<String, WorkAttribution>> {
+        let packages = self
+            .ctx
+            .cargo()
+            .metadata()
+            .workspace_packages()
+            .into_iter()
+            .map(|package| (portable_package_key(self.ctx, package), package))
+            .collect::<BTreeMap<_, _>>();
+        self.decisions
+            .iter()
+            .filter_map(|(id, decision)| {
+                let WorkDecision::Required { scope, cause, .. } = decision else {
+                    return None;
+                };
+                Some((|| {
+                    let mut inputs = self.report_inputs.get(id).cloned().unwrap_or_default();
+                    let mut selections = Vec::new();
+                    if *cause == WorkCause::ForcedAll {
+                        inputs.clear();
+                    }
+                    match scope {
+                        WorkScope::Cargo {
+                            selection: CargoSelection::Packages { packages: selected, .. },
+                        } => {
+                            for selector in selected {
+                                let package = packages
+                                    .get(&selector.key)
+                                    .ok_or_else(|| RailError::message("selected package lacks captured attribution"))?;
+                                let direct = self.structural_impact.seeds.contains(&package.id)
+                                    || self.observed.work(id).is_some_and(|work| {
+                                        work.inputs.iter().any(|input| {
+                                            input.package.as_deref() == Some(selector.key.as_str())
+                                                && self.paths.contains(&input.path.as_str())
+                                        })
+                                    });
+                                let origin = self
+                                    .structural_impact
+                                    .current_build_origins
+                                    .get(&package.id)
+                                    .or_else(|| self.structural_impact.current_development_origins.get(&package.id))
+                                    .or_else(|| self.structural_impact.historical_build_origins.get(&package.id))
+                                    .or_else(|| self.structural_impact.historical_development_origins.get(&package.id));
+                                selections.push(SelectionAttribution {
+                                    subject: selector.key.clone(),
+                                    relation: if direct {
+                                        ImpactRelation::Direct
+                                    } else if origin.is_some() {
+                                        ImpactRelation::Dependency
+                                    } else {
+                                        ImpactRelation::Unattributed
+                                    },
+                                    origin: if direct { None } else { origin.cloned() },
+                                });
+                            }
+                        }
+                        WorkScope::Variants {
+                            selection: VariantSelection::Selected { .. },
+                        } => {
+                            selections = self.variant_relations.get(id).cloned().unwrap_or_default();
+                        }
+                        _ => {}
+                    }
+                    selections.sort_by(|a, b| a.subject.cmp(&b.subject));
+                    Ok((id.clone(), WorkAttribution { inputs, selections }))
+                })())
+            })
+            .collect()
+    }
+
     fn match_cargo_root(&self, root: &ResolvedCargoRoot) -> RailResult<CargoRootMatch> {
         if self.structural_impact.workspace || self.structural_impact.deliverables_workspace {
             return Ok(CargoRootMatch {
@@ -1400,14 +1616,14 @@ impl Evaluator<'_> {
             .config_deltas
             .iter()
             .filter(|delta| crate::config::schema::field_consumers(&delta.path).contains(&spec.id.as_str()))
-            .map(|delta| format!("config:{}", delta.path))
+            .map(|delta| WorkInput::new(WorkInputKind::Configuration, delta.path.clone()))
             .collect::<Vec<_>>();
         let paths = self.paths;
         let mut direct = match spec.id.as_str() {
             "cargo.fmt" => paths
                 .iter()
                 .filter(|path| path.ends_with(".rs") || path.ends_with("rustfmt.toml"))
-                .map(|path| format!("path:{path}"))
+                .map(|path| WorkInput::path(*path))
                 .collect::<Vec<_>>(),
             "dependency-policy" => paths
                 .iter()
@@ -1416,19 +1632,19 @@ impl Evaluator<'_> {
                         && semantic_path_changed(self.semantic_changes, path)
                         || path.ends_with("deny.toml")
                 })
-                .map(|path| format!("path:{path}"))
+                .map(|path| WorkInput::path(*path))
                 .collect(),
             "release.semver" => paths
                 .iter()
                 .filter(|path| is_semver_input(path) && semantic_path_changed(self.semantic_changes, path))
-                .map(|path| format!("path:{path}"))
+                .map(|path| WorkInput::path(*path))
                 .chain(config_inputs)
                 .collect(),
             "surface" if !self.ctx.config().is_some_and(|config| config.surface.enabled) => Vec::new(),
             "surface" => paths
                 .iter()
                 .filter(|path| path.ends_with(".rs"))
-                .map(|path| format!("path:{path}"))
+                .map(|path| WorkInput::path(*path))
                 .chain(config_inputs)
                 .collect(),
             id if BUILTIN_CARGO_WORK.binary_search(&id).is_ok() => {
@@ -1437,11 +1653,23 @@ impl Evaluator<'_> {
             _ => Vec::new(),
         };
         if let Some(prerequisite) = self.prerequisite_source_roots.get(&spec.id) {
-            direct.extend(prerequisite.inputs.iter().cloned());
+            direct.extend(
+                prerequisite
+                    .inputs
+                    .iter()
+                    .cloned()
+                    .map(|input| WorkInput::new(WorkInputKind::Prerequisite, input)),
+            );
         }
 
         if !direct.is_empty() {
-            let input = direct.join(",");
+            self.report_inputs
+                .insert(spec.id.clone(), direct.iter().cloned().collect());
+            let input = direct
+                .iter()
+                .map(WorkInput::evidence_text)
+                .collect::<Vec<_>>()
+                .join(",");
             let evidence = self.add_evidence(
                 "changed_input",
                 &spec.id,
@@ -1565,6 +1793,13 @@ impl Evaluator<'_> {
             }));
         }
 
+        self.report_inputs.insert(
+            spec.id.clone(),
+            changed
+                .iter()
+                .map(|input| WorkInput::path(input.path.clone()))
+                .collect(),
+        );
         let input = changed
             .iter()
             .map(|input| format!("{}@{}", input.path, input.identity))
@@ -1655,25 +1890,36 @@ impl Evaluator<'_> {
         let config_changed = !required_config.is_empty();
         let config_inputs = required_config
             .iter()
-            .map(|path| format!("config:{path}"))
+            .map(|path| WorkInput::new(WorkInputKind::Configuration, path.clone()))
             .collect::<Vec<_>>();
         let cargo_inputs = selected_cargo
             .iter()
-            .map(|id| format!("cargo:{id}"))
+            .map(|id| WorkInput::new(WorkInputKind::Work, id.clone()))
             .collect::<Vec<_>>();
         let mut direct = path_inputs
             .iter()
-            .map(|path| format!("path:{path}"))
+            .map(|path| WorkInput::path(path.clone()))
             .collect::<Vec<_>>();
         direct.extend(config_inputs);
         direct.extend(cargo_inputs);
-        direct.extend(prerequisite_inputs);
+        direct.extend(
+            prerequisite_inputs
+                .into_iter()
+                .map(|input| WorkInput::new(WorkInputKind::Prerequisite, input)),
+        );
 
         // Variant rows are a narrower authority than the work-level gate. A
         // changed work input can require the family while the catalog still
         // proves an exact row subset; only an unmatched required input widens
         // to the explicit `all` selection.
         let selected_variants = self.select_variants(spec, &path_inputs, &required_config)?;
+        let mut report_inputs = direct.iter().cloned().collect::<BTreeSet<_>>();
+        if let Some(selection) = &selected_variants {
+            report_inputs.extend(selection.report_inputs.iter().cloned());
+            self.variant_relations
+                .insert(spec.id.clone(), selection.relations.clone());
+        }
+        self.report_inputs.insert(spec.id.clone(), report_inputs);
         if !direct.is_empty()
             || selected_variants
                 .as_ref()
@@ -1688,7 +1934,11 @@ impl Evaluator<'_> {
                     .collect::<Vec<_>>()
                     .join(",")
             } else {
-                direct.join(",")
+                direct
+                    .iter()
+                    .map(WorkInput::evidence_text)
+                    .collect::<Vec<_>>()
+                    .join(",")
             };
             let (code, complete, description, cause) = if incomplete_cargo {
                 (
@@ -1795,6 +2045,8 @@ impl Evaluator<'_> {
         let mut unmatched_paths = required_paths.iter().map(String::as_str).collect::<HashSet<_>>();
         let mut unmatched_config = required_config.iter().map(String::as_str).collect::<HashSet<_>>();
         let mut selected = Vec::new();
+        let mut report_inputs = BTreeSet::new();
+        let mut relations = Vec::new();
         let mut attributed_inputs = BTreeSet::new();
         for row in &catalog.variants {
             let matched_paths = matching_paths(&row.external_paths, self.paths)?;
@@ -1803,12 +2055,17 @@ impl Evaluator<'_> {
                 attributed_inputs.insert(format!("path:{path}->variant:{}", row.id));
             }
             let mut matched = !matched_paths.is_empty();
+            let mut direct = matched;
+            let mut origins = BTreeSet::new();
+            report_inputs.extend(matched_paths.iter().cloned().map(WorkInput::path));
             for delta in self
                 .config_deltas
                 .iter()
                 .filter(|delta| row.config.contains(&delta.path))
             {
                 matched = true;
+                direct = true;
+                report_inputs.insert(WorkInput::new(WorkInputKind::Configuration, delta.path.clone()));
                 unmatched_config.remove(delta.path.as_str());
                 attributed_inputs.insert(format!("config:{}->variant:{}", delta.path, row.id));
             }
@@ -1816,6 +2073,17 @@ impl Evaluator<'_> {
                 for root in &row.resolved_cargo_roots {
                     let cargo_match = self.match_cargo_root(root)?;
                     matched |= cargo_match.selected;
+                    if cargo_match.selected {
+                        if self.structural_impact.seeds.contains(&root.package) {
+                            direct = true;
+                            report_inputs.insert(WorkInput::new(WorkInputKind::Package, root.package_key.clone()));
+                        } else {
+                            for origin in &cargo_match.origins {
+                                report_inputs.insert(WorkInput::new(WorkInputKind::Dependency, origin.clone()));
+                                origins.insert(origin.clone());
+                            }
+                        }
+                    }
                     for path in &cargo_match.attributed_paths {
                         unmatched_paths.remove(path.as_str());
                     }
@@ -1840,6 +2108,17 @@ impl Evaluator<'_> {
                 }
             }
             if matched {
+                relations.push(SelectionAttribution {
+                    subject: row.id.clone(),
+                    relation: if direct {
+                        ImpactRelation::Direct
+                    } else if origins.is_empty() {
+                        ImpactRelation::Unattributed
+                    } else {
+                        ImpactRelation::Dependency
+                    },
+                    origin: if direct { None } else { origins.into_iter().next() },
+                });
                 selected.push(SelectedVariant {
                     id: row.id.clone(),
                     dimensions: row.dimensions.clone(),
@@ -1847,6 +2126,8 @@ impl Evaluator<'_> {
             }
         }
         Ok(Some(SelectedVariants {
+            report_inputs,
+            relations,
             variants: selected,
             attributed_inputs,
             all_required_inputs_attributed: unmatched_paths.is_empty() && unmatched_config.is_empty(),
@@ -2046,7 +2327,7 @@ fn cargo_direct_inputs(
     id: &str,
     paths: &[&str],
     semantic_changes: &BTreeMap<String, SemanticFileChange>,
-) -> Vec<String> {
+) -> Vec<WorkInput> {
     paths
         .iter()
         .filter(|path| {
@@ -2075,7 +2356,7 @@ fn cargo_direct_inputs(
                 _ => false,
             }
         })
-        .map(|path| format!("path:{path}"))
+        .map(|path| WorkInput::path(*path))
         .collect()
 }
 
@@ -2520,9 +2801,10 @@ fn plan_identity(plan: &WorkPlan) -> RailResult<String> {
         work: &'a BTreeMap<String, WorkDecision>,
         required: &'a [String],
         evidence: Vec<&'a str>,
+        attribution: &'a BTreeMap<String, WorkAttribution>,
     }
     identity(
-        "plan-v8",
+        "plan-v9",
         &canonical_bytes(&Portable {
             plan_contract_version: plan.plan_contract_version,
             inputs: &plan.inputs,
@@ -2533,6 +2815,7 @@ fn plan_identity(plan: &WorkPlan) -> RailResult<String> {
             // completeness. Human descriptions deliberately remain outside
             // the portable plan identity so wording can improve independently.
             evidence: plan.evidence.keys().map(String::as_str).collect(),
+            attribution: &plan.attribution,
         })?,
     )
 }
@@ -2581,13 +2864,13 @@ fn validate_decisions(
 ) -> RailResult<()> {
     if decisions.len() != specs.len() {
         return Err(RailError::message(
-            "v8 planner did not decide every registered work item",
+            "v9 planner did not decide every registered work item",
         ));
     }
     for spec in specs {
         let decision = decisions
             .get(&spec.id)
-            .ok_or_else(|| RailError::message(format!("v8 planner omitted work '{}'", spec.id)))?;
+            .ok_or_else(|| RailError::message(format!("v9 planner omitted work '{}'", spec.id)))?;
         let refs = match decision {
             WorkDecision::Skipped { evidence } | WorkDecision::Required { evidence, .. } => evidence,
         };
@@ -2665,6 +2948,7 @@ mod tests {
                 },
             )]),
             required: Vec::new(),
+            attribution: BTreeMap::new(),
             evidence: BTreeMap::from([(
                 evidence_id,
                 EvidenceRecord {

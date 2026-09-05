@@ -11,7 +11,7 @@ use crate::error::{RailError, RailResult};
 use crate::mutation::{self, ExpectedMutation, MutationAction, MutationEffect, MutationRisk, MutationTrace};
 use crate::progress;
 use crate::workspace::WorkspaceContext;
-use sha2::{Digest, Sha256};
+use rscrypto::Sha256;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 

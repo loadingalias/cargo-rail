@@ -2,7 +2,7 @@
 
 use std::net::IpAddr;
 
-use sha2::{Digest as _, Sha256};
+use rscrypto::Sha256;
 
 use super::{RemoteStoreError, RemoteStoreResult};
 use crate::compiler::native_cache::RemoteAuthorityId;
@@ -666,14 +666,14 @@ fn authority_id(
     ] {
         let tag_length = u32::try_from(tag.len())
             .map_err(|_| RemoteStoreError::integrity("remote cache authority tag length is out of range"))?;
-        hasher.update(tag_length.to_le_bytes());
+        hasher.update(&tag_length.to_le_bytes());
         hasher.update(tag.as_bytes());
-        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(&(value.len() as u64).to_le_bytes());
         hasher.update(value.as_bytes());
     }
     RemoteAuthorityId::parse(format!(
         "remote-authority-v1-sha256-{}",
-        ContentDigest::from_sha256_bytes(hasher.finalize().into())
+        ContentDigest::from_sha256_bytes(hasher.finalize())
     ))
     .map_err(|_| RemoteStoreError::integrity("remote cache authority identity could not be derived"))
 }

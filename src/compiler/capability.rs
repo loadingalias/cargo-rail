@@ -71,13 +71,13 @@ pub(crate) fn host_is_qualified() -> bool {
 }
 
 pub(crate) fn unqualified_host_reason_for(host_os: &str, host_arch: &str) -> Option<&'static str> {
-    if !matches!(host_os, "linux" | "macos" | "windows") {
-        return Some("native_cache_platform_qualification_unavailable");
+    match (host_os, host_arch) {
+        ("linux", "x86_64" | "aarch64" | "riscv64" | "s390x" | "powerpc64")
+        | ("macos", "x86_64" | "aarch64")
+        | ("windows", "x86_64" | "aarch64") => None,
+        ("linux" | "macos" | "windows", _) => Some("native_cache_hardware_qualification_unavailable"),
+        _ => Some("native_cache_platform_qualification_unavailable"),
     }
-    if !matches!(host_arch, "x86_64" | "aarch64") && !(host_os == "linux" && host_arch == "riscv64") {
-        return Some("native_cache_hardware_qualification_unavailable");
-    }
-    None
 }
 
 /// Bind the exact declared role set and positive host qualification into recovery authority.
@@ -126,15 +126,21 @@ mod tests {
 
     #[test]
     fn host_qualification_is_positive_and_closed() {
-        for os in ["linux", "macos", "windows"] {
-            for arch in ["x86_64", "aarch64"] {
-                assert_eq!(unqualified_host_reason_for(os, arch), None, "{os}/{arch}");
-            }
+        for (os, arch) in [
+            ("linux", "x86_64"),
+            ("linux", "aarch64"),
+            ("linux", "riscv64"),
+            ("linux", "s390x"),
+            ("linux", "powerpc64"),
+            ("macos", "x86_64"),
+            ("macos", "aarch64"),
+            ("windows", "x86_64"),
+            ("windows", "aarch64"),
+        ] {
+            assert_eq!(unqualified_host_reason_for(os, arch), None, "{os}/{arch}");
         }
-        assert_eq!(unqualified_host_reason_for("linux", "riscv64"), None);
         for (os, arch, reason) in [
-            ("linux", "powerpc64", "native_cache_hardware_qualification_unavailable"),
-            ("linux", "s390x", "native_cache_hardware_qualification_unavailable"),
+            ("linux", "x86", "native_cache_hardware_qualification_unavailable"),
             ("macos", "riscv64", "native_cache_hardware_qualification_unavailable"),
             ("macos", "powerpc64", "native_cache_hardware_qualification_unavailable"),
             ("windows", "x86", "native_cache_hardware_qualification_unavailable"),
@@ -166,10 +172,10 @@ mod tests {
     fn compiler_set_identity_binds_host_qualification_and_role_contract() {
         let qualified = local_compiler_set_identity_for("linux", "x86_64").expect("qualified identity");
         let architecture = local_compiler_set_identity_for("linux", "aarch64").expect("architecture identity");
-        let unqualified = local_compiler_set_identity_for("linux", "s390x").expect("unqualified identity");
+        let ibm_z = local_compiler_set_identity_for("linux", "s390x").expect("IBM Z identity");
         assert!(qualified.starts_with(LOCAL_COMPILER_SET_IDENTITY_PREFIX));
         assert_ne!(qualified, architecture);
-        assert_ne!(qualified, unqualified);
+        assert_ne!(qualified, ibm_z);
     }
 
     #[test]

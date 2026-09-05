@@ -14,7 +14,7 @@ use std::io::{self, ErrorKind, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use sha2::{Digest as _, Sha256};
+use rscrypto::Sha256;
 
 use crate::cargo::ToolchainIdentity;
 use crate::compiler::facts::{
@@ -401,14 +401,14 @@ impl CompilerFactDriverAuthority {
                 self.compiler_library_digest.clone(),
             ),
         ] {
-            hasher.update((name.len() as u64).to_le_bytes());
+            hasher.update(&(name.len() as u64).to_le_bytes());
             hasher.update(name);
-            hasher.update((value.len() as u64).to_le_bytes());
+            hasher.update(&(value.len() as u64).to_le_bytes());
             hasher.update(value.as_bytes());
         }
         format!(
             "{DRIVER_IDENTITY_PREFIX}{}",
-            ContentDigest::from_sha256_bytes(hasher.finalize().into())
+            ContentDigest::from_sha256_bytes(hasher.finalize())
         )
     }
 
@@ -1800,7 +1800,7 @@ fn finish_windows_execution_authentication(
     }
     crate::instrumentation::record_hash(usize::try_from(bytes).unwrap_or(usize::MAX));
     crate::instrumentation::record_hashed_file_bytes_read(usize::try_from(bytes).unwrap_or(usize::MAX));
-    let actual = format!("sha256:{}", ContentDigest::from_sha256_bytes(hasher.finalize().into()));
+    let actual = format!("sha256:{}", ContentDigest::from_sha256_bytes(hasher.finalize()));
     if actual != expected_digest {
         return Err(RailError::message(format!(
             "{description} bytes do not match the captured workspace authority"
@@ -1912,7 +1912,7 @@ fn authenticate_compiler_library(path: &Path, expected_digest: &str) -> RailResu
     }
     crate::instrumentation::record_hash(usize::try_from(bytes).unwrap_or(usize::MAX));
     crate::instrumentation::record_hashed_file_bytes_read(usize::try_from(bytes).unwrap_or(usize::MAX));
-    let actual = format!("sha256:{}", ContentDigest::from_sha256_bytes(hasher.finalize().into()));
+    let actual = format!("sha256:{}", ContentDigest::from_sha256_bytes(hasher.finalize()));
     if actual != expected_digest {
         return Err(RailError::with_help(
             "compiler fact runtime library does not match embedded release authority",
@@ -1993,7 +1993,7 @@ fn transfer_authenticated_component(
     }
     crate::instrumentation::record_hash(usize::try_from(bytes).unwrap_or(usize::MAX));
     crate::instrumentation::record_hashed_file_bytes_read(usize::try_from(bytes).unwrap_or(usize::MAX));
-    let actual = format!("sha256:{}", ContentDigest::from_sha256_bytes(hasher.finalize().into()));
+    let actual = format!("sha256:{}", ContentDigest::from_sha256_bytes(hasher.finalize()));
     if actual != expected_digest {
         return Err(RailError::message(
             "compiler fact driver bytes do not match embedded release authority",

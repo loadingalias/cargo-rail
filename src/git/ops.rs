@@ -400,7 +400,7 @@ impl GitObjectQuarantine {
         expected: Option<&str>,
         output: &mut std::fs::File,
     ) -> RailResult<String> {
-        use sha2::{Digest as _, Sha256};
+        use rscrypto::Sha256;
         use std::io::{Read as _, Seek as _, Write as _};
         use std::process::Stdio;
 
@@ -2987,7 +2987,7 @@ fn require_complete_object_closures<'a>(
 }
 
 fn digest_opened_pack(file: &mut std::fs::File) -> RailResult<String> {
-    use sha2::{Digest as _, Sha256};
+    use rscrypto::Sha256;
     use std::io::{Read as _, Seek as _};
 
     file.rewind()?;

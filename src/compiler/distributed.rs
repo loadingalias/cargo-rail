@@ -21,8 +21,8 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use rscrypto::Sha256;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
 
 use crate::compiler::native_cache::NativePhaseMeasurement;
@@ -4111,7 +4111,7 @@ fn digest_file(path: &Path, expected_bytes: u64) -> RailResult<String> {
     {
         return Err(RailError::message("distributed worker file changed while hashing"));
     }
-    Ok(format_sha256(hasher.finalize().into()))
+    Ok(format_sha256(hasher.finalize()))
 }
 
 fn format_sha256(bytes: [u8; 32]) -> String {
@@ -6218,7 +6218,7 @@ fn read_request_with_staging_parent(
             remaining = remaining.saturating_sub(read as u64);
         }
         drop(file);
-        if format_sha256(hasher.finalize().into()) != frame.content_digest {
+        if format_sha256(hasher.finalize()) != frame.content_digest {
             return Err(RailError::message(
                 "distributed execution request input failed digest validation",
             ));
@@ -6323,7 +6323,7 @@ fn copy_exact_input_file(writer: &mut impl Write, path: &Path, frame: &InputFram
         || before.len() != after.len()
         || before.modified()? != after.modified()?
         || crate::utils::is_symlink_or_reparse(&after)
-        || format_sha256(hasher.finalize().into()) != frame.content_digest
+        || format_sha256(hasher.finalize()) != frame.content_digest
     {
         return Err(RailError::message(
             "distributed execution input changed during transfer",
@@ -6763,7 +6763,7 @@ fn read_response_into(
             remaining = remaining.saturating_sub(read as u64);
         }
         drop(file);
-        if format_sha256(hasher.finalize().into()) != frame.content_digest {
+        if format_sha256(hasher.finalize()) != frame.content_digest {
             return Err(RailError::message(
                 "distributed execution response frame failed digest validation",
             ));

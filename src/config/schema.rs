@@ -35,10 +35,6 @@ impl ConfigPath {
     pub(crate) fn is_root(&self) -> bool {
         self.segments.is_empty()
     }
-
-    pub(crate) fn first(&self) -> Option<&str> {
-        self.segments.first().map(String::as_str)
-    }
 }
 
 impl fmt::Display for ConfigPath {
@@ -159,6 +155,142 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
     policy(
         "unify.skip_undeclared_patterns",
         "Declares borrowed-feature names that are intentionally non-actionable.",
+    ),
+    policy(
+        "release.source",
+        "Selects release input or reviewed presentation policy.",
+    ),
+    policy(
+        "release.require_changelog_entries",
+        "Selects release input or reviewed presentation policy.",
+    ),
+    policy(
+        "release.require_release_notes",
+        "Selects release input or reviewed presentation policy.",
+    ),
+    policy(
+        "release.release_notes_dir",
+        "Selects release input or reviewed presentation policy.",
+    ),
+    policy(
+        "release.unconventional_commits",
+        "Selects release input or reviewed presentation policy.",
+    ),
+    policy(
+        "release.require_change_files",
+        "Selects release input or reviewed presentation policy.",
+    ),
+    policy(
+        "release.changelog.entry_format",
+        "Controls changelog presentation and commit attribution without granting publication authority.",
+    ),
+    policy(
+        "release.changelog.emoji",
+        "Controls changelog presentation and commit attribution without granting publication authority.",
+    ),
+    policy(
+        "release.changelog.group_order",
+        "Controls changelog presentation and commit attribution without granting publication authority.",
+    ),
+    policy(
+        "release.changelog.fallback",
+        "Controls changelog presentation and commit attribution without granting publication authority.",
+    ),
+    policy(
+        "release.changelog.groups",
+        "Controls changelog presentation and commit attribution without granting publication authority.",
+    ),
+    policy(
+        "release.changelog.groups.<index>.types",
+        "Controls changelog presentation and commit attribution without granting publication authority.",
+    ),
+    policy(
+        "release.changelog.groups.<index>.title",
+        "Controls changelog presentation and commit attribution without granting publication authority.",
+    ),
+    policy(
+        "release.changelog.groups.<index>.emoji",
+        "Controls changelog presentation and commit attribution without granting publication authority.",
+    ),
+    policy(
+        "release.changelog.filters.skip_types",
+        "Controls changelog presentation and commit attribution without granting publication authority.",
+    ),
+    policy(
+        "release.changelog.filters.skip_scopes",
+        "Controls changelog presentation and commit attribution without granting publication authority.",
+    ),
+    policy(
+        "release.changelog.filters.include_paths",
+        "Controls changelog presentation and commit attribution without granting publication authority.",
+    ),
+    policy(
+        "release.changelog.filters.exclude_paths",
+        "Controls changelog presentation and commit attribution without granting publication authority.",
+    ),
+    policy(
+        "release.changelog.commit_url",
+        "Controls changelog presentation and commit attribution without granting publication authority.",
+    ),
+    policy(
+        "release.changelog.pr_url",
+        "Controls changelog presentation and commit attribution without granting publication authority.",
+    ),
+    policy(
+        "crates.<name>.changelog.entry_format",
+        "Controls changelog presentation and commit attribution without granting publication authority.",
+    ),
+    policy(
+        "crates.<name>.changelog.emoji",
+        "Controls changelog presentation and commit attribution without granting publication authority.",
+    ),
+    policy(
+        "crates.<name>.changelog.group_order",
+        "Controls changelog presentation and commit attribution without granting publication authority.",
+    ),
+    policy(
+        "crates.<name>.changelog.fallback",
+        "Controls changelog presentation and commit attribution without granting publication authority.",
+    ),
+    policy(
+        "crates.<name>.changelog.groups",
+        "Controls changelog presentation and commit attribution without granting publication authority.",
+    ),
+    policy(
+        "crates.<name>.changelog.groups.<index>.types",
+        "Controls changelog presentation and commit attribution without granting publication authority.",
+    ),
+    policy(
+        "crates.<name>.changelog.groups.<index>.title",
+        "Controls changelog presentation and commit attribution without granting publication authority.",
+    ),
+    policy(
+        "crates.<name>.changelog.groups.<index>.emoji",
+        "Controls changelog presentation and commit attribution without granting publication authority.",
+    ),
+    policy(
+        "crates.<name>.changelog.filters.skip_types",
+        "Controls changelog presentation and commit attribution without granting publication authority.",
+    ),
+    policy(
+        "crates.<name>.changelog.filters.skip_scopes",
+        "Controls changelog presentation and commit attribution without granting publication authority.",
+    ),
+    policy(
+        "crates.<name>.changelog.filters.include_paths",
+        "Controls changelog presentation and commit attribution without granting publication authority.",
+    ),
+    policy(
+        "crates.<name>.changelog.filters.exclude_paths",
+        "Controls changelog presentation and commit attribution without granting publication authority.",
+    ),
+    policy(
+        "crates.<name>.changelog.commit_url",
+        "Controls changelog presentation and commit attribution without granting publication authority.",
+    ),
+    policy(
+        "crates.<name>.changelog.pr_url",
+        "Controls changelog presentation and commit attribution without granting publication authority.",
     ),
     policy("release.tag_prefix", "Defines the repository's release tag prefix."),
     policy(

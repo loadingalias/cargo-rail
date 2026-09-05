@@ -1,0 +1,156 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/loadingalias/cargo-rail/main/schemas/cache-report-v1.schema.json",
+  "title": "Cargo-Rail cache reporting interval",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "command",
+    "mode",
+    "result",
+    "exit_code",
+    "operation",
+    "measurements"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "command": {
+      "const": "cache"
+    },
+    "mode": {
+      "const": "report"
+    },
+    "result": {
+      "const": "success"
+    },
+    "exit_code": {
+      "const": 0
+    },
+    "operation": {
+      "enum": [
+        "start",
+        "finish"
+      ]
+    },
+    "measurements": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/measurements"
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "measurements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "hits",
+        "misses",
+        "bypasses",
+        "failures",
+        "local_bytes_read",
+        "remote_bytes_read",
+        "remote_bytes_written",
+        "bypass_reasons",
+        "failure_reasons",
+        "incomplete"
+      ],
+      "properties": {
+        "hits": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "misses": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "bypasses": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "failures": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "local_bytes_read": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "remote_bytes_read": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "remote_bytes_written": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "bypass_reasons": {
+          "type": "object",
+          "maxProperties": 128,
+          "propertyNames": {
+            "pattern": "^[a-z0-9_]{1,96}$"
+          },
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 18446744073709551615
+          }
+        },
+        "failure_reasons": {
+          "type": "object",
+          "maxProperties": 128,
+          "propertyNames": {
+            "pattern": "^[a-z0-9_]{1,96}$"
+          },
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 18446744073709551615
+          }
+        },
+        "incomplete": {
+          "type": "boolean"
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "operation": {
+            "const": "start"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "measurements": {
+            "type": "null"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "measurements": {
+            "$ref": "#/$defs/measurements"
+          }
+        }
+      }
+    }
+  ]
+}

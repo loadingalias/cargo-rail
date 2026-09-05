@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use rscrypto::Sha256;
 use rustc_hir as hir;
 use rustc_hir::Node;
 use rustc_hir::def::{CtorOf, DefKind, Res};
@@ -17,7 +18,6 @@ use rustc_middle::ty::{self, TyCtxt};
 use rustc_session::config::CrateType;
 use rustc_span::def_id::LOCAL_CRATE;
 use rustc_span::{FileName, Pos};
-use sha2::{Digest as _, Sha256};
 
 use crate::fact_protocol::{
     COMPILER_FACT_PROTOCOL_VERSION, CompilerFactCompletion, CompilerFactCoverage, CompilerFactEdge,
@@ -755,12 +755,12 @@ fn compiler_owned_source_identity(source: &rustc_span::SourceFile) -> Result<Str
     let source_hash_kind = source.src_hash.kind.to_string();
     let mut hasher = Sha256::new();
     hasher.update(b"cargo-rail-compiler-owned-source-v1\0");
-    hasher.update((kind.len() as u64).to_le_bytes());
+    hasher.update(&(kind.len() as u64).to_le_bytes());
     hasher.update(kind);
-    hasher.update((name_identity.len() as u64).to_le_bytes());
-    hasher.update(name_identity);
-    hasher.update(source.unnormalized_source_len.to_le_bytes());
-    hasher.update((source_hash_kind.len() as u64).to_le_bytes());
+    hasher.update(&(name_identity.len() as u64).to_le_bytes());
+    hasher.update(&name_identity);
+    hasher.update(&source.unnormalized_source_len.to_le_bytes());
+    hasher.update(&(source_hash_kind.len() as u64).to_le_bytes());
     hasher.update(source_hash_kind.as_bytes());
     hasher.update(source.src_hash.hash_bytes());
     let digest = hasher.finalize();
@@ -777,7 +777,7 @@ fn item_id(tcx: TyCtxt<'_>, def_id: DefId) -> CompilerItemId {
     let crate_name = crate_name.as_str();
     let mut crate_hasher = Sha256::new();
     crate_hasher.update(b"cargo-rail-compiler-item-crate-v1\0");
-    crate_hasher.update((crate_name.len() as u64).to_le_bytes());
+    crate_hasher.update(&(crate_name.len() as u64).to_le_bytes());
     crate_hasher.update(crate_name.as_bytes());
     let crate_digest = crate_hasher.finalize();
 
@@ -788,17 +788,17 @@ fn item_id(tcx: TyCtxt<'_>, def_id: DefId) -> CompilerItemId {
     let def_path = tcx.def_path(def_id);
     let mut definition_hasher = Sha256::new();
     definition_hasher.update(b"cargo-rail-compiler-item-definition-v1\0");
-    definition_hasher.update((def_path.data.len() as u64).to_le_bytes());
+    definition_hasher.update(&(def_path.data.len() as u64).to_le_bytes());
     for component in def_path.data {
         let (tag, name) = def_path_component(component.data);
-        definition_hasher.update([tag]);
-        definition_hasher.update(component.disambiguator.to_le_bytes());
+        definition_hasher.update(&[tag]);
+        definition_hasher.update(&component.disambiguator.to_le_bytes());
         if let Some(name) = name {
             let name = name.as_str();
-            definition_hasher.update((name.len() as u64).to_le_bytes());
+            definition_hasher.update(&(name.len() as u64).to_le_bytes());
             definition_hasher.update(name.as_bytes());
         } else {
-            definition_hasher.update(0_u64.to_le_bytes());
+            definition_hasher.update(&0_u64.to_le_bytes());
         }
     }
     let definition_digest = definition_hasher.finalize();

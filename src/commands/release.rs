@@ -271,7 +271,7 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
     let validator = ReleaseValidator::new(ctx);
     let effective_skip_publish = skip_publish || args.pr;
     let effective_skip_tag = args.skip_tag || args.pr;
-    let (plan, expected_mutation_plan) = plan_release_operation(
+    let (mut plan, mut expected_mutation_plan) = plan_release_operation(
         ctx,
         release_config,
         ReleaseOperationOptions {
@@ -325,6 +325,40 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
             ));
         }
         mutation::validate_pre_apply_with_allowed_paths(ctx, &from_file, std::slice::from_ref(path))?;
+        // The saved date is presentation input, not a fresh clock reading. Rebuild
+        // every other value from the current selected intent before comparison.
+        let github = crate::release::changelog::detect_github_repo(ctx.workspace_root());
+        for planned in &mut plan.crates {
+            let date = from_file
+                .actions
+                .iter()
+                .filter(|action| action.code == "UPDATE_CHANGELOG")
+                .find(|action| {
+                    action.payload.get("crate").and_then(serde_json::Value::as_str) == Some(planned.name.as_str())
+                })
+                .and_then(|action| action.payload.get("presentation"))
+                .and_then(|value| value.get("date"))
+                .and_then(serde_json::Value::as_str);
+            if let Some(date) = date {
+                chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                    .map_err(|error| RailError::message(format!("invalid saved release date: {error}")))?;
+                planned.presentation = Some(crate::release::presentation::capture(
+                    ctx.workspace_root(),
+                    release_config,
+                    planned,
+                    date,
+                    github.as_ref(),
+                )?);
+            }
+        }
+        expected_mutation_plan = build_release_mutation_plan(
+            ctx,
+            &plan,
+            effective_skip_publish,
+            effective_skip_tag,
+            args.pr,
+            release_config,
+        )?;
         mutation::validate_requested_operation(&from_file, &expected_mutation_plan)?;
         from_file
     } else {
@@ -540,6 +574,9 @@ pub(super) fn run_release_publication_check_with_plan_inputs(
     validator.validate_apply_preconditions(&plan, true, skip_tag, false)?;
 
     let insights = ReleasePlanner::new(ctx, release_config).release_check_insights(&target_crates)?;
+    let commit_diagnostics = insights.commit_diagnostics;
+    let commit_failed =
+        release_config.unconventional_commits == crate::config::CommitPolicy::Deny && !commit_diagnostics.is_empty();
     let missing_change_files = insights.missing_change_files;
     let shallow_repository = insights.shallow_repository;
     let has_change_file_failures = !missing_change_files.is_empty();
@@ -577,6 +614,11 @@ pub(super) fn run_release_publication_check_with_plan_inputs(
         if shallow_repository {
             println!("\nrelease history:");
             println!("  shallow clone: fetch tags: git fetch --unshallow --tags, or set fetch-depth: 0");
+        }
+        for (name, diagnostics) in &commit_diagnostics {
+            for diagnostic in diagnostics {
+                println!("{name}: {}", diagnostic.describe());
+            }
         }
         if !missing_change_files.is_empty() {
             println!("\nmissing change files:");
@@ -638,7 +680,7 @@ pub(super) fn run_release_publication_check_with_plan_inputs(
         }
     }
 
-    let validation_failed = has_extended_failures || has_change_file_failures || has_shallow_failures;
+    let validation_failed = has_extended_failures || has_change_file_failures || has_shallow_failures || commit_failed;
     if json {
         let (result, exit_code, status) = if validation_failed {
             ("failed", 2, "failed")
@@ -662,6 +704,9 @@ pub(super) fn run_release_publication_check_with_plan_inputs(
               .collect::<Vec<_>>(),
           "warnings": warnings,
         });
+        if !commit_diagnostics.is_empty() {
+            payload["commit_diagnostics"] = serde_json::json!(commit_diagnostics);
+        }
         if extended {
             payload["extended"] = serde_json::json!(extended_results);
         }
@@ -2240,6 +2285,7 @@ fn build_release_mutation_plan(
                   "crate": crate_plan.name,
                   "version": crate_plan.new_version,
                   "body": crate_plan.changelog_body,
+                  "presentation": crate_plan.presentation,
                 }))
                 .with_mutations(vec![release_mutation(
                     ctx,
@@ -2376,14 +2422,14 @@ fn build_release_mutation_plan(
                 for crate_plan in &plan.crates {
                     actions.push(
             MutationAction::new("CREATE_FORGE_RELEASE", crate_plan.tag_name.clone(), None).with_payload(
-              serde_json::json!({ "forge": release_forge_detail(release_config.remote_effects), "tag": crate_plan.tag_name }),
+              serde_json::json!({ "forge": release_forge_detail(release_config.remote_effects), "tag": crate_plan.tag_name, "body": crate_plan.presentation.as_ref().map(|presentation| &presentation.release_notes) }),
             ),
           );
                 }
                 for crate_plan in &plan.crates {
                     actions.push(
             MutationAction::new("PUBLISH_FORGE_RELEASE", crate_plan.tag_name.clone(), None).with_payload(
-              serde_json::json!({ "forge": release_forge_detail(release_config.remote_effects), "tag": crate_plan.tag_name }),
+              serde_json::json!({ "forge": release_forge_detail(release_config.remote_effects), "tag": crate_plan.tag_name, "body": crate_plan.presentation.as_ref().map(|presentation| &presentation.release_notes) }),
             ),
           );
                 }
@@ -2425,10 +2471,20 @@ fn build_release_mutation_plan(
         ),
     )];
 
-    mutation::build_plan_with_inputs(ctx, "release", actions, release_declared_inputs(ctx)?, risks, trace)
+    mutation::build_plan_with_inputs(
+        ctx,
+        "release",
+        actions,
+        release_declared_inputs(ctx, plan)?,
+        risks,
+        trace,
+    )
 }
 
-fn release_declared_inputs(ctx: &WorkspaceContext) -> RailResult<Vec<MutationInput>> {
+fn release_declared_inputs(
+    ctx: &WorkspaceContext,
+    plan: &crate::release::planner::ReleasePlan,
+) -> RailResult<Vec<MutationInput>> {
     let git = ctx.git()?.git();
     let git_root = &git.worktree_root;
     let mut paths = Vec::new();
@@ -2436,6 +2492,16 @@ fn release_declared_inputs(ctx: &WorkspaceContext) -> RailResult<Vec<MutationInp
         paths.push(config_path);
     }
 
+    for planned in &plan.crates {
+        if let Some(presentation) = &planned.presentation {
+            paths.extend(
+                presentation
+                    .note_inputs
+                    .iter()
+                    .map(|input| ctx.workspace_root().join(&input.path)),
+            );
+        }
+    }
     paths.sort();
     paths.dedup();
     paths

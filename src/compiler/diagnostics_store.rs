@@ -8,8 +8,8 @@ use crate::compiler::model::{
     COLLECTOR_VERSION, CompilerDiagEntry, CompilerDiagKey, DiagnosticsCompleteness, TargetEvidence,
 };
 use crate::error::{RailError, RailResult};
+use rscrypto::Sha256;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -845,15 +845,15 @@ fn framed_sha256(prefix: &str, domain: &[u8], frames: &[(&[u8], &[u8])]) -> Stri
     let mut hasher = Sha256::new();
     hasher.update(domain);
     for (tag, value) in frames {
-        hasher.update((tag.len() as u64).to_le_bytes());
+        hasher.update(&(tag.len() as u64).to_le_bytes());
         hasher.update(tag);
-        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(&(value.len() as u64).to_le_bytes());
         hasher.update(value);
     }
     crate::instrumentation::record_hash_operation();
     format!(
         "{prefix}{}",
-        crate::source::ContentDigest::from_sha256_bytes(hasher.finalize().into())
+        crate::source::ContentDigest::from_sha256_bytes(hasher.finalize())
     )
 }
 

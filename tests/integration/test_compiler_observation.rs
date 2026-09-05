@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use sha2::{Digest as _, Sha256};
+use rscrypto::Sha256;
 
 use crate::helpers::TestWorkspace;
 
@@ -17,7 +17,7 @@ fn compiler_fact_path_identity(path: &Path) -> Result<String> {
     let bytes = path.as_os_str().as_encoded_bytes();
     let mut hasher = Sha256::new();
     hasher.update(b"cargo-rail-compiler-fact-path-v1\0");
-    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
     hasher.update(bytes);
     let digest = hasher
         .finalize()

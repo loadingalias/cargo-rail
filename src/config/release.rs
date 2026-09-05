@@ -10,6 +10,47 @@ use std::path::{Component, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseConfig {
+    /// Require change files to cover released crates in commit workflows.
+    ///
+    /// Changes mode always requires repository-wide coverage. In commit
+    /// workflows:
+    /// - `false` (default): change files are optional
+    /// - `true`: every released crate with code changes needs a covering change file
+    /// - `["crate-a", ...]`: only the listed crates are gated
+    #[serde(default)]
+    pub require_change_files: RequireChangeFiles,
+
+    /// Handling for commits that do not parse as conventional (default: "warn").
+    ///
+    /// Ignored when `source = "changes"`.
+    /// - "allow": ignore silently
+    /// - "warn": report in `release check` and plan output
+    /// - "deny": fail `release check` when the release range contains them
+    #[serde(default)]
+    pub unconventional_commits: CommitPolicy,
+
+    /// Directory containing manual release note overrides.
+    ///
+    /// If `release-notes/v1.2.3.md` or `release-notes/<tag>.md` exists, cargo-rail
+    /// uses it as the forge release body instead of generated changelog text.
+    #[serde(default = "default_release_notes_dir")]
+    pub release_notes_dir: String,
+
+    /// If true, require release notes for the target version before publishing/tagging.
+    ///
+    /// This preflight check fails release apply when generated changelog entries are empty
+    /// and no existing `## [<version>]` section exists in the crate's changelog.
+    #[serde(default = "default_true")]
+    pub require_release_notes: bool,
+
+    /// If true, error when there are no changelog entries for a crate
+    #[serde(default)]
+    pub require_changelog_entries: bool,
+
+    /// Authoritative source for release bump selection and changelog prose.
+    #[serde(default)]
+    pub source: ReleaseSource,
+
     /// Git tag prefix (default: "v")
     #[serde(default = "default_tag_prefix")]
     pub tag_prefix: String,
@@ -78,6 +119,12 @@ pub struct ReleaseConfig {
 impl Default for ReleaseConfig {
     fn default() -> Self {
         Self {
+            require_change_files: RequireChangeFiles::default(),
+            unconventional_commits: CommitPolicy::default(),
+            release_notes_dir: default_release_notes_dir(),
+            require_release_notes: true,
+            require_changelog_entries: false,
+            source: ReleaseSource::default(),
             tag_prefix: default_tag_prefix(),
             tag_format: default_tag_format(),
             remote_effects: ReleaseRemoteEffects::default(),
@@ -93,18 +140,42 @@ impl Default for ReleaseConfig {
     }
 }
 
+/// Authoritative input used to select releases and render changelogs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReleaseSource {
+    /// Use reviewed change files. Commit messages are not release inputs.
+    #[default]
+    Changes,
+    /// Use conventional commits for compatibility with older repositories.
+    Commits,
+    /// Combine reviewed change files and conventional commits for compatibility.
+    Both,
+}
+
+impl ReleaseSource {
+    /// Whether conventional commits contribute to release planning.
+    pub const fn uses_commits(self) -> bool {
+        matches!(self, Self::Commits | Self::Both)
+    }
+
+    /// Whether reviewed change files contribute to release planning.
+    pub const fn uses_changes(self) -> bool {
+        matches!(self, Self::Changes | Self::Both)
+    }
+}
+
 impl ReleaseConfig {
+    /// Whether code changes in this crate require reviewed coverage.
+    pub fn requires_change_file(&self, crate_name: &str) -> bool {
+        self.source == ReleaseSource::Changes || self.require_change_files.applies_to(crate_name)
+    }
+
     /// Validate the release configuration
     pub fn validate(&self, workspace_members: &[String]) -> Result<Vec<String>, ConfigError> {
         let mut warnings = Vec::new();
 
-        // Validate tag_format
-        if self.tag_format.trim().is_empty() {
-            return Err(ConfigError::InvalidField {
-                field: "release.tag_format".to_string(),
-                reason: "tag_format cannot be empty".to_string(),
-            });
-        }
+        self.validate_policy()?;
 
         // Check for recommended placeholders in monorepo context
         let is_monorepo = workspace_members.len() > 1;
@@ -124,12 +195,38 @@ impl ReleaseConfig {
             );
         }
 
-        validate_change_dir(&self.change_dir)?;
+        if let RequireChangeFiles::Crates(crates) = &self.require_change_files {
+            for name in crates {
+                if !workspace_members.contains(name) {
+                    warnings.push(format!("release.require_change_files contains unknown crate '{name}'"));
+                }
+            }
+        }
 
         self.validate_version_groups(workspace_members)?;
-        self.validate_auxiliary_cargo_manifests()?;
 
         Ok(warnings)
+    }
+
+    pub(crate) fn validate_policy(&self) -> Result<(), ConfigError> {
+        // Validate tag_format
+        if self.tag_format.trim().is_empty() {
+            return Err(ConfigError::InvalidField {
+                field: "release.tag_format".to_string(),
+                reason: "tag_format cannot be empty".to_string(),
+            });
+        }
+
+        validate_change_dir(&self.change_dir)?;
+        if let Some(reason) = crate::release::change_files::change_dir_validation_error(&self.release_notes_dir) {
+            return Err(ConfigError::InvalidField {
+                field: "release.release_notes_dir".to_string(),
+                reason: reason.to_string(),
+            });
+        }
+        self.changelog.filters.validate("release.changelog.filters")?;
+        self.validate_auxiliary_cargo_manifests()?;
+        Ok(())
     }
 
     fn validate_auxiliary_cargo_manifests(&self) -> Result<(), ConfigError> {
@@ -212,6 +309,19 @@ pub enum Pre1BreakingBump {
     Major,
 }
 
+/// Policy for commits that fail conventional-commit parsing
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CommitPolicy {
+    /// Ignore silently
+    Allow,
+    /// Report as diagnostics (default)
+    #[default]
+    Warn,
+    /// Fail `release check`
+    Deny,
+}
+
 /// Policy for cargo-semver-checks integration
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -286,12 +396,47 @@ impl ReleaseRemoteEffects {
     }
 }
 
+/// Which crates require change-file coverage
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RequireChangeFiles {
+    /// Gate all crates (true) or none (false)
+    All(bool),
+    /// Gate only the listed crates
+    Crates(Vec<String>),
+}
+
+impl Default for RequireChangeFiles {
+    fn default() -> Self {
+        Self::All(false)
+    }
+}
+
+impl RequireChangeFiles {
+    /// Whether the gate applies to `crate_name`
+    pub fn applies_to(&self, crate_name: &str) -> bool {
+        match self {
+            Self::All(enabled) => *enabled,
+            Self::Crates(crates) => crates.iter().any(|c| c == crate_name),
+        }
+    }
+
+    /// Whether the gate applies to any crate at all
+    pub fn is_enabled(&self) -> bool {
+        match self {
+            Self::All(enabled) => *enabled,
+            Self::Crates(crates) => !crates.is_empty(),
+        }
+    }
+}
+
 /// Changelog location and shape (`[release.changelog]`)
 ///
 /// Declarative: sections, ordering, and entry rendering are configured with
 /// placeholder templates, never a template engine. All keys have per-crate
 /// overrides in `[crates.NAME.changelog]`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChangelogShape {
     /// Changelog file path (default: "CHANGELOG.md")
     #[serde(default = "default_changelog_path")]
@@ -302,6 +447,51 @@ pub struct ChangelogShape {
     /// - "workspace": relative to the workspace root
     #[serde(default)]
     pub relative_to: ChangelogRelativeTo,
+
+    /// Entry line template. Placeholders render with their separators and
+    /// collapse to nothing when empty:
+    /// - {scope}: "**scope**: " when the commit has a scope
+    /// - {breaking}: "\[**breaking**\] " for breaking changes
+    /// - {description}: the commit description
+    /// - {prs}: " #12 #34" (linked when a PR URL is known)
+    /// - {sha}: short commit SHA
+    /// - {sha_link}: short SHA linked to the commit when a commit URL is known
+    /// - {type}: the parsed commit type
+    #[serde(default = "default_entry_format")]
+    pub entry_format: String,
+
+    /// Render emoji in section headers (default: true)
+    #[serde(default = "default_true")]
+    pub emoji: bool,
+
+    /// Section render order, by commit type. Types absent from this list fall
+    /// through to `fallback`. Breaking commits always classify as "breaking".
+    #[serde(default = "default_group_order")]
+    pub group_order: Vec<String>,
+
+    /// Where unlisted or unknown commit types go: a type key from
+    /// `group_order`, or "skip" to drop them (default: "other")
+    #[serde(default = "default_fallback")]
+    pub fallback: String,
+
+    /// Custom commit types and section overrides. Each entry maps one or more
+    /// commit types to a shared section.
+    #[serde(default)]
+    pub groups: Vec<GroupSpec>,
+
+    /// Commit filters applied before grouping
+    #[serde(default)]
+    pub filters: ChangelogFilters,
+
+    /// Commit link template with a {sha} placeholder
+    /// (default: inferred from a GitHub `origin` remote)
+    #[serde(default)]
+    pub commit_url: Option<String>,
+
+    /// Pull-request link template with a {pr} placeholder
+    /// (default: inferred from a GitHub `origin` remote)
+    #[serde(default)]
+    pub pr_url: Option<String>,
 }
 
 impl Default for ChangelogShape {
@@ -309,7 +499,56 @@ impl Default for ChangelogShape {
         Self {
             path: default_changelog_path(),
             relative_to: ChangelogRelativeTo::default(),
+            entry_format: default_entry_format(),
+            emoji: true,
+            group_order: default_group_order(),
+            fallback: default_fallback(),
+            groups: Vec::new(),
+            filters: ChangelogFilters::default(),
+            commit_url: None,
+            pr_url: None,
         }
+    }
+}
+
+/// A custom changelog section: one or more commit types rendered together
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupSpec {
+    /// Commit types that map to this section (e.g. ["sec", "security"])
+    pub types: Vec<String>,
+    /// Section title (e.g. "Security")
+    pub title: String,
+    /// Section emoji (omit to inherit none)
+    #[serde(default)]
+    pub emoji: Option<String>,
+}
+
+/// Commit filters applied before grouping
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChangelogFilters {
+    /// Commit types to drop entirely (e.g. ["chore", "ci"])
+    #[serde(default)]
+    pub skip_types: Vec<String>,
+    /// Commit scopes to drop entirely (e.g. ["internal"])
+    #[serde(default)]
+    pub skip_scopes: Vec<String>,
+    /// If non-empty, only commits touching paths matching one of these glob
+    /// patterns are attributed to changelogs.
+    #[serde(default)]
+    pub include_paths: Vec<String>,
+    /// Commits touching only paths matching these glob patterns are excluded
+    /// from changelog attribution.
+    #[serde(default)]
+    pub exclude_paths: Vec<String>,
+}
+
+impl ChangelogFilters {
+    /// Validate glob path filters.
+    pub fn validate(&self, field_prefix: &str) -> Result<(), ConfigError> {
+        validate_globs(field_prefix, "include_paths", &self.include_paths)?;
+        validate_globs(field_prefix, "exclude_paths", &self.exclude_paths)
     }
 }
 
@@ -325,6 +564,7 @@ pub struct CrateReleaseConfig {
 ///
 /// Every field is optional; absent fields inherit `[release.changelog]`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChangelogConfig {
     /// Path to changelog file
     /// Relative to crate directory (default) or workspace root depending on `relative_to`
@@ -334,6 +574,23 @@ pub struct ChangelogConfig {
     /// Exclude this crate from changelog generation?
     #[serde(default)]
     pub skip: bool,
+    /// Override the entry line template for this crate
+    pub entry_format: Option<String>,
+    /// Override emoji rendering for this crate
+    pub emoji: Option<bool>,
+    /// Override the section order for this crate
+    pub group_order: Option<Vec<String>>,
+    /// Override the fallback section for this crate
+    pub fallback: Option<String>,
+    /// Additional custom sections for this crate (extend workspace groups)
+    #[serde(default)]
+    pub groups: Vec<GroupSpec>,
+    /// Override commit filters for this crate
+    pub filters: Option<ChangelogFilters>,
+    /// Override commit link template with a {sha} placeholder
+    pub commit_url: Option<String>,
+    /// Override pull-request link template with a {pr} placeholder
+    pub pr_url: Option<String>,
 }
 
 /// What the changelog path is relative to
@@ -365,6 +622,10 @@ fn default_changelog_path() -> String {
     "CHANGELOG.md".to_string()
 }
 
+fn default_release_notes_dir() -> String {
+    "release-notes".to_string()
+}
+
 fn default_change_dir() -> String {
     crate::release::change_files::DEFAULT_CHANGE_DIR.to_string()
 }
@@ -377,6 +638,37 @@ fn validate_change_dir(change_dir: &str) -> Result<(), ConfigError> {
         });
     }
     Ok(())
+}
+
+fn validate_globs(field_prefix: &str, key: &str, patterns: &[String]) -> Result<(), ConfigError> {
+    for pattern in patterns {
+        if let Err(e) = glob::Pattern::new(pattern) {
+            return Err(ConfigError::InvalidGlobPattern {
+                pattern: format!("{}.{} = {}", field_prefix, key, pattern),
+                message: e.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn default_entry_format() -> String {
+    "- {scope}{breaking}{description}{prs} ({sha_link})".to_string()
+}
+
+fn default_fallback() -> String {
+    "other".to_string()
+}
+
+/// Default section order: breaking first, features and fixes next, remaining
+/// built-in types alphabetically (matches deterministic render order).
+pub(crate) fn default_group_order() -> Vec<String> {
+    [
+        "breaking", "feat", "fix", "build", "chore", "ci", "deps", "docs", "other", "perf", "refactor", "style", "test",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect()
 }
 
 // Tests

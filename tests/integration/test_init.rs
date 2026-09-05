@@ -159,6 +159,7 @@ fn test_init_generated_config_is_valid() -> Result<()> {
 fn test_init_generated_config_passes_strict_validate() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("init-strict-validate")?;
+        ws.add_crate("demo", "0.1.0", &[])?;
         ws.remove_config()?;
 
         let init_output = run_cargo_rail(&ws.path, &["rail", "init"])?;

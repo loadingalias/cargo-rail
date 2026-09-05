@@ -15,7 +15,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use sha2::{Digest, Sha256};
+use rscrypto::Sha256;
 
 use crate::error::{RailError, RailResult};
 use crate::git::SystemGit;
@@ -98,7 +98,7 @@ impl ContentDigest {
     /// Digest exact file bytes.
     pub fn sha256(bytes: &[u8]) -> Self {
         crate::instrumentation::record_hash(bytes.len());
-        Self(Sha256::digest(bytes).into())
+        Self(Sha256::digest(bytes))
     }
 
     /// Return the raw SHA-256 bytes.

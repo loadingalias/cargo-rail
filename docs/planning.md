@@ -96,7 +96,7 @@ catalogs are rejected.
 ## Consume the machine contract
 
 `cargo rail plan --json` writes one schema-owned value. The checked-in contract is
-[`plan-v8.schema.json`](../schemas/plan-v8.schema.json):
+[`plan-v9.schema.json`](../schemas/plan-v9.schema.json):
 
 ```bash
 cargo rail plan --schema > plan.schema.json
@@ -123,28 +123,11 @@ Before each executor:
 4. Run the matching reader's checkout verification in the execution workspace.
 5. Start the executor only after verification succeeds.
 
-For local and captured-worktree plans, `verify-checkout` delegates to the matching Cargo-Rail binary and binds the
-plan to the exact head plus captured Git provenance. Comparing `HEAD` alone is insufficient. Drift exits `2` before
-selectors are emitted or work starts.
-
-Cross-platform CI can transfer an object-bound plan as a portable bundle:
-
-```bash
-RAIL_SINCE=BASE_SHA RAIL_OBJECT_HEAD=HEAD_SHA scripts/plan/read.py create target/plan-v8.json
-scripts/plan/read.py bundle target/plan-v8.json target --producer-version 0.26.0
-python3 target/plan-read.py verify-bundle target/plan-bundle-v1.json
-```
-
-[`plan-bundle-v1.schema.json`](../schemas/plan-bundle-v1.schema.json) names the plan contract, producer version,
-platform limits, clean-object source authority, file roles, byte sizes, and SHA-256 hashes. The bundle contains the
-plan and its exact reader, not a host executable. The bundled reader verifies its own inventory, the complete plan,
-the exact plan identity, `HEAD`, and a clean tracked/untracked/submodule checkout. Portable verification requires Git
-and Python 3.10 or newer on Linux, macOS, or Windows; it deliberately rejects `WORKTREE` plans.
-
-`scripts/plan/read.py` is the strict reference consumer. It validates identities, projections, selector shapes,
-checkout binding, and workflow matrices before emitting NUL-delimited arguments. `cargo-scope` distinguishes
-`skipped`, `workspace`, and `packages`; `package-names` emits names only for exact package scope and rejects duplicate
-names.
+The companion GitHub Action owns the independent strict consumer. It publishes the exact plan, reader, and Cargo-Rail
+version used to create the decision. Every execution job installs that exact version before the reader delegates
+checkout verification to Cargo-Rail. Comparing `HEAD` alone is insufficient; drift exits `2` before selectors are
+emitted or work starts. Readers that already captured a plan use `cargo rail plan --verify -` and pass those exact
+bytes on standard input so verification cannot reopen a different pathname.
 
 ## Observed-input evidence
 
@@ -174,3 +157,18 @@ cargo rail plan --json | jq '{inputs, changes, required, work}'
 
 See [Troubleshooting](troubleshooting.md) when the compared states, selected work, or executor scope differ from
 expectation.
+
+### Impact attribution
+
+Plan contract v9 adds `attribution`, keyed by exactly the required work IDs. It records typed triggering inputs and
+one relation for every selected package or variant: `direct`, `dependency`, or `unattributed`. Dependency relations
+name one captured originating package; they do not claim to enumerate every causal path. A directly changed package
+can also have affected dependencies and remains direct in the presentation.
+
+Attribution is bound into the canonical plan identity. It explains the final selectors without changing their
+execution authority. Workspace scope, incomplete evidence, and `--all` remain explicit. Consumers must not reconstruct
+these relations from paths or the human evidence description. The Action keeps direct selections visible and places
+dependency details in expandable sections. CLI `--explain` includes the complete selected scope.
+
+The published v8 schema remains available for historical readers. Current source emits and verifies v9 plans;
+regenerate older saved plans and use a companion Action that independently validates v9 attribution.

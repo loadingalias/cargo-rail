@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use anyhow::{Context as _, Result, ensure};
-use sha2::{Digest as _, Sha256};
+use rscrypto::Sha256;
 
 #[cfg(windows)]
 fn git_bash() -> Result<PathBuf> {
@@ -24,7 +24,7 @@ fn git_bash() -> Result<PathBuf> {
 }
 
 fn materialize_fixture(destination: &Path, git_source: &Path) -> Result<()> {
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/fixtures/materialize-native-cache.sh");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/materialize-native-cache.sh");
     #[cfg(windows)]
     let mut command = {
         let mut command = Command::new(git_bash()?);
@@ -344,7 +344,7 @@ fn current_root_diagnostic(output: &Output) -> Result<String> {
 
 fn digest_file(path: &Path) -> Result<String> {
     let mut hasher = Sha256::new();
-    hasher.update(fs::read(path)?);
+    hasher.update(&fs::read(path)?);
     Ok(hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
 }
 

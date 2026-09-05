@@ -12,8 +12,8 @@ use crate::git::ops::GitTreeEntry;
 use crate::git::{CommitMetadata, SystemGit};
 use crate::source::{ContentDigest, RepositoryPath};
 use crate::utils;
+use rscrypto::Sha256;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 use std::ffi::{OsStr, OsString};
 #[cfg(not(unix))]
 use std::fs::OpenOptions;

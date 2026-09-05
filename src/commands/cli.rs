@@ -104,6 +104,7 @@ Inspect or transfer the contract:
   cargo rail plan --explain-work cargo.test # Explain one decision, even when skipped
   cargo rail plan --evidence inputs.json    # Use compatible observed-input evidence
   cargo rail plan --verify plan.json        # Revalidate a saved plan without executing it
+  cargo rail plan --verify -                # Revalidate a saved plan read from standard input
   cargo rail plan --json > plan.json        # Redirect the exact plan to a file";
 
 const SURFACE_HELP: &str = "\
@@ -221,9 +222,8 @@ Inspect:
   cargo rail config explain             # Explain effective values and sources
   cargo rail config explain --all       # Explain the complete field inventory
 
-Normalize exact v0.25 input:
-  cargo rail config migrate --check     # Check for pending v0.25 migrations
-  cargo rail config migrate             # Apply the lossless v0.25 migration";
+Bare `cargo rail config` explains configured overrides. Supported older spellings
+are interpreted automatically without editing the file.";
 
 const COMPLETIONS_HELP: &str = "\
 Examples:
@@ -290,7 +290,7 @@ pub enum Commands {
         /// Load portable compatible observed-input evidence
         #[arg(long, value_name = "PATH")]
         evidence: Option<PathBuf>,
-        /// Verify that the current checkout matches one saved plan
+        /// Verify that the current checkout matches one saved plan; use `-` for standard input
         #[arg(
             long,
             value_name = "PATH",
@@ -507,13 +507,13 @@ pub enum Commands {
         format: TextJsonOutputFormat,
     },
 
-    /// Inspect, validate, or migrate repository policy
+    /// Inspect effective repository policy
     #[command(name = "config")]
     #[command(after_long_help = CONFIG_HELP)]
     Config {
         /// Subcommand
         #[command(subcommand)]
-        command: ConfigCommand,
+        command: Option<ConfigCommand>,
     },
 
     /// Generate shell completions
@@ -682,6 +682,18 @@ pub struct CacheSetupArgs {
 pub enum CacheCommand {
     /// Install or repair transparent verified compiler reuse.
     Setup(Box<CacheSetupArgs>),
+    /// Start or finish one explicit cache measurement interval.
+    Report {
+        /// Create a new private recording; export CARGO_RAIL_CACHE_REPORT to this absolute path.
+        #[arg(long, conflicts_with = "finish", required_unless_present = "finish")]
+        start: Option<PathBuf>,
+        /// Finish the interval and report aggregated compiler outcomes.
+        #[arg(long, conflicts_with = "start", required_unless_present = "start")]
+        finish: Option<PathBuf>,
+        /// Report format.
+        #[arg(long, short = 'f', default_value_t, value_enum)]
+        format: TextJsonOutputFormat,
+    },
     /// (Advanced) Validate and normalize one machine-owned remote cache URL without network access.
     Normalize {
         /// AWS S3, Azure Blob Storage, or Cloudflare R2 URL.
@@ -833,8 +845,8 @@ pub enum ConfigCommand {
     /// Validate the configuration file
     ///
     /// Checks for parse errors, unknown keys, and semantic issues.
-    /// By default, unknown keys warn locally but error in CI environments
-    /// (detected via CI, GITHUB_ACTIONS, GITLAB_CI, or CIRCLECI env vars).
+    /// Unknown keys always fail. Semantic warnings become errors in CI
+    /// unless --no-strict is selected. Supported older spellings never warn.
     Validate {
         /// Output format
         #[arg(long, short = 'f', default_value_t, value_enum)]
@@ -854,18 +866,6 @@ pub enum ConfigCommand {
         /// Explain every known effective field
         #[arg(long, conflicts_with = "fields")]
         all: bool,
-        /// Output format
-        #[arg(long, short = 'f', default_value_t, value_enum)]
-        format: TextJsonOutputFormat,
-    },
-    /// Normalize exact v0.25 repository policy into the current schema
-    ///
-    /// This never adds coded defaults. It only performs the frozen v0.25.0
-    /// migration while preserving unrelated TOML formatting.
-    Migrate {
-        /// Check for pending migrations without modifying rail.toml
-        #[arg(long)]
-        check: bool,
         /// Output format
         #[arg(long, short = 'f', default_value_t, value_enum)]
         format: TextJsonOutputFormat,
@@ -1157,6 +1157,7 @@ impl Commands {
                 CacheCommand::Normalize { format, .. }
                 | CacheCommand::Probe { format }
                 | CacheCommand::Status { format, .. }
+                | CacheCommand::Report { format, .. }
                 | CacheCommand::Recover { format, .. }
                 | CacheCommand::Clean { format, .. }
                 | CacheCommand::Profiles { format }
@@ -1209,13 +1210,15 @@ impl Commands {
                     ChangeOutputFormat::NamesOnly => OutputProtocol::Raw,
                 },
             },
-            Commands::Config { command } => match command {
-                ConfigCommand::Locate { format }
-                | ConfigCommand::Print { format }
-                | ConfigCommand::Explain { format, .. }
-                | ConfigCommand::Validate { format, .. }
-                | ConfigCommand::Migrate { format, .. } => text_json_protocol(format.is_json()),
-            },
+            Commands::Config {
+                command:
+                    Some(
+                        ConfigCommand::Locate { format }
+                        | ConfigCommand::Print { format }
+                        | ConfigCommand::Explain { format, .. }
+                        | ConfigCommand::Validate { format, .. },
+                    ),
+            } => text_json_protocol(format.is_json()),
             Commands::Completions { .. } => OutputProtocol::Raw,
             _ => OutputProtocol::Text,
         }
@@ -1292,6 +1295,7 @@ impl Commands {
                 CacheCommand::Normalize { format, .. }
                 | CacheCommand::Probe { format }
                 | CacheCommand::Status { format, .. }
+                | CacheCommand::Report { format, .. }
                 | CacheCommand::Recover { format, .. }
                 | CacheCommand::Clean { format, .. }
                 | CacheCommand::Profiles { format }
@@ -1333,11 +1337,19 @@ impl Commands {
                     | ChangeCommand::Check { format, .. },
             } => *format = ChangeOutputFormat::Json,
             Commands::Config { command } => match command {
-                ConfigCommand::Locate { format }
-                | ConfigCommand::Print { format }
-                | ConfigCommand::Explain { format, .. }
-                | ConfigCommand::Validate { format, .. }
-                | ConfigCommand::Migrate { format, .. } => *format = TextJsonOutputFormat::Json,
+                Some(
+                    ConfigCommand::Locate { format }
+                    | ConfigCommand::Print { format }
+                    | ConfigCommand::Explain { format, .. }
+                    | ConfigCommand::Validate { format, .. },
+                ) => *format = TextJsonOutputFormat::Json,
+                None => {
+                    *command = Some(ConfigCommand::Explain {
+                        fields: Vec::new(),
+                        all: false,
+                        format: TextJsonOutputFormat::Json,
+                    })
+                }
             },
             _ => {}
         }

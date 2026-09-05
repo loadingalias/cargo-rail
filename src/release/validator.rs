@@ -217,7 +217,13 @@ impl<'a> ReleaseValidator<'a> {
             }
         }
 
-        self.validate_release_notes(plan)?;
+        if self
+            .ctx
+            .config()
+            .is_none_or(|config| config.release.require_release_notes)
+        {
+            self.validate_release_notes(plan)?;
+        }
 
         Ok(())
     }
@@ -259,7 +265,12 @@ impl<'a> ReleaseValidator<'a> {
                 continue;
             }
 
-            if changelog_contains_version_entry(&crate_plan.changelog_path, &crate_plan.new_version.to_string()) {
+            if crate::release::presentation::read_optional(self.ctx.workspace_root(), &crate_plan.changelog_path)?
+                .as_deref()
+                .is_some_and(|text| {
+                    crate::release::presentation::extract_section(text, &crate_plan.new_version.to_string()).is_some()
+                })
+            {
                 continue;
             }
 
@@ -720,14 +731,6 @@ impl<'a> ReleaseValidator<'a> {
         }
         Ok(())
     }
-}
-
-fn changelog_contains_version_entry(path: &std::path::Path, version: &str) -> bool {
-    let Ok(contents) = fs::read_to_string(path) else {
-        return false;
-    };
-    let needle = format!("## [{}]", version);
-    contents.lines().any(|line| line.trim_start().starts_with(&needle))
 }
 
 #[cfg(test)]

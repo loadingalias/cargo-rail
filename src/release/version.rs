@@ -201,6 +201,22 @@ impl std::fmt::Display for BumpLevel {
     }
 }
 
+/// Semver impact of one conventional commit
+///
+/// Fixed semantics regardless of custom changelog groups: breaking → major,
+/// feat → minor, fix/perf → patch, everything else (including custom types
+/// and unconventional commits) → no bump.
+pub(crate) fn commit_bump_level(parsed: &crate::release::changelog::ParsedSubject<'_>) -> Option<BumpLevel> {
+    if parsed.breaking {
+        return Some(BumpLevel::Major);
+    }
+    match parsed.commit_type? {
+        "feat" => Some(BumpLevel::Minor),
+        "fix" | "perf" => Some(BumpLevel::Patch),
+        _ => None,
+    }
+}
+
 /// Version bumper for Cargo.toml files
 #[derive(Debug)]
 pub struct VersionBumper;

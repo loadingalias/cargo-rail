@@ -9,8 +9,8 @@ use super::{
     Step, StepStatus, V0_25ExecutionInputs,
 };
 use crate::config::{
-    ChangelogRelativeTo, ChangelogShape, Pre1BreakingBump, ReleaseConfig, ReleaseRegistryPublication,
-    ReleaseRemoteEffects, SemverCheckPolicy,
+    ChangelogRelativeTo, Pre1BreakingBump, ReleaseConfig, ReleaseRegistryPublication, ReleaseRemoteEffects,
+    SemverCheckPolicy,
 };
 use crate::error::{RailError, RailResult};
 use crate::release::planner::{RELEASE_PLAN_CONTRACT_VERSION, ReleasePlan};
@@ -69,7 +69,6 @@ struct ReleasePlanV5 {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct CrateReleasePlanV5 {
     name: String,
     current_version: semver::Version,
@@ -104,7 +103,6 @@ struct DependencyUpdateV5 {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct PlannedChangeEntryV5 {
     path: PathBuf,
     bump: crate::release::change_files::ChangeBump,
@@ -143,7 +141,7 @@ struct ReleaseSummaryV5 {
     crates_to_tag: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReleaseConfigV5 {
     source: String,
@@ -166,7 +164,7 @@ struct ReleaseConfigV5 {
     changelog: ChangelogShapeV5,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ChangelogShapeV5 {
     path: String,
@@ -181,7 +179,7 @@ struct ChangelogShapeV5 {
     pr_url: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GroupSpecV5 {
     types: Vec<String>,
@@ -189,7 +187,7 @@ struct GroupSpecV5 {
     emoji: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ChangelogFiltersV5 {
     skip_types: Vec<String>,
@@ -312,7 +310,7 @@ impl ReleaseStateV5 {
             });
 
         let plan = self.plan.into_current()?;
-        let release_config = self.release_config.into_current();
+        let release_config = self.release_config.into_current()?;
         let remote_repository = self
             .remote_repository
             .map(RemoteRepositoryV5::into_current)
@@ -362,7 +360,6 @@ impl ReleasePlanV5 {
         let object = value
             .as_object_mut()
             .ok_or_else(|| RailError::message("release plan version 5 is not an object"))?;
-        object.remove("source");
         object.insert(
             "plan_contract_version".to_string(),
             serde_json::Value::from(RELEASE_PLAN_CONTRACT_VERSION),
@@ -375,8 +372,6 @@ impl ReleasePlanV5 {
             let planned = planned
                 .as_object_mut()
                 .ok_or_else(|| RailError::message("release plan version 5 contains a non-object crate"))?;
-            planned.remove("commits");
-            planned.remove("commit_diagnostics");
             planned.remove("changelog_entries");
         }
         serde_json::from_value(value)
@@ -385,50 +380,11 @@ impl ReleasePlanV5 {
 }
 
 impl ReleaseConfigV5 {
-    fn into_current(self) -> ReleaseConfig {
-        let retired_groups = self
-            .changelog
-            .groups
-            .into_iter()
-            .map(|group| (group.types, group.title, group.emoji))
-            .collect::<Vec<_>>();
-        let retired_filters = (
-            self.changelog.filters.skip_types,
-            self.changelog.filters.skip_scopes,
-            self.changelog.filters.include_paths,
-            self.changelog.filters.exclude_paths,
-        );
-        let _retired_planning_fields = (
-            self.source,
-            self.require_release_notes,
-            self.release_notes_dir,
-            self.unconventional_commits,
-            self.require_change_files,
-            self.changelog.entry_format,
-            self.changelog.emoji,
-            self.changelog.group_order,
-            self.changelog.fallback,
-            retired_groups,
-            retired_filters,
-            self.changelog.commit_url,
-            self.changelog.pr_url,
-        );
-        ReleaseConfig {
-            tag_prefix: self.tag_prefix,
-            tag_format: self.tag_format,
-            remote_effects: self.remote_effects,
-            registry_publication: self.registry_publication,
-            sign_tags: self.sign_tags,
-            change_dir: self.change_dir,
-            pre_1_breaking_bump: self.pre_1_breaking_bump,
-            semver_check: self.semver_check,
-            version_groups: self.version_groups,
-            auxiliary_cargo_manifests: self.auxiliary_cargo_manifests,
-            changelog: ChangelogShape {
-                path: self.changelog.path,
-                relative_to: self.changelog.relative_to,
-            },
-        }
+    fn into_current(self) -> RailResult<ReleaseConfig> {
+        let value = serde_json::to_value(self)
+            .map_err(|error| RailError::message(format!("invalid predecessor release configuration: {error}")))?;
+        serde_json::from_value(value)
+            .map_err(|error| RailError::message(format!("invalid predecessor release configuration: {error}")))
     }
 }
 

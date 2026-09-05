@@ -78,6 +78,12 @@ or incomplete input evidence executes the original compiler. Physical-root mode 
 use `--root-portability remap` only for certified cross-root Rust metadata and library results. External
 `CARGO_TARGET_DIR` locations are supported for eligible native results. A bypass is safe fallback, not a failed hit.
 
+`native_cache_hardware_qualification_unavailable` means the operating system is recognized but its architecture is
+not in the [native host table](caching.md#native-host-eligibility).
+`native_cache_platform_qualification_unavailable` means the operating system is unsupported.
+`cross_target_toolchain_evidence_unavailable` means Cargo selected a target other than rustc's host target; run that
+build natively to make it eligible for compiler-result reuse.
+
 Status schema 15 keeps native failure-reason counters outside the bounded 65,536-event usage ledger. Inspect
 `usage.failure_reason_counts_available` before interpreting `usage.failure_reasons`; event eviction does not erase
 those counters. A strict `cache probe` verifies authenticated provider and protocol readiness without exposing the

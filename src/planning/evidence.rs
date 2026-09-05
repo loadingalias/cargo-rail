@@ -5,9 +5,9 @@ use std::fs;
 use std::io::Read as _;
 use std::path::Path;
 
+use rscrypto::Sha256;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest as _, Sha256};
 
 use crate::workspace::WorkspaceContext;
 

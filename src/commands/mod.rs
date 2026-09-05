@@ -42,8 +42,7 @@ pub use cli::{
 };
 pub use common::{ChangeOutputFormat, SplitOutputFormat, SurfaceOutputFormat, TextJsonOutputFormat};
 pub use config::{
-    StrictnessMode, run_config_explain, run_config_locate, run_config_migrate, run_config_print,
-    run_config_validate_standalone,
+    StrictnessMode, run_config_explain, run_config_locate, run_config_print, run_config_validate_standalone,
 };
 pub use doctor::run_native_cache_doctor;
 pub use init::{run_init, run_init_standalone};
@@ -232,50 +231,36 @@ pub fn try_dispatch_pre_context(
             Ok(PreContextDispatch::Handled)
         }
 
-        Commands::Config {
-            command:
+        Commands::Config { command } => {
+            match command.unwrap_or(cli::ConfigCommand::Explain {
+                fields: Vec::new(),
+                all: false,
+                format: common::TextJsonOutputFormat::Text,
+            }) {
                 cli::ConfigCommand::Validate {
                     format,
                     strict,
                     no_strict,
-                },
-        } => {
-            let strictness = if strict {
-                StrictnessMode::Strict
-            } else if no_strict {
-                StrictnessMode::NoStrict
-            } else {
-                StrictnessMode::Auto
-            };
-            config::run_config_validate_standalone(workspace_root, config_override, format, strictness)?;
-            Ok(PreContextDispatch::Handled)
-        }
-
-        Commands::Config {
-            command: cli::ConfigCommand::Locate { format },
-        } => {
-            config::run_config_locate(workspace_root, config_override, format)?;
-            Ok(PreContextDispatch::Handled)
-        }
-
-        Commands::Config {
-            command: cli::ConfigCommand::Print { format },
-        } => {
-            config::run_config_print(workspace_root, config_override, format)?;
-            Ok(PreContextDispatch::Handled)
-        }
-
-        Commands::Config {
-            command: cli::ConfigCommand::Explain { fields, all, format },
-        } => {
-            config::run_config_explain(workspace_root, config_override, &fields, all, format)?;
-            Ok(PreContextDispatch::Handled)
-        }
-
-        Commands::Config {
-            command: cli::ConfigCommand::Migrate { check, format },
-        } => {
-            config::run_config_migrate(workspace_root, config_override, check, format)?;
+                } => {
+                    let strictness = if strict {
+                        StrictnessMode::Strict
+                    } else if no_strict {
+                        StrictnessMode::NoStrict
+                    } else {
+                        StrictnessMode::Auto
+                    };
+                    config::run_config_validate_standalone(workspace_root, config_override, format, strictness)?;
+                }
+                cli::ConfigCommand::Locate { format } => {
+                    config::run_config_locate(workspace_root, config_override, format)?
+                }
+                cli::ConfigCommand::Print { format } => {
+                    config::run_config_print(workspace_root, config_override, format)?
+                }
+                cli::ConfigCommand::Explain { fields, all, format } => {
+                    config::run_config_explain(workspace_root, config_override, &fields, all, format)?
+                }
+            }
             Ok(PreContextDispatch::Handled)
         }
 
@@ -365,6 +350,9 @@ pub fn try_dispatch_pre_context(
                     format,
                 } => cache::run_normalize(&url, mode.as_deref(), environment, format)?,
                 cli::CacheCommand::Probe { format } => cache::run_probe(workspace_root, format)?,
+                cli::CacheCommand::Report { start, finish, format } => {
+                    cache::run_report(start.as_deref(), finish.as_deref(), format)?
+                }
                 cli::CacheCommand::Status { scope, format } => cache::run_status(workspace_root, scope, format)?,
                 cli::CacheCommand::Profiles { format } => cache::run_profiles(workspace_root, format)?,
                 cli::CacheCommand::Detach { check, format } => {
@@ -737,23 +725,9 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext, prepared_plan: Option<Pla
         )),
 
         // Config commands are handled before WorkspaceContext is built
-        Commands::Config { command } => match command {
-            cli::ConfigCommand::Locate { .. } => Err(crate::error::RailError::message(
-                "config locate reached workspace dispatch",
-            )),
-            cli::ConfigCommand::Print { .. } => Err(crate::error::RailError::message(
-                "config print reached workspace dispatch",
-            )),
-            cli::ConfigCommand::Explain { .. } => Err(crate::error::RailError::message(
-                "config explain reached workspace dispatch",
-            )),
-            cli::ConfigCommand::Validate { .. } => Err(crate::error::RailError::message(
-                "config validate reached workspace dispatch",
-            )),
-            cli::ConfigCommand::Migrate { .. } => Err(crate::error::RailError::message(
-                "config migrate reached workspace dispatch",
-            )),
-        },
+        Commands::Config { .. } => Err(crate::error::RailError::message(
+            "config command reached workspace dispatch",
+        )),
 
         // Completions is handled before WorkspaceContext is built
         Commands::Completions { .. } => Err(crate::error::RailError::message(

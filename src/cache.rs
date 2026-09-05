@@ -3,6 +3,7 @@
 pub(crate) mod cas;
 pub(crate) mod installation;
 pub(crate) mod profile;
+pub(crate) mod report;
 pub(crate) mod result;
 
 use crate::error::{RailError, RailResult};

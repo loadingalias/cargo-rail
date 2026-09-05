@@ -5,7 +5,6 @@
 Install these tools:
 
 - Rust through `rustup`; `rust-toolchain.toml` selects the repository toolchain and components.
-- Python 3.11 or newer.
 - `just`, `cargo-nextest`, and `cargo-deny`.
 
 Run commands from the repository root. Use `just --list` to see the maintained command surface.
@@ -19,27 +18,25 @@ Run commands from the repository root. Use `just --list` to see the maintained c
 - Update documentation when commands, configuration, output, side effects, compatibility, or recovery behavior changes.
 ## Validate the worktree
 
-Inspect the planner-selected work, then run the affected local lanes:
+Run the direct workspace build and test lanes:
 
 ```bash
-just plan
-just check-affected
 just build
 just test
 git diff --check
 ```
 
-Run the complete lanes when a change crosses planner, mutation, cache, compiler, release, platform, or public-contract
-boundaries:
+Run the complete quality lane when a change crosses planner, mutation, cache, compiler, release, platform, or
+public-contract boundaries:
 
 ```bash
 just check
-just test-all
 ```
 
-`just check` is workspace-wide and read-only. `just fix` formats files and applies Clippy fixes; run it only when those
-edits are intended. Use the contract-specific recipes listed by `just --list` for compiler-driver, Windows-target,
-benchmark, or remote-machine work.
+`just build` and `just test` are workspace-wide and do not lower plan selectors. `just check` is workspace-wide and
+read-only. `just fix` formats files and applies Clippy fixes; run it only when those edits are intended. Use the
+contract-specific recipes listed by `just --list` for compiler-driver, Windows-target, benchmark, or remote-machine
+work.
 
 ## Work on Surface compiler integration
 
@@ -48,8 +45,7 @@ Surface's compiler integration, install `rustc-dev` for the selected toolchain a
 
 ```bash
 rustup component add rustc-dev
-just check-compiler-fact-driver
-scripts/with-compiler-fact-driver.sh cargo build --locked --bin cargo-rail
+just check-compiler-driver
 ```
 
 The driver is built separately because it is tied to one exact Rust compiler toolchain.

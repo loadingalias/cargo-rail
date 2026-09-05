@@ -14,27 +14,6 @@ workload. A smoke run validates orchestration; it does not qualify latency.
 Do not combine different commits, worktrees, toolchains, target-state policies, physical roots, cache protocols, or
 machines into one population.
 
-## Planner
-
-Validate the harness first:
-
-```bash
-just bench-plan-smoke
-```
-
-Run the qualification corpus only on a quiet pinned machine:
-
-```bash
-just bench-plan 20
-```
-
-Results live under `target/benchmarks/plan/`. `results.json` records raw samples, source and binary identity, host,
-toolchain, harness identity, and the final `qualified`, `completed_unqualified`, or `failed` status. Keep
-`failure_reason` and the accepted samples when a bound fails.
-
-An external candidate requires a provenance sidecar that binds its binary digest to an immutable source identity. The
-harness verifies that digest before creating fixtures or collecting samples.
-
 ## Claim requirements
 
 Publish a performance claim only when:

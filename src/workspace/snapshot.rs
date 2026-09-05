@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use cargo_metadata::{Metadata, PackageId, Source};
+use rscrypto::Sha256;
 use serde::Deserialize;
-use sha2::{Digest as _, Sha256};
 
 use crate::cargo::MultiTargetMetadata;
 use crate::cargo::resolution::{
@@ -1056,7 +1056,7 @@ impl SnapshotIdentityHasher {
     fn finish(self) -> ContentDigest {
         crate::instrumentation::record_hash_operation();
         crate::instrumentation::record_hash_input_bytes(self.input_bytes);
-        ContentDigest::from_sha256_bytes(self.hasher.finalize().into())
+        ContentDigest::from_sha256_bytes(self.hasher.finalize())
     }
 }
 
@@ -1369,6 +1369,20 @@ fn capture_declared_file_outside_tree(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn framed_snapshot_digest_preserves_sha256_identity() {
+        let mut identity = SnapshotIdentityHasher::new(b"cargo-rail-workspace-snapshot\0");
+        identity.frame(b"empty", b"");
+        identity.frame(b"source", &vec![b'a'; 65_537]);
+        identity.frame(b"target", b"x86_64-unknown-linux-gnu");
+
+        // Fixed SHA-256 of the domain and little-endian length-prefixed fields.
+        assert_eq!(
+            identity.finish().to_string(),
+            "01ff397d49a8a5b9555308cd2bba93090b0e0ea79d3254495c3fd10703a964c1"
+        );
+    }
 
     fn lockfile(bytes: &[u8]) -> SnapshotFile {
         SnapshotFile {

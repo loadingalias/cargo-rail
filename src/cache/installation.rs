@@ -5,8 +5,8 @@ use std::fs::{self, File};
 use std::io::{Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 
+use rscrypto::Sha256;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 use toml_edit::{DocumentMut, Item, Table, Value};
 
 use crate::cache::cas::{LocalCacheSelection, LocalCas};
@@ -2959,7 +2959,7 @@ fn digest_regular_file(path: &Path, require_single_link: bool) -> RailResult<Str
     }
     Ok(format!(
         "sha256:{}",
-        ContentDigest::from_sha256_bytes(hasher.finalize().into())
+        ContentDigest::from_sha256_bytes(hasher.finalize())
     ))
 }
 

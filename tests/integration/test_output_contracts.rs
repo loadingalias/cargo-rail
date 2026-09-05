@@ -182,6 +182,7 @@ fn test_verbose_and_quiet_are_distinct_global_detail_levels() {
 fn test_closed_stdout_pipe_is_a_clean_process_boundary() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("closed-stdout-pipe")?;
+        ws.add_crate("demo", "0.1.0", &[])?;
         std::fs::write(ws.path.join(".config/rail.toml"), "")?;
         let mut child = cargo_rail_command(&ws.path)?
             .args(["rail", "config", "explain", "--all"])
@@ -201,6 +202,7 @@ fn test_closed_stdout_pipe_is_a_clean_process_boundary() {
 fn test_config_explain_default_is_compact_and_selection_is_complete() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("config-explain-detail")?;
+        ws.add_crate("demo", "0.1.0", &[])?;
         std::fs::write(
             ws.path.join(".config/rail.toml"),
             "[unify]\nconsumer_scope = \"workspace\"\n",

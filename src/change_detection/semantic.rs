@@ -6,7 +6,6 @@ use std::fs;
 use cargo_metadata::{Package, PackageId};
 use serde_json::{Map, Value};
 
-use super::classify::{FileProfile, classify_path};
 use crate::error::RailResult;
 use crate::workspace::WorkspaceContext;
 
@@ -26,6 +25,13 @@ pub(crate) enum SemanticScope {
     Workspace,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticCargoInput {
+    PackageManifest,
+    WorkspaceManifest,
+    Lockfile,
+}
+
 #[derive(Debug)]
 struct MemberManifestInput {
     package: PackageId,
@@ -41,12 +47,7 @@ pub(crate) fn analyze<'a>(
 ) -> RailResult<BTreeMap<String, SemanticFileChange>> {
     let semantic_paths = changed_files
         .into_iter()
-        .filter(|path| {
-            matches!(
-                classify_path(std::path::Path::new(path)),
-                FileProfile::TomlManifest | FileProfile::TomlWorkspace | FileProfile::CargoLock
-            )
-        })
+        .filter_map(|path| semantic_cargo_input(path).map(|input| (path, input)))
         .collect::<Vec<_>>();
     if semantic_paths.is_empty() {
         return Ok(BTreeMap::new());
@@ -54,7 +55,7 @@ pub(crate) fn analyze<'a>(
 
     let absolute_paths = semantic_paths
         .iter()
-        .map(|path| ctx.workspace_root().join(path))
+        .map(|(path, _)| ctx.workspace_root().join(path))
         .collect::<Vec<_>>();
     let repository_paths = absolute_paths
         .iter()
@@ -74,7 +75,7 @@ pub(crate) fn analyze<'a>(
     } else if ctx.planning_source_capture().is_some() {
         let paths = semantic_paths
             .iter()
-            .map(|path| (*path).to_string())
+            .map(|(path, _)| (*path).to_string())
             .collect::<Vec<_>>();
         ctx.read_planning_current_files(&paths)?
     } else {
@@ -89,30 +90,34 @@ pub(crate) fn analyze<'a>(
     };
     let member_manifests = semantic_paths
         .iter()
-        .any(|path| classify_path(std::path::Path::new(path)) == FileProfile::TomlWorkspace)
+        .any(|(_, input)| *input == SemanticCargoInput::WorkspaceManifest)
         .then(|| member_manifest_inputs(ctx, base_ref, head_ref))
         .transpose()?;
 
-    semantic_paths
+    Ok(semantic_paths
         .into_iter()
         .zip(base)
         .zip(head)
-        .map(|((path, before), after)| {
-            let change = match classify_path(std::path::Path::new(path)) {
-                FileProfile::TomlWorkspace => {
+        .map(|(((path, input), before), after)| {
+            let change = match input {
+                SemanticCargoInput::WorkspaceManifest => {
                     workspace_manifest_change(ctx, &before, &after, member_manifests.as_deref().unwrap_or_default())
                 }
-                FileProfile::TomlManifest => package_manifest_change(ctx, path, &before, &after),
-                FileProfile::CargoLock => lockfile_change(ctx, &before, &after),
-                _ => {
-                    return Err(crate::error::RailError::message(format!(
-                        "semantic path '{path}' has no semantic profile"
-                    )));
-                }
+                SemanticCargoInput::PackageManifest => package_manifest_change(ctx, path, &before, &after),
+                SemanticCargoInput::Lockfile => lockfile_change(ctx, &before, &after),
             };
-            Ok((path.to_string(), change))
+            (path.to_string(), change)
         })
-        .collect()
+        .collect())
+}
+
+fn semantic_cargo_input(path: &str) -> Option<SemanticCargoInput> {
+    match path {
+        "Cargo.lock" => Some(SemanticCargoInput::Lockfile),
+        "Cargo.toml" => Some(SemanticCargoInput::WorkspaceManifest),
+        path if path.ends_with("Cargo.toml") => Some(SemanticCargoInput::PackageManifest),
+        _ => None,
+    }
 }
 
 fn member_manifest_inputs(
@@ -527,6 +532,22 @@ fn fallback(input: &'static str, reason: &'static str) -> SemanticFileChange {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognizes_only_semantically_analyzed_cargo_inputs() {
+        assert_eq!(
+            semantic_cargo_input("Cargo.toml"),
+            Some(SemanticCargoInput::WorkspaceManifest)
+        );
+        assert_eq!(
+            semantic_cargo_input("crates/demo/Cargo.toml"),
+            Some(SemanticCargoInput::PackageManifest)
+        );
+        assert_eq!(semantic_cargo_input("Cargo.lock"), Some(SemanticCargoInput::Lockfile));
+        assert_eq!(semantic_cargo_input("crates/demo/Cargo.lock"), None);
+        assert_eq!(semantic_cargo_input(".cargo/config.toml"), None);
+        assert_eq!(semantic_cargo_input("scripts/generate.py"), None);
+    }
 
     #[test]
     fn lock_checksum_diff_maps_to_exact_resolved_package_id() {

@@ -14,7 +14,6 @@ use crate::source::ContentDigest;
 use crate::utils::canonicalize_existing;
 use crate::workspace::WorkspaceContext;
 use crate::{progress, warn};
-use chrono::Local;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -278,6 +277,9 @@ impl<'a> ReleasePublisher<'a> {
         planned_paths: &[PathBuf],
         control_paths: &[PathBuf],
     ) -> RailResult<()> {
+        for planned in &plan.crates {
+            crate::release::presentation::validate_inputs(self.ctx.workspace_root(), planned)?;
+        }
         let remote_repository = self.preflight_pr()?;
         let branch = release_branch_name(plan)?;
         let git = self.ctx.git()?.git();
@@ -505,6 +507,11 @@ impl<'a> ReleasePublisher<'a> {
         wait_for_checks: bool,
     ) -> RailResult<()> {
         self.validate_remote_repository(state)?;
+        if state.phase < ReleasePhase::Prepared {
+            for plan in &state.plan.crates {
+                crate::release::presentation::validate_inputs(self.ctx.workspace_root(), plan)?;
+            }
+        }
         self.reconcile_local_commits(state, state_path)?;
         self.validate_release_head(state)?;
         advance_phase(state, state_path, ReleasePhase::Prepared)?;
@@ -1172,54 +1179,16 @@ impl<'a> ReleasePublisher<'a> {
         Ok(())
     }
 
-    /// Update or create CHANGELOG.md
+    /// Apply the exact insertion captured before release preparation.
     fn update_changelog(&self, plan: &CrateReleasePlan, require_entries: bool) -> RailResult<()> {
-        if !plan.generate_changelog {
-            return Ok(());
+        let presentation = plan.presentation.as_ref().ok_or_else(|| {
+            RailError::message("release has no captured presentation; resume through the supported journal reader")
+        })?;
+        if let Some(write) = &presentation.changelog {
+            crate::release::presentation::apply_changelog(self.ctx.workspace_root(), &plan.changelog_path, write)?;
+        } else if require_entries && plan.generate_changelog && plan.changelog_body.trim().is_empty() {
+            return Err(RailError::message(format!("no changelog entries for {}", plan.name)));
         }
-
-        let github_repo = detect_github_repo(self.ctx.workspace_root());
-        let new_entries = plan.changelog_body.as_str();
-
-        // Read existing changelog or create new
-        let existing = if plan.changelog_path.exists() {
-            fs::read_to_string(&plan.changelog_path).unwrap_or_default()
-        } else {
-            format!(
-                "# Changelog\n\nAll notable changes to {} will be documented in this file.\n\n",
-                plan.name
-            )
-        };
-
-        // Build the new release section.
-        let date = self.get_current_date();
-        let mut release = self.format_version_header(plan, plan.previous_tag.as_deref(), &date, github_repo.as_ref());
-        release.push_str(new_entries);
-        release.push('\n');
-
-        if new_entries.trim().is_empty() {
-            if require_entries {
-                return Err(RailError::message(format!(
-                    "no changelog entries for {} (enable commits or disable changelog)",
-                    plan.name
-                )));
-            }
-            return Ok(());
-        }
-
-        let updated = insert_changelog_release(&existing, &release);
-
-        // Auto-create parent directories if they don't exist
-        if let Some(parent) = plan.changelog_path.parent()
-            && !parent.exists()
-        {
-            fs::create_dir_all(parent)
-                .map_err(|e| RailError::message(format!("failed to create directory {}: {}", parent.display(), e)))?;
-        }
-
-        fs::write(&plan.changelog_path, updated)
-            .map_err(|e| RailError::message(format!("failed to write {}: {}", plan.changelog_path.display(), e)))?;
-
         Ok(())
     }
 
@@ -1855,107 +1824,17 @@ impl<'a> ReleasePublisher<'a> {
         if let Some(body) = predecessor_body {
             return Ok(body.to_string());
         }
-        if plan.changelog_path.exists() {
-            let changelog = fs::read_to_string(&plan.changelog_path)
-                .map_err(|e| RailError::message(format!("failed to read {}: {}", plan.changelog_path.display(), e)))?;
-            if let Some(section) = extract_changelog_section(&changelog, &plan.new_version.to_string()) {
-                return Ok(section);
-            }
-        }
-
-        Ok(format!("Release {} v{}\n", plan.name, plan.new_version))
-    }
-
-    /// Get current date in YYYY-MM-DD format
-    fn get_current_date(&self) -> String {
-        Local::now().format("%Y-%m-%d").to_string()
-    }
-
-    fn format_version_header(
-        &self,
-        plan: &CrateReleasePlan,
-        previous_tag: Option<&str>,
-        date: &str,
-        github_repo: Option<&(String, String)>,
-    ) -> String {
-        if let Some((org, repo)) = github_repo {
-            let url = if let Some(prev) = previous_tag {
-                format!(
-                    "https://github.com/{}/{}/compare/{}...{}",
-                    org, repo, prev, plan.tag_name
-                )
-            } else {
-                format!("https://github.com/{}/{}/releases/tag/{}", org, repo, plan.tag_name)
-            };
-
-            return format!("## [{}]({}) - {}\n\n", plan.new_version, url, date);
-        }
-
-        format!("## [{}] - {}\n\n", plan.new_version, date)
+        plan.presentation
+            .as_ref()
+            .map(|presentation| presentation.release_notes.clone())
+            .ok_or_else(|| RailError::message("release has no captured forge body"))
     }
 }
 
-fn insert_changelog_release(existing: &str, release: &str) -> String {
-    let lines: Vec<&str> = existing.lines().collect();
-    let first_release = lines
-        .iter()
-        .position(|line| line.starts_with("## ["))
-        .unwrap_or(lines.len());
-    let mut updated = String::new();
-
-    if let Some(header) = lines.first() {
-        updated.push_str(header);
-        updated.push_str("\n\n");
-    }
-    for line in lines.iter().take(first_release).skip(1) {
-        updated.push_str(line);
-        updated.push('\n');
-    }
-    if !updated.is_empty() && !updated.ends_with("\n\n") {
-        updated.push('\n');
-    }
-    updated.push_str(release.trim_start_matches('\n'));
-    if !updated.ends_with('\n') {
-        updated.push('\n');
-    }
-    for line in lines.iter().skip(first_release) {
-        updated.push_str(line);
-        updated.push('\n');
-    }
-
-    updated
-}
-
-fn detect_github_repo(workspace_root: &Path) -> Option<(String, String)> {
-    let repository = crate::release::remote::fetch_repository(workspace_root).ok()?;
-    if repository.host() != Some("github.com") {
-        return None;
-    }
-    let (owner, name) = repository.github_owner_repo()?;
-    Some((owner.to_string(), name.to_string()))
-}
-
-fn extract_changelog_section(changelog: &str, version: &str) -> Option<String> {
-    let needle = format!("## [{}]", version);
-    let mut section = String::new();
-    let mut in_section = false;
-
-    for line in changelog.lines() {
-        if line.trim_start().starts_with("## ") {
-            if in_section {
-                break;
-            }
-            in_section = line.trim_start().starts_with(&needle);
-        }
-
-        if in_section {
-            section.push_str(line);
-            section.push('\n');
-        }
-    }
-
-    if section.trim().is_empty() { None } else { Some(section) }
-}
+#[cfg(test)]
+use crate::release::presentation::{
+    extract_section as extract_changelog_section, insert_release as insert_changelog_release,
+};
 
 fn sanitize_filename(value: &str) -> String {
     value
@@ -2322,6 +2201,7 @@ mod tests {
         let plan = ReleasePlan {
             plan_contract_version: crate::release::planner::RELEASE_PLAN_CONTRACT_VERSION,
             snapshot_id: String::new(),
+            source: Default::default(),
             canonical_crate_order: Vec::new(),
             crates: Vec::new(),
             summary: crate::release::planner::ReleaseSummary {

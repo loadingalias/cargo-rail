@@ -16,8 +16,8 @@ use std::process::{Child, Command};
 
 use windows_sys::Win32::Foundation::{
     ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_NO_MORE_FILES, ERROR_NOT_FOUND, ERROR_NOT_SAME_DEVICE,
-    ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_UNABLE_TO_MOVE_REPLACEMENT_2, FILETIME, GENERIC_READ, HANDLE,
-    INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, FILETIME, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TEMPORARY, FILE_BASIC_INFO,
@@ -26,7 +26,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileBasicInfo, FileDispositionInfo,
     GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
     MAXIMUM_REPARSE_DATA_BUFFER_SIZE, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    PIPE_ACCESS_DUPLEX, ReadFile, ReplaceFileW, SetFileInformationByHandle, VOLUME_NAME_GUID, WriteFile,
+    PIPE_ACCESS_DUPLEX, ReadFile, SetFileInformationByHandle, VOLUME_NAME_GUID, WriteFile,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
@@ -610,22 +610,6 @@ pub(crate) struct FileObservation {
     pub(crate) number_of_links: u64,
 }
 
-impl FileObservation {
-    /// Compare handle-bound generation evidence across an intentional NTFS rename.
-    ///
-    /// NTFS may advance ChangeTime for a namespace-only change. Callers must
-    /// separately revalidate exact bytes before adopting the new observation.
-    pub(crate) fn same_generation_after_rename(self, other: Self) -> bool {
-        self.volume_serial_number == other.volume_serial_number
-            && self.file_id == other.file_id
-            && self.creation_time == other.creation_time
-            && self.last_write_time == other.last_write_time
-            && self.file_attributes == other.file_attributes
-            && self.size == other.size
-            && self.number_of_links == other.number_of_links
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BasicObservation {
     creation_time: u64,
@@ -1074,61 +1058,6 @@ pub(crate) fn rename_write_through(from: &Path, to: &Path, replace: bool) -> io:
     }
 }
 
-/// Atomically replace `destination`, retaining its prior identity at `backup`.
-///
-/// No ignore flags are passed: Windows must merge the destination DACL,
-/// security resource attributes, encryption, compression, and named streams
-/// into the replacement or fail. If Windows reports its one documented
-/// partial-move state, this wrapper restores the destination name without
-/// overwriting any concurrently created entry. A failed restoration leaves
-/// the prior destination at `backup` and reports both errors.
-pub(crate) fn replace_file_with_backup(destination: &Path, replacement: &Path, backup: &Path) -> io::Result<()> {
-    let destination_wide = encode_path(destination)?;
-    let replacement_wide = encode_path(replacement)?;
-    let backup_wide = encode_path(backup)?;
-
-    // SAFETY: all three vectors are nonempty NUL-terminated UTF-16 path
-    // buffers that remain live for the call and contain no interior NUL.
-    // Both reserved pointers are null as required, no metadata-error ignore
-    // flags are used, and Windows retains none of the pointers.
-    let succeeded = unsafe {
-        ReplaceFileW(
-            destination_wide.as_ptr(),
-            replacement_wide.as_ptr(),
-            backup_wide.as_ptr(),
-            0,
-            std::ptr::null(),
-            std::ptr::null(),
-        )
-    };
-    if succeeded != 0 {
-        return Ok(());
-    }
-
-    // GetLastError must be captured before any other Win32 call.
-    let replace_error = io::Error::last_os_error();
-    let partial_move = replace_error
-        .raw_os_error()
-        .and_then(|code| u32::try_from(code).ok())
-        .is_some_and(|code| code == ERROR_UNABLE_TO_MOVE_REPLACEMENT_2);
-    if !partial_move {
-        return Err(replace_error);
-    }
-
-    // In ERROR_UNABLE_TO_MOVE_REPLACEMENT_2, Windows documents that the prior
-    // destination is at `backup` and the destination name is vacant. Restore
-    // it without REPLACE_EXISTING so a concurrent creator is never destroyed.
-    match rename_write_through(backup, destination, false) {
-        Ok(()) => Err(io::Error::other(format!(
-            "ReplaceFileW partially moved the destination but it was restored: {replace_error}"
-        ))),
-        Err(restore_error) => Err(io::Error::other(format!(
-            "ReplaceFileW partially moved the destination ({replace_error}); restoration from '{}' failed ({restore_error})",
-            backup.display()
-        ))),
-    }
-}
-
 fn nt_junction_target(target: &Path) -> io::Result<Vec<u16>> {
     let absolute = std::path::absolute(target)?;
     let path = absolute.as_os_str().encode_wide().collect::<Vec<_>>();
@@ -1369,33 +1298,13 @@ fn unsupported_with_source(message: &str, source: io::Error) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        FileObservation, create_directory_junction, directory_junction_targets, observe_file, open_for_execution_guard,
+        create_directory_junction, directory_junction_targets, observe_file, open_for_execution_guard,
         open_for_execution_guard_following_reparse, open_for_mutable_directory_guard, open_for_observation,
         open_for_stable_byte_observation, prove_local_ntfs, rename_write_through,
     };
     use std::fs::{self, File};
     use std::io;
     use std::time::Duration;
-
-    #[test]
-    fn rename_generation_ignores_only_change_time() {
-        let observation = FileObservation {
-            volume_serial_number: 1,
-            file_id: 2,
-            creation_time: 3,
-            last_write_time: 4,
-            change_time: 5,
-            file_attributes: 6,
-            size: 7,
-            number_of_links: 1,
-        };
-        let mut renamed = observation;
-        renamed.change_time = 8;
-        assert!(observation.same_generation_after_rename(renamed));
-
-        renamed.last_write_time = 9;
-        assert!(!observation.same_generation_after_rename(renamed));
-    }
 
     #[test]
     #[expect(

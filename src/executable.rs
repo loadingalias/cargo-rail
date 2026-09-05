@@ -6,8 +6,8 @@ use std::fs::{self, File};
 use std::io::{ErrorKind, Read as _};
 use std::path::{Path, PathBuf};
 
+use rscrypto::Sha256;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 use crate::error::{RailError, RailResult};
 use crate::source::ContentDigest;
@@ -321,7 +321,7 @@ fn digest_executable(path: &Path) -> RailResult<(ContentDigest, Option<Vec<u8>>)
     }
     crate::instrumentation::record_hash(bytes_read);
     crate::instrumentation::record_hashed_file_bytes_read(bytes_read);
-    Ok((ContentDigest::from_sha256_bytes(hasher.finalize().into()), shebang))
+    Ok((ContentDigest::from_sha256_bytes(hasher.finalize()), shebang))
 }
 
 fn read_executable_chunk(file: &mut File, buffer: &mut [u8], path: &Path) -> RailResult<usize> {
@@ -468,14 +468,27 @@ mod tests {
     fn executable_digest_streams_exact_bytes_and_retains_only_the_shebang() {
         let directory = tempfile::tempdir().expect("tempdir");
         let program = directory.path().join("tool");
-        for (bytes, expected_shebang) in [
-            (b"#".to_vec(), None),
-            (b"#!/bin/sh\npayload\xff".to_vec(), Some(b"/bin/sh\n".to_vec())),
-            (vec![0x5a; 256 * 1024], None),
+        for (bytes, expected_digest, expected_shebang) in [
+            (
+                b"#".to_vec(),
+                "334359b90efed75da5f0ada1d5e6b256f4a6bd0aee7eb39c0f90182a021ffc8b",
+                None,
+            ),
+            (
+                b"#!/bin/sh\npayload\xff".to_vec(),
+                "86b8ff2539328098b7ddcfee07768fe37e41ad84df6d334056cd3e5dbf2c6e9b",
+                Some(b"/bin/sh\n".to_vec()),
+            ),
+            (
+                vec![0x5a; 256 * 1024 + 1],
+                "b0630119a35d42df473390bebf77bc16837f0590058d3be38b538bd5dc5e3415",
+                None,
+            ),
         ] {
             fs::write(&program, &bytes).expect("write tool");
             let (digest, shebang) = digest_executable(&program).expect("digest executable");
-            assert_eq!(digest, ContentDigest::sha256(&bytes));
+            assert_eq!(digest.to_string(), expected_digest);
+            assert_eq!(ContentDigest::sha256(&bytes).to_string(), expected_digest);
             assert_eq!(shebang, expected_shebang);
         }
     }

@@ -51,7 +51,7 @@ impl CleanContext {
             },
         );
         let config = config_path
-            .map(|path| RailConfig::load_path_with_bytes(&path).map(|(config, _)| Arc::new(config)))
+            .map(|path| RailConfig::load_path_with_bytes(&path, &workspace_root).map(|(config, _)| Arc::new(config)))
             .transpose()?;
         if let Some(config) = &config {
             config.validate(&workspace_root, None)?;

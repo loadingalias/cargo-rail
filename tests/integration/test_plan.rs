@@ -1,15 +1,16 @@
-//! Integration tests for the evidence-backed v8 planner contract.
+//! Integration tests for the evidence-backed v9 planner contract.
 
 use std::collections::{BTreeSet, HashMap};
-use std::process::Command;
+use std::io::Write as _;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context as _, Result, anyhow, ensure};
+use rscrypto::Sha256;
 use serde_json::Value;
-use sha2::{Digest as _, Sha256};
 
-use crate::helpers::{TestWorkspace, git, run_cargo_rail, run_cargo_rail_with_env};
+use crate::helpers::{TestWorkspace, cargo_rail_command, git, run_cargo_rail, run_cargo_rail_with_env};
 
-const PLAN_V8_SCHEMA: &str = include_str!("../../schemas/plan-v8.schema.json");
+const PLAN_V9_SCHEMA: &str = include_str!("../../schemas/plan-v9.schema.json");
 const PLAN_VARIANTS_V1_SCHEMA: &str = include_str!("../../schemas/plan-variants-v1.schema.json");
 const PLAN_VARIANTS_V2_SCHEMA: &str = include_str!("../../schemas/plan-variants-v2.schema.json");
 const PLANNING_EVIDENCE_V1_SCHEMA: &str = include_str!("../../schemas/planning-evidence-v1.schema.json");
@@ -22,6 +23,87 @@ const CARGO_WORK: [&str; 6] = [
     "cargo.package",
     "cargo.test",
 ];
+
+#[test]
+fn equivalent_configuration_spellings_keep_policy_but_change_source_binding() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_single_crate("demo", "0.1.0")?;
+        std::fs::create_dir_all(ws.path.join(".config"))?;
+        let config = ws.path.join(".config/rail.toml");
+        std::fs::write(&config, "[unify]\nmsrv = false\n[release]\npush = true\n")?;
+        ws.commit("predecessor policy")?;
+        let before = plan(&ws, &["--since", "HEAD"])?;
+        let saved = write_saved_plan(&ws, "old-policy.json", &before)?;
+        std::fs::write(
+            &config,
+            "[unify]\nmsrv_policy = { mode = 'disabled' }\n[release]\nremote_effects = 'push'\n",
+        )?;
+        let after = plan(&ws, &["--since", "HEAD"])?;
+        assert_eq!(after["changes"]["config"], serde_json::json!([]));
+        assert_ne!(before["identity"], after["identity"]);
+        let verification = verify_saved_plan(&ws, &saved)?;
+        assert!(
+            !verification.status.success(),
+            "saved plan accepted different config bytes: {verification:?}"
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn historical_configuration_uses_historical_split_and_transitive_host_paths() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("historical-config-paths")?;
+        ws.add_crate("old-host", "0.1.0", &[])?;
+        ws.add_crate("remaining", "0.1.0", &[])?;
+        std::fs::write(
+            ws.path.join(".config/rail.toml"),
+            "[unify]\npin_transitives = true\ntransitive_host = 'crates/old-host'\n[crates.old-host.split]\nremote = '../old-host'\nbranch = 'main'\nmode = 'single'\npaths = [{ crate = 'crates/old-host' }]\n",
+        )?;
+        let base = ws.commit("historical workspace")?;
+        std::fs::remove_dir_all(ws.path.join("crates/old-host"))?;
+        std::fs::write(ws.path.join(".config/rail.toml"), "")?;
+        let head = ws.commit("remove former host")?;
+        let value = plan(&ws, &["--since", &base])?;
+        assert_eq!(value["plan_contract_version"], 9);
+        let historical = plan(&ws, &["--from", &base, "--to", &head])?;
+        assert_eq!(historical["plan_contract_version"], 9);
+        assert!(!ws.path.join("crates/old-host").exists());
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(unix)]
+#[test]
+fn historical_configuration_never_interprets_symlink_targets_as_manifest_bytes() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("historical-linked-manifest")?;
+        ws.add_crate("demo", "0.1.0", &[])?;
+        let manifest = ws.path.join("crates/demo/Cargo.toml");
+        let original = std::fs::read(&manifest)?;
+        let config = ws.path.join(".config/rail.toml");
+        std::fs::write(
+            &config,
+            "[crates.demo.split]\nremote = '../demo'\nbranch = 'main'\nmode = 'single'\npaths = [{ crate = 'crates/demo' }]\n",
+        )?;
+        std::fs::remove_file(&manifest)?;
+        std::os::unix::fs::symlink("[package]\nname = 'demo'\n", &manifest)?;
+        let base = ws.commit("historical linked manifest")?;
+        std::fs::remove_file(&manifest)?;
+        std::fs::write(&manifest, original)?;
+        std::fs::write(&config, "")?;
+        ws.commit("regular current manifest")?;
+        let output = run_cargo_rail(&ws.path, &["rail", "plan", "--since", &base])?;
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("must be a regular Git file"), "{error}");
+        assert!(error.contains(&base), "{error}");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
 
 fn plan(ws: &TestWorkspace, args: &[&str]) -> Result<Value> {
     let mut command = vec!["rail", "plan"];
@@ -45,6 +127,21 @@ fn write_saved_plan(ws: &TestWorkspace, name: &str, plan: &Value) -> Result<Stri
 
 fn verify_saved_plan(ws: &TestWorkspace, path: &str) -> Result<std::process::Output> {
     run_cargo_rail(&ws.path, &["rail", "plan", "--verify", path])
+}
+
+fn verify_saved_plan_stdin(ws: &TestWorkspace, plan: &[u8]) -> Result<std::process::Output> {
+    let mut child = cargo_rail_command(&ws.path)?
+        .args(["rail", "plan", "--verify", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .context("saved-plan verifier has no stdin")?
+        .write_all(plan)?;
+    Ok(child.wait_with_output()?)
 }
 
 #[test]
@@ -103,7 +200,7 @@ fn sign_planning_evidence(mut manifest: Value) -> Result<Value> {
         }
     }
     let encoded = serde_json::to_vec(&canonicalize(manifest.clone()))?;
-    let digest = Sha256::digest(encoded);
+    let digest = Sha256::digest(&encoded);
     manifest["identity"] = Value::String(format!(
         "planning-evidence-v1:sha256:{}",
         digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
@@ -195,7 +292,7 @@ fn test_plan_schema_command_matches_published_schema() {
         let ws = TestWorkspace::new_named("plan-schema-command")?;
         let output = run_cargo_rail(&ws.path, &["rail", "plan", "--schema"])?;
         assert!(output.status.success());
-        assert_eq!(String::from_utf8_lossy(&output.stdout), PLAN_V8_SCHEMA);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), PLAN_V9_SCHEMA);
         assert!(output.stderr.is_empty());
         Ok(())
     })();
@@ -216,21 +313,21 @@ fn test_published_plan_variants_v1_schema_remains_exactly_available() {
 }
 
 #[test]
-fn test_plan_v8_is_the_canonical_global_json_contract() {
+fn test_plan_v9_is_the_canonical_global_json_contract() {
     let result: Result<()> = (|| {
-        let ws = TestWorkspace::new_named("plan-v8-canonical-json")?;
+        let ws = TestWorkspace::new_named("plan-v9-canonical-json")?;
         ws.add_crate("canonical", "0.1.0", &[])?;
         ws.commit("establish workspace")?;
         let plan = plan(&ws, &["--since", "HEAD"])?;
-        assert_eq!(plan["plan_contract_version"], 8);
+        assert_eq!(plan["plan_contract_version"], 9);
         assert!(plan.get("schema_version").is_none());
-        let schema: Value = serde_json::from_str(PLAN_V8_SCHEMA)?;
+        let schema: Value = serde_json::from_str(PLAN_V9_SCHEMA)?;
         let validator = jsonschema::validator_for(&schema).map_err(|error| anyhow!("invalid schema: {error}"))?;
         let errors = validator
             .iter_errors(&plan)
             .map(|error| error.to_string())
             .collect::<Vec<_>>();
-        assert!(errors.is_empty(), "v8 plan failed schema: {errors:#?}");
+        assert!(errors.is_empty(), "v9 plan failed schema: {errors:#?}");
         Ok(())
     })();
     super::helpers::finish_test(result);
@@ -265,15 +362,15 @@ fn test_plan_decodes_exact_v0_25_configuration_from_git_history() {
 
         std::fs::write(ws.path.join(".config/rail.toml"), "")?;
         let planned = plan(&ws, &["--since", "HEAD"])?;
-        assert_eq!(planned["plan_contract_version"], 8);
+        assert_eq!(planned["plan_contract_version"], 9);
         assert!(
             planned["changes"]["files"]
                 .as_array()
                 .is_some_and(|changed| changed.iter().any(|entry| entry["path"] == ".config/rail.toml"))
         );
         let rendered = serde_json::to_string(&planned)?;
-        assert!(!rendered.contains("require_change_files"));
-        assert!(!rendered.contains("unconventional_commits"));
+        assert!(rendered.contains("require_change_files"));
+        assert!(rendered.contains("unconventional_commits"));
 
         Ok(())
     })();
@@ -714,6 +811,26 @@ fn test_plan_propagates_cargo_domains_with_portable_selectors() {
                 .filter_map(|selector| selector["name"].as_str())
                 .collect::<BTreeSet<_>>();
             assert_eq!(names, BTreeSet::from(["domain-a", "domain-b"]), "{work}");
+            let attribution = plan["attribution"][work]["selections"]
+                .as_array()
+                .context("scope attribution missing")?;
+            let direct = attribution
+                .iter()
+                .find(|item| item["subject"].as_str().is_some_and(|key| key.starts_with("domain-a@")))
+                .context("direct package missing")?;
+            let dependent = attribution
+                .iter()
+                .find(|item| item["subject"].as_str().is_some_and(|key| key.starts_with("domain-b@")))
+                .context("dependent package missing")?;
+            assert_eq!(direct["relation"], "direct");
+            assert_eq!(dependent["relation"], "dependency");
+            assert_eq!(dependent["origin"], direct["subject"]);
+            let schema: Value = serde_json::from_str(PLAN_V9_SCHEMA)?;
+            assert!(
+                jsonschema::validator_for(&schema)
+                    .map_err(|error| anyhow!("invalid schema: {error}"))?
+                    .is_valid(&plan)
+            );
         }
         assert!(
             plan["work"]["cargo.build"]["scope"]["selection"]["packages"]
@@ -1042,6 +1159,32 @@ fn test_saved_worktree_plan_rejects_every_git_drift_layer() {
             assert_eq!(rejected.status.code(), Some(2), "{drift} drift was accepted");
             assert!(rejected.stdout.is_empty(), "{drift} verification emitted stdout");
         }
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_saved_plan_from_stdin_preserves_checkout_verification() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("plan-verify-stdin")?;
+        let package = ws.add_crate("verify", "0.1.0", &[])?;
+        generate_lockfile(&ws)?;
+        ws.commit("establish stdin saved-plan verification fixture")?;
+        let saved = serde_json::to_vec(&plan(&ws, &["--since", "HEAD"])?)?;
+
+        let unchanged = verify_saved_plan_stdin(&ws, &saved)?;
+        ensure!(
+            unchanged.status.success(),
+            "unchanged stdin plan failed verification: {}",
+            String::from_utf8_lossy(&unchanged.stderr)
+        );
+        ensure!(unchanged.stdout.is_empty(), "stdin verification emitted stdout");
+
+        std::fs::write(package.join("src/lib.rs"), "pub fn drift() {}\n")?;
+        let rejected = verify_saved_plan_stdin(&ws, &saved)?;
+        assert_eq!(rejected.status.code(), Some(2));
+        assert!(rejected.stdout.is_empty());
         Ok(())
     })();
     super::helpers::finish_test(result);

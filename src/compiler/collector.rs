@@ -54,8 +54,8 @@ use crate::progress;
 use crate::source::{ContentDigest, SourceEntryKind};
 use crate::workspace::WorkspaceSnapshot;
 use cargo_metadata::{Message, PackageId, TargetKind};
+use rscrypto::Sha256;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
@@ -3190,13 +3190,13 @@ fn typed_session(
     let view_identity = view.fact_cache_identity(view.package())?;
     let mut hasher = Sha256::new();
     hasher.update(b"cargo-rail-compiler-fact-run-v1\0");
-    hasher.update((view_identity.len() as u64).to_le_bytes());
+    hasher.update(&(view_identity.len() as u64).to_le_bytes());
     hasher.update(view_identity.as_bytes());
-    hasher.update((observation_directory.as_os_str().as_encoded_bytes().len() as u64).to_le_bytes());
+    hasher.update(&(observation_directory.as_os_str().as_encoded_bytes().len() as u64).to_le_bytes());
     hasher.update(observation_directory.as_os_str().as_encoded_bytes());
     let run_identity = format!(
         "{RUN_IDENTITY_PREFIX}{}",
-        ContentDigest::from_sha256_bytes(hasher.finalize().into())
+        ContentDigest::from_sha256_bytes(hasher.finalize())
     );
     let host_platform = context.snapshot.toolchain().host_target().to_string();
     let target_platform = if view.platform() == "default" {
@@ -4505,7 +4505,7 @@ fn hash_compiler_sysroot_with_limit(
         crate::instrumentation::record_hash_operation();
         crate::instrumentation::record_hash_input_bytes(usize::try_from(bytes_read).unwrap_or(usize::MAX));
         crate::instrumentation::record_hashed_file_bytes_read(usize::try_from(bytes_read).unwrap_or(usize::MAX));
-        let digest = ContentDigest::from_sha256_bytes(hasher.finalize().into());
+        let digest = ContentDigest::from_sha256_bytes(hasher.finalize());
         append_identity_frame(&mut framed, relative.as_bytes(), digest.to_string().as_bytes());
     }
     append_identity_frame(&mut framed, b"bytes", &total.to_le_bytes());

@@ -3,10 +3,6 @@
 /benchmark_results/
 /tools/compiler-fact-driver/**/target/
 
-# Python
-__pycache__
-.ruff_cache
-
 # OS
 Thumbs.db
 .DS_Store
@@ -25,4 +21,3 @@ docs/tasks/
 docs/content/
 .ropeproject/
 docs/integration-contrib/
-tests/fixtures/surface_conformance/target/

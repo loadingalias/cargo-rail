@@ -73,6 +73,40 @@ impl std::fmt::Display for ChangeBump {
     }
 }
 
+/// Optional authored presentation metadata under `["$release"]`.
+///
+/// The dollar sign cannot occur in a Cargo package name, so existing crate keys remain unambiguous.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChangePresentation {
+    /// Explicit section key; unrelated to semantic bump intent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    /// Preserve authored blocks or use the existing convenience list rendering.
+    #[serde(default)]
+    pub format: ChangeFormat,
+}
+
+/// Rendering rule for a reviewed change body.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChangeFormat {
+    /// Existing list entries pass through; prose becomes a list item.
+    #[default]
+    List,
+    /// Preserve the authored Markdown block structure.
+    Markdown,
+}
+
+impl ChangePresentation {
+    pub(crate) fn render(&self, body: &str) -> String {
+        match self.format {
+            ChangeFormat::List => render_change_body(body),
+            ChangeFormat::Markdown => body.to_string(),
+        }
+    }
+}
+
 /// One crate intent from a change file.
 #[derive(Debug, Clone, Serialize)]
 pub struct ChangeIntent {
@@ -84,6 +118,8 @@ pub struct ChangeIntent {
     pub bump: ChangeBump,
     /// User-facing changelog body.
     pub body: String,
+    /// Authored presentation policy shared by the file.
+    pub presentation: ChangePresentation,
 }
 
 /// One parsed change file.
@@ -95,6 +131,8 @@ pub struct ChangeFile {
     pub intents: Vec<ChangeIntent>,
     /// User-facing body shared by the file's intents.
     pub body: String,
+    /// Authored presentation policy shared by the file.
+    pub presentation: ChangePresentation,
 }
 
 /// Effective pending bump for one crate.
@@ -239,7 +277,10 @@ impl PendingChangeSet {
             if retained.is_empty() {
                 delete.push(file.path.clone());
             } else {
-                update.push((file.path.clone(), render_change_content(&retained, &file.body)));
+                update.push((
+                    file.path.clone(),
+                    render_change_content_with_presentation(&retained, &file.body, &file.presentation),
+                ));
             }
         }
 
@@ -307,9 +348,26 @@ pub fn write_change_file(
 
 /// Render canonical change-file content from validated intents and body.
 pub fn render_change_content(intents: &BTreeMap<String, ChangeBump>, body: &str) -> String {
+    render_change_content_with_presentation(intents, body, &ChangePresentation::default())
+}
+
+fn render_change_content_with_presentation(
+    intents: &BTreeMap<String, ChangeBump>,
+    body: &str,
+    presentation: &ChangePresentation,
+) -> String {
     let mut content = String::from("---\n");
     for (crate_name, bump) in intents {
         content.push_str(&format!("\"{}\" = \"{}\"\n", crate_name, bump.as_str()));
+    }
+    if *presentation != ChangePresentation::default() {
+        content.push_str("\n[\"$release\"]\n");
+        if let Some(category) = &presentation.category {
+            content.push_str(&format!("category = {}\n", toml_edit::Value::from(category.as_str())));
+        }
+        if presentation.format == ChangeFormat::Markdown {
+            content.push_str("format = \"markdown\"\n");
+        }
     }
     content.push_str("---\n\n");
     content.push_str(body.trim());
@@ -343,8 +401,29 @@ pub(crate) fn parse_change_file(
         )));
     }
 
-    let raw: std::collections::BTreeMap<String, String> = toml_edit::de::from_str(frontmatter)
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum FrontmatterValue {
+        Bump(String),
+        Presentation(ChangePresentation),
+    }
+    let mut raw: BTreeMap<String, FrontmatterValue> = toml_edit::de::from_str(frontmatter)
         .map_err(|e| RailError::message(format!("invalid change file {} frontmatter: {}", path.display(), e)))?;
+    let presentation = match raw.remove("$release") {
+        None => ChangePresentation::default(),
+        Some(FrontmatterValue::Presentation(value)) => value,
+        Some(_) => {
+            return Err(RailError::message(format!(
+                "invalid change file {}: $release must be a presentation table",
+                path.display()
+            )));
+        }
+    };
+    if let Some(category) = &presentation.category {
+        crate::release::changelog::validate_label(category, "change category")?;
+    }
+    crate::release::presentation::validate_entry(&presentation.render(body))
+        .map_err(|error| error.context(format!("invalid change file {}", path.display())))?;
     if raw.is_empty() {
         return Err(RailError::message(format!(
             "invalid change file {}: frontmatter must name at least one crate",
@@ -362,9 +441,18 @@ pub(crate) fn parse_change_file(
         }
         intents.push(ChangeIntent {
             path: path.to_path_buf(),
-            crate_name,
-            bump: bump.parse()?,
+            crate_name: crate_name.clone(),
+            bump: match bump {
+                FrontmatterValue::Bump(bump) => bump.parse()?,
+                FrontmatterValue::Presentation(_) => {
+                    return Err(RailError::message(format!(
+                        "invalid change file {}: crate '{crate_name}' requires a bump string",
+                        path.display()
+                    )));
+                }
+            },
             body: body.to_string(),
+            presentation: presentation.clone(),
         });
     }
     intents.sort_by(|a, b| a.crate_name.cmp(&b.crate_name));
@@ -373,6 +461,7 @@ pub(crate) fn parse_change_file(
         path: path.to_path_buf(),
         intents,
         body: body.to_string(),
+        presentation,
     })
 }
 

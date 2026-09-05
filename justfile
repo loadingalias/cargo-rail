@@ -1,10 +1,7 @@
 check:
     @scripts/check/check.sh
 
-check-affected:
-    @scripts/plan/affected.sh
-
-check-compiler-fact-driver:
+check-compiler-driver:
     @scripts/check-compiler-fact-driver.sh
 
 check-windows-targets:
@@ -14,51 +11,34 @@ check-windows-targets:
 fix:
     @scripts/check/check.sh --fix
 
-test crate="":
-    @scripts/cargo/run.sh test "{{ crate }}"
+test:
+    cargo nextest run --workspace -P default --all-features --locked \
+        --config-file .config/nextest.toml
+    cargo test --doc -p cargo-rail --all-features --locked
 
 build:
-    @scripts/cargo/run.sh build
+    cargo build --workspace --all-targets --all-features --locked
 
 build-release:
     cargo build --workspace --all-targets --all-features --release --locked
 
-# Full Workspace Commands (no change detection)
-
-test-all:
-    @scripts/cargo/run.sh test --all
-
-build-all:
-    cargo build --workspace --all-targets --all-features --locked
-
 bench-unify packages="25" runs="10": build-release
     @scripts/bench/unify.sh "{{ packages }}" "{{ runs }}"
 
-bench-plan runs="20":
-    @scripts/bench/plan.py run "{{ runs }}"
-
-bench-plan-smoke:
-    @scripts/bench/plan.py smoke
-
 bench-compiler-facts runs="20":
-    @scripts/bench/compiler-facts.py run "{{ runs }}"
+    @cargo xtask compiler-facts run "{{ runs }}"
 
 bench-compiler-facts-smoke:
-    @scripts/bench/compiler-facts.py smoke
+    @cargo xtask compiler-facts smoke
 
 bench-compiler-facts-summarize results:
-    @scripts/bench/compiler-facts.py summarize "{{ results }}"
+    @cargo xtask compiler-facts summarize "{{ results }}"
 
 bench-compiler-facts-validate results:
-    @scripts/bench/compiler-facts.py validate "{{ results }}"
+    @cargo xtask compiler-facts validate "{{ results }}"
 
 gen-fixture members output:
-    @scripts/fixtures/generate-workspace.sh "{{ members }}" "{{ output }}"
-
-# Explainability
-
-plan:
-    @scripts/plan/read.py create -
+    @tests/fixtures/generate-workspace.sh "{{ members }}" "{{ output }}"
 
 unify:
     @cargo rail unify --check --explain --show-diff
@@ -68,6 +48,3 @@ surface:
 
 cache-status:
     @cargo rail cache status
-
-rail-cache-setup *args="":
-    @scripts/cache/setup.sh {{ args }}

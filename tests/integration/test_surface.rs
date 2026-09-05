@@ -4,7 +4,7 @@ use std::fs;
 
 use crate::helpers::{NestedWorkspace, TestWorkspace, run_cargo_rail, run_cargo_rail_with_env};
 use anyhow::{Result, anyhow};
-use sha2::{Digest as _, Sha256};
+use rscrypto::Sha256;
 
 const SURFACE_V1_SCHEMA: &str = include_str!("../../schemas/surface-v1.schema.json");
 const SURFACE_V2_SCHEMA: &str = include_str!("../../schemas/surface-v2.schema.json");
@@ -142,7 +142,7 @@ pub fn dead_public() {}
 
 /// Complete surface analysis reads authenticated typed compiler facts, so this
 /// front-door contract only holds for a cargo-rail built with an embedded
-/// driver authority. `scripts/test-compiler-fact-protocol.sh` provisions that
+/// driver authority. `just check-compiler-driver` provisions that
 /// build; an ordinary source build has no producer authority to exercise.
 #[test]
 #[ignore = "requires the exact rustc-dev companion authority embedded by the protocol harness"]

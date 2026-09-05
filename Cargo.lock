@@ -816,7 +816,7 @@ dependencies = [
 
 [[package]]
 name = "cargo-rail"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -832,7 +832,6 @@ dependencies = [
  "chrono",
  "clap",
  "clap_complete",
- "exacl",
  "fs2",
  "futures-util",
  "getrandom 0.4.3",
@@ -841,13 +840,13 @@ dependencies = [
  "jsonschema",
  "petgraph",
  "rayon",
+ "rscrypto",
  "rustc-hash",
  "rustix",
  "rustls",
  "semver",
  "serde",
  "serde_json",
- "sha2",
  "signal-hook",
  "tempfile",
  "tokio",
@@ -1220,18 +1219,6 @@ checksum = "8be9f3dfaaffdae2972880079a491a1a8bb7cbed0b8dd7a347f668b4150a3b93"
 dependencies = [
  "event-listener",
  "pin-project-lite",
-]
-
-[[package]]
-name = "exacl"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8de9e551ced9d700a31dacb8b168129640240fcd7a279a3fa4d59608b84ebcae"
-dependencies = [
- "bitflags",
- "log",
- "scopeguard",
- "uuid",
 ]
 
 [[package]]
@@ -2512,6 +2499,12 @@ dependencies = [
  "untrusted",
  "windows-sys 0.52.0",
 ]
+
+[[package]]
+name = "rscrypto"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edeae3565e70552f033348825873950436631dee240e1cf342d27965818e7b61"
 
 [[package]]
 name = "rustc-hash"

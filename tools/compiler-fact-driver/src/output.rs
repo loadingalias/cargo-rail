@@ -4,8 +4,8 @@ use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::Path;
 
+use rscrypto::Sha256;
 use serde_json::json;
-use sha2::{Digest as _, Sha256};
 
 use crate::fact_protocol::{
     COMPILER_FACT_ANNOUNCEMENT_CODE, COMPILER_FACT_ANNOUNCEMENT_PREFIX, COMPILER_FACT_PROTOCOL_VERSION,

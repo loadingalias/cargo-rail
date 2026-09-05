@@ -1,34 +1,11 @@
 # Migrate from v0.25 to v0.26
 
-v0.26 is a bounded compatibility break. It accepts the exact v0.25 repository configuration only through the
-migration and historical-planning paths; current configuration, CLI, library, cache, and machine contracts reject
-retired compatibility inputs.
+Supported v0.25 repository configuration is interpreted automatically without rewriting `rail.toml`. Existing
+release source choices and presentation policy remain available. Configuration inspection is optional; see
+[configuration](config.md) for current authoring and inspection.
 
-## Migrate repository policy first
-
-Run the read-only preview with the v0.26 binary:
-
-```bash
-cargo rail config migrate --check
-cargo rail config validate --strict
-cargo rail config explain --all
-```
-
-`config migrate --check` exits `1` when normalization is pending. Review every reported removal or replacement, then
-run `cargo rail config migrate`. Apply mode preserves unrelated TOML and comments, revalidates immediately before
-replacement, and reports the previous-file recovery path on platforms where that recovery file can be retained.
-
-The frozen v0.25 migration performs these typed conversions:
-
-- `unify.pin_transitives` plus `unify.transitive_host` becomes `unify.transitive_pinning`;
-- `unify.msrv`, `unify.msrv_source`, and `unify.enforce_msrv_inheritance` become `unify.msrv_policy`;
-- `release.push`, `release.create_github_release`, and `release.forge` become `release.remote_effects`; and
-- `crates.<name>.split.paths` becomes package-name-based `members` after resolving each captured `Cargo.toml`.
-
-It removes implementation switches whose behavior is now fixed, including Unify diagnostic/mutation toggles,
-release cleanliness and changelog-shape controls, reserved `workspace`/`toolchain` tables, and reserved per-crate
-`sync` tables. Reviewed `.changes` files are the only current release-note authority. Unknown fields and ambiguous or
-invalid predecessor combinations fail without writing.
+Cache enrollment, stored protocols, command invocations, and release recovery have their own compatibility
+boundaries. The changes below concern those operations.
 
 ## Update command invocations
 
@@ -71,14 +48,15 @@ validation, but active catalogs must use typed `cargo_roots`. A root can now add
 Cargo-Rail narrows only captured source paths proved reachable through Cargo feature edges and ordinary Rust module
 cfgs. Manifest, lockfile, toolchain, catalog, shared, or unattributed changes continue to select every row.
 
-Object-bound CI plans can replace a host-specific Cargo-Rail verification binary with the v1 portable plan bundle.
-The bundle contains `plan-v8.json`, `plan-read.py`, and `plan-bundle-v1.json`; the manifest binds the producer,
-contract, platform limits, roles, sizes, and hashes. Run `verify-bundle` with the bundled reader before reading any
-selector. Worktree plans still require matching Cargo-Rail verification.
+The companion Action publishes the exact Cargo-Rail version with its validated plan and strict reader. Every execution
+job must install that version and verify checkout binding before reading a selector.
 
 ## Review other contract changes
 
 - GNU Linux archives require glibc 2.39 or newer; installers reject an unsupported host before replacement.
+- Native cache setup now admits native Linux RISC-V 64, IBM Z, and IBM POWER hosts. These hosts still require a native
+  cache component set, and cross-target compiler invocations remain ineligible. See
+  [native host eligibility](caching.md#native-host-eligibility).
 - `unify.compiler_targets` may select the exact subset of top-level resolution targets valid for workspace-wide
   compiler evidence. It never narrows dependency resolution.
 - Surface analyzes the host by default; use `surface.targets = "workspace"` or an explicit non-empty list for more

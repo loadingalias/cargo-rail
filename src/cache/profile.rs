@@ -5,8 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use rscrypto::Sha256;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 use crate::cache::cas::{DEFAULT_CACHE_MAX_BYTES, LocalCacheSelection};
 use crate::error::{RailError, RailResult};
@@ -1673,8 +1673,8 @@ fn physical_directory_identity(path: &Path) -> RailResult<String> {
         if !metadata.is_dir() {
             return Err(RailError::message("cache profile workspace is not a directory"));
         }
-        hasher.update(metadata.dev().to_be_bytes());
-        hasher.update(metadata.ino().to_be_bytes());
+        hasher.update(&metadata.dev().to_be_bytes());
+        hasher.update(&metadata.ino().to_be_bytes());
     }
     #[cfg(windows)]
     {
@@ -1684,14 +1684,14 @@ fn physical_directory_identity(path: &Path) -> RailResult<String> {
         if observation.file_attributes & 0x10 == 0 {
             return Err(RailError::message("cache profile workspace is not a directory"));
         }
-        hasher.update(observation.volume_serial_number.to_be_bytes());
-        hasher.update(observation.file_id.to_be_bytes());
+        hasher.update(&observation.volume_serial_number.to_be_bytes());
+        hasher.update(&observation.file_id.to_be_bytes());
     }
     #[cfg(not(any(unix, windows)))]
     {
         hasher.update(crate::utils::canonicalize_existing(path)?.to_string_lossy().as_bytes());
     }
-    let digest: [u8; 32] = hasher.finalize().into();
+    let digest: [u8; 32] = hasher.finalize();
     Ok(crate::source::ContentDigest::from_sha256_bytes(digest).to_string())
 }
 

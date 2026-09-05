@@ -18,21 +18,17 @@ fn test_documented_frontdoor_commands_smoke() {
         let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let readme = std::fs::read_to_string(repo_root.join("README.md"))?;
         let justfile = std::fs::read_to_string(repo_root.join("justfile"))?;
-        let cargo_script = std::fs::read_to_string(repo_root.join("scripts/cargo/run.sh"))?;
         assert!(
             justfile.contains("cargo build --workspace --all-targets --all-features --release --locked"),
             "just build-release should produce the complete release artifact set"
         );
-        assert!(justfile.contains("@scripts/cargo/run.sh build"));
-        assert!(justfile.contains("@scripts/cargo/run.sh test"));
-        assert!(justfile.contains("@scripts/plan/read.py create -"));
+        assert!(justfile.contains("cargo build --workspace --all-targets --all-features --locked"));
+        assert!(justfile.contains("cargo nextest run --workspace -P default --all-features --locked"));
+        assert!(justfile.contains("cargo test --doc -p cargo-rail --all-features --locked"));
+        assert!(!justfile.contains("rail plan"));
         assert!(!justfile.contains("cargo run --quiet --locked --target-dir"));
         assert!(!justfile.contains("rail run"));
-        assert!(cargo_script.contains("scripts/plan/read.py"));
-        assert!(cargo_script.contains("run_cargo_work cargo.build build"));
-        assert!(cargo_script.contains("run_cargo_work cargo.test nextest run"));
-        assert!(cargo_script.contains("run_cargo_work cargo.doctest test --doc"));
-        assert!(!cargo_script.contains(" rail run"));
+        assert!(!repo_root.join("scripts/cargo/run.sh").exists());
 
         let cases: &[(&str, &[&str], &str)] = &[
             ("README plan", &["rail", "plan"], "cargo rail plan"),

@@ -13,8 +13,8 @@ use super::{
     validate_result_key, validate_sha256,
 };
 use crate::error::{RailError, RailResult};
+use rscrypto::Sha256;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 const DESCRIPTOR_MAGIC: &[u8; 8] = b"CRNDESC1";
 const DESCRIPTOR_VERSION: u16 = 8;
@@ -708,7 +708,7 @@ fn copy_exact_digest<R: Read, W: Write>(
     }
     let actual = format!(
         "sha256:{}",
-        crate::source::ContentDigest::from_sha256_bytes(hasher.finalize().into())
+        crate::source::ContentDigest::from_sha256_bytes(hasher.finalize())
     );
     if actual != expected_digest {
         return Err(RailError::message(

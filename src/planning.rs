@@ -263,32 +263,53 @@ fn config_at_ref(ctx: &WorkspaceContext, revision: &str, candidates: &[String]) 
         .git()?
         .git()
         .collect_tree_entries_for_paths(revision, &repository_paths)?;
-    let selected = candidates.iter().find(|candidate| {
-        entries.iter().any(|entry| {
+    let selected = candidates.iter().find_map(|candidate| {
+        entries.iter().find_map(|entry| {
             ctx.to_workspace_path(&entry.path)
                 .is_some_and(|path| crate::utils::path_to_git_format(&path) == candidate.as_str())
+                .then_some((candidate, entry))
         })
     });
-    let Some(selected) = selected else {
+    let Some((selected, entry)) = selected else {
         return Ok(RailConfig::default());
     };
-    let path = ctx.repository_path_from_workspace(PathBuf::from(selected).as_path())?;
-    let bytes = ctx.git()?.git().read_files_bulk(&[(revision, path.as_path())])?;
-    crate::config::v0_25::normalize(&bytes[0], |package_root| {
+    if !matches!(entry.mode.as_str(), "100644" | "100755") {
+        return Err(RailError::message(format!(
+            "historical configuration '{selected}' at {revision} must be a regular Git file"
+        )));
+    }
+    let bytes = ctx.git()?.git().read_blobs_bulk(&[&entry.object_id])?;
+    let read_manifest = |package_root: &std::path::Path| -> RailResult<Vec<u8>> {
         let manifest = package_root.join("Cargo.toml");
         let manifest = ctx.repository_path_from_workspace(&manifest)?;
-        let mut contents = ctx.git()?.git().read_files_bulk(&[(revision, manifest.as_path())])?;
+        let entry = ctx
+            .git()?
+            .git()
+            .tree_entry(revision, &manifest)?
+            .ok_or_else(|| RailError::message(format!("historical configuration has no {}", manifest.display())))?;
+        if !matches!(entry.mode.as_str(), "100644" | "100755") {
+            return Err(RailError::message(format!(
+                "historical manifest '{}' must be a regular Git file",
+                manifest.display()
+            )));
+        }
+        let mut contents = ctx.git()?.git().read_blobs_bulk(&[&entry.object_id])?;
         contents
             .pop()
-            .ok_or_else(|| RailError::message(format!("historical split member has no {}", manifest.display())))
-    })
-    .map(|normalized| normalized.config)
-    .map_err(|error| {
-        RailError::with_help(
-            format!("failed to parse historical planning configuration '{selected}': {error}"),
-            "migrate the selected base configuration or choose a comparison ref with a supported configuration",
-        )
-    })
+            .ok_or_else(|| RailError::message(format!("historical configuration has no {}", manifest.display())))
+    };
+    let decode = || -> RailResult<RailConfig> {
+        let decoded = crate::config::decode(&bytes[0], |package_root| {
+            let manifest = read_manifest(package_root)?;
+            crate::config::split_member_name(&manifest, package_root)
+        })?;
+        decoded.config.validate_policy()?;
+        if let Some(host) = decoded.config.unify.transitive_host_path() {
+            read_manifest(std::path::Path::new(host))?;
+        }
+        Ok(decoded.config)
+    };
+    decode().map_err(|error| error.context(format!("historical configuration '{selected}' at {revision}")))
 }
 
 fn config_deltas(before: &RailConfig, after: &RailConfig) -> RailResult<Vec<ConfigDelta>> {
@@ -335,10 +356,16 @@ mod tests {
 
     #[test]
     fn effective_config_delta_names_only_changed_schema_leaves() {
-        let before =
-            RailConfig::parse_bytes(b"[release]\nsemver_check = \"warn\"\n\n[surface]\nenabled = true\n").unwrap();
-        let after =
-            RailConfig::parse_bytes(b"[release]\nsemver_check = \"off\"\n\n[surface]\nenabled = true\n").unwrap();
+        let before = crate::config::decode_without_workspace(
+            b"[release]\nsemver_check = \"warn\"\n\n[surface]\nenabled = true\n",
+        )
+        .unwrap()
+        .config;
+        let after = crate::config::decode_without_workspace(
+            b"[release]\nsemver_check = \"off\"\n\n[surface]\nenabled = true\n",
+        )
+        .unwrap()
+        .config;
         let deltas = config_deltas(&before, &after).unwrap();
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].path, "release.semver_check");
@@ -349,16 +376,18 @@ mod tests {
     #[test]
     fn exact_v0_25_normalization_projects_only_current_configuration_facts() {
         let tagged = include_bytes!("../tests/fixtures/config/v0.25.0/rail.toml");
-        let normalized = crate::config::v0_25::normalize(tagged, |_| {
+        let normalized = crate::config::decode(tagged, |_| {
             Err(RailError::message("fixture unexpectedly requested a split manifest"))
         })
         .unwrap();
-        let reparsed = RailConfig::parse_bytes(&normalized.bytes).unwrap();
+        let reparsed = crate::config::decode_without_workspace(normalized.document.to_string().as_bytes())
+            .unwrap()
+            .config;
         assert!(config_deltas(&normalized.config, &reparsed).unwrap().is_empty());
 
         let encoded = serde_json::to_string(&normalized.config).unwrap();
-        assert!(!encoded.contains("require_change_files"));
-        assert!(!encoded.contains("unconventional_commits"));
-        assert!(!encoded.contains("skip_types"));
+        assert!(encoded.contains("require_change_files"));
+        assert!(encoded.contains("unconventional_commits"));
+        assert!(encoded.contains("skip_types"));
     }
 }

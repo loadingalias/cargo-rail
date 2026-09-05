@@ -10,7 +10,7 @@ use crate::helpers::{git, run_cargo_rail};
 const MEMBER_COUNTS: [usize; 4] = [1, 10, 100, 1_000];
 
 fn generate_fixture(member_count: usize, destination: &Path) -> Result<()> {
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/fixtures/generate-workspace.sh");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/generate-workspace.sh");
     let output = Command::new("bash")
         .arg(script)
         .arg(member_count.to_string())
@@ -198,7 +198,7 @@ fn scale_fixture_generator_refuses_nonempty_destinations() {
         let root = TempDir::new()?;
         std::fs::write(root.path().join("keep"), "do not replace\n")?;
 
-        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/fixtures/generate-workspace.sh");
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/generate-workspace.sh");
         let output = Command::new("bash").arg(script).arg("1").arg(root.path()).output()?;
 
         assert_eq!(output.status.code(), Some(2));

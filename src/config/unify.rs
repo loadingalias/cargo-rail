@@ -237,6 +237,11 @@ impl UnifyConfig {
     /// - transitive pinning host path exists if configured as a path (not "root")
     /// - transitive pinning host path contains a Cargo.toml
     pub fn validate(&self, workspace_root: &std::path::Path) -> Result<(), crate::error::ConfigError> {
+        self.validate_policy()?;
+        self.validate_host(workspace_root)
+    }
+
+    pub(crate) fn validate_policy(&self) -> Result<(), crate::error::ConfigError> {
         validate_glob_patterns("unify.preserve_features", &self.preserve_features)?;
         validate_glob_patterns("unify.skip_undeclared_patterns", &self.skip_undeclared_patterns)?;
 
@@ -272,7 +277,19 @@ impl UnifyConfig {
                     message: format!("path '{}' is absolute, must be relative to workspace root", p),
                 });
             }
+        }
+        Ok(())
+    }
 
+    pub(crate) fn transitive_host_path(&self) -> Option<&str> {
+        match self.transitive_pinning.as_ref().map(|pinning| &pinning.host) {
+            Some(TransitiveFeatureHost::Path(path)) => Some(path),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn validate_host(&self, workspace_root: &std::path::Path) -> Result<(), crate::error::ConfigError> {
+        if let Some(p) = self.transitive_host_path() {
             // Check directory exists
             let full_path = workspace_root.join(p);
             if !full_path.exists() {

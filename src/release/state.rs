@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-const RELEASE_STATE_SCHEMA_VERSION: u32 = 6;
+const RELEASE_STATE_SCHEMA_VERSION: u32 = 7;
 
 #[derive(Deserialize)]
 struct ReleaseStateSchema {
@@ -197,6 +197,9 @@ impl ReleaseState {
             reconstructed,
         } = request;
         let git = SystemGit::open(root)?;
+        for planned in &plan.crates {
+            crate::release::presentation::validate_inputs(root, planned)?;
+        }
         let publish_registry = if skip_publish {
             None
         } else {
@@ -340,11 +343,33 @@ impl ReleaseState {
     pub(crate) fn load_for_recovery(path: &Path) -> RailResult<Self> {
         let bytes = std::fs::read(path)?;
         let root = release_root(path);
-        let (state, predecessor) = Self::decode(&bytes, path, root, true)?;
+        let (mut state, predecessor) = Self::decode(&bytes, path, root, true)?;
         state.validate_journal_path(path)?;
         if state.status == ReleaseStatus::Active {
             state.validate_recovery_paths(root)?;
             if predecessor {
+                let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+                let github = crate::release::changelog::detect_github_repo(root);
+                for plan in &mut state.plan.crates {
+                    if plan.presentation.is_some() {
+                        continue;
+                    }
+                    let mut input = plan.clone();
+                    let existing = crate::release::presentation::read_optional(root, &plan.changelog_path)?;
+                    if existing.as_deref().is_some_and(|text| {
+                        crate::release::presentation::extract_section(text, &plan.new_version.to_string()).is_some()
+                    }) {
+                        input.changelog_body.clear();
+                        input.current_version = input.new_version.clone();
+                    }
+                    plan.presentation = Some(crate::release::presentation::capture(
+                        root,
+                        &state.release_config,
+                        &input,
+                        &date,
+                        github.as_ref(),
+                    )?);
+                }
                 state.save(path, "migrated_v0_25")?;
             }
         }
@@ -359,6 +384,20 @@ impl ReleaseState {
         if schema.schema_version == 5 {
             return v0_25::ReleaseStateV5::decode(bytes, path, root, capture_predecessor_inputs)
                 .map(|state| (state, true));
+        }
+        if schema.schema_version == 6 {
+            let mut state: Self = serde_json::from_slice(bytes)
+                .map_err(|error| RailError::message(format!("invalid release state '{}': {error}", path.display())))?;
+            if state.plan.plan_contract_version != 6 || state.plan.crates.iter().any(|plan| plan.presentation.is_some())
+            {
+                return Err(RailError::message(
+                    "release state version 6 requires an unchanged version 6 plan",
+                ));
+            }
+            state.schema_version = RELEASE_STATE_SCHEMA_VERSION;
+            state.plan.plan_contract_version = RELEASE_PLAN_CONTRACT_VERSION;
+            state.validate_contract()?;
+            return Ok((state, true));
         }
         if schema.schema_version != RELEASE_STATE_SCHEMA_VERSION {
             return Err(RailError::message(format!(
@@ -671,6 +710,7 @@ mod tests {
             plan: ReleasePlan {
                 plan_contract_version,
                 snapshot_id: String::new(),
+                source: Default::default(),
                 canonical_crate_order: Vec::new(),
                 crates: Vec::new(),
                 summary: ReleaseSummary {
@@ -721,7 +761,10 @@ mod tests {
         for plan_contract in [4, RELEASE_PLAN_CONTRACT_VERSION + 1] {
             let error = load_fixture(&fixture(RELEASE_STATE_SCHEMA_VERSION, plan_contract)).unwrap_err();
             assert!(
-                error.to_string().contains("requires embedded release plan contract 6"),
+                error.to_string().contains(&format!(
+                    "requires embedded release plan contract {}",
+                    RELEASE_PLAN_CONTRACT_VERSION
+                )),
                 "{error}"
             );
         }
@@ -772,7 +815,10 @@ mod tests {
         ))
         .unwrap_err();
         assert!(
-            error.to_string().contains("unsupported release state version 7"),
+            error.to_string().contains(&format!(
+                "unsupported release state version {}",
+                RELEASE_STATE_SCHEMA_VERSION + 1
+            )),
             "{error}"
         );
     }
@@ -872,7 +918,7 @@ mod tests {
         let document: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(document["schema_version"], RELEASE_STATE_SCHEMA_VERSION);
         assert_eq!(document["plan"]["plan_contract_version"], RELEASE_PLAN_CONTRACT_VERSION);
-        assert!(document["plan"].get("source").is_none());
+        assert_eq!(document["plan"]["source"], "changes");
         assert_eq!(
             document["predecessor_execution"]["release_note_bodies"]["fixture-crate"],
             "Exact live predecessor release body.\n"
