@@ -51,7 +51,7 @@ pub(crate) struct GitObjectQuarantine {
     git: SystemGit,
     object_format: String,
     empty_shallow_file: PathBuf,
-    exact_tree_index: tempfile::TempPath,
+    exact_tree_index: PathBuf,
     exact_tree_index_initialized: std::cell::Cell<bool>,
     exact_tree_entries: std::cell::RefCell<std::collections::BTreeSet<PathBuf>>,
 }
@@ -486,12 +486,8 @@ impl SystemGit {
         let object_format = self.object_format()?;
         validate_object_format(&object_format)?;
         let empty_shallow_file = create_empty_shallow_file(directory.path())?;
-        let exact_tree_index = tempfile::Builder::new()
-            .prefix("cargo-rail-quarantine-index-")
-            .tempfile()
-            .context("Failed to allocate private exact-tree index")?
-            .into_temp_path();
-        std::fs::remove_file(&exact_tree_index).context("Failed to initialize private exact-tree index")?;
+        // Git creates the index and its adjacent lock within one retained private directory.
+        let exact_tree_index = directory.path().join("index");
         Ok(GitObjectQuarantine {
             directory,
             git: self.clone(),
@@ -3745,6 +3741,34 @@ mod tests {
             "duplicate bytes must retain one Git object identity"
         );
         assert!(quarantine.write_blobs(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn quarantine_owns_its_index_and_git_lock_lifetime() {
+        let (_directory, git) = init_test_repo();
+        let quarantine = git.object_quarantine().unwrap();
+        quarantine.write_exact_tree(&[]).unwrap();
+        let lock = quarantine.exact_tree_index.with_extension("lock");
+        std::fs::write(&lock, b"interrupted Git writer").unwrap();
+        let error = quarantine
+            .write_exact_tree(&[])
+            .expect_err("Git must respect its owned lock");
+        assert!(error.to_string().contains("lock"), "{error}");
+
+        let other = git.object_quarantine().unwrap();
+        other
+            .write_exact_tree(&[])
+            .expect("another quarantine has an independent index");
+        drop(quarantine);
+        assert!(!lock.with_extension("").exists(), "quarantine leaked its index");
+        let leaked_lock = lock.exists();
+        if leaked_lock {
+            std::fs::remove_file(&lock).unwrap();
+        }
+        assert!(!leaked_lock, "quarantine leaked Git's adjacent lock file");
+        other
+            .write_exact_tree(&[])
+            .expect("dropping one quarantine must preserve another");
     }
 
     #[test]
