@@ -359,7 +359,6 @@ pub fn run_surface(ctx: &WorkspaceContext, options: SurfaceOptions) -> RailResul
 
     let applied = apply_visibility_mutation(ctx, plan, &updates, options.backup)?;
     let verification = (|| {
-        surface_test_fault("recompilation")?;
         let verified_context = ctx.recapture_after_mutation()?;
         let verified_config = verified_context
             .config()
@@ -870,26 +869,8 @@ fn apply_visibility_mutation(
     revalidate_surface_updates(git_root, updates)?;
     for (index, update) in updates.iter().enumerate() {
         let absolute = git_root.join(update.path.as_path());
-        let fault_point = if index == 0 { "first-write" } else { "write" };
-        let write =
-            surface_test_fault(fault_point).and_then(|()| crate::utils::write_file_atomic(&absolute, &update.after));
+        let write = crate::utils::write_file_atomic(&absolute, &update.after);
         if let Err(error) = write {
-            let rollback_error = rollback_surface_updates(git_root, &updates[..=index]);
-            return match rollback_error {
-                Ok(()) => Err(error.context("surface visibility application failed; applied files were restored")),
-                Err(rollback) => Err(RailError::with_help(
-                    format!("surface visibility application failed: {error}; automatic recovery failed: {rollback}"),
-                    backup.as_ref().map_or_else(
-                        || "restore the affected files from version control".to_string(),
-                        |backup| format!("restore backup '{backup}' before retrying"),
-                    ),
-                )),
-            };
-        }
-        if index == 0
-            && updates.len() > 1
-            && let Err(error) = surface_test_fault("partial-write")
-        {
             let rollback_error = rollback_surface_updates(git_root, &updates[..=index]);
             return match rollback_error {
                 Ok(()) => Err(error.context("surface visibility application failed; applied files were restored")),
@@ -904,8 +885,7 @@ fn apply_visibility_mutation(
         }
     }
 
-    if let Err(error) = surface_test_fault("post-write-validation")
-        .and_then(|()| verify_surface_updates(git_root, updates))
+    if let Err(error) = verify_surface_updates(git_root, updates)
         .and_then(|()| validate_changed_paths_with_allowed_paths(ctx, &plan, &plan.pre_apply.changed_paths))
     {
         let rollback = rollback_surface_updates(git_root, updates);
@@ -929,22 +909,20 @@ fn finalize_surface_mutation(
     applied: AppliedSurfaceMutation,
     updates: &[SurfaceFileUpdate],
 ) -> RailResult<SurfaceMutationReport> {
-    let receipt = surface_test_fault("receipt-write").and_then(|()| {
-        write_receipt(
-            ctx.workspace_root(),
-            "surface",
-            "apply",
-            "applied",
-            applied.plan.clone(),
-            vec![MutationTrace::new(
-                "SURFACE_VISIBILITY_VERIFIED",
-                format!(
-                    "applied {} authorized source file mutation(s) and revalidated every configured compiler view",
-                    updates.len()
-                ),
-            )],
-        )
-    });
+    let receipt = write_receipt(
+        ctx.workspace_root(),
+        "surface",
+        "apply",
+        "applied",
+        applied.plan.clone(),
+        vec![MutationTrace::new(
+            "SURFACE_VISIBILITY_VERIFIED",
+            format!(
+                "applied {} authorized source file mutation(s) and revalidated every configured compiler view",
+                updates.len()
+            ),
+        )],
+    );
     let receipt = match receipt {
         Ok(receipt) => receipt,
         Err(error) => {
@@ -967,16 +945,6 @@ fn finalize_surface_mutation(
         receipt: Some(display_repository_path(&ctx.git()?.git().worktree_root, &receipt)),
         backup: applied.backup,
     })
-}
-
-fn surface_test_fault(point: &str) -> RailResult<()> {
-    #[cfg(debug_assertions)]
-    if std::env::var("CARGO_RAIL_SURFACE_FAIL_AT").as_deref() == Ok(point) {
-        return Err(RailError::message(format!("injected surface failure at {point}")));
-    }
-    #[cfg(not(debug_assertions))]
-    let _ = point;
-    Ok(())
 }
 
 fn recover_failed_verification(

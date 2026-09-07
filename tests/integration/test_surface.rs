@@ -75,7 +75,9 @@ fn source_built_surface_fails_before_workspace_acquisition() {
         fs::write(workspace.path.join("Cargo.toml"), "this is not Cargo metadata")?;
 
         for operation in ["--check", "--prepare"] {
-            let output = run_cargo_rail(&workspace.path, &["rail", "surface", operation])?;
+            let output = super::helpers::source_built_cargo_rail_command(&workspace.path)?
+                .args(["rail", "surface", operation])
+                .output()?;
 
             assert_eq!(output.status.code(), Some(2));
             let stderr = String::from_utf8(output.stderr)?;
@@ -94,7 +96,6 @@ fn source_built_surface_fails_before_workspace_acquisition() {
 /// Typed target authority and wrapper observations must share the captured Git
 /// source root even when Cargo owns a workspace below it.
 #[test]
-#[ignore = "requires the exact rustc-dev companion authority embedded by the protocol harness"]
 fn surface_inspects_a_workspace_nested_below_its_git_root() {
     let result: Result<()> = (|| {
         let workspace = NestedWorkspace::new("rust")?;
@@ -111,7 +112,15 @@ pub fn dead_public() {}
         )?;
         fs::write(
             workspace.workspace_root.join(".config/rail.toml"),
-            "[surface]\nenabled = true\n",
+            r#"[surface]
+enabled = true
+consumer_scope = "workspace"
+
+[[surface.product]]
+package = "nested-surface-app"
+bin = "nested-surface-app"
+reason = "nested fixture product"
+"#,
         )?;
         fs::write(
             workspace.workspace_root.join("rust-toolchain.toml"),
@@ -129,6 +138,14 @@ pub fn dead_public() {}
         let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
         assert_eq!(report["mode"], "inspect");
         assert_eq!(report["config"]["enabled"], true);
+        let dead = report["findings"]
+            .as_array()
+            .and_then(|findings| findings.iter().find(|finding| finding["name"] == "dead_public"))
+            .ok_or_else(|| anyhow!("nested binary's dead declaration was not analyzed: {report}"))?;
+        assert_eq!(dead["kind"], "dead-public");
+        assert_eq!(dead["source"], "rust/crates/nested-surface-app/src/main.rs");
+        assert_eq!(dead["source_generated"], false);
+
         assert!(
             report["metrics"]["acquisition"]["compiler_invocations"]
                 .as_u64()
@@ -140,12 +157,7 @@ pub fn dead_public() {}
     super::helpers::finish_test(result);
 }
 
-/// Complete surface analysis reads authenticated typed compiler facts, so this
-/// front-door contract only holds for a cargo-rail built with an embedded
-/// driver authority. `just check-compiler-driver` provisions that
-/// build; an ordinary source build has no producer authority to exercise.
 #[test]
-#[ignore = "requires the exact rustc-dev companion authority embedded by the protocol harness"]
 fn surface_check_collects_production_tests_and_doctests_once() {
     let result: Result<()> = (|| {
         let workspace = TestWorkspace::new_named("surface-complete-views")?;
@@ -500,13 +512,12 @@ reason = "fixture product"
 }
 
 #[test]
-#[ignore = "requires the exact rustc-dev companion authority embedded by the protocol harness"]
-fn surface_partial_acquisition_is_machine_resumable_and_reuses_exact_completed_views() {
+fn surface_resume_reuses_completed_views_and_matches_concurrent_cold_analysis() {
     let result: Result<()> = (|| {
         let workspace = TestWorkspace::new_named("surface-acquisition-resume")?;
         let package = workspace.add_crate("surface-resume-app", "0.1.0", &[])?;
         let manifest = fs::read_to_string(package.join("Cargo.toml"))?;
-        let features = (0..12)
+        let features = (0..3)
             .map(|index| format!("feature-{index} = []"))
             .collect::<Vec<_>>()
             .join("\n");
@@ -518,7 +529,7 @@ fn surface_partial_acquisition_is_machine_resumable_and_reuses_exact_completed_v
             package.join("src/main.rs"),
             "fn main() { live(); }\npub fn live() {}\npub fn dead_public() {}\n",
         )?;
-        let profiles = (0..12)
+        let profiles = (0..3)
             .map(|index| {
                 format!("[[surface.feature-profile]]\nname = \"profile-{index}\"\nfeatures = [\"feature-{index}\"]\n")
             })
@@ -544,6 +555,45 @@ reason = "resume fixture product"
             workspace.path.join("rust-toolchain.toml"),
             include_str!("../../rust-toolchain.toml"),
         )?;
+        let external = tempfile::tempdir()?;
+        let unavailable = external.path().join("unavailable");
+        fs::write(&unavailable, "build dependency unavailable")?;
+        let cargo_source = external.path().join("cargo.rs");
+        let cargo_proxy = external
+            .path()
+            .join(format!("cargo-proxy{}", std::env::consts::EXE_SUFFIX));
+        fs::write(
+            &cargo_source,
+            format!(
+                r#"fn main() {{
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if std::path::Path::new({:?}).exists()
+        && args.iter().any(|arg| arg.to_string_lossy().contains("feature-1")) {{
+        eprintln!("fixture Cargo executor unavailable for feature-1");
+        std::process::exit(74);
+    }}
+    let status = std::process::Command::new({:?}).args(args).status().unwrap();
+    std::process::exit(status.code().unwrap_or(1));
+}}
+"#,
+                unavailable
+                    .to_str()
+                    .ok_or_else(|| anyhow!("fixture path is not UTF-8"))?,
+                env!("CARGO"),
+            ),
+        )?;
+        let compiled = std::process::Command::new("rustc")
+            .arg(&cargo_source)
+            .args(["--crate-name", "cargo_proxy", "-o"])
+            .arg(&cargo_proxy)
+            .output()?;
+        assert!(
+            compiled.status.success(),
+            "compile Cargo executor fixture: {compiled:?}"
+        );
+        let cargo_proxy = cargo_proxy
+            .to_str()
+            .ok_or_else(|| anyhow!("Cargo executor path is not UTF-8"))?;
         workspace.commit("Add Surface resume fixture")?;
 
         let failed = run_cargo_rail_with_env(
@@ -551,7 +601,9 @@ reason = "resume fixture product"
             &["rail", "surface", "--format", "json"],
             &[
                 ("CARGO_BUILD_JOBS", "1"),
-                ("CARGO_RAIL_SURFACE_FAIL_ACQUISITION_VIEW", "10"),
+                ("CARGO", cargo_proxy),
+                ("CARGO_MAKEFLAGS", ""),
+                ("MAKEFLAGS", ""),
             ],
         )?;
         assert_eq!(failed.status.code(), Some(2));
@@ -570,7 +622,7 @@ reason = "resume fixture product"
         let document: serde_json::Value = serde_json::from_slice(&fs::read(&journal)?)?;
         let header = &document["header"];
         assert_eq!(header["surface_acquisition_contract_version"], 2);
-        assert_eq!(header["view_count"], 12);
+        assert_eq!(header["view_count"], 3);
         assert_eq!(header["concurrency"], 1);
         assert_eq!(header["products"][0]["package"], "surface-resume-app");
         let failed_view = document["views"]
@@ -583,7 +635,7 @@ reason = "resume fixture product"
             failed_view["ordinal"].is_null(),
             "new v2 journals must not emit legacy ordinals"
         );
-        assert_eq!(failed_view["view_index"], 9);
+        assert_eq!(failed_view["view_index"], 1);
         assert_eq!(failed_view["target_triple"], "default");
         assert_eq!(failed_view["command_class"], "cargo-check-all-targets");
         assert_eq!(
@@ -592,19 +644,25 @@ reason = "resume fixture product"
         );
         let partial = &document["summary"];
         assert_eq!(partial["state"], "partial");
-        assert_eq!(partial["completed"], 9);
-        assert_eq!(partial["failed"], 1);
-        assert_eq!(partial["pending"], 2);
-        assert_eq!(partial["running"], 0);
+        assert_eq!(partial["completed"], 1, "{document}");
+        assert_eq!(partial["failed"], 1, "{document}");
+        assert_eq!(partial["pending"], 1, "{document}");
+        assert_eq!(partial["running"], 0, "{document}");
 
         let journal_argument = journal
             .strip_prefix(&workspace.path)?
             .to_str()
             .ok_or_else(|| anyhow!("journal path is not UTF-8"))?;
+        fs::remove_file(&unavailable)?;
         let resumed = run_cargo_rail_with_env(
             &workspace.path,
             &["rail", "surface", "--resume", journal_argument, "--format", "json"],
-            &[("CARGO_BUILD_JOBS", "1")],
+            &[
+                ("CARGO_BUILD_JOBS", "1"),
+                ("CARGO", cargo_proxy),
+                ("CARGO_MAKEFLAGS", ""),
+                ("MAKEFLAGS", ""),
+            ],
         )?;
         assert!(
             resumed.status.success(),
@@ -613,19 +671,48 @@ reason = "resume fixture product"
             String::from_utf8_lossy(&resumed.stderr)
         );
         let mut resumed_report: serde_json::Value = serde_json::from_slice(&resumed.stdout)?;
-        assert_eq!(resumed_report["metrics"]["acquisition"]["analysis_views"], 12);
-        assert_eq!(resumed_report["metrics"]["acquisition"]["fact_cache_hits"], 9);
-        assert_eq!(resumed_report["metrics"]["acquisition"]["cargo_views_executed"], 3);
+        assert_eq!(resumed_report["metrics"]["acquisition"]["analysis_views"], 3);
+        assert_eq!(resumed_report["metrics"]["acquisition"]["fact_cache_hits"], 1);
+        assert_eq!(resumed_report["metrics"]["acquisition"]["cargo_views_executed"], 2);
 
         fs::remove_dir_all(workspace.path.join("target/cargo-rail-test-cache"))?;
+        let diagnostics = external.path().join("concurrent.json");
         let cold = run_cargo_rail_with_env(
             &workspace.path,
-            &["rail", "surface", "--format", "json"],
-            &[("CARGO_BUILD_JOBS", "1")],
+            &[
+                "rail",
+                "--diagnostics-file",
+                diagnostics
+                    .to_str()
+                    .ok_or_else(|| anyhow!("diagnostics path is not UTF-8"))?,
+                "surface",
+                "--format",
+                "json",
+            ],
+            &[
+                ("CARGO_BUILD_JOBS", "3"),
+                ("CARGO", cargo_proxy),
+                ("CARGO_MAKEFLAGS", ""),
+                ("MAKEFLAGS", ""),
+            ],
         )?;
-        assert!(cold.status.success());
+        assert!(cold.status.success(), "concurrent acquisition: {cold:?}");
+        let counters: serde_json::Value = serde_json::from_slice(&fs::read(&diagnostics)?)?;
+        let acquisition = &counters["compiler_acquisition"];
+        assert_eq!(acquisition["configured_process_slots"], 3, "{counters}");
+        assert_eq!(acquisition["cargo_views"], 3, "{counters}");
+        assert_eq!(acquisition["live_cargo_processes"], 0, "{counters}");
+        assert!(
+            matches!(acquisition["max_live_cargo_processes"].as_u64(), Some(2 | 3)),
+            "{counters}"
+        );
         let mut cold_report: serde_json::Value = serde_json::from_slice(&cold.stdout)?;
+        assert_ne!(
+            resumed_report["snapshot"], cold_report["snapshot"],
+            "changing configured Cargo jobs must change captured configuration authority"
+        );
         for report in [&mut resumed_report, &mut cold_report] {
+            report["snapshot"] = serde_json::Value::Null;
             report["metrics"] = serde_json::Value::Null;
             report["cache"] = serde_json::Value::Null;
             report["fragments"] = serde_json::Value::Null;
@@ -641,7 +728,6 @@ reason = "resume fixture product"
 
 #[cfg(unix)]
 #[test]
-#[ignore = "requires the exact rustc-dev companion authority embedded by the protocol harness"]
 fn surface_keeps_std_and_alloc_roots_package_local_across_resume_and_reuse() {
     let result: Result<()> = (|| {
         use std::os::unix::fs::PermissionsExt as _;
@@ -682,6 +768,14 @@ features = ["isolate"]
             &cargo_recorder,
             r#"#!/bin/sh
 set -eu
+case " $* " in
+  *" --package shared "*)
+    if [ -e "$CARGO_RAIL_TEST_CARGO_LOG/../fail-shared" ]; then
+      echo "fixture Cargo executor unavailable for shared" >&2
+      exit 74
+    fi
+    ;;
+esac
 trace="$(mktemp "$CARGO_RAIL_TEST_CARGO_LOG/argv.XXXXXX")"
 printf '%s\0' "$@" > "$trace"
 exec cargo "$@"
@@ -697,6 +791,8 @@ exec cargo "$@"
             .to_str()
             .ok_or_else(|| anyhow!("Cargo trace path is not UTF-8"))?;
 
+        let unavailable = trace_directory.parent().unwrap().join("fail-shared");
+        fs::write(&unavailable, "executor unavailable")?;
         let failed = run_cargo_rail_with_env(
             &workspace.path,
             &["rail", "surface", "--format", "json"],
@@ -704,7 +800,6 @@ exec cargo "$@"
                 ("CARGO", cargo_recorder),
                 ("CARGO_BUILD_JOBS", "1"),
                 ("CARGO_RAIL_TEST_CARGO_LOG", trace_directory_value),
-                ("CARGO_RAIL_SURFACE_FAIL_ACQUISITION_VIEW", "2"),
             ],
         )?;
         assert_eq!(failed.status.code(), Some(2));
@@ -750,6 +845,7 @@ exec cargo "$@"
             .strip_prefix(&workspace.path)?
             .to_str()
             .ok_or_else(|| anyhow!("journal path is not UTF-8"))?;
+        fs::remove_file(&unavailable)?;
         let resumed = run_cargo_rail_with_env(
             &workspace.path,
             &["rail", "surface", "--resume", journal_argument, "--format", "json"],
@@ -854,8 +950,7 @@ exec cargo "$@"
 }
 
 #[test]
-#[ignore = "requires the exact rustc-dev companion authority embedded by the protocol harness"]
-fn surface_fix_failure_matrix_restores_every_written_source() {
+fn surface_verification_and_receipt_failures_restore_every_written_source() {
     let result: Result<()> = (|| {
         let workspace = TestWorkspace::new_named("surface-failure-matrix")?;
         let package = workspace.add_crate("surface-fault-app", "0.1.0", &[])?;
@@ -892,39 +987,51 @@ reason = "failure-matrix product"
             workspace.path.join("rust-toolchain.toml"),
             include_str!("../../rust-toolchain.toml"),
         )?;
+        let external = tempfile::tempdir()?;
+        let require_public = external.path().join("require-public");
+        fs::write(&require_public, "external source consumer")?;
+        fs::write(
+            package.join("build.rs"),
+            format!(
+                "fn main() {{ assert!(!std::path::Path::new({:?}).exists() || include_str!(\"src/main.rs\").contains(\"pub fn first()\"), \"external source consumer requires public first\"); println!(\"cargo:rerun-if-changed=src/main.rs\"); }}\n",
+                require_public
+                    .to_str()
+                    .ok_or_else(|| anyhow!("fixture path is not UTF-8"))?
+            ),
+        )?;
         workspace.commit("Add surface failure fixture")?;
 
-        for point in [
-            "first-write",
-            "partial-write",
-            "post-write-validation",
-            "recompilation",
-            "receipt-write",
-        ] {
-            let output = run_cargo_rail_with_env(
-                &workspace.path,
-                &["rail", "surface", "--fix"],
-                &[("CARGO_RAIL_SURFACE_FAIL_AT", point)],
-            )?;
-            assert_eq!(
-                output.status.code(),
-                Some(2),
-                "{point}: stdout={} stderr={}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert!(
-                String::from_utf8_lossy(&output.stderr).contains(&format!("injected surface failure at {point}")),
-                "{point}: unexpected stderr={}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert_eq!(fs::read_to_string(package.join("src/main.rs"))?, main_source, "{point}");
-            assert_eq!(
-                fs::read_to_string(package.join("src/support.rs"))?,
-                support_source,
-                "{point}"
-            );
-        }
+        let rejected = run_cargo_rail(&workspace.path, &["rail", "surface", "--fix"])?;
+        assert_eq!(rejected.status.code(), Some(2), "{rejected:?}");
+        let error = String::from_utf8_lossy(&rejected.stderr);
+        assert!(
+            error.contains("surface post-apply verification failed; source files were restored"),
+            "{error}"
+        );
+        assert!(
+            error.contains("external source consumer requires public first"),
+            "{error}"
+        );
+        assert_eq!(fs::read_to_string(package.join("src/main.rs"))?, main_source);
+        assert_eq!(fs::read_to_string(package.join("src/support.rs"))?, support_source);
+        fs::remove_file(&require_public)?;
+
+        let receipts = workspace.path.join("target/cargo-rail/receipts");
+        let retained_receipts = workspace.path.join("target/cargo-rail/retained-receipts");
+        fs::rename(&receipts, &retained_receipts)?;
+        fs::write(&receipts, "occupied by a regular file")?;
+        let output = run_cargo_rail(&workspace.path, &["rail", "surface", "--fix"])?;
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("surface receipt publication failed; source files were restored"),
+            "receipt failure must occur after source mutation and verification: {output:?}"
+        );
+        assert_eq!(fs::read_to_string(package.join("src/main.rs"))?, main_source);
+        assert_eq!(fs::read_to_string(package.join("src/support.rs"))?, support_source);
+        assert_eq!(fs::read_to_string(&receipts)?, "occupied by a regular file");
+        fs::remove_file(&receipts)?;
+        fs::rename(&retained_receipts, &receipts)?;
 
         fs::write(
             workspace.path.join(".config/rail.toml"),
