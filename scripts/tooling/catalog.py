@@ -116,7 +116,8 @@ def main():
         for key in args:
             value = value[key]
         if isinstance(value, list):
-            print('\n'.join(value))
+            for item in value:
+                print(item)
         elif isinstance(value, dict):
             print(json.dumps(value))
         else:

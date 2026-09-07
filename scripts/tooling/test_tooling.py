@@ -3,6 +3,7 @@ import copy
 import io
 from pathlib import Path
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -12,6 +13,15 @@ from unittest.mock import patch
 import tomlkit
 import catalog
 import update
+
+
+class CatalogCommand(unittest.TestCase):
+    def test_empty_tool_inventory_emits_no_shell_array_element(self):
+        output = subprocess.run(
+            [sys.executable, str(Path(catalog.__file__).resolve()), 'get', 'riscv64-linux', 'cargo'],
+            check=True, capture_output=True,
+        )
+        self.assertEqual(output.stdout, b'')
 
 
 class ReleaseSelection(unittest.TestCase):
