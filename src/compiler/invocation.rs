@@ -226,7 +226,8 @@ pub fn dispatch() -> PreClapDispatch {
     }
     let signals = InvocationSignals {
         link_adapter: std::env::var_os(crate::compiler::native_cache::APPLE_LINK_ADAPTER_ENV).is_some()
-            || std::env::var_os(crate::compiler::native_cache::ELF_LINK_ADAPTER_ENV).is_some(),
+            || std::env::var_os(crate::compiler::native_cache::ELF_LINK_ADAPTER_ENV).is_some()
+            || std::env::var_os(crate::compiler::native_cache::coff::ADAPTER_ENV).is_some(),
         direct_cache: crate::compiler::native_cache::NativeCacheContext::is_direct_invocation(),
         marked_cache: std::env::var_os(CACHE_WRAPPER_MARKER).is_some(),
         rustc_observation: std::env::var_os(WRAPPER_MARKER).is_some(),
@@ -253,10 +254,7 @@ pub fn dispatch() -> PreClapDispatch {
     let exit_code = match role {
         InvocationRole::LinkAdapter => run_link_adapter(),
         InvocationRole::DirectCache => run_direct_cache(),
-        InvocationRole::MarkedCache => run_cache(
-            crate::compiler::native_cache::NativeCacheContext::from_environment(),
-            signals.rustc_observation,
-        ),
+        InvocationRole::MarkedCache => run_cache(None, signals.rustc_observation),
         InvocationRole::RustcObservation => run_rustc(),
         InvocationRole::RustdocObservation => run_rustdoc(),
         InvocationRole::DoctestBuilder => run_doctest_builder(),
@@ -295,7 +293,10 @@ fn direct_rustc_argument_shape() -> bool {
 
 fn run_link_adapter() -> i32 {
     let elf = std::env::var_os(crate::compiler::native_cache::ELF_LINK_ADAPTER_ENV).is_some();
-    let driver = if elf {
+    let coff = std::env::var_os(crate::compiler::native_cache::coff::ADAPTER_ENV).is_some();
+    let driver = if coff {
+        std::env::var_os(crate::compiler::native_cache::coff::DRIVER_ENV)
+    } else if elf {
         std::env::var_os(crate::compiler::native_cache::ELF_LINK_DRIVER_ENV)
     } else {
         std::env::var_os(crate::compiler::native_cache::APPLE_LINK_DRIVER_ENV)
@@ -306,10 +307,15 @@ fn run_link_adapter() -> i32 {
     };
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     let mut command = Command::new(driver);
-    let instrumented = if elf {
-        crate::compiler::native_cache::configure_elf_link_adapter(&mut command, &arguments)
+    let instrumented = if coff {
+        crate::compiler::native_cache::coff::configure(&mut command, &arguments)
     } else {
-        crate::compiler::native_cache::configure_apple_link_adapter(&mut command, &arguments)
+        crate::compiler::native_cache::reset_link_adapter_evidence(elf)
+            && if elf {
+                crate::compiler::native_cache::configure_elf_link_adapter(&mut command, &arguments)
+            } else {
+                crate::compiler::native_cache::configure_apple_link_adapter(&mut command, &arguments)
+            }
     };
     if !instrumented {
         command.args(&arguments);
@@ -318,10 +324,35 @@ fn run_link_adapter() -> i32 {
     if !instrumented {
         return run_transparently(command, "cargo-rail linker adapter");
     }
+    if elf && !coff && cfg!(target_os = "linux") {
+        return match crate::compiler::native_cache::execute_elf_link_adapter(command) {
+            Ok(output) => {
+                if let Err(error) = std::io::stdout()
+                    .lock()
+                    .write_all(&output.stdout)
+                    .and_then(|()| std::io::stderr().lock().write_all(&output.stderr))
+                {
+                    eprintln!("cargo-rail linker adapter: failed to replay compiler output: {error}");
+                    return 1;
+                }
+                compiler_status_code(output.status)
+            }
+            Err(error) => {
+                eprintln!("cargo-rail linker adapter: failed to execute compiler: {error}");
+                1
+            }
+        };
+    }
     match command.status() {
         Ok(status) => {
-            if status.success() && !elf {
-                let _ = crate::compiler::native_cache::finalize_apple_link_adapter();
+            if status.success() {
+                let _ = if coff {
+                    crate::compiler::native_cache::coff::finalize()
+                } else if elf {
+                    crate::compiler::native_cache::finalize_elf_link_adapter()
+                } else {
+                    crate::compiler::native_cache::finalize_apple_link_adapter()
+                };
             }
             compiler_status_code(status)
         }
@@ -353,7 +384,8 @@ pub fn dispatch_required() -> i32 {
 pub fn dispatch_observation_required() -> i32 {
     let signals = InvocationSignals {
         link_adapter: std::env::var_os("CARGO_RAIL_APPLE_LINK_ADAPTER").is_some()
-            || std::env::var_os("CARGO_RAIL_ELF_LINK_ADAPTER").is_some(),
+            || std::env::var_os("CARGO_RAIL_ELF_LINK_ADAPTER").is_some()
+            || std::env::var_os("CARGO_RAIL_COFF_LINK_ADAPTER").is_some(),
         marked_cache: std::env::var_os(CACHE_WRAPPER_MARKER).is_some(),
         rustc_observation: std::env::var_os(WRAPPER_MARKER).is_some(),
         rustdoc_observation: std::env::var_os(RUSTDOC_WRAPPER_MARKER).is_some(),
@@ -766,13 +798,26 @@ fn run_rustc_with_session(
         recorder.set_compiler_fact_unit(invocation.unit.clone());
     }
     let typed = typed_invocation.as_ref().and_then(|_| fact_session.typed());
-    let mut command = rustc_command(
-        &invocation.program,
-        None,
-        typed
-            .map(|typed| std::ffi::OsStr::new(&typed.driver_program))
-            .or(inner_wrapper),
-    );
+    let native_capability = typed.and_then(|_| {
+        std::env::var_os(crate::compiler::native_cache::ANALYSIS_OUTER_OBSERVATION_ENV)
+            .and_then(|_| std::env::var_os(crate::compiler::native_input_protocol::NATIVE_INPUT_INVOCATION_ENV))
+    });
+    let mut command = if let (Some(typed), Some(capability)) = (typed, native_capability.as_ref()) {
+        let mut command = Command::new(&typed.driver_program);
+        command
+            .arg(crate::compiler::native_input_protocol::NATIVE_INPUT_INVOCATION_ARGUMENT)
+            .arg(capability)
+            .arg(&invocation.program);
+        command
+    } else {
+        rustc_command(
+            &invocation.program,
+            None,
+            typed
+                .map(|typed| std::ffi::OsStr::new(&typed.driver_program))
+                .or(inner_wrapper),
+        )
+    };
     command.args(recorder.execution_arguments());
     if let Some(input) = doctest_input {
         command.stdin(Stdio::from(input.file));

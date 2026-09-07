@@ -1507,7 +1507,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[ignore = "requires the separately manufactured exact-toolchain companion"]
     fn manufactured_driver_fragment_passes_the_stable_admission_boundary() {
         use std::os::unix::fs::symlink;
         use std::process::Command;

@@ -26,7 +26,23 @@ cargo rail doctor native-cache
 ```
 
 Setup previews and then owns one global `build.rustc-wrapper`, private launcher and worker bytes, and an installation
-receipt. It also binds the exact physical workspace root to one private profile with its own bounded CAS trust domain.
+receipt. It copies the compiler fact driver and driver-source components declared by the build's embedded authority
+beside the worker. Missing or changed declared files beside the invoked Cargo-Rail executable reject setup before
+writes. Setup does not build or download these components. Native reuse requires an authenticated driver for the
+selected compiler; source builds without embedded component authority, including an ordinary `cargo install`,
+execute the compiler normally and bypass reuse.
+
+For development in this checkout, `just build` and `just test` prepare the authenticated driver and source bundle,
+then build Cargo-Rail with that component authority. Preparation requires `rustc-dev` for the selected toolchain and
+the driver's locked dependencies in the local Cargo cache; it does not download missing components or crates.
+`just check-compiler-driver` runs the separate driver checks. Plain Cargo builds do not perform this preparation.
+
+`just package-release OUTPUT_DIRECTORY` builds the native release components and writes a deflated ZIP,
+`cargo-rail-components-v1.tsv` inside that archive, and an adjacent `SHA256SUMS`. Use a separate output directory for
+each host. The command verifies component digests and refuses existing release outputs; it does not publish them.
+The companion cache Action requires core, wrapper, worker, matched driver and authenticated driver source components.
+
+Setup also binds the exact physical workspace root to one private profile with its own bounded CAS trust domain.
 Running setup in another workspace creates another profile; it does not replace the first profile. An unenrolled
 workspace executes normally without L1 or L2 reuse. Setup refuses another global wrapper, persistent shadowing,
 ambiguous Cargo homes, linked authority paths, or changed owned state.
@@ -37,6 +53,20 @@ binds the canonical workspace root. Remap mode replaces that root only for certi
 keeping the executor's physical output directory out of the portable operation identity. Stored descriptors and every
 output byte are reverified before restore. The bounded source capture deliberately over-invalidates when it cannot
 prove that an unused path was irrelevant.
+
+Eligible cold compilation uses the shared, compiler-matched fact driver to record the Rust libraries rustc selects,
+including transitive libraries, and the candidate filenames it searches. This native-input witness is separate from
+diagnostic facts. Reuse checks the selected files, matching alternatives, and missing candidates before restoring
+outputs. Metadata-only work records that no code generation occurred. Code generation with inline or global
+assembly, or LTO modes that may import dependency assembly, bypasses reuse because assembler inputs are incomplete.
+
+Native reuse requires the selected `RUSTC` executable to resolve to the captured sysroot's compiler. A custom compiler
+program or an opaque workspace wrapper executes normally, preserving its flags and behavior. A matching version
+response alone does not authorize replacing that program with the shared driver.
+
+Compiler-selected environment values remain exact inputs, even when they contain workspace paths. A different
+literal value produces a different action. Dep-info path rebinding preserves rustc's trailing `# env-dep:` records
+byte-for-byte; dependency rules interleaved after those records are unsupported.
 
 A result is:
 
@@ -75,11 +105,24 @@ This eligibility applies to local L1, remote L2, and the distributed client. It 
 the runner still needs a native Cargo-Rail build with the cache component binaries required by the selected mode.
 Remote objects also remain bound to the exact compiler action and platform identity.
 
-Compiler-result reuse is native-target only. If Cargo passes an explicit `--target` that differs from rustc's host
-target, Cargo-Rail records `cross_target_toolchain_evidence_unavailable` and executes rustc normally. A native RISC-V,
-IBM Z, or IBM POWER runner is therefore eligible for L1 and L2; an x86-64 runner cross-compiling to one of those
-targets is not. A distributed worker must match the client's architecture, endianness, operating system, rustc host
-target, compiler, and sysroot.
+Windows currently bypasses native reuse because compiler-matched native driver launch is not implemented. The
+current Linux native path remains unqualified for shared libraries outside the sysroot, including loader selection
+and earlier search candidates. A successful driver readiness probe does not establish that complete input boundary.
+
+Explicit targets can reuse metadata and Rust library outputs when Cargo-Rail captures the selected target
+definition, compiler distribution, sysroot and target-library bytes. Host-built dependencies retain their own compiler
+identity. Linked reuse requires evidence for the selected linker and every owned output; verified COFF results
+include PDBs and import libraries. Missing backend, linker or auxiliary-output evidence runs the original compiler
+and records the unavailable boundary.
+Zig/cargo-zigbuild, MSVC `link.exe`, the rustc GCC backend, packed Darwin debug output and post-link stripping are
+deferred from the current release preparation. These paths retain their normal compiler execution when complete
+cache evidence is unavailable; they are not qualified positive-reuse cases.
+
+Unpacked debug object files use the same verified file restore transaction. Packed Darwin debug output and
+post-link stripping currently run the original compiler because their additional tool inputs are not fully observed.
+A distributed worker must match the client's architecture, endianness, operating system, rustc host target,
+compiler, and sysroot. Target identity is checked separately. Cargo invocations with additional dependency-search
+directories remain local until their complete search inputs can be transported and verified.
 
 ## Share results remotely
 
@@ -169,11 +212,12 @@ user-selected remaps, and unsupported output classes bypass cross-root reuse.
 
 External `CARGO_TARGET_DIR` locations are supported for eligible native results. The cache identity uses one stable
 logical output directory, while local compilation and restore continue to use Cargo's exact physical output parent.
-Changing only a checkout or target root therefore preserves portable identity; changing a selected input, including a
-same-size edit, produces a miss.
+Changing a checkout or target root preserves portable identity when selected input paths and environment values stay
+unchanged. Changing a selected input, including a same-size edit, produces a miss.
 
 Additional L2 environment names must be reviewed and non-secret. Select them with repeated `--remote-environment`
-options during setup. Only value digests enter identity; raw values are not uploaded.
+options during setup. Value digests enter action identity. Rustc may also write those values into dep-info; those
+environment records are stored and restored exactly.
 
 ## Distribute eligible misses
 
@@ -181,13 +225,22 @@ Distributed execution runs below Cargo L0, L1, and L2. It accepts only bounded c
 complete source, dependency, and selected repository inputs. Linked outputs, build scripts, generated namespaces,
 native dependencies, unmodeled options, and newly observed compiler environments remain local.
 
+Worker protocol version 5 requires the actual compiler-selected native-input observation in each successful response.
+The client validates it against the transported files and matched toolchain before admitting the result. An input
+selected outside that transported set, incomplete assembly coverage, or missing driver evidence rejects remote
+admission and falls back locally. The operation retains ordered dependency-search directories and the selected
+source-directory identity. Physical-root operations read staged sources through the matched driver while preserving
+ordinary compiler metadata paths; explicit remapping retains the virtual root. Matching candidates and transitive libraries are
+transported as exact files at their declared search paths under the worker’s existing input bounds. Untransported
+inputs keep the invocation local before worker execution.
+
 The client requires one complete mTLS worker authority:
 
 ```bash
 cargo rail cache setup --check \
   --distributed-endpoint '10.0.0.20:39443' \
   --distributed-server-name worker.example.internal \
-  --distributed-capability 'worker-capability-v3:sha256:CAPABILITY_DIGEST' \
+  --distributed-capability 'worker-capability-v5:sha256:CAPABILITY_DIGEST' \
   --distributed-authority /etc/cargo-rail/server-ca.pem \
   --distributed-client-certificate /etc/cargo-rail/client.pem \
   --distributed-client-private-key /etc/cargo-rail/client.key
@@ -230,12 +283,23 @@ Workspace cleanup removes reconstructible state for the current checkout. Local 
 profile's CAS after validating ownership and waiting for readers; rerun `cache setup` afterward. `cache detach`
 removes the current root binding but preserves the profile and CAS. `cache drop-profile` accepts an opaque ID from
 `cache profiles` and removes only a detached profile with no enrolled roots. `cache uninstall` removes the global
-wrapper, Cargo field, and installation receipt while preserving profiles and their CAS data.
+wrapper, worker, receipt-owned compiler components, Cargo field, and installation receipt while preserving profiles
+and their CAS data.
 
-An upgrade from v0.25 retains its machine-global policy as unbound pre-profile state because that receipt cannot prove
-which workspace owned its remote. Runtime selection never uses that state. Enroll the intended workspace explicitly,
-then preview `cache drop-unbound` before removing the retained CAS. Every operation refuses changed, shadowed, linked,
-or unowned authority. Do not edit profile records, individual CAS objects, or Cargo fingerprints by hand.
+Before upgrading a v0.25 installation, use v0.25 to preview `cargo rail cache remove --check`, then run
+`cargo rail cache remove`. This removes its wrapper installation and preserves the old CAS. With the new version,
+run `cargo rail cache setup` in each intended workspace and select its remote explicitly. Setup refuses old receipts
+without changing their files or adopting machine-global policy. Ordinary Cargo compilation still falls back normally.
+
+Receipt version 5 requires an explicit compiler component inventory. For a version 4 receipt without that inventory,
+use the previous Cargo-Rail executable that created it to preview `cargo rail cache remove --check`, then run
+`cargo rail cache remove`. This preserves the CAS. Run `cargo rail cache setup` with the current executable afterward;
+the current executable does not upgrade or adopt version 4 receipts.
+
+Previously retained unbound state remains visible through `cache profiles`; preview `cache drop-unbound` before
+removing that CAS. Runtime selection never uses unbound state. Removal and reuse refuse changed, shadowed, linked,
+or unowned authority. Setup can repair installed component bytes from their authenticated source files. Do not edit
+profile records, individual CAS objects, or Cargo fingerprints by hand.
 
 Status schema 15 reports the selected profile ID, workspace binding, trust domain, and redacted remote selection
 source. It reports stable native failure-reason counters separately from the bounded 65,536-event usage ledger,

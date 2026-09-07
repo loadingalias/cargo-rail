@@ -222,6 +222,14 @@ pub(crate) fn stable_open_file_generation(file: &fs::File) -> Option<Vec<u8>> {
     linux_file_generation(&metadata)
 }
 
+/// Capture generation evidence from an already-open directory without accepting regular files.
+#[cfg(target_os = "linux")]
+pub(crate) fn stable_open_directory_generation(directory: &fs::File) -> Option<Vec<u8>> {
+    let metadata = directory.metadata().ok()?;
+    metadata.is_dir().then_some(())?;
+    linux_file_generation(&metadata)
+}
+
 #[cfg(windows)]
 pub(crate) fn stable_file_generation(path: &Path) -> Option<Vec<u8>> {
     let file = crate::windows_fs::open_for_observation(path).ok()?;

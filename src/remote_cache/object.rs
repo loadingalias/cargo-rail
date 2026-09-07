@@ -41,7 +41,7 @@ pub(crate) enum Lookup {
     Miss,
     Conflict,
     Unique {
-        selector: crate::compiler::native_cache::NativeDynamicInputSelector,
+        selector: Box<crate::compiler::native_cache::NativeDynamicInputSelector>,
         action_key: String,
         result_key: String,
         body: EntryBody,
@@ -431,7 +431,7 @@ impl ObjectStore {
                     .ok_or_else(|| RemoteStoreError::integrity("remote unique entry has no payload"))?;
                 let compressed_bytes = body.compressed_bytes();
                 Ok(Lookup::Unique {
-                    selector: identity.selector,
+                    selector: Box::new(identity.selector),
                     action_key: identity.action_key,
                     result_key: identity.result_key,
                     body,

@@ -15,6 +15,7 @@ pub(crate) mod facts;
 pub mod invocation;
 pub mod model;
 pub(crate) mod native_cache;
+pub(crate) mod native_input_protocol;
 pub(crate) mod observation;
 pub(crate) mod operation;
 pub(crate) mod scheduler;

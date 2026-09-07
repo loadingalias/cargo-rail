@@ -1,5 +1,7 @@
 # Benchmarking
 
+Repository benchmarks cover compiler caching: local reuse, remote reuse, and distributed compilation.
+
 A performance claim needs retained correctness evidence from the exact measured source, binary, toolchain, host, and
 workload. A smoke run validates orchestration; it does not qualify latency.
 

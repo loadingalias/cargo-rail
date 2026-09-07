@@ -1,0 +1,23 @@
+# AWS runners. Other providers are selected directly in workflows.
+runners:
+  x86_64-linux:
+    family: [c8a, c8i, m8a, m8i]
+    cpu: [32]
+    ram: [64, 128]
+    image: ubuntu26-full-x64
+    spot: price-capacity-optimized
+    volume: 150gb:gp3
+  aarch64-linux:
+    family: [c8g, m8g]
+    cpu: [32]
+    ram: [64, 128]
+    image: ubuntu26-full-arm64
+    spot: price-capacity-optimized
+    volume: 150gb:gp3
+  x86_64-win:
+    family: [c8a, c8i, m8a, m8i]
+    cpu: [32]
+    ram: [64, 128]
+    image: windows25-full-x64
+    spot: price-capacity-optimized
+    volume: 200gb:gp3

@@ -62,7 +62,6 @@ fn write_compiler_fact_capability(observation_directory: &Path, source_root: &Pa
 
 #[cfg(any(unix, windows))]
 #[test]
-#[ignore = "requires the separately manufactured exact-toolchain companion"]
 fn stable_wrapper_authorizes_the_matched_driver_per_compilation_unit() {
     let result: Result<()> = (|| {
         let first = stable_wrapper_typed_fixture(false)?;
@@ -155,7 +154,6 @@ fn json_difference(left: &serde_json::Value, right: &serde_json::Value) -> Optio
 
 #[cfg(unix)]
 #[test]
-#[ignore = "requires the separately manufactured exact-toolchain companion"]
 fn stable_rustdoc_proxy_authorizes_generated_doctest_units() -> Result<()> {
     let _ = stable_wrapper_typed_fixture(true)?;
     Ok(())
@@ -569,7 +567,8 @@ fn stage_test_doctest_sysroot(source_root: &Path, toolchain_sysroot: &Path) -> R
         if entry.file_type()?.is_dir() {
             symlink(entry.path(), destination)?;
         } else {
-            fs::hard_link(entry.path(), destination)?;
+            // Hard links change the shared toolchain's generation during concurrent cache tests.
+            fs::copy(entry.path(), destination)?;
         }
     }
     Ok(root)

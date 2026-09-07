@@ -538,15 +538,21 @@ pub(crate) struct InvocationRecorder {
     metadata_paths: Vec<PathBuf>,
     rlib_paths: Vec<PathBuf>,
     output_paths: Vec<PathBuf>,
+    auxiliary_outputs: Vec<NativeOutputArtifact>,
+    debug_object_prefix: Option<String>,
+    previous_debug_objects: BTreeMap<PathBuf, Vec<u8>>,
     execution_arguments: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
 pub(crate) struct NativeOutputPaths {
     pub(crate) dep_info: PathBuf,
     pub(crate) artifacts: Vec<NativeOutputArtifact>,
+    pub(crate) debug_object_prefix: Option<String>,
 }
 
 /// One typed compiler artifact destination from the original rustc invocation.
+#[derive(Debug, Clone)]
 pub(crate) struct NativeOutputArtifact {
     pub(crate) role: NativeOutputRole,
     pub(crate) path: PathBuf,
@@ -562,6 +568,10 @@ pub(crate) enum NativeOutputRole {
     Dylib,
     Cdylib,
     Staticlib,
+    Pdb,
+    ImportLibrary,
+    ExportObject,
+    DebugObject,
 }
 
 impl NativeOutputRole {
@@ -574,6 +584,10 @@ impl NativeOutputRole {
             Self::Dylib => "dylib",
             Self::Cdylib => "cdylib",
             Self::Staticlib => "staticlib",
+            Self::Pdb => "pdb",
+            Self::ImportLibrary => "import_library",
+            Self::ExportObject => "export_object",
+            Self::DebugObject => "debug_object",
         }
     }
 
@@ -608,7 +622,7 @@ impl NativeOutputRole {
 
     fn implicit_file_name(self, crate_name: &str, extra_filename: &str) -> Option<String> {
         match self {
-            Self::Metadata => None,
+            Self::Metadata | Self::Pdb | Self::ImportLibrary | Self::ExportObject | Self::DebugObject => None,
             Self::Rlib => Some(format!("lib{crate_name}{extra_filename}.rlib")),
             Self::Executable if cfg!(windows) => Some(format!("{crate_name}{extra_filename}.exe")),
             Self::Executable => Some(format!("{crate_name}{extra_filename}")),
@@ -623,6 +637,15 @@ impl NativeOutputRole {
             Self::Staticlib => Some(format!("lib{crate_name}{extra_filename}.a")),
         }
     }
+}
+
+// The native pack uses one byte for all slots: reserve five ordinary outputs and two streams.
+pub(crate) const MAX_NATIVE_DEBUG_OBJECTS: usize = u8::MAX as usize - 7;
+
+pub(crate) fn debug_object_name_matches(prefix: &str, name: &str) -> bool {
+    name.starts_with(prefix)
+        && (name.ends_with(".rcgu.o") || name.ends_with(".dwo"))
+        && Path::new(name).file_name().and_then(OsStr::to_str) == Some(name)
 }
 
 /// Wrapper evidence before Cargo compiler-artifact correlation.
@@ -1276,12 +1299,12 @@ fn platform_identity() -> String {
 pub(crate) fn begin_invocation(
     directory: &Path,
     source_root: &Path,
-    _rustc: &OsStr,
+    rustc: &OsStr,
     arguments: &[OsString],
 ) -> RailResult<InvocationRecorder> {
     let current_dir = std::env::current_dir()
         .map_err(|error| RailError::message(format!("failed to capture compiler working directory: {error}")))?;
-    begin_compiler_invocation(directory, source_root, &current_dir, arguments, CompilerMode::Rustc)
+    begin_invocation_in(directory, source_root, &current_dir, rustc, arguments)
 }
 
 /// Capture argv-declared inputs using the exact working directory rustc will receive.
@@ -1289,10 +1312,12 @@ pub(crate) fn begin_invocation_in(
     directory: &Path,
     source_root: &Path,
     current_dir: &Path,
-    _rustc: &OsStr,
+    rustc: &OsStr,
     arguments: &[OsString],
 ) -> RailResult<InvocationRecorder> {
-    begin_compiler_invocation(directory, source_root, current_dir, arguments, CompilerMode::Rustc)
+    let mut recorder = begin_compiler_invocation(directory, source_root, current_dir, arguments, CompilerMode::Rustc)?;
+    recorder.raw.compiler = Some(ExecutableIdentity::capture(rustc, current_dir, source_root)?);
+    Ok(recorder)
 }
 
 /// Capture one rustdoc invocation through the transparent observation proxy.
@@ -1401,10 +1426,108 @@ fn begin_compiler_invocation(
             compiler_fact_unit: None,
         },
         execution_arguments,
+        auxiliary_outputs: Vec::new(),
+        debug_object_prefix: None,
+        previous_debug_objects: BTreeMap::new(),
     })
 }
 
 impl InvocationRecorder {
+    pub(crate) fn set_debug_object_outputs(&mut self) -> RailResult<()> {
+        let mut bypasses = BTreeSet::new();
+        let parsed = ParsedArguments::parse(
+            &self.execution_arguments,
+            &self.current_dir,
+            self.raw.mode,
+            &mut bypasses,
+        );
+        let crate_name = self
+            .raw
+            .crate_name
+            .as_deref()
+            .ok_or_else(|| RailError::message("debug outputs have no crate name"))?;
+        let prefix = format!("{crate_name}{}.", parsed.extra_filename);
+        self.debug_object_prefix = Some(prefix);
+        self.previous_debug_objects = self
+            .debug_object_paths()?
+            .into_iter()
+            .map(|path| {
+                let generation = crate::utils::stable_file_generation(&path)
+                    .ok_or_else(|| RailError::message("debug output generation is unavailable"))?;
+                Ok((path, generation))
+            })
+            .collect::<RailResult<_>>()?;
+        Ok(())
+    }
+
+    pub(crate) fn debug_object_paths(&self) -> RailResult<Vec<PathBuf>> {
+        let Some(prefix) = &self.debug_object_prefix else {
+            return Ok(Vec::new());
+        };
+        let outputs = self
+            .native_output_paths()
+            .ok_or_else(|| RailError::message("debug output parent is unavailable"))?;
+        let parent = outputs
+            .dep_info
+            .parent()
+            .ok_or_else(|| RailError::message("debug output has no parent"))?;
+        let mut paths = Vec::new();
+        for (index, entry) in fs::read_dir(parent)?.enumerate() {
+            if index >= 100_000 {
+                return Err(RailError::message("debug output directory exceeds its scan bound"));
+            }
+            let entry = entry?;
+            let name = entry.file_name();
+            if name
+                .to_str()
+                .is_some_and(|name| debug_object_name_matches(prefix, name))
+            {
+                let metadata = fs::symlink_metadata(entry.path())?;
+                if !metadata.is_file() || crate::utils::is_symlink_or_reparse(&metadata) {
+                    return Err(RailError::message("debug output is not a regular file"));
+                }
+                paths.push(entry.path());
+                if paths.len() > MAX_NATIVE_DEBUG_OBJECTS {
+                    return Err(RailError::message("debug output inventory exceeds its bound"));
+                }
+            }
+        }
+        paths.sort_unstable();
+        Ok(paths)
+    }
+
+    pub(crate) fn capture_debug_object_outputs(&mut self) -> RailResult<()> {
+        let paths = self.current_debug_object_paths()?;
+        if self.debug_object_prefix.is_some() && paths.is_empty() {
+            return Err(RailError::message(
+                "compiler emitted no expected separate debug objects",
+            ));
+        }
+        for path in paths {
+            self.output_paths.push(path.clone());
+            self.auxiliary_outputs.push(NativeOutputArtifact {
+                role: NativeOutputRole::DebugObject,
+                path,
+            });
+        }
+        Ok(())
+    }
+
+    fn current_debug_object_paths(&self) -> RailResult<Vec<PathBuf>> {
+        self.debug_object_paths()?
+            .into_iter()
+            .filter_map(|path| {
+                let Some(previous) = self.previous_debug_objects.get(&path) else {
+                    return Some(Ok(path));
+                };
+                match crate::utils::stable_file_generation(&path) {
+                    Some(current) if current == *previous => None,
+                    Some(_) => Some(Ok(path)),
+                    None => Some(Err(RailError::message("debug output generation is unavailable"))),
+                }
+            })
+            .collect()
+    }
     pub(crate) fn observation(&self) -> &RawCompilerInvocation {
         &self.raw
     }
@@ -1412,6 +1535,118 @@ impl InvocationRecorder {
     /// Exact argv to execute after one rustc-compatible ordinary response-file expansion.
     pub(crate) fn execution_arguments(&self) -> &[String] {
         &self.execution_arguments
+    }
+
+    /// Bind native outputs to the selected compiler's naming result and MSVC argv.
+    pub(crate) fn set_native_target_output(&mut self, name: Option<&str>, msvc: bool) -> RailResult<()> {
+        let previous_auxiliary = self
+            .auxiliary_outputs
+            .iter()
+            .map(|output| output.path.clone())
+            .collect::<BTreeSet<_>>();
+        self.output_paths.retain(|path| !previous_auxiliary.contains(path));
+        self.auxiliary_outputs.clear();
+        let outputs = self
+            .native_output_paths()
+            .ok_or_else(|| RailError::message("compiler output paths are unavailable"))?;
+        let Some(primary) = outputs
+            .artifacts
+            .iter()
+            .find(|output| output.role.requires_linker() || output.role == NativeOutputRole::Staticlib)
+        else {
+            return Ok(());
+        };
+        let mut bypasses = BTreeSet::new();
+        let parsed = ParsedArguments::parse(
+            &self.execution_arguments,
+            &self.current_dir,
+            self.raw.mode,
+            &mut bypasses,
+        );
+        let mut primary_path = primary.path.clone();
+        if let Some(name) = name
+            && parsed.explicit_link_paths.is_empty()
+            && !self.execution_arguments.iter().any(|argument| argument == "-o")
+        {
+            if name.is_empty() || Path::new(name).file_name().and_then(OsStr::to_str) != Some(name) {
+                return Err(RailError::message("compiler returned an invalid output filename"));
+            }
+            primary_path.set_file_name(name);
+        }
+        let mut pdb = None;
+        let mut import_library = None;
+        let mut debug = true;
+        if msvc && primary.role.requires_linker() {
+            for argument in &parsed.link_arguments {
+                let Some(option) = argument.strip_prefix('/').or_else(|| argument.strip_prefix('-')) else {
+                    continue;
+                };
+                let (option, value) = option
+                    .split_once(':')
+                    .map_or((option, None), |(option, value)| (option, Some(value)));
+                match option.to_ascii_lowercase().as_str() {
+                    "out" | "pdb" | "implib" => {
+                        let value = value
+                            .filter(|value| !value.is_empty())
+                            .ok_or_else(|| RailError::message("MSVC output option has no path"))?;
+                        let path = resolve_argument_path(value, &self.current_dir);
+                        match option.to_ascii_lowercase().as_str() {
+                            "out" => primary_path = path,
+                            "pdb" => pdb = Some(path),
+                            _ => import_library = Some(path),
+                        }
+                    }
+                    "debug" if value.is_some_and(|value| value.eq_ignore_ascii_case("none")) => debug = false,
+                    "debug" if value.is_none_or(|value| value.eq_ignore_ascii_case("full")) => debug = true,
+                    "debug" | "incremental" if !value.is_some_and(|value| value.eq_ignore_ascii_case("no")) => {
+                        return Err(RailError::message(
+                            "persistent MSVC linker state is not an owned output",
+                        ));
+                    }
+                    "pdbstripped" | "map" | "lldmap" | "manifestfile" | "ilk" | "noimplib" => {
+                        return Err(RailError::message(
+                            "MSVC auxiliary output option has no captured output role",
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            if debug {
+                self.auxiliary_outputs.push(NativeOutputArtifact {
+                    role: NativeOutputRole::Pdb,
+                    path: pdb.unwrap_or_else(|| primary_path.with_extension("pdb")),
+                });
+            }
+            if matches!(
+                primary.role,
+                NativeOutputRole::ProcMacro | NativeOutputRole::Dylib | NativeOutputRole::Cdylib
+            ) {
+                let path = import_library.unwrap_or_else(|| primary_path.with_extension("dll.lib"));
+                self.auxiliary_outputs.push(NativeOutputArtifact {
+                    role: NativeOutputRole::ImportLibrary,
+                    path: path.clone(),
+                });
+                if parsed.linker.as_deref().is_none_or(|linker| {
+                    Path::new(linker)
+                        .file_name()
+                        .and_then(OsStr::to_str)
+                        .is_some_and(|name| name.eq_ignore_ascii_case("link.exe"))
+                }) {
+                    self.auxiliary_outputs.push(NativeOutputArtifact {
+                        role: NativeOutputRole::ExportObject,
+                        path: path.with_extension("exp"),
+                    });
+                }
+            }
+        }
+        for output in &mut self.output_paths {
+            if *output == primary.path {
+                *output = primary_path.clone();
+            }
+        }
+        self.output_paths
+            .extend(self.auxiliary_outputs.iter().map(|output| output.path.clone()));
+        Ok(())
     }
 
     pub(crate) fn native_output_paths(&self) -> Option<NativeOutputPaths> {
@@ -1439,6 +1674,7 @@ impl InvocationRecorder {
             .iter()
             .chain(&self.metadata_paths)
             .chain(&self.rlib_paths)
+            .chain(self.auxiliary_outputs.iter().map(|output| &output.path))
             .collect::<BTreeSet<_>>();
         let linked = self
             .output_paths
@@ -1459,9 +1695,11 @@ impl InvocationRecorder {
         if artifacts.is_empty() {
             return None;
         }
+        artifacts.extend(self.auxiliary_outputs.iter().cloned());
         Some(NativeOutputPaths {
             dep_info: dep_info.clone(),
             artifacts,
+            debug_object_prefix: self.debug_object_prefix.clone(),
         })
     }
 
@@ -1515,6 +1753,19 @@ impl InvocationRecorder {
                 &mut self.raw.bypasses,
                 "emitted_output",
             );
+        }
+        if self.debug_object_prefix.is_some() {
+            let expected = self
+                .auxiliary_outputs
+                .iter()
+                .filter(|artifact| artifact.role == NativeOutputRole::DebugObject)
+                .map(|artifact| artifact.path.clone())
+                .collect::<Vec<_>>();
+            if !self.current_debug_object_paths().is_ok_and(|paths| paths == expected) {
+                self.raw
+                    .bypasses
+                    .insert("compiler_debug_output_capture_unavailable".to_string());
+            }
         }
         sort_and_deduplicate_files(&mut self.raw.observed_reads);
         sort_and_deduplicate_files(&mut self.raw.emitted_outputs);
@@ -1760,6 +2011,8 @@ struct ParsedArguments {
     output_paths: Vec<PathBuf>,
     out_dir: Option<PathBuf>,
     extra_filename: String,
+    linker: Option<String>,
+    link_arguments: Vec<String>,
 }
 
 impl ParsedArguments {
@@ -1997,6 +2250,13 @@ impl ParsedArguments {
     fn capture_codegen_option(&mut self, value: &str) {
         if let Some(extra_filename) = value.strip_prefix("extra-filename=") {
             self.extra_filename = extra_filename.to_string();
+        } else if let Some(linker) = value.strip_prefix("linker=") {
+            self.linker = Some(linker.to_string());
+        } else if let Some(argument) = value.strip_prefix("link-arg=") {
+            self.link_arguments.push(argument.to_string());
+        } else if let Some(arguments) = value.strip_prefix("link-args=") {
+            self.link_arguments
+                .extend(arguments.split_whitespace().map(str::to_string));
         }
     }
 }
@@ -2338,6 +2598,213 @@ fn is_executable(_metadata: &fs::Metadata) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn separate_debug_capture_excludes_unchanged_leftovers_and_owns_replaced_objects() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("lib.rs"), "pub const VALUE: u8 = 42;\n").expect("source");
+        let output = workspace.path().join("target");
+        fs::create_dir(&output).expect("outputs");
+        let stale = output.join("fixture.old.rcgu.o");
+        let replaced = output.join("fixture.current.rcgu.o");
+        fs::write(&stale, b"leftover").expect("leftover");
+        fs::write(&replaced, b"previous").expect("old output");
+        let mut recorder = begin_compiler_invocation(
+            workspace.path(),
+            workspace.path(),
+            workspace.path(),
+            &[
+                "--crate-name",
+                "fixture",
+                "--crate-type",
+                "rlib",
+                "--emit=dep-info,metadata,link",
+                "--out-dir",
+                "target",
+                "lib.rs",
+            ]
+            .map(OsString::from),
+            CompilerMode::Rustc,
+        )
+        .expect("invocation");
+        recorder
+            .set_debug_object_outputs()
+            .expect("capture previous generation");
+        fs::remove_file(&replaced).expect("replace old generation");
+        fs::write(&replaced, b"current!").expect("new generation");
+        fs::write(output.join("fixture.d"), "target/libfixture.rlib: lib.rs\n").expect("dep-info");
+        fs::write(output.join("libfixture.rmeta"), b"metadata").expect("metadata");
+        fs::write(output.join("libfixture.rlib"), b"archive").expect("archive");
+        recorder.capture_debug_object_outputs().expect("current outputs");
+        let raw = recorder.complete(true).expect("completion");
+        assert!(raw.bypasses.is_empty(), "{:#?}", raw.bypasses);
+        assert_eq!(raw.emitted_outputs.len(), 4);
+        assert!(
+            raw.emitted_outputs
+                .iter()
+                .any(|file| file.path == ObservationPath::Repository("target/fixture.current.rcgu.o".into()))
+        );
+        assert!(
+            !raw.emitted_outputs
+                .iter()
+                .any(|file| file.path == ObservationPath::Repository("target/fixture.old.rcgu.o".into()))
+        );
+        assert_eq!(fs::read(stale).expect("preserved leftover"), b"leftover");
+    }
+
+    #[test]
+    fn separate_debug_output_limit_preserves_a_reportable_compiler_completion() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("lib.rs"), "pub fn answer() -> u8 { 42 }\n").expect("source");
+        let output = workspace.path().join("target");
+        fs::create_dir(&output).expect("output directory");
+        let mut recorder = begin_compiler_invocation(
+            workspace.path(),
+            workspace.path(),
+            workspace.path(),
+            &[
+                "--crate-name",
+                "fixture",
+                "--crate-type",
+                "rlib",
+                "--emit=dep-info,metadata,link",
+                "--out-dir",
+                "target",
+                "lib.rs",
+            ]
+            .map(OsString::from),
+            CompilerMode::Rustc,
+        )
+        .expect("invocation");
+        recorder.set_debug_object_outputs().expect("separate output contract");
+        fs::write(output.join("fixture.d"), "target/libfixture.rlib: lib.rs\n").expect("dep-info");
+        fs::write(output.join("libfixture.rmeta"), b"metadata").expect("metadata");
+        fs::write(output.join("libfixture.rlib"), b"archive").expect("archive");
+        for index in 0..=MAX_NATIVE_DEBUG_OBJECTS {
+            fs::write(
+                output.join(format!("fixture.fixture.cgu.{index}.rcgu.o")),
+                b"debug object",
+            )
+            .expect("debug object");
+        }
+        let error = recorder
+            .capture_debug_object_outputs()
+            .expect_err("an oversized inventory must not be truncated");
+        assert_eq!(error.to_string(), "debug output inventory exceeds its bound");
+        let raw = recorder
+            .complete(true)
+            .expect("ordinary compiler completion stays reportable");
+        assert!(raw.success);
+        assert!(raw.bypasses.contains("compiler_debug_output_capture_unavailable"));
+        assert_eq!(
+            raw.emitted_outputs.len(),
+            3,
+            "oversized debug inventory must not become partial output authority"
+        );
+        assert_eq!(
+            fs::read_dir(output).expect("preserved outputs").count(),
+            MAX_NATIVE_DEBUG_OBJECTS + 4
+        );
+    }
+
+    #[test]
+    fn selected_msvc_output_owns_the_dll_pdb_and_import_library() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("lib.rs"), "pub fn answer() -> u8 { 42 }\n").expect("source");
+        let mut recorder = begin_compiler_invocation(
+            workspace.path(),
+            workspace.path(),
+            workspace.path(),
+            &[
+                "--crate-name",
+                "fixture",
+                "--crate-type",
+                "cdylib",
+                "--emit=dep-info,link",
+                "--out-dir",
+                "target",
+                "-Clinker=lld-link",
+                "lib.rs",
+            ]
+            .map(OsString::from),
+            CompilerMode::Rustc,
+        )
+        .expect("invocation");
+        recorder
+            .set_native_target_output(Some("fixture.dll"), true)
+            .expect("selected outputs");
+        let outputs = recorder.native_output_paths().expect("native outputs");
+        assert_eq!(
+            outputs
+                .artifacts
+                .iter()
+                .map(|output| (
+                    output.role,
+                    output
+                        .path
+                        .file_name()
+                        .expect("filename")
+                        .to_string_lossy()
+                        .into_owned()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (NativeOutputRole::Cdylib, "fixture.dll".to_string()),
+                (NativeOutputRole::Pdb, "fixture.pdb".to_string()),
+                (NativeOutputRole::ImportLibrary, "fixture.dll.lib".to_string()),
+            ]
+        );
+        recorder
+            .set_native_target_output(Some("fixture.dll"), true)
+            .expect("repeated binding");
+        assert_eq!(
+            recorder.native_output_paths().expect("native outputs").artifacts.len(),
+            3
+        );
+    }
+
+    #[test]
+    fn explicit_msvc_output_paths_preserve_linker_overrides_and_export_objects() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("lib.rs"), "pub fn answer() -> u8 { 42 }\n").expect("source");
+        let mut recorder = begin_compiler_invocation(
+            workspace.path(),
+            workspace.path(),
+            workspace.path(),
+            &[
+                "--crate-name",
+                "fixture",
+                "--crate-type",
+                "cdylib",
+                "--emit=dep-info=target/named.d,link=target/named.dll",
+                "-Clinker=link.exe",
+                "-Clink-arg=/PDB:target/symbols.pdb",
+                "-Clink-arg=/IMPLIB:target/imports.lib",
+                "lib.rs",
+            ]
+            .map(OsString::from),
+            CompilerMode::Rustc,
+        )
+        .expect("invocation");
+        recorder
+            .set_native_target_output(Some("fixture.dll"), true)
+            .expect("selected outputs");
+        let outputs = recorder.native_output_paths().expect("native outputs");
+        assert_eq!(
+            outputs
+                .artifacts
+                .iter()
+                .map(|output| output
+                    .path
+                    .file_name()
+                    .expect("filename")
+                    .to_string_lossy()
+                    .into_owned())
+                .collect::<Vec<_>>(),
+            ["named.dll", "symbols.pdb", "imports.lib", "imports.exp"]
+        );
+        assert_eq!(outputs.artifacts[3].role, NativeOutputRole::ExportObject);
+    }
 
     #[test]
     fn ordinary_response_file_is_the_observed_and_executed_argument_stream() {

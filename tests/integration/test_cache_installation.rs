@@ -104,6 +104,160 @@ fn selected_profile_cache_root(workspace: &Path, cargo_home: &Path) -> Result<Pa
         .context("selected profile cache root")
 }
 
+#[cfg(unix)]
+#[test]
+fn authenticated_compiler_components_follow_installation_ownership() {
+    let result: Result<()> = (|| {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let manufactured = PathBuf::from(std::env::var_os("CARGO_RAIL_TEST_COMPONENT_BINARY").context(
+            "set CARGO_RAIL_TEST_COMPONENT_BINARY to the cargo-rail binary from the authenticated component preparation route",
+        )?);
+        let source = manufactured.parent().context("manufactured component directory")?;
+        let bundle = tempfile::tempdir()?;
+        for name in [
+            "cargo-rail",
+            "cargo-rail-native-rustc-wrapper",
+            "cargo-rail-native-rustc-worker",
+            "cargo-rail-fact-driver",
+            "cargo-rail-fact-driver-source-v1.json",
+        ] {
+            fs::copy(source.join(name), bundle.path().join(name))?;
+        }
+        let workspace = TestWorkspace::new_single_crate("installed-components", "0.1.0")?;
+        let cargo_home = tempfile::tempdir()?;
+        let run = |arguments: &[&str]| -> Result<Output> {
+            let mut command = Command::new(bundle.path().join("cargo-rail"));
+            for (name, _) in std::env::vars_os() {
+                if name.to_str().is_some_and(|name| name.starts_with("CARGO_RAIL_")) {
+                    command.env_remove(name);
+                }
+            }
+            command
+                .args(arguments)
+                .current_dir(&workspace.path)
+                .env("CARGO_HOME", cargo_home.path())
+                .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+                .env_remove("RUSTC_WRAPPER")
+                .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .output()
+                .context("run authenticated component installation")
+        };
+        let source_bundle = bundle.path().join("cargo-rail-fact-driver-source-v1.json");
+        let source_bytes = fs::read(&source_bundle)?;
+        fs::remove_file(&source_bundle)?;
+        let missing = run(&["rail", "cache", "setup"])?;
+        anyhow::ensure!(
+            !missing.status.success(),
+            "missing authenticated source was accepted: {missing:?}"
+        );
+        anyhow::ensure!(
+            fs::read_dir(cargo_home.path())?.next().is_none(),
+            "rejected setup wrote Cargo state"
+        );
+        fs::write(&source_bundle, &source_bytes)?;
+
+        let setup = run(&["rail", "cache", "setup"])?;
+        anyhow::ensure!(setup.status.success(), "component setup failed: {setup:?}");
+        let installation = fs::canonicalize(cargo_home.path())?.join("cargo-rail/compiler-cache-v1");
+        let receipt_path = installation.join("setup.json");
+        let receipt_bytes = fs::read(&receipt_path)?;
+        let receipt: serde_json::Value = serde_json::from_slice(&receipt_bytes)?;
+        assert_eq!(receipt["version"], 5);
+        let components = receipt["compiler_components"]
+            .as_array()
+            .context("required component inventory")?;
+        assert_eq!(components.len(), 2);
+        let names = components
+            .iter()
+            .map(|component| {
+                let path = PathBuf::from(component["path"].as_str().context("component path")?);
+                anyhow::ensure!(
+                    path.parent() == Some(installation.as_path()),
+                    "component escaped installation"
+                );
+                let name = path.file_name().context("component name")?.to_owned();
+                anyhow::ensure!(
+                    fs::read(&path)? == fs::read(bundle.path().join(&name))?,
+                    "installed component bytes changed"
+                );
+                let mode = if name == "cargo-rail-fact-driver" { 0o700 } else { 0o600 };
+                anyhow::ensure!(
+                    fs::metadata(&path)?.permissions().mode() & 0o777 == mode,
+                    "component permissions changed"
+                );
+                Ok(name)
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
+        assert_eq!(
+            names,
+            BTreeSet::from([
+                "cargo-rail-fact-driver".into(),
+                "cargo-rail-fact-driver-source-v1.json".into()
+            ])
+        );
+        let before = components
+            .iter()
+            .map(|component| {
+                let path = PathBuf::from(component["path"].as_str().context("component path")?);
+                Ok((path.clone(), capture_unchanged_file(&path)?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let repeated = run(&["rail", "cache", "setup"])?;
+        anyhow::ensure!(
+            repeated.status.success(),
+            "repeated component setup failed: {repeated:?}"
+        );
+        assert_eq!(fs::read(&receipt_path)?, receipt_bytes);
+        for (path, identity) in before {
+            assert_unchanged_file(&path, &identity, "unchanged compiler component")?;
+        }
+
+        let installed_source = installation.join("cargo-rail-fact-driver-source-v1.json");
+        fs::write(&installed_source, b"changed component bytes")?;
+        let status = run(&["rail", "cache", "status", "--scope", "local", "-f", "json"])?;
+        assert_eq!(json(&status)?["status"]["installation"]["healthy"], false);
+        let config_before = fs::read(cargo_home.path().join("config.toml"))?;
+        let retained_files = [
+            "cargo-rail-native-rustc-wrapper",
+            "cargo-rail-native-rustc-worker",
+            "cargo-rail-fact-driver",
+        ]
+        .into_iter()
+        .map(|name| {
+            let path = installation.join(name);
+            Ok((path.clone(), capture_unchanged_file(&path)?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+        let refused = run(&["rail", "cache", "uninstall"])?;
+        anyhow::ensure!(
+            !refused.status.success(),
+            "changed component removal was accepted: {refused:?}"
+        );
+        assert_eq!(fs::read(cargo_home.path().join("config.toml"))?, config_before);
+        assert_eq!(fs::read(&receipt_path)?, receipt_bytes);
+        for (path, identity) in retained_files {
+            assert_unchanged_file(&path, &identity, "compiler file after refused component removal")?;
+        }
+        assert_eq!(fs::read(&installed_source)?, b"changed component bytes");
+        let repair = run(&["rail", "cache", "setup"])?;
+        anyhow::ensure!(repair.status.success(), "component repair failed: {repair:?}");
+        assert_eq!(fs::read(&installed_source)?, source_bytes);
+        let status = run(&["rail", "cache", "status", "--scope", "local", "-f", "json"])?;
+        assert_eq!(json(&status)?["status"]["installation"]["healthy"], true);
+        let sentinel = installation.join("unowned-user-file");
+        fs::write(&sentinel, b"retain this file")?;
+        let removed = run(&["rail", "cache", "uninstall"])?;
+        anyhow::ensure!(removed.status.success(), "component removal failed: {removed:?}");
+        assert!(!installed_source.exists());
+        assert!(!installation.join("cargo-rail-fact-driver").exists());
+        assert!(!receipt_path.exists());
+        assert_eq!(fs::read(sentinel)?, b"retain this file");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
 fn selected_profile_state_root(workspace: &Path, cargo_home: &Path) -> Result<PathBuf> {
     let status = selected_profile_status(workspace, cargo_home)?;
     let profile_id = status["status"]["installation"]["profile_id"]
@@ -212,7 +366,7 @@ fn cargo_check_remote(
 }
 
 fn cargo_check_installed_remote(workspace: &Path, cargo_home: &Path, coverage: &Path) -> Result<Output> {
-    cargo_check_installed_remote_with_options(workspace, cargo_home, coverage, None, None)
+    cargo_check_installed_remote_with_options(workspace, cargo_home, coverage, None, None, None)
 }
 
 fn cargo_check_installed_remote_in_target(
@@ -221,7 +375,7 @@ fn cargo_check_installed_remote_in_target(
     coverage: &Path,
     target: &Path,
 ) -> Result<Output> {
-    cargo_check_installed_remote_with_options(workspace, cargo_home, coverage, None, Some(target))
+    cargo_check_installed_remote_with_options(workspace, cargo_home, coverage, None, Some(target), None)
 }
 
 fn cargo_check_installed_remote_with_rustflags(
@@ -230,7 +384,7 @@ fn cargo_check_installed_remote_with_rustflags(
     coverage: &Path,
     rustflags: Option<&str>,
 ) -> Result<Output> {
-    cargo_check_installed_remote_with_options(workspace, cargo_home, coverage, rustflags, None)
+    cargo_check_installed_remote_with_options(workspace, cargo_home, coverage, rustflags, None, None)
 }
 
 fn cargo_check_installed_remote_with_options(
@@ -239,6 +393,7 @@ fn cargo_check_installed_remote_with_options(
     coverage: &Path,
     rustflags: Option<&str>,
     target: Option<&Path>,
+    artifact_target: Option<&str>,
 ) -> Result<Output> {
     let coverage = fs::canonicalize(coverage).context("canonicalize native-cache coverage directory")?;
     let mut command = Command::new("cargo");
@@ -266,6 +421,9 @@ fn cargo_check_installed_remote_with_options(
         .env_remove("OUT_DIR")
         .env_remove("RUSTC_WRAPPER")
         .env_remove("RUSTC_WORKSPACE_WRAPPER");
+    if let Some(artifact_target) = artifact_target {
+        command.arg("--target").arg(artifact_target);
+    }
     if let Some(rustflags) = rustflags {
         command.env("RUSTFLAGS", rustflags);
     } else {
@@ -614,6 +772,1291 @@ fn json(output: &Output) -> Result<serde_json::Value> {
     serde_json::from_slice(&output.stdout).context("decode command JSON")
 }
 
+fn explicit_target_cargo(
+    workspace: &Path,
+    cargo_home: &Path,
+    workload: &str,
+    target: &str,
+    report: Option<&Path>,
+) -> Result<()> {
+    let mut command = Command::new("cargo");
+    command
+        .current_dir(workspace)
+        .args([workload, "--offline", "--quiet", "--target", target])
+        .env("CARGO_HOME", cargo_home)
+        .env("CARGO_INCREMENTAL", "0")
+        .env("CARGO_TARGET_DIR", workspace.join("target"))
+        .env_remove("CARGO_BUILD_TARGET")
+        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("CARGO_RAIL_CACHE")
+        .env_remove("CARGO_RAIL_CACHE_REMOTE")
+        .env_remove("CARGO_RAIL_CACHE_MODE")
+        .env_remove("CARGO_RAIL_CACHE_REMOTE_ENVIRONMENT")
+        .env_remove("CARGO_RAIL_CACHE_REPORT")
+        .env_remove("OUT_DIR");
+    if let Some(report) = report {
+        command.env("CARGO_RAIL_CACHE_REPORT", report);
+    }
+    let output = command
+        .output()
+        .with_context(|| format!("run explicit-target cargo {workload} for {target}"))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "cargo {workload} --target {target} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+fn compiler_only_outputs(directory: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
+    let mut outputs = BTreeMap::new();
+    for entry in fs::read_dir(directory)? {
+        let path = entry?.path();
+        if matches!(
+            path.extension().and_then(|extension| extension.to_str()),
+            Some("rmeta" | "rlib")
+        ) {
+            outputs.insert(path.strip_prefix(directory)?.to_path_buf(), fs::read(path)?);
+        }
+    }
+    Ok(outputs)
+}
+
+fn explicit_target_reuse(target: &str, mixed_host_target: bool) -> Result<()> {
+    for workload in ["check", "build"] {
+        let workspace = TestWorkspace::new_single_crate("explicit-target", "0.1.0")?;
+        let cargo_home = tempfile::tempdir()?;
+        let source = if mixed_host_target {
+            fs::write(
+                workspace.path.join("Cargo.toml"),
+                "[package]\nname = \"explicit-target\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+                 [dependencies]\nhost-target-support = { path = \"support\" }\n\
+                 [build-dependencies]\nhost-target-support = { path = \"support\" }\n",
+            )?;
+            fs::create_dir_all(workspace.path.join("support/src"))?;
+            fs::write(
+                workspace.path.join("support/Cargo.toml"),
+                "[package]\nname = \"host-target-support\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            )?;
+            fs::write(workspace.path.join("support/src/lib.rs"), "pub const VALUE: u64 = 7;\n")?;
+            fs::write(
+                workspace.path.join("build.rs"),
+                "fn main() { assert_eq!(host_target_support::VALUE, 7); \
+                 println!(\"cargo::rerun-if-changed=build.rs\"); }\n",
+            )?;
+            "pub const VALUE: u64 = 41 + host_target_support::VALUE;\n"
+        } else {
+            "pub const VALUE: u64 = 41;\n"
+        };
+        fs::write(workspace.path.join("src/lib.rs"), source)?;
+        explicit_target_cargo(&workspace.path, cargo_home.path(), workload, target, None)
+            .context("uncached upstream fixture must build before cache qualification")?;
+        let target_directory = workspace.path.join("target").join(target);
+        let outputs_directory = target_directory.join("debug/deps");
+        let baseline = compiler_only_outputs(&outputs_directory)?;
+        let expected_libraries = if mixed_host_target { 2 } else { 1 };
+        let metadata_count = baseline
+            .keys()
+            .filter(|path| path.extension().is_some_and(|extension| extension == "rmeta"))
+            .count();
+        anyhow::ensure!(
+            metadata_count == expected_libraries,
+            "upstream {workload} produced {metadata_count} metadata files; expected {expected_libraries}"
+        );
+        let archive_count = baseline
+            .keys()
+            .filter(|path| path.extension().is_some_and(|extension| extension == "rlib"))
+            .count();
+        let expected_archives = if workload == "build" { expected_libraries } else { 0 };
+        anyhow::ensure!(
+            archive_count == expected_archives,
+            "upstream {workload} produced {archive_count} archives; expected {expected_archives}"
+        );
+        let host_outputs = if mixed_host_target {
+            let outputs = compiler_only_outputs(&workspace.path.join("target/debug/deps"))?;
+            anyhow::ensure!(
+                outputs
+                    .keys()
+                    .any(|path| path.extension().is_some_and(|extension| extension == "rlib")),
+                "the shared build dependency was not compiled for the host"
+            );
+            Some(outputs)
+        } else {
+            None
+        };
+        let setup = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "setup"])?;
+        anyhow::ensure!(setup.status.success(), "explicit-target cache setup failed: {setup:?}");
+
+        fs::remove_dir_all(&target_directory)?;
+        explicit_target_cargo(&workspace.path, cargo_home.path(), workload, target, None)?;
+        let cold = selected_profile_status(&workspace.path, cargo_home.path())?;
+        let cold_usage = &cold["status"]["installation"]["usage"];
+        anyhow::ensure!(
+            cold_usage["misses"] == expected_libraries,
+            "cold {workload} did not cache every target library: {cold_usage}"
+        );
+        anyhow::ensure!(
+            cold_usage["hits"] == 0,
+            "cold {workload} reused an unseeded result: {cold_usage}"
+        );
+        anyhow::ensure!(
+            compiler_only_outputs(&outputs_directory)? == baseline,
+            "cached cold {workload} changed upstream output bytes"
+        );
+
+        fs::remove_dir_all(&target_directory)?;
+        explicit_target_cargo(&workspace.path, cargo_home.path(), workload, target, None)?;
+        let warm = selected_profile_status(&workspace.path, cargo_home.path())?;
+        let warm_usage = &warm["status"]["installation"]["usage"];
+        anyhow::ensure!(
+            warm_usage["hits"] == expected_libraries,
+            "warm {workload} did not restore every target library: {warm_usage}"
+        );
+        anyhow::ensure!(
+            warm_usage["misses"] == cold_usage["misses"],
+            "warm {workload} compiled a target library: cold {cold_usage}; warm {warm_usage}"
+        );
+        anyhow::ensure!(
+            compiler_only_outputs(&outputs_directory)? == baseline,
+            "warm {workload} restored different output bytes"
+        );
+
+        let changed_source = source.replace("41", "42");
+        anyhow::ensure!(
+            source.len() == changed_source.len(),
+            "source replacement changed length from {} to {}",
+            source.len(),
+            changed_source.len()
+        );
+        fs::write(workspace.path.join("src/lib.rs"), changed_source)?;
+        explicit_target_cargo(&workspace.path, cargo_home.path(), workload, target, None)?;
+        let changed = selected_profile_status(&workspace.path, cargo_home.path())?;
+        let changed_usage = &changed["status"]["installation"]["usage"];
+        anyhow::ensure!(
+            changed_usage["misses"] == expected_libraries + 1,
+            "same-size source replacement did not cause a miss: {changed_usage}"
+        );
+        anyhow::ensure!(
+            changed_usage["hits"] == warm_usage["hits"],
+            "same-size source replacement reused stale output: warm {warm_usage}; changed {changed_usage}"
+        );
+        anyhow::ensure!(
+            compiler_only_outputs(&outputs_directory)? != baseline,
+            "same-size source replacement restored the old library"
+        );
+        if let Some(host_outputs) = host_outputs {
+            anyhow::ensure!(
+                compiler_only_outputs(&workspace.path.join("target/debug/deps"))? == host_outputs,
+                "target cache activity changed the host build dependency"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn explicit_host_target_check_and_build_restore_exact_compiler_outputs() {
+    let result: Result<()> = (|| {
+        let version = Command::new("rustc").arg("-vV").output()?;
+        anyhow::ensure!(version.status.success(), "rustc -vV failed: {version:?}");
+        let verbose = String::from_utf8(version.stdout)?;
+        let host = verbose
+            .lines()
+            .find_map(|line| line.strip_prefix("host: "))
+            .context("rustc host target")?;
+        explicit_target_reuse(host, false)
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn cross_target_check_and_build_restore_libraries_without_changing_host_dependencies() {
+    let result: Result<()> = (|| {
+        let target = "x86_64-unknown-linux-gnu";
+        let installed = Command::new("rustup")
+            .args(["target", "list", "--installed"])
+            .output()?;
+        anyhow::ensure!(
+            installed.status.success(),
+            "cannot inspect installed targets: {installed:?}"
+        );
+        anyhow::ensure!(
+            String::from_utf8(installed.stdout)?
+                .lines()
+                .any(|installed| installed == target),
+            "cross-target cache qualification requires the {target} standard library declared in rust-toolchain.toml; run rustup target add {target}"
+        );
+        explicit_target_reuse(target, true)
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn explicit_default_linker_restores_the_exact_executable_and_mode() {
+    super::helpers::finish_test(explicit_linker_reuse(false));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn direct_rust_lld_restores_the_exact_executable_and_mode() {
+    super::helpers::finish_test(explicit_linker_reuse(true));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn dynamic_libraries_restore_after_rustc_removes_its_export_lists() {
+    let result: Result<()> = (|| {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let workspace = TestWorkspace::new_single_crate("export-lists", "0.1.0")?;
+        fs::write(
+            workspace.path.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"dylib\", \"cdylib\", \"macros\"]\nresolver = \"3\"\n\
+             [profile.dev]\ndebug = 1\nsplit-debuginfo = \"unpacked\"\n",
+        )?;
+        for (name, crate_type, source) in [
+            ("dylib", "dylib", "pub fn answer() -> u64 { 41 }\n"),
+            (
+                "cdylib",
+                "cdylib",
+                "#[unsafe(no_mangle)] pub extern \"C\" fn answer() -> u64 { 42 }\n",
+            ),
+            (
+                "macros",
+                "proc-macro",
+                "use proc_macro::TokenStream;\n\
+                 #[proc_macro] pub fn answer(_: TokenStream) -> TokenStream { \"43\".parse().unwrap() }\n",
+            ),
+        ] {
+            let directory = workspace.path.join(name);
+            fs::create_dir_all(directory.join("src"))?;
+            fs::write(
+                directory.join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"export-{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+                     [lib]\ncrate-type = [\"{crate_type}\"]\n"
+                ),
+            )?;
+            fs::write(directory.join("src/lib.rs"), source)?;
+        }
+        let version = Command::new("rustc").arg("-vV").output()?;
+        anyhow::ensure!(version.status.success(), "rustc prerequisite failed: {version:?}");
+        let verbose = String::from_utf8(version.stdout)?;
+        let host = verbose
+            .lines()
+            .find_map(|line| line.strip_prefix("host: "))
+            .context("rustc host")?;
+        let cargo_home = tempfile::tempdir()?;
+        let target = workspace.path.join("target");
+        explicit_target_cargo(&workspace.path, cargo_home.path(), "build", host, None)?;
+        let mut baseline = BTreeMap::new();
+        for directory in [target.join("debug/deps"), target.join(host).join("debug/deps")] {
+            if !directory.is_dir() {
+                continue;
+            }
+            for entry in fs::read_dir(directory)? {
+                let path = entry?.path();
+                if path.extension().is_some_and(|extension| extension == "dylib")
+                    || path
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().ends_with(".rcgu.o"))
+                {
+                    baseline.insert(
+                        path.strip_prefix(&target)?.to_path_buf(),
+                        (fs::read(&path)?, fs::metadata(&path)?.permissions().mode() & 0o777),
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            baseline
+                .keys()
+                .filter(|path| path.extension().is_some_and(|extension| extension == "dylib"))
+                .count(),
+            3,
+            "upstream dynamic-library inventory"
+        );
+        assert!(
+            baseline
+                .keys()
+                .any(|path| path.extension().is_some_and(|extension| extension == "o")),
+            "upstream separate debug objects are absent"
+        );
+        let setup = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "setup"])?;
+        assert!(setup.status.success(), "export-list cache setup failed: {setup:?}");
+        let reports = tempfile::tempdir()?;
+        for (phase, hits) in [("cold", 0), ("warm", 3)] {
+            fs::remove_dir_all(&target)?;
+            let recording = reports.path().join(format!("{phase}.json"));
+            let report_path = recording.to_str().context("export-list report path")?;
+            let start = rail(
+                &workspace.path,
+                cargo_home.path(),
+                &["rail", "cache", "report", "--start", report_path],
+            )?;
+            assert!(start.status.success(), "{phase} report start failed: {start:?}");
+            explicit_target_cargo(&workspace.path, cargo_home.path(), "build", host, Some(&recording))?;
+            let finish = rail(
+                &workspace.path,
+                cargo_home.path(),
+                &["rail", "cache", "report", "--finish", report_path, "-f", "json"],
+            )?;
+            assert!(finish.status.success(), "{phase} report finish failed: {finish:?}");
+            let report = json(&finish)?;
+            assert_eq!(report["measurements"]["hits"], hits, "{phase}: {report}");
+            assert_eq!(report["measurements"]["misses"], 3 - hits, "{phase}: {report}");
+            assert_eq!(report["measurements"]["failures"], 0, "{phase}: {report}");
+            for (path, (bytes, mode)) in &baseline {
+                let output = target.join(path);
+                assert!(fs::read(&output)? == *bytes, "{phase} changed {}", path.display());
+                assert_eq!(
+                    fs::metadata(&output)?.permissions().mode() & 0o777,
+                    *mode,
+                    "{phase} mode of {}",
+                    path.display()
+                );
+            }
+        }
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(target_os = "macos")]
+fn explicit_linker_reuse(direct_lld: bool) -> Result<()> {
+    (|| {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let version = Command::new("rustc").arg("-vV").output()?;
+        anyhow::ensure!(version.status.success(), "rustc -vV failed: {version:?}");
+        let verbose = String::from_utf8(version.stdout)?;
+        let host = verbose
+            .lines()
+            .find_map(|line| line.strip_prefix("host: "))
+            .context("rustc host target")?;
+        let (linker, flags) = if direct_lld {
+            let sysroot = Command::new("rustc").arg("--print=sysroot").output()?;
+            anyhow::ensure!(sysroot.status.success(), "rustc sysroot query failed: {sysroot:?}");
+            let sysroot = String::from_utf8(sysroot.stdout)?;
+            (
+                Path::new(sysroot.trim())
+                    .join("lib/rustlib")
+                    .join(host)
+                    .join("bin/rust-lld"),
+                "rustflags = [\"-Clinker-flavor=ld64.lld\"]\n",
+            )
+        } else {
+            (PathBuf::from("/usr/bin/cc"), "")
+        };
+        let workspace = TestWorkspace::new_single_crate("explicit-linker", "0.1.0")?;
+        let cargo_home = tempfile::tempdir()?;
+        fs::remove_file(workspace.path.join("src/lib.rs"))?;
+        fs::write(
+            workspace.path.join("src/main.rs"),
+            "fn main() { println!(\"explicit linker result\"); }\n",
+        )?;
+        fs::create_dir(workspace.path.join(".cargo"))?;
+        fs::write(
+            workspace.path.join(".cargo/config.toml"),
+            format!(
+                "[target.{host}]\nlinker = {}\n{flags}\n[profile.dev]\nsplit-debuginfo = \"off\"\n",
+                serde_json::to_string(linker.to_str().context("linker path")?)?
+            ),
+        )?;
+        explicit_target_cargo(&workspace.path, cargo_home.path(), "build", host, None)
+            .context("uncached upstream explicit-linker fixture must build before cache qualification")?;
+        let target_directory = workspace.path.join("target").join(host);
+        let executable = target_directory.join("debug/explicit-linker");
+        let baseline_bytes = fs::read(&executable)?;
+        let baseline_mode = fs::metadata(&executable)?.permissions().mode() & 0o777;
+        anyhow::ensure!(baseline_mode & 0o111 != 0, "upstream output has no executable mode");
+        let baseline_output = Command::new(&executable).output()?;
+        anyhow::ensure!(
+            baseline_output.status.success(),
+            "upstream executable failed: {baseline_output:?}"
+        );
+        anyhow::ensure!(
+            baseline_output.stdout == b"explicit linker result\n",
+            "upstream executable stdout changed: {baseline_output:?}"
+        );
+        anyhow::ensure!(baseline_output.stderr.is_empty(), "upstream executable emitted stderr");
+        let setup = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "setup"])?;
+        anyhow::ensure!(setup.status.success(), "explicit-linker cache setup failed: {setup:?}");
+
+        let reports = tempfile::tempdir()?;
+        for (phase, expected_hits) in [("cold", 0), ("warm", 1)] {
+            fs::remove_dir_all(&target_directory)?;
+            let recording = reports.path().join(format!("{phase}.json"));
+            let path = recording.to_str().context("explicit-linker report path")?;
+            let started = rail(
+                &workspace.path,
+                cargo_home.path(),
+                &["rail", "cache", "report", "--start", path],
+            )?;
+            anyhow::ensure!(started.status.success(), "{phase} report start failed: {started:?}");
+            explicit_target_cargo(&workspace.path, cargo_home.path(), "build", host, Some(&recording))?;
+            let finished = rail(
+                &workspace.path,
+                cargo_home.path(),
+                &["rail", "cache", "report", "--finish", path, "-f", "json"],
+            )?;
+            anyhow::ensure!(finished.status.success(), "{phase} report finish failed: {finished:?}");
+            let report = json(&finished)?;
+            let status = selected_profile_status(&workspace.path, cargo_home.path())?;
+            let usage = &status["status"]["installation"]["usage"];
+            anyhow::ensure!(
+                usage["misses"] == 1,
+                "{phase} explicit-linker build did not retain one verified miss: {usage}; report: {report}"
+            );
+            anyhow::ensure!(
+                usage["hits"] == expected_hits,
+                "{phase} explicit-linker build had the wrong reuse outcome: {usage}; report: {report}"
+            );
+            anyhow::ensure!(
+                fs::read(&executable)? == baseline_bytes,
+                "{phase} explicit-linker output differs from uncached bytes"
+            );
+            anyhow::ensure!(
+                fs::metadata(&executable)?.permissions().mode() & 0o777 == baseline_mode,
+                "{phase} explicit-linker executable mode changed"
+            );
+            let output = Command::new(&executable).output()?;
+            anyhow::ensure!(
+                output.status.success(),
+                "{phase} explicit-linker executable failed: {output:?}"
+            );
+            anyhow::ensure!(
+                output.stdout == baseline_output.stdout,
+                "{phase} executable stdout changed"
+            );
+            anyhow::ensure!(
+                output.stderr == baseline_output.stderr,
+                "{phase} executable stderr changed"
+            );
+        }
+        Ok(())
+    })()
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn cranelift_emitted_library_reuse_binds_backend_bytes_and_preserves_assembly_bypass() {
+    let result: Result<()> = (|| {
+        let toolchain = std::env::var("CARGO_RAIL_TEST_CRANELIFT_TOOLCHAIN")
+            .context("select the matched Cranelift test toolchain")?;
+        let workspace = TestWorkspace::new_single_crate("clif-fixture", "0.1.0")?;
+        let cargo_home = tempfile::tempdir()?;
+        let copied = tempfile::tempdir()?;
+        let original = Command::new("rustc")
+            .env("RUSTUP_TOOLCHAIN", &toolchain)
+            .args(["--print", "sysroot"])
+            .output()?;
+        anyhow::ensure!(original.status.success(), "Cranelift toolchain: {original:?}");
+        let sysroot = copied.path().join("sysroot");
+        let copied_output = Command::new("cp")
+            .arg("-cR")
+            .arg(String::from_utf8(original.stdout)?.trim())
+            .arg(&sysroot)
+            .output()?;
+        anyhow::ensure!(
+            copied_output.status.success(),
+            "private sysroot clone: {copied_output:?}"
+        );
+        let rustc = sysroot.join("bin/rustc");
+        let version = Command::new(&rustc).arg("-vV").output()?;
+        anyhow::ensure!(version.status.success(), "copied compiler: {version:?}");
+        let version = String::from_utf8(version.stdout)?;
+        let host = version
+            .lines()
+            .find_map(|line| line.strip_prefix("host: "))
+            .context("compiler host")?;
+        let backends = fs::read_dir(sysroot.join("lib/rustlib").join(host).join("codegen-backends"))?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let backend = backends
+            .iter()
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().contains("rustc_codegen_cranelift"))
+            })
+            .collect::<Vec<_>>();
+        let [backend] = backend.as_slice() else {
+            anyhow::bail!("expected one Cranelift backend");
+        };
+        let mut backend_bytes = fs::read(backend)?;
+        backend_bytes.push(0);
+        fs::write(backend, &backend_bytes)?;
+        fs::create_dir_all(workspace.path.join(".cargo"))?;
+        fs::write(
+            workspace.path.join(".cargo/config.toml"),
+            "[build]\nrustflags = [\"-Zcodegen-backend=cranelift\"]\n",
+        )?;
+        let source = workspace.path.join("src/lib.rs");
+        fs::write(&source, "pub fn value() -> u32 { 7 }\n")?;
+        let target = workspace.path.join("target");
+        let reports = tempfile::tempdir()?;
+        let recording = reports.path().join("cranelift.json");
+        let recording_path = recording.to_str().context("Cranelift recording path")?;
+        let run = |program: &Path, args: &[&str], cached: bool| -> Result<Output> {
+            let mut command = Command::new(program);
+            command
+                .current_dir(&workspace.path)
+                .args(args)
+                .env("RUSTUP_TOOLCHAIN", &toolchain)
+                .env("RUSTC", &rustc)
+                .env("CARGO_HOME", cargo_home.path())
+                .env("CARGO_TARGET_DIR", &target)
+                .env("CARGO_INCREMENTAL", "0")
+                .env_remove("CARGO_BUILD_TARGET")
+                .env_remove("RUSTFLAGS")
+                .env_remove("CARGO_ENCODED_RUSTFLAGS")
+                .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+                .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("CARGO_RAIL_CACHE")
+                .env_remove("CARGO_RAIL_CACHE_REMOTE")
+                .env_remove("CARGO_RAIL_CACHE_MODE")
+                .env_remove("CARGO_RAIL_CACHE_REMOTE_ENVIRONMENT")
+                .env_remove("CARGO_RAIL_CACHE_REPORT");
+            if cached && program == Path::new("cargo") {
+                command.env("CARGO_RAIL_CACHE_REPORT", &recording);
+            }
+            if cached {
+                command.env_remove("RUSTC_WRAPPER");
+            } else {
+                command.env("RUSTC_WRAPPER", "");
+            }
+            Ok(command.output()?)
+        };
+        let compile = |cached| run(Path::new("cargo"), &["build", "--offline", "--quiet"], cached);
+        let cli = Path::new(env!("CARGO_BIN_EXE_cargo-rail"));
+        let baseline = compile(false)?;
+        anyhow::ensure!(baseline.status.success(), "ordinary Cranelift: {baseline:?}");
+        let mut expected = directory_snapshot(&target.join("debug/deps"))?;
+        let modes = expected
+            .keys()
+            .map(|path| {
+                Ok((
+                    path.clone(),
+                    fs::metadata(target.join("debug/deps").join(path))?.permissions(),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let setup = run(cli, &["rail", "cache", "setup"], true)?;
+        anyhow::ensure!(setup.status.success(), "Cranelift cache setup: {setup:?}");
+        let started = run(cli, &["rail", "cache", "report", "--start", recording_path], true)?;
+        anyhow::ensure!(started.status.success(), "Cranelift report: {started:?}");
+        for (phase, misses, hits, value) in [
+            ("cold", 1, 0, 7),
+            ("warm", 1, 1, 7),
+            ("source changed", 2, 1, 8),
+            ("source warm", 2, 2, 8),
+            ("backend changed", 3, 2, 8),
+            ("backend warm", 3, 3, 8),
+        ] {
+            if phase == "source changed" {
+                fs::write(&source, "pub fn value() -> u32 { 8 }\n")?;
+            }
+            if phase == "backend changed" {
+                *backend_bytes.last_mut().context("backend trailer")? = 1;
+                fs::write(backend, &backend_bytes)?;
+            }
+            fs::remove_dir_all(&target)?;
+            let output = compile(true)?;
+            assert_eq!(output.status.code(), baseline.status.code(), "{phase}: {output:?}");
+            assert_eq!(output.stdout, baseline.stdout, "{phase}");
+            assert_eq!(output.stderr, baseline.stderr, "{phase}: {output:?}");
+            let status = run(
+                cli,
+                &["rail", "cache", "status", "--scope", "local", "-f", "json"],
+                true,
+            )?;
+            anyhow::ensure!(status.status.success(), "cache status: {status:?}");
+            let status = json(&status)?;
+            let usage = &status["status"]["installation"]["usage"];
+            if usage["misses"] != misses || usage["hits"] != hits {
+                let report = run(
+                    cli,
+                    &["rail", "cache", "report", "--finish", recording_path, "-f", "json"],
+                    true,
+                )?;
+                anyhow::bail!("{phase}: {status}; report: {}", String::from_utf8_lossy(&report.stdout));
+            }
+            assert_eq!(usage["misses"], misses, "{phase}: {status}");
+            assert_eq!(usage["hits"], hits, "{phase}: {status}");
+            let observed = directory_snapshot(&target.join("debug/deps"))?;
+            if phase == "source changed" {
+                assert_ne!(observed, expected, "source change must change emitted bytes");
+                expected = observed;
+            } else {
+                assert_eq!(observed, expected, "{phase} exact outputs");
+            }
+            for (path, mode) in &modes {
+                assert_eq!(
+                    &fs::metadata(target.join("debug/deps").join(path))?.permissions(),
+                    mode,
+                    "{phase}"
+                );
+            }
+            let consumer = copied.path().join("consumer.rs");
+            fs::write(&consumer, "fn main() { println!(\"{}\", clif_fixture::value()); }\n")?;
+            let executable = copied.path().join("consumer");
+            let linked = Command::new(&rustc)
+                .arg(&consumer)
+                .arg("--extern")
+                .arg(format!(
+                    "clif_fixture={}",
+                    target.join("debug/libclif_fixture.rlib").display()
+                ))
+                .arg("-o")
+                .arg(&executable)
+                .output()?;
+            anyhow::ensure!(linked.status.success(), "consume emitted rlib: {linked:?}");
+            let executed = Command::new(&executable).output()?;
+            anyhow::ensure!(executed.status.success(), "execute rlib consumer: {executed:?}");
+            assert_eq!(executed.stdout, format!("{value}\n").as_bytes());
+            assert!(executed.stderr.is_empty());
+        }
+        fs::write(
+            &source,
+            "pub fn value() -> u32 { 8 }\ncore::arch::global_asm!(\".byte 0\");\n",
+        )?;
+        fs::remove_dir_all(&target)?;
+        let assembly_baseline = compile(false)?;
+        anyhow::ensure!(
+            assembly_baseline.status.success(),
+            "ordinary assembly: {assembly_baseline:?}"
+        );
+        let assembly_outputs = directory_snapshot(&target.join("debug/deps"))?;
+        fs::remove_dir_all(&target)?;
+        let assembly = compile(true)?;
+        assert_eq!(assembly.status.code(), assembly_baseline.status.code(), "{assembly:?}");
+        assert_eq!(assembly.stdout, assembly_baseline.stdout);
+        assert_eq!(assembly.stderr, assembly_baseline.stderr);
+        assert_eq!(directory_snapshot(&target.join("debug/deps"))?, assembly_outputs);
+        let status = run(
+            cli,
+            &["rail", "cache", "status", "--scope", "local", "-f", "json"],
+            true,
+        )?;
+        anyhow::ensure!(status.status.success(), "assembly cache status: {status:?}");
+        let status = json(&status)?;
+        let usage = &status["status"]["installation"]["usage"];
+        assert_eq!(usage["misses"], 3, "{status}");
+        assert_eq!(usage["hits"], 3, "{status}");
+        assert_eq!(usage["bypasses"], 1, "{status}");
+        let finished = run(
+            cli,
+            &["rail", "cache", "report", "--finish", recording_path, "-f", "json"],
+            true,
+        )?;
+        anyhow::ensure!(finished.status.success(), "Cranelift report finish: {finished:?}");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[test]
+#[ignore = "requires GNU BFD and a C compiler; run actual linker-runtime qualification explicitly"]
+fn elf_link_adapter_rejects_a_runtime_loaded_only_during_linking() {
+    let result: Result<()> = (|| {
+        let root = tempfile::tempdir()?;
+        let source = root.path().join("native.c");
+        let object = root.path().join("native.o");
+        let observer_source = root.path().join("observer.c");
+        let observer = root.path().join("observer.so");
+        let plugin = root.path().join("extra.so");
+        fs::write(&source, "unsigned native_value(void) { return 7; }\n")?;
+        fs::write(
+            &observer_source,
+            r#"#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+__attribute__((constructor)) static void observe_link(void) {
+    char argv[16384];
+    int fd = open("/proc/self/cmdline", O_RDONLY);
+    if (fd < 0) return;
+    ssize_t len = read(fd, argv, sizeof(argv));
+    close(fd);
+    if (len <= 0 || !memmem(argv, (size_t)len, "--dependency-file=", 18)) return;
+    const char *marker = getenv("RAIL_LINK_EXECUTIONS");
+    if (marker) {
+        FILE *file = fopen(marker, "a");
+        if (file) { fputs("link execution\n", file); fclose(file); }
+    }
+    const char *plugin = getenv("RAIL_LINK_RUNTIME_PLUGIN");
+    if (plugin) dlopen(plugin, RTLD_NOW | RTLD_LOCAL);
+}
+"#,
+        )?;
+        for arguments in [
+            vec![
+                "-fPIC".into(),
+                "-c".into(),
+                source.as_os_str().to_owned(),
+                "-o".into(),
+                object.as_os_str().to_owned(),
+            ],
+            vec![
+                "-fPIC".into(),
+                "-shared".into(),
+                source.as_os_str().to_owned(),
+                "-o".into(),
+                plugin.as_os_str().to_owned(),
+            ],
+            vec![
+                "-fPIC".into(),
+                "-shared".into(),
+                observer_source.as_os_str().to_owned(),
+                "-ldl".into(),
+                "-o".into(),
+                observer.as_os_str().to_owned(),
+            ],
+        ] {
+            let compiled = Command::new("cc").args(arguments).output()?;
+            anyhow::ensure!(compiled.status.success(), "C fixture compilation: {compiled:?}");
+        }
+        let selected = Command::new("sh").args(["-c", "command -v ld.bfd"]).output()?;
+        anyhow::ensure!(selected.status.success(), "BFD prerequisite: {selected:?}");
+        let linker = PathBuf::from(String::from_utf8(selected.stdout)?.trim());
+        for late_runtime in [false, true] {
+            let attempt = tempfile::tempdir_in(root.path())?;
+            let output = attempt.path().join("libnative.so");
+            let marker = attempt.path().join("executions");
+            let certificate = attempt.path().join("elf-linker-dependencies.d");
+            let evidence = attempt.path().join("elf-linker-driver-inputs.json");
+            let configure = |command: &mut Command| {
+                command
+                    .arg("-shared")
+                    .arg(&object)
+                    .arg("-o")
+                    .arg(&output)
+                    .env("LD_PRELOAD", &observer)
+                    .env("RAIL_LINK_EXECUTIONS", &marker)
+                    .env_remove("LD_DEBUG")
+                    .env_remove("LD_DEBUG_OUTPUT")
+                    .env_remove("LD_TRACE_LOADED_OBJECTS")
+                    .env_remove("RAIL_LINK_RUNTIME_PLUGIN");
+                if late_runtime {
+                    command.env("RAIL_LINK_RUNTIME_PLUGIN", &plugin);
+                }
+            };
+            let mut ordinary = Command::new(&linker);
+            configure(&mut ordinary);
+            let ordinary = ordinary.output()?;
+            anyhow::ensure!(ordinary.status.success(), "ordinary link: {ordinary:?}");
+            let bytes = fs::read(&output)?;
+            let mode = fs::metadata(&output)?.permissions();
+            fs::remove_file(&output)?;
+            let mut adapter = Command::new(env!("CARGO_BIN_EXE_cargo-rail"));
+            configure(&mut adapter);
+            adapter
+                .env("CARGO_RAIL_ELF_LINK_ADAPTER", "1")
+                .env("CARGO_RAIL_ELF_LINK_DRIVER", &linker)
+                .env("CARGO_RAIL_ELF_LINK_DEPENDENCIES", &certificate)
+                .env("CARGO_RAIL_ELF_LINK_DRIVER_INPUTS", &evidence);
+            let observed = adapter.output()?;
+            assert_eq!(observed.status.code(), ordinary.status.code(), "{observed:?}");
+            assert_eq!(observed.stdout, ordinary.stdout);
+            assert_eq!(observed.stderr, ordinary.stderr);
+            assert_eq!(fs::read(&output)?, bytes);
+            assert_eq!(fs::metadata(&output)?.permissions(), mode);
+            assert_eq!(fs::read(&marker)?, b"link execution\n", "linker must execute once");
+            let record: serde_json::Value = serde_json::from_slice(&fs::read(&evidence)?)?;
+            assert_eq!(record["completed"], !late_runtime, "{record}");
+        }
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires mold, a C compiler, ar and Python; run the direct ELF linker contract explicitly"]
+fn direct_mold_reuse_tracks_selected_libraries_and_tool_bytes() {
+    elf_linker_reuse("mold", false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires GNU BFD, a C compiler, ar and Python; run the direct ELF linker contract explicitly"]
+fn direct_bfd_reuse_tracks_selected_libraries_and_tool_bytes() {
+    elf_linker_reuse("ld.bfd", false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires GNU gold, a C compiler, ar and Python; run the direct ELF linker contract explicitly"]
+fn direct_gold_reuse_tracks_selected_libraries_and_tool_bytes() {
+    elf_linker_reuse("ld.gold", false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires GCC, collect2, GNU ld, liblto_plugin, ar and Python; run the GCC linker contract explicitly"]
+fn gcc_driver_reuse_tracks_selected_tools_and_plugin_bytes() {
+    elf_linker_reuse("gcc", false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires GCC, collect2, GNU ld, liblto_plugin, ar and Python; run the default GCC contract explicitly"]
+fn default_gcc_driver_reuse_tracks_selected_tools_and_plugin_bytes() {
+    elf_linker_reuse("gcc", true);
+}
+
+#[cfg(target_os = "linux")]
+fn elf_linker_reuse(linker_name: &str, default_gcc: bool) {
+    let result: Result<()> = (|| {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let workspace = TestWorkspace::new_single_crate("direct-elf", "0.1.0")?;
+        let cargo_home = tempfile::tempdir()?;
+        let coverage = tempfile::tempdir()?;
+        fs::set_permissions(coverage.path(), fs::Permissions::from_mode(0o700))?;
+        let selected_linker = Command::new("sh")
+            .args(["-c", "command -v \"$1\"", "select-linker", linker_name])
+            .output()?;
+        anyhow::ensure!(
+            selected_linker.status.success(),
+            "{linker_name} prerequisite: {selected_linker:?}"
+        );
+        let mut tool_bytes = fs::read(String::from_utf8(selected_linker.stdout)?.trim())?;
+        tool_bytes.push(0);
+        let linker = if linker_name == "gcc" {
+            let bin = workspace.path.join("gcc-installation/bin");
+            fs::create_dir_all(&bin)?;
+            bin.join(if default_gcc { "cc" } else { "gcc" })
+        } else {
+            workspace.path.join(linker_name)
+        };
+        fs::write(&linker, &tool_bytes)?;
+        fs::set_permissions(&linker, fs::Permissions::from_mode(0o700))?;
+        let mut tools = vec![(linker.clone(), tool_bytes)];
+        if linker_name == "gcc" {
+            let query = |argument: &str| -> Result<String> {
+                let output = Command::new("gcc").arg(argument).output()?;
+                anyhow::ensure!(output.status.success(), "GCC {argument} prerequisite: {output:?}");
+                Ok(String::from_utf8(output.stdout)?.trim().to_string())
+            };
+            let triple = query("-dumpmachine")?;
+            let version = query("-dumpversion")?;
+            let installation = workspace.path.join("gcc-installation");
+            let library = installation.join("lib/gcc").join(&triple).join(&version);
+            let linker_directory = installation.join(&triple).join("bin");
+            fs::create_dir_all(&library)?;
+            fs::create_dir_all(&linker_directory)?;
+            for (name, query_argument, directory, mutate) in [
+                ("collect2", "-print-prog-name=collect2", &library, true),
+                ("ld", "-print-prog-name=ld", &linker_directory, true),
+                ("liblto_plugin.so", "-print-file-name=liblto_plugin.so", &library, true),
+                ("lto-wrapper", "-print-prog-name=lto-wrapper", &library, false),
+                ("crtbeginS.o", "-print-file-name=crtbeginS.o", &library, false),
+                ("crtendS.o", "-print-file-name=crtendS.o", &library, false),
+            ] {
+                let selection = query(query_argument)?;
+                let source = if Path::new(&selection).is_absolute() {
+                    PathBuf::from(selection)
+                } else {
+                    let resolved = Command::new("sh")
+                        .args(["-c", "command -v \"$1\"", "select-gcc-tool", &selection])
+                        .output()?;
+                    anyhow::ensure!(resolved.status.success(), "resolve GCC {name}: {resolved:?}");
+                    PathBuf::from(String::from_utf8(resolved.stdout)?.trim())
+                };
+                let mut bytes = fs::read(source)?;
+                if mutate {
+                    bytes.push(0);
+                }
+                let path = directory.join(name);
+                fs::write(&path, &bytes)?;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+                let selected = Command::new(&linker).arg(query_argument).output()?;
+                anyhow::ensure!(selected.status.success(), "private GCC selection: {selected:?}");
+                assert_eq!(
+                    fs::canonicalize(String::from_utf8(selected.stdout)?.trim())?,
+                    fs::canonicalize(&path)?,
+                    "GCC must select the private {name} before its mutation is exercised"
+                );
+                if mutate {
+                    tools.push((path, bytes));
+                }
+            }
+        }
+        let early = workspace.path.join("early");
+        let selected = workspace.path.join("selected");
+        fs::create_dir(&selected)?;
+        let build_library = |directory: &Path, value: u32| -> Result<()> {
+            fs::create_dir_all(directory)?;
+            let source = directory.join("native.c");
+            let object = directory.join("native.o");
+            fs::write(
+                &source,
+                format!("unsigned cache_native_value(void) {{ return {value}; }}\n"),
+            )?;
+            let compiled = Command::new("cc")
+                .args(["-fPIC", "-c"])
+                .arg(&source)
+                .arg("-o")
+                .arg(&object)
+                .output()?;
+            anyhow::ensure!(compiled.status.success(), "C prerequisite: {compiled:?}");
+            let archived = Command::new("ar")
+                .arg("crs")
+                .arg(directory.join("libcache_native.a"))
+                .arg(&object)
+                .output()?;
+            anyhow::ensure!(archived.status.success(), "archive prerequisite: {archived:?}");
+            Ok(())
+        };
+        build_library(&selected, 7)?;
+        fs::write(
+            workspace.path.join("Cargo.toml"),
+            "[package]\nname = \"direct-elf\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\
+             [lib]\ncrate-type = [\"cdylib\"]\n[profile.dev]\npanic = \"abort\"\ndebug = 0\n",
+        )?;
+        fs::write(
+            workspace.path.join("src/lib.rs"),
+            "#![no_std]\n#[link(name = \"cache_native\", kind = \"static\")]\n\
+             unsafe extern \"C\" { fn cache_native_value() -> u32; }\n\
+             #[unsafe(no_mangle)] pub extern \"C\" fn cache_linker_value() -> u32 { unsafe { cache_native_value() } }\n\
+             #[panic_handler] fn panic(_: &core::panic::PanicInfo<'_>) -> ! { loop {} }\n",
+        )?;
+        fs::create_dir(workspace.path.join(".cargo"))?;
+        let mut flags = vec![
+            format!("-Clinker-flavor={}", if linker_name == "gcc" { "gcc" } else { "ld" }),
+            format!("-Lnative={}", early.display()),
+            format!("-Lnative={}", selected.display()),
+        ];
+        if !default_gcc {
+            flags.push(format!("-Clinker={}", linker.display()));
+        }
+        let inherited_path = std::env::var_os("PATH").context("toolchain PATH")?;
+        let path = if default_gcc {
+            std::env::join_paths(
+                std::iter::once(linker.parent().context("private GCC bin directory")?.to_path_buf())
+                    .chain(std::env::split_paths(&inherited_path)),
+            )?
+        } else {
+            inherited_path
+        };
+        fs::write(
+            workspace.path.join(".cargo/config.toml"),
+            format!("[build]\nrustflags = {}\n", serde_json::to_string(&flags)?),
+        )?;
+        let target = workspace.path.join("target");
+        let compile = || -> Result<Output> {
+            Ok(Command::new("cargo")
+                .current_dir(&workspace.path)
+                .args(["build", "--offline", "--quiet"])
+                .env("PATH", &path)
+                .env("CARGO_HOME", cargo_home.path())
+                .env("CARGO_TARGET_DIR", &target)
+                .env("CARGO_INCREMENTAL", "0")
+                .env("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1")
+                .env("CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY", coverage.path())
+                .env_remove("CARGO_BUILD_TARGET")
+                .env_remove("RUSTC_WRAPPER")
+                .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+                .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("RUSTFLAGS")
+                .env_remove("CARGO_ENCODED_RUSTFLAGS")
+                .env_remove("CARGO_RAIL_CACHE_REMOTE")
+                .env_remove("CARGO_RAIL_CACHE_MODE")
+                .env_remove("CARGO_RAIL_CACHE_REMOTE_ENVIRONMENT")
+                .env_remove("CARGO_RAIL_CACHE_REPORT")
+                .output()?)
+        };
+        let baseline = compile()?;
+        anyhow::ensure!(baseline.status.success(), "ordinary {linker_name} build: {baseline:?}");
+        let mut expected_outputs = directory_snapshot(&target.join("debug/deps"))?;
+        let expected_modes = expected_outputs
+            .keys()
+            .map(|path| {
+                Ok((
+                    path.clone(),
+                    fs::metadata(target.join("debug/deps").join(path))?.permissions().mode(),
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let setup = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "setup"])?;
+        anyhow::ensure!(setup.status.success(), "{linker_name} cache setup: {setup:?}");
+        let mut phases = vec![
+            ("cold".to_string(), 1, 0, 7, None),
+            ("warm".to_string(), 1, 1, 7, None),
+            ("library changed".to_string(), 2, 1, 8, None),
+            ("library warm".to_string(), 2, 2, 8, None),
+        ];
+        let (mut misses, mut hits) = (2, 2);
+        for (index, (path, _)) in tools.iter().enumerate() {
+            misses += 1;
+            phases.push((
+                format!("tool changed: {}", path.display()),
+                misses,
+                hits,
+                8,
+                Some(index),
+            ));
+            hits += 1;
+            phases.push((format!("tool warm: {}", path.display()), misses, hits, 8, None));
+        }
+        phases.push(("earlier candidate".to_string(), misses + 1, hits, 9, None));
+        phases.push(("earlier warm".to_string(), misses + 1, hits + 1, 9, None));
+        for (phase, misses, hits, value, changed_tool) in phases {
+            if phase == "library changed" {
+                let length = fs::metadata(selected.join("libcache_native.a"))?.len();
+                build_library(&selected, value)?;
+                assert_eq!(fs::metadata(selected.join("libcache_native.a"))?.len(), length);
+            } else if let Some(index) = changed_tool {
+                let (path, bytes) = &mut tools[index];
+                *bytes.last_mut().context("tool trailer")? = 1;
+                fs::write(path, bytes)?;
+            } else if phase == "earlier candidate" {
+                build_library(&early, value)?;
+            }
+            fs::remove_dir_all(&target)?;
+            let output = compile()?;
+            assert_eq!(output.status.code(), baseline.status.code(), "{phase}: {output:?}");
+            assert_eq!(output.stdout, baseline.stdout, "{phase} compiler stdout");
+            assert_eq!(
+                output.stderr,
+                baseline.stderr,
+                "{phase} compiler stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let status = selected_profile_status(&workspace.path, cargo_home.path())?;
+            let usage = &status["status"]["installation"]["usage"];
+            let events = directory_snapshot(coverage.path())?
+                .values()
+                .map(|bytes| serde_json::from_slice::<serde_json::Value>(bytes))
+                .collect::<Result<Vec<_>, _>>()?;
+            assert_eq!(usage["misses"], misses, "{phase}: {status}; events: {events:?}");
+            assert_eq!(usage["hits"], hits, "{phase}: {status}");
+            let outputs = directory_snapshot(&target.join("debug/deps"))?;
+            if matches!(phase.as_str(), "library changed" | "earlier candidate") {
+                assert_ne!(outputs, expected_outputs, "{phase} must affect linked bytes");
+                expected_outputs = outputs;
+            } else {
+                assert_eq!(outputs, expected_outputs, "{phase} exact compiler output inventory");
+            }
+            for (path, mode) in &expected_modes {
+                assert_eq!(
+                    fs::metadata(target.join("debug/deps").join(path))?.permissions().mode(),
+                    *mode,
+                    "{phase}"
+                );
+            }
+            let executed = Command::new("python3")
+                .args([
+                    "-c",
+                    "import ctypes, sys; print(ctypes.CDLL(sys.argv[1]).cache_linker_value())",
+                ])
+                .arg(target.join("debug/libdirect_elf.so"))
+                .output()?;
+            assert!(executed.status.success(), "{phase}: {executed:?}");
+            assert_eq!(executed.stdout, format!("{value}\n").as_bytes(), "{phase}");
+            assert!(executed.stderr.is_empty(), "{phase}: {executed:?}");
+        }
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn cache_setup_preserves_the_implicit_linker_selected_from_path() {
+    let result: Result<()> = (|| {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let workspace = TestWorkspace::new_single_crate("path-linker", "0.1.0")?;
+        let cargo_home = tempfile::tempdir()?;
+        let tools = tempfile::tempdir()?;
+        let driver = tools.path().join("cc");
+        let selected_log = tools.path().join("selected.log");
+        let recording = tools.path().join("report.json");
+        let report_path = recording.to_str().context("PATH linker report path")?;
+        fs::write(
+            &driver,
+            "#!/bin/sh\nprintf 'selected cc\\n' >> \"$SELECTED_CC_LOG\"\nexec /usr/bin/cc \"$@\"\n",
+        )?;
+        fs::set_permissions(&driver, fs::Permissions::from_mode(0o755))?;
+        let inherited_path = std::env::var_os("PATH").context("toolchain PATH")?;
+        let path = std::env::join_paths(
+            std::iter::once(tools.path().to_path_buf()).chain(std::env::split_paths(&inherited_path)),
+        )?;
+        fs::remove_file(workspace.path.join("src/lib.rs"))?;
+        fs::write(
+            workspace.path.join("src/main.rs"),
+            "fn main() { println!(\"selected linker result\"); }\n",
+        )?;
+
+        for phase in ["upstream", "installed"] {
+            if phase == "installed" {
+                let setup = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "setup"])?;
+                assert!(setup.status.success(), "PATH linker cache setup failed: {setup:?}");
+                fs::remove_dir_all(workspace.path.join("target"))?;
+                let started = rail(
+                    &workspace.path,
+                    cargo_home.path(),
+                    &["rail", "cache", "report", "--start", report_path],
+                )?;
+                assert!(started.status.success(), "PATH linker report start failed: {started:?}");
+            }
+            fs::write(&selected_log, b"")?;
+            let mut command = Command::new("cargo");
+            for (name, _) in std::env::vars_os() {
+                if name.to_str().is_some_and(|name| {
+                    name.starts_with("CARGO_RAIL_") || name.starts_with("CARGO_TARGET_") && name.ends_with("_LINKER")
+                }) {
+                    command.env_remove(name);
+                }
+            }
+            command
+                .current_dir(&workspace.path)
+                .args(["build", "--offline", "--quiet"])
+                .env("CARGO_HOME", cargo_home.path())
+                .env("CARGO_INCREMENTAL", "0")
+                .env("CARGO_TARGET_DIR", workspace.path.join("target"))
+                .env("PATH", &path)
+                .env("SELECTED_CC_LOG", &selected_log)
+                .env_remove("CARGO_BUILD_TARGET")
+                .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+                .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("RUSTC_WRAPPER")
+                .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("RUSTFLAGS")
+                .env_remove("CARGO_ENCODED_RUSTFLAGS")
+                .env_remove("OUT_DIR");
+            if phase == "installed" {
+                command.env("CARGO_RAIL_CACHE_REPORT", &recording);
+            }
+            let built = command.output()?;
+            assert!(built.status.success(), "{phase} PATH linker build failed: {built:?}");
+            assert_eq!(
+                fs::read(&selected_log)?,
+                b"selected cc\n",
+                "{phase} build did not execute the selected PATH linker exactly once"
+            );
+            let output = Command::new(workspace.path.join("target/debug/path-linker")).output()?;
+            assert!(output.status.success(), "{phase} executable failed: {output:?}");
+            assert_eq!(output.stdout, b"selected linker result\n");
+            assert!(output.stderr.is_empty());
+        }
+        let finished = rail(
+            &workspace.path,
+            cargo_home.path(),
+            &["rail", "cache", "report", "--finish", report_path, "-f", "json"],
+        )?;
+        assert!(
+            finished.status.success(),
+            "PATH linker report finish failed: {finished:?}"
+        );
+        let report = json(&finished)?;
+        assert_eq!(
+            report["measurements"]["bypass_reasons"]["default_linker_execution_evidence_unavailable"], 1,
+            "custom PATH linker must execute normally without cache admission: {report}"
+        );
+        assert_eq!(report["measurements"]["misses"], 0, "{report}");
+        assert_eq!(report["measurements"]["hits"], 0, "{report}");
+        assert_eq!(report["measurements"]["failures"], 0, "{report}");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn apple_link_adapter_retry_certifies_only_the_successful_attempt() {
+    let result: Result<()> = (|| {
+        let fixture = tempfile::tempdir()?;
+        let directory = fs::canonicalize(fixture.path())?;
+        let source = directory.join("main.c");
+        let object = directory.join("main.o");
+        let missing = directory.join("missing.o");
+        let executable = directory.join("linked");
+        let certificate = directory.join("apple-linker-dependencies.bin");
+        let driver_inputs = directory.join("apple-linker-driver-inputs.json");
+        fs::write(
+            &source,
+            "#include <stdio.h>\nint main(void) { puts(\"adapter retry result\"); return 0; }\n",
+        )?;
+        let compiled = Command::new("/usr/bin/cc")
+            .arg("-c")
+            .arg(&source)
+            .arg("-o")
+            .arg(&object)
+            .output()?;
+        assert!(
+            compiled.status.success(),
+            "adapter object prerequisite failed: {compiled:?}"
+        );
+
+        let adapter = |inputs: &[&Path]| -> Result<Output> {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-rail"));
+            for (name, _) in std::env::vars_os() {
+                if name.to_str().is_some_and(|name| name.starts_with("CARGO_RAIL_")) {
+                    command.env_remove(name);
+                }
+            }
+            command
+                .current_dir(&directory)
+                .args(inputs)
+                .arg("-o")
+                .arg(&executable)
+                .env("CARGO_RAIL_APPLE_LINK_ADAPTER", "1")
+                .env("CARGO_RAIL_APPLE_LINK_DRIVER", "/usr/bin/cc")
+                .env("CARGO_RAIL_APPLE_LINK_CERTIFICATE", &certificate)
+                .env("CARGO_RAIL_APPLE_LINK_DRIVER_INPUTS", &driver_inputs)
+                .output()
+                .context("run the real Apple linker adapter")
+        };
+        let ordinary_failure = Command::new("/usr/bin/cc")
+            .arg(&missing)
+            .arg(&object)
+            .arg("-o")
+            .arg(&executable)
+            .output()?;
+        assert!(!ordinary_failure.status.success());
+        let failed = adapter(&[&missing, &object])?;
+        assert_eq!(failed.status.code(), ordinary_failure.status.code(), "{failed:?}");
+        assert_eq!(failed.stdout, ordinary_failure.stdout);
+        assert_eq!(failed.stderr, ordinary_failure.stderr);
+        assert!(!executable.exists());
+        assert!(
+            fs::read(&driver_inputs)?.is_empty(),
+            "failed driver probing must not certify an invocation"
+        );
+
+        let completed = adapter(&[&object])?;
+        assert!(completed.status.success(), "adapter retry failed: {completed:?}");
+        assert!(completed.stdout.is_empty(), "{completed:?}");
+        assert!(completed.stderr.is_empty(), "{completed:?}");
+        let evidence: serde_json::Value = serde_json::from_slice(&fs::read(&driver_inputs)?)?;
+        assert_eq!(evidence["completed"], true, "{evidence}");
+        assert_eq!(evidence["direct_inputs"], serde_json::json!([object]));
+        assert!(fs::metadata(&certificate)?.len() > 0);
+        let output = Command::new(&executable).output()?;
+        assert!(output.status.success(), "retried link output failed: {output:?}");
+        assert_eq!(output.stdout, b"adapter retry result\n");
+        assert!(output.stderr.is_empty());
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
 #[test]
 fn setup_check_in_a_source_checkout_reports_the_missing_component_recovery() {
     let result: Result<()> = (|| {
@@ -889,6 +2332,98 @@ fn markerless_local_cas_recovery_quarantines_every_byte_before_reinitializing() 
     super::helpers::finish_test(result);
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn distributed_worker_revalidates_a_cross_target_library_before_local_admission() {
+    let result: Result<()> = (|| {
+        let target = "x86_64-unknown-linux-gnu";
+        let workspace = TestWorkspace::new_single_crate("distributed_cross_target", "0.1.0")?;
+        fs::write(workspace.path.join("src/lib.rs"), "pub const VALUE: u64 = 41;\n")?;
+        let cargo_home = tempfile::tempdir()?;
+        let coverage = tempfile::tempdir()?;
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(coverage.path(), fs::Permissions::from_mode(0o700))?;
+        let coverage = fs::canonicalize(coverage.path())?;
+        let build = || {
+            Command::new("cargo")
+                .current_dir(&workspace.path)
+                .args(["build", "--offline", "--release", "--lib", "--target", target])
+                .env("CARGO_HOME", cargo_home.path())
+                .env("CARGO_INCREMENTAL", "0")
+                .env("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1")
+                .env("CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY", &coverage)
+                .env_remove("OUT_DIR")
+                .env_remove("RUSTFLAGS")
+                .env_remove("CARGO_ENCODED_RUSTFLAGS")
+                .env_remove("RUSTC_WRAPPER")
+                .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .output()
+        };
+        let upstream = build()?;
+        anyhow::ensure!(
+            upstream.status.success(),
+            "uncached cross-target compilation failed: {upstream:?}"
+        );
+        let outputs = workspace.path.join("target").join(target).join("release/deps");
+        let baseline = compiler_only_outputs(&outputs)?;
+        anyhow::ensure!(baseline.len() == 2, "uncached metadata/rlib contract is incomplete");
+        let setup = rail(
+            &workspace.path,
+            cargo_home.path(),
+            &["rail", "cache", "setup", "--distributed-local"],
+        )?;
+        anyhow::ensure!(setup.status.success(), "worker fixture setup failed: {setup:?}");
+        fs::remove_dir_all(workspace.path.join("target"))?;
+        let seeded = build()?;
+        anyhow::ensure!(seeded.status.success(), "target environment seed failed: {seeded:?}");
+        anyhow::ensure!(
+            compiler_only_outputs(&outputs)? == baseline,
+            "local capture changed uncached output bytes"
+        );
+        let cache_root = selected_profile_cache_root(&workspace.path, cargo_home.path())?;
+        fs::remove_dir_all(workspace.path.join("target"))?;
+        for entry in fs::read_dir(cache_root.join("native-actions-v2"))? {
+            fs::remove_file(entry?.path())?;
+        }
+        for entry in fs::read_dir(&coverage)? {
+            fs::remove_file(entry?.path())?;
+        }
+        let distributed = build()?;
+        let events = coverage_events(&coverage)?;
+        anyhow::ensure!(
+            distributed.status.success(),
+            "cross-target worker compilation failed: {distributed:?}"
+        );
+        anyhow::ensure!(
+            events
+                .iter()
+                .any(|event| event["reason"] == "verified_distributed_execution"),
+            "cross-target operation never crossed worker admission: {:?}; {}",
+            events
+                .iter()
+                .map(|event| (&event["crate_name"], &event["status"], &event["reason"]))
+                .collect::<Vec<_>>(),
+            String::from_utf8_lossy(&distributed.stderr)
+        );
+        anyhow::ensure!(
+            compiler_only_outputs(&outputs)? == baseline,
+            "worker changed uncached target bytes"
+        );
+        fs::write(workspace.path.join("src/lib.rs"), "pub const VALUE: u64 = 42;\n")?;
+        let changed = build()?;
+        anyhow::ensure!(
+            changed.status.success(),
+            "changed target compilation failed: {changed:?}"
+        );
+        anyhow::ensure!(
+            compiler_only_outputs(&outputs)? != baseline,
+            "same-size input change reused stale worker output"
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
 #[test]
 fn receipt_qualified_local_distribution_executes_an_ordinary_cargo_library() {
     let result: Result<()> = (|| {
@@ -1021,8 +2556,8 @@ fn receipt_qualified_local_distribution_executes_an_ordinary_cargo_library() {
         );
         assert!(
             !diagnostics
-                .windows(b"/cargo-rail/exec/v3".len())
-                .any(|window| window == b"/cargo-rail/exec/v3"),
+                .windows(b"/cargo-rail/exec/v5".len())
+                .any(|window| window == b"/cargo-rail/exec/v5"),
             "distributed virtual paths escaped into Cargo diagnostics: {failed:?}"
         );
 
@@ -1755,9 +3290,74 @@ fn interrupted_profile_replace_retries_to_one_canonical_result() {
 }
 
 #[test]
-fn v0_25_policy_migrates_to_unbound_pre_profile_state_and_cleans_up_idempotently() {
+fn pre_profile_receipt_is_refused_without_changing_installation_or_cache() {
     let result: Result<()> = (|| {
-        let workspace = TestWorkspace::new_single_crate("profile-v0-25-migration", "0.1.0")?;
+        let workspace = TestWorkspace::new_single_crate("pre-profile-refusal", "0.1.0")?;
+        let cargo_home = tempfile::tempdir()?;
+        let setup = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "setup"])?;
+        anyhow::ensure!(setup.status.success(), "fixture setup failed: {setup:?}");
+        let cache_root = selected_profile_cache_root(&workspace.path, cargo_home.path())?;
+        let sentinel = cache_root.join("retained-user-data");
+        fs::write(&sentinel, b"preserve exact bytes")?;
+        let store = cargo_home.path().join("cargo-rail/cache-profiles-v1");
+        let profile_path = fs::read_dir(store.join("profiles"))?
+            .next()
+            .transpose()?
+            .context("fixture profile")?
+            .path();
+        let profile: serde_json::Value = serde_json::from_slice(&fs::read(profile_path)?)?;
+        let receipt_path = cargo_home.path().join("cargo-rail/compiler-cache-v1/setup.json");
+        let mut receipt: serde_json::Value = serde_json::from_slice(&fs::read(&receipt_path)?)?;
+        receipt["version"] = serde_json::json!(3);
+        receipt["cache"] = profile["cache"].clone();
+        receipt["root_portability"] = profile["root_portability"].clone();
+        let receipt_bytes = serde_json::to_vec_pretty(&receipt)?;
+        fs::write(&receipt_path, &receipt_bytes)?;
+        let config_path = cargo_home.path().join("config.toml");
+        let config_before = fs::read(&config_path)?;
+        fs::remove_dir_all(&store)?;
+        for args in [
+            vec!["rail", "cache", "setup", "--check"],
+            vec!["rail", "cache", "setup"],
+            vec!["rail", "cache", "uninstall"],
+        ] {
+            let refused = rail(&workspace.path, cargo_home.path(), &args)?;
+            anyhow::ensure!(
+                !refused.status.success(),
+                "pre-profile receipt was adopted: {refused:?}"
+            );
+            let diagnostic = String::from_utf8_lossy(&refused.stderr);
+            anyhow::ensure!(
+                diagnostic.contains("explicit removal before setup") && diagnostic.contains("v0.25"),
+                "missing explicit transition: {diagnostic}"
+            );
+            anyhow::ensure!(
+                fs::read(&receipt_path)? == receipt_bytes && fs::read(&config_path)? == config_before,
+                "refusal changed installation authority"
+            );
+            anyhow::ensure!(
+                fs::read(&sentinel)? == b"preserve exact bytes" && !store.exists(),
+                "refusal changed retained data or created profile state"
+            );
+        }
+        let compiled = cargo_check(&workspace.path, cargo_home.path(), None, None)?;
+        anyhow::ensure!(
+            compiled.status.success(),
+            "old receipt prevented ordinary Cargo compilation: {compiled:?}"
+        );
+        anyhow::ensure!(
+            fs::read(&receipt_path)? == receipt_bytes && !store.exists(),
+            "compiler fallback adopted old installation state"
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn retained_pre_profile_state_cleans_up_without_adopting_its_policy() {
+    let result: Result<()> = (|| {
+        let workspace = TestWorkspace::new_single_crate("retained-pre-profile-cleanup", "0.1.0")?;
         let cargo_home = tempfile::tempdir()?;
         let remote = LoopbackS3::start()?;
         let remote_url = remote.remote_url();
@@ -1776,7 +3376,7 @@ fn v0_25_policy_migrates_to_unbound_pre_profile_state_and_cleans_up_idempotently
                 "remap",
             ],
         )?;
-        assert!(setup.status.success(), "migration fixture setup failed: {setup:?}");
+        assert!(setup.status.success(), "retained-state fixture setup failed: {setup:?}");
         let old_cache_root = selected_profile_cache_root(&workspace.path, cargo_home.path())?;
         let old_status = selected_profile_status(&workspace.path, cargo_home.path())?;
         let old_remote_authority = old_status["status"]["remote"]["authority"].clone();
@@ -1785,36 +3385,28 @@ fn v0_25_policy_migrates_to_unbound_pre_profile_state_and_cleans_up_idempotently
         let profile_path = fs::read_dir(store.join("profiles"))?
             .next()
             .transpose()?
-            .context("migration fixture profile record")?
+            .context("retained-state fixture profile record")?
             .path();
         let profile: serde_json::Value = serde_json::from_slice(&fs::read(profile_path)?)?;
         let receipt_path = cargo_home.path().join("cargo-rail/compiler-cache-v1/setup.json");
-        let mut receipt: serde_json::Value = serde_json::from_slice(&fs::read(&receipt_path)?)?;
-        receipt["version"] = serde_json::json!(3);
-        receipt["cache"] = profile["cache"].clone();
-        receipt["remote"] = profile["remote"].clone();
-        receipt["root_portability"] = profile["root_portability"].clone();
-        let mut receipt_bytes = serde_json::to_vec_pretty(&receipt)?;
-        receipt_bytes.push(b'\n');
-        fs::write(&receipt_path, receipt_bytes)?;
+        let receipt: serde_json::Value = serde_json::from_slice(&fs::read(&receipt_path)?)?;
+        let retained_bytes = format!(
+            "{{\"version\":1,\"installation_authority\":{},\"cache\":{},\"remote\":{{\"version\":{},\"normalized_url\":{},\"mode\":{},\"additional_environment_names\":{}}},\"root_portability\":{}}}\n",
+            receipt["authority"], profile["cache"], profile["remote"]["version"],
+            profile["remote"]["normalized_url"], profile["remote"]["mode"],
+            profile["remote"]["additional_environment_names"], profile["root_portability"],
+        ).into_bytes();
         fs::remove_dir_all(&store)?;
+        fs::create_dir_all(&store)?;
+        fs::write(store.join("unbound-v0.25.json"), &retained_bytes)?;
         assert!(old_cache_root.exists());
-
-        let check = rail(
-            &workspace.path,
-            cargo_home.path(),
-            &["rail", "cache", "setup", "--local-only", "--check", "-f", "json"],
-        )?;
-        assert_eq!(check.status.code(), Some(1));
-        assert!(!store.exists(), "migration preview created private profile state");
-        assert!(old_cache_root.exists(), "migration preview removed the old CAS");
 
         let migrated = rail(
             &workspace.path,
             cargo_home.path(),
-            &["rail", "cache", "setup", "--local-only", "-f", "json"],
+            &["rail", "cache", "setup", "-f", "json"],
         )?;
-        assert!(migrated.status.success(), "v0.25 migration failed: {migrated:?}");
+        assert!(migrated.status.success(), "workspace setup failed: {migrated:?}");
         let migrated_status = selected_profile_status(&workspace.path, cargo_home.path())?;
         assert!(migrated_status["status"]["remote"].is_null());
         assert_eq!(
@@ -1823,7 +3415,10 @@ fn v0_25_policy_migrates_to_unbound_pre_profile_state_and_cleans_up_idempotently
         );
         let new_cache_root = selected_profile_cache_root(&workspace.path, cargo_home.path())?;
         assert_ne!(new_cache_root, old_cache_root);
-        assert!(old_cache_root.exists(), "migration did not preserve the old CAS");
+        assert!(
+            old_cache_root.exists(),
+            "workspace setup did not preserve the retained CAS"
+        );
 
         let profiles = rail(
             &workspace.path,
@@ -1843,7 +3438,7 @@ fn v0_25_policy_migrates_to_unbound_pre_profile_state_and_cleans_up_idempotently
         )?;
         assert!(
             repeated.status.success(),
-            "migration retry did not converge: {repeated:?}"
+            "workspace setup retry did not converge: {repeated:?}"
         );
 
         let cleanup_check = rail(
@@ -2017,6 +3612,118 @@ fn hostile_or_corrupt_profile_state_fails_closed_without_touching_an_external_ta
         assert!(!status.status.success());
         assert_cold_without_remote("replaced binding directory")?;
         assert_eq!(fs::read(&external_target)?, expected_external);
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn cross_target_l2_reuse_preserves_physical_and_remapped_root_authority() {
+    let result: Result<()> = (|| {
+        use std::os::unix::fs::PermissionsExt as _;
+        let target = "x86_64-unknown-linux-gnu";
+        for portability in ["physical", "remap"] {
+            let first = TestWorkspace::new_single_crate("target-remote", "0.1.0")?;
+            let second = TestWorkspace::new_single_crate("target-remote", "0.1.0")?;
+            for workspace in [&first.path, &second.path] {
+                fs::write(workspace.join("src/lib.rs"), "pub const VALUE: u64 = 41;\n")?;
+            }
+            let consumer = if portability == "physical" {
+                &first.path
+            } else {
+                &second.path
+            };
+            let remote = LoopbackS3::start()?;
+            let remote_url = remote.remote_url();
+            let seed_home = tempfile::tempdir()?;
+            let import_home = tempfile::tempdir()?;
+            let seed_coverage = tempfile::tempdir()?;
+            let import_coverage = tempfile::tempdir()?;
+            for directory in [seed_coverage.path(), import_coverage.path()] {
+                fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+            }
+            for (workspace, home, mode) in [
+                (&first.path, seed_home.path(), "read-write"),
+                (consumer, import_home.path(), "read"),
+            ] {
+                let setup = rail(
+                    workspace,
+                    home,
+                    &[
+                        "rail",
+                        "cache",
+                        "setup",
+                        "--remote",
+                        &remote_url,
+                        "--remote-mode",
+                        mode,
+                        "--root-portability",
+                        portability,
+                    ],
+                )?;
+                anyhow::ensure!(setup.status.success(), "target L2 setup failed: {setup:?}");
+            }
+            let seeded = cargo_check_installed_remote_with_options(
+                &first.path,
+                seed_home.path(),
+                seed_coverage.path(),
+                None,
+                None,
+                Some(target),
+            )?;
+            anyhow::ensure!(seeded.status.success(), "target L2 seed failed: {seeded:?}");
+            let baseline = compiler_only_outputs(&first.path.join("target").join(target).join("debug/deps"))?;
+            anyhow::ensure!(baseline.len() == 1, "target metadata seed contract incomplete");
+            if consumer == &first.path {
+                fs::remove_dir_all(first.path.join("target"))?;
+            }
+            let writes = remote.requests().iter().filter(|(method, _)| method == "PUT").count();
+            let imported = cargo_check_installed_remote_with_options(
+                consumer,
+                import_home.path(),
+                import_coverage.path(),
+                None,
+                None,
+                Some(target),
+            )?;
+            let events = coverage_events(import_coverage.path())?;
+            anyhow::ensure!(imported.status.success(), "target L2 import failed: {imported:?}");
+            anyhow::ensure!(
+                events.iter().any(|event| event["status"] == "hit"
+                    && event["reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.starts_with("verified_remote_result"))),
+                "{portability} target result did not cross L2 verification: {:?}; {}",
+                events
+                    .iter()
+                    .map(|event| (&event["crate_name"], &event["status"], &event["reason"]))
+                    .collect::<Vec<_>>(),
+                String::from_utf8_lossy(&imported.stderr)
+            );
+            anyhow::ensure!(
+                compiler_only_outputs(&consumer.join("target").join(target).join("debug/deps"))? == baseline,
+                "{portability} L2 restore changed target metadata bytes"
+            );
+            anyhow::ensure!(
+                remote.requests().iter().filter(|(method, _)| method == "PUT").count() == writes,
+                "read-only target import wrote remote objects"
+            );
+            fs::write(consumer.join("src/lib.rs"), "pub const VALUE: u64 = 42;\n")?;
+            let mutated = cargo_check_installed_remote_with_options(
+                consumer,
+                import_home.path(),
+                import_coverage.path(),
+                None,
+                None,
+                Some(target),
+            )?;
+            anyhow::ensure!(mutated.status.success(), "target L2 input mutation failed: {mutated:?}");
+            anyhow::ensure!(
+                compiler_only_outputs(&consumer.join("target").join(target).join("debug/deps"))? != baseline,
+                "same-size input mutation restored stale target metadata"
+            );
+        }
         Ok(())
     })();
     super::helpers::finish_test(result);
@@ -2383,6 +4090,22 @@ fn direct_s3_remote_is_l2_only_and_falls_back_cold_on_corruption_or_outage() {
         fs::set_permissions(&rustc, fs::Permissions::from_mode(0o700))?;
 
         let credential_home = tempfile::tempdir()?;
+        let source_path = workspace.path.join("src/lib.rs");
+        let original_source = fs::read_to_string(&source_path)?;
+        let mut credential_source = original_source.clone();
+        for name in [
+            "CARGO_RAIL_CACHE_REMOTE",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_CONFIG_FILE",
+            "AWS_SHARED_CREDENTIALS_FILE",
+        ] {
+            credential_source.push_str(&format!(
+                "\nconst _: () = assert!(option_env!(\"{name}\").is_none(), \"compiler inherited {name}\");\n"
+            ));
+        }
+        fs::write(&source_path, credential_source)?;
         let setup = rail(&workspace.path, credential_home.path(), &["rail", "cache", "setup"])?;
         assert!(setup.status.success(), "credential cache setup failed: {setup:?}");
         let credential_probe = cargo_check_remote(
@@ -2400,7 +4123,7 @@ fn direct_s3_remote_is_l2_only_and_falls_back_cold_on_corruption_or_outage() {
         let compiler_environments = fs::read_to_string(workspace.path.join("remote-compiler-environment.log"))?;
         let controlled_compilers = compiler_environments
             .lines()
-            .filter(|line| line.contains("--crate-name transparent_remote"))
+            .filter(|line| line.contains("--crate-name transparent_remote") || line.ends_with("args=--print=sysroot"))
             .collect::<Vec<_>>();
         assert!(
             !controlled_compilers.is_empty()
@@ -2409,6 +4132,7 @@ fn direct_s3_remote_is_l2_only_and_falls_back_cold_on_corruption_or_outage() {
                 }),
             "remote authority entered a Cargo-Rail-controlled compiler subprocess: {compiler_environments:?}"
         );
+        fs::write(source_path, original_source)?;
         fs::remove_dir_all(workspace.path.join("target"))?;
 
         let seed_home = tempfile::tempdir()?;
@@ -2676,7 +4400,11 @@ fn direct_cargo_reuses_verified_outputs_and_off_never_touches_l1() {
             "#!/bin/sh\nif [ -n \"$CACHE_ENV_LOG\" ]; then printf '%s\\n' \"${CARGO_RAIL_CACHE-unset}\" >> \"$CACHE_ENV_LOG\"; fi\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"transparent_hit\" ]; then exit 91; fi\ndone\nexec \"$REAL_RUSTC\" \"$@\"\n",
         )?;
         fs::set_permissions(&shim, fs::Permissions::from_mode(0o700))?;
-        let hit = Command::new("cargo")
+        let hit = cargo_check(&workspace.path, cargo_home.path(), None, None)?;
+        assert!(hit.status.success(), "verified hit failed: {hit:?}");
+
+        fs::remove_dir_all(workspace.path.join("target"))?;
+        let replaced = Command::new("cargo")
             .current_dir(&workspace.path)
             .args(["check", "--quiet"])
             .env("CARGO_HOME", cargo_home.path())
@@ -2687,9 +4415,10 @@ fn direct_cargo_reuses_verified_outputs_and_off_never_touches_l1() {
             .env_remove("RUSTC_WORKSPACE_WRAPPER")
             .output()?;
         assert!(
-            hit.status.success(),
-            "verified hit executed the rejecting rustc shim: {hit:?}"
+            !replaced.status.success(),
+            "cache skipped the selected compiler: {replaced:?}"
         );
+        assert!(String::from_utf8_lossy(&replaced.stderr).contains("exit status: 91"));
 
         let observed = rail(
             &workspace.path,
@@ -2748,6 +4477,57 @@ fn direct_cargo_reuses_verified_outputs_and_off_never_touches_l1() {
         assert!(
             observed_environment.lines().all(|value| value == "off"),
             "cache opt-out changed the compiler environment: {observed_environment:?}"
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(unix)]
+#[test]
+fn selected_compiler_wrapper_preserves_its_flags_after_cache_setup() {
+    let result: Result<()> = (|| {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let workspace = TestWorkspace::new_single_crate("selected-compiler-wrapper", "0.1.0")?;
+        fs::write(
+            workspace.path.join("src/lib.rs"),
+            "#[cfg(not(wrapper_authorized))]\ncompile_error!(\"selected compiler flag was lost\");\npub fn value() -> u8 { 7 }\n",
+        )?;
+        let probe = tempfile::tempdir()?;
+        let compiler = probe.path().join("selected-rustc");
+        fs::write(&compiler, "#!/bin/sh\nexec rustc \"$@\" --cfg wrapper_authorized\n")?;
+        fs::set_permissions(&compiler, fs::Permissions::from_mode(0o700))?;
+        let cargo_home = tempfile::tempdir()?;
+        let run = || {
+            Command::new("cargo")
+                .current_dir(&workspace.path)
+                .args(["check", "--quiet"])
+                .env("CARGO_HOME", cargo_home.path())
+                .env("RUSTC", &compiler)
+                .env("CARGO_INCREMENTAL", "0")
+                .env_remove("RUSTC_WRAPPER")
+                .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+                .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+                .output()
+        };
+        let uncached = run()?;
+        assert!(uncached.status.success(), "uncached compiler failed: {uncached:?}");
+        let outputs = compiler_only_outputs(&workspace.path.join("target/debug/deps"))?;
+        let setup = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "setup"])?;
+        assert!(setup.status.success(), "cache setup failed: {setup:?}");
+        fs::remove_dir_all(workspace.path.join("target"))?;
+        let installed = run()?;
+        assert!(
+            installed.status.success(),
+            "cache changed selected compiler behavior: {installed:?}"
+        );
+        assert_eq!(installed.stdout, uncached.stdout);
+        assert_eq!(installed.stderr, uncached.stderr);
+        assert_eq!(
+            compiler_only_outputs(&workspace.path.join("target/debug/deps"))?,
+            outputs
         );
         Ok(())
     })();
@@ -2868,8 +4648,6 @@ fn analysis_missing_binding_executes_despite_an_ordinary_native_result() {
 #[test]
 fn compiler_analysis_reuses_native_result_only_after_an_exact_binding() {
     let result: Result<()> = (|| {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let workspace = TestWorkspace::new_single_crate("bound-analysis-cache", "0.1.0")?;
         fs::create_dir_all(workspace.path.join("helper/src"))?;
         fs::write(
@@ -2895,65 +4673,80 @@ fn compiler_analysis_reuses_native_result_only_after_an_exact_binding() {
         let setup = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "setup"])?;
         assert!(setup.status.success(), "cache setup failed: {setup:?}");
 
-        let probe = tempfile::tempdir()?;
-        let rustc_log = probe.path().join("rustc.log");
-        let rustc_shim = probe.path().join("rustc-shim");
-        fs::write(
-            &rustc_shim,
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CARGO_RAIL_TEST_RUSTC_LOG\"\nexec \"$REAL_RUSTC\" \"$@\"\n",
-        )?;
-        fs::set_permissions(&rustc_shim, fs::Permissions::from_mode(0o700))?;
-        let run = || -> Result<std::process::Output> {
-            Ok(Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+        let wrapper_probe = tempfile::tempdir()?;
+        let wrapper_log = wrapper_probe.path().join("wrapper.log");
+        let run = |wrapper: Option<&Path>| -> Result<std::process::Output> {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-rail"));
+            command
                 .current_dir(&workspace.path)
                 .args(["rail", "unify", "--check"])
                 .env("CARGO_HOME", cargo_home.path())
                 .env("CARGO_INCREMENTAL", "0")
-                .env("RUSTC", &rustc_shim)
-                .env("REAL_RUSTC", "rustc")
-                .env("CARGO_RAIL_TEST_RUSTC_LOG", &rustc_log)
                 .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
                 .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
                 .env_remove("RUSTC_WRAPPER")
-                .env_remove("RUSTC_WORKSPACE_WRAPPER")
-                .output()?)
+                .env_remove("RUSTC_WORKSPACE_WRAPPER");
+            if let Some(wrapper) = wrapper {
+                command
+                    .env("RUSTC_WORKSPACE_WRAPPER", wrapper)
+                    .env("CARGO_RAIL_TEST_WORKSPACE_WRAPPER_LOG", &wrapper_log);
+            }
+            Ok(command.output()?)
         };
 
-        let cold = run()?;
+        let cold = run(None)?;
         assert_eq!(cold.status.code(), Some(1), "cold analysis failed: {cold:?}");
-        let cold_log = fs::read_to_string(&rustc_log)?;
-        assert!(
-            cold_log
-                .lines()
-                .any(|line| line.contains("--crate-name bound_analysis_cache")),
-            "cold analysis did not execute the selected compiler:\n{cold_log}"
-        );
-        fs::write(&rustc_log, "")?;
+        let usage = || -> Result<serde_json::Value> {
+            let status = rail(
+                &workspace.path,
+                cargo_home.path(),
+                &["rail", "cache", "status", "--scope", "local", "-f", "json"],
+            )?;
+            assert!(status.status.success(), "cache status failed: {status:?}");
+            Ok(json(&status)?["status"]["installation"]["usage"].clone())
+        };
+        let cold_usage = usage()?;
+        assert!(cold_usage["misses"].as_u64().unwrap() >= 1, "{cold_usage}");
+        assert_eq!(cold_usage["hits"], 0, "{cold_usage}");
+        assert!(String::from_utf8_lossy(&cold.stdout).contains("Dependencies: helper"));
 
-        let warm = run()?;
+        let warm = run(None)?;
         assert_eq!(warm.status.code(), Some(1), "warm analysis failed: {warm:?}");
-        let cache_status = rail(
-            &workspace.path,
-            cargo_home.path(),
-            &["rail", "cache", "status", "--scope", "local", "-f", "json"],
-        )?;
         assert!(
             String::from_utf8_lossy(&warm.stdout).contains("Dependencies: helper"),
             "warm analysis lost exact diagnostic evidence: {warm:?}"
         );
-        let warm_log = fs::read_to_string(&rustc_log)?;
+        let warm_usage = usage()?;
+        assert!(warm_usage["hits"].as_u64().unwrap() >= 1, "{warm_usage}");
+        assert_eq!(warm_usage["misses"], cold_usage["misses"], "{warm_usage}");
+        fs::write(workspace.path.join("src/lib.rs"), "pub fn changed() {}\n")?;
+        let changed = run(None)?;
+        assert_eq!(changed.status.code(), Some(1), "changed analysis failed: {changed:?}");
+        assert!(String::from_utf8_lossy(&changed.stdout).contains("Dependencies: helper"));
+        let changed_usage = usage()?;
         assert!(
-            !warm_log
-                .lines()
-                .any(|line| line.contains("--crate-name bound_analysis_cache")),
-            "warm analysis executed rustc despite its exact binding:\n{warm_log}\ncold stdout:\n{}\ncold stderr:\n{}\nwarm stdout:\n{}\nwarm stderr:\n{}\ncache status stdout:\n{}\ncache status stderr:\n{}",
-            String::from_utf8_lossy(&cold.stdout),
-            String::from_utf8_lossy(&cold.stderr),
-            String::from_utf8_lossy(&warm.stdout),
-            String::from_utf8_lossy(&warm.stderr),
-            String::from_utf8_lossy(&cache_status.stdout),
-            String::from_utf8_lossy(&cache_status.stderr),
+            changed_usage["misses"].as_u64().unwrap() > warm_usage["misses"].as_u64().unwrap(),
+            "{changed_usage}"
         );
+        fs::write(
+            workspace.path.join("src/lib.rs"),
+            "pub fn used() { helper::helper(); }\n",
+        )?;
+        let used = run(None)?;
+        assert!(used.status.success(), "used dependency analysis failed: {used:?}");
+        assert!(!String::from_utf8_lossy(&used.stdout).contains("Dependencies: helper"));
+        use std::os::unix::fs::PermissionsExt as _;
+        let wrapper = wrapper_probe.path().join("workspace-wrapper");
+        fs::write(
+            &wrapper,
+            "#!/bin/sh\nprintf '%s\n' \"$*\" >> \"$CARGO_RAIL_TEST_WORKSPACE_WRAPPER_LOG\"\nexec \"$@\"\n",
+        )?;
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700))?;
+        fs::write(workspace.path.join("src/lib.rs"), "pub fn changed() {}\n")?;
+        let wrapped = run(Some(&wrapper))?;
+        assert_eq!(wrapped.status.code(), Some(1), "wrapped analysis failed: {wrapped:?}");
+        assert!(String::from_utf8_lossy(&wrapped.stdout).contains("Dependencies: helper"));
+        assert!(fs::read_to_string(&wrapper_log)?.contains("--crate-name bound_analysis_cache"));
         Ok(())
     })();
     super::helpers::finish_test(result);
@@ -2961,11 +4754,8 @@ fn compiler_analysis_reuses_native_result_only_after_an_exact_binding() {
 
 #[cfg(unix)]
 #[test]
-#[ignore = "blocked by a known process-tree descendant ownership failure"]
-fn remote_analysis_imports_evidence_before_reusing_the_native_result() {
+fn remote_diagnostics_reuse_revalidates_source_inputs() {
     let result: Result<()> = (|| {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let workspace = TestWorkspace::new_single_crate("remote-bound-analysis", "0.1.0")?;
         fs::create_dir_all(workspace.path.join("helper/src"))?;
         fs::write(
@@ -2988,27 +4778,19 @@ fn remote_analysis_imports_evidence_before_reusing_the_native_result() {
 
         let remote = LoopbackS3::start()?;
         let remote_url = remote.remote_url();
-        let seed_home = tempfile::tempdir()?;
-        let seed_setup = rail(&workspace.path, seed_home.path(), &["rail", "cache", "setup"])?;
-        assert!(seed_setup.status.success(), "seed cache setup failed: {seed_setup:?}");
+        let cargo_home = tempfile::tempdir()?;
+        let setup = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "setup"])?;
+        assert!(setup.status.success(), "remote fixture setup: {setup:?}");
 
-        let probe = tempfile::tempdir()?;
-        let rustc_log = probe.path().join("rustc.log");
-        let rustc_shim = probe.path().join("rustc-shim");
-        fs::write(
-            &rustc_shim,
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CARGO_RAIL_TEST_RUSTC_LOG\"\nexec \"$REAL_RUSTC\" \"$@\"\n",
-        )?;
-        fs::set_permissions(&rustc_shim, fs::Permissions::from_mode(0o700))?;
-        let run = |cargo_home: &Path, mode: &str| -> Result<Output> {
+        let run = |cache_root: &Path, mode: &str| -> Result<Output> {
             Ok(Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
                 .current_dir(&workspace.path)
-                .args(["rail", "unify", "--check"])
-                .env("CARGO_HOME", cargo_home)
+                .args(["rail", "--diagnostics-file"])
+                .arg(cache_root.join("diagnostics.json"))
+                .args(["unify", "--check"])
+                .env("CARGO_HOME", cargo_home.path())
+                .env("CARGO_RAIL_CACHE_DIR", cache_root)
                 .env("CARGO_INCREMENTAL", "0")
-                .env("RUSTC", &rustc_shim)
-                .env("REAL_RUSTC", "rustc")
-                .env("CARGO_RAIL_TEST_RUSTC_LOG", &rustc_log)
                 .env("AWS_ACCESS_KEY_ID", "fixture-access-key")
                 .env("AWS_SECRET_ACCESS_KEY", "fixture-secret-key")
                 .env("AWS_SESSION_TOKEN", "fixture-session-token")
@@ -3031,7 +4813,8 @@ fn remote_analysis_imports_evidence_before_reusing_the_native_result() {
                 .output()?)
         };
 
-        let seed = run(seed_home.path(), "read-write")?;
+        let seed_cache = tempfile::tempdir()?;
+        let seed = run(seed_cache.path(), "read-write")?;
         assert_eq!(seed.status.code(), Some(1), "remote analysis seed failed: {seed:?}");
         let seed_requests = remote.requests();
         assert!(
@@ -3047,16 +4830,9 @@ fn remote_analysis_imports_evidence_before_reusing_the_native_result() {
             "analysis seed did not publish evidence candidate indexes: {seed_requests:?}"
         );
 
-        fs::remove_dir_all(workspace.path.join("target"))?;
-        fs::write(&rustc_log, "")?;
-        let import_home = tempfile::tempdir()?;
-        let import_setup = rail(&workspace.path, import_home.path(), &["rail", "cache", "setup"])?;
-        assert!(
-            import_setup.status.success(),
-            "remote import setup failed: {import_setup:?}"
-        );
+        let import_cache = tempfile::tempdir()?;
         let requests_before_import = remote.request_count();
-        let imported = run(import_home.path(), "read")?;
+        let imported = run(import_cache.path(), "read")?;
         assert_eq!(
             imported.status.code(),
             Some(1),
@@ -3066,13 +4842,13 @@ fn remote_analysis_imports_evidence_before_reusing_the_native_result() {
             String::from_utf8_lossy(&imported.stdout).contains("Dependencies: helper"),
             "remote analysis import lost exact fact evidence: {imported:?}"
         );
-        let imported_rustc = fs::read_to_string(&rustc_log)?;
-        assert!(
-            !imported_rustc
-                .lines()
-                .any(|line| line.contains("--crate-name remote_bound_analysis")),
-            "remote analysis reran the selected compiler despite its imported binding:\n{imported_rustc}"
+        let imported_counters: serde_json::Value =
+            serde_json::from_slice(&fs::read(import_cache.path().join("diagnostics.json"))?)?;
+        assert_eq!(
+            imported_counters["compiler_acquisition"]["cargo_views"], 0,
+            "unchanged remote diagnostics must avoid Cargo acquisition: {imported_counters}; {imported:?}"
         );
+        assert_eq!(imported_counters["compiler_acquisition"]["compiler_actions"], 0);
         let import_requests = remote.requests();
         assert!(
             import_requests[requests_before_import..]
@@ -3086,6 +4862,33 @@ fn remote_analysis_imports_evidence_before_reusing_the_native_result() {
                 .any(|(method, path)| method == "GET" && path.contains("/evidence-v1/objects/")),
             "analysis reuse did not import remote evidence objects: {import_requests:?}"
         );
+        assert!(
+            import_requests[requests_before_import..]
+                .iter()
+                .all(|(method, _)| method != "PUT"),
+            "read-only diagnostics import published remote data"
+        );
+
+        fs::remove_dir_all(workspace.path.join("target"))?;
+        let cold_cache = tempfile::tempdir()?;
+        fs::write(workspace.path.join("src/lib.rs"), "pub fn changed() -> u8 { 7 }\n")?;
+        let cold = run(cold_cache.path(), "read")?;
+        assert_eq!(cold.status.code(), Some(1), "changed-input acquisition: {cold:?}");
+        assert!(String::from_utf8_lossy(&cold.stdout).contains("Dependencies: helper"));
+        let cold_counters: serde_json::Value =
+            serde_json::from_slice(&fs::read(cold_cache.path().join("diagnostics.json"))?)?;
+        assert_eq!(
+            cold_counters["compiler_acquisition"]["cargo_views"], 1,
+            "{cold_counters}"
+        );
+        assert!(
+            cold_counters["compiler_acquisition"]["compiler_actions"]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "source change must execute the compiler: {cold_counters}"
+        );
+        let removed = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "uninstall"])?;
+        assert!(removed.status.success(), "stop fixture coordinator: {removed:?}");
         Ok(())
     })();
     super::helpers::finish_test(result);
@@ -3648,28 +5451,6 @@ fn ordinary_cargo_and_nextest_commands_receive_eligible_library_reuse() {
         let setup = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "setup"])?;
         assert!(setup.status.success(), "setup failed: {setup:?}");
 
-        let shim = workspace.path.join("rustc-command-shape-proof");
-        fs::write(
-            &shim,
-            r#"#!/bin/sh
-crate_name=
-crate_type=
-previous=
-for argument in "$@"; do
-  if [ "$previous" = "--crate-name" ]; then crate_name="$argument"; fi
-  if [ "$previous" = "--crate-type" ]; then crate_type="$argument"; fi
-  case "$argument" in
-    --crate-name=*) crate_name="${argument#--crate-name=}" ;;
-    --crate-type=*) crate_type="${argument#--crate-type=}" ;;
-  esac
-  previous="$argument"
-done
-if [ "$crate_name" = "transparent_shapes" ] && [ "$crate_type" = "lib" ]; then exit 91; fi
-exec "$REAL_RUSTC" "$@"
-"#,
-        )?;
-        fs::set_permissions(&shim, fs::Permissions::from_mode(0o700))?;
-
         let lanes: &[(&str, &[&str])] = &[
             ("check", &["check", "--quiet"]),
             ("build", &["build", "--quiet"]),
@@ -3689,19 +5470,38 @@ exec "$REAL_RUSTC" "$@"
                 .output()?;
             assert!(seed.status.success(), "{name} seed failed: {seed:?}");
             fs::remove_dir_all(workspace.path.join("target"))?;
+            let coverage = tempfile::tempdir()?;
+            fs::set_permissions(coverage.path(), fs::Permissions::from_mode(0o700))?;
+            let coverage_path = fs::canonicalize(coverage.path())?;
             let reused = Command::new("cargo")
                 .current_dir(&workspace.path)
                 .args(*arguments)
                 .env("CARGO_HOME", cargo_home.path())
                 .env("CARGO_INCREMENTAL", "0")
-                .env("RUSTC", &shim)
-                .env("REAL_RUSTC", "rustc")
+                .env("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1")
+                .env("CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY", &coverage_path)
                 .env_remove("RUSTC_WRAPPER")
                 .env_remove("RUSTC_WORKSPACE_WRAPPER")
                 .output()?;
             assert!(
                 reused.status.success(),
                 "{name} executed an eligible library compiler instead of restoring it: {reused:?}"
+            );
+            let events = coverage_events(&coverage_path)?;
+            let libraries = events
+                .iter()
+                .filter(|event| {
+                    event["action"]["crate_name"] == "transparent_shapes"
+                        && event["action"]["action_class"] == "rust_library"
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                !libraries.is_empty(),
+                "{name} did not observe library reuse: {events:?}"
+            );
+            assert!(
+                libraries.iter().all(|event| event["status"] == "hit"),
+                "{name}: {libraries:?}"
             );
             fs::remove_dir_all(workspace.path.join("target"))?;
         }
@@ -3791,6 +5591,610 @@ fn cache_reporting_intervals_capture_cold_and_warm_production_outcomes() {
             measurements[1]
         );
         assert_eq!(measurements[1]["misses"], 0, "report path changed cache identity");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn cross_windows_link_restores_the_exact_dll_pdb_and_import_library() {
+    let result: Result<()> = (|| {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let workspace = TestWorkspace::new_single_crate("coff-outputs", "0.1.0")?;
+        let cargo_home = tempfile::tempdir()?;
+        let reports = tempfile::tempdir()?;
+        fs::write(
+            workspace.path.join("Cargo.toml"),
+            "[package]\nname = \"coff-outputs\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n",
+        )?;
+        let source = workspace.path.join("src/lib.rs");
+        fs::write(
+            &source,
+            "#[unsafe(no_mangle)] pub extern \"C\" fn answer() -> u32 { 42 }\n",
+        )?;
+        let target = "x86_64-pc-windows-msvc";
+        let target_directory = workspace.path.join("target").join(target);
+        let build = |recording: Option<&Path>| -> Result<()> {
+            let mut command = Command::new("cargo");
+            command
+                .current_dir(&workspace.path)
+                .args(["xwin", "build", "--offline", "--quiet", "--target", target])
+                .env("CARGO_HOME", cargo_home.path())
+                .env("CARGO_INCREMENTAL", "0")
+                .env("SOURCE_DATE_EPOCH", "0")
+                .env("CARGO_TARGET_DIR", workspace.path.join("target"))
+                .env_remove("RUSTC_WRAPPER")
+                .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("RUSTFLAGS")
+                .env_remove("CARGO_ENCODED_RUSTFLAGS")
+                .env_remove("CARGO_RAIL_CACHE")
+                .env_remove("CARGO_RAIL_CACHE_REPORT")
+                .env_remove("LLD_REPRODUCE");
+            if let Some(recording) = recording {
+                command.env("CARGO_RAIL_CACHE_REPORT", recording);
+            }
+            let output = command
+                .output()
+                .context("run cargo-xwin using the already provisioned MSVC SDK")?;
+            anyhow::ensure!(
+                output.status.success(),
+                "cross-Windows Cargo build failed; provision cargo-xwin, lld-link and its cached MSVC SDK before this lane: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Ok(())
+        };
+        let outputs = || -> Result<BTreeMap<PathBuf, (Vec<u8>, u32)>> {
+            let mut result = BTreeMap::new();
+            for entry in fs::read_dir(target_directory.join("debug/deps"))? {
+                let entry = entry?;
+                let path = entry.path();
+                if matches!(
+                    path.extension().and_then(std::ffi::OsStr::to_str),
+                    Some("dll" | "pdb" | "lib")
+                ) {
+                    result.insert(
+                        PathBuf::from(entry.file_name()),
+                        (fs::read(&path)?, fs::metadata(&path)?.permissions().mode() & 0o777),
+                    );
+                }
+            }
+            anyhow::ensure!(
+                result.len() == 3,
+                "expected exactly the DLL, PDB and import library, observed {:?}",
+                result.keys().collect::<Vec<_>>()
+            );
+            Ok(result)
+        };
+        build(None).context("uncached upstream Windows link must succeed before cache qualification")?;
+        let baseline = outputs()?;
+        assert!(
+            baseline
+                .keys()
+                .any(|path| path.extension().is_some_and(|extension| extension == "pdb"))
+        );
+        assert!(baseline.keys().any(|path| path.to_string_lossy().ends_with(".dll.lib")));
+        let setup = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "setup"])?;
+        assert!(setup.status.success(), "COFF cache setup failed: {setup:?}");
+        let mut cold_outputs = None;
+        for (phase, hits, misses) in [("cold", 0, 1), ("warm", 1, 0), ("source-change", 0, 1)] {
+            if phase == "source-change" {
+                fs::write(
+                    &source,
+                    "#[unsafe(no_mangle)] pub extern \"C\" fn answer() -> u32 { 43 }\n",
+                )?;
+            }
+            fs::remove_dir_all(&target_directory)?;
+            let recording = reports.path().join(format!("{phase}.json"));
+            let path = recording.to_str().context("COFF report path")?;
+            let start = rail(
+                &workspace.path,
+                cargo_home.path(),
+                &["rail", "cache", "report", "--start", path],
+            )?;
+            assert!(start.status.success(), "{phase} recording failed: {start:?}");
+            build(Some(&recording))?;
+            let finish = rail(
+                &workspace.path,
+                cargo_home.path(),
+                &["rail", "cache", "report", "--finish", path, "-f", "json"],
+            )?;
+            assert!(finish.status.success(), "{phase} reporting failed: {finish:?}");
+            let report = json(&finish)?;
+            assert_eq!(report["measurements"]["hits"], hits, "{phase}: {report}");
+            assert_eq!(report["measurements"]["misses"], misses, "{phase}: {report}");
+            assert!(
+                report["measurements"]["bypass_reasons"]
+                    .as_object()
+                    .context("COFF bypass reasons")?
+                    .keys()
+                    .all(|reason| matches!(
+                        reason.as_str(),
+                        "compiler_information_request" | "compiler_stdin_observation_unavailable"
+                    )),
+                "{phase} bypassed a compiler action: {report}"
+            );
+            assert_eq!(report["measurements"]["failures"], 0, "{phase}: {report}");
+            let current = outputs()?;
+            if phase == "cold" {
+                assert_eq!(
+                    current.keys().collect::<Vec<_>>(),
+                    baseline.keys().collect::<Vec<_>>(),
+                    "instrumentation changed the ordinary output set"
+                );
+                for (name, (_, mode)) in &baseline {
+                    assert_eq!(
+                        current.get(name).map(|(_, current_mode)| current_mode),
+                        Some(mode),
+                        "instrumentation changed mode for {}",
+                        name.display()
+                    );
+                    if name.to_string_lossy().ends_with(".dll.lib") {
+                        assert_eq!(
+                            current.get(name),
+                            baseline.get(name),
+                            "instrumentation changed the deterministic import library"
+                        );
+                    }
+                }
+                cold_outputs = Some(current);
+            } else if phase == "warm" {
+                assert_eq!(
+                    Some(current),
+                    cold_outputs,
+                    "warm restore changed COFF output bytes or modes"
+                );
+            } else {
+                assert_ne!(
+                    Some(current),
+                    cold_outputs,
+                    "same-size source mutation did not change linked outputs"
+                );
+            }
+        }
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn packed_apple_debug_outputs_run_the_compiler_until_the_complete_tree_is_owned() {
+    let result: Result<()> = (|| {
+        let workspace = TestWorkspace::new_single_crate("apple-debug-outputs", "0.1.0")?;
+        let manifest = workspace.path.join("Cargo.toml");
+        fs::write(
+            &manifest,
+            format!(
+                "{}\n[profile.dev]\nsplit-debuginfo = \"packed\"\n",
+                fs::read_to_string(&manifest)?
+            ),
+        )?;
+        fs::remove_file(workspace.path.join("src/lib.rs"))?;
+        fs::write(
+            workspace.path.join("src/main.rs"),
+            "fn main() { println!(\"debug outputs\"); }\n",
+        )?;
+        let version = Command::new("rustc").arg("-vV").output()?;
+        assert!(version.status.success(), "rustc prerequisite failed: {version:?}");
+        let verbose = String::from_utf8(version.stdout)?;
+        let host = verbose
+            .lines()
+            .find_map(|line| line.strip_prefix("host: "))
+            .context("rustc host")?;
+        let cargo_home = tempfile::tempdir()?;
+        let reports = tempfile::tempdir()?;
+        explicit_target_cargo(&workspace.path, cargo_home.path(), "build", host, None)?;
+        let target = workspace.path.join("target").join(host);
+        let baseline = directory_snapshot(&target.join("debug/deps"))?;
+        let auxiliary_names = baseline
+            .keys()
+            .filter(|path| {
+                path.extension().is_some_and(|extension| extension == "o")
+                    || path
+                        .components()
+                        .any(|part| part.as_os_str().to_string_lossy().ends_with(".dSYM"))
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert!(
+            !auxiliary_names.is_empty(),
+            "upstream packed debug build emitted no separate debug artifacts: {:?}",
+            baseline.keys().collect::<Vec<_>>()
+        );
+        let setup = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "setup"])?;
+        assert!(setup.status.success(), "debug cache setup failed: {setup:?}");
+        fs::remove_dir_all(&target)?;
+        let recording = reports.path().join("debug.json");
+        let path = recording.to_str().context("debug report path")?;
+        let start = rail(
+            &workspace.path,
+            cargo_home.path(),
+            &["rail", "cache", "report", "--start", path],
+        )?;
+        assert!(start.status.success(), "debug report start failed: {start:?}");
+        explicit_target_cargo(&workspace.path, cargo_home.path(), "build", host, Some(&recording))?;
+        let finish = rail(
+            &workspace.path,
+            cargo_home.path(),
+            &["rail", "cache", "report", "--finish", path, "-f", "json"],
+        )?;
+        assert!(finish.status.success(), "debug report finish failed: {finish:?}");
+        let report = json(&finish)?;
+        assert_eq!(report["measurements"]["hits"], 0, "{report}");
+        assert_eq!(report["measurements"]["misses"], 0, "{report}");
+        assert!(
+            report["measurements"]["bypass_reasons"]
+                .as_object()
+                .context("debug bypass reasons")?
+                .keys()
+                .all(|reason| matches!(
+                    reason.as_str(),
+                    "compiler_information_request"
+                        | "compiler_stdin_observation_unavailable"
+                        | "compiler_debug_output_evidence_unavailable"
+                )),
+            "unexpected debug bypass: {report}"
+        );
+        assert_eq!(
+            report["measurements"]["bypass_reasons"]["compiler_debug_output_evidence_unavailable"], 1,
+            "{report}"
+        );
+        let current = directory_snapshot(&target.join("debug/deps"))?;
+        for name in auxiliary_names {
+            assert!(
+                current.get(&name).is_some_and(|bytes| !bytes.is_empty()),
+                "ordinary compiler lost debug output {}",
+                name.display()
+            );
+        }
+        let output = Command::new(target.join("debug/apple-debug-outputs")).output()?;
+        assert!(output.status.success(), "debug executable failed: {output:?}");
+        assert_eq!(output.stdout, b"debug outputs\n");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn coff_adapter_preserves_exact_outputs_with_windows_response_arguments() {
+    let result: Result<()> = (|| {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir()?;
+        let directory = fs::canonicalize(fixture.path())?.join("COFF response fixture");
+        fs::create_dir(&directory)?;
+        let driver = std::env::split_paths(&std::env::var_os("PATH").context("linker PATH")?)
+            .map(|directory| directory.join("lld-link"))
+            .find(|path| path.is_file())
+            .context("lld-link must be provisioned before this explicit local contract")?;
+        let source = directory.join("source.c");
+        let object = directory.join("source object.obj");
+        fs::write(&source, "__declspec(dllexport) int answer(void) { return 42; }\n")?;
+        let compiled = Command::new("clang")
+            .args(["--target=x86_64-pc-windows-msvc", "-gcodeview", "-c"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&object)
+            .output()?;
+        assert!(
+            compiled.status.success(),
+            "COFF object prerequisite failed: {compiled:?}"
+        );
+        let dll = directory.join("fixture.dll");
+        let pdb = directory.join("fixture.pdb");
+        let library = directory.join("fixture.dll.lib");
+        let response = directory.join("original arguments.rsp");
+        fs::write(
+            &response,
+            format!(
+                "/dll\n/noentry\n/debug\n/out:\"{}\"\n/pdb:\"{}\"\n/implib:\"{}\"\n\"{}\"\n",
+                dll.display(),
+                pdb.display(),
+                library.display(),
+                object.display()
+            ),
+        )?;
+        let argument = format!("@{}", response.display());
+        let baseline = Command::new(&driver)
+            .arg(&argument)
+            .current_dir(&directory)
+            .env("SOURCE_DATE_EPOCH", "0")
+            .env_remove("LLD_REPRODUCE")
+            .env_remove("LINK")
+            .env_remove("_LINK_")
+            .output()?;
+        assert!(baseline.status.success(), "ordinary COFF linker failed: {baseline:?}");
+        let mut expected = BTreeMap::new();
+        for path in [&dll, &pdb, &library] {
+            expected.insert(
+                path.clone(),
+                (fs::read(path)?, fs::metadata(path)?.permissions().mode() & 0o777),
+            );
+            fs::remove_file(path)?;
+        }
+        let evidence = directory.join("coff-linker-driver-inputs.json");
+        let archive = directory.join("coff-linker-inputs.tar");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-rail"));
+        for (name, _) in std::env::vars_os() {
+            if name.to_str().is_some_and(|name| name.starts_with("CARGO_RAIL_")) {
+                command.env_remove(name);
+            }
+        }
+        let observed = command
+            .arg(argument)
+            .current_dir(&directory)
+            .env("SOURCE_DATE_EPOCH", "0")
+            .env("CARGO_RAIL_COFF_LINK_ADAPTER", "1")
+            .env("CARGO_RAIL_COFF_LINK_DRIVER", &driver)
+            .env("CARGO_RAIL_COFF_LINK_ARCHIVE", &archive)
+            .env("CARGO_RAIL_COFF_LINK_EVIDENCE", &evidence)
+            .env_remove("LLD_REPRODUCE")
+            .env_remove("LINK")
+            .env_remove("_LINK_")
+            .output()?;
+        assert_eq!(observed.status.code(), baseline.status.code(), "{observed:?}");
+        assert_eq!(observed.stdout, baseline.stdout);
+        assert_eq!(observed.stderr, baseline.stderr);
+        for (path, (bytes, mode)) in expected {
+            assert!(fs::read(&path)? == bytes, "adapter changed {}", path.display());
+            assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, mode);
+        }
+        let evidence: serde_json::Value = serde_json::from_slice(&fs::read(evidence)?)?;
+        assert_eq!(evidence["completed"], true, "{evidence}");
+        assert_eq!(
+            evidence["response_files"].as_array().map(Vec::len),
+            Some(1),
+            "{evidence}"
+        );
+        assert!(fs::metadata(archive)?.len() > fs::metadata(object)?.len());
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn unpacked_debug_objects_restore_exactly_and_remain_bound_to_the_output_directory() {
+    let result: Result<()> = (|| {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let workspace = TestWorkspace::new_single_crate("unpacked-debug", "0.1.0")?;
+        let manifest = workspace.path.join("Cargo.toml");
+        fs::write(
+            &manifest,
+            format!(
+                "{}\n[profile.dev]\nsplit-debuginfo = \"unpacked\"\n",
+                fs::read_to_string(&manifest)?
+            ),
+        )?;
+        fs::write(workspace.path.join("src/lib.rs"), "pub fn answer() -> u64 { 41 }\n")?;
+        let version = Command::new("rustc").arg("-vV").output()?;
+        assert!(version.status.success(), "rustc prerequisite failed: {version:?}");
+        let verbose = String::from_utf8(version.stdout)?;
+        let host = verbose
+            .lines()
+            .find_map(|line| line.strip_prefix("host: "))
+            .context("rustc host")?;
+        let cargo_home = tempfile::tempdir()?;
+        explicit_target_cargo(&workspace.path, cargo_home.path(), "build", host, None)?;
+        let target = workspace.path.join("target").join(host);
+        let outputs = target.join("debug/deps");
+        let baseline = directory_snapshot(&outputs)?;
+        let objects = baseline
+            .keys()
+            .filter(|name| name.to_string_lossy().ends_with(".rcgu.o"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            objects.len(),
+            1,
+            "upstream separate object inventory: {:?}",
+            baseline.keys()
+        );
+        let modes = baseline
+            .keys()
+            .map(|name| {
+                Ok((
+                    name.clone(),
+                    fs::metadata(outputs.join(name))?.permissions().mode() & 0o777,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let setup = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "setup"])?;
+        assert!(setup.status.success(), "unpacked cache setup failed: {setup:?}");
+        let reports = tempfile::tempdir()?;
+        for (phase, hits) in [("cold", 0), ("warm", 1)] {
+            fs::remove_dir_all(&target)?;
+            let recording = reports.path().join(format!("{phase}.json"));
+            let path = recording.to_str().context("report path")?;
+            let start = rail(
+                &workspace.path,
+                cargo_home.path(),
+                &["rail", "cache", "report", "--start", path],
+            )?;
+            assert!(start.status.success(), "report start failed: {start:?}");
+            explicit_target_cargo(&workspace.path, cargo_home.path(), "build", host, Some(&recording))?;
+            let finish = rail(
+                &workspace.path,
+                cargo_home.path(),
+                &["rail", "cache", "report", "--finish", path, "-f", "json"],
+            )?;
+            assert!(finish.status.success(), "report finish failed: {finish:?}");
+            let report = json(&finish)?;
+            assert_eq!(report["measurements"]["hits"], hits, "{phase}: {report}");
+            assert_eq!(report["measurements"]["misses"], 1 - hits, "{phase}: {report}");
+            assert_eq!(report["measurements"]["failures"], 0, "{phase}: {report}");
+            assert_eq!(
+                directory_snapshot(&outputs)?,
+                baseline,
+                "{phase} changed or omitted an upstream compiler output"
+            );
+            for (name, mode) in &modes {
+                assert_eq!(
+                    fs::metadata(outputs.join(name))?.permissions().mode() & 0o777,
+                    *mode,
+                    "{phase} mode of {}",
+                    name.display()
+                );
+            }
+        }
+        let moved_target = workspace.path.join("target/moved");
+        let moved = Command::new("cargo")
+            .current_dir(&workspace.path)
+            .args(["build", "--offline", "--quiet", "--target", host])
+            .env("CARGO_HOME", cargo_home.path())
+            .env("CARGO_TARGET_DIR", &moved_target)
+            .env("CARGO_INCREMENTAL", "0")
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
+            .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+            .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+            .env_remove("RUSTFLAGS")
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .output()?;
+        assert!(moved.status.success(), "moved unpacked build failed: {moved:?}");
+        let moved_status = selected_profile_status(&workspace.path, cargo_home.path())?;
+        let usage = &moved_status["status"]["installation"]["usage"];
+        assert_eq!(
+            usage["hits"], 1,
+            "separate debug objects crossed output directories: {usage}"
+        );
+        assert_eq!(
+            usage["misses"], 2,
+            "moved debug build did not compile its own objects: {usage}"
+        );
+        assert_eq!(
+            directory_snapshot(&outputs)?,
+            baseline,
+            "moved build changed the original debug objects"
+        );
+        fs::remove_dir_all(&target)?;
+        fs::write(workspace.path.join("src/lib.rs"), "pub fn answer() -> u64 { 42 }\n")?;
+        explicit_target_cargo(&workspace.path, cargo_home.path(), "build", host, None)?;
+        let changed = selected_profile_status(&workspace.path, cargo_home.path())?;
+        let usage = &changed["status"]["installation"]["usage"];
+        assert_eq!(usage["hits"], 1, "changed source restored stale debug objects: {usage}");
+        assert_eq!(usage["misses"], 3, "changed source did not cause a miss: {usage}");
+        assert_ne!(
+            fs::read(outputs.join(objects[0]))?,
+            baseline[objects[0]],
+            "changed code retained stale separate debug bytes"
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn external_macho_order_file_invalidates_reuse_without_changing_source() {
+    let result: Result<()> = (|| {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let linker = std::env::split_paths(&std::env::var_os("PATH").context("linker PATH")?)
+            .map(|directory| directory.join("ld64.lld"))
+            .find(|path| path.is_file())
+            .context("install ld64.lld and put it on PATH before running the Mach-O linker contract")?;
+        let workspace = TestWorkspace::new_single_crate("order-control", "0.1.0")?;
+        let external = tempfile::tempdir()?;
+        let external_root = fs::canonicalize(external.path())?;
+        let order_file = external_root.join("symbols.order");
+        let clang_config = external_root.join("clang.cfg");
+        fs::write(
+            &clang_config,
+            format!(
+                "-fuse-ld={}\n-Wl,-order_file,{}\n",
+                linker.display(),
+                order_file.display()
+            ),
+        )?;
+        fs::remove_file(workspace.path.join("src/lib.rs"))?;
+        fs::write(
+            workspace.path.join("src/main.rs"),
+            "#[no_mangle]\n#[inline(never)]\npub extern \"C\" fn first() -> u64 { 41 }\n\
+             #[no_mangle]\n#[inline(never)]\npub extern \"C\" fn second() -> u64 { 42 }\n\
+             fn main() { println!(\"{} {}\", first(), second()); }\n",
+        )?;
+        let version = Command::new("rustc").arg("-vV").output()?;
+        assert!(version.status.success(), "rustc prerequisite failed: {version:?}");
+        let verbose = String::from_utf8(version.stdout)?;
+        let host = verbose
+            .lines()
+            .find_map(|line| line.strip_prefix("host: "))
+            .context("rustc host")?;
+        fs::create_dir(workspace.path.join(".cargo"))?;
+        fs::write(
+            workspace.path.join(".cargo/config.toml"),
+            format!(
+                "[target.{host}]\nlinker = \"/usr/bin/clang\"\nrustflags = [{}]\n[profile.dev]\nsplit-debuginfo = \"off\"\n",
+                serde_json::to_string(&format!("-Clink-arg=--config={}", clang_config.display()))?
+            ),
+        )?;
+        let cargo_home = tempfile::tempdir()?;
+        let target = workspace.path.join("target").join(host);
+        let executable = target.join("debug/order-control");
+        let orders = ["_first\n_second\n", "_second\n_first\n"];
+        assert_eq!(orders[0].len(), orders[1].len(), "order mutation must retain file size");
+        let mut baselines = Vec::new();
+        for order in orders {
+            fs::write(&order_file, order)?;
+            if target.exists() {
+                fs::remove_dir_all(&target)?;
+            }
+            explicit_target_cargo(&workspace.path, cargo_home.path(), "build", host, None)?;
+            let run = Command::new(&executable).output()?;
+            assert!(run.status.success(), "uncached executable failed: {run:?}");
+            assert_eq!(run.stdout, b"41 42\n");
+            assert!(run.stderr.is_empty());
+            baselines.push((
+                fs::read(&executable)?,
+                fs::metadata(&executable)?.permissions().mode() & 0o777,
+            ));
+        }
+        assert_ne!(
+            baselines[0].0, baselines[1].0,
+            "order-file fixture did not change the independently linked executable"
+        );
+        let setup = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "setup"])?;
+        assert!(setup.status.success(), "order-file cache setup failed: {setup:?}");
+        let reports = tempfile::tempdir()?;
+        for (phase, order_index, hits, misses) in [("cold", 0, 0, 1), ("warm", 0, 1, 0), ("changed-order", 1, 0, 1)] {
+            if phase != "warm" {
+                fs::write(&order_file, orders[order_index])?;
+            }
+            fs::remove_dir_all(&target)?;
+            let recording = reports.path().join(format!("{phase}.json"));
+            let path = recording.to_str().context("report path")?;
+            let start = rail(
+                &workspace.path,
+                cargo_home.path(),
+                &["rail", "cache", "report", "--start", path],
+            )?;
+            assert!(start.status.success(), "report start failed: {start:?}");
+            explicit_target_cargo(&workspace.path, cargo_home.path(), "build", host, Some(&recording))?;
+            let finish = rail(
+                &workspace.path,
+                cargo_home.path(),
+                &["rail", "cache", "report", "--finish", path, "-f", "json"],
+            )?;
+            assert!(finish.status.success(), "report finish failed: {finish:?}");
+            let report = json(&finish)?;
+            assert_eq!(report["measurements"]["hits"], hits, "{phase}: {report}");
+            assert_eq!(report["measurements"]["misses"], misses, "{phase}: {report}");
+            assert_eq!(report["measurements"]["failures"], 0, "{phase}: {report}");
+            assert_eq!(
+                fs::read(&executable)?,
+                baselines[order_index].0,
+                "{phase} did not preserve uncached linker output"
+            );
+            assert_eq!(
+                fs::metadata(&executable)?.permissions().mode() & 0o777,
+                baselines[order_index].1,
+                "{phase} changed executable permissions"
+            );
+        }
         Ok(())
     })();
     super::helpers::finish_test(result);

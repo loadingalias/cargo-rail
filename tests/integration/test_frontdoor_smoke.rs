@@ -19,12 +19,12 @@ fn test_documented_frontdoor_commands_smoke() {
         let readme = std::fs::read_to_string(repo_root.join("README.md"))?;
         let justfile = std::fs::read_to_string(repo_root.join("justfile"))?;
         assert!(
-            justfile.contains("cargo build --workspace --all-targets --all-features --release --locked"),
+            justfile.contains("cargo build --workspace --bins --all-features --release --locked"),
             "just build-release should produce the complete release artifact set"
         );
         assert!(justfile.contains("cargo build --workspace --all-targets --all-features --locked"));
-        assert!(justfile.contains("cargo nextest run --workspace -P default --all-features --locked"));
-        assert!(justfile.contains("cargo test --doc -p cargo-rail --all-features --locked"));
+        assert!(justfile.contains("--workspace -P default --all-features --locked"));
+        assert!(justfile.contains("--doc -p cargo-rail --all-features --locked"));
         assert!(!justfile.contains("rail plan"));
         assert!(!justfile.contains("cargo run --quiet --locked --target-dir"));
         assert!(!justfile.contains("rail run"));

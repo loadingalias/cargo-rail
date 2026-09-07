@@ -239,14 +239,6 @@ pub(crate) struct ProfileSetupRequest<'a> {
     pub(crate) local_only: bool,
 }
 
-/// Policy retained from the global v0.25 receipt without assigning it to a workspace.
-pub(crate) struct PreProfileSetupInput {
-    pub(crate) installation_authority: String,
-    pub(crate) cache: LocalCacheSelection,
-    pub(crate) remote: Option<InstalledRemoteCache>,
-    pub(crate) root_portability: RootPortability,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UnboundPreProfileState {
@@ -311,8 +303,6 @@ pub(crate) struct ProfileStatus {
 pub(crate) struct ProfileSetupPlan {
     store: ProfileStore,
     transaction_before: Option<Vec<u8>>,
-    pre_profile_before: Option<Vec<u8>>,
-    pre_profile_after: Option<Vec<u8>>,
     mutations: Vec<ProfileFileMutation>,
     desired: InstalledCacheProfile,
     pending: bool,
@@ -741,7 +731,6 @@ pub(crate) fn plan_setup(
     workspace_root: &Path,
     installation_authority: &str,
     request: ProfileSetupRequest<'_>,
-    pre_profile: Option<PreProfileSetupInput>,
 ) -> RailResult<ProfileSetupPlan> {
     let identity = capture_workspace_identity(workspace_root)?;
     let store = ProfileStore::new(cargo_home)?;
@@ -749,30 +738,6 @@ pub(crate) fn plan_setup(
     let (transaction_before, recovery) = loaded_transaction
         .map(|(bytes, transaction)| (Some(bytes), Some(transaction)))
         .unwrap_or_default();
-    let pre_profile_before = store.read_pre_profile_state()?;
-    let pre_profile_after = match pre_profile {
-        Some(pre_profile) => {
-            let desired = UnboundPreProfileState {
-                version: 1,
-                installation_authority: pre_profile.installation_authority,
-                cache: pre_profile.cache,
-                remote: pre_profile.remote,
-                root_portability: pre_profile.root_portability,
-            };
-            desired.validate()?;
-            let bytes = encode_canonical(&desired, MAX_PROFILE_BYTES)?;
-            if let Some(existing) = pre_profile_before.as_deref() {
-                let retained = decode_pre_profile_state(existing)?;
-                if retained != desired {
-                    return Err(RailError::message(
-                        "retained pre-profile cache state conflicts with the v0.25 installation receipt",
-                    ));
-                }
-            }
-            Some(bytes)
-        }
-        None => pre_profile_before.clone(),
-    };
     let binding_relative = ProfileStore::binding_relative(&identity.physical_identity);
     let binding_before = store.read_effective(&binding_relative, MAX_BINDING_BYTES, recovery.as_ref())?;
     let existing_binding = binding_before.as_deref().map(decode_binding).transpose()?;
@@ -938,9 +903,7 @@ pub(crate) fn plan_setup(
     Ok(ProfileSetupPlan {
         store,
         transaction_before,
-        pre_profile_before: pre_profile_before.clone(),
-        pre_profile_after: pre_profile_after.clone(),
-        pending: pending || pre_profile_before != pre_profile_after,
+        pending,
         mutations,
         desired: desired.select_root(&identity)?,
     })
@@ -964,16 +927,6 @@ pub(crate) fn apply_setup(plan: &ProfileSetupPlan) -> RailResult<InstalledCacheP
     if let Some((_, transaction)) = live_transaction {
         plan.store.reconcile(&transaction)?;
         remove_file_durable(&plan.store.transaction_path())?;
-    }
-    if plan.store.read_pre_profile_state()? != plan.pre_profile_before {
-        return Err(RailError::message(
-            "unbound pre-profile cache state changed after setup planning",
-        ));
-    }
-    if plan.pre_profile_before != plan.pre_profile_after
-        && let Some(bytes) = &plan.pre_profile_after
-    {
-        super::installation::write_private_atomic(&plan.store.pre_profile_state_path(), bytes)?;
     }
     for mutation in &plan.mutations {
         if plan.store.read(&mutation.relative_path, MAX_PROFILE_BYTES)? != mutation.before {

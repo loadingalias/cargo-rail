@@ -37,12 +37,13 @@ use crate::compiler::model::{
     DependencyEvidenceState, DiagnosticsCompleteness, EvidenceCacheSummary, FeatureSelection, MemberEvidence,
     PlatformTarget, TargetEvidence,
 };
-use crate::compiler::native_cache::{NativeCompilerSession, NativeSessionAuthority};
+use crate::compiler::native_cache::{NativeCompilerSession, NativeInputFailure};
 use crate::compiler::observation::{
     BuildScriptResultBinding, CargoArtifactObservation, CompilationObservationContext, CompilationObservationManifest,
     CompilationProfile, CompilerCacheWrapperMetadata, CompilerCacheWrapperStatus, CompilerMode,
-    CompilerWrapperIdentity, CompilerWrapperRole, FileObservation, ObservationPath,
-    attach_build_script_result_dependencies, attach_execution_identities, build_manifests, load_raw,
+    CompilerWrapperIdentity, CompilerWrapperRole, FileObservation, NativeOutputRole, ObservationPath,
+    RawCompilerInvocation, attach_build_script_result_dependencies, attach_execution_identities, build_manifests,
+    load_raw,
 };
 use crate::compiler::scheduler::{
     AnalysisSchedule, CompilerAcquisitionPlan, CompilerAcquisitionView, CompilerCandidate, ViewIx,
@@ -65,15 +66,6 @@ use std::process::{Command, ExitStatus};
 use std::sync::{Arc, atomic::AtomicBool, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-#[cfg(test)]
-static QUALIFICATION_CARGO_VIEWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-#[cfg(test)]
-static QUALIFICATION_COMPILER_INVOCATIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-#[cfg(test)]
-static QUALIFICATION_LIVE_CARGO_VIEWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-#[cfg(test)]
-static QUALIFICATION_MAX_LIVE_CARGO_VIEWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 /// Compiler diagnostics collector and cache coordinator.
 pub(crate) struct CompilerDiagnosticsCollector<'a> {
     workspace_root: &'a Path,
@@ -82,8 +74,6 @@ pub(crate) struct CompilerDiagnosticsCollector<'a> {
     identity: CompilerCacheIdentity,
     artifact_budget: CompilerArtifactBudget,
     acquisition: Option<CompilerAcquisitionRequest>,
-    #[cfg(test)]
-    execution_policy: Option<ExecutionPolicy>,
 }
 
 /// Storage authority for the command-owned Cargo working set shared across evidence views.
@@ -238,7 +228,794 @@ impl NativeToolchainCapability {
     }
 }
 
-const TRANSPARENT_SESSION_MEMO_VERSION: u32 = 2;
+/// Object format reported by the selected compiler target, independent of the cache host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeTargetFormat {
+    Elf,
+    MachO,
+    Coff,
+    Wasm,
+    Other,
+}
+
+impl NativeTargetFormat {
+    pub(crate) const fn host() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::MachO
+        } else if cfg!(windows) {
+            Self::Coff
+        } else if cfg!(target_os = "linux") {
+            Self::Elf
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// Invocation-selected target inputs beyond the session's host compiler authority.
+#[derive(Debug, Clone)]
+pub(crate) struct NativeToolchainInputs {
+    identity: String,
+    portable_target_identity: String,
+    target_format: NativeTargetFormat,
+    primary_output_name: Option<String>,
+    is_like_msvc: bool,
+    target_linker: Option<String>,
+    target_linker_flavor: String,
+    default_split_debuginfo: Option<String>,
+    apple_sdk_name: Option<&'static str>,
+    compiler_program: OsString,
+    compiler: ExecutableIdentity,
+    compiler_guard: CompilerInputGuard,
+    current_dir: PathBuf,
+    host_guard: CompilerInputGuard,
+    target_libraries: NativeTargetLibraries,
+    target_specifications: Vec<NativeTargetSpecification>,
+    source_root: PathBuf,
+    bytes_hashed: u64,
+}
+
+#[derive(Debug, Clone)]
+struct NativeTargetLibraries {
+    path: PathBuf,
+    canonical_path: Option<PathBuf>,
+    identity: String,
+    guard: CompilerInputGuard,
+}
+
+#[derive(Debug, Clone)]
+struct NativeTargetSpecification {
+    path: PathBuf,
+    observation: Option<FileObservation>,
+    guard: CompilerInputGuard,
+}
+
+impl NativeToolchainInputs {
+    pub(crate) fn required(observation: &RawCompilerInvocation) -> bool {
+        native_target_override_required(&observation.compiler_arguments)
+            || (observation.emit_modes.contains("link")
+                && NativeOutputRole::from_invocation(&observation.crate_types, observation.test_mode)
+                    .is_some_and(NativeOutputRole::requires_linker))
+    }
+
+    pub(crate) fn capture(
+        rustc_program: &OsStr,
+        observation: &RawCompilerInvocation,
+        host_target: Option<&str>,
+        current_dir: &Path,
+        source_root: &Path,
+        cache: Option<&LocalCas>,
+    ) -> Result<Self, NativeInputFailure> {
+        let compiler_failure = |error| NativeInputFailure::new("compiler_executable_evidence_unavailable", error);
+        let host_failure = |error| NativeInputFailure::new("compiler_host_runtime_evidence_unavailable", error);
+        let target_failure = |error| NativeInputFailure::new("compiler_target_definition_evidence_unavailable", error);
+        let compiler_guard = CompilerInputGuard::capture_path(
+            &crate::executable::resolve_executable_selection(rustc_program, current_dir).map_err(compiler_failure)?,
+        )
+        .map_err(compiler_failure)?;
+        let compiler =
+            ExecutableIdentity::capture(rustc_program, current_dir, source_root).map_err(compiler_failure)?;
+        let verbose;
+        let host_target = match host_target {
+            Some(host_target) => host_target,
+            None => {
+                verbose = transparent_rustc_query(rustc_program, "-vV", current_dir).map_err(host_failure)?;
+                verbose
+                    .lines()
+                    .find_map(|line| line.strip_prefix("host: "))
+                    .filter(|host| !host.is_empty())
+                    .ok_or_else(|| host_failure(RailError::message("compiler_host_target_evidence_unavailable")))?
+            }
+        };
+        let options = native_target_query_options(&observation.compiler_arguments, current_dir, source_root)
+            .map_err(|error| NativeInputFailure::new("compiler_target_option_evidence_unavailable", error))?;
+        let host_sysroot = PathBuf::from(
+            transparent_rustc_query(rustc_program, "--print=sysroot", current_dir).map_err(host_failure)?,
+        );
+        let host_sysroot_memo =
+            cache.and_then(|cache| compiler_sysroot_memo_path_in(cache, &host_sysroot, host_target));
+        let host_guard = CompilerInputGuard::capture_sysroot(&host_sysroot, host_target).map_err(host_failure)?;
+        let (host_sysroot_identity, mut bytes_hashed) =
+            compiler_sysroot_fingerprint(&host_sysroot, host_target, host_sysroot_memo.as_deref())
+                .map_err(host_failure)?;
+        let sysroot = options
+            .sysroot
+            .as_deref()
+            .map_or_else(|| host_sysroot.clone(), |path| absolute_target_input(path, current_dir));
+        let (target_specifications, specification_bytes) =
+            capture_native_target_specifications(options.target.as_deref(), &sysroot, current_dir, source_root)
+                .map_err(target_failure)?;
+        bytes_hashed = bytes_hashed.saturating_add(specification_bytes);
+        let output_query = native_target_output_query(observation);
+        let query = query_native_target(rustc_program, &options.arguments, current_dir, output_query)
+            .map_err(|error| NativeInputFailure::new("compiler_target_query_failed", error))?;
+        let mut values = serde_json::Deserializer::from_slice(&query).into_iter::<serde_json::Value>();
+        let specification = values
+            .next()
+            .transpose()
+            .map_err(|error| NativeInputFailure::new("compiler_target_definition_evidence_unavailable", error.into()))?
+            .filter(serde_json::Value::is_object)
+            .ok_or_else(|| target_failure(RailError::message("compiler_target_definition_evidence_unavailable")))?;
+        let trailing = std::str::from_utf8(&query[values.byte_offset()..])
+            .map_err(|_| target_failure(RailError::message("compiler_target_definition_evidence_unavailable")))?;
+        let mut lines = trailing.trim_start().lines();
+        let target_libdir = lines
+            .next()
+            .filter(|path| Path::new(path).is_absolute())
+            .ok_or_else(|| {
+                NativeInputFailure::new(
+                    "compiler_target_library_directory_evidence_unavailable",
+                    RailError::message("selected compiler did not report an absolute target library directory"),
+                )
+            })?;
+        let primary_output_name = if output_query.is_some() {
+            Some(
+                lines
+                    .next()
+                    .filter(|name| {
+                        !name.is_empty() && !matches!(*name, "." | "..") && !name.contains(['/', '\\', '\0'])
+                    })
+                    .ok_or_else(|| {
+                        NativeInputFailure::new(
+                            "compiler_target_output_name_evidence_unavailable",
+                            RailError::message("selected compiler did not report one primary output filename"),
+                        )
+                    })?
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+        if output_query.is_some() && lines.next() != Some(target_libdir) {
+            return Err(NativeInputFailure::new(
+                "compiler_target_output_name_evidence_unavailable",
+                RailError::message("selected compiler did not delimit exactly one primary output filename"),
+            ));
+        }
+        let is_like_msvc = match specification.get("is-like-msvc") {
+            None => false,
+            Some(value) => value.as_bool().ok_or_else(|| {
+                target_failure(RailError::message(
+                    "selected compiler reported an invalid MSVC target property",
+                ))
+            })?,
+        };
+        let target_linker = specification
+            .get("linker")
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|value| !value.is_empty() && !value.contains('\0'))
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        target_failure(RailError::message(
+                            "selected compiler reported an invalid target linker",
+                        ))
+                    })
+            })
+            .transpose()?;
+        let target_linker_flavor = specification
+            .get("linker-flavor")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                target_failure(RailError::message(
+                    "selected compiler did not report its target linker flavor",
+                ))
+            })?
+            .to_string();
+        let default_split_debuginfo = specification
+            .get("split-debuginfo")
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|value| matches!(*value, "off" | "packed" | "unpacked"))
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        target_failure(RailError::message(
+                            "selected compiler reported an invalid split-debuginfo default",
+                        ))
+                    })
+            })
+            .transpose()?;
+        let cfg = lines.map(str::to_string).collect::<BTreeSet<_>>();
+        if !cfg.iter().any(|value| value.starts_with("target_arch=")) {
+            return Err(NativeInputFailure::new(
+                "compiler_target_cfg_evidence_unavailable",
+                RailError::message("selected compiler did not report target cfg"),
+            ));
+        }
+        let target_format = native_target_format(&specification, &cfg)
+            .map_err(|error| NativeInputFailure::new("compiler_target_object_format_evidence_unavailable", error))?;
+        if specification.get("cpu").and_then(serde_json::Value::as_str) == Some("native") {
+            return Err(NativeInputFailure::new(
+                "native_cpu_identity_unavailable",
+                RailError::message("target definition selects the machine's native CPU"),
+            ));
+        }
+        let backend = options
+            .backend
+            .as_deref()
+            .or_else(|| {
+                specification
+                    .get("default-codegen-backend")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .unwrap_or("llvm");
+        match backend {
+            "llvm" => {}
+            "cranelift" => {
+                if crate::utils::canonicalize_existing(&sysroot).map_err(|error| target_failure(error.into()))?
+                    != crate::utils::canonicalize_existing(&host_sysroot).map_err(|error| host_failure(error.into()))?
+                {
+                    return Err(NativeInputFailure::new(
+                        "codegen_backend_runtime_dependencies_unavailable",
+                        RailError::message(
+                            "custom sysroot can select backend libraries outside the compiler distribution",
+                        ),
+                    ));
+                }
+                // The actual compiler's completed module observation certifies
+                // whether code emission required a separate assembly step.
+            }
+            _ => {
+                return Err(NativeInputFailure::new(
+                    "codegen_backend_runtime_dependencies_unavailable",
+                    RailError::message("selected codegen backend runtime dependencies have not been observed"),
+                ));
+            }
+        }
+        let (target_libraries, library_bytes) = NativeTargetLibraries::capture(Path::new(target_libdir), cache)
+            .map_err(|error| NativeInputFailure::new("compiler_target_library_evidence_unavailable", error))?;
+        bytes_hashed = bytes_hashed.saturating_add(library_bytes);
+        let specification_inputs = target_specifications
+            .iter()
+            .map(|input| &input.observation)
+            .collect::<Vec<_>>();
+        let portable_target_identity = format!(
+            "sha256:{}",
+            ContentDigest::sha256(
+                &serde_json::to_vec(&(
+                    "cargo-rail-portable-target-v1",
+                    &specification,
+                    &cfg,
+                    backend,
+                    &target_libraries.identity,
+                ))
+                .map_err(|error| NativeInputFailure::new(
+                    "compiler_toolchain_identity_encoding_failed",
+                    error.into(),
+                ))?
+            )
+        );
+        let identity = format!(
+            "sha256:{}",
+            ContentDigest::sha256(
+                &serde_json::to_vec(&(
+                    "cargo-rail-invocation-toolchain-v1",
+                    host_target,
+                    &compiler,
+                    &host_sysroot_identity,
+                    options.target.as_deref().unwrap_or(host_target),
+                    &specification,
+                    &cfg,
+                    backend,
+                    &specification_inputs,
+                    &target_libraries.identity,
+                ))
+                .map_err(|error| NativeInputFailure::new(
+                    "compiler_toolchain_identity_encoding_failed",
+                    error.into()
+                ))?
+            )
+        );
+        let mut captured = Self {
+            identity,
+            portable_target_identity,
+            target_format,
+            primary_output_name,
+            is_like_msvc,
+            target_linker,
+            target_linker_flavor,
+            default_split_debuginfo,
+            apple_sdk_name: native_target_apple_sdk(&specification),
+            compiler_program: rustc_program.to_os_string(),
+            compiler,
+            compiler_guard,
+            current_dir: current_dir.to_path_buf(),
+            host_guard,
+            target_libraries,
+            target_specifications,
+            source_root: source_root.to_path_buf(),
+            bytes_hashed,
+        };
+        captured.bytes_hashed = captured.bytes_hashed.saturating_add(
+            captured
+                .revalidate()
+                .map_err(|error| NativeInputFailure::new("compiler_toolchain_input_changed", error))?,
+        );
+        Ok(captured)
+    }
+
+    pub(crate) fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    pub(crate) const fn target_format(&self) -> NativeTargetFormat {
+        self.target_format
+    }
+
+    pub(crate) fn portable_target_identity(&self) -> &str {
+        &self.portable_target_identity
+    }
+
+    pub(crate) fn primary_output_name(&self) -> Option<&str> {
+        self.primary_output_name.as_deref()
+    }
+
+    pub(crate) fn target_library_directory(&self) -> &Path {
+        &self.target_libraries.path
+    }
+
+    pub(crate) const fn is_like_msvc(&self) -> bool {
+        self.is_like_msvc
+    }
+
+    pub(crate) fn target_linker(&self) -> Option<&str> {
+        self.target_linker.as_deref()
+    }
+
+    pub(crate) fn target_linker_flavor(&self) -> &str {
+        &self.target_linker_flavor
+    }
+
+    pub(crate) fn default_split_debuginfo(&self) -> Option<&str> {
+        self.default_split_debuginfo.as_deref()
+    }
+
+    pub(crate) const fn apple_sdk_name(&self) -> Option<&'static str> {
+        self.apple_sdk_name
+    }
+
+    pub(crate) const fn bytes_hashed(&self) -> u64 {
+        self.bytes_hashed
+    }
+
+    pub(crate) fn revalidate(&self) -> RailResult<u64> {
+        self.compiler_guard.revalidate()?;
+        self.host_guard.revalidate()?;
+        if ExecutableIdentity::capture(&self.compiler_program, &self.current_dir, &self.source_root)? != self.compiler {
+            return Err(RailError::message("compiler_executable_changed"));
+        }
+        // The initial hashes own content identity. Retained file and directory
+        // generations close the execution interval without rebuilding inventories.
+        let mut bytes_hashed = 0u64;
+        for input in &self.target_specifications {
+            bytes_hashed = bytes_hashed.saturating_add(input.revalidate(&self.source_root)?);
+        }
+        self.target_libraries.revalidate()?;
+        self.compiler_guard.revalidate()?;
+        self.host_guard.revalidate()?;
+        Ok(bytes_hashed)
+    }
+}
+
+fn native_target_override_required(arguments: &[String]) -> bool {
+    arguments.iter().enumerate().any(|(index, argument)| {
+        argument == "--target"
+            || argument.starts_with("--target=")
+            || argument == "--sysroot"
+            || argument.starts_with("--sysroot=")
+            || argument.starts_with("-Ctarget-cpu=")
+            || argument.starts_with("-Ctarget-feature=")
+            || argument.starts_with("-Zcodegen-backend=")
+            || argument == "-C"
+                && arguments
+                    .get(index + 1)
+                    .is_some_and(|value| value.starts_with("target-cpu=") || value.starts_with("target-feature="))
+            || argument == "-Z"
+                && arguments
+                    .get(index + 1)
+                    .is_some_and(|value| value.starts_with("codegen-backend="))
+    })
+}
+
+struct NativeTargetQueryOptions {
+    arguments: Vec<String>,
+    target: Option<String>,
+    sysroot: Option<String>,
+    backend: Option<String>,
+}
+
+fn native_target_query_options(
+    arguments: &[String],
+    current_dir: &Path,
+    source_root: &Path,
+) -> RailResult<NativeTargetQueryOptions> {
+    let mut selected = NativeTargetQueryOptions {
+        arguments: Vec::new(),
+        target: None,
+        sysroot: None,
+        backend: None,
+    };
+    let mut arguments = arguments.iter();
+    while let Some(argument) = arguments.next() {
+        let (option, value) = if matches!(argument.as_str(), "--target" | "--sysroot" | "-C" | "-Z") {
+            (
+                argument.as_str(),
+                arguments
+                    .next()
+                    .ok_or_else(|| RailError::message("compiler_target_option_value_unavailable"))?
+                    .as_str(),
+            )
+        } else if let Some(value) = argument.strip_prefix("--target=") {
+            ("--target", value)
+        } else if let Some(value) = argument.strip_prefix("--sysroot=") {
+            ("--sysroot", value)
+        } else if let Some(value) = argument.strip_prefix("-C") {
+            ("-C", value)
+        } else if let Some(value) = argument.strip_prefix("-Z") {
+            ("-Z", value)
+        } else {
+            continue;
+        };
+        let restored;
+        let value = if matches!(option, "--target" | "--sysroot") && value.starts_with("repository:") {
+            let path = if value
+                .strip_prefix("repository:")
+                .is_some_and(|relative| relative.trim_start_matches(['/', '\\']).is_empty())
+            {
+                source_root.to_path_buf()
+            } else {
+                crate::compiler::native_cache::resolve_portable_compiler_path(value, current_dir, source_root)?
+            };
+            restored = path
+                .to_str()
+                .ok_or_else(|| RailError::message("compiler_target_path_encoding_unavailable"))?
+                .to_string();
+            restored.as_str()
+        } else {
+            value
+        };
+        match option {
+            "--target" => selected.target = Some(value.to_string()),
+            "--sysroot" => selected.sysroot = Some(value.to_string()),
+            "-C" if value.starts_with("target-cpu=") => {
+                if value == "target-cpu=native" {
+                    return Err(RailError::message("native_cpu_identity_unavailable"));
+                }
+            }
+            "-C" if value.starts_with("target-feature=") || value.starts_with("extra-filename=") => {}
+            "-Z" if value.starts_with("codegen-backend=") => {
+                selected.backend = value.strip_prefix("codegen-backend=").map(str::to_string);
+            }
+            _ => continue,
+        }
+        selected.arguments.extend([option.to_string(), value.to_string()]);
+    }
+    Ok(selected)
+}
+
+fn native_target_output_query(observation: &RawCompilerInvocation) -> Option<(&str, &str)> {
+    NativeOutputRole::from_invocation(&observation.crate_types, observation.test_mode)?;
+    Some((
+        observation.crate_name.as_deref()?,
+        if observation.test_mode {
+            "bin"
+        } else {
+            observation.crate_types.iter().next()?.as_str()
+        },
+    ))
+}
+
+fn query_native_target(
+    program: &OsStr,
+    arguments: &[String],
+    current_dir: &Path,
+    output_query: Option<(&str, &str)>,
+) -> RailResult<Vec<u8>> {
+    const MAX_TARGET_QUERY_BYTES: u64 = 1024 * 1024;
+    let mut command = Command::new(program);
+    command.args(arguments).args([
+        "-Zunstable-options",
+        "--print=target-spec-json",
+        "--print=target-libdir",
+    ]);
+    if let Some((name, crate_type)) = output_query {
+        // Repeating the absolute directory delimits the single filename, so an
+        // unsupported crate type cannot turn the first cfg line into an output.
+        command.args([
+            "--print=file-names",
+            "--print=target-libdir",
+            "--crate-name",
+            name,
+            "--crate-type",
+            crate_type,
+            "-",
+        ]);
+    }
+    command
+        .arg("--print=cfg")
+        .stdin(std::process::Stdio::null())
+        .current_dir(current_dir)
+        // This enables only the read-only target description query. The original
+        // compiler invocation retains its exact environment and arguments.
+        .env("RUSTC_BOOTSTRAP", "1")
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .env("RUSTUP_NO_UPDATE_CHECK", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    crate::remote_cache::scrub_child_environment(&mut command);
+    let mut child = command.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| RailError::message("compiler_target_query_stdout_unavailable"))?;
+    let mut bytes = Vec::new();
+    let read = stdout.take(MAX_TARGET_QUERY_BYTES + 1).read_to_end(&mut bytes);
+    if read.is_err() || bytes.len() as u64 > MAX_TARGET_QUERY_BYTES {
+        drop(child.kill());
+        drop(child.wait());
+        return Err(RailError::message("compiler_target_query_output_limit"));
+    }
+    if !child.wait()?.success() {
+        return Err(RailError::message("compiler_target_query_failed"));
+    }
+    Ok(bytes)
+}
+
+fn native_target_format(specification: &serde_json::Value, cfg: &BTreeSet<String>) -> RailResult<NativeTargetFormat> {
+    let format = match specification.get("binary-format") {
+        Some(value) => value.as_str(),
+        None => cfg.iter().find_map(|value| {
+            value
+                .strip_prefix("target_object_format=\"")
+                .and_then(|value| value.strip_suffix('"'))
+        }),
+    };
+    match format {
+        Some("elf") => Ok(NativeTargetFormat::Elf),
+        Some("mach-o" | "macho") => Ok(NativeTargetFormat::MachO),
+        Some("coff") => Ok(NativeTargetFormat::Coff),
+        Some("wasm") => Ok(NativeTargetFormat::Wasm),
+        Some("xcoff") => Ok(NativeTargetFormat::Other),
+        _ => Err(RailError::message("compiler_target_object_format_evidence_unavailable")),
+    }
+}
+
+fn native_target_apple_sdk(specification: &serde_json::Value) -> Option<&'static str> {
+    let os = specification.get("os")?.as_str()?;
+    let environment = match specification.get("env") {
+        None => "",
+        Some(value) => value.as_str()?,
+    };
+    // rustc_codegen_ssa::back::apple::sdk_name selects from the effective
+    // target properties, including custom targets and simulator environments.
+    match (os, environment) {
+        ("macos", "") | ("ios", "macabi") => Some("MacOSX"),
+        ("ios", "") => Some("iPhoneOS"),
+        ("ios", "sim") => Some("iPhoneSimulator"),
+        ("tvos", "") => Some("AppleTVOS"),
+        ("tvos", "sim") => Some("AppleTVSimulator"),
+        ("visionos", "") => Some("XROS"),
+        ("visionos", "sim") => Some("XRSimulator"),
+        ("watchos", "") => Some("WatchOS"),
+        ("watchos", "sim") => Some("WatchSimulator"),
+        _ => None,
+    }
+}
+
+fn absolute_target_input(path: &str, current_dir: &Path) -> PathBuf {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        current_dir.join(path)
+    }
+}
+
+fn capture_native_target_specifications(
+    target: Option<&str>,
+    sysroot: &Path,
+    current_dir: &Path,
+    source_root: &Path,
+) -> RailResult<(Vec<NativeTargetSpecification>, u64)> {
+    let Some(target) = target else {
+        return Ok((Vec::new(), 0));
+    };
+    let mut candidates = if target.ends_with(".json") {
+        vec![absolute_target_input(target, current_dir)]
+    } else {
+        if target.contains(['/', '\\']) || matches!(target, "" | "." | "..") {
+            return Err(RailError::message("compiler_target_definition_evidence_unavailable"));
+        }
+        let mut paths = std::env::var_os("RUST_TARGET_PATH")
+            .map(|value| {
+                std::env::split_paths(&value)
+                    .map(|path| {
+                        if path.is_absolute() {
+                            path
+                        } else {
+                            current_dir.join(path)
+                        }
+                        .join(format!("{target}.json"))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        paths.push(sysroot.join("lib/rustlib").join(target).join("target.json"));
+        paths
+    };
+    candidates.sort();
+    candidates.dedup();
+    let mut bytes_hashed = 0u64;
+    let inputs = candidates
+        .into_iter()
+        .map(|path| {
+            let guard = CompilerInputGuard::capture_path(&path)?;
+            let observation = match fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    let (observation, bytes) = FileObservation::capture_counted(&path, current_dir, source_root)?;
+                    bytes_hashed = bytes_hashed.saturating_add(bytes);
+                    Some(observation)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            Ok(NativeTargetSpecification {
+                path,
+                observation,
+                guard,
+            })
+        })
+        .collect::<RailResult<Vec<_>>>()?;
+    Ok((inputs, bytes_hashed))
+}
+
+impl NativeTargetSpecification {
+    fn revalidate(&self, source_root: &Path) -> RailResult<u64> {
+        self.guard.revalidate()?;
+        let (unchanged, bytes) = match &self.observation {
+            Some(observation) => {
+                let (current, bytes) = FileObservation::capture_counted(&self.path, source_root, source_root)?;
+                (current == *observation, bytes)
+            }
+            None => (
+                fs::symlink_metadata(&self.path).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+                0,
+            ),
+        };
+        self.guard.revalidate()?;
+        if unchanged {
+            Ok(bytes)
+        } else {
+            Err(RailError::message("compiler_target_specification_changed"))
+        }
+    }
+}
+
+impl NativeTargetLibraries {
+    fn capture(path: &Path, cache: Option<&LocalCas>) -> RailResult<(Self, u64)> {
+        let canonical_path = match fs::symlink_metadata(path) {
+            Ok(_) => Some(crate::utils::canonicalize_existing(path)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let memo_path = canonical_path
+            .as_deref()
+            .and_then(|root| cache.and_then(|cache| compiler_sysroot_memo_path_in(cache, root, "target-libraries-v1")));
+        let guard = match canonical_path.as_deref() {
+            Some(root) => CompilerInputGuard::capture_inventory(target_library_inventory(root)?, path)?,
+            None => CompilerInputGuard::capture_path(path)?,
+        };
+        let (identity, bytes_hashed) = match canonical_path.as_deref() {
+            Some(root) => target_library_fingerprint(root, memo_path.as_deref())?,
+            None => ("absent".to_string(), 0),
+        };
+        guard.revalidate()?;
+        Ok((
+            Self {
+                path: path.to_path_buf(),
+                canonical_path,
+                identity,
+                guard,
+            },
+            bytes_hashed,
+        ))
+    }
+
+    fn revalidate(&self) -> RailResult<()> {
+        self.guard.revalidate()?;
+        let unchanged = match self.canonical_path.as_deref() {
+            Some(root) => crate::utils::canonicalize_existing(&self.path).is_ok_and(|current| current == root),
+            None => fs::symlink_metadata(&self.path).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+        };
+        self.guard.revalidate()?;
+        if unchanged {
+            Ok(())
+        } else {
+            Err(RailError::message("compiler_target_libraries_changed"))
+        }
+    }
+}
+
+fn target_library_fingerprint(root: &Path, memo: Option<&Path>) -> RailResult<(String, u64)> {
+    fingerprint_compiler_inventory(target_library_inventory(root)?, "target-libraries-v1", memo, || {
+        target_library_inventory(root)
+    })
+}
+
+fn target_library_inventory(root: &Path) -> RailResult<CompilerSysrootInventory> {
+    validate_sysroot_directory(root)?;
+    let mut files = Vec::new();
+    let mut directories = vec![root.to_path_buf()];
+    let mut visited = Vec::new();
+    while let Some(directory) = directories.pop() {
+        visited.push(directory.clone());
+        for entry in fs::read_dir(&directory)? {
+            let path = entry?.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if crate::utils::is_symlink_or_reparse(&metadata) {
+                return Err(RailError::message("compiler_target_library_symlink_unavailable"));
+            }
+            if metadata.is_dir() {
+                directories.push(path);
+            } else if metadata.is_file() {
+                files.push((sysroot_relative_path(root, &path)?, path));
+            } else {
+                return Err(RailError::message("compiler_target_library_entry_unavailable"));
+            }
+            if files.len() + visited.len() + directories.len() > MAX_SYSROOT_FILES {
+                return Err(RailError::message("compiler_target_library_inventory_limit"));
+            }
+        }
+    }
+    files.sort();
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    let evidence_locations = {
+        let mut locations = visited
+            .iter()
+            .map(|path| evidence_location(root, path, SysrootEvidenceKind::Directory))
+            .chain(
+                files
+                    .iter()
+                    .map(|(_, path)| evidence_location(root, path, SysrootEvidenceKind::File)),
+            )
+            .collect::<RailResult<Vec<_>>>()?;
+        locations.sort_by(|left, right| (&left.kind, &left.relative_path).cmp(&(&right.kind, &right.relative_path)));
+        locations
+    };
+    Ok(CompilerSysrootInventory {
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        root: root.to_path_buf(),
+        files,
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        evidence_locations,
+    })
+}
+
+const TRANSPARENT_SESSION_MEMO_VERSION: u32 = 3;
 
 /// Regenerable, receipt-private proof that a direct compiler session remains
 /// exact without launching two identity probes for every rustc unit.
@@ -292,11 +1069,6 @@ impl CompilerCacheBypass {
 static COMPILER_OBSERVATION_PROCESS: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 fn compiler_observation_wrapper() -> RailResult<PathBuf> {
-    #[cfg(test)]
-    if let Some(path) = std::env::var_os("CARGO_RAIL_TEST_OBSERVATION_WRAPPER") {
-        return crate::utils::canonicalize_existing(Path::new(&path))
-            .with_context(|| "locating the explicitly provisioned compiler-observation test wrapper".to_string());
-    }
     if let Some(process) = COMPILER_OBSERVATION_PROCESS.get() {
         return Ok(process.clone());
     }
@@ -516,7 +1288,7 @@ impl CompilerCacheIdentity {
     }
 }
 
-/// Capture the retained exact v10 session from the compiler Cargo selected for
+/// Capture the retained exact session from the compiler Cargo selected for
 /// one transparent wrapper invocation. This runs only after acquisition-free
 /// eligibility gates have accepted the rustc shape.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -526,7 +1298,12 @@ pub(crate) fn capture_transparent_native_session(
     rustc_program: &OsStr,
     cache: &LocalCacheSelection,
     root_portability: crate::cache::installation::InstalledRootPortability,
-) -> RailResult<(NativeCompilerSession, u64, TransparentNativeSessionMemo)> {
+) -> RailResult<(
+    NativeCompilerSession,
+    u64,
+    TransparentNativeSessionMemo,
+    CompilerInputGuard,
+)> {
     let source_root = crate::utils::canonicalize_existing(source_root)?;
     let resolved_rustc = crate::executable::resolve_executable_path(rustc_program, &source_root)?;
     let rustc_program_generation = crate::utils::stable_file_generation(&resolved_rustc)
@@ -539,6 +1316,9 @@ pub(crate) fn capture_transparent_native_session(
         .ok_or_else(|| RailError::message("selected rustc verbose identity has no host target"))?;
     let rustc_sysroot = PathBuf::from(transparent_rustc_query(rustc_program, "--print=sysroot", &source_root)?);
     let rustc_sysroot = crate::utils::canonicalize_existing(&rustc_sysroot)?;
+    let selected_rustc = crate::executable::resolve_executable_selection(rustc_program, &source_root)?;
+    let guard = CompilerInputGuard::capture_session(&rustc_sysroot, host_target, &selected_rustc)?;
+    let sysroot_evidence = guard.evidence.clone();
     #[cfg(windows)]
     let rustc_implementation = rustc_sysroot.join("bin/rustc.exe");
     #[cfg(not(windows))]
@@ -550,6 +1330,7 @@ pub(crate) fn capture_transparent_native_session(
     let memo_path = compiler_sysroot_memo_path(&rustc_sysroot, host_target, Some(cache));
     let (sysroot_identity, bytes_hashed) =
         compiler_sysroot_fingerprint(&rustc_sysroot, host_target, memo_path.as_deref())?;
+    guard.revalidate()?;
     let platform = format!(
         "{}-{}-{}",
         std::env::consts::FAMILY,
@@ -574,18 +1355,20 @@ pub(crate) fn capture_transparent_native_session(
     append_identity_frame(&mut framed, b"compiler-sysroot", sysroot_identity.as_bytes());
     let capability_identity = format!("sha256:{}", ContentDigest::sha256(&framed));
     let compiler_environment = transparent_native_compiler_process_env_fingerprint(target_root)?;
-    let session = NativeCompilerSession::capture_with_root_portability(
+    let session = NativeCompilerSession::capture(
         &source_root,
         &rustc_verbose_version,
+        &rustc_sysroot,
         &capability_identity,
         &compiler_environment,
-        crate::compiler::native_cache::native_cache_execution_contract(),
-        NativeSessionAuthority::Exact,
         root_portability,
     )?;
-    let inventory = compiler_sysroot_inventory(&rustc_sysroot, host_target)?;
-    let sysroot_evidence = capture_exact_sysroot_evidence(&inventory)
-        .ok_or_else(|| RailError::message("selected rustc sysroot has no stable local generation evidence"))?;
+    if crate::executable::resolve_executable_path(rustc_program, &source_root)? != resolved_rustc
+        || crate::utils::stable_file_generation(&resolved_rustc).as_ref() != Some(&rustc_program_generation)
+    {
+        return Err(RailError::message("selected rustc changed during session capture"));
+    }
+    guard.revalidate()?;
     let mut memo = TransparentNativeSessionMemo {
         version: TRANSPARENT_SESSION_MEMO_VERSION,
         source_root: source_root
@@ -608,7 +1391,7 @@ pub(crate) fn capture_transparent_native_session(
         digest: String::new(),
     };
     memo.digest = transparent_session_memo_digest(&memo)?;
-    Ok((session, bytes_hashed, memo))
+    Ok((session, bytes_hashed, memo, guard))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -618,7 +1401,12 @@ pub(crate) fn capture_transparent_native_session(
     _rustc_program: &OsStr,
     _cache: &LocalCacheSelection,
     _root_portability: crate::cache::installation::InstalledRootPortability,
-) -> RailResult<(NativeCompilerSession, u64, TransparentNativeSessionMemo)> {
+) -> RailResult<(
+    NativeCompilerSession,
+    u64,
+    TransparentNativeSessionMemo,
+    CompilerInputGuard,
+)> {
     Err(RailError::message(
         "transparent compiler session memoization is unsupported on this platform",
     ))
@@ -630,7 +1418,7 @@ pub(crate) fn reuse_transparent_native_session(
     source_root: &Path,
     target_root: &Path,
     rustc_program: &OsStr,
-) -> RailResult<Option<NativeCompilerSession>> {
+) -> RailResult<Option<(NativeCompilerSession, CompilerInputGuard)>> {
     let source_root = crate::utils::canonicalize_existing(source_root)?;
     if memo.version != TRANSPARENT_SESSION_MEMO_VERSION
         || memo.digest != transparent_session_memo_digest(memo)?
@@ -645,15 +1433,20 @@ pub(crate) fn reuse_transparent_native_session(
     {
         return Ok(None);
     }
-    let inventory = compiler_sysroot_inventory(Path::new(&memo.rustc_sysroot), &memo.host_target)?;
-    let Some(before) = capture_exact_sysroot_evidence(&inventory) else {
+    let selected_rustc = crate::executable::resolve_executable_selection(rustc_program, &source_root)?;
+    let guard =
+        CompilerInputGuard::capture_session(Path::new(&memo.rustc_sysroot), &memo.host_target, &selected_rustc)?;
+    if guard.evidence != memo.sysroot_evidence {
         return Ok(None);
-    };
-    if before != memo.sysroot_evidence || capture_exact_sysroot_evidence(&inventory).as_ref() != Some(&before) {
+    }
+    if guard.revalidate().is_err()
+        || crate::executable::resolve_executable_path(rustc_program, &source_root)? != resolved_rustc
+        || crate::utils::stable_file_generation(&resolved_rustc).as_ref() != Some(&memo.rustc_program_generation)
+    {
         return Ok(None);
     }
     memo.session.validate_for_source_root(&source_root)?;
-    Ok(Some(memo.session.clone()))
+    Ok(Some((memo.session.clone(), guard)))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -662,7 +1455,7 @@ pub(crate) fn reuse_transparent_native_session(
     _source_root: &Path,
     _target_root: &Path,
     _rustc_program: &OsStr,
-) -> RailResult<Option<NativeCompilerSession>> {
+) -> RailResult<Option<(NativeCompilerSession, CompilerInputGuard)>> {
     Ok(None)
 }
 
@@ -736,8 +1529,6 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
             identity: identity.clone(),
             artifact_budget: CompilerArtifactBudget::default(),
             acquisition: None,
-            #[cfg(test)]
-            execution_policy: None,
         }
     }
 
@@ -748,12 +1539,6 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
 
     pub(crate) fn with_acquisition_manifest(mut self, request: CompilerAcquisitionRequest) -> Self {
         self.acquisition = Some(request);
-        self
-    }
-
-    #[cfg(test)]
-    fn with_execution_policy(mut self, policy: ExecutionPolicy) -> Self {
-        self.execution_policy = Some(policy);
         self
     }
 
@@ -838,15 +1623,11 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                 metrics,
             });
         }
-        let derived_policy = ExecutionPolicy::derive(
+        let execution_policy = ExecutionPolicy::derive(
             plan.view_count(),
             self.identity.analysis_cache.is_some(),
             self.identity.explicit_build_jobs,
         );
-        #[cfg(test)]
-        let execution_policy = self.execution_policy.unwrap_or(derived_policy);
-        #[cfg(not(test))]
-        let execution_policy = derived_policy;
         crate::instrumentation::record_compiler_acquisition_execution_policy(
             execution_policy.process_slots(),
             execution_policy.work_permits(),
@@ -1352,19 +2133,6 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                                     active_members,
                                     if active_members == 1 { "" } else { "s" }
                                 );
-                            }
-                            if let Err(error) = surface_acquisition_test_fault(prepared.ordinal) {
-                                cancellation.store(true, std::sync::atomic::Ordering::Release);
-                                runtime.fail(index)?;
-                                failures.push(AcquisitionFailure::view(
-                                    prepared.ordinal,
-                                    index,
-                                    Vec::new(),
-                                    FailureClass::Coordinator,
-                                    error,
-                                ));
-                                idle_workers.push_front(worker);
-                                break;
                             }
                             let sandbox = match sandbox_pool.lease(SandboxCompatibility::new(
                                 self.identity.toolchain_fingerprint.clone(),
@@ -1898,24 +2666,6 @@ type CandidateId = (
     String,
     Option<FeatureSelection>,
 );
-
-fn surface_acquisition_test_fault(ordinal: usize) -> RailResult<()> {
-    #[cfg(debug_assertions)]
-    {
-        let requested = std::env::var("CARGO_RAIL_SURFACE_FAIL_ACQUISITION_VIEW")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok());
-        if requested == Some(ordinal + 1) {
-            return Err(RailError::message(format!(
-                "injected Surface compiler acquisition failure at view {}",
-                ordinal + 1
-            )));
-        }
-    }
-    #[cfg(not(debug_assertions))]
-    let _ = ordinal;
-    Ok(())
-}
 
 fn build_candidate_target_index(
     candidates: &[CompilerCandidate],
@@ -2590,8 +3340,6 @@ fn run_workspace_check(
         command.env(INNER_WRAPPER_ENV, inner_wrapper);
     }
 
-    #[cfg(test)]
-    QUALIFICATION_CARGO_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let bounded = run_artifact_bounded_command(
         &mut command,
         &cargo_target,
@@ -2635,8 +3383,6 @@ fn run_workspace_check(
 
     let invocations = load_raw(observation_directory.path())?;
     crate::instrumentation::record_compiler_acquisition_actions(invocations.len());
-    #[cfg(test)]
-    QUALIFICATION_COMPILER_INVOCATIONS.fetch_add(invocations.len(), std::sync::atomic::Ordering::Relaxed);
     let compiler_fact_fragments = typed_session.as_ref().map_or_else(
     || Ok(Vec::new()),
     |typed| {
@@ -2748,26 +3494,6 @@ struct ArtifactPreflight {
     soft_limit_observed_bytes: Option<u64>,
 }
 
-#[cfg(test)]
-struct QualificationLiveCargoProcess;
-
-#[cfg(test)]
-impl QualificationLiveCargoProcess {
-    fn start() -> Self {
-        let live = QUALIFICATION_LIVE_CARGO_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        QUALIFICATION_MAX_LIVE_CARGO_VIEWS.fetch_max(live, std::sync::atomic::Ordering::Relaxed);
-        Self
-    }
-}
-
-#[cfg(test)]
-impl Drop for QualificationLiveCargoProcess {
-    fn drop(&mut self) {
-        let previous = QUALIFICATION_LIVE_CARGO_VIEWS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        debug_assert!(previous > 0, "qualification live Cargo process counter underflowed");
-    }
-}
-
 fn run_artifact_bounded_command(
     command: &mut Command,
     artifact_root: &Path,
@@ -2811,8 +3537,6 @@ fn run_artifact_bounded_command(
     }
     let mut process = ProcessTree::spawn(command)?;
     let _live_process = crate::instrumentation::compiler_acquisition_process_started(!broker_enabled);
-    #[cfg(test)]
-    let _qualification_live_process = QualificationLiveCargoProcess::start();
     let stdout = process.take_stdout()?;
     let stderr = process.take_stderr()?;
     let stream_failed = Arc::new(AtomicBool::new(false));
@@ -4099,12 +4823,155 @@ const MAX_SYSROOT_FILES: usize = 4096;
 // but size that bound for the complete supported compiler inventory.
 const MAX_SYSROOT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+#[derive(Debug, Clone)]
 struct CompilerSysrootInventory {
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     root: PathBuf,
     files: Vec<(String, PathBuf)>,
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     evidence_locations: Vec<SysrootEvidenceLocation>,
+}
+
+/// Retained local generations reject input changes that return to their old bytes.
+#[derive(Debug, Clone)]
+pub(crate) struct CompilerInputGuard {
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    inventory: CompilerSysrootInventory,
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    evidence: ExactSysrootEvidence,
+}
+
+impl CompilerInputGuard {
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    fn capture_session(sysroot: &Path, host_target: &str, selected_rustc: &Path) -> RailResult<Self> {
+        let mut inventory = compiler_sysroot_inventory(sysroot, host_target)?;
+        inventory.evidence_locations.push(SysrootEvidenceLocation {
+            kind: SysrootEvidenceKind::File,
+            relative_path: "selected-rustc-program".into(),
+            physical_path: crate::utils::canonicalize_existing(selected_rustc)?,
+        });
+        Self::capture_inventory(inventory, selected_rustc)
+    }
+
+    pub(crate) fn capture_sysroot(sysroot: &Path, host_target: &str) -> RailResult<Self> {
+        Self::capture_inventory(compiler_sysroot_inventory(sysroot, host_target)?, sysroot)
+    }
+
+    fn capture_path(path: &Path) -> RailResult<Self> {
+        let mut existing = path.to_path_buf();
+        loop {
+            match fs::symlink_metadata(&existing) {
+                Ok(_) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if !existing.pop() {
+                        return Err(RailError::message("compiler_input_parent_evidence_unavailable"));
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let existing = crate::utils::canonicalize_existing(&existing)?;
+        let metadata = fs::symlink_metadata(&existing)?;
+        let directory = if metadata.is_dir() {
+            existing.clone()
+        } else if metadata.is_file() {
+            existing
+                .parent()
+                .ok_or_else(|| RailError::message("compiler input has no parent"))?
+                .to_path_buf()
+        } else {
+            return Err(RailError::message("compiler_input_file_kind_unavailable"));
+        };
+        Self::capture_inventory(
+            CompilerSysrootInventory {
+                #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+                root: directory.clone(),
+                files: Vec::new(),
+                #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+                evidence_locations: vec![evidence_location(
+                    &directory,
+                    &existing,
+                    if metadata.is_dir() {
+                        SysrootEvidenceKind::Directory
+                    } else {
+                        SysrootEvidenceKind::File
+                    },
+                )?],
+            },
+            path,
+        )
+    }
+
+    fn capture_inventory(mut inventory: CompilerSysrootInventory, selected_path: &Path) -> RailResult<Self> {
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        {
+            let mut pending = vec![selected_path.to_path_buf()];
+            let mut selected_links = BTreeSet::new();
+            while let Some(selected) = pending.pop() {
+                for component in selected.ancestors() {
+                    match fs::symlink_metadata(component) {
+                        Ok(metadata) if crate::utils::is_symlink_or_reparse(&metadata) => {
+                            if !selected_links.insert(component.to_path_buf()) {
+                                continue;
+                            }
+                            if selected_links.len() > 40 {
+                                return Err(RailError::message("compiler_input_symlink_chain_limit"));
+                            }
+                            let parent = component
+                                .parent()
+                                .ok_or_else(|| RailError::message("selected compiler input link has no parent"))?;
+                            let target = fs::read_link(component)?;
+                            pending.push(if target.is_absolute() {
+                                target
+                            } else {
+                                parent.join(target)
+                            });
+                            let parent = crate::utils::canonicalize_existing(parent)?;
+                            inventory.evidence_locations.push(SysrootEvidenceLocation {
+                                kind: SysrootEvidenceKind::Directory,
+                                relative_path: format!("selected-parent:{}", parent.display()),
+                                physical_path: parent,
+                            });
+                        }
+                        Ok(_) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+            inventory.evidence_locations.push(evidence_location(
+                &inventory.root,
+                &inventory.root,
+                SysrootEvidenceKind::Directory,
+            )?);
+            inventory
+                .evidence_locations
+                .sort_by(|left, right| left.physical_path.cmp(&right.physical_path));
+            inventory
+                .evidence_locations
+                .dedup_by(|left, right| left.physical_path == right.physical_path);
+            inventory.files.clear();
+            #[cfg(windows)]
+            let evidence = retry_unstable_windows_sysroot_capture(|| Ok(capture_exact_sysroot_evidence(&inventory)))?;
+            #[cfg(not(windows))]
+            let evidence = capture_exact_sysroot_evidence(&inventory)
+                .ok_or_else(|| RailError::message("compiler_input_generation_evidence_unavailable"))?;
+            Ok(Self { inventory, evidence })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        {
+            let _ = (&mut inventory, selected_path);
+            Err(RailError::message("compiler_input_generation_evidence_unavailable"))
+        }
+    }
+
+    pub(crate) fn revalidate(&self) -> RailResult<()> {
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        if capture_exact_sysroot_evidence(&self.inventory).as_ref() == Some(&self.evidence) {
+            return Ok(());
+        }
+        Err(RailError::message("compiler_input_generation_changed"))
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -4116,6 +4983,7 @@ enum SysrootEvidenceKind {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[derive(Debug, Clone)]
 struct SysrootEvidenceLocation {
     kind: SysrootEvidenceKind,
     relative_path: String,
@@ -4204,14 +5072,26 @@ pub(crate) fn compiler_sysroot_fingerprint(
     memo_path: Option<&Path>,
 ) -> RailResult<(String, u64)> {
     let _sysroot_fingerprinting_phase = crate::instrumentation::sysroot_fingerprinting_phase();
-    let inventory = compiler_sysroot_inventory(sysroot, host_target)?;
+    fingerprint_compiler_inventory(
+        compiler_sysroot_inventory(sysroot, host_target)?,
+        host_target,
+        memo_path,
+        || compiler_sysroot_inventory(sysroot, host_target),
+    )
+}
 
+fn fingerprint_compiler_inventory(
+    inventory: CompilerSysrootInventory,
+    selection: &str,
+    memo_path: Option<&Path>,
+    recapture: impl Fn() -> RailResult<CompilerSysrootInventory>,
+) -> RailResult<(String, u64)> {
     #[cfg(windows)]
     let windows_before = retry_unstable_windows_sysroot_capture(|| Ok(capture_exact_sysroot_evidence(&inventory)))?;
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     if let Some(memo_path) = memo_path
-        && let Some(memo) = load_sysroot_identity_memo(memo_path, &inventory, host_target)
+        && let Some(memo) = load_sysroot_identity_memo(memo_path, &inventory, selection)
         && let Some(before) = capture_exact_sysroot_evidence(&inventory)
         && before.volume_identifier == memo.volume_identifier
         && before.entries == memo.entries
@@ -4222,7 +5102,7 @@ pub(crate) fn compiler_sysroot_fingerprint(
 
     #[cfg(windows)]
     if let Some(memo_path) = memo_path
-        && let Some(memo) = load_sysroot_identity_memo(memo_path, &inventory, host_target)
+        && let Some(memo) = load_sysroot_identity_memo(memo_path, &inventory, selection)
         && windows_before.volume_identifier == memo.volume_identifier
         && windows_before.entries == memo.entries
         && capture_exact_sysroot_evidence(&inventory).as_ref() == Some(&windows_before)
@@ -4231,20 +5111,24 @@ pub(crate) fn compiler_sysroot_fingerprint(
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let before = memo_path.and_then(|_| capture_exact_sysroot_evidence(&inventory));
+    let before = capture_exact_sysroot_evidence(&inventory)
+        .ok_or_else(|| RailError::message("compiler sysroot generation evidence is unavailable"))?;
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     let _ = memo_path;
     #[cfg(not(windows))]
     let fingerprint = hash_compiler_sysroot(&inventory)?;
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    if let (Some(memo_path), Some(before)) = (memo_path, before)
-        && let Ok(after_inventory) = compiler_sysroot_inventory(sysroot, host_target)
-        && inventory.files == after_inventory.files
-        && let Some(after) = capture_exact_sysroot_evidence(&after_inventory)
-        && before == after
     {
-        publish_sysroot_identity_memo(memo_path, &after_inventory, host_target, &fingerprint.0, after);
+        let after_inventory = recapture()?;
+        let after = capture_exact_sysroot_evidence(&after_inventory)
+            .ok_or_else(|| RailError::message("compiler sysroot generation evidence is unavailable"))?;
+        if inventory.files != after_inventory.files || before != after {
+            return Err(RailError::message("compiler sysroot changed during identity capture"));
+        }
+        if let Some(memo_path) = memo_path {
+            publish_sysroot_identity_memo(memo_path, &after_inventory, selection, &fingerprint.0, after);
+        }
     }
 
     #[cfg(windows)]
@@ -4255,7 +5139,7 @@ pub(crate) fn compiler_sysroot_fingerprint(
         let mut retry_before = windows_before;
         let (fingerprint, stable_inventory, stable_evidence) = retry_unstable_windows_sysroot_capture(|| {
             let fingerprint = hash_compiler_sysroot(&retry_inventory)?;
-            let after_inventory = compiler_sysroot_inventory(sysroot, host_target)?;
+            let after_inventory = recapture()?;
             let Some(after) = capture_exact_sysroot_evidence(&after_inventory) else {
                 return Ok(None);
             };
@@ -4267,19 +5151,17 @@ pub(crate) fn compiler_sysroot_fingerprint(
             Ok(Some((fingerprint, after_inventory, after)))
         })?;
         if let Some(memo_path) = memo_path {
-            publish_sysroot_identity_memo(
-                memo_path,
-                &stable_inventory,
-                host_target,
-                &fingerprint.0,
-                stable_evidence,
-            );
+            publish_sysroot_identity_memo(memo_path, &stable_inventory, selection, &fingerprint.0, stable_evidence);
         }
         Ok(fingerprint)
     }
 
     #[cfg(not(windows))]
-    Ok(fingerprint)
+    {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let _ = (selection, recapture);
+        Ok(fingerprint)
+    }
 }
 
 #[cfg(any(windows, test))]
@@ -4342,14 +5224,14 @@ fn compiler_sysroot_inventory(sysroot: &Path, host_target: &str) -> RailResult<C
         let path = entry?.path();
         let name = path.file_name().and_then(std::ffi::OsStr::to_str).unwrap_or_default();
         let metadata = std::fs::symlink_metadata(&path)?;
-        if rustc_driver_library(name) {
+        if rustc_driver_library(name) || compiler_runtime_library(name) {
             if !metadata.is_file() || metadata.file_type().is_symlink() {
                 return Err(RailError::message(
                     "compiler driver sysroot entry is not a regular file",
                 ));
             }
+            driver_files += usize::from(rustc_driver_library(name));
             files.push(path);
-            driver_files += 1;
         }
     }
     let codegen_backends = rustlib.join("codegen-backends");
@@ -4824,6 +5706,10 @@ fn rustc_driver_library(name: &str) -> bool {
 #[cfg(not(windows))]
 fn rustc_driver_library(name: &str) -> bool {
     name.starts_with("librustc_driver-") && (name.ends_with(".so") || name.ends_with(".dylib"))
+}
+
+fn compiler_runtime_library(name: &str) -> bool {
+    name.ends_with(".dll") || name.ends_with(".dylib") || name.ends_with(".so") || name.contains(".so.")
 }
 
 fn package_observation_identities(snapshot: &WorkspaceSnapshot) -> RailResult<HashMap<PackageId, String>> {
@@ -5825,578 +6711,6 @@ mod tests {
         );
     }
 
-    #[cfg(any(unix, windows))]
-    struct InstalledTestFactDriver {
-        path: PathBuf,
-        installed: bool,
-    }
-
-    #[cfg(any(unix, windows))]
-    impl InstalledTestFactDriver {
-        fn install() -> RailResult<Self> {
-            let source = std::env::var_os("CARGO_RAIL_TEST_FACT_DRIVER")
-                .map(PathBuf::from)
-                .ok_or_else(|| {
-                    RailError::message("CARGO_RAIL_TEST_FACT_DRIVER is required for the exact-reuse workload")
-                })?;
-            let executable = std::env::current_exe()?;
-            let path = executable
-                .parent()
-                .ok_or_else(|| RailError::message("test executable has no companion directory"))?
-                .join(if cfg!(windows) {
-                    "cargo-rail-fact-driver.exe"
-                } else {
-                    "cargo-rail-fact-driver"
-                });
-            if path.exists() {
-                return Err(RailError::message(format!(
-                    "refusing to replace pre-existing test driver sibling '{}'",
-                    path.display()
-                )));
-            }
-            fs::copy(&source, &path)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                fs::set_permissions(&path, fs::Permissions::from_mode(0o500))?;
-            }
-            Ok(Self { path, installed: true })
-        }
-
-        fn remove(&mut self) -> RailResult<()> {
-            if self.installed {
-                fs::remove_file(&self.path)?;
-                self.installed = false;
-            }
-            Ok(())
-        }
-    }
-
-    #[cfg(any(unix, windows))]
-    impl Drop for InstalledTestFactDriver {
-        fn drop(&mut self) {
-            if self.installed {
-                drop(fs::remove_file(&self.path));
-            }
-        }
-    }
-
-    #[cfg(any(unix, windows))]
-    fn exact_reuse_workspace() -> RailResult<tempfile::TempDir> {
-        let workspace = tempfile::Builder::new()
-            .prefix("cargo-rail-compiler-fact-reuse-")
-            .tempdir()?;
-        crate::git::init_repo(workspace.path(), "main")?;
-        fs::create_dir_all(workspace.path().join(".config"))?;
-        fs::create_dir_all(workspace.path().join("app/src"))?;
-        fs::create_dir_all(workspace.path().join("dep/src"))?;
-        fs::write(
-            workspace.path().join("Cargo.toml"),
-            r#"[workspace]
-members = ["app", "dep"]
-resolver = "3"
-"#,
-        )?;
-        fs::write(
-            workspace.path().join("Cargo.lock"),
-            r#"# This file is automatically @generated by Cargo.
-# It is not intended for manual editing.
-version = 4
-
-[[package]]
-name = "app"
-version = "0.1.0"
-dependencies = [
- "dep",
-]
-
-[[package]]
-name = "dep"
-version = "0.1.0"
-"#,
-        )?;
-        fs::write(workspace.path().join(".gitignore"), "/target\n/.cargo-rail\n")?;
-        fs::write(workspace.path().join(".config/rail.toml"), "")?;
-        fs::write(
-            workspace.path().join("app/Cargo.toml"),
-            r#"[package]
-name = "app"
-version = "0.1.0"
-edition = "2024"
-
-[features]
-default = ["default-mode"]
-default-mode = []
-extra = []
-
-[dependencies]
-dep = { path = "../dep" }
-"#,
-        )?;
-        fs::write(
-            workspace.path().join("app/src/lib.rs"),
-            r#"pub fn answer() -> u32 {
-  42
-}
-"#,
-        )?;
-        fs::write(
-            workspace.path().join("dep/Cargo.toml"),
-            r#"[package]
-name = "dep"
-version = "0.1.0"
-edition = "2024"
-"#,
-        )?;
-        fs::write(
-            workspace.path().join("dep/src/lib.rs"),
-            "pub fn unused() -> u32 { 7 }\n",
-        )?;
-
-        let git = crate::git::SystemGit::open(workspace.path())?;
-        git.set_config("user.name", "Compiler Fact Test")?;
-        git.set_config("user.email", "compiler-fact-test@example.invalid")?;
-        git.set_config("commit.gpgSign", "false")?;
-        git.stage_all()?;
-        git.commit("fixture")?;
-        Ok(workspace)
-    }
-
-    /// This is an ignored, explicitly provisioned native-driver workload rather
-    /// than an ordinary unit test. It proves the cold acquisition and the warm
-    /// exact-CAS path through the production collector.
-    #[cfg(any(unix, windows))]
-    #[test]
-    #[ignore = "requires the exact rustc-dev companion authority embedded by the protocol harness"]
-    fn exact_compiler_fact_cas_reuse_eliminates_independent_acquisitions() {
-        let result: RailResult<()> = (|| {
-            let workspace = exact_reuse_workspace()?;
-            let context = crate::workspace::WorkspaceContext::build_with_snapshot(workspace.path())?;
-            let snapshot = context.snapshot()?;
-            let packages = context.cargo().workspace_members();
-            let manifests = ManifestAnalyzer::parse_snapshot(snapshot, &packages)?;
-            let identity = CompilerCacheIdentity::capture(snapshot)?;
-            let targets = vec!["default"];
-            let collector =
-                CompilerDiagnosticsCollector::with_identity(workspace.path(), &manifests, targets.clone(), &identity);
-            let candidates = [CompilerCandidate {
-                member: "app".to_string(),
-                crate_name: "dep".to_string(),
-                kind: DepKind::Normal,
-                applicable_targets: BTreeSet::from(["default".to_string()]),
-                required_features: None,
-            }];
-            let typed_packages = BTreeSet::from(["app".to_string()]);
-            let doctest_packages = BTreeSet::new();
-
-            let combined = AnalysisSchedule::for_combined(
-                &manifests.members,
-                &targets,
-                &candidates,
-                &typed_packages,
-                &doctest_packages,
-            )?
-            .views()
-            .len();
-            let diagnostics = AnalysisSchedule::for_diagnostics(&manifests.members, &targets, &candidates)?
-                .views()
-                .len();
-            let typed =
-                AnalysisSchedule::for_combined(&manifests.members, &targets, &[], &typed_packages, &doctest_packages)?
-                    .views()
-                    .len();
-            assert_eq!((combined, diagnostics + typed), (3, 6));
-
-            let driver_source = std::env::var_os("CARGO_RAIL_TEST_FACT_DRIVER")
-                .map(PathBuf::from)
-                .ok_or_else(|| {
-                    RailError::message("CARGO_RAIL_TEST_FACT_DRIVER is required for the exact-reuse workload")
-                })?;
-            let driver_bytes = fs::metadata(driver_source)?.len();
-            let mut installed_driver = InstalledTestFactDriver::install()?;
-            let cold_started = Instant::now();
-            let cold = collector.collect_with_typed_items(snapshot, &candidates, &typed_packages, &doctest_packages)?;
-            let cold_elapsed = cold_started.elapsed();
-            if cold.compiler_facts.is_empty() {
-                return Err(RailError::message(
-                    "cold compiler fact workload returned no exact objects",
-                ));
-            }
-            let app = context
-                .cargo()
-                .get_package("app")
-                .ok_or_else(|| RailError::message("fixture app package disappeared"))?;
-            let cold_cache = &cold
-                .diagnostics
-                .get(&app.id)
-                .ok_or_else(|| RailError::message("cold compiler diagnostics disappeared"))?
-                .cache;
-            assert_eq!((cold_cache.hits, cold_cache.misses), (0, diagnostics));
-            let cold_objects = cold
-                .compiler_facts
-                .iter()
-                .map(|fact| serde_json::to_vec(fact.object()))
-                .collect::<Result<Vec<_>, _>>()?;
-            let cold_identities = cold
-                .compiler_facts
-                .iter()
-                .map(|fact| fact.identity().to_string())
-                .collect::<Vec<_>>();
-
-            installed_driver.remove()?;
-            let warm_started = Instant::now();
-            let warm = collector.collect_with_typed_items(snapshot, &[], &typed_packages, &doctest_packages)?;
-            let warm_elapsed = warm_started.elapsed();
-            assert!(warm.diagnostics.is_empty());
-            assert_eq!(
-                warm.compiler_facts
-                    .iter()
-                    .map(|fact| fact.identity())
-                    .collect::<Vec<_>>(),
-                cold_identities.iter().map(String::as_str).collect::<Vec<_>>()
-            );
-            assert_eq!(
-                warm.compiler_facts
-                    .iter()
-                    .map(|fact| serde_json::to_vec(fact.object()))
-                    .collect::<Result<Vec<_>, _>>()?,
-                cold_objects
-            );
-            assert!(
-                warm_elapsed < cold_elapsed,
-                "warm exact reuse ({warm_elapsed:?}) must be faster than cold acquisition ({cold_elapsed:?})"
-            );
-
-            println!(
-                "{}",
-                serde_json::to_string(&serde_json::json!({
-                  "schema_version": 1,
-                  "workload": "compiler-fact-exact-reuse",
-                  "host": snapshot.toolchain().host_target(),
-                  "combined_cold_cargo_views": combined,
-                  "independent_cold_cargo_views": diagnostics + typed,
-                  "cold_cargo_views_eliminated": diagnostics + typed - combined,
-                  "warm_cargo_views": 0,
-                  "cold_wall_ms": u64::try_from(cold_elapsed.as_millis()).unwrap_or(u64::MAX),
-                  "warm_wall_ms": u64::try_from(warm_elapsed.as_millis()).unwrap_or(u64::MAX),
-                  "exact_fact_objects": cold_objects.len(),
-                  "exact_fact_bytes": cold_objects.iter().map(Vec::len).sum::<usize>(),
-                  "driver_bytes": driver_bytes,
-                }))?
-            );
-            Ok(())
-        })();
-        result.unwrap();
-    }
-
-    /// Compare equivalent serial and concurrent cold acquisitions in one
-    /// physical workspace. Cache reuse is disabled so both policies execute
-    /// the same three typed views and produce byte-identical fact objects.
-    #[cfg(any(unix, windows))]
-    #[test]
-    #[ignore = "requires the exact rustc-dev companion authority embedded by the qualification harness"]
-    fn compiler_fact_concurrent_acquisition_qualification_sample() {
-        let result: RailResult<()> = (|| {
-            let workspace = exact_reuse_workspace()?;
-            let context = crate::workspace::WorkspaceContext::build_with_snapshot(workspace.path())?;
-            let snapshot = context.snapshot()?;
-            let packages = context.cargo().workspace_members();
-            let manifests = ManifestAnalyzer::parse_snapshot(snapshot, &packages)?;
-            let mut identity = CompilerCacheIdentity::capture(snapshot)?;
-            identity.analysis_cache = None;
-            identity.cache_bypass_reason = Some(CompilerCacheBypass::CargoConfiguration);
-            let targets = vec!["default"];
-            let typed_packages = BTreeSet::from(["app".to_string()]);
-            let doctest_packages = BTreeSet::new();
-            let _installed_driver = InstalledTestFactDriver::install()?;
-
-            let run = |policy: ExecutionPolicy| -> RailResult<(Duration, usize, usize, Vec<Vec<u8>>)> {
-                assert_eq!(
-                    QUALIFICATION_LIVE_CARGO_VIEWS.load(std::sync::atomic::Ordering::Relaxed),
-                    0,
-                    "a prior acquisition retained a live Cargo process"
-                );
-                QUALIFICATION_CARGO_VIEWS.store(0, std::sync::atomic::Ordering::Relaxed);
-                QUALIFICATION_COMPILER_INVOCATIONS.store(0, std::sync::atomic::Ordering::Relaxed);
-                QUALIFICATION_MAX_LIVE_CARGO_VIEWS.store(0, std::sync::atomic::Ordering::Relaxed);
-                let collector = CompilerDiagnosticsCollector::with_identity(
-                    workspace.path(),
-                    &manifests,
-                    targets.clone(),
-                    &identity,
-                )
-                .with_execution_policy(policy);
-                let started = Instant::now();
-                let evidence = collector.collect_with_typed_items(snapshot, &[], &typed_packages, &doctest_packages)?;
-                let elapsed = started.elapsed();
-                let cargo_views = QUALIFICATION_CARGO_VIEWS.load(std::sync::atomic::Ordering::Relaxed);
-                let compiler_invocations =
-                    QUALIFICATION_COMPILER_INVOCATIONS.load(std::sync::atomic::Ordering::Relaxed);
-                let max_live = QUALIFICATION_MAX_LIVE_CARGO_VIEWS.load(std::sync::atomic::Ordering::Relaxed);
-                if cargo_views != 3 || compiler_invocations == 0 {
-                    return Err(RailError::message(format!(
-                        "compiler concurrency workload executed {cargo_views} Cargo views and {compiler_invocations} compiler invocations"
-                    )));
-                }
-                let objects = evidence
-                    .compiler_facts
-                    .iter()
-                    .map(|fact| serde_json::to_vec(fact.object()))
-                    .collect::<Result<Vec<_>, _>>()?;
-                if objects.is_empty() {
-                    return Err(RailError::message(
-                        "compiler concurrency workload returned no exact fact objects",
-                    ));
-                }
-                Ok((elapsed, compiler_invocations, max_live, objects))
-            };
-
-            let serial_policy = ExecutionPolicy::fixed(1, 1)?;
-            let concurrent_policy = ExecutionPolicy::fixed(3, 3)?;
-            let serial_first = run(serial_policy)?;
-            let concurrent_first = run(concurrent_policy)?;
-            let concurrent_second = run(concurrent_policy)?;
-            let serial_second = run(serial_policy)?;
-
-            let reference = &serial_first.3;
-            for objects in [&concurrent_first.3, &concurrent_second.3, &serial_second.3] {
-                if objects != reference {
-                    return Err(RailError::message(
-                        "serial and concurrent compiler acquisitions produced different exact fact objects",
-                    ));
-                }
-            }
-            if serial_first.1 != concurrent_first.1
-                || serial_first.1 != concurrent_second.1
-                || serial_first.1 != serial_second.1
-            {
-                return Err(RailError::message(
-                    "serial and concurrent compiler acquisitions executed different compiler work",
-                ));
-            }
-            if serial_first.2 != 1 || serial_second.2 != 1 {
-                return Err(RailError::message(
-                    "serial compiler acquisition exceeded one live Cargo process",
-                ));
-            }
-            if concurrent_first.2 < 2 || concurrent_second.2 < 2 {
-                return Err(RailError::message(
-                    "concurrent compiler acquisition did not overlap Cargo processes",
-                ));
-            }
-            let serial_wall = serial_first.0.saturating_add(serial_second.0);
-            let concurrent_wall = concurrent_first.0.saturating_add(concurrent_second.0);
-            if concurrent_wall >= serial_wall {
-                return Err(RailError::message(format!(
-                    "concurrent compiler acquisition ({concurrent_wall:?}) did not outperform equivalent serial work ({serial_wall:?})"
-                )));
-            }
-
-            println!(
-                "{}",
-                serde_json::to_string(&serde_json::json!({
-                    "schema_version": 1,
-                    "workload": "compiler-fact-concurrent-acquisition",
-                    "host": snapshot.toolchain().host_target(),
-                    "cargo_views_per_run": 3,
-                    "compiler_invocations_per_run": serial_first.1,
-                    "serial_wall_ns": u64::try_from(serial_wall.as_nanos()).unwrap_or(u64::MAX),
-                    "concurrent_wall_ns": u64::try_from(concurrent_wall.as_nanos()).unwrap_or(u64::MAX),
-                    "reduction_percent": 100.0 * (serial_wall.as_secs_f64() - concurrent_wall.as_secs_f64())
-                        / serial_wall.as_secs_f64(),
-                    "serial_max_live_cargo_processes": serial_first.2.max(serial_second.2),
-                    "concurrent_max_live_cargo_processes": concurrent_first.2.max(concurrent_second.2),
-                    "exact_fact_objects": reference.len(),
-                    "exact_fact_bytes": reference.iter().map(Vec::len).sum::<usize>(),
-                }))?
-            );
-            Ok(())
-        })();
-        result.unwrap();
-    }
-
-    /// Execute one release-optimized acquisition sample for the retained Task 6
-    /// qualification harness. The lane is explicit so the harness measures the
-    /// real independent collectors instead of inferring their cost from a view
-    /// count.
-    #[cfg(any(unix, windows))]
-    #[test]
-    #[ignore = "requires the exact rustc-dev companion authority embedded by the qualification harness"]
-    fn compiler_fact_acquisition_qualification_sample() {
-        let result: RailResult<()> = (|| {
-            let lane = std::env::var("CARGO_RAIL_COMPILER_FACT_QUALIFICATION_LANE")
-                .map_err(|_| RailError::message("CARGO_RAIL_COMPILER_FACT_QUALIFICATION_LANE is required"))?;
-            if lane != "combined" && lane != "independent" {
-                return Err(RailError::message(format!(
-                    "unsupported compiler fact qualification lane '{lane}'"
-                )));
-            }
-
-            let workspace = exact_reuse_workspace()?;
-            let context = crate::workspace::WorkspaceContext::build_with_snapshot(workspace.path())?;
-            let snapshot = context.snapshot()?;
-            let packages = context.cargo().workspace_members();
-            let manifests = ManifestAnalyzer::parse_snapshot(snapshot, &packages)?;
-            let identity = CompilerCacheIdentity::capture(snapshot)?;
-            let targets = vec!["default"];
-            let collector =
-                CompilerDiagnosticsCollector::with_identity(workspace.path(), &manifests, targets.clone(), &identity);
-            let candidates = [CompilerCandidate {
-                member: "app".to_string(),
-                crate_name: "dep".to_string(),
-                kind: DepKind::Normal,
-                applicable_targets: BTreeSet::from(["default".to_string()]),
-                required_features: None,
-            }];
-            let typed_packages = BTreeSet::from(["app".to_string()]);
-            let doctest_packages = BTreeSet::new();
-            let combined_views = AnalysisSchedule::for_combined(
-                &manifests.members,
-                &targets,
-                &candidates,
-                &typed_packages,
-                &doctest_packages,
-            )?
-            .views()
-            .len();
-            let diagnostic_views = AnalysisSchedule::for_diagnostics(&manifests.members, &targets, &candidates)?
-                .views()
-                .len();
-            let typed_views =
-                AnalysisSchedule::for_combined(&manifests.members, &targets, &[], &typed_packages, &doctest_packages)?
-                    .views()
-                    .len();
-            assert_eq!((combined_views, diagnostic_views + typed_views), (3, 6));
-            // The diagnostics-only lane proves the fixture's sole candidate in
-            // its first view and stops. The remaining two scheduled diagnostic
-            // views are intentionally eliminated; the independent baseline is
-            // executed work, not the schedule's theoretical upper bound.
-            let independent_diagnostic_views = 1;
-
-            let driver_source = std::env::var_os("CARGO_RAIL_TEST_FACT_DRIVER")
-                .map(PathBuf::from)
-                .ok_or_else(|| {
-                    RailError::message("CARGO_RAIL_TEST_FACT_DRIVER is required for the qualification workload")
-                })?;
-            let driver_bytes = fs::metadata(driver_source)?.len();
-            let mut installed_driver = InstalledTestFactDriver::install()?;
-            QUALIFICATION_CARGO_VIEWS.store(0, std::sync::atomic::Ordering::Relaxed);
-            QUALIFICATION_COMPILER_INVOCATIONS.store(0, std::sync::atomic::Ordering::Relaxed);
-
-            let cold_started = Instant::now();
-            let cold = if lane == "combined" {
-                collector.collect_with_typed_items(snapshot, &candidates, &typed_packages, &doctest_packages)?
-            } else {
-                let diagnostics = collector.collect_for_candidates(&candidates)?;
-                let mut typed =
-                    collector.collect_with_typed_items(snapshot, &[], &typed_packages, &doctest_packages)?;
-                assert!(typed.diagnostics.is_empty());
-                typed.diagnostics = diagnostics;
-                typed
-            };
-            let cold_elapsed = cold_started.elapsed();
-            let cold_cargo_views = QUALIFICATION_CARGO_VIEWS.load(std::sync::atomic::Ordering::Relaxed);
-            let cold_compiler_invocations =
-                QUALIFICATION_COMPILER_INVOCATIONS.load(std::sync::atomic::Ordering::Relaxed);
-            let expected_cold_views = if lane == "combined" {
-                combined_views
-            } else {
-                independent_diagnostic_views + typed_views
-            };
-            assert_eq!(cold_cargo_views, expected_cold_views);
-            if cold.compiler_facts.is_empty() {
-                return Err(RailError::message(
-                    "compiler fact qualification workload returned no exact objects",
-                ));
-            }
-            let app = context
-                .cargo()
-                .get_package("app")
-                .ok_or_else(|| RailError::message("qualification fixture app package disappeared"))?;
-            let cold_cache = &cold
-                .diagnostics
-                .get(&app.id)
-                .ok_or_else(|| RailError::message("qualification compiler diagnostics disappeared"))?
-                .cache;
-            assert_eq!((cold_cache.hits, cold_cache.misses), (0, diagnostic_views));
-            let cold_objects = cold
-                .compiler_facts
-                .iter()
-                .map(|fact| serde_json::to_vec(fact.object()))
-                .collect::<Result<Vec<_>, _>>()?;
-            let cold_identities = cold
-                .compiler_facts
-                .iter()
-                .map(|fact| fact.identity().to_string())
-                .collect::<Vec<_>>();
-            let mut framed_objects = Vec::new();
-            for object in &cold_objects {
-                framed_objects.extend_from_slice(&(object.len() as u64).to_le_bytes());
-                framed_objects.extend_from_slice(object);
-            }
-            let object_set_digest = format!("sha256:{}", ContentDigest::sha256(&framed_objects));
-
-            let mut warm_wall_ns = None;
-            let mut warm_cargo_views = None;
-            let mut warm_compiler_invocations = None;
-            if lane == "combined" {
-                installed_driver.remove()?;
-                QUALIFICATION_CARGO_VIEWS.store(0, std::sync::atomic::Ordering::Relaxed);
-                QUALIFICATION_COMPILER_INVOCATIONS.store(0, std::sync::atomic::Ordering::Relaxed);
-                let warm_started = Instant::now();
-                let warm = collector.collect_with_typed_items(snapshot, &[], &typed_packages, &doctest_packages)?;
-                let warm_elapsed = warm_started.elapsed();
-                assert!(warm.diagnostics.is_empty());
-                assert_eq!(
-                    warm.compiler_facts
-                        .iter()
-                        .map(|fact| fact.identity())
-                        .collect::<Vec<_>>(),
-                    cold_identities.iter().map(String::as_str).collect::<Vec<_>>()
-                );
-                assert_eq!(
-                    warm.compiler_facts
-                        .iter()
-                        .map(|fact| serde_json::to_vec(fact.object()))
-                        .collect::<Result<Vec<_>, _>>()?,
-                    cold_objects
-                );
-                warm_wall_ns = Some(u64::try_from(warm_elapsed.as_nanos()).unwrap_or(u64::MAX));
-                warm_cargo_views = Some(QUALIFICATION_CARGO_VIEWS.load(std::sync::atomic::Ordering::Relaxed));
-                warm_compiler_invocations =
-                    Some(QUALIFICATION_COMPILER_INVOCATIONS.load(std::sync::atomic::Ordering::Relaxed));
-                assert_eq!((warm_cargo_views, warm_compiler_invocations), (Some(0), Some(0)));
-                assert!(warm_elapsed < cold_elapsed);
-            }
-
-            println!(
-                "{}",
-                serde_json::to_string(&serde_json::json!({
-                  "schema_version": 2,
-                  "workload": "compiler-fact-acquisition",
-                  "lane": lane,
-                  "host": snapshot.toolchain().host_target(),
-                  "combined_scheduled_cargo_views": combined_views,
-                  "diagnostic_scheduled_cargo_views": diagnostic_views,
-                  "typed_scheduled_cargo_views": typed_views,
-                  "cold_cargo_views": cold_cargo_views,
-                  "cold_compiler_invocations": cold_compiler_invocations,
-                  "cold_wall_ns": u64::try_from(cold_elapsed.as_nanos()).unwrap_or(u64::MAX),
-                  "warm_cargo_views": warm_cargo_views,
-                  "warm_compiler_invocations": warm_compiler_invocations,
-                  "warm_wall_ns": warm_wall_ns,
-                  "exact_fact_objects": cold_objects.len(),
-                  "exact_fact_bytes": cold_objects.iter().map(Vec::len).sum::<usize>(),
-                  "exact_fact_identities": cold_identities,
-                  "exact_fact_set_digest": object_set_digest,
-                  "driver_bytes": driver_bytes,
-                }))?
-            );
-            Ok(())
-        })();
-        result.unwrap();
-    }
-
     #[test]
     fn native_session_environment_excludes_launcher_and_build_script_only_state() {
         for name in [
@@ -6843,6 +7157,469 @@ edition = "2024"
     }
 
     #[test]
+    fn selected_target_libraries_revalidate_bytes_names_and_absence() {
+        let sysroot = tempfile::tempdir().expect("sysroot");
+        let libraries = sysroot.path().join("lib/rustlib/selected-target/lib");
+        let (missing, _) = NativeTargetLibraries::capture(&libraries, None).expect("absent target libraries");
+        missing.revalidate().expect("target libraries remain absent");
+
+        fs::create_dir_all(&libraries).expect("target library directory");
+        let core = libraries.join("libcore.rlib");
+        fs::write(&core, b"core-one").expect("target library");
+        assert_eq!(
+            missing
+                .revalidate()
+                .expect_err("new target library directory invalidates absence")
+                .to_string(),
+            "compiler_input_generation_changed"
+        );
+        let (initial, bytes) = NativeTargetLibraries::capture(&libraries, None).expect("selected target libraries");
+        assert_eq!(bytes, 8);
+        initial.revalidate().expect("unchanged target libraries");
+        fs::write(&core, b"core-two").expect("same-size library replacement");
+        assert_eq!(
+            initial
+                .revalidate()
+                .expect_err("same-size target library replacement invalidates capture")
+                .to_string(),
+            "compiler_input_generation_changed"
+        );
+        let (replacement, _) = NativeTargetLibraries::capture(&libraries, None).expect("replacement capture");
+        assert_ne!(replacement.identity, initial.identity);
+        fs::rename(&core, libraries.join("libother.rlib")).expect("library namespace mutation");
+        assert_eq!(
+            replacement
+                .revalidate()
+                .expect_err("renamed target library invalidates capture")
+                .to_string(),
+            "compiler_input_generation_changed"
+        );
+    }
+
+    #[test]
+    fn target_library_identity_memo_rehashes_same_size_backend_inputs() {
+        let root = tempfile::tempdir().expect("target libraries");
+        let libraries = root.path().join("libraries");
+        fs::create_dir(&libraries).expect("library directory");
+        let library = libraries.join("libcore.rlib");
+        fs::write(&library, b"library-a").expect("target library");
+        let memo = root.path().join("memo.json");
+        let first = target_library_fingerprint(&libraries, Some(&memo)).expect("cold target identity");
+        assert_eq!(first.1, 9);
+        let warm = target_library_fingerprint(&libraries, Some(&memo)).expect("warm target identity");
+        assert_eq!(warm, (first.0.clone(), 0));
+        fs::write(&library, b"library-b").expect("same-size target library mutation");
+        let changed = target_library_fingerprint(&libraries, Some(&memo)).expect("revalidated target identity");
+        assert_ne!(first.0, changed.0);
+        assert_eq!(changed.1, 9);
+    }
+
+    #[test]
+    fn target_input_generations_reject_content_and_namespace_aba() {
+        let root = tempfile::tempdir().expect("target input fixture");
+        let libraries = root.path().join("libraries");
+        fs::create_dir(&libraries).expect("library directory");
+        let library = libraries.join("libcore.rlib");
+        fs::write(&library, b"original").expect("target library");
+        let (captured, _) = NativeTargetLibraries::capture(&libraries, None).expect("library capture");
+        fs::write(&library, b"changed!").expect("concurrent library mutation");
+        fs::write(&library, b"original").expect("restored library bytes");
+        assert_eq!(fs::read(&library).expect("restored library"), b"original");
+        assert_eq!(
+            captured
+                .revalidate()
+                .expect_err("restored bytes do not erase drift")
+                .to_string(),
+            "compiler_input_generation_changed"
+        );
+
+        let target = root.path().join("target.json");
+        fs::write(&target, b"{}").expect("custom target");
+        let (specification, _) = capture_native_target_specifications(
+            Some(target.to_str().expect("target path")),
+            root.path(),
+            root.path(),
+            root.path(),
+        )
+        .expect("custom target capture");
+        fs::write(&target, b"[]").expect("concurrent custom target mutation");
+        fs::write(&target, b"{}").expect("restored custom target bytes");
+        assert_eq!(
+            specification[0]
+                .revalidate(root.path())
+                .expect_err("custom target ABA")
+                .to_string(),
+            "compiler_input_generation_changed"
+        );
+
+        let missing = root.path().join("missing.json");
+        let (absence, _) = capture_native_target_specifications(
+            Some(missing.to_str().expect("missing target path")),
+            root.path(),
+            root.path(),
+            root.path(),
+        )
+        .expect("absent custom target capture");
+        fs::write(&missing, b"{}").expect("transient lookup candidate");
+        fs::remove_file(&missing).expect("removed lookup candidate");
+        assert!(!missing.exists());
+        assert_eq!(
+            absence[0]
+                .revalidate(root.path())
+                .expect_err("missing-present-missing lookup ABA")
+                .to_string(),
+            "compiler_input_generation_changed"
+        );
+    }
+
+    #[test]
+    fn selected_target_library_guard_ignores_unrelated_sibling_directories() {
+        let root = tempfile::tempdir().expect("target input fixture");
+        let libraries = root.path().join("libraries");
+        fs::create_dir(&libraries).expect("target libraries");
+        fs::write(libraries.join("libcore.rlib"), b"library").expect("target library");
+        let (captured, _) = NativeTargetLibraries::capture(&libraries, None).expect("target library capture");
+        fs::create_dir(root.path().join("unrelated-build-output")).expect("unrelated sibling directory");
+        captured
+            .revalidate()
+            .expect("an unrelated sibling does not change the selected libraries");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_target_symlink_generations_reject_retarget_and_restore() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("selected target fixture");
+        let targets = tempfile::tempdir().expect("target definitions");
+        let first = targets.path().join("first.json");
+        let second = targets.path().join("second.json");
+        fs::write(&first, b"{}").expect("first target");
+        fs::write(&second, b"[]").expect("second target");
+        let selected = root.path().join("selected.json");
+        symlink(&first, &selected).expect("selected target link");
+        let (captured, _) = capture_native_target_specifications(
+            Some(selected.to_str().expect("selected target path")),
+            root.path(),
+            root.path(),
+            root.path(),
+        )
+        .expect("selected target capture");
+        fs::remove_file(&selected).expect("remove selected link");
+        symlink(&second, &selected).expect("retarget selected link");
+        fs::remove_file(&selected).expect("remove replacement link");
+        symlink(&first, &selected).expect("restore original selected link");
+        assert_eq!(fs::read(&selected).expect("restored selected bytes"), b"{}");
+        assert_eq!(
+            captured[0]
+                .revalidate(root.path())
+                .expect_err("selected link ABA")
+                .to_string(),
+            "compiler_input_generation_changed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_target_chained_symlink_generations_reject_retarget_and_restore() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("selected target fixture");
+        let aliases = tempfile::tempdir().expect("intermediate target aliases");
+        let targets = tempfile::tempdir().expect("target definitions");
+        let first = targets.path().join("first.json");
+        let second = targets.path().join("second.json");
+        fs::write(&first, b"{}").expect("first target");
+        fs::write(&second, b"[]").expect("second target");
+        let alias = aliases.path().join("alias.json");
+        symlink(&first, &alias).expect("intermediate target link");
+        let selected = root.path().join("selected.json");
+        symlink(&alias, &selected).expect("selected target link");
+        let (captured, _) = capture_native_target_specifications(
+            Some(selected.to_str().expect("selected target path")),
+            root.path(),
+            root.path(),
+            root.path(),
+        )
+        .expect("selected target capture");
+        fs::remove_file(&alias).expect("remove intermediate link");
+        symlink(&second, &alias).expect("retarget intermediate link");
+        fs::remove_file(&alias).expect("remove replacement link");
+        symlink(&first, &alias).expect("restore original intermediate link");
+        assert_eq!(fs::read(&selected).expect("restored selected bytes"), b"{}");
+        assert_eq!(
+            captured[0]
+                .revalidate(root.path())
+                .expect_err("intermediate link ABA")
+                .to_string(),
+            "compiler_input_generation_changed"
+        );
+    }
+
+    #[test]
+    fn target_specification_revalidation_binds_exact_bytes_and_negative_lookup() {
+        let root = tempfile::tempdir().expect("target specification fixture");
+        let target = root.path().join("target.json");
+        let (missing, _) = capture_native_target_specifications(
+            Some(target.to_str().expect("target path")),
+            root.path(),
+            root.path(),
+            root.path(),
+        )
+        .expect("absent target specification");
+        fs::write(&target, b"{\"cpu\":\"a\"}").expect("target specification");
+        assert_eq!(
+            missing[0]
+                .revalidate(root.path())
+                .expect_err("new target shadows missing lookup")
+                .to_string(),
+            "compiler_input_generation_changed"
+        );
+        let (captured, _) = capture_native_target_specifications(
+            Some(target.to_str().expect("target path")),
+            root.path(),
+            root.path(),
+            root.path(),
+        )
+        .expect("target specification capture");
+        captured[0]
+            .revalidate(root.path())
+            .expect("stable custom specification");
+        fs::write(&target, b"{\"cpu\":\"b\"}").expect("same-size target specification replacement");
+        assert_eq!(
+            captured[0]
+                .revalidate(root.path())
+                .expect_err("same-size custom target replacement")
+                .to_string(),
+            "compiler_input_generation_changed"
+        );
+    }
+
+    #[test]
+    fn target_capture_requires_linked_output_authority_and_preserves_compiler_only_fast_path() {
+        let mut observation = RawCompilerInvocation {
+            version: 1,
+            mode: CompilerMode::Rustc,
+            crate_name: Some("fixture".to_string()),
+            crate_types: BTreeSet::from(["rlib".to_string()]),
+            target_argument: None,
+            cfg: BTreeSet::new(),
+            emit_modes: BTreeSet::from(["dep-info".to_string(), "link".to_string()]),
+            test_mode: false,
+            compiler_arguments: Vec::new(),
+            declared_inputs: Vec::new(),
+            observed_reads: Vec::new(),
+            dependency_artifacts: Vec::new(),
+            emitted_outputs: Vec::new(),
+            environment_reads: BTreeSet::new(),
+            compiler: None,
+            wrappers: Vec::new(),
+            cache_wrapper: None,
+            compiler_exit_code: None,
+            success: false,
+            bypasses: BTreeSet::new(),
+            compiler_fact_unit: None,
+        };
+        assert!(!NativeToolchainInputs::required(&observation));
+        assert_eq!(native_target_output_query(&observation), Some(("fixture", "rlib")));
+        for (crate_type, requires_linker) in [
+            ("bin", true),
+            ("dylib", true),
+            ("cdylib", true),
+            ("proc-macro", true),
+            ("staticlib", false),
+            ("lib", false),
+            ("rlib", false),
+        ] {
+            observation.crate_types = BTreeSet::from([crate_type.to_string()]);
+            observation.emit_modes = BTreeSet::from(["dep-info".to_string(), "link".to_string()]);
+            assert_eq!(
+                NativeToolchainInputs::required(&observation),
+                requires_linker,
+                "{crate_type}"
+            );
+            assert_eq!(native_target_output_query(&observation), Some(("fixture", crate_type)));
+            observation.emit_modes = BTreeSet::from(["dep-info".to_string(), "metadata".to_string()]);
+            assert!(!NativeToolchainInputs::required(&observation), "{crate_type}");
+        }
+        observation.compiler_arguments = vec!["-Ctarget-feature=+aes".to_string()];
+        assert!(NativeToolchainInputs::required(&observation));
+        observation.compiler_arguments = vec!["-C".to_string(), "target-feature=+aes".to_string()];
+        assert!(NativeToolchainInputs::required(&observation));
+        observation.compiler_arguments.clear();
+        observation.crate_types = BTreeSet::from(["rlib".to_string()]);
+        observation.emit_modes.insert("link".to_string());
+        observation.test_mode = true;
+        assert!(NativeToolchainInputs::required(&observation));
+        assert_eq!(native_target_output_query(&observation), Some(("fixture", "bin")));
+        observation.test_mode = false;
+        observation.crate_types.insert("cdylib".to_string());
+        assert_eq!(native_target_output_query(&observation), None);
+    }
+
+    #[test]
+    fn target_query_preserves_selected_target_sysroot_cpu_features_and_backend() {
+        let arguments = [
+            "--target=first",
+            "--target",
+            "second",
+            "--sysroot",
+            "custom-sysroot",
+            "-Ctarget-cpu=generic",
+            "-C",
+            "target-feature=+aes",
+            "-Cextra-filename=-artifact",
+            "-Z",
+            "codegen-backend=llvm",
+            "--out-dir",
+            "ignored-output",
+            "src/lib.rs",
+        ]
+        .map(str::to_string);
+        let selected = native_target_query_options(&arguments, Path::new("/workspace"), Path::new("/workspace"))
+            .expect("selected target query options");
+        assert_eq!(selected.target.as_deref(), Some("second"));
+        assert_eq!(selected.sysroot.as_deref(), Some("custom-sysroot"));
+        assert_eq!(selected.backend.as_deref(), Some("llvm"));
+        assert_eq!(
+            selected.arguments,
+            [
+                "--target",
+                "first",
+                "--target",
+                "second",
+                "--sysroot",
+                "custom-sysroot",
+                "-C",
+                "target-cpu=generic",
+                "-C",
+                "target-feature=+aes",
+                "-C",
+                "extra-filename=-artifact",
+                "-Z",
+                "codegen-backend=llvm",
+            ]
+        );
+        assert!(native_target_override_required(&arguments));
+        assert!(!native_target_override_required(&[
+            "--emit=metadata".to_string(),
+            "src/lib.rs".to_string()
+        ]));
+        assert_eq!(
+            native_target_query_options(
+                &["-Ctarget-cpu=native".to_string()],
+                Path::new("/workspace"),
+                Path::new("/workspace"),
+            )
+            .err()
+            .expect("native CPU cannot be identified by its requested spelling")
+            .to_string(),
+            "native_cpu_identity_unavailable"
+        );
+    }
+
+    #[test]
+    fn target_query_restores_observed_repository_target_and_sysroot_paths() {
+        let root = tempfile::tempdir().expect("selected target fixture");
+        let target = root.path().join("custom target.json");
+        let sysroot = root.path().join("custom sysroot");
+        let target = target.to_str().expect("target path");
+        let sysroot = sysroot.to_str().expect("sysroot path");
+        let split = native_target_query_options(
+            &[
+                "--target".to_string(),
+                "repository:/custom target.json".to_string(),
+                "--sysroot".to_string(),
+                "repository:/custom sysroot".to_string(),
+            ],
+            &root.path().join("member"),
+            root.path(),
+        )
+        .expect("portable split target selection");
+        assert_eq!(split.target.as_deref(), Some(target));
+        assert_eq!(split.sysroot.as_deref(), Some(sysroot));
+        assert_eq!(split.arguments, ["--target", target, "--sysroot", sysroot]);
+        let joined = native_target_query_options(
+            &[format!("--target={target}"), format!("--sysroot={sysroot}")],
+            &root.path().join("member"),
+            root.path(),
+        )
+        .expect("absolute joined target selection");
+        assert_eq!(joined.arguments, ["--target", target, "--sysroot", sysroot]);
+        for value in ["repository:", "repository:/", r"repository:\"] {
+            assert_eq!(
+                native_target_query_options(&["--sysroot".to_string(), value.to_string()], root.path(), root.path(),)
+                    .expect("source root is the selected custom sysroot")
+                    .sysroot
+                    .as_deref(),
+                root.path().to_str()
+            );
+        }
+        assert!(
+            native_target_query_options(
+                &["--target".to_string(), "repository:/../outside.json".to_string()],
+                root.path(),
+                root.path(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn target_format_requires_compiler_reported_format() {
+        for (format, expected) in [
+            ("elf", NativeTargetFormat::Elf),
+            ("mach-o", NativeTargetFormat::MachO),
+            ("coff", NativeTargetFormat::Coff),
+            ("wasm", NativeTargetFormat::Wasm),
+        ] {
+            assert_eq!(
+                native_target_format(&serde_json::json!({"binary-format": format}), &BTreeSet::new())
+                    .expect("compiler-reported object format"),
+                expected
+            );
+        }
+        assert_eq!(
+            native_target_format(
+                &serde_json::json!({}),
+                &BTreeSet::from(["target_object_format=\"elf\"".to_string()])
+            )
+            .expect("compiler-reported cfg format"),
+            NativeTargetFormat::Elf
+        );
+        assert_eq!(
+            native_target_format(&serde_json::json!({"os": "linux"}), &BTreeSet::new())
+                .expect_err("OS alone is not object format authority")
+                .to_string(),
+            "compiler_target_object_format_evidence_unavailable"
+        );
+    }
+
+    #[test]
+    fn target_sdk_query_distinguishes_catalyst_and_simulator() {
+        let root = tempfile::tempdir().expect("target SDK query fixture");
+        for (target, expected) in [
+            ("aarch64-apple-ios-macabi", Some("MacOSX")),
+            ("aarch64-apple-ios-sim", Some("iPhoneSimulator")),
+            ("aarch64-unknown-linux-gnu", None),
+        ] {
+            let query = query_native_target(
+                OsStr::new("rustc"),
+                &["--target".to_string(), target.to_string()],
+                root.path(),
+                None,
+            )
+            .expect("selected compiler target query");
+            let specification = serde_json::Deserializer::from_slice(&query)
+                .into_iter::<serde_json::Value>()
+                .next()
+                .expect("target specification")
+                .expect("valid target specification");
+            assert_eq!(native_target_apple_sdk(&specification), expected, "{target}");
+        }
+    }
+
+    #[test]
     fn compiler_sysroot_identity_rehashes_target_driver_and_self_contained_bytes() {
         let sysroot = tempfile::tempdir().expect("sysroot");
         let target_lib = sysroot.path().join("lib/rustlib/test-host/lib");
@@ -6859,6 +7636,11 @@ edition = "2024"
         std::fs::create_dir_all(driver.parent().expect("driver parent")).expect("driver directory");
         std::fs::write(&driver, b"driver-one").expect("driver library");
         #[cfg(windows)]
+        let llvm = sysroot.path().join("bin/LLVM.dll");
+        #[cfg(not(windows))]
+        let llvm = sysroot.path().join("lib/libLLVM.so");
+        std::fs::write(&llvm, b"llvm-one").expect("LLVM runtime library");
+        #[cfg(windows)]
         let rustc_implementation = sysroot.path().join("bin/rustc.exe");
         #[cfg(not(windows))]
         let rustc_implementation = sysroot.path().join("bin/rustc");
@@ -6866,12 +7648,12 @@ edition = "2024"
         std::fs::write(rustc_implementation, b"rustc").expect("rustc implementation");
 
         let baseline = compiler_sysroot_fingerprint(sysroot.path(), "test-host", None).expect("baseline fingerprint");
-        assert_eq!(baseline.1, 31);
+        assert_eq!(baseline.1, 39);
         let inventory = compiler_sysroot_inventory(sysroot.path(), "test-host").expect("sysroot inventory");
         hash_compiler_sysroot_with_limit(&inventory, baseline.1).expect("exact byte limit");
         let error = hash_compiler_sysroot_with_limit(&inventory, baseline.1 - 1).expect_err("byte limit +1 must fail");
         assert!(
-            error.to_string().contains("30-byte limit after 31 bytes"),
+            error.to_string().contains("38-byte limit after 39 bytes"),
             "unexpected byte-limit diagnostic: {error}"
         );
         std::fs::write(target_lib.join("libcore-test.rlib"), b"target-two").expect("target mutation");
@@ -6882,10 +7664,34 @@ edition = "2024"
         let driver_changed =
             compiler_sysroot_fingerprint(sysroot.path(), "test-host", None).expect("driver fingerprint");
         assert_ne!(target_changed.0, driver_changed.0);
+        std::fs::write(&llvm, b"llvm-two").expect("LLVM backend mutation");
+        let llvm_changed = compiler_sysroot_fingerprint(sysroot.path(), "test-host", None).expect("LLVM fingerprint");
+        assert_ne!(driver_changed.0, llvm_changed.0);
         std::fs::write(&runtime, b"runtime-two").expect("self-contained runtime mutation");
         let runtime_changed =
             compiler_sysroot_fingerprint(sysroot.path(), "test-host", None).expect("runtime fingerprint");
-        assert_ne!(driver_changed.0, runtime_changed.0);
+        assert_ne!(llvm_changed.0, runtime_changed.0);
+
+        let guard = CompilerInputGuard::capture_sysroot(sysroot.path(), "test-host").expect("retained host inputs");
+        guard.revalidate().expect("unchanged host inputs");
+        std::fs::write(&llvm, b"llvm-alt").expect("same-size host runtime mutation");
+        assert_eq!(
+            guard.revalidate().expect_err("runtime drift").to_string(),
+            "compiler_input_generation_changed"
+        );
+        std::fs::write(&llvm, b"llvm-two").expect("restore original host runtime bytes");
+        assert_eq!(
+            guard.revalidate().expect_err("runtime ABA").to_string(),
+            "compiler_input_generation_changed"
+        );
+        let guard = CompilerInputGuard::capture_sysroot(sysroot.path(), "test-host").expect("new retained host inputs");
+        let backends = sysroot.path().join("lib/rustlib/test-host/codegen-backends");
+        std::fs::create_dir(&backends).expect("transient backend search namespace");
+        std::fs::remove_dir(&backends).expect("restore absent backend namespace");
+        assert_eq!(
+            guard.revalidate().expect_err("backend namespace ABA").to_string(),
+            "compiler_input_generation_changed"
+        );
 
         #[cfg(unix)]
         {
@@ -6898,6 +7704,67 @@ edition = "2024"
                     .contains("compiler self-contained sysroot contains a non-regular entry")
             );
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn returned_transparent_session_guard_rejects_compiler_and_sysroot_aba() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        fs::create_dir(root.join("target")).unwrap();
+        let sysroot = root.join("sysroot");
+        let target = sysroot.join("lib/rustlib/test-host/lib");
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir(sysroot.join("bin")).unwrap();
+        fs::write(sysroot.join("bin/rustc"), b"compiler").unwrap();
+        fs::write(sysroot.join("lib/librustc_driver-test.so"), b"driver").unwrap();
+        let library = target.join("libcore-test.rlib");
+        fs::write(&library, b"AAAA").unwrap();
+        let program = root.join("selected-rustc");
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n-vV) printf '%s\\n' 'rustc test' 'host: test-host';;\n--print=sysroot) printf '%s\\n' '{}';;\nesac\n",
+            sysroot.to_str().unwrap().replace('\'', "'\\''")
+        );
+        fs::write(&program, &script).unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        let cache = LocalCacheSelection::new(root.join("cache"), 1024 * 1024, None).unwrap();
+        let (_, _, memo, guard) = capture_transparent_native_session(
+            &root,
+            &root.join("target"),
+            program.as_os_str(),
+            &cache,
+            crate::cache::installation::InstalledRootPortability::Physical,
+        )
+        .unwrap();
+        guard.revalidate().unwrap();
+        let (_, reused_guard) =
+            reuse_transparent_native_session(&memo, &root, &root.join("target"), program.as_os_str())
+                .unwrap()
+                .expect("unchanged compiler session");
+        fs::write(&program, script.replace("rustc test", "rustc next")).unwrap();
+        fs::write(&program, &script).unwrap();
+        for guard in [&guard, &reused_guard] {
+            assert_eq!(
+                guard.revalidate().unwrap_err().to_string(),
+                "compiler_input_generation_changed"
+            );
+        }
+        let (_, _, _, guard) = capture_transparent_native_session(
+            &root,
+            &root.join("target"),
+            program.as_os_str(),
+            &cache,
+            crate::cache::installation::InstalledRootPortability::Physical,
+        )
+        .unwrap();
+        fs::write(&library, b"BBBB").unwrap();
+        fs::write(&library, b"AAAA").unwrap();
+        assert_eq!(
+            guard.revalidate().unwrap_err().to_string(),
+            "compiler_input_generation_changed"
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]

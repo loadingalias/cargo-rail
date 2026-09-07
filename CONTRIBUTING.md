@@ -6,6 +6,10 @@ Install these tools:
 
 - Rust through `rustup`; `rust-toolchain.toml` selects the repository toolchain and components.
 - `just`, `cargo-nextest`, and `cargo-deny`.
+- For `just build` and `just test`: Python 3.11 or newer and `rustc-dev` for the selected toolchain.
+- For local checks on macOS: Zig, `cargo-zigbuild`, `cargo-xwin`, and LLVM tools required by cargo-xwin.
+- For `just test` on macOS: clang with COFF support, `lld-link`, and `ld64.lld` on `PATH`, plus `cargo-xwin`
+  with its x86_64 MSVC SDK already cached. The cross-link test runs offline.
 
 Run commands from the repository root. Use `just --list` to see the maintained command surface.
 
@@ -18,7 +22,7 @@ Run commands from the repository root. Use `just --list` to see the maintained c
 - Update documentation when commands, configuration, output, side effects, compatibility, or recovery behavior changes.
 ## Validate the worktree
 
-Run the direct workspace build and test lanes:
+With the prerequisites installed, run the workspace build and test lanes:
 
 ```bash
 just build
@@ -33,15 +37,33 @@ public-contract boundaries:
 just check
 ```
 
-`just build` and `just test` are workspace-wide and do not lower plan selectors. `just check` is workspace-wide and
-read-only. `just fix` formats files and applies Clippy fixes; run it only when those edits are intended. Use the
-contract-specific recipes listed by `just --list` for compiler-driver, Windows-target, benchmark, or remote-machine
-work.
+`just build` and `just test` prepare authenticated compiler components beside Cargo's debug binaries, then use that
+authority for the whole recipe. Preparation runs offline and reuses exact unchanged components; missing prerequisites
+stop the recipe. Both recipes are workspace-wide and do not lower plan selectors.
 
-## Work on Surface compiler integration
+On macOS, `just test` also runs the Cranelift production-cache contract.
+`just test-cranelift` runs that contract alone. Both recipes install missing components from
+[the pinned Cranelift toolchain](.config/cranelift-toolchain.toml), including its matched development files and backend.
+The first run may download these components; later runs reuse the installed toolchain.
+Advance that separate nightly pin only after the focused lane passes.
 
-General CLI, planner, release, dependency, and documentation work does not require compiler internals. When changing
-Surface's compiler integration, install `rustc-dev` for the selected toolchain and validate the excluded driver:
+On the local macOS workstation, `just check` first runs `just fix`, then validates the resulting worktree.
+Both commands run host Clippy and
+cross-target Clippy for Linux GNU/musl and Windows MSVC on x86-64 and ARM64, with all Cargo targets and features.
+`just fix` applies Rustfmt and Clippy edits, including to dirty or staged files; review the resulting diff.
+Cross-target checks do not execute tests or prove final executable linking.
+
+CI uses `just ci-check` for native formatting, Clippy, dependency policy, and documentation checks without source
+repairs. Dependency unification remains in the local check because it analyzes the repository's full target policy.
+Run `just test` separately for runtime tests, including native cache tests. `just check-tooling` validates
+the installer and updater scripts; it does not update tooling. Use `just check-compiler-driver` for the excluded
+compiler driver.
+
+## Work on compiler integration
+
+Plain `cargo build` can build the general CLI without compiler components. Native cache reuse and Surface compiler
+facts use the separately built driver. Install its selected-toolchain prerequisite and run its dedicated checks when
+changing either compiler contract:
 
 ```bash
 rustup component add rustc-dev

@@ -502,7 +502,7 @@ pub(crate) enum RemoteLookup {
     Miss,
     Conflict,
     Unique {
-        selector: crate::compiler::native_cache::NativeDynamicInputSelector,
+        selector: Box<crate::compiler::native_cache::NativeDynamicInputSelector>,
         action_key: String,
         result_key: String,
         body: RemoteBody,

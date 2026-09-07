@@ -1,0 +1,6 @@
+# The compiler and backend must match the authenticated driver source.
+# Advance this pin only with a passing `just test-cranelift` run.
+[toolchain]
+channel = "nightly-2026-07-01"
+profile = "minimal"
+components = ["rustc-dev", "rustc-codegen-cranelift"]

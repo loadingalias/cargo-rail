@@ -27,31 +27,37 @@ use zeroize::Zeroizing;
 
 use crate::compiler::native_cache::NativePhaseMeasurement;
 use crate::compiler::native_cache::pack::NativeResultStaging;
+use crate::compiler::native_input_protocol::{
+    MAX_NATIVE_INPUT_OBSERVATION_BYTES, NATIVE_INPUT_INVOCATION_ARGUMENT, NATIVE_INPUT_PROTOCOL_VERSION,
+    NativeAssemblyObservation, NativeInputInvocation, NativeInputObservation, native_invocation_digest,
+};
 use crate::error::{RailError, RailResult};
 use crate::source::ContentDigest;
 
-const PROTOCOL_VERSION: u32 = 3;
+const PROTOCOL_VERSION: u32 = 5;
 const ANALYSIS_OPERATION_VERSION: u32 = 1;
-const REQUEST_MAGIC: &[u8; 8] = b"CRXREQ3\0";
-const REQUEST_TRAILER: &[u8; 8] = b"CRXEND3\0";
-const RESPONSE_MAGIC: &[u8; 8] = b"CRXRES3\0";
-const RESPONSE_TRAILER: &[u8; 8] = b"CRXDONE3";
-const CANCEL_MAGIC: &[u8; 8] = b"CRXCAN3\0";
-const CANCEL_TRAILER: &[u8; 8] = b"CRXCEND3";
-const CAPABILITY_MAGIC: &[u8; 8] = b"CRXCAP3\0";
-const CAPABILITY_TRAILER: &[u8; 8] = b"CRXCPEN3";
-const LEASE_REQUEST_MAGIC: &[u8; 8] = b"CRXLRQ3\0";
-const LEASE_REQUEST_TRAILER: &[u8; 8] = b"CRXLRQE3";
-const LEASE_GRANT_MAGIC: &[u8; 8] = b"CRXLGT3\0";
-const LEASE_GRANT_TRAILER: &[u8; 8] = b"CRXLGTE3";
+const REQUEST_MAGIC: &[u8; 8] = b"CRXREQ5\0";
+const REQUEST_TRAILER: &[u8; 8] = b"CRXEND5\0";
+const RESPONSE_MAGIC: &[u8; 8] = b"CRXRES5\0";
+const RESPONSE_TRAILER: &[u8; 8] = b"CRXDONE5";
+const CANCEL_MAGIC: &[u8; 8] = b"CRXCAN5\0";
+const CANCEL_TRAILER: &[u8; 8] = b"CRXCEND5";
+const CAPABILITY_MAGIC: &[u8; 8] = b"CRXCAP5\0";
+const CAPABILITY_TRAILER: &[u8; 8] = b"CRXCPEN5";
+const LEASE_REQUEST_MAGIC: &[u8; 8] = b"CRXLRQ5\0";
+const LEASE_REQUEST_TRAILER: &[u8; 8] = b"CRXLRQE5";
+const LEASE_GRANT_MAGIC: &[u8; 8] = b"CRXLGT5\0";
+const LEASE_GRANT_TRAILER: &[u8; 8] = b"CRXLGTE5";
 #[cfg(target_os = "linux")]
-const SANDBOX_READY_MAGIC: &[u8; 8] = b"CRXRUN3\0";
+const SANDBOX_READY_MAGIC: &[u8; 8] = b"CRXRUN5\0";
 #[cfg(target_os = "linux")]
-const VIRTUAL_WORKER: &str = "/cargo-rail/exec/v3/worker";
-pub(crate) const VIRTUAL_ROOT: &str = "/cargo-rail/exec/v3";
-pub(crate) const VIRTUAL_WORKSPACE: &str = "/cargo-rail/exec/v3/workspace";
+const VIRTUAL_WORKER: &str = "/cargo-rail/exec/v5/worker";
+pub(crate) const VIRTUAL_ROOT: &str = "/cargo-rail/exec/v5";
+pub(crate) const VIRTUAL_WORKSPACE: &str = "/cargo-rail/exec/v5/workspace";
 pub(crate) const VIRTUAL_OUTPUT_DIRECTORY: &str = "target/cargo-rail-distributed/deps";
-const VIRTUAL_DEPENDENCIES: &str = "/cargo-rail/exec/v3/dependencies";
+const VIRTUAL_DEPENDENCIES: &str = "/cargo-rail/exec/v5/dependencies";
+const VIRTUAL_HOST_LIBRARIES: &str = "/cargo-rail/exec/v5/toolchain/host";
+const VIRTUAL_TARGET_LIBRARIES: &str = "/cargo-rail/exec/v5/toolchain/target";
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_INPUT_ENTRIES: usize = 16 * 1024;
 const MAX_INPUT_PATH_BYTES: usize = 1024 * 1024;
@@ -180,12 +186,12 @@ struct AnalysisWorkerCapability {
 }
 
 struct CapturedWorkerCapability {
-    analysis_driver: Option<crate::compiler::driver::PreparedDistributedCompilerFactDriver>,
+    analysis_readiness: Option<crate::compiler::driver::CompilerFactDriverReadiness>,
     capability: WorkerCapability,
     rustc: PathBuf,
     rustc_generation: Vec<u8>,
+    sysroot_guard: crate::compiler::collector::CompilerInputGuard,
     runtime: WorkerRuntime,
-    #[cfg(target_os = "linux")]
     sysroot: PathBuf,
 }
 
@@ -342,9 +348,12 @@ struct RustLibraryOperation {
     lints: Vec<RustLibraryLint>,
     operation_class: OperationClass,
     output_relative_directory: String,
-    output_dependency_search: bool,
+    dependency_searches: Vec<String>,
+    source_working_directory: Option<String>,
     rlib_name: Option<String>,
     source_virtual_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target: Option<RustLibraryTarget>,
     test_mode: bool,
     toolchain_proc_macro: bool,
 }
@@ -374,7 +383,8 @@ struct PortableCompilerFactInvocation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RustLibraryDependency {
-    extern_name: String,
+    extern_name: Option<String>,
+    search_directories: Vec<String>,
     virtual_path: String,
 }
 
@@ -411,12 +421,56 @@ pub(crate) enum RustLibraryLintLevel {
     Allow,
     Deny,
     Forbid,
+    ForceWarn,
     Warn,
+}
+
+/// Selected compiler-only target inputs, re-observed by the worker before execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RustLibraryTarget {
+    pub(crate) triple: Option<String>,
+    pub(crate) cpu: Option<String>,
+    pub(crate) features: Option<String>,
+    pub(crate) identity: String,
+}
+
+impl RustLibraryTarget {
+    pub(crate) fn validate(&self) -> RailResult<()> {
+        let name = |value: &str| {
+            !value.is_empty()
+                && value.len() <= 256
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        };
+        let triple_valid = self
+            .triple
+            .as_deref()
+            .is_none_or(|triple| name(triple) && !triple.contains('.') && triple.contains('-'));
+        let cpu_valid = self.cpu.as_deref().is_none_or(|cpu| name(cpu) && cpu != "native");
+        let features_valid = self.features.as_deref().is_none_or(|features| {
+            features.len() <= 8192
+                && features.split(',').all(|feature| {
+                    matches!(feature.as_bytes().first(), Some(b'+' | b'-')) && feature.get(1..).is_some_and(name)
+                })
+        });
+        if self.triple.is_none() && self.cpu.is_none() && self.features.is_none()
+            || !triple_valid
+            || !cpu_valid
+            || !features_valid
+            || !valid_identity(&self.identity, "sha256:")
+        {
+            return Err(RailError::message("distributed target input authority is invalid"));
+        }
+        Ok(())
+    }
 }
 
 /// Machine-independent rustc options retained by the portable action.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RustLibraryExecutionOptions {
+    pub(crate) target: Option<RustLibraryTarget>,
     pub(crate) cap_lints: Option<String>,
     pub(crate) cargo_json_diagnostics: bool,
     pub(crate) check_cfg: Vec<String>,
@@ -425,7 +479,8 @@ pub(crate) struct RustLibraryExecutionOptions {
     pub(crate) cfg: Vec<String>,
     pub(crate) diagnostic_width: Option<u32>,
     pub(crate) lints: Vec<RustLibraryLint>,
-    pub(crate) output_dependency_search: bool,
+    pub(crate) dependency_searches: Vec<String>,
+    pub(crate) source_working_directory: Option<String>,
 }
 
 /// Named inputs for one portable Rust library operation.
@@ -460,9 +515,10 @@ pub(crate) struct RustLibrarySourceInput {
 /// One exact prebuilt Rust dependency admitted to portable execution.
 pub(crate) struct RustLibraryDependencyInput {
     pub(crate) artifact_name: String,
+    pub(crate) search_directories: Vec<String>,
     pub(crate) bytes: u64,
     pub(crate) content_digest: String,
-    pub(crate) extern_name: String,
+    pub(crate) extern_name: Option<String>,
     pub(crate) path: PathBuf,
 }
 
@@ -567,6 +623,7 @@ enum ResponseSlot {
     CompilerFacts,
     DepInfo,
     Metadata,
+    NativeInputs,
     Rlib,
     Stderr,
     Stdout,
@@ -579,6 +636,7 @@ impl ResponseSlot {
             Self::CompilerFacts => "compiler-facts",
             Self::DepInfo => "dep-info",
             Self::Metadata => "metadata",
+            Self::NativeInputs => "native-inputs",
             Self::Rlib => "rlib",
             Self::Stderr => "stderr",
             Self::Stdout => "stdout",
@@ -592,7 +650,7 @@ impl ResponseSlot {
     const fn is_bytes(self) -> bool {
         matches!(
             self,
-            Self::AnalysisObservation | Self::CompilerFacts | Self::Stderr | Self::Stdout
+            Self::AnalysisObservation | Self::CompilerFacts | Self::NativeInputs | Self::Stderr | Self::Stdout
         )
     }
 }
@@ -601,6 +659,286 @@ struct RequestEnvelope {
     inputs: BTreeMap<String, PathBuf>,
     request: ExecutionRequest,
     _staging: tempfile::TempDir,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerNativeInputs {
+    invocation: NativeInputInvocation,
+    observation: NativeInputObservation,
+}
+
+struct WorkerNativeInvocation {
+    driver: crate::compiler::driver::PreparedNativeCompilerDriver,
+    invocation: NativeInputInvocation,
+    _capability: tempfile::TempPath,
+}
+
+impl WorkerNativeInvocation {
+    fn prepare(
+        captured: &CapturedWorkerCapability,
+        envelope: &RequestEnvelope,
+        attempt: &Path,
+        command: &mut Command,
+    ) -> RailResult<Option<Self>> {
+        let Some(driver) = crate::compiler::driver::PreparedNativeCompilerDriver::prepare(
+            attempt,
+            &captured.capability.rustc_verbose_version,
+            &captured.sysroot,
+            attempt,
+        )?
+        else {
+            return Ok(None);
+        };
+        let arguments = command
+            .get_args()
+            .map(|value| {
+                value
+                    .to_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| RailError::message("distributed compiler argument is not UTF-8"))
+            })
+            .collect::<RailResult<Vec<_>>>()?;
+        let workspace = command
+            .get_current_dir()
+            .ok_or_else(|| RailError::message("distributed compiler working directory is unavailable"))?;
+        let invocation = NativeInputInvocation {
+            version: NATIVE_INPUT_PROTOCOL_VERSION,
+            source_working_directory: envelope.request.operation.source_working_directory.clone(),
+            nonce: ContentDigest::sha256(envelope.request.lease_id.as_bytes()).to_string(),
+            action_identity: native_input_action_identity(&envelope.request.operation, &envelope.request.inputs)?,
+            invocation_digest: native_invocation_digest(&arguments, workspace).map_err(RailError::message)?,
+            result_path: attempt
+                .join("native-input-result")
+                .to_str()
+                .ok_or_else(|| RailError::message("distributed native input result path is not UTF-8"))?
+                .to_string(),
+        };
+        let mut capability = tempfile::Builder::new()
+            .prefix("native-input-invocation-")
+            .tempfile_in(attempt)?;
+        let bytes = serde_json::to_vec(&invocation)?;
+        NativeInputInvocation::decode(&bytes).map_err(RailError::message)?;
+        capability.write_all(&bytes)?;
+        let mut observed = driver.command(None)?;
+        observed
+            .arg(NATIVE_INPUT_INVOCATION_ARGUMENT)
+            .arg(capability.path())
+            .arg(command.get_program())
+            .args(command.get_args())
+            .current_dir(workspace)
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (name, value) in command.get_envs() {
+            if let Some(value) = value {
+                observed.env(name, value);
+            }
+        }
+        *command = observed;
+        Ok(Some(Self {
+            driver,
+            invocation,
+            _capability: capability.into_temp_path(),
+        }))
+    }
+
+    fn complete(
+        self,
+        captured: &CapturedWorkerCapability,
+        request: &ExecutionRequest,
+        attempt: &Path,
+        target_library_directory: Option<&Path>,
+    ) -> RailResult<Vec<u8>> {
+        self.driver.revalidate()?;
+        let path = Path::new(&self.invocation.result_path);
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_file()
+            || crate::utils::is_symlink_or_reparse(&metadata)
+            || metadata.len() > MAX_NATIVE_INPUT_OBSERVATION_BYTES
+        {
+            return Err(RailError::message(
+                "distributed native input record is not a bounded regular file",
+            ));
+        }
+        let mut bytes = Vec::new();
+        File::open(path)?
+            .take(MAX_NATIVE_INPUT_OBSERVATION_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        let mut observation = NativeInputObservation::decode(&bytes, &self.invocation).map_err(RailError::message)?;
+        validate_native_assembly(&observation, &request.operation)?;
+        let host_library_directory = captured
+            .sysroot
+            .join("lib/rustlib")
+            .join(&captured.capability.host_target)
+            .join("lib");
+        let map = |path: &str, directory: bool| -> RailResult<String> {
+            let path = Path::new(path);
+            for (physical, portable) in [
+                (Some(host_library_directory.as_path()), VIRTUAL_HOST_LIBRARIES),
+                (target_library_directory, VIRTUAL_TARGET_LIBRARIES),
+            ] {
+                if let Some(root) = physical
+                    && let Ok(relative) = path.strip_prefix(root)
+                {
+                    validate_native_toolchain_relative(relative, directory)?;
+                    return portable_native_path(Path::new(portable).join(relative));
+                }
+            }
+            let relative = path
+                .strip_prefix(attempt)
+                .map_err(|_| RailError::message("distributed compiler selected an untransported input"))?;
+            let portable = portable_native_path(Path::new(VIRTUAL_ROOT).join(relative))?;
+            validate_native_input_path(&portable, directory, &request.operation, &request.inputs)?;
+            if !directory {
+                let frame = native_input_frame(Path::new(&portable), &request.operation, &request.inputs)
+                    .ok_or_else(|| RailError::message("distributed compiler input frame is unavailable"))?;
+                if digest_file(path, frame.bytes)? != frame.content_digest {
+                    return Err(RailError::message(
+                        "distributed compiler input changed during execution",
+                    ));
+                }
+            }
+            Ok(portable)
+        };
+        map_native_inputs(&mut observation, map)?;
+        let record = WorkerNativeInputs {
+            invocation: self.invocation,
+            observation,
+        };
+        record
+            .observation
+            .encode(&record.invocation)
+            .map_err(RailError::message)?;
+        let encoded = serde_json::to_vec(&record)?;
+        if encoded.len() as u64 > MAX_NATIVE_INPUT_OBSERVATION_BYTES + 64 * 1024 {
+            return Err(RailError::message(
+                "distributed native input record exceeds its byte bound",
+            ));
+        }
+        Ok(encoded)
+    }
+}
+
+fn native_input_action_identity(operation: &RustLibraryOperation, inputs: &[InputFrame]) -> RailResult<String> {
+    Ok(format!(
+        "distributed-native-inputs-v1:sha256:{}",
+        ContentDigest::sha256(&canonical_json(&(operation, inputs))?)
+    ))
+}
+
+fn validate_native_assembly(observation: &NativeInputObservation, operation: &RustLibraryOperation) -> RailResult<()> {
+    let expected = match operation.emission {
+        RustLibraryEmission::Metadata => NativeAssemblyObservation::NoCodegen,
+        RustLibraryEmission::MetadataAndLink => NativeAssemblyObservation::Absent,
+    };
+    if observation.assembly != expected {
+        return Err(RailError::message(
+            "distributed compiler assembly input authority is unavailable",
+        ));
+    }
+    if expected != NativeAssemblyObservation::NoCodegen && !observation.codegen.certifies_no_external_tools() {
+        return Err(RailError::message(
+            "distributed compiler backend tool authority is unavailable",
+        ));
+    }
+    Ok(())
+}
+
+fn portable_native_path(path: PathBuf) -> RailResult<String> {
+    path.into_os_string()
+        .into_string()
+        .map_err(|_| RailError::message("distributed native input path is not UTF-8"))
+}
+
+fn validate_native_toolchain_relative(relative: &Path, directory: bool) -> RailResult<()> {
+    if if directory {
+        !relative.as_os_str().is_empty()
+    } else {
+        relative.components().count() != 1
+            || !matches!(relative.components().next(), Some(std::path::Component::Normal(_)))
+    } {
+        return Err(RailError::message(
+            "distributed native toolchain input escaped its library directory",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_native_input_path(
+    path: &str,
+    directory: bool,
+    operation: &RustLibraryOperation,
+    inputs: &[InputFrame],
+) -> RailResult<()> {
+    let path = Path::new(path);
+    let valid = if directory {
+        path == Path::new(VIRTUAL_WORKSPACE).join(&operation.output_relative_directory)
+            || operation
+                .dependency_searches
+                .iter()
+                .any(|search| path == Path::new(VIRTUAL_WORKSPACE).join(search))
+            || inputs
+                .iter()
+                .any(|input| Path::new(&input.virtual_path).parent() == Some(path))
+    } else {
+        native_input_frame(path, operation, inputs).is_some()
+    };
+    if !valid {
+        return Err(RailError::message(
+            "distributed compiler selected an untransported Rust library input",
+        ));
+    }
+    Ok(())
+}
+
+fn native_input_frame<'a>(
+    path: &Path,
+    operation: &RustLibraryOperation,
+    inputs: &'a [InputFrame],
+) -> Option<&'a InputFrame> {
+    inputs
+        .iter()
+        .find(|frame| Path::new(&frame.virtual_path) == path)
+        .or_else(|| {
+            operation.dependencies.iter().find_map(|dependency| {
+                let name = Path::new(&dependency.virtual_path).file_name()?;
+                dependency
+                    .search_directories
+                    .iter()
+                    .any(|directory| path == Path::new(VIRTUAL_WORKSPACE).join(directory).join(name))
+                    .then(|| {
+                        inputs
+                            .iter()
+                            .find(|frame| frame.virtual_path == dependency.virtual_path)
+                    })
+                    .flatten()
+            })
+        })
+}
+
+fn map_native_inputs(
+    observation: &mut NativeInputObservation,
+    map: impl Fn(&str, bool) -> RailResult<String>,
+) -> RailResult<()> {
+    for source in &mut observation.crates {
+        for path in &mut source.files {
+            *path = map(path, false)?;
+        }
+        source.files.sort_unstable();
+    }
+    observation.crates.sort_unstable();
+    for search in &mut observation.searches {
+        for name in &search.files {
+            map(&portable_native_path(Path::new(&search.directory).join(name))?, false)?;
+        }
+        search.directory = map(&search.directory, true)?;
+    }
+    observation
+        .searches
+        .sort_unstable_by(|left, right| left.directory.cmp(&right.directory));
+    Ok(())
 }
 
 struct WorkerAnalysisInvocation {
@@ -704,6 +1042,107 @@ impl StagedExecutionResult {
             ));
         }
         Ok(bytes)
+    }
+
+    /// Rebase the actual worker observation through the exact transported input
+    /// bindings. A previous local selector is never execution evidence.
+    pub(crate) fn validated_native_inputs(
+        &self,
+        candidate: &RustLibraryCandidate,
+        workspace: &Path,
+        host_library_directory: &Path,
+        target_library_directory: Option<&Path>,
+    ) -> RailResult<NativeInputObservation> {
+        if !self.binds_candidate(candidate) {
+            return Err(RailError::message(
+                "distributed native inputs do not bind their candidate",
+            ));
+        }
+        let bytes = self.read_verified_response_slot(ResponseSlot::NativeInputs)?;
+        if bytes.len() as u64 > MAX_NATIVE_INPUT_OBSERVATION_BYTES + 64 * 1024 {
+            return Err(RailError::message(
+                "distributed native input record exceeds its byte bound",
+            ));
+        }
+        let mut record: WorkerNativeInputs = serde_json::from_slice(&bytes)?;
+        if serde_json::to_vec(&record)? != bytes
+            || record.invocation.source_working_directory != self.operation.source_working_directory
+            || record.invocation.action_identity != native_input_action_identity(&self.operation, &self.inputs)?
+        {
+            return Err(RailError::message(
+                "distributed native input record does not bind its action",
+            ));
+        }
+        record
+            .observation
+            .encode(&record.invocation)
+            .map_err(RailError::message)?;
+        validate_native_assembly(&record.observation, &self.operation)?;
+        map_native_inputs(&mut record.observation, |path, directory| {
+            let path = Path::new(path);
+            for (portable, local) in [
+                (VIRTUAL_HOST_LIBRARIES, Some(host_library_directory)),
+                (VIRTUAL_TARGET_LIBRARIES, target_library_directory),
+            ] {
+                if let Ok(relative) = path.strip_prefix(portable) {
+                    validate_native_toolchain_relative(relative, directory)?;
+                    let local = local
+                        .ok_or_else(|| RailError::message("distributed target library authority is unavailable"))?;
+                    return portable_native_path(local.join(relative));
+                }
+            }
+            let encoded = path
+                .to_str()
+                .ok_or_else(|| RailError::message("distributed input path is not UTF-8"))?;
+            validate_native_input_path(encoded, directory, &self.operation, &self.inputs)?;
+            if let Ok(relative) =
+                path.strip_prefix(Path::new(VIRTUAL_WORKSPACE).join(&self.operation.output_relative_directory))
+            {
+                return portable_native_path(
+                    candidate
+                        .local_output_directory
+                        .as_ref()
+                        .ok_or_else(|| RailError::message("distributed local output directory is unavailable"))?
+                        .join(relative),
+                );
+            }
+            if let Ok(relative) = path.strip_prefix(VIRTUAL_WORKSPACE) {
+                return portable_native_path(workspace.join(relative));
+            }
+            let mut local = candidate.inputs.iter().filter_map(|input| {
+                let matches = if directory {
+                    Path::new(&input.frame.virtual_path).parent() == Some(path)
+                } else {
+                    Path::new(&input.frame.virtual_path) == path
+                };
+                match (&input.payload, matches) {
+                    (CandidateInputPayload::File(local), true) => {
+                        if directory {
+                            local.parent().map(Path::to_path_buf)
+                        } else {
+                            Some(local.clone())
+                        }
+                    }
+                    _ => None,
+                }
+            });
+            let selected = local
+                .next()
+                .ok_or_else(|| RailError::message("distributed Rust input has no local binding"))?;
+            if local.any(|other| other != selected) {
+                return Err(RailError::message(
+                    "distributed Rust input has ambiguous local bindings",
+                ));
+            }
+            portable_native_path(selected)
+        })?;
+        // The mapping may change ordering, but every rebased path must still
+        // satisfy the shared record's strict shape.
+        record
+            .observation
+            .encode(&record.invocation)
+            .map_err(RailError::message)?;
+        Ok(record.observation)
     }
 
     pub(crate) fn validated_analysis_evidence(
@@ -949,7 +1388,7 @@ struct PlacementShape<'a> {
     emission: RustLibraryEmission,
     endpoint_digest: String,
     operation_class: OperationClass,
-    output_dependency_search: bool,
+    dependency_searches: Vec<String>,
     semantic_options_digest: String,
     source_size_class: u32,
     version: u32,
@@ -1089,6 +1528,7 @@ impl RustLibraryCandidate {
             &self.operation.diagnostic_width,
             &self.operation.lints,
             &self.operation.dependencies,
+            &self.operation.target,
         ))?);
         let endpoint_digest = digest_bytes(endpoint.as_bytes());
         let shape = PlacementShape {
@@ -1101,7 +1541,7 @@ impl RustLibraryCandidate {
             emission: self.operation.emission,
             endpoint_digest,
             operation_class: self.operation.operation_class,
-            output_dependency_search: self.operation.output_dependency_search,
+            dependency_searches: self.operation.dependency_searches.clone(),
             semantic_options_digest,
             source_size_class: usize::BITS.saturating_sub(1).saturating_sub(
                 usize::try_from(self.input_bytes())
@@ -1141,6 +1581,13 @@ impl RustLibraryCandidate {
         )
     }
 
+    pub(crate) fn has_dependency_input(&self, path: &Path) -> bool {
+        self.inputs.iter().any(|input| {
+            input.frame.kind == InputKind::Dependency
+                && matches!(&input.payload, CandidateInputPayload::File(candidate) if candidate == path)
+        })
+    }
+
     pub(crate) fn from_captured_inputs(
         input: RustLibraryCandidateInput,
         mut sources: Vec<RustLibrarySourceInput>,
@@ -1163,10 +1610,13 @@ impl RustLibraryCandidate {
         let mut portable_dependencies = Vec::with_capacity(dependencies.len());
         for (index, dependency) in dependencies.into_iter().enumerate() {
             validate_dependency_artifact_name(&dependency.artifact_name)?;
-            validate_extern_name(&dependency.extern_name)?;
+            if let Some(name) = &dependency.extern_name {
+                validate_extern_name(name)?;
+            }
             let virtual_path = format!("{VIRTUAL_DEPENDENCIES}/{index:05}/{}", dependency.artifact_name);
             portable_dependencies.push(RustLibraryDependency {
                 extern_name: dependency.extern_name,
+                search_directories: dependency.search_directories,
                 virtual_path: virtual_path.clone(),
             });
             captured.push(CandidateInput {
@@ -1224,9 +1674,11 @@ impl RustLibraryCandidate {
                 lints: input.options.lints,
                 operation_class: OperationClass::RustLibrary,
                 output_relative_directory: input.output_relative_directory,
-                output_dependency_search: input.options.output_dependency_search,
+                dependency_searches: input.options.dependency_searches,
+                source_working_directory: input.options.source_working_directory,
                 rlib_name: input.rlib_name,
                 source_virtual_path,
+                target: input.options.target,
                 test_mode: input.test_mode,
                 toolchain_proc_macro: input.toolchain_proc_macro,
             },
@@ -1276,7 +1728,8 @@ impl RustLibraryCandidate {
             .operation
             .dependencies
             .iter()
-            .map(|dependency| {
+            .filter_map(|dependency| dependency.extern_name.as_deref().map(|name| (name, dependency)))
+            .map(|(name, dependency)| {
                 let input = self
                     .inputs
                     .iter()
@@ -1285,7 +1738,7 @@ impl RustLibraryCandidate {
                 let CandidateInputPayload::File(path) = &input.payload else {
                     return Err(RailError::message("distributed dependency has no local path authority"));
                 };
-                Ok((dependency.extern_name.as_str(), path.as_path()))
+                Ok((name, path.as_path()))
             })
             .collect::<RailResult<Vec<_>>>()?;
         compiler_command(CompilerCommandInput {
@@ -1780,7 +2233,7 @@ fn execute_mutual_tls_worker_inner(
                 capability.capability_id, expected.capability.capability_id
             )));
         }
-        if stream.conn.alpn_protocol() != Some(b"cargo-rail-execution/3") {
+        if stream.conn.alpn_protocol() != Some(b"cargo-rail-execution/5") {
             return Err(RailError::message(
                 "distributed worker did not negotiate the execution protocol",
             ));
@@ -1788,7 +2241,7 @@ fn execute_mutual_tls_worker_inner(
 
         let lease_started = Instant::now();
         let workload_identity = client_workload_identity(identity)?;
-        let pending_lease = format!("execution-lease-v3:sha256:{}", "0".repeat(64));
+        let pending_lease = format!("execution-lease-v5:sha256:{}", "0".repeat(64));
         let template = execution_request(&capability, candidate, &pending_lease, &workload_identity)?;
         let mut nonce = [0_u8; 32];
         getrandom::fill(&mut nonce)
@@ -1880,12 +2333,12 @@ pub(crate) fn decide_local_attempt(
     }
 }
 
-#[derive(Clone, Copy)]
 pub(crate) struct DistributedAdmissionAuthority<'a> {
     pub(crate) context: &'a crate::compiler::native_cache::NativeCacheContext,
     pub(crate) cas: &'a crate::cache::cas::LocalCas,
     pub(crate) session: &'a crate::compiler::native_cache::NativeCompilerSession,
     pub(crate) capture: &'a crate::compiler::native_cache::NativeActionCapture,
+    pub(crate) native_inputs: crate::compiler::native_cache::ColdRustInputGuard,
     pub(crate) base_action_key: &'a str,
     pub(crate) observation: &'a crate::compiler::observation::RawCompilerInvocation,
     pub(crate) output_paths: &'a crate::compiler::observation::NativeOutputPaths,
@@ -2158,14 +2611,14 @@ fn local_execution_request(
     let issued = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| RailError::message("local distributed lease clock is unavailable"))?;
-    let pending_lease = format!("execution-lease-v3:sha256:{}", "0".repeat(64));
+    let pending_lease = format!("execution-lease-v5:sha256:{}", "0".repeat(64));
     let workload_identity = format!(
         "workload-v1:sha256:{}",
         ContentDigest::sha256(b"local-process-qualification")
     );
     let template = execution_request(capability, candidate, &pending_lease, &workload_identity)?;
     let lease = canonical_json(&(&template.action_id, std::process::id(), sequence, issued.as_nanos()))?;
-    let lease_id = format!("execution-lease-v3:sha256:{}", ContentDigest::sha256(&lease));
+    let lease_id = format!("execution-lease-v5:sha256:{}", ContentDigest::sha256(&lease));
     execution_request(capability, candidate, &lease_id, &workload_identity)
 }
 
@@ -2764,7 +3217,7 @@ fn serve_mutual_tls_connection(
     let peer_workload_identity = peer_workload_identity(stream.conn.peer_certificates())?;
     let lease_request: LeaseRequest =
         read_control_frame(&mut stream, LEASE_REQUEST_MAGIC, LEASE_REQUEST_TRAILER, "lease request")?;
-    if stream.conn.alpn_protocol() != Some(b"cargo-rail-execution/3") {
+    if stream.conn.alpn_protocol() != Some(b"cargo-rail-execution/5") {
         return Err(RailError::message(
             "distributed client did not negotiate the execution protocol",
         ));
@@ -2924,7 +3377,7 @@ fn grant_connection_lease(request: &LeaseRequest) -> RailResult<LeaseGrant> {
     Ok(LeaseGrant {
         action_id: request.action_id.clone(),
         capability_id: request.capability_id.clone(),
-        lease_id: format!("execution-lease-v3:sha256:{}", ContentDigest::sha256(&lease)),
+        lease_id: format!("execution-lease-v5:sha256:{}", ContentDigest::sha256(&lease)),
         protocol_version: PROTOCOL_VERSION,
         workload_identity: request.workload_identity.clone(),
     })
@@ -2933,7 +3386,7 @@ fn grant_connection_lease(request: &LeaseRequest) -> RailResult<LeaseGrant> {
 fn validate_lease_request(request: &LeaseRequest, capability: &WorkerCapability) -> RailResult<()> {
     if request.protocol_version != PROTOCOL_VERSION
         || request.capability_id != capability.capability_id
-        || !valid_identity(&request.action_id, "execution-action-v3:sha256:")
+        || !valid_identity(&request.action_id, "execution-action-v5:sha256:")
         || !valid_identity(&request.client_nonce, "sha256:")
         || !valid_identity(&request.workload_identity, "workload-v1:sha256:")
     {
@@ -2946,7 +3399,7 @@ fn validate_lease_grant(grant: &LeaseGrant, request: &LeaseRequest) -> RailResul
     if grant.protocol_version != PROTOCOL_VERSION
         || grant.action_id != request.action_id
         || grant.capability_id != request.capability_id
-        || !valid_identity(&grant.lease_id, "execution-lease-v3:sha256:")
+        || !valid_identity(&grant.lease_id, "execution-lease-v5:sha256:")
         || grant.workload_identity != request.workload_identity
         || !valid_identity(&grant.workload_identity, "workload-v1:sha256:")
     {
@@ -2973,7 +3426,7 @@ fn mutual_tls_client_config(identity: &MutualTlsClientIdentity<'_>) -> RailResul
         .with_root_certificates(roots)
         .with_client_auth_cert(certificates, private_key)
         .map_err(|error| RailError::message(format!("distributed TLS client identity is invalid: {error}")))?;
-    config.alpn_protocols = vec![b"cargo-rail-execution/3".to_vec()];
+    config.alpn_protocols = vec![b"cargo-rail-execution/5".to_vec()];
     Ok(Arc::new(config))
 }
 
@@ -3035,7 +3488,7 @@ fn mutual_tls_server_config(
         .with_client_cert_verifier(verifier)
         .with_single_cert(certificates, private_key)
         .map_err(|error| RailError::message(format!("distributed TLS server identity is invalid: {error}")))?;
-    config.alpn_protocols = vec![b"cargo-rail-execution/3".to_vec()];
+    config.alpn_protocols = vec![b"cargo-rail-execution/5".to_vec()];
     Ok(Arc::new(config))
 }
 
@@ -3781,7 +4234,7 @@ fn capture_bubblewrap_worker_capability(rustc: &OsStr, bubblewrap: &OsStr) -> Ra
         // staged fact driver into the sandbox. Do not advertise analysis until
         // that runtime has its own native qualification; native execution
         // remains fully available and analysis safely stays local.
-        captured.analysis_driver = None;
+        captured.analysis_readiness = None;
         captured.capability.analysis = None;
         captured
             .capability
@@ -3846,6 +4299,7 @@ fn capture_worker_capability_for_runtime(
         .to_string();
     let memo = cache
         .and_then(|cache| crate::compiler::collector::compiler_sysroot_memo_path_in(cache, &sysroot, &host_target));
+    let sysroot_guard = crate::compiler::collector::CompilerInputGuard::capture_sysroot(&sysroot, &host_target)?;
     let (sysroot_identity, _) =
         crate::compiler::collector::compiler_sysroot_fingerprint(&sysroot, &host_target, memo.as_deref())?;
     let rustc_content_digest = digest_file(&rustc, rustc_metadata.len())?;
@@ -3873,15 +4327,19 @@ fn capture_worker_capability_for_runtime(
         sysroot_identity,
         working_directory_contract: "canonical-workspace-relative-remapped-v1".to_string(),
     };
-    let analysis_driver = authenticate_analysis_driver
-        .then(|| crate::compiler::driver::PreparedDistributedCompilerFactDriver::prepare(&verbose, &sysroot))
+    let analysis_readiness = authenticate_analysis_driver
+        .then(|| {
+            crate::compiler::driver::CompilerFactDriverAuthority::authenticated_distributed_readiness(
+                &verbose, &sysroot,
+            )
+        })
         .transpose()
         .ok()
         .flatten()
         .flatten();
     let declared_readiness;
-    let readiness = if let Some(driver) = &analysis_driver {
-        Some(driver.readiness())
+    let readiness = if let Some(driver) = &analysis_readiness {
+        Some(driver)
     } else if authenticate_analysis_driver {
         None
     } else {
@@ -3902,15 +4360,16 @@ fn capture_worker_capability_for_runtime(
         });
         capability.operation_classes.push(OperationClass::RustAnalysisV1);
     }
+    sysroot_guard.revalidate()?;
     capability.capability_id = capability_identity(&capability)?;
     validate_capability(&capability)?;
     Ok(CapturedWorkerCapability {
-        analysis_driver,
+        analysis_readiness,
         capability,
         rustc,
         rustc_generation,
+        sysroot_guard,
         runtime,
-        #[cfg(target_os = "linux")]
         sysroot,
     })
 }
@@ -3969,7 +4428,7 @@ fn capability_identity(capability: &WorkerCapability) -> RailResult<String> {
         Some(analysis) => canonical_json(&("rust-analysis-v1", analysis, &native))?,
     };
     Ok(format!(
-        "worker-capability-v3:sha256:{}",
+        "worker-capability-v5:sha256:{}",
         ContentDigest::sha256(&encoded)
     ))
 }
@@ -4204,10 +4663,11 @@ fn execute_sandboxed(rustc: &OsStr) -> RailResult<()> {
         ));
     }
     let captured = CapturedWorkerCapability {
-        analysis_driver: selected.analysis_driver,
+        analysis_readiness: selected.analysis_readiness,
         capability,
         rustc: selected.rustc,
         rustc_generation: selected.rustc_generation,
+        sysroot_guard: selected.sysroot_guard,
         runtime: WorkerRuntime::ProcessOnly,
         sysroot: selected.sysroot,
     };
@@ -4530,16 +4990,39 @@ fn execute_request_in_process(
             staged_dependencies.insert(frame.virtual_path.as_str(), destination);
         }
     }
+    let mut search_placements = BTreeSet::new();
+    for dependency in &envelope.request.operation.dependencies {
+        let frame = envelope
+            .request
+            .inputs
+            .iter()
+            .find(|frame| frame.virtual_path == dependency.virtual_path)
+            .ok_or_else(|| RailError::message("distributed dependency frame is unavailable"))?;
+        let staged = envelope
+            .inputs
+            .get(&dependency.virtual_path)
+            .ok_or_else(|| RailError::message("distributed dependency staging is unavailable"))?;
+        let name = Path::new(&dependency.virtual_path)
+            .file_name()
+            .ok_or_else(|| RailError::message("distributed dependency has no filename"))?;
+        for directory in &dependency.search_directories {
+            let destination = workspace_directory.join(directory).join(name);
+            if search_placements.insert(destination.clone()) {
+                copy_staged_input(staged, &destination, frame)?;
+            }
+        }
+    }
     let outputs = output_paths(&envelope.request.operation, &output_directory)?;
     let dependencies = envelope
         .request
         .operation
         .dependencies
         .iter()
-        .map(|dependency| {
+        .filter_map(|dependency| dependency.extern_name.as_deref().map(|name| (name, dependency)))
+        .map(|(name, dependency)| {
             staged_dependencies
                 .get(dependency.virtual_path.as_str())
-                .map(|path| (dependency.extern_name.as_str(), path.as_path()))
+                .map(|path| (name, path.as_path()))
                 .ok_or_else(|| RailError::message("distributed execution dependency staging is incomplete"))
         })
         .collect::<RailResult<Vec<_>>>()?;
@@ -4551,7 +5034,7 @@ fn execute_request_in_process(
         &temporary_directory,
         attempt,
     )?;
-    let command = worker_compiler_command(WorkerCompilerCommandInput {
+    let mut command = worker_compiler_command(WorkerCompilerCommandInput {
         captured,
         operation: &envelope.request.operation,
         source_relative: Path::new(source_relative),
@@ -4561,6 +5044,42 @@ fn execute_request_in_process(
         dependencies: &dependencies,
         analysis: analysis_invocation.as_ref(),
     })?;
+    let target_capture = if let Some(target) = &envelope.request.operation.target {
+        let arguments = command.get_args().map(OsStr::to_os_string).collect::<Vec<_>>();
+        let recorder = crate::compiler::observation::begin_invocation_in(
+            attempt,
+            &workspace_directory,
+            &workspace_directory,
+            captured.rustc.as_os_str(),
+            &arguments,
+        )?;
+        let target_capture = match crate::compiler::collector::NativeToolchainInputs::capture(
+            captured.rustc.as_os_str(),
+            recorder.observation(),
+            Some(&captured.capability.host_target),
+            &workspace_directory,
+            &workspace_directory,
+            None,
+        ) {
+            Ok(inputs) if inputs.portable_target_identity() == target.identity => inputs,
+            Ok(_) | Err(_) => return Ok(WorkerExecution::Rejected("compiler_target_identity_mismatch")),
+        };
+        Some(target_capture)
+    } else {
+        None
+    };
+    if !worker_runtime_generation_is_stable(captured)
+        || target_capture
+            .as_ref()
+            .is_some_and(|inputs| inputs.revalidate().is_err())
+    {
+        return Ok(WorkerExecution::Rejected("compiler_inputs_changed"));
+    }
+    let native_execution = match WorkerNativeInvocation::prepare(captured, envelope, attempt, &mut command) {
+        Ok(Some(execution)) => execution,
+        Ok(None) => return Ok(WorkerExecution::Rejected("compiler_native_input_driver_unavailable")),
+        Err(_) => return Ok(WorkerExecution::Rejected("compiler_native_input_evidence_unavailable")),
+    };
     timing.input_ns = elapsed_nanos(input_started);
     let compiler_started = Instant::now();
     let run = run_compiler(
@@ -4579,6 +5098,13 @@ fn execute_request_in_process(
         CompilerRun::Completed(output) => output,
         CompilerRun::Cancelled(reason) | CompilerRun::Failed(reason) => return Ok(WorkerExecution::Rejected(reason)),
     };
+    if !worker_runtime_generation_is_stable(captured)
+        || target_capture
+            .as_ref()
+            .is_some_and(|inputs| inputs.revalidate().is_err())
+    {
+        return Ok(WorkerExecution::Rejected("compiler_inputs_changed"));
+    }
     rebind_compiler_stream(&mut stdout, &workspace_directory, attempt)?;
     rebind_compiler_stream(&mut stderr, &workspace_directory, attempt)?;
     if !status.success() {
@@ -4592,6 +5118,17 @@ fn execute_request_in_process(
             frames,
         });
     }
+    let native_inputs = match native_execution.complete(
+        captured,
+        &envelope.request,
+        attempt,
+        target_capture
+            .as_ref()
+            .map(crate::compiler::collector::NativeToolchainInputs::target_library_directory),
+    ) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(WorkerExecution::Rejected("compiler_native_input_evidence_unavailable")),
+    };
     let mut allowed_targets = vec![outputs.dep_info.as_path(), outputs.metadata.as_path()];
     if let Some(rlib) = &outputs.rlib {
         allowed_targets.push(rlib);
@@ -4645,6 +5182,11 @@ fn execute_request_in_process(
             )?,
         ]);
     }
+    frames.push(prepare_bytes_frame(
+        ResponseSlot::NativeInputs,
+        native_inputs,
+        MAX_NATIVE_INPUT_OBSERVATION_BYTES + 64 * 1024,
+    )?);
     frames.extend([
         prepare_bytes_frame(ResponseSlot::Stderr, stderr, envelope.request.limits.max_stream_bytes)?,
         prepare_bytes_frame(ResponseSlot::Stdout, stdout, envelope.request.limits.max_stream_bytes)?,
@@ -4657,6 +5199,7 @@ fn execute_request_in_process(
     if total > MAX_TOTAL_OUTPUT_BYTES {
         return Ok(WorkerExecution::Rejected("result_size_limit_exceeded"));
     }
+    frames.sort_unstable_by_key(|frame| frame.descriptor.slot);
     timing.result_encode_ns = elapsed_nanos(encode_started);
     Ok(WorkerExecution::Success(frames))
 }
@@ -4746,6 +5289,17 @@ fn compiler_command(input: CompilerCommandInput<'_>) -> RailResult<Command> {
         "--edition",
         &operation.edition,
     ]);
+    if let Some(target) = &operation.target {
+        if let Some(triple) = &target.triple {
+            command.arg("--target").arg(triple);
+        }
+        if let Some(cpu) = &target.cpu {
+            command.arg(format!("-Ctarget-cpu={cpu}"));
+        }
+        if let Some(features) = &target.features {
+            command.arg(format!("-Ctarget-feature={features}"));
+        }
+    }
     if operation.test_mode {
         command.arg("--test");
     }
@@ -4795,6 +5349,7 @@ fn compiler_command(input: CompilerCommandInput<'_>) -> RailResult<Command> {
                 RustLibraryLintLevel::Allow => "--allow",
                 RustLibraryLintLevel::Deny => "--deny",
                 RustLibraryLintLevel::Forbid => "--forbid",
+                RustLibraryLintLevel::ForceWarn => "--force-warn",
                 RustLibraryLintLevel::Warn => "--warn",
             })
             .arg(&lint.name);
@@ -4808,14 +5363,20 @@ fn compiler_command(input: CompilerCommandInput<'_>) -> RailResult<Command> {
     command
         .arg(format!("-Cmetadata={}", operation.metadata))
         .arg(format!("-Cextra-filename={}", operation.extra_filename));
-    if operation.output_dependency_search {
+    for search in &operation.dependency_searches {
+        let directory = if search == &operation.output_relative_directory {
+            output_directory.to_path_buf()
+        } else {
+            workspace.join(search)
+        };
+        command.arg("-L").arg(format!("dependency={}", directory.display()));
+    }
+    if operation.source_working_directory.is_none() {
         command
-            .arg("-L")
-            .arg(format!("dependency={}", output_directory.display()));
+            .arg("--remap-path-prefix")
+            .arg(format!("{}={VIRTUAL_WORKSPACE}", workspace.display()));
     }
     command
-        .arg("--remap-path-prefix")
-        .arg(format!("{}={VIRTUAL_WORKSPACE}", workspace.display()))
         .current_dir(workspace)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -4837,7 +5398,9 @@ fn compiler_command(input: CompilerCommandInput<'_>) -> RailResult<Command> {
 }
 
 fn worker_runtime_generation_is_stable(captured: &CapturedWorkerCapability) -> bool {
-    if crate::utils::stable_file_generation(&captured.rustc).as_ref() != Some(&captured.rustc_generation) {
+    if crate::utils::stable_file_generation(&captured.rustc).as_ref() != Some(&captured.rustc_generation)
+        || captured.sysroot_guard.revalidate().is_err()
+    {
         return false;
     }
     match &captured.runtime {
@@ -4883,7 +5446,7 @@ fn worker_compiler_command(input: WorkerCompilerCommandInput<'_>) -> RailResult<
             let driver = match analysis {
                 Some(_) => Some(
                     captured
-                        .analysis_driver
+                        .analysis_readiness
                         .as_ref()
                         .ok_or_else(|| RailError::message("distributed analysis driver is unavailable"))?,
                 ),
@@ -4891,7 +5454,7 @@ fn worker_compiler_command(input: WorkerCompilerCommandInput<'_>) -> RailResult<
             };
             let mut command = compiler_command(CompilerCommandInput {
                 rustc: captured.rustc.as_os_str(),
-                wrapper: driver.map(|driver| driver.program().as_os_str()),
+                wrapper: None,
                 operation,
                 source_relative,
                 outputs,
@@ -4900,25 +5463,13 @@ fn worker_compiler_command(input: WorkerCompilerCommandInput<'_>) -> RailResult<
                 dependencies,
                 inherit_environment: false,
             })?;
-            if let (Some(analysis), Some(driver)) = (analysis, driver) {
+            if let (Some(analysis), Some(_driver)) = (analysis, driver) {
                 command
                     .env(
                         crate::compiler::facts::COMPILER_FACT_INVOCATION_ENV,
                         &analysis.capability,
                     )
                     .env_remove("RUSTC_BOOTSTRAP");
-                #[cfg(target_os = "macos")]
-                command
-                    .env("DYLD_LIBRARY_PATH", driver.compiler_library_directory())
-                    .env_remove("DYLD_FALLBACK_LIBRARY_PATH")
-                    .env_remove("DYLD_INSERT_LIBRARIES");
-                #[cfg(all(unix, not(target_os = "macos")))]
-                command
-                    .env("LD_LIBRARY_PATH", driver.compiler_library_directory())
-                    .env_remove("LD_PRELOAD")
-                    .env_remove("LD_AUDIT");
-                #[cfg(windows)]
-                command.env("PATH", driver.compiler_library_directory());
             }
             Ok(command)
         }
@@ -4941,7 +5492,7 @@ fn prepare_worker_analysis_invocation(
         return Ok(None);
     };
     validate_operation_capability(operation, &captured.capability)?;
-    if captured.analysis_driver.is_none() {
+    if captured.analysis_readiness.is_none() {
         return Err(RailError::message(
             "distributed analysis operation has no retained driver authority",
         ));
@@ -5287,6 +5838,16 @@ fn bounded_bubblewrap_command(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .env_clear();
+    for component in crate::compiler::driver::CompilerFactDriverAuthority::installation_components(worker)? {
+        let name = component
+            .source_path
+            .file_name()
+            .ok_or_else(|| RailError::message("distributed compiler component has no file name"))?;
+        command
+            .arg("--ro-bind")
+            .arg(&component.source_path)
+            .arg(Path::new(VIRTUAL_ROOT).join(name));
+    }
     Ok(command)
 }
 
@@ -5730,7 +6291,7 @@ fn validate_request(request: &ExecutionRequest, capability: &WorkerCapability) -
     if request.protocol_version != PROTOCOL_VERSION
         || request.capability_id != capability.capability_id
         || request.limits != capability.resource_limits
-        || !valid_identity(&request.lease_id, "execution-lease-v3:sha256:")
+        || !valid_identity(&request.lease_id, "execution-lease-v5:sha256:")
         || !valid_identity(&request.workload_identity, "workload-v1:sha256:")
         || request.action_id != action_identity(request)?
     {
@@ -5868,8 +6429,11 @@ fn validate_inputs(inputs: &[InputFrame], operation: &RustLibraryOperation) -> R
     {
         return Err(RailError::message("distributed execution input set is invalid"));
     }
+    let mut search_placements = BTreeMap::new();
     for dependency in &operation.dependencies {
-        validate_extern_name(&dependency.extern_name)?;
+        if let Some(name) = &dependency.extern_name {
+            validate_extern_name(name)?;
+        }
         let matching = inputs
             .iter()
             .filter(|input| input.kind == InputKind::Dependency && input.virtual_path == dependency.virtual_path)
@@ -5879,14 +6443,69 @@ fn validate_inputs(inputs: &[InputFrame], operation: &RustLibraryOperation) -> R
                 "distributed execution dependency authority is incomplete",
             ));
         }
+        if dependency.search_directories.len() > 512
+            || dependency.search_directories.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(RailError::message(
+                "distributed dependency search placements exceed their bounds",
+            ));
+        }
+        let frame = inputs
+            .iter()
+            .find(|frame| frame.kind == InputKind::Dependency && frame.virtual_path == dependency.virtual_path)
+            .ok_or_else(|| RailError::message("distributed dependency frame is unavailable"))?;
+        let name = Path::new(&dependency.virtual_path)
+            .file_name()
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| RailError::message("distributed dependency has no filename"))?;
+        for directory in &dependency.search_directories {
+            validate_source_input_relative_path(directory)?;
+            if !operation.dependency_searches.contains(directory) {
+                return Err(RailError::message(
+                    "distributed dependency placement is not a declared search directory",
+                ));
+            }
+            let destination = format!("{VIRTUAL_WORKSPACE}/{directory}/{name}");
+            if inputs.iter().any(|input| input.virtual_path == destination)
+                || (directory == &operation.output_relative_directory
+                    && [
+                        Some(operation.dep_info_name.as_str()),
+                        Some(operation.metadata_name.as_str()),
+                        operation.rlib_name.as_deref(),
+                    ]
+                    .contains(&Some(name)))
+            {
+                return Err(RailError::message(
+                    "distributed dependency search placement overlaps another input or output",
+                ));
+            }
+            if let Some((digest, bytes)) = search_placements.insert(destination, (&frame.content_digest, frame.bytes)) {
+                if digest != &frame.content_digest || bytes != frame.bytes {
+                    return Err(RailError::message("distributed dependency search placements conflict"));
+                }
+            } else {
+                total_bytes = total_bytes
+                    .checked_add(frame.bytes)
+                    .ok_or_else(|| RailError::message("distributed dependency placement size overflowed"))?;
+                if total_bytes > MAX_TOTAL_INPUT_BYTES || search_placements.len() > MAX_INPUT_ENTRIES {
+                    return Err(RailError::message(
+                        "distributed dependency search placements exceed their bounds",
+                    ));
+                }
+            }
+        }
     }
     if operation
         .dependencies
         .iter()
-        .map(|dependency| dependency.extern_name.as_str())
+        .filter_map(|dependency| dependency.extern_name.as_deref())
         .collect::<BTreeSet<_>>()
         .len()
-        != operation.dependencies.len()
+        != operation
+            .dependencies
+            .iter()
+            .filter(|dependency| dependency.extern_name.is_some())
+            .count()
     {
         return Err(RailError::message("distributed execution repeats an extern name"));
     }
@@ -5932,6 +6551,14 @@ fn validate_extern_name(name: &str) -> RailResult<()> {
 }
 
 fn validate_operation(operation: &RustLibraryOperation) -> RailResult<()> {
+    if operation.emission == RustLibraryEmission::MetadataAndLink
+        && operation.codegen.split_debuginfo.as_deref() == Some("unpacked")
+        && operation.codegen.debuginfo.as_deref().is_some_and(|value| value != "0")
+    {
+        return Err(RailError::message(
+            "distributed compiler debug output contract is unavailable",
+        ));
+    }
     let crate_name = operation.crate_name.as_bytes();
     let crate_name_valid = !crate_name.is_empty()
         && crate_name.len() <= MAX_CRATE_NAME_BYTES
@@ -5982,6 +6609,11 @@ fn validate_operation(operation: &RustLibraryOperation) -> RailResult<()> {
         (OperationClass::RustLibrary | OperationClass::RustAnalysisV1, _) => false,
     };
     if !operation_class_valid
+        || operation
+            .target
+            .as_ref()
+            .is_some_and(|target| target.validate().is_err())
+        || operation.target.is_some() && operation.analysis.is_some()
         || !crate_name_valid
         || !matches!(operation.edition.as_str(), "2015" | "2018" | "2021" | "2024")
         || !metadata_valid
@@ -6003,10 +6635,21 @@ fn validate_operation(operation: &RustLibraryOperation) -> RailResult<()> {
         || !valid_rust_library_codegen(&operation.codegen)
         || source_relative_path(&operation.source_virtual_path).is_none()
         || operation.dependencies.len() > MAX_INPUT_ENTRIES
+        || operation.dependencies.iter().any(|dependency| {
+            dependency
+                .extern_name
+                .as_deref()
+                .is_some_and(|name| validate_extern_name(name).is_err())
+                || (dependency.extern_name.is_none() && dependency.search_directories.is_empty())
+        })
+        || operation.source_working_directory.as_deref().is_some_and(|path| {
+            path.len() > 4096 || !Path::new(path).is_absolute() || path.chars().any(char::is_control)
+        })
+        || operation.dependency_searches.len() > 512
         || operation
-            .dependencies
+            .dependency_searches
             .iter()
-            .any(|dependency| validate_extern_name(&dependency.extern_name).is_err())
+            .any(|path| validate_repository_relative_directory(path).is_err())
         || validate_repository_relative_directory(&operation.output_relative_directory).is_err()
         || validate_output_file_name(&operation.dep_info_name, "d").is_err()
         || validate_output_file_name(&operation.metadata_name, "rmeta").is_err()
@@ -6156,7 +6799,7 @@ fn action_identity(request: &ExecutionRequest) -> RailResult<String> {
         request.protocol_version,
     ))?;
     Ok(format!(
-        "execution-action-v3:sha256:{}",
+        "execution-action-v5:sha256:{}",
         ContentDigest::sha256(&encoded)
     ))
 }
@@ -6171,7 +6814,7 @@ fn valid_identity(value: &str, prefix: &str) -> bool {
 }
 
 pub(crate) fn worker_capability_identity_is_valid(value: &str) -> bool {
-    valid_identity(value, "worker-capability-v3:sha256:")
+    valid_identity(value, "worker-capability-v5:sha256:")
 }
 
 fn read_request(reader: &mut impl Read) -> RailResult<RequestEnvelope> {
@@ -6583,9 +7226,9 @@ fn copy_exact_file(writer: &mut impl Write, path: &Path, expected: u64) -> RailR
 
 fn validate_response_header(response: &ExecutionResponse, operation: &RustLibraryOperation) -> RailResult<()> {
     if response.protocol_version != PROTOCOL_VERSION
-        || !valid_identity(&response.action_id, "execution-action-v3:sha256:")
-        || !valid_identity(&response.capability_id, "worker-capability-v3:sha256:")
-        || !valid_identity(&response.lease_id, "execution-lease-v3:sha256:")
+        || !valid_identity(&response.action_id, "execution-action-v5:sha256:")
+        || !valid_identity(&response.capability_id, "worker-capability-v5:sha256:")
+        || !valid_identity(&response.lease_id, "execution-lease-v5:sha256:")
         || !valid_identity(&response.workload_identity, "workload-v1:sha256:")
     {
         return Err(RailError::message(
@@ -6603,7 +7246,8 @@ fn validate_response_header(response: &ExecutionResponse, operation: &RustLibrar
             if operation.analysis.is_some() {
                 expected.extend([ResponseSlot::AnalysisObservation, ResponseSlot::CompilerFacts]);
             }
-            expected.extend([ResponseSlot::Stderr, ResponseSlot::Stdout]);
+            expected.extend([ResponseSlot::NativeInputs, ResponseSlot::Stderr, ResponseSlot::Stdout]);
+            expected.sort_unstable();
             if response.termination != Some(CompilerTermination::Exit { code: 0 }) || response.reason.is_some() {
                 return Err(RailError::message(
                     "distributed execution success response is incomplete",
@@ -6675,7 +7319,9 @@ fn validate_response_frames(response: &ExecutionResponse, expected: &[ResponseSl
             .ok_or_else(|| RailError::message("distributed execution response size overflowed"))?;
         if !valid_identity(&frame.content_digest, "sha256:")
             || frame.bytes
-                > if frame.slot.is_stream() {
+                > if frame.slot == ResponseSlot::NativeInputs {
+                    MAX_NATIVE_INPUT_OBSERVATION_BYTES + 64 * 1024
+                } else if frame.slot.is_stream() {
                     MAX_STREAM_BYTES
                 } else {
                     MAX_OUTPUT_BYTES
@@ -6883,7 +7529,7 @@ mod tests {
                 kind: InputKind::Source,
                 virtual_path: format!("{VIRTUAL_WORKSPACE}/src/lib.rs"),
             }],
-            lease_id: fixed_identity("execution-lease-v3:sha256:", '4'),
+            lease_id: fixed_identity("execution-lease-v5:sha256:", '4'),
             limits: worker_execution_limits(),
             operation: RustLibraryOperation {
                 analysis: None,
@@ -6906,9 +7552,11 @@ mod tests {
                 lints: Vec::new(),
                 operation_class: OperationClass::RustLibrary,
                 output_relative_directory: "target/debug/deps".to_string(),
-                output_dependency_search: false,
+                dependency_searches: Vec::new(),
+                source_working_directory: None,
                 rlib_name: Some("libdistributed_fixture-0123456789abcdef.rlib".to_string()),
                 source_virtual_path: format!("{VIRTUAL_WORKSPACE}/src/lib.rs"),
+                target: None,
                 test_mode: false,
                 toolchain_proc_macro: false,
             },
@@ -7168,6 +7816,111 @@ mod tests {
         result.unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn native_worker_admission_requires_actual_bounded_input_evidence() {
+        let result: RailResult<()> = (|| {
+            let root = tempfile::tempdir()?;
+            let candidate = placement_candidate(SOURCE)?;
+            let mut staged =
+                StagedExecutionResult::from_test_frames(&candidate, b"dep", b"metadata", b"rlib", b"", b"")?;
+            let host = root.path().join("host-lib");
+            staged
+                .validated_native_inputs(&candidate, root.path(), &host, None)
+                .expect_err("ordinary outputs must not substitute for native compiler evidence");
+            let invocation = NativeInputInvocation {
+                version: NATIVE_INPUT_PROTOCOL_VERSION,
+                source_working_directory: None,
+                nonce: "1".repeat(64),
+                action_identity: native_input_action_identity(&candidate.operation, &candidate.input_frames())?,
+                invocation_digest: "2".repeat(64),
+                result_path: "/private-worker/native-input-result".into(),
+            };
+            let observation = NativeInputObservation {
+                version: NATIVE_INPUT_PROTOCOL_VERSION,
+                request_identity: invocation.identity().map_err(RailError::message)?,
+                assembly: NativeAssemblyObservation::Absent,
+                codegen: crate::compiler::native_input_protocol::NativeCodegenObservation::Llvm,
+                crates: vec![crate::compiler::native_input_protocol::NativeCrateSource {
+                    name: "core".into(),
+                    files: vec![format!("{VIRTUAL_HOST_LIBRARIES}/libcore-exact.rlib")],
+                }],
+                searches: Vec::new(),
+            };
+            let mut record = WorkerNativeInputs {
+                invocation,
+                observation,
+            };
+            let install = |staged: &mut StagedExecutionResult, record: &WorkerNativeInputs| -> RailResult<()> {
+                let bytes = serde_json::to_vec(record)?;
+                let path = staged.staging_path().join("distributed/native-inputs");
+                fs::write(&path, &bytes)?;
+                staged.frames.insert(ResponseSlot::NativeInputs, path);
+                staged.descriptors.insert(
+                    ResponseSlot::NativeInputs,
+                    ResponseFrame {
+                        slot: ResponseSlot::NativeInputs,
+                        bytes: bytes.len() as u64,
+                        content_digest: digest_bytes(&bytes),
+                        mode: 0,
+                    },
+                );
+                Ok(())
+            };
+            install(&mut staged, &record)?;
+            let actual = staged.validated_native_inputs(&candidate, root.path(), &host, None)?;
+            assert_eq!(
+                actual.crates[0].files,
+                vec![host.join("libcore-exact.rlib").to_string_lossy().into_owned()]
+            );
+
+            record.observation.codegen = crate::compiler::native_input_protocol::NativeCodegenObservation::Cranelift {
+                separate_assembly: true,
+            };
+            install(&mut staged, &record)?;
+            assert_eq!(
+                staged
+                    .validated_native_inputs(&candidate, root.path(), &host, None)
+                    .unwrap_err()
+                    .to_string(),
+                "distributed compiler backend tool authority is unavailable",
+            );
+            record.observation.codegen = crate::compiler::native_input_protocol::NativeCodegenObservation::Llvm;
+
+            record.invocation.source_working_directory = Some("/different-source-root".into());
+            record.observation.request_identity = record.invocation.identity().map_err(RailError::message)?;
+            install(&mut staged, &record)?;
+            staged
+                .validated_native_inputs(&candidate, root.path(), &host, None)
+                .expect_err("a worker cannot choose a different source-directory identity");
+            record.invocation.source_working_directory = None;
+            record.observation.request_identity = record.invocation.identity().map_err(RailError::message)?;
+
+            record.observation.crates[0].files = vec![format!("{VIRTUAL_WORKSPACE}/deps/libtransitive.rlib")];
+            install(&mut staged, &record)?;
+            staged
+                .validated_native_inputs(&candidate, root.path(), &host, None)
+                .expect_err("untransported transitive library must not acquire local authority");
+
+            record.observation.crates[0].files = vec![format!("{VIRTUAL_HOST_LIBRARIES}/libcore-exact.rlib")];
+            record.observation.assembly = NativeAssemblyObservation::Present;
+            install(&mut staged, &record)?;
+            staged
+                .validated_native_inputs(&candidate, root.path(), &host, None)
+                .expect_err("assembly-bearing worker output must remain outside native reuse");
+
+            record.observation.assembly = NativeAssemblyObservation::Absent;
+            record.invocation.action_identity = "another-action".into();
+            record.observation.request_identity = record.invocation.identity().map_err(RailError::message)?;
+            install(&mut staged, &record)?;
+            staged
+                .validated_native_inputs(&candidate, root.path(), &host, None)
+                .expect_err("a valid record for another action must not authorize these outputs");
+            Ok(())
+        })();
+        result.unwrap();
+    }
+
     fn success_frames(root: &Path) -> RailResult<Vec<PreparedResponseFrame>> {
         let files = [
             (ResponseSlot::DepInfo, b"portable dep-info".as_slice()),
@@ -7190,6 +7943,12 @@ mod tests {
             b"compiler output".to_vec(),
             MAX_STREAM_BYTES,
         )?);
+        frames.push(prepare_bytes_frame(
+            ResponseSlot::NativeInputs,
+            b"native input record".to_vec(),
+            MAX_NATIVE_INPUT_OBSERVATION_BYTES,
+        )?);
+        frames.sort_unstable_by_key(|frame| frame.descriptor.slot);
         Ok(frames)
     }
 
@@ -7326,13 +8085,56 @@ mod tests {
                 virtual_path: format!("{VIRTUAL_WORKSPACE}/src/module.rs"),
             });
             request.operation.dependencies.push(RustLibraryDependency {
-                extern_name: "dependency".to_string(),
+                search_directories: Vec::new(),
+                extern_name: Some("dependency".to_string()),
                 virtual_path: dependency_path,
             });
             request.action_id = action_identity(&request)?;
             validate_request(&request, &capability()?)?;
 
             let identity = request.action_id.clone();
+            let mut placed = request.clone();
+            let search = placed.operation.output_relative_directory.clone();
+            placed.operation.dependency_searches.push(search.clone());
+            placed.operation.dependencies[0].search_directories.push(search.clone());
+            placed.action_id = action_identity(&placed)?;
+            validate_request(&placed, &capability()?)?;
+            assert_ne!(
+                placed.action_id, identity,
+                "search placement must bind the execution identity"
+            );
+            let placed_path = Path::new(VIRTUAL_WORKSPACE)
+                .join(&search)
+                .join("libdependency-0123456789abcdef.rmeta");
+            let selected = native_input_frame(&placed_path, &placed.operation, &placed.inputs)
+                .expect("exact transported search input");
+            assert_eq!(selected.content_digest, fixed_identity("sha256:", '7'));
+            assert!(
+                native_input_frame(
+                    &placed_path.with_file_name("libuntransported.rmeta"),
+                    &placed.operation,
+                    &placed.inputs
+                )
+                .is_none()
+            );
+            for invalid in ["../outside", "/outside", "undeclared-search"] {
+                let mut hostile = placed.clone();
+                hostile.operation.dependencies[0].search_directories = vec![invalid.into()];
+                assert!(validate_inputs(&hostile.inputs, &hostile.operation).is_err());
+            }
+            let mut output_collision = placed.clone();
+            output_collision.operation.metadata_name = "libdependency-0123456789abcdef.rmeta".into();
+            assert!(validate_inputs(&output_collision.inputs, &output_collision.operation).is_err());
+            let mut repeated_placement = placed.clone();
+            repeated_placement.operation.dependencies[0]
+                .search_directories
+                .push(search);
+            assert!(validate_inputs(&repeated_placement.inputs, &repeated_placement.operation).is_err());
+            let mut amplified = placed.clone();
+            amplified.inputs[0].bytes = MAX_INPUT_BYTES;
+            amplified.operation.dependency_searches = (0..4).map(|index| format!("search-{index}")).collect();
+            amplified.operation.dependencies[0].search_directories = amplified.operation.dependency_searches.clone();
+            assert!(validate_inputs(&amplified.inputs, &amplified.operation).is_err());
             let mut changed_module = request.clone();
             changed_module.inputs[2].content_digest = fixed_identity("sha256:", '9');
             changed_module.action_id = action_identity(&changed_module)?;
@@ -7376,7 +8178,7 @@ mod tests {
         let result: RailResult<()> = (|| {
             let request = request_for(SOURCE)?;
             let mut retried = request.clone();
-            retried.lease_id = fixed_identity("execution-lease-v3:sha256:", '5');
+            retried.lease_id = fixed_identity("execution-lease-v5:sha256:", '5');
             assert_eq!(action_identity(&request)?, action_identity(&retried)?);
 
             let mut another_workload = request.clone();
@@ -7419,7 +8221,7 @@ mod tests {
             Path::new("/private/attempt")
         ));
         assert!(!physical_worker_root_remains(
-            b"diagnostic at /cargo-rail/exec/v3/workspace/src/lib.rs",
+            b"diagnostic at /cargo-rail/exec/v5/workspace/src/lib.rs",
             Path::new("/private/attempt")
         ));
     }
@@ -7434,7 +8236,7 @@ mod tests {
 
         assert_eq!(
             stream,
-            br#"{"artifact":"/cargo-rail/exec/v3/workspace\\target/release/lib.rlib"}"#
+            br#"{"artifact":"/cargo-rail/exec/v5/workspace\\target/release/lib.rlib"}"#
         );
         assert!(!physical_worker_root_remains(&stream, attempt));
     }
@@ -7678,7 +8480,7 @@ mod tests {
             assert_ne!(first.lease_id, another_grant.lease_id);
 
             let mut forged_action = lease_request.clone();
-            forged_action.action_id = fixed_identity("execution-action-v3:sha256:", '7');
+            forged_action.action_id = fixed_identity("execution-action-v5:sha256:", '7');
             assert!(validate_lease_grant(&first, &forged_action).is_err());
 
             let mut another_workload = lease_request.clone();
@@ -7687,7 +8489,7 @@ mod tests {
             assert_ne!(first.lease_id, grant_connection_lease(&another_workload)?.lease_id);
 
             let mut forged_capability = lease_request;
-            forged_capability.capability_id = fixed_identity("worker-capability-v3:sha256:", '6');
+            forged_capability.capability_id = fixed_identity("worker-capability-v5:sha256:", '6');
             assert!(validate_lease_request(&forged_capability, &capability).is_err());
             assert!(validate_lease_grant(&first, &forged_capability).is_err());
             Ok(())
@@ -7761,6 +8563,15 @@ mod tests {
     fn request_validation_rejects_forgery_and_path_shaped_arguments() {
         let result: RailResult<()> = (|| {
             let capability = capability()?;
+            for search in ["../escape", "/absolute", "target/../escape"] {
+                let mut forged = request_for(SOURCE)?;
+                forged.operation.dependency_searches = vec![search.into()];
+                forged.action_id = action_identity(&forged)?;
+                assert!(
+                    validate_request(&forged, &capability).is_err(),
+                    "accepted search {search}"
+                );
+            }
             let mut forged = request_for(SOURCE)?;
             forged.operation.crate_name = "../escape".to_string();
             forged.action_id = action_identity(&forged)?;
@@ -7772,8 +8583,65 @@ mod tests {
             assert!(validate_request(&forged, &capability).is_err());
 
             let mut forged = request_for(SOURCE)?;
-            forged.action_id = fixed_identity("execution-action-v3:sha256:", '7');
+            forged.action_id = fixed_identity("execution-action-v5:sha256:", '7');
             assert!(validate_request(&forged, &capability).is_err());
+            Ok(())
+        })();
+        result.unwrap();
+    }
+
+    #[test]
+    fn target_operation_rejects_machine_selection_paths_and_old_protocol() {
+        let result: RailResult<()> = (|| {
+            let capability = capability()?;
+            let mut request = request_for(SOURCE)?;
+            request.operation.target = Some(RustLibraryTarget {
+                triple: Some("x86_64-unknown-linux-gnu".to_string()),
+                cpu: Some("x86-64-v3".to_string()),
+                features: Some("+sse2,-avx".to_string()),
+                identity: fixed_identity("sha256:", 'a'),
+            });
+            request.action_id = action_identity(&request)?;
+            validate_request(&request, &capability)?;
+            let original_id = request.action_id.clone();
+            for invalid in [
+                "../target.json",
+                "repository:target.json",
+                "--sysroot=/tmp",
+                "custom.json",
+            ] {
+                let mut forged = request.clone();
+                forged.operation.target.as_mut().unwrap().triple = Some(invalid.to_string());
+                forged.action_id = action_identity(&forged)?;
+                assert!(
+                    validate_request(&forged, &capability).is_err(),
+                    "accepted target {invalid}"
+                );
+            }
+            let mut native = request.clone();
+            native.operation.target.as_mut().unwrap().cpu = Some("native".to_string());
+            native.action_id = action_identity(&native)?;
+            assert!(validate_request(&native, &capability).is_err());
+            let mut unpacked = request.clone();
+            unpacked.operation.codegen.debuginfo = Some("2".to_string());
+            unpacked.operation.codegen.split_debuginfo = Some("unpacked".to_string());
+            unpacked.action_id = action_identity(&unpacked)?;
+            assert!(
+                validate_request(&unpacked, &capability).is_err(),
+                "accepted code generation with unowned debug objects"
+            );
+            request.operation.target.as_mut().unwrap().identity = fixed_identity("sha256:", 'b');
+            request.action_id = action_identity(&request)?;
+            assert_ne!(
+                request.action_id, original_id,
+                "target bytes did not bind action identity"
+            );
+            request.protocol_version = 3;
+            request.action_id = action_identity(&request)?;
+            assert!(
+                validate_request(&request, &capability).is_err(),
+                "old worker protocol was accepted"
+            );
             Ok(())
         })();
         result.unwrap();
@@ -7791,7 +8659,7 @@ mod tests {
             let DecodedExecution::Success(staged) = decoded else {
                 return Err(RailError::message("test response was unexpectedly rejected"));
             };
-            assert_eq!(staged.frames.len(), 5);
+            assert_eq!(staged.frames.len(), 6);
             assert_eq!(fs::read(&staged.frames[&ResponseSlot::Metadata])?, b"metadata bytes");
             assert_eq!(fs::read(&staged.frames[&ResponseSlot::Rlib])?, b"rlib bytes");
             assert!(staged.staging.path().starts_with(staging_parent.path()));
@@ -7819,7 +8687,7 @@ mod tests {
             let (response, _) = successful_response(&request, frames, timing);
 
             let mut missing_rlib = response.clone();
-            missing_rlib.frames.remove(2);
+            missing_rlib.frames.retain(|frame| frame.slot != ResponseSlot::Rlib);
             assert!(validate_response_header(&missing_rlib, &request.operation).is_err());
 
             let mut metadata_request = request;
@@ -7856,7 +8724,7 @@ mod tests {
             );
 
             let mut wrong_request = request.clone();
-            wrong_request.lease_id = fixed_identity("execution-lease-v3:sha256:", '8');
+            wrong_request.lease_id = fixed_identity("execution-lease-v5:sha256:", '8');
             let staging = NativeResultStaging::temporary_in(staging_parent.path())?;
             assert!(
                 read_response_into(

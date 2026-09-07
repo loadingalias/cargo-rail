@@ -14,6 +14,7 @@ use rustc_hir::intravisit::{self, Visitor};
 use rustc_lint_defs::builtin::DEAD_CODE;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::middle::privacy::Level as PrivacyLevel;
+use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_session::config::CrateType;
 use rustc_span::def_id::LOCAL_CRATE;
@@ -343,9 +344,12 @@ impl<'tcx> Collector<'tcx> {
         defined_ids: &HashMap<LocalDefId, CompilerItemId>,
     ) -> Result<RawItem, String> {
         let span = node_span(self.tcx, def_id);
-        let mut raw_span = self
-            .capture_span(span)
-            .map_err(|error| format!("{}: {error}", self.tcx.def_path_str(def_id.to_def_id())))?;
+        let mut raw_span = self.capture_span(span).map_err(|error| {
+            format!(
+                "{}: {error}",
+                with_no_trimmed_paths!(self.tcx.def_path_str(def_id.to_def_id()))
+            )
+        })?;
         let visibility_span = visibility_span(self.tcx, def_id).filter(|span| span.lo() < span.hi());
         let (written_visibility, written_visibility_complete) = written_visibility(self.tcx, def_id, visibility_span);
         let raw_visibility_span = visibility_span.map(|span| self.capture_span(span)).transpose()?;
@@ -359,7 +363,7 @@ impl<'tcx> Collector<'tcx> {
                 &mut raw_span,
                 visibility,
                 expansion_authority.as_ref(),
-                &self.tcx.def_path_str(def_id.to_def_id()),
+                &with_no_trimmed_paths!(self.tcx.def_path_str(def_id.to_def_id())),
             )?;
         }
         let effective_visibility = self
@@ -369,7 +373,7 @@ impl<'tcx> Collector<'tcx> {
             .map(|visibility| fact_visibility(self.tcx, *visibility.at_level(PrivacyLevel::Reachable)))
             .unwrap_or(CompilerFactVisibility::Private);
         let kind = fact_kind(self.tcx, def_id).ok_or_else(|| "definition kind disappeared".to_string())?;
-        let diagnostic_path = self.tcx.def_path_str(def_id.to_def_id());
+        let diagnostic_path = with_no_trimmed_paths!(self.tcx.def_path_str(def_id.to_def_id()));
         let name = self
             .tcx
             .hir_node_by_def_id(def_id)

@@ -19,9 +19,9 @@ pub(super) const MARKER_ENV: &str = "CARGO_RAIL_REMOTE_CACHE_COORDINATOR";
 
 const STATE_VERSION: u32 = 1;
 const STATE_MAX_BYTES: u64 = (super::url::MAX_URL_BYTES + 1024) as u64;
-const IPC_MAGIC: &[u8; 8] = b"CRRIPC6\0";
-const IPC_RESPONSE_MAGIC: &[u8; 8] = b"CRRRES6\0";
-const IPC_RESPONSE_TRAILER_MAGIC: &[u8; 8] = b"CRREND6\0";
+const IPC_MAGIC: &[u8; 8] = b"CRRIPC7\0";
+const IPC_RESPONSE_MAGIC: &[u8; 8] = b"CRRRES7\0";
+const IPC_RESPONSE_TRAILER_MAGIC: &[u8; 8] = b"CRREND7\0";
 const IPC_MAX_TOKEN_BYTES: usize = 128;
 const IPC_MAX_IDENTITY_BYTES: usize = 128;
 const IPC_MAX_AUTHORITY_BYTES: usize = super::url::MAX_URL_BYTES;
@@ -209,7 +209,7 @@ impl Client {
                     ));
                 }
                 Ok(Lookup::Unique {
-                    selector,
+                    selector: Box::new(selector),
                     action_key,
                     result_key,
                     body: PackReader {
@@ -286,7 +286,7 @@ pub(super) enum Lookup {
     Miss,
     Conflict,
     Unique {
-        selector: crate::compiler::native_cache::NativeDynamicInputSelector,
+        selector: Box<crate::compiler::native_cache::NativeDynamicInputSelector>,
         action_key: String,
         result_key: String,
         body: PackReader,
@@ -391,6 +391,14 @@ pub(super) fn connect(
         // timeout and serializes later dependency work behind a detached process.
         // Client-side cache events retain the authoritative failure evidence.
         .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+
+        // The profile owns this service's lifetime, not the Cargo acquisition
+        // process group whose wrapper happened to start it.
+        coordinator.process_group(0);
+    }
     #[cfg(windows)]
     let child = {
         use std::os::windows::process::CommandExt as _;
@@ -818,7 +826,7 @@ fn coordinator_identity(
         .to_str()
         .ok_or_else(|| RemoteStoreError::configuration("local cache path is not valid UTF-8"))?;
     let mut hasher = Sha256::new();
-    hasher.update(b"cargo-rail-remote-coordinator-v6\0");
+    hasher.update(b"cargo-rail-remote-coordinator-v7\0");
     hash_field(&mut hasher, selection.authority().as_str());
     hash_field(&mut hasher, selection.mode().as_str());
     hash_field(&mut hasher, receipt.authority());
@@ -982,34 +990,6 @@ fn elapsed_nanos(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
-fn write_environment_names(stream: &mut TcpStream, names: &[String]) -> RemoteStoreResult<()> {
-    super::validate_environment_names(names)?;
-    let count = u16::try_from(names.len())
-        .map_err(|_| RemoteStoreError::integrity("remote environment count is out of range"))?;
-    stream.write_all(&count.to_le_bytes()).map_err(io_unavailable)?;
-    for name in names {
-        write_string(stream, name, super::MAX_APPROVED_ENVIRONMENT_NAME_BYTES)?;
-    }
-    Ok(())
-}
-
-fn read_environment_names(stream: &mut TcpStream) -> RemoteStoreResult<Vec<String>> {
-    let mut count = [0_u8; 2];
-    stream.read_exact(&mut count).map_err(io_unavailable)?;
-    let count = usize::from(u16::from_le_bytes(count));
-    if count > super::MAX_APPROVED_ENVIRONMENT_NAMES {
-        return Err(RemoteStoreError::integrity(
-            "remote environment count exceeds its bound",
-        ));
-    }
-    let mut names = Vec::with_capacity(count);
-    for _ in 0..count {
-        names.push(read_string(stream, super::MAX_APPROVED_ENVIRONMENT_NAME_BYTES)?);
-    }
-    super::validate_environment_names(&names)?;
-    Ok(names)
-}
-
 fn write_dynamic_input_selector(
     stream: &mut TcpStream,
     selector: &crate::compiler::native_cache::NativeDynamicInputSelector,
@@ -1017,44 +997,46 @@ fn write_dynamic_input_selector(
     selector
         .validate()
         .map_err(|_| RemoteStoreError::integrity("remote dynamic-input selector is invalid"))?;
-    write_environment_names(stream, &selector.environment_names)?;
-    let count = u16::try_from(selector.repository_paths.len())
-        .map_err(|_| RemoteStoreError::integrity("remote repository path count is out of range"))?;
-    stream.write_all(&count.to_le_bytes()).map_err(io_unavailable)?;
-    for path in &selector.repository_paths {
-        write_string(
-            stream,
-            path,
-            crate::compiler::native_cache::MAX_DYNAMIC_REPOSITORY_PATH_BYTES,
-        )?;
+    let bytes = serde_json::to_vec(selector)
+        .map_err(|_| RemoteStoreError::integrity("remote dynamic-input selector could not be encoded"))?;
+    let length = u64::try_from(bytes.len())
+        .map_err(|_| RemoteStoreError::integrity("remote dynamic-input selector length is out of range"))?;
+    if length == 0 || length > object::MAX_METADATA_BYTES {
+        return Err(RemoteStoreError::integrity(
+            "remote dynamic-input selector is empty or exceeds its byte bound",
+        ));
     }
-    Ok(())
+    stream.write_all(&length.to_le_bytes()).map_err(io_unavailable)?;
+    stream.write_all(&bytes).map_err(io_unavailable)
 }
 
 fn read_dynamic_input_selector(
     stream: &mut TcpStream,
 ) -> RemoteStoreResult<crate::compiler::native_cache::NativeDynamicInputSelector> {
-    let environment_names = read_environment_names(stream)?;
-    let mut count = [0_u8; 2];
-    stream.read_exact(&mut count).map_err(io_unavailable)?;
-    let count = usize::from(u16::from_le_bytes(count));
-    if count > crate::compiler::native_cache::MAX_DYNAMIC_REPOSITORY_INPUTS {
+    let length = read_u64(stream)?;
+    if length == 0 || length > object::MAX_METADATA_BYTES {
         return Err(RemoteStoreError::integrity(
-            "remote repository path count exceeds its bound",
+            "remote dynamic-input selector is empty or exceeds its byte bound",
         ));
     }
-    let mut repository_paths = Vec::with_capacity(count);
-    let mut total_bytes = 0usize;
-    for _ in 0..count {
-        let path = read_string(stream, crate::compiler::native_cache::MAX_DYNAMIC_REPOSITORY_PATH_BYTES)?;
-        total_bytes = total_bytes
-            .checked_add(path.len())
-            .filter(|bytes| *bytes <= crate::compiler::native_cache::MAX_DYNAMIC_REPOSITORY_TOTAL_PATH_BYTES)
-            .ok_or_else(|| RemoteStoreError::integrity("remote repository path bytes exceed their bound"))?;
-        repository_paths.push(path);
+    let length = usize::try_from(length)
+        .map_err(|_| RemoteStoreError::integrity("remote dynamic-input selector length is out of range"))?;
+    let mut bytes = vec![0; length];
+    stream.read_exact(&mut bytes).map_err(io_unavailable)?;
+    let selector: crate::compiler::native_cache::NativeDynamicInputSelector = serde_json::from_slice(&bytes)
+        .map_err(|_| RemoteStoreError::integrity("remote dynamic-input selector is malformed"))?;
+    selector
+        .validate()
+        .map_err(|_| RemoteStoreError::integrity("remote dynamic-input selector is invalid"))?;
+    if serde_json::to_vec(&selector)
+        .map_err(|_| RemoteStoreError::integrity("remote dynamic-input selector could not be encoded"))?
+        != bytes
+    {
+        return Err(RemoteStoreError::integrity(
+            "remote dynamic-input selector is not canonically encoded",
+        ));
     }
-    crate::compiler::native_cache::NativeDynamicInputSelector::new(environment_names, repository_paths)
-        .map_err(|_| RemoteStoreError::integrity("remote dynamic-input selector is invalid"))
+    Ok(selector)
 }
 
 fn write_string(stream: &mut TcpStream, value: &str, maximum: usize) -> RemoteStoreResult<()> {
@@ -1113,25 +1095,70 @@ mod tests {
 
     #[test]
     fn dynamic_input_selector_round_trips_over_the_coordinator_protocol() {
+        const SELECTOR: &[u8] = br#"{"version":2,"environment_names":["CARGO_PKG_NAME"],"repository_paths":[".config/target-matrix.json"],"rust_inputs":{"crates":[{"name":"dependency","selected":[{"root":"repository","path":"deps/libdependency.rlib"}]}],"searches":[{"directory":{"root":"repository","path":"deps"},"patterns":[{"prefix":"libdependency","suffix":".rlib"}]}]}}"#;
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind listener");
-        let selector = crate::compiler::native_cache::NativeDynamicInputSelector::new(
-            vec!["CARGO_PKG_NAME".to_string()],
-            vec![".config/target-matrix.json".to_string()],
-        )
-        .expect("selector");
-        let sent = selector.clone();
+        let selector: crate::compiler::native_cache::NativeDynamicInputSelector =
+            serde_json::from_slice(SELECTOR).expect("independent complete selector fixture");
         let address = listener.local_addr().expect("listener address");
         let writer = std::thread::spawn(move || {
             let mut stream = TcpStream::connect(address).expect("connect coordinator test client");
-            write_dynamic_input_selector(&mut stream, &sent).expect("write selector");
+            write_dynamic_input_selector(&mut stream, &selector).expect("write selector");
+            assert_eq!(
+                read_dynamic_input_selector(&mut stream).expect("read independent selector frame"),
+                selector
+            );
         });
         let (mut stream, _) = listener.accept().expect("accept coordinator test client");
-
-        assert_eq!(
-            read_dynamic_input_selector(&mut stream).expect("read selector"),
-            selector
-        );
+        let expected_length = u64::try_from(SELECTOR.len()).expect("fixture length").to_le_bytes();
+        let mut length = [0; 8];
+        stream.read_exact(&mut length).expect("read selector length");
+        assert_eq!(length, expected_length);
+        let mut bytes = vec![0; SELECTOR.len()];
+        stream.read_exact(&mut bytes).expect("read complete selector bytes");
+        assert_eq!(bytes, SELECTOR);
+        stream
+            .write_all(&expected_length)
+            .expect("write independent selector length");
+        stream.write_all(SELECTOR).expect("write independent selector bytes");
         writer.join().expect("join coordinator test client");
+    }
+
+    #[test]
+    fn dynamic_input_selector_rejects_unbounded_malformed_and_noncanonical_frames() {
+        for (payload, advertised, reason) in [
+            (&b""[..], Some(0), "empty or exceeds its byte bound"),
+            (&b""[..], Some(object::MAX_METADATA_BYTES + 1), "empty or exceeds its byte bound"),
+            (&b"{"[..], None, "selector is malformed"),
+            (
+                &br#"{"version":2, "environment_names":[],"repository_paths":[],"rust_inputs":{"crates":[],"searches":[]}}"#[..],
+                None,
+                "selector is not canonically encoded",
+            ),
+            (
+                &br#"{"version":1,"environment_names":[],"repository_paths":[],"rust_inputs":{"crates":[],"searches":[]}}"#[..],
+                None,
+                "selector is invalid",
+            ),
+            (
+                &br#"{"version":2,"environment_names":["A=B"],"repository_paths":[],"rust_inputs":{"crates":[],"searches":[]}}"#[..],
+                None,
+                "selector is invalid",
+            ),
+        ] {
+            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind listener");
+            let address = listener.local_addr().expect("listener address");
+            let payload = payload.to_vec();
+            let length = advertised.unwrap_or_else(|| u64::try_from(payload.len()).expect("fixture length"));
+            let writer = std::thread::spawn(move || {
+                let mut stream = TcpStream::connect(address).expect("connect coordinator test client");
+                stream.write_all(&length.to_le_bytes()).expect("write selector length");
+                stream.write_all(&payload).expect("write selector payload");
+            });
+            let (mut stream, _) = listener.accept().expect("accept coordinator test client");
+            let error = read_dynamic_input_selector(&mut stream).expect_err("invalid selector frame must fail");
+            assert!(error.to_string().contains(reason), "{error}");
+            writer.join().expect("join coordinator test client");
+        }
     }
 
     #[test]

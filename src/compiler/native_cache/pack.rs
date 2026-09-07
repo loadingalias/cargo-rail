@@ -7,18 +7,19 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use super::{
-    CDYLIB_SLOT, DEP_INFO_SLOT, DYLIB_SLOT, EXECUTABLE_SLOT, MAX_DYNAMIC_REPOSITORY_INPUTS, MAX_SOURCE_ENTRIES,
-    METADATA_SLOT, NativeCompilerOutput, NativeCompilerWitness, NativeResultIdentity, PROC_MACRO_SLOT,
-    RESULT_KEY_PREFIX, RLIB_SLOT, STATICLIB_SLOT, STDERR_SLOT, STDOUT_SLOT, sha256_identity, validate_action_key,
-    validate_result_key, validate_sha256,
+    CDYLIB_SLOT, DEBUG_OBJECT_SLOT, DEP_INFO_SLOT, DYLIB_SLOT, EXECUTABLE_SLOT, EXPORT_OBJECT_SLOT,
+    IMPORT_LIBRARY_SLOT, MAX_DYNAMIC_REPOSITORY_INPUTS, MAX_SOURCE_ENTRIES, METADATA_SLOT, NativeCompilerOutput,
+    NativeCompilerWitness, NativeResultIdentity, PDB_SLOT, PROC_MACRO_SLOT, RESULT_KEY_PREFIX, RLIB_SLOT,
+    STATICLIB_SLOT, STDERR_SLOT, STDOUT_SLOT, sha256_identity, validate_action_key, validate_result_key,
+    validate_sha256,
 };
 use crate::error::{RailError, RailResult};
 use rscrypto::Sha256;
 use serde::{Deserialize, Serialize};
 
 const DESCRIPTOR_MAGIC: &[u8; 8] = b"CRNDESC1";
-const DESCRIPTOR_VERSION: u16 = 8;
-const IDENTITY_CONTRACT_VERSION: u16 = 13;
+const DESCRIPTOR_VERSION: u16 = 10;
+const IDENTITY_CONTRACT_VERSION: u16 = 15;
 const RESULT_CLASS_VERSION: u16 = 6;
 const MAX_DESCRIPTOR_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DESCRIPTOR_STRING_BYTES: usize = 4 * 1024;
@@ -44,6 +45,10 @@ const SLOT_PROC_MACRO: u8 = 7;
 const SLOT_DYLIB: u8 = 8;
 const SLOT_CDYLIB: u8 = 9;
 const SLOT_STATICLIB: u8 = 10;
+const SLOT_PDB: u8 = 11;
+const SLOT_IMPORT_LIBRARY: u8 = 12;
+const SLOT_EXPORT_OBJECT: u8 = 13;
+const SLOT_DEBUG_OBJECT: u8 = 14;
 const STREAM_SLOT_MODE: u32 = 0o644;
 
 /// Private payload staging protected by the local CAS active-file lease.
@@ -135,7 +140,7 @@ impl NativeResultDescriptor {
         Ok(sha256_identity(
             RESULT_KEY_PREFIX,
             b"cargo-rail-native-compiler-result\0",
-            &[(b"version", &9_u32.to_le_bytes()), (b"descriptor", &descriptor)],
+            &[(b"version", &10_u32.to_le_bytes()), (b"descriptor", &descriptor)],
         ))
     }
 
@@ -152,11 +157,19 @@ impl NativeResultDescriptor {
             .map_err(|_| RailError::message("native result descriptor witness version is out of range"))?;
         bytes.extend_from_slice(&witness_version.to_le_bytes());
         bytes.push(u8::from(self.witness.complete));
+        bytes.push(match self.witness.target_format {
+            crate::compiler::collector::NativeTargetFormat::Elf => 1,
+            crate::compiler::collector::NativeTargetFormat::MachO => 2,
+            crate::compiler::collector::NativeTargetFormat::Coff => 3,
+            crate::compiler::collector::NativeTargetFormat::Wasm => 4,
+            crate::compiler::collector::NativeTargetFormat::Other => 5,
+        });
         push_strings(&mut bytes, &self.witness.source_paths)?;
         push_strings(&mut bytes, &self.witness.generated_paths)?;
         push_strings(&mut bytes, &self.witness.repository_paths)?;
         push_strings(&mut bytes, &self.witness.dependency_names)?;
         push_strings(&mut bytes, &self.witness.environment_names)?;
+        push_bytes(&mut bytes, &serde_json::to_vec(&self.witness.rust_inputs)?)?;
         push_bytes(&mut bytes, &serde_json::to_vec(&self.witness.linker)?)?;
         bytes.push(
             u8::try_from(self.outputs.len() + 2)
@@ -172,6 +185,10 @@ impl NativeResultDescriptor {
                 DYLIB_SLOT => SLOT_DYLIB,
                 CDYLIB_SLOT => SLOT_CDYLIB,
                 STATICLIB_SLOT => SLOT_STATICLIB,
+                PDB_SLOT => SLOT_PDB,
+                IMPORT_LIBRARY_SLOT => SLOT_IMPORT_LIBRARY,
+                EXPORT_OBJECT_SLOT => SLOT_EXPORT_OBJECT,
+                slot if slot.starts_with(&format!("{DEBUG_OBJECT_SLOT}-")) => SLOT_DEBUG_OBJECT,
                 _ => {
                     return Err(RailError::message(
                         "native result descriptor contains an unknown output slot",
@@ -216,17 +233,20 @@ impl NativeResultDescriptor {
                     .ok_or_else(|| RailError::message("native result descriptor size overflow"))
             })?;
         let linker = serde_json::to_vec(&self.witness.linker)?;
+        let rust_inputs = serde_json::to_vec(&self.witness.rust_inputs)?;
         FIXED_DESCRIPTOR_PREFIX_BYTES
             .checked_add(strings)
-            .and_then(|total| total.checked_add(2 + 1 + 5 * 4 + 1))
+            .and_then(|total| total.checked_add(2 + 1 + 1 + 5 * 4 + 1))
             .and_then(|total| total.checked_add(4 + linker.len()))
+            .and_then(|total| total.checked_add(4 + rust_inputs.len()))
             .and_then(|total| total.checked_add((self.outputs.len() + 2) * (1 + 2 + 8 + 32)))
             .ok_or_else(|| RailError::message("native result descriptor size overflow"))
     }
 
     fn validate(&self) -> RailResult<()> {
         validate_action_key(&self.action_key)?;
-        if self.witness.version != 6
+        if self.witness.version != 8
+            || self.witness.rust_inputs.validate().is_err()
             || !self.witness.complete
             || self.witness.source_paths.is_empty()
             || self.witness.source_paths.len() > MAX_SOURCE_ENTRIES
@@ -247,25 +267,7 @@ impl NativeResultDescriptor {
         {
             return Err(RailError::message("native result descriptor has an invalid witness"));
         }
-        let contract = self.outputs.as_slice();
-        let valid_contract = matches!(contract, [dep_info, metadata]
-        if dep_info.role == "dep_info" && dep_info.slot == DEP_INFO_SLOT
-          && metadata.role == "metadata" && metadata.slot == METADATA_SLOT)
-            || matches!(contract, [dep_info, metadata, rlib]
-        if dep_info.role == "dep_info" && dep_info.slot == DEP_INFO_SLOT
-          && metadata.role == "metadata" && metadata.slot == METADATA_SLOT
-          && rlib.role == "rlib" && rlib.slot == RLIB_SLOT)
-            || matches!(contract, [dep_info, linked]
-            if dep_info.role == "dep_info" && dep_info.slot == DEP_INFO_SLOT
-              && matches!(
-                (linked.role.as_str(), linked.slot.as_str()),
-                ("executable", EXECUTABLE_SLOT)
-                  | ("proc_macro", PROC_MACRO_SLOT)
-                  | ("dylib", DYLIB_SLOT)
-                  | ("cdylib", CDYLIB_SLOT)
-                  | ("staticlib", STATICLIB_SLOT)
-              ));
-        if !valid_contract
+        if !super::valid_native_output_contract(&self.outputs, self.witness.target_format)
             || self.outputs.iter().any(|output| {
                 output.bytes == 0 && output.role != "metadata"
                     || output.file_name.is_empty()
@@ -834,6 +836,59 @@ mod tests {
         assert_eq!(exported.content_length, bytes.len() as u64);
         assert_eq!(exported.bytes_written, bytes.len() as u64);
         bytes
+    }
+
+    #[test]
+    fn result_identity_binds_the_artifact_target_format() {
+        let validation = super::super::tests::cas_validation_with_stdout(b"");
+        let mut descriptor = descriptor_from_validation(&validation).expect("result descriptor");
+        descriptor.witness.target_format = crate::compiler::collector::NativeTargetFormat::Elf;
+        let elf = descriptor.result_key().expect("ELF result identity");
+        descriptor.witness.target_format = crate::compiler::collector::NativeTargetFormat::Coff;
+
+        assert_ne!(elf, descriptor.result_key().expect("COFF result identity"));
+    }
+
+    #[test]
+    fn coff_descriptor_binds_auxiliary_outputs_in_one_ordered_contract() {
+        let validation = super::super::tests::cas_validation_with_stdout(b"");
+        let mut descriptor = descriptor_from_validation(&validation).expect("result descriptor");
+        descriptor.witness.target_format = crate::compiler::collector::NativeTargetFormat::Coff;
+        let mut primary = descriptor.outputs[1].clone();
+        primary.role = "cdylib".to_string();
+        primary.slot = CDYLIB_SLOT.to_string();
+        primary.file_name = "fixture.dll".to_string();
+        primary.mode = 0o755;
+        descriptor.outputs[1] = primary.clone();
+        for (role, slot, name) in [
+            ("pdb", PDB_SLOT, "fixture.pdb"),
+            ("import_library", IMPORT_LIBRARY_SLOT, "fixture.dll.lib"),
+        ] {
+            let mut output = primary.clone();
+            output.role = role.to_string();
+            output.slot = slot.to_string();
+            output.file_name = name.to_string();
+            output.mode = 0o644;
+            descriptor.outputs.push(output);
+        }
+        let complete = descriptor.result_key().expect("complete COFF contract");
+        let mut changed = descriptor.clone();
+        changed.outputs[2].content_digest = super::super::digest(b"changed PDB");
+        assert_ne!(complete, changed.result_key().expect("changed symbol identity"));
+        changed = descriptor.clone();
+        changed.outputs.swap(2, 3);
+        assert!(
+            changed.result_key().is_err(),
+            "auxiliary order is part of the machine contract"
+        );
+        changed = descriptor.clone();
+        changed.outputs.push(changed.outputs[2].clone());
+        assert!(changed.result_key().is_err(), "duplicate output roles must be rejected");
+        descriptor.witness.target_format = crate::compiler::collector::NativeTargetFormat::Elf;
+        assert!(
+            descriptor.result_key().is_err(),
+            "PDB/import-library roles require a COFF target"
+        );
     }
 
     #[test]

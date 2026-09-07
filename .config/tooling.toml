@@ -1,0 +1,197 @@
+# Updated by just update on the local macOS workstation.
+# Installers consume these pins; they never select latest releases.
+# Ubuntu system packages are pinned together by archive snapshot.
+# Rust is owned by rust-toolchain.toml; each runner lists its own components.
+# macOS development and testing remain local.
+
+[cargo]
+cargo-audit = "0.22.2"
+cargo-deny = "0.20.2"
+cargo-nextest = "0.9.143"
+cargo-xwin = "0.23.1"
+cargo-mutants = "27.1.0"
+just = "1.58.0"
+ripgrep = "15.2.0"
+rumdl = "0.2.66"
+lychee = "0.24.2"
+samply = "0.13.1"
+
+[updater]
+tomlkit = "0.15.1"
+
+[versions]
+cargo-binstall = "1.23.0"
+cmake = "4.4.3"
+llvm = "23.1.0"
+git = "2.55.0.windows.5"
+jq = "1.8.2"
+powershell = "7.6.5"
+rustup = "1.29.1"
+python = "3.14.7"
+
+[linux]
+ubuntu = "26.04"
+codename = "resolute"
+snapshot = "20260906T053626Z"
+
+[windows]
+visual-studio = "18.9.2"
+build-version = "18.9.12120.119"
+channel-url = "https://download.visualstudio.microsoft.com/download/pr/fe4fb3e6-ea32-4ae3-b154-72821a274f0d/8ae0a45312cd28cec640174c5df11085f4efcb3bf210bd94cea932fb42c36778/VisualStudio.18.Release.chman"
+channel-sha256 = "d3aa7336680097d007876ffb85c9d2b5c32c21796e0125407c4e3b88ebe4fc31"
+bootstrap-url = "https://download.visualstudio.microsoft.com/download/pr/fe4fb3e6-ea32-4ae3-b154-72821a274f0d/352ac5776d592a4870c15756f9e140507b9ee64de62b401152e5929f7c0c52a6/vs_BuildTools.exe"
+bootstrap-sha256 = "352ac5776d592a4870c15756f9e140507b9ee64de62b401152e5929f7c0c52a6"
+sdk-component = "Microsoft.VisualStudio.Component.Windows11SDK.28000"
+
+[aarch64-linux]
+packages = ["build-essential", "ca-certificates", "curl", "git", "jq", "pkgconf", "python3", "python3-venv", "unzip", "xz-utils", "zstd"]
+os = "Ubuntu 26.04 LTS"
+rust-host = "aarch64-unknown-linux-gnu"
+components = ["clippy", "rustfmt", "rustc-dev", "llvm-tools"]
+cargo = ["cargo-audit", "cargo-deny", "cargo-nextest", "cargo-mutants", "just", "ripgrep", "rumdl", "lychee", "samply"]
+
+[aarch64-linux.assets.rustup]
+url = "https://static.rust-lang.org/rustup/archive/1.29.1/aarch64-unknown-linux-gnu/rustup-init"
+sha256 = "15f6e4ce9f583b929c996c91562bad6d4454f3281de858b02cdfdef615fac433"
+
+[aarch64-linux.assets.cargo-binstall]
+url = "https://github.com/cargo-bins/cargo-binstall/releases/download/v1.23.0/cargo-binstall-aarch64-unknown-linux-gnu.tgz"
+sha256 = "c458cfe9534d1958f159fc17b5f50e839297b4ee752b23ffdd80c5e15a734c42"
+
+[aarch64-linux.assets.cmake]
+url = "https://github.com/Kitware/CMake/releases/download/v4.4.3/cmake-4.4.3-linux-aarch64.tar.gz"
+sha256 = "2efc974dbd63b4444c0e8494b92f2e80c2d7e635b4b80eac2916985ddd8f72a6"
+
+[x86_64-linux]
+packages = ["build-essential", "ca-certificates", "curl", "git", "jq", "pkgconf", "python3", "python3-venv", "shellcheck", "unzip", "xz-utils", "zstd"]
+os = "Ubuntu 26.04 LTS"
+rust-host = "x86_64-unknown-linux-gnu"
+components = ["clippy", "rustfmt", "rustc-dev", "llvm-tools"]
+cargo = ["cargo-audit", "cargo-deny", "cargo-nextest", "cargo-mutants", "just", "ripgrep", "rumdl", "lychee", "samply"]
+
+[x86_64-linux.assets.rustup]
+url = "https://static.rust-lang.org/rustup/archive/1.29.1/x86_64-unknown-linux-gnu/rustup-init"
+sha256 = "dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71"
+
+[x86_64-linux.assets.cargo-binstall]
+url = "https://github.com/cargo-bins/cargo-binstall/releases/download/v1.23.0/cargo-binstall-x86_64-unknown-linux-gnu.tgz"
+sha256 = "cdada45ad6bb501185ab309f5eef3f628b6bc44460746565cb3e0c7538815bf3"
+
+[x86_64-linux.assets.cmake]
+url = "https://github.com/Kitware/CMake/releases/download/v4.4.3/cmake-4.4.3-linux-x86_64.tar.gz"
+sha256 = "d6c83076c575bc00b823522ac974bda66d0af05d6ddc30e739c12385cf32c6cc"
+
+[aarch64-win]
+os = "Windows 11 Enterprise ARM64"
+rust-host = "aarch64-pc-windows-msvc"
+components = ["clippy", "rustfmt", "rustc-dev", "llvm-tools"]
+cargo = ["cargo-audit", "cargo-deny", "cargo-nextest", "cargo-mutants", "just", "ripgrep", "rumdl", "lychee"]
+
+[aarch64-win.assets.rustup]
+url = "https://static.rust-lang.org/rustup/archive/1.29.1/aarch64-pc-windows-msvc/rustup-init.exe"
+sha256 = "01aa49cf9574a8bd0ae52005d7de2590e8f27181ded6748236e702c92aef826d"
+
+[aarch64-win.assets.cargo-binstall]
+url = "https://github.com/cargo-bins/cargo-binstall/releases/download/v1.23.0/cargo-binstall-aarch64-pc-windows-msvc.zip"
+sha256 = "a3996cbd0c7fa2be599bd52eaf70ccd8c0dce4cce8d01345d486f47b0e0ee0f9"
+
+[aarch64-win.assets.llvm]
+url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.0/clang%2Bllvm-23.1.0-aarch64-pc-windows-msvc.tar.xz"
+sha256 = "caec9387c7925f61de5f53ced0ccf3a9ab9effbe200ea67787f52aa188471cf8"
+
+[aarch64-win.assets.cmake]
+url = "https://github.com/Kitware/CMake/releases/download/v4.4.3/cmake-4.4.3-windows-arm64.zip"
+sha256 = "7b410ddd00e24c7250eec7452da2348a4a70437aa87e9cda0a20d6a85662fcff"
+
+[aarch64-win.assets.python]
+url = "https://www.python.org/ftp/python/3.14.7/python-3.14.7-embed-arm64.zip"
+sha256 = "f6773983c8959d4281e48c4540cb0bdd23e42391e4e951ce17e7ceb52658f21c"
+
+[aarch64-win.assets.git]
+url = "https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.5/Git-2.55.0.5-arm64.exe"
+sha256 = "c955de342b1465bc637f0e71fddf4e28e8d0b829668ec1866ab32a839303e8e3"
+
+[aarch64-win.assets.jq]
+url = "https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-windows-arm64.exe"
+sha256 = "083b5377392bc57cf27052b6d20a2d927770683bca844632901ff38b4b7b0ac7"
+
+[aarch64-win.assets.powershell]
+url = "https://github.com/PowerShell/PowerShell/releases/download/v7.6.5/PowerShell-7.6.5-win-arm64.zip"
+sha256 = "20514a755d16428dc4355c85e0883c859531e71cc3e122670aa1fccdbf96ba7e"
+
+[x86_64-win]
+os = "Windows Server 2025"
+rust-host = "x86_64-pc-windows-msvc"
+components = ["clippy", "rustfmt", "rustc-dev", "llvm-tools"]
+cargo = ["cargo-audit", "cargo-deny", "cargo-nextest", "cargo-mutants", "just", "ripgrep", "rumdl", "lychee"]
+
+[x86_64-win.assets.rustup]
+url = "https://static.rust-lang.org/rustup/archive/1.29.1/x86_64-pc-windows-msvc/rustup-init.exe"
+sha256 = "6f4bef66261261fcb43131be8720bab817d403a09edec7455c371974b90bdb7e"
+
+[x86_64-win.assets.cargo-binstall]
+url = "https://github.com/cargo-bins/cargo-binstall/releases/download/v1.23.0/cargo-binstall-x86_64-pc-windows-msvc.zip"
+sha256 = "f4641479477aca40387e88297e3813fab8e44a8d21f25faa44e0ff33e2bc1726"
+
+[x86_64-win.assets.llvm]
+url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.0/clang%2Bllvm-23.1.0-x86_64-pc-windows-msvc.tar.xz"
+sha256 = "5799ebeca6870e9e61d5b4c8bc869ca8490e8db55f22d1388c4545404864d9e3"
+
+[x86_64-win.assets.cmake]
+url = "https://github.com/Kitware/CMake/releases/download/v4.4.3/cmake-4.4.3-windows-x86_64.zip"
+sha256 = "4d52ebab7193a698651639ed80d8d04fd903358843572cf44c7fd234cb7c26ab"
+
+[x86_64-win.assets.python]
+url = "https://www.python.org/ftp/python/3.14.7/python-3.14.7-embed-amd64.zip"
+sha256 = "d297e5ff019966817ad8502465176139f2d3d840fa4ed84b13bed399a6ab1f15"
+
+[x86_64-win.assets.git]
+url = "https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.5/Git-2.55.0.5-64-bit.exe"
+sha256 = "d065a4e23c3d9a6b5073d609b5be0830227ec3ca053c083ba385061ddfaf94c6"
+
+[x86_64-win.assets.jq]
+url = "https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-windows-amd64.exe"
+sha256 = "a6fc67fedaf9128a3309a1e2ebb8b986aeccf70122ee46d2cb4849e423f0c627"
+
+[x86_64-win.assets.powershell]
+url = "https://github.com/PowerShell/PowerShell/releases/download/v7.6.5/PowerShell-7.6.5-win-x64.zip"
+sha256 = "32eb8f6cdce08f86e987d625a2733e54ac3e289ae7e1621b14c0b5bcec2434ea"
+
+[riscv64-linux]
+os = "Ubuntu 24.04 LTS"
+ubuntu = "24.04"
+codename = "noble"
+rust-host = "riscv64gc-unknown-linux-gnu"
+components = ["rustc-dev", "llvm-tools"]
+cargo = []
+packages = ["build-essential", "ca-certificates", "curl", "git", "python3"]
+
+[riscv64-linux.assets.rustup]
+url = "https://static.rust-lang.org/rustup/archive/1.29.1/riscv64gc-unknown-linux-gnu/rustup-init"
+sha256 = "e94134ed99fed1a3a1f13a3bf0a05d616fc1c2496ec0b557aaee4856cd34b2f2"
+
+[s390x-linux]
+os = "Ubuntu 24.04 LTS"
+ubuntu = "24.04"
+codename = "noble"
+rust-host = "s390x-unknown-linux-gnu"
+components = ["rustc-dev", "llvm-tools"]
+cargo = []
+packages = ["build-essential", "ca-certificates", "curl", "git", "python3"]
+
+[s390x-linux.assets.rustup]
+url = "https://static.rust-lang.org/rustup/archive/1.29.1/s390x-unknown-linux-gnu/rustup-init"
+sha256 = "312ac9390467fd7870f8aff6557c7cb3bff0a04bb11b263173fdfd81586da641"
+
+[powerpc64le-linux]
+os = "Ubuntu 24.04 LTS"
+ubuntu = "24.04"
+codename = "noble"
+rust-host = "powerpc64le-unknown-linux-gnu"
+components = ["rustc-dev", "llvm-tools"]
+cargo = []
+packages = ["build-essential", "ca-certificates", "curl", "git", "python3"]
+
+[powerpc64le-linux.assets.rustup]
+url = "https://static.rust-lang.org/rustup/archive/1.29.1/powerpc64le-unknown-linux-gnu/rustup-init"
+sha256 = "86ebc5b46b20013fca57dff4f83aa0c325ee90914626ce1c80ae76e126e48afb"

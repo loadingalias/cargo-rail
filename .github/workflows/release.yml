@@ -1,0 +1,183 @@
+name: Release v0.26.0
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release-v0.26.0
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  ready:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Require prepared release and successful CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          grep -Fx 'version = "0.26.0"' Cargo.toml
+          [[ -z "$(find .changes -maxdepth 1 -name '*.md' ! -name README.md -print)" ]]
+          grep -q '^## \[0\.26\.0\]' CHANGELOG.md
+          run="$(gh api --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+            -f head_sha="$GITHUB_SHA" -f branch=main -f per_page=100 \
+            --jq '[.workflow_runs[] | select(.event == "push" or .event == "workflow_dispatch")] | max_by(.id)')"
+          jq -e --arg sha "$GITHUB_SHA" \
+            '.head_sha == $sha and .status == "completed" and .conclusion == "success"' <<< "$run"
+          printf 'run-id=%s\n' "$(jq -r .id <<< "$run")" >> "$GITHUB_OUTPUT"
+
+  package:
+    needs: ready
+    name: Package / ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The 24.04 build host preserves the Action's glibc 2.39 baseline.
+          - runner: runs-on=${{ github.run_id }}/runner=x86_64-linux/image=ubuntu24-full-x64/env=production
+            target: x86_64-unknown-linux-gnu
+            timeout: 30
+          - runner: runs-on=${{ github.run_id }}/runner=aarch64-linux/image=ubuntu24-full-arm64/env=production
+            target: aarch64-unknown-linux-gnu
+            timeout: 30
+          - runner: runs-on=${{ github.run_id }}/runner=x86_64-win/env=production
+            target: x86_64-pc-windows-msvc
+            timeout: 60
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            timeout: 60
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Windows tooling and package
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          ./scripts/tooling/x86_64-win.ps1
+          just package-release "$env:RUNNER_TEMP/release"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Install native release tooling and package
+        if: runner.os != 'Windows'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          export RUSTUP_TOOLCHAIN
+          RUSTUP_TOOLCHAIN="$(python3 scripts/tooling/catalog.py rust-channel)"
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustc-dev,llvm-tools
+          cargo install just --version "$(python3 scripts/tooling/catalog.py get cargo just)" --locked
+          [[ "$(rustc -vV | sed -n 's/^host: //p')" == "$TARGET" ]]
+          just package-release "$RUNNER_TEMP/release"
+          if [[ "$TARGET" == x86_64-unknown-linux-gnu ]]; then
+            cargo package --locked
+            cp target/package/cargo-rail-0.26.0.crate "$RUNNER_TEMP/release/"
+            (cd "$RUNNER_TEMP/release"; sha256sum cargo-rail-0.26.0.crate >> SHA256SUMS)
+          fi
+      - name: Require unchanged sources
+        run: git diff --exit-code HEAD
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: package-${{ matrix.target }}
+          path: ${{ runner.temp }}/release/*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Recheck CI before publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run="$(gh api --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+            -f head_sha="$GITHUB_SHA" -f branch=main -f per_page=100 \
+            --jq '[.workflow_runs[] | select(.event == "push" or .event == "workflow_dispatch")] | max_by(.id)')"
+          jq -e --arg sha "$GITHUB_SHA" \
+            '.head_sha == $sha and .status == "completed" and .conclusion == "success"' <<< "$run"
+          printf 'run-id=%s\n' "$(jq -r .id <<< "$run")" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: package-*
+          path: ${{ runner.temp }}/packages
+      - name: Collect and verify release files
+        run: |
+          assets="$RUNNER_TEMP/release"
+          mkdir -p "$assets"
+          cp "$RUNNER_TEMP"/packages/*/*.zip "$RUNNER_TEMP"/packages/*/*.crate "$assets/"
+          cat "$RUNNER_TEMP"/packages/*/SHA256SUMS | sort > "$assets/SHA256SUMS"
+          [[ "$(wc -l < "$assets/SHA256SUMS")" -eq 5 ]]
+          (cd "$assets"; sha256sum --check --strict SHA256SUMS)
+          awk '/^## \[0\.26\.0\]/{found=1; next} found && /^## /{exit} found{print}' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          grep -q '[^[:space:]]' "$RUNNER_TEMP/notes.md"
+          export RUSTUP_TOOLCHAIN
+          RUSTUP_TOOLCHAIN="$(python3 scripts/tooling/catalog.py rust-channel)"
+          echo "RUSTUP_TOOLCHAIN=$RUSTUP_TOOLCHAIN" >> "$GITHUB_ENV"
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+          cargo package --locked --no-verify
+          cmp target/package/cargo-rail-0.26.0.crate "$assets/cargo-rail-0.26.0.crate"
+          git diff --exit-code HEAD
+      - name: Create or verify the release draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          assets="$RUNNER_TEMP/release"
+          tag_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v0.26.0" \
+            --jq '.[] | select(.ref == "refs/tags/v0.26.0") | .object.sha')"
+          [[ -z "$tag_sha" || "$tag_sha" == "$GITHUB_SHA" ]]
+          existing="$(gh release list --limit 100 --json tagName --jq '.[] | select(.tagName == "v0.26.0") | .tagName')"
+          if [[ -z "$existing" ]]; then
+            gh release create v0.26.0 "$assets"/* --target "$GITHUB_SHA" \
+              --draft --title v0.26.0 --notes-file "$RUNNER_TEMP/notes.md"
+          else
+            [[ "$(gh release view v0.26.0 --json targetCommitish --jq .targetCommitish)" == "$GITHUB_SHA" ]]
+            [[ "$(gh release view v0.26.0 --json body --jq .body)" == "$(cat "$RUNNER_TEMP/notes.md")" ]]
+            mkdir "$RUNNER_TEMP/existing-release"
+            gh release download v0.26.0 --dir "$RUNNER_TEMP/existing-release"
+            diff "$assets/SHA256SUMS" "$RUNNER_TEMP/existing-release/SHA256SUMS"
+            (cd "$RUNNER_TEMP/existing-release"; sha256sum --check --strict SHA256SUMS)
+          fi
+          [[ "$(gh release view v0.26.0 --json isPrerelease --jq .isPrerelease)" == false ]]
+      - name: Publish crates.io package
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          checksum="$(curl --fail --silent --show-error https://index.crates.io/ca/rg/cargo-rail | \
+            jq -r 'select(.vers == "0.26.0") | if .yanked then error("version is yanked") else .cksum end')"
+          if [[ -n "$checksum" ]]; then
+            [[ "$checksum" == "$(sha256sum "$RUNNER_TEMP/release/cargo-rail-0.26.0.crate" | cut -d ' ' -f 1)" ]]
+          else
+            cargo publish --locked --no-verify
+          fi
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$(gh release view v0.26.0 --json isDraft --jq .isDraft)" == true ]]; then
+            gh release edit v0.26.0 --draft=false --latest
+          fi

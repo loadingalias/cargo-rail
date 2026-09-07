@@ -12,22 +12,24 @@ use anyhow::{Context, Result};
 use cargo_rail::source::ContentDigest;
 use serde::{Deserialize, Serialize};
 
-const REQUEST_MAGIC: &[u8; 8] = b"CRXREQ3\0";
-const REQUEST_TRAILER: &[u8; 8] = b"CRXEND3\0";
-const RESPONSE_MAGIC: &[u8; 8] = b"CRXRES3\0";
-const RESPONSE_TRAILER: &[u8; 8] = b"CRXDONE3";
-const CANCEL_MAGIC: &[u8; 8] = b"CRXCAN3\0";
-const CANCEL_TRAILER: &[u8; 8] = b"CRXCEND3";
+const REQUEST_MAGIC: &[u8; 8] = b"CRXREQ5\0";
+const REQUEST_TRAILER: &[u8; 8] = b"CRXEND5\0";
+const RESPONSE_MAGIC: &[u8; 8] = b"CRXRES5\0";
+const RESPONSE_TRAILER: &[u8; 8] = b"CRXDONE5";
+const CANCEL_MAGIC: &[u8; 8] = b"CRXCAN5\0";
+const CANCEL_TRAILER: &[u8; 8] = b"CRXCEND5";
 #[cfg(unix)]
-const CAPABILITY_MAGIC: &[u8; 8] = b"CRXCAP3\0";
+const CAPABILITY_MAGIC: &[u8; 8] = b"CRXCAP5\0";
 #[cfg(unix)]
-const CAPABILITY_TRAILER: &[u8; 8] = b"CRXCPEN3";
-const VIRTUAL_ROOT: &str = "/cargo-rail/exec/v3";
-const VIRTUAL_WORKSPACE: &str = "/cargo-rail/exec/v3/workspace";
+const CAPABILITY_TRAILER: &[u8; 8] = b"CRXCPEN5";
+const VIRTUAL_ROOT: &str = "/cargo-rail/exec/v5";
+const VIRTUAL_WORKSPACE: &str = "/cargo-rail/exec/v5/workspace";
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkerCapability {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    analysis: Option<AnalysisWorkerCapability>,
     architecture: String,
     capability_id: String,
     endianness: String,
@@ -45,6 +47,18 @@ struct WorkerCapability {
     rustc_verbose_version: String,
     sysroot_identity: String,
     working_directory_contract: String,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnalysisWorkerCapability {
+    compiler_library_digest: String,
+    coverage: Vec<String>,
+    driver_digest: String,
+    driver_identity: String,
+    fact_protocol: u32,
+    target: String,
+    version: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,7 +94,8 @@ struct RustLibraryOperation {
     lints: Vec<RustLibraryLint>,
     operation_class: String,
     output_relative_directory: String,
-    output_dependency_search: bool,
+    dependency_searches: Vec<String>,
+    source_working_directory: Option<String>,
     rlib_name: Option<String>,
     source_virtual_path: String,
     test_mode: bool,
@@ -89,7 +104,8 @@ struct RustLibraryOperation {
 
 #[derive(Debug, Clone, Serialize)]
 struct RustLibraryDependency {
-    extern_name: String,
+    extern_name: Option<String>,
+    search_directories: Vec<String>,
     virtual_path: String,
 }
 
@@ -175,7 +191,7 @@ fn one_shot_worker_matches_local_rustc_and_honors_cancellation() -> Result<()> {
     let rustc = which_rustc()?;
     let version = Command::new(worker).arg("protocol-version").output()?;
     anyhow::ensure!(version.status.success(), "worker protocol query failed: {version:?}");
-    anyhow::ensure!(version.stdout == b"3\n", "unexpected worker protocol version");
+    anyhow::ensure!(version.stdout == b"5\n", "unexpected worker protocol version");
 
     let qualification = Command::new(worker)
         .args(["qualify-local-client"])
@@ -186,7 +202,7 @@ fn one_shot_worker_matches_local_rustc_and_honors_cancellation() -> Result<()> {
         "local client qualification failed: {qualification:?}"
     );
     anyhow::ensure!(
-        qualification.stdout == b"3\n" && qualification.stderr.is_empty(),
+        qualification.stdout == b"5\n" && qualification.stderr.is_empty(),
         "local client qualification contaminated its machine output"
     );
 
@@ -196,7 +212,7 @@ fn one_shot_worker_matches_local_rustc_and_honors_cancellation() -> Result<()> {
         "worker capability query failed: {capability_output:?}"
     );
     let capability: WorkerCapability = serde_json::from_slice(&capability_output.stdout)?;
-    anyhow::ensure!(capability.protocol_version == 3, "unexpected capability protocol");
+    anyhow::ensure!(capability.protocol_version == 5, "unexpected capability protocol");
     let proxy_capability_output = Command::new(worker).args(["capability", "rustc"]).output()?;
     anyhow::ensure!(
         proxy_capability_output.status.success(),
@@ -226,7 +242,12 @@ fn one_shot_worker_matches_local_rustc_and_honors_cancellation() -> Result<()> {
         "worker overstated its isolation qualification"
     );
     anyhow::ensure!(
-        capability.operation_classes == ["rust_library"],
+        capability.operation_classes
+            == if capability.analysis.is_some() {
+                vec!["rust_library", "rust_analysis_v1"]
+            } else {
+                vec!["rust_library"]
+            },
         "unexpected operation classes"
     );
     anyhow::ensure!(
@@ -266,12 +287,64 @@ fn one_shot_worker_matches_local_rustc_and_honors_cancellation() -> Result<()> {
     assert_frame_digests(&metadata_result)?;
     anyhow::ensure!(
         metadata_result.frames.keys().map(String::as_str).collect::<Vec<_>>()
-            == ["dep_info", "metadata", "stderr", "stdout"],
+            == ["dep_info", "metadata", "native_inputs", "stderr", "stdout"],
         "metadata-only execution returned the wrong slot set"
     );
+    for (slot, expected) in metadata_local {
+        anyhow::ensure!(
+            metadata_result.frames.get(&slot) == Some(&expected),
+            "metadata-only execution changed local rustc {slot}"
+        );
+    }
+    let native_inputs: serde_json::Value = serde_json::from_slice(&result.frames["native_inputs"])?;
     anyhow::ensure!(
-        metadata_result.frames == metadata_local,
-        "metadata-only execution changed local rustc output"
+        native_inputs["observation"]["assembly"] == "absent",
+        "rlib execution did not prove assembly absence"
+    );
+    let crates = native_inputs["observation"]["crates"]
+        .as_array()
+        .context("compiler-selected crates")?;
+    anyhow::ensure!(
+        crates.iter().any(|krate| krate["name"] == "core") && crates.iter().any(|krate| krate["name"] == "std"),
+        "worker omitted actual toolchain crate selection"
+    );
+    let metadata_inputs: serde_json::Value = serde_json::from_slice(&metadata_result.frames["native_inputs"])?;
+    anyhow::ensure!(
+        metadata_inputs["observation"]["assembly"] == "no_codegen",
+        "metadata execution claimed codegen observation"
+    );
+
+    let no_std = b"#![no_std]\npub fn answer() -> u64 { 42 }\n";
+    let no_std_request = execution_request(&capability, no_std)?;
+    let no_std_result = run_worker(worker, &rustc, &no_std_request, no_std, false)?;
+    assert_success_authority(&no_std_result.header, &no_std_request)?;
+    for (slot, expected) in compile_locally(&rustc, &no_std_request.operation, no_std)? {
+        anyhow::ensure!(
+            no_std_result.frames.get(&slot) == Some(&expected),
+            "no_std worker changed ordinary rustc {slot}"
+        );
+    }
+    let no_std_inputs: serde_json::Value = serde_json::from_slice(&no_std_result.frames["native_inputs"])?;
+    let selected = no_std_inputs["observation"]["crates"]
+        .as_array()
+        .context("no_std selected crates")?;
+    anyhow::ensure!(
+        selected.iter().any(|krate| krate["name"] == "core") && !selected.iter().any(|krate| krate["name"] == "std"),
+        "no_std worker did not report its actual distinct crate closure"
+    );
+
+    let assembly = b"#![no_std]\ncore::arch::global_asm!(\".text\");\npub fn answer() -> u64 { 42 }\n";
+    let assembly_request = execution_request(&capability, assembly)?;
+    compile_locally(&rustc, &assembly_request.operation, assembly)?;
+    let assembly_result = run_worker(worker, &rustc, &assembly_request, assembly, false)?;
+    anyhow::ensure!(
+        assembly_result.header.status == "rejected" && assembly_result.frames.is_empty(),
+        "worker admitted outputs without assembly input closure: {:?}",
+        assembly_result.header
+    );
+    anyhow::ensure!(
+        assembly_result.header.reason.as_deref() == Some("compiler_native_input_evidence_unavailable"),
+        "worker lost its explicit native input rejection"
     );
 
     let cancelled = run_worker(worker, &rustc, &request, source, true)?;
@@ -389,12 +462,21 @@ fn first_seen_compiler_environment_executes_locally_before_distribution() -> Res
 #[test]
 fn ordinary_cargo_distributes_module_trees_and_exact_rust_dependencies() -> Result<()> {
     let workspace = crate::helpers::TestWorkspace::new()?;
-    let dependency = workspace.add_crate("task10-dep", "0.1.0", &[])?;
+    let leaf = workspace.add_crate("task10-leaf", "0.1.0", &[])?;
+    fs::write(leaf.join("src/lib.rs"), "pub fn value() -> u64 { 41 }\n")?;
+    let dependency = workspace.add_crate(
+        "task10-dep",
+        "0.1.0",
+        &[("task10-leaf", "{ path = \"../task10-leaf\" }")],
+    )?;
     fs::write(
         dependency.join("src/lib.rs"),
         "pub mod nested;\npub fn dependency_value() -> u64 { nested::value() }\n",
     )?;
-    fs::write(dependency.join("src/nested.rs"), "pub fn value() -> u64 { 41 }\n")?;
+    fs::write(
+        dependency.join("src/nested.rs"),
+        "pub fn value() -> u64 { task10_leaf::value() }\n",
+    )?;
     let consumer = workspace.add_crate("task10-app", "0.1.0", &[("task10-dep", "{ path = \"../task10-dep\" }")])?;
     fs::write(
         consumer.join("src/lib.rs"),
@@ -483,8 +565,8 @@ fn ordinary_cargo_distributes_module_trees_and_exact_rust_dependencies() -> Resu
         .filter(|event| event["status"] == "hit" && event["reason"] == "verified_distributed_execution")
         .count();
     anyhow::ensure!(
-        hits == 2,
-        "module/dependency build did not distribute both Rust actions: {events:?}"
+        hits == 3,
+        "module/dependency build did not distribute all three Rust actions: {events:?}"
     );
 
     fs::remove_dir_all(workspace.path.join("target"))?;
@@ -535,11 +617,12 @@ fn ordinary_cargo_distributes_module_trees_and_exact_rust_dependencies() -> Resu
         .filter(|event| event["action_key"].is_string())
         .collect::<Vec<_>>();
     anyhow::ensure!(
-        compiler_actions.len() >= 4
+        compiler_actions.len() >= 6
             && compiler_actions
                 .iter()
                 .all(|event| event["status"] == "hit" && event["reason"] == "verified_distributed_execution"),
-        "metadata/test compiler actions did not all use verified distributed execution: {check_events:?}"
+        "metadata/test compiler actions did not all use verified distributed execution: {check_events:?}; stderr: {}",
+        String::from_utf8_lossy(&distributed_check.stderr)
     );
     Ok(())
 }
@@ -560,7 +643,7 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
             .arg(&rustc)
             .arg(bubblewrap)
             .output()
-            .is_ok_and(|output| output.status.success() && output.stdout == b"3\n" && output.stderr.is_empty());
+            .is_ok_and(|output| output.status.success() && output.stdout == b"5\n" && output.stderr.is_empty());
     let mut server_command = Command::new(worker);
     server_command.arg(if sandboxed {
         "serve-mtls-bubblewrap"
@@ -635,7 +718,7 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
         .arg(&rustc)
         .arg(endpoint)
         .arg("localhost")
-        .arg(format!("worker-capability-v3:sha256:{}", "0".repeat(64)))
+        .arg(format!("worker-capability-v5:sha256:{}", "0".repeat(64)))
         .arg(&identity.authority_certificate)
         .arg(&identity.client_certificate)
         .arg(&identity.client_private_key)
@@ -658,7 +741,7 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
         qualified.status.success(),
         "mTLS client qualification failed: {qualified:?}"
     );
-    anyhow::ensure!(qualified.stdout == b"3\n", "mTLS qualification contaminated stdout");
+    anyhow::ensure!(qualified.stdout == b"5\n", "mTLS qualification contaminated stdout");
 
     let workspace = crate::helpers::TestWorkspace::new_single_crate("mtls_front_door", "0.1.0")?;
     let cargo_home = tempfile::tempdir()?;
@@ -1020,6 +1103,72 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
     anyhow::ensure!(installation["distributed_placement_history"]["local_observations"] == 1);
     anyhow::ensure!(installation["distributed_placement_history"]["remote_observations"] == 2);
 
+    let receipt_path = installed.join("setup.json");
+    let current_receipt = fs::read(&receipt_path)?;
+    let receipt: serde_json::Value = serde_json::from_slice(&current_receipt)?;
+    let current_pin = receipt["distributed"]["mutual_tls"]["worker_capability_id"]
+        .as_str()
+        .context("installed receipt has no worker capability pin")?;
+    let stale_receipt = std::str::from_utf8(&current_receipt)?.replacen(
+        current_pin,
+        &format!("worker-capability-v3:sha256:{}", "a".repeat(64)),
+        1,
+    );
+    fs::write(&receipt_path, stale_receipt)?;
+    let installation_files = || {
+        use std::os::unix::fs::MetadataExt as _;
+        let mut paths = vec![cargo_home.path().join("config.toml")];
+        for directory in [
+            &installed,
+            &cargo_home.path().join("cargo-rail/cache-profiles-v1/profiles"),
+        ] {
+            for entry in fs::read_dir(directory)? {
+                let path = entry?.path();
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        paths
+            .into_iter()
+            .map(|path| {
+                let metadata = fs::metadata(&path)?;
+                Ok((
+                    path,
+                    (
+                        metadata.ino(),
+                        metadata.len(),
+                        metadata.ctime(),
+                        metadata.ctime_nsec(),
+                        metadata.mode(),
+                    ),
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()
+    };
+    let before_stale_setup = installation_files()?;
+    for check in [true, false] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-rail"));
+        command
+            .current_dir(&workspace.path)
+            .args(["rail", "cache", "setup", "--max-size", "100MiB"])
+            .env("CARGO_HOME", cargo_home.path());
+        if check {
+            command.arg("--check");
+        }
+        let refused = command.output()?;
+        anyhow::ensure!(
+            !refused.status.success()
+                && String::from_utf8_lossy(&refused.stderr).contains("worker pin uses an incompatible protocol"),
+            "stale worker pin was not rejected during planning: {refused:?}"
+        );
+        anyhow::ensure!(
+            installation_files()? == before_stale_setup,
+            "stale worker rejection changed installation or profile files"
+        );
+    }
+    fs::write(&receipt_path, current_receipt)?;
+
     let installed_key_bytes = fs::read(&installed_key)?;
     fs::write(&installed_key, b"drifted installed identity")?;
     let status = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
@@ -1335,7 +1484,7 @@ fn mutually_authenticated_idle_connection(
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_root_certificates(roots)
         .with_client_auth_cert(client_chain, client_private_key)?;
-    config.alpn_protocols = vec![b"cargo-rail-execution/3".to_vec()];
+    config.alpn_protocols = vec![b"cargo-rail-execution/5".to_vec()];
     let socket = std::net::TcpStream::connect(endpoint)?;
     socket.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
     socket.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
@@ -1589,7 +1738,7 @@ fn digest(bytes: &[u8]) -> String {
 }
 
 fn capability_identity(capability: &WorkerCapability) -> Result<String> {
-    let encoded = serde_json::to_vec(&(
+    let native = (
         &capability.architecture,
         &capability.endianness,
         &capability.environment_contract,
@@ -1606,9 +1755,13 @@ fn capability_identity(capability: &WorkerCapability) -> Result<String> {
         &capability.rustc_verbose_version,
         &capability.sysroot_identity,
         &capability.working_directory_contract,
-    ))?;
+    );
+    let encoded = match &capability.analysis {
+        None => serde_json::to_vec(&native)?,
+        Some(analysis) => serde_json::to_vec(&("rust-analysis-v1", analysis, &native))?,
+    };
     Ok(format!(
-        "worker-capability-v3:sha256:{}",
+        "worker-capability-v5:sha256:{}",
         ContentDigest::sha256(&encoded)
     ))
 }
@@ -1656,7 +1809,8 @@ fn execution_request_with_emission(
         metadata_name: "libdistributed_fixture-0123456789abcdef.rmeta".to_string(),
         operation_class: "rust_library".to_string(),
         output_relative_directory: "target/release/deps".to_string(),
-        output_dependency_search: true,
+        dependency_searches: vec!["target/release/deps".into()],
+        source_working_directory: None,
         rlib_name: (emission == "metadata_and_link")
             .then(|| "libdistributed_fixture-0123456789abcdef.rlib".to_string()),
         source_virtual_path: format!("{VIRTUAL_WORKSPACE}/src/lib.rs"),
@@ -1669,15 +1823,15 @@ fn execution_request_with_emission(
         kind: "source".to_string(),
         virtual_path: format!("{VIRTUAL_WORKSPACE}/src/lib.rs"),
     }];
-    let action = serde_json::to_vec(&(&capability.capability_id, &inputs, limits, &operation, 3_u32))?;
+    let action = serde_json::to_vec(&(&capability.capability_id, &inputs, limits, &operation, 5_u32))?;
     Ok(ExecutionRequest {
-        action_id: format!("execution-action-v3:sha256:{}", ContentDigest::sha256(&action)),
+        action_id: format!("execution-action-v5:sha256:{}", ContentDigest::sha256(&action)),
         capability_id: capability.capability_id.clone(),
         inputs,
-        lease_id: format!("execution-lease-v3:sha256:{}", "a".repeat(64)),
+        lease_id: format!("execution-lease-v5:sha256:{}", "a".repeat(64)),
         limits,
         operation,
-        protocol_version: 3,
+        protocol_version: 5,
         workload_identity: format!("workload-v1:sha256:{}", "b".repeat(64)),
     })
 }
@@ -1799,9 +1953,9 @@ fn assert_success_authority(response: &ExecutionResponse, request: &ExecutionReq
         .map(|frame| frame.slot.as_str())
         .collect::<Vec<_>>();
     let expected = if request.operation.emission == "metadata" {
-        &["dep_info", "metadata", "stderr", "stdout"][..]
+        &["dep_info", "metadata", "native_inputs", "stderr", "stdout"][..]
     } else {
-        &["dep_info", "metadata", "rlib", "stderr", "stdout"][..]
+        &["dep_info", "metadata", "native_inputs", "rlib", "stderr", "stdout"][..]
     };
     anyhow::ensure!(slots == expected, "slot order changed");
     Ok(())
@@ -1815,7 +1969,7 @@ fn assert_frame_digests(response: &DecodedResponse) -> Result<()> {
             "{} digest mismatch",
             descriptor.slot
         );
-        let expected_mode = if matches!(descriptor.slot.as_str(), "stderr" | "stdout") {
+        let expected_mode = if matches!(descriptor.slot.as_str(), "native_inputs" | "stderr" | "stdout") {
             0
         } else {
             0o644
@@ -1891,10 +2045,10 @@ fn compile_locally(
     command
         .arg(format!("-Cmetadata={}", operation.metadata))
         .arg(format!("-Cextra-filename={}", operation.extra_filename));
-    if operation.output_dependency_search {
+    for search in &operation.dependency_searches {
         command
             .arg("-L")
-            .arg(format!("dependency={}", output_directory.display()));
+            .arg(format!("dependency={}", workspace_directory.join(search).display()));
     }
     command
         .arg("--remap-path-prefix")

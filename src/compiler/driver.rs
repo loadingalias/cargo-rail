@@ -20,6 +20,7 @@ use crate::cargo::ToolchainIdentity;
 use crate::compiler::facts::{
     COMPILER_FACT_PROTOCOL_VERSION, COMPILER_IDENTITY_PREFIX, CompilerFactProducerAuthority, DRIVER_IDENTITY_PREFIX,
 };
+use crate::compiler::native_input_protocol::{NATIVE_INPUT_PROTOCOL_VERSION, NATIVE_INPUT_PROTOCOL_VERSION_ARGUMENT};
 use crate::error::{RailError, RailResult};
 use crate::source::ContentDigest;
 use crate::workspace::WorkspaceSnapshot;
@@ -31,6 +32,7 @@ const FACT_DRIVER_PROTOCOL_ARGUMENT: &str = "--cargo-rail-fact-protocol-version"
 #[cfg(windows)]
 const MAX_DOCTEST_EXECUTABLE_BYTES: u64 = 1024 * 1024 * 1024;
 const COMPILED_TARGET: &str = env!("CARGO_RAIL_COMPILED_TARGET");
+pub(crate) const COMPILER_DRIVER_SOURCE_FILE_NAME: &str = "cargo-rail-fact-driver-source-v1.json";
 
 const FACT_DRIVER_FILE: Option<&str> = option_env!("CARGO_RAIL_FACT_DRIVER_FILE");
 const FACT_DRIVER_SHA256: Option<&str> = option_env!("CARGO_RAIL_FACT_DRIVER_SHA256");
@@ -96,12 +98,40 @@ struct SelectedCompilerLibrary {
     rustup_toolchain: Option<String>,
 }
 
+/// Captured compiler selection needed to prepare the shared driver component.
+struct CompilerDriverToolchain<'a> {
+    current_directory: &'a Path,
+    cargo_program: &'a OsStr,
+    rustc_verbose: &'a str,
+    rustc_sysroot: &'a Path,
+    install_development_support: bool,
+}
+
+impl<'a> CompilerDriverToolchain<'a> {
+    fn surface(snapshot: &'a WorkspaceSnapshot) -> Self {
+        Self {
+            current_directory: snapshot.cargo_current_dir(),
+            cargo_program: snapshot.toolchain().cargo_program(),
+            rustc_verbose: snapshot.toolchain().direct_rustc_verbose_version(),
+            rustc_sysroot: snapshot.toolchain().direct_rustc_sysroot(),
+            install_development_support: true,
+        }
+    }
+}
+
 /// Exact sibling component bytes accepted by embedded release authority.
 pub(crate) struct CompilerFactDriverComponent {
     authority: CompilerFactDriverAuthority,
     path: PathBuf,
     compiler_library_directory: PathBuf,
     compiler_library_path: PathBuf,
+}
+
+/// One existing sibling component authenticated for cache installation.
+pub(crate) struct CompilerDriverInstallationComponent {
+    pub(crate) source_path: PathBuf,
+    pub(crate) content_digest: String,
+    pub(crate) executable: bool,
 }
 
 /// Authenticated Surface producer readiness for one exact selected toolchain.
@@ -119,11 +149,9 @@ pub(crate) struct CompilerFactDriverReadiness {
 /// Runtime-library bytes authenticated once and retained through doctest staging.
 struct AuthenticatedCompilerLibrary {
     path: PathBuf,
-    #[cfg(unix)]
     file: File,
     #[cfg(unix)]
     generation: Vec<u8>,
-    #[cfg(unix)]
     bytes: u64,
 }
 
@@ -133,6 +161,10 @@ pub(crate) struct CompilerFactDriverExecutionCapability {
     identity: String,
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     _file: File,
+    #[cfg(target_os = "linux")]
+    _directory: Option<tempfile::TempDir>,
+    #[cfg(target_os = "linux")]
+    runtime_layout: Option<(File, Vec<u8>)>,
     #[cfg(windows)]
     _directory_file: File,
     #[cfg(windows)]
@@ -152,16 +184,10 @@ pub(crate) struct PreparedCompilerFactDriver {
     compiler_library_digest: String,
 }
 
-/// Authenticated fact-driver capability retained by one distributed worker.
-///
-/// This deliberately supports only an embedded release component. A worker
-/// has no workspace snapshot or authority to install/build a component while
-/// advertising a machine capability.
-pub(crate) struct PreparedDistributedCompilerFactDriver {
+/// Authenticated shared driver retained for one native compiler invocation.
+pub(crate) struct PreparedNativeCompilerDriver {
     execution: CompilerFactDriverExecutionCapability,
-    readiness: CompilerFactDriverReadiness,
-    compiler_library_directory: PathBuf,
-    _compiler_library: AuthenticatedCompilerLibrary,
+    compiler_library: AuthenticatedCompilerLibrary,
 }
 
 /// Private stable-rustdoc sysroot view whose test builder is cargo-rail.
@@ -194,6 +220,44 @@ pub(crate) struct CompilerFactDoctestSysroot {
 }
 
 impl CompilerFactDriverAuthority {
+    /// Authenticate only the optional shared-driver components embedded by the builder.
+    pub(crate) fn installation_components(
+        cargo_rail_executable: &Path,
+    ) -> RailResult<Vec<CompilerDriverInstallationComponent>> {
+        let authority = Self::embedded()?;
+        let source = CompilerFactDriverSourceAuthority::embedded()?;
+        if authority.is_none() && source.is_none() {
+            return Ok(Vec::new());
+        }
+        let executable = crate::utils::canonicalize_existing(cargo_rail_executable)?;
+        let directory = executable
+            .parent()
+            .ok_or_else(|| RailError::message("cargo-rail executable has no compiler component directory"))?;
+        let mut components = Vec::new();
+        if let Some(authority) = authority {
+            let path = directory.join(&authority.file_name);
+            authenticate_component_file(&path, &authority.content_digest)?;
+            components.push(CompilerDriverInstallationComponent {
+                source_path: path,
+                content_digest: authority.content_digest,
+                executable: true,
+            });
+        }
+        if let Some(source) = source {
+            let path = directory.join(&source.file_name);
+            let bytes = read_authenticated_component(&path, &source.content_digest, MAX_FACT_DRIVER_SOURCE_BYTES)?;
+            let bundle = serde_json::from_slice(&bytes)?;
+            validate_source_bundle(&bundle)?;
+            components.push(CompilerDriverInstallationComponent {
+                source_path: path,
+                content_digest: source.content_digest,
+                executable: false,
+            });
+        }
+        components.sort_by(|left, right| left.source_path.file_name().cmp(&right.source_path.file_name()));
+        Ok(components)
+    }
+
     /// Describe the embedded distributed-analysis producer without staging or
     /// probing it. Client selection uses this immutable build authority; the
     /// worker separately authenticates and retains the actual component before
@@ -315,7 +379,7 @@ impl CompilerFactDriverAuthority {
     }
 
     fn validate(&self) -> RailResult<()> {
-        if self.file_name != expected_driver_file_name() {
+        if self.file_name != compiler_driver_file_name() {
             return Err(RailError::message(
                 "compiler fact driver build authority has an invalid component file name",
             ));
@@ -363,7 +427,11 @@ impl CompilerFactDriverAuthority {
     }
 
     fn validate_toolchain_identity(&self, toolchain: &ToolchainIdentity) -> RailResult<()> {
-        let selected = RustcVerboseIdentity::parse(toolchain.direct_rustc_verbose_version())?;
+        self.validate_rustc_identity(toolchain.direct_rustc_verbose_version())
+    }
+
+    fn validate_rustc_identity(&self, rustc_verbose: &str) -> RailResult<()> {
+        let selected = RustcVerboseIdentity::parse(rustc_verbose)?;
         if selected.release != self.rustc_release
             || selected.commit != self.rustc_commit
             || selected.host != self.rustc_host
@@ -386,9 +454,13 @@ impl CompilerFactDriverAuthority {
 
     fn calculate_identity(&self) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(b"cargo-rail-compiler-fact-driver-authority-v1\0");
+        hasher.update(b"cargo-rail-compiler-fact-driver-authority-v2\0");
         for (name, value) in [
             (b"protocol".as_slice(), COMPILER_FACT_PROTOCOL_VERSION.to_string()),
+            (
+                b"native-input-protocol".as_slice(),
+                NATIVE_INPUT_PROTOCOL_VERSION.to_string(),
+            ),
             (b"file".as_slice(), self.file_name.clone()),
             (b"content".as_slice(), self.content_digest.clone()),
             (b"provenance".as_slice(), self.provenance.clone()),
@@ -428,9 +500,13 @@ impl CompilerFactDriverAuthority {
         {
             authority.identity
         } else if let Some(source) = CompilerFactDriverSourceAuthority::embedded()? {
-            runtime_compiler_fact_driver(snapshot, &cargo_rail_executable, &source)?
-                .authority
-                .identity
+            runtime_compiler_fact_driver(
+                &CompilerDriverToolchain::surface(snapshot),
+                &cargo_rail_executable,
+                &source,
+            )?
+            .authority
+            .identity
         } else if let Some(authority) = CompilerFactDriverAuthority::embedded()? {
             authority.validate_toolchain_identity(snapshot.toolchain())?;
             authority.identity
@@ -512,7 +588,7 @@ impl CompilerFactDriverSourceAuthority {
     }
 
     fn validate(&self) -> RailResult<()> {
-        if self.file_name != "cargo-rail-fact-driver-source-v1.json" {
+        if self.file_name != COMPILER_DRIVER_SOURCE_FILE_NAME {
             return Err(RailError::message(
                 "compiler fact driver source authority has an invalid component file name",
             ));
@@ -534,7 +610,12 @@ impl CompilerFactDriverComponent {
                 .map(Some);
         }
         if let Some(source) = CompilerFactDriverSourceAuthority::embedded()? {
-            return runtime_compiler_fact_driver(snapshot, cargo_rail_executable, &source).map(Some);
+            return runtime_compiler_fact_driver(
+                &CompilerDriverToolchain::surface(snapshot),
+                cargo_rail_executable,
+                &source,
+            )
+            .map(Some);
         }
         if let Some(authority) = CompilerFactDriverAuthority::embedded()? {
             authority.validate_toolchain_identity(toolchain)?;
@@ -585,7 +666,7 @@ impl CompilerFactDriverComponent {
 }
 
 fn runtime_compiler_fact_driver(
-    snapshot: &WorkspaceSnapshot,
+    toolchain: &CompilerDriverToolchain<'_>,
     cargo_rail_executable: &Path,
     source: &CompilerFactDriverSourceAuthority,
 ) -> RailResult<CompilerFactDriverComponent> {
@@ -598,24 +679,25 @@ fn runtime_compiler_fact_driver(
         read_authenticated_component(&source_path, &source.content_digest, MAX_FACT_DRIVER_SOURCE_BYTES)?;
     let bundle: CompilerFactDriverSourceBundle = serde_json::from_slice(&source_bytes)?;
     validate_source_bundle(&bundle)?;
-    let selected = RustcVerboseIdentity::parse(snapshot.toolchain().direct_rustc_verbose_version())?;
-    let compiler_library = selected_compiler_library(snapshot, selected.host)?;
+    let selected = RustcVerboseIdentity::parse(toolchain.rustc_verbose)?;
+    let compiler_library = selected_compiler_library(toolchain, selected.host)?;
     let compiler_library_path = compiler_library.path.clone();
     let cache_key = ContentDigest::sha256(
         format!(
-            "cargo-rail-runtime-fact-driver-v1\0{}\0{}\0{}\0{}",
+            "cargo-rail-runtime-fact-driver-v2\0{}\0{}\0{}\0{}\0{}",
             source.content_digest,
-            snapshot.toolchain().direct_rustc_verbose_version(),
+            toolchain.rustc_verbose,
             compiler_library.content_digest,
-            COMPILER_FACT_PROTOCOL_VERSION
+            COMPILER_FACT_PROTOCOL_VERSION,
+            NATIVE_INPUT_PROTOCOL_VERSION
         )
         .as_bytes(),
     );
-    let cargo_home = crate::cargo::CargoConfigSnapshot::cargo_home(snapshot.cargo_current_dir())?;
+    let cargo_home = crate::cargo::CargoConfigSnapshot::cargo_home(toolchain.current_directory)?;
     let cargo_home = if cargo_home.is_absolute() {
         cargo_home
     } else {
-        snapshot.cargo_current_dir().join(cargo_home)
+        toolchain.current_directory.join(cargo_home)
     };
     fs::create_dir_all(&cargo_home)?;
     let cargo_home = crate::utils::canonicalize_existing(&cargo_home)?;
@@ -625,7 +707,9 @@ fn runtime_compiler_fact_driver(
     let lock_path = cache.join(format!("driver-{cache_key}.lock"));
     let lock = crate::utils::open_cache_lock_file(&lock_path, true)?;
     lock.lock()?;
-    if let Some(component) = load_cached_runtime_driver(&entry, source, snapshot.toolchain(), &compiler_library_path)? {
+    if let Some(component) =
+        load_cached_runtime_driver(&entry, source, toolchain.rustc_verbose, &compiler_library_path)?
+    {
         return Ok(component);
     }
 
@@ -635,13 +719,26 @@ fn runtime_compiler_fact_driver(
     extract_source_bundle(&bundle, build.path())?;
     let manifest = build.path().join("tools/compiler-fact-driver/Cargo.toml");
     let target = build.path().join("target");
-    let rustc = snapshot
-        .toolchain()
-        .direct_rustc_sysroot()
+    let rustc = toolchain
+        .rustc_sysroot
         .join("bin")
         .join(if cfg!(windows) { "rustc.exe" } else { "rustc" });
+    if !toolchain.install_development_support {
+        let output = Command::new(&rustc)
+            .current_dir(toolchain.current_directory)
+            .arg("-vV")
+            .output()?;
+        if !output.status.success()
+            || !output.stderr.is_empty()
+            || std::str::from_utf8(&output.stdout).map(str::trim) != Ok(toolchain.rustc_verbose.trim())
+        {
+            return Err(RailError::message(
+                "native driver build compiler does not match the captured compiler identity",
+            ));
+        }
+    }
     let rustflags = runtime_fact_driver_rustflags(build.path(), selected.host);
-    let mut command = Command::new(snapshot.toolchain().cargo_program());
+    let mut command = Command::new(toolchain.cargo_program);
     command
         .current_dir(build.path())
         .args(["build", "--release", "--frozen", "--manifest-path"])
@@ -651,8 +748,10 @@ fn runtime_compiler_fact_driver(
         .env("RUSTC_BOOTSTRAP", "cargo_rail_fact_driver")
         .env("CARGO_TARGET_DIR", &target)
         .env("RUSTFLAGS", rustflags)
-        .env_remove("RUSTC_WRAPPER")
-        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env("RUSTC_WRAPPER", "")
+        .env("CARGO_BUILD_RUSTC_WRAPPER", "")
+        .env("RUSTC_WORKSPACE_WRAPPER", "")
+        .env("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "")
         .env_remove("CARGO_ENCODED_RUSTFLAGS");
     if let Some(toolchain) = &compiler_library.rustup_toolchain {
         command.env("RUSTUP_TOOLCHAIN", toolchain);
@@ -677,11 +776,11 @@ fn runtime_compiler_fact_driver(
     let built = target
         .join(selected.host)
         .join("release")
-        .join(expected_driver_file_name());
+        .join(compiler_driver_file_name());
     let built_bytes = read_bounded_build_output(&built, MAX_FACT_DRIVER_BYTES)?;
     let content_digest = format!("sha256:{}", ContentDigest::sha256(&built_bytes));
     let authority = CompilerFactDriverAuthority {
-        file_name: expected_driver_file_name().to_string(),
+        file_name: compiler_driver_file_name().to_string(),
         content_digest,
         provenance: source.provenance.clone(),
         rustc_release: selected.release.to_string(),
@@ -699,13 +798,13 @@ fn runtime_compiler_fact_driver(
     let cached = CachedCompilerFactDriver {
         version: 1,
         source_digest: source.content_digest.clone(),
-        rustc_verbose: snapshot.toolchain().direct_rustc_verbose_version().to_string(),
+        rustc_verbose: toolchain.rustc_verbose.to_string(),
         authority: authority.clone(),
     };
     let staged = tempfile::Builder::new()
         .prefix(".cargo-rail-fact-driver-entry-")
         .tempdir_in(&cache)?;
-    let staged_driver = staged.path().join(expected_driver_file_name());
+    let staged_driver = staged.path().join(compiler_driver_file_name());
     fs::write(&staged_driver, built_bytes)?;
     #[cfg(unix)]
     {
@@ -722,7 +821,7 @@ fn runtime_compiler_fact_driver(
             entry.display()
         ))
     })?;
-    load_cached_runtime_driver(&entry, source, snapshot.toolchain(), &compiler_library_path)?
+    load_cached_runtime_driver(&entry, source, toolchain.rustc_verbose, &compiler_library_path)?
         .ok_or_else(|| RailError::message("selected-toolchain fact driver disappeared after commit"))
 }
 
@@ -820,14 +919,18 @@ fn digest_regular_file(path: &Path, maximum_bytes: u64) -> RailResult<String> {
 
 fn validate_source_bundle(bundle: &CompilerFactDriverSourceBundle) -> RailResult<()> {
     const MAX_SOURCE_FILES: usize = 10_000;
-    const REQUIRED: [&str; 7] = [
+    const REQUIRED: [&str; 11] = [
         ".cargo/config.toml",
         "src/compiler/fact_protocol.rs",
+        "src/compiler/native_input_protocol.rs",
         "tools/compiler-fact-driver/Cargo.lock",
         "tools/compiler-fact-driver/Cargo.toml",
         "tools/compiler-fact-driver/build.rs",
+        "tools/compiler-fact-driver/src/codegen.rs",
         "tools/compiler-fact-driver/src/collection.rs",
         "tools/compiler-fact-driver/src/main.rs",
+        "tools/compiler-fact-driver/src/native_inputs.rs",
+        "tools/compiler-fact-driver/src/output.rs",
     ];
 
     if bundle.version != 1 || bundle.files.is_empty() || bundle.files.len() > MAX_SOURCE_FILES {
@@ -937,13 +1040,20 @@ fn create_private_real_directory(parent: &Path, name: &str) -> RailResult<PathBu
     crate::utils::canonicalize_existing(&path).map_err(Into::into)
 }
 
-fn selected_compiler_library(snapshot: &WorkspaceSnapshot, rustc_host: &str) -> RailResult<SelectedCompilerLibrary> {
-    let sysroot = crate::utils::canonicalize_existing(snapshot.toolchain().direct_rustc_sysroot())?;
-    let rustup_toolchain = rustup_toolchain_for_sysroot(snapshot, &sysroot)?;
+fn selected_compiler_library(
+    toolchain: &CompilerDriverToolchain<'_>,
+    rustc_host: &str,
+) -> RailResult<SelectedCompilerLibrary> {
+    let sysroot = crate::utils::canonicalize_existing(toolchain.rustc_sysroot)?;
+    let rustup_toolchain = if toolchain.install_development_support {
+        rustup_toolchain_for_sysroot(toolchain.current_directory, &sysroot)?
+    } else {
+        None
+    };
     let mut libraries = compiler_libraries(&sysroot)?;
     let mut development_support = compiler_development_support_present(&sysroot, rustc_host)?;
-    if libraries.is_empty() || !development_support {
-        install_selected_rustc_dev(snapshot, &sysroot, rustup_toolchain.as_deref())?;
+    if (libraries.is_empty() || !development_support) && toolchain.install_development_support {
+        install_selected_rustc_dev(toolchain.current_directory, &sysroot, rustup_toolchain.as_deref())?;
         libraries = compiler_libraries(&sysroot)?;
         development_support = compiler_development_support_present(&sysroot, rustc_host)?;
     }
@@ -1025,8 +1135,8 @@ fn ensure_authority_compiler_library(
         Ok(_) => {}
         Err(error) if error.kind() == ErrorKind::NotFound => {
             let sysroot = crate::utils::canonicalize_existing(snapshot.toolchain().direct_rustc_sysroot())?;
-            let rustup_toolchain = rustup_toolchain_for_sysroot(snapshot, &sysroot)?;
-            install_selected_rustc_dev(snapshot, &sysroot, rustup_toolchain.as_deref())?;
+            let rustup_toolchain = rustup_toolchain_for_sysroot(snapshot.cargo_current_dir(), &sysroot)?;
+            install_selected_rustc_dev(snapshot.cargo_current_dir(), &sysroot, rustup_toolchain.as_deref())?;
         }
         Err(error) => return Err(error.into()),
     }
@@ -1034,7 +1144,7 @@ fn ensure_authority_compiler_library(
 }
 
 fn install_selected_rustc_dev(
-    snapshot: &WorkspaceSnapshot,
+    current_directory: &Path,
     sysroot: &Path,
     rustup_toolchain: Option<&str>,
 ) -> RailResult<()> {
@@ -1048,7 +1158,7 @@ fn install_selected_rustc_dev(
         )
     })?;
     let output = Command::new("rustup")
-        .current_dir(snapshot.cargo_current_dir())
+        .current_dir(current_directory)
         .args(["component", "add", "rustc-dev", "--toolchain", toolchain])
         .output()
         .map_err(|error| RailError::message(format!("failed to invoke rustup for selected rustc-dev: {error}")))?;
@@ -1097,7 +1207,7 @@ fn compiler_libraries(sysroot: &Path) -> RailResult<Vec<PathBuf>> {
     Ok(libraries)
 }
 
-fn rustup_toolchain_for_sysroot(snapshot: &WorkspaceSnapshot, sysroot: &Path) -> RailResult<Option<String>> {
+fn rustup_toolchain_for_sysroot(current_directory: &Path, sysroot: &Path) -> RailResult<Option<String>> {
     let Some(toolchains) = sysroot.parent() else {
         return Ok(None);
     };
@@ -1111,7 +1221,7 @@ fn rustup_toolchain_for_sysroot(snapshot: &WorkspaceSnapshot, sysroot: &Path) ->
         return Ok(None);
     }
     let output = match Command::new("rustup")
-        .current_dir(snapshot.cargo_current_dir())
+        .current_dir(current_directory)
         .args(["run", name, "rustc", "--print", "sysroot"])
         .output()
     {
@@ -1133,7 +1243,7 @@ fn rustup_toolchain_for_sysroot(snapshot: &WorkspaceSnapshot, sysroot: &Path) ->
 fn load_cached_runtime_driver(
     entry: &Path,
     source: &CompilerFactDriverSourceAuthority,
-    toolchain: &ToolchainIdentity,
+    rustc_verbose: &str,
     compiler_library_path: &Path,
 ) -> RailResult<Option<CompilerFactDriverComponent>> {
     let metadata = match fs::symlink_metadata(entry) {
@@ -1151,16 +1261,16 @@ fn load_cached_runtime_driver(
     let cached: CachedCompilerFactDriver = serde_json::from_slice(&manifest_bytes)?;
     if cached.version != 1
         || cached.source_digest != source.content_digest
-        || cached.rustc_verbose != toolchain.direct_rustc_verbose_version()
+        || cached.rustc_verbose != rustc_verbose
         || serde_json::to_vec(&cached)? != manifest_bytes
     {
         return Err(RailError::message(
             "selected-toolchain fact driver cache authority is incompatible",
         ));
     }
-    cached.authority.validate_toolchain_identity(toolchain)?;
+    cached.authority.validate_rustc_identity(rustc_verbose)?;
     authenticate_component_file(
-        &entry.join(expected_driver_file_name()),
+        &entry.join(compiler_driver_file_name()),
         &cached.authority.content_digest,
     )?;
     if digest_regular_file(compiler_library_path, MAX_COMPILER_LIBRARY_BYTES)?
@@ -1176,7 +1286,7 @@ fn load_cached_runtime_driver(
             .ok_or_else(|| RailError::message("compiler fact runtime library has no parent"))?
             .to_path_buf(),
         compiler_library_path: compiler_library_path.to_path_buf(),
-        path: entry.join(expected_driver_file_name()),
+        path: entry.join(compiler_driver_file_name()),
         authority: cached.authority,
     }))
 }
@@ -1188,6 +1298,23 @@ impl CompilerFactDriverExecutionCapability {
 
     pub(crate) fn identity(&self) -> &str {
         &self.identity
+    }
+
+    fn native_command(&self, fallback_library_path: Option<&OsStr>) -> Command {
+        #[cfg(target_os = "macos")]
+        if let Some(value) = fallback_library_path {
+            // sandbox-exec strips DYLD_* at its own entry. Apply Cargo's exact
+            // fallback value inside the sandbox so compile-time environment
+            // reads are unchanged; the captured runtime resolves via @rpath.
+            let mut assignment = std::ffi::OsString::from("DYLD_FALLBACK_LIBRARY_PATH=");
+            assignment.push(value);
+            let mut command = self.cargo_command(OsStr::new("/usr/bin/env"));
+            command.arg(assignment).arg(&self.program);
+            return command;
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = fallback_library_path;
+        self.cargo_command(self.program.as_os_str())
     }
 
     /// Launch Cargo inside the platform guard that protects this capability.
@@ -1282,10 +1409,125 @@ impl PreparedCompilerFactDriver {
     }
 }
 
-impl PreparedDistributedCompilerFactDriver {
+impl PreparedNativeCompilerDriver {
+    /// Prepare the shared driver from an already captured native compiler selection.
+    /// Missing authority leaves native compilation on the ordinary rustc path.
+    pub(crate) fn prepare(
+        current_directory: &Path,
+        rustc_verbose: &str,
+        rustc_sysroot: &Path,
+        staging_parent: &Path,
+    ) -> RailResult<Option<Self>> {
+        if !cfg!(any(target_os = "macos", target_os = "linux")) {
+            return Ok(None);
+        }
+        // Runtime overrides beyond Cargo's fallback path need their own loader evidence.
+        #[cfg(target_os = "macos")]
+        if std::env::vars_os()
+            .any(|(name, _)| name.as_encoded_bytes().starts_with(b"DYLD_") && name != "DYLD_FALLBACK_LIBRARY_PATH")
+        {
+            return Ok(None);
+        }
+        let authority = CompilerFactDriverAuthority::embedded()?;
+        let source = CompilerFactDriverSourceAuthority::embedded()?;
+        if authority.is_none() && source.is_none() {
+            return Ok(None);
+        }
+        let selected = RustcVerboseIdentity::parse(rustc_verbose)?;
+        if selected.host != COMPILED_TARGET {
+            return Ok(None);
+        }
+        let executable = std::env::current_exe()
+            .map_err(|error| RailError::message(format!("failed to locate native compiler wrapper: {error}")))?;
+        let rustc_sysroot = crate::utils::canonicalize_existing(rustc_sysroot)?;
+        let component = if let Some(authority) = authority
+            && authority.validate_rustc_identity(rustc_verbose).is_ok()
+        {
+            let compiler_library_path = rustc_sysroot.join(&authority.compiler_library);
+            let compiler_library_directory = compiler_library_path
+                .parent()
+                .ok_or_else(|| RailError::message("native compiler runtime library has no parent"))?
+                .to_path_buf();
+            CompilerFactDriverComponent::discover_with_authority(&authority, &executable, compiler_library_directory)?
+        } else if let Some(source) = source {
+            let cargo = rustc_sysroot
+                .join("bin")
+                .join(if cfg!(windows) { "cargo.exe" } else { "cargo" });
+            let toolchain = CompilerDriverToolchain {
+                current_directory,
+                cargo_program: cargo.as_os_str(),
+                rustc_verbose,
+                rustc_sysroot: &rustc_sysroot,
+                install_development_support: false,
+            };
+            runtime_compiler_fact_driver(&toolchain, &executable, &source)?
+        } else {
+            return Ok(None);
+        };
+        let compiler_library = authenticate_compiler_library(
+            &component.compiler_library_path,
+            &component.authority.compiler_library_digest,
+        )?;
+        let Some(execution) = stage_native_component(&component, staging_parent)? else {
+            return Ok(None);
+        };
+        let output = execution
+            .native_command(std::env::var_os("DYLD_FALLBACK_LIBRARY_PATH").as_deref())
+            .arg(NATIVE_INPUT_PROTOCOL_VERSION_ARGUMENT)
+            .output()?;
+        let expected_protocol = NATIVE_INPUT_PROTOCOL_VERSION.to_string();
+        if !output.status.success()
+            || !output.stderr.is_empty()
+            || std::str::from_utf8(&output.stdout).map(str::trim) != Ok(expected_protocol.as_str())
+        {
+            return Err(RailError::message(
+                "native compiler driver failed its transparent protocol readiness probe",
+            ));
+        }
+        let prepared = Self {
+            execution,
+            compiler_library,
+        };
+        prepared.revalidate()?;
+        Ok(Some(prepared))
+    }
+
+    pub(crate) fn command(&self, fallback_library_path: Option<&OsStr>) -> RailResult<Command> {
+        self.revalidate()?;
+        Ok(self.execution.native_command(fallback_library_path))
+    }
+
+    pub(crate) fn revalidate(&self) -> RailResult<()> {
+        #[cfg(target_os = "linux")]
+        if let Some((directory, generation)) = &self.execution.runtime_layout
+            && crate::utils::stable_open_directory_generation(directory).as_ref() != Some(generation)
+        {
+            return Err(RailError::message("native compiler driver runtime layout changed"));
+        }
+        #[cfg(unix)]
+        if crate::utils::stable_open_file_generation(&self.compiler_library.file).as_ref()
+            != Some(&self.compiler_library.generation)
+        {
+            return Err(RailError::message("native compiler driver runtime library changed"));
+        }
+        if !crate::utils::opened_file_matches_path(
+            &self.compiler_library.file,
+            &self.compiler_library.path,
+            self.compiler_library.bytes,
+        )? {
+            return Err(RailError::message("native compiler driver runtime selection changed"));
+        }
+        Ok(())
+    }
+}
+
+impl CompilerFactDriverAuthority {
     /// Authenticate an already installed release component against the exact
     /// compiler implementation selected by the worker.
-    pub(crate) fn prepare(rustc_verbose: &str, rustc_sysroot: &Path) -> RailResult<Option<Self>> {
+    pub(crate) fn authenticated_distributed_readiness(
+        rustc_verbose: &str,
+        rustc_sysroot: &Path,
+    ) -> RailResult<Option<CompilerFactDriverReadiness>> {
         let Some(authority) = CompilerFactDriverAuthority::embedded()? else {
             return Ok(None);
         };
@@ -1319,6 +1561,8 @@ impl PreparedDistributedCompilerFactDriver {
             ));
         }
         probe_fact_driver_protocol(&execution, &compiler_library_directory)?;
+        drop(execution);
+        drop(compiler_library);
         let readiness = CompilerFactDriverReadiness {
             protocol: COMPILER_FACT_PROTOCOL_VERSION,
             driver_identity: authority.identity,
@@ -1328,24 +1572,7 @@ impl PreparedDistributedCompilerFactDriver {
             rustc_commit: authority.rustc_commit,
             rustc_host: authority.rustc_host,
         };
-        Ok(Some(Self {
-            execution,
-            readiness,
-            compiler_library_directory,
-            _compiler_library: compiler_library,
-        }))
-    }
-
-    pub(crate) fn readiness(&self) -> &CompilerFactDriverReadiness {
-        &self.readiness
-    }
-
-    pub(crate) fn program(&self) -> &Path {
-        self.execution.program()
-    }
-
-    pub(crate) fn compiler_library_directory(&self) -> &Path {
-        &self.compiler_library_directory
+        Ok(Some(readiness))
     }
 }
 
@@ -1884,6 +2111,9 @@ fn authenticate_compiler_library(path: &Path, expected_digest: &str) -> RailResu
             "compiler fact runtime library is not a bounded real file; install the exact rustc-dev component",
         ));
     }
+    #[cfg(windows)]
+    let mut file = crate::windows_fs::open_for_execution_guard(path)?;
+    #[cfg(not(windows))]
     let mut file = File::open(path)?;
     if !crate::utils::opened_file_matches_path(&file, path, metadata.len())? {
         return Err(RailError::message(
@@ -1932,11 +2162,9 @@ fn authenticate_compiler_library(path: &Path, expected_digest: &str) -> RailResu
     };
     Ok(AuthenticatedCompilerLibrary {
         path: path.to_path_buf(),
-        #[cfg(unix)]
         file,
         #[cfg(unix)]
         generation,
-        #[cfg(unix)]
         bytes,
     })
 }
@@ -2004,13 +2232,43 @@ fn transfer_authenticated_component(
 
 #[cfg(target_os = "linux")]
 fn stage_component(component: &CompilerFactDriverComponent) -> RailResult<CompilerFactDriverExecutionCapability> {
+    stage_linux_component(component, None)
+}
+
+#[cfg(target_os = "linux")]
+fn stage_native_component(
+    component: &CompilerFactDriverComponent,
+    staging_parent: &Path,
+) -> RailResult<Option<CompilerFactDriverExecutionCapability>> {
+    stage_linux_component(component, Some(staging_parent)).map(Some)
+}
+
+#[cfg(target_os = "linux")]
+fn stage_linux_component(
+    component: &CompilerFactDriverComponent,
+    native_staging_parent: Option<&Path>,
+) -> RailResult<CompilerFactDriverExecutionCapability> {
     use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::PermissionsExt as _;
 
     let mut builder = tempfile::Builder::new();
     builder.prefix("cargo-rail-fact-driver-");
     builder.permissions(fs::Permissions::from_mode(0o700));
-    let mut staged = builder.tempfile()?;
+    let directory = native_staging_parent
+        .map(|parent| {
+            tempfile::Builder::new()
+                .prefix("cargo-rail-fact-driver-")
+                .tempdir_in(parent)
+        })
+        .transpose()?;
+    let mut staged = if let Some(directory) = &directory {
+        let bin = directory.path().join("bin");
+        fs::create_dir(&bin)?;
+        std::os::unix::fs::symlink(&component.compiler_library_directory, directory.path().join("lib"))?;
+        builder.tempfile_in(bin)?
+    } else {
+        builder.tempfile()?
+    };
     let bytes = transfer_authenticated_component(
         &component.path,
         &component.authority.content_digest,
@@ -2036,19 +2294,64 @@ fn stage_component(component: &CompilerFactDriverComponent) -> RailResult<Compil
     })?;
     let descriptor = file.as_raw_fd();
     let program = PathBuf::from(format!("/proc/self/fd/{descriptor}"));
+    let runtime_layout = directory
+        .as_ref()
+        .map(|directory| {
+            let file = File::open(directory.path())?;
+            let generation = crate::utils::stable_open_directory_generation(&file)
+                .ok_or_else(|| RailError::message("native compiler runtime layout has no stable generation"))?;
+            Ok::<_, RailError>((file, generation))
+        })
+        .transpose()?;
     Ok(CompilerFactDriverExecutionCapability {
         program,
         identity: component.authority.identity.clone(),
         _file: file,
+        _directory: directory,
+        runtime_layout,
     })
 }
 
 #[cfg(target_os = "macos")]
 fn stage_component(component: &CompilerFactDriverComponent) -> RailResult<CompilerFactDriverExecutionCapability> {
+    stage_macos_component(component, None)
+}
+
+#[cfg(target_os = "macos")]
+fn stage_native_component(
+    component: &CompilerFactDriverComponent,
+    staging_parent: &Path,
+) -> RailResult<Option<CompilerFactDriverExecutionCapability>> {
+    stage_macos_component(component, Some(staging_parent)).map(Some)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn stage_native_component(
+    _component: &CompilerFactDriverComponent,
+    _staging_parent: &Path,
+) -> RailResult<Option<CompilerFactDriverExecutionCapability>> {
+    Ok(None)
+}
+
+#[cfg(target_os = "macos")]
+fn stage_macos_component(
+    component: &CompilerFactDriverComponent,
+    native_staging_parent: Option<&Path>,
+) -> RailResult<CompilerFactDriverExecutionCapability> {
     use std::os::unix::fs::PermissionsExt as _;
 
-    let directory = tempfile::Builder::new().prefix("cargo-rail-fact-driver-").tempdir()?;
-    let path = directory.path().join(expected_driver_file_name());
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("cargo-rail-fact-driver-");
+    let directory = native_staging_parent.map_or_else(|| builder.tempdir(), |parent| builder.tempdir_in(parent))?;
+    let executable_directory = if native_staging_parent.is_some() {
+        let bin = directory.path().join("bin");
+        fs::create_dir(&bin)?;
+        std::os::unix::fs::symlink(&component.compiler_library_directory, directory.path().join("lib"))?;
+        bin
+    } else {
+        directory.path().to_path_buf()
+    };
+    let path = executable_directory.join(compiler_driver_file_name());
     let mut destination = fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
     let bytes = transfer_authenticated_component(
         &component.path,
@@ -2066,9 +2369,7 @@ fn stage_component(component: &CompilerFactDriverComponent) -> RailResult<Compil
         ));
     }
     let program = crate::utils::canonicalize_existing(&path)?;
-    let directory_path = program
-        .parent()
-        .ok_or_else(|| RailError::message("staged compiler fact driver has no parent directory"))?;
+    let directory_path = crate::utils::canonicalize_existing(directory.path())?;
     let directory_text = directory_path
         .to_str()
         .filter(|path| !path.contains(['"', '\\', '\n', '\r']))
@@ -2090,7 +2391,7 @@ fn stage_component(component: &CompilerFactDriverComponent) -> RailResult<Compil
 #[cfg(windows)]
 fn stage_component(component: &CompilerFactDriverComponent) -> RailResult<CompilerFactDriverExecutionCapability> {
     let directory = tempfile::Builder::new().prefix("cargo-rail-fact-driver-").tempdir()?;
-    let path = directory.path().join(expected_driver_file_name());
+    let path = directory.path().join(compiler_driver_file_name());
     let mut destination = fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
     let bytes = transfer_authenticated_component(
         &component.path,
@@ -2133,7 +2434,7 @@ fn stage_component(_component: &CompilerFactDriverComponent) -> RailResult<Compi
     ))
 }
 
-fn expected_driver_file_name() -> &'static str {
+pub(crate) fn compiler_driver_file_name() -> &'static str {
     if cfg!(windows) {
         "cargo-rail-fact-driver.exe"
     } else {
@@ -2182,7 +2483,7 @@ mod tests {
 
     fn authority(bytes: &[u8]) -> CompilerFactDriverAuthority {
         CompilerFactDriverAuthority::from_fields([
-            Some(expected_driver_file_name()),
+            Some(compiler_driver_file_name()),
             Some(&digest(bytes)),
             Some(&format!("sha256:{}", "a".repeat(64))),
             Some("1.95.0"),
@@ -2245,6 +2546,62 @@ mod tests {
         assert!(!rejected.exists());
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn native_driver_execution_rejects_runtime_mutation_and_restoration() {
+        let directory = tempfile::tempdir().expect("native driver directory");
+        let executable = directory.path().join("cargo-rail");
+        write_executable(&executable, b"frontend");
+        let driver_path = directory.path().join(compiler_driver_file_name());
+        // Keep the native fixture below the component bound even with full Linux debug information.
+        let source = directory.path().join("driver.rs");
+        fs::write(&source, "fn main() { println!(\"authenticated-native-execution\"); }\n")
+            .expect("native fixture source");
+        let compiled = Command::new("rustc")
+            .arg(&source)
+            .arg("-o")
+            .arg(&driver_path)
+            .output()
+            .expect("compile native fixture");
+        assert!(
+            compiled.status.success(),
+            "native fixture compilation failed: {compiled:?}"
+        );
+        let authority = authority(&fs::read(&driver_path).expect("driver bytes"));
+        let component = CompilerFactDriverComponent::discover_with_authority(
+            &authority,
+            &executable,
+            directory.path().to_path_buf(),
+        )
+        .expect("authenticated driver");
+        let library_path = directory.path().join("compiler-runtime");
+        fs::write(&library_path, b"original runtime").expect("runtime bytes");
+        let library =
+            authenticate_compiler_library(&library_path, &digest(b"original runtime")).expect("authenticated runtime");
+        let prepared = PreparedNativeCompilerDriver {
+            execution: component.stage().expect("staged native executable"),
+            compiler_library: library,
+        };
+        let output = prepared
+            .command(None)
+            .expect("guarded native command")
+            .arg("authenticated-native-execution")
+            .output()
+            .expect("execute native command");
+        assert!(output.status.success(), "native staged command failed: {output:?}");
+        assert_eq!(output.stdout, b"authenticated-native-execution\n");
+        assert!(output.stderr.is_empty());
+
+        fs::write(&library_path, b"modified runtime").expect("change runtime");
+        fs::write(&library_path, b"original runtime").expect("restore runtime bytes");
+        prepared
+            .revalidate()
+            .expect_err("runtime replacement and restoration must invalidate the native driver");
+        prepared
+            .command(None)
+            .expect_err("invalid runtime must prevent execution");
+    }
+
     #[test]
     fn absent_build_authority_is_an_explicit_source_installation_state() {
         assert_eq!(
@@ -2258,11 +2615,15 @@ mod tests {
         let files = [
             ".cargo/config.toml",
             "src/compiler/fact_protocol.rs",
+            "src/compiler/native_input_protocol.rs",
             "tools/compiler-fact-driver/Cargo.lock",
             "tools/compiler-fact-driver/Cargo.toml",
             "tools/compiler-fact-driver/build.rs",
+            "tools/compiler-fact-driver/src/codegen.rs",
             "tools/compiler-fact-driver/src/collection.rs",
             "tools/compiler-fact-driver/src/main.rs",
+            "tools/compiler-fact-driver/src/native_inputs.rs",
+            "tools/compiler-fact-driver/src/output.rs",
             "vendor/serde-1.0.0/Cargo.toml",
         ]
         .into_iter()
@@ -2273,6 +2634,21 @@ mod tests {
         .collect();
         let bundle = CompilerFactDriverSourceBundle { version: 1, files };
         validate_source_bundle(&bundle).expect("closed source inventory");
+
+        let missing_native_protocol = CompilerFactDriverSourceBundle {
+            version: 1,
+            files: bundle
+                .files
+                .iter()
+                .filter(|file| file.path != "src/compiler/native_input_protocol.rs")
+                .map(|file| CompilerFactDriverSourceFile {
+                    path: file.path.clone(),
+                    hex: file.hex.clone(),
+                })
+                .collect(),
+        };
+        validate_source_bundle(&missing_native_protocol)
+            .expect_err("driver source must include its independent native-input protocol");
 
         let mut traversal = bundle.files;
         traversal[0].path = "../outside".to_string();
@@ -2298,7 +2674,7 @@ mod tests {
     #[test]
     fn runtime_build_output_accepts_cargo_hard_links_before_private_staging() {
         let directory = tempfile::tempdir().expect("build output directory");
-        let cargo_output = directory.path().join(expected_driver_file_name());
+        let cargo_output = directory.path().join(compiler_driver_file_name());
         let cargo_cache = directory.path().join("cargo-cache-driver");
         write_executable(&cargo_cache, b"cargo-produced driver");
         fs::hard_link(&cargo_cache, &cargo_output).expect("hard-link Cargo output");
@@ -2332,7 +2708,7 @@ mod tests {
     #[test]
     fn build_authority_is_all_or_nothing_and_target_bound() {
         let incomplete = [
-            Some(expected_driver_file_name()),
+            Some(compiler_driver_file_name()),
             None,
             None,
             None,
@@ -2347,7 +2723,7 @@ mod tests {
         let commit = "b".repeat(40);
         let wrong_target = format!("{COMPILED_TARGET}-wrong");
         CompilerFactDriverAuthority::from_fields([
-            Some(expected_driver_file_name()),
+            Some(compiler_driver_file_name()),
             Some(&digest),
             Some(&digest),
             Some("1.95.0"),
@@ -2382,7 +2758,7 @@ mod tests {
             .path()
             .join(if cfg!(windows) { "cargo-rail.exe" } else { "cargo-rail" });
         write_executable(&executable, b"frontend");
-        let component_path = directory.path().join(expected_driver_file_name());
+        let component_path = directory.path().join(compiler_driver_file_name());
         write_executable(&component_path, b"matched driver");
         let authority = authority(b"matched driver");
 
@@ -2416,7 +2792,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let executable = directory.path().join("cargo-rail");
         write_executable(&executable, b"frontend");
-        let component_path = directory.path().join(expected_driver_file_name());
+        let component_path = directory.path().join(compiler_driver_file_name());
         fs::copy("/bin/echo", &component_path).expect("copy native executable");
         let component_bytes = fs::read(&component_path).expect("read native executable");
         let authority = authority(&component_bytes);
@@ -2456,6 +2832,42 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(output.stdout, b"inherited\n");
+
+        let library_bytes = b"retained compiler library";
+        fs::write(&component.compiler_library_path, library_bytes).expect("compiler library fixture");
+        let native = PreparedNativeCompilerDriver {
+            execution: stage_linux_component(&component, Some(directory.path())).expect("native execution layout"),
+            compiler_library: authenticate_compiler_library(&component.compiler_library_path, &digest(library_bytes))
+                .expect("authenticated compiler library fixture"),
+        };
+        let output = native
+            .command(None)
+            .expect("validated native layout")
+            .arg("native-layout")
+            .output()
+            .expect("execute native layout");
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"native-layout\n");
+        assert!(output.stderr.is_empty());
+
+        let library_alias = native
+            .execution
+            ._directory
+            .as_ref()
+            .expect("retained native directory")
+            .path()
+            .join("lib");
+        let library_target = fs::read_link(&library_alias).expect("runtime alias");
+        fs::remove_file(&library_alias).expect("replace runtime alias");
+        std::os::unix::fs::symlink(library_target, &library_alias).expect("restore identical runtime alias");
+        let error = native
+            .revalidate()
+            .expect_err("runtime alias replacement must invalidate the retained layout");
+        assert!(
+            error
+                .to_string()
+                .contains("native compiler driver runtime layout changed")
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -2464,7 +2876,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let executable = directory.path().join("cargo-rail");
         write_executable(&executable, b"frontend");
-        let component_path = directory.path().join(expected_driver_file_name());
+        let component_path = directory.path().join(compiler_driver_file_name());
         fs::copy(
             std::env::current_exe().expect("current test executable"),
             &component_path,
@@ -2517,7 +2929,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let executable = directory.path().join("cargo-rail.exe");
         write_executable(&executable, b"frontend");
-        let component_path = directory.path().join(expected_driver_file_name());
+        let component_path = directory.path().join(compiler_driver_file_name());
         fs::copy(
             std::env::current_exe().expect("current test executable"),
             &component_path,
@@ -2639,7 +3051,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let executable = directory.path().join("cargo-rail");
         write_executable(&executable, b"frontend");
-        let component_path = directory.path().join(expected_driver_file_name());
+        let component_path = directory.path().join(compiler_driver_file_name());
         let authority = authority(b"matched driver");
 
         let target = directory.path().join("target-driver");

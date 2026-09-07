@@ -529,6 +529,15 @@ pub fn run_cargo_rail(cwd: &Path, args: &[&str]) -> Result<Output> {
     run_cargo_rail_with_env(cwd, args, &[])
 }
 
+/// Select the separately built CLI that embeds no compiler-component authority.
+pub fn source_built_cargo_rail_command(cwd: &Path) -> Result<Command> {
+    let binary = std::env::var_os("CARGO_RAIL_TEST_SOURCE_BINARY")
+        .context("prepare the component-free source CLI with the maintained test recipe")?;
+    let mut command = Command::new(binary);
+    command.current_dir(cwd);
+    Ok(command)
+}
+
 /// Run cargo-rail with explicit environment overrides.
 pub fn run_cargo_rail_with_env(cwd: &Path, args: &[&str], environment: &[(&str, &str)]) -> Result<Output> {
     let mut command = if matches!(args.get(1), Some(&"cache" | &"clean")) {

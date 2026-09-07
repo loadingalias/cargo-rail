@@ -1,6 +1,6 @@
 //! Integration tests for command-specific output format contracts.
 
-use crate::helpers::{TestWorkspace, cargo_rail_command, run_cargo_rail};
+use crate::helpers::{TestWorkspace, cargo_rail_command, isolated_cargo_rail_command, run_cargo_rail};
 use anyhow::Result;
 use std::process::Stdio;
 
@@ -127,7 +127,9 @@ fn test_global_json_rejects_a_distinct_stream_protocol() {
 fn test_surface_github_failure_preserves_the_raw_stream_boundary() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("surface-github-failure")?;
-        let output = run_cargo_rail(&ws.path, &["rail", "surface", "--format", "github"])?;
+        let output = super::helpers::source_built_cargo_rail_command(&ws.path)?
+            .args(["rail", "surface", "--format", "github"])
+            .output()?;
 
         assert_eq!(output.status.code(), Some(2));
         assert!(
@@ -347,14 +349,22 @@ fn test_clean_text_uses_iec_units_and_verbose_owns_paths() {
         std::fs::write(&artifact, vec![b'x'; 2048])?;
         let artifact_root = cargo_rail::utils::canonicalize_existing(&artifact_root)?;
 
-        let normal = run_cargo_rail(&ws.path, &["rail", "clean", "--cache", "--check"])?;
-        assert_eq!(normal.status.code(), Some(1));
+        let normal = isolated_cargo_rail_command(&ws.path)?
+            .args(["rail", "clean", "--cache", "--check"])
+            .output()?;
+        assert_eq!(normal.status.code(), Some(1), "normal clean preview failed: {normal:?}");
         let normal = String::from_utf8(normal.stdout)?;
         assert!(normal.contains("2.0 KiB"), "{normal}");
         assert!(!normal.contains(artifact_root.to_string_lossy().as_ref()), "{normal}");
 
-        let verbose = run_cargo_rail(&ws.path, &["rail", "--verbose", "clean", "--cache", "--check"])?;
-        assert_eq!(verbose.status.code(), Some(1));
+        let verbose = isolated_cargo_rail_command(&ws.path)?
+            .args(["rail", "--verbose", "clean", "--cache", "--check"])
+            .output()?;
+        assert_eq!(
+            verbose.status.code(),
+            Some(1),
+            "verbose clean preview failed: {verbose:?}"
+        );
         let verbose = String::from_utf8(verbose.stdout)?;
         assert!(
             verbose.contains(artifact_root.to_string_lossy().as_ref()),

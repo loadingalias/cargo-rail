@@ -14,8 +14,7 @@ use crate::cargo::CargoConfigSnapshot;
 use crate::error::{RailError, RailResult};
 use crate::source::ContentDigest;
 
-const INSTALLATION_VERSION: u32 = 4;
-const V0_25_INSTALLATION_VERSION: u32 = 3;
+const INSTALLATION_VERSION: u32 = 5;
 const INSTALLATION_DIRECTORY: &str = "compiler-cache-v1";
 const INSTALLATION_LOCK_FILE: &str = "compiler-cache-v1.lock";
 const RECEIPT_FILE: &str = "setup.json";
@@ -83,6 +82,8 @@ pub(crate) struct SetupPlan {
     receipt: InstallationReceipt,
     wrapper: ExecutableSetup,
     worker: ExecutableSetup,
+    compiler_components: Vec<CompilerComponentSetup>,
+    retired_compiler_components: Vec<(InstalledCompilerComponent, Option<String>)>,
     distributed_worker: Option<ExecutableSetup>,
     source_distributed_identity: Option<SourceDistributedIdentity>,
     profile: crate::cache::profile::ProfileSetupPlan,
@@ -99,6 +100,26 @@ struct ExecutableSetup {
     source: PathBuf,
     source_digest: String,
     before: Option<InstalledExecutable>,
+}
+
+struct CompilerComponentSetup {
+    file: ExecutableSetup,
+    executable: bool,
+    mode_matches: bool,
+}
+
+impl CompilerComponentSetup {
+    fn requires_installation(&self) -> bool {
+        self.file.requires_installation() || !self.mode_matches
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstalledCompilerComponent {
+    path: PathBuf,
+    digest: String,
+    generation: Vec<u8>,
 }
 
 impl ExecutableSetup {
@@ -135,6 +156,7 @@ pub(crate) struct RemovalPlan {
     receipt: Option<InstallationReceipt>,
     wrapper_before_digest: Option<String>,
     worker_before_digest: Option<String>,
+    compiler_component_before_digests: Vec<Option<String>>,
     distributed_worker_before_digest: Option<String>,
     distributed_identity_before_digests: Vec<Option<String>>,
 }
@@ -246,12 +268,7 @@ pub(crate) struct InstallationReceipt {
     worker_path: PathBuf,
     worker_digest: String,
     worker_generation: Vec<u8>,
-    #[serde(default, rename = "cache", skip_serializing)]
-    v0_25_cache: Option<LocalCacheSelection>,
-    #[serde(default, rename = "remote", skip_serializing)]
-    v0_25_remote: Option<crate::remote_cache::InstalledRemoteCache>,
-    #[serde(default, rename = "root_portability", skip_serializing)]
-    v0_25_root_portability: Option<InstalledRootPortability>,
+    compiler_components: Vec<InstalledCompilerComponent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     distributed: Option<InstalledDistributedQualification>,
     #[serde(skip)]
@@ -483,7 +500,6 @@ impl InstallationReceipt {
         self.active_profile
             .as_ref()
             .map(crate::cache::profile::InstalledCacheProfile::cache)
-            .or(self.v0_25_cache.as_ref())
             .ok_or_else(|| RailError::message("no workspace cache profile is selected"))
     }
 
@@ -502,10 +518,11 @@ impl InstallationReceipt {
     }
 
     pub(crate) fn root_portability(&self) -> InstalledRootPortability {
-        self.active_profile.as_ref().map_or_else(
-            || self.v0_25_root_portability.unwrap_or_default(),
-            |profile| profile.root_portability().into(),
-        )
+        self.active_profile
+            .as_ref()
+            .map_or(InstalledRootPortability::Physical, |profile| {
+                profile.root_portability().into()
+            })
     }
 
     pub(crate) fn profile(&self) -> RailResult<&crate::cache::profile::InstalledCacheProfile> {
@@ -622,11 +639,7 @@ impl InstallationReceipt {
     }
 
     fn validate(&self) -> RailResult<()> {
-        let predecessor = self.version == V0_25_INSTALLATION_VERSION;
-        if (!predecessor && self.version != INSTALLATION_VERSION)
-            || (predecessor && self.v0_25_cache.is_none())
-            || (!predecessor
-                && (self.v0_25_cache.is_some() || self.v0_25_remote.is_some() || self.v0_25_root_portability.is_some()))
+        if self.version != INSTALLATION_VERSION
             || !valid_hex_digest(&self.authority)
             || !valid_sha256(&self.wrapper_digest)
             || !valid_sha256(&self.worker_digest)
@@ -654,18 +667,6 @@ impl InstallationReceipt {
                 "transparent compiler-cache installation receipt is invalid",
             ));
         }
-        if let Some(cache) = &self.v0_25_cache {
-            LocalCacheSelection::new(
-                cache.base().to_path_buf(),
-                cache.max_bytes(),
-                cache.trust_domain().map(str::to_string),
-            )?;
-        }
-        if let Some(remote) = &self.v0_25_remote {
-            remote
-                .selection()
-                .map_err(|error| RailError::message(format!("installed remote cache policy is invalid: {error}")))?;
-        }
         if let Some(distributed) = &self.distributed
             && (!matches!(
                 distributed.mode.as_str(),
@@ -688,8 +689,43 @@ impl InstallationReceipt {
                 "transparent compiler-cache distributed qualification receipt is invalid",
             ));
         }
+        if self.compiler_components.len() > 2
+            || self
+                .compiler_components
+                .windows(2)
+                .any(|pair| pair[0].path >= pair[1].path)
+            || self.compiler_components.iter().any(|component| {
+                component.path.parent() != self.wrapper_path.parent()
+                    || !matches!(
+                        component.path.file_name().and_then(OsStr::to_str),
+                        Some(name) if name == crate::compiler::driver::compiler_driver_file_name()
+                            || name == crate::compiler::driver::COMPILER_DRIVER_SOURCE_FILE_NAME
+                    )
+                    || !valid_sha256(&component.digest)
+                    || component.generation.is_empty()
+                    || component.generation.len() > 512
+            })
+        {
+            return Err(RailError::message("installed compiler component receipt is invalid"));
+        }
         Ok(())
     }
+}
+
+// A stored pin remains removable/repairable after the execution protocol changes.
+// Setup and runtime activation separately require the current worker capability.
+fn valid_installed_worker_capability(value: &str) -> bool {
+    let Some((version, digest)) = value
+        .strip_prefix("worker-capability-v")
+        .and_then(|value| value.split_once(':'))
+    else {
+        return false;
+    };
+    version
+        .parse::<u32>()
+        .ok()
+        .is_some_and(|number| number > 0 && number.to_string() == version)
+        && valid_sha256(digest)
 }
 
 fn valid_installed_mutual_tls(mutual_tls: &InstalledMutualTlsDirect, worker_path: &Path) -> bool {
@@ -698,7 +734,7 @@ fn valid_installed_mutual_tls(mutual_tls: &InstalledMutualTlsDirect, worker_path
     };
     mutual_tls.endpoint.parse::<std::net::SocketAddr>().is_ok()
         && rustls::pki_types::ServerName::try_from(mutual_tls.server_name.clone()).is_ok()
-        && crate::compiler::distributed::worker_capability_identity_is_valid(&mutual_tls.worker_capability_id)
+        && valid_installed_worker_capability(&mutual_tls.worker_capability_id)
         && [
             (
                 &mutual_tls.authority_certificate,
@@ -1164,6 +1200,48 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
         &worker_path,
         "installed compiler worker",
     )?;
+    let sources =
+        crate::compiler::driver::CompilerFactDriverAuthority::installation_components(&std::env::current_exe()?)?;
+    let mut compiler_components = Vec::with_capacity(sources.len());
+    let mut installed_compiler_components = Vec::with_capacity(sources.len());
+    for source in sources {
+        let name = source
+            .source_path
+            .file_name()
+            .ok_or_else(|| RailError::message("compiler component has no file name"))?;
+        let path = install_directory.join(name);
+        let file = plan_executable_setup(source.source_path, &path, "installed compiler component")?;
+        if file.source_digest != source.content_digest {
+            return Err(RailError::message("compiler component changed after authentication"));
+        }
+        let mode_matches = file.before.is_none() || compiler_component_mode_matches(&path, source.executable)?;
+        let generation = if mode_matches {
+            file.preserved_generation().map_or_else(|| vec![0], <[u8]>::to_vec)
+        } else {
+            vec![0]
+        };
+        installed_compiler_components.push(InstalledCompilerComponent {
+            path,
+            digest: source.content_digest,
+            generation,
+        });
+        compiler_components.push(CompilerComponentSetup {
+            file,
+            executable: source.executable,
+            mode_matches,
+        });
+    }
+    let retired_compiler_components = existing
+        .as_ref()
+        .into_iter()
+        .flat_map(|receipt| &receipt.compiler_components)
+        .filter(|component| {
+            !installed_compiler_components
+                .iter()
+                .any(|selected| selected.path == component.path)
+        })
+        .map(|component| Ok((component.clone(), compiler_component_removal_digest(component)?)))
+        .collect::<RailResult<Vec<_>>>()?;
     let requested_mutual_tls = match (
         request.distributed_endpoint.as_deref(),
         request.distributed_server_name.as_deref(),
@@ -1309,6 +1387,14 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
             .and_then(|receipt| receipt.distributed.as_ref())
             .and_then(|distributed| distributed.mutual_tls.clone())
     };
+    if mutual_tls.as_ref().is_some_and(|identity| {
+        !crate::compiler::distributed::worker_capability_identity_is_valid(&identity.worker_capability_id)
+    }) {
+        return Err(RailError::with_help(
+            "installed distributed worker pin uses an incompatible protocol",
+            "run cache setup with the current worker capability and complete TLS inputs, or preview cache uninstall --check before removing this installation",
+        ));
+    }
     let placement = if mutual_tls.is_some() {
         requested_placement
             .or_else(|| {
@@ -1346,9 +1432,7 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
         worker_path,
         worker_digest: worker.source_digest.clone(),
         worker_generation,
-        v0_25_cache: None,
-        v0_25_remote: None,
-        v0_25_root_portability: None,
+        compiler_components: installed_compiler_components,
         distributed: distributed_worker
             .as_ref()
             .map(|worker| InstalledDistributedQualification {
@@ -1380,21 +1464,6 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
             root_portability: request.root_portability.as_deref(),
             local_only: request.local_only,
         },
-        existing
-            .as_ref()
-            .filter(|existing| existing.version == V0_25_INSTALLATION_VERSION)
-            .map(|existing| {
-                Ok::<_, RailError>(crate::cache::profile::PreProfileSetupInput {
-                    installation_authority: existing.authority.clone(),
-                    cache: existing
-                        .v0_25_cache
-                        .clone()
-                        .ok_or_else(|| RailError::message("validated v0.25 receipt has no local cache selection"))?,
-                    remote: existing.v0_25_remote.clone(),
-                    root_portability: existing.v0_25_root_portability.unwrap_or_default().into(),
-                })
-            })
-            .transpose()?,
     )?;
     receipt.attach_profile(profile.profile().clone());
     receipt.validate()?;
@@ -1416,6 +1485,10 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
         || receipt_before.as_deref() != Some(encoded_receipt.as_slice())
         || wrapper.requires_installation()
         || worker.requires_installation()
+        || compiler_components
+            .iter()
+            .any(CompilerComponentSetup::requires_installation)
+        || !retired_compiler_components.is_empty()
         || distributed_worker
             .as_ref()
             .is_some_and(ExecutableSetup::requires_installation)
@@ -1440,6 +1513,8 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
         receipt,
         wrapper,
         worker,
+        compiler_components,
+        retired_compiler_components,
         distributed_worker,
         source_distributed_identity,
         profile,
@@ -1492,6 +1567,11 @@ pub(crate) fn apply_setup(mut plan: SetupPlan) -> RailResult<()> {
         return Err(RailError::message(
             "compiler worker executable changed after setup planning",
         ));
+    }
+    for component in &plan.compiler_components {
+        if installation_source_digest(&component.file.source)? != component.file.source_digest {
+            return Err(RailError::message("compiler component changed after setup planning"));
+        }
     }
     if let Some(distributed_worker) = &plan.distributed_worker
         && installation_source_digest(&distributed_worker.source)? != distributed_worker.source_digest
@@ -1569,6 +1649,12 @@ pub(crate) fn apply_setup(mut plan: SetupPlan) -> RailResult<()> {
     let _session_lock = lock_session(&plan.receipt)?;
     revalidate_executable_setup(&plan.receipt.wrapper_path, &plan.wrapper, "installed compiler wrapper")?;
     revalidate_executable_setup(&plan.receipt.worker_path, &plan.worker, "installed compiler worker")?;
+    for (component, setup) in plan.receipt.compiler_components.iter().zip(&plan.compiler_components) {
+        revalidate_executable_setup(&component.path, &setup.file, "installed compiler component")?;
+    }
+    for (component, expected) in &plan.retired_compiler_components {
+        revalidate_compiler_component_removal(component, expected)?;
+    }
     if let (Some(setup), Some(distributed)) = (&plan.distributed_worker, &plan.receipt.distributed) {
         revalidate_executable_setup(&distributed.worker_path, setup, "installed distributed compiler worker")?;
     }
@@ -1578,6 +1664,33 @@ pub(crate) fn apply_setup(mut plan: SetupPlan) -> RailResult<()> {
     LocalCas::open_selected(plan.receipt.cache()?)?;
     install_planned_executable(&plan.wrapper, &plan.receipt.wrapper_path)?;
     install_planned_executable(&plan.worker, &plan.receipt.worker_path)?;
+    for (component, setup) in plan
+        .receipt
+        .compiler_components
+        .iter_mut()
+        .zip(&plan.compiler_components)
+    {
+        if setup.requires_installation() {
+            if setup.executable {
+                install_executable_atomic(&setup.file.source, &component.path)?;
+            } else {
+                install_private_file_atomic(&setup.file.source, &component.path, &component.digest)?;
+            }
+        }
+        if file_digest(&component.path)? != component.digest
+            || !compiler_component_mode_matches(&component.path, setup.executable)?
+        {
+            return Err(RailError::message("installed compiler component failed verification"));
+        }
+        component.generation = crate::utils::stable_file_generation(&component.path)
+            .ok_or_else(|| RailError::message("installed compiler component has no stable local file generation"))?;
+    }
+    for (component, expected) in &plan.retired_compiler_components {
+        revalidate_compiler_component_removal(component, expected)?;
+        if expected.is_some() {
+            fs::remove_file(&component.path)?;
+        }
+    }
     if let (Some(setup), Some(distributed)) = (&plan.distributed_worker, &plan.receipt.distributed) {
         install_planned_executable(setup, &distributed.worker_path)?;
     }
@@ -1696,6 +1809,7 @@ pub(crate) fn plan_removal(current_dir: &Path) -> RailResult<RemovalPlan> {
             receipt: None,
             wrapper_before_digest: None,
             worker_before_digest: None,
+            compiler_component_before_digests: Vec::new(),
             distributed_worker_before_digest: None,
             distributed_identity_before_digests: Vec::new(),
         });
@@ -1751,6 +1865,11 @@ pub(crate) fn plan_removal(current_dir: &Path) -> RailResult<RemovalPlan> {
         },
         None => None,
     };
+    let compiler_component_before_digests = receipt
+        .compiler_components
+        .iter()
+        .map(compiler_component_removal_digest)
+        .collect::<RailResult<Vec<_>>>()?;
     let distributed_identity_before_digests = receipt
         .distributed
         .as_ref()
@@ -1781,6 +1900,7 @@ pub(crate) fn plan_removal(current_dir: &Path) -> RailResult<RemovalPlan> {
         receipt: Some(receipt),
         wrapper_before_digest,
         worker_before_digest,
+        compiler_component_before_digests,
         distributed_worker_before_digest,
         distributed_identity_before_digests,
     })
@@ -1821,6 +1941,13 @@ pub(crate) fn apply_removal(plan: RemovalPlan) -> RailResult<()> {
                 "rerun the command after inspecting the installation drift",
             ));
         }
+    }
+    for (component, expected) in receipt
+        .compiler_components
+        .iter()
+        .zip(&plan.compiler_component_before_digests)
+    {
+        revalidate_compiler_component_removal(component, expected)?;
     }
     if let Some(distributed) = &receipt.distributed {
         match (
@@ -1881,6 +2008,16 @@ pub(crate) fn apply_removal(plan: RemovalPlan) -> RailResult<()> {
     }
     if plan.worker_before_digest.is_some() {
         fs::remove_file(&receipt.worker_path)?;
+    }
+    for (component, expected) in receipt
+        .compiler_components
+        .iter()
+        .zip(&plan.compiler_component_before_digests)
+    {
+        revalidate_compiler_component_removal(component, expected)?;
+        if expected.is_some() {
+            fs::remove_file(&component.path)?;
+        }
     }
     if plan.distributed_worker_before_digest.is_some()
         && let Some(distributed) = &receipt.distributed
@@ -2016,6 +2153,9 @@ pub(crate) fn load_for_wrapper(invoked: &Path, workspace_root: &Path) -> RailRes
     }
     if crate::utils::stable_file_generation(&invoked).as_ref() != Some(&receipt.worker_generation)
         || crate::utils::stable_file_generation(&launcher).as_ref() != Some(&receipt.wrapper_generation)
+        || receipt.compiler_components.iter().any(|component| {
+            crate::utils::stable_file_generation(&component.path).as_ref() != Some(&component.generation)
+        })
         || receipt.distributed.as_ref().is_some_and(|distributed| {
             crate::utils::stable_file_generation(&distributed.worker_path).as_ref()
                 != Some(&distributed.worker_generation)
@@ -2055,6 +2195,9 @@ pub(crate) fn load_for_coordinator(invoked: &Path) -> RailResult<InstallationRec
     if crate::utils::canonicalize_existing(&receipt.worker_path)? != crate::utils::canonicalize_existing(&invoked)?
         || crate::utils::stable_file_generation(&invoked).as_ref() != Some(&receipt.worker_generation)
         || file_digest(&invoked)? != receipt.worker_digest
+        || receipt.compiler_components.iter().any(|component| {
+            crate::utils::stable_file_generation(&component.path).as_ref() != Some(&component.generation)
+        })
     {
         return Err(RailError::message(
             "remote coordinator worker does not match its setup authority",
@@ -2277,6 +2420,22 @@ pub(crate) fn status(current_dir: &Path) -> RailResult<InstallationStatus> {
         Ok(digest) if digest == receipt.worker_digest => {}
         Ok(_) => issues.push("installed worker content changed".to_string()),
         Err(error) => issues.push(format!("installed worker is unavailable: {error}")),
+    }
+    for component in &receipt.compiler_components {
+        match file_digest(&component.path) {
+            Ok(digest)
+                if digest == component.digest
+                    && crate::utils::stable_file_generation(&component.path).as_ref()
+                        == Some(&component.generation) => {}
+            Ok(_) => issues.push(format!(
+                "installed compiler component '{}' changed",
+                component.path.display()
+            )),
+            Err(error) => issues.push(format!(
+                "installed compiler component '{}' is unavailable: {error}",
+                component.path.display()
+            )),
+        }
     }
     if let Some(distributed) = &receipt.distributed {
         match file_digest(&distributed.worker_path) {
@@ -2716,6 +2875,46 @@ fn plan_executable_setup(source: PathBuf, destination: &Path, description: &str)
     })
 }
 
+fn compiler_component_mode_matches(path: &Path, executable: bool) -> RailResult<bool> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() || crate::utils::is_symlink_or_reparse(&metadata) {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        Ok(metadata.permissions().mode() & 0o777 == if executable { 0o700 } else { 0o600 })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = executable;
+        Ok(!metadata.permissions().readonly())
+    }
+}
+
+fn compiler_component_removal_digest(component: &InstalledCompilerComponent) -> RailResult<Option<String>> {
+    match optional_file_digest(&component.path)? {
+        Some(digest) if digest == component.digest => Ok(Some(digest)),
+        Some(_) => Err(RailError::message(
+            "installed compiler component changed; removal refused",
+        )),
+        None => Ok(None),
+    }
+}
+
+fn revalidate_compiler_component_removal(
+    component: &InstalledCompilerComponent,
+    expected: &Option<String>,
+) -> RailResult<()> {
+    if optional_file_digest(&component.path)? != *expected {
+        return Err(RailError::with_help(
+            "installed compiler component changed after removal planning",
+            "rerun the command after inspecting the installation drift",
+        ));
+    }
+    Ok(())
+}
+
 fn observe_installed_executable(path: &Path, description: &str) -> RailResult<Option<InstalledExecutable>> {
     match fs::symlink_metadata(path) {
         Ok(_) => {
@@ -2884,9 +3083,30 @@ fn revalidate_optional(path: &Path, expected: Option<&[u8]>, max_bytes: u64) -> 
 }
 
 fn parse_receipt(bytes: &[u8]) -> RailResult<InstallationReceipt> {
-    let receipt: InstallationReceipt = serde_json::from_slice(bytes)?;
+    if serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .is_some_and(|value| value.get("version").and_then(serde_json::Value::as_u64) == Some(4))
+    {
+        return Err(RailError::with_help(
+            "pre-component compiler-cache installation requires explicit removal before setup",
+            "use the previous cargo-rail executable that created the version 4 receipt to preview `cache remove --check`, then run `cache remove`; this preserves the CAS. Run `cargo rail cache setup` with this version to install authenticated compiler components",
+        ));
+    }
+    let receipt: InstallationReceipt = serde_json::from_slice(bytes).map_err(|error| {
+        let pre_profile = serde_json::from_slice::<serde_json::Value>(bytes)
+            .ok()
+            .is_some_and(|value| value.get("version").and_then(serde_json::Value::as_u64) == Some(3));
+        if pre_profile {
+            RailError::with_help(
+                "pre-profile compiler-cache installation requires explicit removal before setup",
+                "use cargo-rail v0.25 to preview `cache remove --check`, then run `cache remove`; this preserves the old CAS. Run `cargo rail cache setup` with this version to enroll the workspace",
+            )
+        } else {
+            error.into()
+        }
+    })?;
     receipt.validate()?;
-    if receipt.version == INSTALLATION_VERSION && encode_receipt(&receipt)? != bytes {
+    if encode_receipt(&receipt)? != bytes {
         return Err(RailError::message(
             "transparent compiler-cache installation receipt is not canonical",
         ));
@@ -3000,6 +3220,118 @@ fn valid_sha256(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn receipt_with_components(cargo_home: &Path) -> InstallationReceipt {
+        let directory = cargo_home.join("cargo-rail").join(INSTALLATION_DIRECTORY);
+        InstallationReceipt {
+            version: INSTALLATION_VERSION,
+            authority: "a".repeat(64),
+            cargo_home: cargo_home.to_path_buf(),
+            config_path: cargo_home.join("config.toml"),
+            config_created: true,
+            build_table_created: true,
+            wrapper_path: directory.join(WRAPPER_FILE),
+            wrapper_digest: format!("sha256:{}", "b".repeat(64)),
+            wrapper_generation: vec![1],
+            worker_path: directory.join(WORKER_FILE),
+            worker_digest: format!("sha256:{}", "c".repeat(64)),
+            worker_generation: vec![2],
+            compiler_components: vec![InstalledCompilerComponent {
+                path: directory.join(crate::compiler::driver::compiler_driver_file_name()),
+                digest: format!("sha256:{}", "d".repeat(64)),
+                generation: vec![3],
+            }],
+            distributed: None,
+            active_profile: None,
+            active_profile_lock: None,
+        }
+    }
+
+    #[test]
+    fn compiler_component_receipt_binds_only_named_siblings_and_requires_current_inventory() {
+        let root = tempfile::tempdir().expect("receipt fixture");
+        let receipt = receipt_with_components(root.path());
+        receipt.validate().expect("named compiler component");
+        for path in [
+            root.path().join("outside"),
+            receipt.wrapper_path.clone(),
+            receipt.worker_path.clone(),
+        ] {
+            let mut changed = receipt.clone();
+            changed.compiler_components[0].path = path;
+            assert_eq!(
+                changed.validate().unwrap_err().to_string(),
+                "installed compiler component receipt is invalid"
+            );
+        }
+        let mut duplicate = receipt.clone();
+        duplicate
+            .compiler_components
+            .push(duplicate.compiler_components[0].clone());
+        duplicate
+            .validate()
+            .expect_err("duplicated component ownership must fail");
+
+        let mut value = serde_json::to_value(&receipt).expect("receipt encoding");
+        value
+            .as_object_mut()
+            .expect("receipt object")
+            .remove("compiler_components");
+        let error = parse_receipt(&serde_json::to_vec(&value).expect("missing inventory encoding"))
+            .expect_err("current receipt cannot silently acquire an empty inventory");
+        assert!(error.to_string().contains("missing field `compiler_components`"));
+        value["version"] = serde_json::json!(4);
+        let error = parse_receipt(&serde_json::to_vec(&value).expect("previous receipt encoding"))
+            .expect_err("previous receipt cannot acquire current runtime authority");
+        assert!(error.to_string().contains("explicit removal before setup"));
+    }
+
+    #[test]
+    fn compiler_component_removal_rejects_changed_and_reappearing_files() {
+        let root = tempfile::tempdir().expect("component fixture");
+        let path = root
+            .path()
+            .join(crate::compiler::driver::COMPILER_DRIVER_SOURCE_FILE_NAME);
+        fs::write(&path, b"authenticated source bytes").expect("source bytes");
+        let component = InstalledCompilerComponent {
+            path: path.clone(),
+            digest: file_digest(&path).expect("component digest"),
+            generation: vec![1],
+        };
+        let observed = compiler_component_removal_digest(&component).expect("unchanged owned component");
+        assert_eq!(observed.as_ref(), Some(&component.digest));
+        fs::write(&path, b"changed source bytes").expect("replace source");
+        compiler_component_removal_digest(&component).expect_err("changed bytes are not removal authority");
+        revalidate_compiler_component_removal(&component, &observed).expect_err("planned bytes changed");
+        fs::remove_file(&path).expect("remove component");
+        assert_eq!(
+            compiler_component_removal_digest(&component).expect("missing component"),
+            None
+        );
+        fs::write(&path, b"authenticated source bytes").expect("reappearing component");
+        revalidate_compiler_component_removal(&component, &None).expect_err("a newly present file is outside the plan");
+    }
+
+    #[test]
+    fn stale_worker_pin_retains_only_installation_ownership_authority() {
+        let stale = format!("worker-capability-v3:sha256:{}", "a".repeat(64));
+        assert!(valid_installed_worker_capability(&stale));
+        assert!(!crate::compiler::distributed::worker_capability_identity_is_valid(
+            &stale
+        ));
+        for invalid in [
+            stale.replace("-v3:", "-v03:"),
+            stale.replace("-v3:", "-v0:"),
+            stale.replace("-v3:", "-v../:"),
+            stale.replace("sha256:", "sha512:"),
+            stale.to_uppercase(),
+        ] {
+            assert!(
+                !valid_installed_worker_capability(&invalid),
+                "accepted malformed pin: {invalid}"
+            );
+        }
+    }
 
     #[test]
     fn lossless_wrapper_edit_preserves_existing_cargo_configuration() {
