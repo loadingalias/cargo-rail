@@ -1,13 +1,11 @@
 //! Typed `rail.toml` configuration and discovery.
 
-mod compatibility;
 pub(crate) mod plan;
 mod release;
 pub(crate) mod schema;
 mod split;
 mod surface;
 mod unify;
-pub(crate) use compatibility::Compatibility;
 
 pub use plan::{
     CargoPrerequisiteConfig, CargoRootConfig, CargoTargetRootConfig, PlanConfig, PlanWorkConfig, PlanWorkScope,
@@ -91,90 +89,25 @@ pub enum ConfigLoadResult {
 pub(crate) struct DecodedConfig {
     pub(crate) config: RailConfig,
     pub(crate) document: toml_edit::DocumentMut,
-    pub(crate) compatibility: Vec<compatibility::Compatibility>,
 }
 
-/// Decode captured input once. Only predecessor split paths require the resolver.
-pub(crate) fn decode(
-    bytes: &[u8],
-    resolve_member: impl FnMut(&Path) -> RailResult<String>,
-) -> RailResult<DecodedConfig> {
+/// Decode captured input using the current configuration contract.
+pub(crate) fn decode(bytes: &[u8]) -> RailResult<DecodedConfig> {
     let content = std::str::from_utf8(bytes)
         .map_err(|error| RailError::message(format!("configuration is not valid UTF-8: {error}")))?;
-    let mut document: toml_edit::DocumentMut = content
-        .parse()
-        .map_err(|error: toml_edit::TomlError| RailError::message(error.to_string()))?;
-    let compatibility = compatibility::normalize_document(&mut document, resolve_member)?;
-    let config = RailConfig::from_document(document.clone()).map_err(RailError::message)?;
-    Ok(DecodedConfig {
-        config,
-        document,
-        compatibility,
-    })
-}
-
-/// Decode policy without inferring workspace facts from the caller's working directory.
-pub(crate) fn decode_without_workspace(bytes: &[u8]) -> RailResult<DecodedConfig> {
-    decode(bytes, |_| Err(workspace_context_required("split.paths")))
-}
-
-/// Decode a file while retaining its exact bytes for capture and drift validation.
-pub(crate) fn load_decoded(
-    path: &Path,
-    resolve_member: impl FnMut(&Path) -> RailResult<String>,
-) -> RailResult<(DecodedConfig, Vec<u8>)> {
-    let bytes =
-        fs::read(path).map_err(|error| RailError::message(format!("failed to read {}: {error}", path.display())))?;
-    let decoded =
-        decode(&bytes, resolve_member).map_err(|error| error.context(format!("configuration {}", path.display())))?;
-    Ok((decoded, bytes))
-}
-
-/// Resolve a predecessor path using the caller's captured Cargo package facts.
-pub(crate) fn resolve_split_member(metadata: &cargo_metadata::Metadata, relative: &Path) -> RailResult<String> {
-    let manifest = split_member_manifest(metadata.workspace_root.as_std_path(), relative)?;
-    metadata
-        .packages
-        .iter()
-        .find(|package| {
-            metadata.workspace_members.contains(&package.id) && package.manifest_path.as_std_path() == manifest
-        })
-        .map(|package| package.name.to_string())
-        .ok_or_else(|| {
-            RailError::message(format!(
-                "split member path '{}' does not name a captured Cargo workspace member",
-                relative.display()
-            ))
-        })
-}
-
-/// Validate the live lookup boundary without reading another copy of captured Cargo facts.
-fn split_member_manifest(workspace_root: &Path, relative: &Path) -> RailResult<PathBuf> {
-    let manifest = crate::source::RepositoryPath::new(&relative.join("Cargo.toml"))?;
-    let absolute = workspace_root.join(manifest.as_path());
-    let resolved = crate::utils::path_relative_to(workspace_root, &absolute)?;
-    if resolved != manifest.as_path() || !fs::symlink_metadata(&absolute)?.is_file() {
-        return Err(RailError::message(format!(
-            "split member manifest '{}' must be a regular file inside the workspace without symbolic links",
-            absolute.display()
-        )));
-    }
-    Ok(absolute)
-}
-
-/// Extract a package fact from manifest bytes captured by the caller's source boundary.
-pub(crate) fn split_member_name(bytes: &[u8], relative: &Path) -> RailResult<String> {
-    let content = std::str::from_utf8(bytes).map_err(|error| RailError::message(error.to_string()))?;
     let document: toml_edit::DocumentMut = content
         .parse()
         .map_err(|error: toml_edit::TomlError| RailError::message(error.to_string()))?;
-    document
-        .get("package")
-        .and_then(toml_edit::Item::as_table_like)
-        .and_then(|package| package.get("name"))
-        .and_then(toml_edit::Item::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| RailError::message(format!("split member '{}' has no package.name", relative.display())))
+    let config = RailConfig::from_document(document.clone()).map_err(RailError::message)?;
+    Ok(DecodedConfig { config, document })
+}
+
+/// Decode a file while retaining its exact bytes for capture and drift validation.
+pub(crate) fn load_decoded(path: &Path) -> RailResult<(DecodedConfig, Vec<u8>)> {
+    let bytes =
+        fs::read(path).map_err(|error| RailError::message(format!("failed to read {}: {error}", path.display())))?;
+    let decoded = decode(&bytes).map_err(|error| error.context(format!("configuration {}", path.display())))?;
+    Ok((decoded, bytes))
 }
 
 pub(crate) fn workspace_context_required(field: &str) -> RailError {
@@ -189,7 +122,9 @@ impl RailConfig {
             .into_iter()
             .find(|path| !schema::is_known_config_path(path))
         {
-            return Err(format!("unknown configuration key '{path}'"));
+            return Err(format!(
+                "unknown configuration key '{path}'; run `cargo rail config explain --all` with supported configuration to inspect current fields"
+            ));
         }
         toml_edit::de::from_document(doc).map_err(|error| error.to_string())
     }
@@ -273,14 +208,9 @@ impl RailConfig {
         Ok(warnings)
     }
 
-    /// Load policy without Cargo discovery, capturing only explicitly referenced predecessor manifests.
-    pub(crate) fn load_path_with_bytes(path: &Path, workspace_root: &Path) -> RailResult<(Self, Vec<u8>)> {
-        let (decoded, bytes) = load_decoded(path, |relative| {
-            let manifest = split_member_manifest(workspace_root, relative)?;
-            let bytes = fs::read(&manifest)?;
-            split_member_manifest(workspace_root, relative)?;
-            split_member_name(&bytes, relative)
-        })?;
+    /// Load policy without Cargo discovery, retaining the captured bytes.
+    pub(crate) fn load_path_with_bytes(path: &Path) -> RailResult<(Self, Vec<u8>)> {
+        let (decoded, bytes) = load_decoded(path)?;
         Ok((decoded.config, bytes))
     }
 
@@ -377,14 +307,13 @@ impl RailConfig {
 
     /// Try to load config, returning a result that distinguishes between
     /// "not found" and "parse error" without Cargo discovery.
-    /// Supported predecessor split paths read only their declared package manifests.
     pub fn try_load(path: &Path) -> ConfigLoadResult {
         let config_path = match Self::find_config_path(path) {
             Some(p) => p,
             None => return ConfigLoadResult::NotFound,
         };
 
-        match Self::load_path_with_bytes(&config_path, path) {
+        match Self::load_path_with_bytes(&config_path) {
             Ok((config, _)) => ConfigLoadResult::Loaded(Box::new(config)),
             Err(error) => ConfigLoadResult::ParseError {
                 path: config_path,

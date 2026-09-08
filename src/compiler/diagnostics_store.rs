@@ -892,11 +892,6 @@ impl CompilerDiagnosticsStore {
         Self::load_with_cas_and_remote(cas, None)
     }
 
-    pub(crate) fn load_with_remote(remote: Option<Arc<crate::remote_cache::RemoteStore>>) -> Self {
-        let cas = crate::cache::cas::LocalCas::open().ok();
-        Self::load_with_cas_and_remote(cas, remote)
-    }
-
     pub(crate) const fn durability_available(&self) -> bool {
         self.cas.is_some()
     }
@@ -906,7 +901,7 @@ impl CompilerDiagnosticsStore {
         Self::load_with_cas_and_remote(cas, None)
     }
 
-    fn load_with_cas_and_remote(
+    pub(crate) fn load_with_cas_and_remote(
         cas: Option<crate::cache::cas::LocalCas>,
         remote: Option<Arc<crate::remote_cache::RemoteStore>>,
     ) -> Self {

@@ -160,8 +160,9 @@ fn split_diagnostics_prove_bounded_git_object_streams() {
         );
         assert!(objects <= 24, "bounded split object-read baseline regressed: {objects}");
         assert!(batches <= 4, "bounded split stream baseline regressed: {batches}");
+        // Include reserved-note checks at capture and final mutation boundaries.
         assert!(
-            subprocesses <= 170,
+            subprocesses <= 180,
             "bounded split Git subprocess baseline regressed: {subprocesses}"
         );
         Ok(())

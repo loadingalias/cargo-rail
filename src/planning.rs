@@ -299,10 +299,7 @@ fn config_at_ref(ctx: &WorkspaceContext, revision: &str, candidates: &[String]) 
             .ok_or_else(|| RailError::message(format!("historical configuration has no {}", manifest.display())))
     };
     let decode = || -> RailResult<RailConfig> {
-        let decoded = crate::config::decode(&bytes[0], |package_root| {
-            let manifest = read_manifest(package_root)?;
-            crate::config::split_member_name(&manifest, package_root)
-        })?;
+        let decoded = crate::config::decode(&bytes[0])?;
         decoded.config.validate_policy()?;
         if let Some(host) = decoded.config.unify.transitive_host_path() {
             read_manifest(std::path::Path::new(host))?;
@@ -356,38 +353,16 @@ mod tests {
 
     #[test]
     fn effective_config_delta_names_only_changed_schema_leaves() {
-        let before = crate::config::decode_without_workspace(
-            b"[release]\nsemver_check = \"warn\"\n\n[surface]\nenabled = true\n",
-        )
-        .unwrap()
-        .config;
-        let after = crate::config::decode_without_workspace(
-            b"[release]\nsemver_check = \"off\"\n\n[surface]\nenabled = true\n",
-        )
-        .unwrap()
-        .config;
+        let before = crate::config::decode(b"[release]\nsemver_check = \"warn\"\n\n[surface]\nenabled = true\n")
+            .unwrap()
+            .config;
+        let after = crate::config::decode(b"[release]\nsemver_check = \"off\"\n\n[surface]\nenabled = true\n")
+            .unwrap()
+            .config;
         let deltas = config_deltas(&before, &after).unwrap();
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].path, "release.semver_check");
         assert_eq!(deltas[0].before, "warn");
         assert_eq!(deltas[0].after, "off");
-    }
-
-    #[test]
-    fn exact_v0_25_normalization_projects_only_current_configuration_facts() {
-        let tagged = include_bytes!("../tests/fixtures/config/v0.25.0/rail.toml");
-        let normalized = crate::config::decode(tagged, |_| {
-            Err(RailError::message("fixture unexpectedly requested a split manifest"))
-        })
-        .unwrap();
-        let reparsed = crate::config::decode_without_workspace(normalized.document.to_string().as_bytes())
-            .unwrap()
-            .config;
-        assert!(config_deltas(&normalized.config, &reparsed).unwrap().is_empty());
-
-        let encoded = serde_json::to_string(&normalized.config).unwrap();
-        assert!(encoded.contains("require_change_files"));
-        assert!(encoded.contains("unconventional_commits"));
-        assert!(encoded.contains("skip_types"));
     }
 }

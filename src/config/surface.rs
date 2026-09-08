@@ -114,7 +114,7 @@ pub enum SurfaceDoctestCoverage {
     /// Compile every doctest-enabled workspace package.
     #[default]
     Automatic,
-    /// Compile no doctests; intended for exact migration from an analyzer run that omitted them.
+    /// Exclude doctests from compiler-backed analysis.
     Disabled,
 }
 

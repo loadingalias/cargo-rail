@@ -22,7 +22,7 @@ use std::io::{Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const EFFECT_SCHEMA_VERSION: u32 = 1;
+const EFFECT_SCHEMA_VERSION: u32 = 2;
 const EFFECT_ROOT: &str = "effects-v1";
 const OWNER_MARKER: &str = "OWNER";
 const OWNER_MARKER_BYTES: &[u8] = b"cargo-rail prepared git effects v1\n";
@@ -252,10 +252,6 @@ pub(crate) struct GitMappingBinding {
     pub(crate) pre_authority: String,
     /// Exact mapping authority digest after the effect.
     pub(crate) post_authority: String,
-    /// Exact predecessor migration candidate digest, when migration is present.
-    pub(crate) migration_digest: Option<String>,
-    /// Exact predecessor migration candidate count.
-    pub(crate) migration_count: usize,
 }
 
 /// Exact remote branch publication intent.
@@ -281,16 +277,12 @@ impl GitMappingBinding {
         ownership_snapshot: String,
         pre_authority: String,
         post_authority: String,
-        migration_digest: Option<String>,
-        migration_count: usize,
     ) -> Self {
         Self {
             owner,
             ownership_snapshot,
             pre_authority,
             post_authority,
-            migration_digest,
-            migration_count,
         }
     }
 
@@ -308,14 +300,6 @@ impl GitMappingBinding {
 
     pub(crate) fn post_authority(&self) -> &str {
         &self.post_authority
-    }
-
-    pub(crate) fn migration_digest(&self) -> Option<&str> {
-        self.migration_digest.as_deref()
-    }
-
-    pub(crate) fn migration_count(&self) -> usize {
-        self.migration_count
     }
 }
 
@@ -398,11 +382,11 @@ impl GitEffectIntent {
     /// Return the deterministic identity of this exact effect.
     pub(crate) fn effect_id(&self) -> RailResult<String> {
         let payload_digest = self.payload_digest()?;
-        let mut canonical = CanonicalBytes::new(b"cargo-rail-git-effect-id-v1");
+        let mut canonical = CanonicalBytes::new(b"cargo-rail-git-effect-id-v2");
         canonical.field(b"operation-id", self.operation_id.as_bytes())?;
         canonical.field(b"payload-digest", payload_digest.as_bytes())?;
         Ok(format!(
-            "git-effect-v1-sha256-{}",
+            "git-effect-v2-sha256-{}",
             ContentDigest::sha256(canonical.as_slice())
         ))
     }
@@ -481,7 +465,7 @@ impl GitEffectIntent {
     }
 
     fn canonical_payload_bytes(&self) -> RailResult<Vec<u8>> {
-        let mut canonical = CanonicalBytes::new(b"cargo-rail-git-effect-payload-v1");
+        let mut canonical = CanonicalBytes::new(b"cargo-rail-git-effect-payload-v2");
         canonical.field(b"operation-id", self.operation_id.as_bytes())?;
         canonical.nested(b"repository", |repository| self.repository.encode(repository))?;
         canonical.optional_nested(b"commit", self.commit.as_ref(), GitCommitEffect::encode)?;
@@ -1009,15 +993,10 @@ pub(crate) struct GitObjectBundleTemp {
 /// One exact, no-follow opened object bundle retained after durable publication.
 #[derive(Debug)]
 pub(crate) struct PreparedGitObjectBundle {
-    path: PathBuf,
     file: File,
 }
 
 impl PreparedGitObjectBundle {
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
-    }
-
     #[cfg(test)]
     pub(crate) fn file(&self) -> &File {
         &self.file
@@ -1390,7 +1369,7 @@ impl GitEffectStore {
                 "prepared Git object bundle digest changed: expected {expected_digest}, found {actual}"
             )));
         }
-        Ok(Some(PreparedGitObjectBundle { path, file }))
+        Ok(Some(PreparedGitObjectBundle { file }))
     }
 
     fn open_common_dir(common_dir: &Path) -> RailResult<Self> {
@@ -1716,7 +1695,6 @@ impl GitEffectStore {
                     directory.path.join(&entry).display()
                 ))
             })?;
-            validate_effect_id(effect_id)?;
             let journal = self
                 .read_journal_entry(directory, &entry)?
                 .ok_or_else(|| RailError::message("prepared Git effect disappeared during discovery"))?;
@@ -1769,6 +1747,26 @@ impl GitEffectStore {
                 "prepared Git effect journal '{}' changed while it was read",
                 path.display()
             )));
+        }
+        #[derive(Deserialize)]
+        struct JournalVersion {
+            schema_version: u32,
+        }
+        let version: JournalVersion = serde_json::from_slice(&bytes).map_err(|error| {
+            RailError::message(format!(
+                "invalid prepared Git effect journal '{}': {error}",
+                path.display()
+            ))
+        })?;
+        if version.schema_version != EFFECT_SCHEMA_VERSION {
+            return Err(RailError::with_help(
+                format!(
+                    "unsupported prepared Git effect schema {} in '{}'",
+                    version.schema_version,
+                    path.display()
+                ),
+                "preserve this journal and finish or safely reconcile its transaction with its originating executable; the originating release is unknown",
+            ));
         }
         let journal: GitEffectJournal = serde_json::from_slice(&bytes).map_err(|error| {
             RailError::message(format!(
@@ -2047,19 +2045,6 @@ impl GitMappingBinding {
         validate_token("ownership snapshot", &self.ownership_snapshot)?;
         validate_sha256("pre-effect mapping authority", &self.pre_authority)?;
         validate_sha256("post-effect mapping authority", &self.post_authority)?;
-        if let Some(digest) = &self.migration_digest {
-            validate_sha256("mapping migration digest", digest)?;
-        }
-        if self.migration_count == 0 && self.migration_digest.is_some() {
-            return Err(RailError::message(
-                "prepared Git effect has a migration digest but no migration candidates",
-            ));
-        }
-        if self.migration_count > 0 && self.migration_digest.is_none() {
-            return Err(RailError::message(
-                "prepared Git effect has migration candidates but no migration digest",
-            ));
-        }
         Ok(())
     }
 
@@ -2068,13 +2053,7 @@ impl GitMappingBinding {
         canonical.field(b"ownership-snapshot", self.ownership_snapshot.as_bytes())?;
         canonical.field(b"pre-authority", self.pre_authority.as_bytes())?;
         canonical.field(b"post-authority", self.post_authority.as_bytes())?;
-        canonical.optional_field(b"migration-digest", self.migration_digest.as_deref())?;
-        canonical.field(
-            b"migration-count",
-            &u64::try_from(self.migration_count)
-                .map_err(|_| RailError::message("mapping migration count exceeds u64"))?
-                .to_be_bytes(),
-        )
+        Ok(())
     }
 }
 
@@ -3056,7 +3035,7 @@ fn validate_sha256(field: &str, value: &str) -> RailResult<()> {
 }
 
 fn validate_effect_id(value: &str) -> RailResult<()> {
-    let Some(hex) = value.strip_prefix("git-effect-v1-sha256-") else {
+    let Some(hex) = value.strip_prefix("git-effect-v2-sha256-") else {
         return Err(RailError::message("invalid prepared Git effect identity"));
     };
     if hex.len() != 64
@@ -3210,8 +3189,6 @@ mod tests {
                 ownership_snapshot: "v2-stable-policy".to_string(),
                 pre_authority: digest('e'),
                 post_authority: digest('f'),
-                migration_digest: None,
-                migration_count: 0,
             }),
             publication.then(|| GitPublicationEffect {
                 logical_remote: digest('1'),
@@ -3466,6 +3443,47 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_active_journal_blocks_recovery_and_new_effects_without_writes() {
+        let (_repo, git) = repository();
+        let store = GitEffectStore::open(&git).unwrap();
+        let planned = intent(&store, &git, false);
+        let effect_id = planned.effect_id().unwrap();
+        drop(active(store.prepare(planned.clone()).unwrap()));
+        let path = store.active_path(&effect_id).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["schema_version"] = serde_json::json!(1);
+        let bytes = serde_json::to_vec(&value).unwrap();
+        utils::write_file_atomic(&path, &bytes).unwrap();
+        let head = git.exact_branch_ref_oid("refs/heads/main").unwrap();
+        let mut new_effect = planned.clone();
+        new_effect.operation_id = "different-operation".to_string();
+        for error in [
+            store.resume(&effect_id).unwrap_err(),
+            store.prepare(new_effect).unwrap_err(),
+        ] {
+            assert!(
+                error.to_string().contains("unsupported prepared Git effect schema 1"),
+                "{error}"
+            );
+            assert!(error.to_string().contains(&path.display().to_string()), "{error}");
+        }
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        let old_path = path.with_file_name(format!(
+            "{}.json",
+            effect_id.replace("git-effect-v2-", "git-effect-v1-")
+        ));
+        fs::rename(&path, &old_path).unwrap();
+        let error = store.prepare(planned).unwrap_err();
+        assert!(
+            error.to_string().contains("unsupported prepared Git effect schema 1"),
+            "{error}"
+        );
+        assert!(error.to_string().contains(&old_path.display().to_string()), "{error}");
+        assert_eq!(fs::read(&old_path).unwrap(), bytes);
+        assert_eq!(git.exact_branch_ref_oid("refs/heads/main").unwrap(), head);
+    }
+
+    #[test]
     fn strict_journal_rejects_unknown_top_level_and_nested_fields() {
         let (_repo, git) = repository();
         let store = GitEffectStore::open(&git).unwrap();
@@ -3505,7 +3523,7 @@ mod tests {
         assert!(error.to_string().contains("payload digest"), "{error}");
 
         utils::write_file_atomic(&path, &original).unwrap();
-        let wrong = format!("git-effect-v1-sha256-{}", "9".repeat(64));
+        let wrong = format!("git-effect-v2-sha256-{}", "9".repeat(64));
         let renamed = store.active.path.join(format!("{wrong}.json"));
         fs::rename(&path, &renamed).unwrap();
         let error = store.discover_active().unwrap_err();
@@ -3651,7 +3669,7 @@ mod tests {
         let stale_completed = store.completed.path.join(".cargo-rail-stale.tmp");
         let stale_object = store.objects.path.join(".cargo-rail-stale.tmp");
         let fresh_object = store.objects.path.join(".cargo-rail-fresh.tmp");
-        let orphan_effect = format!("git-effect-v1-sha256-{}", "7".repeat(64));
+        let orphan_effect = format!("git-effect-v2-sha256-{}", "7".repeat(64));
         let orphan_pack = store.objects.path.join(format!("{orphan_effect}.pack"));
         for path in [&stale_active, &stale_completed, &stale_object, &orphan_pack] {
             make_private_file(path, b"stale\n", true);
@@ -3838,7 +3856,6 @@ mod tests {
         let mut temporary = store.create_object_bundle_temp().unwrap();
         temporary.file_mut().unwrap().write_all(bytes).unwrap();
         let mut bundle = temporary.persist(&effect_id, &expected_digest).unwrap();
-        assert_eq!(bundle.path(), store.object_bundle_path(&effect_id).unwrap());
         let mut observed = Vec::new();
         bundle.file.read_to_end(&mut observed).unwrap();
         assert_eq!(observed, bytes);

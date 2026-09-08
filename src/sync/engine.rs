@@ -8,8 +8,7 @@ use crate::config::{SplitMode, WorkspaceMode};
 use crate::error::RailResult;
 use crate::git::mappings::{
     MappingAuthoritySnapshot, MappingStore, OriginContext, TargetPublicationSnapshot, append_origin_trailers,
-    is_ancestor, migrate_v025_receipt_message, observe_target_branch, remote_endpoint_identity,
-    remote_repository_identity, repository_identity,
+    is_ancestor, observe_target_branch, remote_endpoint_identity, remote_repository_identity, repository_identity,
 };
 use crate::git::ops::{GitIndexChange, GitObjectQuarantine, GitTreeEntry};
 use crate::git::{CommitInfo, CommitMetadata, SystemGit};
@@ -149,6 +148,8 @@ struct MaterializedEntry {
 
 type CommitWithChanges = (CommitInfo, Vec<(PathBuf, char)>);
 
+const SYNC_CONFLICT_RECEIPT_VERSION: u32 = 4;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SyncConflictReceipt {
@@ -171,10 +172,6 @@ struct SyncConflictReceipt {
     mapping_authority_target_head: Option<String>,
     #[serde(default)]
     mapping_authority_post_digest: Option<String>,
-    #[serde(default)]
-    mapping_authority_migration_digest: Option<String>,
-    #[serde(default)]
-    mapping_authority_migration_count: Option<usize>,
     #[serde(default)]
     publication_authority_present: Option<bool>,
     #[serde(default)]
@@ -204,74 +201,29 @@ struct SyncConflictReceipt {
     resulting_commit: Option<String>,
 }
 
-/// Exact durable conflict receipt written by v0.25.0. It is decoded only for
-/// a one-time, read-only authority reconstruction and is persisted as schema 3
-/// before any resumed mutation.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct V025SyncConflictReceipt {
-    schema_version: u32,
-    status: String,
-    crate_name: String,
-    branch: String,
-    expected_head: String,
-    remote_commit: String,
-    message: String,
-    author: String,
-    author_email: String,
-    author_timestamp: i64,
-    author_timezone: String,
-    committer: String,
-    committer_email: String,
-    committer_timestamp: i64,
-    committer_timezone: String,
-    commit_paths: Vec<PathBuf>,
-    conflicts: Vec<ConflictInfo>,
-    resulting_commit: Option<String>,
-}
-
-impl From<V025SyncConflictReceipt> for SyncConflictReceipt {
-    fn from(receipt: V025SyncConflictReceipt) -> Self {
-        Self {
-            schema_version: 3,
-            status: receipt.status,
-            crate_name: receipt.crate_name,
-            effect_payload_digest: None,
-            materialization_digest: None,
-            conflict_strategy: None,
-            mapping_authority_direction: None,
-            mapping_authority_digest: None,
-            mapping_authority_ownership_snapshot: None,
-            mapping_authority_target_head: None,
-            mapping_authority_post_digest: None,
-            mapping_authority_migration_digest: None,
-            mapping_authority_migration_count: None,
-            publication_authority_present: None,
-            publication_authority_digest: None,
-            publication_remote_repository: None,
-            publication_remote_head: None,
-            publication_local_head: None,
-            publication_relation: None,
-            branch: receipt.branch,
-            expected_head: receipt.expected_head,
-            remote_commit: receipt.remote_commit,
-            message: receipt.message,
-            author: receipt.author,
-            author_email: receipt.author_email,
-            author_timestamp: receipt.author_timestamp,
-            author_timezone: receipt.author_timezone,
-            committer: receipt.committer,
-            committer_email: receipt.committer_email,
-            committer_timestamp: receipt.committer_timestamp,
-            committer_timezone: receipt.committer_timezone,
-            commit_paths: receipt.commit_paths,
-            conflicts: receipt.conflicts,
-            resulting_commit: receipt.resulting_commit,
-        }
-    }
-}
-
 impl SyncConflictReceipt {
+    fn decode(bytes: &[u8], path: &Path) -> RailResult<Self> {
+        #[derive(Deserialize)]
+        struct ReceiptVersion {
+            schema_version: u32,
+        }
+        let invalid = |error: serde_json::Error| {
+            crate::error::RailError::message(format!("invalid sync conflict receipt '{}': {error}", path.display()))
+        };
+        let version: ReceiptVersion = serde_json::from_slice(bytes).map_err(invalid)?;
+        if version.schema_version != SYNC_CONFLICT_RECEIPT_VERSION {
+            return Err(crate::error::RailError::with_help(
+                format!(
+                    "unsupported sync conflict receipt schema {} in '{}'",
+                    version.schema_version,
+                    path.display()
+                ),
+                "preserve the receipt and finish or safely reconcile it with the executable that created it before starting new sync work; its release version is unknown",
+            ));
+        }
+        serde_json::from_slice(bytes).map_err(invalid)
+    }
+
     fn commit_metadata(&self) -> CommitMetadata {
         CommitMetadata {
             author: self.author.clone(),
@@ -318,24 +270,6 @@ impl SyncConflictReceipt {
         Ok(())
     }
 
-    fn bind_mapping_authority(&mut self, authority: &MappingAuthoritySnapshot) {
-        self.mapping_authority_direction = Some(authority.direction().to_string());
-        self.mapping_authority_digest = Some(authority.digest());
-        self.mapping_authority_ownership_snapshot = Some(authority.ownership_snapshot().to_string());
-        self.mapping_authority_target_head = authority.target_head().map(str::to_string);
-        self.mapping_authority_migration_digest = Some(authority.migration_digest());
-        self.mapping_authority_migration_count = Some(authority.count());
-    }
-
-    fn bind_publication_authority(&mut self, publication: Option<&TargetPublicationSnapshot>) {
-        self.publication_authority_present = Some(publication.is_some());
-        self.publication_authority_digest = publication.map(TargetPublicationSnapshot::digest);
-        self.publication_remote_repository = publication.map(|snapshot| snapshot.remote_repository().to_string());
-        self.publication_remote_head = publication.and_then(|snapshot| snapshot.remote_head().map(str::to_string));
-        self.publication_local_head = publication.and_then(|snapshot| snapshot.local_head().map(str::to_string));
-        self.publication_relation = publication.map(|snapshot| snapshot.relation().to_string());
-    }
-
     fn matches_publication_authority(&self, publication: Option<&TargetPublicationSnapshot>) -> bool {
         self.publication_authority_present == Some(publication.is_some())
             && publication.map(TargetPublicationSnapshot::digest) == self.publication_authority_digest
@@ -361,7 +295,7 @@ pub struct SyncEngine<'a> {
     source_origin: OriginContext,
     /// Origin evidence for target commits synthesized into the monorepo.
     target_origin: OriginContext,
-    /// One-way predecessor migration preparation state.
+    /// Checked mapping authority and its preparation state.
     mapping_preparation: MappingPreparation,
     /// Whether the configured remote was observed before mapping capture.
     remote_observed: bool,
@@ -466,7 +400,7 @@ impl<'a> SyncEngine<'a> {
             .map(str::to_string)
         };
         let captured = if let Some(selected_source_head) = selected_source_head.as_deref() {
-            MappingStore::capture_v025_authority_at_source(
+            MappingStore::capture_authority_at_source(
                 self.ctx.workspace_root(),
                 &self.config.target_repo_path,
                 &self.source_origin,
@@ -478,7 +412,7 @@ impl<'a> SyncEngine<'a> {
                 selected_target_head.as_deref(),
             )?
         } else if let Some(selected_target_head) = selected_target_head.as_deref() {
-            MappingStore::capture_v025_authority_at(
+            MappingStore::capture_authority_at(
                 self.ctx.workspace_root(),
                 &self.config.target_repo_path,
                 &self.source_origin,
@@ -489,7 +423,7 @@ impl<'a> SyncEngine<'a> {
                 selected_target_head,
             )?
         } else {
-            MappingStore::capture_v025_authority(
+            MappingStore::capture_authority(
                 self.ctx.workspace_root(),
                 &self.config.target_repo_path,
                 &self.source_origin,
@@ -503,7 +437,7 @@ impl<'a> SyncEngine<'a> {
         Ok(captured)
     }
 
-    pub(crate) fn bind_origin_migration(&mut self, expected: MappingAuthoritySnapshot) -> RailResult<()> {
+    pub(crate) fn bind_origin_authority(&mut self, expected: MappingAuthoritySnapshot) -> RailResult<()> {
         let MappingPreparation::Unprepared {
             expected: current_expected,
         } = &mut self.mapping_preparation
@@ -580,7 +514,36 @@ impl<'a> SyncEngine<'a> {
         Ok(())
     }
 
+    fn reject_active_conflict_receipts(&self) -> RailResult<()> {
+        let directory = crate::workspace::cargo_rail_state_root(self.ctx.workspace_root()).join("receipts");
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let prefix = format!("sync-conflict-{}-", self.config.crate_name);
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+                continue;
+            }
+            let path = self.validate_conflict_receipt_path(&entry.path())?;
+            let receipt = SyncConflictReceipt::decode(&std::fs::read(&path)?, &path)?;
+            if receipt.crate_name == self.config.crate_name && receipt.status != "resolved" {
+                return Err(crate::error::RailError::with_help(
+                    format!("active sync conflict receipt '{}' blocks new sync work", path.display()),
+                    format!(
+                        "resolve the recorded conflict and run `cargo rail sync --resume '{}'`",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn prepare_mapping_evidence(&mut self, direction: &str) -> RailResult<()> {
+        self.reject_active_conflict_receipts()?;
         let expected = match &self.mapping_preparation {
             MappingPreparation::Unprepared { expected } => expected.clone(),
             MappingPreparation::Prepared(_) => return self.revalidate_prepared_mapping_evidence(direction),
@@ -595,63 +558,9 @@ impl<'a> SyncEngine<'a> {
                 "restart sync from a fresh check/apply plan after repository histories and mapping refs stop changing",
             ));
         }
-        crate::split::engine::validate_predecessor_mapping_projections(
-            self.ctx,
-            &self.transform,
-            &self.config.crate_paths,
-            &self.config.path_capabilities,
-            &self.config.target_repo_path,
-            &self.config.mode,
-            &self.config.workspace_mode,
-            &captured,
-        )?;
         self.validate_unproven_exact_pair_ancestry(direction, captured.source_head(), captured.target_selected_head())?;
-        self.revalidate_publication_before_effect(direction, captured.count() > 0)?;
-        if captured.count() == 0 {
-            self.mapping_preparation = MappingPreparation::Prepared(captured);
-            return Ok(());
-        }
-        self.config.path_capabilities.validate_target_repository()?;
-        let obstructing = SystemGit::open(&self.config.target_repo_path)?.obstructing_worktree_paths()?;
-        if !obstructing.is_empty() {
-            return Err(crate::error::RailError::with_help(
-                "sync target became dirty before predecessor migration",
-                "commit, restore, or remove staged, unstaged, untracked, and ignored target paths before retrying",
-            ));
-        }
-        if self
-            .mapping_store
-            .migrate_v025_evidence_bound(
-                self.ctx.workspace_root(),
-                &self.config.target_repo_path,
-                &self.source_origin,
-                self.target_origin.source_repository(),
-                self.config.path_capabilities.target_root(),
-                &self.config.branch,
-                direction,
-                expected.as_ref(),
-            )?
-            .is_some()
-        {
-            progress!("   Migrated predecessor mappings into ordinary Git history");
-        }
-        self.config.path_capabilities.validate_target_repository()?;
-        let authority = self.mapping_store.mapping_authority_snapshot(
-            direction,
-            self.config.path_capabilities.target_root(),
-            &self.config.branch,
-        )?;
-        if authority.count() > 0 {
-            return Err(pending_origin_migration_after_preparation());
-        }
-        let actual = self.load_mapping_evidence(direction)?;
-        if actual != authority {
-            return Err(crate::error::RailError::with_help(
-                "sync mapping authority changed during predecessor migration preparation",
-                "restart sync from a fresh check/apply plan after repository histories and mapping refs stop changing",
-            ));
-        }
-        self.mapping_preparation = MappingPreparation::Prepared(actual);
+        self.revalidate_publication_before_effect(direction)?;
+        self.mapping_preparation = MappingPreparation::Prepared(captured);
         Ok(())
     }
 
@@ -758,8 +667,6 @@ impl<'a> SyncEngine<'a> {
                 .ok_or_else(|| crate::error::RailError::message("prepared sync effect has no mapping authority"))?;
             if mapping.owner() != self.config.crate_name
                 || mapping.ownership_snapshot() != self.config.ownership.snapshot_id
-                || mapping.migration_count() != 0
-                || mapping.migration_digest().is_some()
                 || journal.publication().is_some()
                 || (index + 1 < ordered.len() && !journal.is_terminal())
             {
@@ -801,11 +708,7 @@ impl<'a> SyncEngine<'a> {
             .map(Some)
     }
 
-    fn revalidate_publication_before_effect(
-        &mut self,
-        direction: &str,
-        migration_will_mutate_target: bool,
-    ) -> RailResult<()> {
+    fn revalidate_publication_before_effect(&mut self, direction: &str) -> RailResult<()> {
         let actual = self.capture_publication()?;
         if let Some(expected) = &self.expected_publication {
             if actual.as_ref() != Some(expected)
@@ -822,9 +725,7 @@ impl<'a> SyncEngine<'a> {
             self.expected_publication = actual.clone();
         }
         let owned_publication_retry = actual.as_ref().is_some_and(|snapshot| snapshot.count() > 0);
-        let target_will_mutate = migration_will_mutate_target
-            || owned_publication_retry
-            || matches!(direction, "mono_to_remote" | "bidirectional");
+        let target_will_mutate = owned_publication_retry || matches!(direction, "mono_to_remote" | "bidirectional");
         self.target_publication_authorized = target_will_mutate;
         if target_will_mutate
             && actual
@@ -1072,7 +973,7 @@ impl<'a> SyncEngine<'a> {
         let actual = self.load_mapping_evidence(direction)?;
         if actual != expected {
             return Err(crate::error::RailError::with_help(
-                "sync mapping authority changed after predecessor migration preparation",
+                "sync mapping authority changed after mapping preparation",
                 "restart sync from a fresh check/apply plan after repository histories and mapping refs stop changing",
             ));
         }
@@ -1097,9 +998,6 @@ impl<'a> SyncEngine<'a> {
                 "restart sync from a fresh check/apply plan without changing repository identity, target root, branch, or ownership",
             ));
         }
-        if expected.count() > 0 {
-            return Err(pending_origin_migration_after_preparation());
-        }
         self.mapping_preparation = MappingPreparation::Prepared(expected);
         self.revalidate_prepared_mapping_evidence(direction)
     }
@@ -1111,6 +1009,7 @@ impl<'a> SyncEngine<'a> {
 
     /// Count mapped-history commits pending in the selected public direction.
     pub fn pending_commit_count(&mut self, direction: &SyncDirection) -> RailResult<usize> {
+        self.reject_active_conflict_receipts()?;
         let actual = self.load_mapping_evidence(direction.authority_name())?;
         if let MappingPreparation::Unprepared {
             expected: Some(expected),
@@ -1185,40 +1084,10 @@ impl<'a> SyncEngine<'a> {
     pub fn resume_from_receipt(&mut self, receipt_path: &Path) -> RailResult<SyncResult> {
         let receipt_path = self.validate_conflict_receipt_path(receipt_path)?;
         let bytes = std::fs::read(&receipt_path)?;
-        let envelope: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|error| crate::error::RailError::message(format!("invalid sync conflict receipt: {}", error)))?;
-        let schema_version = envelope
-            .get("schema_version")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| crate::error::RailError::message("sync conflict receipt has no schema version"))?;
-        let legacy_v025 = schema_version == 2;
-        let mut receipt = match schema_version {
-            2 => {
-                let legacy: V025SyncConflictReceipt = serde_json::from_value(envelope).map_err(|error| {
-                    crate::error::RailError::message(format!("invalid v0.25 sync conflict receipt: {}", error))
-                })?;
-                if legacy.schema_version != 2 || legacy.status != "conflicted" || legacy.resulting_commit.is_some() {
-                    return Err(crate::error::RailError::message(
-                        "sync conflict receipt is not an active v0.25 version-2 conflict",
-                    ));
-                }
-                SyncConflictReceipt::from(legacy)
-            }
-            3 => serde_json::from_value(envelope).map_err(|error| {
-                crate::error::RailError::message(format!("invalid sync conflict receipt: {}", error))
-            })?,
-            _ => {
-                return Err(crate::error::RailError::message(format!(
-                    "unsupported sync conflict receipt schema {}",
-                    schema_version
-                )));
-            }
-        };
-        if receipt.schema_version != 3
-            || !matches!(receipt.status.as_str(), "materializing" | "conflicted" | "prepared")
-        {
+        let mut receipt = SyncConflictReceipt::decode(&bytes, &receipt_path)?;
+        if !matches!(receipt.status.as_str(), "materializing" | "conflicted" | "prepared") {
             return Err(crate::error::RailError::message(
-                "sync conflict receipt is not an active version-3 conflict",
+                "sync conflict receipt is not an active conflict",
             ));
         }
         if receipt.crate_name != self.config.crate_name {
@@ -1249,75 +1118,6 @@ impl<'a> SyncEngine<'a> {
             ));
         }
 
-        if legacy_v025 {
-            let direction = SyncDirection::RemoteToMono.authority_name();
-            self.observe_remote_before_mapping_capture()?;
-            let authority = self.load_mapping_evidence(direction)?;
-            crate::split::engine::validate_predecessor_mapping_projections(
-                self.ctx,
-                &self.transform,
-                &self.config.crate_paths,
-                &self.config.path_capabilities,
-                &self.config.target_repo_path,
-                &self.config.mode,
-                &self.config.workspace_mode,
-                &authority,
-            )?;
-            self.validate_unproven_exact_pair_ancestry(
-                direction,
-                authority.source_head(),
-                authority.target_selected_head(),
-            )?;
-            let selected_target_head = authority
-                .target_selected_head()
-                .ok_or_else(|| crate::error::RailError::message("v0.25 sync receipt has no selected target history"))?;
-            if !is_ancestor(
-                &self.config.target_repo_path,
-                &receipt.remote_commit,
-                selected_target_head,
-            )? {
-                return Err(crate::error::RailError::with_help(
-                    "v0.25 sync receipt remote commit is outside the configured target history",
-                    "restart sync; cargo-rail will not reconstruct authority for an unrelated predecessor receipt",
-                ));
-            }
-            if self.mapping_store.has_reverse_mapping(&receipt.remote_commit) {
-                return Err(crate::error::RailError::with_help(
-                    "v0.25 sync receipt remote commit is already mapped",
-                    "inspect current history and start a fresh sync instead of replaying the predecessor receipt",
-                ));
-            }
-            let publication = self.capture_publication()?;
-            receipt.bind_mapping_authority(&authority);
-            receipt.bind_publication_authority(publication.as_ref());
-            receipt.message =
-                migrate_v025_receipt_message(&receipt.message, &self.target_origin, &receipt.remote_commit)?;
-            receipt.bind_effect_payload()?;
-            self.validate_receipt_effect_payload(&receipt, true)?;
-            // Persist the exact predecessor and publication authority before
-            // a migration commit can move target HEAD. A crash after this write
-            // is recoverable from the bound migration digest below.
-            write_json_atomic(&receipt_path, &receipt)?;
-
-            if authority.count() > 0 {
-                self.expected_publication = publication;
-                self.mapping_preparation = MappingPreparation::Unprepared {
-                    expected: Some(authority),
-                };
-                self.prepare_mapping_evidence(direction)?;
-                let MappingPreparation::Prepared(migrated) = &self.mapping_preparation else {
-                    return Err(crate::error::RailError::message(
-                        "predecessor receipt migration did not produce prepared authority",
-                    ));
-                };
-                let migrated = migrated.clone();
-                let migrated_publication = self.capture_publication()?;
-                receipt.bind_mapping_authority(&migrated);
-                receipt.bind_publication_authority(migrated_publication.as_ref());
-                write_json_atomic(&receipt_path, &receipt)?;
-            }
-        }
-
         let resume_direction = receipt.mapping_authority_direction.clone().ok_or_else(|| {
             crate::error::RailError::with_help(
                 "sync conflict receipt has no mapping authority binding",
@@ -1329,7 +1129,7 @@ impl<'a> SyncEngine<'a> {
                 "sync conflict receipt has an invalid mapping authority direction",
             ));
         }
-        let mut expected_authority_digest = receipt.mapping_authority_digest.clone().ok_or_else(|| {
+        let expected_authority_digest = receipt.mapping_authority_digest.clone().ok_or_else(|| {
             crate::error::RailError::with_help(
                 "sync conflict receipt has no mapping authority digest",
                 "restart sync to create a current conflict receipt before committing resolved work",
@@ -1348,96 +1148,7 @@ impl<'a> SyncEngine<'a> {
             ));
         }
         self.observe_remote_before_mapping_capture()?;
-        let mut resume_authority = self.load_mapping_evidence(&resume_direction)?;
-        if resume_authority.count() > 0 {
-            if resume_authority.digest() != expected_authority_digest
-                || receipt.mapping_authority_migration_count != Some(resume_authority.count())
-                || receipt.mapping_authority_migration_digest.as_deref()
-                    != Some(resume_authority.migration_digest().as_str())
-            {
-                return Err(crate::error::RailError::with_help(
-                    "sync resume found an unbound predecessor origin migration",
-                    "restart sync from current repository histories; cargo-rail only resumes the exact migration persisted in the receipt",
-                ));
-            }
-            let before_publication = self.capture_publication()?;
-            if !receipt.matches_publication_authority(before_publication.as_ref()) {
-                return Err(crate::error::RailError::with_help(
-                    "sync target publication authority changed before receipt migration",
-                    "restore the receipt's exact local/remote target heads before resuming",
-                ));
-            }
-            crate::split::engine::validate_predecessor_mapping_projections(
-                self.ctx,
-                &self.transform,
-                &self.config.crate_paths,
-                &self.config.path_capabilities,
-                &self.config.target_repo_path,
-                &self.config.mode,
-                &self.config.workspace_mode,
-                &resume_authority,
-            )?;
-            self.validate_unproven_exact_pair_ancestry(
-                &resume_direction,
-                resume_authority.source_head(),
-                resume_authority.target_selected_head(),
-            )?;
-            self.expected_publication = before_publication;
-            self.mapping_preparation = MappingPreparation::Unprepared {
-                expected: Some(resume_authority),
-            };
-            self.prepare_mapping_evidence(&resume_direction)?;
-            let MappingPreparation::Prepared(migrated) = &self.mapping_preparation else {
-                return Err(crate::error::RailError::message(
-                    "receipt predecessor migration did not produce prepared authority",
-                ));
-            };
-            resume_authority = migrated.clone();
-            let publication = self.capture_publication()?;
-            receipt.bind_mapping_authority(&resume_authority);
-            receipt.bind_publication_authority(publication.as_ref());
-            expected_authority_digest = resume_authority.digest();
-            write_json_atomic(&receipt_path, &receipt)?;
-        } else if resume_authority.digest() != expected_authority_digest
-            && receipt.mapping_authority_migration_count.is_some_and(|count| count > 0)
-        {
-            let expected_parent = receipt.mapping_authority_target_head.as_deref().ok_or_else(|| {
-                crate::error::RailError::message("sync receipt migration recovery has no bound predecessor target HEAD")
-            })?;
-            let actual_target_head = resume_authority
-                .target_head()
-                .ok_or_else(|| crate::error::RailError::message("sync receipt migration recovery lost target HEAD"))?;
-            let expected_migration_digest = receipt.mapping_authority_migration_digest.as_deref().ok_or_else(|| {
-                crate::error::RailError::message("sync receipt migration recovery has no migration digest")
-            })?;
-            MappingStore::validate_completed_v025_migration(
-                &self.config.target_repo_path,
-                actual_target_head,
-                expected_parent,
-                &self.source_origin,
-                self.target_origin.source_repository(),
-                expected_migration_digest,
-            )?;
-            let publication = self.capture_publication()?;
-            let remote_unchanged = match (publication.as_ref(), receipt.publication_authority_present) {
-                (None, Some(false)) => true,
-                (Some(actual), Some(true)) => {
-                    receipt.publication_remote_repository.as_deref() == Some(actual.remote_repository())
-                        && receipt.publication_remote_head.as_deref() == actual.remote_head()
-                }
-                _ => false,
-            };
-            if !remote_unchanged {
-                return Err(crate::error::RailError::with_help(
-                    "remote publication authority changed during receipt migration recovery",
-                    "restart sync; cargo-rail will not adopt a migration commit across remote drift",
-                ));
-            }
-            receipt.bind_mapping_authority(&resume_authority);
-            receipt.bind_publication_authority(publication.as_ref());
-            expected_authority_digest = resume_authority.digest();
-            write_json_atomic(&receipt_path, &receipt)?;
-        }
+        let resume_authority = self.load_mapping_evidence(&resume_direction)?;
         let required_authority_digest = if head_is_prepared {
             receipt.mapping_authority_post_digest.as_deref().ok_or_else(|| {
                 crate::error::RailError::with_help(
@@ -1467,11 +1178,8 @@ impl<'a> SyncEngine<'a> {
                 "restart sync from current local and remote branch authority; cargo-rail will not resume or publish against a deleted, rewound, or advanced remote ref",
             ));
         }
-        self.expected_publication = resume_publication.clone();
-        self.revalidate_publication_before_effect(
-            &resume_direction,
-            resume_publication.as_ref().is_some_and(|snapshot| snapshot.count() > 0),
-        )?;
+        self.expected_publication = resume_publication;
+        self.revalidate_publication_before_effect(&resume_direction)?;
         self.mapping_preparation = MappingPreparation::Prepared(resume_authority);
         self.validate_receipt_effect_payload(&receipt, receipt.status != "prepared")?;
 
@@ -1665,8 +1373,6 @@ impl<'a> SyncEngine<'a> {
                 self.config.ownership.snapshot_id.clone(),
                 expected_authority_digest.clone(),
                 post_authority.digest(),
-                None,
-                0,
             );
             let mut bundle = store.create_object_bundle_temp()?;
             let bundle_digest = quarantine.write_pack(&commit, Some(&receipt.expected_head), bundle.file_mut()?)?;
@@ -1966,7 +1672,7 @@ impl<'a> SyncEngine<'a> {
         let remote_git = SystemGit::open(&target_repo_path)?;
 
         // Select descendants of the newest actual pair mapping from the unbounded target
-        // history, then filter exact evidence per commit. In particular, migration evidence
+        // history, then filter exact evidence per commit. In particular, explicit-pair evidence
         // above an independent target commit cannot become a frontier that hides that commit.
         let new_commits = frozen_commits.map_or_else(|| self.collect_pending_remote_commits(&remote_git), Ok)?;
         let commits_to_sync = new_commits.iter().collect::<Vec<_>>();
@@ -2056,7 +1762,7 @@ impl<'a> SyncEngine<'a> {
                     .ok_or_else(|| crate::error::RailError::message("conflicted sync has no recovery branch"))?;
                 let receipt_publication = self.capture_publication()?;
                 let mut receipt_payload = SyncConflictReceipt {
-                    schema_version: 3,
+                    schema_version: SYNC_CONFLICT_RECEIPT_VERSION,
                     status: "materializing".to_string(),
                     crate_name: self.config.crate_name.clone(),
                     effect_payload_digest: None,
@@ -2067,8 +1773,6 @@ impl<'a> SyncEngine<'a> {
                     mapping_authority_ownership_snapshot: Some(receipt_authority.ownership_snapshot().to_string()),
                     mapping_authority_target_head: receipt_authority.target_head().map(str::to_string),
                     mapping_authority_post_digest: None,
-                    mapping_authority_migration_digest: Some(receipt_authority.migration_digest()),
-                    mapping_authority_migration_count: Some(receipt_authority.count()),
                     publication_authority_present: Some(receipt_publication.is_some()),
                     publication_authority_digest: receipt_publication.as_ref().map(TargetPublicationSnapshot::digest),
                     publication_remote_repository: receipt_publication
@@ -2461,8 +2165,6 @@ impl<'a> SyncEngine<'a> {
             pre_authority.ownership_snapshot().to_string(),
             pre_authority.digest(),
             post_authority.digest(),
-            None,
-            0,
         );
         let mut bundle = store.create_object_bundle_temp()?;
         let bundle_digest = quarantine.write_pack(&new_commit_sha, Some(current_remote_head), bundle.file_mut()?)?;
@@ -2650,8 +2352,6 @@ impl<'a> SyncEngine<'a> {
             || mapping.ownership_snapshot() != self.config.ownership.snapshot_id
             || mapping.pre_authority() != pre_authority_digest
             || mapping.post_authority() != post_authority_digest
-            || mapping.migration_count() != 0
-            || mapping.migration_digest().is_some()
             || repository.result_oid != commit.oid()
             || journal.object_bundle_digest().is_none()
         {
@@ -2849,8 +2549,6 @@ impl<'a> SyncEngine<'a> {
             pre_authority.ownership_snapshot().to_string(),
             pre_authority.digest(),
             post_authority.digest(),
-            None,
-            0,
         );
         let mut bundle = store.create_object_bundle_temp()?;
         let bundle_digest = quarantine.write_pack(&new_commit_sha, Some(current_mono_head), bundle.file_mut()?)?;
@@ -3541,17 +3239,10 @@ fn sync_mapping_authority_changed_error() -> crate::error::RailError {
     )
 }
 
-fn pending_origin_migration_after_preparation() -> crate::error::RailError {
-    crate::error::RailError::with_help(
-        "sync found new predecessor origin evidence after migration preparation",
-        "restart sync from a fresh check/apply plan; prepared sync phases never authorize another migration",
-    )
-}
-
 fn unproven_mapping_ancestry_error(ancestor: &str, endpoint: &str, side: &str) -> crate::error::RailError {
     crate::error::RailError::with_help(
         format!(
-            "exact predecessor mapping endpoint '{}' has unmatched {} ancestor '{}' without directional frontier proof",
+            "exact mapping endpoint '{}' has unmatched {} ancestor '{}' without directional frontier proof",
             endpoint, side, ancestor
         ),
         "restore authoritative directional origin history or resolve the mapping topology manually; cargo-rail will not guess ancestry or replay an ancestor after its mapped descendant",

@@ -21,3 +21,4 @@ docs/tasks/
 docs/content/
 .ropeproject/
 docs/integration-contrib/
+.rumdl_cache/

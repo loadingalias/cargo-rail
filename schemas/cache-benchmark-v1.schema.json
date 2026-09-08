@@ -1,0 +1,268 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/loadingalias/cargo-rail/main/schemas/cache-benchmark-v1.schema.json",
+  "title": "Cargo-Rail local cache benchmark summary",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "kind": {
+      "const": "cargo-rail-cache-benchmark"
+    },
+    "mode": {
+      "const": "local"
+    },
+    "purpose": {
+      "enum": [
+        "measurement",
+        "orchestration-smoke"
+      ]
+    },
+    "profile": {
+      "enum": [
+        "dev",
+        "dev-non-incremental"
+      ]
+    },
+    "status": {
+      "enum": [
+        "preparing",
+        "running",
+        "complete",
+        "failed"
+      ]
+    },
+    "context": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "benchmark_version": {
+              "type": "string"
+            },
+            "workload_sha256": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "tool_versions": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "tool_digests": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              }
+            },
+            "rustc": {
+              "type": "string"
+            },
+            "os": {
+              "type": "string"
+            },
+            "architecture": {
+              "type": "string"
+            },
+            "available_parallelism": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "cargo_arguments": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "benchmark_version",
+            "workload_sha256",
+            "tool_versions",
+            "tool_digests",
+            "rustc",
+            "os",
+            "architecture",
+            "available_parallelism",
+            "cargo_arguments"
+          ]
+        }
+      ]
+    },
+    "samples": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "order": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "round": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "tool": {
+            "enum": [
+              "native",
+              "cargo-rail",
+              "sccache"
+            ]
+          },
+          "scenario": {
+            "enum": [
+              "cold",
+              "rebuild",
+              "freshness",
+              "source-edit"
+            ]
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "running",
+              "passed",
+              "failed"
+            ]
+          },
+          "seconds": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "exclusiveMinimum": 0
+          },
+          "cargo_fresh_units": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "cargo_rebuilt_units": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "cargo_reported_files": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "compiler_cache_hits": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "compiler_cache_misses": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "failed_compiler_attempts": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "verified_restored_files": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "description": "Distinct restored compiler output paths still present at build completion and verified against admitted seed bytes and modes; null means attribution is unavailable."
+          },
+          "evidence": {
+            "type": "string",
+            "pattern": "^sample-[0-9]{4,}$"
+          },
+          "cache_bypass_reasons": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "verified_restored_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "restored_by_role": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "unretained_restore_outputs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "description": "Restored output instances absent or overwritten at build completion, excluded from the verified retained-file count."
+          }
+        },
+        "required": [
+          "order",
+          "round",
+          "tool",
+          "scenario",
+          "status",
+          "seconds",
+          "cargo_fresh_units",
+          "cargo_rebuilt_units",
+          "cargo_reported_files",
+          "compiler_cache_hits",
+          "compiler_cache_misses",
+          "failed_compiler_attempts",
+          "verified_restored_files",
+          "evidence",
+          "cache_bypass_reasons",
+          "verified_restored_bytes",
+          "restored_by_role",
+          "unretained_restore_outputs"
+        ]
+      }
+    }
+  },
+  "required": [
+    "schema_version",
+    "kind",
+    "mode",
+    "purpose",
+    "profile",
+    "status",
+    "context",
+    "samples"
+  ]
+}

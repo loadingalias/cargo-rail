@@ -1258,7 +1258,7 @@ impl StagedExecutionResult {
         stdout: &[u8],
         stderr: &[u8],
     ) -> RailResult<Self> {
-        let staging = NativeResultStaging::temporary()?;
+        let staging = NativeResultStaging::temporary_in(&std::env::temp_dir())?;
         let distributed = staging.path().join("distributed");
         fs::create_dir(&distributed)?;
         let mut frames = BTreeMap::new();
@@ -8010,7 +8010,7 @@ mod tests {
     fn empty_staged_result() -> RailResult<StagedExecutionResult> {
         let request = request_for(SOURCE)?;
         Ok(StagedExecutionResult {
-            staging: NativeResultStaging::temporary()?,
+            staging: NativeResultStaging::temporary_in(&std::env::temp_dir())?,
             frames: BTreeMap::new(),
             descriptors: BTreeMap::new(),
             inputs: request.inputs,

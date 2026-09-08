@@ -14,7 +14,7 @@ pub mod clean;
 pub mod cli;
 /// Common utilities for command implementations.
 pub mod common;
-/// Inspect, validate, explain, and migrate repository policy.
+/// Inspect, validate, and explain repository policy.
 pub mod config;
 /// Read-only workspace and toolchain diagnostics.
 pub mod doctor;
@@ -361,9 +361,7 @@ pub fn try_dispatch_pre_context(
                 cli::CacheCommand::DropProfile { profile, check, format } => {
                     cache::run_drop_profile(workspace_root, &profile, check, format)?;
                 }
-                cli::CacheCommand::DropUnbound { check, format } => {
-                    cache::run_drop_unbound(workspace_root, check, format)?;
-                }
+
                 cli::CacheCommand::Recover { check, format } => {
                     cache::run_recover(workspace_root, check, format)?;
                 }

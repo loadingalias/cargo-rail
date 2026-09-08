@@ -75,3 +75,14 @@ update:
 
 check-tooling:
     @scripts/tooling/check.sh
+
+# The sole performance benchmark; fixture preparation and resets are owned by the binary.
+[positional-arguments]
+bench *args: build-release
+    #!/usr/bin/env bash
+    set -euo pipefail
+    component_directory="$(
+        cargo metadata --no-deps --format-version 1 --locked --offline |
+            python3 -c 'import json, pathlib, sys; print((pathlib.Path(json.load(sys.stdin)["target_directory"]) / "release").as_posix())'
+    )"
+    exec "$component_directory/cargo-rail-bench" local "$@"

@@ -21,7 +21,6 @@ use rayon::prelude::*;
 struct CrateSyncResult {
     crate_name: String,
     result: SyncResult,
-    origin_migrations: usize,
     skipped: bool,
 }
 
@@ -194,22 +193,17 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
                     return Ok(1);
                 }
                 let mut engine = SyncEngine::new(ctx, config.clone(), args.strategy)?;
-                engine.bind_origin_migration(mapping_snapshots[&config.crate_name].origin_migration.clone())?;
+                engine.bind_origin_authority(mapping_snapshots[&config.crate_name].origin_authority.clone())?;
                 engine.bind_publication(mapping_snapshots[&config.crate_name].publication.clone())?;
                 engine.pending_commit_count(&direction)
             })
             .collect::<RailResult<Vec<_>>>()?;
         revalidate_sync_mapping_snapshots(ctx, &configs, &direction, &mapping_snapshots)?;
-        let pending_origin_migrations = configs
-            .iter()
-            .map(|(config, _)| mapping_snapshots[&config.crate_name].origin_migration.count())
-            .collect::<Vec<_>>();
         let pending_publications = configs
             .iter()
             .map(|(config, _)| {
                 let mapping = &mapping_snapshots[&config.crate_name];
                 let publishes_target = matches!(direction, SyncDirection::MonoToRemote | SyncDirection::Both)
-                    || mapping.origin_migration.count() > 0
                     || mapping
                         .publication
                         .as_ref()
@@ -222,7 +216,6 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
             })
             .collect::<Vec<_>>();
         let has_pending = pending_commits.iter().any(|count| *count > 0)
-            || pending_origin_migrations.iter().any(|count| *count > 0)
             || pending_publications.iter().any(|count| *count > 0)
             || mapping_snapshots
                 .values()
@@ -238,9 +231,8 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
                 .map(
                     |(index, (sync_config, target_exists))| {
                         let pending_commits = pending_commits[index];
-                        let pending_origin_migrations = pending_origin_migrations[index];
                         let pending_publication = pending_publications[index];
-                        let migration = &mapping_snapshots[&sync_config.crate_name].origin_migration;
+                        let authority = &mapping_snapshots[&sync_config.crate_name].origin_authority;
                         serde_json::json!({
                           "crate_name": sync_config.crate_name,
                           "mode": split_mode_name(&sync_config.mode),
@@ -248,12 +240,10 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
                           "branch": sync_config.branch,
                           "remote_url": sync_config.remote_url,
                           "target_exists": target_exists,
-                          "pending": pending_commits > 0 || pending_origin_migrations > 0 || pending_publication > 0 || !mapping_snapshots[&sync_config.crate_name].prepared_effects.is_empty(),
+                          "pending": pending_commits > 0 || pending_publication > 0 || !mapping_snapshots[&sync_config.crate_name].prepared_effects.is_empty(),
                           "pending_commits": pending_commits,
-                          "pending_origin_migrations": pending_origin_migrations,
                           "pending_publication_commits": pending_publication,
-                          "origin_migration_digest": migration.migration_digest(),
-                          "origin_authority": origin_authority_json(migration),
+                          "origin_authority": origin_authority_json(authority),
                           "publication_authority": publication_authority_json(mapping_snapshots[&sync_config.crate_name].publication.as_ref()),
                           "prepared_effects": mapping_snapshots[&sync_config.crate_name].prepared_effects,
                         })
@@ -286,12 +276,11 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
 
         for (index, (sync_config, target_exists)) in configs.iter().enumerate() {
             println!(
-                "{}: {}; repository {} ({} pending commit(s), {} pending origin migration(s), {} pending publication commit(s))",
+                "{}: {}; repository {} ({} pending commit(s), {} pending publication commit(s))",
                 sync_config.crate_name,
                 direction_display(&direction),
                 sync_config.target_repo_path.display(),
                 pending_commits[index],
-                pending_origin_migrations[index],
                 pending_publications[index],
             );
             if !target_exists {
@@ -373,7 +362,7 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
                         return Ok(CrateSyncResult {
                             crate_name,
                             result: SyncResult::default(),
-                            origin_migrations: 0,
+
                             skipped: true,
                         });
                     }
@@ -381,9 +370,8 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
                     if crate::output::is_verbose() {
                         progress!("  {}", crate_name);
                     }
-                    let origin_migrations = mapping_snapshots[&crate_name].origin_migration.count();
                     let mut engine = SyncEngine::new(ctx, sync_config, strategy)?;
-                    engine.bind_origin_migration(mapping_snapshots[&crate_name].origin_migration.clone())?;
+                    engine.bind_origin_authority(mapping_snapshots[&crate_name].origin_authority.clone())?;
                     engine.bind_publication(mapping_snapshots[&crate_name].publication.clone())?;
 
                     let result = match direction {
@@ -396,7 +384,7 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
                     Ok(CrateSyncResult {
                         crate_name,
                         result,
-                        origin_migrations,
+
                         skipped: false,
                     })
                 })
@@ -415,7 +403,7 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
                     results.push(CrateSyncResult {
                         crate_name,
                         result: SyncResult::default(),
-                        origin_migrations: 0,
+
                         skipped: true,
                     });
                     continue;
@@ -424,9 +412,8 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
                 if crate::output::is_verbose() {
                     progress!("syncing {}...", crate_name);
                 }
-                let origin_migrations = mapping_snapshots[&crate_name].origin_migration.count();
                 let mut engine = SyncEngine::new(ctx, sync_config, args.strategy)?;
-                engine.bind_origin_migration(mapping_snapshots[&crate_name].origin_migration.clone())?;
+                engine.bind_origin_authority(mapping_snapshots[&crate_name].origin_authority.clone())?;
                 engine.bind_publication(mapping_snapshots[&crate_name].publication.clone())?;
 
                 let result = match direction {
@@ -440,7 +427,7 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
                 results.push(CrateSyncResult {
                     crate_name,
                     result,
-                    origin_migrations,
+
                     skipped: false,
                 });
                 if conflicted {
@@ -535,7 +522,7 @@ fn run_sync_resume(ctx: &WorkspaceContext, receipt: &Path, json: bool) -> RailRe
     let results = vec![CrateSyncResult {
         crate_name: crate_name.clone(),
         result,
-        origin_migrations: 0,
+
         skipped: false,
     }];
     print_sync_summary(&results, json, None, &selected_repositories)?;
@@ -611,11 +598,7 @@ fn collect_sync_effect_audits_for_crate(
     let mut acknowledgements = GitEffectStore::completed_audits_read_only(
         &target,
         crate_name,
-        &[
-            "origin-migration-",
-            to_remote_prefix.as_str(),
-            publication_prefix.as_str(),
-        ],
+        &[to_remote_prefix.as_str(), publication_prefix.as_str()],
     )?
     .into_iter()
     .map(|audit| (target_repo_path.to_path_buf(), audit))
@@ -660,7 +643,6 @@ fn print_sync_summary(
           "crate": r.crate_name,
           "target_repository": repositories.get(&r.crate_name),
           "commits_synced": r.result.commits_synced,
-          "origin_migrations": r.origin_migrations,
           "conflicts": conflicts,
           "status": if r.result.status == crate::sync::SyncStatus::Conflicted { "conflicted" } else { "complete" },
           "conflict_receipt": r.result.conflict_receipt,
@@ -670,7 +652,6 @@ fn print_sync_summary(
       .collect();
 
         let total_commits: usize = results.iter().map(|r| r.result.commits_synced).sum();
-        let total_origin_migrations: usize = results.iter().map(|r| r.origin_migrations).sum();
         let total_conflicts: usize = results.iter().map(|r| r.result.conflicts.len()).sum();
 
         let conflicted = results
@@ -682,7 +663,6 @@ fn print_sync_summary(
           "crates": crates,
           "summary": {
             "total_commits": total_commits,
-            "total_origin_migrations": total_origin_migrations,
             "total_conflicts": total_conflicts,
             "crates_synced": results.iter().filter(|r| !r.skipped).count(),
             "crates_skipped": results.iter().filter(|r| r.skipped).count()
@@ -702,7 +682,6 @@ fn print_sync_summary(
     // Text output
     let active_results: Vec<_> = results.iter().filter(|r| !r.skipped).collect();
     let total_commits: usize = active_results.iter().map(|r| r.result.commits_synced).sum();
-    let total_origin_migrations: usize = active_results.iter().map(|r| r.origin_migrations).sum();
     let total_conflicts: usize = active_results.iter().map(|r| r.result.conflicts.len()).sum();
     let conflicted = active_results
         .iter()
@@ -718,8 +697,8 @@ fn print_sync_summary(
         let direction = direction.map(direction_display).unwrap_or("resumed conflict");
         if r.result.conflicts.is_empty() {
             println!(
-                "{}: {}; repository {} ({} {}, {} origin migration(s))",
-                r.crate_name, direction, repository, r.result.commits_synced, commit_word, r.origin_migrations,
+                "{}: {}; repository {} ({} {})",
+                r.crate_name, direction, repository, r.result.commits_synced, commit_word,
             );
         } else {
             let conflict_word = if r.result.conflicts.len() == 1 {
@@ -728,13 +707,12 @@ fn print_sync_summary(
                 "conflicts"
             };
             println!(
-                "{}: {}; repository {} ({} {}, {} origin migration(s), {} {})",
+                "{}: {}; repository {} ({} {}, {} {})",
                 r.crate_name,
                 direction,
                 repository,
                 r.result.commits_synced,
                 commit_word,
-                r.origin_migrations,
                 r.result.conflicts.len(),
                 conflict_word
             );
@@ -762,14 +740,11 @@ fn print_sync_summary(
     } else if total_conflicts > 0 {
         let conflict_word = if total_conflicts == 1 { "conflict" } else { "conflicts" };
         println!(
-            "Sync complete: {} {}, {} origin migration(s), {} {}.",
-            total_commits, commit_word, total_origin_migrations, total_conflicts, conflict_word
+            "Sync complete: {} {}, {} {}.",
+            total_commits, commit_word, total_conflicts, conflict_word
         );
     } else {
-        println!(
-            "Sync complete: {} {}, {} origin migration(s).",
-            total_commits, commit_word, total_origin_migrations
-        );
+        println!("Sync complete: {} {}.", total_commits, commit_word);
     }
 
     Ok(())
@@ -831,8 +806,8 @@ fn build_sync_mutation_plan(
         .into_iter()
         .map(|(config, target_exists)| {
             let mapping = &mapping_snapshots[&config.crate_name];
-            let source_head = mapping.origin_migration.source_head();
-            let target_head = mapping.origin_migration.target_head().unwrap_or("none");
+            let source_head = mapping.origin_authority.source_head();
+            let target_head = mapping.origin_authority.target_head().unwrap_or("none");
             let publication_count = mapping.publication.as_ref().map_or(0, |snapshot| snapshot.count());
             let publication_digest = mapping
                 .publication
@@ -845,9 +820,7 @@ fn build_sync_mutation_plan(
                 "source_head": source_head,
                 "target_head": target_head,
                 "mapping_count": mapping.mapping_count,
-                "origin_migration_count": mapping.origin_migration.count(),
-                "origin_migration_digest": mapping.origin_migration.migration_digest(),
-                "origin_authority": origin_authority_json(&mapping.origin_migration),
+                "origin_authority": origin_authority_json(&mapping.origin_authority),
                 "publication_count": publication_count,
                 "publication_authority": publication_authority_json(mapping.publication.as_ref()),
             });
@@ -858,15 +831,15 @@ fn build_sync_mutation_plan(
                 "SYNC_CRATE",
                 config.crate_name.clone(),
                 Some(format!(
-                    "direction={}, strategy={}, target_exists={}, source_head={}, target_head={}, mapping_count={}, origin_migration_count={}, origin_migration_digest={}, publication_count={}, publication_digest={}",
+                    "direction={}, strategy={}, target_exists={}, source_head={}, target_head={}, mapping_count={}, publication_count={}, publication_digest={}",
                     direction_name,
                     strategy_name(strategy),
                     target_exists,
                     source_head,
                     target_head,
                     mapping.mapping_count,
-                    mapping.origin_migration.count(),
-                    mapping.origin_migration.migration_digest(),
+
+
                     publication_count,
                     publication_digest,
                 )),
@@ -921,8 +894,8 @@ fn collect_sync_snapshots(
               "crate_name": config.crate_name,
               "direction": direction_name,
               "strategy": strategy_name(strategy),
-              "source_head": mapping.origin_migration.source_head(),
-              "target_head": mapping.origin_migration.target_head(),
+              "source_head": mapping.origin_authority.source_head(),
+              "target_head": mapping.origin_authority.target_head(),
               "target_exists": target_exists,
               "ownership": {
                 "snapshot_id": config.ownership.snapshot_id,
@@ -935,9 +908,7 @@ fn collect_sync_snapshots(
               },
               "mapping_snapshot": {
                 "mapping_count": mapping.mapping_count,
-                "pending_origin_migrations": mapping.origin_migration.count(),
-                "origin_migration_digest": mapping.origin_migration.migration_digest(),
-                "origin_authority": origin_authority_json(&mapping.origin_migration),
+                "origin_authority": origin_authority_json(&mapping.origin_authority),
                 "publication_authority": publication_authority_json(mapping.publication.as_ref()),
                 "prepared_effects": mapping.prepared_effects,
               },
@@ -1022,9 +993,9 @@ fn capture_sync_mapping_snapshots(
                         RailError::message("prepared source sync effect has no predecessor source HEAD")
                     })?;
                 let selected_target_head = snapshot
-                    .origin_migration
+                    .origin_authority
                     .target_selected_head()
-                    .or_else(|| snapshot.origin_migration.target_head())
+                    .or_else(|| snapshot.origin_authority.target_head())
                     .ok_or_else(|| RailError::message("prepared source sync effect lost target HEAD authority"))?;
                 let (store, authority) = crate::git::mappings::MappingStore::capture_prepared_source_authority_at(
                     ctx.workspace_root(),
@@ -1047,7 +1018,7 @@ fn capture_sync_mapping_snapshots(
                     return Err(RailError::message("prepared source sync mapping pre-authority changed"));
                 }
                 snapshot.mapping_count = store.count();
-                snapshot.origin_migration = authority;
+                snapshot.origin_authority = authority;
                 if let Some(target_pre_authority) = snapshot.prepared_effects.iter().find_map(|effect| {
                     effect
                         .pointer("/mapping/pre_authority")

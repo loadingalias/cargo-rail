@@ -336,7 +336,6 @@ pub(crate) fn run_report(start: Option<&Path>, finish: Option<&Path>, format: Te
 pub(crate) fn run_profiles(workspace_root: &Path, format: TextJsonOutputFormat) -> RailResult<()> {
     let cargo_home = crate::cache::installation::selected_cargo_home(workspace_root)?;
     let profiles = crate::cache::profile::list(&cargo_home)?;
-    let pre_profile_state = crate::cache::profile::pre_profile_state_status(&cargo_home)?;
     if format.is_json() {
         let output = crate::output::machine_json_envelope(
             "cache",
@@ -345,7 +344,6 @@ pub(crate) fn run_profiles(workspace_root: &Path, format: TextJsonOutputFormat) 
             0,
             serde_json::json!({
               "profiles": profiles,
-              "unbound_pre_profile_state": pre_profile_state,
             }),
         );
         println!("{}", serde_json::to_string_pretty(&output)?);
@@ -359,9 +357,6 @@ pub(crate) fn run_profiles(workspace_root: &Path, format: TextJsonOutputFormat) 
                 profile.state,
                 profile.root_portability
             );
-        }
-        if pre_profile_state.is_some() {
-            println!("Unbound pre-profile cache state: retained for explicit cleanup");
         }
     }
     Ok(())
@@ -442,43 +437,6 @@ pub(crate) fn run_drop_profile(
         );
     } else {
         println!("Profile {} is not installed.", plan.profile_id());
-    }
-    if check && pending {
-        Err(RailError::CheckHasPendingChanges)
-    } else {
-        Ok(())
-    }
-}
-
-pub(crate) fn run_drop_unbound(workspace_root: &Path, check: bool, format: TextJsonOutputFormat) -> RailResult<()> {
-    let cargo_home = crate::cache::installation::selected_cargo_home(workspace_root)?;
-    let plan = crate::cache::profile::plan_pre_profile_state_removal(&cargo_home)?;
-    let pending = plan.pending();
-    let details = serde_json::json!({
-      "pending": pending,
-      "cache_root": plan.cache_root(),
-      "bytes": plan.bytes(),
-    });
-    if !check {
-        crate::cache::profile::apply_pre_profile_state_removal(&plan)?;
-    }
-    if format.is_json() {
-        let output = crate::output::machine_json_envelope(
-            "cache",
-            if check { "drop_unbound_check" } else { "drop_unbound" },
-            if check && pending { "pending_changes" } else { "success" },
-            if check && pending { 1 } else { 0 },
-            details,
-        );
-        println!("{}", serde_json::to_string_pretty(&output)?);
-    } else if pending {
-        println!(
-            "Unbound pre-profile cache state {} ({} reclaimed).",
-            if check { "would be removed" } else { "removed" },
-            human_bytes(plan.bytes())
-        );
-    } else {
-        println!("No unbound pre-profile cache state is installed.");
     }
     if check && pending {
         Err(RailError::CheckHasPendingChanges)

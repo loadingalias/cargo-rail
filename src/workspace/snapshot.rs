@@ -14,7 +14,7 @@ use serde::Deserialize;
 use crate::cargo::MultiTargetMetadata;
 use crate::cargo::resolution::{
     CargoConfigSnapshot, ResolutionInputs, ResolutionRequest, ResolutionView, ResolutionViews, TargetIdentity,
-    ToolchainIdentity, credential_bearing_url,
+    TargetSpecificationIdentity, ToolchainIdentity, credential_bearing_url,
 };
 use crate::compiler::cfg_eval::{TargetCfgSet, load_target_cfg_sets};
 use crate::config::RailConfig;
@@ -671,7 +671,26 @@ impl WorkspaceSnapshot {
     }
 
     pub(crate) fn target_cfg_sets(&self) -> RailResult<Arc<std::collections::HashMap<String, TargetCfgSet>>> {
-        self.derived.target_cfg_sets()
+        cached_snapshot_view(self.derived.target_cfg_sets.get_or_init(|| {
+            let mut cfg_sets = std::collections::HashMap::with_capacity(self.derived.analysis_targets.len() + 1);
+            for target in &self.targets {
+                if !target.is_host() && !target.is_analysis_target() {
+                    continue;
+                }
+                let cfg = TargetCfgSet::from_rustc_output(&target.cfg().join("\n"));
+                if target.is_analysis_target() {
+                    let name = match target.specification() {
+                        TargetSpecificationIdentity::BuiltIn(name) => name.as_str(),
+                        TargetSpecificationIdentity::Custom(specification) => specification.name(),
+                    };
+                    cfg_sets.insert(name.to_string(), cfg.clone());
+                }
+                if target.is_host() {
+                    cfg_sets.insert("default".to_string(), cfg);
+                }
+            }
+            Ok(Arc::new(cfg_sets))
+        }))
     }
 
     pub(crate) fn validate_external_targets_unchanged(&self) -> RailResult<()> {

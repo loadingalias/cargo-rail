@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 pub(crate) const RELEASE_REGISTRY: &str = "crates-io";
-pub(crate) const RELEASE_PLAN_CONTRACT_VERSION: u32 = 7;
+pub(crate) const RELEASE_PLAN_CONTRACT_VERSION: u32 = 8;
 
 /// A plan for releasing one or more crates
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,8 +121,8 @@ pub struct CrateReleasePlan {
     pub bump_reason: String,
     /// Rendered changelog body for the planned version, excluding the version header.
     pub changelog_body: String,
-    /// Exact captured insertion and forge prose; absent only in predecessor recovery.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Exact insertion and forge prose, required in serialized plans; filled after intent resolution.
+    #[serde(deserialize_with = "required_presentation")]
     pub presentation: Option<PlannedPresentation>,
     /// Attributed commits supplying intent in commit workflows.
     #[serde(default)]
@@ -147,6 +147,12 @@ pub struct CrateReleasePlan {
     /// Synthesized changelog entry for group-only releases.
     #[serde(skip)]
     version_group_entry: Option<String>,
+}
+
+fn required_presentation<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<PlannedPresentation>, D::Error> {
+    PlannedPresentation::deserialize(deserializer).map(Some)
 }
 
 /// One commit included in a crate release plan.

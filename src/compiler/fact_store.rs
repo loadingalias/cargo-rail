@@ -23,11 +23,11 @@ pub(crate) struct CompilerFactStore {
 }
 
 impl CompilerFactStore {
-    pub(crate) fn load_with_remote(remote: Option<Arc<crate::remote_cache::RemoteStore>>) -> Self {
-        Self {
-            cas: LocalCas::open().ok(),
-            remote,
-        }
+    pub(crate) fn load_with_cas_and_remote(
+        cas: Option<LocalCas>,
+        remote: Option<Arc<crate::remote_cache::RemoteStore>>,
+    ) -> Self {
+        Self { cas, remote }
     }
 
     pub(crate) const fn durability_available(&self) -> bool {

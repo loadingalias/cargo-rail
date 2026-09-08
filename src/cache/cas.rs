@@ -47,7 +47,6 @@ const ACCESS_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const EVIDENCE_CANDIDATE_INDEX_VERSION: u32 = 1;
 const EVIDENCE_CANDIDATE_INDEX_DIRECTORY: &str = "compiler-evidence-candidates";
 const NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY: &str = "native-dynamic-input-selectors-v1";
-const V025_NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY: &str = "native-environment-selectors-v1";
 const NATIVE_LINK_CANDIDATE_DIRECTORY: &str = "native-link-candidates-v1";
 const NATIVE_LINK_CANDIDATE_VERSION: u32 = 1;
 const MAX_NATIVE_LINK_CANDIDATES: usize = 64;
@@ -67,7 +66,6 @@ const PACKED_NATIVE_ACTION_PRELUDE_BYTES: u64 = 8 + 2 + 4;
 const PACKED_NATIVE_ACTION_PRELUDE_LEN: usize = 8 + 2 + 4;
 const MAX_PACKED_NATIVE_ACTION_HEADER_BYTES: u64 = 1024 * 1024;
 const MAX_PACKED_NATIVE_ACTION_BYTES: u64 = crate::compiler::native_cache::pack::MAX_PACK_BYTES + 1024 * 1024;
-const V025_NATIVE_ACTION_STATE_DIRECTORY: &str = "native-actions";
 const CAPACITY_STATE_FILE: &str = "CAPACITY.json";
 const NATIVE_LEDGER_STATE_FILE: &str = "NATIVE_LEDGER.json";
 const MAX_NATIVE_TERMINAL_STATES: u64 = 32 * 1024;
@@ -931,7 +929,11 @@ impl LocalCas {
             Err(fs::TryLockError::WouldBlock) => return Ok(NativeExecutionClaimAttempt::Contended),
             Err(fs::TryLockError::Error(error)) => return Err(error.into()),
         }
-        validate_native_execution_claim_file(&path)?;
+        if !crate::utils::private_file_matches_path(&file, &path, 0)? {
+            return Err(RailError::message(
+                "native execution-claim shard changed while it was acquired",
+            ));
+        }
         Ok(NativeExecutionClaimAttempt::Acquired(NativeExecutionClaim {
             _file: file,
         }))
@@ -945,7 +947,11 @@ impl LocalCas {
     ) -> RailResult<NativeExecutionClaim> {
         let (file, path) = self.native_execution_claim_file(identity)?;
         file.lock()?;
-        validate_native_execution_claim_file(&path)?;
+        if !crate::utils::private_file_matches_path(&file, &path, 0)? {
+            return Err(RailError::message(
+                "native execution-claim shard changed while it was acquired",
+            ));
+        }
         Ok(NativeExecutionClaim { _file: file })
     }
 
@@ -1477,9 +1483,14 @@ impl LocalCas {
         ] {
             validate_real_directory(&root.join(name), "local CAS required directory")?;
         }
-        validate_native_execution_claim_directory(&native_execution_claim_directory(&root)?)?;
-        validate_native_restore_lock_directory(&root.join(NATIVE_RESTORE_LOCK_DIRECTORY))?;
-        validate_v025_preserved_namespaces(&root)?;
+        validate_real_directory(
+            &native_execution_claim_directory(&root)?,
+            "local CAS native execution claims",
+        )?;
+        validate_real_directory(
+            &root.join(NATIVE_RESTORE_LOCK_DIRECTORY),
+            "local CAS native restore locks",
+        )?;
         #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         validate_real_directory(
             &root.join(SYSROOT_IDENTITY_MEMO_DIRECTORY),
@@ -1510,7 +1521,6 @@ impl LocalCas {
         let root = create_real_directory(&cargo_rail, &authority.root_name)?;
         prove_local_cache_volume(&root)?;
         ensure_owner_marker(&root, &authority.trust_domain)?;
-        validate_v025_preserved_namespaces(&root)?;
         create_real_directory(&root, "staging")?;
         for name in [
             "results",
@@ -2228,7 +2238,6 @@ fn initialize_selected_root(
     let root = create_real_directory(cargo_rail, &authority.root_name)?;
     prove_local_cache_volume(&root)?;
     ensure_owner_marker(&root, &authority.trust_domain)?;
-    validate_v025_preserved_namespaces(&root)?;
     create_real_directory(&root, "staging")?;
     for name in [
         "results",
@@ -2661,17 +2670,6 @@ fn validate_optional_real_directory(path: &Path, description: &str) -> RailResul
     }
 }
 
-fn validate_v025_preserved_namespaces(root: &Path) -> RailResult<()> {
-    validate_optional_real_directory(
-        &root.join(V025_NATIVE_ACTION_STATE_DIRECTORY),
-        "v0.25-preserved local CAS native action state",
-    )?;
-    validate_optional_real_directory(
-        &root.join(V025_NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY),
-        "v0.25-preserved local CAS native environment selectors",
-    )
-}
-
 fn ensure_owner_marker(root: &Path, trust_domain: &str) -> RailResult<()> {
     let marker = root.join("OWNER");
     match fs::symlink_metadata(&marker) {
@@ -2729,8 +2727,6 @@ fn validate_root_entries(root: &Path) -> RailResult<()> {
         NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY,
         NATIVE_LINK_CANDIDATE_DIRECTORY,
         NATIVE_RESTORE_LOCK_DIRECTORY,
-        V025_NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY,
-        V025_NATIVE_ACTION_STATE_DIRECTORY,
         "pins",
         "results",
         "staging",
@@ -5726,14 +5722,6 @@ fn validate_native_ledger(root: &Path) -> RailResult<NativeLedgerState> {
     let mut stats = ReadStats::default();
     let state: NativeLedgerState =
         read_canonical_json(&path, MAX_OBJECT_METADATA_BYTES, &mut stats).map_err(fault_to_error)?;
-    if state.version == 1 && !root.join(NATIVE_ACTION_STATE_DIRECTORY).exists() {
-        return Ok(NativeLedgerState {
-            version: NATIVE_ACTION_STATE_VERSION,
-            terminal_states: 0,
-            terminal_bytes: 0,
-            disabled: false,
-        });
-    }
     if state.version != NATIVE_ACTION_STATE_VERSION
         || (!state.disabled
             && (state.terminal_states > MAX_NATIVE_TERMINAL_STATES || state.terminal_bytes > MAX_NATIVE_TERMINAL_BYTES))
@@ -6003,7 +5991,6 @@ pub(crate) fn existing_root_at(root: &Path) -> RailResult<Option<PathBuf>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    validate_v025_preserved_namespaces(root)?;
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     validate_optional_real_directory(&root.join(SYSROOT_IDENTITY_MEMO_DIRECTORY), "local CAS domain")?;
     validate_capacity_state(root)?;
@@ -6524,13 +6511,24 @@ mod tests {
     use super::*;
     use crate::source::ContentDigest;
 
-    const V025_NATIVE_LEDGER: &[u8] = include_bytes!("../../tests/fixtures/compat/v0.25.0/cache/NATIVE_LEDGER.json");
-    const V025_NATIVE_ACTION_STATE: &[u8] = include_bytes!(
-        "../../tests/fixtures/compat/v0.25.0/cache/native-actions/0000000000000000000000000000000000000000000000000000000000000001.json"
-    );
-    const V025_NATIVE_ENVIRONMENT_SELECTOR: &[u8] = include_bytes!(
-        "../../tests/fixtures/compat/v0.25.0/cache/native-environment-selectors-v1/0000000000000000000000000000000000000000000000000000000000000001.json"
-    );
+    #[test]
+    fn unsupported_native_ledger_never_becomes_empty_current_authority() {
+        let cache = tempfile::tempdir().expect("cache base");
+        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("current CAS");
+        let root = cas.root.clone();
+        drop(cas);
+        let path = root.join(NATIVE_LEDGER_STATE_FILE);
+        let unsupported = canonical_json(&NativeLedgerState {
+            version: 1,
+            terminal_states: 0,
+            terminal_bytes: 0,
+            disabled: false,
+        })
+        .unwrap();
+        fs::write(&path, &unsupported).unwrap();
+        validate_native_ledger(&root).unwrap_err();
+        assert_eq!(fs::read(&path).unwrap(), unsupported);
+    }
 
     #[test]
     fn preverified_blob_generation_rejects_same_length_mutation() {
@@ -6572,10 +6570,6 @@ mod tests {
 
     fn base_action_key(value: u8) -> String {
         format!("{}{value:064x}", crate::compiler::native_cache::BASE_ACTION_KEY_PREFIX)
-    }
-
-    fn v025_fixture(bytes: &'static [u8]) -> &'static [u8] {
-        bytes.strip_suffix(b"\n").unwrap_or(bytes)
     }
 
     fn dynamic_selector(names: &[&str], paths: &[&str]) -> crate::compiler::native_cache::NativeDynamicInputSelector {
@@ -7529,126 +7523,6 @@ mod tests {
     }
 
     #[test]
-    fn v025_namespaces_are_preserved_without_becoming_current_authority() {
-        let cache = tempfile::tempdir().expect("cache base");
-        let output = tempfile::tempdir().expect("output root");
-        let (manifest, validation) = native_fixture(output.path());
-        let initialized = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should initialize");
-        let root = initialized.root().to_path_buf();
-        drop(initialized);
-
-        let current_actions = root.join(NATIVE_ACTION_STATE_DIRECTORY);
-        fs::remove_dir(&current_actions).expect("v0.25 fixture omits the current action namespace");
-        fs::write(root.join(NATIVE_LEDGER_STATE_FILE), v025_fixture(V025_NATIVE_LEDGER)).expect("v0.25 native ledger");
-        let preserved_actions = root.join(V025_NATIVE_ACTION_STATE_DIRECTORY);
-        let preserved_selectors = root.join(V025_NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY);
-        fs::create_dir(&preserved_actions).expect("v0.25 native actions");
-        fs::create_dir(&preserved_selectors).expect("v0.25 native environment selectors");
-
-        let action_hex = validated_action_key_hex(validation.action_key()).expect("current action key");
-        let preserved_action = preserved_actions.join(format!("{action_hex}.json"));
-        fs::write(&preserved_action, v025_fixture(V025_NATIVE_ACTION_STATE)).expect("v0.25 action state");
-        let base_action = base_action_key(1);
-        let base_hex = validated_id_hex(&base_action, crate::compiler::native_cache::BASE_ACTION_KEY_PREFIX)
-            .expect("base action key");
-        let preserved_selector = preserved_selectors.join(format!("{base_hex}.json"));
-        fs::write(&preserved_selector, v025_fixture(V025_NATIVE_ENVIRONMENT_SELECTOR))
-            .expect("v0.25 environment selector");
-
-        let predecessor_status = status_at_with_max(&root, 1024 * 1024)
-            .expect("v0.25 root status")
-            .expect("v0.25 root should be present");
-        assert_eq!(predecessor_status.native_actions, 0);
-        assert_eq!(predecessor_status.index_files, 0);
-        assert!(!current_actions.exists());
-
-        let upgraded = LocalCas::open_at(cache.path(), 1024 * 1024).expect("setup should upgrade around v0.25 state");
-        assert!(current_actions.is_dir(), "setup must create the current namespace");
-        assert_eq!(
-            fs::read(&preserved_action).expect("preserved action"),
-            v025_fixture(V025_NATIVE_ACTION_STATE)
-        );
-        assert_eq!(
-            fs::read(&preserved_selector).expect("preserved selector"),
-            v025_fixture(V025_NATIVE_ENVIRONMENT_SELECTOR)
-        );
-        let NativeActionLookup::Miss(miss) = upgraded
-            .native_action(validation.action_key())
-            .expect("predecessor action lookup")
-        else {
-            panic!("v0.25 state must not grant current native-action authority");
-        };
-        assert_eq!(miss.reason, "action_not_found");
-        assert_eq!(
-            upgraded
-                .native_environment_selector(&base_action)
-                .expect("predecessor selector lookup"),
-            None,
-            "v0.25 selectors must not grant current selector authority"
-        );
-        let ledger = validate_native_ledger(upgraded.root()).expect("upgraded native ledger");
-        assert_eq!(ledger.version, NATIVE_ACTION_STATE_VERSION);
-        assert_eq!(ledger.terminal_states, 0);
-        assert_eq!(ledger.terminal_bytes, 0);
-        assert!(!ledger.disabled);
-        drop(upgraded);
-
-        let canonical_base = fs::canonicalize(cache.path()).expect("canonical cache base");
-        let wrapper = LocalCas::open_initialized_at(&canonical_base, 1024 * 1024, None)
-            .expect("wrapper should open the upgraded v0.25 root");
-        let selector = dynamic_selector(&["CARGO_CFG_TARGET_ARCH"], &[".config/target-matrix.json"]);
-        assert_eq!(
-            wrapper
-                .publish_native_environment_selector(&base_action, &selector)
-                .expect("current selector publication"),
-            NativeEnvironmentSelectorPublication::Created
-        );
-        store_native_fixture(&wrapper, output.path(), &manifest, &validation);
-        assert_eq!(
-            fs::read(&preserved_action).expect("preserved action"),
-            v025_fixture(V025_NATIVE_ACTION_STATE)
-        );
-        assert_eq!(
-            fs::read(&preserved_selector).expect("preserved selector"),
-            v025_fixture(V025_NATIVE_ENVIRONMENT_SELECTOR)
-        );
-        let status = wrapper.status().expect("upgraded CAS status");
-        assert_eq!(status.native_actions, 1);
-        assert_eq!(status.native_unique, 1);
-        assert_eq!(status.index_files, 1);
-        drop(wrapper);
-
-        assert!(remove_owned_root_at(&root).expect("v0.25-compatible cleanup").is_some());
-        assert!(!root.exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn v025_namespace_links_are_rejected_without_touching_their_targets() {
-        use std::os::unix::fs::symlink;
-
-        for namespace in [
-            V025_NATIVE_ACTION_STATE_DIRECTORY,
-            V025_NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY,
-        ] {
-            let cache = tempfile::tempdir().expect("cache base");
-            let outside = tempfile::tempdir().expect("outside root");
-            let sentinel = outside.path().join("keep");
-            fs::write(&sentinel, b"outside").expect("outside sentinel");
-            let initialized = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should initialize");
-            let root = initialized.root().to_path_buf();
-            drop(initialized);
-            symlink(outside.path(), root.join(namespace)).expect("v0.25 namespace link");
-
-            let error =
-                LocalCas::open_at(cache.path(), 1024 * 1024).expect_err("setup must reject a linked v0.25 namespace");
-
-            assert!(error.to_string().contains("is not a real directory"), "{error}");
-            assert_eq!(fs::read(&sentinel).expect("outside sentinel"), b"outside");
-        }
-    }
-
-    #[test]
     fn native_action_state_is_the_only_native_authority() {
         let cache = tempfile::tempdir().expect("cache base");
         let output = tempfile::tempdir().expect("output root");
@@ -8378,5 +8252,85 @@ mod tests {
         assert!(!hostile.exists(), "hostile staging link must be unlinked");
         assert_eq!(fs::read(&sentinel).expect("outside sentinel"), b"outside");
         assert_eq!(fs::read_dir(reopened.root().join("staging")).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initialized_open_defers_shard_validation_until_use() {
+        #[derive(Debug)]
+        enum Damage {
+            Missing,
+            Nonempty,
+            Directory,
+            Symlink,
+            Hardlink,
+        }
+
+        let selected = ContentDigest::sha256(b"selected lock");
+        let other = (0_u64..)
+            .map(|value| ContentDigest::sha256(&value.to_le_bytes()))
+            .find(|value| {
+                value.as_bytes()[0] % NATIVE_EXECUTION_CLAIM_SHARDS
+                    != selected.as_bytes()[0] % NATIVE_EXECUTION_CLAIM_SHARDS
+                    && value.as_bytes()[0] % NATIVE_RESTORE_LOCK_SHARDS
+                        != selected.as_bytes()[0] % NATIVE_RESTORE_LOCK_SHARDS
+            })
+            .expect("distinct lock shards");
+        for damage in [
+            Damage::Missing,
+            Damage::Nonempty,
+            Damage::Directory,
+            Damage::Symlink,
+            Damage::Hardlink,
+        ] {
+            let cache = tempfile::tempdir().expect("cache base");
+            let selection = LocalCacheSelection::new(cache.path().to_path_buf(), 1024 * 1024, None).unwrap();
+            let cas = LocalCas::open_selected(&selection).expect("initialize CAS");
+            let outside = tempfile::NamedTempFile::new().expect("outside lock");
+            let claims = native_execution_claim_directory(cas.root()).unwrap();
+            for (directory, shards) in [
+                (claims, NATIVE_EXECUTION_CLAIM_SHARDS),
+                (
+                    cas.root().join(NATIVE_RESTORE_LOCK_DIRECTORY),
+                    NATIVE_RESTORE_LOCK_SHARDS,
+                ),
+            ] {
+                let path = directory.join(format!("{:02x}.lock", selected.as_bytes()[0] % shards));
+                fs::remove_file(&path).expect("remove selected shard");
+                match damage {
+                    Damage::Missing => {}
+                    Damage::Nonempty => fs::write(&path, b"not a lock").unwrap(),
+                    Damage::Directory => fs::create_dir(&path).unwrap(),
+                    Damage::Symlink => std::os::unix::fs::symlink(outside.path(), &path).unwrap(),
+                    Damage::Hardlink => fs::hard_link(outside.path(), &path).unwrap(),
+                }
+            }
+            let wrapper = LocalCas::open_initialized_selected(&selection).expect("open without scanning shards");
+            drop(wrapper.native_restore_lock(&other).expect("unaffected restore shard"));
+            assert!(matches!(
+                wrapper
+                    .try_native_execution_claim(&other)
+                    .expect("unaffected claim shard"),
+                NativeExecutionClaimAttempt::Acquired(_)
+            ));
+            assert!(
+                wrapper.native_restore_lock(&selected).is_err(),
+                "accepted {damage:?} restore lock"
+            );
+            assert!(
+                wrapper.try_native_execution_claim(&selected).is_err(),
+                "accepted {damage:?} claim"
+            );
+            assert!(
+                wrapper.native_execution_claim(&selected).is_err(),
+                "accepted {damage:?} blocking claim"
+            );
+            assert!(wrapper.status().is_err(), "status must audit every shard: {damage:?}");
+            assert_eq!(
+                fs::read(outside.path()).unwrap(),
+                b"",
+                "outside file must remain untouched"
+            );
+        }
     }
 }

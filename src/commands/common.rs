@@ -112,7 +112,7 @@ pub(crate) fn format_preview_list<T: AsRef<str>>(items: &[T], preview_limit: usi
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SplitMappingSnapshot {
     pub(crate) mapping_count: usize,
-    pub(crate) origin_migration: MappingAuthoritySnapshot,
+    pub(crate) origin_authority: MappingAuthoritySnapshot,
     pub(crate) publication: Option<TargetPublicationSnapshot>,
     pub(crate) prepared_effects: Vec<serde_json::Value>,
 }
@@ -131,6 +131,10 @@ pub(crate) fn split_mapping_snapshot(
     effect_family: &str,
     remote_url: Option<&str>,
 ) -> RailResult<SplitMappingSnapshot> {
+    MappingStore::reject_mapping_notes(workspace_root, crate_name)?;
+    if target_repo_path.join(".git").exists() {
+        MappingStore::reject_mapping_notes(target_repo_path, crate_name)?;
+    }
     let source_git = crate::git::SystemGit::open(workspace_root)?;
     let source_head = source_git.head_commit()?;
     let source_identity = crate::git::mappings::repository_identity_from_git(&source_git, Some(&source_head))?;
@@ -207,7 +211,7 @@ pub(crate) fn split_mapping_snapshot(
         let mapping_matches = journal.mapping().is_some_and(|mapping| {
             mapping.owner() == crate_name
                 && mapping.ownership_snapshot() == ownership_snapshot
-                && (mapping_operation_matches || journal.operation_id().starts_with("origin-migration-"))
+                && mapping_operation_matches
         });
         let publication_matches =
             journal.mapping().is_none() && journal.publication().is_some() && publication_operation_matches;
@@ -283,7 +287,7 @@ pub(crate) fn split_mapping_snapshot(
     if let (Some(journal), Some(terminal)) = (ordered_mapping_journals.first(), ordered_mapping_journals.last()) {
         let mapping = journal.mapping().expect("filtered mapping journal");
         let repository = journal.repository();
-        let (store, origin_migration) = MappingStore::capture_prepared_authority_at(
+        let (store, origin_authority) = MappingStore::capture_prepared_authority_at(
             workspace_root,
             target_repo_path,
             &source_origin,
@@ -294,20 +298,20 @@ pub(crate) fn split_mapping_snapshot(
             repository.expected_oid.as_deref(),
             &terminal.repository().result_oid,
         )?;
-        if origin_migration.digest() != mapping.pre_authority() {
+        if origin_authority.digest() != mapping.pre_authority() {
             return Err(RailError::with_help(
                 format!(
                     "prepared split effect '{}' pre-authority changed: expected '{}', found '{}'",
                     journal.effect_id(),
                     mapping.pre_authority(),
-                    origin_migration.digest()
+                    origin_authority.digest()
                 ),
                 "restore the exact journaled predecessor histories before retrying",
             ));
         }
         return Ok(SplitMappingSnapshot {
             mapping_count: store.count(),
-            origin_migration,
+            origin_authority,
             publication: split_prepared_publication_snapshot(
                 publication_observation.as_ref(),
                 target_repo_path,
@@ -365,7 +369,7 @@ pub(crate) fn split_mapping_snapshot(
                 format!("reinitialize the empty target with: git init -b {branch}"),
             ));
         }
-        let origin_migration = MappingAuthoritySnapshot::empty_initialized_from_observed(
+        let origin_authority = MappingAuthoritySnapshot::empty_initialized_from_observed(
             &source_origin,
             source_head,
             target_identity,
@@ -382,12 +386,12 @@ pub(crate) fn split_mapping_snapshot(
         )?;
         return Ok(SplitMappingSnapshot {
             mapping_count: 0,
-            origin_migration,
+            origin_authority,
             publication,
             prepared_effects,
         });
     }
-    let (store, origin_migration) = capture_current_mapping_authority(
+    let (store, origin_authority) = capture_current_mapping_authority(
         workspace_root,
         target_repo_path,
         &source_origin,
@@ -407,7 +411,7 @@ pub(crate) fn split_mapping_snapshot(
     )?;
     Ok(SplitMappingSnapshot {
         mapping_count: store.count(),
-        origin_migration,
+        origin_authority,
         publication,
         prepared_effects,
     })
@@ -435,7 +439,7 @@ fn capture_current_mapping_authority(
         None
     };
     if let Some(selected_source_head) = selected_source_head.as_deref() {
-        MappingStore::capture_v025_authority_at_source(
+        MappingStore::capture_authority_at_source(
             workspace_root,
             target_repo_path,
             source_origin,
@@ -447,7 +451,7 @@ fn capture_current_mapping_authority(
             selected_target_head,
         )
     } else if let Some(selected_target_head) = selected_target_head {
-        MappingStore::capture_v025_authority_at(
+        MappingStore::capture_authority_at(
             workspace_root,
             target_repo_path,
             source_origin,
@@ -458,7 +462,7 @@ fn capture_current_mapping_authority(
             selected_target_head,
         )
     } else {
-        MappingStore::capture_v025_authority(
+        MappingStore::capture_authority(
             workspace_root,
             target_repo_path,
             source_origin,
@@ -557,8 +561,6 @@ pub(crate) fn prepared_effect_projection(journal: &GitEffectJournal) -> serde_js
             "ownership_snapshot": mapping.ownership_snapshot(),
             "pre_authority": mapping.pre_authority(),
             "post_authority": mapping.post_authority(),
-            "migration_digest": mapping.migration_digest(),
-            "migration_count": mapping.migration_count(),
         })),
         "path_transition_count": journal.paths().len(),
         "publication": journal.publication().map(|publication| serde_json::json!({
@@ -624,7 +626,6 @@ fn permits_prepared_target_recovery(target: &crate::git::SystemGit) -> RailResul
 pub(crate) fn origin_authority_json(snapshot: &MappingAuthoritySnapshot) -> serde_json::Value {
     serde_json::json!({
         "digest": snapshot.digest(),
-        "migration_digest": snapshot.migration_digest(),
         "direction": snapshot.direction(),
         "target_root": snapshot.target_root(),
         "branch": snapshot.branch(),
@@ -642,7 +643,6 @@ pub(crate) fn origin_authority_json(snapshot: &MappingAuthoritySnapshot) -> serd
         "target_frontier_count": snapshot.target_frontier_count(),
         "source_evidence_count": snapshot.source_evidence().len(),
         "target_evidence_count": snapshot.target_evidence().len(),
-        "pending_candidate_count": snapshot.count(),
     })
 }
 

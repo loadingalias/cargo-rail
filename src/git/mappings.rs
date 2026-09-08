@@ -3,25 +3,18 @@
 //! Synthesized commits carry a versioned `Rail-Origin` trailer, so ordinary
 //! clone history is sufficient to recover source/target mappings.
 
-use std::collections::BTreeSet;
 use std::path::Path;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::error::{GitError, RailError, RailResult, ResultExt, git_command_diagnostics};
-use crate::git::{CommitMetadata, SystemGit, git_cmd_for_path};
-use crate::mutation::git_effect::{
-    GitCommitEffect, GitEffectCommitMetadata, GitEffectIntent, GitEffectJournal, GitEffectRecord, GitEffectStore,
-    GitMappingBinding,
-};
+use crate::git::{SystemGit, git_cmd_for_path};
+
 use crate::source::ContentDigest;
 use crate::utils;
 
 const TRAILER_PREFIX: &str = "Rail-Origin: ";
 const TRAILER_SCHEMA: &str = "v2";
-const V025_TRAILER_SCHEMA: &str = "v1";
-const V025_NOTE_SCHEMA: &str = "cargo-rail-mapping-v1";
-const V025_MIGRATION_SUBJECT: &str = "chore: migrate cargo-rail origin mappings";
 
 /// Split/sync transform schema recorded in every synthesized commit.
 pub const TRANSFORM_VERSION: u32 = 1;
@@ -121,60 +114,6 @@ pub fn append_origin_trailers(message: &str, trailers: &[String]) -> String {
     output
 }
 
-/// Convert the exact weak trailer written into a v0.25 conflict receipt into
-/// the current stable-ownership trailer before the receipt can authorize a
-/// commit. The weak trailer must be the receipt's entire final trailer block;
-/// accepting it anywhere else would let mutable receipt text supply mapping
-/// authority that did not come from the predecessor writer.
-pub(crate) fn migrate_v025_receipt_message(
-    message: &str,
-    context: &OriginContext,
-    remote_commit: &str,
-) -> RailResult<String> {
-    let remote_commit = normalize_object_id("v0.25 receipt remote", remote_commit)?;
-    let lines = message.lines().collect::<Vec<_>>();
-    let end = lines
-        .iter()
-        .rposition(|line| !line.trim().is_empty())
-        .map_or(0, |index| index + 1);
-    let start = lines[..end]
-        .iter()
-        .rposition(|line| line.trim().is_empty())
-        .map_or(0, |index| index + 1);
-    let Some(value) = lines
-        .get(start)
-        .and_then(|line| line.strip_prefix(TRAILER_PREFIX))
-        .filter(|_| end.saturating_sub(start) == 1)
-    else {
-        return Err(RailError::with_help(
-            "v0.25 sync receipt has an invalid predecessor origin trailer",
-            "restart sync; cargo-rail will not reinterpret modified predecessor receipt text",
-        ));
-    };
-    let parsed = ParsedTrailer::parse_v025(value).map_err(|_| {
-        RailError::with_help(
-            "v0.25 sync receipt has an invalid predecessor origin trailer",
-            "restart sync; cargo-rail will not reinterpret modified predecessor receipt text",
-        )
-    })?;
-    if !parsed.mapping
-        || parsed.target_commit.is_some()
-        || parsed.frontier.is_some()
-        || parsed.source_commit != remote_commit
-        || parsed.source_repository != context.source_repository
-        || parsed.owner != context.owner
-        || parsed.transform_version != TRANSFORM_VERSION
-    {
-        return Err(RailError::with_help(
-            "v0.25 sync receipt predecessor origin does not match its bound remote commit and owner",
-            "restart sync; cargo-rail will not reinterpret modified predecessor receipt authority",
-        ));
-    }
-
-    let body = lines[..start].to_vec().join("\n").trim_end().to_string();
-    Ok(append_origin_trailers(&body, &[context.trailer(&remote_commit)?]))
-}
-
 /// Derive a path-independent, credential-free repository identity.
 ///
 /// A non-local `remote.origin.url` is normalized and hashed. Repositories
@@ -259,7 +198,7 @@ fn normalize_remote_url(url: &str) -> RailResult<String> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct V025CommitMapping {
+struct CommitMapping {
     source: String,
     target: String,
 }
@@ -286,15 +225,6 @@ impl MappingFrontier {
         }
     }
 
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Neither => "none",
-            Self::Source => "source",
-            Self::Target => "target",
-            Self::Both => "both",
-        }
-    }
-
     fn proves_source(self) -> bool {
         matches!(self, Self::Source | Self::Both)
     }
@@ -302,102 +232,14 @@ impl MappingFrontier {
     fn proves_target(self) -> bool {
         matches!(self, Self::Target | Self::Both)
     }
-
-    fn from_proofs(source: bool, target: bool) -> Self {
-        match (source, target) {
-            (true, true) => Self::Both,
-            (true, false) => Self::Source,
-            (false, true) => Self::Target,
-            (false, false) => Self::Neither,
-        }
-    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct MigrationCandidate {
-    source: String,
-    target: String,
-    frontier: MappingFrontier,
-    kind: MigrationCandidateKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum MigrationCandidateKind {
-    Mapping,
-    TargetEvidence,
-}
-
-impl V025CommitMapping {
+impl CommitMapping {
     fn new(source: &str, target: &str) -> RailResult<Self> {
         Ok(Self {
             source: normalize_object_id("source", source)?,
             target: normalize_object_id("target", target)?,
         })
-    }
-
-    fn decode_note(note_target: &str, content: &str) -> RailResult<Self> {
-        let lines = content.lines().collect::<Vec<_>>();
-        if lines.first().copied() != Some(V025_NOTE_SCHEMA) {
-            if lines.len() != 1 {
-                return Err(mapping_resolution_error(
-                    note_target,
-                    "the note contains multiple legacy mapping values",
-                ));
-            }
-            return Self::new(note_target, lines[0].trim());
-        }
-        if lines.len() != 3 {
-            return Err(mapping_resolution_error(
-                note_target,
-                "the v1 note has an invalid field count",
-            ));
-        }
-        let source = lines[1]
-            .strip_prefix("source=")
-            .ok_or_else(|| mapping_resolution_error(note_target, "the v1 note is missing its source field"))?;
-        let target = lines[2]
-            .strip_prefix("target=")
-            .ok_or_else(|| mapping_resolution_error(note_target, "the v1 note is missing its target field"))?;
-        let normalized_note_target = normalize_object_id("note attachment", note_target)?;
-        let normalized_source = normalize_object_id("note source", source)?;
-        if normalized_source != normalized_note_target {
-            return Err(mapping_resolution_error(
-                note_target,
-                "the note attachment and declared source commit differ",
-            ));
-        }
-        Self::new(&normalized_source, target)
-    }
-}
-
-/// Exact read-only decoder for the origin forms accepted by v0.25.0.
-///
-/// Current origin values never pass through this type. Compatibility callers
-/// first use the strict current parser and fall back here only for a form that
-/// is exclusive to the predecessor grammar.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum V025ParsedTrailer {
-    Legacy { side: HistorySide, source_commit: String },
-}
-
-impl V025ParsedTrailer {
-    fn parse(value: &str) -> RailResult<Self> {
-        if let Some(source_commit) = value.strip_prefix("mono@") {
-            return Ok(Self::Legacy {
-                side: HistorySide::Target,
-                source_commit: normalize_object_id("legacy mono origin", source_commit)?,
-            });
-        }
-        if let Some(source_commit) = value.strip_prefix("remote@") {
-            return Ok(Self::Legacy {
-                side: HistorySide::Source,
-                source_commit: normalize_object_id("legacy remote origin", source_commit)?,
-            });
-        }
-        Err(RailError::message(format!(
-            "unsupported predecessor Rail-Origin trailer '{}'",
-            value
-        )))
     }
 }
 
@@ -417,16 +259,8 @@ struct ParsedTrailer {
 
 impl ParsedTrailer {
     fn parse(value: &str) -> RailResult<Self> {
-        Self::parse_schema(value, TRAILER_SCHEMA, true)
-    }
-
-    fn parse_v025(value: &str) -> RailResult<Self> {
-        Self::parse_schema(value, V025_TRAILER_SCHEMA, false)
-    }
-
-    fn parse_schema(value: &str, schema: &str, allow_frontier: bool) -> RailResult<Self> {
         let mut fields = value.split_whitespace();
-        if fields.next() != Some(schema) {
+        if fields.next() != Some(TRAILER_SCHEMA) {
             return Err(RailError::message(format!(
                 "unsupported Rail-Origin trailer '{}'",
                 value
@@ -444,13 +278,11 @@ impl ParsedTrailer {
         let (mapping, target_commit, frontier, evidence_commit, evidence_side) = match fields.next() {
             None => (true, None, None, None, None),
             Some("mapping=evidence") => {
-                let evidence_commit = if allow_frontier {
+                let evidence_commit = {
                     fields
                         .next()
                         .map(|field| normalize_object_id("evidence", parse_field(Some(field), "evidence")?))
                         .transpose()?
-                } else {
-                    None
                 };
                 let evidence_side = if evidence_commit.is_some() {
                     match parse_field(fields.next(), "side")? {
@@ -470,13 +302,11 @@ impl ParsedTrailer {
             }
             Some(target) if target.starts_with("target=") => {
                 let target = normalize_object_id("target", parse_field(Some(target), "target")?)?;
-                let frontier = if allow_frontier {
+                let frontier = {
                     fields
                         .next()
                         .map(|field| MappingFrontier::parse(parse_field(Some(field), "frontier")?))
                         .transpose()?
-                } else {
-                    None
                 };
                 (true, Some(target), frontier, None, None)
             }
@@ -515,17 +345,8 @@ pub struct MappingStore {
     repository_authority: Option<RepositoryAuthority>,
     mappings: FxHashMap<String, String>,
     reverse_mappings: FxHashMap<String, String>,
-    current_history_mappings: FxHashSet<(String, String)>,
-    v025_mappings: BTreeSet<(String, String)>,
     source_frontiers: FxHashSet<String>,
     target_frontiers: FxHashSet<String>,
-    current_source_frontiers: FxHashSet<String>,
-    current_target_frontiers: FxHashSet<String>,
-    v025_source_frontiers: FxHashSet<String>,
-    v025_target_frontiers: FxHashSet<String>,
-    v025_source_evidence: BTreeSet<(String, String)>,
-    v025_target_evidence: BTreeSet<(String, String)>,
-    current_explicit_target_evidence: FxHashSet<String>,
     explicit_pair_commits: FxHashSet<String>,
     source_evidence: FxHashSet<String>,
     target_evidence: FxHashSet<String>,
@@ -845,8 +666,6 @@ pub(crate) struct MappingAuthoritySnapshot {
     target_frontiers: Vec<String>,
     source_evidence: Vec<String>,
     target_evidence: Vec<String>,
-    candidates: Vec<MigrationCandidate>,
-    migration_digest: ContentDigest,
     digest: ContentDigest,
 }
 
@@ -872,7 +691,6 @@ impl MappingAuthoritySnapshot {
         target_frontiers: Vec<String>,
         source_evidence: Vec<String>,
         target_evidence: Vec<String>,
-        candidates: Vec<MigrationCandidate>,
     ) -> RailResult<Self> {
         validate_token("mapping direction", direction)?;
         validate_token("mapping branch", branch)?;
@@ -892,13 +710,6 @@ impl MappingAuthoritySnapshot {
         }
         validate_token("ownership snapshot", &ownership_snapshot)?;
 
-        let migration_digest = ContentDigest::sha256(&canonical_migration_bytes(
-            &source_repository,
-            target_repository.as_deref(),
-            &owner,
-            &ownership_snapshot,
-            &candidates,
-        ));
         let mut snapshot = Self {
             direction: direction.to_string(),
             target_root: target_root.to_path_buf(),
@@ -917,8 +728,6 @@ impl MappingAuthoritySnapshot {
             target_frontiers,
             source_evidence,
             target_evidence,
-            candidates,
-            migration_digest,
             digest: ContentDigest::sha256(&[]),
         };
         snapshot.digest = ContentDigest::sha256(&snapshot.canonical_bytes());
@@ -972,7 +781,6 @@ impl MappingAuthoritySnapshot {
             Vec::new(),
             Vec::new(),
             Vec::new(),
-            Vec::new(),
         )
     }
 
@@ -1000,7 +808,6 @@ impl MappingAuthoritySnapshot {
             None,
             source_context.owner.clone(),
             source_context.ownership_snapshot.clone(),
-            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1046,12 +853,11 @@ impl MappingAuthoritySnapshot {
             Vec::new(),
             Vec::new(),
             Vec::new(),
-            Vec::new(),
         )
     }
 
     fn canonical_bytes(&self) -> Vec<u8> {
-        let mut canonical = b"cargo-rail-mapping-authority-v2".to_vec();
+        let mut canonical = b"cargo-rail-mapping-authority-v3".to_vec();
         append_authority_frame(&mut canonical, b"direction", self.direction.as_bytes());
         append_authority_frame(
             &mut canonical,
@@ -1103,98 +909,11 @@ impl MappingAuthoritySnapshot {
         for commit in &self.target_evidence {
             append_authority_frame(&mut canonical, b"target-evidence", commit.as_bytes());
         }
-        append_migration_candidates(&mut canonical, b"pending-migration", &self.candidates);
         canonical
-    }
-
-    pub(crate) fn count(&self) -> usize {
-        self.candidates.len()
-    }
-
-    pub(crate) fn migration_candidate_pairs(&self) -> Vec<(String, String)> {
-        self.candidates
-            .iter()
-            .filter(|candidate| candidate.kind == MigrationCandidateKind::Mapping)
-            .map(|candidate| (candidate.source.clone(), candidate.target.clone()))
-            .collect()
     }
 
     pub(crate) fn digest(&self) -> String {
         format!("sha256-{}", self.digest)
-    }
-
-    pub(crate) fn migration_digest(&self) -> String {
-        format!("sha256-{}", self.migration_digest)
-    }
-
-    /// Derive the exact mapping authority that one deterministic predecessor
-    /// migration commit must produce. This is pure plan authority: callers can
-    /// bind the post-effect digest before writing the prepared commit or moving
-    /// the target ref, then compare it with a full post-effect recapture.
-    pub(crate) fn after_migration(&self, migration_commit: &str) -> RailResult<Self> {
-        let migration_commit = normalize_object_id("migration commit", migration_commit)?;
-        if self.candidates.is_empty() {
-            return Err(RailError::message(
-                "mapping authority has no predecessor candidates to migrate",
-            ));
-        }
-        if self.target_head.is_none() || self.target_selected_head.is_none() {
-            return Err(RailError::message(
-                "predecessor mapping migration requires an existing selected target history",
-            ));
-        }
-
-        let mut mappings = self.mappings.clone();
-        let mut source_frontiers = self.source_frontiers.clone();
-        let mut target_frontiers = self.target_frontiers.clone();
-        let source_evidence = self.source_evidence.clone();
-        let mut target_evidence = self.target_evidence.clone();
-        for candidate in &self.candidates {
-            match candidate.kind {
-                MigrationCandidateKind::Mapping => {
-                    mappings.push((candidate.source.clone(), candidate.target.clone()));
-                    if candidate.frontier.proves_source() {
-                        source_frontiers.push(candidate.source.clone());
-                    }
-                    if candidate.frontier.proves_target() {
-                        target_frontiers.push(candidate.target.clone());
-                    }
-                }
-                MigrationCandidateKind::TargetEvidence => {
-                    target_evidence.push(format!("endpoint:{}", candidate.target));
-                    target_evidence.push(format!("pair:{}:{}", candidate.source, candidate.target));
-                }
-            }
-        }
-        // Every persistent explicit-pair/evidence migration trailer makes the
-        // containing commit exact target-side evidence as well.
-        target_evidence.push(format!("endpoint:{migration_commit}"));
-        for values in [&mut source_frontiers, &mut target_frontiers, &mut target_evidence] {
-            values.sort();
-            values.dedup();
-        }
-        mappings.sort();
-        mappings.dedup();
-
-        Self::from_authority(
-            &self.direction,
-            &self.target_root,
-            &self.branch,
-            self.source_repository.clone(),
-            self.source_head.clone(),
-            self.source_selected_heads.clone(),
-            self.target_repository.clone(),
-            Some(migration_commit.clone()),
-            Some(migration_commit),
-            self.owner.clone(),
-            self.ownership_snapshot.clone(),
-            mappings,
-            source_frontiers,
-            target_frontiers,
-            source_evidence,
-            target_evidence,
-            Vec::new(),
-        )
     }
 
     /// Derive the exact authority produced by one prepared mono-to-remote
@@ -1209,11 +928,6 @@ impl MappingAuthoritySnapshot {
         target_head: &str,
         target_repository: String,
     ) -> RailResult<Self> {
-        if !self.candidates.is_empty() {
-            return Err(RailError::message(
-                "ordinary split authority cannot advance while predecessor migration is pending",
-            ));
-        }
         if self.target_repository.is_none() {
             return Err(RailError::message(
                 "ordinary split authority requires an initialized target repository",
@@ -1287,7 +1001,6 @@ impl MappingAuthoritySnapshot {
             target_frontiers,
             source_evidence,
             target_evidence,
-            Vec::new(),
         )
     }
 
@@ -1401,6 +1114,8 @@ impl MappingAuthoritySnapshot {
                 "split target root changed during final repository revalidation",
             ));
         }
+        MappingStore::reject_mapping_notes(source_repo, &self.owner)?;
+        MappingStore::reject_mapping_notes(target_repo, &self.owner)?;
         let source = SystemGit::open(source_repo)?;
         let source_head = source.head_commit()?;
         if source_head != self.source_head || self.source_selected_heads.as_slice() != [source_head.as_str()] {
@@ -1454,45 +1169,6 @@ fn append_mapping_pairs(output: &mut Vec<u8>, label: &[u8], mappings: &[(String,
     }
 }
 
-fn append_migration_candidates(output: &mut Vec<u8>, label: &[u8], candidates: &[MigrationCandidate]) {
-    for candidate in candidates {
-        let mut value = Vec::with_capacity(candidate.source.len() + candidate.target.len() + 32);
-        append_authority_frame(&mut value, b"source", candidate.source.as_bytes());
-        append_authority_frame(&mut value, b"target", candidate.target.as_bytes());
-        append_authority_frame(&mut value, b"frontier", candidate.frontier.as_str().as_bytes());
-        append_authority_frame(
-            &mut value,
-            b"kind",
-            match candidate.kind {
-                MigrationCandidateKind::Mapping => b"mapping",
-                MigrationCandidateKind::TargetEvidence => b"target-evidence",
-            },
-        );
-        append_authority_frame(output, label, &value);
-    }
-}
-
-fn canonical_migration_bytes(
-    source_repository: &str,
-    target_repository: Option<&str>,
-    owner: &str,
-    ownership_snapshot: &str,
-    candidates: &[MigrationCandidate],
-) -> Vec<u8> {
-    let mut canonical = b"cargo-rail-v0.25-origin-migration-v3".to_vec();
-    append_authority_frame(&mut canonical, b"source-repository", source_repository.as_bytes());
-    append_optional_authority_frame(
-        &mut canonical,
-        b"target-repository",
-        target_repository.map(str::as_bytes),
-    );
-    append_authority_frame(&mut canonical, b"owner", owner.as_bytes());
-    append_authority_frame(&mut canonical, b"ownership-snapshot", ownership_snapshot.as_bytes());
-    append_authority_frame(&mut canonical, b"transform-version", &TRANSFORM_VERSION.to_be_bytes());
-    append_migration_candidates(&mut canonical, b"pending-migration", candidates);
-    canonical
-}
-
 impl MappingStore {
     /// Create an empty store scoped to one split owner.
     pub fn new(owner: String) -> Self {
@@ -1502,17 +1178,8 @@ impl MappingStore {
             repository_authority: None,
             mappings: FxHashMap::default(),
             reverse_mappings: FxHashMap::default(),
-            current_history_mappings: FxHashSet::default(),
-            v025_mappings: BTreeSet::new(),
             source_frontiers: FxHashSet::default(),
             target_frontiers: FxHashSet::default(),
-            current_source_frontiers: FxHashSet::default(),
-            current_target_frontiers: FxHashSet::default(),
-            v025_source_frontiers: FxHashSet::default(),
-            v025_target_frontiers: FxHashSet::default(),
-            v025_source_evidence: BTreeSet::new(),
-            v025_target_evidence: BTreeSet::new(),
-            current_explicit_target_evidence: FxHashSet::default(),
             explicit_pair_commits: FxHashSet::default(),
             source_evidence: FxHashSet::default(),
             target_evidence: FxHashSet::default(),
@@ -1529,11 +1196,6 @@ impl MappingStore {
     /// immutable histories merely to recover the in-memory maps that the same
     /// command derived before writing the commit.
     pub(crate) fn from_current_snapshot(snapshot: &MappingAuthoritySnapshot) -> RailResult<Self> {
-        if !snapshot.candidates.is_empty() {
-            return Err(RailError::message(
-                "current mapping snapshot still contains predecessor migration candidates",
-            ));
-        }
         let target_repository = snapshot
             .target_repository
             .clone()
@@ -1569,16 +1231,9 @@ impl MappingStore {
         });
         for (source, target) in &snapshot.mappings {
             store.record_mapping(source, target)?;
-            store.current_history_mappings.insert((source.clone(), target.clone()));
         }
         store.source_frontiers.extend(snapshot.source_frontiers.iter().cloned());
-        store
-            .current_source_frontiers
-            .extend(snapshot.source_frontiers.iter().cloned());
         store.target_frontiers.extend(snapshot.target_frontiers.iter().cloned());
-        store
-            .current_target_frontiers
-            .extend(snapshot.target_frontiers.iter().cloned());
         restore_snapshot_evidence(
             &snapshot.source_evidence,
             &mut store.source_evidence,
@@ -1608,6 +1263,7 @@ impl MappingStore {
     ) -> RailResult<()> {
         validate_repository_identity(expected_source_repository)?;
         let git = SystemGit::open(repo_path)?;
+        Self::reject_mapping_notes(repo_path, &self.owner)?;
         let commits = git.ordinary_commit_history()?;
 
         self.load_current_commits(repo_path, side, expected_source_repository, &commits)
@@ -1622,17 +1278,17 @@ impl MappingStore {
     ) -> RailResult<()> {
         for commit in commits {
             for value in origin_trailer_values(&commit.message) {
-                if is_inert_predecessor_trailer(value) {
-                    continue;
-                }
-                let parsed = ParsedTrailer::parse(value)?;
+                let parsed = ParsedTrailer::parse(value).map_err(|error| RailError::with_help(
+                    format!("unsupported Cargo-Rail origin in '{}' at {}: {error}", repo_path.display(), commit.sha),
+                    "preserve the history; continue this relationship with its originating executable (release version unknown), or use a separately reviewed fresh target",
+                ))?;
                 self.record_current_trailer(repo_path, parsed, &commit.sha, side, expected_source_repository)?;
             }
         }
         Ok(())
     }
 
-    fn load_v025_compatible_history_at(
+    fn load_history_at(
         &mut self,
         repo_path: &Path,
         side: HistorySide,
@@ -1641,103 +1297,27 @@ impl MappingStore {
     ) -> RailResult<()> {
         validate_repository_identity(expected_source_repository)?;
         let commits = SystemGit::open(repo_path)?.ordinary_commit_history_at(revision)?;
-        self.load_v025_compatible_commits(repo_path, side, expected_source_repository, &commits)
+        self.load_current_commits(repo_path, side, expected_source_repository, &commits)
     }
 
-    fn load_v025_compatible_commits(
-        &mut self,
-        repo_path: &Path,
-        side: HistorySide,
-        expected_source_repository: &str,
-        commits: &[crate::git::CommitInfo],
-    ) -> RailResult<()> {
-        for commit in commits {
-            for value in origin_trailer_values(&commit.message) {
-                match ParsedTrailer::parse(value) {
-                    Ok(parsed) => {
-                        self.record_current_trailer(repo_path, parsed, &commit.sha, side, expected_source_repository)?;
-                    }
-                    Err(current_error) => match ParsedTrailer::parse_v025(value) {
-                        Ok(parsed) => self.record_v025_current_trailer(
-                            repo_path,
-                            parsed,
-                            &commit.sha,
-                            side,
-                            expected_source_repository,
-                        )?,
-                        Err(_) => match V025ParsedTrailer::parse(value) {
-                            Ok(parsed) => self.record_v025_trailer(parsed, &commit.sha, side)?,
-                            Err(_) => return Err(current_error),
-                        },
-                    },
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Load the exact predecessor notes ref without fetching or mutating it.
-    fn load_v025_notes(&mut self, repo_path: &Path, _side: HistorySide) -> RailResult<()> {
-        let notes_ref = format!("refs/notes/rail/{}", self.owner);
-        let exists = git_cmd_for_path(repo_path)
-            .args(["show-ref", "--verify", "--quiet", &notes_ref])
-            .output()
-            .context("Failed to inspect predecessor mapping notes")?;
-        if !exists.status.success() {
-            if exists.status.code() == Some(1) {
-                return Ok(());
-            }
-            return Err(RailError::Git(GitError::CommandFailed {
-                command: "git show-ref --verify --quiet <mapping-notes-ref>".to_string(),
-                stderr: git_command_diagnostics(&exists.stdout, &exists.stderr),
-            }));
-        }
-
+    /// Reject reserved mapping notes without interpreting their contents.
+    pub(crate) fn reject_mapping_notes(repo_path: &Path, owner: &str) -> RailResult<()> {
         let output = git_cmd_for_path(repo_path)
-            .args(["notes", "--ref", &notes_ref, "list"])
+            .args(["show-ref", "--verify", "--quiet", &format!("refs/notes/rail/{owner}")])
             .output()
-            .context("Failed to list predecessor mapping notes")?;
-        if !output.status.success() {
-            return Err(RailError::Git(GitError::CommandFailed {
-                command: "git notes --ref <mapping-notes-ref> list".to_string(),
-                stderr: git_command_diagnostics(&output.stdout, &output.stderr),
-            }));
+            .context("Failed to inspect mapping authority notes")?;
+        match output.status.code() {
+            Some(1) => Ok(()),
+            Some(0) => Err(RailError::with_help(
+                format!("unsupported Cargo-Rail mapping notes in '{}'", repo_path.display()),
+                "preserve the notes and history; continue this relationship with its originating executable (release version unknown), or use a separately reviewed fresh target",
+            )),
+            _ => Err(RailError::message("failed to inspect Cargo-Rail mapping notes")),
         }
-        let entries = String::from_utf8(output.stdout)?
-            .lines()
-            .map(|line| {
-                let mut fields = line.split_whitespace();
-                let blob = fields
-                    .next()
-                    .ok_or_else(|| RailError::message("mapping note has no blob ID"))?;
-                let source = fields
-                    .next()
-                    .ok_or_else(|| RailError::message("mapping note has no source commit"))?;
-                if fields.next().is_some() {
-                    return Err(RailError::message(format!("invalid mapping note entry '{}'", line)));
-                }
-                validate_object_id("note blob", blob)?;
-                validate_object_id("note source", source)?;
-                Ok((blob.to_string(), source.to_string()))
-            })
-            .collect::<RailResult<Vec<_>>>()?;
-        let git = SystemGit::open(repo_path)?;
-        let blob_ids = entries.iter().map(|(blob, _)| blob.as_str()).collect::<Vec<_>>();
-        let contents = git.read_blobs_bulk(&blob_ids)?;
-        for ((_, source), content) in entries.into_iter().zip(contents) {
-            let content = std::str::from_utf8(&content)
-                .map_err(|_| RailError::message(format!("mapping note for '{}' is not UTF-8", source)))?;
-            let mapping = V025CommitMapping::decode_note(&source, content.trim())?;
-            // Notes carry an exact pair but no trustworthy history-side
-            // provenance. They suppress endpoint replay without proving that
-            // either endpoint's ancestors have already synchronized.
-            self.record_v025_mapping(mapping, MappingFrontier::Neither)?;
-        }
-        Ok(())
     }
 
-    /// Validate weak predecessor evidence against the exact repository pair.
-    fn validate_v025_evidence(
+    /// Validate current evidence against the selected repository histories.
+    fn validate_evidence(
         &mut self,
         source_repo: &Path,
         target_repo: &Path,
@@ -1748,48 +1328,25 @@ impl MappingStore {
     ) -> RailResult<RepositoryAuthority> {
         if source_context.owner != self.owner {
             return Err(RailError::message(
-                "predecessor mapping owner does not match the current split owner",
+                "mapping owner does not match the current split owner",
             ));
         }
         validate_token("ownership snapshot", &source_context.ownership_snapshot)?;
         validate_repository_identity(expected_target_repository)?;
         if repository_identity(source_repo)? != source_context.source_repository {
             return Err(RailError::message(
-                "predecessor mapping source repository identity changed during validation",
+                "mapping source repository identity changed during validation",
             ));
         }
         if repository_identity(target_repo)? != expected_target_repository {
             return Err(RailError::message(
-                "predecessor mapping target repository identity changed during validation",
+                "mapping target repository identity changed during validation",
             ));
         }
 
         let source_head = SystemGit::open(source_repo)?.head_commit()?;
         let target_head = SystemGit::open(target_repo)?.head_commit()?;
         let selected_target_head = normalize_object_id("selected target HEAD", selected_target_head)?;
-        for (source, target) in &self.v025_mappings {
-            if !is_ancestor_of_any(source_repo, source, selected_source_heads)? {
-                return Err(mapping_resolution_error(
-                    source,
-                    "the predecessor source commit is not an ancestor of the selected source HEAD",
-                ));
-            }
-            if !is_ancestor(target_repo, target, &selected_target_head)? {
-                return Err(mapping_resolution_error(
-                    source,
-                    &format!(
-                        "predecessor target '{}' is not an ancestor of the selected target HEAD",
-                        target
-                    ),
-                ));
-            }
-        }
-        if !self.v025_source_evidence.is_empty() {
-            return Err(RailError::with_help(
-                "predecessor source-history evidence cannot be upgraded from target history",
-                "recreate current v2 source-history provenance before retrying; cargo-rail will not guess its repository authority",
-            ));
-        }
         let mut source_evidence_by_commit = FxHashMap::default();
         for (source, target) in &self.source_evidence_pairs {
             if !is_ancestor_of_any(source_repo, source, selected_source_heads)?
@@ -1834,7 +1391,7 @@ impl MappingStore {
             if !is_ancestor(target_repo, commit, &selected_target_head)? {
                 return Err(mapping_resolution_error(
                     commit,
-                    "the predecessor migration commit is not an ancestor of the selected target HEAD",
+                    "the explicit-pair trailer commit is not an ancestor of the selected target HEAD",
                 ));
             }
         }
@@ -1867,585 +1424,7 @@ impl MappingStore {
         })
     }
 
-    /// Persist predecessor evidence in one deterministic history commit only when
-    /// it still matches the checked plan.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "migration application binds each checked repository authority explicitly"
-    )]
-    pub(crate) fn migrate_v025_evidence_bound(
-        &mut self,
-        source_repo: &Path,
-        target_repo: &Path,
-        source_context: &OriginContext,
-        expected_target_repository: &str,
-        target_root: &Path,
-        branch: &str,
-        direction: &str,
-        expected: Option<&MappingAuthoritySnapshot>,
-    ) -> RailResult<Option<String>> {
-        if self.owner != source_context.owner {
-            return Err(RailError::message(
-                "predecessor mapping owner does not match the current split owner",
-            ));
-        }
-        if let Some(commit) = self.resume_active_v025_migration(
-            source_repo,
-            target_repo,
-            source_context,
-            expected_target_repository,
-            target_root,
-            branch,
-            direction,
-            expected,
-        )? {
-            return Ok(Some(commit));
-        }
-        let (captured_store, captured) = Self::capture_v025_authority(
-            source_repo,
-            target_repo,
-            source_context,
-            expected_target_repository,
-            target_root,
-            branch,
-            direction,
-        )?;
-        *self = captured_store;
-        if expected.is_some_and(|expected| expected != &captured) {
-            return Err(origin_migration_drift_error());
-        }
-        if expected.is_none() && captured.count() > 0 {
-            return Err(RailError::with_help(
-                "predecessor mapping migration has no checked authority binding",
-                "run split or sync through its check/apply command boundary before migrating predecessor evidence",
-            ));
-        }
-        let migrations = captured.candidates.clone();
-        if migrations.is_empty() {
-            return Ok(None);
-        }
-
-        let git = SystemGit::open(target_repo)?;
-        let head = git.head_commit()?;
-        let parent = git.get_commit(&head)?;
-        let quarantine = git.object_quarantine()?;
-        quarantine.import_object_closure(&git, &[&head])?;
-        let head_tree = format!("{head}^{{tree}}");
-        let tree = quarantine
-            .git_cmd()
-            .args(["rev-parse", &head_tree])
-            .output()
-            .context("Failed to resolve predecessor mapping migration tree")?;
-        if !tree.status.success() {
-            return Err(RailError::Git(GitError::CommandFailed {
-                command: format!("git rev-parse <migration-parent>^{}tree{} (quarantine)", '{', '}'),
-                stderr: git_command_diagnostics(&tree.stdout, &tree.stderr),
-            }));
-        }
-        let tree = String::from_utf8(tree.stdout)?.trim().to_string();
-        validate_object_id("tree", &tree)?;
-        let trailers = migrations
-            .iter()
-            .map(|candidate| match candidate.kind {
-                MigrationCandidateKind::Mapping => explicit_pair_trailer_with_frontier(
-                    source_context,
-                    &candidate.source,
-                    &candidate.target,
-                    candidate.frontier,
-                ),
-                MigrationCandidateKind::TargetEvidence => {
-                    explicit_target_evidence_trailer(source_context, &candidate.source, &candidate.target)
-                }
-            })
-            .collect::<RailResult<Vec<_>>>()?;
-        let message = append_origin_trailers(V025_MIGRATION_SUBJECT, &trailers);
-        let metadata = parent.metadata();
-        let commit = write_v025_migration_commit_with_command(
-            quarantine.git_cmd(),
-            &tree,
-            &head,
-            &message,
-            &metadata,
-            "git commit-tree <predecessor-migration> (quarantine)",
-        )?;
-        let post_authority = captured.after_migration(&commit)?;
-        let store = GitEffectStore::open(&git)?;
-        let ref_name = format!("refs/heads/{branch}");
-        let repository = store.capture_repository_authority(
-            &git,
-            expected_target_repository.to_string(),
-            ref_name,
-            Some(head.clone()),
-            commit.clone(),
-        )?;
-        let mapping = GitMappingBinding::new(
-            captured.owner.clone(),
-            captured.ownership_snapshot.clone(),
-            captured.digest(),
-            post_authority.digest(),
-            Some(captured.migration_digest()),
-            captured.count(),
-        );
-        let commit_effect = GitCommitEffect::new(
-            commit.clone(),
-            tree,
-            vec![head.clone()],
-            message,
-            GitEffectCommitMetadata::from(&metadata),
-        );
-        let operation_id = format!("origin-migration-{}", captured.migration_digest());
-        let mut bundle = store.create_object_bundle_temp()?;
-        let bundle_digest = quarantine.write_pack(&commit, Some(&head), bundle.file_mut()?)?;
-        let intent = GitEffectIntent::new(
-            operation_id,
-            repository,
-            Some(commit_effect),
-            Vec::new(),
-            Some(mapping),
-            None,
-            Some(bundle_digest.clone()),
-        )?;
-        let effect_id = intent.effect_id()?;
-        let persisted_bundle = bundle.persist(&effect_id, &bundle_digest)?;
-        drop(persisted_bundle);
-
-        let (final_evidence, final_snapshot) = Self::capture_v025_authority(
-            source_repo,
-            target_repo,
-            source_context,
-            expected_target_repository,
-            target_root,
-            branch,
-            direction,
-        )?;
-        if final_snapshot != captured {
-            return Err(origin_migration_drift_error());
-        }
-        *self = final_evidence;
-        let record = store.prepare(intent)?;
-        self.reconcile_v025_migration_record(
-            source_repo,
-            target_repo,
-            source_context,
-            expected_target_repository,
-            target_root,
-            branch,
-            direction,
-            expected,
-            &store,
-            record,
-        )
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "migration preparation keeps exact source and target authority visible"
-    )]
-    fn resume_active_v025_migration(
-        &mut self,
-        source_repo: &Path,
-        target_repo: &Path,
-        source_context: &OriginContext,
-        expected_target_repository: &str,
-        target_root: &Path,
-        branch: &str,
-        direction: &str,
-        expected: Option<&MappingAuthoritySnapshot>,
-    ) -> RailResult<Option<String>> {
-        let git = SystemGit::open(target_repo)?;
-        let ref_name = format!("refs/heads/{branch}");
-        let mut matching = GitEffectStore::discover_unacknowledged_read_only(&git)?
-            .into_iter()
-            .filter(|journal| journal.repository().ref_name == ref_name)
-            .collect::<Vec<_>>();
-        if matching.is_empty() {
-            return Ok(None);
-        }
-        if matching.len() != 1 {
-            return Err(RailError::message(format!(
-                "target branch '{ref_name}' has multiple active prepared Git effects"
-            )));
-        }
-        let journal = matching.pop().expect("one matching prepared effect");
-        if journal.mapping().is_none_or(|mapping| mapping.migration_count() == 0) {
-            return Err(RailError::with_help(
-                format!(
-                    "target branch '{ref_name}' has unrelated active prepared effect '{}'",
-                    journal.effect_id()
-                ),
-                "finish or reconcile that exact target effect before starting predecessor mapping migration",
-            ));
-        }
-        let effect_id = journal.effect_id().to_string();
-        let store = GitEffectStore::open(&git)?;
-        let record = store.resume(&effect_id)?;
-        self.reconcile_v025_migration_record(
-            source_repo,
-            target_repo,
-            source_context,
-            expected_target_repository,
-            target_root,
-            branch,
-            direction,
-            expected,
-            &store,
-            record,
-        )
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "migration commit creation binds every exact repository authority"
-    )]
-    fn reconcile_v025_migration_record(
-        &mut self,
-        source_repo: &Path,
-        target_repo: &Path,
-        source_context: &OriginContext,
-        expected_target_repository: &str,
-        target_root: &Path,
-        branch: &str,
-        direction: &str,
-        expected: Option<&MappingAuthoritySnapshot>,
-        store: &GitEffectStore,
-        record: GitEffectRecord,
-    ) -> RailResult<Option<String>> {
-        match record {
-            GitEffectRecord::Active(mut active) => {
-                let journal = active.journal().clone();
-                let commit = self.reconcile_v025_migration_journal(
-                    source_repo,
-                    target_repo,
-                    source_context,
-                    expected_target_repository,
-                    target_root,
-                    branch,
-                    direction,
-                    expected,
-                    store,
-                    &journal,
-                    true,
-                )?;
-                #[cfg(test)]
-                {
-                    fail_v025_migration_after_ref_cas()?;
-                }
-                active.mark_local_applied()?;
-                let _completed = active.finish()?;
-                Ok(Some(commit))
-            }
-            GitEffectRecord::Completed(completed) => {
-                let journal = completed.journal().clone();
-                let commit = self.reconcile_v025_migration_journal(
-                    source_repo,
-                    target_repo,
-                    source_context,
-                    expected_target_repository,
-                    target_root,
-                    branch,
-                    direction,
-                    expected,
-                    store,
-                    &journal,
-                    false,
-                )?;
-                Ok(Some(commit))
-            }
-        }
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "migration recovery keeps persisted and live authority inputs distinct"
-    )]
-    fn reconcile_v025_migration_journal(
-        &mut self,
-        source_repo: &Path,
-        target_repo: &Path,
-        source_context: &OriginContext,
-        expected_target_repository: &str,
-        target_root: &Path,
-        branch: &str,
-        direction: &str,
-        expected: Option<&MappingAuthoritySnapshot>,
-        store: &GitEffectStore,
-        journal: &GitEffectJournal,
-        install: bool,
-    ) -> RailResult<String> {
-        if !journal.paths().is_empty() || journal.publication().is_some() {
-            return Err(RailError::message(
-                "predecessor mapping recovery journal contains unrelated path or publication effects",
-            ));
-        }
-        let repository = journal.repository();
-        let commit = journal
-            .commit()
-            .ok_or_else(|| RailError::message("predecessor mapping recovery journal has no prepared commit"))?;
-        let mapping = journal
-            .mapping()
-            .ok_or_else(|| RailError::message("predecessor mapping recovery journal has no mapping authority"))?;
-        let bundle_digest = journal
-            .object_bundle_digest()
-            .ok_or_else(|| RailError::message("predecessor mapping recovery journal has no prepared object bundle"))?;
-        if mapping.migration_count() == 0 || mapping.migration_digest().is_none() {
-            return Err(RailError::message(
-                "predecessor mapping recovery journal has no bound migration candidates",
-            ));
-        }
-        if mapping.owner() != source_context.owner
-            || mapping.ownership_snapshot() != source_context.ownership_snapshot
-            || repository.logical_repository != expected_target_repository
-            || repository.ref_name != format!("refs/heads/{branch}")
-            || repository.result_oid != commit.oid()
-        {
-            return Err(origin_migration_drift_error());
-        }
-        let expected_parent = repository
-            .expected_oid
-            .as_deref()
-            .ok_or_else(|| RailError::message("predecessor mapping recovery requires an existing target parent"))?;
-        if commit.parents() != [expected_parent] {
-            return Err(origin_migration_drift_error());
-        }
-        if let Some(expected) = expected
-            && (expected.digest() != mapping.pre_authority()
-                || expected.migration_digest() != mapping.migration_digest().unwrap_or_default()
-                || expected.count() != mapping.migration_count()
-                || expected.owner() != mapping.owner()
-                || expected.ownership_snapshot() != mapping.ownership_snapshot()
-                || expected.after_migration(commit.oid())?.digest() != mapping.post_authority())
-        {
-            return Err(origin_migration_drift_error());
-        }
-
-        let git = SystemGit::open(target_repo)?;
-        let current_head = git.head_commit()?;
-        let observed_repository = store.capture_repository_authority(
-            &git,
-            expected_target_repository.to_string(),
-            repository.ref_name.clone(),
-            Some(current_head.clone()),
-            commit.oid().to_string(),
-        )?;
-        if observed_repository.logical_repository != repository.logical_repository
-            || observed_repository.common_dir_identity != repository.common_dir_identity
-            || observed_repository.worktree_identity != repository.worktree_identity
-            || observed_repository.object_format != repository.object_format
-            || observed_repository.ref_name != repository.ref_name
-            || observed_repository.symbolic_head != repository.symbolic_head
-            || observed_repository.result_oid != repository.result_oid
-        {
-            return Err(origin_migration_drift_error());
-        }
-        if current_head == expected_parent {
-            let (pre_store, pre_authority) = Self::capture_v025_authority(
-                source_repo,
-                target_repo,
-                source_context,
-                expected_target_repository,
-                target_root,
-                branch,
-                direction,
-            )?;
-            if pre_authority.digest() != mapping.pre_authority()
-                || expected.is_some_and(|expected| expected != &pre_authority)
-            {
-                return Err(origin_migration_drift_error());
-            }
-            *self = pre_store;
-            let obstructing = git.obstructing_worktree_paths()?;
-            if !obstructing.is_empty() {
-                return Err(RailError::with_help(
-                    format!(
-                        "target repository became dirty before predecessor migration: {}",
-                        obstructing
-                            .iter()
-                            .map(|path| path.display().to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                    "commit, restore, or remove target work before retrying; the prepared migration remains recoverable",
-                ));
-            }
-        } else if current_head != commit.oid() {
-            return Err(origin_migration_drift_error());
-        }
-
-        if install {
-            let bundle = store
-                .open_object_bundle(journal.effect_id(), bundle_digest)?
-                .ok_or_else(|| {
-                    RailError::message(format!(
-                        "prepared Git effect '{}' is missing its bound object bundle",
-                        journal.effect_id()
-                    ))
-                })?;
-            let bundle_path = bundle.path().to_path_buf();
-            git.install_prepared_object_pack_and_update_ref(
-                bundle.into_file(),
-                &bundle_path,
-                bundle_digest,
-                commit,
-                &repository.ref_name,
-                repository.expected_oid.as_deref(),
-                journal.effect_id(),
-            )?;
-            if !journal.matches_repository_authority(store, &git, Some(repository.result_oid.clone()))? {
-                return Err(origin_migration_drift_error());
-            }
-        } else if current_head != commit.oid() {
-            return Err(origin_migration_drift_error());
-        }
-        Self::validate_completed_v025_migration(
-            target_repo,
-            commit.oid(),
-            expected_parent,
-            source_context,
-            expected_target_repository,
-            mapping.migration_digest().unwrap_or_default(),
-        )?;
-        let (post_store, post_authority) = Self::capture_v025_authority(
-            source_repo,
-            target_repo,
-            source_context,
-            expected_target_repository,
-            target_root,
-            branch,
-            direction,
-        )?;
-        if post_authority.digest() != mapping.post_authority() || post_authority.count() != 0 {
-            return Err(origin_migration_drift_error());
-        }
-        *self = post_store;
-        Ok(commit.oid().to_string())
-    }
-
-    /// Validate the deterministic migration commit left by a crash after the
-    /// target-HEAD CAS but before a durable receipt was advanced. The receipt
-    /// binds only the bounded migration digest; this reconstructs the exact
-    /// candidate set from the current v2 trailers and proves the commit is a
-    /// tree-preserving child of the previously bound target head.
-    pub(crate) fn validate_completed_v025_migration(
-        target_repo: &Path,
-        commit: &str,
-        expected_parent: &str,
-        source_context: &OriginContext,
-        expected_target_repository: &str,
-        expected_migration_digest: &str,
-    ) -> RailResult<()> {
-        let git = SystemGit::open(target_repo)?;
-        let migrated = git.get_commit(commit)?;
-        if migrated.parent_shas != [expected_parent.to_string()]
-            || migrated.message.lines().next() != Some(V025_MIGRATION_SUBJECT)
-            || git.collect_tree_entries(commit, Path::new("."))?
-                != git.collect_tree_entries(expected_parent, Path::new("."))?
-        {
-            return Err(origin_migration_drift_error());
-        }
-
-        let mut candidates = Vec::new();
-        for value in origin_trailer_values(&migrated.message) {
-            let parsed = ParsedTrailer::parse(value)?;
-            if parsed.owner != source_context.owner
-                || parsed.source_repository != source_context.source_repository
-                || parsed.ownership_snapshot != source_context.ownership_snapshot
-                || parsed.transform_version != TRANSFORM_VERSION
-            {
-                return Err(origin_migration_drift_error());
-            }
-            let candidate = if parsed.mapping {
-                let target = parsed.target_commit.ok_or_else(origin_migration_drift_error)?;
-                if !is_ancestor(target_repo, &target, commit)? {
-                    return Err(origin_migration_drift_error());
-                }
-                MigrationCandidate {
-                    source: parsed.source_commit,
-                    target,
-                    frontier: parsed.frontier.unwrap_or(MappingFrontier::Neither),
-                    kind: MigrationCandidateKind::Mapping,
-                }
-            } else {
-                let target = parsed.evidence_commit.ok_or_else(origin_migration_drift_error)?;
-                if parsed.evidence_side != Some(HistorySide::Target) || !is_ancestor(target_repo, &target, commit)? {
-                    return Err(origin_migration_drift_error());
-                }
-                MigrationCandidate {
-                    source: parsed.source_commit,
-                    target,
-                    frontier: MappingFrontier::Neither,
-                    kind: MigrationCandidateKind::TargetEvidence,
-                }
-            };
-            candidates.push(candidate);
-        }
-        candidates.sort();
-        if candidates.is_empty() {
-            return Err(origin_migration_drift_error());
-        }
-        let actual = format!(
-            "sha256-{}",
-            ContentDigest::sha256(&canonical_migration_bytes(
-                &source_context.source_repository,
-                Some(expected_target_repository),
-                &source_context.owner,
-                &source_context.ownership_snapshot,
-                &candidates,
-            ))
-        );
-        if actual != expected_migration_digest {
-            return Err(origin_migration_drift_error());
-        }
-
-        let trailers = candidates
-            .iter()
-            .map(|candidate| match candidate.kind {
-                MigrationCandidateKind::Mapping => explicit_pair_trailer_with_frontier(
-                    source_context,
-                    &candidate.source,
-                    &candidate.target,
-                    candidate.frontier,
-                ),
-                MigrationCandidateKind::TargetEvidence => {
-                    explicit_target_evidence_trailer(source_context, &candidate.source, &candidate.target)
-                }
-            })
-            .collect::<RailResult<Vec<_>>>()?;
-        let expected_message = append_origin_trailers(V025_MIGRATION_SUBJECT, &trailers);
-        let parent = git.get_commit(expected_parent)?;
-        if migrated.message != expected_message || migrated.metadata() != parent.metadata() {
-            return Err(origin_migration_drift_error());
-        }
-
-        let quarantine = git.object_quarantine()?;
-        quarantine.import_object_closure(&git, &[expected_parent])?;
-        let tree = quarantine
-            .git_cmd()
-            .args(["rev-parse", &format!("{expected_parent}^{{tree}}")])
-            .output()
-            .context("Failed to resolve migration recovery tree")?;
-        if !tree.status.success() {
-            return Err(RailError::Git(GitError::CommandFailed {
-                command: format!("git rev-parse <parent>^{}tree{}", '{', '}'),
-                stderr: git_command_diagnostics(&tree.stdout, &tree.stderr),
-            }));
-        }
-        let tree = String::from_utf8(tree.stdout)?.trim().to_string();
-        let metadata = parent.metadata();
-        let reconstructed = write_v025_migration_commit_with_command(
-            quarantine.git_cmd(),
-            &tree,
-            expected_parent,
-            &expected_message,
-            &metadata,
-            "git commit-tree <migration-recovery> (quarantine)",
-        )?;
-        if reconstructed != commit {
-            return Err(origin_migration_drift_error());
-        }
-        Ok(())
-    }
-
-    pub(crate) fn capture_v025_authority(
+    pub(crate) fn capture_authority(
         source_repo: &Path,
         target_repo: &Path,
         source_context: &OriginContext,
@@ -2455,7 +1434,7 @@ impl MappingStore {
         direction: &str,
     ) -> RailResult<(Self, MappingAuthoritySnapshot)> {
         let selected_target_head = SystemGit::open(target_repo)?.head_commit()?;
-        Self::capture_v025_authority_at(
+        Self::capture_authority_at(
             source_repo,
             target_repo,
             source_context,
@@ -2471,7 +1450,7 @@ impl MappingStore {
         clippy::too_many_arguments,
         reason = "the capture boundary keeps selected history and repository authority explicit"
     )]
-    pub(crate) fn capture_v025_authority_at(
+    pub(crate) fn capture_authority_at(
         source_repo: &Path,
         target_repo: &Path,
         source_context: &OriginContext,
@@ -2506,7 +1485,7 @@ impl MappingStore {
         let selected_target_head = normalize_object_id("selected target HEAD", selected_target_head)?;
         target_git.get_commit(&selected_target_head)?;
         let selected_source_heads = selected_source_heads(source_repo)?;
-        let store = Self::capture_v025_evidence_at(
+        let store = Self::capture_evidence_at(
             source_repo,
             target_repo,
             source_context,
@@ -2527,7 +1506,7 @@ impl MappingStore {
             || selected_target_head != authority.target_selected_head
             || branch_after != actual_branch
         {
-            return Err(origin_migration_drift_error());
+            return Err(mapping_authority_drift_error());
         }
         let snapshot = store.mapping_authority_snapshot(direction, target_root, branch)?;
         Ok((store, snapshot))
@@ -2543,7 +1522,7 @@ impl MappingStore {
         clippy::too_many_arguments,
         reason = "selected source history is explicit at the capture boundary"
     )]
-    pub(crate) fn capture_v025_authority_at_source(
+    pub(crate) fn capture_authority_at_source(
         source_repo: &Path,
         target_repo: &Path,
         source_context: &OriginContext,
@@ -2585,7 +1564,7 @@ impl MappingStore {
             .unwrap_or_else(|| target_head_before.clone());
         target_git.get_commit(&selected_target_head)?;
         let selected_source_heads = vec![selected_source_head.clone()];
-        let mut store = Self::capture_v025_evidence_at(
+        let mut store = Self::capture_evidence_at(
             source_repo,
             target_repo,
             source_context,
@@ -2606,7 +1585,7 @@ impl MappingStore {
             || selected_target_head != authority.target_selected_head
             || target_git.current_branch()? != actual_branch
         {
-            return Err(origin_migration_drift_error());
+            return Err(mapping_authority_drift_error());
         }
         let snapshot = store.mapping_authority_snapshot(direction, target_root, branch)?;
         Ok((store, snapshot))
@@ -2676,7 +1655,7 @@ impl MappingStore {
             ));
         }
         let selected_source_heads = selected_source_heads(source_repo)?;
-        let mut store = Self::capture_v025_evidence_at(
+        let mut store = Self::capture_evidence_at(
             source_repo,
             target_repo,
             source_context,
@@ -2691,7 +1670,7 @@ impl MappingStore {
         if current_target_head.as_deref() != Some(authority.target_head.as_str())
             || authority.target_selected_head != expected_target_head
         {
-            return Err(origin_migration_drift_error());
+            return Err(mapping_authority_drift_error());
         }
         authority.target_head = expected_target_head;
         let snapshot = store.mapping_authority_snapshot(direction, target_root, branch)?;
@@ -2729,7 +1708,7 @@ impl MappingStore {
             ));
         }
         let selected_source_heads = vec![expected_source_head.clone()];
-        let mut store = Self::capture_v025_evidence_at(
+        let mut store = Self::capture_evidence_at(
             source_repo,
             target_repo,
             source_context,
@@ -2744,14 +1723,14 @@ impl MappingStore {
         if current_source_head.as_deref() != Some(authority.source_head.as_str())
             || authority.source_selected_heads != selected_source_heads
         {
-            return Err(origin_migration_drift_error());
+            return Err(mapping_authority_drift_error());
         }
         authority.source_head = expected_source_head;
         let snapshot = store.mapping_authority_snapshot(direction, target_root, branch)?;
         Ok((store, snapshot))
     }
 
-    pub(crate) fn capture_v025_evidence(
+    pub(crate) fn capture_evidence(
         source_repo: &Path,
         target_repo: &Path,
         source_context: &OriginContext,
@@ -2759,7 +1738,7 @@ impl MappingStore {
     ) -> RailResult<Self> {
         let selected_target_head = SystemGit::open(target_repo)?.head_commit()?;
         let selected_source_heads = selected_source_heads(source_repo)?;
-        Self::capture_v025_evidence_at(
+        Self::capture_evidence_at(
             source_repo,
             target_repo,
             source_context,
@@ -2769,7 +1748,7 @@ impl MappingStore {
         )
     }
 
-    pub(crate) fn capture_v025_evidence_at(
+    pub(crate) fn capture_evidence_at(
         source_repo: &Path,
         target_repo: &Path,
         source_context: &OriginContext,
@@ -2780,22 +1759,22 @@ impl MappingStore {
         let mut evidence = Self::new(source_context.owner.clone());
         evidence.expected_ownership_snapshot = Some(source_context.ownership_snapshot.clone());
         for selected_source_head in selected_source_heads {
-            evidence.load_v025_compatible_history_at(
+            evidence.load_history_at(
                 source_repo,
                 HistorySide::Source,
                 expected_target_repository,
                 selected_source_head,
             )?;
         }
-        evidence.load_v025_compatible_history_at(
+        evidence.load_history_at(
             target_repo,
             HistorySide::Target,
             source_context.source_repository(),
             selected_target_head,
         )?;
-        evidence.load_v025_notes(source_repo, HistorySide::Source)?;
-        evidence.load_v025_notes(target_repo, HistorySide::Target)?;
-        evidence.repository_authority = Some(evidence.validate_v025_evidence(
+        Self::reject_mapping_notes(source_repo, &evidence.owner)?;
+        Self::reject_mapping_notes(target_repo, &evidence.owner)?;
+        evidence.repository_authority = Some(evidence.validate_evidence(
             source_repo,
             target_repo,
             source_context,
@@ -2855,14 +1834,12 @@ impl MappingStore {
                     if !is_ancestor(repo_path, &endpoint, containing_commit)? {
                         return Err(mapping_resolution_error(
                             &endpoint,
-                            "explicit target evidence is not an ancestor of its migration commit",
+                            "explicit target evidence is not an ancestor of its containing commit",
                         ));
                     }
                     self.target_evidence.insert(endpoint.clone());
                     self.target_evidence.insert(containing_commit.to_string());
-                    self.target_evidence_pairs
-                        .insert((parsed.source_commit, endpoint.clone()));
-                    self.current_explicit_target_evidence.insert(endpoint);
+                    self.target_evidence_pairs.insert((parsed.source_commit, endpoint));
                     self.explicit_pair_commits.insert(containing_commit.to_string());
                 }
                 _ => {
@@ -2894,185 +1871,33 @@ impl MappingStore {
                 self.explicit_pair_commits.insert(containing_commit.to_string());
                 self.target_evidence.insert(containing_commit.to_string());
                 (
-                    V025CommitMapping::new(&parsed.source_commit, &target_commit)?,
+                    CommitMapping::new(&parsed.source_commit, &target_commit)?,
                     parsed.frontier,
                 )
             }
             (HistorySide::Source, None) => (
-                V025CommitMapping::new(containing_commit, &parsed.source_commit)?,
+                CommitMapping::new(containing_commit, &parsed.source_commit)?,
                 Some(MappingFrontier::Target),
             ),
             (HistorySide::Target, None) => (
-                V025CommitMapping::new(&parsed.source_commit, containing_commit)?,
+                CommitMapping::new(&parsed.source_commit, containing_commit)?,
                 Some(MappingFrontier::Source),
             ),
         };
         self.record_mapping(&mapping.source, &mapping.target)?;
         if let Some(frontier) = frontier {
-            self.record_frontier(&mapping, frontier, true);
+            self.record_frontier(&mapping, frontier);
         }
-        self.current_history_mappings.insert((mapping.source, mapping.target));
         Ok(())
     }
 
-    fn record_v025_trailer(
-        &mut self,
-        parsed: V025ParsedTrailer,
-        containing_commit: &str,
-        side: HistorySide,
-    ) -> RailResult<()> {
-        match parsed {
-            V025ParsedTrailer::Legacy {
-                side: trailer_side,
-                source_commit,
-            } if side == trailer_side => {
-                let mapping = match side {
-                    HistorySide::Source => V025CommitMapping::new(containing_commit, &source_commit)?,
-                    HistorySide::Target => V025CommitMapping::new(&source_commit, containing_commit)?,
-                };
-                // Weak predecessor trailers bind neither repository identity
-                // nor ownership/transform authority. Keep the exact pair, but
-                // never infer an ancestry frontier from it.
-                self.record_v025_mapping(mapping, MappingFrontier::Neither)
-            }
-            V025ParsedTrailer::Legacy { .. } => Ok(()),
-        }
-    }
-
-    fn record_v025_current_trailer(
-        &mut self,
-        repo_path: &Path,
-        parsed: ParsedTrailer,
-        containing_commit: &str,
-        side: HistorySide,
-        expected_source_repository: &str,
-    ) -> RailResult<()> {
-        if parsed.owner != self.owner || parsed.source_repository != expected_source_repository {
-            return Ok(());
-        }
-        if parsed.transform_version != TRANSFORM_VERSION {
-            return Err(RailError::message(format!(
-                "unsupported predecessor Rail-Origin transform version {} for '{}'",
-                parsed.transform_version, self.owner
-            )));
-        }
-        validate_token("predecessor workspace snapshot", &parsed.ownership_snapshot)?;
-        if !parsed.mapping {
-            match side {
-                HistorySide::Source => {
-                    self.source_evidence.insert(containing_commit.to_string());
-                    self.source_evidence_pairs
-                        .insert((containing_commit.to_string(), parsed.source_commit.clone()));
-                    self.v025_source_evidence
-                        .insert((containing_commit.to_string(), parsed.source_commit));
-                }
-                HistorySide::Target => {
-                    self.target_evidence.insert(containing_commit.to_string());
-                    self.target_evidence_pairs
-                        .insert((parsed.source_commit.clone(), containing_commit.to_string()));
-                    self.v025_target_evidence
-                        .insert((parsed.source_commit, containing_commit.to_string()));
-                }
-            }
-            return Ok(());
-        }
-        let mapping = match (side, parsed.target_commit) {
-            (HistorySide::Source, Some(_)) => {
-                return Err(mapping_resolution_error(
-                    containing_commit,
-                    "a predecessor explicit-pair trailer is valid only in target history",
-                ));
-            }
-            (HistorySide::Target, Some(target_commit)) => {
-                if !is_ancestor(repo_path, &target_commit, containing_commit)? {
-                    return Err(mapping_resolution_error(
-                        &parsed.source_commit,
-                        &format!(
-                            "predecessor explicit-pair target '{}' is not an ancestor of its trailer commit",
-                            target_commit
-                        ),
-                    ));
-                }
-                V025CommitMapping::new(&parsed.source_commit, &target_commit)?
-            }
-            (HistorySide::Source, None) => V025CommitMapping::new(containing_commit, &parsed.source_commit)?,
-            (HistorySide::Target, None) => V025CommitMapping::new(&parsed.source_commit, containing_commit)?,
-        };
-        // v1's `snapshot=` was the volatile full workspace-content ID. It
-        // cannot prove current ownership ancestry, even when its exact pair is
-        // still valid. Persist the pair as frontier=none and let the ambiguity
-        // guard reject unmatched ancestors rather than guessing.
-        self.record_v025_mapping(mapping, MappingFrontier::Neither)
-    }
-
-    fn record_v025_mapping(&mut self, mapping: V025CommitMapping, frontier: MappingFrontier) -> RailResult<()> {
-        self.record_mapping(&mapping.source, &mapping.target)?;
-        self.record_frontier(&mapping, frontier, false);
-        let pair = (mapping.source, mapping.target);
-        self.v025_mappings.insert(pair);
-        Ok(())
-    }
-
-    fn record_frontier(&mut self, mapping: &V025CommitMapping, frontier: MappingFrontier, current: bool) {
+    fn record_frontier(&mut self, mapping: &CommitMapping, frontier: MappingFrontier) {
         if frontier.proves_source() {
             self.source_frontiers.insert(mapping.source.clone());
-            if current {
-                self.current_source_frontiers.insert(mapping.source.clone());
-            } else {
-                self.v025_source_frontiers.insert(mapping.source.clone());
-            }
         }
         if frontier.proves_target() {
             self.target_frontiers.insert(mapping.target.clone());
-            if current {
-                self.current_target_frontiers.insert(mapping.target.clone());
-            } else {
-                self.v025_target_frontiers.insert(mapping.target.clone());
-            }
         }
-    }
-
-    fn v025_migration_candidates_with_frontiers(&self) -> Vec<MigrationCandidate> {
-        let mut candidates = self
-            .v025_mappings
-            .iter()
-            .filter_map(|(source, target)| {
-                let mapping_missing = !self
-                    .current_history_mappings
-                    .contains(&(source.clone(), target.clone()));
-                let source_missing =
-                    self.v025_source_frontiers.contains(source) && !self.current_source_frontiers.contains(source);
-                let target_missing =
-                    self.v025_target_frontiers.contains(target) && !self.current_target_frontiers.contains(target);
-                (mapping_missing || source_missing || target_missing).then(|| MigrationCandidate {
-                    source: source.clone(),
-                    target: target.clone(),
-                    frontier: MappingFrontier::from_proofs(source_missing, target_missing),
-                    kind: MigrationCandidateKind::Mapping,
-                })
-            })
-            .collect::<Vec<_>>();
-        candidates.extend(
-            self.v025_target_evidence
-                .iter()
-                .filter(|(_, target)| !self.current_explicit_target_evidence.contains(target))
-                .map(|(source, target)| MigrationCandidate {
-                    source: source.clone(),
-                    target: target.clone(),
-                    frontier: MappingFrontier::Neither,
-                    kind: MigrationCandidateKind::TargetEvidence,
-                }),
-        );
-        candidates.sort();
-        candidates
-    }
-
-    #[cfg(test)]
-    fn v025_migration_candidates(&self) -> Vec<(String, String)> {
-        self.v025_migration_candidates_with_frontiers()
-            .into_iter()
-            .map(|candidate| (candidate.source, candidate.target))
-            .collect()
     }
 
     pub(crate) fn mapping_authority_snapshot(
@@ -3134,7 +1959,6 @@ impl MappingStore {
             target_frontiers,
             source_evidence,
             target_evidence,
-            self.v025_migration_candidates_with_frontiers(),
         )
     }
 
@@ -3184,18 +2008,16 @@ impl MappingStore {
     }
 
     pub(crate) fn record_source_frontier_mapping(&mut self, source: &str, target: &str) -> RailResult<()> {
-        let mapping = V025CommitMapping::new(source, target)?;
+        let mapping = CommitMapping::new(source, target)?;
         self.record_mapping(&mapping.source, &mapping.target)?;
-        self.record_frontier(&mapping, MappingFrontier::Source, true);
-        self.current_history_mappings.insert((mapping.source, mapping.target));
+        self.record_frontier(&mapping, MappingFrontier::Source);
         Ok(())
     }
 
     pub(crate) fn record_target_frontier_mapping(&mut self, source: &str, target: &str) -> RailResult<()> {
-        let mapping = V025CommitMapping::new(source, target)?;
+        let mapping = CommitMapping::new(source, target)?;
         self.record_mapping(&mapping.source, &mapping.target)?;
-        self.record_frontier(&mapping, MappingFrontier::Target, true);
-        self.current_history_mappings.insert((mapping.source, mapping.target));
+        self.record_frontier(&mapping, MappingFrontier::Target);
         Ok(())
     }
 
@@ -3223,7 +2045,7 @@ impl MappingStore {
         commits
     }
 
-    /// Exact pairs whose predecessor evidence proves neither directional
+    /// Exact pairs whose evidence proves neither directional
     /// ancestry frontier. These endpoints may suppress exact replay, but an
     /// unmatched relevant ancestor below either endpoint is ambiguous and
     /// must fail closed rather than be reordered after the mapped endpoint.
@@ -3289,56 +2111,13 @@ fn restore_snapshot_evidence(
     Ok(())
 }
 
-fn explicit_pair_trailer(context: &OriginContext, source_commit: &str, target_commit: &str) -> RailResult<String> {
-    let source_commit = normalize_object_id("source", source_commit)?;
-    let target_commit = normalize_object_id("target", target_commit)?;
-    Ok(format!(
-        "{TRAILER_PREFIX}{TRAILER_SCHEMA} source={} commit={} owner={} snapshot={} transform={TRANSFORM_VERSION} target={}",
-        context.source_repository,
-        source_commit,
-        encode_hex(context.owner.as_bytes()),
-        context.ownership_snapshot,
-        target_commit,
-    ))
-}
-
-fn explicit_pair_trailer_with_frontier(
-    context: &OriginContext,
-    source_commit: &str,
-    target_commit: &str,
-    frontier: MappingFrontier,
-) -> RailResult<String> {
-    Ok(format!(
-        "{} frontier={}",
-        explicit_pair_trailer(context, source_commit, target_commit)?,
-        frontier.as_str()
-    ))
-}
-
-fn explicit_target_evidence_trailer(
-    context: &OriginContext,
-    source_commit: &str,
-    target_commit: &str,
-) -> RailResult<String> {
-    let source_commit = normalize_object_id("evidence source", source_commit)?;
-    let target_commit = normalize_object_id("evidence target", target_commit)?;
-    Ok(format!(
-        "{TRAILER_PREFIX}{TRAILER_SCHEMA} source={} commit={} owner={} snapshot={} transform={TRANSFORM_VERSION} mapping=evidence evidence={} side=target",
-        context.source_repository,
-        source_commit,
-        encode_hex(context.owner.as_bytes()),
-        context.ownership_snapshot,
-        target_commit,
-    ))
-}
-
 pub(crate) fn is_ancestor(repo_path: &Path, ancestor: &str, descendant: &str) -> RailResult<bool> {
     validate_object_id("ancestor", ancestor)?;
     validate_object_id("descendant", descendant)?;
     let output = git_cmd_for_path(repo_path)
         .args(["merge-base", "--is-ancestor", ancestor, descendant])
         .output()
-        .context("Failed to validate predecessor mapping ancestry")?;
+        .context("Failed to validate mapping ancestry")?;
     match output.status.code() {
         Some(0) => Ok(true),
         Some(1) => Ok(false),
@@ -3401,14 +2180,6 @@ fn origin_trailer_values(message: &str) -> Vec<&str> {
         .iter()
         .filter_map(|line| line.strip_prefix(TRAILER_PREFIX))
         .collect()
-}
-
-fn is_inert_predecessor_trailer(value: &str) -> bool {
-    ParsedTrailer::parse_v025(value).is_ok()
-        || value
-            .strip_prefix("mono@")
-            .or_else(|| value.strip_prefix("remote@"))
-            .is_some_and(|object_id| validate_object_id("retired predecessor origin", object_id).is_ok())
 }
 
 fn validate_object_id(field: &str, value: &str) -> RailResult<()> {
@@ -3482,9 +2253,9 @@ fn mapping_resolution_error(source: &str, reason: &str) -> RailError {
     )
 }
 
-fn origin_migration_drift_error() -> RailError {
+fn mapping_authority_drift_error() -> RailError {
     RailError::with_help(
-        "predecessor mapping evidence changed after it was checked",
+        "mapping evidence changed after it was checked",
         "retry after the ordinary histories and refs/notes/rail mapping refs stop changing",
     )
 }
@@ -3495,100 +2266,20 @@ std::thread_local! {
 }
 
 #[cfg(test)]
-fn fail_v025_migration_after_ref_cas() -> RailResult<()> {
-    if FAIL_V025_MIGRATION_AFTER_REF_CAS.replace(false) {
-        Err(RailError::message(
-            "injected interruption after predecessor migration ref CAS",
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-fn write_v025_migration_commit(
-    target_repo: &Path,
-    tree: &str,
-    parent: &str,
-    message: &str,
-    metadata: &CommitMetadata,
-) -> RailResult<String> {
-    write_v025_migration_commit_with_command(
-        git_cmd_for_path(target_repo),
-        tree,
-        parent,
-        message,
-        metadata,
-        "git commit-tree -F -",
-    )
-}
-
-fn write_v025_migration_commit_with_command(
-    mut command: std::process::Command,
-    tree: &str,
-    parent: &str,
-    message: &str,
-    metadata: &CommitMetadata,
-    command_name: &str,
-) -> RailResult<String> {
-    use std::io::Write as _;
-    use std::process::Stdio;
-
-    let author_date = format!("{} {}", metadata.author_timestamp, metadata.author_timezone);
-    let committer_date = format!("{} {}", metadata.committer_timestamp, metadata.committer_timezone);
-    command
-        .env("GIT_AUTHOR_NAME", &metadata.author)
-        .env("GIT_AUTHOR_EMAIL", &metadata.author_email)
-        .env("GIT_AUTHOR_DATE", &author_date)
-        .env("GIT_COMMITTER_NAME", &metadata.committer)
-        .env("GIT_COMMITTER_EMAIL", &metadata.committer_email)
-        .env("GIT_COMMITTER_DATE", &committer_date)
-        .args(["commit-tree", tree, "-p", parent, "-F", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .context("Failed to start predecessor mapping migration commit")?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| RailError::message("git commit-tree stdin was unavailable"))?;
-    stdin
-        .write_all(message.as_bytes())
-        .context("Failed to write predecessor mapping migration message")?;
-    drop(stdin);
-    let output = child
-        .wait_with_output()
-        .context("Failed to create predecessor mapping migration commit")?;
-    if !output.status.success() {
-        return Err(RailError::Git(GitError::CommandFailed {
-            command: command_name.to_string(),
-            stderr: git_command_diagnostics(&output.stdout, &output.stderr),
-        }));
-    }
-    let commit = String::from_utf8(output.stdout)?.trim().to_string();
-    validate_object_id("migration", &commit)?;
-    Ok(commit)
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
-    const V025_LEGACY_NOTE: &[u8] = include_bytes!("../../tests/fixtures/compat/v0.25.0/mappings/legacy.note");
-    const V025_MAPPING_NOTE: &[u8] = include_bytes!("../../tests/fixtures/compat/v0.25.0/mappings/mapping-v1.note");
-    const V025_MIGRATION_TRAILER: &[u8] =
-        include_bytes!("../../tests/fixtures/compat/v0.25.0/mappings/migration-origin.trailer");
-    const V025_EVIDENCE_TRAILER: &[u8] =
-        include_bytes!("../../tests/fixtures/compat/v0.25.0/mappings/evidence-origin.trailer");
-    const V025_MONO_TRAILER: &[u8] = include_bytes!("../../tests/fixtures/compat/v0.25.0/mappings/mono-origin.trailer");
-    const V025_REMOTE_TRAILER: &[u8] =
-        include_bytes!("../../tests/fixtures/compat/v0.25.0/mappings/remote-origin.trailer");
-
-    fn fixture(bytes: &'static [u8]) -> &'static str {
-        let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
-        std::str::from_utf8(bytes).unwrap()
+    fn explicit_pair_trailer(context: &OriginContext, source_commit: &str, target_commit: &str) -> RailResult<String> {
+        let source_commit = normalize_object_id("source", source_commit)?;
+        let target_commit = normalize_object_id("target", target_commit)?;
+        Ok(format!(
+            "{TRAILER_PREFIX}{TRAILER_SCHEMA} source={} commit={} owner={} snapshot={} transform={TRANSFORM_VERSION} target={}",
+            context.source_repository,
+            source_commit,
+            encode_hex(context.owner.as_bytes()),
+            context.ownership_snapshot,
+            target_commit,
+        ))
     }
 
     fn oid(digit: char) -> String {
@@ -3597,40 +2288,6 @@ mod tests {
 
     fn repository_id(digit: char) -> String {
         format!("sha256-{}", std::iter::repeat_n(digit, 64).collect::<String>())
-    }
-
-    #[test]
-    fn v025_receipt_message_is_rewritten_to_current_ownership_trailer() {
-        let remote = oid('b');
-        let context = OriginContext::new(repository_id('a'), "demo", "sha256-stable-policy").unwrap();
-        let legacy_context = OriginContext::new(repository_id('a'), "demo", "v1-volatile-content").unwrap();
-        let legacy = format!(
-            "remote change\n\n{}",
-            legacy_context
-                .format_trailer(&remote, true)
-                .unwrap()
-                .replacen("Rail-Origin: v2", "Rail-Origin: v1", 1)
-        );
-
-        let migrated = migrate_v025_receipt_message(&legacy, &context, &remote).unwrap();
-
-        assert_eq!(origin_trailer_values(&migrated).len(), 1);
-        assert!(origin_trailer_values(&migrated)[0].starts_with("v2 source="));
-        assert!(!migrated.contains("Rail-Origin: v1"));
-        ParsedTrailer::parse(origin_trailer_values(&migrated)[0]).unwrap();
-    }
-
-    #[test]
-    fn v025_receipt_message_rejects_modified_predecessor_trailer_block() {
-        let remote = oid('b');
-        let context = OriginContext::new(repository_id('a'), "demo", "sha256-stable-policy").unwrap();
-        let modified = format!(
-            "remote change\n\n{TRAILER_PREFIX}v1 source={} commit={remote} owner=64656d6f snapshot=v1-volatile-content transform=1\nSigned-off-by: attacker",
-            repository_id('a')
-        );
-
-        let error = migrate_v025_receipt_message(&modified, &context, &remote).unwrap_err();
-        assert!(error.to_string().contains("invalid predecessor origin trailer"));
     }
 
     fn git(repo: &Path, args: &[&str]) -> String {
@@ -3658,55 +2315,51 @@ mod tests {
         git(repo, &["rev-parse", "HEAD"])
     }
 
-    fn import_source_and_add_note(source_repo: &Path, target_repo: &Path, source: &str, content: &str) {
-        git(
-            target_repo,
-            &["fetch", "--quiet", source_repo.to_str().unwrap(), source],
+    #[test]
+    fn final_split_revalidation_rejects_notes_added_after_capture() {
+        let source = repository();
+        let source_head = commit(source.path(), "source");
+        let target = repository();
+        let origin = OriginContext::discover(source.path(), "demo", "policy").unwrap();
+        let target_head = commit(
+            target.path(),
+            &format!("split\n\n{}", origin.trailer(&source_head).unwrap()),
         );
-        git(
-            target_repo,
-            &["notes", "--ref", "refs/notes/rail/demo", "add", "-m", content, source],
-        );
-    }
-
-    fn migrate_checked(
-        mappings: &mut MappingStore,
-        source_repo: &Path,
-        target_repo: &Path,
-        source_context: &OriginContext,
-        target_identity: &str,
-    ) -> RailResult<Option<String>> {
-        let target_root = utils::canonicalize_existing(target_repo)?;
-        let (_, expected) = MappingStore::capture_v025_authority(
-            source_repo,
-            &target_root,
-            source_context,
-            target_identity,
+        let target_root = utils::canonicalize_existing(target.path()).unwrap();
+        let (_, captured) = MappingStore::capture_authority(
+            source.path(),
+            target.path(),
+            &origin,
+            &repository_identity(target.path()).unwrap(),
             &target_root,
             "main",
             "mono_to_remote",
-        )?;
-        mappings.migrate_v025_evidence_bound(
-            source_repo,
-            target_repo,
-            source_context,
-            target_identity,
-            &target_root,
-            "main",
-            "mono_to_remote",
-            Some(&expected),
         )
-    }
-
-    fn acknowledge_completed_test_effect(target_repo: &Path) {
-        let git = SystemGit::open(target_repo).unwrap();
-        let journals = GitEffectStore::discover_unacknowledged_read_only(&git).unwrap();
-        assert_eq!(journals.len(), 1, "expected one completed migration effect");
-        let store = GitEffectStore::open(&git).unwrap();
-        match store.resume(journals[0].effect_id()).unwrap() {
-            GitEffectRecord::Completed(completed) => completed.acknowledge().unwrap(),
-            GitEffectRecord::Active(_) => panic!("migration effect was not terminal"),
-        }
+        .unwrap();
+        captured
+            .revalidate_split_repository_state(source.path(), target.path())
+            .unwrap();
+        git(
+            target.path(),
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/rail/demo",
+                "add",
+                "-m",
+                "unsupported authority",
+                &target_head,
+            ],
+        );
+        let error = captured
+            .revalidate_split_repository_state(source.path(), target.path())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("unsupported Cargo-Rail mapping notes"),
+            "{error}"
+        );
+        assert_eq!(git(source.path(), &["rev-parse", "HEAD"]), source_head);
+        assert_eq!(git(target.path(), &["rev-parse", "HEAD"]), target_head);
     }
 
     #[test]
@@ -3730,449 +2383,6 @@ mod tests {
                 evidence_side: None,
             }
         );
-    }
-
-    #[test]
-    fn v025_fixtures_separate_transitional_and_persistent_grammar() {
-        let source = oid('a');
-        let target = oid('b');
-        let repository = repository_id('e');
-
-        assert_eq!(fixture(V025_MONO_TRAILER), format!("mono@{source}"));
-        assert_eq!(fixture(V025_REMOTE_TRAILER), format!("remote@{target}"));
-        assert_eq!(
-            fixture(V025_EVIDENCE_TRAILER),
-            format!(
-                "v1 source={repository} commit={source} owner=64656d6f snapshot=v1-sha256-snapshot transform=1 mapping=evidence"
-            )
-        );
-        assert_eq!(
-            fixture(V025_MIGRATION_TRAILER),
-            format!(
-                "v1 source={repository} commit={source} owner=64656d6f snapshot=v1-sha256-snapshot transform=1 target={target}"
-            )
-        );
-        assert_eq!(fixture(V025_LEGACY_NOTE), target);
-        assert_eq!(
-            fixture(V025_MAPPING_NOTE),
-            format!("{V025_NOTE_SCHEMA}\nsource={source}\ntarget={target}")
-        );
-
-        ParsedTrailer::parse(fixture(V025_MONO_TRAILER)).unwrap_err();
-        ParsedTrailer::parse(fixture(V025_REMOTE_TRAILER)).unwrap_err();
-        assert_eq!(
-            ParsedTrailer::parse_v025(fixture(V025_MIGRATION_TRAILER)).unwrap(),
-            ParsedTrailer {
-                source_repository: repository,
-                source_commit: source.clone(),
-                owner: "demo".to_string(),
-                ownership_snapshot: "v1-sha256-snapshot".to_string(),
-                transform_version: TRANSFORM_VERSION,
-                mapping: true,
-                target_commit: Some(target.clone()),
-                frontier: None,
-                evidence_commit: None,
-                evidence_side: None,
-            }
-        );
-        assert_eq!(
-            V025ParsedTrailer::parse(fixture(V025_MONO_TRAILER)).unwrap(),
-            V025ParsedTrailer::Legacy {
-                side: HistorySide::Target,
-                source_commit: source.clone(),
-            }
-        );
-        assert_eq!(
-            V025ParsedTrailer::parse(fixture(V025_REMOTE_TRAILER)).unwrap(),
-            V025ParsedTrailer::Legacy {
-                side: HistorySide::Source,
-                source_commit: target.clone(),
-            }
-        );
-        V025ParsedTrailer::parse(fixture(V025_MIGRATION_TRAILER)).unwrap_err();
-        assert_eq!(
-            V025CommitMapping::decode_note(&source, fixture(V025_LEGACY_NOTE)).unwrap(),
-            V025CommitMapping::new(&source, &target).unwrap()
-        );
-        assert_eq!(
-            V025CommitMapping::decode_note(&source, fixture(V025_MAPPING_NOTE)).unwrap(),
-            V025CommitMapping::new(&source, &target).unwrap()
-        );
-    }
-
-    #[test]
-    fn v025_decoder_rejects_near_miss_grammar() {
-        let source = oid('a');
-        let target = oid('b');
-        let repository = repository_id('e');
-        V025ParsedTrailer::parse(&format!("mono@{source} extra")).unwrap_err();
-        V025ParsedTrailer::parse(&format!("remote@{target} extra")).unwrap_err();
-        V025ParsedTrailer::parse(&format!(
-            "v1 source={repository} commit={source} owner=64656d6f snapshot=v1-sha256-snapshot transform=1 target={target} extra=value"
-        ))
-        .unwrap_err();
-        for frontier in ["neither", "source", "target", "both"] {
-            V025ParsedTrailer::parse(&format!(
-                "v1 source={repository} commit={source} owner=64656d6f snapshot=v1-sha256-snapshot transform=1 target={target} frontier={frontier}"
-            ))
-            .unwrap_err();
-        }
-        V025CommitMapping::decode_note(&source, &format!("{target}\n{target}")).unwrap_err();
-        V025CommitMapping::decode_note(
-            &source,
-            &format!("{V025_NOTE_SCHEMA}\nsource={}\ntarget={target}", oid('c')),
-        )
-        .unwrap_err();
-    }
-
-    #[test]
-    fn v025_notes_only_migrate_and_mixed_history_is_already_migrated() {
-        let source_repo = repository();
-        let source = commit(source_repo.path(), "source");
-        let target_repo = repository();
-        let target = commit(target_repo.path(), "target");
-        let note = format!("{V025_NOTE_SCHEMA}\nsource={source}\ntarget={target}");
-        import_source_and_add_note(source_repo.path(), target_repo.path(), &source, &note);
-
-        let source_context = OriginContext::discover(source_repo.path(), "demo", "v1-sha256-current").unwrap();
-        let target_identity = repository_identity(target_repo.path()).unwrap();
-        let before_head = git(target_repo.path(), &["rev-parse", "HEAD"]);
-        let before_tree = git(target_repo.path(), &["rev-parse", "HEAD^{tree}"]);
-        let mut mappings = MappingStore::capture_v025_evidence(
-            source_repo.path(),
-            target_repo.path(),
-            &source_context,
-            &target_identity,
-        )
-        .unwrap();
-        assert_eq!(mappings.get_mapping(&source), Some(target.clone()));
-        assert_eq!(
-            mappings.v025_migration_candidates(),
-            vec![(source.clone(), target.clone())]
-        );
-        assert_eq!(git(target_repo.path(), &["rev-parse", "HEAD"]), before_head);
-        let target_root = utils::canonicalize_existing(target_repo.path()).unwrap();
-        let (_, checked_authority) = MappingStore::capture_v025_authority(
-            source_repo.path(),
-            target_repo.path(),
-            &source_context,
-            &target_identity,
-            &target_root,
-            "main",
-            "mono_to_remote",
-        )
-        .unwrap();
-
-        let migration = migrate_checked(
-            &mut mappings,
-            source_repo.path(),
-            target_repo.path(),
-            &source_context,
-            &target_identity,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(git(target_repo.path(), &["rev-parse", "HEAD"]), migration);
-        assert_eq!(git(target_repo.path(), &["rev-parse", "HEAD^{tree}"]), before_tree);
-        let (_, migrated_authority) = MappingStore::capture_v025_authority(
-            source_repo.path(),
-            target_repo.path(),
-            &source_context,
-            &target_identity,
-            &target_root,
-            "main",
-            "mono_to_remote",
-        )
-        .unwrap();
-        assert_eq!(
-            checked_authority.after_migration(&migration).unwrap(),
-            migrated_authority,
-            "the pre-effect authority must predict the exact post-migration store",
-        );
-        let message = git(target_repo.path(), &["log", "-1", "--format=%B"]);
-        assert_eq!(
-            message,
-            format!(
-                "{V025_MIGRATION_SUBJECT}\n\n{}",
-                explicit_pair_trailer_with_frontier(&source_context, &source, &target, MappingFrontier::Neither,)
-                    .unwrap()
-            )
-        );
-        acknowledge_completed_test_effect(target_repo.path());
-
-        let mut mixed = MappingStore::capture_v025_evidence(
-            source_repo.path(),
-            target_repo.path(),
-            &source_context,
-            &target_identity,
-        )
-        .unwrap();
-        assert!(mixed.v025_migration_candidates().is_empty());
-        assert!(mixed.has_reverse_mapping(&migration));
-        assert_eq!(
-            migrate_checked(
-                &mut mixed,
-                source_repo.path(),
-                target_repo.path(),
-                &source_context,
-                &target_identity,
-            )
-            .unwrap(),
-            None
-        );
-        assert_eq!(git(target_repo.path(), &["rev-parse", "HEAD"]), migration);
-
-        git(target_repo.path(), &["update-ref", "-d", "refs/notes/rail/demo"]);
-        let ordinary_only = MappingStore::capture_v025_evidence(
-            source_repo.path(),
-            target_repo.path(),
-            &source_context,
-            &target_identity,
-        )
-        .unwrap();
-        assert_eq!(ordinary_only.get_mapping(&source), Some(target.clone()));
-        assert!(ordinary_only.v025_migration_candidates().is_empty());
-
-        let mut current_only = MappingStore::new("demo".to_string());
-        current_only
-            .load_history(
-                target_repo.path(),
-                HistorySide::Target,
-                source_context.source_repository(),
-            )
-            .unwrap();
-        assert_eq!(current_only.get_mapping(&source), Some(target));
-        assert!(current_only.has_reverse_mapping(&migration));
-        assert!(current_only.source_frontier_commits().is_empty());
-        assert!(current_only.target_frontier_commits().is_empty());
-        assert!(current_only.v025_mappings.is_empty());
-    }
-
-    #[test]
-    fn v025_evidence_only_endpoint_migrates_as_exact_current_evidence() {
-        let source_repo = repository();
-        let source = commit(source_repo.path(), "source");
-        let target_repo = repository();
-        let source_context = OriginContext::discover(source_repo.path(), "demo", "sha256-stable-policy").unwrap();
-        let predecessor_context = OriginContext::new(
-            source_context.source_repository().to_string(),
-            "demo",
-            "v1-volatile-content",
-        )
-        .unwrap();
-        let evidence = commit(
-            target_repo.path(),
-            &predecessor_context
-                .evidence_trailer(&source)
-                .unwrap()
-                .replacen("Rail-Origin: v2", "Rail-Origin: v1", 1),
-        );
-        let target_identity = repository_identity(target_repo.path()).unwrap();
-
-        let mut mappings = MappingStore::capture_v025_evidence(
-            source_repo.path(),
-            target_repo.path(),
-            &source_context,
-            &target_identity,
-        )
-        .unwrap();
-        assert!(mappings.has_reverse_mapping(&evidence));
-        assert_eq!(mappings.v025_migration_candidates_with_frontiers().len(), 1);
-        migrate_checked(
-            &mut mappings,
-            source_repo.path(),
-            target_repo.path(),
-            &source_context,
-            &target_identity,
-        )
-        .unwrap()
-        .unwrap();
-
-        let migrated = MappingStore::capture_v025_evidence(
-            source_repo.path(),
-            target_repo.path(),
-            &source_context,
-            &target_identity,
-        )
-        .unwrap();
-        assert!(migrated.has_reverse_mapping(&evidence));
-        assert!(migrated.v025_migration_candidates_with_frontiers().is_empty());
-        let mut current_only = MappingStore::new("demo".to_string());
-        current_only.expected_ownership_snapshot = Some("sha256-stable-policy".to_string());
-        current_only
-            .load_history(
-                target_repo.path(),
-                HistorySide::Target,
-                source_context.source_repository(),
-            )
-            .unwrap();
-        assert!(current_only.has_reverse_mapping(&evidence));
-    }
-
-    #[test]
-    fn v025_note_migration_is_deterministic_across_equivalent_clones() {
-        let source_repo = repository();
-        let source_one = commit(source_repo.path(), "source one");
-        let source_two = commit(source_repo.path(), "source two");
-        let target_repo = repository();
-        let target_one = commit(target_repo.path(), "target one");
-        let target_two = commit(target_repo.path(), "target two");
-        import_source_and_add_note(source_repo.path(), target_repo.path(), &source_one, &target_one);
-        import_source_and_add_note(
-            source_repo.path(),
-            target_repo.path(),
-            &source_two,
-            &format!("{V025_NOTE_SCHEMA}\nsource={source_two}\ntarget={target_two}"),
-        );
-
-        let clone_parent = tempfile::TempDir::new().unwrap();
-        git(
-            clone_parent.path(),
-            &["clone", "--quiet", target_repo.path().to_str().unwrap(), "copy"],
-        );
-        let clone = clone_parent.path().join("copy");
-        git(
-            &clone,
-            &[
-                "fetch",
-                "--quiet",
-                target_repo.path().to_str().unwrap(),
-                "refs/notes/rail/demo:refs/notes/rail/demo",
-            ],
-        );
-
-        let source_context = OriginContext::discover(source_repo.path(), "demo", "v1-sha256-current").unwrap();
-        let target_identity = repository_identity(target_repo.path()).unwrap();
-        assert_eq!(repository_identity(&clone).unwrap(), target_identity);
-        let mut original = MappingStore::new("demo".to_string());
-        let original_commit = migrate_checked(
-            &mut original,
-            source_repo.path(),
-            target_repo.path(),
-            &source_context,
-            &target_identity,
-        )
-        .unwrap()
-        .unwrap();
-        let mut copied = MappingStore::new("demo".to_string());
-        let copied_commit = migrate_checked(
-            &mut copied,
-            source_repo.path(),
-            &clone,
-            &source_context,
-            &target_identity,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(original_commit, copied_commit);
-
-        let message = git(target_repo.path(), &["log", "-1", "--format=%B"]);
-        let mut encoded_sources = message
-            .lines()
-            .filter_map(|line| line.strip_prefix(TRAILER_PREFIX))
-            .map(|value| {
-                V025ParsedTrailer::parse(value).unwrap_err();
-                let parsed = ParsedTrailer::parse(value).unwrap();
-                assert!(parsed.target_commit.is_some());
-                parsed.source_commit
-            })
-            .collect::<Vec<_>>();
-        let observed = encoded_sources.clone();
-        encoded_sources.sort();
-        assert_eq!(observed, encoded_sources);
-    }
-
-    #[test]
-    fn v025_predecessor_trailer_only_migrates_without_replay() {
-        let source_repo = repository();
-        let source = commit(source_repo.path(), "source");
-        let target_repo = repository();
-        let legacy = format!("split\n\n{TRAILER_PREFIX}mono@{source}");
-        let target = commit(target_repo.path(), &legacy);
-        let source_context = OriginContext::discover(source_repo.path(), "demo", "v1-sha256-current").unwrap();
-        let target_identity = repository_identity(target_repo.path()).unwrap();
-
-        let mut mappings = MappingStore::capture_v025_evidence(
-            source_repo.path(),
-            target_repo.path(),
-            &source_context,
-            &target_identity,
-        )
-        .unwrap();
-        assert_eq!(mappings.get_mapping(&source), Some(target.clone()));
-        let migration = migrate_checked(
-            &mut mappings,
-            source_repo.path(),
-            target_repo.path(),
-            &source_context,
-            &target_identity,
-        )
-        .unwrap()
-        .unwrap();
-
-        let migrated = MappingStore::capture_v025_evidence(
-            source_repo.path(),
-            target_repo.path(),
-            &source_context,
-            &target_identity,
-        )
-        .unwrap();
-        assert_eq!(migrated.get_mapping(&source), Some(target));
-        assert!(migrated.has_reverse_mapping(&migration));
-        assert!(migrated.v025_migration_candidates().is_empty());
-
-        let mut current_only = MappingStore::new("demo".to_string());
-        current_only
-            .load_history(source_repo.path(), HistorySide::Source, &target_identity)
-            .unwrap();
-        current_only
-            .load_history(
-                target_repo.path(),
-                HistorySide::Target,
-                source_context.source_repository(),
-            )
-            .unwrap();
-        assert_eq!(current_only.get_mapping(&source), migrated.get_mapping(&source));
-        assert!(current_only.has_reverse_mapping(&migration));
-        assert!(current_only.source_frontier_commits().is_empty());
-        assert!(current_only.target_frontier_commits().is_empty());
-        assert!(current_only.v025_mappings.is_empty());
-    }
-
-    #[test]
-    fn v025_remote_trailer_on_source_side_migrates_in_the_declared_direction() {
-        let target_repo = repository();
-        let target = commit(target_repo.path(), "target");
-        let source_repo = repository();
-        let source = commit(
-            source_repo.path(),
-            &format!("source\n\n{TRAILER_PREFIX}remote@{target}"),
-        );
-        let source_context = OriginContext::discover(source_repo.path(), "demo", "v1-sha256-current").unwrap();
-        let target_identity = repository_identity(target_repo.path()).unwrap();
-
-        let mut mappings = MappingStore::capture_v025_evidence(
-            source_repo.path(),
-            target_repo.path(),
-            &source_context,
-            &target_identity,
-        )
-        .unwrap();
-        assert_eq!(mappings.get_mapping(&source), Some(target.clone()));
-        assert!(
-            migrate_checked(
-                &mut mappings,
-                source_repo.path(),
-                target_repo.path(),
-                &source_context,
-                &target_identity,
-            )
-            .unwrap()
-            .is_some()
-        );
-        assert_eq!(mappings.get_mapping(&source), Some(target));
-        assert!(mappings.source_frontier_commits().is_empty());
-        assert!(mappings.target_frontier_commits().is_empty());
     }
 
     #[test]
@@ -4210,7 +2420,7 @@ mod tests {
         let invalid_transform = explicit_pair_trailer(&source_context, &source, &transform_target)
             .unwrap()
             .replace(" transform=1 ", " transform=2 ");
-        commit(transform_repo.path(), &format!("migration\n\n{invalid_transform}"));
+        commit(transform_repo.path(), &format!("explicit pair\n\n{invalid_transform}"));
         let mut transform_mappings = MappingStore::new("demo".to_string());
         let transform_error = transform_mappings
             .load_history(
@@ -4227,7 +2437,7 @@ mod tests {
         let unrelated = commit(ancestry_repo.path(), "unrelated root");
         git(ancestry_repo.path(), &["checkout", "main"]);
         let invalid_ancestry = explicit_pair_trailer(&source_context, &source, &unrelated).unwrap();
-        commit(ancestry_repo.path(), &format!("migration\n\n{invalid_ancestry}"));
+        commit(ancestry_repo.path(), &format!("explicit pair\n\n{invalid_ancestry}"));
         let mut ancestry_mappings = MappingStore::new("demo".to_string());
         let ancestry_error = ancestry_mappings
             .load_history(
@@ -4258,323 +2468,6 @@ mod tests {
                 .to_string()
                 .contains("explicit-pair trailer is valid only in target history")
         );
-    }
-
-    #[test]
-    fn v025_conflicting_note_and_trailer_fail_before_head_mutation() {
-        let source_repo = repository();
-        let source = commit(source_repo.path(), "source");
-        let target_repo = repository();
-        let legacy_target = commit(target_repo.path(), &format!("split\n\n{TRAILER_PREFIX}mono@{source}"));
-        let note_target = commit(target_repo.path(), "different target");
-        import_source_and_add_note(source_repo.path(), target_repo.path(), &source, &note_target);
-        let source_context = OriginContext::discover(source_repo.path(), "demo", "v1-sha256-current").unwrap();
-        let target_identity = repository_identity(target_repo.path()).unwrap();
-        let before_head = git(target_repo.path(), &["rev-parse", "HEAD"]);
-
-        let error = MappingStore::capture_v025_evidence(
-            source_repo.path(),
-            target_repo.path(),
-            &source_context,
-            &target_identity,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("maps to both"));
-        assert_ne!(legacy_target, note_target);
-        assert_eq!(git(target_repo.path(), &["rev-parse", "HEAD"]), before_head);
-    }
-
-    #[test]
-    fn mixed_case_object_ids_coalesce_and_still_reject_divergent_evidence() {
-        let source_repo = repository();
-        let source = commit(source_repo.path(), "source");
-        let source_upper = source.to_ascii_uppercase();
-        let target_repo = repository();
-        let target = commit(
-            target_repo.path(),
-            &format!("split\n\n{TRAILER_PREFIX}mono@{source_upper}"),
-        );
-        let note = format!(
-            "{V025_NOTE_SCHEMA}\nsource={}\ntarget={}",
-            source_upper,
-            target.to_ascii_uppercase()
-        );
-        import_source_and_add_note(source_repo.path(), target_repo.path(), &source, &note);
-        let source_context = OriginContext::discover(source_repo.path(), "demo", "v1-sha256-current").unwrap();
-        let target_identity = repository_identity(target_repo.path()).unwrap();
-
-        let mappings = MappingStore::capture_v025_evidence(
-            source_repo.path(),
-            target_repo.path(),
-            &source_context,
-            &target_identity,
-        )
-        .unwrap();
-        assert_eq!(mappings.get_mapping(&source_upper), Some(target.clone()));
-        assert_eq!(
-            mappings.get_reverse_mapping(&target.to_ascii_uppercase()),
-            Some(source.clone())
-        );
-        assert!(mappings.has_mapping(&source_upper));
-        assert!(mappings.has_reverse_mapping(&target.to_ascii_uppercase()));
-        assert_eq!(mappings.v025_migration_candidates(), vec![(source.clone(), target)]);
-
-        let divergent_target = commit(target_repo.path(), "different target");
-        git(
-            target_repo.path(),
-            &[
-                "notes",
-                "--ref",
-                "refs/notes/rail/demo",
-                "add",
-                "-f",
-                "-m",
-                &format!(
-                    "{V025_NOTE_SCHEMA}\nsource={}\ntarget={}",
-                    source_upper,
-                    divergent_target.to_ascii_uppercase()
-                ),
-                &source,
-            ],
-        );
-        let before_head = git(target_repo.path(), &["rev-parse", "HEAD"]);
-        let error = MappingStore::capture_v025_evidence(
-            source_repo.path(),
-            target_repo.path(),
-            &source_context,
-            &target_identity,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("maps to both"));
-        assert_eq!(git(target_repo.path(), &["rev-parse", "HEAD"]), before_head);
-    }
-
-    #[test]
-    fn v025_checked_migration_rejects_candidate_drift_before_head_cas() {
-        let source_repo = repository();
-        let source = commit(source_repo.path(), "source");
-        let target_repo = repository();
-        let original_target = commit(target_repo.path(), "original target");
-        let replacement_target = commit(target_repo.path(), "replacement target");
-        import_source_and_add_note(source_repo.path(), target_repo.path(), &source, &original_target);
-        let source_context = OriginContext::discover(source_repo.path(), "demo", "v1-sha256-current").unwrap();
-        let target_identity = repository_identity(target_repo.path()).unwrap();
-        let target_root = utils::canonicalize_existing(target_repo.path()).unwrap();
-        let (_, expected) = MappingStore::capture_v025_authority(
-            source_repo.path(),
-            &target_root,
-            &source_context,
-            &target_identity,
-            &target_root,
-            "main",
-            "mono_to_remote",
-        )
-        .unwrap();
-
-        git(
-            target_repo.path(),
-            &[
-                "notes",
-                "--ref",
-                "refs/notes/rail/demo",
-                "add",
-                "-f",
-                "-m",
-                &replacement_target,
-                &source,
-            ],
-        );
-        let before_head = git(target_repo.path(), &["rev-parse", "HEAD"]);
-        let mut mappings = MappingStore::new("demo".to_string());
-        let error = mappings
-            .migrate_v025_evidence_bound(
-                source_repo.path(),
-                &target_root,
-                &source_context,
-                &target_identity,
-                &target_root,
-                "main",
-                "mono_to_remote",
-                Some(&expected),
-            )
-            .unwrap_err();
-        assert!(error.to_string().contains("changed after it was checked"));
-        assert_eq!(git(target_repo.path(), &["rev-parse", "HEAD"]), before_head);
-    }
-
-    #[test]
-    fn v025_prepared_migration_recovers_after_ref_cas_exactly_once() {
-        let source_repo = repository();
-        let source = commit(source_repo.path(), "source");
-        let target_repo = repository();
-        let target = commit(target_repo.path(), "target");
-        let note = format!("{V025_NOTE_SCHEMA}\nsource={source}\ntarget={target}");
-        import_source_and_add_note(source_repo.path(), target_repo.path(), &source, &note);
-        let source_context = OriginContext::discover(source_repo.path(), "demo", "sha256-stable-policy").unwrap();
-        let target_identity = repository_identity(target_repo.path()).unwrap();
-        let target_root = utils::canonicalize_existing(target_repo.path()).unwrap();
-        let (_, expected) = MappingStore::capture_v025_authority(
-            source_repo.path(),
-            target_repo.path(),
-            &source_context,
-            &target_identity,
-            &target_root,
-            "main",
-            "mono_to_remote",
-        )
-        .unwrap();
-        let before = git(target_repo.path(), &["rev-parse", "HEAD"]);
-        FAIL_V025_MIGRATION_AFTER_REF_CAS.set(true);
-        let mut mappings = MappingStore::new("demo".to_string());
-        let error = mappings
-            .migrate_v025_evidence_bound(
-                source_repo.path(),
-                target_repo.path(),
-                &source_context,
-                &target_identity,
-                &target_root,
-                "main",
-                "mono_to_remote",
-                Some(&expected),
-            )
-            .unwrap_err();
-        assert!(error.to_string().contains("injected interruption"), "{error}");
-        let migrated = git(target_repo.path(), &["rev-parse", "HEAD"]);
-        assert_ne!(migrated, before);
-        assert_eq!(
-            git(
-                target_repo.path(),
-                &["rev-list", "--count", &format!("{before}..{migrated}")],
-            ),
-            "1"
-        );
-        let target_git = SystemGit::open(target_repo.path()).unwrap();
-        assert_eq!(
-            GitEffectStore::discover_active_read_only(&target_git).unwrap().len(),
-            1,
-            "the ref-CAS interruption must leave exact durable recovery authority",
-        );
-
-        let resumed = mappings
-            .migrate_v025_evidence_bound(
-                source_repo.path(),
-                target_repo.path(),
-                &source_context,
-                &target_identity,
-                &target_root,
-                "main",
-                "mono_to_remote",
-                Some(&expected),
-            )
-            .unwrap();
-        assert_eq!(resumed.as_deref(), Some(migrated.as_str()));
-        assert_eq!(git(target_repo.path(), &["rev-parse", "HEAD"]), migrated);
-        assert!(
-            GitEffectStore::discover_active_read_only(&target_git)
-                .unwrap()
-                .is_empty()
-        );
-        acknowledge_completed_test_effect(target_repo.path());
-
-        let (_, current) = MappingStore::capture_v025_authority(
-            source_repo.path(),
-            target_repo.path(),
-            &source_context,
-            &target_identity,
-            &target_root,
-            "main",
-            "mono_to_remote",
-        )
-        .unwrap();
-        assert_eq!(current, expected.after_migration(&migrated).unwrap());
-        assert_eq!(
-            mappings
-                .migrate_v025_evidence_bound(
-                    source_repo.path(),
-                    target_repo.path(),
-                    &source_context,
-                    &target_identity,
-                    &target_root,
-                    "main",
-                    "mono_to_remote",
-                    Some(&current),
-                )
-                .unwrap(),
-            None,
-        );
-    }
-
-    #[test]
-    fn v025_large_migration_message_bypasses_process_argument_limits() {
-        const MAPPING_COUNT: usize = 4_096;
-
-        let target_repo = repository();
-        let head = commit(target_repo.path(), "target head");
-        let git_backend = SystemGit::open(target_repo.path()).unwrap();
-        let metadata = git_backend.get_commit(&head).unwrap().metadata();
-        let tree_spec = format!("HEAD^{}tree{}", '{', '}');
-        let tree = git(target_repo.path(), &["rev-parse", &tree_spec]);
-        let source_context = OriginContext::new(repository_id('a'), "large-owner", "v1-sha256-large").unwrap();
-        let trailers = (0..MAPPING_COUNT)
-            .map(|index| {
-                let source = format!("{:040x}", index + 1);
-                let target = format!("{:040x}", MAPPING_COUNT + index + 1);
-                explicit_pair_trailer(&source_context, &source, &target).unwrap()
-            })
-            .collect::<Vec<_>>();
-        let message = append_origin_trailers(V025_MIGRATION_SUBJECT, &trailers);
-        assert!(
-            message.len() > 512 * 1_024,
-            "fixture must exceed conservative single-argument process limits"
-        );
-
-        let migration = write_v025_migration_commit(target_repo.path(), &tree, &head, &message, &metadata).unwrap();
-        let repeated = write_v025_migration_commit(target_repo.path(), &tree, &head, &message, &metadata).unwrap();
-        assert_eq!(
-            migration, repeated,
-            "stdin transport must preserve deterministic commits"
-        );
-        let committed_message = git(target_repo.path(), &["show", "-s", "--format=%B", &migration]);
-        assert_eq!(origin_trailer_values(&committed_message).len(), MAPPING_COUNT);
-        assert_eq!(
-            origin_trailer_values(&committed_message).last().copied(),
-            trailers.last().map(|value| {
-                value
-                    .strip_prefix(TRAILER_PREFIX)
-                    .expect("generated migration trailer must use the current prefix")
-            })
-        );
-    }
-
-    #[test]
-    fn v025_wrong_side_and_unrelated_identity_never_grant_mapping_authority() {
-        let source_repo = repository();
-        let source = commit(source_repo.path(), "source");
-        let target_repo = repository();
-        let target = commit(
-            target_repo.path(),
-            &format!("wrong direction\n\n{TRAILER_PREFIX}remote@{source}"),
-        );
-        let target_identity = repository_identity(target_repo.path()).unwrap();
-        let source_context = OriginContext::discover(source_repo.path(), "demo", "v1-sha256-current").unwrap();
-        let unrelated = OriginContext::new(repository_id('f'), "demo", "v1-sha256-old").unwrap();
-        commit(
-            target_repo.path(),
-            &format!(
-                "unrelated\n\n{}",
-                explicit_pair_trailer(&unrelated, &source, &target).unwrap()
-            ),
-        );
-
-        let mappings = MappingStore::capture_v025_evidence(
-            source_repo.path(),
-            target_repo.path(),
-            &source_context,
-            &target_identity,
-        )
-        .unwrap();
-        assert_eq!(mappings.count(), 0);
-        assert!(mappings.v025_migration_candidates().is_empty());
     }
 
     #[test]

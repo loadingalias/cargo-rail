@@ -1663,8 +1663,9 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
             .analysis_cache
             .as_ref()
             .and_then(|cache| cache.remote.clone());
-        let mut store = CompilerDiagnosticsStore::load_with_remote(remote.clone());
-        let fact_store = CompilerFactStore::load_with_remote(remote);
+        let cas = LocalCas::open().ok();
+        let mut store = CompilerDiagnosticsStore::load_with_cas_and_remote(cas.clone(), remote.clone());
+        let fact_store = CompilerFactStore::load_with_cas_and_remote(cas, remote);
         let package_to_member = build_package_member_index(&self.manifests.members);
         let member_ids: HashMap<&str, &PackageId> = self
             .manifests

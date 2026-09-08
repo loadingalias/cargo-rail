@@ -84,7 +84,7 @@ not in the [native host table](caching.md#native-host-eligibility).
 `cross_target_toolchain_evidence_unavailable` means Cargo selected a target other than rustc's host target; run that
 build natively to make it eligible for compiler-result reuse.
 
-Status schema 15 keeps native failure-reason counters outside the bounded 65,536-event usage ledger. Inspect
+Status schema 16 keeps native failure-reason counters outside the bounded 65,536-event usage ledger. Inspect
 `usage.failure_reason_counts_available` before interpreting `usage.failure_reasons`; event eviction does not erase
 those counters. A strict `cache probe` verifies authenticated provider and protocol readiness without exposing the
 remote URL, object names, credentials, or local paths.
@@ -111,7 +111,7 @@ cargo rail cache uninstall --check
 Workspace cleanup removes reconstructible state for the current checkout. Local cleanup removes the current profile's
 CAS and requires `cargo rail cache setup` to repair it. `cache detach` preserves the profile and CAS while removing the
 current root binding. `cache uninstall` removes the global wrapper and Cargo configuration while preserving every
-profile. Use `cache profiles`, `cache drop-profile --profile PROFILE_ID --check`, and `cache drop-unbound --check` for
+profile. Use `cache profiles` and `cache drop-profile --profile PROFILE_ID --check` for
 explicit machine-wide cleanup. Resolve receipt, wrapper, profile, or ownership drift instead of deleting cache files
 or Cargo configuration by hand.
 

@@ -10,7 +10,10 @@ use std::path::{Path, PathBuf};
 
 fn print_config_json<T: Serialize>(mode: &str, result: &str, exit_code: i32, payload: &T) -> RailResult<()> {
     let payload_value = serde_json::to_value(payload).map_err(|e| RailError::message(e.to_string()))?;
-    let output = crate::output::machine_json_envelope("config", mode, result, exit_code, payload_value);
+    let mut output = crate::output::machine_json_envelope("config", mode, result, exit_code, payload_value);
+    if mode == "explain" {
+        output["schema_version"] = serde_json::json!(2);
+    }
     println!(
         "{}",
         serde_json::to_string_pretty(&output).map_err(|e| RailError::message(e.to_string()))?
@@ -246,7 +249,6 @@ struct ExplainResult {
     action: &'static str,
     config_path: Option<String>,
     fields: Vec<ExplainedField>,
-    compatibility: Vec<config::Compatibility>,
 }
 
 /// Explain effective configuration values, defaults, and provenance.
@@ -329,17 +331,11 @@ pub fn run_config_explain(
         action: "explain",
         config_path: source.path.as_ref().map(|path| path.display().to_string()),
         fields,
-        compatibility: decoded.compatibility,
     };
     if json {
         print_config_json("explain", "success", 0, &result)
     } else {
         println!("Configuration: {}", source.label());
-        if all {
-            for fact in &result.compatibility {
-                println!("{}: {}", fact.path, fact.message);
-            }
-        }
         if !all && requested_fields.is_empty() {
             if result.fields.is_empty() {
                 println!("No configured overrides.");
@@ -479,26 +475,15 @@ fn inspect_config(
 ) -> RailResult<(ConfigSource, DecodedConfig, Vec<String>)> {
     let source = read_config_source(workspace_root, config_override)?;
     let standalone = config_override == Some(Path::new("-"));
-    let mut metadata = None;
     let inspect = || -> RailResult<(DecodedConfig, Vec<String>)> {
-        let decoded = if standalone {
-            config::decode_without_workspace(&source.bytes)?
-        } else {
-            config::decode(&source.bytes, |relative| {
-                if metadata.is_none() {
-                    metadata = standalone_workspace_metadata(workspace_root)?;
-                }
-                let metadata = metadata
-                    .as_ref()
-                    .ok_or_else(|| config::workspace_context_required("split.paths"))?;
-                config::resolve_split_member(metadata, relative)
-            })?
-        };
+        let decoded = config::decode(&source.bytes)?;
         // Intrinsic errors remain diagnostic even if the surrounding Cargo workspace is broken.
         decoded.config.validate_policy()?;
-        if !standalone && metadata.is_none() {
-            metadata = standalone_workspace_metadata(workspace_root)?;
-        }
+        let metadata = if standalone {
+            None
+        } else {
+            standalone_workspace_metadata(workspace_root)?
+        };
         let warnings = if let Some(metadata) = metadata {
             let members = metadata
                 .packages

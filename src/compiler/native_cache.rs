@@ -48,7 +48,8 @@ pub(crate) const BASE_ACTION_KEY_PREFIX: &str = "compiler-base-v11-sha256-";
 pub(crate) const CANDIDATE_SELECTOR_PREFIX: &str = "compiler-candidate-v7-sha256-";
 pub(crate) const SESSION_ENV: &str = "CARGO_RAIL_NATIVE_COMPILER_CACHE_SESSION";
 pub(crate) const DISPOSITION_ENV: &str = "CARGO_RAIL_NATIVE_COMPILER_CACHE_DISPOSITION";
-const BENCH_COVERAGE_DIRECTORY_ENV: &str = "CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY";
+pub(crate) const BENCH_COVERAGE_VERSION: u32 = 10;
+pub(crate) const BENCH_COVERAGE_DIRECTORY_ENV: &str = "CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY";
 pub(crate) const APPLE_LINK_ADAPTER_ENV: &str = "CARGO_RAIL_APPLE_LINK_ADAPTER";
 pub(crate) const APPLE_LINK_DRIVER_ENV: &str = "CARGO_RAIL_APPLE_LINK_DRIVER";
 pub(crate) const APPLE_LINK_CERTIFICATE_ENV: &str = "CARGO_RAIL_APPLE_LINK_CERTIFICATE";
@@ -97,7 +98,7 @@ const NATIVE_CACHE_IDENTITY_CONTRACT_VERSION: u32 = 18;
 const NATIVE_COMPILER_SESSION_VERSION: u32 = 17;
 const MAX_CACHE_METADATA_BYTES: u64 = 64 * 1024;
 const MAX_STREAM_BYTES: usize = 16 * 1024 * 1024;
-const MAX_BENCH_COVERAGE_EVENT_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_BENCH_COVERAGE_EVENT_BYTES: usize = 1024 * 1024;
 const STREAM_MEMORY_SPOOL_BYTES: usize = 64 * 1024;
 const MAX_RESTORE_COMMIT_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_DYNAMIC_REPOSITORY_INPUTS: usize = 4096;
@@ -11044,6 +11045,7 @@ fn configure_cold(
                 bytes_hashed,
                 ..NativeCacheMetrics::default()
             },
+            None,
         );
     }
     metadata
@@ -11255,6 +11257,11 @@ fn restore_and_publish(
         return Err(fail_restore_transaction(&mut transaction, error, 0));
     }
 
+    let benchmark_outputs = benchmark_output_inventory(
+        &validation,
+        output_paths,
+        BenchmarkOutputSource::Restored(&prepared.outputs),
+    );
     let PreparedNativeRestore {
         outputs,
         stdout,
@@ -11328,6 +11335,7 @@ fn restore_and_publish(
         Some(&validation.result_key),
         hit_source.remote_action_key(),
         NativeCacheMetrics { ..*metrics },
+        benchmark_outputs.as_deref(),
     );
     Ok(())
 }
@@ -17207,6 +17215,11 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
                 bytes_hashed,
                 0,
             ));
+            let benchmark_outputs = benchmark_output_inventory(
+                &validation,
+                &output_paths,
+                BenchmarkOutputSource::Admitted(&raw, source_root),
+            );
             write_cache_event(
                 CompilerCacheWrapperStatus::Miss,
                 &stored_reason,
@@ -17218,6 +17231,7 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
                     cache_bytes_read,
                     ..NativeCacheMetrics::default()
                 },
+                benchmark_outputs.as_deref(),
             );
         }
         Err(failure_reason) => {
@@ -17252,6 +17266,7 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
                     cache_bytes_read,
                     ..NativeCacheMetrics::default()
                 },
+                None,
             );
         }
     }
@@ -17451,6 +17466,7 @@ fn publish_and_record_cold_observation(
             cache_bytes_read,
             ..NativeCacheMetrics::default()
         },
+        None,
     );
     Ok(())
 }
@@ -18183,6 +18199,7 @@ fn write_cache_event(
     result_key: Option<&str>,
     remote_base_action_key: Option<&str>,
     metrics: NativeCacheMetrics,
+    outputs: Option<&[BenchmarkOutput]>,
 ) {
     let Some(receipt) = active_context().and_then(|context| context.installation.as_ref()) else {
         return;
@@ -18209,8 +18226,15 @@ fn write_cache_event(
         );
     }
     let usage = crate::cache::installation::record_usage(receipt, outcome, failure_reason);
-    let coverage =
-        write_benchmark_coverage_event(status, reason, action_key, result_key, remote_base_action_key, metrics);
+    let coverage = write_benchmark_coverage_event(
+        status,
+        reason,
+        action_key,
+        result_key,
+        remote_base_action_key,
+        metrics,
+        outputs,
+    );
     if BENCH_COVERAGE_DIRECTORY.get().is_some() {
         if let Err(error) = usage {
             retain_benchmark_coverage_failure(format!("usage log: {error}"));
@@ -18221,10 +18245,99 @@ fn write_cache_event(
     }
 }
 
+/// Exact output descriptor admitted or published by one benchmark-observed compiler action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BenchmarkOutput {
+    pub(crate) role: String,
+    pub(crate) path: PathBuf,
+    pub(crate) sha256: String,
+    pub(crate) stored_sha256: String,
+    pub(crate) bytes: u64,
+    pub(crate) mode: u32,
+    pub(crate) symlink_target: Option<String>,
+}
+
+enum BenchmarkOutputSource<'a> {
+    Admitted(&'a RawCompilerInvocation, &'a Path),
+    Restored(&'a [PreparedRestoreOutput]),
+}
+
+fn benchmark_output_inventory(
+    validation: &NativeCompilerValidation,
+    paths: &NativeOutputPaths,
+    source: BenchmarkOutputSource<'_>,
+) -> Option<Vec<BenchmarkOutput>> {
+    BENCH_COVERAGE_DIRECTORY.get()?;
+    let capture = || -> RailResult<Vec<BenchmarkOutput>> {
+        let paths = bind_cached_debug_outputs(paths, &validation.outputs)?;
+        let bindings = native_output_bindings(&paths);
+        let prepared = match source {
+            BenchmarkOutputSource::Restored(outputs) => Some(outputs),
+            BenchmarkOutputSource::Admitted(..) => None,
+        };
+        if bindings.len() != validation.outputs.len() || prepared.is_some_and(|outputs| outputs.len() != bindings.len())
+        {
+            return Err(RailError::message(
+                "benchmark output inventory does not match admitted slots",
+            ));
+        }
+        bindings
+            .iter()
+            .zip(&validation.outputs)
+            .enumerate()
+            .map(|(index, ((role, slot, path), admitted))| {
+                if *role != admitted.role || slot.as_ref() != admitted.slot {
+                    return Err(RailError::message(
+                        "benchmark output binding differs from admitted role or slot",
+                    ));
+                }
+                let restored = prepared.map(|outputs| &outputs[index]);
+                if restored.is_some_and(|output| output.destination != *path) {
+                    return Err(RailError::message(
+                        "benchmark output binding differs from committed destination",
+                    ));
+                }
+                let (sha256, bytes) = match source {
+                    BenchmarkOutputSource::Restored(outputs) => {
+                        (outputs[index].observation.content_digest.clone(), outputs[index].bytes)
+                    }
+                    BenchmarkOutputSource::Admitted(observation, source_root) => (
+                        observed_output(observation, path, source_root)?.content_digest.clone(),
+                        if *role == "dep_info" {
+                            fs::metadata(path)?.len()
+                        } else {
+                            admitted.bytes
+                        },
+                    ),
+                };
+                Ok(BenchmarkOutput {
+                    role: admitted.role.clone(),
+                    path: path.to_path_buf(),
+                    sha256,
+                    stored_sha256: admitted.content_digest.clone(),
+                    bytes,
+                    mode: restored.map_or(admitted.mode, |output| output.mode),
+                    symlink_target: None,
+                })
+            })
+            .collect()
+    };
+    match capture() {
+        Ok(outputs) => Some(outputs),
+        Err(error) => {
+            retain_benchmark_coverage_failure(format!("output inventory: {error}"));
+            None
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct NativeBenchmarkCoverageEvent<'a> {
     schema_version: u32,
     lane: &'static str,
+    recording_identity: String,
+    invocation_identity: String,
     status: CompilerCacheWrapperStatus,
     reason: &'a str,
     action: crate::compiler::operation::CompilerOperation,
@@ -18238,6 +18351,7 @@ struct NativeBenchmarkCoverageEvent<'a> {
     compiler: String,
     arguments: Vec<String>,
     current_directory: String,
+    outputs: Option<&'a [BenchmarkOutput]>,
     bytes_hashed: u64,
     cache_bytes_read: u64,
     remote_request_attempts: u64,
@@ -18265,6 +18379,7 @@ fn write_benchmark_coverage_event(
     result_key: Option<&str>,
     remote_base_action_key: Option<&str>,
     metrics: NativeCacheMetrics,
+    outputs: Option<&[BenchmarkOutput]>,
 ) -> RailResult<()> {
     let Some(directory) = BENCH_COVERAGE_DIRECTORY.get() else {
         return Ok(());
@@ -18282,6 +18397,7 @@ fn write_benchmark_coverage_event(
         result_key,
         remote_base_action_key,
         metrics,
+        outputs,
         compiler: &compiler,
         arguments: &arguments,
     })
@@ -18295,6 +18411,7 @@ struct BenchmarkCoverageInvocation<'a> {
     result_key: Option<&'a str>,
     remote_base_action_key: Option<&'a str>,
     metrics: NativeCacheMetrics,
+    outputs: Option<&'a [BenchmarkOutput]>,
     compiler: &'a OsStr,
     arguments: &'a [OsString],
 }
@@ -18308,6 +18425,7 @@ fn write_benchmark_coverage_invocation(invocation: BenchmarkCoverageInvocation<'
         result_key,
         remote_base_action_key,
         metrics,
+        outputs,
         compiler,
         arguments,
     } = invocation;
@@ -18346,9 +18464,25 @@ fn write_benchmark_coverage_invocation(invocation: BenchmarkCoverageInvocation<'
                 .and_then(crate::remote_cache::RemoteStore::coordinator_connect_error)
                 .map(ToString::to_string)
         });
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".cargo-rail-native-coverage-")
+        .suffix(".tmp")
+        .tempfile_in(directory)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        temporary.as_file().set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
     let encoded = serde_json::to_vec(&NativeBenchmarkCoverageEvent {
-        schema_version: 9,
+        schema_version: BENCH_COVERAGE_VERSION,
         lane: "cargo-rail",
+        recording_identity: digest(directory.as_os_str().as_encoded_bytes()),
+        invocation_identity: format!(
+            "{}:{}",
+            std::process::id(),
+            digest(temporary.path().as_os_str().as_encoded_bytes())
+        ),
         status,
         reason,
         action,
@@ -18359,6 +18493,7 @@ fn write_benchmark_coverage_invocation(invocation: BenchmarkCoverageInvocation<'
         compiler,
         arguments,
         current_directory,
+        outputs,
         bytes_hashed: metrics.bytes_hashed,
         cache_bytes_read: metrics.cache_bytes_read,
         remote_request_attempts: remote.request_attempts,
@@ -18377,16 +18512,6 @@ fn write_benchmark_coverage_invocation(invocation: BenchmarkCoverageInvocation<'
         ));
     }
 
-    let mut temporary = tempfile::Builder::new()
-        .prefix(".cargo-rail-native-coverage-")
-        .suffix(".tmp")
-        .tempfile_in(directory)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        temporary.as_file().set_permissions(fs::Permissions::from_mode(0o600))?;
-    }
     temporary.write_all(&encoded)?;
     temporary.write_all(b"\n")?;
     persist_benchmark_coverage_event(temporary, directory)
@@ -18445,6 +18570,7 @@ pub(crate) fn record_benchmark_coverage_bypass(program: &OsStr, arguments: &[OsS
         result_key: None,
         remote_base_action_key: None,
         metrics: NativeCacheMetrics::default(),
+        outputs: None,
         compiler: program,
         arguments,
     }) {

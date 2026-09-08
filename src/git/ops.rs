@@ -3992,7 +3992,7 @@ mod tests {
         quarantine.import_object_closure(&source, &[&result]).unwrap();
         let mut bundle = tempfile::NamedTempFile::new().unwrap();
         let digest = quarantine.write_pack(&result, None, bundle.as_file_mut()).unwrap();
-        let effect_id = "git-effect-v1-sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let effect_id = "git-effect-v2-sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let expected_commit = commit_effect(&source, &result);
 
         let first = target
@@ -4054,7 +4054,7 @@ mod tests {
                 &expected_commit,
                 "refs/heads/main",
                 None,
-                "git-effect-v1-third-state",
+                "git-effect-v2-third-state",
             )
             .expect_err("an unrelated ref must fail before object installation");
 
@@ -4141,7 +4141,7 @@ mod tests {
                     &tampered,
                     "refs/heads/main",
                     Some(&parent),
-                    "git-effect-v1-tampered-commit",
+                    "git-effect-v2-tampered-commit",
                 )
                 .expect_err(field);
             assert!(error.to_string().contains("does not match"), "{field}: {error}");

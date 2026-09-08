@@ -814,7 +814,7 @@ fn test_sync_both_directions_preserve_large_messages_without_argument_payloads()
 }
 
 #[test]
-fn test_sync_v025_predecessor_trailer_check_is_read_only_and_apply_does_not_replay() {
+fn test_sync_rejects_unsupported_origins_before_check_or_apply() {
     let result: Result<()> = (|| {
         let (ws, split_dir) = setup_split_scenario("legacy-sync")?;
         ws.modify_file("legacy-sync", "src/lib.rs", "// already synchronized by v0.25")?;
@@ -840,226 +840,24 @@ fn test_sync_v025_predecessor_trailer_check_is_read_only_and_apply_does_not_repl
             .trim()
             .to_string();
 
-        let check = run_cargo_rail(&ws.path, &["rail", "sync", "legacy-sync", "--check", "--json"])?;
-        assert_eq!(
-            check.status.code(),
-            Some(1),
-            "{}",
-            String::from_utf8_lossy(&check.stderr)
-        );
-        let check_json: serde_json::Value = serde_json::from_slice(&check.stdout)?;
-        assert_eq!(check_json["crates"][0]["pending_commits"], 0);
-        assert_eq!(check_json["crates"][0]["pending_origin_migrations"], 1);
-        let migration_digest = check_json["crates"][0]["origin_migration_digest"]
-            .as_str()
-            .expect("check must expose the exact origin migration digest");
-        assert!(migration_digest.starts_with("sha256-"));
-        assert_eq!(
-            check_json["mutation_plan"]["actions"][0]["payload"]["origin_migration_count"],
-            1
-        );
-        assert_eq!(
-            check_json["mutation_plan"]["actions"][0]["payload"]["origin_migration_digest"],
-            migration_digest
-        );
-        let authority = &check_json["mutation_plan"]["actions"][0]["payload"]["origin_authority"];
-        assert_eq!(authority["direction"], "bidirectional");
-        assert_eq!(authority["owner"], "legacy-sync");
-        assert_eq!(authority["transform_version"], 1);
-        assert_eq!(authority["pending_candidate_count"], 1);
-        assert_eq!(authority["migration_digest"], migration_digest);
-        assert_eq!(
-            String::from_utf8(git(split_dir.path(), &["rev-parse", "HEAD"])?.stdout)?.trim(),
-            legacy_target
-        );
-        assert_eq!(
-            String::from_utf8(git(&ws.path, &["rev-parse", "HEAD"])?.stdout)?.trim(),
-            mono_head
-        );
-
-        let plan_path = ws.path.join("sync-origin-authority-plan.json");
-        std::fs::write(&plan_path, serde_json::to_vec_pretty(&check_json["mutation_plan"])?)?;
-        git(
-            split_dir.path(),
-            &[
-                "remote",
-                "set-url",
-                "origin",
-                "https://example.invalid/drifted-legacy-sync.git",
-            ],
-        )?;
-        let identity_drift = run_cargo_rail(
-            &ws.path,
-            &[
-                "rail",
-                "sync",
-                "legacy-sync",
-                "--plan",
-                plan_path.to_str().unwrap(),
-                "--allow-dirty",
-            ],
-        )?;
-        assert!(!identity_drift.status.success());
-        assert_eq!(
-            String::from_utf8(git(split_dir.path(), &["rev-parse", "HEAD"])?.stdout)?.trim(),
-            legacy_target
-        );
-        assert_eq!(
-            String::from_utf8(git(&ws.path, &["rev-parse", "HEAD"])?.stdout)?.trim(),
-            mono_head
-        );
-        git(
-            split_dir.path(),
-            &["remote", "set-url", "origin", "https://example.invalid/legacy-sync.git"],
-        )?;
-
-        let apply = run_cargo_rail(&ws.path, &["rail", "sync", "legacy-sync", "--yes", "--allow-dirty"])?;
-        assert!(apply.status.success(), "{}", String::from_utf8_lossy(&apply.stderr));
-        let migrated_head = String::from_utf8(git(split_dir.path(), &["rev-parse", "HEAD"])?.stdout)?
-            .trim()
-            .to_string();
-        assert_ne!(migrated_head, legacy_target);
-        assert_eq!(
-            String::from_utf8(git(&ws.path, &["rev-parse", "HEAD"])?.stdout)?.trim(),
-            mono_head,
-            "the migration evidence commit must not replay into the monorepo"
-        );
-        let message = String::from_utf8(git(split_dir.path(), &["log", "-1", "--format=%B"])?.stdout)?;
-        assert!(message.contains("chore: migrate cargo-rail origin mappings"));
-        assert!(message.contains(&format!("commit={source_commit}")));
-        assert!(message.contains(&format!("target={legacy_target}")));
-        assert!(
-            String::from_utf8(git(split_dir.path(), &["log", "--format=%s"])?.stdout)?
-                .lines()
-                .all(|subject| subject != "Sparse unmapped ancestor S1"),
-            "an actual later pair mapping proves sparse ancestors are already embodied and must not replay"
-        );
-        let migration_commits = String::from_utf8(
-            git(
-                split_dir.path(),
-                &[
-                    "log",
-                    "--format=%H",
-                    "--grep=^chore: migrate cargo-rail origin mappings$",
-                ],
-            )?
-            .stdout,
-        )?;
-        assert_eq!(migration_commits.lines().count(), 1);
-
-        let second = run_cargo_rail(&ws.path, &["rail", "sync", "legacy-sync", "--yes", "--allow-dirty"])?;
-        assert!(second.status.success(), "{}", String::from_utf8_lossy(&second.stderr));
-        assert_eq!(
-            String::from_utf8(git(split_dir.path(), &["rev-parse", "HEAD"])?.stdout)?.trim(),
-            migrated_head
-        );
-        assert_eq!(
-            String::from_utf8(git(&ws.path, &["rev-parse", "HEAD"])?.stdout)?.trim(),
-            mono_head
-        );
-        let migration_commits = String::from_utf8(
-            git(
-                split_dir.path(),
-                &[
-                    "log",
-                    "--format=%H",
-                    "--grep=^chore: migrate cargo-rail origin mappings$",
-                ],
-            )?
-            .stdout,
-        )?;
-        assert_eq!(migration_commits.lines().count(), 1);
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-#[test]
-fn test_sync_v025_migration_does_not_hide_independent_remote_commit() {
-    let result: Result<()> = (|| {
-        let (ws, split_dir) = setup_split_scenario("legacy-remote-gap")?;
-        ws.modify_file("legacy-remote-gap", "src/lib.rs", "// synchronized by v0.25")?;
-        let source_commit = ws.commit("Legacy synchronized source")?;
-        std::fs::write(split_dir.path().join("src/lib.rs"), "// synchronized by v0.25")?;
-        git(split_dir.path(), &["add", "src/lib.rs"])?;
-        git(
-            split_dir.path(),
-            &[
-                "commit",
-                "-m",
-                &format!("Legacy mapped target\n\nRail-Origin: mono@{source_commit}"),
-            ],
-        )?;
-        let mapped_target = String::from_utf8(git(split_dir.path(), &["rev-parse", "HEAD"])?.stdout)?
-            .trim()
-            .to_string();
-
-        std::fs::write(
-            split_dir.path().join("README.md"),
-            "# Independent remote commit after the mapped target\n",
-        )?;
-        git(split_dir.path(), &["add", "README.md"])?;
-        git(split_dir.path(), &["commit", "-m", "Independent remote commit R"])?;
-        let remote_commit = String::from_utf8(git(split_dir.path(), &["rev-parse", "HEAD"])?.stdout)?
-            .trim()
-            .to_string();
-        assert_ne!(mapped_target, remote_commit);
-
-        let check = run_cargo_rail(&ws.path, &["rail", "sync", "legacy-remote-gap", "--check", "--json"])?;
-        assert_eq!(check.status.code(), Some(1));
-        let check_json: serde_json::Value = serde_json::from_slice(&check.stdout)?;
-        assert_eq!(check_json["crates"][0]["pending_commits"], 1);
-        assert_eq!(check_json["crates"][0]["pending_origin_migrations"], 1);
-        assert_eq!(
-            String::from_utf8(git(split_dir.path(), &["rev-parse", "HEAD"])?.stdout)?.trim(),
-            remote_commit,
-            "check must not publish the migration commit"
-        );
-
-        let apply = run_cargo_rail(
-            &ws.path,
-            &["rail", "sync", "legacy-remote-gap", "--yes", "--allow-dirty"],
-        )?;
-        assert!(apply.status.success(), "{}", String::from_utf8_lossy(&apply.stderr));
-        let migration_head = String::from_utf8(git(split_dir.path(), &["rev-parse", "HEAD"])?.stdout)?
-            .trim()
-            .to_string();
-        assert_ne!(migration_head, remote_commit);
-        let migration_subject = String::from_utf8(git(split_dir.path(), &["log", "-1", "--format=%s"])?.stdout)?;
-        assert_eq!(migration_subject.trim(), "chore: migrate cargo-rail origin mappings");
-        assert_eq!(
-            std::fs::read_to_string(ws.path.join("crates/legacy-remote-gap/README.md"))?,
-            "# Independent remote commit after the mapped target\n",
-            "the independent R commit below migration M must be replayed into mono"
-        );
-        let mono_head = String::from_utf8(git(&ws.path, &["rev-parse", "HEAD"])?.stdout)?
-            .trim()
-            .to_string();
-        let mono_message = String::from_utf8(git(&ws.path, &["log", "-1", "--format=%B"])?.stdout)?;
-        assert!(mono_message.contains("Independent remote commit R"));
-        assert!(mono_message.contains(&format!("commit={remote_commit}")));
-        let mono_history = String::from_utf8(git(&ws.path, &["log", "--all", "--format=%B"])?.stdout)?;
-        assert_eq!(mono_history.matches(&format!("commit={remote_commit}")).count(), 1);
-
-        let clean = run_cargo_rail(&ws.path, &["rail", "sync", "legacy-remote-gap", "--check", "--json"])?;
-        assert_eq!(clean.status.code(), Some(0));
-        let clean_json: serde_json::Value = serde_json::from_slice(&clean.stdout)?;
-        assert_eq!(clean_json["crates"][0]["pending_commits"], 0);
-        assert_eq!(clean_json["crates"][0]["pending_origin_migrations"], 0);
-
-        let second = run_cargo_rail(
-            &ws.path,
-            &["rail", "sync", "legacy-remote-gap", "--yes", "--allow-dirty"],
-        )?;
-        assert!(second.status.success(), "{}", String::from_utf8_lossy(&second.stderr));
-        assert_eq!(
-            String::from_utf8(git(split_dir.path(), &["rev-parse", "HEAD"])?.stdout)?.trim(),
-            migration_head
-        );
-        assert_eq!(
-            String::from_utf8(git(&ws.path, &["rev-parse", "HEAD"])?.stdout)?.trim(),
-            mono_head
-        );
+        for flags in [&["--check"][..], &["--yes", "--allow-dirty"][..]] {
+            let mut args = vec!["rail", "sync", "legacy-sync"];
+            args.extend_from_slice(flags);
+            let output = run_cargo_rail(&ws.path, &args)?;
+            assert_eq!(output.status.code(), Some(2), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("unsupported Cargo-Rail origin"),
+                "{output:?}"
+            );
+            assert_eq!(
+                String::from_utf8(git(split_dir.path(), &["rev-parse", "HEAD"])?.stdout)?.trim(),
+                legacy_target
+            );
+            assert_eq!(
+                String::from_utf8(git(&ws.path, &["rev-parse", "HEAD"])?.stdout)?.trim(),
+                mono_head
+            );
+        }
         Ok(())
     })();
     super::helpers::finish_test(result);
@@ -1218,85 +1016,6 @@ fn test_sync_check_requires_preloaded_remote_objects_without_fetching() {
             target_head,
             "exact-object checks must not require or rewrite the tracking ref"
         );
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-#[test]
-fn test_sync_mapping_frontier_excludes_only_mapped_ancestors_across_merges() {
-    let result: Result<()> = (|| {
-        let (ws, split_dir) = setup_split_scenario("legacy-merge-frontier")?;
-        git(&ws.path, &["add", "rail.toml"])?;
-        git(&ws.path, &["commit", "-m", "Add sync fixture configuration"])?;
-
-        git(&ws.path, &["checkout", "-b", "unmapped-side"])?;
-        std::fs::write(
-            ws.path.join("crates/legacy-merge-frontier/src/side.rs"),
-            "pub fn side_branch_value() -> u8 { 7 }\n",
-        )?;
-        git(&ws.path, &["add", "crates/legacy-merge-frontier/src/side.rs"])?;
-        git(&ws.path, &["commit", "-m", "Unmapped side-branch U"])?;
-        git(&ws.path, &["checkout", "main"])?;
-
-        ws.modify_file("legacy-merge-frontier", "src/lib.rs", "// later mapped source S2")?;
-        let mapped_source = ws.commit("Later mapped source S2")?;
-        git(
-            &ws.path,
-            &["merge", "--no-ff", "unmapped-side", "-m", "Merge unmapped side branch"],
-        )?;
-
-        std::fs::write(split_dir.path().join("src/lib.rs"), "// later mapped source S2")?;
-        git(split_dir.path(), &["add", "src/lib.rs"])?;
-        git(
-            split_dir.path(),
-            &[
-                "commit",
-                "-m",
-                &format!("Legacy mapped target T2\n\nRail-Origin: mono@{mapped_source}"),
-            ],
-        )?;
-
-        let check = run_cargo_rail(
-            &ws.path,
-            &["rail", "sync", "legacy-merge-frontier", "--check", "--json"],
-        )?;
-        assert_eq!(check.status.code(), Some(1));
-        let check_json: serde_json::Value = serde_json::from_slice(&check.stdout)?;
-        assert!(check_json["crates"][0]["pending_commits"].as_u64().unwrap() >= 1);
-        assert_eq!(check_json["crates"][0]["pending_origin_migrations"], 1);
-
-        let apply = run_cargo_rail(
-            &ws.path,
-            &["rail", "sync", "legacy-merge-frontier", "--yes", "--allow-dirty"],
-        )?;
-        assert!(apply.status.success(), "{}", String::from_utf8_lossy(&apply.stderr));
-        assert_eq!(
-            std::fs::read_to_string(split_dir.path().join("src/side.rs"))?,
-            "pub fn side_branch_value() -> u8 { 7 }\n",
-            "a side-branch commit not ancestral to mapped S2 must remain pending"
-        );
-        let target_subjects = String::from_utf8(git(split_dir.path(), &["log", "--format=%s"])?.stdout)?;
-        assert!(
-            target_subjects
-                .lines()
-                .any(|subject| subject == "Unmapped side-branch U")
-        );
-        assert!(
-            target_subjects
-                .lines()
-                .all(|subject| subject != "Sparse linear ancestor S1"),
-            "the mapped S2 frontier must suppress only its actual ancestors"
-        );
-
-        let clean = run_cargo_rail(
-            &ws.path,
-            &["rail", "sync", "legacy-merge-frontier", "--check", "--json"],
-        )?;
-        assert_eq!(clean.status.code(), Some(0));
-        let clean_json: serde_json::Value = serde_json::from_slice(&clean.stdout)?;
-        assert_eq!(clean_json["crates"][0]["pending_commits"], 0);
-        assert_eq!(clean_json["crates"][0]["pending_origin_migrations"], 0);
         Ok(())
     })();
     super::helpers::finish_test(result);
@@ -1711,6 +1430,27 @@ fn test_sync_manual_conflict_stops_before_commit_and_resumes_from_receipt() {
         assert_eq!(receipt_json["status"], "conflicted");
         assert_eq!(receipt_json["conflicts"][0]["class"], "content");
 
+        let current_bytes = std::fs::read(&receipt)?;
+        let mut unsupported = receipt_json.clone();
+        unsupported["schema_version"] = serde_json::json!(2);
+        let unsupported_bytes = serde_json::to_vec(&unsupported)?;
+        std::fs::write(&receipt, &unsupported_bytes)?;
+        for args in [
+            vec!["rail", "sync", "--resume", receipt.to_str().unwrap()],
+            vec!["rail", "sync", "manual-conflict-lib", "--check"],
+        ] {
+            let blocked = run_cargo_rail(&ws.path, &args)?;
+            assert_eq!(blocked.status.code(), Some(2), "{blocked:?}");
+            assert!(
+                String::from_utf8_lossy(&blocked.stderr).contains("unsupported sync conflict receipt"),
+                "{blocked:?}"
+            );
+            assert_eq!(std::fs::read(&receipt)?, unsupported_bytes);
+            assert_eq!(std::fs::read_to_string(&conflicted_path)?, content);
+            assert_eq!(git(&ws.path, &["rev-parse", "HEAD"])?.stdout, head.stdout);
+        }
+        std::fs::write(&receipt, current_bytes)?;
+
         let mut interrupted = receipt_json;
         interrupted["status"] = serde_json::Value::String("materializing".to_string());
         std::fs::write(&receipt, serde_json::to_vec_pretty(&interrupted)?)?;
@@ -1747,7 +1487,7 @@ fn test_sync_manual_conflict_stops_before_commit_and_resumes_from_receipt() {
         )?;
         let blocked = run_cargo_rail(&ws.path, &["rail", "sync", "--resume", receipt.to_str().unwrap()])?;
         assert!(!blocked.status.success());
-        assert!(String::from_utf8_lossy(&blocked.stderr).contains("unbound predecessor origin migration"));
+        assert!(String::from_utf8_lossy(&blocked.stderr).contains("unsupported Cargo-Rail mapping notes"));
         assert_eq!(
             String::from_utf8(git(split_dir.path(), &["rev-parse", "HEAD"])?.stdout)?.trim(),
             target_head
@@ -1756,16 +1496,7 @@ fn test_sync_manual_conflict_stops_before_commit_and_resumes_from_receipt() {
             String::from_utf8(git(&ws.path, &["rev-parse", "HEAD"])?.stdout)?.trim(),
             recovery_parent
         );
-        git(
-            &ws.path,
-            &[
-                "notes",
-                "--ref",
-                "refs/notes/rail/manual-conflict-lib",
-                "remove",
-                &recovery_parent,
-            ],
-        )?;
+        git(&ws.path, &["update-ref", "-d", "refs/notes/rail/manual-conflict-lib"])?;
         git(
             split_dir.path(),
             &["commit", "--allow-empty", "-m", "Concurrent target authority drift"],
@@ -1804,100 +1535,6 @@ fn test_sync_manual_conflict_stops_before_commit_and_resumes_from_receipt() {
                 .contains("<<<<<<<")
         );
 
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-#[test]
-fn test_v025_conflict_receipt_with_existing_v1_history_migrates_before_resume() {
-    let result: Result<()> = (|| {
-        let (ws, split_dir) = setup_split_scenario("demo")?;
-        let mono_repository = cargo_rail::git::mappings::repository_identity(&ws.path)?;
-        let target_repository = cargo_rail::git::mappings::repository_identity(split_dir.path())?;
-
-        std::fs::write(ws.path.join("UNOWNED.txt"), "does not change the split projection\n")?;
-        let predecessor_source = ws.commit("Unowned predecessor source marker")?;
-        let predecessor_trailer = format!(
-            "Rail-Origin: v1 source={mono_repository} commit={predecessor_source} owner=64656d6f snapshot=v1-sha256-volatile-content transform=1"
-        );
-        git(
-            split_dir.path(),
-            &[
-                "commit",
-                "--allow-empty",
-                "-m",
-                &format!("Predecessor exact mapping\n\n{predecessor_trailer}"),
-            ],
-        )?;
-
-        ws.modify_file("demo", "src/lib.rs", "pub fn value() -> &'static str { \"mono\" }\n")?;
-        let expected_head = ws.commit("Conflicting monorepo edit")?;
-        std::fs::write(
-            split_dir.path().join("src/lib.rs"),
-            "pub fn value() -> &'static str { \"split\" }\n",
-        )?;
-        git(split_dir.path(), &["add", "src/lib.rs"])?;
-        git(split_dir.path(), &["commit", "-m", "Conflicting split edit"])?;
-        let remote_commit = String::from_utf8(git(split_dir.path(), &["rev-parse", "HEAD"])?.stdout)?
-            .trim()
-            .to_string();
-
-        let branch = "cargo-rail-sync-demo";
-        git(&ws.path, &["checkout", "-b", branch])?;
-        std::fs::write(
-            ws.path.join("crates/demo/src/lib.rs"),
-            "pub fn value() -> &'static str { \"resolved\" }\n",
-        )?;
-
-        let field = |format: &str| -> Result<String> {
-            Ok(
-                String::from_utf8(git(split_dir.path(), &["show", "-s", format, &remote_commit])?.stdout)?
-                    .trim()
-                    .to_string(),
-            )
-        };
-        let mut receipt: serde_json::Value =
-            serde_json::from_str(include_str!("../fixtures/compat/v0.25.0/sync/conflict-receipt-v2.json"))?;
-        receipt["expected_head"] = expected_head.into();
-        receipt["remote_commit"] = remote_commit.clone().into();
-        receipt["branch"] = branch.into();
-        receipt["message"] = format!(
-            "Conflicting split edit\n\nRail-Origin: v1 source={target_repository} commit={remote_commit} owner=64656d6f snapshot=v1-sha256-volatile-content transform=1"
-        )
-        .into();
-        receipt["author"] = field("--format=%an")?.into();
-        receipt["author_email"] = field("--format=%ae")?.into();
-        receipt["author_timestamp"] = field("--format=%at")?.parse::<i64>()?.into();
-        receipt["author_timezone"] = field("--format=%ai")?
-            .split_whitespace()
-            .last()
-            .unwrap_or("+0000")
-            .into();
-        receipt["committer"] = field("--format=%cn")?.into();
-        receipt["committer_email"] = field("--format=%ce")?.into();
-        receipt["committer_timestamp"] = field("--format=%ct")?.parse::<i64>()?.into();
-        receipt["committer_timezone"] = field("--format=%ci")?
-            .split_whitespace()
-            .last()
-            .unwrap_or("+0000")
-            .into();
-
-        let receipts = ws.path.join("target/cargo-rail/receipts");
-        std::fs::create_dir_all(&receipts)?;
-        let receipt_path = receipts.join("sync-conflict-demo-v025.json");
-        std::fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt)?)?;
-
-        let resumed = run_cargo_rail(&ws.path, &["rail", "sync", "--resume", receipt_path.to_str().unwrap()])?;
-        assert!(resumed.status.success(), "{}", String::from_utf8_lossy(&resumed.stderr));
-        let upgraded: serde_json::Value = serde_json::from_slice(&std::fs::read(&receipt_path)?)?;
-        assert_eq!(upgraded["schema_version"], 3);
-        assert_eq!(upgraded["status"], "resolved");
-        let target_log = String::from_utf8(git(split_dir.path(), &["log", "--format=%s%n%B"])?.stdout)?;
-        assert!(target_log.contains("chore: migrate cargo-rail origin mappings"));
-        assert!(target_log.contains("Rail-Origin: v2 source="));
-        let mono_log = String::from_utf8(git(&ws.path, &["log", "-1", "--format=%B"])?.stdout)?;
-        assert!(mono_log.contains("Rail-Origin: v2 source="));
         Ok(())
     })();
     super::helpers::finish_test(result);

@@ -34,6 +34,74 @@ fn workspace_member_names(context: &WorkspaceContext) -> Vec<String> {
 }
 
 #[test]
+fn snapshot_target_cfg_sets_retain_captured_flags_after_configuration_changes() {
+    let result: Result<()> = (|| {
+        if let Some(root) = std::env::var_os("CARGO_RAIL_CFG_SNAPSHOT_FIXTURE") {
+            let root = std::path::PathBuf::from(root);
+            let host = crate::helpers::rustc_host_target()?;
+            let context = WorkspaceContext::build_with_snapshot(&root)?;
+            std::fs::write(
+                root.join(".cargo/config.toml"),
+                "[build]\nrustflags = [\"-Cpanic=unwind\"]\n",
+            )?;
+
+            let cfg_sets = context.target_cfg_sets()?;
+            for target in ["default", host.as_str(), "x86_64-unknown-linux-gnu"] {
+                assert!(
+                    cargo_rail::compiler::cfg_eval::target_constraint_matches_target(
+                        "cfg(panic = \"abort\")",
+                        target,
+                        cfg_sets.get(target)
+                    ),
+                    "captured panic strategy missing for {target}"
+                );
+            }
+            assert!(cargo_rail::compiler::cfg_eval::target_constraint_matches_target(
+                "cfg(target_feature = \"avx2\")",
+                "x86_64-unknown-linux-gnu",
+                cfg_sets.get("x86_64-unknown-linux-gnu")
+            ));
+            assert!(std::sync::Arc::ptr_eq(&cfg_sets, &context.target_cfg_sets()?));
+            return Ok(());
+        }
+        let workspace = TestWorkspace::new_named("snapshot-target-cfg")?;
+        workspace.add_crate("member", "0.1.0", &[])?;
+        let host = crate::helpers::rustc_host_target()?;
+        std::fs::write(
+            workspace.path.join(".config/rail.toml"),
+            format!("targets = [{host:?}, \"x86_64-unknown-linux-gnu\"]\n"),
+        )?;
+        std::fs::create_dir_all(workspace.path.join(".cargo"))?;
+        let cargo_config = workspace.path.join(".cargo/config.toml");
+        std::fs::write(
+            &cargo_config,
+            "[build]\nrustflags = [\"-Cpanic=abort\"]\n[target.x86_64-unknown-linux-gnu]\nrustflags = [\"-Ctarget-feature=+avx2\", \"-Cpanic=abort\"]\n",
+        )?;
+        generate_lockfile(&workspace.path)?;
+        workspace.commit("Add captured compiler flags")?;
+        let output = Command::new(std::env::current_exe()?)
+            .current_dir(&workspace.path)
+            .env("CARGO_RAIL_CFG_SNAPSHOT_FIXTURE", &workspace.path)
+            .env_remove("RUSTFLAGS")
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .args([
+                "--exact",
+                "test_workspace_snapshot::snapshot_target_cfg_sets_retain_captured_flags_after_configuration_changes",
+                "--nocapture",
+            ])
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "snapshot child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    })();
+    crate::helpers::finish_test(result);
+}
+
+#[test]
 fn generic_context_uses_fresh_cargo_glob_membership() {
     let result: Result<()> = (|| {
         let workspace = TestWorkspace::new_named("fresh-cargo-glob-membership")?;

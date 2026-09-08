@@ -99,15 +99,6 @@ impl<'a> CommitAttributor<'a> {
         Self { ctx, members }
     }
 
-    /// Attribute all commits in `from..to` (full history when `from` is `None`)
-    ///
-    /// One git subprocess for the whole range; attribution performs at most one
-    /// hash lookup per path component against the immutable ownership index.
-    #[expect(dead_code, reason = "compatibility helper for complete attributed histories")]
-    pub fn history(&self, from: Option<&str>, to: &str) -> RailResult<AttributedHistory> {
-        self.history_with_filters(from, to, None)
-    }
-
     /// Attribute commits while honoring changelog path filters.
     ///
     /// `include_paths` and `exclude_paths` are an explicit escape hatch for

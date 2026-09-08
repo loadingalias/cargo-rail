@@ -892,8 +892,6 @@ pub(crate) struct InstallationStatus {
     pub(crate) trust_domain: Option<String>,
     pub(crate) selection_source: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) unbound_pre_profile_state: Option<crate::cache::profile::PreProfileStateStatus>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) cache_base: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) max_bytes: Option<u64>,
@@ -1161,7 +1159,10 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
     let install_directory = cargo_home.join("cargo-rail").join(INSTALLATION_DIRECTORY);
     let receipt_path = install_directory.join(RECEIPT_FILE);
     let receipt_before = read_optional_regular(&receipt_path, MAX_RECEIPT_BYTES)?;
-    let existing = receipt_before.as_deref().map(parse_receipt).transpose()?;
+    let existing = receipt_before
+        .as_deref()
+        .map(|bytes| parse_receipt(bytes, &receipt_path))
+        .transpose()?;
 
     let config_path = selected_user_config(&cargo_home);
     if let Some(existing) = &existing
@@ -1625,7 +1626,12 @@ pub(crate) fn apply_setup(mut plan: SetupPlan) -> RailResult<()> {
             }
         }
     }
-    if let Some(existing) = plan.receipt_before.as_deref().map(parse_receipt).transpose()? {
+    if let Some(existing) = plan
+        .receipt_before
+        .as_deref()
+        .map(|bytes| parse_receipt(bytes, &receipt_path))
+        .transpose()?
+    {
         for profile in crate::cache::profile::load_all(&plan.cargo_home)? {
             let mut selected = existing.clone();
             selected.attach_profile(profile);
@@ -1814,7 +1820,7 @@ pub(crate) fn plan_removal(current_dir: &Path) -> RailResult<RemovalPlan> {
             distributed_identity_before_digests: Vec::new(),
         });
     };
-    let receipt = parse_receipt(&receipt_bytes)?;
+    let receipt = parse_receipt(&receipt_bytes, &receipt_path)?;
     if receipt.cargo_home != cargo_home || receipt.config_path != config_path {
         return Err(RailError::message(
             "transparent compiler-cache removal authority does not match the selected Cargo home",
@@ -2141,8 +2147,9 @@ pub(crate) fn load_for_wrapper(invoked: &Path, workspace_root: &Path) -> RailRes
     let directory = invoked
         .parent()
         .ok_or_else(|| RailError::message("installed compiler wrapper has no parent directory"))?;
-    let bytes = read_required_regular(&directory.join(RECEIPT_FILE), MAX_RECEIPT_BYTES)?;
-    let mut receipt = parse_receipt(&bytes)?;
+    let receipt_path = directory.join(RECEIPT_FILE);
+    let bytes = read_required_regular(&receipt_path, MAX_RECEIPT_BYTES)?;
+    let mut receipt = parse_receipt(&bytes, &receipt_path)?;
     if crate::utils::canonicalize_existing(&receipt.worker_path)? != crate::utils::canonicalize_existing(&invoked)?
         || crate::utils::canonicalize_existing(&receipt.wrapper_path)?
             != crate::utils::canonicalize_existing(&launcher)?
@@ -2190,8 +2197,9 @@ pub(crate) fn load_for_coordinator(invoked: &Path) -> RailResult<InstallationRec
     let directory = invoked
         .parent()
         .ok_or_else(|| RailError::message("installed compiler worker has no parent directory"))?;
-    let bytes = read_required_regular(&directory.join(RECEIPT_FILE), MAX_RECEIPT_BYTES)?;
-    let mut receipt = parse_receipt(&bytes)?;
+    let receipt_path = directory.join(RECEIPT_FILE);
+    let bytes = read_required_regular(&receipt_path, MAX_RECEIPT_BYTES)?;
+    let mut receipt = parse_receipt(&bytes, &receipt_path)?;
     if crate::utils::canonicalize_existing(&receipt.worker_path)? != crate::utils::canonicalize_existing(&invoked)?
         || crate::utils::stable_file_generation(&invoked).as_ref() != Some(&receipt.worker_generation)
         || file_digest(&invoked)? != receipt.worker_digest
@@ -2266,7 +2274,7 @@ pub(crate) fn installed_remote(current_dir: &Path) -> RailResult<Option<Installe
     let Some(bytes) = read_optional_regular(&receipt_path, MAX_RECEIPT_BYTES)? else {
         return Ok(None);
     };
-    let receipt = parse_receipt(&bytes)?;
+    let receipt = parse_receipt(&bytes, &receipt_path)?;
     if receipt.cargo_home != cargo_home || receipt.config_path != config_path {
         return Err(RailError::message(
             "transparent compiler-cache setup authority does not match the selected Cargo home",
@@ -2292,7 +2300,7 @@ pub(crate) fn installed_local(current_dir: &Path) -> RailResult<Option<Installed
     let Some(bytes) = read_optional_regular(&receipt_path, MAX_RECEIPT_BYTES)? else {
         return Ok(None);
     };
-    let receipt = parse_receipt(&bytes)?;
+    let receipt = parse_receipt(&bytes, &receipt_path)?;
     if receipt.cargo_home != cargo_home || receipt.config_path != config_path {
         return Err(RailError::message(
             "transparent compiler-cache setup authority does not match the selected Cargo home",
@@ -2319,7 +2327,7 @@ pub(crate) fn verified_installed_wrapper_digest(selection: &OsStr, current_dir: 
     let Some(bytes) = read_optional_regular(&receipt_path, MAX_RECEIPT_BYTES)? else {
         return Ok(None);
     };
-    let receipt = parse_receipt(&bytes)?;
+    let receipt = parse_receipt(&bytes, &receipt_path)?;
     let selected = crate::executable::resolve_executable_path(selection, current_dir)?;
     if receipt.cargo_home != cargo_home
         || receipt.config_path != config_path
@@ -2341,7 +2349,7 @@ pub(crate) fn stop_current_profile_coordinator(current_dir: &Path) -> RailResult
     let Some(bytes) = read_optional_regular(&receipt_path, MAX_RECEIPT_BYTES)? else {
         return Ok(());
     };
-    let mut receipt = parse_receipt(&bytes)?;
+    let mut receipt = parse_receipt(&bytes, &receipt_path)?;
     if let Some(profile) = crate::cache::profile::load(&cargo_home, current_dir)? {
         receipt.attach_profile(profile);
         crate::remote_cache::stop_installed_coordinators(&receipt);
@@ -2368,7 +2376,6 @@ pub(crate) fn status(current_dir: &Path) -> RailResult<InstallationStatus> {
             bound_workspace_root: None,
             trust_domain: None,
             selection_source: "none",
-            unbound_pre_profile_state: crate::cache::profile::pre_profile_state_status(&cargo_home)?,
             cache_base: None,
             max_bytes: None,
             root_portability: None,
@@ -2380,7 +2387,7 @@ pub(crate) fn status(current_dir: &Path) -> RailResult<InstallationStatus> {
             issues: Vec::new(),
         });
     };
-    let mut receipt = parse_receipt(&bytes)?;
+    let mut receipt = parse_receipt(&bytes, &receipt_path)?;
     let mut issues = Vec::new();
     let profile = match crate::cache::profile::load(&cargo_home, current_dir) {
         Ok(Some(profile)) => {
@@ -2539,7 +2546,6 @@ pub(crate) fn status(current_dir: &Path) -> RailResult<InstallationStatus> {
             .as_ref()
             .and_then(|profile| profile.cache().trust_domain().map(str::to_string)),
         selection_source: if profile.is_some() { "installed_profile" } else { "none" },
-        unbound_pre_profile_state: crate::cache::profile::pre_profile_state_status(&cargo_home)?,
         cache_base: profile
             .as_ref()
             .map(|profile| profile.cache().base().to_string_lossy().into_owned()),
@@ -2575,7 +2581,7 @@ pub(crate) fn local_cache_status(current_dir: &Path) -> RailResult<Option<crate:
     let Some(bytes) = read_optional_regular(&receipt_path, MAX_RECEIPT_BYTES)? else {
         return Ok(None);
     };
-    parse_receipt(&bytes)?;
+    parse_receipt(&bytes, &receipt_path)?;
     let Some((profile, _profile_lock)) = crate::cache::profile::load_locked(&cargo_home, current_dir)? else {
         return Ok(None);
     };
@@ -2606,7 +2612,7 @@ pub(crate) fn recover_local_cache(current_dir: &Path) -> RailResult<Option<crate
             "run `cargo rail cache setup --check` before attempting local CAS recovery",
         )
     })?;
-    let receipt = parse_receipt(&bytes)?;
+    let receipt = parse_receipt(&bytes, &receipt_path)?;
     if receipt.cargo_home != cargo_home || receipt.config_path != selected_user_config(&cargo_home) {
         return Err(RailError::message(
             "transparent compiler-cache recovery authority does not match the selected Cargo home",
@@ -2630,7 +2636,7 @@ fn recovery_cache_selection(current_dir: &Path) -> RailResult<LocalCacheSelectio
             "run `cargo rail cache setup --check` before attempting local CAS recovery",
         )
     })?;
-    let receipt = parse_receipt(&bytes)?;
+    let receipt = parse_receipt(&bytes, &receipt_path)?;
     if receipt.cargo_home != cargo_home || receipt.config_path != selected_user_config(&cargo_home) {
         return Err(RailError::message(
             "transparent compiler-cache recovery authority does not match the selected Cargo home",
@@ -2652,7 +2658,7 @@ pub(crate) fn remove_local_cache(current_dir: &Path) -> RailResult<Option<Vec<(P
     let Some(bytes) = read_optional_regular(&receipt_path, MAX_RECEIPT_BYTES)? else {
         return Ok(None);
     };
-    let receipt = parse_receipt(&bytes)?;
+    let receipt = parse_receipt(&bytes, &receipt_path)?;
     if receipt.cargo_home != cargo_home || receipt.config_path != selected_user_config(&cargo_home) {
         return Err(RailError::message(
             "transparent compiler-cache cleanup authority does not match the selected Cargo home",
@@ -3082,29 +3088,23 @@ fn revalidate_optional(path: &Path, expected: Option<&[u8]>, max_bytes: u64) -> 
     }
 }
 
-fn parse_receipt(bytes: &[u8]) -> RailResult<InstallationReceipt> {
-    if serde_json::from_slice::<serde_json::Value>(bytes)
-        .ok()
-        .is_some_and(|value| value.get("version").and_then(serde_json::Value::as_u64) == Some(4))
-    {
+fn parse_receipt(bytes: &[u8], path: &Path) -> RailResult<InstallationReceipt> {
+    #[derive(Deserialize)]
+    struct ReceiptVersion {
+        version: u32,
+    }
+    let version: ReceiptVersion = serde_json::from_slice(bytes)?;
+    if version.version != INSTALLATION_VERSION {
         return Err(RailError::with_help(
-            "pre-component compiler-cache installation requires explicit removal before setup",
-            "use the previous cargo-rail executable that created the version 4 receipt to preview `cache remove --check`, then run `cache remove`; this preserves the CAS. Run `cargo rail cache setup` with this version to install authenticated compiler components",
+            format!(
+                "unsupported compiler-cache installation receipt version {} at '{}'",
+                version.version,
+                path.display()
+            ),
+            "preserve the installation; use the executable that created it to preview and perform its removal, then run current `cargo rail cache setup`; the originating release version is unknown",
         ));
     }
-    let receipt: InstallationReceipt = serde_json::from_slice(bytes).map_err(|error| {
-        let pre_profile = serde_json::from_slice::<serde_json::Value>(bytes)
-            .ok()
-            .is_some_and(|value| value.get("version").and_then(serde_json::Value::as_u64) == Some(3));
-        if pre_profile {
-            RailError::with_help(
-                "pre-profile compiler-cache installation requires explicit removal before setup",
-                "use cargo-rail v0.25 to preview `cache remove --check`, then run `cache remove`; this preserves the old CAS. Run `cargo rail cache setup` with this version to enroll the workspace",
-            )
-        } else {
-            error.into()
-        }
-    })?;
+    let receipt: InstallationReceipt = serde_json::from_slice(bytes)?;
     receipt.validate()?;
     if encode_receipt(&receipt)? != bytes {
         return Err(RailError::message(
@@ -3277,13 +3277,23 @@ mod tests {
             .as_object_mut()
             .expect("receipt object")
             .remove("compiler_components");
-        let error = parse_receipt(&serde_json::to_vec(&value).expect("missing inventory encoding"))
-            .expect_err("current receipt cannot silently acquire an empty inventory");
+        let error = parse_receipt(
+            &serde_json::to_vec(&value).expect("missing inventory encoding"),
+            &root.path().join(RECEIPT_FILE),
+        )
+        .expect_err("current receipt cannot silently acquire an empty inventory");
         assert!(error.to_string().contains("missing field `compiler_components`"));
         value["version"] = serde_json::json!(4);
-        let error = parse_receipt(&serde_json::to_vec(&value).expect("previous receipt encoding"))
-            .expect_err("previous receipt cannot acquire current runtime authority");
-        assert!(error.to_string().contains("explicit removal before setup"));
+        let error = parse_receipt(
+            &serde_json::to_vec(&value).expect("previous receipt encoding"),
+            &root.path().join(RECEIPT_FILE),
+        )
+        .expect_err("previous receipt cannot acquire current runtime authority");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported compiler-cache installation receipt version 4")
+        );
     }
 
     #[test]

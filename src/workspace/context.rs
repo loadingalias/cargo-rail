@@ -658,9 +658,7 @@ impl WorkspaceContext {
         );
         let (config, rail_config, rail_config_discovery_root, captured_config_path) = match config_path {
             Some(path) => {
-                let (decoded, bytes) = crate::config::load_decoded(&path, |relative| {
-                    crate::config::resolve_split_member(cargo.metadata(), relative)
-                })?;
+                let (decoded, bytes) = crate::config::load_decoded(&path)?;
                 let parsed = decoded.config;
                 let parsed = Arc::new(parsed);
                 (

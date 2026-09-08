@@ -18,13 +18,13 @@ fn stdin_validation(workspace: &std::path::Path, input: &[u8]) -> Result<std::pr
 }
 
 #[test]
-fn supported_configuration_loads_directly_without_writes_or_compatibility_warnings() {
+fn current_configuration_loads_without_writes() {
     let result: Result<()> = (|| {
-        let ws = TestWorkspace::new_named("automatic-configuration")?;
+        let ws = TestWorkspace::new_named("current-configuration")?;
         ws.add_crate("test-crate", "0.1.0", &[])?;
         ws.commit("fixture")?;
         let path = ws.path.join(".config/rail.toml");
-        let original = b"# retain comments and spelling\n[unify]\nmsrv = false\npin_transitives = false\ndetect_unused = false\n[release]\nsource = 'commits'\npush = false\nrequire_clean = false\npublish_delay = 17\n";
+        let original = b"# retain comments and spelling\n[unify]\nmsrv_policy = { mode = 'disabled' }\n[release]\nsource = 'commits'\nremote_effects = 'none'\n";
         fs::write(&path, original)?;
         let writable = fs::metadata(&path)?.permissions();
         let mut readonly = writable.clone();
@@ -55,11 +55,11 @@ fn supported_configuration_loads_directly_without_writes_or_compatibility_warnin
                 }
                 if value["action"] == "explain" {
                     let schema: serde_json::Value =
-                        serde_json::from_str(include_str!("../../schemas/config-explain-v1.schema.json"))?;
+                        serde_json::from_str(include_str!("../../schemas/config-explain-v2.schema.json"))?;
                     jsonschema::validator_for(&schema)?
                         .validate(&value)
                         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                    assert!(value["compatibility"].as_array().is_some_and(|facts| !facts.is_empty()));
+                    assert!(value.get("compatibility").is_none());
                 }
                 assert_eq!(fs::read(&path)?, original);
             }
@@ -77,7 +77,7 @@ fn supported_configuration_loads_directly_without_writes_or_compatibility_warnin
 }
 
 #[test]
-fn compatibility_failures_leave_input_unchanged_across_consumers() {
+fn unsupported_configuration_leaves_input_unchanged_across_consumers() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_single_crate("demo", "0.1.0")?;
         fs::create_dir_all(ws.path.join(".config"))?;
@@ -107,130 +107,21 @@ fn compatibility_failures_leave_input_unchanged_across_consumers() {
 }
 
 #[test]
-fn predecessor_split_paths_resolve_captured_members_and_reject_conflicts() {
-    let result: Result<()> = (|| {
-        let ws = TestWorkspace::new_named("automatic-split-members")?;
-        ws.add_crate("member-a", "0.1.0", &[])?;
-        ws.add_crate("member-b", "0.1.0", &[])?;
-        ws.commit("members")?;
-        for selection in [
-            "paths = [{ crate = './crates/member-a' }, { crate = 'crates/member-b' }]",
-            "members = ['member-b', 'member-a']\npaths = [{ crate = 'crates/member-a' }, { crate = 'crates/member-b' }]",
-            "[[crates.bundle.split.paths]]\ncrate = 'crates/member-a'\n[[crates.bundle.split.paths]]\ncrate = 'crates/member-b'",
-        ] {
-            let input = format!(
-                "[crates.bundle.split]\nremote = '../bundle'\nbranch = 'main'\nmode = 'combined'\n{selection}\n"
-            );
-            fs::write(ws.path.join(".config/rail.toml"), &input)?;
-            let output = run_cargo_rail(&ws.path, &["rail", "config", "print", "-f", "json"])?;
-            assert!(output.status.success(), "{output:?}");
-            let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-            let mut members = value["config"]["crates"]["bundle"]["split"]["members"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|member| member.as_str().unwrap())
-                .collect::<Vec<_>>();
-            members.sort_unstable();
-            assert_eq!(members, ["member-a", "member-b"]);
-            assert_eq!(fs::read_to_string(ws.path.join(".config/rail.toml"))?, input);
-        }
-        for selection in [
-            "members = ['member-a']\npaths = [{ crate = 'crates/member-b' }]",
-            "members = 3\npaths = [{ crate = 'crates/member-a' }]",
-            "paths = [{ crate = '../escape' }]",
-            "paths = [{ crate = 'not-a-member' }]",
-            "paths = 'crates/member-a'",
-        ] {
-            fs::write(
-                ws.path.join(".config/rail.toml"),
-                format!("[crates.bundle.split]\nremote = '../bundle'\nbranch = 'main'\nmode = 'single'\n{selection}\n"),
-            )?;
-            let output = run_cargo_rail(&ws.path, &["rail", "config", "explain"])?;
-            assert_eq!(output.status.code(), Some(2), "{selection}: {output:?}");
-        }
-        let root = TestWorkspace::new_single_crate("root-package", "0.1.0")?;
-        fs::create_dir_all(root.path.join(".config"))?;
-        for relative in ["", ".", "./"] {
-            fs::write(
-                root.path.join(".config/rail.toml"),
-                format!(
-                    "[crates.root-package.split]\nremote = '../root-package'\nbranch = 'main'\nmode = 'single'\npaths = [{{ crate = '{relative}' }}]\n"
-                ),
-            )?;
-            let output = run_cargo_rail(&root.path, &["rail", "config", "print", "-f", "json"])?;
-            assert!(output.status.success(), "{relative}: {output:?}");
-            let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-            assert_eq!(
-                value["config"]["crates"]["root-package"]["split"]["members"],
-                serde_json::json!(["root-package"])
-            );
-        }
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-#[test]
-fn predecessor_paths_load_without_cargo_discovery_for_cleanup_and_library_callers() {
+fn unsupported_split_paths_fail_without_cargo_discovery_or_writes() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_single_crate("demo", "0.1.0")?;
         fs::create_dir_all(ws.path.join(".config"))?;
         let path = ws.path.join(".config/rail.toml");
-        let input =
-            "[crates.demo.split]\nremote = '../demo'\nbranch = 'main'\nmode = 'single'\npaths = [{ crate = '.' }]\n";
+        let input = "[crates.demo.split]\nremote = '../demo'\npaths = [{ crate = '.' }]\n";
         fs::write(&path, input)?;
-        // Cargo discovery cannot succeed, but the captured package name is sufficient for these loaders.
-        fs::write(ws.path.join("Cargo.toml"), "[package]\nname = 'demo'\n")?;
-        let config = cargo_rail::config::RailConfig::load(&ws.path)?;
-        assert_eq!(config.build_split_configs()[0].members, ["demo"]);
-        cargo_rail::commands::clean::CleanContext::capture(&ws.path, None)?;
-        assert_eq!(fs::read_to_string(path)?, input);
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-#[cfg(unix)]
-#[test]
-fn predecessor_split_paths_reject_linked_manifests_without_writing() {
-    let result: Result<()> = (|| {
-        let ws = TestWorkspace::new_named("linked-split-manifest")?;
-        ws.add_crate("demo", "0.1.0", &[])?;
-        ws.commit("member")?;
-        let path = ws.path.join(".config/rail.toml");
-        let input = "[crates.demo.split]\nremote = '../demo'\nbranch = 'main'\nmode = 'single'\npaths = [{ crate = 'crates/demo' }]\n";
-        fs::write(&path, input)?;
-        let original = ws.path.join("crates/demo/Cargo.toml");
-        let saved = ws.path.join("saved-manifest.toml");
-        fs::rename(&original, &saved)?;
-        std::os::unix::fs::symlink(&saved, &original)?;
-        for args in [
-            &["rail", "config", "explain"][..],
-            &["rail", "config", "print"][..],
-            &["rail", "config", "validate"][..],
-            &["rail", "plan", "--since", "HEAD"][..],
+        fs::write(ws.path.join("Cargo.toml"), "[broken manifest")?;
+        for error in [
+            cargo_rail::config::RailConfig::load(&ws.path).unwrap_err(),
+            cargo_rail::commands::clean::CleanContext::capture(&ws.path, None).unwrap_err(),
         ] {
-            let output = run_cargo_rail(&ws.path, args)?;
-            assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
-            assert!(
-                String::from_utf8_lossy(&output.stderr).contains("symbolic link"),
-                "{output:?}"
-            );
-            assert_eq!(fs::read_to_string(&path)?, input);
+            assert!(error.to_string().contains("crates.demo.split.paths"), "{error}");
         }
-        assert!(
-            cargo_rail::config::RailConfig::load(&ws.path)
-                .unwrap_err()
-                .to_string()
-                .contains("symbolic links")
-        );
-        assert!(
-            cargo_rail::commands::clean::CleanContext::capture(&ws.path, None)
-                .unwrap_err()
-                .to_string()
-                .contains("symbolic links")
-        );
+        assert_eq!(fs::read_to_string(path)?, input);
         Ok(())
     })();
     super::helpers::finish_test(result);
@@ -257,15 +148,14 @@ fn inspection_never_treats_failed_workspace_discovery_as_valid_policy() {
         assert!(String::from_utf8_lossy(&invalid.stdout).contains("tag_format cannot be empty"));
         for input in [
             b"[release]\nversion_groups = { group = ['demo'] }\n".as_slice(),
-            b"[unify]\npin_transitives = true\ntransitive_host = 'crates/host'\n".as_slice(),
+            b"[unify]\ntransitive_pinning = { host = 'crates/host' }\n".as_slice(),
         ] {
             let missing = stdin_validation(outside.path(), input)?;
             assert_eq!(missing.status.code(), Some(2));
             assert!(String::from_utf8_lossy(&missing.stdout).contains("requires Cargo workspace context"));
         }
         for input in [
-            b"[unify]\nmsrv = false\n".as_slice(),
-            b"[crates.demo.sync]\nformer = 'reserved'\n".as_slice(),
+            b"[unify]\nmsrv_policy = { mode = 'disabled' }\n".as_slice(),
             b"[crates.demo]\n".as_slice(),
         ] {
             let independent = stdin_validation(&ws.path, input)?;

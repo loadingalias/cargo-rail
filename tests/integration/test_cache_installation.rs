@@ -2165,7 +2165,7 @@ fn setup_preview_apply_repeat_status_and_exact_remove_are_lossless() {
         )?;
         assert!(status.status.success(), "installation status failed: {status:?}");
         let status = json(&status)?;
-        assert_eq!(status["status"]["schema_version"], 15);
+        assert_eq!(status["status"]["schema_version"], 16);
         assert_eq!(status["status"]["installation"]["state"], "installed");
         assert_eq!(status["status"]["installation"]["healthy"], true);
         assert_eq!(status["status"]["installation"]["root_portability"], "physical");
@@ -2781,7 +2781,7 @@ fn cache_status_reports_only_redacted_machine_selected_remote_authority() {
             .output()?;
         assert!(output.status.success(), "remote status failed: {output:?}");
         let value = json(&output)?;
-        assert_eq!(value["status"]["schema_version"], 15);
+        assert_eq!(value["status"]["schema_version"], 16);
         assert_eq!(value["status"]["remote"]["activation"], "direct_transport_selected");
         assert_eq!(value["status"]["remote"]["provider"], "aws-s3");
         assert_eq!(value["status"]["remote"]["mode"], "read");
@@ -3328,7 +3328,8 @@ fn pre_profile_receipt_is_refused_without_changing_installation_or_cache() {
             );
             let diagnostic = String::from_utf8_lossy(&refused.stderr);
             anyhow::ensure!(
-                diagnostic.contains("explicit removal before setup") && diagnostic.contains("v0.25"),
+                diagnostic.contains("unsupported compiler-cache installation receipt version 3")
+                    && diagnostic.contains("originating release version is unknown"),
                 "missing explicit transition: {diagnostic}"
             );
             anyhow::ensure!(
@@ -3348,127 +3349,6 @@ fn pre_profile_receipt_is_refused_without_changing_installation_or_cache() {
         anyhow::ensure!(
             fs::read(&receipt_path)? == receipt_bytes && !store.exists(),
             "compiler fallback adopted old installation state"
-        );
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-#[test]
-fn retained_pre_profile_state_cleans_up_without_adopting_its_policy() {
-    let result: Result<()> = (|| {
-        let workspace = TestWorkspace::new_single_crate("retained-pre-profile-cleanup", "0.1.0")?;
-        let cargo_home = tempfile::tempdir()?;
-        let remote = LoopbackS3::start()?;
-        let remote_url = remote.remote_url();
-        let setup = rail(
-            &workspace.path,
-            cargo_home.path(),
-            &[
-                "rail",
-                "cache",
-                "setup",
-                "--remote",
-                &remote_url,
-                "--remote-mode",
-                "read-write",
-                "--root-portability",
-                "remap",
-            ],
-        )?;
-        assert!(setup.status.success(), "retained-state fixture setup failed: {setup:?}");
-        let old_cache_root = selected_profile_cache_root(&workspace.path, cargo_home.path())?;
-        let old_status = selected_profile_status(&workspace.path, cargo_home.path())?;
-        let old_remote_authority = old_status["status"]["remote"]["authority"].clone();
-
-        let store = cargo_home.path().join("cargo-rail/cache-profiles-v1");
-        let profile_path = fs::read_dir(store.join("profiles"))?
-            .next()
-            .transpose()?
-            .context("retained-state fixture profile record")?
-            .path();
-        let profile: serde_json::Value = serde_json::from_slice(&fs::read(profile_path)?)?;
-        let receipt_path = cargo_home.path().join("cargo-rail/compiler-cache-v1/setup.json");
-        let receipt: serde_json::Value = serde_json::from_slice(&fs::read(&receipt_path)?)?;
-        let retained_bytes = format!(
-            "{{\"version\":1,\"installation_authority\":{},\"cache\":{},\"remote\":{{\"version\":{},\"normalized_url\":{},\"mode\":{},\"additional_environment_names\":{}}},\"root_portability\":{}}}\n",
-            receipt["authority"], profile["cache"], profile["remote"]["version"],
-            profile["remote"]["normalized_url"], profile["remote"]["mode"],
-            profile["remote"]["additional_environment_names"], profile["root_portability"],
-        ).into_bytes();
-        fs::remove_dir_all(&store)?;
-        fs::create_dir_all(&store)?;
-        fs::write(store.join("unbound-v0.25.json"), &retained_bytes)?;
-        assert!(old_cache_root.exists());
-
-        let migrated = rail(
-            &workspace.path,
-            cargo_home.path(),
-            &["rail", "cache", "setup", "-f", "json"],
-        )?;
-        assert!(migrated.status.success(), "workspace setup failed: {migrated:?}");
-        let migrated_status = selected_profile_status(&workspace.path, cargo_home.path())?;
-        assert!(migrated_status["status"]["remote"].is_null());
-        assert_eq!(
-            migrated_status["status"]["installation"]["unbound_pre_profile_state"]["remote_authority"],
-            old_remote_authority
-        );
-        let new_cache_root = selected_profile_cache_root(&workspace.path, cargo_home.path())?;
-        assert_ne!(new_cache_root, old_cache_root);
-        assert!(
-            old_cache_root.exists(),
-            "workspace setup did not preserve the retained CAS"
-        );
-
-        let profiles = rail(
-            &workspace.path,
-            cargo_home.path(),
-            &["rail", "cache", "profiles", "-f", "json"],
-        )?;
-        let profiles = json(&profiles)?;
-        assert_eq!(profiles["profiles"].as_array().map(Vec::len), Some(1));
-        assert_eq!(
-            profiles["unbound_pre_profile_state"]["remote_authority"],
-            old_remote_authority
-        );
-        let repeated = rail(
-            &workspace.path,
-            cargo_home.path(),
-            &["rail", "cache", "setup", "--check"],
-        )?;
-        assert!(
-            repeated.status.success(),
-            "workspace setup retry did not converge: {repeated:?}"
-        );
-
-        let cleanup_check = rail(
-            &workspace.path,
-            cargo_home.path(),
-            &["rail", "cache", "drop-unbound", "--check", "-f", "json"],
-        )?;
-        assert_eq!(cleanup_check.status.code(), Some(1));
-        assert!(
-            old_cache_root.exists(),
-            "pre-profile cleanup preview removed the old CAS"
-        );
-        let cleanup = rail(
-            &workspace.path,
-            cargo_home.path(),
-            &["rail", "cache", "drop-unbound", "-f", "json"],
-        )?;
-        assert!(cleanup.status.success(), "pre-profile cleanup failed: {cleanup:?}");
-        assert!(!old_cache_root.exists());
-        assert!(new_cache_root.exists());
-        let cleanup_repeated = rail(
-            &workspace.path,
-            cargo_home.path(),
-            &["rail", "cache", "drop-unbound", "--check"],
-        )?;
-        assert!(cleanup_repeated.status.success());
-        assert!(
-            selected_profile_status(&workspace.path, cargo_home.path())?["status"]["installation"]
-                ["unbound_pre_profile_state"]
-                .is_null()
         );
         Ok(())
     })();

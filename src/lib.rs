@@ -23,6 +23,8 @@ macro_rules! println {
 
 /// Backup and restore for undo operations.
 pub mod backup;
+/// Reproducible cache benchmark workload preparation and execution.
+pub mod benchmark;
 pub(crate) mod build_script;
 pub(crate) mod cache;
 /// Cargo workspace metadata and manifest operations.

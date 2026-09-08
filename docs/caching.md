@@ -275,7 +275,6 @@ cargo rail cache clean --scope workspace --check
 cargo rail cache clean --scope local --check
 cargo rail cache detach --check
 cargo rail cache drop-profile --profile PROFILE_ID --check
-cargo rail cache drop-unbound --check
 cargo rail cache uninstall --check
 ```
 
@@ -286,22 +285,11 @@ removes the current root binding but preserves the profile and CAS. `cache drop-
 wrapper, worker, receipt-owned compiler components, Cargo field, and installation receipt while preserving profiles
 and their CAS data.
 
-Before upgrading a v0.25 installation, use v0.25 to preview `cargo rail cache remove --check`, then run
-`cargo rail cache remove`. This removes its wrapper installation and preserves the old CAS. With the new version,
-run `cargo rail cache setup` in each intended workspace and select its remote explicitly. Setup refuses old receipts
-without changing their files or adopting machine-global policy. Ordinary Cargo compilation still falls back normally.
+Setup repairs current installed component bytes from their authenticated source files. Unsupported installation
+receipts are preserved and rejected; they cannot be adopted by current setup. Removal and reuse refuse changed,
+shadowed, linked, or unowned authority. Do not edit profile records, individual CAS objects, or Cargo fingerprints by hand.
 
-Receipt version 5 requires an explicit compiler component inventory. For a version 4 receipt without that inventory,
-use the previous Cargo-Rail executable that created it to preview `cargo rail cache remove --check`, then run
-`cargo rail cache remove`. This preserves the CAS. Run `cargo rail cache setup` with the current executable afterward;
-the current executable does not upgrade or adopt version 4 receipts.
-
-Previously retained unbound state remains visible through `cache profiles`; preview `cache drop-unbound` before
-removing that CAS. Runtime selection never uses unbound state. Removal and reuse refuse changed, shadowed, linked,
-or unowned authority. Setup can repair installed component bytes from their authenticated source files. Do not edit
-profile records, individual CAS objects, or Cargo fingerprints by hand.
-
-Status schema 15 reports the selected profile ID, workspace binding, trust domain, and redacted remote selection
+Status schema 16 reports the selected profile ID, workspace binding, trust domain, and redacted remote selection
 source. It reports stable native failure-reason counters separately from the bounded 65,536-event usage ledger,
 so capture, identity, and post-execution witness failures remain visible after that ledger fills. If the counter file
 cannot be validated, `failure_reason_counts_available` is `false` instead of reporting invented zeroes. Verbose status

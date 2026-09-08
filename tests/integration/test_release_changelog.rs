@@ -35,17 +35,13 @@ fn generate_lockfile(workspace: &Path) -> Result<()> {
 }
 
 #[test]
-fn automatic_configuration_compatibility_preserves_release_sources_and_presentation() {
+fn current_configuration_preserves_release_sources_and_presentation() {
     let result: Result<()> = (|| {
         for source in ["commits", "both"] {
-            for predecessor in [false, true] {
-                let ws = TestWorkspace::new_named("release-config-compatibility")?;
+            {
+                let ws = TestWorkspace::new_named("release-config-presentation")?;
                 ws.add_crate("lib-a", "1.2.3", &[])?;
-                let authority = if predecessor {
-                    "push = false\nrequire_clean = false\npublish_delay = 27"
-                } else {
-                    "remote_effects = 'none'"
-                };
+                let authority = "remote_effects = 'none'";
                 write_release_config(
                     &ws,
                     &format!(
@@ -66,7 +62,7 @@ fn automatic_configuration_compatibility_preserves_release_sources_and_presentat
                 let config_path = ws.path.join(".config/rail.toml");
                 let original = std::fs::read(&config_path)?;
                 let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "lib-a", "--format", "json"])?;
-                assert_eq!(output.status.code(), Some(1), "{source}/{predecessor}: {output:?}");
+                assert_eq!(output.status.code(), Some(1), "{source}: {output:?}");
                 let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
                 let plan = &value["release_plan"];
                 assert_eq!(plan["source"], source);
@@ -163,71 +159,6 @@ fn only_release_state(workspace: &Path) -> Result<PathBuf> {
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .find(|path| path.extension().is_some_and(|extension| extension == "json"))
         .ok_or_else(|| anyhow::anyhow!("missing release state"))
-}
-
-fn rewrite_release_state_as_v0_25(path: &Path) -> Result<()> {
-    let mut state: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
-    state["schema_version"] = serde_json::json!(5);
-    state
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("release state fixture is not an object"))?
-        .remove("predecessor_execution");
-    let plan = state
-        .get_mut("plan")
-        .and_then(serde_json::Value::as_object_mut)
-        .ok_or_else(|| anyhow::anyhow!("release state fixture has no plan object"))?;
-    plan.insert("plan_contract_version".to_string(), serde_json::json!(5));
-    plan.insert("source".to_string(), serde_json::json!("changes"));
-    for planned in plan
-        .get_mut("crates")
-        .and_then(serde_json::Value::as_array_mut)
-        .ok_or_else(|| anyhow::anyhow!("release state fixture has no plan crate array"))?
-    {
-        planned["commits"] = serde_json::json!([]);
-        planned["commit_diagnostics"] = serde_json::json!([]);
-        planned["changelog_entries"] = serde_json::json!([]);
-    }
-    let config = state
-        .get_mut("release_config")
-        .and_then(serde_json::Value::as_object_mut)
-        .ok_or_else(|| anyhow::anyhow!("release state fixture has no release configuration"))?;
-    config.insert("source".to_string(), serde_json::json!("changes"));
-    config.insert("require_changelog_entries".to_string(), serde_json::json!(false));
-    config.insert("require_release_notes".to_string(), serde_json::json!(true));
-    config.insert("release_notes_dir".to_string(), serde_json::json!("release-notes"));
-    config.insert("unconventional_commits".to_string(), serde_json::json!("warn"));
-    config.insert("require_change_files".to_string(), serde_json::json!(false));
-    let changelog = config
-        .get_mut("changelog")
-        .and_then(serde_json::Value::as_object_mut)
-        .ok_or_else(|| anyhow::anyhow!("release state fixture has no changelog configuration"))?;
-    changelog.insert(
-        "entry_format".to_string(),
-        serde_json::json!("- {scope}{breaking}{description}{prs} ({sha_link})"),
-    );
-    changelog.insert("emoji".to_string(), serde_json::json!(true));
-    changelog.insert(
-        "group_order".to_string(),
-        serde_json::json!([
-            "breaking", "feat", "fix", "build", "chore", "ci", "deps", "docs", "other", "perf", "refactor", "style",
-            "test"
-        ]),
-    );
-    changelog.insert("fallback".to_string(), serde_json::json!("other"));
-    changelog.insert("groups".to_string(), serde_json::json!([]));
-    changelog.insert(
-        "filters".to_string(),
-        serde_json::json!({
-            "skip_types": [],
-            "skip_scopes": [],
-            "include_paths": [],
-            "exclude_paths": []
-        }),
-    );
-    changelog.insert("commit_url".to_string(), serde_json::Value::Null);
-    changelog.insert("pr_url".to_string(), serde_json::Value::Null);
-    std::fs::write(path, serde_json::to_vec_pretty(&state)?)?;
-    Ok(())
 }
 
 fn add_auxiliary_cargo_workspace(ws: &TestWorkspace, name: &str, dependency: &str) -> Result<PathBuf> {
@@ -1154,8 +1085,8 @@ registry_publication = "crates-io"
         );
         assert!(published_path.exists(), "the registry shim should record a publication");
         let state: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
-        assert_eq!(state["schema_version"], 7);
-        assert_eq!(state["plan"]["plan_contract_version"], 7);
+        assert_eq!(state["schema_version"], 8);
+        assert_eq!(state["plan"]["plan_contract_version"], 8);
         assert_eq!(state["publish_registry"], "crates-io");
         assert_eq!(state["release_config"]["registry_publication"], "crates-io");
         assert_eq!(
@@ -1593,7 +1524,7 @@ auxiliary_cargo_manifests = ["aux-one/Cargo.toml", "aux-two/Cargo.toml"]
             String::from_utf8_lossy(&check.stderr)
         );
         let check: serde_json::Value = serde_json::from_slice(&check.stdout)?;
-        assert_eq!(check["release_plan"]["plan_contract_version"], 7);
+        assert_eq!(check["release_plan"]["plan_contract_version"], 8);
         let projections = check["release_plan"]["auxiliary_lockfiles"]
             .as_array()
             .expect("auxiliary lockfile projections");
@@ -2337,8 +2268,8 @@ auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
 
         let state_path = only_release_state(&ws.path)?;
         let state: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
-        assert_eq!(state["schema_version"], 7);
-        assert_eq!(state["plan"]["plan_contract_version"], 7);
+        assert_eq!(state["schema_version"], 8);
+        assert_eq!(state["plan"]["plan_contract_version"], 8);
         assert_eq!(state["plan"]["auxiliary_lockfiles"].as_array().unwrap().len(), 1);
         let resumed = run_cargo_rail(&ws.path, &["rail", "release", "resume", state_path.to_str().unwrap()])?;
         assert!(resumed.status.success(), "{}", String::from_utf8_lossy(&resumed.stderr));
@@ -2511,7 +2442,7 @@ core = ["lib-a", "lib-b", "lib-c"]
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let json: serde_json::Value = serde_json::from_str(&stdout)?;
-        assert_eq!(json["release_plan"]["plan_contract_version"], 7);
+        assert_eq!(json["release_plan"]["plan_contract_version"], 8);
         assert!(
             json["release_plan"]["snapshot_id"]
                 .as_str()
@@ -5313,7 +5244,7 @@ fn release_resume_rejects_same_branch_head_movement() {
 }
 
 #[test]
-fn release_resume_migrates_v0_25_journal_before_continuing() {
+fn unsupported_release_journal_blocks_resume_and_new_transactions() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_single_crate("v025-release-resume", "0.1.0")?;
         ws.write_release_config(
@@ -5341,50 +5272,13 @@ fn release_resume_migrates_v0_25_journal_before_continuing() {
         )?;
         assert!(!interrupted.status.success());
         let state_path = only_release_state(&ws.path)?;
-        std::fs::create_dir_all(ws.path.join("release-notes"))?;
-        std::fs::write(
-            ws.path.join("release-notes/v0.1.1.md"),
-            "Exact live v0.25 release-note override.\n",
-        )?;
-        rewrite_release_state_as_v0_25(&state_path)?;
-
-        let resumed = run_cargo_rail(&ws.path, &["rail", "release", "resume", state_path.to_str().unwrap()])?;
-        assert!(resumed.status.success(), "{}", String::from_utf8_lossy(&resumed.stderr));
-        let state: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
-        assert_eq!(state["schema_version"], 7);
-        assert_eq!(state["plan"]["plan_contract_version"], 7);
-        assert_eq!(state["status"], "complete");
-        assert_eq!(
-            state["predecessor_execution"]["release_note_bodies"]["v025-release-resume"],
-            "Exact live v0.25 release-note override.\n"
-        );
-        assert_eq!(
-            String::from_utf8_lossy(&git(&ws.path, &["rev-list", "--count", "HEAD"])?.stdout)
-                .trim()
-                .parse::<usize>()?,
-            before + 1,
-            "resume must create exactly one release commit"
-        );
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-#[test]
-fn release_abort_migrates_v0_25_journal_and_allows_terminal_cleanup() {
-    let result: Result<()> = (|| {
-        let ws = TestWorkspace::new_single_crate("v025-release-abort", "0.1.0")?;
-        ws.write_release_config(
-            r#"tag_format = "v{version}"
-"#,
-        )?;
-        write_test_change(&ws.path, &["v025-release-abort"])?;
-        let initial_head = String::from_utf8_lossy(&git(&ws.path, &["rev-parse", "HEAD"])?.stdout)
-            .trim()
-            .to_string();
-        let interrupted = run_release_with_fault_env(
-            &ws.path,
-            &[
+        let mut state: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
+        state["schema_version"] = serde_json::json!(5);
+        let unsupported = serde_json::to_vec(&state)?;
+        std::fs::write(&state_path, &unsupported)?;
+        for args in [
+            vec!["rail", "release", "resume", state_path.to_str().unwrap()],
+            vec![
                 "rail",
                 "release",
                 "run",
@@ -5394,153 +5288,17 @@ fn release_abort_migrates_v0_25_journal_and_allows_terminal_cleanup() {
                 "--skip-tag",
                 "--yes",
             ],
-            "CARGO_RAIL_RELEASE_FAIL_AFTER",
-            "journal:planned",
-        )?;
-        assert!(!interrupted.status.success());
-        let state_path = only_release_state(&ws.path)?;
-        rewrite_release_state_as_v0_25(&state_path)?;
-
-        let aborted = run_cargo_rail(
-            &ws.path,
-            &["rail", "release", "abort", state_path.to_str().unwrap(), "--yes"],
-        )?;
-        assert!(aborted.status.success(), "{}", String::from_utf8_lossy(&aborted.stderr));
-        let state: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
-        assert_eq!(state["schema_version"], 7);
-        assert_eq!(state["plan"]["plan_contract_version"], 7);
-        assert_eq!(state["status"], "aborted");
-        assert_eq!(
-            String::from_utf8_lossy(&git(&ws.path, &["rev-parse", "HEAD"])?.stdout).trim(),
-            initial_head,
-            "abort must not create a release commit"
-        );
-
-        let cleaned = run_cargo_rail(
-            &ws.path,
-            &["rail", "clean", "--release-journal", state_path.to_str().unwrap()],
-        )?;
-        assert!(cleaned.status.success(), "{}", String::from_utf8_lossy(&cleaned.stderr));
-        assert!(!state_path.exists(), "terminal predecessor journal should be removable");
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-#[test]
-fn release_status_isolates_mixed_v5_v6_and_unreadable_journals() {
-    let result: Result<()> = (|| {
-        let ws = TestWorkspace::new_single_crate("mixed-release-status", "0.1.0")?;
-        ws.write_release_config(
-            r#"tag_format = "v{version}"
-"#,
-        )?;
-        write_test_change(&ws.path, &["mixed-release-status"])?;
-        let interrupted = run_release_with_before_fault(
-            &ws.path,
-            &[
-                "rail",
-                "release",
-                "run",
-                "--all",
-                "--bump",
-                "patch",
-                "--skip-tag",
-                "--yes",
-            ],
-            "commit:mixed-release-status",
-        )?;
-        assert!(!interrupted.status.success());
-
-        let directory = ws.path.join("target/cargo-rail/releases");
-        let active_state = only_release_state(&ws.path)?;
-        let active_state_bytes = std::fs::read(&active_state)?;
-        std::fs::write(
-            directory.join("release-v025-fixture.json"),
-            include_bytes!("../fixtures/release/v0.25.0/state-v5.json"),
-        )?;
-        std::fs::write(
-            directory.join("release-v025-renamed.json"),
-            include_bytes!("../fixtures/release/v0.25.0/state-v5.json"),
-        )?;
-        std::fs::write(directory.join("release-v6-renamed.json"), active_state_bytes)?;
-        std::fs::write(
-            directory.join("release-v025-unreadable.json"),
-            br#"{"schema_version":5,"transaction_id":"release-v025-unreadable"}"#,
-        )?;
-
-        let status = run_cargo_rail(&ws.path, &["rail", "release", "status", "--format", "json"])?;
-        assert!(status.status.success(), "{}", String::from_utf8_lossy(&status.stderr));
-        let status: serde_json::Value = serde_json::from_slice(&status.stdout)?;
-        let transactions = status["transactions"].as_array().unwrap();
-        assert_eq!(transactions.len(), 5, "{status:#}");
-        let predecessor = transactions
-            .iter()
-            .find(|transaction| transaction["transaction_id"] == "release-v025-fixture")
-            .unwrap();
-        assert_eq!(predecessor["state"], "publishing:active");
-        let unreadable = transactions
-            .iter()
-            .find(|transaction| transaction["transaction_id"] == "release-v025-unreadable")
-            .unwrap();
-        assert_eq!(unreadable["state"], "journal:ambiguous");
-        assert_eq!(unreadable["recoverability"], "unreadable");
-        assert_eq!(unreadable["ambiguity"], true);
-        for renamed in ["release-v025-renamed", "release-v6-renamed"] {
-            let renamed = transactions
-                .iter()
-                .find(|transaction| transaction["transaction_id"] == renamed)
-                .unwrap();
-            assert_eq!(renamed["state"], "journal:ambiguous");
-            assert_eq!(renamed["recoverability"], "unreadable");
-            assert_eq!(renamed["ambiguity"], true);
-            assert!(
-                renamed["observations"][0]
-                    .as_str()
-                    .unwrap()
-                    .contains("does not match transaction identity")
+        ] {
+            let output = run_cargo_rail(&ws.path, &args)?;
+            assert_eq!(output.status.code(), Some(2), "{output:?}");
+            assert_eq!(std::fs::read(&state_path)?, unsupported);
+            assert_eq!(
+                String::from_utf8_lossy(&git(&ws.path, &["rev-list", "--count", "HEAD"])?.stdout)
+                    .trim()
+                    .parse::<usize>()?,
+                before
             );
         }
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-#[test]
-fn release_status_reconstructs_an_exact_v0_25_run_commit() {
-    let result: Result<()> = (|| {
-        let ws = TestWorkspace::new_single_crate("v025-release-history", "0.1.0")?;
-        let message = "chore(release): v025-release-history v0.1.1\n\n\
-Rail-Release: release-v025-history\n\
-Rail-Release-Mode: run\n\
-Rail-Release-Publish: false\n\
-Rail-Release-Publish-Registry: none\n\
-Rail-Release-Tag: false\n\
-Rail-Release-Remote: none\n\
-Rail-Release-Crate: v025-release-history@0.1.1\n\
-Rail-Release-Tag-Name: v025-release-history=v0.1.1\n\
-Rail-Release-Crate-Publish: v025-release-history=false";
-        git(&ws.path, &["commit", "--allow-empty", "-m", message])?;
-        let exact_sha = String::from_utf8_lossy(&git(&ws.path, &["rev-parse", "HEAD"])?.stdout)
-            .trim()
-            .to_string();
-
-        let status = run_cargo_rail(
-            &ws.path,
-            &["rail", "release", "status", "--history", "--format", "json"],
-        )?;
-        assert!(status.status.success(), "{}", String::from_utf8_lossy(&status.stderr));
-        let status: serde_json::Value = serde_json::from_slice(&status.stdout)?;
-        let predecessor = status["transactions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|transaction| transaction["transaction_id"] == "release-v025-history")
-            .unwrap();
-        assert_eq!(predecessor["state"], "released:git");
-        assert_eq!(predecessor["recoverability"], "terminal");
-        assert_eq!(predecessor["ambiguity"], false);
-        assert_eq!(predecessor["exact_sha"], exact_sha);
         Ok(())
     })();
     super::helpers::finish_test(result);

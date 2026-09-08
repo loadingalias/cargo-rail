@@ -81,15 +81,6 @@ impl NativeResultStaging {
         (self.directory, self.active, self.durable_generations)
     }
 
-    pub(crate) fn temporary() -> RailResult<Self> {
-        Ok(Self {
-            directory: tempfile::Builder::new().prefix("native-pack-").tempdir()?,
-            active: None,
-            verified_generations: BTreeMap::new(),
-            durable_generations: BTreeMap::new(),
-        })
-    }
-
     pub(crate) fn temporary_in(parent: &Path) -> RailResult<Self> {
         Ok(Self {
             directory: tempfile::Builder::new().prefix("native-pack-").tempdir_in(parent)?,
@@ -560,11 +551,38 @@ where
 
 /// Decode a complete pack bound to one live action without granting L1 authority.
 pub(crate) fn decode_for_action<R: Read>(
+    reader: R,
+    expected_action: &str,
+    declared_length: Option<u64>,
+    mut staging: NativeResultStaging,
+) -> RailResult<(DecodedNativePack, NativeAssociation)> {
+    let (descriptor, association) = read_pack_for_action(reader, expected_action, declared_length, Some(&mut staging))?;
+    Ok((
+        DecodedNativePack {
+            staging,
+            descriptor,
+            bytes_read: association.pack_length(),
+        },
+        association,
+    ))
+}
+
+/// Validate every pack slot without materializing payload files.
+pub(crate) fn validate_for_action<R: Read>(
+    reader: R,
+    expected_action: &str,
+    declared_length: Option<u64>,
+) -> RailResult<NativeAssociation> {
+    let (_, association) = read_pack_for_action(reader, expected_action, declared_length, None)?;
+    Ok(association)
+}
+
+fn read_pack_for_action<R: Read>(
     mut reader: R,
     expected_action: &str,
     declared_length: Option<u64>,
-    staging: Option<NativeResultStaging>,
-) -> RailResult<(DecodedNativePack, NativeAssociation)> {
+    mut staging: Option<&mut NativeResultStaging>,
+) -> RailResult<(NativeResultDescriptor, NativeAssociation)> {
     validate_action_key(expected_action)?;
     let mut prelude = [0_u8; PACK_PRELUDE_LEN];
     reader
@@ -608,10 +626,17 @@ pub(crate) fn decode_for_action<R: Read>(
             "native result pack declared length does not match its descriptor",
         ));
     }
-    let mut staging = staging.map_or_else(NativeResultStaging::temporary, Ok)?;
-    let durable_handoff = staging.requires_durable_handoff();
     let mut bytes_read = PACK_PRELUDE_BYTES.saturating_add(encoded.len() as u64);
     for slot in descriptor_slots(&descriptor) {
+        let Some(staging) = staging.as_deref_mut() else {
+            bytes_read = bytes_read.saturating_add(copy_exact_digest(
+                &mut reader,
+                &mut std::io::sink(),
+                slot.bytes,
+                slot.digest,
+            )?);
+            continue;
+        };
         let path = staging.path().join(slot.path);
         let parent = path
             .parent()
@@ -620,7 +645,7 @@ pub(crate) fn decode_for_action<R: Read>(
         let mut output = OpenOptions::new().write(true).create_new(true).open(&path)?;
         bytes_read = bytes_read.saturating_add(copy_exact_digest(&mut reader, &mut output, slot.bytes, slot.digest)?);
         set_private_output_mode(&path, slot.mode)?;
-        if durable_handoff {
+        if staging.requires_durable_handoff() {
             let _durability = super::native_durability_phase(super::NativeDurabilityPhase::L1FileSync);
             output.sync_all()?;
             if let Some(generation) = crate::utils::stable_file_generation(&path) {
@@ -642,14 +667,7 @@ pub(crate) fn decode_for_action<R: Read>(
         result_key,
         pack_length: exact_length,
     };
-    Ok((
-        DecodedNativePack {
-            staging,
-            descriptor,
-            bytes_read,
-        },
-        association,
-    ))
+    Ok((descriptor, association))
 }
 
 /// Decode one exact zstd frame while retaining its compressed authority separately.
@@ -662,7 +680,7 @@ pub(crate) fn decode_zstd_for_action<R: Read>(
 ) -> RailResult<(DecodedNativePack, NativeAssociation)> {
     let mut decoder = zstd::stream::read::Decoder::new(source.take(compressed_bytes))
         .map_err(|_| RailError::message("compressed native pack is malformed"))?;
-    let decoded = decode_for_action(&mut decoder, expected_action, Some(pack_bytes), Some(staging))?;
+    let decoded = decode_for_action(&mut decoder, expected_action, Some(pack_bytes), staging)?;
     let source = decoder.finish();
     if !source.buffer().is_empty() || source.get_ref().limit() != 0 {
         return Err(RailError::message(
@@ -899,7 +917,7 @@ mod tests {
             Cursor::new(&bytes),
             validation.action_key(),
             Some(bytes.len() as u64),
-            None,
+            NativeResultStaging::temporary_in(&std::env::temp_dir()).expect("pack staging"),
         )
         .expect("verified decode");
 
@@ -956,7 +974,7 @@ mod tests {
             Cursor::new(&bytes),
             validation.action_key(),
             Some(bytes.len() as u64),
-            None,
+            NativeResultStaging::temporary_in(&std::env::temp_dir()).expect("pack staging"),
         )
         .expect("zero-byte metadata decode");
         assert_eq!(association.result_key(), validation.result_key());
@@ -978,7 +996,7 @@ mod tests {
                 Cursor::new(corrupt),
                 validation.action_key(),
                 Some(bytes.len() as u64),
-                None,
+                NativeResultStaging::temporary_in(&std::env::temp_dir()).expect("pack staging"),
             )
             .is_err(),
             "payload corruption must fail"
@@ -989,7 +1007,7 @@ mod tests {
                 Cursor::new(&bytes),
                 validation.action_key(),
                 Some(bytes.len() as u64 + 1),
-                None,
+                NativeResultStaging::temporary_in(&std::env::temp_dir()).expect("pack staging"),
             )
             .is_err(),
             "declared length drift must fail"
@@ -998,8 +1016,49 @@ mod tests {
         let mut trailing = bytes;
         trailing.push(0);
         assert!(
-            decode_for_action(Cursor::new(trailing), validation.action_key(), None, None).is_err(),
+            decode_for_action(
+                Cursor::new(trailing),
+                validation.action_key(),
+                None,
+                NativeResultStaging::temporary_in(&std::env::temp_dir()).expect("pack staging"),
+            )
+            .is_err(),
             "trailing payload must fail"
         );
+    }
+
+    #[test]
+    fn pack_validation_rejects_corrupt_slots_and_invalid_framing() {
+        let (validation, bytes) = exported_fixture(b"compiler output\n");
+        let association =
+            validate_for_action(&bytes[..], validation.action_key(), Some(bytes.len() as u64)).expect("validated pack");
+        assert_eq!(association.action_key(), validation.action_key());
+        assert_eq!(association.result_key(), validation.result_key());
+        assert_eq!(association.pack_length(), bytes.len() as u64);
+
+        let header_length = u32::from_le_bytes(bytes[10..14].try_into().unwrap()) as usize;
+        let payload_start = PACK_PRELUDE_LEN + header_length;
+        // Corrupt each nonempty slot independently: dep-info, metadata, stdout.
+        for offset in [payload_start, payload_start + 8, payload_start + 16] {
+            let mut corrupt = bytes.clone();
+            corrupt[offset] ^= 0xff;
+            let error = validate_for_action(&corrupt[..], validation.action_key(), Some(bytes.len() as u64))
+                .expect_err("corrupt slot must fail digest validation");
+            assert!(error.to_string().contains("payload digest does not match"), "{error}");
+        }
+        for truncated in [0, PACK_PRELUDE_LEN - 1, payload_start - 1, bytes.len() - 1] {
+            validate_for_action(&bytes[..truncated], validation.action_key(), None).unwrap_err();
+        }
+        validate_for_action(&bytes[..], validation.action_key(), Some(bytes.len() as u64 + 1)).unwrap_err();
+        let wrong_action = format!("{}{}", super::super::ACTION_KEY_PREFIX, "0".repeat(64));
+        let error = validate_for_action(&bytes[..], &wrong_action, None).expect_err("wrong action must fail");
+        assert!(
+            error.to_string().contains("does not match the requested action"),
+            "{error}"
+        );
+        let mut trailing = bytes;
+        trailing.push(0);
+        let error = validate_for_action(&trailing[..], validation.action_key(), None).expect_err("trailing byte");
+        assert!(error.to_string().contains("trailing bytes"), "{error}");
     }
 }

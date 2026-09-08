@@ -1825,7 +1825,7 @@ mod tests {
 
         assert_eq!(
             planned.cargo_arguments(),
-            scheduled.cargo_arguments(&["app"]).expect("legacy argv")
+            scheduled.cargo_arguments(&["app"]).expect("scheduled arguments")
         );
         assert_eq!(
             planned.fact_cache_identity("app").expect("planned identity"),

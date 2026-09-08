@@ -358,6 +358,11 @@ pub fn run_surface(ctx: &WorkspaceContext, options: SurfaceOptions) -> RailResul
     }
 
     let applied = apply_visibility_mutation(ctx, plan, &updates, options.backup)?;
+    if updates.is_empty() {
+        let mutation = finalize_surface_mutation(ctx, applied, &updates)?;
+        let report = build_report(ctx.snapshot()?, &config, &options.only, initial, Some(mutation))?;
+        return emit_report(report, &options, "fix", true);
+    }
     let verification = (|| {
         let verified_context = ctx.recapture_after_mutation()?;
         let verified_config = verified_context

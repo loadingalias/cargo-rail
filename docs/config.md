@@ -32,13 +32,11 @@ a missing explicit `--config PATH` never falls back to defaults.
 `config print` exports canonical TOML with defaults. It preserves policy such as `surface.targets = "workspace"`, so
 saved output continues inheriting future changes to top-level targets. Explanation shows the resolved targets.
 Use `-f json` or `--json` for machine inspection. Explanation conforms to
-[`config-explain-v1.schema.json`](../schemas/config-explain-v1.schema.json).
+[`config-explain-v2.schema.json`](../schemas/config-explain-v2.schema.json).
 
-Supported v0.25 spellings are interpreted automatically in memory, including MSRV and transitive-pinning booleans,
-release remote-effect settings, and split member paths. Commands preserve the file's bytes and effective policy;
-there is no configuration upgrade operation. Accepted older spelling produces no warning, including under strict
-CI validation. `config explain --all` includes informational compatibility provenance. Unknown or conflicting declarations
-still fail before command decisions.
+Only current configuration fields are accepted. Commands preserve input bytes; unsupported keys fail before
+planning or mutation. Historical planning input follows the same contract and identifies the revision and path when
+it cannot be decoded. See the current field reference below when authoring policy.
 
 Canonical output can be validated through stdin:
 

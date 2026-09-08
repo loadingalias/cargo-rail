@@ -162,9 +162,11 @@ required-work selectors:
   env:
     PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
   run: |
+    ARGS_FILE="$(mktemp "$RUNNER_TEMP/cargo-rail-args.XXXXXX")"
+    cargo-rail-action plan cargo-args "$PLAN_FILE" cargo.test > "$ARGS_FILE" || exit "$?"
     CARGO_ARGS=()
-    while IFS= read -r -d '' arg; do CARGO_ARGS+=("$arg"); done \
-      < <(cargo-rail-action plan cargo-args "$PLAN_FILE" cargo.test)
+    while IFS= read -r -d '' argument; do CARGO_ARGS+=("$argument"); done < "$ARGS_FILE"
+    rm -- "$ARGS_FILE"
     cargo nextest run "${CARGO_ARGS[@]}" --locked
 ```
 
@@ -199,8 +201,7 @@ remove complexity or strengthen evidence are welcome.
 ## Documentation and support
 
 Start with [Planning](docs/planning.md), the [cache contract](docs/caching.md), or
-[Troubleshooting](docs/troubleshooting.md). [Configuration](docs/config.md) explains the repository policy boundary;
-[the v0.26 migration guide](docs/migration-v0.26.md) covers the bounded v0.25 upgrade. Use
+[Troubleshooting](docs/troubleshooting.md). [Configuration](docs/config.md) explains the repository policy boundary. Use
 `cargo rail <command> --help` for the exact CLI. Contributors can start with [Architecture](docs/architecture.md).
 
 Cargo-Rail is licensed under [MIT](LICENSE). See [Contributing](CONTRIBUTING.md), the

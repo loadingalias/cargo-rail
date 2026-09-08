@@ -11,7 +11,6 @@ use serde_json::Value;
 use crate::helpers::{TestWorkspace, cargo_rail_command, git, run_cargo_rail, run_cargo_rail_with_env};
 
 const PLAN_V9_SCHEMA: &str = include_str!("../../schemas/plan-v9.schema.json");
-const PLAN_VARIANTS_V1_SCHEMA: &str = include_str!("../../schemas/plan-variants-v1.schema.json");
 const PLAN_VARIANTS_V2_SCHEMA: &str = include_str!("../../schemas/plan-variants-v2.schema.json");
 const PLANNING_EVIDENCE_V1_SCHEMA: &str = include_str!("../../schemas/planning-evidence-v1.schema.json");
 
@@ -25,13 +24,16 @@ const CARGO_WORK: [&str; 6] = [
 ];
 
 #[test]
-fn equivalent_configuration_spellings_keep_policy_but_change_source_binding() {
+fn equivalent_current_configuration_keeps_policy_but_changes_source_binding() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_single_crate("demo", "0.1.0")?;
         std::fs::create_dir_all(ws.path.join(".config"))?;
         let config = ws.path.join(".config/rail.toml");
-        std::fs::write(&config, "[unify]\nmsrv = false\n[release]\npush = true\n")?;
-        ws.commit("predecessor policy")?;
+        std::fs::write(
+            &config,
+            "[unify.msrv_policy]\nmode = 'disabled'\n[release]\nremote_effects = 'push'\n",
+        )?;
+        ws.commit("current policy")?;
         let before = plan(&ws, &["--since", "HEAD"])?;
         let saved = write_saved_plan(&ws, "old-policy.json", &before)?;
         std::fs::write(
@@ -59,7 +61,7 @@ fn historical_configuration_uses_historical_split_and_transitive_host_paths() {
         ws.add_crate("remaining", "0.1.0", &[])?;
         std::fs::write(
             ws.path.join(".config/rail.toml"),
-            "[unify]\npin_transitives = true\ntransitive_host = 'crates/old-host'\n[crates.old-host.split]\nremote = '../old-host'\nbranch = 'main'\nmode = 'single'\npaths = [{ crate = 'crates/old-host' }]\n",
+            "[unify]\ntransitive_pinning = { host = 'crates/old-host' }\n[crates.old-host.split]\nremote = '../old-host'\nbranch = 'main'\nmode = 'single'\nmembers = ['old-host']\n",
         )?;
         let base = ws.commit("historical workspace")?;
         std::fs::remove_dir_all(ws.path.join("crates/old-host"))?;
@@ -86,7 +88,7 @@ fn historical_configuration_never_interprets_symlink_targets_as_manifest_bytes()
         let config = ws.path.join(".config/rail.toml");
         std::fs::write(
             &config,
-            "[crates.demo.split]\nremote = '../demo'\nbranch = 'main'\nmode = 'single'\npaths = [{ crate = 'crates/demo' }]\n",
+            "[unify]\ntransitive_pinning = { host = 'crates/demo' }\n[crates.demo.split]\nremote = '../demo'\nbranch = 'main'\nmode = 'single'\nmembers = ['demo']\n",
         )?;
         std::fs::remove_file(&manifest)?;
         std::os::unix::fs::symlink("[package]\nname = 'demo'\n", &manifest)?;
@@ -300,19 +302,6 @@ fn test_plan_schema_command_matches_published_schema() {
 }
 
 #[test]
-fn test_published_plan_variants_v1_schema_remains_exactly_available() {
-    let schema: Value = serde_json::from_str(PLAN_VARIANTS_V1_SCHEMA).expect("valid historical schema");
-    jsonschema::validator_for(&schema).expect("valid historical JSON Schema");
-    assert_eq!(
-        Sha256::digest(PLAN_VARIANTS_V1_SCHEMA.as_bytes())
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>(),
-        "e25351a0a1d6872a3ce83ccc589faa0b724cabdeecd87da86908d7466ad8903f"
-    );
-}
-
-#[test]
 fn test_plan_v9_is_the_canonical_global_json_contract() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("plan-v9-canonical-json")?;
@@ -351,27 +340,24 @@ fn test_plan_surface_work_requires_explicit_enablement() {
 }
 
 #[test]
-fn test_plan_decodes_exact_v0_25_configuration_from_git_history() {
+fn test_plan_rejects_unsupported_historical_configuration_without_changing_baseline() {
     let result: Result<()> = (|| {
-        const TAGGED_CONFIG: &[u8] = include_bytes!("../fixtures/config/v0.25.0/rail.toml");
-
-        let ws = TestWorkspace::new_named("plan-v0-25-config")?;
+        let ws = TestWorkspace::new_named("historical-policy")?;
         ws.add_crate("historical-config", "0.1.0", &[])?;
-        std::fs::write(ws.path.join(".config/rail.toml"), TAGGED_CONFIG)?;
-        ws.commit("record exact v0.25 configuration")?;
-
+        std::fs::write(ws.path.join(".config/rail.toml"), "[unify]\nmsrv = false\n")?;
+        let revision = ws.commit("unsupported policy")?;
         std::fs::write(ws.path.join(".config/rail.toml"), "")?;
-        let planned = plan(&ws, &["--since", "HEAD"])?;
-        assert_eq!(planned["plan_contract_version"], 9);
+        let output = run_cargo_rail(&ws.path, &["rail", "plan", "--since", &revision, "--json"])?;
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        let diagnostic = String::from_utf8(output.stdout)?;
         assert!(
-            planned["changes"]["files"]
-                .as_array()
-                .is_some_and(|changed| changed.iter().any(|entry| entry["path"] == ".config/rail.toml"))
+            diagnostic.contains("historical configuration")
+                && diagnostic.contains(".config/rail.toml")
+                && diagnostic.contains(&revision),
+            "{diagnostic}"
         );
-        let rendered = serde_json::to_string(&planned)?;
-        assert!(rendered.contains("require_change_files"));
-        assert!(rendered.contains("unconventional_commits"));
-
+        assert!(diagnostic.contains("unify.msrv"), "{diagnostic}");
+        assert_eq!(std::fs::read(ws.path.join(".config/rail.toml"))?, b"");
         Ok(())
     })();
     super::helpers::finish_test(result);

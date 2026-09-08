@@ -4,10 +4,7 @@ use std::fs;
 
 use crate::helpers::{NestedWorkspace, TestWorkspace, run_cargo_rail, run_cargo_rail_with_env};
 use anyhow::{Result, anyhow};
-use rscrypto::Sha256;
 
-const SURFACE_V1_SCHEMA: &str = include_str!("../../schemas/surface-v1.schema.json");
-const SURFACE_V2_SCHEMA: &str = include_str!("../../schemas/surface-v2.schema.json");
 const SURFACE_V3_SCHEMA: &str = include_str!("../../schemas/surface-v3.schema.json");
 
 #[test]
@@ -42,30 +39,6 @@ fn surface_schema_is_pre_context_and_matches_the_published_contract() {
         Ok(())
     })();
     super::helpers::finish_test(result);
-}
-
-#[test]
-fn historical_surface_schemas_remain_exactly_available() {
-    for (schema, digest) in [
-        (
-            SURFACE_V1_SCHEMA,
-            "3e74e75a833ee7cf1c7d504bd1541ee5311d2a070967e322552e1a9a43535145",
-        ),
-        (
-            SURFACE_V2_SCHEMA,
-            "101316fd270606ce5b8d9b1563c0a24cfa4648e61a68c109317b82b4dd3572dd",
-        ),
-    ] {
-        let parsed: serde_json::Value = serde_json::from_str(schema).expect("valid historical schema");
-        jsonschema::validator_for(&parsed).expect("valid historical JSON Schema");
-        assert_eq!(
-            Sha256::digest(schema.as_bytes())
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>(),
-            digest
-        );
-    }
 }
 
 #[test]
@@ -423,9 +396,21 @@ reason = "fixture product"
         assert!(fixed_source.contains("fn test_only_public() {}"));
         assert!(fixed_source.contains("pub fn dead_public() {}"));
 
+        let diagnostics_directory = tempfile::tempdir()?;
+        let diagnostics = diagnostics_directory.path().join("no-op-fix.json");
         let repeated = run_cargo_rail(
             &workspace.path,
-            &["rail", "surface", "--fix", "--dry-run", "--format", "json"],
+            &[
+                "rail",
+                "--diagnostics-file",
+                diagnostics
+                    .to_str()
+                    .ok_or_else(|| anyhow!("diagnostics path is not UTF-8"))?,
+                "surface",
+                "--fix",
+                "--format",
+                "json",
+            ],
         )?;
         assert_eq!(
             repeated.status.code(),
@@ -434,6 +419,22 @@ reason = "fixture product"
             String::from_utf8_lossy(&repeated.stderr)
         );
         let repeated_report: serde_json::Value = serde_json::from_slice(&repeated.stdout)?;
+        let counters: serde_json::Value = serde_json::from_slice(&fs::read(diagnostics)?)?;
+        assert_eq!(
+            counters["compiler_acquisition"]["plans"], 1,
+            "a no-op fix must analyze once"
+        );
+        assert_eq!(
+            counters["cargo_metadata_loads"], 1,
+            "a no-op fix must not recapture the context"
+        );
+        assert_eq!(repeated_report["mode"], "fix");
+        assert_eq!(repeated_report["mutation"]["phase"], "applied");
+        let repeated_receipt = repeated_report["mutation"]["receipt"]
+            .as_str()
+            .expect("no-op apply receipt");
+        assert!(workspace.path.join(repeated_receipt).is_file());
+        assert_eq!(fs::read_to_string(package.join("src/main.rs"))?, fixed_source);
         let repeated_errors = validator
             .iter_errors(&repeated_report)
             .map(|error| error.to_string())
@@ -615,26 +616,22 @@ reason = "resume fixture product"
         let failure: serde_json::Value = serde_json::from_slice(&failed.stdout)?;
         assert!(failure["help"].as_str().is_some_and(|help| help.contains("--resume")));
 
-        let journal_directory = workspace.path.join("target/cargo-rail/surface-acquisitions-v2");
+        let journal_directory = workspace.path.join("target/cargo-rail/surface-acquisitions-v3");
         let journals = fs::read_dir(&journal_directory)?.collect::<Result<Vec<_>, _>>()?;
         assert_eq!(journals.len(), 1);
         let journal = journals[0].path();
         let document: serde_json::Value = serde_json::from_slice(&fs::read(&journal)?)?;
         let header = &document["header"];
-        assert_eq!(header["surface_acquisition_contract_version"], 2);
+        assert_eq!(header["surface_acquisition_contract_version"], 3);
         assert_eq!(header["view_count"], 3);
         assert_eq!(header["concurrency"], 1);
         assert_eq!(header["products"][0]["package"], "surface-resume-app");
         let failed_view = document["views"]
             .as_array()
-            .ok_or_else(|| anyhow!("v2 journal has no view array"))?
+            .ok_or_else(|| anyhow!("acquisition journal has no view array"))?
             .iter()
             .find(|record| record["durable"]["state"] == "failed")
             .ok_or_else(|| anyhow!("partial journal has no failed view"))?;
-        assert!(
-            failed_view["ordinal"].is_null(),
-            "new v2 journals must not emit legacy ordinals"
-        );
         assert_eq!(failed_view["view_index"], 1);
         assert_eq!(failed_view["target_triple"], "default");
         assert_eq!(failed_view["command_class"], "cargo-check-all-targets");
@@ -804,7 +801,7 @@ exec cargo "$@"
         )?;
         assert_eq!(failed.status.code(), Some(2));
 
-        let journal_directory = workspace.path.join("target/cargo-rail/surface-acquisitions-v2");
+        let journal_directory = workspace.path.join("target/cargo-rail/surface-acquisitions-v3");
         let journals = fs::read_dir(&journal_directory)?.collect::<Result<Vec<_>, _>>()?;
         assert_eq!(journals.len(), 1);
         let journal = journals[0].path();

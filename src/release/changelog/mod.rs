@@ -487,7 +487,7 @@ mod tests {
     }
 
     #[test]
-    fn default_render_matches_legacy_shape() {
+    fn default_render_groups_breaking_features_fixes_and_other_changes() {
         let spec = default_spec();
         let links = LinkTemplates::for_github("org", "repo");
         let commits = [

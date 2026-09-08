@@ -751,15 +751,6 @@ pub enum CacheCommand {
         #[arg(long, short = 'f', default_value_t, value_enum)]
         format: TextJsonOutputFormat,
     },
-    /// Permanently remove quarantined pre-profile CAS and migration state.
-    DropUnbound {
-        /// Preview the exact cleanup without modifying cache state.
-        #[arg(long, short = 'c')]
-        check: bool,
-        /// Report format.
-        #[arg(long, short = 'f', default_value_t, value_enum)]
-        format: TextJsonOutputFormat,
-    },
     /// Quarantine a selected markerless CAS and create a fresh owned authority.
     Recover {
         /// Preview the exact quarantine move without modifying cache state.
@@ -1163,7 +1154,6 @@ impl Commands {
                 | CacheCommand::Profiles { format }
                 | CacheCommand::Detach { format, .. }
                 | CacheCommand::DropProfile { format, .. }
-                | CacheCommand::DropUnbound { format, .. }
                 | CacheCommand::Uninstall { format, .. } => text_json_protocol(format.is_json()),
             },
             Commands::Sync { format, .. } | Commands::Clean { format, .. } => text_json_protocol(format.is_json()),
@@ -1301,7 +1291,6 @@ impl Commands {
                 | CacheCommand::Profiles { format }
                 | CacheCommand::Detach { format, .. }
                 | CacheCommand::DropProfile { format, .. }
-                | CacheCommand::DropUnbound { format, .. }
                 | CacheCommand::Uninstall { format, .. } => {
                     *format = TextJsonOutputFormat::Json;
                 }

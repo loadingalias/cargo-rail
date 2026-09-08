@@ -13,14 +13,9 @@ use std::path::{Path, PathBuf};
 
 const STATUS_SCAN_MAX_ENTRIES: usize = 1_000_000;
 const WORKSPACE_LOCK_BYTES: u64 = 0;
-const V025_COMPILER_DIAGNOSTICS_MAX_BYTES: u64 = 256 * 1024 * 1024;
-const V025_COMPILER_DIAGNOSTICS_DIRECTORY: &str = "cache";
-const V025_COMPILER_DIAGNOSTICS_FILE: &str = "compiler-diags-v1.json";
 
 struct WorkspaceCachePaths {
     state_root: PathBuf,
-    predecessor_cache: PathBuf,
-    predecessor_compiler_diagnostics: PathBuf,
     compiler_artifacts: PathBuf,
     lock: PathBuf,
 }
@@ -150,7 +145,7 @@ pub(crate) fn status(workspace_root: &Path, workspace: bool, local: bool) -> Rai
         None
     };
     Ok(CacheStatus {
-        schema_version: 15,
+        schema_version: 16,
         installation,
         workspace: workspace.then(|| workspace_status(workspace_root)).transpose()?,
         local: local
@@ -193,28 +188,7 @@ pub(crate) fn remove_workspace(workspace_root: &Path) -> RailResult<CacheRemoval
                 .checked_add(artifact.bytes)
                 .ok_or_else(|| RailError::message("workspace cache cleanup byte count overflow"))
         })?;
-    let expected_predecessor_diagnostics = status
-        .artifacts
-        .iter()
-        .find(|artifact| artifact.kind == "predecessor_compiler_diagnostics")
-        .map(|artifact| artifact.bytes);
     let mut paths = Vec::new();
-
-    let revalidated = workspace_cache_paths(workspace_root)?;
-    if remove_owned_file(
-        &revalidated.predecessor_compiler_diagnostics,
-        "v0.25 compiler diagnostics file",
-        expected_predecessor_diagnostics,
-    )? {
-        paths.push(
-            revalidated
-                .predecessor_compiler_diagnostics
-                .to_string_lossy()
-                .into_owned(),
-        );
-        let revalidated = workspace_cache_paths(workspace_root)?;
-        remove_empty_owned_directory(&revalidated.predecessor_cache)?;
-    }
 
     let revalidated = workspace_cache_paths(workspace_root)?;
     if remove_owned_tree(&revalidated.compiler_artifacts)? {
@@ -267,11 +241,9 @@ fn workspace_cache_paths(workspace_root: &Path) -> RailResult<WorkspaceCachePath
 
     let target = workspace_root.join("target");
     let state_root = target.join("cargo-rail");
-    let predecessor_cache = state_root.join(V025_COMPILER_DIAGNOSTICS_DIRECTORY);
     for (path, description) in [
         (&target, "workspace target directory"),
         (&state_root, "workspace cache state directory"),
-        (&predecessor_cache, "v0.25 compiler diagnostics directory"),
     ] {
         let metadata = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
@@ -294,51 +266,14 @@ fn workspace_cache_paths(workspace_root: &Path) -> RailResult<WorkspaceCachePath
     }
 
     Ok(WorkspaceCachePaths {
-        predecessor_compiler_diagnostics: predecessor_cache.join(V025_COMPILER_DIAGNOSTICS_FILE),
         compiler_artifacts: state_root.join("compiler-artifacts-v1"),
         lock: state_root.join("cache.lock"),
         state_root,
-        predecessor_cache,
     })
-}
-
-fn private_file_status(path: &Path, description: &str) -> RailResult<Option<u64>> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    if !metadata.is_file() || crate::utils::is_symlink_or_reparse(&metadata) {
-        return Err(RailError::with_help(
-            format!("{description} '{}' is not a private regular file", path.display()),
-            "remove the hostile path manually; cargo-rail will not inspect or reclaim linked cache state",
-        ));
-    }
-    let opened = File::open(path)?;
-    if !crate::utils::private_file_matches_path(&opened, path, metadata.len())? {
-        return Err(RailError::with_help(
-            format!("{description} '{}' is not a private regular file", path.display()),
-            "remove the hostile path manually; cargo-rail will not inspect or reclaim linked cache state",
-        ));
-    }
-    Ok(Some(metadata.len()))
 }
 
 fn workspace_status_for_paths(paths: &WorkspaceCachePaths) -> RailResult<WorkspaceCacheStatus> {
     let mut artifacts = Vec::new();
-    if let Some(bytes) = private_file_status(
-        &paths.predecessor_compiler_diagnostics,
-        "v0.25 compiler diagnostics file",
-    )? {
-        artifacts.push(WorkspaceCacheArtifact {
-            kind: "predecessor_compiler_diagnostics",
-            path: paths.predecessor_compiler_diagnostics.to_string_lossy().into_owned(),
-            bytes,
-            files: 1,
-            directories: 0,
-            max_bytes: Some(V025_COMPILER_DIAGNOSTICS_MAX_BYTES),
-        });
-    }
     for (kind, path, max_bytes) in [
         ("compiler_artifacts", paths.compiler_artifacts.as_path(), None),
         ("workspace_cache_lock", paths.lock.as_path(), Some(WORKSPACE_LOCK_BYTES)),
@@ -429,47 +364,6 @@ pub(crate) fn path_status(root: &Path) -> RailResult<Option<(u64, u64, u64)>> {
         }
     }
     Ok(Some((bytes, files, directories)))
-}
-
-fn remove_owned_file(path: &Path, description: &str, expected_bytes: Option<u64>) -> RailResult<bool> {
-    let observed_bytes = private_file_status(path, description)?;
-    if observed_bytes != expected_bytes {
-        return Err(RailError::message(format!(
-            "{description} '{}' changed while workspace cache cleanup was planned",
-            path.display()
-        )));
-    }
-    if observed_bytes.is_none() {
-        return Ok(false);
-    }
-    fs::remove_file(path)?;
-    Ok(true)
-}
-
-fn remove_empty_owned_directory(path: &Path) -> RailResult<()> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    if !metadata.is_dir() || crate::utils::is_symlink_or_reparse(&metadata) {
-        return Err(RailError::with_help(
-            format!("workspace cache directory '{}' is not a real directory", path.display()),
-            "remove the hostile path manually; cargo-rail will not reclaim linked cache state",
-        ));
-    }
-    match fs::remove_dir(path) {
-        Ok(()) => Ok(()),
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
-            ) =>
-        {
-            Ok(())
-        }
-        Err(error) => Err(error.into()),
-    }
 }
 
 fn remove_owned_tree(root: &Path) -> RailResult<bool> {
@@ -568,17 +462,18 @@ mod tests {
     #[test]
     fn workspace_cleanup_waits_for_an_active_cache_owner() {
         let workspace = tempfile::tempdir().expect("workspace");
-        let diagnostics = workspace.path().join("target/cargo-rail/cache/compiler-diags-v1.json");
+        let diagnostics = workspace
+            .path()
+            .join("target/cargo-rail/compiler-artifacts-v1/observations.json");
         let expected_removed = crate::utils::canonicalize_existing(workspace.path())
             .expect("canonical workspace")
             .join("target")
             .join("cargo-rail")
-            .join("cache")
-            .join("compiler-diags-v1.json")
+            .join("compiler-artifacts-v1")
             .to_string_lossy()
             .into_owned();
         fs::create_dir_all(diagnostics.parent().expect("diagnostics parent")).expect("diagnostics parent");
-        fs::write(&diagnostics, b"{\"version\":10,\"entries\":{}}").expect("v0.25 compiler diagnostics");
+        fs::write(&diagnostics, b"{}").expect("compiler artifacts");
         let owner = lock_workspace(workspace.path()).expect("workspace cache owner");
         let workspace_root = workspace.path().to_path_buf();
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();

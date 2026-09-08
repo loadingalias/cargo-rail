@@ -147,9 +147,9 @@ pub enum ReleaseSource {
     /// Use reviewed change files. Commit messages are not release inputs.
     #[default]
     Changes,
-    /// Use conventional commits for compatibility with older repositories.
+    /// Derive release intent from conventional commits.
     Commits,
-    /// Combine reviewed change files and conventional commits for compatibility.
+    /// Combine reviewed change files and conventional commits.
     Both,
 }
 

@@ -1,7 +1,5 @@
 //! Durable, idempotent release execution state.
 
-mod v0_25;
-
 use crate::config::ReleaseConfig;
 use crate::error::{RailError, RailResult};
 use crate::git::SystemGit;
@@ -12,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-const RELEASE_STATE_SCHEMA_VERSION: u32 = 7;
+const RELEASE_STATE_SCHEMA_VERSION: u32 = 8;
 
 #[derive(Deserialize)]
 struct ReleaseStateSchema {
@@ -49,8 +47,6 @@ pub(crate) struct ReleaseState {
     pub readiness: Step,
     pub tag_push: Step,
     pub abort: Step,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub predecessor_execution: Option<V0_25ExecutionInputs>,
 }
 
 pub(crate) struct ReleaseStateCreate<'a> {
@@ -90,21 +86,6 @@ pub(crate) struct ReconstructedRelease {
     pub release_commit: String,
     pub commit_targets: BTreeMap<String, String>,
     pub remote_repository: Option<RemoteRepository>,
-}
-
-/// Execution inputs removed after v0.25.0 but still required to finish one
-/// already-authorized predecessor transaction without changing its effects.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct V0_25ExecutionInputs {
-    pub(crate) require_changelog_entries: bool,
-    pub(crate) release_note_bodies: BTreeMap<String, String>,
-}
-
-impl V0_25ExecutionInputs {
-    pub(crate) fn release_note_body(&self, crate_name: &str) -> Option<&str> {
-        self.release_note_bodies.get(crate_name).map(String::as_str)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,7 +268,6 @@ impl ReleaseState {
             readiness: Step::default(),
             tag_push: Step::default(),
             abort: Step::default(),
-            predecessor_execution: None,
         };
         state.validate_contract()?;
         state.validate_recovery_paths(&git.worktree_root)?;
@@ -332,87 +312,37 @@ impl ReleaseState {
 
     pub fn load(path: &Path) -> RailResult<Self> {
         let bytes = std::fs::read(path)?;
-        let (state, _) = Self::decode(&bytes, path, release_root(path), false)?;
+        let state = Self::decode(&bytes, path)?;
         state.validate_journal_path(path)?;
         Ok(state)
     }
 
-    /// Load one journal for a command that may mutate recovery state. A valid
-    /// v0.25 journal is atomically upgraded before any recovery mutation or
-    /// external reconciliation can occur.
+    /// Validate current recovery authority without rewriting the journal.
     pub(crate) fn load_for_recovery(path: &Path) -> RailResult<Self> {
-        let bytes = std::fs::read(path)?;
-        let root = release_root(path);
-        let (mut state, predecessor) = Self::decode(&bytes, path, root, true)?;
-        state.validate_journal_path(path)?;
+        let state = Self::load(path)?;
         if state.status == ReleaseStatus::Active {
-            state.validate_recovery_paths(root)?;
-            if predecessor {
-                let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-                let github = crate::release::changelog::detect_github_repo(root);
-                for plan in &mut state.plan.crates {
-                    if plan.presentation.is_some() {
-                        continue;
-                    }
-                    let mut input = plan.clone();
-                    let existing = crate::release::presentation::read_optional(root, &plan.changelog_path)?;
-                    if existing.as_deref().is_some_and(|text| {
-                        crate::release::presentation::extract_section(text, &plan.new_version.to_string()).is_some()
-                    }) {
-                        input.changelog_body.clear();
-                        input.current_version = input.new_version.clone();
-                    }
-                    plan.presentation = Some(crate::release::presentation::capture(
-                        root,
-                        &state.release_config,
-                        &input,
-                        &date,
-                        github.as_ref(),
-                    )?);
-                }
-                state.save(path, "migrated_v0_25")?;
-            }
+            state.validate_recovery_paths(release_root(path))?;
         }
         Ok(state)
     }
 
-    fn decode(bytes: &[u8], path: &Path, root: &Path, capture_predecessor_inputs: bool) -> RailResult<(Self, bool)> {
+    fn decode(bytes: &[u8], path: &Path) -> RailResult<Self> {
         let schema: ReleaseStateSchema = serde_json::from_slice(bytes)
             .map_err(|error| RailError::message(format!("invalid release state '{}': {error}", path.display())))?;
         validate_transaction_id(&schema.transaction_id)?;
         validate_journal_path(&schema.transaction_id, path)?;
-        if schema.schema_version == 5 {
-            return v0_25::ReleaseStateV5::decode(bytes, path, root, capture_predecessor_inputs)
-                .map(|state| (state, true));
-        }
-        if schema.schema_version == 6 {
-            let mut state: Self = serde_json::from_slice(bytes)
-                .map_err(|error| RailError::message(format!("invalid release state '{}': {error}", path.display())))?;
-            if state.plan.plan_contract_version != 6 || state.plan.crates.iter().any(|plan| plan.presentation.is_some())
-            {
-                return Err(RailError::message(
-                    "release state version 6 requires an unchanged version 6 plan",
-                ));
-            }
-            state.schema_version = RELEASE_STATE_SCHEMA_VERSION;
-            state.plan.plan_contract_version = RELEASE_PLAN_CONTRACT_VERSION;
-            state.validate_contract()?;
-            return Ok((state, true));
-        }
         if schema.schema_version != RELEASE_STATE_SCHEMA_VERSION {
-            return Err(RailError::message(format!(
-                "unsupported release state version {}",
-                schema.schema_version
-            )));
+            return Err(RailError::with_help(
+                format!(
+                    "unsupported release state version {} in '{}'",
+                    schema.schema_version,
+                    path.display()
+                ),
+                "preserve this journal and use the executable that created it to finish or safely abort/reconcile the transaction; its release version is unknown and publication may already have happened",
+            ));
         }
         let state: Self = serde_json::from_slice(bytes)
             .map_err(|error| RailError::message(format!("invalid release state '{}': {error}", path.display())))?;
-        if state.schema_version != RELEASE_STATE_SCHEMA_VERSION {
-            return Err(RailError::message(format!(
-                "unsupported release state version {}",
-                state.schema_version
-            )));
-        }
         state.validate_contract()?;
         if state.skip_publish != state.publish_registry.is_none()
             || state
@@ -424,7 +354,7 @@ impl ReleaseState {
                 "release state contains inconsistent or unsupported registry publication authority",
             ));
         }
-        Ok((state, false))
+        Ok(state)
     }
 
     pub fn save(&self, path: &Path, checkpoint: &str) -> RailResult<()> {
@@ -739,7 +669,6 @@ mod tests {
             readiness: Step::default(),
             tag_push: Step::default(),
             abort: Step::default(),
-            predecessor_execution: None,
         }
     }
 
@@ -855,108 +784,6 @@ mod tests {
     }
 
     #[test]
-    fn v0_25_state_preserves_execution_authority_and_ambiguous_steps() {
-        let root = tempfile::tempdir().unwrap();
-        let directory = state_dir(root.path());
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("release-v025-fixture.json");
-        std::fs::write(
-            &path,
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/release/v0.25.0/state-v5.json"
-            )),
-        )
-        .unwrap();
-
-        let state = ReleaseState::load(&path).unwrap();
-        assert_eq!(state.schema_version, RELEASE_STATE_SCHEMA_VERSION);
-        assert_eq!(state.plan.plan_contract_version, RELEASE_PLAN_CONTRACT_VERSION);
-        assert_eq!(state.transaction_id, "release-v025-fixture");
-        assert_eq!(state.crates[0].commit.status, StepStatus::Complete);
-        assert_eq!(state.crates[0].tag.status, StepStatus::InProgress);
-        assert_eq!(state.crates[0].publication.status, StepStatus::InProgress);
-        assert_eq!(
-            state.commit_push.object.as_deref(),
-            Some("2222222222222222222222222222222222222222")
-        );
-        let predecessor = state.predecessor_execution.as_ref().unwrap();
-        assert!(predecessor.require_changelog_entries);
-        assert_eq!(predecessor.release_note_body("fixture-crate"), None);
-        let document: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(document["schema_version"], 5, "inspection must not rewrite a journal");
-    }
-
-    #[test]
-    fn v0_25_recovery_is_atomically_rewritten_as_current_state() {
-        let root = tempfile::tempdir().unwrap();
-        let directory = state_dir(root.path());
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("release-v025-fixture.json");
-        std::fs::write(
-            &path,
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/release/v0.25.0/state-v5.json"
-            )),
-        )
-        .unwrap();
-        let release_notes = root.path().join("release-notes");
-        std::fs::create_dir_all(&release_notes).unwrap();
-        std::fs::write(
-            release_notes.join("fixture-v0.1.1.md"),
-            "Tag fallback must not replace the version override.\n",
-        )
-        .unwrap();
-        std::fs::write(
-            release_notes.join("v0.1.1.md"),
-            "Exact live predecessor release body.\n",
-        )
-        .unwrap();
-
-        ReleaseState::load_for_recovery(&path).unwrap();
-        let document: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(document["schema_version"], RELEASE_STATE_SCHEMA_VERSION);
-        assert_eq!(document["plan"]["plan_contract_version"], RELEASE_PLAN_CONTRACT_VERSION);
-        assert_eq!(document["plan"]["source"], "changes");
-        assert_eq!(
-            document["predecessor_execution"]["release_note_bodies"]["fixture-crate"],
-            "Exact live predecessor release body.\n"
-        );
-        assert_eq!(
-            document["control_paths"],
-            serde_json::json!(["release-notes/fixture-v0.1.1.md", "release-notes/v0.1.1.md"])
-        );
-    }
-
-    #[test]
-    fn v0_25_state_binds_transaction_identity_before_recovery_rewrite() {
-        let root = tempfile::tempdir().unwrap();
-        let directory = state_dir(root.path());
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("release-v025-renamed.json");
-        std::fs::write(
-            &path,
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/release/v0.25.0/state-v5.json"
-            )),
-        )
-        .unwrap();
-        // A renamed journal must fail identity binding before predecessor
-        // recovery inspects any live release-note input.
-        std::fs::create_dir_all(root.path().join("release-notes/v0.1.1.md")).unwrap();
-
-        let error = ReleaseState::load_for_recovery(&path).unwrap_err();
-        assert!(
-            error.to_string().contains("does not match transaction identity"),
-            "{error}"
-        );
-        let document: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(document["schema_version"], 5, "identity failure must precede migration");
-    }
-
-    #[test]
     fn current_recovery_rejects_an_escaping_control_path() {
         let root = tempfile::tempdir().unwrap();
         let directory = state_dir(root.path());
@@ -969,27 +796,6 @@ mod tests {
         let error = ReleaseState::load_for_recovery(&path).unwrap_err();
         assert!(error.to_string().contains("control path"), "{error}");
         assert!(error.to_string().contains("escapes Git worktree"), "{error}");
-    }
-
-    #[test]
-    fn v0_25_recovery_rejects_an_escaping_control_path_before_rewrite() {
-        let root = tempfile::tempdir().unwrap();
-        let directory = state_dir(root.path());
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("release-v025-fixture.json");
-        let mut document: serde_json::Value = serde_json::from_slice(include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/release/v0.25.0/state-v5.json"
-        )))
-        .unwrap();
-        document["control_paths"] = serde_json::json!(["../outside-plan.json"]);
-        std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
-
-        let error = ReleaseState::load_for_recovery(&path).unwrap_err();
-        assert!(error.to_string().contains("control path"), "{error}");
-        assert!(error.to_string().contains("escapes Git worktree"), "{error}");
-        let unchanged: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(unchanged["schema_version"], 5);
     }
 
     #[test]
@@ -1009,132 +815,5 @@ mod tests {
             normalize_release_paths(root.path(), &loaded.control_paths, "control").unwrap(),
             BTreeSet::from([PathBuf::from("release-plan.json")])
         );
-    }
-
-    #[test]
-    fn v0_25_recovery_persists_a_missing_live_override_as_absent() {
-        let root = tempfile::tempdir().unwrap();
-        let directory = state_dir(root.path());
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("release-v025-fixture.json");
-        std::fs::write(
-            &path,
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/release/v0.25.0/state-v5.json"
-            )),
-        )
-        .unwrap();
-
-        ReleaseState::load_for_recovery(&path).unwrap();
-        let document: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(document["schema_version"], RELEASE_STATE_SCHEMA_VERSION);
-        assert_eq!(
-            document["predecessor_execution"]["release_note_bodies"],
-            serde_json::json!({})
-        );
-    }
-
-    #[test]
-    fn v0_25_recovery_uses_the_tag_fallback_when_the_version_override_is_missing() {
-        let root = tempfile::tempdir().unwrap();
-        let directory = state_dir(root.path());
-        let release_notes = root.path().join("release-notes");
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::create_dir_all(&release_notes).unwrap();
-        let path = directory.join("release-v025-fixture.json");
-        std::fs::write(
-            &path,
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/release/v0.25.0/state-v5.json"
-            )),
-        )
-        .unwrap();
-        std::fs::write(release_notes.join("fixture-v0.1.1.md"), "Exact tag fallback body.\n").unwrap();
-
-        ReleaseState::load_for_recovery(&path).unwrap();
-        let document: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(
-            document["predecessor_execution"]["release_note_bodies"]["fixture-crate"],
-            "Exact tag fallback body.\n"
-        );
-        assert_eq!(
-            document["control_paths"],
-            serde_json::json!(["release-notes/fixture-v0.1.1.md"])
-        );
-    }
-
-    #[test]
-    fn v0_25_recovery_rejects_a_non_utf8_live_override_before_rewrite() {
-        let root = tempfile::tempdir().unwrap();
-        let directory = state_dir(root.path());
-        let release_notes = root.path().join("release-notes");
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::create_dir_all(&release_notes).unwrap();
-        let path = directory.join("release-v025-fixture.json");
-        std::fs::write(
-            &path,
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/release/v0.25.0/state-v5.json"
-            )),
-        )
-        .unwrap();
-        std::fs::write(release_notes.join("v0.1.1.md"), [0xff_u8, 0xfe]).unwrap();
-
-        let error = ReleaseState::load_for_recovery(&path).unwrap_err();
-        assert!(error.to_string().contains("is not UTF-8"), "{error}");
-        let unchanged: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(unchanged["schema_version"], 5);
-    }
-
-    #[test]
-    fn v0_25_recovery_rejects_an_escaping_release_note_directory_before_rewrite() {
-        let root = tempfile::tempdir().unwrap();
-        let directory = state_dir(root.path());
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("release-v025-fixture.json");
-        let mut document: serde_json::Value = serde_json::from_slice(include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/release/v0.25.0/state-v5.json"
-        )))
-        .unwrap();
-        document["release_config"]["release_notes_dir"] = serde_json::json!("../outside");
-        std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
-
-        let error = ReleaseState::load_for_recovery(&path).unwrap_err();
-        assert!(error.to_string().contains("escapes workspace"), "{error}");
-        let unchanged: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(unchanged["schema_version"], 5);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn v0_25_recovery_rejects_a_symlinked_release_note_before_rewrite() {
-        use std::os::unix::fs::symlink;
-
-        let root = tempfile::tempdir().unwrap();
-        let directory = state_dir(root.path());
-        let release_notes = root.path().join("release-notes");
-        std::fs::create_dir_all(&directory).unwrap();
-        std::fs::create_dir_all(&release_notes).unwrap();
-        let path = directory.join("release-v025-fixture.json");
-        std::fs::write(
-            &path,
-            include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/release/v0.25.0/state-v5.json"
-            )),
-        )
-        .unwrap();
-        let target = root.path().join("real-note.md");
-        std::fs::write(&target, "live body\n").unwrap();
-        symlink(&target, release_notes.join("v0.1.1.md")).unwrap();
-
-        let error = ReleaseState::load_for_recovery(&path).unwrap_err();
-        assert!(error.to_string().contains("not a regular file"), "{error}");
-        let unchanged: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(unchanged["schema_version"], 5);
     }
 }

@@ -1,0 +1,11 @@
+version = 4
+
+[[package]]
+name = "fixture-git-prefetch"
+version = "0.0.0"
+dependencies = ["fixture-git"]
+
+[[package]]
+name = "fixture-git"
+version = "0.1.0"
+source = "git+__FIXTURE_GIT_URL__?rev=afc03c18f3fe1b2dc8fa9032512d1dafa2cff28c#afc03c18f3fe1b2dc8fa9032512d1dafa2cff28c"

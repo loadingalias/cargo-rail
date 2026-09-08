@@ -187,7 +187,7 @@ impl<'a> SplitEngine<'a> {
         }
         let target_identity = repository_identity(&config.target_repo_path)?;
         let origin = OriginContext::discover(ctx.workspace_root(), &config.crate_name, &config.ownership.snapshot_id)?;
-        let mappings = MappingStore::capture_v025_evidence(
+        let mappings = MappingStore::capture_evidence(
             ctx.workspace_root(),
             &config.target_repo_path,
             &origin,
@@ -499,7 +499,7 @@ impl<'a> SplitEngine<'a> {
                 if is_ancestor(self.ctx.workspace_root(), &ancestor.sha, &source)? {
                     return Err(RailError::with_help(
                         format!(
-                            "exact predecessor mapping endpoint '{}' has unmatched source ancestor '{}' without directional frontier proof",
+                            "exact mapping endpoint '{}' has unmatched source ancestor '{}' without directional frontier proof",
                             source, ancestor.sha
                         ),
                         "restore authoritative directional origin history or resolve the mapping topology manually; cargo-rail will not guess ancestry or replay an ancestor after its mapped descendant",
@@ -528,7 +528,7 @@ impl<'a> SplitEngine<'a> {
         let selected_head = target_git.head_commit()?;
         let selected_source_head = self.ctx.git()?.git().head_commit()?;
         let selected_source_heads = vec![selected_source_head];
-        let mappings = MappingStore::capture_v025_evidence_at(
+        let mappings = MappingStore::capture_evidence_at(
             self.ctx.workspace_root(),
             &config.target_repo_path,
             origin,
@@ -644,7 +644,7 @@ impl<'a> SplitEngine<'a> {
         }
         let target_identity = repository_identity(&config.target_repo_path)?;
         let source_head = self.ctx.git()?.git().head_commit()?;
-        let mappings = MappingStore::capture_v025_evidence_at(
+        let mappings = MappingStore::capture_evidence_at(
             self.ctx.workspace_root(),
             &config.target_repo_path,
             origin,
@@ -707,7 +707,7 @@ impl<'a> SplitEngine<'a> {
     pub(crate) fn split_with_pending_count(
         &self,
         config: &SplitParams,
-        expected_origin_migration: Option<&MappingAuthoritySnapshot>,
+        expected_origin_authority: Option<&MappingAuthoritySnapshot>,
         expected_publication: Option<&TargetPublicationSnapshot>,
     ) -> RailResult<usize> {
         let target = config.path_capabilities.authorize_target(&config.target_repo_path)?;
@@ -740,7 +740,7 @@ impl<'a> SplitEngine<'a> {
             progress!("   Explicit non-Cargo assets: {}", config.asset_paths.len());
         }
 
-        let origin = if let Some(expected) = expected_origin_migration {
+        let origin = if let Some(expected) = expected_origin_authority {
             OriginContext::new(
                 expected.source_repository().to_string(),
                 &config.crate_name,
@@ -754,7 +754,7 @@ impl<'a> SplitEngine<'a> {
             )?
         };
         let recovered_pre_authority = self
-            .resume_active_split_effect(config, &origin, expected_origin_migration)
+            .resume_active_split_effect(config, &origin, expected_origin_authority)
             .map_err(|error| {
                 if !config.target_repo_path.join(".git").exists() {
                     split_mapping_authority_changed_error("target repository disappearance")
@@ -764,12 +764,11 @@ impl<'a> SplitEngine<'a> {
             })?;
         let target_ref = format!("refs/heads/{}", config.branch);
 
-        // Reuse an exact zero-migration authority captured by the command.
+        // Reuse exact mapping authority captured by the command.
         // The source and target scalar refs are checked again immediately
         // before the prepared effect is journaled; recapturing them here would
         // only repeat the same probes before any mutation is possible.
-        let (captured_store, captured_origin) = if let Some(expected) = expected_origin_migration
-            && expected.count() == 0
+        let (captured_store, captured_origin) = if let Some(expected) = expected_origin_authority
             && recovered_pre_authority.is_none()
         {
             (MappingStore::from_current_snapshot(expected)?, expected.clone())
@@ -796,16 +795,16 @@ impl<'a> SplitEngine<'a> {
                 let target_identity =
                     crate::git::mappings::repository_identity_from_git(&target_git, selected_target_head.as_deref())
                         .map_err(|error| {
-                            if expected_origin_migration.is_some() && !config.target_repo_path.join(".git").exists() {
+                            if expected_origin_authority.is_some() && !config.target_repo_path.join(".git").exists() {
                                 split_mapping_authority_changed_error("target initialization")
                             } else {
                                 error
                             }
                         })?;
                 if let Some(selected_target_head) =
-                    expected_origin_migration.and_then(MappingAuthoritySnapshot::target_selected_head)
+                    expected_origin_authority.and_then(MappingAuthoritySnapshot::target_selected_head)
                 {
-                    MappingStore::capture_v025_authority_at(
+                    MappingStore::capture_authority_at(
                         self.ctx.workspace_root(),
                         &config.target_repo_path,
                         &origin,
@@ -816,7 +815,7 @@ impl<'a> SplitEngine<'a> {
                         selected_target_head,
                     )?
                 } else {
-                    MappingStore::capture_v025_authority(
+                    MappingStore::capture_authority(
                         self.ctx.workspace_root(),
                         &config.target_repo_path,
                         &origin,
@@ -828,21 +827,11 @@ impl<'a> SplitEngine<'a> {
                 }
             }
         };
-        if expected_origin_migration.is_some_and(|expected| {
+        if expected_origin_authority.is_some_and(|expected| {
             expected != &captured_origin && recovered_pre_authority.as_deref() != Some(expected.digest().as_str())
         }) {
-            return Err(split_mapping_authority_changed_error("checked predecessor capture"));
+            return Err(split_mapping_authority_changed_error("checked mapping capture"));
         }
-        validate_predecessor_mapping_projections(
-            self.ctx,
-            &self.transform,
-            &config.crate_paths,
-            &config.path_capabilities,
-            &config.target_repo_path,
-            &config.mode,
-            &config.workspace_mode,
-            &captured_origin,
-        )?;
         self.validate_unproven_source_ancestry(config, &captured_store, captured_origin.source_head())?;
         let bound_publication =
             self.revalidate_publication_before_target_effect(config, expected_publication, Some(&captured_store))?;
@@ -871,38 +860,7 @@ impl<'a> SplitEngine<'a> {
             ));
         }
 
-        // Migrate only the exact checked predecessor set before importing
-        // objects or changing any reconstructed target history.
-        let migration_required =
-            captured_origin.count() > 0 || expected_origin_migration.is_some_and(|expected| expected.count() > 0);
-        let mut mapping_store = if captured_origin.target_head().is_some() && migration_required {
-            let target_identity = repository_identity(&config.target_repo_path)?;
-            let mut store = captured_store;
-            let migrated = store
-                .migrate_v025_evidence_bound(
-                    self.ctx.workspace_root(),
-                    &config.target_repo_path,
-                    &origin,
-                    &target_identity,
-                    config.path_capabilities.target_root(),
-                    &config.branch,
-                    "mono_to_remote",
-                    expected_origin_migration,
-                )
-                .map_err(|error| {
-                    if expected_origin_migration.is_some() && !config.target_repo_path.join(".git").exists() {
-                        split_mapping_authority_changed_error("predecessor migration")
-                    } else {
-                        error
-                    }
-                })?;
-            if migrated.is_some() {
-                progress!("   Migrated predecessor mappings into ordinary Git history");
-            }
-            store
-        } else {
-            captured_store
-        };
+        let mut mapping_store = captured_store;
 
         // Walk filtered history to find commits touching the crate
         let filtered_commits = self.walk_filtered_history(&config.path_capabilities, captured_origin.source_head())?;
@@ -1222,21 +1180,7 @@ impl<'a> SplitEngine<'a> {
             .mapping()
             .ok_or_else(|| RailError::message("active split target effect has no mapping authority"))?;
         let pre_digest = mapping.pre_authority().to_string();
-        if mapping.migration_count() > 0 {
-            let target_identity = repository_identity(&config.target_repo_path)?;
-            let mut mappings = MappingStore::new(config.crate_name.clone());
-            mappings.migrate_v025_evidence_bound(
-                self.ctx.workspace_root(),
-                &config.target_repo_path,
-                origin,
-                &target_identity,
-                config.path_capabilities.target_root(),
-                &config.branch,
-                "mono_to_remote",
-                expected_plan,
-            )?;
-            return Ok(Some(pre_digest));
-        }
+
         if !journal.operation_id().starts_with("split-chain-sha256-") {
             return Err(RailError::with_help(
                 format!(
@@ -1311,9 +1255,6 @@ impl<'a> SplitEngine<'a> {
         }
         if mapping.ownership_snapshot() != config.ownership.snapshot_id {
             mismatches.push("ownership");
-        }
-        if mapping.migration_count() != 0 || mapping.migration_digest().is_some() {
-            mismatches.push("migration");
         }
         if repository.ref_name != expected_ref {
             mismatches.push("branch");
@@ -1505,8 +1446,6 @@ impl<'a> SplitEngine<'a> {
             pre_authority.ownership_snapshot().to_string(),
             pre_authority.digest(),
             post_authority.digest(),
-            None,
-            0,
         );
         let commit = GitCommitEffect::new(
             prepared.oid.clone(),
@@ -1587,7 +1526,7 @@ impl<'a> SplitEngine<'a> {
             ));
         }
         let target_identity = repository_identity(&config.target_repo_path)?;
-        MappingStore::capture_v025_authority(
+        MappingStore::capture_authority(
             self.ctx.workspace_root(),
             &config.target_repo_path,
             origin,
@@ -1680,8 +1619,6 @@ impl<'a> SplitEngine<'a> {
             mapping.ownership_snapshot() != pre_authority.ownership_snapshot(),
             mapping.pre_authority() != pre_authority.digest(),
             mapping.post_authority() != post_authority.digest(),
-            mapping.migration_count() != 0,
-            mapping.migration_digest().is_some(),
             repository.ref_name != format!("refs/heads/{}", config.branch),
             repository.logical_repository != pre_authority.target_repository().unwrap_or_default(),
             repository.expected_oid.as_deref() != pre_authority.target_head(),
@@ -2047,103 +1984,6 @@ fn collect_owned_source_entries(
     }
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(entries)
-}
-
-/// Prove that every ownership-less/predecessor exact mapping still represents
-/// the current split projection before it can be stamped with current v2
-/// ownership authority. This is read-only and covers notes, weak trailers, and
-/// exact v1 pairs alike.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "projection validation binds each captured transform and path authority explicitly"
-)]
-pub(crate) fn validate_predecessor_mapping_projections(
-    ctx: &WorkspaceContext,
-    transform: &ManifestTransformPolicy,
-    crate_paths: &[PathBuf],
-    path_capabilities: &SplitPathCapabilities,
-    target_repo_path: &Path,
-    mode: &SplitMode,
-    workspace_mode: &WorkspaceMode,
-    authority: &MappingAuthoritySnapshot,
-) -> RailResult<()> {
-    use std::collections::BTreeMap;
-
-    if authority.count() == 0 {
-        return Ok(());
-    }
-    let source_git = ctx.git()?.git();
-    let target_git = SystemGit::open(target_repo_path)?;
-    for (source, target) in authority.migration_candidate_pairs() {
-        let mut expected = BTreeMap::new();
-        for entry in collect_owned_source_entries(source_git, &source, path_capabilities)? {
-            let target_path = match mode {
-                SplitMode::Single => crate_paths
-                    .iter()
-                    .find_map(|crate_path| entry.path.strip_prefix(crate_path).ok().map(Path::to_path_buf))
-                    .unwrap_or_else(|| entry.path.clone()),
-                SplitMode::Combined => entry.path.clone(),
-            };
-            let expected_content = if entry.path.file_name() == Some(std::ffi::OsStr::new("Cargo.toml")) {
-                let content = source_git
-                    .read_blobs_bulk(&[entry.object_id.as_str()])?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| RailError::message("predecessor source manifest has no blob"))?;
-                let content = std::str::from_utf8(&content)
-                    .map_err(|_| RailError::message("predecessor source manifest is not valid UTF-8"))?;
-                let target_has_workspace = *mode == SplitMode::Combined && *workspace_mode == WorkspaceMode::Workspace;
-                Some(
-                    transform
-                        .transform_to_split(content, target_has_workspace)?
-                        .into_bytes(),
-                )
-            } else {
-                None
-            };
-            if expected
-                .insert(target_path, (entry.mode, entry.object_id, expected_content))
-                .is_some()
-            {
-                return Err(RailError::message(
-                    "current split ownership maps multiple source paths to one predecessor target path",
-                ));
-            }
-        }
-
-        let actual_entries = target_git.collect_tree_entries(&target, Path::new("."))?;
-        let actual = actual_entries
-            .iter()
-            .map(|entry| (entry.path.clone(), entry))
-            .collect::<BTreeMap<_, _>>();
-        if actual.len() != expected.len() || actual.keys().ne(expected.keys()) {
-            return Err(RailError::with_help(
-                "predecessor mapping does not match the current owned split projection",
-                "restore the ownership policy used by the predecessor mapping or rebuild the split history explicitly; cargo-rail will not stamp guessed v2 authority",
-            ));
-        }
-        for (path, (expected_mode, expected_object, expected_content)) in expected {
-            let entry = actual[&path];
-            let content_matches = if let Some(expected_content) = expected_content {
-                target_git
-                    .read_blobs_bulk(&[entry.object_id.as_str()])?
-                    .first()
-                    .is_some_and(|actual_content| actual_content == &expected_content)
-            } else {
-                entry.object_id == expected_object
-            };
-            if entry.mode != expected_mode || !content_matches {
-                return Err(RailError::with_help(
-                    format!(
-                        "predecessor mapping has a different current-owned projection at '{}'",
-                        path.display()
-                    ),
-                    "restore the ownership and transform policy used by the predecessor mapping or rebuild the split history explicitly",
-                ));
-            }
-        }
-    }
-    Ok(())
 }
 
 fn split_mapping_authority_changed_error(boundary: &str) -> RailError {

@@ -8,33 +8,11 @@ use std::process::{Command, Output};
 use anyhow::{Context as _, Result, ensure};
 use rscrypto::Sha256;
 
-#[cfg(windows)]
-fn git_bash() -> Result<PathBuf> {
-    let output = Command::new("git")
-        .arg("--exec-path")
-        .output()
-        .context("resolve Git installation for native-cache fixture")?;
-    ensure!(output.status.success(), "git --exec-path failed");
-    let exec_path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-    exec_path
-        .ancestors()
-        .map(|ancestor| ancestor.join("bin/bash.exe"))
-        .find(|candidate| candidate.is_file())
-        .with_context(|| format!("Git Bash was not found above {}", exec_path.display()))
-}
-
 fn materialize_fixture(destination: &Path, git_source: &Path) -> Result<()> {
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/materialize-native-cache.sh");
-    #[cfg(windows)]
-    let mut command = {
-        let mut command = Command::new(git_bash()?);
-        command.arg(script);
-        command
-    };
-    #[cfg(not(windows))]
-    let mut command = Command::new(script);
-    let output = command
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-rail-bench"))
+        .args(["prepare", "--offline", "--output"])
         .arg(destination)
+        .arg("--git-source")
         .arg(git_source)
         .output()
         .context("materialize native-cache fixture")?;
@@ -43,6 +21,110 @@ fn materialize_fixture(destination: &Path, git_source: &Path) -> Result<()> {
         "fixture materialization failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    Ok(())
+}
+
+#[test]
+fn benchmark_prepare_refuses_existing_output_without_creating_git_source() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let output = root.path().join("existing");
+    let source = root.path().join("git-source");
+    fs::create_dir(&output)?;
+    fs::write(output.join("user-data"), b"preserve these bytes")?;
+    let result = Command::new(env!("CARGO_BIN_EXE_cargo-rail-bench"))
+        .args(["prepare", "--output"])
+        .arg(&output)
+        .arg("--git-source")
+        .arg(&source)
+        .output()?;
+    ensure!(
+        result.status.code() == Some(2),
+        "existing output was accepted: {result:?}"
+    );
+    ensure!(String::from_utf8_lossy(&result.stderr).contains("workload output already exists"));
+    ensure!(fs::read(output.join("user-data"))? == b"preserve these bytes");
+    ensure!(fs::read_dir(&output)?.count() == 1);
+    ensure!(!source.exists(), "refusal created a Git source");
+    Ok(())
+}
+
+#[test]
+fn benchmark_prepare_uses_embedded_locked_inputs_outside_the_checkout() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let binary = executable(root.path().join("installed rail bench"));
+    fs::copy(env!("CARGO_BIN_EXE_cargo-rail-bench"), &binary)?;
+    let fixture = root.path().join("fixture with spaces ü # %");
+    let source = root.path().join("fixture with spaces ü # %.git-source");
+    let mut selected = fixture.as_os_str().to_os_string();
+    selected.push(std::path::MAIN_SEPARATOR_STR);
+    let output = Command::new(&binary)
+        .current_dir(root.path())
+        .args(["rail-bench", "prepare", "--offline", "--output"])
+        .arg(&selected)
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "installed materializer failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lock = fs::read(fixture.join("Cargo.lock"))?;
+    let metadata = cargo_metadata(&fixture, None)?;
+    let packages = metadata["packages"].as_array().context("resolved workload packages")?;
+    let git_package = packages
+        .iter()
+        .find(|package| package["name"] == "fixture-git")
+        .context("bundled Git dependency")?;
+    ensure!(
+        git_package["source"]
+            .as_str()
+            .context("Git identity")?
+            .ends_with("?rev=afc03c18f3fe1b2dc8fa9032512d1dafa2cff28c#afc03c18f3fe1b2dc8fa9032512d1dafa2cff28c"),
+        "resolved a different bundled Git revision"
+    );
+    ensure!(
+        fs::read(fixture.join("Cargo.lock"))? == lock,
+        "metadata changed the frozen lockfile"
+    );
+    ensure!(fixture.join("crates/fixture-cli/src/main.rs").is_file());
+    ensure!(fixture.join("crates/fixture-native-sys/native/value.c").is_file());
+    ensure!(!fixture.join("git-prefetch").exists());
+    let second = root.path().join("second");
+    materialize_fixture(&second, &source)?;
+    ensure!(
+        fs::read(second.join("Cargo.lock"))? == lock,
+        "shared-source materialization changed the graph"
+    );
+    let repository = crate::helpers::TestWorkspace::new()?;
+    let rejected = root.path().join("rejected");
+    let result = Command::new(&binary)
+        .args(["prepare", "--output"])
+        .arg(&rejected)
+        .arg("--git-source")
+        .arg(&repository.path)
+        .output()?;
+    ensure!(result.status.code() == Some(2), "foreign Git source was accepted");
+    ensure!(String::from_utf8_lossy(&result.stderr).contains("does not match the frozen revision"));
+    ensure!(!rejected.exists(), "foreign-source refusal created a workspace");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn benchmark_prepare_refuses_symlink_output_without_touching_its_target() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let outside = root.path().join("outside");
+    fs::create_dir(&outside)?;
+    fs::write(outside.join("keep"), b"untouched")?;
+    let output = root.path().join("output");
+    std::os::unix::fs::symlink(&outside, &output)?;
+    let result = Command::new(env!("CARGO_BIN_EXE_cargo-rail-bench"))
+        .args(["prepare", "--output"])
+        .arg(&output)
+        .output()?;
+    ensure!(result.status.code() == Some(2), "symlink output was accepted");
+    ensure!(String::from_utf8_lossy(&result.stderr).contains("workload path is a symlink"));
+    ensure!(fs::read(outside.join("keep"))? == b"untouched");
+    ensure!(fs::read_dir(&outside)?.count() == 1);
     Ok(())
 }
 
@@ -440,9 +522,30 @@ fn ensure_typed_benchmark_events(directory: &Path) -> Result<()> {
     ensure!(!events.is_empty(), "benchmark compiler operation inventory is empty");
     for event in events {
         ensure!(
-            event["schema_version"] == 9,
+            event["schema_version"] == 10,
             "benchmark compiler operation has an incompatible schema: {event}"
         );
+        if event["status"] == "hit" || (event["status"] == "miss" && event.get("result_key").is_some()) {
+            let outputs = event["outputs"].as_array().context("admitted output inventory")?;
+            ensure!(!outputs.is_empty(), "cache result omitted its output inventory");
+            let mut paths = BTreeSet::new();
+            for output in outputs {
+                ensure!(paths.insert(output["path"].as_str().context("output path")?));
+                ensure!(output["role"].as_str().is_some_and(|role| !role.is_empty()));
+                ensure!(
+                    output["sha256"]
+                        .as_str()
+                        .is_some_and(|digest| digest.starts_with("sha256:") && digest.len() == 71)
+                );
+                ensure!(
+                    output["stored_sha256"]
+                        .as_str()
+                        .is_some_and(|digest| digest.starts_with("sha256:") && digest.len() == 71)
+                );
+                ensure!(output["bytes"].as_u64().is_some() && output["mode"].as_u64().is_some());
+                ensure!(output.get("symlink_target") == Some(&serde_json::Value::Null));
+            }
+        }
         let action = event["action"].as_object().context("benchmark compiler operation")?;
         ensure!(
             action.get("schema_version") == Some(&serde_json::json!(3))
@@ -1535,5 +1638,38 @@ fn transitive_crate_replacement_cannot_restore_a_result_for_stale_direct_metadat
         cached.stdout == baseline.stdout && cached.stderr == baseline.stderr,
         "cached C changed the ordinary transitive compiler diagnostic: cached={cached:?}; baseline={baseline:?}"
     );
+    Ok(())
+}
+
+#[test]
+fn benchmark_local_refuses_inherited_configuration_and_retains_unrun_rows() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    fs::create_dir(root.path().join(".cargo"))?;
+    let configuration = b"[build]\nrustflags = ['--cfg=foreign']\n";
+    fs::write(root.path().join(".cargo/config.toml"), configuration)?;
+    let destination = root.path().join("comparison");
+    let result = Command::new(env!("CARGO_BIN_EXE_cargo-rail-bench"))
+        .args(["local", "--smoke", "--output"])
+        .arg(&destination)
+        .env("PATH", "")
+        .output()?;
+    ensure!(result.status.code() == Some(2));
+    ensure!(String::from_utf8_lossy(&result.stderr).contains("benchmark isolation would inherit"));
+    ensure!(fs::read(root.path().join(".cargo/config.toml"))? == configuration);
+    ensure!(!destination.join("native").exists());
+    let report: serde_json::Value = serde_json::from_slice(&fs::read(destination.join("summary.json"))?)?;
+    let schema: serde_json::Value = serde_json::from_str(include_str!("../../schemas/cache-benchmark-v1.schema.json"))?;
+    let validator = jsonschema::validator_for(&schema)?;
+    ensure!(validator.is_valid(&report), "benchmark summary violates its schema");
+    ensure!(report["status"] == "failed");
+    ensure!(report["purpose"] == "orchestration-smoke");
+    let samples = report["samples"].as_array().context("retained sample rows")?;
+    ensure!(samples.len() == 12);
+    ensure!(
+        samples
+            .iter()
+            .all(|sample| sample["status"] == "pending" && sample["seconds"].is_null())
+    );
+    ensure!(destination.join("failure.txt").is_file());
     Ok(())
 }

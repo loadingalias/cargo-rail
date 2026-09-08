@@ -3459,6 +3459,75 @@ log = { version = "0.4", optional = true }
 }
 
 #[test]
+fn test_unify_preserves_features_gated_by_captured_compiler_flags() {
+    let result: Result<()> = (|| {
+        let workspace = TestWorkspace::new_named("unify-captured-cfg")?;
+        workspace.add_crate("private-crate", "0.1.0", &[])?;
+        std::fs::write(
+            workspace.path.join(".config/rail.toml"),
+            "targets = [\"x86_64-unknown-linux-gnu\"]\n[unify]\nconsumer_scope = \"workspace\"\n",
+        )?;
+        std::fs::create_dir_all(workspace.path.join(".cargo"))?;
+        std::fs::write(
+            workspace.path.join(".cargo/config.toml"),
+            "[build]\nrustflags = [\"-Cpanic=abort\"]\n[target.x86_64-unknown-linux-gnu]\nrustflags = [\"-Ctarget-feature=+avx2\", \"-Cpanic=abort\"]\n",
+        )?;
+        std::fs::write(
+            workspace.path.join("crates/private-crate/Cargo.toml"),
+            r#"[package]
+name = "private-crate"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[features]
+abort-live = []
+avx2-live = []
+dead = []
+"#,
+        )?;
+        std::fs::write(
+            workspace.path.join("crates/private-crate/src/lib.rs"),
+            r#"#[cfg(all(panic = "abort", feature = "abort-live"))]
+pub fn abort_live() {}
+#[cfg(all(target_feature = "avx2", feature = "avx2-live"))]
+pub fn avx2_live() {}
+"#,
+        )?;
+        workspace.commit("Add compiler-flag-gated feature roots")?;
+
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "-f", "json"])?;
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let certificates = json["proof_certificates"].as_array().expect("removal certificates");
+        let removed: Vec<_> = certificates
+            .iter()
+            .filter(|certificate| {
+                certificate["member"] == "private-crate" && certificate["evidence_source"] == "feature_reachability"
+            })
+            .map(|certificate| certificate["subject"]["declaration"].as_str().expect("feature name"))
+            .collect();
+        assert_eq!(removed, ["dead"], "{json}");
+        let reachability = json["feature_reachability"].as_array().expect("feature reachability");
+        for name in ["abort-live", "avx2-live"] {
+            assert!(
+                reachability.iter().any(|feature| feature["member"] == "private-crate"
+                    && feature["feature"] == name
+                    && feature["root_kind"] == "source_cfg"),
+                "{json}"
+            );
+        }
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
 fn test_unify_feature_reachability_prunes_unrooted_cycles_and_forwarders() {
     let result: Result<()> = (|| {
         let workspace = TestWorkspace::new_named("unify-feature-reachability")?;

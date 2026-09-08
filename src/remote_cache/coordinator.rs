@@ -794,10 +794,8 @@ fn handle_publication(stream: &mut TcpStream, shared: &ServerShared) -> RemoteSt
     }
     pack.flush().map_err(io_unavailable)?;
     pack.rewind().map_err(io_unavailable)?;
-    let validation = pack.try_clone().map_err(io_unavailable)?;
-    let (_decoded, association) =
-        crate::compiler::native_cache::pack::decode_for_action(validation, &action_key, Some(bytes), None)
-            .map_err(|_| RemoteStoreError::integrity("remote publication pack is malformed"))?;
+    let association = crate::compiler::native_cache::pack::validate_for_action(&mut pack, &action_key, Some(bytes))
+        .map_err(|_| RemoteStoreError::integrity("remote publication pack is malformed"))?;
     if association.result_key() != result_key || association.pack_length() != bytes {
         return Err(RemoteStoreError::integrity(
             "remote publication pack does not match its requested identity",

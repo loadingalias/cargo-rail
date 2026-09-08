@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{BufRead as _, BufReader, Read as _};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -15,15 +15,12 @@ use crate::error::{RailError, RailResult};
 use crate::progress;
 use crate::source::ContentDigest;
 
-const ACQUISITION_CONTRACT_V1: u32 = 1;
-const ACQUISITION_CONTRACT_V2: u32 = 2;
-const ACQUISITION_IDENTITY_PREFIX: &str = "surface-acquisition-v2-sha256-";
+const ACQUISITION_CONTRACT_VERSION: u32 = 3;
+const ACQUISITION_IDENTITY_PREFIX: &str = "surface-acquisition-v3-sha256-";
 const EVIDENCE_IDENTITY_PREFIX: &str = "surface-acquisition-evidence-v1-sha256-";
-const V1_DIRECTORY: &str = "surface-acquisitions-v1";
-const V2_DIRECTORY: &str = "surface-acquisitions-v2";
+const JOURNAL_DIRECTORY: &str = "surface-acquisitions-v3";
 const MAX_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_JOURNAL_GROUPS: usize = 256;
-const MAX_V1_RECORDS_PER_VIEW: usize = 4;
 const COMPLETION_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 
 /// One Surface product whose policy depends on compiler acquisition.
@@ -91,11 +88,6 @@ enum DurableViewState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DurableViewRecord {
-    /// Read-only compatibility for v2 journals written while the canonical
-    /// array position was redundantly serialized. New journals omit it; view
-    /// identity and `view_index` are the only durable lookup authority.
-    #[serde(rename = "ordinal", default, skip_serializing_if = "Option::is_none")]
-    legacy_ordinal: Option<usize>,
     view_index: usize,
     view_identity: String,
     selected_products: Vec<CompilerAcquisitionProduct>,
@@ -127,7 +119,7 @@ struct JournalSchemas {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CompilerAcquisitionHeaderV2 {
+struct CompilerAcquisitionHeader {
     record: String,
     surface_acquisition_contract_version: u32,
     acquisition_identity: String,
@@ -162,42 +154,18 @@ struct DurableSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AcquisitionJournalV2 {
-    header: CompilerAcquisitionHeaderV2,
+struct AcquisitionJournal {
+    header: CompilerAcquisitionHeader,
     views: Vec<DurableViewRecord>,
     groups: Vec<DurableGroupState>,
     sequence: u64,
     summary: Option<DurableSummary>,
 }
 
-#[derive(Debug, Deserialize)]
-struct CompilerAcquisitionHeaderV1 {
-    record: String,
-    surface_acquisition_contract_version: u32,
-    acquisition_identity: String,
-    snapshot_identity: String,
-    configuration_fingerprint: String,
-    views: usize,
-}
-
-#[derive(Debug, Deserialize)]
-struct CompilerAcquisitionViewV1 {
-    record: String,
-    acquisition_identity: String,
-    ordinal: usize,
-    view_identity: String,
-    status: String,
-}
-
-enum ResumeJournal {
-    V1 { completed_prefix: usize },
-    V2(Box<AcquisitionJournalV2>),
-}
-
-/// The coordinator-owned v2 writer. Workers never receive a reference to it.
+/// The coordinator-owned writer. Workers never receive a reference to it.
 pub(crate) struct CompilerAcquisitionJournal {
     path: PathBuf,
-    document: AcquisitionJournalV2,
+    document: AcquisitionJournal,
     dirty_views: BTreeSet<usize>,
     pending_completions: usize,
     pending_since: Option<Instant>,
@@ -228,7 +196,7 @@ impl CompilerAcquisitionJournal {
         }
         let state_root = crate::workspace::cargo_rail_state_root(workspace_root);
         let canonical_state_root = crate::utils::canonicalize_existing(&state_root)?;
-        let directory = state_root.join(V2_DIRECTORY);
+        let directory = state_root.join(JOURNAL_DIRECTORY);
         match fs::symlink_metadata(&directory) {
             Ok(metadata) if metadata.is_dir() && !crate::utils::is_symlink_or_reparse(&metadata) => {}
             Ok(_) => {
@@ -260,7 +228,7 @@ impl CompilerAcquisitionJournal {
             collector: crate::compiler::model::COLLECTOR_VERSION,
         };
         let binding_bytes = serde_json::to_vec(&(
-            ACQUISITION_CONTRACT_V2,
+            ACQUISITION_CONTRACT_VERSION,
             &request.workspace_identity,
             &request.checkout_identity,
             &request.snapshot_identity,
@@ -282,9 +250,9 @@ impl CompilerAcquisitionJournal {
             "--format".to_string(),
             "json".to_string(),
         ];
-        let header = CompilerAcquisitionHeaderV2 {
+        let header = CompilerAcquisitionHeader {
             record: "manifest".to_string(),
-            surface_acquisition_contract_version: ACQUISITION_CONTRACT_V2,
+            surface_acquisition_contract_version: ACQUISITION_CONTRACT_VERSION,
             acquisition_identity,
             workspace_identity: request.workspace_identity.clone(),
             checkout_identity: request.checkout_identity.clone(),
@@ -310,46 +278,32 @@ impl CompilerAcquisitionJournal {
         let mut sequence = 0;
         let mut groups = Vec::new();
         let mut revalidation_required = BTreeSet::new();
-        let mut resumed_v2 = false;
+        let mut resumed = false;
         if let Some(resume_path) = request.resume_manifest.as_deref() {
-            match read_resume_journal(workspace_root, resume_path, Some(&header), Some(&views))? {
-                ResumeJournal::V1 { completed_prefix } => {
-                    for (position, view) in views.iter_mut().take(completed_prefix).enumerate() {
-                        view.durable = DurableViewState::Complete {
-                            evidence: EvidenceIdentity::new(view.view_identity.as_bytes()),
-                        };
+            let previous = read_resume_journal(workspace_root, resume_path, Some(&header), Some(&views))?;
+            resumed = true;
+            sequence = previous.sequence;
+            groups = previous.groups;
+            for (position, (view, old)) in views.iter_mut().zip(previous.views).enumerate() {
+                view.attempts = old.attempts;
+                view.cargo_targets = old.cargo_targets;
+                match old.durable {
+                    DurableViewState::Complete { evidence } => {
+                        view.durable = DurableViewState::Complete { evidence };
                         revalidation_required.insert(position);
                     }
-                }
-                ResumeJournal::V2(previous) => {
-                    let previous = *previous;
-                    resumed_v2 = true;
-                    sequence = previous.sequence;
-                    groups = previous.groups;
-                    for (position, (view, old)) in views.iter_mut().zip(previous.views).enumerate() {
-                        view.attempts = old.attempts;
-                        view.cargo_targets = old.cargo_targets;
-                        match old.durable {
-                            DurableViewState::Complete { evidence } => {
-                                view.durable = DurableViewState::Complete { evidence };
-                                revalidation_required.insert(position);
-                            }
-                            DurableViewState::Running { .. }
-                            | DurableViewState::Pending
-                            | DurableViewState::Failed { .. } => {}
-                        }
-                    }
+                    DurableViewState::Running { .. } | DurableViewState::Pending | DurableViewState::Failed { .. } => {}
                 }
             }
         }
-        let document = AcquisitionJournalV2 {
+        let document = AcquisitionJournal {
             header,
             views,
             groups,
             sequence,
             summary: None,
         };
-        if !resumed_v2 {
+        if !resumed {
             document.validate()?;
         }
         let mut journal = Self {
@@ -362,7 +316,7 @@ impl CompilerAcquisitionJournal {
             #[cfg(test)]
             fault: None,
         };
-        if resumed_v2 {
+        if resumed {
             journal.dirty_views.extend(0..journal.document.views.len());
             journal.flush()?;
         } else {
@@ -627,28 +581,27 @@ impl CompilerAcquisitionJournal {
     }
 }
 
-impl AcquisitionJournalV2 {
+impl AcquisitionJournal {
     fn validate(&self) -> RailResult<()> {
         let header = &self.header;
         if header.record != "manifest"
-            || header.surface_acquisition_contract_version != ACQUISITION_CONTRACT_V2
+            || header.surface_acquisition_contract_version != ACQUISITION_CONTRACT_VERSION
             || header.view_count != self.views.len()
             || header.journal_batch == 0
         {
             return Err(RailError::message(
-                "Surface acquisition manifest has an invalid v2 contract",
+                "Surface acquisition manifest has an invalid current contract",
             ));
         }
         validate_sha256_identity(&header.acquisition_identity, ACQUISITION_IDENTITY_PREFIX, "acquisition")?;
         let mut identities = BTreeSet::new();
         let mut indices = BTreeSet::new();
-        for (ordinal, view) in self.views.iter().enumerate() {
+        for view in &self.views {
             let running_attempt = match view.durable {
                 DurableViewState::Running { attempt } => Some(attempt),
                 _ => None,
             };
-            if view.legacy_ordinal.is_some_and(|legacy| legacy != ordinal)
-                || !identities.insert(view.view_identity.as_str())
+            if !identities.insert(view.view_identity.as_str())
                 || !indices.insert(view.view_index)
                 || view.view_index >= self.views.len()
                 || view.packages[0].is_empty()
@@ -714,7 +667,7 @@ impl AcquisitionJournalV2 {
 }
 
 fn durable_view(
-    header: &CompilerAcquisitionHeaderV2,
+    header: &CompilerAcquisitionHeader,
     view: CompilerAcquisitionView<'_>,
 ) -> RailResult<DurableViewRecord> {
     let view_bytes = serde_json::to_vec(&(
@@ -725,7 +678,6 @@ fn durable_view(
         view.fact_families(),
     ))?;
     Ok(DurableViewRecord {
-        legacy_ordinal: None,
         view_index: view.index().offset(),
         view_identity: format!("compiler-view-v1-sha256-{}", ContentDigest::sha256(&view_bytes)),
         selected_products: header
@@ -787,15 +739,16 @@ fn resolve_resume_path(workspace_root: &Path, path: &Path) -> RailResult<PathBuf
     }
     let candidate = crate::utils::canonicalize_existing(&candidate)?;
     let state_root = crate::workspace::cargo_rail_state_root(workspace_root);
-    let authorized = [V1_DIRECTORY, V2_DIRECTORY]
-        .into_iter()
-        .filter_map(|directory| crate::utils::canonicalize_existing(&state_root.join(directory)).ok())
-        .any(|directory| candidate.starts_with(directory));
+    let authorized = crate::utils::canonicalize_existing(&state_root.join(JOURNAL_DIRECTORY))
+        .is_ok_and(|directory| candidate.starts_with(directory));
     if !authorized {
-        return Err(RailError::message(format!(
-            "Surface acquisition manifest '{}' is outside the current workspace's journal authority",
-            candidate.display()
-        )));
+        return Err(RailError::with_help(
+            format!(
+                "Surface acquisition manifest '{}' is outside the current workspace's journal authority",
+                candidate.display()
+            ),
+            "preserve this manifest; run 'cargo rail surface' without --resume to create current acquisition evidence",
+        ));
     }
     Ok(candidate)
 }
@@ -829,49 +782,48 @@ fn read_bounded(path: &Path) -> RailResult<Vec<u8>> {
 fn read_resume_journal(
     workspace_root: &Path,
     path: &Path,
-    expected_v2: Option<&CompilerAcquisitionHeaderV2>,
+    expected_header: Option<&CompilerAcquisitionHeader>,
     expected_views: Option<&[DurableViewRecord]>,
-) -> RailResult<ResumeJournal> {
+) -> RailResult<AcquisitionJournal> {
     let path = resolve_resume_path(workspace_root, path)?;
     let bytes = read_bounded(&path)?;
-    let first_line = bytes
-        .split(|byte| *byte == b'\n')
-        .next()
-        .filter(|line| !line.is_empty())
-        .ok_or_else(|| RailError::message("Surface acquisition manifest is empty"))?;
-    if let Ok(document) = serde_json::from_slice::<AcquisitionJournalV2>(&bytes) {
-        document.validate()?;
-        if let Some(expected) = expected_v2 {
-            validate_v2_binding(&document.header, expected)?;
-        }
-        if let Some(expected) = expected_views
-            && (document.views.len() != expected.len()
-                || document.views.iter().zip(expected).any(|(actual, expected)| {
-                    actual.view_index != expected.view_index || actual.view_identity != expected.view_identity
-                }))
-        {
-            return Err(RailError::message(
-                "Surface acquisition resume view catalog differs from the current plan",
-            ));
-        }
-        Ok(ResumeJournal::V2(Box::new(document)))
-    } else {
-        let first: serde_json::Value = serde_json::from_slice(first_line)?;
-        match first
-            .get("surface_acquisition_contract_version")
-            .and_then(serde_json::Value::as_u64)
-        {
-            Some(version) if version == u64::from(ACQUISITION_CONTRACT_V1) => {
-                read_v1(&bytes, expected_v2, expected_views)
-            }
-            _ => Err(RailError::message(
-                "Surface acquisition manifest has an unsupported contract",
-            )),
-        }
+    let document: AcquisitionJournal = serde_json::from_slice(&bytes).map_err(|error| {
+        RailError::with_help(
+            format!(
+                "unsupported or malformed Surface acquisition manifest '{}': {error}",
+                path.display()
+            ),
+            "preserve this manifest; run 'cargo rail surface' without --resume to create current acquisition evidence",
+        )
+    })?;
+    if document.header.surface_acquisition_contract_version != ACQUISITION_CONTRACT_VERSION {
+        return Err(RailError::with_help(
+            format!(
+                "unsupported Surface acquisition manifest version {} in '{}'",
+                document.header.surface_acquisition_contract_version,
+                path.display()
+            ),
+            "preserve this manifest; run 'cargo rail surface' without --resume to create current acquisition evidence",
+        ));
     }
+    document.validate()?;
+    if let Some(expected) = expected_header {
+        validate_binding(&document.header, expected)?;
+    }
+    if let Some(expected) = expected_views
+        && (document.views.len() != expected.len()
+            || document.views.iter().zip(expected).any(|(actual, expected)| {
+                actual.view_index != expected.view_index || actual.view_identity != expected.view_identity
+            }))
+    {
+        return Err(RailError::message(
+            "Surface acquisition resume view catalog differs from the current plan",
+        ));
+    }
+    Ok(document)
 }
 
-fn validate_v2_binding(actual: &CompilerAcquisitionHeaderV2, expected: &CompilerAcquisitionHeaderV2) -> RailResult<()> {
+fn validate_binding(actual: &CompilerAcquisitionHeader, expected: &CompilerAcquisitionHeader) -> RailResult<()> {
     if actual.workspace_identity != expected.workspace_identity
         || actual.checkout_identity != expected.checkout_identity
         || actual.snapshot_identity != expected.snapshot_identity
@@ -890,120 +842,14 @@ fn validate_v2_binding(actual: &CompilerAcquisitionHeaderV2, expected: &Compiler
     Ok(())
 }
 
-fn read_v1(
-    bytes: &[u8],
-    expected_v2: Option<&CompilerAcquisitionHeaderV2>,
-    expected_views: Option<&[DurableViewRecord]>,
-) -> RailResult<ResumeJournal> {
-    let mut lines = BufReader::new(bytes).lines();
-    let header: CompilerAcquisitionHeaderV1 = serde_json::from_str(
-        &lines
-            .next()
-            .transpose()
-            .map_err(RailError::from)?
-            .ok_or_else(|| RailError::message("Surface acquisition manifest is empty"))?,
-    )?;
-    if header.record != "manifest" || header.surface_acquisition_contract_version != ACQUISITION_CONTRACT_V1 {
-        return Err(RailError::message(
-            "Surface acquisition manifest has an invalid v1 contract",
-        ));
-    }
-    if let Some(expected) = expected_v2
-        && (header.snapshot_identity != expected.snapshot_identity
-            || header.configuration_fingerprint != expected.configuration_fingerprint)
-    {
-        return Err(RailError::with_help(
-            "Surface acquisition v1 resume snapshot or configuration differs from the current acquisition",
-            "rerun 'cargo rail surface' without --resume to plan the changed acquisition",
-        ));
-    }
-    let expected = expected_views
-        .ok_or_else(|| RailError::message("Surface acquisition v1 migration requires the current view catalog"))?;
-    if header.views != expected.len() {
-        return Err(RailError::message(
-            "Surface acquisition v1 resume view count differs from the current plan",
-        ));
-    }
-    let record_limit = header
-        .views
-        .checked_mul(MAX_V1_RECORDS_PER_VIEW)
-        .and_then(|count| count.checked_add(16))
-        .ok_or_else(|| RailError::message("Surface acquisition v1 record bound overflowed"))?;
-    let mut statuses = vec!["planned".to_string(); header.views];
-    for (record, line) in lines.enumerate() {
-        if record >= record_limit {
-            return Err(RailError::message(
-                "Surface acquisition v1 manifest exceeds its record bound",
-            ));
-        }
-        let line = line.map_err(RailError::from)?;
-        let value: serde_json::Value = serde_json::from_str(&line)?;
-        if value.get("record").and_then(serde_json::Value::as_str) != Some("view") {
-            continue;
-        }
-        let view: CompilerAcquisitionViewV1 = serde_json::from_value(value)?;
-        let current = expected
-            .get(view.ordinal)
-            .ok_or_else(|| RailError::message("Surface acquisition v1 view ordinal is out of bounds"))?;
-        if view.record != "view"
-            || view.acquisition_identity != header.acquisition_identity
-            || view.view_identity != current.view_identity
-        {
-            return Err(RailError::message(
-                "Surface acquisition v1 view does not match the current canonical view catalog",
-            ));
-        }
-        statuses[view.ordinal] = view.status;
-    }
-    let completed_prefix = statuses
-        .iter()
-        .take_while(|status| matches!(status.as_str(), "reused" | "completed"))
-        .count();
-    Ok(ResumeJournal::V1 { completed_prefix })
-}
-
 /// Validate path authority and the effective configuration before analysis builds the exact plan.
 pub(crate) fn validate_compiler_acquisition_resume(
     workspace_root: &Path,
     path: &Path,
     configuration_fingerprint: &str,
 ) -> RailResult<()> {
-    let path = resolve_resume_path(workspace_root, path).map_err(|error| {
-        RailError::with_help(
-            error.to_string(),
-            "run 'cargo rail surface' once without --resume to create an acquisition manifest",
-        )
-    })?;
-    let bytes = read_bounded(&path)?;
-    let first_line = bytes
-        .split(|byte| *byte == b'\n')
-        .next()
-        .filter(|line| !line.is_empty())
-        .ok_or_else(|| RailError::message("Surface acquisition manifest is empty"))?;
-    let (version, configuration) = if let Ok(document) = serde_json::from_slice::<AcquisitionJournalV2>(&bytes) {
-        document.validate()?;
-        (
-            Some(u64::from(document.header.surface_acquisition_contract_version)),
-            Some(document.header.configuration_fingerprint),
-        )
-    } else {
-        let first: serde_json::Value = serde_json::from_slice(first_line)?;
-        (
-            first
-                .get("surface_acquisition_contract_version")
-                .and_then(serde_json::Value::as_u64),
-            first
-                .get("configuration_fingerprint")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-        )
-    };
-    if !matches!(version, Some(1 | 2)) {
-        return Err(RailError::message(
-            "Surface acquisition manifest has an unsupported contract",
-        ));
-    }
-    if configuration.as_deref() != Some(configuration_fingerprint) {
+    let document = read_resume_journal(workspace_root, path, None, None)?;
+    if document.header.configuration_fingerprint != configuration_fingerprint {
         return Err(RailError::with_help(
             "Surface acquisition resume configuration differs from the planned acquisition",
             "rerun 'cargo rail surface' without --resume to plan the changed configuration",
@@ -1054,11 +900,11 @@ mod tests {
         .expect("journal")
     }
 
-    fn read_document(path: &Path) -> AcquisitionJournalV2 {
+    fn read_document(path: &Path) -> AcquisitionJournal {
         serde_json::from_slice(&fs::read(path).expect("journal bytes")).expect("journal document")
     }
 
-    fn state(document: &AcquisitionJournalV2, index: ViewIx) -> &DurableViewState {
+    fn state(document: &AcquisitionJournal, index: ViewIx) -> &DurableViewState {
         &document
             .views
             .iter()
@@ -1072,6 +918,31 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_resume_preserves_progress_and_fresh_acquisition_uses_current_namespace() {
+        let root = tempfile::tempdir().expect("root");
+        let plan = CompilerAcquisitionPlan::journal_test_plan(&["alpha"]).expect("plan");
+        let journal = begin(root.path(), &plan, None, 1);
+        let old_directory = crate::workspace::cargo_rail_state_root(root.path()).join("surface-acquisitions-v2");
+        fs::create_dir_all(&old_directory).expect("old directory");
+        let old_path = old_directory.join("progress.json");
+        let old_bytes = b"{\"surface_acquisition_contract_version\":2}";
+        fs::write(&old_path, old_bytes).expect("old journal");
+        let error = validate_compiler_acquisition_resume(root.path(), &old_path, "configuration-v1").unwrap_err();
+        assert!(error.to_string().contains("journal authority"), "{error}");
+        assert_eq!(fs::read(&old_path).unwrap(), old_bytes);
+        let fresh = begin(root.path(), &plan, None, 1);
+        assert_eq!(fresh.document.header.surface_acquisition_contract_version, 3);
+        assert_eq!(fs::read(&old_path).unwrap(), old_bytes);
+
+        let mut invalid = serde_json::to_value(&journal.document).unwrap();
+        invalid["header"]["surface_acquisition_contract_version"] = serde_json::json!(2);
+        let invalid = serde_json::to_vec(&invalid).unwrap();
+        fs::write(&journal.path, &invalid).unwrap();
+        assert!(validate_compiler_acquisition_resume(root.path(), &journal.path, "configuration-v1").is_err());
+        assert_eq!(fs::read(&journal.path).unwrap(), invalid);
+    }
+
+    #[test]
     fn out_of_order_completions_commit_as_one_canonical_group() {
         let root = tempfile::tempdir().expect("root");
         let plan = CompilerAcquisitionPlan::journal_test_plan(&["alpha", "beta", "gamma"]).expect("plan");
@@ -1082,11 +953,6 @@ mod tests {
         let first = order[0];
         let last = order[2];
         let mut journal = begin(root.path(), &plan, None, 2);
-        let initial = fs::read_to_string(journal.path()).expect("initial journal");
-        assert!(
-            !initial.contains("\"ordinal\""),
-            "new v2 journals must not serialize ordinal authority"
-        );
 
         journal.running_batch(&[last, first]).expect("start batch");
         journal
@@ -1142,65 +1008,6 @@ mod tests {
             .revalidate(complete, Some(evidence(&resumed, complete)))
             .expect("revalidate complete evidence");
         resumed.seal_revalidation().expect("seal recovery");
-    }
-
-    #[test]
-    fn v1_reader_migrates_only_the_completed_ordinal_prefix() {
-        let root = tempfile::tempdir().expect("root");
-        let plan = CompilerAcquisitionPlan::journal_test_plan(&["alpha", "beta", "gamma"]).expect("plan");
-        let journal = begin(root.path(), &plan, None, 2);
-        let header = &journal.document.header;
-        let views = &journal.document.views;
-        let mut records = vec![serde_json::json!({
-            "record": "manifest",
-            "surface_acquisition_contract_version": 1,
-            "acquisition_identity": "surface-acquisition-v1-sha256-deadbeef",
-            "snapshot_identity": header.snapshot_identity,
-            "configuration_fingerprint": header.configuration_fingerprint,
-            "views": views.len(),
-        })];
-        for (ordinal, view) in views.iter().enumerate() {
-            records.push(serde_json::json!({
-                "record": "view",
-                "acquisition_identity": "surface-acquisition-v1-sha256-deadbeef",
-                "ordinal": ordinal,
-                "view_identity": view.view_identity,
-                "status": "planned",
-            }));
-        }
-        records.push(serde_json::json!({
-            "record": "view",
-            "acquisition_identity": "surface-acquisition-v1-sha256-deadbeef",
-            "ordinal": 1,
-            "view_identity": views[1].view_identity,
-            "status": "completed",
-        }));
-        let encoded = records
-            .iter()
-            .map(serde_json::Value::to_string)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(matches!(
-            read_v1(encoded.as_bytes(), Some(header), Some(views)).expect("out-of-order v1"),
-            ResumeJournal::V1 { completed_prefix: 0 }
-        ));
-
-        records.push(serde_json::json!({
-            "record": "view",
-            "acquisition_identity": "surface-acquisition-v1-sha256-deadbeef",
-            "ordinal": 0,
-            "view_identity": views[0].view_identity,
-            "status": "reused",
-        }));
-        let encoded = records
-            .iter()
-            .map(serde_json::Value::to_string)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(matches!(
-            read_v1(encoded.as_bytes(), Some(header), Some(views)).expect("prefix v1"),
-            ResumeJournal::V1 { completed_prefix: 2 }
-        ));
     }
 
     #[test]
@@ -1351,7 +1158,7 @@ mod tests {
         let journal = begin(root.path(), &plan, None, 1);
         let mut mismatched = journal.document.header.clone();
         mismatched.compiler_set_identity.push_str("-changed");
-        assert!(validate_v2_binding(&mismatched, &journal.document.header).is_err());
+        assert!(validate_binding(&mismatched, &journal.document.header).is_err());
 
         let mut corrupted = journal.document;
         corrupted.sequence = 1;

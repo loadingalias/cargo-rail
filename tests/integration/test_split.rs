@@ -1739,7 +1739,7 @@ fn test_split_initialized_unborn_target_publishes_by_exact_url_and_rechecks_with
 }
 
 #[test]
-fn test_split_v025_notes_only_check_is_read_only_and_apply_migrates_once() {
+fn test_split_rejects_unsupported_notes_before_check_or_apply() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("split-v025-notes")?;
         ws.add_crate("legacy-lib", "0.1.0", &[])?;
@@ -1804,296 +1804,24 @@ authors = ["Test Author"]
         )?;
 
         let notes_before = git(target.path(), &["rev-parse", "refs/notes/rail/legacy-lib"])?.stdout;
-        let check = run_cargo_rail(
-            &ws.path,
-            &[
-                "rail",
-                "split",
-                "run",
-                "legacy-lib",
-                "--check",
-                "--json",
-                "--allow-dirty",
-            ],
-        )?;
-        assert_eq!(
-            check.status.code(),
-            Some(1),
-            "{}",
-            String::from_utf8_lossy(&check.stderr)
-        );
-        let check_json: serde_json::Value = serde_json::from_slice(&check.stdout)?;
-        assert_eq!(check_json["crates"][0]["pending_commits"], 0);
-        assert_eq!(check_json["crates"][0]["pending_origin_migrations"], 1);
-        let migration_digest = check_json["crates"][0]["origin_migration_digest"]
-            .as_str()
-            .expect("check must expose the exact origin migration digest");
-        assert!(migration_digest.starts_with("sha256-"));
-        assert_eq!(
-            check_json["mutation_plan"]["actions"][0]["payload"]["origin_migration_count"],
-            1
-        );
-        assert_eq!(
-            check_json["mutation_plan"]["actions"][0]["payload"]["origin_migration_digest"],
-            migration_digest
-        );
-        let authority = &check_json["mutation_plan"]["actions"][0]["payload"]["origin_authority"];
-        assert_eq!(authority["direction"], "mono_to_remote");
-        assert_eq!(authority["owner"], "legacy-lib");
-        assert_eq!(authority["transform_version"], 1);
-        assert_eq!(authority["pending_candidate_count"], 1);
-        assert_eq!(authority["mapping_count"], 1);
-        assert_eq!(authority["migration_digest"], migration_digest);
-        assert!(authority["source_repository"].as_str().unwrap().starts_with("sha256-"));
-        assert!(authority["target_repository"].as_str().unwrap().starts_with("sha256-"));
-        assert_eq!(
-            String::from_utf8(git(target.path(), &["rev-parse", "HEAD"])?.stdout)?.trim(),
-            legacy_target
-        );
-        assert_eq!(
-            git(target.path(), &["rev-parse", "refs/notes/rail/legacy-lib"],)?.stdout,
-            notes_before
-        );
-
-        let plan_path = ws.path.join("split-origin-migration-plan.json");
-        std::fs::write(&plan_path, serde_json::to_vec_pretty(&check_json["mutation_plan"])?)?;
-        let predecessor_source =
-            String::from_utf8(git(&ws.path, &["rev-parse", &format!("{source_commit}^")])?.stdout)?
-                .trim()
-                .to_string();
-        git(
-            target.path(),
-            &["notes", "--ref", "refs/notes/rail/legacy-lib", "remove", &source_commit],
-        )?;
-        git(
-            target.path(),
-            &[
-                "notes",
-                "--ref",
-                "refs/notes/rail/legacy-lib",
-                "add",
-                "-m",
-                &legacy_target,
-                &predecessor_source,
-            ],
-        )?;
-        let drifted = run_cargo_rail(
-            &ws.path,
-            &[
-                "rail",
-                "split",
-                "run",
-                "legacy-lib",
-                "--plan",
-                plan_path.to_str().expect("test plan path must be UTF-8"),
-                "--allow-dirty",
-            ],
-        )?;
-        assert!(!drifted.status.success());
-        assert_eq!(
-            String::from_utf8(git(target.path(), &["rev-parse", "HEAD"])?.stdout)?.trim(),
-            legacy_target
-        );
-        git(
-            target.path(),
-            &[
-                "notes",
-                "--ref",
-                "refs/notes/rail/legacy-lib",
-                "remove",
-                &predecessor_source,
-            ],
-        )?;
-        git(
-            target.path(),
-            &[
-                "notes",
-                "--ref",
-                "refs/notes/rail/legacy-lib",
-                "add",
-                "-m",
-                &legacy_target,
-                &source_commit,
-            ],
-        )?;
-        git(
-            target.path(),
-            &[
-                "remote",
-                "set-url",
-                "origin",
-                "https://example.invalid/drifted-legacy-lib.git",
-            ],
-        )?;
-        let identity_drift = run_cargo_rail(
-            &ws.path,
-            &[
-                "rail",
-                "split",
-                "run",
-                "legacy-lib",
-                "--plan",
-                plan_path.to_str().expect("test plan path must be UTF-8"),
-                "--allow-dirty",
-            ],
-        )?;
-        assert!(!identity_drift.status.success());
-        assert_eq!(
-            String::from_utf8(git(target.path(), &["rev-parse", "HEAD"])?.stdout)?.trim(),
-            legacy_target,
-            "remote identity drift must fail before moving the target HEAD"
-        );
-        git(
-            target.path(),
-            &["remote", "set-url", "origin", "https://example.invalid/legacy-lib.git"],
-        )?;
-        let notes_before_apply = git(target.path(), &["rev-parse", "refs/notes/rail/legacy-lib"])?.stdout;
-
-        let apply = run_cargo_rail(
-            &ws.path,
-            &["rail", "split", "run", "legacy-lib", "--yes", "--allow-dirty"],
-        )?;
-        assert!(apply.status.success(), "{}", String::from_utf8_lossy(&apply.stderr));
-        let migrated_head = String::from_utf8(git(target.path(), &["rev-parse", "HEAD"])?.stdout)?
-            .trim()
-            .to_string();
-        assert_ne!(migrated_head, legacy_target);
-        let message = String::from_utf8(git(target.path(), &["log", "-1", "--format=%B"])?.stdout)?;
-        assert!(message.contains("chore: migrate cargo-rail origin mappings"));
-        assert!(message.contains(&format!("commit={source_commit}")));
-        assert!(message.contains(&format!("target={legacy_target}")));
-        assert_eq!(
-            git(target.path(), &["rev-parse", "refs/notes/rail/legacy-lib"],)?.stdout,
-            notes_before_apply,
-            "migration must leave predecessor notes read-only"
-        );
-
-        git(target.path(), &["update-ref", "-d", "refs/notes/rail/legacy-lib"])?;
-        let ordinary_only = run_cargo_rail(&ws.path, &["rail", "split", "run", "legacy-lib", "--check", "--json"])?;
-        assert_eq!(ordinary_only.status.code(), Some(0));
-        assert_eq!(
-            String::from_utf8(git(target.path(), &["rev-parse", "HEAD"])?.stdout)?.trim(),
-            migrated_head
-        );
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-#[cfg(unix)]
-#[test]
-fn test_split_revalidates_predecessor_authority_before_nontrivial_target_mutation() {
-    let result: Result<()> = (|| {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let ws = TestWorkspace::new_named("split-v025-live-drift")?;
-        let crate_root = ws.add_crate("legacy-live", "0.1.0", &[])?;
-        let source_commit = ws.commit("Add legacy-live")?;
-
-        let target = TempDir::new()?;
-        git(target.path(), &["init", "-b", "main"])?;
-        git(target.path(), &["config", "user.name", "Test User"])?;
-        git(target.path(), &["config", "user.email", "test@example.com"])?;
-        git(
-            target.path(),
-            &["commit", "--allow-empty", "-m", "Legacy mapped target"],
-        )?;
-        let original_target = String::from_utf8(git(target.path(), &["rev-parse", "HEAD"])?.stdout)?
-            .trim()
-            .to_string();
-        git(
-            target.path(),
-            &["commit", "--allow-empty", "-m", "Unmapped target head"],
-        )?;
-        let target_head = String::from_utf8(git(target.path(), &["rev-parse", "HEAD"])?.stdout)?
-            .trim()
-            .to_string();
-        git(
-            target.path(),
-            &["fetch", "--quiet", ws.path.to_str().unwrap(), &source_commit],
-        )?;
-        git(
-            target.path(),
-            &[
-                "notes",
-                "--ref",
-                "refs/notes/rail/legacy-live",
-                "add",
-                "-m",
-                &original_target,
-                &source_commit,
-            ],
-        )?;
-
-        std::fs::write(crate_root.join("src/lib.rs"), "pub fn pending_split() {}\n")?;
-        ws.commit("Add nontrivial pending split work")?;
-        std::fs::write(
-            ws.path.join("rail.toml"),
-            format!(
-                "[crates.legacy-live.split]\nremote = \"{}\"\nbranch = \"main\"\nmode = \"single\"\n",
-                target.path().display().to_string().replace('\\', "\\\\")
-            ),
-        )?;
-
-        let real_git = std::process::Command::new("sh")
-            .args(["-c", "command -v git"])
-            .output()?;
-        assert!(real_git.status.success());
-        let real_git = String::from_utf8(real_git.stdout)?.trim().to_string();
-        let wrapper_dir = ws.path.join(".git/rail-test-bin");
-        std::fs::create_dir_all(&wrapper_dir)?;
-        let wrapper = wrapper_dir.join("git");
-        std::fs::write(
-            &wrapper,
-            r#"#!/bin/sh
-if [ ! -f "$CARGO_RAIL_TEST_SPLIT_DRIFT_MARKER" ]; then
-  for receipt in "$CARGO_RAIL_TEST_SPLIT_RECEIPTS"/split-*-plan-*.json; do
-    if [ -f "$receipt" ]; then
-    : > "$CARGO_RAIL_TEST_SPLIT_DRIFT_MARKER"
-    "$CARGO_RAIL_TEST_REAL_GIT" -C "$CARGO_RAIL_TEST_SPLIT_TARGET" notes \
-      --ref refs/notes/rail/legacy-live add -f -m "$CARGO_RAIL_TEST_SPLIT_REPLACEMENT" \
-      "$CARGO_RAIL_TEST_SPLIT_SOURCE"
-    break
-    fi
-  done
-fi
-exec "$CARGO_RAIL_TEST_REAL_GIT" "$@"
-"#,
-        )?;
-        let mut permissions = std::fs::metadata(&wrapper)?.permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&wrapper, permissions)?;
-        let path = std::env::join_paths(
-            std::iter::once(wrapper_dir).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())),
-        )?;
-        let marker = ws.path.join(".git/split-drift-injected");
-
-        let output = cargo_rail_command(&ws.path)?
-            .env("PATH", path)
-            .env("CARGO_RAIL_TEST_REAL_GIT", real_git)
-            .env("CARGO_RAIL_TEST_SPLIT_DRIFT_MARKER", &marker)
-            .env(
-                "CARGO_RAIL_TEST_SPLIT_RECEIPTS",
-                ws.path.join("target/cargo-rail/receipts"),
-            )
-            .env("CARGO_RAIL_TEST_SPLIT_TARGET", target.path())
-            .env("CARGO_RAIL_TEST_SPLIT_REPLACEMENT", &target_head)
-            .env("CARGO_RAIL_TEST_SPLIT_SOURCE", &source_commit)
-            .args(["rail", "split", "run", "legacy-live", "--yes", "--allow-dirty"])
-            .output()?;
-        assert!(!output.status.success());
-        assert!(marker.exists(), "the live-drift fixture did not run");
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("changed after it was checked"),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(
-            String::from_utf8(git(target.path(), &["rev-parse", "HEAD"])?.stdout)?.trim(),
-            target_head,
-            "authority drift must fail before any nontrivial split target commit"
-        );
-        assert!(String::from_utf8(git(target.path(), &["status", "--porcelain"])?.stdout)?.is_empty());
+        for flags in [&["--check"][..], &["--yes", "--allow-dirty"][..]] {
+            let mut args = vec!["rail", "split", "run", "legacy-lib"];
+            args.extend_from_slice(flags);
+            let output = run_cargo_rail(&ws.path, &args)?;
+            assert_eq!(output.status.code(), Some(2), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("unsupported Cargo-Rail mapping notes"),
+                "{output:?}"
+            );
+            assert_eq!(
+                git(target.path(), &["rev-parse", "refs/notes/rail/legacy-lib"])?.stdout,
+                notes_before
+            );
+            assert_eq!(
+                String::from_utf8(git(target.path(), &["rev-parse", "HEAD"])?.stdout)?.trim(),
+                legacy_target
+            );
+        }
         Ok(())
     })();
     super::helpers::finish_test(result);

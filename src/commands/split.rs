@@ -23,7 +23,6 @@ struct SplitAppliedCrate {
     target_repo: std::path::PathBuf,
     mode: &'static str,
     pending_commits: usize,
-    pending_origin_migrations: usize,
     status: &'static str,
 }
 
@@ -124,15 +123,11 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
                 SplitEngine::pending_commit_count_at_source_head(
                     ctx,
                     config,
-                    mapping_snapshots[&config.crate_name].origin_migration.source_head(),
+                    mapping_snapshots[&config.crate_name].origin_authority.source_head(),
                 )
             })
             .collect::<RailResult<Vec<_>>>()?;
         revalidate_split_mapping_snapshots(ctx, &configs, &mapping_snapshots)?;
-        let pending_origin_migrations = configs
-            .iter()
-            .map(|config| mapping_snapshots[&config.crate_name].origin_migration.count())
-            .collect::<Vec<_>>();
         let pending_publications = configs
             .iter()
             .map(|config| {
@@ -143,7 +138,6 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
             })
             .collect::<Vec<_>>();
         let has_pending = pending_commits.iter().any(|count| *count > 0)
-            || pending_origin_migrations.iter().any(|count| *count > 0)
             || pending_publications.iter().any(|count| *count > 0)
             || mapping_snapshots
                 .values()
@@ -157,21 +151,18 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
                     .enumerate()
                     .map(|(index, config)| {
                         let pending_commits = pending_commits[index];
-                        let pending_origin_migrations = pending_origin_migrations[index];
                         let pending_publication = pending_publications[index];
-                        let migration = &mapping_snapshots[&config.crate_name].origin_migration;
+                        let authority = &mapping_snapshots[&config.crate_name].origin_authority;
                         serde_json::json!({
                           "crate_name": config.crate_name,
                           "mode": split_mode_name(&config.mode),
                           "target_repo": config.target_repo_path,
                           "branch": config.branch,
                           "remote_url": config.remote_url,
-                          "pending": pending_commits > 0 || pending_origin_migrations > 0 || pending_publication > 0 || !mapping_snapshots[&config.crate_name].prepared_effects.is_empty(),
+                          "pending": pending_commits > 0 || pending_publication > 0 || !mapping_snapshots[&config.crate_name].prepared_effects.is_empty(),
                           "pending_commits": pending_commits,
-                          "pending_origin_migrations": pending_origin_migrations,
                           "pending_publication_commits": pending_publication,
-                          "origin_migration_digest": migration.migration_digest(),
-                          "origin_authority": origin_authority_json(migration),
+                          "origin_authority": origin_authority_json(authority),
                           "publication_authority": publication_authority_json(mapping_snapshots[&config.crate_name].publication.as_ref()),
                           "prepared_effects": mapping_snapshots[&config.crate_name].prepared_effects,
                         })
@@ -199,7 +190,6 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
             SplitOutputFormat::JsonLines => {
                 for (index, config) in configs.iter().enumerate() {
                     let pending_commits = pending_commits[index];
-                    let pending_origin_migrations = pending_origin_migrations[index];
                     let pending_publication = pending_publications[index];
                     let obj = serde_json::json!({
                       "crate_name": config.crate_name,
@@ -207,12 +197,10 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
                       "target_repo": config.target_repo_path.display().to_string(),
                       "branch": config.branch,
                       "remote_url": config.remote_url,
-                      "pending": pending_commits > 0 || pending_origin_migrations > 0 || pending_publication > 0,
+                      "pending": pending_commits > 0 || pending_publication > 0,
                       "pending_commits": pending_commits,
-                      "pending_origin_migrations": pending_origin_migrations,
                       "pending_publication_commits": pending_publication,
-                      "origin_migration_digest": mapping_snapshots[&config.crate_name].origin_migration.migration_digest(),
-                      "origin_authority": origin_authority_json(&mapping_snapshots[&config.crate_name].origin_migration),
+                      "origin_authority": origin_authority_json(&mapping_snapshots[&config.crate_name].origin_authority),
                       "publication_authority": publication_authority_json(mapping_snapshots[&config.crate_name].publication.as_ref()),
                     });
                     println!("{}", serde_json::to_string(&obj)?);
@@ -221,11 +209,10 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
             SplitOutputFormat::Text => {
                 for (index, config) in configs.iter().enumerate() {
                     println!(
-                        "{}: local source -> target repository {} ({} pending commit(s), {} pending origin migration(s), {} pending publication commit(s), mode {})",
+                        "{}: local source -> target repository {} ({} pending commit(s), {} pending publication commit(s), mode {})",
                         config.crate_name,
                         config.target_repo_path.display(),
                         pending_commits[index],
-                        pending_origin_migrations[index],
                         pending_publications[index],
                         split_mode_name(&config.mode)
                     );
@@ -307,10 +294,9 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
                     progress!("  {}", config.crate_name);
                 }
                 let engine = SplitEngine::new(ctx)?;
-                let pending_origin_migrations = mapping_snapshots[&config.crate_name].origin_migration.count();
                 let pending_commits = engine.split_with_pending_count(
                     &config,
-                    Some(&mapping_snapshots[&config.crate_name].origin_migration),
+                    Some(&mapping_snapshots[&config.crate_name].origin_authority),
                     mapping_snapshots[&config.crate_name].publication.as_ref(),
                 )?;
                 Ok(SplitAppliedCrate {
@@ -318,12 +304,8 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
                     target_repo: config.target_repo_path,
                     mode: split_mode_name(&config.mode),
                     pending_commits,
-                    pending_origin_migrations,
-                    status: if pending_commits == 0 && pending_origin_migrations == 0 {
-                        "current"
-                    } else {
-                        "applied"
-                    },
+
+                    status: if pending_commits == 0 { "current" } else { "applied" },
                 })
             })
             .collect();
@@ -335,10 +317,9 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
                 progress!("splitting {}...", config.crate_name);
             }
             let engine = SplitEngine::new(ctx)?;
-            let pending_origin_migrations = mapping_snapshots[&config.crate_name].origin_migration.count();
             let pending_commits = engine.split_with_pending_count(
                 &config,
-                Some(&mapping_snapshots[&config.crate_name].origin_migration),
+                Some(&mapping_snapshots[&config.crate_name].origin_authority),
                 mapping_snapshots[&config.crate_name].publication.as_ref(),
             )?;
             output_crates.push(SplitAppliedCrate {
@@ -346,12 +327,8 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
                 target_repo: config.target_repo_path,
                 mode: split_mode_name(&config.mode),
                 pending_commits,
-                pending_origin_migrations,
-                status: if pending_commits == 0 && pending_origin_migrations == 0 {
-                    "current"
-                } else {
-                    "applied"
-                },
+
+                status: if pending_commits == 0 { "current" } else { "applied" },
             });
         }
         output_crates
@@ -393,22 +370,17 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
         SplitOutputFormat::Text => {
             for item in &output_crates {
                 println!(
-                    "{}: local source -> target repository {} ({} pending commit(s), {} origin migration(s), mode {})",
+                    "{}: local source -> target repository {} ({} pending commit(s), mode {})",
                     item.crate_name,
                     item.target_repo.display(),
                     item.pending_commits,
-                    item.pending_origin_migrations,
                     item.mode
                 );
             }
             println!(
-                "Split complete: {} crate(s), {} pending commit(s) and {} origin migration(s) processed.",
+                "Split complete: {} crate(s), {} pending commit(s) processed.",
                 output_crates.len(),
-                output_crates.iter().map(|item| item.pending_commits).sum::<usize>(),
-                output_crates
-                    .iter()
-                    .map(|item| item.pending_origin_migrations)
-                    .sum::<usize>()
+                output_crates.iter().map(|item| item.pending_commits).sum::<usize>()
             );
             println!("Receipt: {}", apply_receipt.display());
         }
@@ -444,7 +416,7 @@ fn collect_split_effect_audits(output: &[SplitAppliedCrate]) -> RailResult<Vec<(
         let audits = GitEffectStore::completed_audits_read_only(
             &git,
             &item.crate_name,
-            &["origin-migration-", "split-chain-", publication_prefix.as_str()],
+            &["split-chain-", publication_prefix.as_str()],
         )?;
         acknowledgements.extend(audits.into_iter().map(|audit| (item.target_repo.clone(), audit)));
     }
@@ -647,8 +619,8 @@ fn build_split_mutation_plan(
         .into_iter()
         .map(|config| {
             let mapping = &mapping_snapshots[&config.crate_name];
-            let source_head = mapping.origin_migration.source_head();
-            let target_head = mapping.origin_migration.target_head().unwrap_or("none");
+            let source_head = mapping.origin_authority.source_head();
+            let target_head = mapping.origin_authority.target_head().unwrap_or("none");
             let publication_count = mapping.publication.as_ref().map_or(0, |snapshot| snapshot.count());
             let publication_digest = mapping
                 .publication
@@ -659,9 +631,7 @@ fn build_split_mutation_plan(
                 "target": config.target_repo_path,
                 "target_head": target_head,
                 "mapping_count": mapping.mapping_count,
-                "origin_migration_count": mapping.origin_migration.count(),
-                "origin_migration_digest": mapping.origin_migration.migration_digest(),
-                "origin_authority": origin_authority_json(&mapping.origin_migration),
+                "origin_authority": origin_authority_json(&mapping.origin_authority),
                 "publication_count": publication_count,
                 "publication_authority": publication_authority_json(mapping.publication.as_ref()),
             });
@@ -672,13 +642,13 @@ fn build_split_mutation_plan(
                 "SPLIT_CRATE",
                 config.crate_name.clone(),
                 Some(format!(
-                    "source_head={}, target={}, target_head={}, mapping_count={}, origin_migration_count={}, origin_migration_digest={}, publication_count={}, publication_digest={}",
+                    "source_head={}, target={}, target_head={}, mapping_count={}, publication_count={}, publication_digest={}",
                     source_head,
                     config.target_repo_path.display(),
                     target_head,
                     mapping.mapping_count,
-                    mapping.origin_migration.count(),
-                    mapping.origin_migration.migration_digest(),
+
+
                     publication_count,
                     publication_digest,
                 )),
@@ -715,8 +685,8 @@ fn collect_split_snapshots(
         let mapping = &mapping_snapshots[&config.crate_name];
         out.push(serde_json::json!({
           "crate_name": config.crate_name,
-          "source_head": mapping.origin_migration.source_head(),
-          "target_head": mapping.origin_migration.target_head(),
+          "source_head": mapping.origin_authority.source_head(),
+          "target_head": mapping.origin_authority.target_head(),
           "ownership": {
             "snapshot_id": config.ownership.snapshot_id,
             "members": config.ownership.members,
@@ -728,9 +698,7 @@ fn collect_split_snapshots(
           },
           "mapping_snapshot": {
             "mapping_count": mapping.mapping_count,
-            "pending_origin_migrations": mapping.origin_migration.count(),
-            "origin_migration_digest": mapping.origin_migration.migration_digest(),
-            "origin_authority": origin_authority_json(&mapping.origin_migration),
+            "origin_authority": origin_authority_json(&mapping.origin_authority),
             "publication_authority": publication_authority_json(mapping.publication.as_ref()),
             "prepared_effects": mapping.prepared_effects,
           },
@@ -825,7 +793,7 @@ fn revalidate_split_mapping_snapshots(
                 )
             });
         checked
-            .origin_migration
+            .origin_authority
             .revalidate_split_repository_state_with_projection(
                 ctx.workspace_root(),
                 &config.target_repo_path,

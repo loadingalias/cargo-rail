@@ -298,7 +298,7 @@ impl<'a> ReleasePublisher<'a> {
                 self.update_dependents(crate_plan)?;
             }
 
-            self.update_changelog(crate_plan, false)?;
+            self.update_changelog(crate_plan)?;
             if !consumed_change_files {
                 self.consume_change_files(plan)?;
                 consumed_change_files = true;
@@ -615,22 +615,11 @@ impl<'a> ReleasePublisher<'a> {
                         if !crate_plan.affected_dependents.is_empty() {
                             self.update_dependents(&crate_plan)?;
                         }
-                        self.update_changelog(
-                            &crate_plan,
-                            state
-                                .predecessor_execution
-                                .as_ref()
-                                .is_some_and(|execution| execution.require_changelog_entries),
-                        )?;
-                        let predecessor_body = state
-                            .predecessor_execution
-                            .as_ref()
-                            .and_then(|execution| execution.release_note_body(&crate_plan.name));
+                        self.update_changelog(&crate_plan)?;
                         self.validate_release_notes_size(
                             &crate_plan,
                             state.skip_tag,
                             state.remote_repository.as_ref(),
-                            predecessor_body,
                         )?;
                         if !state.crates.iter().any(|crate_state| crate_state.commit.is_complete()) {
                             self.consume_change_files(&state.plan)?;
@@ -886,11 +875,7 @@ impl<'a> ReleasePublisher<'a> {
             state.crates[index].forge_draft.object = Some(crate_plan.tag_name.clone());
             state.save(state_path, &format!("forge_intent:{}", crate_plan.tag_name))?;
             fault_before("forge_draft", &crate_plan.tag_name)?;
-            let predecessor_body = state
-                .predecessor_execution
-                .as_ref()
-                .and_then(|execution| execution.release_note_body(&crate_plan.name));
-            self.create_forge_release(forge, &repository, &crate_plan, predecessor_body)?;
+            self.create_forge_release(forge, &repository, &crate_plan)?;
             fault_after("forge_draft", &crate_plan.tag_name)?;
             state.crates[index].forge_draft.status = StepStatus::Complete;
             state.crates[index].forge_draft.object = Some(crate_plan.tag_name.clone());
@@ -1180,14 +1165,12 @@ impl<'a> ReleasePublisher<'a> {
     }
 
     /// Apply the exact insertion captured before release preparation.
-    fn update_changelog(&self, plan: &CrateReleasePlan, require_entries: bool) -> RailResult<()> {
+    fn update_changelog(&self, plan: &CrateReleasePlan) -> RailResult<()> {
         let presentation = plan.presentation.as_ref().ok_or_else(|| {
             RailError::message("release has no captured presentation; resume through the supported journal reader")
         })?;
         if let Some(write) = &presentation.changelog {
             crate::release::presentation::apply_changelog(self.ctx.workspace_root(), &plan.changelog_path, write)?;
-        } else if require_entries && plan.generate_changelog && plan.changelog_body.trim().is_empty() {
-            return Err(RailError::message(format!("no changelog entries for {}", plan.name)));
         }
         Ok(())
     }
@@ -1317,7 +1300,6 @@ impl<'a> ReleasePublisher<'a> {
         forge: ReleaseForge,
         repository: &RemoteRepository,
         plan: &CrateReleasePlan,
-        predecessor_body: Option<&str>,
     ) -> RailResult<()> {
         self.validate_expected_repository(repository)?;
         if self.forge_release_exists(forge, repository, &plan.tag_name) {
@@ -1329,20 +1311,15 @@ impl<'a> ReleasePublisher<'a> {
             return Ok(());
         }
         match forge {
-            ReleaseForge::Github => self.create_github_release_draft(repository, plan, predecessor_body),
-            ReleaseForge::Gitlab => self.create_gitlab_release(repository, plan, predecessor_body),
+            ReleaseForge::Github => self.create_github_release_draft(repository, plan),
+            ReleaseForge::Gitlab => self.create_gitlab_release(repository, plan),
         }
     }
 
     /// Create a draft GitHub release targeting the exact pushed commit.
-    fn create_github_release_draft(
-        &self,
-        repository: &RemoteRepository,
-        plan: &CrateReleasePlan,
-        predecessor_body: Option<&str>,
-    ) -> RailResult<()> {
+    fn create_github_release_draft(&self, repository: &RemoteRepository, plan: &CrateReleasePlan) -> RailResult<()> {
         let target = self.tag_target_commit(&plan.tag_name)?;
-        let notes_file = self.write_release_notes_temp(plan, predecessor_body)?;
+        let notes_file = self.write_release_notes_temp(plan)?;
         let selector = repository.selector();
         let output = process::run(
             "gh",
@@ -1377,13 +1354,8 @@ impl<'a> ReleasePublisher<'a> {
         Ok(())
     }
 
-    fn create_gitlab_release(
-        &self,
-        repository: &RemoteRepository,
-        plan: &CrateReleasePlan,
-        predecessor_body: Option<&str>,
-    ) -> RailResult<()> {
-        let notes_file = self.write_release_notes_temp(plan, predecessor_body)?;
+    fn create_gitlab_release(&self, repository: &RemoteRepository, plan: &CrateReleasePlan) -> RailResult<()> {
+        let notes_file = self.write_release_notes_temp(plan)?;
         let args = gitlab_release_create_args(
             &plan.tag_name,
             &format!("{} v{}", plan.name, plan.new_version),
@@ -1783,7 +1755,6 @@ impl<'a> ReleasePublisher<'a> {
         plan: &CrateReleasePlan,
         skip_tag: bool,
         repository: Option<&RemoteRepository>,
-        predecessor_body: Option<&str>,
     ) -> RailResult<()> {
         if !self.release_config.remote_effects.creates_forge_release()
             || skip_tag
@@ -1794,7 +1765,7 @@ impl<'a> ReleasePublisher<'a> {
             return Ok(());
         }
 
-        let notes = self.release_notes(plan, predecessor_body)?;
+        let notes = self.release_notes(plan)?;
         if notes.len() > GITHUB_RELEASE_NOTES_SOFT_LIMIT_BYTES {
             return Err(RailError::with_help(
                 format!(
@@ -1810,20 +1781,17 @@ impl<'a> ReleasePublisher<'a> {
         Ok(())
     }
 
-    fn write_release_notes_temp(&self, plan: &CrateReleasePlan, predecessor_body: Option<&str>) -> RailResult<PathBuf> {
+    fn write_release_notes_temp(&self, plan: &CrateReleasePlan) -> RailResult<PathBuf> {
         let dir = crate::workspace::cargo_rail_state_root(self.ctx.workspace_root()).join("forge-release-bodies");
         fs::create_dir_all(&dir)
             .map_err(|e| RailError::message(format!("failed to create {}: {}", dir.display(), e)))?;
         let path = dir.join(format!("{}.md", sanitize_filename(&plan.tag_name)));
-        fs::write(&path, self.release_notes(plan, predecessor_body)?)
+        fs::write(&path, self.release_notes(plan)?)
             .map_err(|e| RailError::message(format!("failed to write {}: {}", path.display(), e)))?;
         Ok(path)
     }
 
-    fn release_notes(&self, plan: &CrateReleasePlan, predecessor_body: Option<&str>) -> RailResult<String> {
-        if let Some(body) = predecessor_body {
-            return Ok(body.to_string());
-        }
+    fn release_notes(&self, plan: &CrateReleasePlan) -> RailResult<String> {
         plan.presentation
             .as_ref()
             .map(|presentation| presentation.release_notes.clone())

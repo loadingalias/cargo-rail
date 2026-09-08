@@ -18,7 +18,6 @@ const PROFILES_DIRECTORY: &str = "profiles";
 const STATE_DIRECTORY: &str = "state";
 const STORE_LOCK_FILE: &str = "registry.lock";
 const TRANSACTION_FILE: &str = "transaction.json";
-const UNBOUND_PRE_PROFILE_STATE_FILE: &str = "unbound-v0.25.json";
 const LIFECYCLE_LOCK_FILE: &str = "profile.lock";
 const PROFILE_VERSION: u32 = 1;
 const BINDING_VERSION: u32 = 1;
@@ -239,50 +238,6 @@ pub(crate) struct ProfileSetupRequest<'a> {
     pub(crate) local_only: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct UnboundPreProfileState {
-    version: u32,
-    installation_authority: String,
-    cache: LocalCacheSelection,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    remote: Option<InstalledRemoteCache>,
-    root_portability: RootPortability,
-}
-
-impl UnboundPreProfileState {
-    fn validate(&self) -> RailResult<()> {
-        if self.version != 1 || !valid_identity(&self.installation_authority) {
-            return Err(RailError::message("unbound pre-profile cache state is invalid"));
-        }
-        LocalCacheSelection::new(
-            self.cache.base().to_path_buf(),
-            self.cache.max_bytes(),
-            self.cache.trust_domain().map(str::to_string),
-        )?;
-        if let Some(remote) = &self.remote {
-            remote.selection().map_err(|error| {
-                RailError::message(format!("unbound pre-profile remote policy is invalid: {error}"))
-            })?;
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct PreProfileStateStatus {
-    pub(crate) state: &'static str,
-    pub(crate) cache_base: String,
-    pub(crate) max_bytes: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) trust_domain: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) remote_authority: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) remote_mode: Option<&'static str>,
-    pub(crate) root_portability: &'static str,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ProfileStatus {
     pub(crate) profile_id: String,
@@ -323,27 +278,6 @@ pub(crate) struct ProfileRemovalPlan {
     cache_root: Option<PathBuf>,
     state_root: PathBuf,
     bytes: u64,
-}
-
-pub(crate) struct PreProfileStateRemovalPlan {
-    store: ProfileStore,
-    state_before: Option<Vec<u8>>,
-    cache_root: Option<PathBuf>,
-    bytes: u64,
-}
-
-impl PreProfileStateRemovalPlan {
-    pub(crate) fn pending(&self) -> bool {
-        self.state_before.is_some()
-    }
-
-    pub(crate) const fn bytes(&self) -> u64 {
-        self.bytes
-    }
-
-    pub(crate) fn cache_root(&self) -> Option<&Path> {
-        self.cache_root.as_deref()
-    }
 }
 
 impl ProfileRemovalPlan {
@@ -609,25 +543,6 @@ impl ProfileStore {
         self.root.join(TRANSACTION_FILE)
     }
 
-    fn pre_profile_state_path(&self) -> PathBuf {
-        self.root.join(UNBOUND_PRE_PROFILE_STATE_FILE)
-    }
-
-    fn read_pre_profile_state(&self) -> RailResult<Option<Vec<u8>>> {
-        validate_existing_layout(&self.root)?;
-        super::installation::read_optional_regular(&self.pre_profile_state_path(), MAX_PROFILE_BYTES)
-    }
-
-    fn remove_pre_profile_state(&self, expected: &[u8]) -> RailResult<()> {
-        let path = self.pre_profile_state_path();
-        if super::installation::read_optional_regular(&path, expected.len() as u64)?.as_deref() != Some(expected) {
-            return Err(RailError::message(
-                "unbound pre-profile cache state changed before its authorized removal",
-            ));
-        }
-        remove_file_durable(&path)
-    }
-
     fn load_transaction(&self) -> RailResult<Option<(Vec<u8>, ProfileTransaction)>> {
         validate_existing_layout(&self.root)?;
         let Some(bytes) = super::installation::read_optional_regular(&self.transaction_path(), MAX_TRANSACTION_BYTES)?
@@ -643,6 +558,26 @@ impl ProfileStore {
             ));
         }
         Ok(Some((bytes, transaction)))
+    }
+
+    fn revalidate_transaction(&self, expected: Option<&[u8]>) -> RailResult<Option<ProfileTransaction>> {
+        let live = self.load_transaction()?;
+        if live.as_ref().map(|(bytes, _)| bytes.as_slice()) == expected {
+            return Ok(live.map(|(_, transaction)| transaction));
+        }
+        // A captured transaction may finish while another workspace plans enrollment.
+        if live.is_none()
+            && let Some(bytes) = expected
+        {
+            let completed: ProfileTransaction = serde_json::from_slice(bytes)?;
+            for mutation in &completed.mutations {
+                if self.read(&mutation.relative_path, MAX_PROFILE_BYTES)? != mutation.after {
+                    return Err(RailError::message("cache profile transaction changed after planning"));
+                }
+            }
+            return Ok(None);
+        }
+        Err(RailError::message("cache profile transaction changed after planning"))
     }
 
     fn create_layout(&self) -> RailResult<()> {
@@ -912,19 +847,14 @@ pub(crate) fn plan_setup(
 /// Apply one profile plan under the registry transaction lock.
 pub(crate) fn apply_setup(plan: &ProfileSetupPlan) -> RailResult<InstalledCacheProfile> {
     let _lock = plan.store.lock()?;
-    let live_transaction = plan.store.load_transaction()?;
-    if live_transaction.as_ref().map(|(bytes, _)| bytes.as_slice()) != plan.transaction_before.as_deref() {
-        return Err(RailError::message(
-            "cache profile transaction changed after setup planning",
-        ));
-    }
+    let live_transaction = plan.store.revalidate_transaction(plan.transaction_before.as_deref())?;
     let _lifecycle = lock_mutation_profiles(
         &plan.store,
-        live_transaction.as_ref().map(|(_, transaction)| transaction),
+        live_transaction.as_ref(),
         Some(plan.desired.profile_id()),
         true,
     )?;
-    if let Some((_, transaction)) = live_transaction {
+    if let Some(transaction) = live_transaction {
         plan.store.reconcile(&transaction)?;
         remove_file_durable(&plan.store.transaction_path())?;
     }
@@ -1028,20 +958,10 @@ pub(crate) fn plan_detach(cargo_home: &Path, workspace_root: &Path) -> RailResul
 
 pub(crate) fn apply_detach(plan: &ProfileDetachPlan) -> RailResult<()> {
     let _lock = plan.store.lock()?;
-    let live_transaction = plan.store.load_transaction()?;
-    if live_transaction.as_ref().map(|(bytes, _)| bytes.as_slice()) != plan.transaction_before.as_deref() {
-        return Err(RailError::message(
-            "cache profile transaction changed after detach planning",
-        ));
-    }
+    let live_transaction = plan.store.revalidate_transaction(plan.transaction_before.as_deref())?;
     let selected_profile = (!plan.profile_id.is_empty()).then_some(plan.profile_id.as_str());
-    let _lifecycle = lock_mutation_profiles(
-        &plan.store,
-        live_transaction.as_ref().map(|(_, transaction)| transaction),
-        selected_profile,
-        false,
-    )?;
-    if let Some((_, transaction)) = live_transaction {
+    let _lifecycle = lock_mutation_profiles(&plan.store, live_transaction.as_ref(), selected_profile, false)?;
+    if let Some(transaction) = live_transaction {
         plan.store.reconcile(&transaction)?;
         remove_file_durable(&plan.store.transaction_path())?;
     }
@@ -1266,87 +1186,6 @@ pub(crate) fn state_directory(cargo_home: &Path, profile_id: &str) -> RailResult
     Ok(ProfileStore::new(cargo_home)?.profile_state_directory(profile_id))
 }
 
-pub(crate) fn pre_profile_state_status(cargo_home: &Path) -> RailResult<Option<PreProfileStateStatus>> {
-    let store = ProfileStore::new(cargo_home)?;
-    let Some(bytes) = store.read_pre_profile_state()? else {
-        return Ok(None);
-    };
-    let state = decode_pre_profile_state(&bytes)?;
-    let remote = state
-        .remote
-        .as_ref()
-        .map(InstalledRemoteCache::selection)
-        .transpose()
-        .map_err(|error| RailError::message(format!("unbound pre-profile remote policy is invalid: {error}")))?;
-    Ok(Some(PreProfileStateStatus {
-        state: "unbound",
-        cache_base: state.cache.base().to_string_lossy().into_owned(),
-        max_bytes: state.cache.max_bytes(),
-        trust_domain: state.cache.trust_domain().map(str::to_string),
-        remote_authority: remote
-            .as_ref()
-            .map(|selection| selection.authority().as_str().to_string()),
-        remote_mode: remote.as_ref().map(|selection| selection.mode().as_str()),
-        root_portability: state.root_portability.as_str(),
-    }))
-}
-
-pub(crate) fn plan_pre_profile_state_removal(cargo_home: &Path) -> RailResult<PreProfileStateRemovalPlan> {
-    let store = ProfileStore::new(cargo_home)?;
-    if store.load_transaction()?.is_some() {
-        return Err(RailError::with_help(
-            "cache profile registry has an interrupted transaction",
-            "rerun `cargo rail cache setup` for the affected workspace before removing pre-profile state",
-        ));
-    }
-    let Some(state_before) = store.read_pre_profile_state()? else {
-        return Ok(PreProfileStateRemovalPlan {
-            store,
-            state_before: None,
-            cache_root: None,
-            bytes: 0,
-        });
-    };
-    let state = decode_pre_profile_state(&state_before)?;
-    let cache_root = state.cache.configured_root()?;
-    ensure_pre_profile_cache_is_unbound(&store, cache_root.as_deref())?;
-    let bytes = cache_root
-        .as_deref()
-        .map(|root| crate::cache::cas::status_at_with_max(root, state.cache.max_bytes()))
-        .transpose()?
-        .flatten()
-        .map_or(0, |status| status.bytes);
-    Ok(PreProfileStateRemovalPlan {
-        store,
-        state_before: Some(state_before),
-        cache_root,
-        bytes,
-    })
-}
-
-pub(crate) fn apply_pre_profile_state_removal(plan: &PreProfileStateRemovalPlan) -> RailResult<()> {
-    let Some(state_before) = plan.state_before.as_deref() else {
-        return Ok(());
-    };
-    let _lock = plan.store.lock()?;
-    if plan.store.load_transaction()?.is_some() {
-        return Err(RailError::message(
-            "cache profile registry transaction changed after pre-profile cleanup planning",
-        ));
-    }
-    if plan.store.read_pre_profile_state()?.as_deref() != Some(state_before) {
-        return Err(RailError::message(
-            "unbound pre-profile cache state changed after cleanup planning",
-        ));
-    }
-    ensure_pre_profile_cache_is_unbound(&plan.store, plan.cache_root.as_deref())?;
-    if let Some(root) = &plan.cache_root {
-        crate::cache::cas::remove_owned_root_at(root)?;
-    }
-    plan.store.remove_pre_profile_state(state_before)?;
-    Ok(())
-}
-
 pub(crate) fn list(cargo_home: &Path) -> RailResult<Vec<ProfileStatus>> {
     load_all(cargo_home)?
         .into_iter()
@@ -1452,44 +1291,6 @@ fn ensure_no_profile_bindings(store: &ProfileStore, profile_id: &str) -> RailRes
     Ok(())
 }
 
-fn ensure_pre_profile_cache_is_unbound(store: &ProfileStore, cache_root: Option<&Path>) -> RailResult<()> {
-    let Some(cache_root) = cache_root else {
-        return Ok(());
-    };
-    let directory = store.root.join(PROFILES_DIRECTORY);
-    let entries = match fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    let mut count = 0usize;
-    for entry in entries {
-        count = count.saturating_add(1);
-        if count > MAX_PROFILES {
-            return Err(RailError::message("cache profile registry exceeds its entry bound"));
-        }
-        let name = entry?
-            .file_name()
-            .into_string()
-            .map_err(|_| RailError::message("cache profile record name is not valid UTF-8"))?;
-        let profile_id = name
-            .strip_suffix(".json")
-            .ok_or_else(|| RailError::message("cache profile registry contains an unknown entry"))?;
-        validate_identity(profile_id)?;
-        let relative = ProfileStore::profile_relative(profile_id);
-        let bytes = store
-            .read(&relative, MAX_PROFILE_BYTES)?
-            .ok_or_else(|| RailError::message("cache profile record changed while it was inspected"))?;
-        let profile = decode_profile(&bytes)?;
-        if profile.cache.configured_root()?.as_deref() == Some(cache_root) {
-            return Err(RailError::message(
-                "unbound pre-profile CAS is selected by an installed workspace profile",
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn lock_mutation_profiles(
     store: &ProfileStore,
     recovery: Option<&ProfileTransaction>,
@@ -1563,18 +1364,6 @@ fn decode_binding(bytes: &[u8]) -> RailResult<ProfileBindingRecord> {
         ));
     }
     Ok(binding)
-}
-
-fn decode_pre_profile_state(bytes: &[u8]) -> RailResult<UnboundPreProfileState> {
-    let state: UnboundPreProfileState = serde_json::from_slice(bytes)
-        .map_err(|_| RailError::message("unbound pre-profile cache state is malformed"))?;
-    state.validate()?;
-    if encode_canonical(&state, MAX_PROFILE_BYTES)? != bytes {
-        return Err(RailError::message(
-            "unbound pre-profile cache state is not canonically encoded",
-        ));
-    }
-    Ok(state)
 }
 
 fn encode_canonical<T: Serialize>(value: &T, maximum: u64) -> RailResult<Vec<u8>> {
@@ -1731,4 +1520,79 @@ fn valid_identity(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setup_accepts_exact_concurrent_transaction_completion_and_rejects_drift() {
+        for drift in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let first = tempfile::tempdir().unwrap();
+            let second = tempfile::tempdir().unwrap();
+            for workspace in [first.path(), second.path()] {
+                fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+            }
+            let authority = "a".repeat(64);
+            let request = || ProfileSetupRequest {
+                requested_profile: None,
+                local_dir: None,
+                max_bytes: None,
+                remote_url: None,
+                remote_mode: None,
+                remote_environment: &[],
+                root_portability: None,
+                local_only: true,
+            };
+            let first_plan = plan_setup(home.path(), first.path(), &authority, request()).unwrap();
+            first_plan.store.create_layout().unwrap();
+            let transaction = ProfileTransaction {
+                version: TRANSACTION_VERSION,
+                transaction_id: "b".repeat(64),
+                mutations: first_plan.mutations.clone(),
+            };
+            transaction.validate().unwrap();
+            super::super::installation::write_private_atomic(
+                &first_plan.store.transaction_path(),
+                &encode_canonical(&transaction, MAX_TRANSACTION_BYTES).unwrap(),
+            )
+            .unwrap();
+            let second_plan = plan_setup(home.path(), second.path(), &authority, request()).unwrap();
+            first_plan.store.reconcile(&transaction).unwrap();
+            remove_file_durable(&first_plan.store.transaction_path()).unwrap();
+            if drift {
+                let changed = &transaction.mutations[0].relative_path;
+                first_plan.store.write(changed, b"changed after completion").unwrap();
+                assert!(
+                    apply_setup(&second_plan)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("transaction changed")
+                );
+                assert_eq!(
+                    first_plan.store.read(changed, MAX_PROFILE_BYTES).unwrap().unwrap(),
+                    b"changed after completion"
+                );
+                for mutation in &second_plan.mutations {
+                    assert_eq!(
+                        second_plan
+                            .store
+                            .read(&mutation.relative_path, MAX_PROFILE_BYTES)
+                            .unwrap(),
+                        mutation.before
+                    );
+                }
+            } else {
+                assert_eq!(apply_setup(&second_plan).unwrap(), second_plan.desired);
+                assert_eq!(
+                    select(&first_plan.store, first_plan.desired.selected_root())
+                        .unwrap()
+                        .unwrap(),
+                    first_plan.desired
+                );
+            }
+        }
+    }
 }

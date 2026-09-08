@@ -18,7 +18,7 @@ use crate::source::ContentDigest;
 
 /// Process-local control for the outer compiler cache boundary.
 pub(crate) const CACHE_CONTROL_ENV: &str = "CARGO_RAIL_CACHE";
-const BENCH_COVERAGE_CACHE_CONTROL: &str = "__cargo_rail_benchmark_coverage_v1";
+pub(crate) const BENCH_COVERAGE_CACHE_CONTROL: &str = "__cargo_rail_benchmark_coverage_v1";
 
 /// Marker set when this executable is the cache-disabled outer compiler wrapper.
 pub(crate) const CACHE_WRAPPER_MARKER: &str = "CARGO_RAIL_COMPILER_CACHE_WRAPPER";
