@@ -44,7 +44,7 @@ bootstrap-sha256 = "352ac5776d592a4870c15756f9e140507b9ee64de62b401152e5929f7c0c
 sdk-component = "Microsoft.VisualStudio.Component.Windows11SDK.28000"
 
 [aarch64-linux]
-packages = ["build-essential", "ca-certificates", "curl", "git", "jq", "pkgconf", "python3", "python3-venv", "unzip", "xz-utils", "zstd"]
+packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "jq", "pkgconf", "python3", "python3-venv", "unzip", "xz-utils", "zstd"]
 os = "Ubuntu 24.04 LTS"
 rust-host = "aarch64-unknown-linux-gnu"
 components = ["clippy", "rustfmt", "rustc-dev", "llvm-tools"]
@@ -63,7 +63,7 @@ url = "https://github.com/Kitware/CMake/releases/download/v4.4.3/cmake-4.4.3-lin
 sha256 = "2efc974dbd63b4444c0e8494b92f2e80c2d7e635b4b80eac2916985ddd8f72a6"
 
 [x86_64-linux]
-packages = ["build-essential", "ca-certificates", "curl", "git", "jq", "pkgconf", "python3", "python3-venv", "shellcheck", "unzip", "xz-utils", "zstd"]
+packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "jq", "pkgconf", "python3", "python3-venv", "shellcheck", "unzip", "xz-utils", "zstd"]
 os = "Ubuntu 24.04 LTS"
 rust-host = "x86_64-unknown-linux-gnu"
 components = ["clippy", "rustfmt", "rustc-dev", "llvm-tools"]
@@ -164,7 +164,7 @@ codename = "noble"
 rust-host = "riscv64gc-unknown-linux-gnu"
 components = ["rustc-dev", "llvm-tools"]
 cargo = []
-packages = ["build-essential", "ca-certificates", "curl", "git", "python3"]
+packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "python3"]
 
 [riscv64-linux.assets.rustup]
 url = "https://static.rust-lang.org/rustup/archive/1.29.1/riscv64gc-unknown-linux-gnu/rustup-init"
@@ -177,7 +177,7 @@ codename = "noble"
 rust-host = "s390x-unknown-linux-gnu"
 components = ["rustc-dev", "llvm-tools"]
 cargo = []
-packages = ["build-essential", "ca-certificates", "curl", "git", "python3"]
+packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "python3"]
 
 [s390x-linux.assets.rustup]
 url = "https://static.rust-lang.org/rustup/archive/1.29.1/s390x-unknown-linux-gnu/rustup-init"
@@ -190,7 +190,7 @@ codename = "noble"
 rust-host = "powerpc64le-unknown-linux-gnu"
 components = ["rustc-dev", "llvm-tools"]
 cargo = []
-packages = ["build-essential", "ca-certificates", "curl", "git", "python3"]
+packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "python3"]
 
 [powerpc64le-linux.assets.rustup]
 url = "https://static.rust-lang.org/rustup/archive/1.29.1/powerpc64le-unknown-linux-gnu/rustup-init"
