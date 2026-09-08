@@ -129,6 +129,9 @@ def main():
     elif command == 'validate':
         validate(data)
         print('Tooling catalog passed')
+    elif command == 'install-archive':
+        platform, name, prefix = args
+        print(install_archive(name, data[platform]['assets'][name], prefix))
     elif command == 'install-archives':
         platform, prefix = args
         for name, asset in data[platform]['assets'].items():

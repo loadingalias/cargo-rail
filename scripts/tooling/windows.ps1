@@ -106,7 +106,7 @@ try {
     $paths = @($pythonDirectory, $binDirectory, (Join-Path $gitDirectory 'cmd'),
         (Join-Path $gitDirectory 'bin'), (Join-Path $gitDirectory 'usr\bin'))
     foreach ($name in @('llvm', 'cmake', 'cargo-binstall', 'powershell')) {
-        $directory = & $python -c 'import sys; sys.path.insert(0, sys.argv[1]); import catalog; d=catalog.read(); print(catalog.install_archive(sys.argv[2], d[sys.argv[3]]["assets"][sys.argv[2]], sys.argv[4]))' $PSScriptRoot $name $Platform $prefix
+        $directory = & $python (Join-Path $PSScriptRoot 'catalog.py') install-archive $Platform $name $prefix
         if ($LASTEXITCODE -ne 0) { throw "Unable to install $name" }
         $toolBin = if (Test-Path (Join-Path $directory 'bin')) { Join-Path $directory 'bin' } else { $directory }
         $paths += $toolBin
