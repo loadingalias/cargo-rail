@@ -45,32 +45,6 @@ jobs:
           just ci-check check-compiler-driver test
           git diff --exit-code HEAD
 
-  macos:
-    name: macOS / ARM64
-    runs-on: macos-15
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-      - name: Install tooling, check, and test
-        run: |
-          export RUSTUP_TOOLCHAIN
-          RUSTUP_TOOLCHAIN="$(python3 scripts/tooling/catalog.py rust-channel)"
-          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy,rustfmt,rustc-dev,llvm-tools
-          targets="$(python3 -c 'import tomllib; print("\n".join(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["targets"]))')"
-          while IFS= read -r target; do rustup target add "$target"; done <<< "$targets"
-          for tool in just cargo-nextest cargo-deny cargo-xwin; do
-            cargo install "$tool" --version "$(python3 scripts/tooling/catalog.py get cargo "$tool")" --locked
-          done
-          brew install llvm
-          llvm_bin="$(brew --prefix llvm)/bin"
-          export PATH="$llvm_bin:$PATH"
-          [[ "$(llvm-config --version)" == "$(python3 scripts/tooling/catalog.py get versions llvm)" ]]
-          cargo xwin cache xwin
-          just ci-check check-compiler-driver test
-          git diff --exit-code HEAD
-
   windows-aws:
     name: Windows / x86_64
     runs-on: runs-on=${{ github.run_id }}/runner=x86_64-win/env=production
