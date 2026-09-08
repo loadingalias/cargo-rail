@@ -459,21 +459,20 @@ fn reusable_outputs(target: &Path) -> Result<BTreeMap<PathBuf, String>> {
     Ok(outputs)
 }
 
-fn native_action_keys(cache_root: &Path) -> Result<BTreeSet<String>> {
+fn native_action_files(cache_root: &Path) -> Result<BTreeSet<PathBuf>> {
     let directory = cache_root.join("native-actions-v2");
-    let mut keys = BTreeSet::new();
+    let mut files = BTreeSet::new();
     if !directory.is_dir() {
-        return Ok(keys);
+        return Ok(files);
     }
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();
         if path.extension().and_then(|value| value.to_str()) == Some("json") {
-            let state: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
-            keys.insert(state["action_key"].as_str().context("native action key")?.to_string());
+            files.insert(path);
         }
     }
-    Ok(keys)
+    Ok(files)
 }
 
 fn benchmark_events(directory: &Path) -> Result<Vec<serde_json::Value>> {
@@ -688,16 +687,37 @@ fn real_cargo_check_reuses_exact_outputs_with_root_bound_authority() -> Result<(
         seed_isolated_cargo_home(&second, &second_cargo_home)?;
         setup_cache(&first, &first_cargo_home, &first_cache)?;
         setup_cache(&second, &second_cargo_home, &second_cache)?;
-        let first_cache_root = profile_cache_root(&first, &first_cargo_home)?;
-        let second_cache_root = profile_cache_root(&second, &second_cargo_home)?;
-
-        let (_, first_cold) = run_cargo(&first, &first_cargo_home, "check", &[])?;
-        let (second_cold_output, second_cold) = run_cargo(&second, &second_cargo_home, "check", &[])?;
+        let cold = |fixture: &Path, cargo_home: &Path, name: &str| -> Result<(Output, Usage, BTreeSet<String>)> {
+            let events = root.path().join(name);
+            create_private_directory(&events)?;
+            let events = fs::canonicalize(events)?;
+            let (output, usage) = run_cargo(
+                fixture,
+                cargo_home,
+                "check",
+                &[
+                    ("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1"),
+                    (
+                        "CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY",
+                        events.to_str().context("events path")?,
+                    ),
+                ],
+            )?;
+            ensure_typed_benchmark_events(&events)?;
+            let keys = benchmark_action_keys(&events, "miss")?
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            ensure!(
+                keys.len() as u64 == usage.misses,
+                "cold usage and action ledgers disagree: {usage:?}"
+            );
+            Ok((output, usage, keys))
+        };
+        let (_, first_cold, first_keys) = cold(&first, &first_cargo_home, "first-cold-events")?;
+        let (second_cold_output, second_cold, second_keys) = cold(&second, &second_cargo_home, "second-cold-events")?;
         ensure!(first_cold.hits == 0 && first_cold.misses >= 12, "{first_cold:?}");
         ensure!(second_cold.hits == 0 && second_cold.misses >= 12, "{second_cold:?}");
         ensure!(first_cold.failures == 0 && second_cold.failures == 0);
-        let first_keys = native_action_keys(&first_cache_root)?;
-        let second_keys = native_action_keys(&second_cache_root)?;
         ensure!(!first_keys.is_empty() && !second_keys.is_empty());
         ensure!(
             first_keys.is_disjoint(&second_keys),
@@ -707,7 +727,6 @@ fn real_cargo_check_reuses_exact_outputs_with_root_bound_authority() -> Result<(
         let second_diagnostic = current_root_diagnostic(&second_cold_output)?;
 
         setup_cache(&second, &second_cargo_home, &first_cache)?;
-        let reconstructed_cache_root = profile_cache_root(&second, &second_cargo_home)?;
         fs::remove_dir_all(second.join("target"))?;
         let root_bound_events = fs::canonicalize(root.path())?.join("root-bound-events");
         create_private_directory(&root_bound_events)?;
@@ -743,15 +762,16 @@ fn real_cargo_check_reuses_exact_outputs_with_root_bound_authority() -> Result<(
             benchmark_event_summary(&root_bound_events)?,
             String::from_utf8_lossy(&root_bound_output.stderr)
         );
-        let reconstructed_keys = native_action_keys(&reconstructed_cache_root)?;
         ensure!(
-            root_bound_misses.len() as u64 == root_bound_cold.misses
-                && root_bound_misses.iter().all(|key| reconstructed_keys.contains(key)),
-            "root-bound reconstruction did not publish every action missed by the current execution: \
-     usage={root_bound_cold:?}, reconstructed={}, misses={root_bound_misses:?}, events={:?}",
-            reconstructed_keys.len(),
+            root_bound_misses.len() as u64 == root_bound_cold.misses,
+            "root-bound usage and action ledgers disagree: \
+     usage={root_bound_cold:?}, misses={root_bound_misses:?}, events={:?}",
             benchmark_event_summary(&root_bound_events)?
         );
+        let reconstructed_keys = root_bound_hits
+            .into_iter()
+            .chain(root_bound_misses)
+            .collect::<BTreeSet<_>>();
         let root_bound_outputs = reusable_outputs(&second.join("target"))?;
         ensure!(
             root_bound_outputs == second_outputs,
@@ -776,6 +796,13 @@ fn real_cargo_check_reuses_exact_outputs_with_root_bound_authority() -> Result<(
         )?;
         let second_warm_summary = benchmark_event_summary(&second_warm_events)?;
         ensure_typed_benchmark_events(&second_warm_events)?;
+        let restored_keys = benchmark_action_keys(&second_warm_events, "hit")?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        ensure!(
+            restored_keys == reconstructed_keys,
+            "warm restore did not reuse every action from the current installation's cold run"
+        );
         let second_warm_miss_crates = benchmark_action_crates(&second_warm_events, "miss")?;
         ensure!(
             second_warm.hits.saturating_add(second_warm.misses) == second_keys.len() as u64,
@@ -834,7 +861,7 @@ fn real_cargo_build_reuses_exact_outputs() -> Result<()> {
         setup_cache(&first, &first_cargo_home, &build_cache)?;
         let build_cache_root = profile_cache_root(&first, &first_cargo_home)?;
         ensure!(
-            native_action_keys(&build_cache_root)?.is_empty(),
+            native_action_files(&build_cache_root)?.is_empty(),
             "release build selected a cache containing native actions"
         );
         let build_cold_events = fs::canonicalize(root.path())?.join("build-cold-events");
@@ -1210,7 +1237,7 @@ fn windows_native_driver_bypass_preserves_cargo_workloads() -> Result<()> {
             );
             ensure_typed_benchmark_events(&events)?;
             ensure!(
-                native_action_keys(&cache)?.is_empty(),
+                native_action_files(&cache)?.is_empty(),
                 "unsupported driver published an action"
             );
             ensure!(
