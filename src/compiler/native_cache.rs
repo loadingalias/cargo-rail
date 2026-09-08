@@ -14703,17 +14703,20 @@ fn gcc_link_selection(
         &serde_json::to_vec(&gcc_link_projection(&linker_arguments, omitted)?)?,
     );
     let version = run_link_driver_probe(linker, &["--version".to_string()], current_directory)?;
-    if !version.stdout.starts_with(b"GNU ld ") {
+    if version.stdout.starts_with(b"GNU ld ") {
+        let search = bfd_search_probe_arguments(linker, &linker_arguments, current_directory)?;
+        append_frame(
+            &mut identity,
+            b"default-search",
+            &link_driver_probe_output(linker, &search, current_directory)?,
+        );
+    } else if !version.stdout.starts_with(b"LLD ") {
         return Err(RailError::message(
             "GCC selected linker default-search evidence is unavailable",
         ));
     }
-    let search = bfd_search_probe_arguments(linker, &linker_arguments, current_directory)?;
-    append_frame(
-        &mut identity,
-        b"default-search",
-        &link_driver_probe_output(linker, &search, current_directory)?,
-    );
+    // LLD has no built-in library search paths. Its captured arguments and
+    // linker-script inputs own search selection, as for a direct LLD invocation.
     Ok(GccLinkSelection {
         collect2,
         linker: linker.clone(),
@@ -15855,7 +15858,12 @@ fn capture_elf_link_driver_evidence(driver: &Path, arguments: &[OsString]) -> Ra
     }
 
     let mut default_search_guards = BTreeMap::new();
-    let gcc_search = if execution.probe.runtimes.len() == 3 && native_gcc_driver(&driver, &current_directory) {
+    let gcc_search = if execution.probe.runtimes.len() == 3
+        && native_gcc_driver(&driver, &current_directory)
+        && run_link_driver_probe(&linker, &["--version".to_string()], &current_directory)?
+            .stdout
+            .starts_with(b"GNU ld ")
+    {
         Some(bfd_search_probe_arguments(
             &linker,
             &execution.linker_arguments,
@@ -22728,6 +22736,58 @@ pub(crate) mod tests {
             resolve_elf_search_directory(Path::new("=/usr/lib"), Path::new("sdk"), Path::new("/workspace")),
             PathBuf::from("/workspace/sdk/usr/lib")
         );
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ))]
+    #[test]
+    fn gcc_driver_capture_revalidates_rust_bundled_lld() {
+        let result: RailResult<()> = (|| {
+            let root = tempfile::tempdir()?;
+            let directory = crate::utils::canonicalize_existing(root.path())?;
+            let driver = crate::executable::resolve_executable_selection(OsStr::new("gcc"), &directory)?;
+            let output = Command::new("rustc").args(["--print", "target-libdir"]).output()?;
+            assert!(output.status.success(), "Rust library directory: {output:?}");
+            let libdir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+            let linker_directory = libdir.parent().expect("Rust target directory").join("bin/gcc-ld");
+            let source = directory.join("native.c");
+            let object = directory.join("native.o");
+            fs::write(&source, "int selected_value(void) { return 7; }\n")?;
+            let output = Command::new(&driver)
+                .args(["-fPIC", "-c"])
+                .arg(&source)
+                .arg("-o")
+                .arg(&object)
+                .output()?;
+            assert!(output.status.success(), "GCC object prerequisite: {output:?}");
+            let arguments = vec![
+                OsString::from(format!("-B{}", linker_directory.display())),
+                OsString::from("-fuse-ld=lld"),
+                OsString::from("-shared"),
+                OsString::from("-nodefaultlibs"),
+                object.as_os_str().to_os_string(),
+                OsString::from("-o"),
+                directory.join("native.so").into_os_string(),
+            ];
+            let evidence = capture_elf_link_driver_evidence(&driver, &arguments)?;
+            let execution = evidence.execution.expect("GCC execution evidence");
+            assert_eq!(Path::new(&execution.linker).file_name(), Some(OsStr::new("ld.lld")));
+            let implementation = crate::utils::canonicalize_existing(
+                &linker_directory.parent().expect("linker directory").join("rust-lld"),
+            )?;
+            assert!(execution.probe.runtimes[2].selection.files().contains(&implementation));
+            assert!(evidence.direct_inputs.contains(&object.to_string_lossy().into_owned()));
+            assert!(!directory.join("native.so").exists(), "probe must not link an output");
+            revalidate_link_driver_probe(&driver, &execution.probe)?;
+            let mut tampered = execution.probe;
+            tampered.arguments.push("-fuse-ld=bfd".to_string());
+            assert!(revalidate_link_driver_probe(&driver, &tampered).is_err());
+            Ok(())
+        })();
+        assert!(result.is_ok(), "GCC with Rust's LLD: {result:?}");
     }
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]

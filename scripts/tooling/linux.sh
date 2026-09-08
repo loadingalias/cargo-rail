@@ -96,25 +96,27 @@ for tool in "${cargo_tools[@]}"; do
   env -u RUSTC_WRAPPER -u CARGO_ENCODED_RUSTFLAGS \
     cargo +"$channel" binstall --locked --no-confirm --targets "$(catalog_get "$platform" rust-host)" "$tool@$version"
 done
-# These hosts lack prebuilt nextest, but the full suite exercises its Cargo command.
+# These hosts build the test executor and recipe runner from pinned sources.
 case "$platform" in
   riscv64-linux|s390x-linux|powerpc64le-linux)
-    cargo +"$channel" install cargo-nextest --locked --version "$(catalog_get cargo cargo-nextest)"
+    for tool in cargo-nextest just; do
+      cargo +"$channel" install "$tool" --locked --version "$(catalog_get cargo "$tool")"
+    done
     ;;
 esac
+python3 "$SCRIPT_DIR/verify.py" "$platform"
 # Persistent paths are shared by interactive shells and non-interactive Bash recipes.
 environment="$prefix/environment.sh"
 {
   printf "export PATH=%q:\"\$PATH\"\n" "$(IFS=:; echo "${tool_paths[*]}")"
   printf 'export RUSTUP_TOOLCHAIN=%q\n' "$channel"
 } > "$environment"
+if [[ -n "${GITHUB_PATH:-}" ]]; then printf '%s\n' "${tool_paths[@]}" >> "$GITHUB_PATH"; fi
+if [[ -n "${GITHUB_ENV:-}" ]]; then printf 'RUSTUP_TOOLCHAIN=%s\n' "$channel" >> "$GITHUB_ENV"; fi
 for startup in "$HOME/.profile" "$HOME/.bashrc"; do
   line="source \"$environment\""
   touch "$startup"
   grep -Fxq "$line" "$startup" || printf '\n%s\n' "$line" >> "$startup"
 done
-rustc -vV
-cargo --version
-cc --version
 printf 'Installed %s tooling. New shells load %s.\n' "$platform" "$environment"
 printf 'Run scripts/check-native-tests.sh for the complete native test suite.\n'

@@ -174,8 +174,9 @@ fn observe_glibc_executable_runtime(
     Ok((output, runtime?.selection))
 }
 
-/// Programs and loader images observed during one command, including completed
-/// dynamic children. This does not observe arbitrary file I/O or static children.
+/// Process entry programs and loader images observed during one command,
+/// including completed dynamic children. Exec replacements belong to selection's
+/// file closure. This does not observe arbitrary file I/O or static children.
 #[derive(Debug)]
 pub(crate) struct ExecutableRuntimeExecution {
     pub(crate) selection: ExecutableRuntimeSelection,
@@ -460,7 +461,89 @@ fn parse_glibc_execution_selection(
     bytes: &[u8],
     startup: ExecutableRuntimeSelection,
 ) -> RailResult<ExecutableRuntimeSelection> {
-    parse_glibc_process_selection(program, process, bytes, startup, false)
+    let invalid = || RailError::message("ELF runtime exec transition is incomplete or unsupported");
+    let text = std::str::from_utf8(bytes).map_err(|_| invalid())?;
+    let prefix = format!("{process}:\tinitialize program: ");
+    let images = text
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            line.trim_start_matches(' ')
+                .strip_prefix(&prefix)
+                .map(|path| (index, Path::new(path)))
+        })
+        .collect::<Vec<_>>();
+    if images.len() <= 1 {
+        return parse_glibc_process_selection(program, process, bytes, startup, false);
+    }
+    if images.len() > MAX_RUNTIME_IMAGES || images[0].1 != program {
+        return Err(invalid());
+    }
+    let lines = text.lines().collect::<Vec<_>>();
+    let file_prefix = format!("{process}:\tfile=");
+    let mut boundaries = vec![0];
+    for pair in images.windows(2) {
+        let [(previous_index, previous), (index, next)] = pair else {
+            return Err(invalid());
+        };
+        if !next.is_absolute() {
+            return Err(invalid());
+        }
+        let transfer = format!("{process}:\ttransferring control: {}", previous.display());
+        let transferred = lines[*previous_index..*index]
+            .iter()
+            .position(|line| line.trim_start_matches(' ') == transfer)
+            .map(|offset| previous_index + offset + 1)
+            .ok_or_else(invalid)?;
+        // A new dynamic image starts with its own loader dependency requests,
+        // before its initialization record. Do not merge its maps with the old
+        // image: that would let an earlier initialization certify a later map.
+        let request = format!(" [0];  needed by {} [0]", next.display());
+        let boundary = lines[transferred..*index]
+            .iter()
+            .position(|line| {
+                line.trim_start_matches(' ')
+                    .strip_prefix(&file_prefix)
+                    .is_some_and(|record| record.ends_with(&request))
+            })
+            .map(|offset| transferred + offset)
+            .ok_or_else(invalid)?;
+        boundaries.push(boundary);
+    }
+    boundaries.push(lines.len());
+    let mut combined = ExecutableRuntimeSelection {
+        files: Vec::new(),
+        platform_images: startup.platform_images.clone(),
+        search_files: Vec::new(),
+        missing_files: Vec::new(),
+    };
+    for (index, (_, image)) in images.iter().enumerate() {
+        let initial = if index == 0 {
+            startup.clone()
+        } else {
+            ExecutableRuntimeSelection {
+                files: vec![crate::utils::canonicalize_existing(image)?],
+                platform_images: Vec::new(),
+                search_files: Vec::new(),
+                missing_files: Vec::new(),
+            }
+        };
+        let frame = lines[boundaries[index]..boundaries[index + 1]].join("\n");
+        let selected = parse_glibc_process_selection(image, process, frame.as_bytes(), initial, false)?;
+        combined.files.extend(selected.files);
+        combined.search_files.extend(selected.search_files);
+        combined.missing_files.extend(selected.missing_files);
+    }
+    for paths in [
+        &mut combined.files,
+        &mut combined.search_files,
+        &mut combined.missing_files,
+    ] {
+        paths.sort_unstable();
+        paths.dedup();
+    }
+    combined.validate()?;
+    Ok(combined)
 }
 
 fn parse_glibc_process_selection(
@@ -830,9 +913,7 @@ pub(crate) fn resolve_executable_selection(selection: &OsStr, current_dir: &Path
 /// Callers must preserve the selected path separately when its basename can
 /// affect process behavior.
 pub(crate) fn resolve_executable_path(selection: &OsStr, current_dir: &Path) -> RailResult<PathBuf> {
-    resolve_executable_selection(selection, current_dir)?
-        .canonicalize()
-        .map_err(Into::into)
+    crate::utils::canonicalize_existing(&resolve_executable_selection(selection, current_dir)?).map_err(Into::into)
 }
 
 impl ToolchainExecutableIdentities {
@@ -1569,6 +1650,55 @@ int main(int argc, char **argv) {
             parse_glibc_execution_selection(&program, 42, changed.as_bytes(), startup.clone())
                 .expect_err("incomplete or unsupported execution");
         }
+    }
+
+    #[test]
+    fn runtime_exec_images_require_independent_loader_initialization() {
+        let root = tempfile::tempdir().expect("runtime records");
+        let program = root.path().join("wrapper");
+        let replacement = root.path().join("implementation");
+        let library = root.path().join("library.so");
+        for path in [&program, &replacement, &library] {
+            fs::write(path, b"image").expect("runtime image");
+        }
+        let startup = ExecutableRuntimeSelection {
+            files: vec![crate::utils::canonicalize_existing(&program).expect("wrapper")],
+            platform_images: Vec::new(),
+            search_files: Vec::new(),
+            missing_files: Vec::new(),
+        };
+        let wrapper = format!(
+            "42:\tfile=library.so [0];  generating link map\n42:\tcalling init: {}\n42:\tinitialize program: {}\n42:\ttransferring control: {}\n",
+            library.display(),
+            program.display(),
+            program.display()
+        );
+        let implementation = format!(
+            "42:\tfile=library.so [0];  needed by {} [0]\n42:\tfile=library.so [0];  generating link map\n42:\tcalling init: {}\n42:\tinitialize program: {}\n42:\ttransferring control: {}\n",
+            replacement.display(),
+            library.display(),
+            replacement.display(),
+            replacement.display()
+        );
+        let trace = format!("{wrapper}{implementation}");
+        let selected = parse_glibc_execution_selection(&program, 42, trace.as_bytes(), startup.clone())
+            .expect("complete exec transition");
+        let mut expected = [&program, &replacement, &library]
+            .map(|path| crate::utils::canonicalize_existing(path).expect("canonical image"));
+        expected.sort_unstable();
+        assert_eq!(selected.files(), expected);
+        let missing_init = implementation.replace(&format!("42:\tcalling init: {}\n", library.display()), "");
+        parse_glibc_execution_selection(
+            &program,
+            42,
+            format!("{wrapper}{missing_init}").as_bytes(),
+            startup.clone(),
+        )
+        .expect_err("wrapper initialization cannot certify the replacement's library map");
+        let missing_transfer =
+            implementation.replace(&format!("42:\ttransferring control: {}\n", replacement.display()), "");
+        parse_glibc_execution_selection(&program, 42, format!("{wrapper}{missing_transfer}").as_bytes(), startup)
+            .expect_err("replacement must reach execution");
     }
 
     #[test]

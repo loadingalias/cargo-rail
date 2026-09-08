@@ -18,81 +18,35 @@ defaults:
     shell: bash
 
 jobs:
-  linux-aws:
-    name: Linux / ${{ matrix.platform }}
+  native:
+    name: ${{ matrix.platform }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
           - platform: x86_64-linux
-            image: ubuntu24-full-x64
+            runner: runs-on=${{ github.run_id }}/runner=x86_64-linux/image=ubuntu24-full-x64/spot=false/env=production
+            checks: true
+            timeout: 30
           - platform: aarch64-linux
-            image: ubuntu24-full-arm64
-    runs-on: runs-on=${{ github.run_id }}/runner=${{ matrix.platform }}/image=${{ matrix.image }}/spot=false/env=production
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-      - name: Install tooling
-        env:
-          PLATFORM: ${{ matrix.platform }}
-        run: scripts/tooling/"$PLATFORM".sh
-      - name: Check tooling
-        if: matrix.platform == 'x86_64-linux'
-        run: |
-          source "$HOME/.local/share/cargo-rail-tooling/environment.sh"
-          just check-tooling
-      - name: Check and test
-        run: |
-          source "$HOME/.local/share/cargo-rail-tooling/environment.sh"
-          just ci-check check-compiler-driver test
-          git diff --exit-code HEAD
-
-  windows-aws:
-    name: Windows / x86_64
-    runs-on: runs-on=${{ github.run_id }}/runner=x86_64-win/spot=false/env=production
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-      - name: Install tooling, check, and test
-        shell: powershell
-        run: |
-          ./scripts/tooling/x86_64-win.ps1
-          ./scripts/tooling/check.ps1
-          just ci-check check-compiler-driver test
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          git diff --exit-code HEAD
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-  # Deferred until the Azure ARM64 runner is provisioned and registered.
-  # windows-azure:
-  #   runs-on: [self-hosted, Windows, ARM64, '${{ vars.AZURE_ARM64_RUNNER }}']
-  #   timeout-minutes: 60
-  #   steps:
-  #     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-  #       with:
-  #         persist-credentials: false
-  #     - name: Install tooling
-  #       shell: powershell
-  #       run: ./scripts/tooling/aarch64-win.ps1
-
-  linux-native:
-    name: Linux / ${{ matrix.platform }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
+            runner: runs-on=${{ github.run_id }}/runner=aarch64-linux/image=ubuntu24-full-arm64/spot=false/env=production
+            checks: true
+            timeout: 30
+          - platform: x86_64-win
+            runner: runs-on=${{ github.run_id }}/runner=x86_64-win/spot=false/env=production
+            checks: true
+            timeout: 60
           - platform: s390x-linux
             runner: ubuntu-24.04-s390x
+            checks: false
             timeout: 90
           - platform: powerpc64le-linux
             runner: ubuntu-24.04-ppc64le-p10
+            checks: false
             timeout: 90
           - platform: riscv64-linux
             runner: ubuntu-24.04-riscv
+            checks: false
             timeout: 120
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout }}
@@ -100,12 +54,19 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - name: Install tooling
+      - name: Install Linux tooling
+        if: runner.os == 'Linux'
         env:
           PLATFORM: ${{ matrix.platform }}
         run: scripts/tooling/"$PLATFORM".sh
-      - name: Run the complete native test suite
-        run: |
-          source "$HOME/.local/share/cargo-rail-tooling/environment.sh"
-          scripts/check-native-tests.sh
-          git diff --exit-code HEAD
+      - name: Install Windows tooling
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./scripts/tooling/x86_64-win.ps1
+      - name: Check
+        if: matrix.checks
+        run: just ci-check check-compiler-driver
+      - name: Test
+        run: scripts/check-native-tests.sh
+      - name: Check worktree
+        run: git diff --exit-code HEAD

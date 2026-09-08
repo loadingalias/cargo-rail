@@ -59,8 +59,11 @@ try {
         $archive = Join-Path $temporary 'python.zip'
         Get-PinnedDownload $url $sha $archive
         Expand-Archive -Path $archive -DestinationPath $pythonDirectory -Force
-        Add-Content (Get-ChildItem $pythonDirectory -Filter 'python*._pth' | Select-Object -First 1).FullName $PSScriptRoot
     }
+    # The embedded interpreter is isolated; bind sibling imports to this checkout on every run.
+    $pythonPathFile = (Get-ChildItem $pythonDirectory -Filter 'python*._pth' | Select-Object -First 1).FullName
+    $pythonPaths = @(Get-Content $pythonPathFile | Where-Object { -not [IO.Path]::IsPathRooted($_) })
+    [IO.File]::WriteAllLines($pythonPathFile, ($pythonPaths + $PSScriptRoot), [Text.UTF8Encoding]::new($false))
     $python3 = Join-Path $pythonDirectory 'python3.exe'
     if (-not (Test-Path $python3)) { New-Item -ItemType HardLink -Path $python3 -Target $python | Out-Null }
     $catalogHelper = Join-Path $PSScriptRoot 'catalog.py'
@@ -94,7 +97,6 @@ try {
     if ($instance.Count -ne 1) { throw 'Visual Studio does not match the pinned build.' }
     Import-Module (Join-Path $vsPath 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
     $vsArch = if ($Platform -eq 'aarch64-win') { 'arm64' } else { 'amd64' }
-    Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation -DevCmdArguments "-arch=$vsArch -host_arch=$vsArch"
 
     $gitInstaller = Join-Path $temporary 'git.exe'
     Get-PinnedDownload $native.assets.git.url $native.assets.git.sha256 $gitInstaller
@@ -103,8 +105,10 @@ try {
     $binDirectory = Join-Path $prefix 'bin'
     New-Item -ItemType Directory -Force $binDirectory | Out-Null
     Get-PinnedDownload $native.assets.jq.url $native.assets.jq.sha256 (Join-Path $binDirectory 'jq.exe')
+    # Use the actual Bash binary. Git's bin/bash.exe launcher prepends usr/bin
+    # again, shadowing MSVC's linker even after the developer shell is entered.
     $paths = @($pythonDirectory, $binDirectory, (Join-Path $gitDirectory 'cmd'),
-        (Join-Path $gitDirectory 'bin'), (Join-Path $gitDirectory 'usr\bin'))
+        (Join-Path $gitDirectory 'usr\bin'))
     foreach ($name in @('llvm', 'cmake', 'cargo-binstall', 'powershell')) {
         $directory = & $python (Join-Path $PSScriptRoot 'catalog.py') install-archive $Platform $name $prefix
         if ($LASTEXITCODE -ne 0) { throw "Unable to install $name" }
@@ -115,6 +119,12 @@ try {
     $cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
     $paths += $cargoBin
     $env:PATH = (@($paths + ($env:PATH -split ';')) | Select-Object -Unique) -join ';'
+    # Git's usr/bin also contains link.exe. Keep the native compiler ahead of it.
+    Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation -DevCmdArguments "-arch=$vsArch -host_arch=$vsArch"
+    $linker = (Get-Command link.exe -CommandType Application).Source
+    if (-not $linker.StartsWith($env:VCToolsInstallDir, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Expected the provisioned MSVC linker; resolved $linker"
+    }
     $rustupInstaller = Join-Path $temporary 'rustup-init.exe'
     Get-PinnedDownload $native.assets.rustup.url $native.assets.rustup.sha256 $rustupInstaller
     Invoke-Native $rustupInstaller @('-y', '--no-modify-path', '--default-host', $native.'rust-host', '--default-toolchain', 'none')
@@ -127,14 +137,20 @@ try {
     foreach ($tool in $native.cargo) {
         Invoke-Native 'cargo' @("+$channel", 'binstall', '--locked', '--no-confirm', '--targets', $native.'rust-host', "$tool@$($catalog.cargo.$tool)")
     }
-    Invoke-Native 'clang' @('--version')
-    Invoke-Native 'cmake' @('--version')
-    Invoke-Native 'cargo' @("+$channel", 'nextest', '--version')
+    # Match the Bash environment used by Just's recipes as well as PowerShell.
+    Invoke-Native 'bash' @('-c', ('python3 "' + ($PSScriptRoot -replace '\\', '/') + '/verify.py" ' + $Platform))
 
     # Persist the complete MSVC/SDK environment, not only the paths to installed executables.
-    foreach ($name in @('PATH', 'RUSTUP_TOOLCHAIN', 'INCLUDE', 'LIB', 'LIBPATH', 'LIBCLANG_PATH', 'VSINSTALLDIR', 'VCINSTALLDIR', 'VCToolsInstallDir', 'WindowsSdkDir', 'WindowsSDKVersion')) {
+    foreach ($name in @('PATH', 'RUSTUP_TOOLCHAIN', 'INCLUDE', 'LIB', 'LIBPATH', 'LIBCLANG_PATH',
+        'VSINSTALLDIR', 'VCINSTALLDIR', 'VCToolsInstallDir', 'VCToolsVersion',
+        'VSCMD_VER', 'VSCMD_ARG_TGT_ARCH', 'VSCMD_ARG_HOST_ARCH',
+        'WindowsSdkDir', 'WindowsSDKVersion', 'WindowsSdkBinPath', 'WindowsSdkVerBinPath',
+        'UniversalCRTSdkDir', 'UCRTVersion', 'WindowsLibPath')) {
         $value = [Environment]::GetEnvironmentVariable($name, 'Process')
-        if ($value) { [Environment]::SetEnvironmentVariable($name, $value, 'User') }
+        if ($value) {
+            [Environment]::SetEnvironmentVariable($name, $value, 'User')
+            if ($env:GITHUB_ENV) { Add-Content -Encoding UTF8 $env:GITHUB_ENV "$name=$value" }
+        }
     }
     Write-Host "Installed $Platform tooling. New shells inherit the configured compiler environment."
 } finally {

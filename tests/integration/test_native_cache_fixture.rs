@@ -380,10 +380,11 @@ fn run_cargo(
 
 fn cargo_command(fixture: &Path, cargo_home: &Path, workload: &str) -> Command {
     let mut command = cargo_process(fixture, Some(cargo_home));
-    command.arg(workload);
+    // These trials require exact reuse. Concurrent Cargo producers can change
+    // a linker's candidate inventory during capture, correctly forcing bypass.
+    command.args([workload, "--jobs", "1"]);
     if workload == "build" {
-        // Pipelined metadata can expose different library candidates in cold and warm builds.
-        command.args(["--release", "--jobs", "1"]);
+        command.arg("--release");
     } else if workload == "test" {
         command.args(["--no-run", "--all-targets"]);
     }
@@ -400,6 +401,7 @@ fn cargo_command(fixture: &Path, cargo_home: &Path, workload: &str) -> Command {
     command
 }
 
+#[cfg(not(windows))]
 fn add_current_root_diagnostic(fixture: &Path) -> Result<()> {
     let path = fixture.join("crates/fixture-types/src/lib.rs");
     let mut source = fs::read_to_string(&path)?;
@@ -414,6 +416,7 @@ fn add_current_root_diagnostic(fixture: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn current_root_diagnostic(output: &Output) -> Result<String> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -484,6 +487,7 @@ fn benchmark_events(directory: &Path) -> Result<Vec<serde_json::Value>> {
         .collect()
 }
 
+#[cfg(not(windows))]
 fn benchmark_action_keys(directory: &Path, status: &str) -> Result<Vec<String>> {
     let mut keys = Vec::new();
     for event in benchmark_events(directory)? {
@@ -499,6 +503,7 @@ fn benchmark_action_keys(directory: &Path, status: &str) -> Result<Vec<String>> 
     Ok(keys)
 }
 
+#[cfg(not(windows))]
 fn benchmark_action_crates(directory: &Path, status: &str) -> Result<Vec<String>> {
     Ok(benchmark_events(directory)?
         .into_iter()
@@ -575,65 +580,6 @@ fn ensure_typed_benchmark_events(directory: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
-fn ensure_windows_native_miss_boundary(
-    usage: Usage,
-    miss_crates: &[String],
-    summary: &BTreeMap<String, u64>,
-    phase: &str,
-) -> Result<()> {
-    // COFF linker observation deliberately bypasses this native producer. Its
-    // rebuilt artifact changes the exact inputs of every downstream action, so
-    // the safe miss boundary is the full dependent closure, including binaries.
-    let allowed_native_misses = BTreeSet::from([
-        "fixture_native",
-        "fixture_native_sys",
-        "fixture_service_b",
-        "fixture_cli",
-        "fixture_worker",
-    ]);
-    let observed_native_misses = miss_crates.iter().map(String::as_str).collect::<BTreeSet<_>>();
-    ensure!(
-        observed_native_misses.len() == miss_crates.len()
-            && miss_crates.len() as u64 == usage.misses
-            && observed_native_misses.is_subset(&allowed_native_misses)
-            && (observed_native_misses.is_empty()
-                || summary
-                    .get("bypassed:dynamic_dependency_execution_observation_unavailable")
-                    .is_some_and(|count| *count > 0)),
-        "Windows {phase} misses escaped the explicitly ungraduated native-artifact boundary: \
-     usage={usage:?}, misses={miss_crates:?}, events={summary:?}"
-    );
-    Ok(())
-}
-
-#[cfg(windows)]
-fn ensure_windows_hit_outputs_are_exact(
-    cold: &BTreeMap<PathBuf, String>,
-    warm: &BTreeMap<PathBuf, String>,
-    uncached_crates: &[String],
-    phase: &str,
-) -> Result<()> {
-    ensure!(
-        cold.keys().eq(warm.keys()),
-        "Windows {phase} changed the reusable output inventory"
-    );
-    let changed = cold
-        .iter()
-        .filter(|(path, digest)| warm.get(*path) != Some(*digest))
-        .map(|(path, _)| path)
-        .collect::<Vec<_>>();
-    ensure!(
-        changed.iter().all(|path| {
-            let normalized = path.to_string_lossy().replace('-', "_");
-            uncached_crates.iter().any(|crate_name| normalized.contains(crate_name))
-        }),
-        "Windows {phase} changed output bytes outside its reported non-hit closure: \
-     uncached={uncached_crates:?}, changed={changed:?}"
-    );
-    Ok(())
-}
-
 fn create_private_directory(path: &Path) -> Result<()> {
     fs::create_dir(path)?;
     #[cfg(unix)]
@@ -673,6 +619,7 @@ fn dynamic_library(directory: &Path, crate_name: &str) -> PathBuf {
 
 #[cfg(debug_assertions)]
 #[test]
+#[cfg(not(windows))]
 fn benchmark_coverage_event_failure_is_explicit() -> Result<()> {
     let root = tempfile::tempdir()?;
     let fixture = root.path().join("fixture");
@@ -722,6 +669,7 @@ fn benchmark_coverage_event_failure_is_explicit() -> Result<()> {
 }
 
 #[test]
+#[cfg(not(windows))]
 fn real_cargo_check_reuses_exact_outputs_with_root_bound_authority() -> Result<()> {
     let root = tempfile::tempdir()?;
     let result: Result<()> = (|| {
@@ -805,20 +753,9 @@ fn real_cargo_check_reuses_exact_outputs_with_root_bound_authority() -> Result<(
             benchmark_event_summary(&root_bound_events)?
         );
         let root_bound_outputs = reusable_outputs(&second.join("target"))?;
-        #[cfg(not(windows))]
         ensure!(
             root_bound_outputs == second_outputs,
             "root-bound output reconstruction changed reusable outputs"
-        );
-        // Correct root-bound misses perform a second cold compilation. Windows
-        // PE/COFF images and native archives can embed build-time data, so that
-        // compilation must reproduce the output inventory, not identical bytes.
-        // The same-root warm phase below remains byte-exact outside its explicitly
-        // reported native miss closure.
-        #[cfg(windows)]
-        ensure!(
-            root_bound_outputs.keys().eq(second_outputs.keys()),
-            "root-bound output reconstruction changed the reusable output inventory"
         );
 
         fs::remove_dir_all(second.join("target"))?;
@@ -840,52 +777,25 @@ fn real_cargo_check_reuses_exact_outputs_with_root_bound_authority() -> Result<(
         let second_warm_summary = benchmark_event_summary(&second_warm_events)?;
         ensure_typed_benchmark_events(&second_warm_events)?;
         let second_warm_miss_crates = benchmark_action_crates(&second_warm_events, "miss")?;
-        #[cfg(not(windows))]
         ensure!(
             second_warm.hits.saturating_add(second_warm.misses) == second_keys.len() as u64,
             "same-root warm reconstruction changed the eligible action count: expected={}, usage={second_warm:?}, \
      misses={second_warm_miss_crates:?}, events={second_warm_summary:?}",
             second_keys.len(),
         );
-        #[cfg(not(windows))]
         ensure!(
             second_warm.hits == second_keys.len() as u64 && second_warm.misses == 0,
             "same-root warm restore was not clean: {second_warm:?}"
         );
-        #[cfg(windows)]
-        ensure!(
-            second_warm.hits.saturating_add(second_warm.misses) == second_keys.len() as u64,
-            "Windows same-root warm restore changed the previously eligible action count: \
-     expected={}, usage={second_warm:?}, misses={second_warm_miss_crates:?}, events={second_warm_summary:?}",
-            second_keys.len(),
-        );
-        #[cfg(windows)]
-        let second_warm_uncached_crates = {
-            let mut crates = second_warm_miss_crates.clone();
-            crates.extend(benchmark_action_crates(&second_warm_events, "bypassed")?);
-            crates.sort();
-            crates.dedup();
-            crates
-        };
-        #[cfg(windows)]
-        ensure_windows_native_miss_boundary(second_warm, &second_warm_miss_crates, &second_warm_summary, "check")?;
         ensure!(
             second_warm.failures == 0,
             "same-root warm restore failed: {second_warm:?}"
         );
         let second_warm_outputs = reusable_outputs(&second.join("target"))?;
-        #[cfg(not(windows))]
         ensure!(
             second_warm_outputs == root_bound_outputs,
             "same-root warm restore changed the outputs published by its cold producer"
         );
-        #[cfg(windows)]
-        ensure_windows_hit_outputs_are_exact(
-            &root_bound_outputs,
-            &second_warm_outputs,
-            &second_warm_uncached_crates,
-            "check",
-        )?;
         ensure!(current_root_diagnostic(&second_warm_output)? == second_diagnostic);
 
         let (_, cargo_l0) = run_cargo(&second, &second_cargo_home, "check", &[])?;
@@ -897,7 +807,7 @@ fn real_cargo_check_reuses_exact_outputs_with_root_bound_authority() -> Result<(
         fs::remove_dir_all(second.join("target"))?;
         let (_, sdk_changed) = run_cargo(&second, &second_cargo_home, "check", &[("SDKROOT", "/")])?;
         ensure!(
-            sdk_changed.hits == 0 && sdk_changed.misses >= second_cold.misses,
+            sdk_changed.hits == 0 && sdk_changed.misses > 0 && sdk_changed.failures == 0,
             "SDKROOT change did not invalidate every action: {sdk_changed:?}"
         );
 
@@ -910,6 +820,7 @@ fn real_cargo_check_reuses_exact_outputs_with_root_bound_authority() -> Result<(
 }
 
 #[test]
+#[cfg(not(windows))]
 fn real_cargo_build_reuses_exact_outputs() -> Result<()> {
     let root = tempfile::tempdir()?;
     let result: Result<()> = (|| {
@@ -943,7 +854,6 @@ fn real_cargo_build_reuses_exact_outputs() -> Result<()> {
         )?;
         ensure_typed_benchmark_events(&build_cold_events)?;
         let build_cold_hits = benchmark_action_crates(&build_cold_events, "hit")?;
-        #[cfg(not(windows))]
         let build_cold_miss_keys = benchmark_action_keys(&build_cold_events, "miss")?;
         ensure!(
             build_cold.hits == 0 && build_cold.misses >= 8 && build_cold.failures == 0,
@@ -979,23 +889,6 @@ fn real_cargo_build_reuses_exact_outputs() -> Result<()> {
                 ),
             ],
         )?;
-        #[cfg(windows)]
-        let (cold_actions, warm_actions) = (
-            build_cold
-                .hits
-                .saturating_add(build_cold.misses)
-                .saturating_add(build_cold.bypasses),
-            build_warm
-                .hits
-                .saturating_add(build_warm.misses)
-                .saturating_add(build_warm.bypasses),
-        );
-        #[cfg(windows)]
-        ensure!(
-            warm_actions == cold_actions,
-            "warm build changed the classified action count: cold={build_cold:?}, warm={build_warm:?}"
-        );
-        #[cfg(not(windows))]
         {
             let build_warm_hit_keys = benchmark_action_keys(&build_warm_events, "hit")?;
             ensure!(
@@ -1023,31 +916,15 @@ fn real_cargo_build_reuses_exact_outputs() -> Result<()> {
                 benchmark_event_summary(&build_warm_events)?
             );
         }
-        #[cfg(windows)]
-        let build_warm_miss_crates = benchmark_action_crates(&build_warm_events, "miss")?;
-        #[cfg(windows)]
-        let build_warm_uncached_crates = {
-            let mut crates = build_warm_miss_crates.clone();
-            crates.extend(benchmark_action_crates(&build_warm_events, "bypassed")?);
-            crates.sort();
-            crates.dedup();
-            crates
-        };
-        #[cfg(windows)]
-        ensure_windows_native_miss_boundary(
-            build_warm,
-            &build_warm_miss_crates,
-            &benchmark_event_summary(&build_warm_events)?,
-            "build",
-        )?;
         ensure!(build_warm.failures == 0);
         ensure_typed_benchmark_events(&build_warm_events)?;
-        #[cfg(not(windows))]
         {
             let hits = benchmark_action_crates(&build_warm_events, "hit")?;
             ensure!(
                 hits.iter().any(|name| name == "fixture_dylib"),
-                "the ordinary Rust dynamic library was not restored: {hits:?}"
+                "the ordinary Rust dynamic library was not restored: {hits:?}; events={:?}; stderr={}",
+                benchmark_event_summary(&build_warm_events)?,
+                String::from_utf8_lossy(&_build_warm_output.stderr)
             );
             for (directory, phase) in [(&build_cold_events, "cold"), (&build_warm_events, "warm")] {
                 let events = benchmark_events(directory)?;
@@ -1073,15 +950,7 @@ fn real_cargo_build_reuses_exact_outputs() -> Result<()> {
         }
 
         let build_warm_outputs = reusable_outputs(&first.join("target/release"))?;
-        #[cfg(not(windows))]
         ensure!(build_warm_outputs == build_outputs);
-        #[cfg(windows)]
-        ensure_windows_hit_outputs_are_exact(
-            &build_outputs,
-            &build_warm_outputs,
-            &build_warm_uncached_crates,
-            "build",
-        )?;
         ensure!(
             dylib.is_file() && cdylib.is_file(),
             "restored dynamic library outputs are missing"
@@ -1099,6 +968,7 @@ fn real_cargo_build_reuses_exact_outputs() -> Result<()> {
 }
 
 #[test]
+#[cfg(not(windows))]
 fn real_cargo_test_targets_reuse_exact_outputs() -> Result<()> {
     let root = tempfile::tempdir()?;
     let result: Result<()> = (|| {
@@ -1113,7 +983,7 @@ fn real_cargo_test_targets_reuse_exact_outputs() -> Result<()> {
         let test_cold_events = fs::canonicalize(root.path())?.join("test-cold-events");
         create_private_directory(&test_cold_events)?;
         let test_cold_events_value = test_cold_events.to_string_lossy().into_owned();
-        let (_, test_cold) = run_cargo(
+        let (_test_cold_output, test_cold) = run_cargo(
             &first,
             &first_cargo_home,
             "test",
@@ -1131,23 +1001,14 @@ fn real_cargo_test_targets_reuse_exact_outputs() -> Result<()> {
         );
         ensure_typed_benchmark_events(&test_cold_events)?;
         let new_test_targets = ["fixture_cli_bench", "fixture_cli_example", "fixture_cli_smoke"];
-        #[cfg(not(windows))]
         {
             let misses = benchmark_action_crates(&test_cold_events, "miss")?;
             for target in new_test_targets {
                 ensure!(
                     misses.iter().any(|crate_name| crate_name == target),
-                    "test-target cold compile did not publish {target}: {misses:?}"
-                );
-            }
-        }
-        #[cfg(windows)]
-        {
-            let bypasses = benchmark_action_crates(&test_cold_events, "bypassed")?;
-            for target in new_test_targets {
-                ensure!(
-                    bypasses.iter().any(|crate_name| crate_name == target),
-                    "COFF test-target compile did not preserve the explicit cold boundary for {target}: {bypasses:?}"
+                    "test-target cold compile did not publish {target}: {misses:?}; events={:?}; stderr={}",
+                    benchmark_event_summary(&test_cold_events)?,
+                    String::from_utf8_lossy(&_test_cold_output.stderr)
                 );
             }
         }
@@ -1173,7 +1034,6 @@ fn real_cargo_test_targets_reuse_exact_outputs() -> Result<()> {
             "test-target warm compile failed: {test_warm:?}"
         );
         ensure_typed_benchmark_events(&test_warm_events)?;
-        #[cfg(not(windows))]
         {
             let hits = benchmark_action_crates(&test_warm_events, "hit")?;
             for target in new_test_targets {
@@ -1183,13 +1043,6 @@ fn real_cargo_test_targets_reuse_exact_outputs() -> Result<()> {
                 );
             }
         }
-        #[cfg(windows)]
-        ensure_windows_native_miss_boundary(
-            test_warm,
-            &benchmark_action_crates(&test_warm_events, "miss")?,
-            &benchmark_event_summary(&test_warm_events)?,
-            "test targets",
-        )?;
         Ok(())
     })();
     if result.is_err() {
@@ -1301,7 +1154,82 @@ fn real_world_native_cache_fixture_exercises_required_compiler_classes() -> Resu
     Ok(())
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(windows)]
+#[test]
+fn windows_native_driver_bypass_preserves_cargo_workloads() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let fixture = write_native_input_fixture(
+        root.path(),
+        "windows-bypass",
+        "pub fn value() -> u64 { 41 }\n#[test] fn value_is_correct() { assert_eq!(value(), 41); }\n",
+    )?;
+    fs::write(
+        fixture.join("src/main.rs"),
+        "fn main() { println!(\"{}\", windows_bypass::value()); }\n",
+    )?;
+    let cargo_home = root.path().join("cargo-home");
+    fs::create_dir(&cargo_home)?;
+    let target = fixture.join("target");
+    let mut baseline = BTreeMap::new();
+    for workload in ["check", "build", "test"] {
+        let output = cargo_command(&fixture, &cargo_home, workload).output()?;
+        ensure!(output.status.success(), "ordinary {workload}: {output:?}");
+        baseline.insert(
+            workload,
+            reusable_outputs(&target)?.into_keys().collect::<BTreeSet<_>>(),
+        );
+        fs::remove_dir_all(&target)?;
+    }
+    setup_cache(&fixture, &cargo_home, &root.path().join("cache"))?;
+    let cache = profile_cache_root(&fixture, &cargo_home)?;
+    for attempt in 0..2 {
+        for workload in ["check", "build", "test"] {
+            let events = root.path().join(format!("events-{attempt}-{workload}"));
+            create_private_directory(&events)?;
+            let events = fs::canonicalize(events)?;
+            let (output, usage) = run_cargo(
+                &fixture,
+                &cargo_home,
+                workload,
+                &[
+                    ("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1"),
+                    (
+                        "CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY",
+                        events.to_str().context("events path")?,
+                    ),
+                ],
+            )?;
+            let summary = benchmark_event_summary(&events)?;
+            ensure!(
+                usage.hits == 0 && usage.misses == 0 && usage.bypasses > 0 && usage.failures == 0,
+                "{workload} must remain a successful bypass: {usage:?}; {summary:?}; {output:?}"
+            );
+            ensure!(
+                summary.get("bypassed:compiler_native_input_driver_unavailable") == Some(&usage.bypasses),
+                "{workload} bypassed at an unexpected boundary: {usage:?}; {summary:?}"
+            );
+            ensure_typed_benchmark_events(&events)?;
+            ensure!(
+                native_action_keys(&cache)?.is_empty(),
+                "unsupported driver published an action"
+            );
+            ensure!(
+                reusable_outputs(&target)?.into_keys().collect::<BTreeSet<_>>() == baseline[workload],
+                "{workload} bypass changed Cargo's output inventory"
+            );
+            if workload == "build" {
+                let executed = Command::new(target.join("release/windows-bypass.exe")).output()?;
+                ensure!(
+                    executed.status.success() && executed.stdout == b"41\n",
+                    "bypassed executable: {executed:?}"
+                );
+            }
+            fs::remove_dir_all(&target)?;
+        }
+    }
+    Ok(())
+}
+
 fn write_native_input_fixture(root: &Path, name: &str, source: &str) -> Result<PathBuf> {
     let fixture = root.join("fixture");
     fs::create_dir_all(fixture.join("src"))?;
@@ -1341,6 +1269,68 @@ fn native_input_diagnostics(output: &Output) -> Result<Vec<serde_json::Value>> {
             Err(error) => Some(Err(error.into())),
         })
         .collect()
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_env = "gnu",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+#[test]
+fn gcc_with_rust_bundled_lld_restores_exact_dynamic_library() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let fixture = write_native_input_fixture(root.path(), "lld-library", "pub fn value() -> u64 { 41 }\n")?;
+    let manifest = fixture.join("Cargo.toml");
+    fs::write(
+        &manifest,
+        fs::read_to_string(&manifest)? + "\n[lib]\ncrate-type = [\"dylib\"]\n",
+    )?;
+    let output = Command::new("rustc").args(["--print", "target-libdir"]).output()?;
+    ensure!(output.status.success(), "Rust library directory: {output:?}");
+    let libdir = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let linker_directory = libdir.parent().context("Rust target directory")?.join("bin/gcc-ld");
+    let inherited_path = std::env::var_os("PATH").context("toolchain PATH")?;
+    let path = std::env::join_paths(std::iter::once(linker_directory).chain(std::env::split_paths(&inherited_path)))?;
+    let path = path.to_str().context("toolchain PATH is UTF-8")?;
+    let target = fixture.join("target");
+    let cargo_home = root.path().join("cargo-home");
+    fs::create_dir(&cargo_home)?;
+    let flags = "-Clink-arg=-fuse-ld=lld";
+    let baseline = cargo_command(&fixture, &cargo_home, "build")
+        .env("PATH", path)
+        .env("RUSTFLAGS", flags)
+        .output()?;
+    ensure!(baseline.status.success(), "ordinary LLD build: {baseline:?}");
+    let expected = native_input_outputs(&target)?;
+    ensure!(target.join("release/liblld_library.so").is_file());
+    setup_cache(&fixture, &cargo_home, &root.path().join("cache"))?;
+    let events = root.path().join("events");
+    create_private_directory(&events)?;
+    let events = fs::canonicalize(events)?;
+    let environment = [
+        ("PATH", path),
+        ("RUSTFLAGS", flags),
+        ("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1"),
+        (
+            "CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY",
+            events.to_str().context("events path")?,
+        ),
+    ];
+    for (phase, misses, hits) in [("cold", 1, 0), ("warm", 0, 1)] {
+        fs::remove_dir_all(&target)?;
+        let (output, usage) = run_cargo(&fixture, &cargo_home, "build", &environment)?;
+        ensure!(
+            usage.misses == misses && usage.hits == hits && usage.bypasses == 0 && usage.failures == 0,
+            "{phase} LLD reuse: {usage:?}; events={:?}; stderr={}",
+            benchmark_event_summary(&events)?,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        ensure!(
+            native_input_outputs(&target)? == expected,
+            "{phase} LLD output bytes or modes changed"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]

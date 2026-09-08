@@ -14,7 +14,7 @@ test profile="default":
     #!/usr/bin/env bash
     set -euo pipefail
     profile={{quote(profile)}}
-    [[ "$profile" == default || "$profile" == cranelift ]] || { echo 'unknown test profile' >&2; exit 2; }
+    [[ "$profile" == default || "$profile" == ci || "$profile" == cranelift ]] || { echo 'unknown test profile' >&2; exit 2; }
     if [[ "$profile" == cranelift && "$(uname -s)" != Darwin ]]; then
         echo 'the Cranelift integration lane requires a native macOS host' >&2
         exit 1
@@ -33,8 +33,8 @@ test profile="default":
     source "$component_directory/compiler-driver-authority.env"
     # Keep fixture Cargo commands out of the runner's build directory.
     unset CARGO_TARGET_DIR
-    if [[ "$profile" == default ]]; then
-        cargo nextest run --target-dir "$(dirname "$component_directory")" --workspace -P default --all-features --locked \
+    if [[ "$profile" != cranelift ]]; then
+        cargo nextest run --target-dir "$(dirname "$component_directory")" --workspace -P "$profile" --all-features --locked \
             --config-file .config/nextest.toml
         cargo test --target-dir "$(dirname "$component_directory")" --doc -p cargo-rail --all-features --locked
     else

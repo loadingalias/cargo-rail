@@ -26,6 +26,11 @@ struct Driver {
 impl Driver {
     fn new() -> Self {
         let temporary = tempfile::tempdir().expect("driver fixture");
+        // Windows current_dir returns the ordinary spelling, while canonicalize
+        // adds a verbatim prefix. The invocation binds the child's exact cwd.
+        #[cfg(windows)]
+        let root = temporary.path().to_path_buf();
+        #[cfg(not(windows))]
         let root = temporary.path().canonicalize().expect("fixture root");
         let rustc_output = Command::new("rustup")
             .args(["which", "rustc"])
@@ -265,8 +270,11 @@ fn native_observation_binds_transitive_crates_and_preserves_compiler_outputs() {
                 .iter()
                 .find(|source| source.name == name)
                 .expect("selected transitive crate")
-                .files,
-            [file.to_str().unwrap()]
+                .files
+                .iter()
+                .map(|path| PathBuf::from(path).canonicalize().unwrap())
+                .collect::<Vec<_>>(),
+            [file.canonicalize().unwrap()]
         );
     }
 
@@ -334,7 +342,7 @@ fn linked_proc_macro_retains_complete_native_inputs() {
         std::env::consts::DLL_PREFIX,
         std::env::consts::DLL_SUFFIX
     );
-    let args = vec![
+    let mut args = vec![
         "consumer.rs".into(),
         "--crate-type=proc-macro".into(),
         "--edition=2024".into(),
@@ -346,6 +354,10 @@ fn linked_proc_macro_retains_complete_native_inputs() {
         "-o".into(),
         output.clone(),
     ];
+    if cfg!(windows) {
+        // Compare compiler behavior without linker timestamps or PDB identities.
+        args.extend(["-Clink-arg=/Brepro".into(), "-Clink-arg=/DEBUG:NONE".into()]);
+    }
     let baseline = driver.command(false).args(&args).output().unwrap();
     assert_success(&baseline);
     let bytes = fs::read(driver.root.join(&output)).unwrap();
