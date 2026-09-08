@@ -16266,12 +16266,18 @@ impl ElfRuntimeSearchGuard {
                 let Some(parent) = child.parent() else { break };
                 match fs::metadata(parent) {
                     Ok(metadata) if metadata.is_dir() => {
-                        directories.entry(parent.to_path_buf()).or_default().insert(
-                            child
-                                .file_name()
-                                .ok_or_else(|| RailError::message("runtime search has no entry name"))?
-                                .to_os_string(),
-                        );
+                        match child.components().next_back() {
+                            Some(std::path::Component::Normal(name)) => {
+                                directories
+                                    .entry(parent.to_path_buf())
+                                    .or_default()
+                                    .insert(name.to_os_string());
+                            }
+                            // Parent traversal has no named entry to watch. Still
+                            // observe its resolved parent and the lexical alias below.
+                            Some(std::path::Component::ParentDir) => {}
+                            _ => return Err(RailError::message("runtime search has no entry name")),
+                        }
                         let canonical = crate::utils::canonicalize_existing(parent)?;
                         if canonical != parent {
                             pending.insert(canonical);
@@ -21581,6 +21587,42 @@ pub(crate) mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn runtime_search_watch_preserves_symlink_parent_traversal() {
+        let root = tempfile::tempdir().expect("runtime search fixture");
+        let parent = root.path().join("nested");
+        let selected = parent.join("selected");
+        fs::create_dir_all(&selected).expect("selected directory");
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&selected, &alias).expect("search alias");
+        let missing = BTreeSet::from([alias.join("../optional.so")]);
+        let guard = ElfRuntimeSearchGuard::new(&missing).expect("parent traversal watch");
+        fs::write(root.path().join("optional.so"), b"unrelated lexical path").expect("unrelated output");
+        assert!(guard.unchanged(), "parent traversal follows the symlink target");
+        fs::write(parent.join("optional.so"), b"transient library").expect("create actual candidate");
+        fs::remove_file(parent.join("optional.so")).expect("remove actual candidate");
+        assert!(
+            !guard.unchanged(),
+            "physical candidate changes must invalidate the link"
+        );
+
+        let guard = ElfRuntimeSearchGuard::new(&missing).expect("alias traversal watch");
+        fs::rename(&alias, root.path().join("saved-alias")).expect("move alias");
+        fs::rename(root.path().join("saved-alias"), &alias).expect("restore alias");
+        assert!(!guard.unchanged(), "alias changes must invalidate parent traversal");
+
+        let guard = ElfRuntimeSearchGuard::new(&missing).expect("target traversal watch");
+        fs::rename(&selected, parent.join("saved-selected")).expect("move alias target");
+        std::os::unix::fs::symlink(root.path(), &selected).expect("retarget parent traversal");
+        fs::remove_file(&selected).expect("remove replacement target");
+        fs::rename(parent.join("saved-selected"), &selected).expect("restore alias target");
+        assert!(
+            !guard.unchanged(),
+            "resolved target changes must invalidate parent traversal"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn runtime_search_watch_allows_outputs_and_rejects_candidate_and_alias_aba() {
         let root = tempfile::tempdir().expect("runtime search fixture");
         let selected = root.path().join("selected");
@@ -22351,7 +22393,7 @@ pub(crate) mod tests {
 
     #[test]
     fn linker_retry_reset_revokes_only_recognized_private_evidence() {
-        let root = tempfile::tempdir().expect("linker evidence root");
+        let root = private_command_directory().expect("linker evidence root");
         let root_path = crate::utils::canonicalize_existing(root.path()).expect("canonical evidence root");
         let certificate = root_path.join(ELF_LINK_DEPENDENCIES_FILE);
         let driver_inputs = root_path.join(ELF_LINK_DRIVER_INPUTS_FILE);
@@ -22651,10 +22693,15 @@ pub(crate) mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn rustc_response_transport_is_endogenous_only_in_the_linked_output_namespace() {
+        use std::os::unix::fs::DirBuilderExt as _;
+
         let root = tempfile::tempdir().expect("response root");
         let root_path = crate::utils::canonicalize_existing(root.path()).expect("canonical output namespace");
         let temporary = root_path.join("rustcABC123");
-        fs::create_dir(&temporary).expect("rustc temporary directory");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&temporary)
+            .expect("rustc temporary directory");
         let response = temporary.join("linker-arguments");
         fs::write(&response, b"generated.o").expect("rustc response");
         let capture = capture_gnu_link_arguments(&[OsString::from(format!("@{}", response.display()))], &root_path)
@@ -22792,6 +22839,44 @@ pub(crate) mod tests {
             assert!(evidence.direct_inputs.contains(&object.to_string_lossy().into_owned()));
             assert!(!directory.join("native.so").exists(), "probe must not link an output");
             revalidate_link_driver_probe(&driver, &execution.probe)?;
+            let missing = execution
+                .probe
+                .runtimes
+                .iter()
+                .flat_map(|runtime| runtime.selection.missing_files().iter().cloned())
+                .collect();
+            let search_guard = ElfRuntimeSearchGuard::new(&missing)?;
+            let mut command = Command::new(&driver);
+            command.args(&arguments);
+            let ordinary = command.output()?;
+            assert!(ordinary.status.success(), "ordinary GCC/LLD link: {ordinary:?}");
+            let expected = fs::read(directory.join("native.so"))?;
+            fs::remove_file(directory.join("native.so"))?;
+            let (observed, runtime) =
+                crate::executable::execute_glibc_runtime(command, execution.probe.runtimes[0].selection.clone())?;
+            assert_eq!(observed.status.code(), ordinary.status.code());
+            assert_eq!(observed.stdout, ordinary.stdout);
+            assert_eq!(observed.stderr, ordinary.stderr);
+            assert_eq!(fs::read(directory.join("native.so"))?, expected);
+            assert!(
+                search_guard.unchanged(),
+                "linking must preserve runtime search selection"
+            );
+            let runtime = runtime?;
+            let expected_files = execution
+                .probe
+                .runtimes
+                .iter()
+                .flat_map(|runtime| runtime.selection.files())
+                .collect::<BTreeSet<_>>();
+            assert!(
+                runtime
+                    .selection
+                    .files()
+                    .iter()
+                    .all(|path| expected_files.contains(path)),
+                "observed GCC/LLD runtime: {runtime:?}; expected: {expected_files:?}"
+            );
             let mut tampered = execution.probe;
             tampered.arguments.push("-fuse-ld=bfd".to_string());
             assert!(revalidate_link_driver_probe(&driver, &tampered).is_err());
