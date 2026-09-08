@@ -47,13 +47,13 @@ jobs:
       matrix:
         include:
           # The 24.04 build host preserves the Action's glibc 2.39 baseline.
-          - runner: runs-on=${{ github.run_id }}/runner=x86_64-linux/image=ubuntu24-full-x64/env=production
+          - runner: runs-on=${{ github.run_id }}/runner=x86_64-linux/image=ubuntu24-full-x64/spot=false/env=production
             target: x86_64-unknown-linux-gnu
             timeout: 30
-          - runner: runs-on=${{ github.run_id }}/runner=aarch64-linux/image=ubuntu24-full-arm64/env=production
+          - runner: runs-on=${{ github.run_id }}/runner=aarch64-linux/image=ubuntu24-full-arm64/spot=false/env=production
             target: aarch64-unknown-linux-gnu
             timeout: 30
-          - runner: runs-on=${{ github.run_id }}/runner=x86_64-win/env=production
+          - runner: runs-on=${{ github.run_id }}/runner=x86_64-win/spot=false/env=production
             target: x86_64-pc-windows-msvc
             timeout: 60
           - runner: macos-15

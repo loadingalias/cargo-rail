@@ -32,7 +32,7 @@ source /etc/os-release
 sudo_cmd=()
 if [[ "$(id -u)" != 0 ]]; then sudo_cmd=(sudo); fi
 temporary="$(mktemp -d)"
-trap 'rm -rf "$temporary"' EXIT
+trap '"${sudo_cmd[@]}" rm -rf -- "$temporary"' EXIT
 # Minimal Ubuntu images may omit the HTTPS trust store and Python. Bootstrap
 # those through Ubuntu's signed archive, then converge them to the snapshot too.
 if ! command -v python3 >/dev/null || [[ ! -f /etc/ssl/certs/ca-certificates.crt ]]; then
@@ -46,10 +46,11 @@ chmod 755 "$temporary" "$temporary/lists" "$temporary/lists/partial"
 # Explicit snapshot URLs work on an empty package cache and on all supported architectures.
 # The archive remains signed; historical snapshots intentionally outlive Valid-Until.
 for suite in "$codename" "$codename-updates" "$codename-security"; do
-  printf 'deb [check-valid-until=no signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://snapshot.ubuntu.com/ubuntu/%s %s main universe\n' "$snapshot" "$suite"
+  printf 'deb [target=Packages check-valid-until=no signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://snapshot.ubuntu.com/ubuntu/%s %s main universe\n' "$snapshot" "$suite"
 done > "$temporary/sources.list"
 apt_options=(-o "Dir::Etc::sourcelist=$temporary/sources.list" -o Dir::Etc::sourceparts=-
-  -o "Dir::State::lists=$temporary/lists" -o APT::Update::Error-Mode=any)
+  -o "Dir::State::lists=$temporary/lists" -o APT::Update::Error-Mode=any
+  -o Acquire::Retries=3 -o Acquire::https::Timeout=30 -o Acquire::Languages=none)
 apt=("${sudo_cmd[@]}" env DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}")
 "${apt[@]}" update
 catalog_get() { python3 "$SCRIPT_DIR/catalog.py" get "$@"; }

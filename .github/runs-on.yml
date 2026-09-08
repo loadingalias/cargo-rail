@@ -5,19 +5,19 @@ runners:
     cpu: [16, 32]
     ram: [32, 128]
     image: ubuntu24-full-x64
-    spot: price-capacity-optimized
+    spot: false
     volume: 150gb:gp3
   aarch64-linux:
     family: [c7g, c8g, m7g, m8g]
     cpu: [16, 32]
     ram: [32, 128]
     image: ubuntu24-full-arm64
-    spot: price-capacity-optimized
+    spot: false
     volume: 150gb:gp3
   x86_64-win:
     family: [c7a, c7i, c8a, c8i, m7a, m7i, m8a, m8i]
     cpu: [16, 32]
     ram: [32, 128]
     image: windows25-full-x64
-    spot: price-capacity-optimized
+    spot: false
     volume: 200gb:gp3
