@@ -10742,7 +10742,7 @@ fn selected_link_driver_argument(
     let selected = match (selected, flavor, target_linker) {
         (Some(selected), _, _) | (None, None, Some(selected)) => selected,
         (None, flavor, _) => match flavor.unwrap_or(target_flavor) {
-            "gcc" | "gnu-cc" | "gnu-cc-lld" | "darwin-cc" | "darwin-cc-lld" => "cc",
+            "gcc" | "gnu-cc" | "gnu-lld-cc" | "darwin-cc" | "darwin-lld-cc" => "cc",
             "ld" | "gnu" | "darwin" => "ld",
             "ld.lld" | "ld64.lld" | "gnu-lld" | "darwin-lld" | "lld-link" | "msvc-lld" => "lld",
             "msvc" => "link.exe",
@@ -10765,7 +10765,7 @@ fn captured_default_linker_flavor<'a>(arguments: &[String], target_flavor: &'a s
     // Stable aliases retain the target's principal flavor. `gcc` changes only
     // its CC bit, preserving a target that already selects LLD through Clang.
     match target_flavor {
-        "gnu-cc" | "gnu-cc-lld" | "darwin-cc" | "darwin-cc-lld" => Some("gcc"),
+        "gnu-cc" | "gnu-lld-cc" | "darwin-cc" | "darwin-lld-cc" => Some("gcc"),
         "gnu" | "darwin" => Some("ld"),
         "gnu-lld" => Some("ld.lld"),
         "darwin-lld" => Some("ld64.lld"),
@@ -22673,6 +22673,16 @@ pub(crate) mod tests {
             persistent_link_response_inputs(&capture.response_files, &observation, &root_path).len(),
             1
         );
+    }
+
+    #[test]
+    fn default_linker_selection_recognizes_rustc_cc_flavors() {
+        for flavor in ["gnu-cc", "gnu-lld-cc", "darwin-cc", "darwin-lld-cc"] {
+            assert_eq!(selected_link_driver_argument(&[], None, flavor).unwrap(), "cc");
+            assert_eq!(captured_default_linker_flavor(&[], flavor), Some("gcc"));
+        }
+        selected_link_driver_argument(&[], None, "unknown").unwrap_err();
+        assert_eq!(captured_default_linker_flavor(&[], "unknown"), None);
     }
 
     #[test]
