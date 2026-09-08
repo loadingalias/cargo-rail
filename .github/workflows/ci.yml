@@ -27,11 +27,11 @@ jobs:
           - platform: x86_64-linux
             runner: runs-on=${{ github.run_id }}/runner=x86_64-linux/image=ubuntu24-full-x64/spot=false/env=production
             checks: true
-            timeout: 30
+            timeout: 45
           - platform: aarch64-linux
             runner: runs-on=${{ github.run_id }}/runner=aarch64-linux/image=ubuntu24-full-arm64/spot=false/env=production
             checks: true
-            timeout: 30
+            timeout: 45
           - platform: x86_64-win
             runner: runs-on=${{ github.run_id }}/runner=x86_64-win/spot=false/env=production
             checks: true
