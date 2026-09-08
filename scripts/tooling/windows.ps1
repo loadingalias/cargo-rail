@@ -149,7 +149,17 @@ try {
         $value = [Environment]::GetEnvironmentVariable($name, 'Process')
         if ($value) {
             [Environment]::SetEnvironmentVariable($name, $value, 'User')
-            if ($env:GITHUB_ENV) { Add-Content -Encoding UTF8 $env:GITHUB_ENV "$name=$value" }
+            if ($name -eq 'PATH') {
+                if ($env:GITHUB_PATH) {
+                    # Actions resolves the step shell before applying GITHUB_ENV.
+                    # It prepends these entries in reverse order; retain MSVC first.
+                    $runnerPaths = @($value -split ';' | Where-Object { $_ })
+                    [Array]::Reverse($runnerPaths)
+                    Add-Content -Encoding UTF8 $env:GITHUB_PATH $runnerPaths
+                }
+            } elseif ($env:GITHUB_ENV) {
+                Add-Content -Encoding UTF8 $env:GITHUB_ENV "$name=$value"
+            }
         }
     }
     Write-Host "Installed $Platform tooling. New shells inherit the configured compiler environment."
