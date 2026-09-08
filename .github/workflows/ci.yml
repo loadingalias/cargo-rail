@@ -23,8 +23,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: [x86_64-linux, aarch64-linux]
-    runs-on: runs-on=${{ github.run_id }}/runner=${{ matrix.platform }}/env=production
+        include:
+          - platform: x86_64-linux
+            image: ubuntu24-full-x64
+          - platform: aarch64-linux
+            image: ubuntu24-full-arm64
+    runs-on: runs-on=${{ github.run_id }}/runner=${{ matrix.platform }}/image=${{ matrix.image }}/env=production
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
