@@ -13,7 +13,11 @@ import catalog
 
 def run(*arguments, cwd=None):
     print('+ ' + ' '.join(map(str, arguments)), flush=True)
-    result = subprocess.run(arguments, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    program = shutil.which(arguments[0])
+    if program is None:
+        raise FileNotFoundError(f'tool is not on PATH: {arguments[0]}')
+    # Windows CreateProcess searches system directories before PATH for bare names.
+    result = subprocess.run((program, *arguments[1:]), cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     print(result.stdout, end='', flush=True)
     result.check_returncode()
     return result.stdout
