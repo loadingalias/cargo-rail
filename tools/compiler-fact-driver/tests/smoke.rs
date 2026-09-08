@@ -27,7 +27,8 @@ fn matched_driver_emits_canonical_typed_fragment() {
         .join("../..")
         .canonicalize()
         .expect("repository root");
-    let temporary = tempfile::tempdir().expect("temporary driver tree");
+    let built = Path::new(env!("CARGO_BIN_EXE_cargo-rail-fact-driver"));
+    let temporary = tempfile::tempdir_in(built.parent().expect("driver directory")).expect("temporary driver tree");
     let bin = temporary.path().join("bin");
     let output = temporary.path().join("facts");
     let first_target = temporary.path().join("cargo-target-a");
@@ -47,7 +48,8 @@ fn matched_driver_emits_canonical_typed_fragment() {
     #[cfg(unix)]
     symlink(sysroot.join("lib"), temporary.path().join("lib")).expect("toolchain library link");
     let staged = bin.join(format!("cargo-rail-fact-driver{}", std::env::consts::EXE_SUFFIX));
-    fs::copy(env!("CARGO_BIN_EXE_cargo-rail-fact-driver"), &staged).expect("stage driver");
+    // Keep the immutable executable free of writable handles during concurrent process launches.
+    fs::hard_link(built, &staged).expect("stage driver on the same filesystem");
 
     let host = rustc_host(&rustc);
     let unit = bind_unit_identity(CompilerFactUnit {

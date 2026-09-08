@@ -1,7 +1,7 @@
 //! The matched compiler observes native inputs without changing compilation.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 #[path = "../../../src/compiler/fact_protocol.rs"]
@@ -25,7 +25,8 @@ struct Driver {
 
 impl Driver {
     fn new() -> Self {
-        let temporary = tempfile::tempdir().expect("driver fixture");
+        let built = Path::new(env!("CARGO_BIN_EXE_cargo-rail-fact-driver"));
+        let temporary = tempfile::tempdir_in(built.parent().expect("driver directory")).expect("driver fixture");
         // Windows current_dir returns the ordinary spelling, while canonicalize
         // adds a verbatim prefix. The invocation binds the child's exact cwd.
         #[cfg(windows)]
@@ -49,7 +50,8 @@ impl Driver {
         #[cfg(unix)]
         std::os::unix::fs::symlink(sysroot.join("lib"), root.join("lib")).expect("runtime libraries");
         let program = bin.join(format!("cargo-rail-fact-driver{}", std::env::consts::EXE_SUFFIX));
-        fs::copy(env!("CARGO_BIN_EXE_cargo-rail-fact-driver"), &program).expect("stage driver");
+        // Keep the immutable executable free of writable handles during concurrent process launches.
+        fs::hard_link(built, &program).expect("stage driver on the same filesystem");
         Self {
             _temporary: temporary,
             root,
