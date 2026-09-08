@@ -30,8 +30,8 @@ rustup = "1.29.1"
 python = "3.14.7"
 
 [linux]
-ubuntu = "26.04"
-codename = "resolute"
+ubuntu = "24.04"
+codename = "noble"
 snapshot = "20260906T053626Z"
 
 [windows]
@@ -45,7 +45,7 @@ sdk-component = "Microsoft.VisualStudio.Component.Windows11SDK.28000"
 
 [aarch64-linux]
 packages = ["build-essential", "ca-certificates", "curl", "git", "jq", "pkgconf", "python3", "python3-venv", "unzip", "xz-utils", "zstd"]
-os = "Ubuntu 26.04 LTS"
+os = "Ubuntu 24.04 LTS"
 rust-host = "aarch64-unknown-linux-gnu"
 components = ["clippy", "rustfmt", "rustc-dev", "llvm-tools"]
 cargo = ["cargo-audit", "cargo-deny", "cargo-nextest", "cargo-mutants", "just", "ripgrep", "rumdl", "lychee", "samply"]
@@ -64,7 +64,7 @@ sha256 = "2efc974dbd63b4444c0e8494b92f2e80c2d7e635b4b80eac2916985ddd8f72a6"
 
 [x86_64-linux]
 packages = ["build-essential", "ca-certificates", "curl", "git", "jq", "pkgconf", "python3", "python3-venv", "shellcheck", "unzip", "xz-utils", "zstd"]
-os = "Ubuntu 26.04 LTS"
+os = "Ubuntu 24.04 LTS"
 rust-host = "x86_64-unknown-linux-gnu"
 components = ["clippy", "rustfmt", "rustc-dev", "llvm-tools"]
 cargo = ["cargo-audit", "cargo-deny", "cargo-nextest", "cargo-mutants", "just", "ripgrep", "rumdl", "lychee", "samply"]
