@@ -128,6 +128,7 @@ const MAX_COMPILER_ENVIRONMENT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_APPLE_LINK_CERTIFICATE_LEN: usize = 8 * 1024 * 1024;
 const MAX_LINK_INPUTS: usize = 16 * 1024;
 const MAX_LINK_PATH_BYTES: usize = 16 * 1024 * 1024;
+const MAX_LINK_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_ELF_LINK_DEPENDENCY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LINK_RESPONSE_FILES: usize = 64;
 const MAX_LINK_RESPONSE_DEPTH: usize = 32;
@@ -3216,7 +3217,7 @@ fn capture_apple_linker_witness(
     }
 
     let started = Instant::now();
-    let mut budget = NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS);
+    let mut budget = NativeCaptureBudget::new(LINK_CAPTURE_LIMITS);
     let current_directory = std::env::current_dir()?;
     let driver_path =
         crate::executable::resolve_executable_selection(OsStr::new(&driver_selection), &current_directory)?;
@@ -3477,7 +3478,7 @@ fn capture_elf_linker_witness(
         );
     }
     let started = Instant::now();
-    let mut budget = NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS);
+    let mut budget = NativeCaptureBudget::new(LINK_CAPTURE_LIMITS);
     let capture_elf_file = |path: &Path, budget: &mut NativeCaptureBudget| {
         let captured = capture_link_file(path, started, budget).map_err(|error| {
             RailError::message(format!("ELF linker input '{}' is unavailable: {error}", path.display()))
@@ -3875,6 +3876,10 @@ fn capture_link_file(
     if !path.is_absolute() || path.as_os_str().as_encoded_bytes().contains(&0) {
         return Err(RailError::message("Apple linker input path is invalid"));
     }
+    let spelling = path
+        .to_str()
+        .ok_or_else(|| RailError::message("Apple linker input path is not valid UTF-8"))?;
+    budget.account_entry(spelling)?;
     let canonical = crate::utils::canonicalize_existing(path)?;
     let generation_before = linker_generation_identity(&canonical);
     let (content_digest, metadata, _) = capture_guarded_file(&canonical, started, budget)?;
@@ -3886,10 +3891,7 @@ fn capture_link_file(
     }
     Ok((
         LinkFileWitness {
-            path: path
-                .to_str()
-                .ok_or_else(|| RailError::message("Apple linker input path is not valid UTF-8"))?
-                .to_string(),
+            path: spelling.to_string(),
             canonical_path: canonical
                 .to_str()
                 .ok_or_else(|| RailError::message("Apple linker canonical input path is not valid UTF-8"))?
@@ -3951,7 +3953,7 @@ fn revalidate_apple_linker_witness(
     }
     revalidate_link_driver_probe_with_apple_sdk(&current_driver, &witness.driver_probe, sdk_name)?;
     let started = Instant::now();
-    let mut budget = NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS);
+    let mut budget = NativeCaptureBudget::new(LINK_CAPTURE_LIMITS);
     revalidate_link_file(
         &witness.driver,
         trusted_generations.map(|generations| generations.driver.as_str()),
@@ -3997,7 +3999,7 @@ fn revalidate_file_linker_witness(
             == Some(&generations.installation_authority)
     });
     let started = Instant::now();
-    let mut budget = NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS);
+    let mut budget = NativeCaptureBudget::new(LINK_CAPTURE_LIMITS);
     revalidate_link_file(
         &witness.driver,
         trusted_generations.map(|generations| generations.driver.as_str()),
@@ -4067,7 +4069,7 @@ struct NativeCaptureLimits {
     depth: usize,
     path_bytes: usize,
     bytes_hashed: u64,
-    elapsed: Duration,
+    elapsed: Option<Duration>,
 }
 
 const NATIVE_CAPTURE_LIMITS: NativeCaptureLimits = NativeCaptureLimits {
@@ -4075,7 +4077,18 @@ const NATIVE_CAPTURE_LIMITS: NativeCaptureLimits = NativeCaptureLimits {
     depth: MAX_SOURCE_DEPTH,
     path_bytes: MAX_SOURCE_PATH_BYTES,
     bytes_hashed: MAX_SOURCE_BYTES,
-    elapsed: MAX_SOURCE_CAPTURE_TIME,
+    elapsed: Some(MAX_SOURCE_CAPTURE_TIME),
+};
+
+// Linker evidence names a finite input set rather than discovering a source
+// namespace. Bound its work by files, path bytes and content bytes; a source
+// discovery deadline would reject complete evidence on slower native hosts.
+const LINK_CAPTURE_LIMITS: NativeCaptureLimits = NativeCaptureLimits {
+    entries: MAX_LINK_INPUTS,
+    depth: MAX_LINK_RESPONSE_DEPTH,
+    path_bytes: MAX_LINK_PATH_BYTES,
+    bytes_hashed: MAX_LINK_BYTES,
+    elapsed: None,
 };
 
 #[cfg(debug_assertions)]
@@ -4135,7 +4148,7 @@ fn native_capture_limits(observation: &RawCompilerInvocation) -> RailResult<Nati
         TestCaptureLimit::Depth => limits.depth = 0,
         TestCaptureLimit::PathBytes => limits.path_bytes = 0,
         TestCaptureLimit::BytesHashed => limits.bytes_hashed = 0,
-        TestCaptureLimit::Elapsed => limits.elapsed = Duration::ZERO,
+        TestCaptureLimit::Elapsed => limits.elapsed = Some(Duration::ZERO),
     }
     Ok(limits)
 }
@@ -4213,7 +4226,7 @@ impl NativeCaptureBudget {
         if self.bytes_hashed > self.limits.bytes_hashed {
             return Err(RailError::message("native source byte bound exceeded"));
         }
-        if elapsed > self.limits.elapsed {
+        if self.limits.elapsed.is_some_and(|limit| elapsed > limit) {
             return Err(RailError::message("native source capture time bound exceeded"));
         }
         Ok(())
@@ -13952,7 +13965,7 @@ fn expand_gnu_link_argument(
     if bytes.is_empty() || *byte_budget > MAX_ELF_LINK_DEPENDENCY_BYTES {
         return Err(RailError::message("linker response capture exceeds its byte bound"));
     }
-    let mut budget = NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS);
+    let mut budget = NativeCaptureBudget::new(LINK_CAPTURE_LIMITS);
     let (file, _) = capture_link_file(&response, Instant::now(), &mut budget)?;
     if file.content_digest != digest(&bytes) {
         return Err(RailError::message("linker response changed while it was captured"));
@@ -14243,7 +14256,7 @@ fn capture_link_runtime_probe(
         }
     };
     let selection = observe_link_runtime(program, &invocation, current_directory)?;
-    let mut budget = NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS);
+    let mut budget = NativeCaptureBudget::new(LINK_CAPTURE_LIMITS);
     let started = Instant::now();
     let inputs = selection
         .inputs()
@@ -14467,7 +14480,7 @@ fn capture_direct_link_driver(
         if values[0] == "-lto_library" {
             let path = absolute_link_argument_path(&values[1], current_directory);
             validate_macho_link_plugin_runtime(&path, &loaded)?;
-            let mut budget = NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS);
+            let mut budget = NativeCaptureBudget::new(LINK_CAPTURE_LIMITS);
             inputs.push(capture_link_file(&path, Instant::now(), &mut budget)?.0);
         }
     }
@@ -14792,7 +14805,7 @@ fn capture_gcc_link_driver(
     for (program, arguments) in gcc_runtime_requests(driver, &live) {
         let os_arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
         let (_, selection) = crate::executable::observe_executable_runtime(&program, &os_arguments, current_directory)?;
-        let mut budget = NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS);
+        let mut budget = NativeCaptureBudget::new(LINK_CAPTURE_LIMITS);
         let started = Instant::now();
         for path in selection.inputs() {
             inputs.insert(path.clone(), capture_link_file(path, started, &mut budget)?.0);
@@ -14804,7 +14817,7 @@ fn capture_gcc_link_driver(
             selection,
         });
     }
-    let mut budget = NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS);
+    let mut budget = NativeCaptureBudget::new(LINK_CAPTURE_LIMITS);
     inputs.insert(
         live.plugin.clone(),
         capture_link_file(&live.plugin, Instant::now(), &mut budget)?.0,
@@ -14876,7 +14889,7 @@ fn capture_clang_config_inputs(paths: &[PathBuf]) -> RailResult<BTreeMap<PathBuf
         if total_bytes > MAX_APPLE_LINK_CERTIFICATE_LEN {
             return Err(RailError::message("Clang configuration bytes exceed their bound"));
         }
-        let mut budget = NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS);
+        let mut budget = NativeCaptureBudget::new(LINK_CAPTURE_LIMITS);
         let (file, _) = capture_link_file(&path, Instant::now(), &mut budget)?;
         if file.content_digest != digest(&bytes) {
             return Err(RailError::message("Clang configuration changed during capture"));
@@ -15003,7 +15016,7 @@ fn capture_clang_link_driver(
         if program == Path::new(&linker) {
             linker_runtime_files.extend(selection.files().iter().cloned());
         }
-        let mut budget = NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS);
+        let mut budget = NativeCaptureBudget::new(LINK_CAPTURE_LIMITS);
         let started = Instant::now();
         for path in selection.inputs() {
             if !inputs.contains_key(path) {
@@ -15026,7 +15039,7 @@ fn capture_clang_link_driver(
             }
             let path = absolute_link_argument_path(&values[1], current_directory);
             validate_macho_link_plugin_runtime(&path, &linker_runtime_files)?;
-            let mut budget = NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS);
+            let mut budget = NativeCaptureBudget::new(LINK_CAPTURE_LIMITS);
             let (file, _) = capture_link_file(&path, Instant::now(), &mut budget)?;
             inputs.insert(path, file);
         }
@@ -15512,7 +15525,7 @@ fn capture_macho_link_control_inputs(
         index += consumed;
     }
     let started = Instant::now();
-    let mut budget = NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS);
+    let mut budget = NativeCaptureBudget::new(LINK_CAPTURE_LIMITS);
     controls
         .into_iter()
         .map(|path| {
@@ -16178,7 +16191,7 @@ pub(crate) fn finalize_apple_link_adapter() -> bool {
             return false;
         };
         let started = Instant::now();
-        let mut budget = NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS);
+        let mut budget = NativeCaptureBudget::new(LINK_CAPTURE_LIMITS);
         for file in &evidence.execution.inputs {
             if rustc_apple_export_list(&evidence, file)
                 && !capture_link_file(Path::new(&file.path), started, &mut budget)
@@ -21919,13 +21932,79 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn linker_capture_outlives_source_discovery_without_losing_content_validation() {
+        let root = tempfile::tempdir().expect("linker input directory");
+        let path = root.path().join("input.o");
+        fs::write(&path, b"abc").expect("linker input");
+        let started = Instant::now()
+            .checked_sub(MAX_SOURCE_CAPTURE_TIME + Duration::from_secs(1))
+            .expect("source discovery deadline has elapsed");
+        let (witness, _) = capture_link_file(&path, started, &mut NativeCaptureBudget::new(LINK_CAPTURE_LIMITS))
+            .expect("finite linker input capture has no source discovery deadline");
+        assert_eq!(witness.bytes, 3);
+        assert_eq!(
+            witness.content_digest,
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        capture_guarded_file(&path, started, &mut NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS))
+            .expect_err("source discovery must retain its deadline");
+        revalidate_link_file(
+            &witness,
+            None,
+            started,
+            &mut NativeCaptureBudget::new(LINK_CAPTURE_LIMITS),
+        )
+        .expect("unchanged linker input");
+        fs::write(&path, b"abd").expect("same-size linker input mutation");
+        revalidate_link_file(
+            &witness,
+            None,
+            started,
+            &mut NativeCaptureBudget::new(LINK_CAPTURE_LIMITS),
+        )
+        .expect_err("elapsed time cannot authorize changed content");
+    }
+
+    #[test]
+    fn linker_capture_enforces_file_path_and_content_work_bounds() {
+        let root = tempfile::tempdir().expect("linker input directory");
+        let path = root.path().join("input.o");
+        fs::write(&path, b"abc").expect("linker input");
+        let exact = NativeCaptureLimits {
+            entries: 1,
+            path_bytes: path.to_str().expect("UTF-8 fixture path").len(),
+            bytes_hashed: 3,
+            ..LINK_CAPTURE_LIMITS
+        };
+        let mut budget = NativeCaptureBudget::new(exact);
+        let (witness, _) = capture_link_file(&path, Instant::now(), &mut budget).expect("exact work bounds");
+        assert_eq!(witness.bytes, 3);
+        assert_eq!(budget.bytes_hashed, 3);
+        for limits in [
+            NativeCaptureLimits { entries: 0, ..exact },
+            NativeCaptureLimits {
+                path_bytes: exact.path_bytes - 1,
+                ..exact
+            },
+            NativeCaptureLimits {
+                bytes_hashed: 2,
+                ..exact
+            },
+        ] {
+            capture_link_file(&path, Instant::now(), &mut NativeCaptureBudget::new(limits))
+                .expect_err("one unit beyond each independent work bound must fail");
+        }
+        capture_link_file(&path, Instant::now(), &mut budget).expect_err("captures must share their cumulative budget");
+    }
+
+    #[test]
     fn source_capture_limits_accept_the_exact_boundary_and_reject_one_more() {
         let limits = NativeCaptureLimits {
             entries: 1,
             depth: 2,
             path_bytes: 3,
             bytes_hashed: 4,
-            elapsed: Duration::from_nanos(5),
+            elapsed: Some(Duration::from_nanos(5)),
         };
 
         let mut entries = NativeCaptureBudget::new(limits);
@@ -22012,7 +22091,7 @@ pub(crate) mod tests {
             depth: 1,
             path_bytes: usize::MAX,
             bytes_hashed: u64::MAX,
-            elapsed: Duration::from_secs(1),
+            elapsed: Some(Duration::from_secs(1)),
         };
         let mut budget = NativeCaptureBudget::new(limits);
         budget.account_entry("").expect("root entry");
@@ -22029,7 +22108,7 @@ pub(crate) mod tests {
             depth: usize::MAX,
             path_bytes: usize::MAX,
             bytes_hashed: u64::MAX,
-            elapsed: Duration::ZERO,
+            elapsed: Some(Duration::ZERO),
         };
         let mut budget = NativeCaptureBudget::new(limits);
         let started = Instant::now()

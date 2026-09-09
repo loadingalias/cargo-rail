@@ -9,6 +9,8 @@ import sys
 # cases are errors: platform gating must not silently reduce cache qualification.
 CASES = {
     'cargo_rail': [
+        'compiler::native_cache::tests::linker_capture_outlives_source_discovery_without_losing_content_validation',
+        'compiler::native_cache::tests::linker_capture_enforces_file_path_and_content_work_bounds',
         'cache::cas::tests::native_manifest_must_match_the_validated_output_contract',
         'cache::cas::tests::malformed_native_action_state_is_durably_quarantined',
         'cache::cas::tests::concurrent_native_publications_converge_on_one_binding',
@@ -16,7 +18,6 @@ CASES = {
         'cache::cas::tests::cache_open_unlinks_hostile_staging_links_without_following_them',
         'compiler::native_cache::tests::restore_commit_rejects_a_destination_created_after_authorization',
         'compiler::native_cache::tests::restore_recovery_discards_partial_private_records_before_authority',
-        'compiler::native_cache::tests::every_pre_execution_mutation_changes_the_action_identity',
         'compiler::native_cache::tests::session_identity_changes_with_exact_compiler_authority',
         'compiler::native_cache::tests::native_search_restore_revalidation_rejects_a_same_size_x_to_y_to_x_mutation',
         'compiler::native_cache::tests::restore_revalidation_rejects_a_same_size_x_to_y_to_x_mutation',

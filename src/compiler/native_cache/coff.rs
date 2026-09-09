@@ -156,7 +156,7 @@ pub(crate) fn configure(command: &mut Command, arguments: &[OsString]) -> bool {
         let (driver, driver_generation) = capture_link_file(
             &driver,
             Instant::now(),
-            &mut NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS),
+            &mut NativeCaptureBudget::new(LINK_CAPTURE_LIMITS),
         )?;
         let version_arguments = if Path::new(&driver.path)
             .file_stem()
@@ -350,7 +350,7 @@ fn capture_arguments(arguments: &[OsString], current_directory: &Path) -> RailRe
             let (file, _) = capture_link_file(
                 &path,
                 Instant::now(),
-                &mut NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS),
+                &mut NativeCaptureBudget::new(LINK_CAPTURE_LIMITS),
             )?;
             if file.content_digest != digest(&bytes)
                 || responses
@@ -792,7 +792,7 @@ pub(super) fn capture(
     }
     directories.sort_unstable_by(|left, right| left.path.cmp(&right.path));
     let started = Instant::now();
-    let mut budget = NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS);
+    let mut budget = NativeCaptureBudget::new(LINK_CAPTURE_LIMITS);
     let (driver, driver_generation) = capture_link_file(&driver_path, started, &mut budget)?;
     if driver != evidence.driver || driver_generation != evidence.driver_generation {
         return Err(RailError::message("COFF driver changed before publication"));
