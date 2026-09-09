@@ -831,6 +831,137 @@ fn test_plan_propagates_cargo_domains_with_portable_selectors() {
 }
 
 #[test]
+#[cfg(unix)]
+fn symlink_workspace_aliases_preserve_changed_package_ownership() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("plan-symlink-aliases")?;
+        ws.add_crate("domain-a", "0.1.0", &[])?;
+        ws.add_crate("domain-b", "0.1.0", &[("domain-a", r#"{ path = "../domain-a" }"#)])?;
+        let context = cargo_rail::workspace::WorkspaceContext::build(&ws.path)?;
+        ws.commit("establish dependency graph")?;
+        ws.modify_file("domain-a", "src/lib.rs", "pub fn changed() {}\n")?;
+        ws.commit("change dependency")?;
+        let aliases = tempfile::tempdir()?;
+        std::os::unix::fs::symlink(&ws.path, aliases.path().join("workspace"))?;
+        std::os::unix::fs::symlink(ws.path.join("crates"), aliases.path().join("children"))?;
+        assert_eq!(
+            context
+                .graph()
+                .file_to_crate(&aliases.path().join("workspace/crates/domain-a/src/deleted.rs")),
+            Some("domain-a".to_string())
+        );
+        assert_eq!(
+            context
+                .graph()
+                .file_to_crate(std::path::Path::new("crates/domain-a/src/deleted.rs")),
+            Some("domain-a".to_string())
+        );
+        for root in [aliases.path().join("workspace"), aliases.path().join("children/..")] {
+            let output = run_cargo_rail(
+                &ws.path,
+                &[
+                    "rail",
+                    "--workspace-root",
+                    root.to_str().context("non-UTF-8 alias")?,
+                    "plan",
+                    "--since",
+                    "HEAD~1",
+                    "--json",
+                ],
+            )?;
+            ensure!(
+                output.status.success(),
+                "alias plan failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let actual: Value = serde_json::from_slice(&output.stdout)?;
+            for work in [
+                "cargo.build",
+                "cargo.clippy",
+                "cargo.doc",
+                "cargo.doctest",
+                "cargo.test",
+            ] {
+                let packages = actual["work"][work]["scope"]["selection"]["packages"]
+                    .as_array()
+                    .context("missing package selection")?;
+                let names = packages
+                    .iter()
+                    .filter_map(|package| package["name"].as_str())
+                    .collect::<BTreeSet<_>>();
+                assert_eq!(
+                    names,
+                    BTreeSet::from(["domain-a", "domain-b"]),
+                    "{work} through {}",
+                    root.display()
+                );
+            }
+        }
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+#[cfg(windows)]
+fn windows_workspace_aliases_preserve_changed_package_ownership() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("plan-windows-aliases")?;
+        ws.add_crate("domain-a", "0.1.0", &[])?;
+        ws.add_crate("domain-b", "0.1.0", &[("domain-a", r#"{ path = "../domain-a" }"#)])?;
+        ws.commit("establish dependency graph")?;
+        ws.modify_file("domain-a", "src/lib.rs", "pub fn changed() {}\n")?;
+        ws.commit("change dependency")?;
+
+        let short = Command::new("cmd.exe")
+            .current_dir(&ws.path)
+            .args(["/d", "/c", "for %I in (.) do @echo %~fsI"])
+            .output()?;
+        ensure!(short.status.success(), "short workspace path lookup failed");
+        let short = String::from_utf8(short.stdout)?.trim().to_string();
+        let uppercase = ws
+            .path
+            .to_str()
+            .context("non-UTF-8 workspace path")?
+            .to_ascii_uppercase();
+        let verbatim = std::fs::canonicalize(&ws.path)?
+            .to_str()
+            .context("non-UTF-8 canonical path")?
+            .to_string();
+        for root in [short, uppercase, verbatim] {
+            assert_eq!(std::fs::canonicalize(&root)?, std::fs::canonicalize(&ws.path)?);
+            let output = run_cargo_rail(
+                &ws.path,
+                &["rail", "--workspace-root", &root, "plan", "--since", "HEAD~1", "--json"],
+            )?;
+            ensure!(
+                output.status.success(),
+                "plan through {root} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let plan: Value = serde_json::from_slice(&output.stdout)?;
+            for work in [
+                "cargo.build",
+                "cargo.clippy",
+                "cargo.doc",
+                "cargo.doctest",
+                "cargo.test",
+            ] {
+                let names = plan["work"][work]["scope"]["selection"]["packages"]
+                    .as_array()
+                    .with_context(|| format!("{work} package selectors missing through {root}: {plan}"))?
+                    .iter()
+                    .filter_map(|selector| selector["name"].as_str())
+                    .collect::<BTreeSet<_>>();
+                assert_eq!(names, BTreeSet::from(["domain-a", "domain-b"]), "{work} through {root}");
+            }
+        }
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
 fn test_plan_cargo_selectors_exclude_non_workspace_dependency_packages() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("plan-non-workspace-dependency")?;

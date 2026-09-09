@@ -51,7 +51,7 @@ impl CargoState {
         let metadata = MetadataCommand::new()
             .manifest_path(workspace_root.join("Cargo.toml"))
             .exec()?;
-        Ok(Self::from_metadata(Arc::new(metadata)))
+        Ok(Self::from_metadata(Arc::new(super::capture_metadata_paths(metadata)?)))
     }
 
     fn load_fresh(
@@ -79,7 +79,7 @@ impl CargoState {
         error.into()
       }
     })?;
-        Ok(Self::from_metadata(Arc::new(metadata)))
+        Ok(Self::from_metadata(Arc::new(super::capture_metadata_paths(metadata)?)))
     }
 
     fn load_planning(workspace_root: &Path, cargo_current_dir: &Path, require_existing_lock: bool) -> RailResult<Self> {
@@ -92,15 +92,12 @@ impl CargoState {
             command.other_options(vec!["--locked".to_string()]);
         }
         let metadata = command.exec()?;
-        Ok(Self::from_metadata(Arc::new(metadata)))
+        Ok(Self::from_metadata(Arc::new(super::capture_metadata_paths(metadata)?)))
     }
 
     /// Build CargoState from metadata, constructing the package index and proc-macro cache
     fn from_metadata(metadata: Arc<Metadata>) -> Self {
-        // Normalize path separators on Windows (cargo metadata uses forward slashes).
-        // Using .components().collect() converts to platform-native separators without
-        // adding the \\?\ prefix that canonicalize() would add.
-        let workspace_root: PathBuf = metadata.workspace_root.as_std_path().components().collect();
+        let workspace_root = metadata.workspace_root.as_std_path().to_path_buf();
 
         // Build O(1) lookup index: package name → index in metadata.packages
         let workspace_member_ids: std::collections::HashSet<_> = metadata.workspace_members.iter().collect();
@@ -525,6 +522,16 @@ impl WorkspaceContext {
         } else {
             process_current_dir.join(workspace_root)
         };
+        // Cargo preserves manifest path aliases, while Git resolves its worktree root.
+        // Capture both from the same physical root so package ownership stays comparable.
+        let canonical_workspace_root =
+            crate::utils::canonicalize_existing(&requested_workspace_root).map_err(|error| {
+                RailError::message(format!(
+                    "failed to resolve workspace root '{}': {error}",
+                    requested_workspace_root.display()
+                ))
+            })?;
+        let workspace_root = canonical_workspace_root.as_path();
         let cargo_current_dir = cargo_current_dir.map_or(process_current_dir, Path::to_path_buf);
         // Load git state when available. Cargo-only commands such as `unify --check`
         // must work in source sandboxes that intentionally omit `.git`.

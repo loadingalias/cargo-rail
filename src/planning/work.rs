@@ -578,6 +578,31 @@ struct StructuralCargoImpact {
 struct CargoDomain {
     metadata: Arc<Metadata>,
     universe: DependencyUniverse,
+    package_roots: BTreeMap<std::path::PathBuf, BTreeSet<PackageId>>,
+}
+
+impl CargoDomain {
+    fn capture(metadata: Arc<Metadata>, source_root: &Path) -> RailResult<Self> {
+        let universe = DependencyUniverse::from_metadata(&metadata, source_root)?;
+        let mut package_roots = BTreeMap::<std::path::PathBuf, BTreeSet<PackageId>>::new();
+        for package in metadata.packages.iter().filter(|package| package.source.is_none()) {
+            if let Some(root) = package
+                .manifest_path
+                .parent()
+                .and_then(|root| root.as_std_path().strip_prefix(source_root).ok())
+            {
+                package_roots
+                    .entry(root.to_path_buf())
+                    .or_default()
+                    .insert(package.id.clone());
+            }
+        }
+        Ok(Self {
+            metadata,
+            universe,
+            package_roots,
+        })
+    }
 }
 
 struct PlanningCargoModel {
@@ -589,9 +614,9 @@ const PRIMARY_CARGO_DOMAIN: &str = "workspace";
 impl PlanningCargoModel {
     fn new(ctx: &WorkspaceContext) -> RailResult<Self> {
         let metadata = ctx.cargo().shared_metadata();
-        let universe = DependencyUniverse::from_metadata(&metadata, ctx.planning_authority_source_root())?;
+        let domain = CargoDomain::capture(metadata, ctx.planning_authority_source_root())?;
         Ok(Self {
-            domains: BTreeMap::from([(PRIMARY_CARGO_DOMAIN.to_string(), CargoDomain { metadata, universe })]),
+            domains: BTreeMap::from([(PRIMARY_CARGO_DOMAIN.to_string(), domain)]),
         })
     }
 
@@ -628,20 +653,15 @@ impl PlanningCargoModel {
             .manifest_path(&manifest_path)
             .other_options(vec!["--locked".to_string()]);
         crate::instrumentation::record_cargo_metadata_load(false);
-        let metadata = Arc::new(command.exec().map_err(|error| {
-            RailError::message(format!(
-                "failed to load configured auxiliary Cargo manifest '{manifest}': {error}"
-            ))
-        })?);
+        let metadata = Arc::new(crate::workspace::capture_metadata_paths(command.exec().map_err(
+            |error| {
+                RailError::message(format!(
+                    "failed to load configured auxiliary Cargo manifest '{manifest}': {error}"
+                ))
+            },
+        )?)?);
         for package in metadata.packages.iter().filter(|package| package.source.is_none()) {
-            let package_manifest = crate::utils::canonicalize_existing(package.manifest_path.as_std_path()).map_err(
-                |error| {
-                    RailError::message(format!(
-                        "failed to resolve local package manifest '{}' from auxiliary Cargo manifest '{manifest}': {error}",
-                        package.manifest_path
-                    ))
-                },
-            )?;
+            let package_manifest = package.manifest_path.as_std_path();
             if package_manifest.strip_prefix(source_root).is_err() {
                 return Err(RailError::with_help(
                     format!(
@@ -652,10 +672,9 @@ impl PlanningCargoModel {
                 ));
             }
         }
-        let universe = DependencyUniverse::from_metadata(&metadata, ctx.planning_authority_source_root())?;
+        let domain = CargoDomain::capture(metadata, ctx.planning_authority_source_root())?;
         ctx.validate_planning_source_unchanged()?;
-        self.domains
-            .insert(manifest.to_string(), CargoDomain { metadata, universe });
+        self.domains.insert(manifest.to_string(), domain);
         Ok(())
     }
 
@@ -756,36 +775,23 @@ impl PlanningCargoModel {
         Ok(merged)
     }
 
-    fn owning_packages(&self, ctx: &WorkspaceContext, path: &Path) -> BTreeSet<PackageId> {
-        let mut matches = Vec::new();
-        for domain in self.domains.values() {
-            for package in domain
-                .metadata
-                .packages
-                .iter()
-                .filter(|package| package.source.is_none())
-            {
-                let Some(root) = package.manifest_path.parent().and_then(|root| {
-                    root.as_std_path()
-                        .strip_prefix(ctx.planning_authority_source_root())
-                        .ok()
-                }) else {
-                    continue;
-                };
-                if path == root.join("Cargo.toml")
-                    || path
-                        .strip_prefix(root)
-                        .is_ok_and(|suffix| !suffix.as_os_str().is_empty())
-                {
-                    matches.push((root.components().count(), package.id.clone()));
-                }
+    fn owning_packages(&self, path: &Path) -> BTreeSet<PackageId> {
+        let Some(parent) = path.parent() else {
+            return BTreeSet::new();
+        };
+        for root in parent.ancestors() {
+            let owners = self
+                .domains
+                .values()
+                .filter_map(|domain| domain.package_roots.get(root))
+                .flatten()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if !owners.is_empty() {
+                return owners;
             }
         }
-        let depth = matches.iter().map(|(depth, _)| *depth).max();
-        matches
-            .into_iter()
-            .filter_map(|(candidate_depth, package)| (Some(candidate_depth) == depth).then_some(package))
-            .collect()
+        BTreeSet::new()
     }
 
     fn package_key(&self, ctx: &WorkspaceContext, package: &PackageId) -> Option<String> {
@@ -1249,7 +1255,7 @@ fn structural_cargo_impact(
     for path in paths {
         match semantic_changes.get(*path).map(|change| &change.scope) {
             Some(SemanticScope::None) | None if path.ends_with(".rs") => {
-                for package in cargo_model.owning_packages(ctx, Path::new(path)) {
+                for package in cargo_model.owning_packages(Path::new(path)) {
                     impact.seeds.insert(package.clone());
                     impact
                         .seed_paths

@@ -646,8 +646,8 @@ fn standalone_workspace_metadata(workspace_root: &Path) -> RailResult<Option<car
     }
     let mut command = cargo_metadata::MetadataCommand::new();
     command.current_dir(workspace_root).no_deps();
-    command
+    let metadata = command
         .exec()
-        .map(Some)
-        .map_err(|error| RailError::message(format!("cannot validate Cargo workspace configuration: {error}")))
+        .map_err(|error| RailError::message(format!("cannot validate Cargo workspace configuration: {error}")))?;
+    crate::workspace::capture_metadata_paths(metadata).map(Some)
 }

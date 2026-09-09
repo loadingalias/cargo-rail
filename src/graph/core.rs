@@ -291,21 +291,7 @@ impl OwnershipIndex {
         if !path.is_absolute() {
             return None;
         }
-        let mut normalized = PathBuf::new();
-        for component in path.components() {
-            match component {
-                Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-                Component::RootDir => normalized.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
-                Component::CurDir => {}
-                Component::ParentDir => {
-                    if !normalized.pop() {
-                        return None;
-                    }
-                }
-                Component::Normal(segment) => normalized.push(segment),
-            }
-        }
-        Some(normalized)
+        crate::utils::canonicalize_allow_missing(path).ok()
     }
 }
 

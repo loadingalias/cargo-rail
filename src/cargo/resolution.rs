@@ -1172,8 +1172,9 @@ impl ResolutionViews {
         crate::instrumentation::record_cargo_metadata_load(key.request.target_filter().is_some());
         let metadata = command.exec();
         self.validate_cargo_config_unchanged(key.cargo_config)?;
-        let metadata =
-            Arc::new(metadata.map_err(|error| resolution_load_error(&key.request, error, key.credential_sensitive))?);
+        let metadata = Arc::new(crate::workspace::capture_metadata_paths(
+            metadata.map_err(|error| resolution_load_error(&key.request, error, key.credential_sensitive))?,
+        )?);
         if metadata.resolve.is_none() {
             return Err(RailError::message(
                 "Cargo returned no resolve graph for a full resolution view",

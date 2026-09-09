@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use crate::config::RailConfig;
 use crate::error::{RailError, RailResult};
@@ -545,12 +545,7 @@ pub fn canonicalize_allow_missing(path: &Path) -> io::Result<PathBuf> {
     } else {
         std::env::current_dir()?.join(path)
     };
-    let normalized = normalize_absolute_path(&absolute)?;
-    if fs::symlink_metadata(&normalized).is_ok() {
-        return canonicalize_existing(&normalized);
-    }
-
-    let mut ancestor = normalized.as_path();
+    let mut ancestor = absolute.as_path();
     let mut suffix = Vec::<OsString>::new();
     loop {
         match fs::symlink_metadata(ancestor) {
@@ -593,27 +588,6 @@ pub fn path_relative_to(root: &Path, path: &Path) -> io::Result<PathBuf> {
     })
 }
 
-fn normalize_absolute_path(path: &Path) -> io::Result<PathBuf> {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("path '{}' escapes the filesystem root", path.display()),
-                    ));
-                }
-            }
-            Component::Normal(part) => normalized.push(part),
-        }
-    }
-    Ok(normalized)
-}
-
 #[cfg(not(windows))]
 fn simplify_canonical_path(path: PathBuf) -> PathBuf {
     path
@@ -621,7 +595,7 @@ fn simplify_canonical_path(path: PathBuf) -> PathBuf {
 
 #[cfg(windows)]
 fn simplify_canonical_path(path: PathBuf) -> PathBuf {
-    use std::path::Prefix;
+    use std::path::{Component, Prefix};
 
     let mut components = path.components();
     let Some(Component::Prefix(prefix)) = components.next() else {
@@ -1042,6 +1016,29 @@ mod tests {
 
         assert_eq!(text_file_fingerprint(&lf), text_file_fingerprint(&crlf));
         assert_ne!(file_fingerprint(&lf), file_fingerprint(&crlf));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn missing_path_resolution_preserves_symlink_parent_traversal() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(outside.join("child")).unwrap();
+        std::os::unix::fs::symlink(outside.join("child"), root.join("alias")).unwrap();
+        let spelling = root.join("alias/../new/output");
+        assert_eq!(
+            canonicalize_allow_missing(&spelling).unwrap(),
+            canonicalize_existing(&outside).unwrap().join("new/output")
+        );
+        path_relative_to(&root, &spelling).unwrap_err();
+        fs::write(outside.join("existing"), b"outside").unwrap();
+        assert_eq!(
+            canonicalize_allow_missing(&root.join("alias/../existing")).unwrap(),
+            canonicalize_existing(&outside.join("existing")).unwrap()
+        );
+        canonicalize_allow_missing(&root.join("missing/../output")).unwrap_err();
     }
 
     #[test]

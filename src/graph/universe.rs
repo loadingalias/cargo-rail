@@ -391,11 +391,7 @@ fn portable_source_path(path: &Path, source_root: &Path) -> String {
 }
 
 fn portable_relative_path(path: &Path, source_root: &Path) -> Option<String> {
-    crate::utils::canonicalize_existing(path)
-        .ok()?
-        .strip_prefix(source_root)
-        .ok()
-        .map(normalized_path)
+    path.strip_prefix(source_root).ok().map(normalized_path)
 }
 
 fn normalized_path(path: &Path) -> String {
@@ -437,21 +433,17 @@ const fn dependency_kind_rank(kind: DependencyKind) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
     use super::*;
 
     #[test]
-    fn portable_paths_resolve_equivalent_platform_spellings() {
+    fn portable_paths_preserve_missing_captured_sources() {
         let root = tempfile::tempdir().expect("source root");
-        let package = root.path().join("crates/example");
-        fs::create_dir_all(&package).expect("package directory");
         let source_root = crate::utils::canonicalize_existing(root.path()).expect("canonical source root");
-        let platform_spelling = fs::canonicalize(&package).expect("platform package spelling");
+        let missing_source = source_root.join("crates/example/src/deleted.rs");
 
         assert_eq!(
-            portable_relative_path(&platform_spelling, &source_root).as_deref(),
-            Some("crates/example")
+            portable_relative_path(&missing_source, &source_root).as_deref(),
+            Some("crates/example/src/deleted.rs")
         );
     }
 }

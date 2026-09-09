@@ -1556,18 +1556,17 @@ fn verify_applied_unify_graph(
             snapshot.validate_post_mutation_resolution_inputs_unchanged()?;
         }
         crate::instrumentation::record_cargo_metadata_load(target != "default");
-        let metadata = std::sync::Arc::new(command.exec().map_err(|error| {
-      if snapshot.cargo_config().has_credential_capability() {
-        RailError::with_help(
-          format!(
-            "resolving post-edit metadata for target '{target}' failed while credential capabilities were active"
-          ),
-          "run cargo metadata directly for provider diagnostics; cargo-rail suppresses credential-provider output",
-        )
-      } else {
-        RailError::message(format!("resolving post-edit metadata for target `{target}`: {error}"))
-      }
-    })?);
+        let metadata = command.exec().map_err(|error| {
+            if snapshot.cargo_config().has_credential_capability() {
+                RailError::with_help(
+                    format!("resolving post-edit metadata for target '{target}' failed while credential capabilities were active"),
+                    "run cargo metadata directly for provider diagnostics; cargo-rail suppresses credential-provider output",
+                )
+            } else {
+                RailError::message(format!("resolving post-edit metadata for target `{target}`: {error}"))
+            }
+        })?;
+        let metadata = std::sync::Arc::new(crate::workspace::capture_metadata_paths(metadata)?);
         snapshot.validate_post_mutation_environment_unchanged()?;
         let current_lock_fingerprint = lockfile_content_fingerprint(&lockfile_path)?;
         if let Some(expected) = post_mutation_lock_fingerprint.as_deref() {
