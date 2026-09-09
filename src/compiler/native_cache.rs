@@ -22201,10 +22201,7 @@ pub(crate) mod tests {
             invocation_bypass_reason(&test, true, &session.class.host_target),
             platform_linker_bypass_reason(NativeTargetFormat::host())
         );
-        assert_eq!(
-            linked_observation(&test),
-            cfg!(any(target_os = "macos", target_os = "linux"))
-        );
+        assert!(linked_observation(&test));
         for (crate_type, crate_name) in [
             ("proc-macro", "fixture_macros"),
             ("dylib", "fixture_dylib"),

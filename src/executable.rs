@@ -1816,8 +1816,8 @@ int main(int argc, char **argv) {
             let captured =
                 ExecutableIdentity::capture(&selection, directory.path(), directory.path()).expect("capture selection");
             assert_eq!(
-                captured.selected_program(directory.path()).expect("recover selection"),
-                expected
+                Path::new(&captured.selected_program(directory.path()).expect("recover selection")),
+                Path::new(&expected)
             );
         }
     }

@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::process::{Command, Stdio};
 
+#[cfg(windows)]
+use crate::helpers::assert_native_driver_unavailable_bypass;
 use anyhow::{Context, Result};
 use cargo_rail::source::ContentDigest;
 use serde::{Deserialize, Serialize};
@@ -186,7 +188,7 @@ struct DecodedResponse {
 }
 
 #[test]
-fn one_shot_worker_matches_local_rustc_and_honors_cancellation() -> Result<()> {
+fn one_shot_worker_enforces_native_input_authority_and_cancellation() -> Result<()> {
     let worker = Path::new(env!("CARGO_BIN_EXE_cargo-rail-distributed-worker"));
     let rustc = which_rustc()?;
     let version = Command::new(worker).arg("protocol-version").output()?;
@@ -197,14 +199,22 @@ fn one_shot_worker_matches_local_rustc_and_honors_cancellation() -> Result<()> {
         .args(["qualify-local-client"])
         .arg(&rustc)
         .output()?;
-    anyhow::ensure!(
-        qualification.status.success(),
-        "local client qualification failed: {qualification:?}"
-    );
-    anyhow::ensure!(
-        qualification.stdout == b"5\n" && qualification.stderr.is_empty(),
-        "local client qualification contaminated its machine output"
-    );
+    if cfg!(windows) {
+        anyhow::ensure!(qualification.status.code() == Some(2), "{qualification:?}");
+        anyhow::ensure!(
+            qualification.stdout.is_empty(),
+            "failed qualification published authority"
+        );
+    } else {
+        anyhow::ensure!(
+            qualification.status.success(),
+            "local client qualification failed: {qualification:?}"
+        );
+        anyhow::ensure!(
+            qualification.stdout == b"5\n" && qualification.stderr.is_empty(),
+            "local client qualification contaminated its machine output"
+        );
+    }
 
     let capability_output = Command::new(worker).args(["capability"]).arg(&rustc).output()?;
     anyhow::ensure!(
@@ -257,6 +267,31 @@ fn one_shot_worker_matches_local_rustc_and_honors_cancellation() -> Result<()> {
 
     let source = b"#![forbid(unsafe_code)]\npub fn answer() -> u64 { 42 }\n";
     let request = execution_request(&capability, source)?;
+    if cfg!(windows) {
+        let result = run_worker(worker, &rustc, &request, source, false)?;
+        anyhow::ensure!(
+            result.header.status == "rejected"
+                && result.header.reason.as_deref() == Some("compiler_native_input_driver_unavailable"),
+            "unexpected worker rejection: {:?}",
+            result.header
+        );
+        anyhow::ensure!(
+            result.header.termination.is_none(),
+            "unexecuted request reported compiler termination"
+        );
+        anyhow::ensure!(
+            result.frames.is_empty() && result.header.frames.is_empty(),
+            "unobserved request returned artifacts"
+        );
+        anyhow::ensure!(
+            result.header.action_id == request.action_id
+                && result.header.capability_id == request.capability_id
+                && result.header.lease_id == request.lease_id
+                && result.header.workload_identity == request.workload_identity,
+            "rejection lost request binding"
+        );
+        return Ok(());
+    }
     let local = compile_locally(&rustc, &request.operation, source)?;
     let result = run_worker(worker, &rustc, &request, source, false)?;
     assert_success_authority(&result.header, &request)?;
@@ -441,6 +476,7 @@ fn first_seen_compiler_environment_executes_locally_before_distribution() -> Res
     let events = fs::read_dir(&coverage)?
         .map(|entry| Ok(serde_json::from_slice::<serde_json::Value>(&fs::read(entry?.path())?)?))
         .collect::<Result<Vec<_>>>()?;
+    #[cfg(not(windows))]
     anyhow::ensure!(
         events.iter().any(|event| {
             event["status"] == "miss"
@@ -450,6 +486,8 @@ fn first_seen_compiler_environment_executes_locally_before_distribution() -> Res
         }),
         "first-seen environment did not publish a locally observed miss: {events:?}"
     );
+    #[cfg(windows)]
+    assert_native_driver_unavailable_bypass(&events, "first-seen environment");
     anyhow::ensure!(
         events
             .iter()
@@ -560,14 +598,17 @@ fn ordinary_cargo_distributes_module_trees_and_exact_rust_dependencies() -> Resu
     let events = fs::read_dir(&coverage)?
         .map(|entry| Ok(serde_json::from_slice::<serde_json::Value>(&fs::read(entry?.path())?)?))
         .collect::<Result<Vec<_>>>()?;
-    let hits = events
-        .iter()
-        .filter(|event| event["status"] == "hit" && event["reason"] == "verified_distributed_execution")
-        .count();
+    #[cfg(not(windows))]
     anyhow::ensure!(
-        hits == 3,
+        events
+            .iter()
+            .filter(|event| event["status"] == "hit" && event["reason"] == "verified_distributed_execution")
+            .count()
+            == 3,
         "module/dependency build did not distribute all three Rust actions: {events:?}"
     );
+    #[cfg(windows)]
+    assert_native_driver_unavailable_bypass(&events, "module/dependency build");
 
     fs::remove_dir_all(workspace.path.join("target"))?;
     for entry in fs::read_dir(&native_actions)? {
@@ -612,10 +653,12 @@ fn ordinary_cargo_distributes_module_trees_and_exact_rust_dependencies() -> Resu
     let check_events = fs::read_dir(&coverage)?
         .map(|entry| Ok(serde_json::from_slice::<serde_json::Value>(&fs::read(entry?.path())?)?))
         .collect::<Result<Vec<_>>>()?;
+    #[cfg(not(windows))]
     let compiler_actions = check_events
         .iter()
         .filter(|event| event["action_key"].is_string())
         .collect::<Vec<_>>();
+    #[cfg(not(windows))]
     anyhow::ensure!(
         compiler_actions.len() >= 6
             && compiler_actions
@@ -624,6 +667,18 @@ fn ordinary_cargo_distributes_module_trees_and_exact_rust_dependencies() -> Resu
         "metadata/test compiler actions did not all use verified distributed execution: {check_events:?}; stderr: {}",
         String::from_utf8_lossy(&distributed_check.stderr)
     );
+    #[cfg(windows)]
+    {
+        assert_native_driver_unavailable_bypass(&check_events, "metadata/test check");
+        anyhow::ensure!(
+            check_events
+                .iter()
+                .filter(|event| event["reason"] == "compiler_native_input_driver_unavailable")
+                .count()
+                >= 6,
+            "metadata/test check did not execute all six compiler actions: {check_events:?}"
+        );
+    }
     Ok(())
 }
 

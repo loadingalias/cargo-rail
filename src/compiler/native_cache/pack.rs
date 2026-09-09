@@ -876,7 +876,7 @@ mod tests {
         primary.role = "cdylib".to_string();
         primary.slot = CDYLIB_SLOT.to_string();
         primary.file_name = "fixture.dll".to_string();
-        primary.mode = 0o755;
+        primary.mode = if cfg!(unix) { 0o755 } else { 0o644 };
         descriptor.outputs[1] = primary.clone();
         for (role, slot, name) in [
             ("pdb", PDB_SLOT, "fixture.pdb"),

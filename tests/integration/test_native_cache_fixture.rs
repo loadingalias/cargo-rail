@@ -1659,6 +1659,7 @@ fn transitive_crate_replacement_cannot_restore_a_result_for_stale_direct_metadat
 }
 
 #[test]
+#[cfg(unix)]
 fn benchmark_local_refuses_inherited_configuration_and_retains_unrun_rows() -> Result<()> {
     let root = tempfile::tempdir()?;
     fs::create_dir(root.path().join(".cargo"))?;
@@ -1688,5 +1689,24 @@ fn benchmark_local_refuses_inherited_configuration_and_retains_unrun_rows() -> R
             .all(|sample| sample["status"] == "pending" && sample["seconds"].is_null())
     );
     ensure!(destination.join("failure.txt").is_file());
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn benchmark_local_rejects_unavailable_isolation_before_writing() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let destination = root.path().join("comparison");
+    let result = Command::new(env!("CARGO_BIN_EXE_cargo-rail-bench"))
+        .args(["local", "--smoke", "--output"])
+        .arg(&destination)
+        .env("PATH", "")
+        .output()?;
+    ensure!(result.status.code() == Some(2), "{result:?}");
+    ensure!(
+        String::from_utf8_lossy(&result.stderr).contains("local comparison currently requires Unix socket isolation"),
+        "{result:?}"
+    );
+    ensure!(!destination.exists(), "unsupported benchmark created output state");
     Ok(())
 }

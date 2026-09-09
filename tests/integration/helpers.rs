@@ -18,6 +18,21 @@ pub fn finish_test(result: Result<()>) {
     assert_eq!(result.map_err(|error| format!("{error:#}")), Ok(()));
 }
 
+#[cfg(windows)]
+#[track_caller]
+pub fn assert_native_driver_unavailable_bypass(events: &[serde_json::Value], phase: &str) {
+    assert!(
+        events.iter().any(|event| {
+            event["status"] == "bypassed" && event["reason"] == "compiler_native_input_driver_unavailable"
+        }),
+        "{phase} did not report unavailable native input capture: {events:?}"
+    );
+    assert!(
+        events.iter().all(|event| event["status"] == "bypassed"),
+        "{phase} admitted a compilation without native input capture: {events:?}"
+    );
+}
+
 fn isolated_git_config() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/isolated.gitconfig")
 }

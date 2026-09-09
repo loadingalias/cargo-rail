@@ -13,6 +13,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::helpers::TestWorkspace;
+#[cfg(windows)]
+use crate::helpers::assert_native_driver_unavailable_bypass;
 
 #[cfg(unix)]
 struct UnchangedFileEvidence {
@@ -896,9 +898,15 @@ fn explicit_target_reuse(target: &str, mixed_host_target: bool) -> Result<()> {
         explicit_target_cargo(&workspace.path, cargo_home.path(), workload, target, None)?;
         let cold = selected_profile_status(&workspace.path, cargo_home.path())?;
         let cold_usage = &cold["status"]["installation"]["usage"];
+        #[cfg(not(windows))]
         anyhow::ensure!(
             cold_usage["misses"] == expected_libraries,
             "cold {workload} did not cache every target library: {cold_usage}"
+        );
+        #[cfg(windows)]
+        anyhow::ensure!(
+            cold_usage["misses"] == 0 && cold_usage["failures"] == 0 && cold_usage["bypasses"] == expected_libraries,
+            "unexpected Windows cold outcome: {cold_usage}"
         );
         anyhow::ensure!(
             cold_usage["hits"] == 0,
@@ -913,9 +921,15 @@ fn explicit_target_reuse(target: &str, mixed_host_target: bool) -> Result<()> {
         explicit_target_cargo(&workspace.path, cargo_home.path(), workload, target, None)?;
         let warm = selected_profile_status(&workspace.path, cargo_home.path())?;
         let warm_usage = &warm["status"]["installation"]["usage"];
+        #[cfg(not(windows))]
         anyhow::ensure!(
             warm_usage["hits"] == expected_libraries,
             "warm {workload} did not restore every target library: {warm_usage}"
+        );
+        #[cfg(windows)]
+        anyhow::ensure!(
+            warm_usage["hits"] == 0 && warm_usage["failures"] == 0 && warm_usage["bypasses"] == expected_libraries * 2,
+            "unexpected Windows warm outcome: {warm_usage}"
         );
         anyhow::ensure!(
             warm_usage["misses"] == cold_usage["misses"],
@@ -937,9 +951,17 @@ fn explicit_target_reuse(target: &str, mixed_host_target: bool) -> Result<()> {
         explicit_target_cargo(&workspace.path, cargo_home.path(), workload, target, None)?;
         let changed = selected_profile_status(&workspace.path, cargo_home.path())?;
         let changed_usage = &changed["status"]["installation"]["usage"];
+        #[cfg(not(windows))]
         anyhow::ensure!(
             changed_usage["misses"] == expected_libraries + 1,
             "same-size source replacement did not cause a miss: {changed_usage}"
+        );
+        #[cfg(windows)]
+        anyhow::ensure!(
+            changed_usage["misses"] == 0
+                && changed_usage["failures"] == 0
+                && changed_usage["bypasses"] == expected_libraries * 2 + 1,
+            "unexpected Windows changed outcome: {changed_usage}"
         );
         anyhow::ensure!(
             changed_usage["hits"] == warm_usage["hits"],
@@ -2321,12 +2343,22 @@ fn markerless_local_cas_recovery_quarantines_every_byte_before_reinitializing() 
             cargo_home.path(),
             &["rail", "cache", "status", "--scope", "local", "-f", "json"],
         )?;
+        #[cfg(not(windows))]
         assert!(
             json(&status)?["status"]["installation"]["usage"]["hits"]
                 .as_u64()
                 .unwrap_or_default()
                 >= 1
         );
+        #[cfg(windows)]
+        {
+            let status = json(&status)?;
+            let usage = &status["status"]["installation"]["usage"];
+            assert_eq!(usage["hits"], 0);
+            assert_eq!(usage["misses"], 0);
+            assert_eq!(usage["failures"], 0);
+            assert!(usage["bypasses"].as_u64().is_some_and(|count| count >= 2));
+        }
         Ok(())
     })();
     super::helpers::finish_test(result);
@@ -2488,6 +2520,7 @@ fn receipt_qualified_local_distribution_executes_an_ordinary_cargo_library() {
             String::from_utf8_lossy(&built.stderr)
         );
         let seeded_events = coverage_events(&coverage)?;
+        #[cfg(not(windows))]
         assert!(
             seeded_events.iter().any(|event| {
                 event["status"] == "miss"
@@ -2497,6 +2530,8 @@ fn receipt_qualified_local_distribution_executes_an_ordinary_cargo_library() {
             }),
             "ordinary Cargo did not establish local compiler-environment authority: {seeded_events:?}"
         );
+        #[cfg(windows)]
+        assert_native_driver_unavailable_bypass(&seeded_events, "distributed seed");
         fs::remove_dir_all(workspace.path.join("target"))?;
         let cache_roots = fs::read_dir(cargo_home.path().join("cargo-rail"))?
             .filter_map(|entry| entry.ok())
@@ -2521,6 +2556,7 @@ fn receipt_qualified_local_distribution_executes_an_ordinary_cargo_library() {
             String::from_utf8_lossy(&built.stderr)
         );
         let events = coverage_events(&coverage)?;
+        #[cfg(not(windows))]
         assert!(
             events
                 .iter()
@@ -2528,6 +2564,8 @@ fn receipt_qualified_local_distribution_executes_an_ordinary_cargo_library() {
             "ordinary Cargo never crossed the distributed admission boundary\nstderr:\n{}\nevents: {events:?}",
             String::from_utf8_lossy(&built.stderr)
         );
+        #[cfg(windows)]
+        assert_native_driver_unavailable_bypass(&events, "distributed rebuild");
 
         fs::write(
             workspace.path.join("src/lib.rs"),
@@ -2609,6 +2647,7 @@ fn failure_reason_counters_remain_live_after_the_usage_ledger_fills() {
         let phases = [
             ("action_capture", "complete_action_capture_unavailable"),
             ("action_identity", "complete_action_identity_unavailable"),
+            #[cfg(not(windows))]
             (
                 "post_execution_witness",
                 "post_execution_witness_validation_unavailable",
@@ -2668,9 +2707,12 @@ fn failure_reason_counters_remain_live_after_the_usage_ledger_fills() {
         )?;
         assert!(human.status.success(), "human cache status failed: {human:?}");
         let human = String::from_utf8_lossy(&human.stdout);
-        for reason in expected.keys() {
+        for (reason, count) in &expected {
+            if *count == 0 {
+                continue;
+            }
             assert!(
-                human.contains(&format!("Cache failure {reason}: 1")),
+                human.contains(&format!("Cache failure {reason}: {count}")),
                 "human status omitted {reason}:\n{human}"
             );
         }
@@ -2836,12 +2878,23 @@ fn setup_owned_remote_is_automatic_coordinated_and_removable() {
         let seed_events = coverage_events(seed_coverage.path())?;
         assert_setup_owned_remote_transport(&seed_events, "seed");
         let seed_requests = remote.requests();
+        #[cfg(not(windows))]
         assert!(
             seed_requests
                 .iter()
                 .any(|(method, path)| method == "PUT" && path.contains("/entries/")),
             "automatic remote seed did not publish an entry: requests={seed_requests:?}, events={seed_events:?}"
         );
+        #[cfg(windows)]
+        {
+            assert_native_driver_unavailable_bypass(&seed_events, "remote seed");
+            assert!(
+                !seed_requests
+                    .iter()
+                    .any(|(method, path)| method == "PUT" && path.contains("/entries/")),
+                "unobserved Windows compilation published a remote entry: {seed_requests:?}"
+            );
+        }
 
         fs::remove_dir_all(workspace.path.join("target"))?;
         let import_home = tempfile::tempdir()?;
@@ -2871,12 +2924,15 @@ fn setup_owned_remote_is_automatic_coordinated_and_removable() {
             "automatic remote import failed: {imported:?}"
         );
         let imported_events = coverage_events(import_coverage.path())?;
+        #[cfg(not(windows))]
         assert!(
             imported_events
                 .iter()
                 .any(|event| event["status"] == "hit" && event["reason"] == "verified_remote_result"),
             "ordinary Cargo did not restore the setup-owned remote result: {imported_events:?}"
         );
+        #[cfg(windows)]
+        assert_native_driver_unavailable_bypass(&imported_events, "remote import");
         assert_setup_owned_remote_transport(&imported_events, "import");
 
         let local_only = rail(
@@ -3692,6 +3748,17 @@ fn remap_authority_restores_a_verified_l2_result_across_checkout_roots() {
         )?;
         assert!(seeded.status.success(), "portable seed failed: {seeded:?}");
         let seed_events = coverage_events(first_coverage.path())?;
+        #[cfg(windows)]
+        {
+            assert_native_driver_unavailable_bypass(&seed_events, "remapped seed");
+            assert!(
+                !remote
+                    .requests()
+                    .iter()
+                    .any(|(method, path)| method == "PUT" && path.contains("/entries/")),
+                "unobserved remapped compilation published a remote entry"
+            );
+        }
         let writes_before_consumer = remote.requests().iter().filter(|(method, _)| method == "PUT").count();
         let restored = cargo_check_installed_remote_in_target(
             &second.path,
@@ -3701,6 +3768,7 @@ fn remap_authority_restores_a_verified_l2_result_across_checkout_roots() {
         )?;
         assert!(restored.status.success(), "portable restore failed: {restored:?}");
         let events = coverage_events(second_coverage.path())?;
+        #[cfg(not(windows))]
         assert!(
             events.iter().any(|event| {
                 event["status"] == "hit"
@@ -3714,6 +3782,8 @@ fn remap_authority_restores_a_verified_l2_result_across_checkout_roots() {
             String::from_utf8_lossy(&restored.stderr),
             remote.requests()
         );
+        #[cfg(windows)]
+        assert_native_driver_unavailable_bypass(&events, "remapped consumer");
         assert_eq!(
             remote.requests().iter().filter(|(method, _)| method == "PUT").count(),
             writes_before_consumer,
@@ -3759,12 +3829,15 @@ fn remap_authority_restores_a_verified_l2_result_across_checkout_roots() {
             "same-size dynamic-input rebuild failed: {mutated:?}"
         );
         let mutated_events = coverage_events(mutated_coverage.path())?;
+        #[cfg(not(windows))]
         assert!(
             mutated_events.iter().any(|event| event["status"] == "miss")
                 && mutated_events.iter().all(|event| event["status"] != "hit"),
             "same-size selected-input mutation did not produce a clean miss: stderr={}, events={mutated_events:?}",
             String::from_utf8_lossy(&mutated.stderr)
         );
+        #[cfg(windows)]
+        assert_native_driver_unavailable_bypass(&mutated_events, "remapped mutation");
         assert_eq!(
             remote.requests().iter().filter(|(method, _)| method == "PUT").count(),
             writes_before_consumer,
@@ -4906,6 +4979,8 @@ resolver = "3"
         );
 
         let mut producer_cached = false;
+        #[cfg(windows)]
+        let mut producer_bypassed = false;
         let mut consumer_bypassed_before_acquisition = false;
         let mut event_summary = Vec::new();
         for entry in fs::read_dir(&coverage_path)? {
@@ -4925,6 +5000,12 @@ resolver = "3"
             if crate_name == Some("fixture_macros") && matches!(event["status"].as_str(), Some("hit" | "miss")) {
                 producer_cached |= event["action_key"].as_str().is_some();
             }
+            #[cfg(windows)]
+            if crate_name == Some("fixture_macros") {
+                assert_eq!(event["status"], "bypassed");
+                assert_eq!(event["reason"], "compiler_native_input_driver_unavailable");
+                producer_bypassed = true;
+            }
             let consumes_fixture_macro = crate_name == Some("transparent_early_bypass")
                 && arguments.iter().any(|argument| {
                     argument
@@ -4940,9 +5021,15 @@ resolver = "3"
                 consumer_bypassed_before_acquisition = true;
             }
         }
+        #[cfg(not(windows))]
         assert!(
             producer_cached,
             "proc-macro producer did not enter verified L1: {event_summary:?}"
+        );
+        #[cfg(windows)]
+        assert!(
+            producer_bypassed && !producer_cached,
+            "proc-macro producer did not bypass unavailable native capture: {event_summary:?}"
         );
         assert!(
             consumer_bypassed_before_acquisition,
@@ -5460,16 +5547,29 @@ fn cache_reporting_intervals_capture_cold_and_warm_production_outcomes() {
             assert!(fs::metadata(&recording)?.len() < 4096);
             measurements.push(output["measurements"].clone());
         }
-        assert!(
-            measurements[0]["misses"].as_u64().unwrap_or_default() >= 1,
-            "cold: {}",
-            measurements[0]
-        );
-        assert!(
-            measurements[1]["hits"].as_u64().unwrap_or_default() >= 1,
-            "warm: {}",
-            measurements[1]
-        );
+        #[cfg(not(windows))]
+        {
+            assert!(
+                measurements[0]["misses"].as_u64().unwrap_or_default() >= 1,
+                "cold: {}",
+                measurements[0]
+            );
+            assert!(
+                measurements[1]["hits"].as_u64().unwrap_or_default() >= 1,
+                "warm: {}",
+                measurements[1]
+            );
+        }
+        #[cfg(windows)]
+        for measurement in &measurements {
+            assert_eq!(measurement["hits"], 0);
+            assert_eq!(measurement["misses"], 0);
+            assert_eq!(measurement["failures"], 0);
+            assert_eq!(
+                measurement["bypass_reasons"]["compiler_native_input_driver_unavailable"],
+                1
+            );
+        }
         assert_eq!(measurements[1]["misses"], 0, "report path changed cache identity");
         Ok(())
     })();
