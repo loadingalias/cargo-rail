@@ -62,10 +62,7 @@ def verify(platform):
             pinned_commands.append((name, command))
     for name, command in pinned_commands:
         verify_version(name, data['versions'][name], command)
-    tools = list(native['cargo'])
-    if not tools:
-        tools = ['cargo-nextest', 'just']
-    for tool in tools:
+    for tool in native['cargo']:
         command = ['cargo', tool.removeprefix('cargo-')] if tool.startswith('cargo-') else [{'ripgrep': 'rg'}.get(tool, tool)]
         verify_version(tool, data['cargo'][tool], [*command, '--version'])
     for tool in ('git', 'bash'):

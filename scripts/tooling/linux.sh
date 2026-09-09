@@ -96,14 +96,6 @@ for tool in "${cargo_tools[@]}"; do
   env -u RUSTC_WRAPPER -u CARGO_ENCODED_RUSTFLAGS \
     cargo +"$channel" binstall --locked --no-confirm --targets "$(catalog_get "$platform" rust-host)" "$tool@$version"
 done
-# These hosts build the test executor and recipe runner from pinned sources.
-case "$platform" in
-  riscv64-linux|s390x-linux|powerpc64le-linux)
-    for tool in cargo-nextest just; do
-      cargo +"$channel" install "$tool" --locked --version "$(catalog_get cargo "$tool")"
-    done
-    ;;
-esac
 python3 "$SCRIPT_DIR/verify.py" "$platform"
 # Persistent paths are shared by interactive shells and non-interactive Bash recipes.
 environment="$prefix/environment.sh"
@@ -119,4 +111,7 @@ for startup in "$HOME/.profile" "$HOME/.bashrc"; do
   grep -Fxq "$line" "$startup" || printf '\n%s\n' "$line" >> "$startup"
 done
 printf 'Installed %s tooling. New shells load %s.\n' "$platform" "$environment"
-printf 'Run scripts/check-native-tests.sh for the complete native test suite.\n'
+case "$platform" in
+  riscv64-linux|s390x-linux|powerpc64le-linux) printf 'Run scripts/check-cache-host.sh for native cache qualification.\n' ;;
+  *) printf 'Run scripts/check-native-tests.sh for the complete native test suite.\n' ;;
+esac

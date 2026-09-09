@@ -1,6 +1,7 @@
 """Behavior checks for provisioning and stable release updates."""
 import copy
 import io
+import importlib.util
 from pathlib import Path
 import subprocess
 import sys
@@ -56,6 +57,25 @@ class CompilerSelection(unittest.TestCase):
                 else:
                     with self.assertRaises(ValueError):
                         verify.verify_rust(platform)
+
+
+class CacheQualification(unittest.TestCase):
+    def test_required_tests_cannot_be_missing_or_ignored(self):
+        path = Path(catalog.__file__).resolve().parents[1] / 'check-cache-host.py'
+        spec = importlib.util.spec_from_file_location('cache_host', path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        for available, ignored, accepted in [('required: test\n', '', True),
+                                              ('different: test\n', '', False),
+                                              ('required: test\n', 'required: test\n', False)]:
+            with self.subTest(available=available, ignored=ignored), patch.object(
+                module.subprocess, 'check_output', side_effect=[available, ignored]
+            ):
+                if accepted:
+                    module.validate_cases('test-binary', ['required'])
+                else:
+                    with self.assertRaisesRegex(ValueError, 'missing or ignored'):
+                        module.validate_cases('test-binary', ['required'])
 
 
 class ReleaseSelection(unittest.TestCase):

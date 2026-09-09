@@ -6179,3 +6179,164 @@ fn external_macho_order_file_invalidates_reuse_without_changing_source() {
     })();
     super::helpers::finish_test(result);
 }
+
+/// Qualify native reuse with tiny, dependency-free Cargo workloads on each host.
+#[cfg(unix)]
+#[test]
+fn native_host_restores_and_executes_small_cargo_outputs() {
+    let result: Result<()> = (|| {
+        use std::os::unix::fs::PermissionsExt as _;
+        let workspace = TestWorkspace::new_single_crate("cache_host", "0.1.0")?;
+        fs::write(
+            workspace.path.join("Cargo.toml"),
+            r#"[package]
+name = "cache_host"
+version = "0.1.0"
+edition = "2024"
+[workspace]
+members = ["macros", "consumer"]
+resolver = "3"
+"#,
+        )?;
+        fs::write(
+            workspace.path.join("build.rs"),
+            r#"fn main() {
+    std::fs::write(std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("value.rs"),
+                   "pub fn value() -> u32 { 42 }").unwrap();
+}"#,
+        )?;
+        fs::write(
+            workspace.path.join("src/lib.rs"),
+            r#"include!(concat!(env!("OUT_DIR"), "/value.rs"));"#,
+        )?;
+        fs::write(
+            workspace.path.join("src/main.rs"),
+            r#"fn main() { println!("{}", cache_host::value()); }"#,
+        )?;
+        for directory in ["macros/src", "consumer/src"] {
+            fs::create_dir_all(workspace.path.join(directory))?;
+        }
+        fs::write(
+            workspace.path.join("macros/Cargo.toml"),
+            r#"[package]
+name = "host_macros"
+version = "0.1.0"
+edition = "2024"
+[lib]
+proc-macro = true
+"#,
+        )?;
+        fs::write(
+            workspace.path.join("macros/src/lib.rs"),
+            r#"extern crate proc_macro;
+#[proc_macro]
+pub fn answer(_: proc_macro::TokenStream) -> proc_macro::TokenStream { "42".parse().unwrap() }
+"#,
+        )?;
+        fs::write(
+            workspace.path.join("consumer/Cargo.toml"),
+            r#"[package]
+name = "host_consumer"
+version = "0.1.0"
+edition = "2024"
+[dependencies]
+host_macros = { path = "../macros" }
+"#,
+        )?;
+        fs::write(
+            workspace.path.join("consumer/src/lib.rs"),
+            "pub fn value() -> u32 { host_macros::answer!() }\n",
+        )?;
+        let cargo_home = tempfile::tempdir()?;
+        let target = workspace.path.join("target");
+        let compile = |coverage: Option<&Path>| -> Result<Output> {
+            let mut command = Command::new("cargo");
+            command
+                .current_dir(&workspace.path)
+                .args(["build", "--workspace", "--quiet"])
+                .env("CARGO_HOME", cargo_home.path())
+                .env("CARGO_INCREMENTAL", "0")
+                .env_remove("RUSTC_WRAPPER")
+                .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("CARGO_BUILD_RUSTC_WRAPPER");
+            if let Some(coverage) = coverage {
+                command
+                    .env("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1")
+                    .env("CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY", coverage);
+            } else {
+                command.env("CARGO_RAIL_CACHE", "off");
+            }
+            Ok(command.output()?)
+        };
+        let baseline = compile(None)?;
+        assert!(baseline.status.success(), "uncached build failed: {baseline:?}");
+        let executable = target.join("debug/cache_host");
+        let artifacts = || -> Result<BTreeMap<PathBuf, (Vec<u8>, u32)>> {
+            directory_snapshot(&target)?
+                .into_iter()
+                .filter(|(path, _)| {
+                    matches!(
+                        path.extension().and_then(|value| value.to_str()),
+                        Some("rlib" | "rmeta" | "so" | "dylib")
+                    ) || path == Path::new("debug/cache_host")
+                        || path.file_name().is_some_and(|name| name == "build-script-build")
+                })
+                .map(|(path, bytes)| {
+                    let mode = fs::metadata(target.join(&path))?.permissions().mode();
+                    Ok((path, (bytes, mode)))
+                })
+                .collect()
+        };
+        let expected = artifacts()?;
+        let setup = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "setup"])?;
+        assert!(setup.status.success(), "cache setup failed: {setup:?}");
+        for (phase, expected_status) in [("cold", "miss"), ("warm", "hit")] {
+            fs::remove_dir_all(&target)?;
+            let coverage = tempfile::tempdir()?;
+            fs::set_permissions(coverage.path(), fs::Permissions::from_mode(0o700))?;
+            let coverage_path = fs::canonicalize(coverage.path())?;
+            let output = compile(Some(&coverage_path))?;
+            assert!(output.status.success(), "{phase} build failed: {output:?}");
+            let events = coverage_events(&coverage_path)?;
+            for (crate_name, action_class) in [
+                ("cache_host", "rust_library"),
+                ("cache_host", "binary"),
+                ("host_macros", "proc_macro_producer"),
+                ("build_script_build", "build_script"),
+            ] {
+                let actions = events
+                    .iter()
+                    .filter(|event| {
+                        event["action"]["crate_name"] == crate_name && event["action"]["action_class"] == action_class
+                    })
+                    .collect::<Vec<_>>();
+                assert!(
+                    !actions.is_empty(),
+                    "{phase}: missing {crate_name}/{action_class}: {events:?}"
+                );
+                assert!(
+                    actions.iter().all(|event| event["status"] == expected_status),
+                    "{phase}: incorrect {crate_name}/{action_class} reuse: {actions:?}"
+                );
+            }
+            assert!(
+                events.iter().any(|event| event["status"] == "bypassed"
+                    && event["reason"] == "dynamic_dependency_execution_observation_unavailable"),
+                "{phase}: proc-macro consumer must retain safe bypass: {events:?}"
+            );
+            assert!(
+                artifacts()? == expected,
+                "{phase}: output inventory, bytes or modes changed"
+            );
+            let executed = Command::new(&executable).output()?;
+            assert!(
+                executed.status.success(),
+                "{phase}: restored executable failed: {executed:?}"
+            );
+            assert_eq!(executed.stdout, b"42\n");
+            assert!(executed.stderr.is_empty());
+        }
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}

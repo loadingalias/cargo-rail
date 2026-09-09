@@ -26,27 +26,27 @@ jobs:
         include:
           - platform: x86_64-linux
             runner: runs-on=${{ github.run_id }}/runner=x86_64-linux/image=ubuntu24-full-x64/spot=false/env=production
-            checks: true
+            suite: full
             timeout: 45
           - platform: aarch64-linux
             runner: runs-on=${{ github.run_id }}/runner=aarch64-linux/image=ubuntu24-full-arm64/spot=false/env=production
-            checks: true
+            suite: full
             timeout: 45
           - platform: x86_64-win
             runner: runs-on=${{ github.run_id }}/runner=x86_64-win/spot=false/env=production
-            checks: true
+            suite: full
             timeout: 60
           - platform: s390x-linux
             runner: ubuntu-24.04-s390x
-            checks: false
+            suite: cache
             timeout: 90
           - platform: powerpc64le-linux
             runner: ubuntu-24.04-ppc64le-p10
-            checks: false
+            suite: cache
             timeout: 90
           - platform: riscv64-linux
             runner: ubuntu-24.04-riscv
-            checks: false
+            suite: cache
             timeout: 120
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout }}
@@ -64,9 +64,13 @@ jobs:
         shell: powershell
         run: ./scripts/tooling/x86_64-win.ps1
       - name: Check
-        if: matrix.checks
+        if: matrix.suite == 'full'
         run: just ci-check check-compiler-driver
       - name: Test
+        if: matrix.suite == 'full'
         run: scripts/check-native-tests.sh
+      - name: Qualify native cache
+        if: matrix.suite == 'cache'
+        run: scripts/check-cache-host.sh
       - name: Check worktree
         run: git diff --exit-code HEAD
