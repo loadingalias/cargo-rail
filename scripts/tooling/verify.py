@@ -28,13 +28,22 @@ def verify_version(name, version, command):
         raise ValueError(f'{name} does not match its pinned version')
 
 
+def verify_rust(platform):
+    native = catalog.read()[platform]
+    channel = catalog.rust_channel(platform)
+    version = run('rustc', '-vV')
+    if f'host: {native["rust-host"]}\n' not in version:
+        raise ValueError('active Rust compiler does not match the native host')
+    for tool, active in [('rustc', version), ('cargo', run('cargo', '-vV'))]:
+        expected = run('rustup', 'run', channel, tool, '-vV')
+        if active != expected:
+            raise ValueError(f'active {tool} does not match the pinned toolchain {channel}')
+
+
 def verify(platform):
     data = catalog.read()
     native = data[platform]
-    version = run('rustc', '-vV')
-    if f'host: {native["rust-host"]}\n' not in version or f'release: {catalog.rust_channel()}\n' not in version:
-        raise ValueError('active Rust compiler does not match the catalog')
-    verify_version('cargo', catalog.rust_channel(), ['cargo', '--version'])
+    verify_rust(platform)
     installed = run('rustup', 'component', 'list', '--installed').splitlines()
     for component in native['components']:
         if not any(line.startswith(component + '-') for line in installed):

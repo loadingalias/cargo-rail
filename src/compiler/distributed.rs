@@ -3106,7 +3106,7 @@ fn serve_mutual_tls_with_capability(
         socket.set_nonblocking(false)?;
         let accepted = Instant::now();
         if active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 (current < u64::from(max_concurrency)).then_some(current.saturating_add(1))
             })
             .is_err()

@@ -1246,7 +1246,7 @@ fn run_connection_worker(
             return Ok(());
         };
         let session = sessions
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |session| session.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |session| session.checked_add(1))
             .map_err(|_| RailError::message("compiler acquisition broker session space is exhausted"))?;
         drop(handle_connection(&mut stream, &event_tx, capability, session, cas));
     }

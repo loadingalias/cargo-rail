@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import sys
@@ -24,7 +25,11 @@ def read(path=CATALOG):
         return tomllib.load(stream)
 
 
-def rust_channel():
+def rust_channel(platform=None):
+    if platform is not None:
+        override = read()[platform].get('rust-channel')
+        if override is not None:
+            return override
     return read(ROOT / 'rust-toolchain.toml')['toolchain']['channel']
 
 
@@ -89,6 +94,8 @@ def install_archive(name, asset, prefix):
 def validate(data):
     for platform in PLATFORMS:
         config = data[platform]
+        if 'rust-channel' in config and not re.fullmatch(r'nightly-\d{4}-\d{2}-\d{2}', config['rust-channel']):
+            raise ValueError(f'{platform}: Rust override must name a dated nightly')
         arch, os_name = platform.split('-')
         arch = 'riscv64gc' if arch == 'riscv64' else arch
         host = f'{arch}-pc-windows-msvc' if os_name == 'win' else f'{arch}-unknown-linux-gnu'
@@ -98,7 +105,7 @@ def validate(data):
             if tool not in data['cargo']:
                 raise ValueError(f'{platform}: no version for {tool}')
         for name, asset in config['assets'].items():
-            if not asset['url'].startswith('https://') or not __import__('re').fullmatch('[0-9a-f]{64}', asset['sha256']):
+            if not asset['url'].startswith('https://') or not re.fullmatch('[0-9a-f]{64}', asset['sha256']):
                 raise ValueError(f'{platform}: invalid {name} asset')
     for platform in ('riscv64-linux', 's390x-linux', 'powerpc64le-linux'):
         config = data[platform]
@@ -125,7 +132,7 @@ def main():
     elif command == 'json':
         print(json.dumps(data))
     elif command == 'rust-channel':
-        print(rust_channel())
+        print(rust_channel(*args))
     elif command == 'validate':
         validate(data)
         print('Tooling catalog passed')

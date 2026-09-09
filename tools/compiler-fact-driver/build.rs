@@ -6,12 +6,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    println!("cargo::rustc-check-cfg=cfg(cargo_rail_rustc_local_mod_id)");
     println!("cargo::rerun-if-env-changed=CARGO_CFG_TARGET_OS");
     println!("cargo::rerun-if-env-changed=RUSTC");
-    if selected_rustc_minor().is_some_and(|minor| minor >= 99) {
-        println!("cargo::rustc-cfg=cargo_rail_rustc_local_mod_id");
-    }
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if matches!(target_os.as_str(), "linux" | "macos") {
         let library = selected_rustc_sysroot().join("lib");
@@ -22,19 +18,6 @@ fn main() {
     } else if target_os == "macos" {
         println!("cargo::rustc-link-arg-bin=cargo-rail-fact-driver=-Wl,-rpath,@loader_path/../lib");
     }
-}
-
-fn selected_rustc_minor() -> Option<u64> {
-    let rustc = std::env::var_os("RUSTC")?;
-    let output = Command::new(rustc).arg("-vV").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let verbose = String::from_utf8(output.stdout).ok()?;
-    let release = verbose.lines().find_map(|line| line.strip_prefix("release: "))?;
-    let mut fields = release.split(['.', '-']);
-    (fields.next()? == "1").then_some(())?;
-    fields.next()?.parse().ok()
 }
 
 fn selected_rustc_sysroot() -> PathBuf {

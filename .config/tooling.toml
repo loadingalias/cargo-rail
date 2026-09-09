@@ -1,7 +1,7 @@
 # Updated by just update on the local macOS workstation.
 # Installers consume these pins; they never select latest releases.
 # Ubuntu system packages are pinned together by archive snapshot.
-# Rust is owned by rust-toolchain.toml; each runner lists its own components.
+# Rust defaults to rust-toolchain.toml; runners declare required channel overrides and components.
 # macOS development and testing remain local.
 
 [cargo]
@@ -158,6 +158,8 @@ url = "https://github.com/PowerShell/PowerShell/releases/download/v7.6.5/PowerSh
 sha256 = "32eb8f6cdce08f86e987d625a2733e54ac3e289ae7e1621b14c0b5bcec2434ea"
 
 [riscv64-linux]
+# rscrypto SHA-2 uses nightly-only RISC-V intrinsics.
+rust-channel = "nightly-2026-07-06"
 os = "Ubuntu 24.04 LTS"
 ubuntu = "24.04"
 codename = "noble"

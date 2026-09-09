@@ -69,7 +69,7 @@ prefix="$HOME/.local/share/cargo-rail-tooling"
 mkdir -p "$prefix/bin"
 python3 "$SCRIPT_DIR/catalog.py" download "$platform" rustup "$temporary/rustup-init"
 chmod +x "$temporary/rustup-init"
-channel="$(python3 "$SCRIPT_DIR/catalog.py" rust-channel)"
+channel="$(python3 "$SCRIPT_DIR/catalog.py" rust-channel "$platform")"
 "$temporary/rustup-init" -y --no-modify-path --default-host "$(catalog_get "$platform" rust-host)" --default-toolchain none
 export PATH="$HOME/.cargo/bin:$PATH"
 mapfile -t components < <(catalog_get "$platform" components)

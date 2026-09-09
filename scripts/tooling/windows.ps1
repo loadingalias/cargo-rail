@@ -72,8 +72,8 @@ try {
     $catalog = $catalogJson | ConvertFrom-Json
     Invoke-Native $python @($catalogHelper, 'validate')
     $native = $catalog.$Platform
-    $channel = & $python $catalogHelper rust-channel
-    if ($LASTEXITCODE -ne 0) { throw 'Unable to read rust-toolchain.toml.' }
+    $channel = & $python $catalogHelper rust-channel $Platform
+    if ($LASTEXITCODE -ne 0) { throw 'Unable to resolve the runner Rust toolchain.' }
 
     $channelFile = Join-Path $prefix ('vs-channel-' + $catalog.windows.'channel-sha256' + '.json')
     Get-PinnedDownload $catalog.windows.'channel-url' $catalog.windows.'channel-sha256' $channelFile

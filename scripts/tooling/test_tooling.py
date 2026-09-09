@@ -13,6 +13,7 @@ from unittest.mock import patch
 import tomlkit
 import catalog
 import update
+import verify
 
 
 class CatalogCommand(unittest.TestCase):
@@ -22,6 +23,39 @@ class CatalogCommand(unittest.TestCase):
             check=True, capture_output=True,
         )
         self.assertEqual(output.stdout, b'')
+
+    def test_runner_channel_selects_pinned_override_and_default(self):
+        for platform, expected in [('riscv64-linux', catalog.read()['riscv64-linux']['rust-channel']),
+                                   ('x86_64-linux', catalog.rust_channel()),
+                                   ('x86_64-win', catalog.rust_channel())]:
+            output = subprocess.check_output(
+                [sys.executable, str(Path(catalog.__file__).resolve()), 'rust-channel', platform], text=True)
+            self.assertEqual(output.strip(), expected)
+
+
+class CompilerSelection(unittest.TestCase):
+    def test_native_compiler_and_cargo_must_match_the_exact_pin(self):
+        platform = 'riscv64-linux'
+        channel = catalog.rust_channel(platform)
+        rustc = 'rustc 1.98.0-nightly\nhost: riscv64gc-unknown-linux-gnu\ncommit-hash: expected\n'
+        cargo = 'cargo 1.98.0-nightly\ncommit-hash: expected\n'
+        for changed in (None, 'rustc', 'cargo', 'host'):
+            def run(*arguments):
+                if arguments[0] == 'rustup':
+                    self.assertEqual(arguments[:3], ('rustup', 'run', channel))
+                    return rustc if arguments[3] == 'rustc' else cargo
+                value = rustc if arguments[0] == 'rustc' else cargo
+                if arguments[0] == changed:
+                    value = value.replace('expected', 'different')
+                if changed == 'host' and arguments[0] == 'rustc':
+                    value = value.replace('riscv64gc', 'x86_64')
+                return value
+            with self.subTest(changed=changed), patch.object(verify, 'run', side_effect=run):
+                if changed is None:
+                    verify.verify_rust(platform)
+                else:
+                    with self.assertRaises(ValueError):
+                        verify.verify_rust(platform)
 
 
 class ReleaseSelection(unittest.TestCase):
@@ -118,6 +152,13 @@ aliased={package="serde",version="=1",features=["derive"]} # keep
 
 
 class CatalogPolicy(unittest.TestCase):
+    def test_rust_override_requires_a_dated_nightly(self):
+        for channel in ('nightly', 'stable', 'nightly-latest'):
+            data = catalog.read()
+            data['riscv64-linux']['rust-channel'] = channel
+            with self.assertRaisesRegex(ValueError, 'dated nightly'):
+                catalog.validate(data)
+
     def test_native_profiles_are_complete_and_cannot_inherit_full_tooling(self):
         data = catalog.read()
         catalog.validate(data)
