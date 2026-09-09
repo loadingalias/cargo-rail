@@ -6297,6 +6297,10 @@ host_macros = { path = "../macros" }
             let coverage_path = fs::canonicalize(coverage.path())?;
             let output = compile(Some(&coverage_path))?;
             assert!(output.status.success(), "{phase} build failed: {output:?}");
+            eprintln!(
+                "{phase} compiler diagnostics:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
             let events = coverage_events(&coverage_path)?;
             for (crate_name, action_class) in [
                 ("cache_host", "rust_library"),

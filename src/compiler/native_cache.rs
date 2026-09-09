@@ -22884,7 +22884,6 @@ pub(crate) mod tests {
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[test]
-    #[ignore = "requires GCC, collect2, GNU BFD and its linker plugin"]
     fn gcc_driver_capture_preserves_startup_inputs_and_revalidates_selection() {
         let result: RailResult<()> = (|| {
             let root = tempfile::tempdir()?;

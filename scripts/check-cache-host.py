@@ -32,6 +32,11 @@ CASES = {
     ],
 }
 
+if sys.platform == 'linux':
+    CASES['cargo_rail'].insert(
+        0, 'compiler::native_cache::tests::gcc_driver_capture_preserves_startup_inputs_and_revalidates_selection',
+    )
+
 
 def validate_cases(binary, cases):
     listed = subprocess.check_output([binary, '--list', '--format=terse'], text=True)
