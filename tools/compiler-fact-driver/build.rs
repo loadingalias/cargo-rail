@@ -29,7 +29,11 @@ fn selected_rustc_sysroot() -> PathBuf {
         Err(error) => panic!("failed to query the selected rustc sysroot: {error}"),
     };
     if !output.status.success() {
-        panic!("selected rustc did not report its sysroot");
+        panic!(
+            "selected rustc did not report its sysroot ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     let stdout = match String::from_utf8(output.stdout) {
         Ok(stdout) => stdout,

@@ -162,7 +162,7 @@ def validate(data):
             raise ValueError(f'{platform}: missing native build/bootstrap package')
 
     cross = selection(data, 'x86_64-linux', 'riscv-build')
-    if cross['components'] or set(cross['cargo']) != {'just', 'cargo-nextest'} or set(cross['assets']) != {'rustup', 'cargo-binstall', 'cmake'}:
+    if set(cross['components']) != {'rustc-dev'} or set(cross['cargo']) != {'just', 'cargo-nextest'} or set(cross['assets']) != {'rustup', 'cargo-binstall', 'cmake'}:
         raise ValueError('riscv-build must install only archive build tools')
     if not {'build-essential', 'ca-certificates', 'curl', 'git', 'git-man', 'python3', 'perl', 'gcc-riscv64-linux-gnu',
             'g++-riscv64-linux-gnu', 'libc6-dev-riscv64-cross'} <= set(cross['packages']):

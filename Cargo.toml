@@ -210,10 +210,12 @@ overflow-checks = true
 [profile.dev.package.rscrypto]
 opt-level = 3
 
-# Cache qualification needs assertions, not large debugger payloads on slow runners.
+# Cache qualification keeps development assertions while optimizing native execution.
 [profile.cache-host]
 inherits = "dev"
+opt-level = 3
 debug = false
+incremental = false
 
 [[test]]
 name = "cache"

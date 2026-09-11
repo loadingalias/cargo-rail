@@ -9,6 +9,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 import tomllib
 import sys
 
@@ -162,22 +163,31 @@ def prepare(target, directory):
     directory.parent.mkdir(parents=True, exist_ok=True)
     build = ROOT / 'target/cache-transfer-build'
     components = build / target / 'cache-host'
-    subprocess.run(['scripts/check-compiler-fact-driver.sh', '--prepare-source', str(components)],
-                   cwd=ROOT, env=env, check=True)
+    subprocess.run(['scripts/check-compiler-fact-driver.sh', '--prepare', str(components), target],
+                   cwd=ROOT, env=dict(env, CARGO_TARGET_DIR=str(build / 'compiler-driver')), check=True)
+    authority = {}
     for line in (components / 'compiler-driver-authority.env').read_text().splitlines():
         export, assignment = shlex.split(line)
         name, value = assignment.split('=', 1)
-        if export != 'export' or name not in {'CARGO_RAIL_FACT_DRIVER_SOURCE_FILE',
-                                             'CARGO_RAIL_FACT_DRIVER_SOURCE_SHA256',
-                                             'CARGO_RAIL_FACT_DRIVER_SOURCE_PROVENANCE'}:
-            raise ValueError('source preparation emitted unexpected compiler authority')
-        env[name] = value
-    source_name = env['CARGO_RAIL_FACT_DRIVER_SOURCE_FILE']
+        if export != 'export' or name in authority:
+            raise ValueError('component preparation emitted invalid compiler authority')
+        authority[name] = value
+    required = {'CARGO_RAIL_FACT_DRIVER_' + field for field in (
+        'FILE', 'SHA256', 'PROVENANCE', 'RUSTC_RELEASE', 'RUSTC_COMMIT', 'RUSTC_HOST',
+        'COMPILER_LIBRARY', 'COMPILER_LIBRARY_SHA256', 'SOURCE_FILE', 'SOURCE_SHA256', 'SOURCE_PROVENANCE',
+    )}
+    if set(authority) != required | {'CARGO_RAIL_TEST_FACT_DRIVER', 'CARGO_RAIL_TEST_COMPONENT_BINARY'}:
+        raise ValueError('component preparation requires complete compiler and source authority')
+    if authority['CARGO_RAIL_FACT_DRIVER_RUSTC_HOST'] != target:
+        raise ValueError('prepared compiler driver does not match the archive target')
+    env.update({name: authority[name] for name in required})
+    names = [authority['CARGO_RAIL_FACT_DRIVER_FILE'], authority['CARGO_RAIL_FACT_DRIVER_SOURCE_FILE']]
     (components / 'deps').mkdir(exist_ok=True)
-    shutil.copyfile(components / source_name, components / 'deps' / source_name)
+    for name in names:
+        shutil.copy2(components / name, components / 'deps' / name)
     # Library harnesses and Cargo binaries discover authenticated components beside themselves.
-    include = [{'path': f'{target}/cache-host/{prefix}{source_name}', 'relative-to': 'target', 'on-missing': 'error'}
-               for prefix in ('', 'deps/')]
+    include = [{'path': f'{target}/cache-host/{prefix}{name}', 'relative-to': 'target', 'on-missing': 'error'}
+               for prefix in ('', 'deps/') for name in names]
     with tempfile.TemporaryDirectory(prefix='.cache-transfer-', dir=directory.parent) as temporary:
         config = Path(temporary) / 'nextest.toml'
         pending = Path(temporary) / 'bundle'
@@ -234,20 +244,55 @@ def execute(directory):
     cases = manifest['cases']
     filters = ' | '.join(f'(binary(={binary}) & test(={case}))'
                          for binary, tests in cases.items() for case in tests)
-    with tempfile.TemporaryDirectory(prefix='cargo-rail-cache-run-') as temporary:
-        args = ['--workspace-remap', str(ROOT), '--config-file', str(ROOT / '.config/nextest.toml'),
+    results = ROOT / 'target/cache-host-results'
+    results.mkdir(parents=True, exist_ok=True)
+    out = Path(tempfile.mkdtemp(prefix='run-', dir=results))
+    (out / 'extracted').mkdir()
+    config = out / 'nextest.toml'
+    config.write_text((ROOT / '.config/nextest.toml').read_text() +
+                      '\n[store]\ndir = ' + json.dumps(str(out / 'store')) + '\n')
+    shutil.copyfile(directory / 'manifest.json', out / 'manifest.json')
+    started = time.monotonic()
+    summary = {'status': 'failed', 'source': manifest['source'], 'target': manifest['target'],
+               'cases': cases, 'nextest': manifest['nextest'], 'rustc': manifest['rustc']}
+    junit = out / 'store/cache-host/junit.xml'
+    print(f'Native cache qualification evidence: {out}', flush=True)
+    try:
+        args = ['--workspace-remap', str(ROOT), '--config-file', str(config),
                 '--profile', 'cache-host', '-E', filters]
-        report = json.loads(subprocess.check_output(['cargo', 'nextest', 'list', *args, '--archive-file', str(directory / 'tests.tar.zst'),
-                                                      '--extract-to', temporary, '--message-format', 'json'],
-                                                   cwd=ROOT, env=env, text=True))
+        listing = subprocess.run(['cargo', 'nextest', 'list', *args, '--archive-file', str(directory / 'tests.tar.zst'),
+                                  '--extract-to', str(out / 'extracted'), '--message-format', 'json'],
+                                 cwd=ROOT, env=env, text=True, capture_output=True)
+        (out / 'list.log').write_text(listing.stderr)
+        (out / 'tests.json').write_text(listing.stdout)
+        print(listing.stderr, end='', flush=True)
+        listing.check_returncode()
+        report = json.loads(listing.stdout)
         validate_nextest_cases(report, cases)
-        target = Path(temporary) / 'target'
-        subprocess.run(['cargo', 'nextest', 'run', *args,
-                        '--cargo-metadata', str(target / 'nextest/cargo-metadata.json'),
-                        '--binaries-metadata', str(target / 'nextest/binaries-metadata.json'),
-                        '--target-dir-remap', str(target), '--no-tests', 'fail'],
-                       cwd=ROOT, env=env, check=True)
-    verify_archive(directory)
+        target = out / 'extracted/target'
+        command = ['cargo', 'nextest', 'run', *args,
+                   '--cargo-metadata', str(target / 'nextest/cargo-metadata.json'),
+                   '--binaries-metadata', str(target / 'nextest/binaries-metadata.json'),
+                   '--target-dir-remap', str(target), '--no-tests', 'fail', '--no-capture']
+        with (out / 'nextest.log').open('w') as log, subprocess.Popen(
+            command, cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        ) as process:
+            for line in process.stdout:
+                print(line, end='', flush=True)
+                log.write(line)
+                log.flush()
+            summary['exit_code'] = process.wait()
+        verify_archive(directory)
+        if summary['exit_code']:
+            raise subprocess.CalledProcessError(summary['exit_code'], command)
+        if not junit.is_file():
+            raise ValueError('native cache qualification did not produce its JUnit report')
+        summary['status'] = 'passed'
+    finally:
+        summary['elapsed_seconds'] = time.monotonic() - started
+        (out / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+        if junit.is_file():
+            shutil.copyfile(junit, out / 'junit.xml')
     print(f'Native cache qualification passed: {sum(map(len, cases.values()))} required cases.', flush=True)
 
 

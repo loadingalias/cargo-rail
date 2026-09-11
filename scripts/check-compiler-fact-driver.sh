@@ -2,8 +2,8 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-if [[ ( ${1:-} == --prepare || ${1:-} == --prepare-source ) && $# == 2 ]]; then
-  python3 - "$2" "$1" <<'PYTHON'
+if [[ ( ${1:-} == --prepare && ( $# == 2 || $# == 3 ) ) || ( ${1:-} == --prepare-source && $# == 2 ) ]]; then
+  python3 - "$2" "$1" "${3:-}" <<'PYTHON'
 import hashlib
 import json
 import os
@@ -35,14 +35,31 @@ def digest(data):
 verbose = run(['rustc', '-vV'])
 identity = dict(line.split(': ', 1) for line in verbose.splitlines() if ': ' in line)
 sysroot = Path(run(['rustc', '--print', 'sysroot'])).resolve()
+target = sys.argv[3] or identity['host']
+target_sysroot = sysroot
+distribution = None
+if target != identity['host']:
+    if (identity['host'], target) != ('x86_64-unknown-linux-gnu', 'riscv64gc-unknown-linux-gnu'):
+        raise SystemExit('compiler driver cross preparation requires x86-64 Linux to RISC-V Linux')
+    channel = tomllib.loads((root / '.config/tooling.toml').read_text())['riscv64-linux']['rust-channel']
+    target_rustc = Path(run(['rustup', 'which', '--toolchain', f'{channel}-{target}', 'rustc']))
+    target_sysroot = target_rustc.resolve().parents[1]
+    # Both sysroots must come from the same distribution manifest. The target
+    # compiler cannot execute here; its identity is verified again on the runner.
+    manifest_path = Path('lib/rustlib/multirust-channel-manifest.toml')
+    distribution = (sysroot / manifest_path).read_bytes()
+    if distribution != (target_sysroot / manifest_path).read_bytes():
+        raise SystemExit('build and target compiler distributions differ')
+    # Host proc-macro dependencies must load the host LLVM runtime during the build.
+    environment['LD_LIBRARY_PATH'] = str(sysroot / 'lib')
 suffix = '.exe' if os.name == 'nt' else ''
 driver_name = 'cargo-rail-fact-driver' + suffix
 library_digest = None
 if not source_only:
-    libraries = sorted([*sysroot.glob('lib/librustc_driver-*.dylib'), *sysroot.glob('lib/librustc_driver-*.so'), *sysroot.glob('bin/rustc_driver-*.dll')])
+    libraries = sorted([*target_sysroot.glob('lib/librustc_driver-*.dylib'), *target_sysroot.glob('lib/librustc_driver-*.so'), *target_sysroot.glob('bin/rustc_driver-*.dll')])
     if len(libraries) != 1:
         raise SystemExit('prepare requires exactly one rustc_driver library in the selected toolchain; install its rustc-dev component first')
-    development = sysroot / 'lib/rustlib' / identity['host'] / 'lib'
+    development = target_sysroot / 'lib/rustlib' / target / 'lib'
     if not any(path.suffix in ('.rmeta', '.rlib') for path in development.glob('librustc_hir-*')):
         raise SystemExit('prepare requires rustc-dev for the exact selected toolchain; no components were downloaded')
     library = libraries[0]
@@ -55,7 +72,10 @@ sources = [root / path for path in (
 sources.extend((root / 'tools/compiler-fact-driver/src').rglob('*.rs'))
 source_bytes = {path.relative_to(root).as_posix(): path.read_bytes() for path in sorted(sources)}
 source_identity = digest(b''.join(name.encode() + b'\0' + data + b'\0' for name, data in source_bytes.items()))
-selection = {'source_identity': source_identity, 'rustc_verbose': verbose, 'sysroot': str(sysroot), 'compiler_library_digest': library_digest, 'source_only': source_only}
+selection = {'source_identity': source_identity, 'rustc_verbose': verbose, 'sysroot': str(sysroot),
+             'target': target, 'target_sysroot': str(target_sysroot),
+             'preparation': digest((root / 'scripts/check-compiler-fact-driver.sh').read_bytes()),
+             'compiler_library_digest': library_digest, 'source_only': source_only}
 record_path = destination / '.cargo-rail-driver-preparation.json'
 env_path = destination / 'compiler-driver-authority.env'
 source_name = 'cargo-rail-fact-driver-source-v1.json'
@@ -76,7 +96,7 @@ build_target = Path(json.loads(run([
     'cargo', 'metadata', '--manifest-path', str(manifest), '--no-deps',
     '--format-version', '1', '--locked', '--offline',
 ]))['target_directory'])
-built_driver = build_target / identity['host'] / 'release' / driver_name
+built_driver = build_target / target / 'release' / driver_name
 with tempfile.TemporaryDirectory(prefix='.cargo-rail-driver-prepare-', dir=destination) as temporary:
     stage = Path(temporary)
     inventory = dict(source_bytes)
@@ -97,14 +117,22 @@ with tempfile.TemporaryDirectory(prefix='.cargo-rail-driver-prepare-', dir=desti
     (stage / '.cargo').mkdir()
     (stage / '.cargo/config.toml').write_bytes(inventory['.cargo/config.toml'])
     if not source_only:
-        flags = f'--remap-path-prefix={stage}=/cargo-rail-fact-driver --remap-path-scope=object'
-        if identity['host'].endswith('-unknown-linux-musl'):
-            flags += ' -C target-feature=-crt-static'
-        environment['RUSTFLAGS'] = flags
+        flags = [f'--remap-path-prefix={stage}=/cargo-rail-fact-driver', '--remap-path-scope=object']
+        if target.endswith('-unknown-linux-musl'):
+            flags += ['-C', 'target-feature=-crt-static']
+        if target != identity['host']:
+            # rustc-private metadata needs target proc macros while expansion
+            # executes their host counterparts. Cargo and rustc both opt in.
+            flags += ['-Z', 'dual-proc-macros', f'--sysroot={target_sysroot}',
+                      '-C', f'link-arg=-Wl,-rpath-link,{target_sysroot / "lib"}',
+                      '-L', f'dependency={sysroot / "lib/rustlib" / identity["host"] / "lib"}']
+        environment.pop('RUSTFLAGS', None)
+        environment['CARGO_ENCODED_RUSTFLAGS'] = '\x1f'.join(flags)
         subprocess.run([
             str(sysroot / 'bin' / ('cargo' + suffix)), 'build', '--release', '--frozen',
+            *(['-Z', 'dual-proc-macros'] if target != identity['host'] else []),
             '--manifest-path', str(stage / 'tools/compiler-fact-driver/Cargo.toml'),
-            '--target-dir', str(build_target), '--target', identity['host'],
+            '--target-dir', str(build_target), '--target', target,
         ], env=environment, check=True, cwd=stage)
     for path in sorted(vendor.rglob('*')):
         if path.is_symlink():
@@ -116,7 +144,11 @@ with tempfile.TemporaryDirectory(prefix='.cargo-rail-driver-prepare-', dir=desti
     bundle = json.dumps({'version': 1, 'files': [{'path': name, 'hex': data.hex()} for name, data in sorted(inventory.items())]}, separators=(',', ':')).encode() + b'\n'
     if len(bundle) > 64 * 1024 * 1024:
         raise SystemExit('driver source bundle exceeds its byte bound')
-    if source_bytes != {path.relative_to(root).as_posix(): path.read_bytes() for path in sorted(sources)} or (not source_only and library_digest != digest(library.read_bytes())) or verbose != run(['rustc', '-vV']):
+    if (source_bytes != {path.relative_to(root).as_posix(): path.read_bytes() for path in sorted(sources)}
+            or (not source_only and library_digest != digest(library.read_bytes()))
+            or verbose != run(['rustc', '-vV'])
+            or (distribution is not None and any((path / manifest_path).read_bytes() != distribution
+                                                for path in (sysroot, target_sysroot)))):
         raise SystemExit('compiler driver inputs changed during preparation; retry after edits finish')
     (stage / source_name).write_bytes(bundle)
     authority = {
@@ -133,8 +165,8 @@ with tempfile.TemporaryDirectory(prefix='.cargo-rail-driver-prepare-', dir=desti
             'CARGO_RAIL_FACT_DRIVER_PROVENANCE': digest(bundle),
             'CARGO_RAIL_FACT_DRIVER_RUSTC_RELEASE': identity['release'],
             'CARGO_RAIL_FACT_DRIVER_RUSTC_COMMIT': identity['commit-hash'],
-            'CARGO_RAIL_FACT_DRIVER_RUSTC_HOST': identity['host'],
-            'CARGO_RAIL_FACT_DRIVER_COMPILER_LIBRARY': library.relative_to(sysroot).as_posix(),
+            'CARGO_RAIL_FACT_DRIVER_RUSTC_HOST': target,
+            'CARGO_RAIL_FACT_DRIVER_COMPILER_LIBRARY': library.relative_to(target_sysroot).as_posix(),
             'CARGO_RAIL_FACT_DRIVER_COMPILER_LIBRARY_SHA256': library_digest,
             'CARGO_RAIL_TEST_FACT_DRIVER': str(destination / driver_name),
             'CARGO_RAIL_TEST_COMPONENT_BINARY': str(destination / ('cargo-rail' + suffix)),
@@ -150,7 +182,7 @@ PYTHON
   exit 0
 fi
 if [[ $# != 0 ]]; then
-  echo "usage: $0 [--prepare|--prepare-source <component-dir>]" >&2
+  echo "usage: $0 [--prepare <component-dir> [target] | --prepare-source <component-dir>]" >&2
   exit 2
 fi
 

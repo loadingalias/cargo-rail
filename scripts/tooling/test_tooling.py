@@ -217,13 +217,17 @@ class CatalogPolicy(unittest.TestCase):
         self.assertEqual(catalog.rust_channel('x86_64-linux', 'riscv-build'), catalog.rust_channel('riscv64-linux'))
         self.assertEqual(catalog.rust_channel('x86_64-linux', 'ci'), catalog.rust_channel())
         selected = catalog.selection(catalog.read(), 'x86_64-linux', 'riscv-build')
-        self.assertEqual(selected['components'], [])
+        self.assertEqual(selected['components'], ['rustc-dev'])
         self.assertEqual(selected['cargo'], ['cargo-nextest', 'just'])
         self.assertEqual(set(selected['assets']), {'rustup', 'cargo-binstall', 'cmake'})
         self.assertTrue({'git', 'git-man'} <= set(selected['packages']),
                         'snapshot Git and its version-coupled manual package must be installed together')
         self.assertTrue({'gcc-riscv64-linux-gnu', 'g++-riscv64-linux-gnu', 'libc6-dev-riscv64-cross'} <= set(selected['packages']))
         self.assertFalse({'shellcheck', 'python3-venv', 'ripgrep', 'openssl'} & set(selected['packages']))
+        missing = catalog.read()
+        missing['operations']['riscv-build']['components'] = []
+        with self.assertRaisesRegex(ValueError, 'riscv-build must install'):
+            catalog.validate(missing)
         with self.assertRaisesRegex(ValueError, 'requires x86_64-linux'):
             catalog.selection(catalog.read(), 'riscv64-linux', 'riscv-build')
 

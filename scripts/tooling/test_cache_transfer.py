@@ -1,12 +1,16 @@
 """Reject transferred cache evidence before executing mismatched or incomplete work."""
 import copy
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
+import xml.etree.ElementTree as ET
 
 SPEC = importlib.util.spec_from_file_location('cache_host', Path(__file__).resolve().parents[1] / 'check-cache-host.py')
 cache = importlib.util.module_from_spec(SPEC)
@@ -14,6 +18,91 @@ SPEC.loader.exec_module(cache)
 
 
 class CacheTransfer(unittest.TestCase):
+    def test_driver_preparation_rejects_an_unsupported_target_without_publishing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            result = subprocess.run(
+                ['scripts/check-compiler-fact-driver.sh', '--prepare', temporary, 'unsupported-target'],
+                cwd=cache.ROOT, capture_output=True, text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('compiler driver cross preparation requires', result.stderr)
+            self.assertEqual(list(Path(temporary).iterdir()), [])
+
+    def test_real_archive_runs_every_case_and_retains_failure_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'src').mkdir()
+            (root / '.config').mkdir()
+            config = (cache.ROOT / '.config/nextest.toml').read_text()
+            (root / '.config/nextest.toml').write_text(
+                config.splitlines()[0] + '\n[profile.cache-host]' + config.split('[profile.cache-host]', 1)[1] +
+                '\n[[profile.cache-host.overrides]]\nfilter = "test(=a_failure)"\npriority = 100\n')
+            shutil.copyfile(cache.ROOT / '.config/tooling.toml', root / '.config/tooling.toml')
+            (root / '.gitignore').write_text('/target\n')
+            (root / 'Cargo.toml').write_text('[package]\nname = "transfer-fixture"\nversion = "0.0.0"\nedition = "2024"\n')
+            (root / 'src/lib.rs').write_text('''
+#[test]
+fn a_failure() {
+    assert!(std::env::var_os("CACHE_TRANSFER_PROBE_FAIL").is_none(), "intentional transfer failure");
+}
+#[test]
+fn b_sentinel() { eprintln!("remaining case executed"); }
+''')
+            env = {key: value for key, value in os.environ.items()
+                   if not key.startswith(('CARGO_', 'NEXTEST_')) and key not in ('RUSTFLAGS', 'RUSTC', 'RUSTDOC', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER')}
+            env['RUSTUP_TOOLCHAIN'] = subprocess.check_output(
+                ['rustup', 'show', 'active-toolchain'], cwd=cache.ROOT, text=True).split()[0]
+            env['CARGO_HOME'] = str(root / 'target/cargo-home')
+            env['CARGO_RAIL_CACHE'] = 'off'
+            env.pop('CACHE_TRANSFER_PROBE_FAIL', None)
+            def run(*args):
+                result = subprocess.run(args, cwd=root, env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                return result
+            run('git', 'init', '--initial-branch=main')
+            run('cargo', 'generate-lockfile', '--offline')
+            run('git', 'add', '.')
+            run('git', '-c', 'user.name=Transfer Test', '-c', 'user.email=transfer@example.invalid',
+                '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=/dev/null', 'commit', '-m', 'fixture')
+            directory = root / 'target/bundle'
+            directory.mkdir(parents=True)
+            cases = {'transfer_fixture': ['a_failure', 'b_sentinel']}
+            with patch.dict(os.environ, env, clear=True), patch.object(cache, 'ROOT', root), \
+                 patch.object(cache, 'cases_for', return_value=cases):
+                compiler = cache.rustc_identity()
+                run('cargo', 'nextest', 'archive', '--locked', '--target', compiler['host'],
+                    '--archive-file', str(directory / 'tests.tar.zst'))
+                import hashlib
+                manifest = {'schema': 1, 'target': compiler['host'], 'source': cache.source_identity(),
+                            'nextest': cache.nextest_identity(),
+                            'rustc': {key: compiler[key] for key in ('release', 'commit-hash')}, 'cases': cases,
+                            'archive_sha256': hashlib.sha256((directory / 'tests.tar.zst').read_bytes()).hexdigest()}
+                (directory / 'manifest.json').write_text(json.dumps(manifest))
+                for failed in (True, False):
+                    before = set((root / 'target/cache-host-results').glob('run-*'))
+                    with patch.dict(os.environ, {'CACHE_TRANSFER_PROBE_FAIL': '1'} if failed else {}), \
+                         patch('sys.stdout', new=io.StringIO()):
+                        if failed:
+                            with self.assertRaises(subprocess.CalledProcessError):
+                                cache.execute(directory)
+                        else:
+                            cache.execute(directory)
+                    after = set((root / 'target/cache-host-results').glob('run-*'))
+                    self.assertEqual(len(after - before), 1)
+                    out = (after - before).pop()
+                    summary = json.loads((out / 'summary.json').read_text())
+                    self.assertEqual(summary['status'], 'failed' if failed else 'passed')
+                    self.assertEqual(summary['source'], manifest['source'])
+                    self.assertEqual(summary['exit_code'] == 0, not failed)
+                    log = (out / 'nextest.log').read_text()
+                    self.assertIn('remaining case executed', log)
+                    self.assertEqual('intentional transfer failure' in log, failed)
+                    if failed:
+                        self.assertLess(log.index('intentional transfer failure'), log.index('remaining case executed'))
+                    suites = ET.parse(out / 'junit.xml').getroot()
+                    self.assertEqual(int(suites.attrib['tests']), 2)
+                    self.assertEqual(int(suites.attrib['failures']), int(failed))
+
     def test_exact_required_tests_cannot_be_missing_ignored_or_supplemented(self):
         report = {'rust-suites': {'cargo-rail::cache': {'binary-name': 'cache', 'testcases': {
             'required': {'ignored': False, 'filter-match': {'status': 'matches'}},

@@ -86,6 +86,11 @@ if [[ "$operation" == riscv-build ]]; then
   toolchain_args+=(--target "$(catalog_get riscv64-linux rust-host)")
 fi
 rustup toolchain install "$channel" --profile minimal "${toolchain_args[@]}"
+if [[ "$operation" == riscv-build ]]; then
+  # Keep target compiler internals separate from the executable build-host sysroot.
+  rustup toolchain install "$channel-$(catalog_get riscv64-linux rust-host)" \
+    --force-non-host --profile minimal --component rustc-dev
+fi
 # Explicit toolchain selection avoids auto-installing rust-toolchain.toml's
 # cross targets and local development components when Cargo runs in this checkout.
 export RUSTUP_TOOLCHAIN="$channel"

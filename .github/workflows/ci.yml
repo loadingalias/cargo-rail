@@ -105,6 +105,17 @@ jobs:
       - name: Qualify RISC-V cache
         if: matrix.platform == 'riscv64-linux'
         run: scripts/check-cache-host.sh run target/riscv-cache
+      - name: Retain RISC-V cache evidence
+        if: ${{ always() && matrix.platform == 'riscv64-linux' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: riscv-cache-results
+          path: |
+            target/cache-host-results/run-*/*.json
+            target/cache-host-results/run-*/*.log
+            target/cache-host-results/run-*/*.xml
+          if-no-files-found: warn
+          retention-days: 7
       - name: Check worktree
         run: git diff --exit-code HEAD
 
