@@ -35,7 +35,7 @@ packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "pkg
 components = []
 cargo = ["cargo-nextest", "just"]
 assets = ["rustup", "cargo-binstall", "cmake"]
-packages = ["build-essential", "ca-certificates", "curl", "git", "python3", "perl", "gcc-riscv64-linux-gnu", "g++-riscv64-linux-gnu", "libc6-dev-riscv64-cross"]
+packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "python3", "perl", "gcc-riscv64-linux-gnu", "g++-riscv64-linux-gnu", "libc6-dev-riscv64-cross"]
 
 [versions]
 actionlint = "1.7.12"

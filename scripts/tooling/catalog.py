@@ -147,7 +147,7 @@ def validate(data):
             prerequisites = set(config['assets']) - {'actionlint'}
             if not prerequisites <= set(selected['assets']):
                 raise ValueError(f'{platform}/{operation}: missing native build/bootstrap asset')
-            if platform.endswith('-linux') and not {'build-essential', 'ca-certificates', 'curl', 'git', 'python3'} <= set(selected['packages']):
+            if platform.endswith('-linux') and not {'build-essential', 'ca-certificates', 'curl', 'git', 'git-man', 'python3'} <= set(selected['packages']):
                 raise ValueError(f'{platform}/{operation}: missing native build/bootstrap package')
     for platform in ('riscv64-linux', 's390x-linux', 'powerpc64le-linux'):
         config = data[platform]
@@ -159,7 +159,7 @@ def validate(data):
     cross = selection(data, 'x86_64-linux', 'riscv-build')
     if cross['components'] or set(cross['cargo']) != {'just', 'cargo-nextest'} or set(cross['assets']) != {'rustup', 'cargo-binstall', 'cmake'}:
         raise ValueError('riscv-build must install only archive build tools')
-    if not {'build-essential', 'ca-certificates', 'curl', 'git', 'python3', 'perl', 'gcc-riscv64-linux-gnu',
+    if not {'build-essential', 'ca-certificates', 'curl', 'git', 'git-man', 'python3', 'perl', 'gcc-riscv64-linux-gnu',
             'g++-riscv64-linux-gnu', 'libc6-dev-riscv64-cross'} <= set(cross['packages']):
         raise ValueError('riscv-build is missing cross compiler prerequisites')
 

@@ -211,6 +211,8 @@ class CatalogPolicy(unittest.TestCase):
         self.assertEqual(selected['components'], [])
         self.assertEqual(selected['cargo'], ['cargo-nextest', 'just'])
         self.assertEqual(set(selected['assets']), {'rustup', 'cargo-binstall', 'cmake'})
+        self.assertTrue({'git', 'git-man'} <= set(selected['packages']),
+                        'snapshot Git and its version-coupled manual package must be installed together')
         self.assertTrue({'gcc-riscv64-linux-gnu', 'g++-riscv64-linux-gnu', 'libc6-dev-riscv64-cross'} <= set(selected['packages']))
         self.assertFalse({'shellcheck', 'python3-venv', 'openssl'} & set(selected['packages']))
         with self.assertRaisesRegex(ValueError, 'requires x86_64-linux'):
@@ -228,7 +230,10 @@ class CatalogPolicy(unittest.TestCase):
                                        ('ci', 'components', 'clippy'),
                                        ('ci', 'components', 'rustfmt'),
                                        ('ci', 'cargo', 'cargo-nextest'),
-                                       ('ci', 'packages', 'build-essential')]:
+                                       ('ci', 'packages', 'build-essential'),
+                                       ('ci', 'packages', 'git-man'),
+                                       ('package', 'packages', 'git-man'),
+                                       ('riscv-build', 'packages', 'git-man')]:
             with self.subTest(operation=operation, field=field, name=name):
                 data = catalog.read()
                 data['operations'][operation][field].remove(name)
