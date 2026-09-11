@@ -5,7 +5,11 @@ export PYTHONDONTWRITEBYTECODE=1
 
 platform="${1:?native platform is required}"
 shift
-[[ "$#" -eq 0 ]] || { echo "usage: scripts/tooling/$platform.sh" >&2; exit 64; }
+[[ "$#" -eq 1 && ( "$1" == ci || "$1" == package || "$1" == riscv-build ) ]] || { echo "usage: scripts/tooling/$platform.sh {ci|package|riscv-build}" >&2; exit 64; }
+operation="$1"
+if [[ "$operation" == riscv-build && "$platform" != x86_64-linux ]]; then
+  echo "riscv-build requires x86_64-linux" >&2; exit 64
+fi
 case "$platform" in
   aarch64-linux|x86_64-linux|riscv64-linux|s390x-linux) machine="${platform%-linux}" ;;
   powerpc64le-linux) machine=ppc64le ;;
@@ -55,7 +59,10 @@ apt=("${sudo_cmd[@]}" env DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[
 "${apt[@]}" update
 catalog_get() { python3 "$SCRIPT_DIR/catalog.py" get "$@"; }
 python3 "$SCRIPT_DIR/catalog.py" validate
-mapfile -t packages < <(catalog_get "$platform" packages)
+catalog_select() { python3 "$SCRIPT_DIR/catalog.py" select "$platform" "$operation" "$@"; }
+# Resolve the complete selection before package installation; process substitutions do not propagate failures.
+catalog_select > /dev/null
+mapfile -t packages < <(catalog_select packages)
 # Exact candidates come from the selected snapshot, including repeat installations.
 pinned_packages=()
 for package in "${packages[@]}"; do
@@ -66,37 +73,40 @@ done
 "${apt[@]}" install -y --allow-downgrades --no-install-recommends "${pinned_packages[@]}"
 
 prefix="$HOME/.local/share/cargo-rail-tooling"
-mkdir -p "$prefix/bin"
+mkdir -p "$prefix"
 python3 "$SCRIPT_DIR/catalog.py" download "$platform" rustup "$temporary/rustup-init"
 chmod +x "$temporary/rustup-init"
-channel="$(python3 "$SCRIPT_DIR/catalog.py" rust-channel "$platform")"
+channel="$(python3 "$SCRIPT_DIR/catalog.py" rust-channel "$platform" "$operation")"
 "$temporary/rustup-init" -y --no-modify-path --default-host "$(catalog_get "$platform" rust-host)" --default-toolchain none
 export PATH="$HOME/.cargo/bin:$PATH"
-mapfile -t components < <(catalog_get "$platform" components)
-component_args=()
-for component in "${components[@]}"; do component_args+=(--component "$component"); done
-rustup toolchain install "$channel" --profile minimal "${component_args[@]}"
+mapfile -t components < <(catalog_select components)
+toolchain_args=()
+for component in "${components[@]}"; do toolchain_args+=(--component "$component"); done
+if [[ "$operation" == riscv-build ]]; then
+  toolchain_args+=(--target "$(catalog_get riscv64-linux rust-host)")
+fi
+rustup toolchain install "$channel" --profile minimal "${toolchain_args[@]}"
 # Explicit toolchain selection avoids auto-installing rust-toolchain.toml's
 # cross targets and local development components when Cargo runs in this checkout.
 export RUSTUP_TOOLCHAIN="$channel"
 
 # Archive tools retain their complete directory layouts.
-python3 "$SCRIPT_DIR/catalog.py" install-archives "$platform" "$prefix" > "$temporary/archives"
+python3 "$SCRIPT_DIR/catalog.py" install-archives "$platform" "$operation" "$prefix" > "$temporary/archives"
 tool_paths=()
 while IFS=$'\t' read -r _name directory; do
   if [[ -d "$directory/bin" ]]; then tool_paths+=("$directory/bin"); else tool_paths+=("$directory"); fi
 done < "$temporary/archives"
-tool_paths+=("$prefix/bin" "$HOME/.cargo/bin")
+tool_paths+=("$HOME/.cargo/bin")
 PATH="$(IFS=:; echo "${tool_paths[*]}"):$PATH"
 export PATH
-mapfile -t cargo_tools < <(catalog_get "$platform" cargo)
+mapfile -t cargo_tools < <(catalog_select cargo)
 for tool in "${cargo_tools[@]}"; do
   version="$(catalog_get cargo "$tool")"
   # Cargo's install registry verifies exact installed package versions on reruns.
   env -u RUSTC_WRAPPER -u CARGO_ENCODED_RUSTFLAGS \
     cargo +"$channel" binstall --locked --no-confirm --targets "$(catalog_get "$platform" rust-host)" "$tool@$version"
 done
-python3 "$SCRIPT_DIR/verify.py" "$platform"
+python3 "$SCRIPT_DIR/verify.py" "$platform" "$operation"
 # Persistent paths are shared by interactive shells and non-interactive Bash recipes.
 environment="$prefix/environment.sh"
 {
@@ -110,8 +120,4 @@ for startup in "$HOME/.profile" "$HOME/.bashrc"; do
   touch "$startup"
   grep -Fxq "$line" "$startup" || printf '\n%s\n' "$line" >> "$startup"
 done
-printf 'Installed %s tooling. New shells load %s.\n' "$platform" "$environment"
-case "$platform" in
-  riscv64-linux|s390x-linux|powerpc64le-linux) printf 'Run scripts/check-cache-host.sh for native cache qualification.\n' ;;
-  *) printf 'Run scripts/check-native-tests.sh for the complete native test suite.\n' ;;
-esac
+printf 'Installed %s %s tooling. New shells load %s.\n' "$platform" "$operation" "$environment"

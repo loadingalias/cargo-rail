@@ -1,19 +1,17 @@
 //! Front-door integration coverage for cargo-rail commands and workspace contracts.
 
+#[path = "../helpers/mod.rs"]
 mod helpers;
-mod test_cache_installation;
 mod test_check;
 mod test_clean;
 mod test_compiler_observation;
 mod test_config;
-mod test_distributed_compilation;
 mod test_error_handling;
 mod test_frontdoor_smoke;
 mod test_git_notes;
 mod test_init;
 mod test_instrumentation;
 mod test_msrv;
-mod test_native_cache_fixture;
 mod test_nested_workspace;
 mod test_output_contracts;
 mod test_ownership_index;

@@ -14,14 +14,11 @@ flaky-result = "fail"
 [test-groups]
 cargo-subprocess = { max-threads = 2 }
 
-[profile.ci]
-fail-fast = true
-
 [profile.cranelift]
 default-filter = 'test(=test_cache_installation::cranelift_emitted_library_reuse_binds_backend_bytes_and_preserves_assembly_bypass)'
 
 [[profile.default.overrides]]
-filter = 'binary(integration) & test(=test_native_cache_fixture::windows_native_driver_bypass_preserves_cargo_workloads)'
+filter = 'binary(cache) & test(=test_native_cache_fixture::windows_native_driver_bypass_preserves_cargo_workloads)'
 test-group = 'cargo-subprocess'
 priority = 100
 threads-required = "num-test-threads"
@@ -36,7 +33,7 @@ threads-required = "num-test-threads"
 slow-timeout = { period = "60s", terminate-after = 5 }
 
 [[profile.default.overrides]]
-filter = 'binary(integration) & test(=test_native_cache_fixture::real_cargo_build_reuses_exact_outputs)'
+filter = 'binary(cache) & test(=test_native_cache_fixture::real_cargo_build_reuses_exact_outputs)'
 test-group = 'cargo-subprocess'
 # Serial cold and warm release builds retain deterministic Rust library candidate inventories.
 priority = 100
@@ -44,7 +41,7 @@ threads-required = "num-test-threads"
 slow-timeout = { period = "60s", terminate-after = 20 }
 
 [[profile.default.overrides]]
-filter = 'binary(integration) & test(/test_native_cache_fixture::real_cargo_(check|test_targets)_reuse/)'
+filter = 'binary(cache) & test(/test_native_cache_fixture::real_cargo_(check|test_targets)_reuse/)'
 test-group = 'cargo-subprocess'
 # These Cargo matrices have bounded compiler-cache deadlines. Run each first and alone.
 priority = 100
@@ -52,19 +49,19 @@ threads-required = "num-test-threads"
 slow-timeout = { period = "60s", terminate-after = 10 }
 
 [[profile.default.overrides]]
-filter = 'binary(integration) & test(/test_native_cache_fixture::/)'
+filter = 'binary(cache) & test(/test_native_cache_fixture::/)'
 test-group = 'cargo-subprocess'
 slow-timeout = { period = "60s", terminate-after = 6 }
 
 [[profile.default.overrides]]
-filter = 'binary(integration) & test(=test_cache_installation::direct_s3_remote_is_l2_only_and_falls_back_cold_on_corruption_or_outage)'
+filter = 'binary(cache) & test(=test_cache_installation::direct_s3_remote_is_l2_only_and_falls_back_cold_on_corruption_or_outage)'
 test-group = 'cargo-subprocess'
 priority = 90
 threads-required = "num-test-threads"
 slow-timeout = { period = "60s", terminate-after = 6 }
 
 [[profile.default.overrides]]
-filter = 'binary(integration) & test(=test_cache_installation::setup_owned_remote_is_automatic_coordinated_and_removable)'
+filter = 'binary(cache) & test(=test_cache_installation::setup_owned_remote_is_automatic_coordinated_and_removable)'
 test-group = 'cargo-subprocess'
 # This test owns a bounded loopback server plus two coordinator process trees.
 priority = 80
@@ -76,9 +73,17 @@ filter = 'binary(integration) & test(=test_compiler_observation::source_capture_
 leak-timeout = { period = "10s", result = "fail" }
 
 [[profile.default.overrides]]
-filter = 'binary(integration) & test(/test_(cache_installation|distributed_compilation|instrumentation|scale_fixture|source_snapshot|surface|unify|unused_detection|undeclared_features)/)'
+filter = 'binary(cache) | (binary(integration) & test(/test_(instrumentation|scale_fixture|source_snapshot|surface|unify|unused_detection|undeclared_features)/))'
 test-group = 'cargo-subprocess'
 
 [[profile.default.overrides]]
 filter = 'test(/test_compiler_observation::stable_(wrapper_authorizes_the_matched_driver_per_compilation_unit|rustdoc_proxy_authorizes_generated_doctest_units)$/) | test(=compiler::facts::tests::manufactured_driver_fragment_passes_the_stable_admission_boundary)'
 test-group = 'cargo-subprocess'
+
+[profile.cache-host]
+fail-fast = true
+test-threads = 1
+
+[[profile.cache-host.overrides]]
+filter = 'all()'
+slow-timeout = { period = "60s", terminate-after = 15 }

@@ -18,22 +18,45 @@ defaults:
     shell: bash
 
 jobs:
+  riscv-build:
+    name: Prepare RISC-V cache tests
+    runs-on: runs-on=${{ github.run_id }}/runner=x86_64-linux/env=production
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Cross-build cache tests
+        run: |
+          scripts/tooling/x86_64-linux.sh riscv-build
+          source "$HOME/.local/share/cargo-rail-tooling/environment.sh"
+          just test-cache-host prepare riscv64gc-unknown-linux-gnu target/riscv-cache
+          git diff --exit-code HEAD
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: riscv-cache
+          path: target/riscv-cache/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 2
+
   native:
+    needs: riscv-build
     name: ${{ matrix.platform }}
     strategy:
       fail-fast: true
       matrix:
         include:
           - platform: x86_64-linux
-            runner: runs-on=${{ github.run_id }}/runner=x86_64-linux/image=ubuntu24-full-x64/spot=false/env=production
+            runner: runs-on=${{ github.run_id }}/runner=x86_64-linux/env=production
             suite: full
             timeout: 45
           - platform: aarch64-linux
-            runner: runs-on=${{ github.run_id }}/runner=aarch64-linux/image=ubuntu24-full-arm64/spot=false/env=production
+            runner: runs-on=${{ github.run_id }}/runner=aarch64-linux/env=production
             suite: full
             timeout: 45
           - platform: x86_64-win
-            runner: runs-on=${{ github.run_id }}/runner=x86_64-win/spot=false/env=production
+            runner: runs-on=${{ github.run_id }}/runner=x86_64-win/env=production
             suite: full
             timeout: 60
           - platform: s390x-linux
@@ -58,19 +81,35 @@ jobs:
         if: runner.os == 'Linux'
         env:
           PLATFORM: ${{ matrix.platform }}
-        run: scripts/tooling/"$PLATFORM".sh
+        run: scripts/tooling/"$PLATFORM".sh ci
+      - name: Check PowerShell syntax
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./scripts/tooling/check.ps1
       - name: Install Windows tooling
         if: runner.os == 'Windows'
         shell: powershell
-        run: ./scripts/tooling/x86_64-win.ps1
+        run: ./scripts/tooling/x86_64-win.ps1 -Operation ci
+      - name: Check tooling and workflows
+        if: matrix.platform == 'x86_64-linux'
+        run: just check-tooling
       - name: Check
         if: matrix.suite == 'full'
-        run: just ci-check check-compiler-driver
+        run: just ci-check
       - name: Test
         if: matrix.suite == 'full'
-        run: scripts/check-native-tests.sh
+        run: just test
       - name: Qualify native cache
-        if: matrix.suite == 'cache'
+        if: matrix.suite == 'cache' && matrix.platform != 'riscv64-linux'
         run: scripts/check-cache-host.sh
+      - name: Download RISC-V cache tests
+        if: matrix.platform == 'riscv64-linux'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: riscv-cache
+          path: target/riscv-cache
+      - name: Qualify RISC-V cache
+        if: matrix.platform == 'riscv64-linux'
+        run: scripts/check-cache-host.sh run target/riscv-cache
       - name: Check worktree
         run: git diff --exit-code HEAD

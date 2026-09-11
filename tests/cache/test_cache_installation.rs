@@ -77,7 +77,7 @@ fn assert_unchanged_file(path: &Path, _expected: &UnchangedFileEvidence, descrip
 }
 
 fn rail(workspace: &Path, cargo_home: &Path, arguments: &[&str]) -> Result<Output> {
-    Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+    Command::new(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(workspace)
         .args(arguments)
         .env("CARGO_HOME", cargo_home)
@@ -284,7 +284,7 @@ fn profile_authority_projection(status: &serde_json::Value) -> serde_json::Value
 }
 
 fn remote_probe(workspace: &Path, cargo_home: &Path, remote: &str, mode: &str) -> Result<Output> {
-    Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+    Command::new(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(workspace)
         .args(["rail", "cache", "probe", "-f", "json"])
         .env("CARGO_HOME", cargo_home)
@@ -1358,7 +1358,7 @@ fn cranelift_emitted_library_reuse_binds_backend_bytes_and_preserves_assembly_by
             Ok(command.output()?)
         };
         let compile = |cached| run(Path::new("cargo"), &["build", "--offline", "--quiet"], cached);
-        let cli = Path::new(env!("CARGO_BIN_EXE_cargo-rail"));
+        let cli = &crate::helpers::cargo_binary("cargo-rail");
         let baseline = compile(false)?;
         anyhow::ensure!(baseline.status.success(), "ordinary Cranelift: {baseline:?}");
         let mut expected = directory_snapshot(&target.join("debug/deps"))?;
@@ -1490,7 +1490,10 @@ fn cranelift_emitted_library_reuse_binds_backend_bytes_and_preserves_assembly_by
 #[ignore = "requires GNU BFD and a C compiler; run actual linker-runtime qualification explicitly"]
 fn elf_link_adapter_rejects_a_runtime_loaded_only_during_linking() {
     let result: Result<()> = (|| {
+        use std::os::unix::fs::PermissionsExt as _;
+
         let root = tempfile::tempdir()?;
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))?;
         let source = root.path().join("native.c");
         let object = root.path().join("native.o");
         let observer_source = root.path().join("observer.c");
@@ -1555,6 +1558,7 @@ __attribute__((constructor)) static void observe_link(void) {
         let linker = PathBuf::from(String::from_utf8(selected.stdout)?.trim());
         for late_runtime in [false, true] {
             let attempt = tempfile::tempdir_in(root.path())?;
+            fs::set_permissions(attempt.path(), fs::Permissions::from_mode(0o700))?;
             let output = attempt.path().join("libnative.so");
             let marker = attempt.path().join("executions");
             let certificate = attempt.path().join("elf-linker-dependencies.d");
@@ -1582,7 +1586,7 @@ __attribute__((constructor)) static void observe_link(void) {
             let bytes = fs::read(&output)?;
             let mode = fs::metadata(&output)?.permissions();
             fs::remove_file(&output)?;
-            let mut adapter = Command::new(env!("CARGO_BIN_EXE_cargo-rail"));
+            let mut adapter = Command::new(crate::helpers::cargo_binary("cargo-rail"));
             configure(&mut adapter);
             adapter
                 .env("CARGO_RAIL_ELF_LINK_ADAPTER", "1")
@@ -1655,7 +1659,8 @@ fn elf_linker_reuse(linker_name: &str, default_gcc: bool) {
             selected_linker.status.success(),
             "{linker_name} prerequisite: {selected_linker:?}"
         );
-        let mut tool_bytes = fs::read(String::from_utf8(selected_linker.stdout)?.trim())?;
+        let selected_linker = fs::canonicalize(String::from_utf8(selected_linker.stdout)?.trim())?;
+        let mut tool_bytes = fs::read(&selected_linker)?;
         tool_bytes.push(0);
         let linker = if linker_name == "gcc" {
             let bin = workspace.path.join("gcc-installation/bin");
@@ -1668,25 +1673,27 @@ fn elf_linker_reuse(linker_name: &str, default_gcc: bool) {
         fs::set_permissions(&linker, fs::Permissions::from_mode(0o700))?;
         let mut tools = vec![(linker.clone(), tool_bytes)];
         if linker_name == "gcc" {
+            let compiler_prefix = selected_linker
+                .parent()
+                .and_then(Path::parent)
+                .context("GCC installation prefix")?;
             let query = |argument: &str| -> Result<String> {
                 let output = Command::new("gcc").arg(argument).output()?;
                 anyhow::ensure!(output.status.success(), "GCC {argument} prerequisite: {output:?}");
                 Ok(String::from_utf8(output.stdout)?.trim().to_string())
             };
             let triple = query("-dumpmachine")?;
-            let version = query("-dumpversion")?;
             let installation = workspace.path.join("gcc-installation");
-            let library = installation.join("lib/gcc").join(&triple).join(&version);
             let linker_directory = installation.join(&triple).join("bin");
-            fs::create_dir_all(&library)?;
             fs::create_dir_all(&linker_directory)?;
-            for (name, query_argument, directory, mutate) in [
-                ("collect2", "-print-prog-name=collect2", &library, true),
-                ("ld", "-print-prog-name=ld", &linker_directory, true),
-                ("liblto_plugin.so", "-print-file-name=liblto_plugin.so", &library, true),
-                ("lto-wrapper", "-print-prog-name=lto-wrapper", &library, false),
-                ("crtbeginS.o", "-print-file-name=crtbeginS.o", &library, false),
-                ("crtendS.o", "-print-file-name=crtendS.o", &library, false),
+            let mut selections = Vec::new();
+            for (name, query_argument, mutate) in [
+                ("collect2", "-print-prog-name=collect2", true),
+                ("ld.bfd", "-print-prog-name=ld.bfd", true),
+                ("liblto_plugin.so", "-print-file-name=liblto_plugin.so", true),
+                ("lto-wrapper", "-print-prog-name=lto-wrapper", false),
+                ("crtbeginS.o", "-print-file-name=crtbeginS.o", false),
+                ("crtendS.o", "-print-file-name=crtendS.o", false),
             ] {
                 let selection = query(query_argument)?;
                 let source = if Path::new(&selection).is_absolute() {
@@ -1698,23 +1705,43 @@ fn elf_linker_reuse(linker_name: &str, default_gcc: bool) {
                     anyhow::ensure!(resolved.status.success(), "resolve GCC {name}: {resolved:?}");
                     PathBuf::from(String::from_utf8(resolved.stdout)?.trim())
                 };
-                let mut bytes = fs::read(source)?;
+                let canonical = fs::canonicalize(&source).with_context(|| format!("resolve GCC {name}: {source:?}"))?;
+                let mut bytes = fs::read(&canonical)?;
                 if mutate {
                     bytes.push(0);
                 }
-                let path = directory.join(name);
+                // Preserve GCC's lib/libexec layout and aliases so information
+                // probes and actual links select the same private runtime files.
+                let path = if name == "ld.bfd" {
+                    linker_directory.join(name)
+                } else {
+                    installation.join(canonical.strip_prefix(compiler_prefix)?)
+                };
+                fs::create_dir_all(path.parent().context("private GCC input parent")?)?;
                 fs::write(&path, &bytes)?;
                 fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
-                let selected = Command::new(&linker).arg(query_argument).output()?;
-                anyhow::ensure!(selected.status.success(), "private GCC selection: {selected:?}");
-                assert_eq!(
-                    fs::canonicalize(String::from_utf8(selected.stdout)?.trim())?,
-                    fs::canonicalize(&path)?,
-                    "GCC must select the private {name} before its mutation is exercised"
-                );
+                if name != "ld.bfd" && source != canonical {
+                    let alias = installation.join(source.strip_prefix(compiler_prefix)?);
+                    fs::create_dir_all(alias.parent().context("private GCC alias parent")?)?;
+                    std::os::unix::fs::symlink(&path, alias)?;
+                }
+                selections.push((name, query_argument, path.clone()));
                 if mutate {
                     tools.push((path, bytes));
                 }
+            }
+            // GCC's relative searches can traverse another tool's directory.
+            // Complete the installation before validating any selection.
+            for (name, query_argument, path) in selections {
+                let selected = Command::new(&linker).arg(query_argument).output()?;
+                anyhow::ensure!(selected.status.success(), "private GCC selection: {selected:?}");
+                let selection = String::from_utf8(selected.stdout)?;
+                assert_eq!(
+                    fs::canonicalize(selection.trim())
+                        .with_context(|| format!("private GCC {name} selection: {selection:?}"))?,
+                    fs::canonicalize(&path)?,
+                    "GCC must select the private {name} before its mutation is exercised"
+                );
             }
         }
         let early = workspace.path.join("early");
@@ -1762,6 +1789,10 @@ fn elf_linker_reuse(linker_name: &str, default_gcc: bool) {
             format!("-Lnative={}", early.display()),
             format!("-Lnative={}", selected.display()),
         ];
+        if linker_name == "gcc" {
+            // Select the BFD contract explicitly; target defaults can select LLD.
+            flags.push("-Clink-arg=-fuse-ld=bfd".to_string());
+        }
         if !default_gcc {
             flags.push(format!("-Clinker={}", linker.display()));
         }
@@ -2027,7 +2058,7 @@ fn apple_link_adapter_retry_certifies_only_the_successful_attempt() {
         );
 
         let adapter = |inputs: &[&Path]| -> Result<Output> {
-            let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-rail"));
+            let mut command = Command::new(crate::helpers::cargo_binary("cargo-rail"));
             for (name, _) in std::env::vars_os() {
                 if name.to_str().is_some_and(|name| name.starts_with("CARGO_RAIL_")) {
                     command.env_remove(name);
@@ -2089,11 +2120,12 @@ fn setup_check_in_a_source_checkout_reports_the_missing_component_recovery() {
         let isolated_bin = tempfile::Builder::new()
             .prefix("cargo-rail-missing-worker-")
             .tempdir_in(&source_target)?;
-        let executable_name = Path::new(env!("CARGO_BIN_EXE_cargo-rail"))
+        let executable_name = crate::helpers::cargo_binary("cargo-rail")
             .file_name()
-            .context("cargo-rail test binary has no file name")?;
+            .context("cargo-rail test binary has no file name")?
+            .to_owned();
         let executable = isolated_bin.path().join(executable_name);
-        fs::copy(env!("CARGO_BIN_EXE_cargo-rail"), &executable)?;
+        fs::copy(crate::helpers::cargo_binary("cargo-rail"), &executable)?;
         let cargo_home = tempfile::tempdir()?;
 
         let output = Command::new(&executable)
@@ -2772,7 +2804,7 @@ fn setup_refuses_global_conflicts_and_workspace_shadowing() {
 
         fs::write(&config, "[net]\noffline = true\n")?;
         for name in ["RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"] {
-            let shadowed = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+            let shadowed = Command::new(crate::helpers::cargo_binary("cargo-rail"))
                 .current_dir(&workspace.path)
                 .args(["rail", "cache", "setup", "--check"])
                 .env("CARGO_HOME", cargo_home.path())
@@ -2809,7 +2841,7 @@ fn cache_status_reports_only_redacted_machine_selected_remote_authority() {
     let result: Result<()> = (|| {
         let workspace = TestWorkspace::new_single_crate("transparent-remote-status", "0.1.0")?;
         let cargo_home = tempfile::tempdir()?;
-        let output = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+        let output = Command::new(crate::helpers::cargo_binary("cargo-rail"))
             .current_dir(&workspace.path)
             .args(["rail", "cache", "status", "--scope", "local", "-f", "json"])
             .env("CARGO_HOME", cargo_home.path())
@@ -3298,7 +3330,7 @@ fn interrupted_profile_replace_retries_to_one_canonical_result() {
         let setup = rail(&first.path, cargo_home.path(), &["rail", "cache", "setup"])?;
         assert!(setup.status.success(), "initial profile setup failed: {setup:?}");
 
-        let interrupted = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+        let interrupted = Command::new(crate::helpers::cargo_binary("cargo-rail"))
             .current_dir(&first.path)
             .args(["rail", "cache", "setup", "--max-size", "32MiB"])
             .env("CARGO_HOME", cargo_home.path())
@@ -4560,7 +4592,7 @@ fn analysis_missing_binding_executes_despite_an_ordinary_native_result() {
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CARGO_RAIL_TEST_RUSTC_LOG\"\nexec \"$REAL_RUSTC\" \"$@\"\n",
         )?;
         fs::set_permissions(&rustc_shim, fs::Permissions::from_mode(0o700))?;
-        let analysis = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+        let analysis = Command::new(crate::helpers::cargo_binary("cargo-rail"))
             .current_dir(&workspace.path)
             .args(["rail", "unify", "--check"])
             .env("CARGO_HOME", cargo_home.path())
@@ -4629,7 +4661,7 @@ fn compiler_analysis_reuses_native_result_only_after_an_exact_binding() {
         let wrapper_probe = tempfile::tempdir()?;
         let wrapper_log = wrapper_probe.path().join("wrapper.log");
         let run = |wrapper: Option<&Path>| -> Result<std::process::Output> {
-            let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-rail"));
+            let mut command = Command::new(crate::helpers::cargo_binary("cargo-rail"));
             command
                 .current_dir(&workspace.path)
                 .args(["rail", "unify", "--check"])
@@ -4736,7 +4768,7 @@ fn remote_diagnostics_reuse_revalidates_source_inputs() {
         assert!(setup.status.success(), "remote fixture setup: {setup:?}");
 
         let run = |cache_root: &Path, mode: &str| -> Result<Output> {
-            Ok(Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+            Ok(Command::new(crate::helpers::cargo_binary("cargo-rail"))
                 .current_dir(&workspace.path)
                 .args(["rail", "--diagnostics-file"])
                 .arg(cache_root.join("diagnostics.json"))
@@ -5585,16 +5617,41 @@ fn cross_windows_link_restores_the_exact_dll_pdb_and_import_library() {
         let workspace = TestWorkspace::new_single_crate("coff-outputs", "0.1.0")?;
         let cargo_home = tempfile::tempdir()?;
         let reports = tempfile::tempdir()?;
+        let target = "x86_64-pc-windows-msvc";
+        let mut rustflags = Vec::new();
+        for (directory, name) in [("link", "first"), ("link-inputs", "second")] {
+            let directory = workspace.path.join(directory);
+            fs::create_dir(&directory)?;
+            let source = directory.join("lib.rs");
+            fs::write(
+                &source,
+                format!("#![no_std]\n#[unsafe(no_mangle)] pub extern \"C\" fn {name}() -> u32 {{ 1 }}\n"),
+            )?;
+            let compiled = Command::new("rustc")
+                .args([
+                    "--edition=2024",
+                    "--crate-type=rlib",
+                    "--target",
+                    target,
+                    "--crate-name",
+                    name,
+                ])
+                .arg(&source)
+                .arg("-o")
+                .arg(directory.join(format!("{name}.lib")))
+                .output()?;
+            anyhow::ensure!(compiled.status.success(), "COFF input archive failed: {compiled:?}");
+            rustflags.push(format!("-Lnative={}", directory.display()));
+        }
         fs::write(
             workspace.path.join("Cargo.toml"),
             "[package]\nname = \"coff-outputs\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n",
         )?;
         let source = workspace.path.join("src/lib.rs");
-        fs::write(
-            &source,
-            "#[unsafe(no_mangle)] pub extern \"C\" fn answer() -> u32 { 42 }\n",
-        )?;
-        let target = "x86_64-pc-windows-msvc";
+        let original_source = "#[link(name = \"first\", kind = \"static\")] unsafe extern \"C\" { fn first() -> u32; }\n\
+            #[link(name = \"second\", kind = \"static\")] unsafe extern \"C\" { fn second() -> u32; }\n\
+            #[unsafe(no_mangle)] pub extern \"C\" fn answer() -> u32 { unsafe { first() + second() + 42 } }\n";
+        fs::write(&source, original_source)?;
         let target_directory = workspace.path.join("target").join(target);
         let build = |recording: Option<&Path>| -> Result<()> {
             let mut command = Command::new("cargo");
@@ -5608,7 +5665,7 @@ fn cross_windows_link_restores_the_exact_dll_pdb_and_import_library() {
                 .env_remove("RUSTC_WRAPPER")
                 .env_remove("RUSTC_WORKSPACE_WRAPPER")
                 .env_remove("RUSTFLAGS")
-                .env_remove("CARGO_ENCODED_RUSTFLAGS")
+                .env("CARGO_ENCODED_RUSTFLAGS", rustflags.join("\x1f"))
                 .env_remove("CARGO_RAIL_CACHE")
                 .env_remove("CARGO_RAIL_CACHE_REPORT")
                 .env_remove("LLD_REPRODUCE");
@@ -5660,10 +5717,7 @@ fn cross_windows_link_restores_the_exact_dll_pdb_and_import_library() {
         let mut cold_outputs = None;
         for (phase, hits, misses) in [("cold", 0, 1), ("warm", 1, 0), ("source-change", 0, 1)] {
             if phase == "source-change" {
-                fs::write(
-                    &source,
-                    "#[unsafe(no_mangle)] pub extern \"C\" fn answer() -> u32 { 43 }\n",
-                )?;
+                fs::write(&source, original_source.replace("42", "43"))?;
             }
             fs::remove_dir_all(&target_directory)?;
             let recording = reports.path().join(format!("{phase}.json"));
@@ -5897,7 +5951,7 @@ fn coff_adapter_preserves_exact_outputs_with_windows_response_arguments() {
         }
         let evidence = directory.join("coff-linker-driver-inputs.json");
         let archive = directory.join("coff-linker-inputs.tar");
-        let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-rail"));
+        let mut command = Command::new(crate::helpers::cargo_binary("cargo-rail"));
         for (name, _) in std::env::vars_os() {
             if name.to_str().is_some_and(|name| name.starts_with("CARGO_RAIL_")) {
                 command.env_remove(name);

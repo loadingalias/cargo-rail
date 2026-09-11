@@ -19,13 +19,30 @@ samply = "0.13.1"
 [updater]
 tomlkit = "0.15.1"
 
+[operations.ci]
+components = ["clippy", "rustfmt", "rustc-dev", "llvm-tools"]
+cargo = ["cargo-deny", "cargo-nextest", "just"]
+assets = ["rustup", "cargo-binstall", "cmake", "llvm", "git", "python", "actionlint", "cargo-nextest"]
+packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "openssl", "pkgconf", "python3", "python3-venv", "shellcheck", "unzip", "xz-utils", "zstd"]
+
+[operations.package]
+components = ["rustc-dev", "llvm-tools"]
+cargo = ["just"]
+assets = ["rustup", "cargo-binstall", "cmake", "llvm", "git", "python"]
+packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "pkgconf", "python3", "unzip", "xz-utils", "zstd"]
+
+[operations.riscv-build]
+components = []
+cargo = ["cargo-nextest", "just"]
+assets = ["rustup", "cargo-binstall", "cmake"]
+packages = ["build-essential", "ca-certificates", "curl", "git", "python3", "perl", "gcc-riscv64-linux-gnu", "g++-riscv64-linux-gnu", "libc6-dev-riscv64-cross"]
+
 [versions]
+actionlint = "1.7.12"
 cargo-binstall = "1.23.0"
 cmake = "4.4.3"
 llvm = "23.1.0"
 git = "2.55.0.windows.5"
-jq = "1.8.2"
-powershell = "7.6.5"
 rustup = "1.29.1"
 python = "3.14.7"
 
@@ -44,11 +61,11 @@ bootstrap-sha256 = "352ac5776d592a4870c15756f9e140507b9ee64de62b401152e5929f7c0c
 sdk-component = "Microsoft.VisualStudio.Component.Windows11SDK.28000"
 
 [aarch64-linux]
-packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "jq", "pkgconf", "python3", "python3-venv", "unzip", "xz-utils", "zstd"]
+packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "pkgconf", "python3", "unzip", "xz-utils", "zstd"]
 os = "Ubuntu 24.04 LTS"
 rust-host = "aarch64-unknown-linux-gnu"
 components = ["clippy", "rustfmt", "rustc-dev", "llvm-tools"]
-cargo = ["cargo-audit", "cargo-deny", "cargo-nextest", "cargo-mutants", "just", "ripgrep", "rumdl", "lychee", "samply"]
+cargo = ["cargo-deny", "cargo-nextest", "just"]
 
 [aarch64-linux.assets.rustup]
 url = "https://static.rust-lang.org/rustup/archive/1.29.1/aarch64-unknown-linux-gnu/rustup-init"
@@ -63,11 +80,15 @@ url = "https://github.com/Kitware/CMake/releases/download/v4.4.3/cmake-4.4.3-lin
 sha256 = "2efc974dbd63b4444c0e8494b92f2e80c2d7e635b4b80eac2916985ddd8f72a6"
 
 [x86_64-linux]
-packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "jq", "pkgconf", "python3", "python3-venv", "shellcheck", "unzip", "xz-utils", "zstd"]
+packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "pkgconf", "python3", "python3-venv", "shellcheck", "unzip", "xz-utils", "zstd", "perl", "gcc-riscv64-linux-gnu", "g++-riscv64-linux-gnu", "libc6-dev-riscv64-cross"]
 os = "Ubuntu 24.04 LTS"
 rust-host = "x86_64-unknown-linux-gnu"
 components = ["clippy", "rustfmt", "rustc-dev", "llvm-tools"]
-cargo = ["cargo-audit", "cargo-deny", "cargo-nextest", "cargo-mutants", "just", "ripgrep", "rumdl", "lychee", "samply"]
+cargo = ["cargo-deny", "cargo-nextest", "just"]
+
+[x86_64-linux.assets.actionlint]
+url = "https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz"
+sha256 = "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
 
 [x86_64-linux.assets.rustup]
 url = "https://static.rust-lang.org/rustup/archive/1.29.1/x86_64-unknown-linux-gnu/rustup-init"
@@ -85,7 +106,7 @@ sha256 = "d6c83076c575bc00b823522ac974bda66d0af05d6ddc30e739c12385cf32c6cc"
 os = "Windows 11 Enterprise ARM64"
 rust-host = "aarch64-pc-windows-msvc"
 components = ["clippy", "rustfmt", "rustc-dev", "llvm-tools"]
-cargo = ["cargo-audit", "cargo-deny", "cargo-nextest", "cargo-mutants", "just", "ripgrep", "rumdl", "lychee"]
+cargo = ["cargo-deny", "cargo-nextest", "just"]
 
 [aarch64-win.assets.rustup]
 url = "https://static.rust-lang.org/rustup/archive/1.29.1/aarch64-pc-windows-msvc/rustup-init.exe"
@@ -111,19 +132,11 @@ sha256 = "f6773983c8959d4281e48c4540cb0bdd23e42391e4e951ce17e7ceb52658f21c"
 url = "https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.5/Git-2.55.0.5-arm64.exe"
 sha256 = "c955de342b1465bc637f0e71fddf4e28e8d0b829668ec1866ab32a839303e8e3"
 
-[aarch64-win.assets.jq]
-url = "https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-windows-arm64.exe"
-sha256 = "083b5377392bc57cf27052b6d20a2d927770683bca844632901ff38b4b7b0ac7"
-
-[aarch64-win.assets.powershell]
-url = "https://github.com/PowerShell/PowerShell/releases/download/v7.6.5/PowerShell-7.6.5-win-arm64.zip"
-sha256 = "20514a755d16428dc4355c85e0883c859531e71cc3e122670aa1fccdbf96ba7e"
-
 [x86_64-win]
 os = "Windows Server 2025"
 rust-host = "x86_64-pc-windows-msvc"
 components = ["clippy", "rustfmt", "rustc-dev", "llvm-tools"]
-cargo = ["cargo-audit", "cargo-deny", "cargo-nextest", "cargo-mutants", "just", "ripgrep", "rumdl", "lychee"]
+cargo = ["cargo-deny", "cargo-nextest", "just"]
 
 [x86_64-win.assets.rustup]
 url = "https://static.rust-lang.org/rustup/archive/1.29.1/x86_64-pc-windows-msvc/rustup-init.exe"
@@ -149,14 +162,6 @@ sha256 = "d297e5ff019966817ad8502465176139f2d3d840fa4ed84b13bed399a6ab1f15"
 url = "https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.5/Git-2.55.0.5-64-bit.exe"
 sha256 = "d065a4e23c3d9a6b5073d609b5be0830227ec3ca053c083ba385061ddfaf94c6"
 
-[x86_64-win.assets.jq]
-url = "https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-windows-amd64.exe"
-sha256 = "a6fc67fedaf9128a3309a1e2ebb8b986aeccf70122ee46d2cb4849e423f0c627"
-
-[x86_64-win.assets.powershell]
-url = "https://github.com/PowerShell/PowerShell/releases/download/v7.6.5/PowerShell-7.6.5-win-x64.zip"
-sha256 = "32eb8f6cdce08f86e987d625a2733e54ac3e289ae7e1621b14c0b5bcec2434ea"
-
 [riscv64-linux]
 # rscrypto SHA-2 uses nightly-only RISC-V intrinsics.
 rust-channel = "nightly-2026-07-06"
@@ -166,11 +171,15 @@ codename = "noble"
 rust-host = "riscv64gc-unknown-linux-gnu"
 components = ["rustc-dev", "llvm-tools"]
 cargo = []
-packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "python3"]
+packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "openssl", "python3"]
 
 [riscv64-linux.assets.rustup]
 url = "https://static.rust-lang.org/rustup/archive/1.29.1/riscv64gc-unknown-linux-gnu/rustup-init"
 sha256 = "e94134ed99fed1a3a1f13a3bf0a05d616fc1c2496ec0b557aaee4856cd34b2f2"
+
+[riscv64-linux.assets.cargo-nextest]
+url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.143/cargo-nextest-0.9.143-riscv64gc-unknown-linux-gnu.tar.gz"
+sha256 = "cb5035deced2353e6e03a8408dd7cddaa82ddf0a22238566254617f59f25cb42"
 
 [s390x-linux]
 os = "Ubuntu 24.04 LTS"
@@ -179,7 +188,7 @@ codename = "noble"
 rust-host = "s390x-unknown-linux-gnu"
 components = ["rustc-dev", "llvm-tools"]
 cargo = []
-packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "python3"]
+packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "openssl", "python3"]
 
 [s390x-linux.assets.rustup]
 url = "https://static.rust-lang.org/rustup/archive/1.29.1/s390x-unknown-linux-gnu/rustup-init"
@@ -192,7 +201,7 @@ codename = "noble"
 rust-host = "powerpc64le-unknown-linux-gnu"
 components = ["rustc-dev", "llvm-tools"]
 cargo = []
-packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "python3"]
+packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "openssl", "python3"]
 
 [powerpc64le-linux.assets.rustup]
 url = "https://static.rust-lang.org/rustup/archive/1.29.1/powerpc64le-unknown-linux-gnu/rustup-init"

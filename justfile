@@ -1,20 +1,27 @@
-check: fix
-    @scripts/check.sh local
+# Local repair, shared validation, cross-compilation, and dogfooding.
+check: fix ci-check
+    @scripts/check-cross.sh
+    cargo rail unify --check --explain
 
+# Shared nonmutating checks, also run by the local check recipe.
 ci-check:
-    @scripts/check.sh native
+    @scripts/check.sh
 
 check-compiler-driver:
     @scripts/check-compiler-fact-driver.sh
 
 fix:
-    @scripts/check.sh fix
+    cargo fmt --all
+    cargo clippy --workspace --all-targets --all-features --locked --fix --allow-dirty --allow-staged
+    cargo fmt --all
 
 test profile="default":
     #!/usr/bin/env bash
     set -euo pipefail
+    # Fixtures own remote authority; machine enrollment must not supply cache hits.
+    unset CARGO_RAIL_CACHE_REMOTE CARGO_RAIL_CACHE_MODE CARGO_RAIL_CACHE_REMOTE_ENVIRONMENT
     profile={{quote(profile)}}
-    [[ "$profile" == default || "$profile" == ci || "$profile" == cranelift ]] || { echo 'unknown test profile' >&2; exit 2; }
+    [[ "$profile" == default || "$profile" == cranelift ]] || { echo 'unknown test profile' >&2; exit 2; }
     if [[ "$profile" == cranelift && "$(uname -s)" != Darwin ]]; then
         echo 'the Cranelift integration lane requires a native macOS host' >&2
         exit 1
@@ -41,6 +48,10 @@ test profile="default":
         cargo nextest run --target-dir "$(dirname "$component_directory")" --workspace -P cranelift --all-features --locked \
             --config-file .config/nextest.toml
     fi
+
+# Native local, remote-storage, and distributed cache qualification.
+test-cache-host *args:
+    @scripts/check-cache-host.sh {{args}}
 
 test-cranelift:
     @just test cranelift

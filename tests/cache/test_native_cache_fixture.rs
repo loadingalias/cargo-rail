@@ -9,7 +9,7 @@ use anyhow::{Context as _, Result, ensure};
 use rscrypto::Sha256;
 
 fn materialize_fixture(destination: &Path, git_source: &Path) -> Result<()> {
-    let output = Command::new(env!("CARGO_BIN_EXE_cargo-rail-bench"))
+    let output = Command::new(crate::helpers::cargo_binary("cargo-rail-bench"))
         .args(["prepare", "--offline", "--output"])
         .arg(destination)
         .arg("--git-source")
@@ -31,7 +31,7 @@ fn benchmark_prepare_refuses_existing_output_without_creating_git_source() -> Re
     let source = root.path().join("git-source");
     fs::create_dir(&output)?;
     fs::write(output.join("user-data"), b"preserve these bytes")?;
-    let result = Command::new(env!("CARGO_BIN_EXE_cargo-rail-bench"))
+    let result = Command::new(crate::helpers::cargo_binary("cargo-rail-bench"))
         .args(["prepare", "--output"])
         .arg(&output)
         .arg("--git-source")
@@ -52,7 +52,7 @@ fn benchmark_prepare_refuses_existing_output_without_creating_git_source() -> Re
 fn benchmark_prepare_uses_embedded_locked_inputs_outside_the_checkout() -> Result<()> {
     let root = tempfile::tempdir()?;
     let binary = executable(root.path().join("installed rail bench"));
-    fs::copy(env!("CARGO_BIN_EXE_cargo-rail-bench"), &binary)?;
+    fs::copy(crate::helpers::cargo_binary("cargo-rail-bench"), &binary)?;
     let fixture = root.path().join("fixture with spaces ü # %");
     let source = root.path().join("fixture with spaces ü # %.git-source");
     let mut selected = fixture.as_os_str().to_os_string();
@@ -117,7 +117,7 @@ fn benchmark_prepare_refuses_symlink_output_without_touching_its_target() -> Res
     fs::write(outside.join("keep"), b"untouched")?;
     let output = root.path().join("output");
     std::os::unix::fs::symlink(&outside, &output)?;
-    let result = Command::new(env!("CARGO_BIN_EXE_cargo-rail-bench"))
+    let result = Command::new(crate::helpers::cargo_binary("cargo-rail-bench"))
         .args(["prepare", "--output"])
         .arg(&output)
         .output()?;
@@ -286,7 +286,7 @@ fn seed_isolated_cargo_home(fixture: &Path, cargo_home: &Path) -> Result<()> {
 }
 
 fn setup_cache(fixture: &Path, cargo_home: &Path, cache_base: &Path) -> Result<()> {
-    let output = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+    let output = Command::new(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(fixture)
         .args(["rail", "cache", "setup", "--local-dir"])
         .arg(cache_base)
@@ -324,7 +324,7 @@ impl Usage {
 }
 
 fn cache_status(fixture: &Path, cargo_home: &Path) -> Result<serde_json::Value> {
-    let output = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+    let output = Command::new(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(fixture)
         .args(["rail", "cache", "status", "--scope", "local", "-f", "json"])
         .env("CARGO_HOME", cargo_home)
@@ -1666,7 +1666,7 @@ fn benchmark_local_refuses_inherited_configuration_and_retains_unrun_rows() -> R
     let configuration = b"[build]\nrustflags = ['--cfg=foreign']\n";
     fs::write(root.path().join(".cargo/config.toml"), configuration)?;
     let destination = root.path().join("comparison");
-    let result = Command::new(env!("CARGO_BIN_EXE_cargo-rail-bench"))
+    let result = Command::new(crate::helpers::cargo_binary("cargo-rail-bench"))
         .args(["local", "--smoke", "--output"])
         .arg(&destination)
         .env("PATH", "")
@@ -1697,7 +1697,7 @@ fn benchmark_local_refuses_inherited_configuration_and_retains_unrun_rows() -> R
 fn benchmark_local_rejects_unavailable_isolation_before_writing() -> Result<()> {
     let root = tempfile::tempdir()?;
     let destination = root.path().join("comparison");
-    let result = Command::new(env!("CARGO_BIN_EXE_cargo-rail-bench"))
+    let result = Command::new(crate::helpers::cargo_binary("cargo-rail-bench"))
         .args(["local", "--smoke", "--output"])
         .arg(&destination)
         .env("PATH", "")

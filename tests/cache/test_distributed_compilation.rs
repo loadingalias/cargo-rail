@@ -189,7 +189,7 @@ struct DecodedResponse {
 
 #[test]
 fn one_shot_worker_enforces_native_input_authority_and_cancellation() -> Result<()> {
-    let worker = Path::new(env!("CARGO_BIN_EXE_cargo-rail-distributed-worker"));
+    let worker = &crate::helpers::cargo_binary("cargo-rail-distributed-worker");
     let rustc = which_rustc()?;
     let version = Command::new(worker).arg("protocol-version").output()?;
     anyhow::ensure!(version.status.success(), "worker protocol query failed: {version:?}");
@@ -443,7 +443,7 @@ fn first_seen_compiler_environment_executes_locally_before_distribution() -> Res
         fs::set_permissions(coverage.path(), fs::Permissions::from_mode(0o700))?;
     }
     let coverage = fs::canonicalize(coverage.path())?;
-    let setup = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+    let setup = Command::new(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(&workspace.path)
         .args(["rail", "cache", "setup", "--local-dir"])
         .arg(cache.path())
@@ -532,7 +532,7 @@ fn ordinary_cargo_distributes_module_trees_and_exact_rust_dependencies() -> Resu
         fs::set_permissions(coverage.path(), fs::Permissions::from_mode(0o700))?;
     }
     let coverage = fs::canonicalize(coverage.path())?;
-    let setup = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+    let setup = Command::new(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(&workspace.path)
         .args(["rail", "cache", "setup", "--local-dir"])
         .arg(cache.path())
@@ -687,7 +687,7 @@ fn ordinary_cargo_distributes_module_trees_and_exact_rust_dependencies() -> Resu
 fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
-    let worker = Path::new(env!("CARGO_BIN_EXE_cargo-rail-distributed-worker"));
+    let worker = &crate::helpers::cargo_binary("cargo-rail-distributed-worker");
     let rustc = which_rustc()?;
     let identity = generate_mutual_tls_identity()?;
     let bubblewrap = Path::new("/usr/bin/bwrap");
@@ -827,7 +827,7 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
         "-f",
         "json",
     ];
-    let preview = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+    let preview = Command::new(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(&workspace.path)
         .args(setup_arguments)
         .arg("--check")
@@ -844,7 +844,7 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
         !cargo_home.path().join("cargo-rail/compiler-cache-v1").exists(),
         "mTLS setup preview mutated private state"
     );
-    let setup = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+    let setup = Command::new(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(&workspace.path)
         .args(setup_arguments)
         .env("CARGO_HOME", cargo_home.path())
@@ -868,7 +868,7 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
         fs::metadata(&installed_key)?.permissions().mode() & 0o777 == 0o600,
         "installed client key is not private"
     );
-    let rejected_local_replacement = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+    let rejected_local_replacement = Command::new(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(&workspace.path)
         .args(["rail", "cache", "setup", "--distributed-local"])
         .env("CARGO_HOME", cargo_home.path())
@@ -1027,7 +1027,7 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
         "metadata-only execution produced an rlib or omitted metadata: {check_artifacts:?}"
     );
 
-    let automatic = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+    let automatic = Command::new(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(&workspace.path)
         .args([
             "rail",
@@ -1049,13 +1049,13 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
         automatic["distributed_policy"] == "automatic",
         "automatic placement was not installed"
     );
-    let clean = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+    let clean = Command::new(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(&workspace.path)
         .args(["rail", "cache", "clean", "--scope", "local"])
         .env("CARGO_HOME", cargo_home.path())
         .output()?;
     anyhow::ensure!(clean.status.success(), "test cache cleanup failed: {clean:?}");
-    let reinitialize = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+    let reinitialize = Command::new(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(&workspace.path)
         .args(["rail", "cache", "setup", "--distributed-policy", "automatic"])
         .env("CARGO_HOME", cargo_home.path())
@@ -1130,7 +1130,7 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
             .all(|event| event["reason"] != "verified_distributed_execution"),
         "automatic placement ignored its conservative cost gate: {automatic_events:?}"
     );
-    let placement_status = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+    let placement_status = Command::new(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(&workspace.path)
         .args(["rail", "cache", "status", "--scope", "local", "-f", "json"])
         .env("CARGO_HOME", cargo_home.path())
@@ -1203,7 +1203,7 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
     };
     let before_stale_setup = installation_files()?;
     for check in [true, false] {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-rail"));
+        let mut command = Command::new(crate::helpers::cargo_binary("cargo-rail"));
         command
             .current_dir(&workspace.path)
             .args(["rail", "cache", "setup", "--max-size", "100MiB"])
@@ -1226,7 +1226,7 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
 
     let installed_key_bytes = fs::read(&installed_key)?;
     fs::write(&installed_key, b"drifted installed identity")?;
-    let status = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+    let status = Command::new(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(&workspace.path)
         .args(["rail", "cache", "status", "--scope", "local", "-f", "json"])
         .env("CARGO_HOME", cargo_home.path())
@@ -1238,13 +1238,13 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
     );
     fs::write(&installed_key, installed_key_bytes)?;
     fs::write(&identity.client_private_key, original_client_key)?;
-    let repair = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+    let repair = Command::new(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(&workspace.path)
         .args(setup_arguments)
         .env("CARGO_HOME", cargo_home.path())
         .output()?;
     anyhow::ensure!(repair.status.success(), "mTLS identity repair failed: {repair:?}");
-    let remove = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+    let remove = Command::new(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(&workspace.path)
         .args(["rail", "cache", "uninstall"])
         .env("CARGO_HOME", cargo_home.path())
@@ -1260,7 +1260,7 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
 fn saturated_mutual_tls_worker_falls_excess_cargo_actions_back_locally() -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
-    let worker = Path::new(env!("CARGO_BIN_EXE_cargo-rail-distributed-worker"));
+    let worker = &crate::helpers::cargo_binary("cargo-rail-distributed-worker");
     let rustc = which_rustc()?;
     let identity = generate_mutual_tls_identity()?;
     let mut server = Command::new(worker)
@@ -1299,7 +1299,7 @@ fn saturated_mutual_tls_worker_falls_excess_cargo_actions_back_locally() -> Resu
     fs::set_permissions(coverage.path(), fs::Permissions::from_mode(0o700))?;
     let coverage = fs::canonicalize(coverage.path())?;
 
-    let setup = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+    let setup = Command::new(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(&workspace.path)
         .args([
             "rail",
@@ -1413,7 +1413,7 @@ fn saturated_mutual_tls_worker_falls_excess_cargo_actions_back_locally() -> Resu
 #[cfg(unix)]
 #[test]
 fn mutual_tls_worker_drains_accepted_connections_before_stopping() -> Result<()> {
-    let worker = Path::new(env!("CARGO_BIN_EXE_cargo-rail-distributed-worker"));
+    let worker = &crate::helpers::cargo_binary("cargo-rail-distributed-worker");
     let rustc = which_rustc()?;
     let identity = generate_mutual_tls_identity()?;
     let mut server = Command::new(worker)

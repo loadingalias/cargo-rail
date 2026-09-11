@@ -13,8 +13,8 @@ import urllib.request
 import tomlkit
 
 from catalog import ROOT, PLATFORMS, read, validate
-REPOS = {'cargo-binstall': 'cargo-bins/cargo-binstall', 'cmake': 'Kitware/CMake', 'llvm': 'llvm/llvm-project',
-         'git': 'git-for-windows/git', 'jq': 'jqlang/jq', 'powershell': 'PowerShell/PowerShell'}
+REPOS = {'actionlint': 'rhysd/actionlint', 'cargo-binstall': 'cargo-bins/cargo-binstall', 'cmake': 'Kitware/CMake', 'llvm': 'llvm/llvm-project',
+         'git': 'git-for-windows/git'}
 
 def fetch(url):
     request = urllib.request.Request(url, headers={'User-Agent': 'Cargo-Rail tooling (local release updater)'})
@@ -120,7 +120,7 @@ def update_catalog():
         data['updater'][name] = api(f'https://pypi.org/pypi/{name}/json')['info']['version']
     versions = data['versions']
     for name, repo in REPOS.items():
-        versions[name] = release(repo)['tag_name'].removeprefix('v').removeprefix('jq-').removeprefix('llvmorg-')
+        versions[name] = release(repo)['tag_name'].removeprefix('v').removeprefix('llvmorg-')
     versions['rustup'] = tomllib.loads(fetch('https://static.rust-lang.org/rustup/release-stable.toml')[0].decode())['version']
     releases = api('https://www.python.org/api/v2/downloads/release/')
     versions['python'] = max((semver(item['name'].removeprefix('Python ')), item['name'].removeprefix('Python '))
@@ -158,9 +158,17 @@ def update_catalog():
         if not re.fullmatch('[0-9a-f]{64}', checksum):
             raise ValueError('invalid rustup checksum')
         assets['rustup'] = {'url': rustup_url, 'sha256': checksum}
+        if 'cargo-nextest' in assets:
+            version = data['cargo']['cargo-nextest']
+            release_data = api(f'https://api.github.com/repos/nextest-rs/nextest/releases/tags/cargo-nextest-{version}')
+            name = f'cargo-nextest-{version}-{host}.tar.gz'
+            asset = next(item for item in release_data['assets'] if item['name'] == name)
+            assets['cargo-nextest'] = pinned_url(asset['browser_download_url'])
         if not platform['cargo']:
             continue
         assets['cargo-binstall'] = github_asset(REPOS['cargo-binstall'], f'cargo-binstall-{host}.' + ('zip' if windows else 'tgz'))
+        if 'actionlint' in assets:
+            assets['actionlint'] = github_asset(REPOS['actionlint'], f'actionlint_{versions["actionlint"]}_linux_amd64.tar.gz')
         cmake_arch = ('arm64' if arch == 'aarch64' else 'x86_64') if windows else arch
         assets['cmake'] = github_asset(REPOS['cmake'], f'cmake-{versions["cmake"]}-' + (f'windows-{cmake_arch}.zip' if windows else f'linux-{cmake_arch}.tar.gz'))
         if 'llvm' in assets:
@@ -170,8 +178,6 @@ def update_catalog():
             assets['python'] = pinned_url(f'https://www.python.org/ftp/python/{versions["python"]}/python-{versions["python"]}-embed-{pyarch}.zip')
             git_version = versions['git'].replace('.windows.', '.')
             assets['git'] = github_asset(REPOS['git'], f'Git-{git_version}-' + ('arm64' if arch == 'aarch64' else '64-bit') + '.exe')
-            assets['jq'] = github_asset(REPOS['jq'], f'jq-windows-{pyarch}.exe')
-            assets['powershell'] = github_asset(REPOS['powershell'], f'PowerShell-{versions["powershell"]}-win-' + ('arm64' if arch == 'aarch64' else 'x64') + '.zip')
     validate(data)
     write(path, data)
 

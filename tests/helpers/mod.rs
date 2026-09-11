@@ -1,5 +1,10 @@
 //! Test helpers for integration tests
 
+#![allow(
+    dead_code,
+    reason = "Each integration target uses a subset of these shared fixtures."
+)]
+
 use anyhow::{Context, Result, ensure};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -33,8 +38,14 @@ pub fn assert_native_driver_unavailable_bypass(events: &[serde_json::Value], pha
     );
 }
 
+/// Resolve Cargo's runtime binary location, including Nextest archive relocation.
+pub fn cargo_binary(name: &str) -> PathBuf {
+    PathBuf::from(std::env::var_os(format!("CARGO_BIN_EXE_{name}")).expect("Cargo test binary location"))
+}
+
 fn isolated_git_config() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/isolated.gitconfig")
+    PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo test workspace location"))
+        .join("tests/fixtures/isolated.gitconfig")
 }
 
 /// Build a Git command isolated from ambient identity and line-ending policy.
@@ -98,7 +109,7 @@ pub fn rustc_host_target() -> Result<String> {
 /// Build a cargo-rail command isolated from developer compiler wrappers and Git configuration.
 pub fn cargo_rail_command(cwd: &Path) -> Result<Command> {
     let git_config = isolated_git_config();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-rail"));
+    let mut command = Command::new(crate::helpers::cargo_binary("cargo-rail"));
     command
         .current_dir(cwd)
         .env("CARGO_RAIL_CACHE_DIR", cwd.join("target/cargo-rail-test-cache"))

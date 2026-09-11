@@ -2,7 +2,10 @@
 import copy
 import io
 import importlib.util
+import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -20,7 +23,7 @@ import verify
 class CatalogCommand(unittest.TestCase):
     def test_empty_tool_inventory_emits_no_shell_array_element(self):
         output = subprocess.run(
-            [sys.executable, str(Path(catalog.__file__).resolve()), 'get', 'riscv64-linux', 'cargo'],
+            [sys.executable, str(Path(catalog.__file__).resolve()), 'select', 'riscv64-linux', 'ci', 'cargo'],
             check=True, capture_output=True,
         )
         self.assertEqual(output.stdout, b'')
@@ -172,6 +175,74 @@ aliased={package="serde",version="=1",features=["derive"]} # keep
 
 
 class CatalogPolicy(unittest.TestCase):
+    def test_full_ci_and_package_selections_preserve_native_build_tools(self):
+        data = catalog.read()
+        for platform in ('aarch64-linux', 'x86_64-linux', 'aarch64-win', 'x86_64-win'):
+            with self.subTest(platform=platform):
+                ci = catalog.selection(data, platform, 'ci')
+                package = catalog.selection(data, platform, 'package')
+                self.assertEqual(ci['cargo'], ['cargo-deny', 'cargo-nextest', 'just'])
+                self.assertEqual(set(ci['components']), {'clippy', 'rustfmt', 'rustc-dev', 'llvm-tools'})
+                self.assertEqual(package['cargo'], ['just'])
+                self.assertEqual(package['components'], ['rustc-dev', 'llvm-tools'])
+                required = {'rustup', 'cargo-binstall', 'cmake'}
+                if platform.endswith('-win'):
+                    required |= {'llvm', 'python', 'git'}
+                self.assertEqual(set(package['assets']), required)
+                self.assertEqual(set(ci['assets']), required | ({'actionlint'} if platform == 'x86_64-linux' else set()))
+                if platform.endswith('-linux'):
+                    self.assertFalse({'shellcheck', 'python3-venv', 'jq'} & set(package['packages']))
+        self.assertEqual(data, catalog.read(), 'selection mutated the catalog')
+
+    def test_cache_hosts_keep_their_small_ci_selection(self):
+        for platform in ('riscv64-linux', 's390x-linux', 'powerpc64le-linux'):
+            selected = catalog.selection(catalog.read(), platform, 'ci')
+            self.assertEqual(selected['cargo'], [])
+            self.assertEqual(selected['components'], ['rustc-dev', 'llvm-tools'])
+            self.assertIn('openssl', selected['packages'])
+            self.assertEqual(set(selected['assets']), {'rustup', 'cargo-nextest'} if platform == 'riscv64-linux' else {'rustup'})
+            with self.assertRaisesRegex(ValueError, 'no package tool selection'):
+                catalog.selection(catalog.read(), platform, 'package')
+
+    def test_riscv_build_installs_only_cross_build_tools(self):
+        self.assertEqual(catalog.rust_channel('x86_64-linux', 'riscv-build'), catalog.rust_channel('riscv64-linux'))
+        self.assertEqual(catalog.rust_channel('x86_64-linux', 'ci'), catalog.rust_channel())
+        selected = catalog.selection(catalog.read(), 'x86_64-linux', 'riscv-build')
+        self.assertEqual(selected['components'], [])
+        self.assertEqual(selected['cargo'], ['cargo-nextest', 'just'])
+        self.assertEqual(set(selected['assets']), {'rustup', 'cargo-binstall', 'cmake'})
+        self.assertTrue({'gcc-riscv64-linux-gnu', 'g++-riscv64-linux-gnu', 'libc6-dev-riscv64-cross'} <= set(selected['packages']))
+        self.assertFalse({'shellcheck', 'python3-venv', 'openssl'} & set(selected['packages']))
+        with self.assertRaisesRegex(ValueError, 'requires x86_64-linux'):
+            catalog.selection(catalog.read(), 'riscv64-linux', 'riscv-build')
+
+    def test_unknown_operation_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, 'unknown tooling operation'):
+            catalog.selection(catalog.read(), 'x86_64-linux', 'typo')
+
+    def test_selected_build_prerequisites_cannot_be_removed(self):
+        for operation, field, name in [('package', 'components', 'rustc-dev'),
+                                       ('package', 'components', 'llvm-tools'),
+                                       ('package', 'assets', 'llvm'),
+                                       ('package', 'assets', 'cmake'),
+                                       ('ci', 'components', 'clippy'),
+                                       ('ci', 'components', 'rustfmt'),
+                                       ('ci', 'cargo', 'cargo-nextest'),
+                                       ('ci', 'packages', 'build-essential')]:
+            with self.subTest(operation=operation, field=field, name=name):
+                data = catalog.read()
+                data['operations'][operation][field].remove(name)
+                with self.assertRaises(ValueError):
+                    catalog.validate(data)
+
+    def test_selection_command_supplies_windows_package_inventory(self):
+        output = subprocess.check_output(
+            [sys.executable, str(Path(catalog.__file__).resolve()), 'select', 'x86_64-win', 'package'], text=True)
+        selected = json.loads(output)
+        self.assertEqual(selected['cargo'], ['just'])
+        self.assertEqual(selected['components'], ['rustc-dev', 'llvm-tools'])
+        self.assertEqual(set(selected['assets']), {'rustup', 'cargo-binstall', 'llvm', 'cmake', 'python', 'git'})
+
     def test_rust_override_requires_a_dated_nightly(self):
         for channel in ('nightly', 'stable', 'nightly-latest'):
             data = catalog.read()
@@ -190,6 +261,13 @@ class CatalogPolicy(unittest.TestCase):
 
 
 class Archives(unittest.TestCase):
+    def test_package_archive_installation_omits_workflow_validator(self):
+        with patch.object(sys, 'argv', ['catalog.py', 'install-archives', 'x86_64-linux', 'package', '/fixture']), \
+             patch.object(catalog, 'install_archive', return_value=Path('/installed')) as install, \
+             patch('sys.stdout', new_callable=io.StringIO):
+            catalog.main()
+        self.assertEqual([call.args[0] for call in install.call_args_list], ['cargo-binstall', 'cmake'])
+
     def test_extraction_rejects_traversal(self):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary); archive=root/'archive.tar'
@@ -231,6 +309,50 @@ class Archives(unittest.TestCase):
             path=Path(temporary)/'download'
             with self.assertRaises(ValueError): catalog.download(response.url,path,'a'*64)
             self.assertFalse(path.exists())
+
+
+class SelectedVerification(unittest.TestCase):
+    def test_package_verification_requires_only_selected_components_and_tools(self):
+        def run(*arguments, **kwargs):
+            if arguments[:3] == ('rustup', 'component', 'list'):
+                return 'rustc-dev-x86_64-unknown-linux-gnu\nllvm-tools-x86_64-unknown-linux-gnu\n'
+            if Path(arguments[0]).name == 'rust-smoke':
+                return 'native-rust-ok\n'
+            if Path(arguments[0]).name == 'c-smoke':
+                return 'native-c-ok\n'
+            return ''
+        with patch('sys.stdout', new_callable=io.StringIO), \
+             patch.object(verify, 'verify_rust'), patch.object(verify, 'run', side_effect=run), \
+             patch.object(verify, 'verify_version') as version:
+            verify.verify('x86_64-linux', 'package')
+        self.assertEqual([call.args[0] for call in version.call_args_list], ['rustup', 'cargo-binstall', 'cmake', 'just'])
+
+
+class ToolingLane(unittest.TestCase):
+    def test_shared_recipe_rejects_invalid_workflow(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shutil.copytree(catalog.ROOT / 'scripts', root / 'scripts')
+            shutil.copytree(catalog.ROOT / '.config', root / '.config')
+            shutil.copy(catalog.ROOT / 'justfile', root / 'justfile')
+            (root / '.git').mkdir()
+            workflows = root / '.github/workflows'
+            workflows.mkdir(parents=True)
+            (workflows / 'invalid.yml').write_text('''name: Invalid
+on: push
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    unexpected-tooling-key: true
+    steps:
+      - run: echo checked
+''')
+            environment = dict(os.environ)
+            environment.pop('BASH_ENV', None)
+            result = subprocess.run(['just', 'check-tooling'], cwd=root, env=environment,
+                                    capture_output=True, text=True, timeout=30)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('unexpected-tooling-key', result.stdout + result.stderr)
 
 
 if __name__ == '__main__': unittest.main()

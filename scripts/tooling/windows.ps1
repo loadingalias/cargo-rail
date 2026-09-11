@@ -1,5 +1,8 @@
 # Shared native Windows provisioning. Run in an elevated PowerShell session.
-param([Parameter(Mandatory)][ValidateSet('aarch64-win', 'x86_64-win')][string]$Platform)
+param(
+    [Parameter(Mandatory)][ValidateSet('aarch64-win', 'x86_64-win')][string]$Platform,
+    [Parameter(Mandatory)][ValidateSet('ci', 'package')][string]$Operation
+)
 $ErrorActionPreference = 'Stop'
 $env:PYTHONDONTWRITEBYTECODE = '1'
 Set-StrictMode -Version Latest
@@ -71,7 +74,9 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Unable to parse tooling catalog.' }
     $catalog = $catalogJson | ConvertFrom-Json
     Invoke-Native $python @($catalogHelper, 'validate')
-    $native = $catalog.$Platform
+    $selection = & $python $catalogHelper select $Platform $Operation
+    if ($LASTEXITCODE -ne 0) { throw 'Unable to select operation tooling.' }
+    $native = $selection | ConvertFrom-Json
     $channel = & $python $catalogHelper rust-channel $Platform
     if ($LASTEXITCODE -ne 0) { throw 'Unable to resolve the runner Rust toolchain.' }
 
@@ -102,14 +107,11 @@ try {
     Get-PinnedDownload $native.assets.git.url $native.assets.git.sha256 $gitInstaller
     $gitDirectory = Join-Path $prefix ('git-' + $catalog.versions.git)
     Install-Exe $gitInstaller @('/VERYSILENT', '/NORESTART', '/NOCANCEL', '/SP-', ('/DIR="' + $gitDirectory + '"'))
-    $binDirectory = Join-Path $prefix 'bin'
-    New-Item -ItemType Directory -Force $binDirectory | Out-Null
-    Get-PinnedDownload $native.assets.jq.url $native.assets.jq.sha256 (Join-Path $binDirectory 'jq.exe')
     # Use the actual Bash binary. Git's bin/bash.exe launcher prepends usr/bin
     # again, shadowing MSVC's linker even after the developer shell is entered.
-    $paths = @($pythonDirectory, $binDirectory, (Join-Path $gitDirectory 'cmd'),
+    $paths = @($pythonDirectory, (Join-Path $gitDirectory 'cmd'),
         (Join-Path $gitDirectory 'usr\bin'))
-    foreach ($name in @('llvm', 'cmake', 'cargo-binstall', 'powershell')) {
+    foreach ($name in @('llvm', 'cmake', 'cargo-binstall')) {
         $directory = & $python (Join-Path $PSScriptRoot 'catalog.py') install-archive $Platform $name $prefix
         if ($LASTEXITCODE -ne 0) { throw "Unable to install $name" }
         $toolBin = if (Test-Path (Join-Path $directory 'bin')) { Join-Path $directory 'bin' } else { $directory }
@@ -138,7 +140,7 @@ try {
         Invoke-Native 'cargo' @("+$channel", 'binstall', '--locked', '--no-confirm', '--targets', $native.'rust-host', "$tool@$($catalog.cargo.$tool)")
     }
     # Match the Bash environment used by Just's recipes as well as PowerShell.
-    Invoke-Native 'bash' @('-c', ('python3 "' + ($PSScriptRoot -replace '\\', '/') + '/verify.py" ' + $Platform))
+    Invoke-Native 'bash' @('-c', ('python3 "' + ($PSScriptRoot -replace '\\', '/') + '/verify.py" ' + $Platform + ' ' + $Operation))
 
     # Persist the complete MSVC/SDK environment, not only the paths to installed executables.
     foreach ($name in @('PATH', 'RUSTUP_TOOLCHAIN', 'INCLUDE', 'LIB', 'LIBPATH', 'LIBCLANG_PATH',
@@ -162,7 +164,7 @@ try {
             }
         }
     }
-    Write-Host "Installed $Platform tooling. New shells inherit the configured compiler environment."
+    Write-Host "Installed $Platform $Operation tooling. New shells inherit the configured compiler environment."
 } finally {
     Remove-Item -Recurse -Force $temporary -ErrorAction SilentlyContinue
 }

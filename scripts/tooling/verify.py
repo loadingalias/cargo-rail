@@ -28,9 +28,9 @@ def verify_version(name, version, command):
         raise ValueError(f'{name} does not match its pinned version')
 
 
-def verify_rust(platform):
+def verify_rust(platform, operation=None):
     native = catalog.read()[platform]
-    channel = catalog.rust_channel(platform)
+    channel = catalog.rust_channel(platform, operation)
     version = run('rustc', '-vV')
     if f'host: {native["rust-host"]}\n' not in version:
         raise ValueError('active Rust compiler does not match the native host')
@@ -40,30 +40,31 @@ def verify_rust(platform):
             raise ValueError(f'active {tool} does not match the pinned toolchain {channel}')
 
 
-def verify(platform):
+def verify(platform, operation):
     data = catalog.read()
-    native = data[platform]
-    verify_rust(platform)
+    native = catalog.selection(data, platform, operation)
+    verify_rust(platform, operation)
     installed = run('rustup', 'component', 'list', '--installed').splitlines()
     for component in native['components']:
         if not any(line.startswith(component + '-') for line in installed):
             raise ValueError(f'missing Rust component: {component}')
     pinned_commands = [('rustup', ['rustup', '--version'])]
     for name, command in (
+        ('actionlint', ['actionlint', '--version']),
         ('cargo-binstall', ['cargo', 'binstall', '-V']),
         ('cmake', ['cmake', '--version']),
         ('llvm', ['clang', '--version']),
         ('git', ['git', '--version']),
-        ('jq', ['jq', '--version']),
         ('python', [sys.executable, '--version']),
-        ('powershell', ['pwsh', '-NoProfile', '-NonInteractive', '-Command', '$PSVersionTable.PSVersion.ToString()']),
     ):
         if name in native['assets']:
             pinned_commands.append((name, command))
     for name, command in pinned_commands:
         verify_version(name, data['versions'][name], command)
+    if 'cargo-nextest' in native['assets']:
+        verify_version('cargo-nextest', data['cargo']['cargo-nextest'], ['cargo', 'nextest', '--version'])
     for tool in native['cargo']:
-        command = ['cargo', tool.removeprefix('cargo-')] if tool.startswith('cargo-') else [{'ripgrep': 'rg'}.get(tool, tool)]
+        command = ['cargo', tool.removeprefix('cargo-')] if tool.startswith('cargo-') else [tool]
         verify_version(tool, data['cargo'][tool], [*command, '--version'])
     for tool in ('git', 'bash'):
         run(tool, '--version')
@@ -97,4 +98,4 @@ def verify(platform):
 
 
 if __name__ == '__main__':
-    verify(sys.argv[1])
+    verify(*sys.argv[1:])

@@ -7,11 +7,19 @@ Install these tools:
 - Rust through `rustup`; `rust-toolchain.toml` selects the repository toolchain and components.
 - `just`, `cargo-nextest`, and `cargo-deny`.
 - For `just build` and `just test`: Python 3.11 or newer and `rustc-dev` for the selected toolchain.
-- For local checks on macOS: Zig, `cargo-zigbuild`, `cargo-xwin`, and LLVM tools required by cargo-xwin.
+- For `just check` and `just ci-check`: `rustc-dev` for the selected toolchain.
+- For `just check` on macOS: Zig, `cargo-zigbuild`, `cargo-xwin`, and LLVM tools required by cargo-xwin.
+- For `just check-tooling`: Python 3.11 or newer, ShellCheck, and Actionlint.
 - For `just test` on macOS: clang with COFF support, `lld-link`, and `ld64.lld` on `PATH`, plus `cargo-xwin`
   with its x86_64 MSVC SDK already cached. The cross-link test runs offline.
 
 Run commands from the repository root. Use `just --list` to see the maintained command surface.
+
+Native runner installers require an operation: for example, `scripts/tooling/x86_64-linux.sh ci` or
+`scripts/tooling/x86_64-win.ps1 -Operation package`. The tooling catalog selects the operation's Cargo tools,
+Rust components, and native prerequisites. Package provisioning retains the compiler development components
+and native build tools while omitting check and test tools. Unix release jobs use `scripts/tooling/package-unix.sh`
+with their native target; macOS packaging requires the runner's Xcode tools, CMake, Python, and rustup.
 
 ## Make a change
 
@@ -47,17 +55,37 @@ On macOS, `just test` also runs the Cranelift production-cache contract.
 The first run may download these components; later runs reuse the installed toolchain.
 Advance that separate nightly pin only after the focused lane passes.
 
-On the local macOS workstation, `just check` first runs `just fix`, then validates the resulting worktree.
-Both commands run host Clippy and
-cross-target Clippy for Linux GNU/musl and Windows MSVC on x86-64 and ARM64, with all Cargo targets and features.
-`just fix` applies Rustfmt and Clippy edits, including to dirty or staged files; review the resulting diff.
-Cross-target checks do not execute tests or prove final executable linking.
+Local work and CI use the same nonmutating `just ci-check` lane: formatting, host Clippy with all Cargo targets and
+features, dependency policy using `deny.toml`'s target scope, documentation, and the excluded compiler driver's
+dedicated checks.
 
-CI uses `just ci-check` for native formatting, Clippy, dependency policy, and documentation checks without source
-repairs. Dependency unification remains in the local check because it analyzes the repository's full target policy.
-Run `just test` separately for runtime tests, including native cache tests. `just check-tooling` validates
-the installer and updater scripts; it does not update tooling. Use `just check-compiler-driver` for the excluded
-compiler driver.
+On the macOS workstation, `just check` first runs `just fix`, then `just ci-check`, followed by cross-target Clippy
+for Linux GNU/musl and Windows MSVC on x86-64 and ARM64, and `cargo rail unify --check --explain` against the
+repository. Fixing applies workspace Rustfmt and host Clippy repairs, including to dirty or staged files;
+review the resulting diff. Cross-target checks do not execute tests or prove final executable linking.
+CI calls `just ci-check` for this lane; workstation cross-compilation and dogfooding remain outside it.
+
+Run `just test` separately for runtime tests, including native cache tests and doctests. Local work and CI use
+the default nextest profile and the same concurrency policy for the full suite.
+`just check-tooling` validates the installer and updater scripts and runs Actionlint over the workflows without
+updating tooling. CI runs it once on Linux x64 and runs `scripts/tooling/check.ps1` once with Windows' existing
+PowerShell runtime to check PowerShell syntax.
+Use `just test-cache-host` for the native local-cache, remote-storage, and mTLS distributed-worker qualification
+used by the IBM Z, POWER, and RISC-V CI runners. It builds the library test harness and the separate `cache`
+integration target with the `cache-host` Cargo profile (debug information disabled; assertions retained), then runs required cases serially and stops on the first failure. The same cases remain in
+`just test`; the cache-only lane does not run doctests or unrelated integration tests. CI invokes
+`scripts/check-cache-host.sh` directly so IBM Z and POWER do not need Just or Nextest installed.
+
+RISC-V builds the same cache harnesses and Cargo binaries on x86-64, then runs them through Nextest on the
+native runner. Install `scripts/tooling/x86_64-linux.sh riscv-build`, source the emitted tooling environment,
+and run `just test-cache-host prepare riscv64gc-unknown-linux-gnu target/riscv-cache`. Transfer that directory
+to the same source checkout on RISC-V, install its `ci` tooling, and run
+`just test-cache-host run target/riscv-cache` locally or `scripts/check-cache-host.sh run target/riscv-cache`
+in CI. The transfer requires the same source, compiler release and commit, Nextest build, and exact test selection;
+missing or ignored cases fail. The native runner installs prebuilt Nextest and retains Rust, compiler development
+components, a linker, and OpenSSL for the cache fixtures. The authenticated compiler-driver source travels in the
+archive and bootstraps against the native compiler. No doctests or unrelated integration tests enter this lane.
+Use `just check-compiler-driver` to run only the excluded compiler driver's checks.
 
 ## Work on compiler integration
 

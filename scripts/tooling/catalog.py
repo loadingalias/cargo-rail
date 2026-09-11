@@ -25,12 +25,31 @@ def read(path=CATALOG):
         return tomllib.load(stream)
 
 
-def rust_channel(platform=None):
+def rust_channel(platform=None, operation=None):
+    if operation == 'riscv-build':
+        platform = 'riscv64-linux'
     if platform is not None:
         override = read()[platform].get('rust-channel')
         if override is not None:
             return override
     return read(ROOT / 'rust-toolchain.toml')['toolchain']['channel']
+
+
+def selection(data, platform, operation):
+    if operation not in data['operations']:
+        raise ValueError(f'unknown tooling operation: {operation}')
+    if operation == 'riscv-build' and platform != 'x86_64-linux':
+        raise ValueError('riscv-build requires x86_64-linux')
+    native = data[platform]
+    if operation == 'package' and 'just' not in native['cargo']:
+        raise ValueError(f'{platform}: no package tool selection')
+    policy = data['operations'][operation]
+    selected = dict(native)
+    for field in ('cargo', 'components', 'packages'):
+        if field in native:
+            selected[field] = [name for name in native[field] if name in policy[field]]
+    selected['assets'] = {name: asset for name, asset in native['assets'].items() if name in policy['assets']}
+    return selected
 
 
 def download(url, destination, checksum):
@@ -92,6 +111,14 @@ def install_archive(name, asset, prefix):
 
 
 def validate(data):
+    if set(data['operations']) != {'ci', 'package', 'riscv-build'}:
+        raise ValueError('tooling operations must be ci, package, and riscv-build')
+    for operation, policy in data['operations'].items():
+        if operation != 'riscv-build' and not {'rustc-dev', 'llvm-tools'} <= set(policy['components']):
+            raise ValueError(f'{operation}: missing compiler components')
+        for tool in policy['cargo']:
+            if tool not in data['cargo']:
+                raise ValueError(f'{operation}: no version for {tool}')
     for platform in PLATFORMS:
         config = data[platform]
         if 'rust-channel' in config and not re.fullmatch(r'nightly-\d{4}-\d{2}-\d{2}', config['rust-channel']):
@@ -107,12 +134,34 @@ def validate(data):
         for name, asset in config['assets'].items():
             if not asset['url'].startswith('https://') or not re.fullmatch('[0-9a-f]{64}', asset['sha256']):
                 raise ValueError(f'{platform}: invalid {name} asset')
+        for operation in ('ci', 'package') if config['cargo'] else ('ci',):
+            selected = selection(data, platform, operation)
+            components = {'rustc-dev', 'llvm-tools'}
+            if operation == 'ci' and config['cargo']:
+                components |= {'clippy', 'rustfmt'}
+            if not components <= set(selected['components']):
+                raise ValueError(f'{platform}/{operation}: missing compiler components')
+            required = {'just', 'cargo-deny', 'cargo-nextest'} if operation == 'ci' else {'just'}
+            if config['cargo'] and not required <= set(selected['cargo']):
+                raise ValueError(f'{platform}/{operation}: missing required Cargo tools')
+            prerequisites = set(config['assets']) - {'actionlint'}
+            if not prerequisites <= set(selected['assets']):
+                raise ValueError(f'{platform}/{operation}: missing native build/bootstrap asset')
+            if platform.endswith('-linux') and not {'build-essential', 'ca-certificates', 'curl', 'git', 'python3'} <= set(selected['packages']):
+                raise ValueError(f'{platform}/{operation}: missing native build/bootstrap package')
     for platform in ('riscv64-linux', 's390x-linux', 'powerpc64le-linux'):
         config = data[platform]
-        if config['cargo'] or set(config['components']) != {'rustc-dev', 'llvm-tools'} or set(config['assets']) != {'rustup'}:
-            raise ValueError(f'{platform}: native cache validation requires rustc-dev and llvm-tools without auxiliary Cargo tools')
+        if config['cargo'] or set(config['components']) != {'rustc-dev', 'llvm-tools'} or set(config['assets']) != ({'rustup', 'cargo-nextest'} if platform == 'riscv64-linux' else {'rustup'}):
+            raise ValueError(f'{platform}: native cache validation requires its minimal compiler and runner tools')
         if not {'build-essential', 'ca-certificates', 'curl', 'git', 'python3'} <= set(config['packages']):
             raise ValueError(f'{platform}: missing native build/bootstrap package')
+
+    cross = selection(data, 'x86_64-linux', 'riscv-build')
+    if cross['components'] or set(cross['cargo']) != {'just', 'cargo-nextest'} or set(cross['assets']) != {'rustup', 'cargo-binstall', 'cmake'}:
+        raise ValueError('riscv-build must install only archive build tools')
+    if not {'build-essential', 'ca-certificates', 'curl', 'git', 'python3', 'perl', 'gcc-riscv64-linux-gnu',
+            'g++-riscv64-linux-gnu', 'libc6-dev-riscv64-cross'} <= set(cross['packages']):
+        raise ValueError('riscv-build is missing cross compiler prerequisites')
 
 
 def main():
@@ -131,6 +180,16 @@ def main():
             print(value)
     elif command == 'json':
         print(json.dumps(data))
+    elif command == 'select':
+        platform, operation, *keys = args
+        value = selection(data, platform, operation)
+        for key in keys:
+            value = value[key]
+        if isinstance(value, list):
+            for item in value:
+                print(item)
+        else:
+            print(json.dumps(value))
     elif command == 'rust-channel':
         print(rust_channel(*args))
     elif command == 'validate':
@@ -140,8 +199,8 @@ def main():
         platform, name, prefix = args
         print(install_archive(name, data[platform]['assets'][name], prefix))
     elif command == 'install-archives':
-        platform, prefix = args
-        for name, asset in data[platform]['assets'].items():
+        platform, operation, prefix = args
+        for name, asset in selection(data, platform, operation)['assets'].items():
             if name == 'rustup':
                 continue
             directory = install_archive(name, asset, prefix)

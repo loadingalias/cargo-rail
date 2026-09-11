@@ -210,6 +210,15 @@ overflow-checks = true
 [profile.dev.package.rscrypto]
 opt-level = 3
 
+# Cache qualification needs assertions, not large debugger payloads on slow runners.
+[profile.cache-host]
+inherits = "dev"
+debug = false
+
+[[test]]
+name = "cache"
+path = "tests/cache/mod.rs"
+
 [[test]]
 name = "integration"
 path = "tests/integration/mod.rs"
