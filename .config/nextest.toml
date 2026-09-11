@@ -87,7 +87,7 @@ test-threads = 1
 [[profile.cache-host.overrides]]
 platform = 'riscv64gc-unknown-linux-gnu'
 filter = 'binary(=cache) & test(=test_cache_installation::direct_s3_remote_is_l2_only_and_falls_back_cold_on_corruption_or_outage)'
-# This case performs five isolated installations plus reuse and recovery checks.
+# This case includes source-only driver preparation plus reuse and recovery checks.
 slow-timeout = { period = "60s", terminate-after = 30 }
 
 [[profile.cache-host.overrides]]
