@@ -111,6 +111,9 @@ def install_archive(name, asset, prefix):
 
 
 def validate(data):
+    jobs = data['windows'].get('cargo-build-jobs')
+    if type(jobs) is not int or jobs < 1:
+        raise ValueError('windows: cargo-build-jobs must be a positive integer')
     if set(data['operations']) != {'ci', 'package', 'riscv-build'}:
         raise ValueError('tooling operations must be ci, package, and riscv-build')
     for operation, policy in data['operations'].items():

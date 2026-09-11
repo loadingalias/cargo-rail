@@ -44,7 +44,7 @@ jobs:
     needs: riscv-build
     name: ${{ matrix.platform }}
     strategy:
-      fail-fast: true
+      fail-fast: false
       matrix:
         include:
           - platform: x86_64-linux

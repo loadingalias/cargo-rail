@@ -134,6 +134,7 @@ try {
     foreach ($component in $native.components) { $rustArguments += @('--component', $component) }
     Invoke-Native 'rustup' $rustArguments
     $env:RUSTUP_TOOLCHAIN = $channel
+    $env:CARGO_BUILD_JOBS = [string]$catalog.windows.'cargo-build-jobs'
     Remove-Item Env:RUSTC_WRAPPER -ErrorAction SilentlyContinue
     Remove-Item Env:CARGO_ENCODED_RUSTFLAGS -ErrorAction SilentlyContinue
     foreach ($tool in $native.cargo) {
@@ -143,7 +144,7 @@ try {
     Invoke-Native 'bash' @('-c', ('python3 "' + ($PSScriptRoot -replace '\\', '/') + '/verify.py" ' + $Platform + ' ' + $Operation))
 
     # Persist the complete MSVC/SDK environment, not only the paths to installed executables.
-    foreach ($name in @('PATH', 'RUSTUP_TOOLCHAIN', 'INCLUDE', 'LIB', 'LIBPATH', 'LIBCLANG_PATH',
+    foreach ($name in @('PATH', 'RUSTUP_TOOLCHAIN', 'CARGO_BUILD_JOBS', 'INCLUDE', 'LIB', 'LIBPATH', 'LIBCLANG_PATH',
         'VSINSTALLDIR', 'VCINSTALLDIR', 'VCToolsInstallDir', 'VCToolsVersion',
         'VSCMD_VER', 'VSCMD_ARG_TGT_ARCH', 'VSCMD_ARG_HOST_ARCH',
         'WindowsSdkDir', 'WindowsSDKVersion', 'WindowsSdkBinPath', 'WindowsSdkVerBinPath',

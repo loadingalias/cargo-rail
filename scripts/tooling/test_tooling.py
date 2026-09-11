@@ -175,6 +175,13 @@ aliased={package="serde",version="=1",features=["derive"]} # keep
 
 
 class CatalogPolicy(unittest.TestCase):
+    def test_windows_build_jobs_require_a_positive_integer(self):
+        for value in (None, 0, -1, True, '2'):
+            data = catalog.read()
+            data['windows']['cargo-build-jobs'] = value
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'cargo-build-jobs'):
+                catalog.validate(data)
+
     def test_full_ci_and_package_selections_preserve_native_build_tools(self):
         data = catalog.read()
         for platform in ('aarch64-linux', 'x86_64-linux', 'aarch64-win', 'x86_64-win'):

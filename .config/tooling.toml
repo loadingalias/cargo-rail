@@ -52,6 +52,8 @@ codename = "noble"
 snapshot = "20260906T053626Z"
 
 [windows]
+# Bound simultaneous Rust links on the smallest provisioned Windows runner.
+cargo-build-jobs = 2
 visual-studio = "18.9.2"
 build-version = "18.9.12120.119"
 channel-url = "https://download.visualstudio.microsoft.com/download/pr/fe4fb3e6-ea32-4ae3-b154-72821a274f0d/8ae0a45312cd28cec640174c5df11085f4efcb3bf210bd94cea932fb42c36778/VisualStudio.18.Release.chman"

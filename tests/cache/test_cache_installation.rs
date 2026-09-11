@@ -4091,8 +4091,10 @@ fn direct_s3_remote_is_l2_only_and_falls_back_cold_on_corruption_or_outage() {
             ));
         }
         fs::write(&source_path, credential_source)?;
+        eprintln!("S3 cache qualification: credential setup");
         let setup = rail(&workspace.path, credential_home.path(), &["rail", "cache", "setup"])?;
         assert!(setup.status.success(), "credential cache setup failed: {setup:?}");
+        eprintln!("S3 cache qualification: credential compilation");
         let credential_probe = cargo_check_remote(
             &workspace.path,
             credential_home.path(),
@@ -4121,10 +4123,12 @@ fn direct_s3_remote_is_l2_only_and_falls_back_cold_on_corruption_or_outage() {
         fs::remove_dir_all(workspace.path.join("target"))?;
 
         let seed_home = tempfile::tempdir()?;
+        eprintln!("S3 cache qualification: seed setup");
         let setup = rail(&workspace.path, seed_home.path(), &["rail", "cache", "setup"])?;
         assert!(setup.status.success(), "seed cache setup failed: {setup:?}");
         let seed_coverage = tempfile::tempdir()?;
         fs::set_permissions(seed_coverage.path(), fs::Permissions::from_mode(0o700))?;
+        eprintln!("S3 cache qualification: remote seed compilation");
         let seed = cargo_check_remote(
             &workspace.path,
             seed_home.path(),
@@ -4147,6 +4151,7 @@ fn direct_s3_remote_is_l2_only_and_falls_back_cold_on_corruption_or_outage() {
         let before_l1_hit = remote.request_count();
         let l1_coverage = tempfile::tempdir()?;
         fs::set_permissions(l1_coverage.path(), fs::Permissions::from_mode(0o700))?;
+        eprintln!("S3 cache qualification: offline L1 reuse");
         let l1_hit = cargo_check_remote(
             &workspace.path,
             seed_home.path(),
@@ -4175,6 +4180,7 @@ fn direct_s3_remote_is_l2_only_and_falls_back_cold_on_corruption_or_outage() {
 
         remote.set_available(true);
         let import_home = tempfile::tempdir()?;
+        eprintln!("S3 cache qualification: import setup");
         let setup = rail(&workspace.path, import_home.path(), &["rail", "cache", "setup"])?;
         assert!(setup.status.success(), "import cache setup failed: {setup:?}");
         fs::remove_dir_all(workspace.path.join("target"))?;
@@ -4182,6 +4188,7 @@ fn direct_s3_remote_is_l2_only_and_falls_back_cold_on_corruption_or_outage() {
         fs::set_permissions(import_coverage.path(), fs::Permissions::from_mode(0o700))?;
         let writes_before_import = remote.requests().iter().filter(|(method, _)| method == "PUT").count();
         let requests_before_import = remote.request_count();
+        eprintln!("S3 cache qualification: remote import");
         let imported = cargo_check_remote(
             &workspace.path,
             import_home.path(),
@@ -4285,6 +4292,7 @@ fn direct_s3_remote_is_l2_only_and_falls_back_cold_on_corruption_or_outage() {
         let requests_before_packed_hit = remote.request_count();
         let packed_coverage = tempfile::tempdir()?;
         fs::set_permissions(packed_coverage.path(), fs::Permissions::from_mode(0o700))?;
+        eprintln!("S3 cache qualification: offline imported L1 reuse");
         let packed_hit = cargo_check_remote(
             &workspace.path,
             import_home.path(),
@@ -4316,11 +4324,13 @@ fn direct_s3_remote_is_l2_only_and_falls_back_cold_on_corruption_or_outage() {
         remote.set_available(true);
         assert!(remote.corrupt_result(), "fixture had no remote result to corrupt");
         let corrupt_home = tempfile::tempdir()?;
+        eprintln!("S3 cache qualification: corruption setup");
         let setup = rail(&workspace.path, corrupt_home.path(), &["rail", "cache", "setup"])?;
         assert!(setup.status.success(), "corrupt cache setup failed: {setup:?}");
         fs::remove_dir_all(workspace.path.join("target"))?;
         let corrupt_coverage = tempfile::tempdir()?;
         fs::set_permissions(corrupt_coverage.path(), fs::Permissions::from_mode(0o700))?;
+        eprintln!("S3 cache qualification: corruption cold fallback");
         let corrupt = cargo_check_remote(
             &workspace.path,
             corrupt_home.path(),
@@ -4344,9 +4354,11 @@ fn direct_s3_remote_is_l2_only_and_falls_back_cold_on_corruption_or_outage() {
 
         remote.set_available(false);
         let outage_home = tempfile::tempdir()?;
+        eprintln!("S3 cache qualification: outage setup");
         let setup = rail(&workspace.path, outage_home.path(), &["rail", "cache", "setup"])?;
         assert!(setup.status.success(), "outage cache setup failed: {setup:?}");
         fs::remove_dir_all(workspace.path.join("target"))?;
+        eprintln!("S3 cache qualification: outage cold fallback");
         let outage = cargo_check_remote(
             &workspace.path,
             outage_home.path(),
