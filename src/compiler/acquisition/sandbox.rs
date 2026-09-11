@@ -44,8 +44,6 @@ enum SandboxState {
 
 #[derive(Debug)]
 struct SandboxGeneration {
-    #[cfg(test)]
-    number: u64,
     root: PathBuf,
     target: PathBuf,
     build: PathBuf,
@@ -149,8 +147,6 @@ impl SandboxPool {
         create_private_directory(&build)?;
         fs::write(target.join("CACHEDIR.TAG"), CARGO_CACHE_DIRECTORY_TAG)?;
         let generation = SandboxGeneration {
-            #[cfg(test)]
-            number,
             root,
             target,
             build,
@@ -236,11 +232,6 @@ impl SandboxLease {
 
     pub(crate) fn build_dir(&self) -> &Path {
         &self.generation.as_ref().expect("live sandbox lease").build
-    }
-
-    #[cfg(test)]
-    pub(crate) fn generation(&self) -> u64 {
-        self.generation.as_ref().expect("live sandbox lease").number
     }
 
     pub(crate) fn finish(mut self) -> ReturnedSandbox {
@@ -348,7 +339,7 @@ mod tests {
             target
         };
         let second = pool.lease(compatibility("default")).expect("recreated lease");
-        assert_eq!(second.generation(), 1);
+        assert_ne!(second.target_dir(), first_target);
         assert!(!first_target.exists(), "poisoned generation survived reuse");
         assert!(!second.target_dir().join("partial").exists());
         let returned = second.finish();
@@ -362,19 +353,23 @@ mod tests {
         let first_target = {
             let first = pool.lease(compatibility("default")).expect("first lease");
             let target = first.target_dir().to_path_buf();
+            fs::write(target.join("artifact"), b"retained").expect("seed artifact");
             let returned = first.finish();
             pool.reclaim(returned).expect("return first sandbox");
             target
         };
         let second = pool.lease(compatibility("default")).expect("compatible lease");
-        assert_eq!(second.generation(), 0);
         assert_eq!(second.target_dir(), first_target);
+        assert_eq!(
+            fs::read(second.target_dir().join("artifact")).expect("reused artifact"),
+            b"retained"
+        );
         let returned = second.finish();
         pool.reclaim(returned).expect("return compatible sandbox");
 
         let third = pool.lease(compatibility("wasm32-wasip1")).expect("incompatible lease");
-        assert_eq!(third.generation(), 1);
         assert_ne!(third.target_dir(), first_target);
+        assert!(!third.target_dir().join("artifact").exists());
         assert!(!first_target.exists());
         let returned = third.finish();
         pool.reclaim(returned).expect("return incompatible sandbox");

@@ -67,103 +67,6 @@ impl AnalysisView {
     pub(crate) fn packages(&self) -> &BTreeSet<String> {
         &self.packages
     }
-
-    #[cfg(test)]
-    pub(crate) fn fact_families(&self) -> &BTreeSet<CompilerFactFamily> {
-        &self.fact_families
-    }
-
-    /// Root-independent typed-fact identity for the exact Cargo package set.
-    ///
-    /// Diagnostics are deliberately excluded: adding a stable diagnostic
-    /// consumer cannot invalidate otherwise identical compiler-owned facts.
-    #[cfg(test)]
-    pub(crate) fn fact_cache_identity(
-        &self,
-        cargo_members: &[&str],
-        typed_members: &BTreeSet<String>,
-    ) -> RailResult<String> {
-        let selected = cargo_members.iter().copied().collect::<BTreeSet<_>>();
-        if selected.len() != 1
-            || cargo_members.len() != 1
-            || selected.iter().any(|member| !self.packages.contains(*member))
-            || typed_members.is_empty()
-            || typed_members.iter().any(|member| !selected.contains(member.as_str()))
-        {
-            return Err(RailError::message(
-                "compiler fact cache identity requires one scheduled package",
-            ));
-        }
-        let bytes = serde_json::to_vec(&(
-            self.acquisition,
-            &self.platform,
-            &self.features,
-            selected,
-            typed_members,
-        ))?;
-        Ok(format!(
-            "{}{}",
-            crate::compiler::facts::VIEW_IDENTITY_PREFIX,
-            crate::source::ContentDigest::sha256(&bytes)
-        ))
-    }
-
-    /// Produce the fixed Cargo argv for an executable subset of this view.
-    #[cfg(test)]
-    pub(crate) fn cargo_arguments(&self, members: &[&str]) -> RailResult<Vec<OsString>> {
-        let selected = members.iter().copied().collect::<BTreeSet<_>>();
-        if selected.len() != 1 || members.len() != 1 || selected.iter().any(|member| !self.packages.contains(*member)) {
-            return Err(RailError::message(
-                "compiler analysis execution requires one scheduled package",
-            ));
-        }
-
-        let mut arguments: Vec<OsString> = match self.acquisition {
-            AnalysisAcquisition::CheckAllTargets => vec![
-                "check".into(),
-                "--locked".into(),
-                "--all-targets".into(),
-                "--message-format=json".into(),
-            ],
-            AnalysisAcquisition::CompileDoctests => vec![
-                "test".into(),
-                "--locked".into(),
-                "--doc".into(),
-                "--message-format=json".into(),
-            ],
-        };
-        match &self.features {
-            FeatureSelection::Default => {}
-            FeatureSelection::DefaultWith(features) => {
-                for member in &selected {
-                    for feature in features {
-                        arguments.push("--features".into());
-                        arguments.push(format!("{member}/{feature}").into());
-                    }
-                }
-            }
-            FeatureSelection::NoDefaultFeatures => arguments.push("--no-default-features".into()),
-            FeatureSelection::AllFeatures => arguments.push("--all-features".into()),
-            FeatureSelection::Selected(features) => {
-                arguments.push("--no-default-features".into());
-                for member in &selected {
-                    for feature in features {
-                        arguments.push("--features".into());
-                        arguments.push(format!("{member}/{feature}").into());
-                    }
-                }
-            }
-        }
-        for member in selected {
-            arguments.push("--package".into());
-            arguments.push(member.into());
-        }
-        if self.platform.as_str() != "default" {
-            arguments.push("--target".into());
-            arguments.push(self.platform.as_str().into());
-        }
-        Ok(arguments)
-    }
 }
 
 /// Deterministically ordered minimum analysis views for one set of fact requirements.
@@ -1479,7 +1382,7 @@ mod tests {
         assert_eq!(left.views().len(), 10);
         assert!(left.views().iter().all(|view| {
             view.packages() == &BTreeSet::from(["app".to_string()])
-                && view.fact_families() == &BTreeSet::from([CompilerFactFamily::StableDiagnostics])
+                && view.fact_families == BTreeSet::from([CompilerFactFamily::StableDiagnostics])
         }));
     }
 
@@ -1494,7 +1397,13 @@ mod tests {
             fact_families: BTreeSet::from([CompilerFactFamily::StableDiagnostics]),
         };
 
-        let arguments = view.cargo_arguments(&["app"]).expect("scheduled package");
+        let schedule = AnalysisSchedule {
+            packages: view.packages.clone(),
+            views: vec![view],
+        };
+        let plan = CompilerAcquisitionPlan::from_schedule(&schedule, &[], &["x86_64-unknown-linux-gnu"])
+            .expect("acquisition plan");
+        let arguments = plan.views().next().expect("selected view").cargo_arguments();
         assert_eq!(
             arguments,
             [
@@ -1604,8 +1513,8 @@ mod tests {
                 .iter()
                 .filter(|view| view.packages().contains("app"))
                 .all(|view| {
-                    view.fact_families()
-                        == &BTreeSet::from([
+                    view.fact_families
+                        == BTreeSet::from([
                             CompilerFactFamily::StableDiagnostics,
                             CompilerFactFamily::TypedRustItems,
                         ])
@@ -1615,7 +1524,7 @@ mod tests {
             check_views
                 .iter()
                 .filter(|view| view.packages().contains("worker"))
-                .all(|view| view.fact_families() == &BTreeSet::from([CompilerFactFamily::TypedRustItems]))
+                .all(|view| view.fact_families == BTreeSet::from([CompilerFactFamily::TypedRustItems]))
         );
 
         let doctest_views = schedule
@@ -1625,11 +1534,15 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(doctest_views.len(), 5);
         assert!(doctest_views.iter().all(|view| {
-            view.packages() == &doctests
-                && view.fact_families() == &BTreeSet::from([CompilerFactFamily::TypedRustItems])
+            view.packages() == &doctests && view.fact_families == BTreeSet::from([CompilerFactFamily::TypedRustItems])
         }));
+        let plan = CompilerAcquisitionPlan::from_schedule(&schedule, &[], &["default"]).expect("acquisition plan");
+        let doctest = plan
+            .views()
+            .find(|view| view.compiles_doctests() && view.features() == FeatureSelection::Default)
+            .expect("default doctest view");
         assert_eq!(
-            doctest_views[0].cargo_arguments(&["app"]).expect("doctest argv"),
+            doctest.cargo_arguments(),
             ["test", "--locked", "--doc", "--message-format=json", "--package", "app",]
                 .into_iter()
                 .map(OsString::from)
@@ -1687,17 +1600,15 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from(profiles)
         );
-        let default_with = schedule
+        let plan = CompilerAcquisitionPlan::from_schedule(&schedule, &[], &["default"]).expect("acquisition plan");
+        let default_with = plan
             .views()
-            .iter()
             .find(|view| {
-                view.packages() == &BTreeSet::from(["worker".to_string()])
-                    && view.features() == &FeatureSelection::DefaultWith(vec!["backend".to_string()])
+                view.package() == "worker"
+                    && view.features() == FeatureSelection::DefaultWith(vec!["backend".to_string()])
             })
             .expect("default-plus-selected view");
-        let arguments = default_with
-            .cargo_arguments(&["worker"])
-            .expect("default-plus-selected argv");
+        let arguments = default_with.cargo_arguments();
         assert!(!arguments.contains(&OsString::from("--no-default-features")));
         assert!(
             arguments
@@ -1706,23 +1617,6 @@ mod tests {
         );
         assert!(!arguments.contains(&OsString::from("app/backend")));
         assert_eq!(arguments.iter().filter(|argument| *argument == "--package").count(), 1);
-    }
-
-    #[test]
-    fn package_local_view_rejects_multi_package_execution_and_cache_identity() {
-        let view = AnalysisView {
-            acquisition: AnalysisAcquisition::CheckAllTargets,
-            platform: PlatformTarget::from("default"),
-            features: FeatureSelection::Selected(vec!["alloc".to_string()]),
-            packages: BTreeSet::from(["alloc-root".to_string()]),
-            domains: BTreeSet::from([CompilerFactDomain::Production]),
-            fact_families: BTreeSet::from([CompilerFactFamily::TypedRustItems]),
-        };
-
-        view.cargo_arguments(&["std-root", "alloc-root"])
-            .expect_err("package-local view must reject multiple roots");
-        view.fact_cache_identity(&["std-root", "alloc-root"], &BTreeSet::from(["alloc-root".to_string()]))
-            .expect_err("package-local fact identity must reject multiple roots");
     }
 
     #[test]
@@ -1802,7 +1696,7 @@ mod tests {
     }
 
     #[test]
-    fn acquisition_plan_preserves_serial_argv_and_fact_identity() {
+    fn acquisition_plan_emits_exact_argv_and_binds_fact_identity_to_its_root() {
         let typed_packages = BTreeSet::from(["app".to_string()]);
         let schedule = AnalysisSchedule::for_combined(
             &[manifest("app", "app")],
@@ -1813,11 +1707,6 @@ mod tests {
         )
         .expect("schedule");
         let plan = CompilerAcquisitionPlan::from_schedule(&schedule, &[], &["default"]).expect("plan");
-        let scheduled = schedule
-            .views()
-            .iter()
-            .find(|view| view.features() == &FeatureSelection::Default)
-            .expect("default scheduled view");
         let planned = plan
             .views()
             .find(|view| view.features() == FeatureSelection::Default)
@@ -1825,14 +1714,24 @@ mod tests {
 
         assert_eq!(
             planned.cargo_arguments(),
-            scheduled.cargo_arguments(&["app"]).expect("scheduled arguments")
+            [
+                "check",
+                "--locked",
+                "--all-targets",
+                "--message-format=json",
+                "--package",
+                "app"
+            ]
+            .map(OsString::from)
         );
         assert_eq!(
             planned.fact_cache_identity("app").expect("planned identity"),
-            scheduled
-                .fact_cache_identity(&["app"], &typed_packages)
-                .expect("scheduled identity")
+            "compiler-fact-view-v1-sha256-92ba10be4ef2772e8e2c2611344e68534071089e165a04c52726a4bbbdc32584"
         );
+        let error = planned
+            .fact_cache_identity("worker")
+            .expect_err("another package cannot reuse the view identity");
+        assert!(error.to_string().contains("root package"), "{error}");
     }
 
     #[test]
