@@ -112,6 +112,12 @@ Native compiler caching accepts x86-64 and Apple Silicon macOS; x86-64 and Arm64
 normally without compiler-result reuse. Runtime eligibility does not imply that a release archive exists for that
 host. See [native host eligibility](docs/caching.md#native-host-eligibility).
 
+**IBM validation is incomplete.** Native caching and execution remain
+implemented for IBM Z (`s390x`) and little-endian IBM POWER (`powerpc64le`)
+Linux, but end-to-end validation on these hosts is deferred while repository
+runner access is resolved. Treat these targets as unvalidated until their
+native qualification checks pass.
+
 ## Audit product reachability
 
 `cargo rail surface` merges real compiler facts across products, libraries, build scripts, proc macros, doctests, features, and configured targets. It reports dead public declarations and visibility wider than actual consumers need.

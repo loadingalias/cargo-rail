@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      qualify_ibm:
+        description: Run IBM Z and POWER native qualification (requires repository runner approval)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -59,14 +64,6 @@ jobs:
             runner: runs-on=${{ github.run_id }}/runner=x86_64-win/env=production
             suite: full
             timeout: 60
-          - platform: s390x-linux
-            runner: ubuntu-24.04-s390x
-            suite: cache
-            timeout: 90
-          - platform: powerpc64le-linux
-            runner: ubuntu-24.04-ppc64le-p10
-            suite: cache
-            timeout: 90
           - platform: riscv64-linux
             runner: ubuntu-24.04-riscv
             suite: cache
@@ -99,9 +96,6 @@ jobs:
       - name: Test
         if: matrix.suite == 'full'
         run: just test
-      - name: Qualify native cache
-        if: matrix.suite == 'cache' && matrix.platform != 'riscv64-linux'
-        run: scripts/check-cache-host.sh
       - name: Download RISC-V cache tests
         if: matrix.platform == 'riscv64-linux'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -111,5 +105,31 @@ jobs:
       - name: Qualify RISC-V cache
         if: matrix.platform == 'riscv64-linux'
         run: scripts/check-cache-host.sh run target/riscv-cache
+      - name: Check worktree
+        run: git diff --exit-code HEAD
+
+  ibm:
+    if: github.event_name == 'workflow_dispatch' && inputs.qualify_ibm
+    name: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: s390x-linux
+            runner: ubuntu-24.04-s390x
+          - platform: powerpc64le-linux
+            runner: ubuntu-24.04-ppc64le-p10
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install Linux tooling
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: scripts/tooling/"$PLATFORM".sh ci
+      - name: Qualify native cache
+        run: scripts/check-cache-host.sh
       - name: Check worktree
         run: git diff --exit-code HEAD
