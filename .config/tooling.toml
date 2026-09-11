@@ -7,12 +7,12 @@
 [cargo]
 cargo-audit = "0.22.2"
 cargo-deny = "0.20.2"
-cargo-nextest = "0.9.143"
+cargo-nextest = "0.9.144"
 cargo-xwin = "0.23.1"
 cargo-mutants = "27.1.0"
 just = "1.58.0"
 ripgrep = "15.2.0"
-rumdl = "0.2.66"
+rumdl = "0.2.71"
 lychee = "0.24.2"
 samply = "0.13.1"
 
@@ -41,7 +41,7 @@ packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "pyt
 actionlint = "1.7.12"
 cargo-binstall = "1.23.0"
 cmake = "4.4.3"
-llvm = "23.1.0"
+llvm = "23.1.1"
 git = "2.55.0.windows.5"
 rustup = "1.29.1"
 python = "3.14.7"
@@ -119,8 +119,8 @@ url = "https://github.com/cargo-bins/cargo-binstall/releases/download/v1.23.0/ca
 sha256 = "a3996cbd0c7fa2be599bd52eaf70ccd8c0dce4cce8d01345d486f47b0e0ee0f9"
 
 [aarch64-win.assets.llvm]
-url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.0/clang%2Bllvm-23.1.0-aarch64-pc-windows-msvc.tar.xz"
-sha256 = "caec9387c7925f61de5f53ced0ccf3a9ab9effbe200ea67787f52aa188471cf8"
+url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.1/clang%2Bllvm-23.1.1-aarch64-pc-windows-msvc.tar.xz"
+sha256 = "c8cd61f6624accf0d0f9f4519ddcc97745c6a865205bb43f364b6aaf9c50a31e"
 
 [aarch64-win.assets.cmake]
 url = "https://github.com/Kitware/CMake/releases/download/v4.4.3/cmake-4.4.3-windows-arm64.zip"
@@ -149,8 +149,8 @@ url = "https://github.com/cargo-bins/cargo-binstall/releases/download/v1.23.0/ca
 sha256 = "f4641479477aca40387e88297e3813fab8e44a8d21f25faa44e0ff33e2bc1726"
 
 [x86_64-win.assets.llvm]
-url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.0/clang%2Bllvm-23.1.0-x86_64-pc-windows-msvc.tar.xz"
-sha256 = "5799ebeca6870e9e61d5b4c8bc869ca8490e8db55f22d1388c4545404864d9e3"
+url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.1/clang%2Bllvm-23.1.1-x86_64-pc-windows-msvc.tar.xz"
+sha256 = "c54ac8146b420fe72e11e6fdd56498d6818011ad23267196b6ab37b5ac9264c3"
 
 [x86_64-win.assets.cmake]
 url = "https://github.com/Kitware/CMake/releases/download/v4.4.3/cmake-4.4.3-windows-x86_64.zip"
@@ -180,8 +180,8 @@ url = "https://static.rust-lang.org/rustup/archive/1.29.1/riscv64gc-unknown-linu
 sha256 = "e94134ed99fed1a3a1f13a3bf0a05d616fc1c2496ec0b557aaee4856cd34b2f2"
 
 [riscv64-linux.assets.cargo-nextest]
-url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.143/cargo-nextest-0.9.143-riscv64gc-unknown-linux-gnu.tar.gz"
-sha256 = "cb5035deced2353e6e03a8408dd7cddaa82ddf0a22238566254617f59f25cb42"
+url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.144/cargo-nextest-0.9.144-riscv64gc-unknown-linux-gnu.tar.gz"
+sha256 = "1d5d081245e73e9f7cfa462a4bcb37bf055c69f6bb7988b278523a8f8ead79ba"
 
 [s390x-linux]
 os = "Ubuntu 24.04 LTS"
