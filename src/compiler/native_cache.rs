@@ -76,8 +76,8 @@ const CAPTURE_PAUSE_DIRECTORY_ENV: &str = "CARGO_RAIL_TEST_NATIVE_CAPTURE_PAUSE_
 const BENCH_COVERAGE_FAULT_ENV: &str = "CARGO_RAIL_TEST_BENCH_COVERAGE_FAULT";
 #[cfg(debug_assertions)]
 const NATIVE_ACTION_FAULT_ENV: &str = "CARGO_RAIL_TEST_NATIVE_ACTION_FAULT";
-pub(crate) const DIAGNOSTIC_EXECUTION_CONTRACT: &str = "diagnostic-workspace-wrapper-v22";
-pub(crate) const DIRECT_EXECUTION_CONTRACT: &str = "direct-global-wrapper-v22";
+pub(crate) const DIAGNOSTIC_EXECUTION_CONTRACT: &str = "diagnostic-workspace-wrapper-v23";
+pub(crate) const DIRECT_EXECUTION_CONTRACT: &str = "direct-global-wrapper-v23";
 #[cfg(not(windows))]
 const DIRECT_WRAPPER_NAME: &str = "cargo-rail-native-rustc-wrapper";
 #[cfg(windows)]
@@ -488,20 +488,33 @@ struct NativeSourceEntry {
     kind: NativeSourceEntryKind,
 }
 
-/// Physical external package binding used for cold remapping and local revalidation only.
+/// Physical external source binding used for cold remapping and local revalidation only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NativePackageBinding {
     root: PathBuf,
     spelling: PathBuf,
     source_relative: String,
+    compiler_library_ancestors: Option<String>,
 }
 
 impl NativePackageBinding {
+    const COMPILER_LIBRARY: &str = "lib/rustlib/src/rust/library";
+
     fn capture(source_root: &Path, source_root_spelling: &Path) -> RailResult<Self> {
         let spelling = std::env::var_os("CARGO_MANIFEST_DIR")
             .map(PathBuf::from)
             .ok_or_else(|| RailError::message("external native source has no Cargo package root"))?;
+        let compiler_sysroot = active_context().map(|context| context.session.rustc_sysroot.as_path());
+        Self::capture_at(source_root, source_root_spelling, spelling, compiler_sysroot)
+    }
+
+    fn capture_at(
+        source_root: &Path,
+        source_root_spelling: &Path,
+        spelling: PathBuf,
+        compiler_sysroot: Option<&Path>,
+    ) -> RailResult<Self> {
         let root = crate::utils::canonicalize_existing(&spelling)?;
         let source_relative = native_relative_path(
             source_root
@@ -512,8 +525,29 @@ impl NativePackageBinding {
             root,
             spelling,
             source_relative,
+            compiler_library_ancestors: None,
         };
         binding.validate_live(source_root, source_root_spelling)?;
+
+        // build-std crates include sibling rust-src trees. Capture that entire
+        // compiler-owned namespace before execution, including absent module
+        // candidates through its directory inventory and generation guards.
+        if let Some(library) = compiler_sysroot.map(|sysroot| sysroot.join(Self::COMPILER_LIBRARY))
+            && let Ok(canonical_library) = crate::utils::canonicalize_existing(&library)
+            && binding.root.starts_with(&canonical_library)
+        {
+            if canonical_library != library || binding.spelling != binding.root || source_root_spelling != source_root {
+                return Err(RailError::message("compiler source binding crosses an alias boundary"));
+            }
+            let binding = Self {
+                compiler_library_ancestors: Some(Self::capture_compiler_library_ancestors(&library)?),
+                root: canonical_library,
+                spelling: library,
+                source_relative: String::new(),
+            };
+            binding.validate_live(&binding.root, &binding.spelling)?;
+            return Ok(binding);
+        }
         Ok(binding)
     }
 
@@ -525,6 +559,15 @@ impl NativePackageBinding {
             || native_relative_path(Path::new(&self.source_relative))? != self.source_relative
         {
             return Err(RailError::message("native package binding is invalid"));
+        }
+        if let Some(ancestors) = &self.compiler_library_ancestors {
+            validate_sha256(ancestors)?;
+            if !self.source_relative.is_empty()
+                || self.spelling != self.root
+                || !self.root.ends_with(Self::COMPILER_LIBRARY)
+            {
+                return Err(RailError::message("compiler source library binding is invalid"));
+            }
         }
         Ok(())
     }
@@ -549,7 +592,35 @@ impl NativePackageBinding {
             ));
         }
         source_root_spellings(&self.spelling)?;
+        if let Some(expected) = &self.compiler_library_ancestors
+            && Self::capture_compiler_library_ancestors(&self.root)? != *expected
+        {
+            return Err(RailError::message("compiler source library ancestor changed"));
+        }
         Ok(())
+    }
+
+    fn capture_compiler_library_ancestors(library: &Path) -> RailResult<String> {
+        let depth = Path::new(Self::COMPILER_LIBRARY).components().count();
+        let mut generations = Vec::with_capacity(depth);
+        for ancestor in library.ancestors().skip(1).take(depth) {
+            let metadata = fs::symlink_metadata(ancestor)?;
+            if !metadata.is_dir() || crate::utils::is_symlink_or_reparse(&metadata) {
+                return Err(RailError::message(
+                    "compiler source library ancestor is not a real directory",
+                ));
+            }
+            generations.push(native_metadata_guard(ancestor, &metadata)?);
+        }
+        if generations.len() != depth {
+            return Err(RailError::message(
+                "compiler source library ancestor boundary is incomplete",
+            ));
+        }
+        Ok(format!(
+            "sha256:{}",
+            ContentDigest::sha256(&serde_json::to_vec(&generations)?)
+        ))
     }
 
     fn portable_source_root(&self) -> String {
@@ -1743,6 +1814,29 @@ impl NativeActionCapture {
             ));
         }
 
+        let package_binding = match ObservationPath::capture(&namespace, source_root, source_root) {
+            ObservationPath::Repository(_) => {
+                if package_binding.is_some() {
+                    return Err(RailError::message(
+                        "workspace native source has an external package binding",
+                    ));
+                }
+                None
+            }
+            ObservationPath::Host(_) => Some(match package_binding {
+                Some(binding) => binding,
+                None => NativePackageBinding::capture(&namespace, &namespace_spelling)?,
+            }),
+        };
+        let (namespace, namespace_spelling) = if let Some(binding) = &package_binding {
+            let namespace = binding.root.join(&binding.source_relative);
+            let spelling = binding.spelling.join(&binding.source_relative);
+            binding.validate_live(&namespace, &spelling)?;
+            (namespace, spelling)
+        } else {
+            (namespace, namespace_spelling)
+        };
+
         let toolchain_bytes = toolchain.as_ref().map_or(0, NativeToolchainInputs::bytes_hashed);
         let started = Instant::now();
         let crate_root_relative = crate_root
@@ -1771,24 +1865,6 @@ impl NativeActionCapture {
             capture_pathless_extern_searches(&observation.compiler_arguments, source_root, started, &mut budget)?;
         let (selected_repository_inputs, selected_guards) =
             capture_selected_repository_inputs(source_root, selected_repository_paths, started, &mut budget)?;
-        let package_binding = match &source_state.root {
-            ObservationPath::Repository(_) => {
-                if package_binding.is_some() {
-                    return Err(RailError::message(
-                        "workspace native source has an external package binding",
-                    ));
-                }
-                None
-            }
-            ObservationPath::Host(_) => {
-                let binding = match package_binding {
-                    Some(binding) => binding,
-                    None => NativePackageBinding::capture(&namespace, &namespace_spelling)?,
-                };
-                binding.validate_live(&namespace, &namespace_spelling)?;
-                Some(binding)
-            }
-        };
         let (approved_environment, environment_bytes) = match approved_environment {
             Some(environment) => (environment, 0),
             None => (ApprovedEnvState::empty(), 0),
@@ -1896,6 +1972,28 @@ impl NativeActionCapture {
             .ok_or_else(|| RailError::message("native crate root has no source namespace"))?;
         let namespace = crate::utils::canonicalize_existing(namespace_spelling)?;
         let crate_root = crate::utils::canonicalize_existing(&crate_root_spelling)?;
+        if crate_root.parent() != Some(namespace.as_path()) {
+            return Err(RailError::message(
+                "native crate root crosses a source namespace capability",
+            ));
+        }
+        let package_binding = match ObservationPath::capture(&namespace, workspace_root, workspace_root) {
+            ObservationPath::Repository(_) => None,
+            ObservationPath::Host(_) => Some(NativePackageBinding::capture(&namespace, namespace_spelling)?),
+        };
+        if package_binding != self.package_binding {
+            return Err(RailError::message(
+                "native package binding changed before the restore commit",
+            ));
+        }
+        let (namespace, namespace_spelling) = if let Some(binding) = &package_binding {
+            (
+                binding.root.join(&binding.source_relative),
+                binding.spelling.join(&binding.source_relative),
+            )
+        } else {
+            (namespace, namespace_spelling.to_path_buf())
+        };
         let crate_root_relative = native_relative_path(
             crate_root
                 .strip_prefix(&namespace)
@@ -1903,22 +2001,11 @@ impl NativeActionCapture {
         )?;
         if namespace != self.source_root
             || namespace_spelling != self.source_root_spelling
-            || crate_root.parent() != Some(namespace.as_path())
             || crate_root_relative != self.crate_root
             || ObservationPath::capture(&namespace, workspace_root, workspace_root) != self.source_state.root
         {
             return Err(RailError::message(
                 "native source namespace changed before the restore commit",
-            ));
-        }
-
-        let package_binding = match &self.source_state.root {
-            ObservationPath::Repository(_) => None,
-            ObservationPath::Host(_) => Some(NativePackageBinding::capture(&namespace, namespace_spelling)?),
-        };
-        if package_binding != self.package_binding {
-            return Err(RailError::message(
-                "native package binding changed before the restore commit",
             ));
         }
 
@@ -2143,6 +2230,9 @@ impl NativeActionCapture {
             "sha256:{}",
             ContentDigest::sha256(&serde_json::to_vec(&(
                 &self.guard,
+                self.package_binding
+                    .as_ref()
+                    .and_then(|binding| binding.compiler_library_ancestors.as_deref()),
                 self.generated.as_ref().map(|generated| &generated.guard),
                 self.native_searches
                     .iter()
@@ -2273,6 +2363,36 @@ impl NativeActionCapture {
         })
     }
 
+    fn validate_compiler_library_read_spelling(&self, spelling: &Path, canonical: &Path) -> RailResult<()> {
+        if !self
+            .package_binding
+            .as_ref()
+            .is_some_and(|binding| binding.compiler_library_ancestors.is_some())
+            || !canonical.starts_with(&self.source_root)
+        {
+            return Ok(());
+        }
+        let relative = spelling
+            .strip_prefix(&self.source_root)
+            .map_err(|_| RailError::message("compiler source read uses an alias outside its captured namespace"))?;
+        // Parent traversal between sibling source trees is valid only while every
+        // traversed directory stays inside the captured, alias-free namespace.
+        let mut depth = 0usize;
+        for component in relative.components() {
+            match component {
+                std::path::Component::Normal(_) => depth += 1,
+                std::path::Component::ParentDir if depth > 0 => depth -= 1,
+                std::path::Component::CurDir => {}
+                _ => {
+                    return Err(RailError::message(
+                        "compiler source read escapes its captured namespace",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn witness(&self, observation: &RawCompilerInvocation, workspace_root: &Path) -> RailResult<NativeCompilerWitness> {
         let mut source_paths = Vec::with_capacity(observation.observed_reads.len());
         let mut generated_paths = Vec::new();
@@ -2286,8 +2406,9 @@ impl NativeActionCapture {
             {
                 continue;
             }
-            let absolute = observed.path.resolve(workspace_root);
-            let absolute = crate::utils::canonicalize_existing(&absolute)?;
+            let spelling = observed.path.resolve(workspace_root);
+            let absolute = crate::utils::canonicalize_existing(&spelling)?;
+            self.validate_compiler_library_read_spelling(&spelling, &absolute)?;
             let source_relative = absolute.strip_prefix(&self.source_root).ok();
             let generated_relative = self
                 .generated
@@ -2513,6 +2634,7 @@ fn dynamic_input_selector_from_observation(
         }
         let spelling = observed.path.resolve(workspace_root);
         let absolute = crate::utils::canonicalize_existing(&spelling)?;
+        capture.validate_compiler_library_read_spelling(&spelling, &absolute)?;
         if absolute.starts_with(&capture.source_root)
             || capture
                 .generated
@@ -3225,7 +3347,7 @@ fn capture_apple_linker_witness(
     revalidate_link_driver_probe_with_apple_sdk(&driver_path, &driver_inputs.execution.probe, sdk_name)?;
     let linker_path = PathBuf::from(&driver_inputs.execution.linker);
     let (linker, linker_generation) = capture_link_file(&linker_path, started, &mut budget)?;
-    let found = found_paths
+    let mut found = found_paths
         .into_iter()
         .map(|path| {
             let captured = capture_link_file(&path, started, &mut budget).map_err(|error| {
@@ -3243,6 +3365,7 @@ fn capture_apple_linker_witness(
             Ok(captured)
         })
         .collect::<RailResult<Vec<_>>>()?;
+    found.sort_unstable_by(|left, right| left.0.path.cmp(&right.0.path));
     let (found, found_generations): (Vec<_>, Vec<_>) = found.into_iter().unzip();
     let witness = AppleLinkerWitness {
         version: 7,
@@ -6070,7 +6193,7 @@ impl NativeCompilerValidation {
 
 impl NativePublicationProof {
     fn validate_object(&self) -> RailResult<()> {
-        if self.version != 6 {
+        if self.version != 7 {
             return Err(RailError::message(
                 "native publication proof has an incompatible schema",
             ));
@@ -17855,7 +17978,7 @@ fn native_publication_proof(
         return Err("cold_inputs_changed_before_admission");
     }
     Ok(NativePublicationProof {
-        version: 6,
+        version: 7,
         source_state: initial_capture.source_state.clone(),
         package_binding: initial_capture.package_binding.clone(),
         approved_environment,
@@ -19095,15 +19218,24 @@ pub(crate) mod tests {
         let linked = root.join("fixture");
         let endogenous = root.join("fixture.0.o");
         let found = root.join("stable-link-input.tbd");
+        let nested = root.join("stable-link/input.tbd");
         let missing = root.join("absent-link-input.tbd");
         let certificate = root.join("linker-dependencies.bin");
         let driver_inputs = root.join("linker-driver-inputs.json");
         fs::write(&linked, b"linked-output").expect("linked output");
         fs::write(&endogenous, b"object").expect("endogenous object");
         fs::write(&found, b"stable-one").expect("stable input");
+        fs::create_dir(nested.parent().expect("nested input directory")).expect("input directory");
+        fs::write(&nested, b"nested-input").expect("nested input");
         write_apple_link_certificate(
             &certificate,
-            &[(0x10, &endogenous), (0x10, &found), (0x11, &missing), (0x40, &linked)],
+            &[
+                (0x10, &endogenous),
+                (0x10, &found),
+                (0x10, &nested),
+                (0x11, &missing),
+                (0x40, &linked),
+            ],
         );
         write_apple_link_driver_inputs(&driver_inputs, &[&endogenous]);
         let outputs = NativeOutputPaths {
@@ -19140,7 +19272,10 @@ pub(crate) mod tests {
                 .filter(|input| Path::new(&input.path).starts_with(&root))
                 .map(|input| input.path.as_str())
                 .collect::<Vec<_>>(),
-            [found.to_str().expect("fixture path")]
+            [
+                found.to_str().expect("fixture path"),
+                nested.to_str().expect("nested path")
+            ]
         );
         assert!(witness.found.iter().any(|input| input.path.ends_with("/usr/bin/clang")));
         assert_eq!(
@@ -19646,6 +19781,215 @@ pub(crate) mod tests {
         let parsed = DistributedRustLibraryArguments::parse(&rscrypto_release).expect("rscrypto release codegen forms");
         assert_eq!(parsed.codegen.linker_plugin_lto, Some(true));
         assert_eq!(parsed.codegen.overflow_checks, Some(true));
+    }
+
+    #[test]
+    fn compiler_library_source_capture_binds_siblings_and_missing_candidates() {
+        let workspace = tempfile::tempdir().expect("application workspace");
+        let compiler = tempfile::tempdir().expect("compiler source tree");
+        let compiler_root = crate::utils::canonicalize_existing(compiler.path()).expect("canonical compiler root");
+        let library = compiler_root.join(NativePackageBinding::COMPILER_LIBRARY);
+        let package = library.join("core");
+        let source_directory = package.join("src");
+        fs::create_dir_all(&source_directory).expect("crate directory");
+        fs::create_dir_all(library.join("stdarch")).expect("sibling directory");
+        let source = source_directory.join("lib.rs");
+        let sibling = library.join("stdarch/mod.rs");
+        fs::write(&source, b"#[path=\"../../stdarch/mod.rs\"] pub mod arch;\n").expect("crate source");
+        fs::write(&sibling, b"pub const VALUE: u8 = 1;\n").expect("sibling source");
+        let outside = compiler.path().join("outside.rs");
+        fs::write(&outside, b"outside\n").expect("outside source");
+        let source_directory = crate::utils::canonicalize_existing(&source_directory).expect("canonical source");
+        let binding = NativePackageBinding::capture_at(
+            &source_directory,
+            &source_directory,
+            package.clone(),
+            Some(&compiler_root),
+        )
+        .expect("compiler source authority");
+        assert_eq!(
+            binding.root,
+            crate::utils::canonicalize_existing(&library).expect("canonical library")
+        );
+        assert_eq!(binding.source_relative, "");
+        let ordinary = NativePackageBinding::capture_at(&source_directory, &source_directory, package, None)
+            .expect("ordinary external package");
+        assert_eq!(ordinary.source_relative, "src");
+
+        let mut observation = graduated_observation();
+        observation.declared_inputs =
+            vec![FileObservation::capture(&source, workspace.path(), workspace.path()).expect("declared source")];
+        let sibling_spelling = source_directory.join("../../stdarch/mod.rs");
+        observation.observed_reads = [source.as_path(), sibling_spelling.as_path()]
+            .into_iter()
+            .map(|path| FileObservation::capture(path, workspace.path(), workspace.path()).expect("observed source"))
+            .collect();
+        let selector = NativeDynamicInputSelector::new(Vec::new(), Vec::new()).expect("empty selector");
+        let capture = || {
+            capture_selected_inputs(&observation, workspace.path(), &selector, Some(binding.clone()))
+                .expect("compiler library capture")
+        };
+        let initial = capture();
+        assert_eq!(initial.crate_root, "core/src/lib.rs");
+        assert_eq!(
+            initial.portable_crate_root().expect("portable crate"),
+            "/cargo-rail/native-package/v2/core/src/lib.rs"
+        );
+        let witness = initial
+            .witness(&observation, workspace.path())
+            .expect("sibling witness");
+        assert_eq!(witness.source_paths, ["core/src/lib.rs", "stdarch/mod.rs"]);
+        assert!(
+            witness.repository_paths.is_empty(),
+            "compiler sources are not application inputs"
+        );
+        let outputs = metadata_output_paths(
+            workspace.path().join("target/debug/deps/fixture.d"),
+            workspace.path().join("target/debug/deps/libfixture.rmeta"),
+        );
+        let mut worker_capture = initial.clone();
+        worker_capture.generated = None;
+        assert_eq!(
+            distributed_rust_library_normalization_candidate(
+                &observation,
+                &worker_capture,
+                &outputs,
+                workspace.path(),
+                workspace.path(),
+            )
+            .err(),
+            Some("distributed_source_input_unavailable")
+        );
+        let selected = dynamic_input_selector_from_observation(&observation, &initial, workspace.path())
+            .expect("sibling selector");
+        assert!(selected.repository_paths.is_empty());
+        let narrow = capture_selected_inputs(&observation, workspace.path(), &selector, Some(ordinary))
+            .expect("ordinary package capture");
+        dynamic_input_selector_from_observation(&observation, &narrow, workspace.path())
+            .expect_err("ordinary packages do not inherit compiler source authority");
+
+        let session = graduated_session(digest(b"compiler library session"));
+        let key = |captured: &NativeActionCapture| {
+            base_action_key(&session.identity, &session.class, &observation, captured).expect("base action")
+        };
+        let initial_key = key(&initial);
+        fs::write(&sibling, b"pub const VALUE: u8 = 2;\n").expect("same-size sibling change");
+        let changed = capture();
+        assert_ne!(key(&changed), initial_key, "sibling bytes must bind the action");
+        changed
+            .witness(&observation, workspace.path())
+            .expect_err("old observation cannot certify changed bytes");
+        fs::write(&sibling, b"pub const VALUE: u8 = 1;\n").expect("restore sibling bytes");
+        let restored = capture();
+        assert_eq!(key(&restored), initial_key);
+        assert_ne!(
+            restored.guard_identity().expect("restored guard"),
+            initial.guard_identity().expect("initial guard"),
+            "restored bytes must not erase concurrent generation drift"
+        );
+
+        let candidate = library.join("stdarch/new.rs");
+        fs::write(&candidate, b"pub const NEW: u8 = 3;\n").expect("new module candidate");
+        assert_ne!(
+            key(&capture()),
+            initial_key,
+            "missing candidates are part of the namespace"
+        );
+        fs::remove_file(&candidate).expect("remove transient candidate");
+        assert_ne!(
+            capture().guard_identity().expect("current guard"),
+            restored.guard_identity().expect("prior guard")
+        );
+
+        let mut escaped = observation.clone();
+        escaped
+            .observed_reads
+            .push(FileObservation::capture(&outside, workspace.path(), workspace.path()).expect("outside observation"));
+        dynamic_input_selector_from_observation(&escaped, &initial, workspace.path())
+            .expect_err("the compiler library does not authorize its parent");
+
+        #[cfg(unix)]
+        {
+            let alias = workspace.path().join("compiler-alias");
+            std::os::unix::fs::symlink(compiler.path(), &alias).expect("library alias");
+            let aliased_library = alias.join(NativePackageBinding::COMPILER_LIBRARY);
+            for spelling in [
+                aliased_library.join("stdarch/mod.rs"),
+                library.join("../library/stdarch/mod.rs"),
+            ] {
+                let mut aliased = observation.clone();
+                aliased.observed_reads.push(
+                    FileObservation::capture(&spelling, workspace.path(), workspace.path())
+                        .expect("aliased source observation"),
+                );
+                dynamic_input_selector_from_observation(&aliased, &initial, workspace.path())
+                    .expect_err("a selector must retain the source spelling boundary");
+                initial
+                    .witness(&aliased, workspace.path())
+                    .expect_err("a witness must retain the source spelling boundary");
+            }
+            fs::remove_file(&sibling).expect("remove sibling");
+            std::os::unix::fs::symlink(&outside, &sibling).expect("aliased sibling");
+            capture_selected_inputs(&observation, workspace.path(), &selector, Some(binding.clone()))
+                .expect_err("sibling aliases must be rejected before execution");
+            NativePackageBinding::capture_at(&source_directory, &source_directory, library.join("core"), Some(&alias))
+                .expect_err("the selected compiler library must be a real directory");
+            NativePackageBinding::capture_at(
+                &source_directory,
+                &aliased_library.join("core/src"),
+                aliased_library.join("core"),
+                Some(&compiler_root),
+            )
+            .expect_err("package aliases outside the guarded compiler tree must not be discarded");
+            NativePackageBinding::capture_at(
+                &source_directory,
+                &aliased_library.join("core/src"),
+                library.join("core"),
+                Some(&compiler_root),
+            )
+            .expect_err("crate-root aliases outside the guarded compiler tree must not be discarded");
+        }
+    }
+
+    #[test]
+    fn compiler_library_binding_rejects_parent_replacement_and_restoration() {
+        let compiler = tempfile::tempdir().expect("compiler root");
+        let sysroot = crate::utils::canonicalize_existing(compiler.path()).expect("canonical compiler root");
+        let library = sysroot.join(NativePackageBinding::COMPILER_LIBRARY);
+        let package = library.join("core");
+        let source = package.join("src");
+        fs::create_dir_all(&source).expect("compiler source directories");
+        let capture = || {
+            NativePackageBinding::capture_at(&source, &source, package.clone(), Some(&sysroot))
+                .expect("compiler library binding")
+        };
+        let initial = capture();
+        initial
+            .validate_live(&library, &library)
+            .expect("unchanged compiler library");
+        let parent = sysroot.join("lib/rustlib/src");
+        let retained = sysroot.join("lib/rustlib/retained-src");
+        let initial_guard = native_metadata_guard(&parent, &fs::symlink_metadata(&parent).expect("parent metadata"))
+            .expect("parent generation");
+        mutate_until_native_guard_changes(&parent, &initial_guard, || {
+            fs::rename(&parent, &retained).expect("replace parent");
+            fs::create_dir(&parent).expect("replacement parent");
+            initial
+                .validate_live(&library, &library)
+                .expect_err("replacement loses source authority");
+            fs::remove_dir(&parent).expect("remove replacement");
+            fs::rename(&retained, &parent).expect("restore original parent");
+        });
+        let error = initial
+            .validate_live(&library, &library)
+            .expect_err("restoring the original tree must not erase ancestor drift");
+        assert!(error.to_string().contains("ancestor changed"), "{error}");
+        let current = capture();
+        assert_eq!(current.root, initial.root);
+        assert_ne!(current.compiler_library_ancestors, initial.compiler_library_ancestors);
+        current
+            .validate_live(&library, &library)
+            .expect("fresh source authority after mutation");
     }
 
     #[test]
@@ -23888,6 +24232,22 @@ pub(crate) mod tests {
             ),
             session.identity
         );
+        for contract in ["diagnostic-workspace-wrapper-v22", "direct-global-wrapper-v22"] {
+            let previous = NativeCompilerSession {
+                identity: identity(
+                    &session.capability_identity,
+                    &session.compiler_process_environment_identity,
+                    contract,
+                ),
+                execution_contract: contract.to_string(),
+                ..session.clone()
+            };
+            assert_ne!(previous.identity, session.identity);
+            let error = previous
+                .validate_object()
+                .expect_err("prior source authority must not be reused");
+            assert!(error.to_string().contains("unsupported execution contract"), "{error}");
+        }
     }
 
     #[test]
@@ -24462,6 +24822,7 @@ pub(crate) mod tests {
                 root: crate::utils::canonicalize_existing(package).expect("canonical package"),
                 spelling: package.to_path_buf(),
                 source_relative: "src/lib.rs".to_string(),
+                compiler_library_ancestors: None,
             });
             capture
         };

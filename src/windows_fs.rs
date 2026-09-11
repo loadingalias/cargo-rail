@@ -15,9 +15,8 @@ use std::path::Path;
 use std::process::{Child, Command};
 
 use windows_sys::Win32::Foundation::{
-    ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_NO_MORE_FILES, ERROR_NOT_FOUND, ERROR_NOT_SAME_DEVICE,
-    ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, FILETIME, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
-    WAIT_TIMEOUT,
+    ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_NO_MORE_FILES, ERROR_NOT_FOUND, ERROR_PIPE_BUSY,
+    ERROR_PIPE_CONNECTED, FILETIME, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TEMPORARY, FILE_BASIC_INFO,
@@ -742,15 +741,6 @@ pub(crate) fn create_for_execution_copy(path: &Path) -> io::Result<File> {
         .attributes(FILE_ATTRIBUTE_TEMPORARY)
         .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN);
     options.open(path)
-}
-
-/// Return whether a hard-link failure is precisely Windows' cross-volume
-/// boundary. Other errors must remain failures rather than becoming copies.
-pub(crate) fn is_cross_volume_error(error: &io::Error) -> bool {
-    error
-        .raw_os_error()
-        .and_then(|code| u32::try_from(code).ok())
-        .is_some_and(|code| code == ERROR_NOT_SAME_DEVICE)
 }
 
 /// Create and retain an exact NTFS directory junction.

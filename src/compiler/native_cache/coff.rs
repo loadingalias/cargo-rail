@@ -798,7 +798,6 @@ pub(super) fn capture(
         return Err(RailError::message("COFF driver changed before publication"));
     }
     let mut found = Vec::new();
-    let mut found_generations = Vec::new();
     for path in found_paths {
         let (file, generation) = capture_link_file(&path, started, &mut budget)?;
         if expected_files
@@ -812,9 +811,10 @@ pub(super) fn capture(
         {
             return Err(RailError::message("COFF linker input changed after it was consumed"));
         }
-        found.push(file);
-        found_generations.push(generation);
+        found.push((file, generation));
     }
+    found.sort_unstable_by(|left, right| left.0.path.cmp(&right.0.path));
+    let (found, found_generations): (Vec<_>, Vec<_>) = found.into_iter().unzip();
     let witness = FileLinkerWitness {
         version: 3,
         driver_selection,

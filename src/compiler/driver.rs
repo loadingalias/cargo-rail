@@ -1882,63 +1882,28 @@ fn stage_windows_execution_file(
     crate::windows_fs::prove_local_ntfs(&source_file, source_before.volume_serial_number)?;
     validate_windows_execution_file_observation(&source_before, maximum_bytes, description)?;
 
-    match fs::hard_link(source, destination) {
-        Ok(()) => {
-            let mut destination_file = crate::windows_fs::open_for_execution_guard(destination)?;
-            let source_after = crate::windows_fs::observe_file(&source_file)?;
-            let destination_before = crate::windows_fs::observe_file(&destination_file)?;
-            crate::windows_fs::prove_local_ntfs(&destination_file, destination_before.volume_serial_number)?;
-            if source_after != destination_before {
-                return Err(RailError::message(format!(
-                    "staged {description} hard link does not retain the selected source file"
-                )));
-            }
-            authenticate_windows_open_file(
-                &mut destination_file,
-                destination_before,
-                expected_digest,
-                maximum_bytes,
-                description,
-            )?;
-            if crate::windows_fs::observe_file(&source_file)? != crate::windows_fs::observe_file(&destination_file)? {
-                return Err(RailError::message(format!(
-                    "staged {description} hard link changed while it was authenticated"
-                )));
-            }
-            Ok(destination_file)
-        }
-        Err(error) if crate::windows_fs::is_cross_volume_error(&error) => {
-            let mut destination_file = crate::windows_fs::create_for_execution_copy(destination)
-                .map_err(|error| RailError::message(format!("failed to create private {description} copy: {error}")))?;
-            transfer_windows_execution_file(
-                &mut source_file,
-                &mut destination_file,
-                source_before,
-                expected_digest,
-                maximum_bytes,
-                description,
-            )?;
-            destination_file.flush()?;
-            let destination_observation = crate::windows_fs::observe_file(&destination_file)?;
-            crate::windows_fs::prove_local_ntfs(&destination_file, destination_observation.volume_serial_number)?;
-            if destination_observation.size != source_before.size || destination_observation.number_of_links != 1 {
-                return Err(RailError::message(format!(
-                    "private {description} copy does not have exact single-file ownership"
-                )));
-            }
-            drop(destination_file);
-            let path_file = crate::windows_fs::open_for_execution_guard(destination)?;
-            if crate::windows_fs::observe_file(&path_file)? != destination_observation {
-                return Err(RailError::message(format!(
-                    "private {description} copy changed before its path was retained"
-                )));
-            }
-            Ok(path_file)
-        }
-        Err(error) => Err(RailError::message(format!(
-            "failed to retain {description} in the private doctest sysroot: {error}"
-        ))),
+    // Hard links change shared compiler generations even when the bytes stay unchanged.
+    let mut destination_file = crate::windows_fs::create_for_execution_copy(destination)
+        .map_err(|error| RailError::message(format!("failed to create private {description} copy: {error}")))?;
+    let copied = io::copy(
+        &mut (&mut source_file).take(source_before.size.saturating_add(1)),
+        &mut destination_file,
+    )?;
+    if copied != source_before.size || crate::windows_fs::observe_file(&source_file)? != source_before {
+        return Err(RailError::message(format!(
+            "{description} source changed during private doctest staging"
+        )));
     }
+    drop(destination_file);
+    let destination_file =
+        authenticate_windows_execution_file(destination, expected_digest, maximum_bytes, description)?;
+    let observation = crate::windows_fs::observe_file(&destination_file)?;
+    if observation.size != source_before.size || observation.number_of_links != 1 {
+        return Err(RailError::message(format!(
+            "private {description} copy does not have exact single-file ownership"
+        )));
+    }
+    Ok(destination_file)
 }
 
 #[cfg(windows)]
@@ -1980,35 +1945,6 @@ fn authenticate_windows_open_file(
         hasher.update(&buffer[..read]);
     }
     finish_windows_execution_authentication(file, observation, bytes, hasher, expected_digest, description)
-}
-
-#[cfg(windows)]
-fn transfer_windows_execution_file(
-    source: &mut File,
-    destination: &mut File,
-    observation: crate::windows_fs::FileObservation,
-    expected_digest: &str,
-    maximum_bytes: u64,
-    description: &str,
-) -> RailResult<u64> {
-    validate_windows_execution_file_observation(&observation, maximum_bytes, description)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    let mut bytes = 0_u64;
-    loop {
-        let read = match source.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => read,
-            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error.into()),
-        };
-        bytes = bytes
-            .checked_add(read as u64)
-            .ok_or_else(|| RailError::message(format!("{description} byte count overflow")))?;
-        hasher.update(&buffer[..read]);
-        destination.write_all(&buffer[..read])?;
-    }
-    finish_windows_execution_authentication(source, observation, bytes, hasher, expected_digest, description)
 }
 
 #[cfg(windows)]
@@ -2978,6 +2914,11 @@ mod tests {
         let compiler_library_digest = digest(b"compiler library");
         let compiler_library = authenticate_compiler_library(&compiler_library, &compiler_library_digest)
             .expect("authenticated compiler library");
+        let source_observations = [compiler_library.path.as_path(), &rustdoc, &wrapper].map(|path| {
+            let file = crate::windows_fs::open_for_observation(path).expect("source handle");
+            let observation = crate::windows_fs::observe_file(&file).expect("source generation");
+            (file, observation)
+        });
 
         let capability = CompilerFactDoctestSysroot::stage(
             &sysroot,
@@ -3000,12 +2941,45 @@ mod tests {
         );
         assert!(private_root.join("lib/rustlib").is_dir());
         capability.revalidate().expect("stable private doctest sysroot");
+        assert_eq!(
+            fs::read(private_root.join("bin/rustc_driver-test.dll")).expect("private runtime"),
+            b"compiler library"
+        );
+        for name in ["rustc.exe", "rustdoc.exe", "rustc_driver-test.dll"] {
+            let staged = private_root.join("bin").join(name);
+            assert_eq!(
+                fs::write(&staged, b"replacement")
+                    .expect_err("retained private executable must exclude writes")
+                    .raw_os_error(),
+                Some(32)
+            );
+            assert_eq!(
+                fs::rename(&staged, staged.with_extension("replacement"))
+                    .expect_err("retained private executable must exclude replacement")
+                    .raw_os_error(),
+                Some(32)
+            );
+        }
+        for (file, before) in &source_observations {
+            assert_eq!(
+                crate::windows_fs::observe_file(file).expect("source generation while staged"),
+                *before,
+                "private doctest staging must not invalidate another compiler's source identity"
+            );
+        }
 
         drop(capability);
         assert!(
             !private_root.exists(),
             "guard handles must close before the private sysroot is removed"
         );
+        for (file, before) in &source_observations {
+            assert_eq!(
+                crate::windows_fs::observe_file(file).expect("source generation after staging"),
+                *before,
+                "private doctest cleanup must preserve the shared compiler identity"
+            );
+        }
     }
 
     #[cfg(windows)]
