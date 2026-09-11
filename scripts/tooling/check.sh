@@ -3,7 +3,7 @@ set -euo pipefail
 export PYTHONDONTWRITEBYTECODE=1
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/../.."
-for command in python3 shellcheck actionlint bash; do
+for command in python3 shellcheck actionlint bash rg; do
   command -v "$command" >/dev/null || { echo "missing tooling check prerequisite: $command" >&2; exit 127; }
 done
 python3 scripts/tooling/catalog.py validate

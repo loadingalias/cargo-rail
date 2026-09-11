@@ -9,7 +9,8 @@ Install these tools:
 - For `just build` and `just test`: Python 3.11 or newer and `rustc-dev` for the selected toolchain.
 - For `just check` and `just ci-check`: `rustc-dev` for the selected toolchain.
 - For `just check` on macOS: Zig, `cargo-zigbuild`, `cargo-xwin`, and LLVM tools required by cargo-xwin.
-- For `just check-tooling`: Python 3.11 or newer, ShellCheck, and Actionlint.
+- For `just check-tooling`: Python 3.11 or newer, ShellCheck, Actionlint,
+  and ripgrep (`rg`).
 - For `just test` on macOS: clang with COFF support, `lld-link`, and `ld64.lld` on `PATH`, plus `cargo-xwin`
   with its x86_64 MSVC SDK already cached. The cross-link test runs offline.
 

@@ -136,6 +136,8 @@ def validate(data):
                 raise ValueError(f'{platform}: invalid {name} asset')
         for operation in ('ci', 'package') if config['cargo'] else ('ci',):
             selected = selection(data, platform, operation)
+            if platform == 'x86_64-linux' and operation == 'ci' and 'ripgrep' not in selected['packages']:
+                raise ValueError('x86_64-linux/ci: tooling checks require ripgrep')
             components = {'rustc-dev', 'llvm-tools'}
             if operation == 'ci' and config['cargo']:
                 components |= {'clippy', 'rustfmt'}

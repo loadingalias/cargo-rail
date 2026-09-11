@@ -190,8 +190,10 @@ class CatalogPolicy(unittest.TestCase):
                     required |= {'llvm', 'python', 'git'}
                 self.assertEqual(set(package['assets']), required)
                 self.assertEqual(set(ci['assets']), required | ({'actionlint'} if platform == 'x86_64-linux' else set()))
+                if platform == 'x86_64-linux':
+                    self.assertIn('ripgrep', ci['packages'], 'tooling tests execute real manifest discovery through rg')
                 if platform.endswith('-linux'):
-                    self.assertFalse({'shellcheck', 'python3-venv', 'jq'} & set(package['packages']))
+                    self.assertFalse({'shellcheck', 'python3-venv', 'ripgrep', 'jq'} & set(package['packages']))
         self.assertEqual(data, catalog.read(), 'selection mutated the catalog')
 
     def test_cache_hosts_keep_their_small_ci_selection(self):
@@ -214,7 +216,7 @@ class CatalogPolicy(unittest.TestCase):
         self.assertTrue({'git', 'git-man'} <= set(selected['packages']),
                         'snapshot Git and its version-coupled manual package must be installed together')
         self.assertTrue({'gcc-riscv64-linux-gnu', 'g++-riscv64-linux-gnu', 'libc6-dev-riscv64-cross'} <= set(selected['packages']))
-        self.assertFalse({'shellcheck', 'python3-venv', 'openssl'} & set(selected['packages']))
+        self.assertFalse({'shellcheck', 'python3-venv', 'ripgrep', 'openssl'} & set(selected['packages']))
         with self.assertRaisesRegex(ValueError, 'requires x86_64-linux'):
             catalog.selection(catalog.read(), 'riscv64-linux', 'riscv-build')
 
@@ -232,6 +234,7 @@ class CatalogPolicy(unittest.TestCase):
                                        ('ci', 'cargo', 'cargo-nextest'),
                                        ('ci', 'packages', 'build-essential'),
                                        ('ci', 'packages', 'git-man'),
+                                       ('ci', 'packages', 'ripgrep'),
                                        ('package', 'packages', 'git-man'),
                                        ('riscv-build', 'packages', 'git-man')]:
             with self.subTest(operation=operation, field=field, name=name):
