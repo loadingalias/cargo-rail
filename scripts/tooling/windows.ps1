@@ -94,7 +94,18 @@ try {
     if (Test-Path (Join-Path $vsPath 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')) {
         $vsArguments = @('modify') + $vsArguments
     }
-    Install-Exe $bootstrap $vsArguments
+    $vsStarted = Get-Date
+    try {
+        Install-Exe $bootstrap $vsArguments
+    } catch {
+        Get-ChildItem -Path ([IO.Path]::GetTempPath()) -Filter 'dd_*.log' -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -ge $vsStarted } |
+            Sort-Object LastWriteTime | Select-Object -Last 5 | ForEach-Object {
+                Write-Host "Visual Studio installer log: $($_.FullName)"
+                Get-Content -LiteralPath $_.FullName -Tail 80 -ErrorAction SilentlyContinue
+            }
+        throw
+    }
     $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
     $instances = & $vswhere -products Microsoft.VisualStudio.Product.BuildTools -format json | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0) { throw 'Unable to inspect Visual Studio installation.' }
