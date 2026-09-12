@@ -1,8 +1,6 @@
 //! Provider-neutral native compiler-result object protocol.
 
 use std::fs::File;
-#[cfg(test)]
-use std::io::Read as _;
 use std::io::{BufReader, Seek as _, Write as _};
 
 use serde::{Deserialize, Serialize};
@@ -727,6 +725,7 @@ fn io_unavailable(_error: std::io::Error) -> RemoteStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read as _;
 
     fn base(value: u8) -> String {
         format!("{}{value:064x}", crate::compiler::native_cache::BASE_ACTION_KEY_PREFIX)

@@ -46,7 +46,7 @@ impl TomlFormatter {
                 if !group.items.is_empty() {
                     output.push_str(&format!("{}# {}\n", self.indent, group.name));
                     for item in &group.items {
-                        output.push_str(&format!("{}\"{}\",\n", self.indent, item));
+                        output.push_str(&format!("{}{},\n", self.indent, toml_edit::Value::from(item.as_str())));
                     }
                 }
             }
@@ -63,7 +63,7 @@ impl TomlFormatter {
         // Multiline default
         let mut output = String::from("[\n");
         for item in items {
-            output.push_str(&format!("{}\"{}\",\n", self.indent, item));
+            output.push_str(&format!("{}{},\n", self.indent, toml_edit::Value::from(item.as_str())));
         }
         output.push(']');
         output
@@ -78,7 +78,11 @@ impl TomlFormatter {
         if features.len() > self.inline_feature_threshold {
             let mut output = String::from("[\n");
             for feature in features {
-                output.push_str(&format!("{}\"{}\",\n", self.indent, feature));
+                output.push_str(&format!(
+                    "{}{},\n",
+                    self.indent,
+                    toml_edit::Value::from(feature.as_str())
+                ));
             }
             output.push(']');
             output
@@ -109,7 +113,7 @@ impl TomlFormatter {
         }
         let mut output = String::from("[\n");
         for item in items {
-            output.push_str(&format!("{}\"{}\",\n", self.indent, item));
+            output.push_str(&format!("{}{},\n", self.indent, toml_edit::Value::from(item.as_str())));
         }
         output.push(']');
         output
@@ -128,7 +132,7 @@ impl TomlFormatter {
 
         let content = pairs
             .iter()
-            .map(|(k, v)| format!("{} = {}", k, v))
+            .map(|(k, v)| format!("{} = {}", toml_edit::Key::new(k), v))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -314,7 +318,7 @@ pub enum TomlValue {
 impl std::fmt::Display for TomlValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TomlValue::String(s) => write!(f, "\"{}\"", s),
+            TomlValue::String(s) => write!(f, "{}", toml_edit::Value::from(s.as_str())),
             TomlValue::Bool(b) => write!(f, "{}", b),
             TomlValue::Integer(i) => write!(f, "{}", i),
             TomlValue::Array(arr) => {
@@ -334,9 +338,7 @@ where
         if idx > 0 {
             out.push_str(", ");
         }
-        out.push('"');
-        out.push_str(item);
-        out.push('"');
+        out.push_str(&toml_edit::Value::from(item).to_string());
     }
     out
 }
@@ -353,6 +355,52 @@ pub struct Group {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formatted_strings_preserve_quotes_backslashes_and_control_characters() {
+        let items = vec![
+            "quote\"".to_owned(),
+            "back\\slash".to_owned(),
+            "line\nbreak".to_owned(),
+            "tab\there".to_owned(),
+            "control\u{0001}".to_owned(),
+        ];
+        for threshold in [0, 10] {
+            let formatter = TomlFormatter {
+                inline_array_threshold: threshold,
+                inline_feature_threshold: threshold,
+                ..TomlFormatter::new()
+            };
+            let grouped = formatter.array_string(
+                &items,
+                Some(vec![Group {
+                    name: "strings".to_owned(),
+                    items: items.clone(),
+                }]),
+            );
+            for output in [
+                formatter.array_string(&items, None),
+                formatter.array_simple(&items),
+                formatter.array_features(&items),
+                grouped,
+                TomlValue::Array(items.clone()).to_string(),
+            ] {
+                let doc: DocumentMut = format!("items = {output}").parse().unwrap();
+                assert_eq!(
+                    doc["items"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_str().unwrap())
+                        .collect::<Vec<_>>(),
+                    ["quote\"", "back\\slash", "line\nbreak", "tab\there", "control\u{0001}"]
+                );
+            }
+            let output = formatter.inline_table(&[("a.b".to_owned(), TomlValue::String("quote\"\\\n".to_owned()))]);
+            let doc: DocumentMut = format!("item = {output}").parse().unwrap();
+            assert_eq!(doc["item"]["a.b"].as_str(), Some("quote\"\\\n"));
+        }
+    }
 
     #[test]
     fn test_inline_array() {

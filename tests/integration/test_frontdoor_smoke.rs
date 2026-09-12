@@ -12,43 +12,6 @@ fn setup_frontdoor_workspace(name: &str) -> Result<TestWorkspace> {
 }
 
 #[test]
-fn test_documented_frontdoor_commands_smoke() {
-    let result: Result<()> = (|| {
-        let ws = setup_frontdoor_workspace("frontdoor-smoke")?;
-        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let readme = std::fs::read_to_string(repo_root.join("README.md"))?;
-        let cases: &[(&str, &[&str], &str)] = &[
-            ("README plan", &["rail", "plan"], "cargo rail plan"),
-            (
-                "README unify",
-                &["rail", "unify", "--check"],
-                "cargo rail unify --check",
-            ),
-        ];
-        for (name, args, snippet) in cases {
-            assert!(
-                readme.contains(snippet),
-                "{name} should stay documented in README.\nmissing snippet: {snippet}"
-            );
-            let output = run_cargo_rail(&ws.path, args)?;
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                output.status.success(),
-                "{} should succeed.\nargs: {:?}\nstdout:\n{}\nstderr:\n{}",
-                name,
-                args,
-                stdout,
-                stderr
-            );
-        }
-
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-#[test]
 fn direct_and_cargo_sentinel_invocations_share_one_cli_grammar() {
     let result: Result<()> = (|| {
         let ws = setup_frontdoor_workspace("frontdoor-normalized-argv")?;

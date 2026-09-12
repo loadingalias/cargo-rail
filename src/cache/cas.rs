@@ -39,7 +39,7 @@ const MAX_TREE_DEPTH: usize = 128;
 const MAX_PATH_BYTES: usize = 4 * 1024;
 const MAX_NAME_BYTES: usize = 255;
 const MAX_ENTRIES: usize = 1_000_000;
-#[cfg(any(unix, windows, test))]
+#[cfg(any(unix, windows))]
 const MAX_CANDIDATE_PINS: usize = 4096;
 const IO_BUFFER_BYTES: usize = 64 * 1024;
 const STALE_LEASE_SECONDS: u64 = 24 * 60 * 60;
@@ -79,13 +79,13 @@ const MANIFEST_PREFIX: &str = "output-manifest-v1-sha256-";
 const ACTION_RESULT_PREFIX: &str = "action-result-v1-sha256-";
 const VALIDATION_PREFIX: &str = "validation-v1-sha256-";
 
-#[cfg(any(unix, windows, test))]
+#[cfg(any(unix, windows))]
 pub(crate) struct NativeCacheHit {
     pub(crate) bytes_read: u64,
     pub(crate) bytes_restored: u64,
 }
 
-#[cfg(any(unix, windows, test))]
+#[cfg(any(unix, windows))]
 pub(crate) struct NativeCacheMiss {
     pub(crate) reason: String,
     pub(crate) bytes_read: u64,
@@ -101,7 +101,7 @@ pub(crate) struct PackedNativeActionStagingRequest<'a> {
     pub(crate) compressed_bytes: u64,
 }
 
-#[cfg(any(unix, windows, test))]
+#[cfg(any(unix, windows))]
 struct MaterializeBlobRequest<'a> {
     bundle: &'a Path,
     identity: &'a str,
@@ -113,7 +113,7 @@ struct MaterializeBlobRequest<'a> {
     durable: bool,
 }
 
-#[cfg(any(unix, windows, test))]
+#[cfg(any(unix, windows))]
 pub(crate) enum NativeCacheLookup {
     Hit(NativeCacheHit),
     Miss(NativeCacheMiss),
@@ -420,23 +420,6 @@ impl NativeActionHit<'_> {
         })
     }
 
-    /// Materialize the already verified unique result into private staging.
-    #[cfg(test)]
-    pub(crate) fn restore(&self, destination: &Path) -> NativeCacheLookup {
-        let mut stats = ReadStats::default();
-        if let Err(fault) = self.cas.materialize(&self.verified, destination, &mut stats) {
-            return NativeCacheLookup::Miss(NativeCacheMiss {
-                reason: fault.reason,
-                bytes_read: stats.bytes,
-            });
-        }
-        self.refresh_access_if_stale();
-        NativeCacheLookup::Hit(NativeCacheHit {
-            bytes_read: stats.bytes,
-            bytes_restored: stats.restored,
-        })
-    }
-
     /// Materialize into one caller-registered exact staging directory.
     ///
     /// Restore transactions use this path so process-death recovery never has
@@ -738,7 +721,7 @@ struct NativeLedgerState {
 struct ReadStats {
     objects: u64,
     bytes: u64,
-    #[cfg(any(unix, windows, test))]
+    #[cfg(any(unix, windows))]
     restored: u64,
 }
 
@@ -869,11 +852,6 @@ enum BuildNode {
 }
 
 impl LocalCas {
-    #[cfg(test)]
-    pub(crate) fn root(&self) -> &Path {
-        &self.root
-    }
-
     fn lock(&self) -> RailResult<LocalCasLifecycleLock> {
         let _durability = native_durability_phase(NativeDurabilityPhase::CasLockWait);
         lock_local_cas(&self.lifecycle_lock, false, LockMode::Exclusive)?
@@ -1220,7 +1198,7 @@ impl LocalCas {
     }
 
     /// Load bounded exact-action candidates for one non-authoritative pre-link selector.
-    #[cfg(any(target_os = "macos", target_os = "linux", test))]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) fn native_link_candidates(&self, candidate_key: &str) -> RailResult<Vec<String>> {
         let _lock = self.read_lock()?;
         let candidate_hex = validated_id_hex(candidate_key, crate::compiler::native_cache::CANDIDATE_SELECTOR_PREFIX)?;
@@ -1387,8 +1365,6 @@ impl LocalCas {
         let staging = self.root.join("staging");
         validate_real_directory(&staging, "local CAS staging")?;
         let directory = tempfile::Builder::new().prefix(prefix).tempdir_in(&staging)?;
-        #[cfg(test)]
-        pause_test_staging_before_active(directory.path())?;
         let active_path = directory.path().join("ACTIVE");
         let active = OpenOptions::new()
             .read(true)
@@ -1397,11 +1373,6 @@ impl LocalCas {
             .open(active_path)?;
         active.lock()?;
         Ok((directory, active))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn status(&self) -> RailResult<LocalCasStatus> {
-        status_at_with_max(&self.root, self.max_bytes)?.ok_or_else(|| RailError::message("local CAS disappeared"))
     }
 
     /// Return the private candidate location for one verified sysroot identity memo.
@@ -1506,55 +1477,12 @@ impl LocalCas {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn open_at(base: &Path, max_bytes: u64) -> RailResult<Self> {
-        fs::create_dir_all(base)?;
-        let base = fs::canonicalize(base)?;
-        let cargo_rail = create_real_directory(&base, "cargo-rail")?;
-        let authority = SelectedCacheAuthority {
-            root_name: CAS_ROOT_NAME.to_string(),
-            trust_domain: load_default_trust_domain(&cargo_rail, true)?,
-        };
-        let lifecycle_lock = cargo_rail.join(format!("{}.lock", authority.root_name));
-        let _lock = lock_local_cas(&lifecycle_lock, true, LockMode::Exclusive)?
-            .ok_or_else(|| RailError::message("local CAS lifecycle lock was not created"))?;
-        let root = create_real_directory(&cargo_rail, &authority.root_name)?;
-        prove_local_cache_volume(&root)?;
-        ensure_owner_marker(&root, &authority.trust_domain)?;
-        create_real_directory(&root, "staging")?;
-        for name in [
-            "results",
-            "pins",
-            "leases",
-            NATIVE_ACTION_STATE_DIRECTORY,
-            NATIVE_ENVIRONMENT_SELECTOR_DIRECTORY,
-            NATIVE_LINK_CANDIDATE_DIRECTORY,
-            NATIVE_RESTORE_LOCK_DIRECTORY,
-            EVIDENCE_CANDIDATE_INDEX_DIRECTORY,
-        ] {
-            create_real_directory(&root, name)?;
-        }
-        initialize_native_execution_claims(&root)?;
-        initialize_native_restore_locks(&root)?;
-        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-        create_real_directory(&root, SYSROOT_IDENTITY_MEMO_DIRECTORY)?;
-        validate_root_entries(&root)?;
-        clear_staging(&root.join("staging"))?;
-        reconcile_capacity_state(&root)?;
-        reconcile_native_ledger(&root)?;
-        Ok(Self {
-            root,
-            lifecycle_lock,
-            max_bytes,
-        })
-    }
-
-    #[cfg(any(unix, windows, test))]
+    #[cfg(any(unix, windows))]
     pub(crate) fn native_action(&self, action_key: &str) -> RailResult<NativeActionLookup<'_>> {
         self.native_action_with_retry(action_key, true)
     }
 
-    #[cfg(any(unix, windows, test))]
+    #[cfg(any(unix, windows))]
     fn native_action_with_retry(&self, action_key: &str, retry_after_race: bool) -> RailResult<NativeActionLookup<'_>> {
         let lock = self.read_lock()?;
         if validate_native_ledger(&self.root)?.disabled {
@@ -1698,7 +1626,7 @@ impl LocalCas {
 
     /// Preserve evidence that an unreadable state may already have encoded a conflict.
     /// Returns `false` only when a concurrent writer installed a valid state first.
-    #[cfg(any(unix, windows, test))]
+    #[cfg(any(unix, windows))]
     fn quarantine_native_action_if_invalid(
         &self,
         action_key: &str,
@@ -1840,14 +1768,6 @@ impl LocalCas {
         }
         candidates.sort_unstable_by_key(|candidate| std::cmp::Reverse(candidate.created_unix_nanos));
         Ok(candidates)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn store_native(
-        &self,
-        prepared: PreparedNativeResult,
-    ) -> RailResult<(NativeCompilerValidation, StoreStats)> {
-        self.store_native_revalidated(prepared, |_| Ok(()))
     }
 
     /// Publish one already-authenticated compressed result as the action's sole L1 result authority.
@@ -2194,15 +2114,15 @@ impl LocalCas {
 }
 
 struct VerifiedResult {
-    #[cfg(any(unix, windows, test))]
+    #[cfg(any(unix, windows))]
     object: ActionResultObject,
-    #[cfg(any(unix, windows, test))]
+    #[cfg(any(unix, windows))]
     manifest: OutputManifest,
-    #[cfg(any(unix, windows, test))]
+    #[cfg(any(unix, windows))]
     validation: StoredValidation,
-    #[cfg(any(unix, windows, test))]
+    #[cfg(any(unix, windows))]
     trees: BTreeMap<String, TreeObject>,
-    #[cfg(any(unix, windows, test))]
+    #[cfg(any(unix, windows))]
     bundle: PathBuf,
 }
 
@@ -3646,15 +3566,15 @@ impl LocalCas {
             "json",
         )?;
         Ok(VerifiedResult {
-            #[cfg(any(unix, windows, test))]
+            #[cfg(any(unix, windows))]
             object,
-            #[cfg(any(unix, windows, test))]
+            #[cfg(any(unix, windows))]
             manifest,
-            #[cfg(any(unix, windows, test))]
+            #[cfg(any(unix, windows))]
             validation,
-            #[cfg(any(unix, windows, test))]
+            #[cfg(any(unix, windows))]
             trees,
-            #[cfg(any(unix, windows, test))]
+            #[cfg(any(unix, windows))]
             bundle,
         })
     }
@@ -3743,18 +3663,7 @@ impl LocalCas {
         Ok(VerifiedCompilerEvidence { validation, evidence })
     }
 
-    #[cfg(test)]
-    fn materialize(&self, verified: &VerifiedResult, destination: &Path, stats: &mut ReadStats) -> Result<(), Fault> {
-        let (_, output_tree, _) = output_result_payload(&verified.object)?;
-        let parent = validate_materialization_destination(destination)?;
-        let temporary = tempfile::Builder::new()
-            .prefix("restore-")
-            .tempdir_in(parent)
-            .map_err(|error| Fault::corrupt(format!("materialization_staging_unavailable: {error}")))?;
-        materialize_from_staging(verified, output_tree, destination, temporary.path(), parent, stats)
-    }
-
-    #[cfg(any(unix, windows, test))]
+    #[cfg(any(unix, windows))]
     fn materialize_registered(
         &self,
         verified: &VerifiedResult,
@@ -3778,7 +3687,7 @@ impl LocalCas {
     }
 }
 
-#[cfg(any(unix, windows, test))]
+#[cfg(any(unix, windows))]
 fn validate_materialization_destination(destination: &Path) -> Result<&Path, Fault> {
     let parent = destination
         .parent()
@@ -3793,7 +3702,7 @@ fn validate_materialization_destination(destination: &Path) -> Result<&Path, Fau
     }
 }
 
-#[cfg(any(unix, windows, test))]
+#[cfg(any(unix, windows))]
 fn materialize_from_staging(
     verified: &VerifiedResult,
     output_tree: &str,
@@ -4114,7 +4023,7 @@ fn validate_object_directory(
     Ok(())
 }
 
-#[cfg(any(unix, windows, test))]
+#[cfg(any(unix, windows))]
 fn materialize_tree(
     bundle: &Path,
     identity: &str,
@@ -4165,7 +4074,7 @@ fn materialize_tree(
     Ok(())
 }
 
-#[cfg(any(unix, windows, test))]
+#[cfg(any(unix, windows))]
 fn materialize_blob(request: MaterializeBlobRequest<'_>) -> Result<(), Fault> {
     let MaterializeBlobRequest {
         bundle,
@@ -4319,7 +4228,7 @@ fn create_materialized_symlink(_target: &Path, _destination: &Path, _directory: 
     Err(Fault::incompatible("symlink_materialization_unsupported"))
 }
 
-#[cfg(any(unix, windows, test))]
+#[cfg(any(unix, windows))]
 fn sync_output_tree(root: &Path) -> RailResult<()> {
     let mut directories = Vec::new();
     let mut pending = vec![root.to_path_buf()];
@@ -4380,8 +4289,6 @@ impl LocalCas {
         write_new_before_commit(&payload.join("action-result.json"), object_bytes)?;
         stats.objects_written = stats.objects_written.saturating_add(1);
         stats.bytes_written = stats.bytes_written.saturating_add(object_bytes.len() as u64);
-        #[cfg(test)]
-        pause_test_publication_after_first_object(&payload)?;
 
         let manifest_hex = validated_id_hex(manifest.digest(), MANIFEST_PREFIX)?;
         write_new_before_commit(
@@ -4552,8 +4459,6 @@ impl LocalCas {
         write_new_synced(&payload.join("action-result.json"), object_bytes)?;
         stats.objects_written = 1;
         stats.bytes_written = object_bytes.len() as u64;
-        #[cfg(test)]
-        pause_test_publication_after_first_object(&payload)?;
 
         let validation_hex = validated_id_hex(&object.validation, VALIDATION_PREFIX)?;
         write_new_synced(
@@ -5020,52 +4925,6 @@ fn sync_directory_before_commit(path: &Path) -> RailResult<()> {
 
 #[cfg(not(unix))]
 fn sync_directory_before_commit(_path: &Path) -> RailResult<()> {
-    Ok(())
-}
-
-#[cfg(test)]
-fn pause_test_publication_after_first_object(_payload: &Path) -> RailResult<()> {
-    const FAIL_ENV: &str = "CARGO_RAIL_TEST_CAS_FAIL_AFTER_FIRST_OBJECT";
-    const PAUSE_ENV: &str = "CARGO_RAIL_TEST_CAS_PAUSE_AFTER_FIRST_OBJECT";
-    if std::env::var_os(FAIL_ENV).is_some() {
-        #[cfg(windows)]
-        const OUT_OF_SPACE: i32 = 112;
-        #[cfg(not(windows))]
-        const OUT_OF_SPACE: i32 = 28;
-        return Err(std::io::Error::from_raw_os_error(OUT_OF_SPACE).into());
-    }
-    let Some(control) = std::env::var_os(PAUSE_ENV) else {
-        return Ok(());
-    };
-    let control = PathBuf::from(control);
-    fs::create_dir_all(&control)?;
-    write_new_synced(&control.join("ready"), b"ready\n")?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while !control.join("continue").is_file() {
-        if std::time::Instant::now() >= deadline {
-            return Err(RailError::message("test publication pause timed out"));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-fn pause_test_staging_before_active(_directory: &Path) -> RailResult<()> {
-    const PAUSE_ENV: &str = "CARGO_RAIL_TEST_CAS_PAUSE_BEFORE_ACTIVE";
-    let Some(control) = std::env::var_os(PAUSE_ENV) else {
-        return Ok(());
-    };
-    let control = PathBuf::from(control);
-    fs::create_dir_all(&control)?;
-    write_new_synced(&control.join("ready"), b"ready\n")?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while !control.join("continue").is_file() {
-        if std::time::Instant::now() >= deadline {
-            return Err(RailError::message("test staging-creation pause timed out"));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
     Ok(())
 }
 
@@ -6504,17 +6363,25 @@ fn has_single_link(_metadata: &fs::Metadata) -> bool {
     true
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(unix, windows)))]
 mod tests {
     use std::sync::{Arc, Barrier};
 
     use super::*;
     use crate::source::ContentDigest;
 
+    fn open_cas(base: &Path, max_bytes: u64) -> RailResult<LocalCas> {
+        LocalCas::open_selected(&LocalCacheSelection::new(base.to_path_buf(), max_bytes, None)?)
+    }
+
+    fn status(cas: &LocalCas) -> RailResult<LocalCasStatus> {
+        status_at_with_max(&cas.root, cas.max_bytes)?.ok_or_else(|| RailError::message("local CAS disappeared"))
+    }
+
     #[test]
     fn unsupported_native_ledger_never_becomes_empty_current_authority() {
         let cache = tempfile::tempdir().expect("cache base");
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("current CAS");
+        let cas = open_cas(cache.path(), 1024 * 1024).expect("current CAS");
         let root = cas.root.clone();
         drop(cas);
         let path = root.join(NATIVE_LEDGER_STATE_FILE);
@@ -6580,10 +6447,12 @@ mod tests {
         .expect("valid test dynamic-input selector")
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn native_action_key(value: u8) -> String {
         format!("{}{value:064x}", crate::compiler::native_cache::ACTION_KEY_PREFIX)
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn native_link_candidate_key(value: u8) -> String {
         format!(
             "{}{value:064x}",
@@ -6602,16 +6471,25 @@ mod tests {
             ("target/streams/stdout", stdout),
             ("target/streams/stderr", b"".as_slice()),
         ];
-        let mut paths = Vec::new();
+        let mut slots = Vec::new();
         for (relative, bytes) in files {
             let path = root.join(relative);
             fs::create_dir_all(path.parent().expect("fixture parent")).expect("fixture directory");
             fs::write(&path, bytes).expect("fixture output");
             set_exact_mode(&path, 0o644).expect("fixture output mode");
-            paths.push(path);
+            slots.push((
+                relative,
+                format!("sha256:{}", ContentDigest::sha256(bytes)),
+                bytes.len() as u64,
+                0o644,
+            ));
         }
+        let borrowed_slots = slots
+            .iter()
+            .map(|(path, digest, bytes, mode)| (*path, digest.as_str(), *bytes, *mode))
+            .collect::<Vec<_>>();
         let manifest =
-            crate::cache::result::capture_native_compiler_outputs(root, &paths).expect("native output manifest");
+            crate::cache::result::manifest_from_verified_native_slots(&borrowed_slots).expect("native output manifest");
         let validation = crate::compiler::native_cache::tests::cas_validation_with_stdout(stdout);
         (manifest, validation)
     }
@@ -6622,7 +6500,7 @@ mod tests {
         manifest: &OutputManifest,
         validation: &NativeCompilerValidation,
     ) -> StoreStats {
-        cas.store_native(prepared_native_fixture(output, manifest, validation))
+        cas.store_native_revalidated(prepared_native_fixture(output, manifest, validation), |_| Ok(()))
             .expect("native fixture should enter the CAS")
             .1
     }
@@ -6632,38 +6510,7 @@ mod tests {
         manifest: &OutputManifest,
         validation: &NativeCompilerValidation,
     ) -> PreparedNativeResult {
-        let staging = tempfile::tempdir().expect("native prepared staging");
-        for entry in &manifest.entries {
-            let source = output.join(&entry.path);
-            let destination = staging.path().join(&entry.path);
-            match &entry.kind {
-                OutputEntryKind::Directory { mode } => {
-                    fs::create_dir(&destination).expect("prepared directory");
-                    set_exact_mode(&destination, *mode).expect("prepared directory mode");
-                }
-                OutputEntryKind::File { mode, .. } => {
-                    fs::copy(source, &destination).expect("prepared file");
-                    set_exact_mode(&destination, *mode).expect("prepared file mode");
-                }
-                OutputEntryKind::Symlink { .. } => panic!("native fixtures have no symlinks"),
-            }
-        }
-        PreparedNativeResult::from_verified_staging(staging, manifest.clone(), validation.clone())
-    }
-
-    fn native_revision_validation(base: &NativeCompilerValidation, revision: u64) -> NativeCompilerValidation {
-        let revision_bytes = revision.to_le_bytes();
-        let action_key = format!(
-            "{}{}",
-            crate::compiler::native_cache::ACTION_KEY_PREFIX,
-            framed_identity(
-                b"cargo-rail-cas-test-hot-crate-revision\0",
-                &[(b"revision", revision_bytes.as_slice())],
-            )
-        );
-
-        base.with_action_key_for_test(action_key)
-            .expect("valid revision identity")
+        crate::compiler::native_cache::tests::prepared_cas_from_outputs(output, manifest, validation)
     }
 
     fn native_action_result_for_revision(revision: u64) -> String {
@@ -6697,7 +6544,8 @@ mod tests {
         )
         .expect("revision action key");
         fs::write(
-            cas.root()
+            cas.root
+                .as_path()
                 .join(NATIVE_ACTION_STATE_DIRECTORY)
                 .join(format!("{action_hex}.json")),
             canonical_json(&state).expect("canonical revision state"),
@@ -6708,7 +6556,7 @@ mod tests {
     #[test]
     fn native_environment_selector_round_trips_canonical_names_and_status() {
         let cache = tempfile::tempdir().expect("cache base");
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
         let key = base_action_key(1);
         let selector = dynamic_selector(
             &["CARGO_CFG_TARGET_ARCH", "P73_SELECTED"],
@@ -6730,7 +6578,7 @@ mod tests {
                 .expect("equal publication"),
             NativeEnvironmentSelectorPublication::Converged
         );
-        assert_eq!(cas.status().expect("status").index_files, 1);
+        assert_eq!(status(&cas).expect("status").index_files, 1);
 
         let path = cas.native_environment_selector_path(&key).expect("selector path");
         assert_eq!(
@@ -6747,7 +6595,7 @@ mod tests {
     #[test]
     fn packed_native_action_is_the_single_reopenable_accounted_authority() {
         let source_base = tempfile::tempdir().expect("source cache base");
-        let source = LocalCas::open_at(source_base.path(), 16 * 1024 * 1024).expect("source CAS should open");
+        let source = open_cas(source_base.path(), 16 * 1024 * 1024).expect("source CAS should open");
         let output = tempfile::tempdir().expect("native output");
         let (manifest, validation) = native_fixture(output.path());
         store_native_fixture(&source, output.path(), &manifest, &validation);
@@ -6763,8 +6611,7 @@ mod tests {
         let compressed = zstd::stream::encode_all(pack.as_slice(), 1).expect("native pack compression");
 
         let destination_base = tempfile::tempdir().expect("destination cache base");
-        let destination =
-            LocalCas::open_at(destination_base.path(), 16 * 1024 * 1024).expect("destination CAS should open");
+        let destination = open_cas(destination_base.path(), 16 * 1024 * 1024).expect("destination CAS should open");
         let base_action = base_action_key(91);
         let selector = crate::compiler::native_cache::NativeDynamicInputSelector::new(Vec::new(), Vec::new())
             .expect("empty selector");
@@ -6793,12 +6640,15 @@ mod tests {
             PackedNativeActionPublication::Created
         );
         assert_eq!(
-            bounded_optional_directory_entries(&destination.root().join("results"), "test materialized results")
-                .expect("materialized results")
-                .len(),
+            bounded_optional_directory_entries(
+                &destination.root.as_path().join("results"),
+                "test materialized results"
+            )
+            .expect("materialized results")
+            .len(),
             0
         );
-        let committed_bytes = destination.status().expect("packed status").committed_result_bytes;
+        let committed_bytes = status(&destination).expect("packed status").committed_result_bytes;
         assert!(committed_bytes > compressed.len() as u64);
 
         let NativeActionLookup::Packed(packed) = destination
@@ -6817,8 +6667,7 @@ mod tests {
         drop(packed);
         drop(destination);
 
-        let reopened =
-            LocalCas::open_at(destination_base.path(), 16 * 1024 * 1024).expect("destination CAS should reopen");
+        let reopened = open_cas(destination_base.path(), 16 * 1024 * 1024).expect("destination CAS should reopen");
         assert!(matches!(
             reopened
                 .native_action(validation.action_key())
@@ -6826,13 +6675,13 @@ mod tests {
             NativeActionLookup::Packed(_)
         ));
         assert_eq!(
-            reopened.status().expect("reopened status").committed_result_bytes,
+            status(&reopened).expect("reopened status").committed_result_bytes,
             committed_bytes
         );
         reopened
             .quarantine_packed_native_action(validation.action_key(), "test corruption")
             .expect("packed quarantine");
-        assert_eq!(reopened.status().expect("quarantined status").committed_result_bytes, 0);
+        assert_eq!(status(&reopened).expect("quarantined status").committed_result_bytes, 0);
         assert!(matches!(
             reopened
                 .native_action(validation.action_key())
@@ -6842,9 +6691,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn native_link_candidates_are_bounded_canonical_disposable_pointers() {
         let cache = tempfile::tempdir().expect("cache base");
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
         let candidate = native_link_candidate_key(1);
         let first = native_action_key(2);
         let second = native_action_key(3);
@@ -6864,13 +6714,14 @@ mod tests {
             cas.native_link_candidates(&candidate).expect("candidate lookup"),
             vec![first, second]
         );
-        assert_eq!(cas.status().expect("status").index_files, 2);
+        assert_eq!(status(&cas).expect("status").index_files, 2);
     }
 
     #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn native_link_candidates_reject_noncanonical_and_hostile_state() {
         let cache = tempfile::tempdir().expect("cache base");
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
         cas.native_link_candidates("compiler-candidate-v4-sha256-1")
             .unwrap_err();
 
@@ -6883,7 +6734,8 @@ mod tests {
         let action_hex =
             validated_id_hex(&action, crate::compiler::native_cache::ACTION_KEY_PREFIX).expect("action identity");
         let entry = cas
-            .root()
+            .root
+            .as_path()
             .join(NATIVE_LINK_CANDIDATE_DIRECTORY)
             .join(candidate_hex)
             .join(format!("{action_hex}.json"));
@@ -6893,16 +6745,21 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn native_link_candidate_lookup_never_follows_a_directory_symlink() {
         use std::os::unix::fs::symlink;
 
         let cache = tempfile::tempdir().expect("cache base");
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
         let candidate = native_link_candidate_key(6);
         let candidate_hex = validated_id_hex(&candidate, crate::compiler::native_cache::CANDIDATE_SELECTOR_PREFIX)
             .expect("candidate identity");
         let outside = tempfile::tempdir().expect("outside directory");
-        let directory = cas.root().join(NATIVE_LINK_CANDIDATE_DIRECTORY).join(candidate_hex);
+        let directory = cas
+            .root
+            .as_path()
+            .join(NATIVE_LINK_CANDIDATE_DIRECTORY)
+            .join(candidate_hex);
         symlink(outside.path(), &directory).expect("candidate symlink");
         cas.native_link_candidates(&candidate).unwrap_err();
     }
@@ -6910,7 +6767,7 @@ mod tests {
     #[test]
     fn native_environment_selector_divergence_preserves_the_first_binding() {
         let cache = tempfile::tempdir().expect("cache base");
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
         let key = base_action_key(2);
         let first = dynamic_selector(&["FIRST"], &["README.md"]);
         let second = dynamic_selector(&["SECOND"], &[".config/target-matrix.json"]);
@@ -6938,10 +6795,10 @@ mod tests {
             .native_environment_selector(&key)
             .expect_err("conflicted selector must fail closed");
         assert!(error.to_string().contains("durably conflicted"), "{error}");
-        assert_eq!(cas.status().expect("status").index_files, 2);
+        assert_eq!(status(&cas).expect("status").index_files, 2);
 
         drop(cas);
-        let reopened = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should reopen");
+        let reopened = open_cas(cache.path(), 1024 * 1024).expect("CAS should reopen");
         let error = reopened
             .native_environment_selector(&key)
             .expect_err("conflict must survive reopening");
@@ -6951,7 +6808,7 @@ mod tests {
     #[test]
     fn concurrent_native_environment_selector_publishers_converge() {
         let cache = tempfile::tempdir().expect("cache base");
-        let cas = Arc::new(LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open"));
+        let cas = Arc::new(open_cas(cache.path(), 1024 * 1024).expect("CAS should open"));
         let barrier = Arc::new(Barrier::new(2));
         let key = base_action_key(3);
         let selector = dynamic_selector(&["P73_SELECTED"], &["README.md"]);
@@ -6994,7 +6851,7 @@ mod tests {
     #[test]
     fn concurrent_differing_native_environment_selector_publishers_conflict_terminally() {
         let cache = tempfile::tempdir().expect("cache base");
-        let cas = Arc::new(LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open"));
+        let cas = Arc::new(open_cas(cache.path(), 1024 * 1024).expect("CAS should open"));
         let barrier = Arc::new(Barrier::new(2));
         let key = base_action_key(10);
         let selectors = [
@@ -7055,7 +6912,7 @@ mod tests {
     fn retained_native_action_hit_blocks_selector_conflict_publication() {
         let cache = tempfile::tempdir().expect("cache base");
         let output = tempfile::tempdir().expect("output root");
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
         let (manifest, validation) = native_fixture(output.path());
         store_native_fixture(&cas, output.path(), &manifest, &validation);
         let key = base_action_key(13);
@@ -7102,7 +6959,7 @@ mod tests {
     #[test]
     fn native_environment_selector_rejects_noncanonical_input_and_state() {
         let cache = tempfile::tempdir().expect("cache base");
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
         let unsorted_key = base_action_key(4);
         let unsorted = vec!["Z".to_string(), "A".to_string()];
         let error = crate::compiler::native_cache::NativeDynamicInputSelector::new(unsorted, Vec::new())
@@ -7144,7 +7001,7 @@ mod tests {
     #[test]
     fn native_environment_selector_validates_its_identity_names_and_bounds() {
         let cache = tempfile::tempdir().expect("cache base");
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
 
         let error = cas
             .native_environment_selector(&format!(
@@ -7176,7 +7033,7 @@ mod tests {
     #[test]
     fn native_environment_selector_rejects_canonical_compiler_invalid_state() {
         let cache = tempfile::tempdir().expect("cache base");
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
         let private_key = base_action_key(11);
         let private_path = cas
             .native_environment_selector_path(&private_key)
@@ -7214,7 +7071,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let cache = tempfile::tempdir().expect("cache base");
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
         let hard_link_key = base_action_key(7);
         cas.publish_native_environment_selector(&hard_link_key, &dynamic_selector(&["VALID"], &[]))
             .expect("valid publication");
@@ -7252,9 +7109,9 @@ mod tests {
 
         let cache = tempfile::tempdir().expect("cache base");
         let output = tempfile::tempdir().expect("output root");
-        let (manifest, base) = native_fixture(output.path());
-        let current = native_revision_validation(&base, REVISIONS - 1);
-        let cas = LocalCas::open_at(cache.path(), 64 * 1024 * 1024).expect("CAS should open");
+        let (manifest, _) = native_fixture(output.path());
+        let current = crate::compiler::native_cache::tests::cas_validation_for_revision(REVISIONS - 1);
+        let cas = open_cas(cache.path(), 64 * 1024 * 1024).expect("CAS should open");
         let current_stats = store_native_fixture(&cas, output.path(), &manifest, &current);
         let current_action_result = current_stats.action_result.expect("current action result");
 
@@ -7273,7 +7130,7 @@ mod tests {
         let mut action_keys = BTreeSet::new();
         let mut result_keys = BTreeSet::new();
         for revision in 0..REVISIONS {
-            let validation = native_revision_validation(&base, revision);
+            let validation = crate::compiler::native_cache::tests::cas_validation_for_revision(revision);
             assert!(action_keys.insert(validation.action_key().to_string()));
             assert!(result_keys.insert(validation.result_key().to_string()));
             if revision != REVISIONS - 1 {
@@ -7287,7 +7144,8 @@ mod tests {
         assert_eq!(result_keys.len(), revision_count);
 
         let mut fanout = BTreeMap::<String, BTreeSet<String>>::new();
-        for entry in fs::read_dir(cas.root().join(NATIVE_ACTION_STATE_DIRECTORY)).expect("native action states") {
+        for entry in fs::read_dir(cas.root.as_path().join(NATIVE_ACTION_STATE_DIRECTORY)).expect("native action states")
+        {
             let entry = entry.expect("native action entry");
             let name = entry.file_name().into_string().expect("UTF-8 action state name");
             let action_hex = name.strip_suffix(".json").expect("canonical action state name");
@@ -7312,7 +7170,7 @@ mod tests {
         assert_eq!(after.validation, current);
         assert_eq!(after.bytes_read, baseline_bytes_read);
         assert_eq!(
-            fs::read_dir(cas.root().join("results"))
+            fs::read_dir(cas.root.as_path().join("results"))
                 .expect("result namespace")
                 .count(),
             1
@@ -7325,7 +7183,7 @@ mod tests {
         let output = tempfile::tempdir().expect("output root");
         let restore_parent = tempfile::tempdir().expect("restore parent");
         let (manifest, validation) = native_fixture(output.path());
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
         store_native_fixture(&cas, output.path(), &manifest, &validation);
 
         let destination = restore_parent.path().join("native-output");
@@ -7334,7 +7192,9 @@ mod tests {
         };
         assert!(!destination.exists(), "action lookup must not materialize output");
 
-        let NativeCacheLookup::Hit(hit) = cached.restore(&destination) else {
+        let NativeCacheLookup::Hit(hit) =
+            cached.restore_registered(&destination, &restore_parent.path().join("staging"))
+        else {
             panic!("verified native action should restore");
         };
         assert_eq!(hit.bytes_restored, manifest.bytes);
@@ -7368,7 +7228,7 @@ mod tests {
         let output = tempfile::tempdir().expect("output root");
         let restore_parent = tempfile::tempdir().expect("restore parent");
         let (manifest, validation) = native_fixture(output.path());
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
         store_native_fixture(&cas, output.path(), &manifest, &validation);
         let action_hex = validated_action_key_hex(validation.action_key()).expect("native action key");
         let state = cas
@@ -7384,7 +7244,10 @@ mod tests {
             panic!("fresh native action should be authoritative");
         };
         assert!(matches!(
-            cached.restore(&restore_parent.path().join("fresh")),
+            cached.restore_registered(
+                &restore_parent.path().join("fresh"),
+                &restore_parent.path().join("fresh-staging")
+            ),
             NativeCacheLookup::Hit(_)
         ));
         drop(cached);
@@ -7410,7 +7273,10 @@ mod tests {
             panic!("stale native action should remain authoritative");
         };
         assert!(matches!(
-            cached.restore(&restore_parent.path().join("stale")),
+            cached.restore_registered(
+                &restore_parent.path().join("stale"),
+                &restore_parent.path().join("stale-staging")
+            ),
             NativeCacheLookup::Hit(_)
         ));
         drop(cached);
@@ -7430,7 +7296,7 @@ mod tests {
         let output = tempfile::tempdir().expect("output root");
         let restore_parent = tempfile::tempdir().expect("restore parent");
         let (manifest, validation) = native_fixture(output.path());
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
         store_native_fixture(&cas, output.path(), &manifest, &validation);
         let NativeActionLookup::Hit(cached) = cas.native_action(validation.action_key()).expect("action lookup") else {
             panic!("verified native action should be authoritative");
@@ -7464,7 +7330,7 @@ mod tests {
         let output = tempfile::tempdir().expect("output root");
         let restore_parent = tempfile::tempdir().expect("restore parent");
         let (manifest, validation) = native_fixture(output.path());
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
         store_native_fixture(&cas, output.path(), &manifest, &validation);
         let NativeActionLookup::Hit(cached) = cas.native_action(validation.action_key()).expect("action lookup") else {
             panic!("verified native action should be authoritative");
@@ -7527,7 +7393,7 @@ mod tests {
         let cache = tempfile::tempdir().expect("cache base");
         let output = tempfile::tempdir().expect("output root");
         let (manifest, validation) = native_fixture(output.path());
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
         store_native_fixture(&cas, output.path(), &manifest, &validation);
 
         let action_hex = validated_action_key_hex(validation.action_key()).expect("action key");
@@ -7538,7 +7404,7 @@ mod tests {
         )
         .expect("remove action state");
 
-        let reopened = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should reopen");
+        let reopened = open_cas(cache.path(), 1024 * 1024).expect("CAS should reopen");
         assert!(matches!(
             reopened.native_action(validation.action_key()).expect("missing action"),
             NativeActionLookup::Miss(_)
@@ -7554,15 +7420,14 @@ mod tests {
         let (second_manifest, second_validation) = native_fixture_with_stdout(second_output.path(), b"different");
         assert_eq!(first_validation.action_key(), second_validation.action_key());
         assert_ne!(first_validation.result_key(), second_validation.result_key());
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
         store_native_fixture(&cas, first_output.path(), &first_manifest, &first_validation);
 
         let error = cas
-            .store_native(prepared_native_fixture(
-                second_output.path(),
-                &second_manifest,
-                &second_validation,
-            ))
+            .store_native_revalidated(
+                prepared_native_fixture(second_output.path(), &second_manifest, &second_validation),
+                |_| Ok(()),
+            )
             .expect_err("a distinct result must conflict");
         assert!(error.to_string().contains("two different verified results"), "{error}");
         let NativeActionLookup::Miss(miss) = cas
@@ -7574,7 +7439,7 @@ mod tests {
         assert_eq!(miss.reason, "action_conflicted");
 
         drop(cas);
-        let reopened = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should reopen");
+        let reopened = open_cas(cache.path(), 1024 * 1024).expect("CAS should reopen");
         reopened.garbage_collect(0, None).expect("GC must preserve the ledger");
         let NativeActionLookup::Miss(miss) = reopened
             .native_action(first_validation.action_key())
@@ -7599,10 +7464,10 @@ mod tests {
         let second_output = tempfile::tempdir().expect("second output root");
         let (first_manifest, first_validation) = native_fixture(first_output.path());
         let (second_manifest, second_validation) = native_fixture_with_stdout(second_output.path(), b"different");
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
         store_native_fixture(&cas, first_output.path(), &first_manifest, &first_validation);
         write_native_ledger(
-            cas.root(),
+            cas.root.as_path(),
             &NativeLedgerState {
                 version: NATIVE_ACTION_STATE_VERSION,
                 terminal_states: MAX_NATIVE_TERMINAL_STATES,
@@ -7613,14 +7478,13 @@ mod tests {
         .expect("ledger at exact bound");
 
         let error = cas
-            .store_native(prepared_native_fixture(
-                second_output.path(),
-                &second_manifest,
-                &second_validation,
-            ))
+            .store_native_revalidated(
+                prepared_native_fixture(second_output.path(), &second_manifest, &second_validation),
+                |_| Ok(()),
+            )
             .expect_err("terminal ledger must refuse another conflict marker");
         assert!(error.to_string().contains("ledger is full"), "{error}");
-        assert!(validate_native_ledger(cas.root()).expect("ledger").disabled);
+        assert!(validate_native_ledger(cas.root.as_path()).expect("ledger").disabled);
         let NativeActionLookup::Miss(miss) = cas
             .native_action(first_validation.action_key())
             .expect("disabled lookup")
@@ -7630,7 +7494,8 @@ mod tests {
         assert_eq!(miss.reason, "native_authority_ledger_full");
         let action_hex = validated_action_key_hex(first_validation.action_key()).expect("action key");
         let state_path = cas
-            .root()
+            .root
+            .as_path()
             .join(NATIVE_ACTION_STATE_DIRECTORY)
             .join(format!("{action_hex}.json"));
         let state: NativeActionState =
@@ -7643,7 +7508,7 @@ mod tests {
         let cache = tempfile::tempdir().expect("cache base");
         let output = tempfile::tempdir().expect("output root");
         let (manifest, validation) = native_fixture(output.path());
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
         store_native_fixture(&cas, output.path(), &manifest, &validation);
         let action_hex = validated_action_key_hex(validation.action_key()).expect("action key");
         let state_path = cas
@@ -7662,7 +7527,7 @@ mod tests {
         assert!(matches!(state.state, NativeActionStateKind::Quarantined { .. }));
 
         drop(cas);
-        let reopened = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should reopen");
+        let reopened = open_cas(cache.path(), 1024 * 1024).expect("CAS should reopen");
         reopened.garbage_collect(0, None).expect("GC must preserve quarantine");
         let NativeActionLookup::Miss(miss) = reopened
             .native_action(validation.action_key())
@@ -7681,7 +7546,7 @@ mod tests {
         let (manifest, validation) = native_fixture(output.path());
         let manifest = Arc::new(manifest);
         let validation = Arc::new(validation);
-        LocalCas::open_at(cache.path(), 1024 * 1024).expect("initialize CAS");
+        open_cas(cache.path(), 1024 * 1024).expect("initialize CAS");
         let barrier = Arc::new(Barrier::new(2));
         let cache_path = cache.path();
         let output_path = output.path();
@@ -7692,7 +7557,7 @@ mod tests {
                 let validation = Arc::clone(&validation);
                 let barrier = Arc::clone(&barrier);
                 handles.push(scope.spawn(move || {
-                    let cas = LocalCas::open_at(cache_path, 1024 * 1024).expect("writer CAS");
+                    let cas = open_cas(cache_path, 1024 * 1024).expect("writer CAS");
                     barrier.wait();
                     store_native_fixture(&cas, output_path, &manifest, &validation);
                 }));
@@ -7720,9 +7585,9 @@ mod tests {
         let cache = tempfile::tempdir().expect("cache base");
         let outside = tempfile::tempdir().expect("outside root");
         fs::write(outside.path().join("keep"), b"outside").expect("outside sentinel");
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
-        symlink(outside.path(), cas.root().join("staging/hostile-link")).expect("hostile nested link");
-        let removed = remove_owned_root_at(cas.root()).expect("owned cleanup should succeed");
+        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
+        symlink(outside.path(), cas.root.as_path().join("staging/hostile-link")).expect("hostile nested link");
+        let removed = remove_owned_root_at(cas.root.as_path()).expect("owned cleanup should succeed");
         assert!(removed.is_some());
         assert_eq!(
             fs::read(outside.path().join("keep")).expect("outside sentinel"),
@@ -7738,7 +7603,7 @@ mod tests {
         let sentinel = root.join("user-data");
         fs::write(&sentinel, b"preserve me").expect("hostile sentinel");
 
-        let error = LocalCas::open_at(cache.path(), 1024 * 1024).expect_err("unowned root must not be adopted");
+        let error = open_cas(cache.path(), 1024 * 1024).expect_err("unowned root must not be adopted");
         assert!(error.to_string().contains("nonempty"), "{error}");
         assert!(!root.join("OWNER").exists());
         assert_eq!(fs::read(&sentinel).expect("sentinel must survive"), b"preserve me");
@@ -7752,11 +7617,11 @@ mod tests {
     #[test]
     fn cleanup_refuses_an_invalid_owner_marker() {
         let cache = tempfile::tempdir().expect("cache base");
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
-        fs::write(cas.root().join("OWNER"), b"forged\n").expect("tamper owner marker");
-        let error = remove_owned_root_at(cas.root()).expect_err("invalid marker must block recursive cleanup");
+        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
+        fs::write(cas.root.as_path().join("OWNER"), b"forged\n").expect("tamper owner marker");
+        let error = remove_owned_root_at(cas.root.as_path()).expect_err("invalid marker must block recursive cleanup");
         assert!(error.to_string().contains("authority marker"), "{error}");
-        assert!(cas.root().exists());
+        assert!(cas.root.as_path().exists());
     }
 
     #[test]
@@ -7764,7 +7629,7 @@ mod tests {
         let cache = tempfile::tempdir().expect("cache base");
         let output = tempfile::tempdir().expect("output root");
         let (manifest, validation) = native_fixture(output.path());
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
         store_native_fixture(&cas, output.path(), &manifest, &validation);
         let action_hex = validated_id_hex(
             validation.action_key(),
@@ -7772,21 +7637,22 @@ mod tests {
         )
         .expect("action key");
         let action_state = cas
-            .root()
+            .root
+            .as_path()
             .join(NATIVE_ACTION_STATE_DIRECTORY)
             .join(format!("{action_hex}.json"));
         assert!(action_state.is_file());
 
         cas.garbage_collect(0, None).expect("GC should remove native result");
-        assert_eq!(fs::read_dir(cas.root().join("pins")).unwrap().count(), 0);
-        assert_eq!(fs::read_dir(cas.root().join("results")).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(cas.root.as_path().join("pins")).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(cas.root.as_path().join("results")).unwrap().count(), 0);
         assert!(!action_state.exists());
     }
 
     #[test]
     fn cleanup_waits_for_an_in_flight_cache_reader() {
         let cache = tempfile::tempdir().expect("cache base");
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
         let root = cas.root.clone();
         let reader = cas.read_lock().expect("shared lifecycle lock");
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
@@ -7814,7 +7680,7 @@ mod tests {
     #[test]
     fn cleanup_waits_for_an_in_flight_cache_mutation() {
         let cache = tempfile::tempdir().expect("cache base");
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
         let root = cas.root.clone();
         let mutation = cas.lock().expect("exclusive lifecycle lock");
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
@@ -7842,12 +7708,12 @@ mod tests {
     #[test]
     fn native_restore_locks_use_a_bounded_shard_set() {
         let cache = tempfile::tempdir().expect("cache base");
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
         for destination in 0..4096_u64 {
             let identity = ContentDigest::sha256(&destination.to_le_bytes());
             drop(cas.native_restore_lock(&identity).expect("restore shard lock"));
         }
-        let status = cas.status().expect("bounded restore-lock status");
+        let status = status(&cas).expect("bounded restore-lock status");
         assert_eq!(status.native_restore_lock_files, u64::from(NATIVE_RESTORE_LOCK_SHARDS));
         assert_eq!(status.staging_entries, 0);
     }
@@ -7855,7 +7721,7 @@ mod tests {
     #[test]
     fn native_execution_claims_use_a_bounded_shard_set() {
         let cache = tempfile::tempdir().expect("cache base");
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
         for candidate in 0..4096_u64 {
             let identity = ContentDigest::sha256(&candidate.to_le_bytes());
             let NativeExecutionClaimAttempt::Acquired(claim) = cas
@@ -7878,13 +7744,13 @@ mod tests {
         let entries =
             bounded_directory_entries(&claims, "test execution claims").expect("bounded execution-claim directory");
         assert_eq!(entries.len(), usize::from(NATIVE_EXECUTION_CLAIM_SHARDS));
-        assert_eq!(cas.status().expect("CAS status").staging_entries, 0);
+        assert_eq!(status(&cas).expect("CAS status").staging_entries, 0);
     }
 
     #[test]
     fn native_execution_claim_hash_collisions_only_serialize_work() {
         let cache = tempfile::tempdir().expect("cache base");
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
         let first = ContentDigest::sha256(b"first unrelated compiler action");
         let second = (0_u64..)
             .map(|candidate| ContentDigest::sha256(&candidate.to_le_bytes()))
@@ -7916,7 +7782,7 @@ mod tests {
     #[test]
     fn native_execution_claim_does_not_retain_cas_lifecycle_authority() {
         let cache = tempfile::tempdir().expect("cache base");
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
         let identity = ContentDigest::sha256(b"publication must not self-deadlock");
         let claim = cas.native_execution_claim(&identity).expect("execution claim");
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
@@ -7938,7 +7804,7 @@ mod tests {
     #[test]
     fn cache_cleanup_preserves_the_fixed_execution_claim_namespace() {
         let cache = tempfile::tempdir().expect("cache base");
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
         let root = cas.root;
         let claims = native_execution_claim_directory(&root).expect("execution-claim directory");
         validate_native_execution_claim_directory(&claims).expect("initial execution-claim namespace");
@@ -7950,7 +7816,7 @@ mod tests {
             u64::from(NATIVE_EXECUTION_CLAIM_SHARDS)
         );
 
-        let reopened = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should reopen");
+        let reopened = open_cas(cache.path(), 1024 * 1024).expect("CAS should reopen");
         assert_eq!(
             native_execution_claim_directory(&reopened.root).expect("reopened execution-claim directory"),
             claims
@@ -7967,7 +7833,7 @@ mod tests {
         let control = root.path().join("control");
         fs::create_dir(&cache).expect("cache base");
         fs::create_dir(&control).expect("control directory");
-        let cas = LocalCas::open_at(&cache, 1024 * 1024).expect("CAS should open");
+        let cas = open_cas(&cache, 1024 * 1024).expect("CAS should open");
         let identity = ContentDigest::sha256(b"shared compiler candidate");
         let claim = cas.native_execution_claim(&identity).expect("parent execution claim");
         let mut child = std::process::Command::new(std::env::current_exe().expect("current test executable"))
@@ -8037,7 +7903,7 @@ mod tests {
         let control = root.path().join("control");
         fs::create_dir(&cache).expect("cache base");
         fs::create_dir(&control).expect("control directory");
-        let cas = LocalCas::open_at(&cache, 1024 * 1024).expect("CAS should open");
+        let cas = open_cas(&cache, 1024 * 1024).expect("CAS should open");
         let identity = ContentDigest::sha256(b"shared restore destination");
         let lock = cas.native_restore_lock(&identity).expect("parent restore lock");
         let mut child = std::process::Command::new(std::env::current_exe().expect("current test executable"))
@@ -8093,30 +7959,31 @@ mod tests {
     #[test]
     fn status_and_cleanup_accept_an_owned_missing_optional_evidence_index() {
         let cache = tempfile::tempdir().expect("cache base");
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
-        fs::remove_dir(cas.root().join(EVIDENCE_CANDIDATE_INDEX_DIRECTORY)).expect("remove transition directory");
+        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
+        fs::remove_dir(cas.root.as_path().join(EVIDENCE_CANDIDATE_INDEX_DIRECTORY))
+            .expect("remove transition directory");
 
-        let status = status_at_with_max(cas.root(), 1024 * 1024)
+        let status = status_at_with_max(cas.root.as_path(), 1024 * 1024)
             .expect("transition status")
             .expect("present transition root");
         assert_eq!(status.index_files, 0);
 
-        let removed = remove_owned_root_at(cas.root()).expect("transition cleanup");
+        let removed = remove_owned_root_at(cas.root.as_path()).expect("transition cleanup");
         assert!(removed.is_some());
-        assert!(!cas.root().exists());
+        assert!(!cas.root.as_path().exists());
     }
 
     #[test]
     fn initialized_cache_open_validates_without_reclaiming_shared_staging() {
         let cache = tempfile::tempdir().expect("cache base");
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
-        let in_flight = cas.root().join("staging/in-flight");
+        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
+        let in_flight = cas.root.as_path().join("staging/in-flight");
         fs::write(&in_flight, b"owned by another compiler process").expect("staging sentinel");
 
         let base = fs::canonicalize(cache.path()).expect("canonical cache base");
         let reopened = LocalCas::open_initialized_at(&base, 1024 * 1024, None).expect("initialized CAS should open");
 
-        assert_eq!(reopened.root(), cas.root());
+        assert_eq!(reopened.root.as_path(), cas.root.as_path());
         assert_eq!(
             fs::read(in_flight).expect("initialized open must preserve staging"),
             b"owned by another compiler process"
@@ -8124,66 +7991,65 @@ mod tests {
     }
 
     #[test]
-    fn staging_creation_holds_lifecycle_authority_until_its_active_lease_exists() {
-        const CACHE_ENV: &str = "CARGO_RAIL_TEST_CAS_STAGING_CACHE";
-        const PAUSE_ENV: &str = "CARGO_RAIL_TEST_CAS_PAUSE_BEFORE_ACTIVE";
-
-        let root = tempfile::tempdir().expect("staging race root");
-        let cache = root.path().join("cache");
-        let control = root.path().join("control");
-        fs::create_dir(&cache).expect("cache base");
-        let cas = LocalCas::open_at(&cache, 1024 * 1024).expect("CAS should open");
-        let mut child = std::process::Command::new(std::env::current_exe().expect("current test executable"))
-            .args([
-                "--exact",
-                "cache::cas::tests::guarded_staging_creation_worker",
-                "--nocapture",
-            ])
-            .env(CACHE_ENV, &cache)
-            .env(PAUSE_ENV, &control)
-            .spawn()
-            .expect("staging worker should start");
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !control.join("ready").is_file() {
-            assert!(
-                child.try_wait().expect("worker status").is_none(),
-                "staging worker exited before reaching the unleased-directory boundary"
-            );
-            assert!(
-                std::time::Instant::now() < deadline,
-                "staging worker did not reach the unleased-directory boundary"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-
-        let lifecycle = crate::utils::open_cache_lock_file(&cas.lifecycle_lock, false).expect("lifecycle lock file");
-        assert!(
-            matches!(lifecycle.try_lock(), Err(fs::TryLockError::WouldBlock)),
-            "cleanup authority must remain excluded until the staging lease is locked"
-        );
-        assert_eq!(
-            fs::read_dir(cas.root.join("staging"))
-                .expect("staging directory")
-                .count(),
-            1,
-            "the unleased staging directory must remain protected by lifecycle authority"
-        );
-
-        write_new_synced(&control.join("continue"), b"continue\n").expect("release staging worker");
-        let status = child.wait().expect("staging worker status");
-        assert!(status.success(), "staging worker failed: {status}");
+    fn concurrent_staging_creation_and_cleanup_preserve_every_live_payload() {
+        let cache = tempfile::tempdir().unwrap();
+        let cas = open_cas(cache.path(), 1024 * 1024).unwrap();
+        let barrier = Barrier::new(2);
+        std::thread::scope(|scope| {
+            let producer = scope.spawn(|| {
+                for iteration in 0_u8..32 {
+                    barrier.wait();
+                    let (directory, active) = cas.create_guarded_staging("concurrent-").unwrap();
+                    let payload = directory.path().join("payload");
+                    fs::write(&payload, [iteration]).unwrap();
+                    barrier.wait();
+                    assert_eq!(fs::read(&payload).unwrap(), [iteration]);
+                    drop(active);
+                    drop(directory);
+                }
+            });
+            let collector = scope.spawn(|| {
+                for _ in 0..32 {
+                    barrier.wait();
+                    {
+                        let _lock = cas.lock().unwrap();
+                        clear_staging(&cas.root.join("staging")).unwrap();
+                    }
+                    barrier.wait();
+                }
+            });
+            producer.join().unwrap();
+            collector.join().unwrap();
+        });
+        let _lock = cas.lock().unwrap();
+        clear_staging(&cas.root.join("staging")).unwrap();
+        assert_eq!(fs::read_dir(cas.root.join("staging")).unwrap().count(), 0);
     }
 
     #[test]
-    fn guarded_staging_creation_worker() {
-        const CACHE_ENV: &str = "CARGO_RAIL_TEST_CAS_STAGING_CACHE";
-        let Some(cache) = std::env::var_os(CACHE_ENV) else {
-            return;
-        };
-        let base = fs::canonicalize(cache).expect("canonical cache base");
-        let cas = LocalCas::open_initialized_at(&base, 1024 * 1024, None).expect("initialized CAS should open");
-        let _staging = cas.native_result_staging().expect("guarded staging should be created");
+    fn staging_cleanup_preserves_live_leases_and_removes_abandoned_directories() {
+        let cache = tempfile::tempdir().expect("cache base");
+        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
+        let (directory, active) = cas.create_guarded_staging("live-").expect("guarded staging");
+        let live = directory.keep();
+        let payload = live.join("payload");
+        fs::write(&payload, b"in-flight compiler output").expect("live payload");
+        let abandoned = cas.root.join("staging/abandoned");
+        fs::create_dir(&abandoned).expect("abandoned staging");
+        fs::write(abandoned.join("payload"), b"interrupted output").expect("abandoned payload");
+        let lifecycle = crate::utils::open_cache_lock_file(&cas.lifecycle_lock, false).expect("lifecycle lock");
+        lifecycle
+            .try_lock()
+            .expect("construction must release lifecycle authority after acquiring its lease");
+        clear_staging(&cas.root.join("staging")).expect("concurrent cleanup");
+        assert_eq!(
+            fs::read(&payload).expect("live payload survives"),
+            b"in-flight compiler output"
+        );
+        assert!(!abandoned.exists(), "unleased interrupted staging must be reclaimed");
+        drop(active);
+        clear_staging(&cas.root.join("staging")).expect("cleanup after lease release");
+        assert!(!live.exists(), "released staging must be reclaimed");
     }
 
     #[cfg(unix)]
@@ -8213,7 +8079,7 @@ mod tests {
         fs::write(outside.path(), b"preserve").expect("outside contents");
         symlink(outside.path(), owner.join(format!("{CAS_ROOT_NAME}.lock"))).expect("hostile lock link");
 
-        let error = LocalCas::open_at(cache.path(), 1024 * 1024).expect_err("linked lock must fail");
+        let error = open_cas(cache.path(), 1024 * 1024).expect_err("linked lock must fail");
 
         assert!(error.to_string().contains("not a private regular file"), "{error}");
         assert_eq!(fs::read(outside.path()).expect("outside contents"), b"preserve");
@@ -8228,7 +8094,7 @@ mod tests {
         let outside = tempfile::NamedTempFile::new().expect("outside file");
         fs::hard_link(outside.path(), owner.join(format!("{CAS_ROOT_NAME}.lock"))).expect("hostile hard-linked lock");
 
-        let error = LocalCas::open_at(cache.path(), 1024 * 1024).expect_err("hard-linked lock must fail");
+        let error = open_cas(cache.path(), 1024 * 1024).expect_err("hard-linked lock must fail");
 
         assert!(error.to_string().contains("not a private regular file"), "{error}");
         assert!(outside.path().exists(), "outside lock target must survive");
@@ -8243,15 +8109,18 @@ mod tests {
         let outside = tempfile::tempdir().expect("outside root");
         let sentinel = outside.path().join("keep");
         fs::write(&sentinel, b"outside").expect("outside sentinel");
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
-        let hostile = cas.root().join("staging/hostile-link");
+        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
+        let hostile = cas.root.as_path().join("staging/hostile-link");
         symlink(outside.path(), &hostile).expect("hostile staging link");
 
-        let reopened = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should reclaim staging");
+        let reopened = open_cas(cache.path(), 1024 * 1024).expect("CAS should reclaim staging");
 
         assert!(!hostile.exists(), "hostile staging link must be unlinked");
         assert_eq!(fs::read(&sentinel).expect("outside sentinel"), b"outside");
-        assert_eq!(fs::read_dir(reopened.root().join("staging")).unwrap().count(), 0);
+        assert_eq!(
+            fs::read_dir(reopened.root.as_path().join("staging")).unwrap().count(),
+            0
+        );
     }
 
     #[cfg(unix)]
@@ -8287,11 +8156,11 @@ mod tests {
             let selection = LocalCacheSelection::new(cache.path().to_path_buf(), 1024 * 1024, None).unwrap();
             let cas = LocalCas::open_selected(&selection).expect("initialize CAS");
             let outside = tempfile::NamedTempFile::new().expect("outside lock");
-            let claims = native_execution_claim_directory(cas.root()).unwrap();
+            let claims = native_execution_claim_directory(cas.root.as_path()).unwrap();
             for (directory, shards) in [
                 (claims, NATIVE_EXECUTION_CLAIM_SHARDS),
                 (
-                    cas.root().join(NATIVE_RESTORE_LOCK_DIRECTORY),
+                    cas.root.as_path().join(NATIVE_RESTORE_LOCK_DIRECTORY),
                     NATIVE_RESTORE_LOCK_SHARDS,
                 ),
             ] {
@@ -8325,7 +8194,7 @@ mod tests {
                 wrapper.native_execution_claim(&selected).is_err(),
                 "accepted {damage:?} blocking claim"
             );
-            assert!(wrapper.status().is_err(), "status must audit every shard: {damage:?}");
+            assert!(status(&wrapper).is_err(), "status must audit every shard: {damage:?}");
             assert_eq!(
                 fs::read(outside.path()).unwrap(),
                 b"",

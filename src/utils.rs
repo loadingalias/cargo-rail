@@ -636,13 +636,10 @@ fn simplify_canonical_path(path: PathBuf) -> PathBuf {
 pub fn is_local_path(path: &str) -> bool {
     let p = Path::new(path);
 
-    // Check for relative paths
     if path.starts_with("./") || path.starts_with("../") {
         return true;
     }
 
-    // Check for Windows drive letter (C:\ or C:/)
-    // Must check before URL check since Windows paths contain ':'
     if path.len() >= 3 {
         let bytes = path.as_bytes();
         if bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/') {
@@ -650,38 +647,16 @@ pub fn is_local_path(path: &str) -> bool {
         }
     }
 
-    // Check for Windows UNC paths (\\server\share)
     if path.starts_with("\\\\") {
         return true;
     }
 
-    // Check for Unix absolute paths (/path/to/repo)
-    // Important: Check this BEFORE is_absolute() because on Windows,
-    // Path::is_absolute() returns false for Unix-style paths
-    if path.starts_with('/') {
-        // Make sure it's not part of a URL pattern
-        if !path.contains("://") && !path.contains('@') {
-            return true;
-        }
-    }
-
-    // Check for absolute paths (fallback for platform-specific cases)
-    if p.is_absolute() {
+    // Windows does not consider Unix-style paths absolute.
+    if path.starts_with('/') && !path.contains("://") && !path.contains('@') {
         return true;
     }
 
-    // If it contains :// it's a URL
-    if path.contains("://") {
-        return false;
-    }
-
-    // If it contains @ it's likely an SSH URL (git@github.com:user/repo.git)
-    if path.contains('@') {
-        return false;
-    }
-
-    // Default to false for safety (require preflight checks)
-    false
+    p.is_absolute()
 }
 
 /// Prompt for an explicit mutation confirmation on stderr.
@@ -706,9 +681,7 @@ fn prompt_for_confirmation_from(reader: &mut impl io::BufRead, writer: &mut impl
     Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
 }
 
-/// Detect CHANGELOG file in a crate directory
-///
-/// Searches for common changelog file patterns and returns the first match found.
+/// Return the first recognized changelog filename, relative to the crate directory.
 pub fn detect_crate_changelog(crate_dir: &cargo_metadata::camino::Utf8Path) -> Option<std::path::PathBuf> {
     let changelog_patterns = [
         "CHANGELOG.md",
@@ -726,7 +699,6 @@ pub fn detect_crate_changelog(crate_dir: &cargo_metadata::camino::Utf8Path) -> O
     for pattern in &changelog_patterns {
         let changelog = crate_dir.join(pattern);
         if changelog.exists() {
-            // Return relative path from crate root
             return Some(std::path::PathBuf::from(pattern));
         }
     }
@@ -734,10 +706,7 @@ pub fn detect_crate_changelog(crate_dir: &cargo_metadata::camino::Utf8Path) -> O
     None
 }
 
-/// Convert a path to Git format (always forward slashes)
-///
-/// Git expects paths with forward slashes, even on Windows.
-/// This function converts backslashes to forward slashes for use in Git commands.
+/// Convert a path to forward slashes for Git, replacing invalid Unicode lossily.
 pub fn path_to_git_format(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
@@ -823,12 +792,6 @@ mod tests {
         // FNV-1a test vectors
         assert_eq!(fnv1a64(b"a"), 0xaf63dc4c8601ec8c);
         assert_eq!(fnv1a64(b"foobar"), 0x85944171f73967e8);
-    }
-
-    #[test]
-    fn test_fnv1a64_deterministic() {
-        let data = b"hello world";
-        assert_eq!(fnv1a64(data), fnv1a64(data));
     }
 
     #[test]

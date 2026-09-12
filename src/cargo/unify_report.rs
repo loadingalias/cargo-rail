@@ -4,7 +4,7 @@
 
 use crate::cargo::manifest_analyzer::DepKind;
 use crate::cargo::unify_types::{IssueSeverity, MemberEdit, UnificationPlan, UnusedReason};
-use crate::error::RailResult;
+use crate::error::{RailResult, ResultExt};
 
 /// Generate a markdown report from the unification plan
 #[derive(Debug)]
@@ -253,7 +253,8 @@ impl UnifyReport {
         let content = Self::from_plan(plan);
 
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating unify report directory '{}'", parent.display()))?;
         }
 
         crate::utils::write_file_atomic(path, content.as_bytes())

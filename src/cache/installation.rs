@@ -3221,6 +3221,45 @@ fn valid_sha256(value: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn failure_reason_counters_advance_after_the_usage_ledger_fills() {
+        let root = tempfile::tempdir().unwrap();
+        let receipt = receipt_with_components(root.path());
+        fs::create_dir_all(receipt.profile_state_directory().unwrap()).unwrap();
+        let usage = receipt.usage_path().unwrap();
+        let full_ledger = vec![b'B'; usize::try_from(MAX_USAGE_BYTES).unwrap()];
+        fs::write(&usage, &full_ledger).unwrap();
+        let mut expected = std::collections::BTreeMap::from([
+            ("complete_action_capture_unavailable".to_string(), 0_u64),
+            ("complete_action_identity_unavailable".to_string(), 0_u64),
+            ("post_execution_witness_validation_unavailable".to_string(), 0_u64),
+        ]);
+        for (reason, key) in [
+            (
+                NativeCacheFailureReason::ActionCapture,
+                "complete_action_capture_unavailable",
+            ),
+            (
+                NativeCacheFailureReason::ActionIdentity,
+                "complete_action_identity_unavailable",
+            ),
+            (
+                NativeCacheFailureReason::PostExecutionWitness,
+                "post_execution_witness_validation_unavailable",
+            ),
+            (
+                NativeCacheFailureReason::ActionCapture,
+                "complete_action_capture_unavailable",
+            ),
+        ] {
+            let error = record_usage(&receipt, b'B', Some(reason)).unwrap_err();
+            assert!(error.to_string().contains("size bound"), "{error}");
+            *expected.get_mut(key).unwrap() += 1;
+            assert_eq!(read_failure_counters(&receipt).unwrap().unwrap().status(), expected);
+            assert_eq!(fs::read(&usage).unwrap(), full_ledger);
+        }
+    }
+
     fn receipt_with_components(cargo_home: &Path) -> InstallationReceipt {
         let directory = cargo_home.join("cargo-rail").join(INSTALLATION_DIRECTORY);
         InstallationReceipt {

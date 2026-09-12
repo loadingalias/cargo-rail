@@ -616,7 +616,7 @@ mod tests {
         let mut cfg_sets = HashMap::new();
         cfg_sets.insert(
             "x86_64-pc-windows-msvc".to_string(),
-            TargetCfgSet::from_test_lines(&["windows", "target_os=\"windows\""]),
+            TargetCfgSet::from_rustc_output("windows\ntarget_os=\"windows\""),
         );
         assert!(target_constraint_matches_any("cfg(windows)", &targets, &cfg_sets));
         assert!(!target_constraint_matches_any("cfg(unix)", &targets, &cfg_sets));
@@ -628,11 +628,11 @@ mod tests {
         let mut cfg_sets = HashMap::new();
         cfg_sets.insert(
             "x86_64-unknown-linux-gnu".to_string(),
-            TargetCfgSet::from_test_lines(&["unix", "target_os=\"linux\""]),
+            TargetCfgSet::from_rustc_output("unix\ntarget_os=\"linux\""),
         );
         cfg_sets.insert(
             "aarch64-apple-darwin".to_string(),
-            TargetCfgSet::from_test_lines(&["unix", "target_os=\"macos\""]),
+            TargetCfgSet::from_rustc_output("unix\ntarget_os=\"macos\""),
         );
         assert!(target_constraint_matches_any("cfg(unix)", &targets, &cfg_sets));
         assert!(!target_constraint_matches_any("cfg(windows)", &targets, &cfg_sets));
@@ -644,7 +644,7 @@ mod tests {
         let mut cfg_sets = HashMap::new();
         cfg_sets.insert(
             "x86_64-unknown-linux-gnu".to_string(),
-            TargetCfgSet::from_test_lines(&["unix", "target_os=\"linux\""]),
+            TargetCfgSet::from_rustc_output("unix\ntarget_os=\"linux\""),
         );
         assert!(target_constraint_matches_any(
             "cfg(target_os = \"linux\")",
@@ -681,11 +681,11 @@ mod tests {
         let mut cfg_sets = HashMap::new();
         cfg_sets.insert(
             "x86_64-unknown-linux-gnu".to_string(),
-            TargetCfgSet::from_test_lines(&["unix", "target_os=\"linux\""]),
+            TargetCfgSet::from_rustc_output("unix\ntarget_os=\"linux\""),
         );
         cfg_sets.insert(
             "x86_64-pc-windows-msvc".to_string(),
-            TargetCfgSet::from_test_lines(&["windows", "target_os=\"windows\""]),
+            TargetCfgSet::from_rustc_output("windows\ntarget_os=\"windows\""),
         );
         let required = usage_required_targets(&usage, &configured, &cfg_sets);
         assert_eq!(required, vec!["x86_64-pc-windows-msvc"]);

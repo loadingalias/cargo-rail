@@ -132,7 +132,7 @@
       "required": ["path", "identity", "package", "target"],
       "properties": {
         "path": { "type": "string", "minLength": 1 },
-        "identity": { "type": "string", "pattern": "^(git:[0-9]+:[0-9a-f]{40,64}|sha256:[0-9a-f]{64})$" },
+        "identity": { "type": "string", "pattern": "^(git:[0-9]+:(?:[0-9a-f]{40}|[0-9a-f]{64})|sha256:[0-9a-f]{64})$" },
         "package": { "type": ["string", "null"] },
         "target": { "type": ["string", "null"] }
       }

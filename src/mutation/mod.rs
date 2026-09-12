@@ -352,17 +352,7 @@ pub fn validate_pre_apply_with_allowed_paths(
     let mut current = capture_pre_apply_checks(ctx)?;
     if !allowed_paths.is_empty() {
         let git_root = canonicalize_existing(&ctx.git()?.git().worktree_root)?;
-        let mut allowed = BTreeSet::new();
-        for path in allowed_paths {
-            if path.is_absolute() {
-                let canonical = canonicalize_existing(path)?;
-                if let Ok(relative) = canonical.strip_prefix(&git_root) {
-                    allowed.insert(relative.to_path_buf());
-                }
-            } else {
-                allowed.insert(path.clone());
-            }
-        }
+        let allowed = allowed_worktree_paths(&git_root, allowed_paths)?;
         current.changed_paths.retain(|path| !allowed.contains(path));
         current.worktree_fingerprint = fingerprint_changed_paths(ctx.git()?.git(), &git_root, &current.changed_paths)?;
         current.metadata_fingerprint = format!("snapshot:{}", ctx.snapshot()?.id_excluding_paths(&allowed)?);
@@ -524,11 +514,11 @@ pub fn read_plan_file(path: &Path) -> RailResult<MutationPlan> {
     let content = fs::read_to_string(path)
         .map_err(|e| RailError::message(format!("failed to read '{}': {}", path.display(), e)))?;
 
-    let value: serde_json::Value = serde_json::from_str(&content)
+    let mut value: serde_json::Value = serde_json::from_str(&content)
         .map_err(|e| RailError::message(format!("invalid mutation plan JSON '{}': {}", path.display(), e)))?;
 
-    if let Some(inner) = value.get("mutation_plan") {
-        return serde_json::from_value(inner.clone())
+    if let Some(inner) = value.as_object_mut().and_then(|object| object.remove("mutation_plan")) {
+        return serde_json::from_value(inner)
             .map_err(|e| RailError::message(format!("invalid mutation_plan in '{}': {}", path.display(), e)));
     }
 
@@ -632,22 +622,8 @@ pub fn validate_changed_paths_with_allowed_paths(
 ) -> RailResult<()> {
     let git = ctx.git()?.git();
     let canonical_git_root = canonicalize_existing(&git.worktree_root)?;
-    let mut allowed: BTreeSet<_> = expected_paths(plan)
-        .into_iter()
-        .chain(declared_input_paths(plan))
-        .collect();
-    for path in allowed_paths {
-        let relative = if path.is_absolute() {
-            let canonical = canonicalize_existing(path)?;
-            let Ok(relative) = canonical.strip_prefix(&canonical_git_root) else {
-                continue;
-            };
-            relative.to_path_buf()
-        } else {
-            path.clone()
-        };
-        allowed.insert(relative);
-    }
+    let mut allowed = allowed_worktree_paths(&canonical_git_root, allowed_paths)?;
+    allowed.extend(expected_paths(plan).into_iter().chain(declared_input_paths(plan)));
     let changed = ctx.changed_source_paths()?;
     let unexpected: Vec<_> = changed.into_iter().filter(|path| !allowed.contains(path)).collect();
     if unexpected.is_empty() {
@@ -660,6 +636,21 @@ pub fn validate_changed_paths_with_allowed_paths(
         ),
         "restore the unexpected paths, then regenerate and re-run the mutation plan",
     ))
+}
+
+fn allowed_worktree_paths(git_root: &Path, paths: &[PathBuf]) -> RailResult<BTreeSet<PathBuf>> {
+    let mut allowed = BTreeSet::new();
+    for path in paths {
+        if path.is_absolute() {
+            let canonical = canonicalize_existing(path)?;
+            if let Ok(relative) = canonical.strip_prefix(git_root) {
+                allowed.insert(relative.to_path_buf());
+            }
+        } else {
+            allowed.insert(path.clone());
+        }
+    }
+    Ok(allowed)
 }
 
 fn fingerprint_changed_paths(git: &SystemGit, workspace_root: &Path, paths: &[PathBuf]) -> RailResult<String> {

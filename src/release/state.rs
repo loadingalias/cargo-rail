@@ -292,12 +292,7 @@ impl ReleaseState {
                 help,
             ));
         }
-        let checkpoint = if state.phase == ReleasePhase::Prepared {
-            "reconstructed"
-        } else {
-            "planned"
-        };
-        if let Err(error) = state.save(&path, checkpoint) {
+        if let Err(error) = state.save(&path) {
             if path.exists() {
                 return Err(error.context(format!(
                     "release journal may have been persisted at '{}'; inspect it with: cargo rail release status {}",
@@ -357,7 +352,7 @@ impl ReleaseState {
         Ok(state)
     }
 
-    pub fn save(&self, path: &Path, checkpoint: &str) -> RailResult<()> {
+    pub fn save(&self, path: &Path) -> RailResult<()> {
         self.validate_contract()?;
         self.validate_journal_path(path)?;
         self.validate_recovery_paths(release_root(path))?;
@@ -365,11 +360,11 @@ impl ReleaseState {
             .parent()
             .ok_or_else(|| RailError::message("release state path has no parent"))?;
         std::fs::create_dir_all(parent)?;
-        journal_fault("before", checkpoint)?;
+
         let bytes = serde_json::to_vec_pretty(self)
             .map_err(|error| RailError::message(format!("failed to serialize release state: {}", error)))?;
         crate::utils::write_file_atomic(path, &bytes)?;
-        journal_fault("after", checkpoint)?;
+
         Ok(())
     }
 
@@ -515,7 +510,7 @@ pub(crate) fn prepare_recovery(root: &Path, path: &Path) -> RailResult<()> {
                 crate_state.commit = complete_step(Some(head.clone()));
             }
             state.release_commit = Some(head);
-            state.save(&path, "pre_context_finalize_commit_observed")?;
+            state.save(&path)?;
             return Ok(());
         }
         if let Some(index) = state
@@ -540,7 +535,7 @@ pub(crate) fn prepare_recovery(root: &Path, path: &Path) -> RailResult<()> {
                 .ok_or_else(|| RailError::message(format!("release state has no plan for '{}'", crate_name)))?;
             if parent == expected_parent && subject == expected_subject {
                 state.crates[index].commit = complete_step(Some(head));
-                state.save(&path, &format!("pre_context_commit_observed:{}", crate_name))?;
+                state.save(&path)?;
                 return Ok(());
             }
         }
@@ -585,7 +580,7 @@ pub(crate) fn prepare_recovery(root: &Path, path: &Path) -> RailResult<()> {
         let relative = normalize_release_path(&git.worktree_root, &backup.path, "backup")?;
         crate::utils::write_file_atomic(&git.worktree_root.join(relative), backup.content.as_bytes())?;
     }
-    state.save(&path, "pre_context_local_restore")
+    state.save(&path)
 }
 
 pub(crate) fn state_dir(root: &Path) -> PathBuf {
@@ -605,24 +600,6 @@ fn complete_step(object: Option<String>) -> Step {
         status: StepStatus::Complete,
         object,
     }
-}
-
-fn journal_fault(boundary: &str, checkpoint: &str) -> RailResult<()> {
-    let variable = match boundary {
-        "before" => "CARGO_RAIL_RELEASE_FAIL_BEFORE",
-        _ => "CARGO_RAIL_RELEASE_FAIL_AFTER",
-    };
-    let Ok(requested) = std::env::var(variable) else {
-        return Ok(());
-    };
-    let point = format!("journal:{}", checkpoint);
-    if requested == "journal" || requested == point {
-        return Err(RailError::message(format!(
-            "injected release failure {} {}",
-            boundary, point
-        )));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -765,7 +742,7 @@ mod tests {
             "{error}"
         );
         let save_path = root.path().join("release-also-renamed.json");
-        let error = state.save(&save_path, "test").unwrap_err();
+        let error = state.save(&save_path).unwrap_err();
         assert!(
             error.to_string().contains("does not match transaction identity"),
             "{error}"
@@ -778,7 +755,7 @@ mod tests {
         let mut state = fixture(RELEASE_STATE_SCHEMA_VERSION, RELEASE_PLAN_CONTRACT_VERSION);
         state.transaction_id = "release_bad".to_string();
         let error = state
-            .save(&tempfile::tempdir().unwrap().path().join("release_bad.json"), "test")
+            .save(&tempfile::tempdir().unwrap().path().join("release_bad.json"))
             .unwrap_err();
         assert!(error.to_string().contains("invalid transaction identity"), "{error}");
     }

@@ -2,8 +2,6 @@
 
 use crate::error::RailResult;
 use crate::git::SystemGit;
-#[cfg(test)]
-use crate::progress;
 
 /// Detect the default base ref for change detection
 ///
@@ -49,39 +47,39 @@ pub fn detect_default_base_ref(git: &SystemGit) -> RailResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
 
     #[test]
-    fn test_detect_default_base_ref() {
-        // Use current directory as test repo
-        let current_dir = env::current_dir().unwrap();
-        let git = SystemGit::open(&current_dir).expect("Should open git repo");
+    fn default_base_prefers_remote_head_then_main_then_local_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::git::init_repo(directory.path(), "main").unwrap();
+        let git = SystemGit::open(directory.path()).unwrap();
+        git.set_config("user.name", "Test User").unwrap();
+        git.set_config("user.email", "test@example.com").unwrap();
+        git.set_config("commit.gpgsign", "false").unwrap();
+        assert_eq!(detect_default_base_ref(&git).unwrap(), "HEAD~1");
 
-        // Should return a valid ref
-        let base_ref = detect_default_base_ref(&git);
-        assert!(base_ref.is_ok(), "Should detect a default base ref");
+        let commit = git
+            .git_cmd()
+            .args(["commit", "--allow-empty", "-m", "initial"])
+            .output()
+            .unwrap();
+        assert!(commit.status.success(), "{commit:?}");
+        for name in ["main", "stable"] {
+            let output = git
+                .git_cmd()
+                .args(["update-ref", &format!("refs/remotes/origin/{name}"), "HEAD"])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+        }
+        assert_eq!(detect_default_base_ref(&git).unwrap(), "origin/main");
 
-        let ref_str = base_ref.unwrap();
-
-        // Should be one of the expected formats
-        assert!(
-            ref_str.starts_with("origin/") || ref_str == "HEAD~1",
-            "Ref should be origin/* or HEAD~1, got: {}",
-            ref_str
-        );
-
-        progress!("Detected base ref: {}", ref_str);
-    }
-
-    #[test]
-    fn test_detect_returns_usable_ref() {
-        let current_dir = env::current_dir().unwrap();
-        let git = SystemGit::open(&current_dir).expect("Should open git repo");
-
-        let base_ref = detect_default_base_ref(&git).expect("Should detect base ref");
-
-        // The detected ref should be resolvable to a commit
-        // Note: This might fail in CI if origin isn't set up, so we just check format
-        assert!(!base_ref.is_empty(), "Base ref should not be empty: {}", base_ref);
+        let output = git
+            .git_cmd()
+            .args(["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/stable"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(detect_default_base_ref(&git).unwrap(), "origin/stable");
     }
 }

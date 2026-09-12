@@ -881,7 +881,11 @@ mod tests {
     #[test]
     fn complete_native_binding_reopens_its_independent_observation() {
         let root = tempfile::tempdir().expect("CAS root");
-        let cas = LocalCas::open_at(root.path(), 16 * 1024 * 1024).expect("local CAS");
+        let cas = LocalCas::open_selected(
+            &crate::cache::cas::LocalCacheSelection::new(root.path().to_path_buf(), 16 * 1024 * 1024, None)
+                .expect("cache selection"),
+        )
+        .expect("local CAS");
         let store = AnalysisEvidenceStore::from_cas(cas);
         let contract = contract();
         let action = native_identity(crate::compiler::native_cache::ACTION_KEY_PREFIX, 'a');
@@ -914,7 +918,11 @@ mod tests {
     #[test]
     fn physical_sandbox_paths_do_not_multiply_exact_binding_candidates() {
         let root = tempfile::tempdir().expect("CAS root");
-        let cas = LocalCas::open_at(root.path(), 16 * 1024 * 1024).expect("local CAS");
+        let cas = LocalCas::open_selected(
+            &crate::cache::cas::LocalCacheSelection::new(root.path().to_path_buf(), 16 * 1024 * 1024, None)
+                .expect("cache selection"),
+        )
+        .expect("local CAS");
         let store = AnalysisEvidenceStore::from_cas(cas.clone());
         let contract = contract();
         let action = native_identity(crate::compiler::native_cache::ACTION_KEY_PREFIX, 'a');
@@ -952,7 +960,11 @@ mod tests {
     #[test]
     fn conflicting_complete_bindings_are_a_fail_closed_miss() {
         let root = tempfile::tempdir().expect("CAS root");
-        let cas = LocalCas::open_at(root.path(), 16 * 1024 * 1024).expect("local CAS");
+        let cas = LocalCas::open_selected(
+            &crate::cache::cas::LocalCacheSelection::new(root.path().to_path_buf(), 16 * 1024 * 1024, None)
+                .expect("cache selection"),
+        )
+        .expect("local CAS");
         let store = AnalysisEvidenceStore::from_cas(cas);
         let contract = contract();
         let action = native_identity(crate::compiler::native_cache::ACTION_KEY_PREFIX, 'a');
@@ -980,7 +992,11 @@ mod tests {
     #[test]
     fn action_result_and_contract_mismatches_are_clean_misses() {
         let root = tempfile::tempdir().expect("CAS root");
-        let cas = LocalCas::open_at(root.path(), 16 * 1024 * 1024).expect("local CAS");
+        let cas = LocalCas::open_selected(
+            &crate::cache::cas::LocalCacheSelection::new(root.path().to_path_buf(), 16 * 1024 * 1024, None)
+                .expect("cache selection"),
+        )
+        .expect("local CAS");
         let store = AnalysisEvidenceStore::from_cas(cas);
         let contract = contract();
         let action = native_identity(crate::compiler::native_cache::ACTION_KEY_PREFIX, 'a');
@@ -1031,7 +1047,11 @@ mod tests {
     #[test]
     fn binding_without_its_observation_object_is_a_miss() {
         let root = tempfile::tempdir().expect("CAS root");
-        let cas = LocalCas::open_at(root.path(), 16 * 1024 * 1024).expect("local CAS");
+        let cas = LocalCas::open_selected(
+            &crate::cache::cas::LocalCacheSelection::new(root.path().to_path_buf(), 16 * 1024 * 1024, None)
+                .expect("cache selection"),
+        )
+        .expect("local CAS");
         let store = AnalysisEvidenceStore::from_cas(cas.clone());
         let contract = contract();
         let action = native_identity(crate::compiler::native_cache::ACTION_KEY_PREFIX, 'a');
@@ -1064,7 +1084,11 @@ mod tests {
     #[test]
     fn mismatched_binding_validation_and_payload_is_a_miss() {
         let root = tempfile::tempdir().expect("CAS root");
-        let cas = LocalCas::open_at(root.path(), 16 * 1024 * 1024).expect("local CAS");
+        let cas = LocalCas::open_selected(
+            &crate::cache::cas::LocalCacheSelection::new(root.path().to_path_buf(), 16 * 1024 * 1024, None)
+                .expect("cache selection"),
+        )
+        .expect("local CAS");
         let store = AnalysisEvidenceStore::from_cas(cas.clone());
         let contract = contract();
         let action = native_identity(crate::compiler::native_cache::ACTION_KEY_PREFIX, 'a');

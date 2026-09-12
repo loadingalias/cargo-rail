@@ -7,8 +7,8 @@ use toml_edit::{DocumentMut, Item, Table};
 
 /// Ensure a section exists, creating if necessary
 pub fn ensure_section(doc: &mut DocumentMut, path: &str) -> RailResult<()> {
-    let parts: Vec<&str> = path.split('.').collect();
-    if parts.is_empty() {
+    let parts = path.split('.');
+    if parts.clone().any(str::is_empty) {
         return Err(RailError::message("Empty path provided"));
     }
 
@@ -34,14 +34,14 @@ pub fn ensure_section(doc: &mut DocumentMut, path: &str) -> RailResult<()> {
 
 /// Get or create a table at dotted path
 pub fn get_or_create_table<'a>(doc: &'a mut DocumentMut, path: &str) -> RailResult<&'a mut Table> {
-    let parts: Vec<&str> = path.split('.').collect();
-    if parts.is_empty() {
+    let parts = path.split('.');
+    if parts.clone().any(str::is_empty) {
         return Err(RailError::message("Empty path provided"));
     }
 
     let mut current = doc.as_item_mut();
 
-    for part in &parts {
+    for part in parts {
         if let Some(table) = current.as_table_mut() {
             if !table.contains_key(part) {
                 table.insert(part, Item::Table(Table::new()));
@@ -85,8 +85,12 @@ pub fn insert_target_dependency(
 
 /// Remove a dependency from target-specific section
 pub fn remove_target_dependency(doc: &mut DocumentMut, target: &str, section: &str, name: &str) -> RailResult<()> {
-    let path = format!("target.{}.{}", target, section);
-    if let Some(target_section) = get_table_mut(doc, &path) {
+    if let Some(target_section) = doc
+        .get_mut("target")
+        .and_then(|item| item.get_mut(target))
+        .and_then(|item| item.get_mut(section))
+        .and_then(Item::as_table_mut)
+    {
         target_section.remove(name);
     }
     Ok(())
@@ -94,20 +98,15 @@ pub fn remove_target_dependency(doc: &mut DocumentMut, target: &str, section: &s
 
 /// Get target-specific dependencies section (mutable)
 fn get_target_section_mut<'a>(doc: &'a mut DocumentMut, target: &str, section: &str) -> RailResult<&'a mut Table> {
-    let path = format!("target.{}.{}", target, section);
-    get_or_create_table(doc, &path)
-}
-
-/// Get a mutable reference to a table by path (returns None if not found)
-fn get_table_mut<'a>(doc: &'a mut DocumentMut, path: &str) -> Option<&'a mut Table> {
-    let parts: Vec<&str> = path.split('.').collect();
-    let mut current: &mut Item = doc.as_item_mut();
-
-    for part in parts {
-        current = current.get_mut(part)?;
+    let mut table = doc.as_table_mut();
+    for key in ["target", target, section] {
+        table = table
+            .entry(key)
+            .or_insert(Item::Table(Table::new()))
+            .as_table_mut()
+            .ok_or_else(|| RailError::message(format!("cannot navigate to {}: expected table", key)))?;
     }
-
-    current.as_table_mut()
+    Ok(table)
 }
 
 #[cfg(test)]
@@ -160,15 +159,50 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_target_dependency() {
-        let content = "";
-        let mut doc: DocumentMut = content.parse().unwrap();
+    fn target_dependency_keys_are_literal_and_removal_is_scoped() {
+        for target in [
+            "cfg(unix)",
+            "thumbv8m.main-none-eabi",
+            "cfg(target_feature = \"sse4.2\")",
+        ] {
+            let mut doc = DocumentMut::new();
+            insert_target_dependency(
+                &mut doc,
+                target,
+                "dependencies",
+                "libc",
+                Item::Value(Value::from("1.0")),
+            )
+            .unwrap();
+            insert_target_dependency(
+                &mut doc,
+                target,
+                "dependencies",
+                "keep",
+                Item::Value(Value::from("2.0")),
+            )
+            .unwrap();
+            let parsed: DocumentMut = doc.to_string().parse().unwrap();
+            assert_eq!(parsed["target"].as_table().unwrap().len(), 1);
+            assert_eq!(parsed["target"][target]["dependencies"]["libc"].as_str(), Some("1.0"));
+            remove_target_dependency(&mut doc, target, "dependencies", "libc").unwrap();
+            assert!(
+                !doc["target"][target]["dependencies"]
+                    .as_table()
+                    .unwrap()
+                    .contains_key("libc")
+            );
+            assert_eq!(doc["target"][target]["dependencies"]["keep"].as_str(), Some("2.0"));
+        }
+    }
 
-        let entry = Item::Value(Value::from("1.0"));
-        insert_target_dependency(&mut doc, "'cfg(unix)'", "dependencies", "libc", entry).unwrap();
-
-        // Verify it was inserted
-        let target_deps = get_or_create_table(&mut doc, "target.'cfg(unix)'.dependencies").unwrap();
-        assert!(target_deps.contains_key("libc"));
+    #[test]
+    fn empty_path_components_are_rejected_without_mutation() {
+        for path in ["", ".workspace", "workspace.", "workspace..dependencies"] {
+            let mut doc = DocumentMut::new();
+            assert!(ensure_section(&mut doc, path).is_err());
+            get_or_create_table(&mut doc, path).unwrap_err();
+            assert_eq!(doc.to_string(), "");
+        }
     }
 }

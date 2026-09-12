@@ -239,7 +239,11 @@ mod tests {
     #[test]
     fn complete_fact_set_reopens_from_independent_cas_objects() {
         let cache = tempfile::tempdir().expect("cache root");
-        let cas = LocalCas::open_at(cache.path(), 16 * 1024 * 1024).expect("local CAS");
+        let cas = LocalCas::open_selected(
+            &crate::cache::cas::LocalCacheSelection::new(cache.path().to_path_buf(), 16 * 1024 * 1024, None)
+                .expect("cache selection"),
+        )
+        .expect("local CAS");
         let store = CompilerFactStore {
             cas: Some(cas),
             remote: None,
@@ -251,7 +255,13 @@ mod tests {
         drop(store);
 
         let reopened = CompilerFactStore {
-            cas: Some(LocalCas::open_at(cache.path(), 16 * 1024 * 1024).expect("reopen local CAS")),
+            cas: Some(
+                LocalCas::open_selected(
+                    &crate::cache::cas::LocalCacheSelection::new(cache.path().to_path_buf(), 16 * 1024 * 1024, None)
+                        .expect("cache selection"),
+                )
+                .expect("reopen local CAS"),
+            ),
             remote: None,
         };
         let hit = reopened.get(&key).expect("fact lookup").expect("complete hit");
@@ -262,7 +272,11 @@ mod tests {
     #[test]
     fn empty_fact_set_is_a_complete_reusable_result() {
         let cache = tempfile::tempdir().expect("cache root");
-        let cas = LocalCas::open_at(cache.path(), 16 * 1024 * 1024).expect("local CAS");
+        let cas = LocalCas::open_selected(
+            &crate::cache::cas::LocalCacheSelection::new(cache.path().to_path_buf(), 16 * 1024 * 1024, None)
+                .expect("cache selection"),
+        )
+        .expect("local CAS");
         let store = CompilerFactStore {
             cas: Some(cas),
             remote: None,
@@ -277,7 +291,11 @@ mod tests {
     #[test]
     fn set_manifest_without_its_object_is_a_cache_miss() {
         let cache = tempfile::tempdir().expect("cache root");
-        let cas = LocalCas::open_at(cache.path(), 16 * 1024 * 1024).expect("local CAS");
+        let cas = LocalCas::open_selected(
+            &crate::cache::cas::LocalCacheSelection::new(cache.path().to_path_buf(), 16 * 1024 * 1024, None)
+                .expect("cache selection"),
+        )
+        .expect("local CAS");
         let (key, object) = fact_fixture();
         let reference = CompilerFactObjectReference::new(
             object.identity().to_string(),
@@ -304,7 +322,11 @@ mod tests {
     #[test]
     fn moved_workspace_root_reuses_the_same_exact_fact_set() {
         let cache = tempfile::tempdir().expect("cache root");
-        let cas = LocalCas::open_at(cache.path(), 16 * 1024 * 1024).expect("local CAS");
+        let cas = LocalCas::open_selected(
+            &crate::cache::cas::LocalCacheSelection::new(cache.path().to_path_buf(), 16 * 1024 * 1024, None)
+                .expect("cache selection"),
+        )
+        .expect("local CAS");
         let store = CompilerFactStore {
             cas: Some(cas),
             remote: None,
@@ -321,7 +343,11 @@ mod tests {
     #[test]
     fn every_fact_set_authority_change_is_a_cache_miss() {
         let cache = tempfile::tempdir().expect("cache root");
-        let cas = LocalCas::open_at(cache.path(), 16 * 1024 * 1024).expect("local CAS");
+        let cas = LocalCas::open_selected(
+            &crate::cache::cas::LocalCacheSelection::new(cache.path().to_path_buf(), 16 * 1024 * 1024, None)
+                .expect("cache selection"),
+        )
+        .expect("local CAS");
         let store = CompilerFactStore {
             cas: Some(cas),
             remote: None,
@@ -356,7 +382,11 @@ mod tests {
     #[test]
     fn corrupt_fact_object_cannot_authorize_a_hit() {
         let cache = tempfile::tempdir().expect("cache root");
-        let cas = LocalCas::open_at(cache.path(), 16 * 1024 * 1024).expect("local CAS");
+        let cas = LocalCas::open_selected(
+            &crate::cache::cas::LocalCacheSelection::new(cache.path().to_path_buf(), 16 * 1024 * 1024, None)
+                .expect("cache selection"),
+        )
+        .expect("local CAS");
         let store = CompilerFactStore {
             cas: Some(cas),
             remote: None,

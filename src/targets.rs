@@ -7,11 +7,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
-/// Detect all Rust target triples mentioned in any .toml file in the workspace
+/// Return sorted, deduplicated Rust targets found in workspace TOML and GitHub workflows.
 ///
-/// Scans workspace TOML and GitHub workflow files, matches against rustc's
-/// canonical target list, and returns a deduplicated sorted result.
-///
+/// Matches tokens against `rustc --print target-list`; unreadable files are skipped.
 pub fn detect_targets(workspace_root: &Path) -> RailResult<Vec<String>> {
     detect_targets_excluding(workspace_root, &[])
 }
@@ -21,19 +19,14 @@ pub fn detect_targets(workspace_root: &Path) -> RailResult<Vec<String>> {
 /// Same as [`detect_targets`] but skips paths in `exclude`.
 /// Useful when a caller needs to avoid circular self-detection.
 pub fn detect_targets_excluding(workspace_root: &Path, exclude: &[&Path]) -> RailResult<Vec<String>> {
-    // Get canonical target list from rustc (cached)
     let canonical_targets = get_rust_target_list()?;
 
-    // Find all config files (TOML + GitHub workflow YAML)
     let mut config_files = find_toml_files(workspace_root);
     config_files.extend(find_github_workflow_files(workspace_root));
 
-    // Track found targets (deduplicate)
     let mut found = HashSet::new();
 
-    // For each config file, check if it mentions any canonical target
     for file_path in config_files {
-        // Skip excluded files
         if exclude.iter().any(|e| file_path == *e) {
             continue;
         }
@@ -47,7 +40,6 @@ pub fn detect_targets_excluding(workspace_root: &Path, exclude: &[&Path]) -> Rai
         }
     }
 
-    // Return sorted for deterministic output
     let mut targets: Vec<_> = found.into_iter().collect();
     targets.sort();
 
@@ -86,22 +78,19 @@ pub fn validate_targets(targets: &[String]) -> RailResult<()> {
     Ok(())
 }
 
-/// Get canonical list of Rust target triples from rustc
+/// Return the targets supported by `rustc` on `PATH`.
 ///
-/// Caches the result using OnceLock for efficiency (rustc call is ~5ms).
-/// Returns ~320 target triples as of Rust 1.95.
+/// The first query, including failure, is cached for the process lifetime.
 pub fn get_rust_target_list() -> RailResult<Vec<String>> {
     static TARGETS: OnceLock<Option<Vec<String>>> = OnceLock::new();
 
     let targets = TARGETS.get_or_init(|| {
-        // Run rustc --print target-list
         let output = Command::new("rustc").args(["--print", "target-list"]).output().ok()?;
 
         if !output.status.success() {
             return None;
         }
 
-        // Parse output into Vec<String>
         let targets: Vec<String> = String::from_utf8_lossy(&output.stdout)
             .lines()
             .map(str::trim)
@@ -117,53 +106,31 @@ pub fn get_rust_target_list() -> RailResult<Vec<String>> {
     })
 }
 
-/// Check if content contains a target triple as a complete word/token
-///
-/// This avoids false positives like matching "thumbv7em-none-eabi" when the
-/// file only contains "thumbv7em-none-eabihf". Target triples in config files
-/// are typically surrounded by:
-/// - Whitespace
-/// - Quotes (single or double)
-/// - Brackets
-/// - Commas
-/// - Newlines
-/// - Start/end of string
+/// Match complete target tokens so a longer triple cannot match its prefix.
 fn contains_target_match(content: &str, target: &str) -> bool {
-    // Find all occurrences of the target string
     let mut start = 0;
     while let Some(pos) = content.get(start..).and_then(|remaining| remaining.find(target)) {
         let absolute_pos = start + pos;
         let end_pos = absolute_pos + target.len();
 
-        // Check character before (if any)
         let char_before = if absolute_pos > 0 {
             content.get(..absolute_pos).and_then(|prefix| prefix.chars().last())
         } else {
             None
         };
 
-        // Check character after (if any)
         let char_after = content.get(end_pos..).and_then(|suffix| suffix.chars().next());
 
-        // A target triple character is: alphanumeric, hyphen, or underscore
-        // Note: Some targets have dots (e.g., "thumbv8m.main-none-eabi") but treating
-        // dots as target chars breaks TOML table detection like [target.x86_64-linux-gnu].
-        // Since dotted targets are rare (only thumbv8m.* variants) and must be quoted
-        // in TOML anyway, we treat dots as boundaries. This works because:
-        // - In arrays: "thumbv8m.main-none-eabi" - the target is quoted, boundaries are quotes
-        // - In tables: [target."thumbv8m.main-none-eabi"] - must be quoted due to the dot
+        // Dots delimit TOML table components; dotted triples must be quoted.
         let is_target_char = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
 
-        // Valid boundary: start of string, or non-target character
         let valid_before = char_before.is_none_or(|c| !is_target_char(c));
-        // Valid boundary: end of string, or non-target character
         let valid_after = char_after.is_none_or(|c| !is_target_char(c));
 
         if valid_before && valid_after {
             return true;
         }
 
-        // Move past this match to find next occurrence
         start = absolute_pos + 1;
     }
 
@@ -181,17 +148,11 @@ fn find_toml_files(workspace_root: &Path) -> Vec<PathBuf> {
     toml_files
 }
 
-/// Recursive helper for find_toml_files
-///
-/// Walks the directory tree depth-first and appends discovered `.toml` files
-/// to the provided accumulator.
 fn find_toml_files_recursive(dir: &Path, current_depth: usize, max_depth: usize, toml_files: &mut Vec<PathBuf>) {
-    // Stop at max depth
     if current_depth > max_depth {
         return;
     }
 
-    // Read directory entries
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -199,7 +160,6 @@ fn find_toml_files_recursive(dir: &Path, current_depth: usize, max_depth: usize,
     for entry in entries.flatten() {
         let path = entry.path();
 
-        // Skip known build/cache directories
         if let Some(name) = path.file_name().and_then(|n| n.to_str())
             && matches!(name, "target" | ".git" | "node_modules" | ".cargo-rail")
         {
@@ -207,26 +167,19 @@ fn find_toml_files_recursive(dir: &Path, current_depth: usize, max_depth: usize,
         }
 
         if path.is_file() {
-            // Check if it's a .toml file
             if path.extension() == Some(OsStr::new("toml")) {
                 toml_files.push(path);
             }
         } else if path.is_dir() {
-            // Recurse into subdirectories
             find_toml_files_recursive(&path, current_depth + 1, max_depth, toml_files);
         }
     }
 }
 
-/// Find GitHub workflow files (.yml and .yaml) in .github/workflows/
-///
-/// Many monorepos define their cross-compilation targets in GitHub Actions
-/// workflow files rather than TOML configuration files. This function
-/// finds all workflow files for target detection.
+/// Find `.yml` and `.yaml` files directly inside `.github/workflows/`.
 fn find_github_workflow_files(workspace_root: &Path) -> Vec<PathBuf> {
     let workflows_dir = workspace_root.join(".github").join("workflows");
 
-    // Return empty if .github/workflows doesn't exist
     if !workflows_dir.is_dir() {
         return Vec::new();
     }
@@ -250,17 +203,15 @@ fn find_github_workflow_files(workspace_root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Check if a workspace has GitHub workflow files
+/// Return whether `.github/workflows/` contains a `.yml` or `.yaml` file.
 ///
-/// Used to provide helpful hints during `cargo rail init` when no targets
-/// are detected from TOML files but workflows exist.
+/// Returns `false` when the directory cannot be read.
 pub fn has_github_workflows(workspace_root: &Path) -> bool {
     let workflows_dir = workspace_root.join(".github").join("workflows");
     if !workflows_dir.is_dir() {
         return false;
     }
 
-    // Check if there's at least one .yml or .yaml file
     if let Ok(entries) = std::fs::read_dir(&workflows_dir) {
         for entry in entries.flatten() {
             let path = entry.path();

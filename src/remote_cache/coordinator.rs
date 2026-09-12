@@ -30,9 +30,6 @@ const IPC_TRANSFER_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const LOCK_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 const ACCEPT_POLL: Duration = Duration::from_millis(1);
-#[cfg(debug_assertions)]
-const IDLE_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(not(debug_assertions))]
 const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const WORKERS: usize = 4;
 

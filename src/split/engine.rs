@@ -1331,10 +1331,6 @@ impl<'a> SplitEngine<'a> {
             repository.expected_oid.as_deref(),
             journal.effect_id(),
         )?;
-        #[cfg(test)]
-        {
-            fail_split_after_ref_cas()?;
-        }
         if !journal.matches_repository_authority(store, &target, Some(repository.result_oid.clone()))? {
             return Err(RailError::message(
                 "prepared split repository authority changed before final materialization",
@@ -1681,10 +1677,6 @@ impl<'a> SplitEngine<'a> {
             repository.expected_oid.as_deref(),
             journal.effect_id(),
         )?;
-        #[cfg(test)]
-        {
-            fail_split_after_ref_cas()?;
-        }
         if !journal.matches_repository_authority(store, &target, Some(repository.result_oid.clone()))? {
             return Err(RailError::message(
                 "prepared split repository authority changed before final materialization",
@@ -1908,20 +1900,6 @@ fn git_entry_matches_image(entry: Option<&GitTreeEntry>, image: &GitPathImage) -
         (None, None) => true,
         (Some(entry), Some((mode, object_id))) => entry.mode == mode && entry.object_id == object_id,
         _ => false,
-    }
-}
-
-#[cfg(test)]
-std::thread_local! {
-    static FAIL_SPLIT_AFTER_REF_CAS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-#[cfg(test)]
-fn fail_split_after_ref_cas() -> RailResult<()> {
-    if FAIL_SPLIT_AFTER_REF_CAS.replace(false) {
-        Err(RailError::message("injected interruption after prepared split ref CAS"))
-    } else {
-        Ok(())
     }
 }
 

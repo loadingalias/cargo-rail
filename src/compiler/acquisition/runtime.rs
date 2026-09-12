@@ -79,27 +79,6 @@ impl ExecutionPolicy {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn fixed(process_slots: usize, work_permits: usize) -> RailResult<Self> {
-        if process_slots == 0
-            || work_permits == 0
-            || work_permits > process_slots
-            || process_slots > MAX_PROCESS_SLOTS
-            || work_permits > MAX_WORK_PERMITS
-        {
-            return Err(RailError::message(
-                "compiler acquisition test execution policy is invalid",
-            ));
-        }
-        Ok(Self {
-            process_slots: NonZeroUsize::new(process_slots).expect("validated non-zero process slots"),
-            work_permits: NonZeroUsize::new(work_permits).expect("validated non-zero work permits"),
-            sandbox_count: NonZeroUsize::new(process_slots).expect("validated non-zero sandbox count"),
-            journal_batch: NonZeroUsize::new(process_slots.min(MAX_JOURNAL_BATCH))
-                .expect("journal batch follows non-zero process slots"),
-        })
-    }
-
     pub(crate) const fn process_slots(self) -> usize {
         self.process_slots.get()
     }
@@ -143,16 +122,6 @@ impl RuntimeViewSpec {
             ordinal,
             required,
             candidates,
-        }
-    }
-
-    #[cfg(test)]
-    fn test(view: usize, ordinal: usize, required: bool, candidates: &[usize]) -> Self {
-        Self {
-            view: ViewIx::checked(view).expect("test view index"),
-            ordinal,
-            required,
-            candidates: candidates.iter().copied().collect(),
         }
     }
 }
@@ -470,11 +439,26 @@ mod tests {
 
     #[test]
     fn required_views_precede_disjoint_conditionals_and_respect_process_slots() {
-        let policy = ExecutionPolicy::fixed(2, 1).expect("policy");
+        let policy = ExecutionPolicy::derive_for(2, true, Some(1), false, 2, true);
         let specs = [
-            RuntimeViewSpec::test(0, 0, false, &[0]),
-            RuntimeViewSpec::test(1, 1, true, &[0]),
-            RuntimeViewSpec::test(2, 2, false, &[1]),
+            RuntimeViewSpec::new(
+                super::ViewIx::checked(0).unwrap(),
+                0,
+                false,
+                [0].into_iter().map(|index| super::CandidateIx::checked(index).unwrap()),
+            ),
+            RuntimeViewSpec::new(
+                super::ViewIx::checked(1).unwrap(),
+                1,
+                true,
+                [0].into_iter().map(|index| super::CandidateIx::checked(index).unwrap()),
+            ),
+            RuntimeViewSpec::new(
+                super::ViewIx::checked(2).unwrap(),
+                2,
+                false,
+                [1].into_iter().map(|index| super::CandidateIx::checked(index).unwrap()),
+            ),
         ];
         let mut runtime = RuntimeState::new(policy, 3, specs).expect("runtime");
         assert!(runtime.refresh(|_| true).expect("admit").is_empty());
@@ -503,10 +487,20 @@ mod tests {
 
     #[test]
     fn conditional_frontier_is_admitted_once_and_cancelled_when_false() {
-        let policy = ExecutionPolicy::fixed(1, 1).expect("policy");
+        let policy = ExecutionPolicy::derive_for(1, false, Some(1), false, 1, true);
         let specs = [
-            RuntimeViewSpec::test(0, 0, false, &[7]),
-            RuntimeViewSpec::test(1, 1, false, &[7]),
+            RuntimeViewSpec::new(
+                super::ViewIx::checked(0).unwrap(),
+                0,
+                false,
+                [7].into_iter().map(|index| super::CandidateIx::checked(index).unwrap()),
+            ),
+            RuntimeViewSpec::new(
+                super::ViewIx::checked(1).unwrap(),
+                1,
+                false,
+                [7].into_iter().map(|index| super::CandidateIx::checked(index).unwrap()),
+            ),
         ];
         let mut runtime = RuntimeState::new(policy, 2, specs).expect("runtime");
         runtime.refresh(|_| true).expect("first frontier");
@@ -524,11 +518,26 @@ mod tests {
 
     #[test]
     fn failure_cancels_queued_and_integrated_work_without_leaking_slots() {
-        let policy = ExecutionPolicy::fixed(2, 1).expect("policy");
+        let policy = ExecutionPolicy::derive_for(2, true, Some(1), false, 2, true);
         let specs = [
-            RuntimeViewSpec::test(0, 0, true, &[]),
-            RuntimeViewSpec::test(1, 1, true, &[]),
-            RuntimeViewSpec::test(2, 2, true, &[]),
+            RuntimeViewSpec::new(
+                super::ViewIx::checked(0).unwrap(),
+                0,
+                true,
+                [].into_iter().map(|index| super::CandidateIx::checked(index).unwrap()),
+            ),
+            RuntimeViewSpec::new(
+                super::ViewIx::checked(1).unwrap(),
+                1,
+                true,
+                [].into_iter().map(|index| super::CandidateIx::checked(index).unwrap()),
+            ),
+            RuntimeViewSpec::new(
+                super::ViewIx::checked(2).unwrap(),
+                2,
+                true,
+                [].into_iter().map(|index| super::CandidateIx::checked(index).unwrap()),
+            ),
         ];
         let mut runtime = RuntimeState::new(policy, 3, specs).expect("runtime");
         runtime.refresh(|_| true).expect("admit");
@@ -545,8 +554,13 @@ mod tests {
 
     #[test]
     fn invalid_terminal_transitions_fail_closed() {
-        let policy = ExecutionPolicy::fixed(1, 1).expect("policy");
-        let spec = RuntimeViewSpec::test(0, 0, true, &[]);
+        let policy = ExecutionPolicy::derive_for(1, false, Some(1), false, 1, true);
+        let spec = RuntimeViewSpec::new(
+            super::ViewIx::checked(0).unwrap(),
+            0,
+            true,
+            [].into_iter().map(|index| super::CandidateIx::checked(index).unwrap()),
+        );
         let mut runtime = RuntimeState::new(policy, 1, [spec]).expect("runtime");
         let view = crate::compiler::scheduler::ViewIx::checked(0).expect("view");
         assert!(runtime.complete(view).is_err());

@@ -170,8 +170,6 @@ pub(crate) struct CompilerAcquisitionJournal {
     pending_completions: usize,
     pending_since: Option<Instant>,
     revalidation_required: BTreeSet<usize>,
-    #[cfg(test)]
-    fault: Option<JournalFault>,
 }
 
 impl CompilerAcquisitionJournal {
@@ -313,8 +311,6 @@ impl CompilerAcquisitionJournal {
             pending_completions: 0,
             pending_since: None,
             revalidation_required,
-            #[cfg(test)]
-            fault: None,
         };
         if resumed {
             journal.dirty_views.extend(0..journal.document.views.len());
@@ -564,19 +560,9 @@ impl CompilerAcquisitionJournal {
                 "Surface acquisition manifest exceeds its byte bound",
             ));
         }
-        #[cfg(test)]
-        if self.fault == Some(JournalFault::BeforeReplace) {
-            self.fault = None;
-            return Err(RailError::message("injected journal replace failure"));
-        }
         let started = crate::instrumentation::compiler_acquisition_timer();
         crate::utils::write_file_atomic(&self.path, encoded)?;
         crate::instrumentation::record_compiler_acquisition_journal_write(started, encoded.len(), true, true);
-        #[cfg(test)]
-        if self.fault == Some(JournalFault::AfterReplace) {
-            self.fault = None;
-            return Err(RailError::message("injected journal sync acknowledgement failure"));
-        }
         Ok(())
     }
 }
@@ -859,15 +845,40 @@ pub(crate) fn validate_compiler_acquisition_resume(
 }
 
 #[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JournalFault {
-    BeforeReplace,
-    AfterReplace,
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
+
+    fn journal_plan(packages: &[&str]) -> RailResult<CompilerAcquisitionPlan> {
+        let manifests = packages
+            .iter()
+            .map(|name| crate::cargo::manifest_analyzer::ParsedManifest {
+                package_id: cargo_metadata::PackageId {
+                    repr: format!("path+file:///fixture/{name}#{name}@0.1.0"),
+                },
+                path: PathBuf::from(format!("/fixture/{name}/Cargo.toml")),
+                package_name: (*name).to_string(),
+                declared_features: Default::default(),
+                required_feature_selections: Default::default(),
+                condition_feature_selections: Default::default(),
+                source_cfg_features: Default::default(),
+                source_cfg_expressions: Default::default(),
+                retention_identifiers: Default::default(),
+                inherits_workspace_msrv: false,
+                package_fields: Default::default(),
+                dependencies: Default::default(),
+            })
+            .collect::<Vec<_>>();
+        let typed = packages.iter().map(|name| (*name).to_string()).collect();
+        let schedule = crate::compiler::scheduler::AnalysisSchedule::for_combined_with_features(
+            &manifests,
+            &["default"],
+            &[],
+            &typed,
+            &Default::default(),
+            None,
+        )?;
+        CompilerAcquisitionPlan::from_schedule(&schedule, &[], &["default"])
+    }
 
     fn request(resume_manifest: Option<PathBuf>) -> CompilerAcquisitionRequest {
         CompilerAcquisitionRequest {
@@ -920,7 +931,7 @@ mod tests {
     #[test]
     fn unsupported_resume_preserves_progress_and_fresh_acquisition_uses_current_namespace() {
         let root = tempfile::tempdir().expect("root");
-        let plan = CompilerAcquisitionPlan::journal_test_plan(&["alpha"]).expect("plan");
+        let plan = journal_plan(&["alpha"]).expect("plan");
         let journal = begin(root.path(), &plan, None, 1);
         let old_directory = crate::workspace::cargo_rail_state_root(root.path()).join("surface-acquisitions-v2");
         fs::create_dir_all(&old_directory).expect("old directory");
@@ -945,7 +956,7 @@ mod tests {
     #[test]
     fn out_of_order_completions_commit_as_one_canonical_group() {
         let root = tempfile::tempdir().expect("root");
-        let plan = CompilerAcquisitionPlan::journal_test_plan(&["alpha", "beta", "gamma"]).expect("plan");
+        let plan = journal_plan(&["alpha", "beta", "gamma"]).expect("plan");
         let order = plan
             .execution_order()
             .map(CompilerAcquisitionView::index)
@@ -977,7 +988,7 @@ mod tests {
     #[test]
     fn forced_termination_recovers_complete_views_and_resets_running_views() {
         let root = tempfile::tempdir().expect("root");
-        let plan = CompilerAcquisitionPlan::journal_test_plan(&["alpha", "beta", "gamma"]).expect("plan");
+        let plan = journal_plan(&["alpha", "beta", "gamma"]).expect("plan");
         let order = plan
             .execution_order()
             .map(CompilerAcquisitionView::index)
@@ -1011,26 +1022,32 @@ mod tests {
     }
 
     #[test]
-    fn replace_and_sync_acknowledgement_faults_recover_at_an_atomic_boundary() {
+    fn failed_replacement_preserves_running_state_and_completed_bytes_resume() {
         let root = tempfile::tempdir().expect("root");
-        let plan = CompilerAcquisitionPlan::journal_test_plan(&["alpha"]).expect("plan");
+        let plan = journal_plan(&["alpha"]).expect("plan");
         let view = plan.execution_order().next().expect("view").index();
-
-        let mut before = begin(root.path(), &plan, None, 1);
-        before.running_batch(&[view]).expect("running");
-        before.fault = Some(JournalFault::BeforeReplace);
-        assert!(before.complete(view, evidence(&before, view), true).is_err());
+        let mut journal = begin(root.path(), &plan, None, 1);
+        journal.running_batch(&[view]).expect("running");
+        let path = journal.path().to_path_buf();
+        let saved = path.with_extension("saved");
+        fs::rename(&path, &saved).unwrap();
+        fs::create_dir(&path).unwrap();
+        let error = journal.complete(view, evidence(&journal, view), true).unwrap_err();
+        assert!(
+            matches!(state(&read_document(&saved), view), DurableViewState::Running { .. }),
+            "{error}"
+        );
+        fs::remove_dir(&path).unwrap();
+        fs::rename(&saved, &path).unwrap();
+        journal.flush().expect("retry real replacement");
         assert!(matches!(
-            state(&read_document(before.path()), view),
-            DurableViewState::Running { .. }
+            state(&read_document(&path), view),
+            DurableViewState::Complete { .. }
         ));
-
-        let mut after = begin(root.path(), &plan, None, 1);
-        after.running_batch(&[view]).expect("running");
-        after.fault = Some(JournalFault::AfterReplace);
-        assert!(after.complete(view, evidence(&after, view), true).is_err());
+        drop(journal);
+        let resumed = begin(root.path(), &plan, Some(path), 1);
         assert!(matches!(
-            state(&read_document(after.path()), view),
+            state(&read_document(resumed.path()), view),
             DurableViewState::Complete { .. }
         ));
     }
@@ -1038,7 +1055,7 @@ mod tests {
     #[test]
     fn duration_bound_flushes_a_partial_completion_group() {
         let root = tempfile::tempdir().expect("root");
-        let plan = CompilerAcquisitionPlan::journal_test_plan(&["alpha"]).expect("plan");
+        let plan = journal_plan(&["alpha"]).expect("plan");
         let view = plan.execution_order().next().expect("view").index();
         let mut journal = begin(root.path(), &plan, None, 8);
         journal.running_batch(&[view]).expect("running");
@@ -1060,7 +1077,7 @@ mod tests {
     #[test]
     fn fatal_transition_flushes_completed_progress_and_terminal_failure_class() {
         let root = tempfile::tempdir().expect("root");
-        let plan = CompilerAcquisitionPlan::journal_test_plan(&["alpha", "beta"]).expect("plan");
+        let plan = journal_plan(&["alpha", "beta"]).expect("plan");
         let views = plan
             .execution_order()
             .map(CompilerAcquisitionView::index)
@@ -1093,7 +1110,7 @@ mod tests {
     #[test]
     fn terminal_partial_journal_can_enter_a_new_resume_sequence() {
         let root = tempfile::tempdir().expect("root");
-        let plan = CompilerAcquisitionPlan::journal_test_plan(&["alpha", "beta"]).expect("plan");
+        let plan = journal_plan(&["alpha", "beta"]).expect("plan");
         let views = plan
             .execution_order()
             .map(CompilerAcquisitionView::index)
@@ -1125,7 +1142,7 @@ mod tests {
     #[test]
     fn successful_non_durable_view_finishes_but_remains_pending_for_resume() {
         let root = tempfile::tempdir().expect("root");
-        let plan = CompilerAcquisitionPlan::journal_test_plan(&["alpha"]).expect("plan");
+        let plan = journal_plan(&["alpha"]).expect("plan");
         let view = plan.execution_order().next().expect("view").index();
         let path = {
             let mut journal = begin(root.path(), &plan, None, 1);
@@ -1154,7 +1171,7 @@ mod tests {
     #[test]
     fn binding_and_group_corruption_fail_closed() {
         let root = tempfile::tempdir().expect("root");
-        let plan = CompilerAcquisitionPlan::journal_test_plan(&["alpha"]).expect("plan");
+        let plan = journal_plan(&["alpha"]).expect("plan");
         let journal = begin(root.path(), &plan, None, 1);
         let mut mismatched = journal.document.header.clone();
         mismatched.compiler_set_identity.push_str("-changed");

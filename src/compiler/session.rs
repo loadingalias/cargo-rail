@@ -86,25 +86,6 @@ pub(crate) struct CompilerFactTargetAuthority {
 }
 
 impl CompilerFactSession {
-    #[cfg(test)]
-    pub(crate) fn write(
-        observation_directory: &Path,
-        source_root: &Path,
-        fact_families: &BTreeSet<CompilerFactFamily>,
-    ) -> RailResult<PathBuf> {
-        let contract = AnalysisContract::new(
-            fact_families.clone(),
-            "test-package".to_string(),
-            "default".to_string(),
-            crate::compiler::model::FeatureSelection::Default,
-            "test-analysis".to_string(),
-            "test-configuration".to_string(),
-            None,
-            BTreeSet::new(),
-        )?;
-        Self::write_with_typed(observation_directory, source_root, contract, None, None)
-    }
-
     pub(crate) fn write_with_typed(
         observation_directory: &Path,
         source_root: &Path,
@@ -544,8 +525,24 @@ mod tests {
         let root = tempfile::tempdir().expect("source root");
         let observations = tempfile::tempdir().expect("observation directory");
         let families = BTreeSet::from([CompilerFactFamily::StableDiagnostics]);
-        let capability =
-            CompilerFactSession::write(observations.path(), root.path(), &families).expect("fact capability");
+        let capability = CompilerFactSession::write_with_typed(
+            observations.path(),
+            root.path(),
+            AnalysisContract::new(
+                families.clone(),
+                "test-package".into(),
+                "default".into(),
+                crate::compiler::model::FeatureSelection::Default,
+                "test-analysis".into(),
+                "test-configuration".into(),
+                None,
+                BTreeSet::new(),
+            )
+            .unwrap(),
+            None,
+            None,
+        )
+        .expect("fact capability");
         let session =
             CompilerFactSession::load(&capability, observations.path(), root.path()).expect("valid capability");
         assert_eq!(session.observation_directory(), observations.path());

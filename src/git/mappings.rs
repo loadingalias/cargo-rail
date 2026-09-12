@@ -2261,11 +2261,6 @@ fn mapping_authority_drift_error() -> RailError {
 }
 
 #[cfg(test)]
-std::thread_local! {
-    static FAIL_V025_MIGRATION_AFTER_REF_CAS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 

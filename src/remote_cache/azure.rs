@@ -587,39 +587,114 @@ fn io_unavailable(_error: std::io::Error) -> RemoteStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote_cache::RemoteStoreErrorKind;
+    use azure_core::http::{AsyncRawResponse, StatusCode, headers::Headers};
+    use azure_storage_blob::models::{BlobClientDownloadResult, BlobDownloadProperties};
+
+    fn http_error(status: u16) -> azure_core::Error {
+        ErrorKind::HttpResponse {
+            status: StatusCode::from(status),
+            error_code: None,
+            raw_response: None,
+        }
+        .into_error()
+    }
 
     #[test]
     fn response_statuses_preserve_absence_authentication_and_preconditions() {
-        assert!(matches!(
-            classify_status_for_test(RequestKind::CacheGet, 404),
-            RequestFailure::Absent
-        ));
-        assert!(matches!(
-            classify_status_for_test(RequestKind::ConditionalPut, 412),
-            RequestFailure::Precondition
-        ));
-        assert!(matches!(
-            classify_status_for_test(RequestKind::CacheGet, 403),
-            RequestFailure::Store(_)
-        ));
-    }
-
-    #[test]
-    fn content_range_requires_an_exact_decimal_total() {
-        assert_eq!(parse_content_range_for_test("bytes 0-7/25"), Some(25));
-        assert_eq!(parse_content_range_for_test("bytes 0-7/*"), None);
-        assert_eq!(parse_content_range_for_test("invalid"), None);
-    }
-
-    fn classify_status_for_test(kind: RequestKind, status: u16) -> RequestFailure {
-        match status {
-            404 if matches!(kind, RequestKind::Marker | RequestKind::CacheGet) => RequestFailure::Absent,
-            409 | 412 if kind == RequestKind::ConditionalPut => RequestFailure::Precondition,
-            _ => RequestFailure::Store(RemoteStoreError::unavailable("test status")),
+        for kind in [RequestKind::Marker, RequestKind::CacheGet] {
+            assert!(matches!(classify_error(&http_error(404), kind), RequestFailure::Absent));
+        }
+        for status in [409, 412] {
+            assert!(matches!(
+                classify_error(&http_error(status), RequestKind::ConditionalPut),
+                RequestFailure::Precondition
+            ));
+        }
+        for (kind, status, expected) in [
+            (RequestKind::CacheGet, 401, RemoteStoreErrorKind::Authentication),
+            (RequestKind::CacheGet, 403, RemoteStoreErrorKind::Authentication),
+            (RequestKind::CacheGet, 429, RemoteStoreErrorKind::Unavailable),
+            (RequestKind::CacheGet, 503, RemoteStoreErrorKind::Unavailable),
+            (RequestKind::CacheGet, 412, RemoteStoreErrorKind::Configuration),
+            (RequestKind::ConditionalPut, 404, RemoteStoreErrorKind::Configuration),
+        ] {
+            let RequestFailure::Store(error) = classify_error(&http_error(status), kind) else {
+                panic!("{kind:?} {status} must remain a store error");
+            };
+            assert_eq!(error.kind, expected, "{kind:?} {status}");
         }
     }
 
-    fn parse_content_range_for_test(value: &str) -> Option<u64> {
-        value.rsplit_once('/').and_then(|(_, total)| total.parse().ok())
+    fn download_response(content_range: Option<&str>, content_length: Option<u64>) -> BlobClientDownloadResult {
+        let mut headers = Headers::new();
+        if let Some(value) = content_range {
+            headers.insert("content-range", value.to_owned());
+        }
+        let (_, headers, body) = AsyncRawResponse::from_bytes(StatusCode::Ok, headers, Vec::<u8>::new()).deconstruct();
+        BlobClientDownloadResult {
+            body,
+            headers,
+            properties: BlobDownloadProperties {
+                etag: None,
+                last_modified: None,
+                created_on: None,
+                last_accessed: None,
+                content_length,
+                content_type: None,
+                cache_control: None,
+                content_disposition: None,
+                content_encoding: None,
+                content_language: None,
+                content_md5: None,
+                content_crc64: None,
+                blob_content_md5: None,
+                blob_type: None,
+                blob_sequence_number: None,
+                blob_committed_block_count: None,
+                is_sealed: None,
+                metadata: Default::default(),
+                version_id: None,
+                lease_state: None,
+                lease_status: None,
+                lease_duration: None,
+                legal_hold: None,
+                immutability_policy_mode: None,
+                immutability_policy_expires_on: None,
+                copy_completed_on: None,
+                copy_id: None,
+                copy_progress: None,
+                copy_source: None,
+                copy_status: None,
+                copy_status_description: None,
+                object_replication_policy_id: None,
+                object_replication_rules: Default::default(),
+                tag_count: None,
+                encryption_scope: None,
+                encryption_key_sha256: None,
+            },
+        }
+    }
+
+    #[test]
+    fn response_length_prefers_range_total_and_requires_exact_length() {
+        assert_eq!(
+            response_length(&download_response(Some("bytes 0-7/25"), Some(8))).unwrap(),
+            25
+        );
+        assert_eq!(response_length(&download_response(None, Some(8))).unwrap(), 8);
+        assert_eq!(response_length(&download_response(None, Some(0))).unwrap(), 0);
+        for range in [
+            Some("bytes 0-7/*"),
+            Some("invalid"),
+            Some("bytes 0-7/18446744073709551616"),
+        ] {
+            let error = response_length(&download_response(range, Some(8))).unwrap_err();
+            assert_eq!(error.kind, RemoteStoreErrorKind::Integrity, "{range:?}");
+        }
+        assert_eq!(
+            response_length(&download_response(None, None)).unwrap_err().kind,
+            RemoteStoreErrorKind::Integrity
+        );
     }
 }

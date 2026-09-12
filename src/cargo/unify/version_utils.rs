@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 /// Check if a version string is an exact pin ("=x.y.z")
 pub fn is_exact_pin(version: &str) -> bool {
-    version.starts_with('=') && !version.starts_with(">=")
+    version.starts_with('=')
 }
 
 /// Extract major version from a declared version string
@@ -18,8 +18,7 @@ pub fn is_exact_pin(version: &str) -> bool {
 /// - ">=0.5" -> Some(0)
 pub fn extract_major_version(version: &str) -> Option<u32> {
     let cleaned = strip_version_op(version);
-    let parts: Vec<&str> = cleaned.split('.').collect();
-    parts.first().and_then(|s| s.parse().ok())
+    cleaned.split('.').next().and_then(|s| s.parse().ok())
 }
 
 /// Check for major version conflicts in declared versions
@@ -39,22 +38,10 @@ pub fn find_major_version_conflicts(usages: &[&DepUsage]) -> HashSet<u32> {
 /// This is a heuristic check - it compares the major.minor portions
 /// to detect obvious incompatibilities like "0.11" vs "0.13".
 pub fn versions_compatible(member_version: &str, workspace_version: &str) -> bool {
-    // Strip leading operators for comparison
-    let member_ver = strip_version_op(member_version);
-    let workspace_ver = strip_version_op(workspace_version);
-
-    // Parse into parts
-    let member_parts: Vec<&str> = member_ver.split('.').collect();
-    let workspace_parts: Vec<&str> = workspace_ver.split('.').collect();
-
-    // For semver compatibility, major must match (or be 0)
-    // For 0.x versions, minor must also match
-    if member_parts.is_empty() || workspace_parts.is_empty() {
-        return true; // Can't determine, assume compatible
-    }
-
-    let member_major = member_parts[0].parse::<u32>().unwrap_or(0);
-    let workspace_major = workspace_parts[0].parse::<u32>().unwrap_or(0);
+    let mut member_parts = strip_version_op(member_version).split('.');
+    let mut workspace_parts = strip_version_op(workspace_version).split('.');
+    let member_major = member_parts.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+    let workspace_major = workspace_parts.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
 
     if member_major != workspace_major {
         return false;
@@ -62,8 +49,8 @@ pub fn versions_compatible(member_version: &str, workspace_version: &str) -> boo
 
     // For 0.x versions, minor must match
     if member_major == 0 {
-        let member_minor = member_parts.get(1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
-        let workspace_minor = workspace_parts.get(1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+        let member_minor = member_parts.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+        let workspace_minor = workspace_parts.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
         if member_minor != workspace_minor {
             return false;
         }

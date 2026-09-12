@@ -399,12 +399,6 @@ impl GitEffectIntent {
         ))
     }
 
-    /// Return the exact repository mutation authority.
-    #[cfg(test)]
-    pub(crate) fn repository(&self) -> &GitEffectRepositoryAuthority {
-        &self.repository
-    }
-
     fn validate(&self) -> RailResult<()> {
         validate_token("operation ID", &self.operation_id)?;
         self.repository.validate()?;
@@ -532,12 +526,6 @@ impl GitEffectJournal {
     /// Return the digest binding every immutable effect field.
     pub(crate) fn payload_digest(&self) -> &str {
         &self.payload_digest
-    }
-
-    /// Return the last durably completed phase.
-    #[cfg(test)]
-    pub(crate) fn phase(&self) -> GitEffectPhase {
-        self.phase
     }
 
     /// Return the exact repository mutation authority.
@@ -997,11 +985,6 @@ pub(crate) struct PreparedGitObjectBundle {
 }
 
 impl PreparedGitObjectBundle {
-    #[cfg(test)]
-    pub(crate) fn file(&self) -> &File {
-        &self.file
-    }
-
     pub(crate) fn into_file(self) -> File {
         self.file
     }
@@ -1875,18 +1858,6 @@ impl GitEffectStore {
         }
         remove_directory_entry(&self.objects, &name, &self.objects.path.join(&name))?;
         sync_retained_directory(&self.objects)
-    }
-
-    #[cfg(test)]
-    fn active_path(&self, effect_id: &str) -> RailResult<PathBuf> {
-        validate_effect_id(effect_id)?;
-        Ok(self.active.path.join(format!("{effect_id}.json")))
-    }
-
-    #[cfg(test)]
-    fn completed_path(&self, effect_id: &str) -> RailResult<PathBuf> {
-        validate_effect_id(effect_id)?;
-        Ok(self.completed.path.join(format!("{effect_id}.json")))
     }
 
     fn object_bundle_matches(&self, effect_id: &str, digest: &str, expected_len: u64) -> RailResult<bool> {
@@ -3449,7 +3420,7 @@ mod tests {
         let planned = intent(&store, &git, false);
         let effect_id = planned.effect_id().unwrap();
         drop(active(store.prepare(planned.clone()).unwrap()));
-        let path = store.active_path(&effect_id).unwrap();
+        let path = store.active.path.join(format!("{effect_id}.json"));
         let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         value["schema_version"] = serde_json::json!(1);
         let bytes = serde_json::to_vec(&value).unwrap();
@@ -3490,7 +3461,7 @@ mod tests {
         let intent = intent(&store, &git, false);
         let effect_id = intent.effect_id().unwrap();
         drop(active(store.prepare(intent).unwrap()));
-        let path = store.active_path(&effect_id).unwrap();
+        let path = store.active.path.join(format!("{effect_id}.json"));
         let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         value["unexpected"] = serde_json::json!(true);
         utils::write_file_atomic(&path, &serde_json::to_vec_pretty(&value).unwrap()).unwrap();
@@ -3514,7 +3485,7 @@ mod tests {
         let intent = intent(&store, &git, false);
         let effect_id = intent.effect_id().unwrap();
         drop(active(store.prepare(intent).unwrap()));
-        let path = store.active_path(&effect_id).unwrap();
+        let path = store.active.path.join(format!("{effect_id}.json"));
         let original = fs::read(&path).unwrap();
         let mut value: serde_json::Value = serde_json::from_slice(&original).unwrap();
         value["operation_id"] = serde_json::json!("sync-apply-tampered");
@@ -3537,7 +3508,7 @@ mod tests {
         let intent = intent(&store, &git, true);
         let effect_id = intent.effect_id().unwrap();
         let mut prepared = active(store.prepare(intent.clone()).unwrap());
-        assert_eq!(prepared.journal().phase(), GitEffectPhase::Prepared);
+        assert_eq!(prepared.journal().phase, GitEffectPhase::Prepared);
 
         fs::write(store.active.path.join(".cargo-rail-interrupted.tmp"), b"{truncated").unwrap();
         assert_eq!(store.discover_active().unwrap().len(), 1);
@@ -3545,15 +3516,15 @@ mod tests {
 
         prepared = active(store.resume(&effect_id).unwrap());
         prepared.mark_local_applied().unwrap();
-        assert_eq!(prepared.journal().phase(), GitEffectPhase::LocalApplied);
+        assert_eq!(prepared.journal().phase, GitEffectPhase::LocalApplied);
         drop(prepared);
 
         let mut local = active(store.resume(&effect_id).unwrap());
         local.mark_published().unwrap();
-        assert_eq!(local.journal().phase(), GitEffectPhase::Published);
+        assert_eq!(local.journal().phase, GitEffectPhase::Published);
         let completed = local.finish().unwrap();
-        assert_eq!(completed.journal().phase(), GitEffectPhase::Published);
-        assert!(store.completed_path(&effect_id).unwrap().is_file());
+        assert_eq!(completed.journal().phase, GitEffectPhase::Published);
+        assert!(store.completed.path.join(format!("{effect_id}.json")).is_file());
         assert!(store.discover_active().unwrap().is_empty());
 
         match store.prepare(intent).unwrap() {
@@ -3563,7 +3534,7 @@ mod tests {
             }
             GitEffectRecord::Active(_) => panic!("completed effect was recreated as active"),
         }
-        assert!(!store.completed_path(&effect_id).unwrap().exists());
+        assert!(!store.completed.path.join(format!("{effect_id}.json")).exists());
     }
 
     #[test]
@@ -3611,7 +3582,7 @@ mod tests {
         let mut active = active(store.prepare(intent).unwrap());
         active.mark_local_applied().unwrap();
         let completed = active.finish().unwrap();
-        let completed_path = store.completed_path(&effect_id).unwrap();
+        let completed_path = store.completed.path.join(format!("{effect_id}.json"));
         let bundle_path = store.object_bundle_path(&effect_id).unwrap();
         assert!(completed_path.is_file());
         assert!(bundle_path.is_file());
@@ -3807,7 +3778,7 @@ mod tests {
     fn push_only_intent_is_the_only_valid_unchanged_local_ref_shape() {
         let (_repo, git) = repository();
         let store = GitEffectStore::open(&git).unwrap();
-        let mut repository = intent(&store, &git, false).repository().clone();
+        let mut repository = intent(&store, &git, false).repository;
         repository.expected_oid = Some(repository.result_oid.clone());
         let publication = GitPublicationEffect::new(
             digest('1'),
@@ -3860,7 +3831,7 @@ mod tests {
         bundle.file.read_to_end(&mut observed).unwrap();
         assert_eq!(observed, bytes);
         let reopened = store.open_object_bundle(&effect_id, &expected_digest).unwrap().unwrap();
-        assert_eq!(reopened.file().metadata().unwrap().len(), bytes.len() as u64);
+        assert_eq!(reopened.file.metadata().unwrap().len(), bytes.len() as u64);
         drop(reopened.into_file());
     }
 }

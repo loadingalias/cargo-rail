@@ -576,7 +576,11 @@ mod tests {
     #[test]
     fn remote_graph_import_requires_every_object_then_reuses_through_the_owning_store() {
         let source = tempfile::tempdir().expect("source CAS");
-        let source_cas = LocalCas::open_at(source.path(), 16 * 1024 * 1024).expect("source CAS");
+        let source_cas = LocalCas::open_selected(
+            &crate::cache::cas::LocalCacheSelection::new(source.path().to_path_buf(), 16 * 1024 * 1024, None)
+                .expect("cache selection"),
+        )
+        .expect("source CAS");
         let contract = AnalysisContract::new(
             BTreeSet::from([CompilerFactFamily::StableDiagnostics]),
             "demo".to_string(),
@@ -640,7 +644,11 @@ mod tests {
             .expect("publish binding");
 
         let destination = tempfile::tempdir().expect("destination CAS");
-        let destination_cas = LocalCas::open_at(destination.path(), 16 * 1024 * 1024).expect("destination CAS");
+        let destination_cas = LocalCas::open_selected(
+            &crate::cache::cas::LocalCacheSelection::new(destination.path().to_path_buf(), 16 * 1024 * 1024, None)
+                .expect("cache selection"),
+        )
+        .expect("destination CAS");
         remote
             .import(&destination_cas, &binding_candidate)
             .expect("import binding");

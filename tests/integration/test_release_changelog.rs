@@ -13,7 +13,6 @@ use crate::helpers::{
 };
 use anyhow::Result;
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
 use std::process::Command;
 
 fn generate_lockfile(workspace: &Path) -> Result<()> {
@@ -142,16 +141,120 @@ fn shallow_clone(ws: &TestWorkspace, name: &str) -> Result<(tempfile::TempDir, P
     Ok((root, clone_path))
 }
 
-fn run_release_with_fault(cwd: &Path, args: &[&str], fault: &str) -> Result<std::process::Output> {
-    run_release_with_fault_env(cwd, args, "CARGO_RAIL_RELEASE_FAIL_AFTER", fault)
+fn run_with_rejected_commit(cwd: &Path, args: &[&str]) -> Result<std::process::Output> {
+    let hook = cwd.join(".git/hooks/pre-commit");
+    std::fs::write(&hook, "#!/bin/sh\necho 'fixture commit policy rejected' >&2\nexit 1\n")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))?;
+    }
+    let output = run_cargo_rail(cwd, args);
+    std::fs::remove_file(hook)?;
+    let output = output?;
+    anyhow::ensure!(
+        String::from_utf8_lossy(&output.stderr).contains("fixture commit policy rejected"),
+        "release did not reach the rejecting commit hook: {output:?}"
+    );
+    Ok(output)
 }
 
-fn run_release_with_before_fault(cwd: &Path, args: &[&str], fault: &str) -> Result<std::process::Output> {
-    run_release_with_fault_env(cwd, args, "CARGO_RAIL_RELEASE_FAIL_BEFORE", fault)
+#[cfg(unix)]
+fn run_with_lost_git_acknowledgment(cwd: &Path, args: &[&str], operation: &str) -> Result<std::process::Output> {
+    use std::os::unix::fs::PermissionsExt;
+    let real_git = Command::new("sh").args(["-c", "command -v git"]).output()?;
+    anyhow::ensure!(real_git.status.success(), "cannot locate Git");
+    let real_git = String::from_utf8(real_git.stdout)?.trim().to_owned();
+    let pattern = match operation {
+        "commit" => "*\" commit -m \"*",
+        "tag" => "*\" tag -a \"*|*\" tag -s \"*",
+        "push" => "*\" push \"*",
+        _ => anyhow::bail!("unsupported Git operation"),
+    };
+    let dir = tempfile::tempdir()?;
+    let wrapper = dir.path().join("git");
+    std::fs::write(
+        &wrapper,
+        format!(
+            r#"#!/bin/sh
+case " $* " in
+  {pattern})
+    "{real_git}" "$@" || exit $?
+    echo 'fixture Git transport lost acknowledgment after successful operation' >&2
+    exit 1
+    ;;
+esac
+exec "{real_git}" "$@"
+"#
+        ),
+    )?;
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))?;
+    let path = format!("{}:{}", dir.path().display(), std::env::var("PATH").unwrap_or_default());
+    let output = cargo_rail_command(cwd)?.env("PATH", path).args(args).output()?;
+    anyhow::ensure!(
+        String::from_utf8_lossy(&output.stderr).contains("fixture Git transport lost acknowledgment"),
+        "release did not reach the completed Git operation: {output:?}"
+    );
+    Ok(output)
 }
 
-fn run_release_with_fault_env(cwd: &Path, args: &[&str], variable: &str, fault: &str) -> Result<std::process::Output> {
-    Ok(cargo_rail_command(cwd)?.env(variable, fault).args(args).output()?)
+#[cfg(windows)]
+fn run_with_lost_git_acknowledgment(cwd: &Path, args: &[&str], operation: &str) -> Result<std::process::Output> {
+    let located = Command::new("where.exe").arg("git.exe").output()?;
+    anyhow::ensure!(located.status.success(), "cannot locate Git");
+    let locations = String::from_utf8(located.stdout)?;
+    let real_git = locations
+        .lines()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Git path is empty"))?
+        .trim();
+    let dir = tempfile::tempdir()?;
+    let source = dir.path().join("git_proxy.rs");
+    let wrapper = dir.path().join("git.exe");
+    std::fs::write(
+        &source,
+        format!(
+            r#"
+fn main() {{
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let effect = match {operation:?} {{
+        "commit" => args.windows(2).any(|pair| pair[0] == "commit" && pair[1] == "-m"),
+        "tag" => args.windows(2).any(|pair| pair[0] == "tag" && (pair[1] == "-a" || pair[1] == "-s")),
+        "push" => args.iter().any(|arg| arg == "push"),
+        _ => panic!("unsupported Git operation"),
+    }};
+    let status = std::process::Command::new({real_git:?}).args(&args).status().unwrap();
+    if status.success() && effect {{
+        eprintln!("fixture Git transport lost acknowledgment after successful operation");
+        std::process::exit(1);
+    }}
+    std::process::exit(status.code().unwrap_or(1));
+}}
+"#
+        ),
+    )?;
+    let compiled = Command::new("rustc")
+        .arg(&source)
+        .arg("--edition=2024")
+        .arg("-o")
+        .arg(&wrapper)
+        .output()?;
+    anyhow::ensure!(
+        compiled.status.success(),
+        "Git proxy compilation failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let mut paths = vec![dir.path().to_path_buf()];
+    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+    let output = cargo_rail_command(cwd)?
+        .env("PATH", std::env::join_paths(paths)?)
+        .args(args)
+        .output()?;
+    anyhow::ensure!(
+        String::from_utf8_lossy(&output.stderr).contains("fixture Git transport lost acknowledgment"),
+        "release did not reach the completed Git operation: {output:?}"
+    );
+    Ok(output)
 }
 
 fn only_release_state(workspace: &Path) -> Result<PathBuf> {
@@ -643,8 +746,7 @@ semver_check = "off"
         let change_path = ws.path.join(".changes/recover.md");
         std::fs::write(&change_path, content)?;
 
-        let interrupted =
-            run_release_with_before_fault(&ws.path, &["rail", "release", "run", "lib-a", "--yes"], "commit:lib-a")?;
+        let interrupted = run_with_rejected_commit(&ws.path, &["rail", "release", "run", "lib-a", "--yes"])?;
         assert!(!interrupted.status.success());
         assert_eq!(
             std::fs::read_to_string(&change_path)?,
@@ -877,6 +979,10 @@ if [ "$1" = "info" ]; then
 fi
 
 if [ "$1" = "publish" ]; then
+  if [ -f "{}.deny" ]; then
+    echo "registry temporarily rejected publication" >&2
+    exit 101
+  fi
   if git show-ref --verify --quiet refs/tags/v0.1.1; then
     echo "release tag existed before publication became observable" >&2
     exit 1
@@ -915,6 +1021,7 @@ fi
 exec "{}" "$@"
 "#,
             log_path.display(),
+            published_path.display(),
             published_path.display(),
             published_path.display(),
             real_cargo
@@ -1023,12 +1130,10 @@ registry_publication = "crates-io"
             shim.path().display(),
             std::env::var("PATH").unwrap_or_default()
         );
+        let rejection = PathBuf::from(format!("{}.deny", published_path.display()));
+        std::fs::write(&rejection, "reject this request")?;
         let interrupted = cargo_rail_command(&ws.path)?
             .env("PATH", &path)
-            .env(
-                "CARGO_RAIL_RELEASE_FAIL_AFTER",
-                "journal:publish_intent:registry-shadow",
-            )
             .args([
                 "rail",
                 "release",
@@ -1043,7 +1148,7 @@ registry_publication = "crates-io"
         assert!(!interrupted.status.success());
         assert!(
             !published_path.exists(),
-            "journal failure precedes the publication effect"
+            "a rejected registry request must not mark the version published"
         );
         anyhow::ensure!(
             ws.path.join("target/cargo-rail/releases").is_dir(),
@@ -1051,7 +1156,10 @@ registry_publication = "crates-io"
             String::from_utf8_lossy(&interrupted.stdout),
             String::from_utf8_lossy(&interrupted.stderr)
         );
+        std::fs::remove_file(rejection)?;
         let state_path = only_release_state(&ws.path)?;
+        let pending: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
+        assert_eq!(pending["crates"][0]["publication"]["status"], "in_progress");
         let output = run_with_path_prefix(
             &ws,
             shim.path(),
@@ -1079,8 +1187,8 @@ registry_publication = "crates-io"
             .collect::<Vec<_>>();
         assert_eq!(
             publishes,
-            vec!["publish -p registry-shadow --locked --registry crates-io"],
-            "the release must publish exactly once with fail-closed arguments\ncargo calls:\n{}",
+            vec!["publish -p registry-shadow --locked --registry crates-io"; 2],
+            "the rejected request and retry must use exact publication arguments\ncargo calls:\n{}",
             log
         );
         assert!(published_path.exists(), "the registry shim should record a publication");
@@ -2248,7 +2356,7 @@ auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
         let initial_head = ws.commit("Configure auxiliary Cargo recovery")?;
         let before = std::fs::read(ws.path.join("auxiliary/Cargo.lock"))?;
 
-        let interrupted = run_release_with_before_fault(
+        let interrupted = run_with_rejected_commit(
             &ws.path,
             &[
                 "rail",
@@ -2260,7 +2368,6 @@ auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
                 "--skip-tag",
                 "--yes",
             ],
-            "commit:aux-recovery",
         )?;
         assert!(!interrupted.status.success());
         assert_eq!(std::fs::read(ws.path.join("auxiliary/Cargo.lock"))?, before);
@@ -4114,7 +4221,7 @@ remote_effects = "push"
         )?;
         write_test_change(&ws.path, &["push-resume"])?;
 
-        let interrupted = run_release_with_fault(
+        let interrupted = run_with_lost_git_acknowledgment(
             &ws.path,
             &[
                 "rail",
@@ -4154,7 +4261,7 @@ remote_effects = "push"
 fn test_release_resume_rejects_remote_repository_drift() {
     let result: Result<()> = (|| {
         let (ws, _original_remote) = push_release_workspace("push-target-drift")?;
-        let interrupted = run_release_with_fault(
+        let interrupted = run_with_lost_git_acknowledgment(
             &ws.path,
             &[
                 "rail",
@@ -4195,7 +4302,7 @@ fn test_release_abort_remains_local_before_a_push_after_origin_drift() {
     let result: Result<()> = (|| {
         let (ws, _original_remote) = push_release_workspace("abort-before-push-drift")?;
         let initial_head = git(&ws.path, &["rev-parse", "HEAD"])?.stdout;
-        let interrupted = run_release_with_fault(
+        let interrupted = run_with_lost_git_acknowledgment(
             &ws.path,
             &[
                 "rail",
@@ -4207,7 +4314,7 @@ fn test_release_abort_remains_local_before_a_push_after_origin_drift() {
                 "--skip-tag",
                 "--yes",
             ],
-            "commit:abort-before-push-drift",
+            "commit",
         )?;
         assert!(!interrupted.status.success());
         let state_path = only_release_state(&ws.path)?;
@@ -4498,9 +4605,11 @@ fn publication_check_plan_is_accepted_by_the_matching_publish_run() {
             shim.path().display(),
             std::env::var("PATH").unwrap_or_default()
         );
+        let journal_root = ws.path.join("target/cargo-rail/releases");
+        std::fs::create_dir_all(journal_root.parent().unwrap())?;
+        std::fs::write(&journal_root, "blocked journal directory")?;
         let run = cargo_rail_command(&ws.path)?
             .env("PATH", path)
-            .env("CARGO_RAIL_RELEASE_FAIL_BEFORE", "journal:planned")
             .args([
                 "rail",
                 "release",
@@ -4520,21 +4629,12 @@ fn publication_check_plan_is_accepted_by_the_matching_publish_run() {
         let stderr = String::from_utf8_lossy(&run.stderr);
         let stdout = String::from_utf8_lossy(&run.stdout);
         assert_eq!(run.status.code(), Some(2), "stdout:\n{}\nstderr:\n{stderr}", stdout);
-        assert!(
-            stdout.contains("injected release failure before journal:planned"),
-            "stdout:\n{stdout}\nstderr:\n{stderr}"
-        );
+        assert!(stdout.contains("File exists"), "stdout:\n{stdout}\nstderr:\n{stderr}");
         assert!(
             !published_path.exists(),
             "parity validation must stop before publication"
         );
-        let persisted_journal = std::fs::read_dir(ws.path.join("target/cargo-rail/releases"))?
-            .filter_map(|entry| entry.ok())
-            .any(|entry| entry.path().extension().is_some_and(|extension| extension == "json"));
-        assert!(
-            !persisted_journal,
-            "parity validation must stop before journal persistence"
-        );
+        assert_eq!(std::fs::read_to_string(&journal_root)?, "blocked journal directory");
         for crate_name in ["publication-core", "publication-app"] {
             assert!(
                 std::fs::read_to_string(ws.path.join("crates").join(crate_name).join("Cargo.toml"))?
@@ -5178,7 +5278,7 @@ fn test_release_resume_reconciles_tag_created_before_failure() {
         ws.commit("feat: resumable release")?;
         write_test_change(&ws.path, &["lib-a"])?;
 
-        let interrupted = run_release_with_fault(
+        let interrupted = run_with_lost_git_acknowledgment(
             &ws.path,
             &["rail", "release", "run", "lib-a", "--bump", "patch", "--yes"],
             "tag",
@@ -5220,7 +5320,7 @@ fn release_resume_rejects_same_branch_head_movement() {
         ws.commit("feat: prepare release")?;
         write_test_change(&ws.path, &["lib-a"])?;
 
-        let interrupted = run_release_with_fault(
+        let interrupted = run_with_lost_git_acknowledgment(
             &ws.path,
             &["rail", "release", "run", "lib-a", "--bump", "patch", "--yes"],
             "tag",
@@ -5255,7 +5355,7 @@ fn unsupported_release_journal_blocks_resume_and_new_transactions() {
         let before = String::from_utf8_lossy(&git(&ws.path, &["rev-list", "--count", "HEAD"])?.stdout)
             .trim()
             .parse::<usize>()?;
-        let interrupted = run_release_with_fault_env(
+        let interrupted = run_with_rejected_commit(
             &ws.path,
             &[
                 "rail",
@@ -5267,8 +5367,6 @@ fn unsupported_release_journal_blocks_resume_and_new_transactions() {
                 "--skip-tag",
                 "--yes",
             ],
-            "CARGO_RAIL_RELEASE_FAIL_AFTER",
-            "journal:planned",
         )?;
         assert!(!interrupted.status.success());
         let state_path = only_release_state(&ws.path)?;
@@ -5313,7 +5411,7 @@ fn release_recovery_survives_invalid_metadata_and_clean_refuses_active_state() {
 "#,
         )?;
         write_test_change(&ws.path, &["release-status-active"])?;
-        let interrupted = run_release_with_before_fault(
+        let interrupted = run_with_rejected_commit(
             &ws.path,
             &[
                 "rail",
@@ -5325,7 +5423,6 @@ fn release_recovery_survives_invalid_metadata_and_clean_refuses_active_state() {
                 "--skip-tag",
                 "--yes",
             ],
-            "commit:release-status-active",
         )?;
         assert!(!interrupted.status.success());
         let state_path = only_release_state(&ws.path)?;
@@ -5384,52 +5481,62 @@ fn release_recovery_survives_invalid_metadata_and_clean_refuses_active_state() {
 }
 
 #[test]
-fn release_resume_reconciles_a_journal_write_that_failed_after_persistence() {
+fn release_resume_reconciles_commits_before_and_after_journal_observation() {
     let result: Result<()> = (|| {
-        let ws = TestWorkspace::new_single_crate("journal-fault", "0.1.0")?;
-        ws.write_release_config(
-            r#"tag_format = "v{version}"
+        for observed in [false, true] {
+            let ws = TestWorkspace::new_single_crate("journal-fault", "0.1.0")?;
+            ws.write_release_config(
+                r#"tag_format = "v{version}"
 "#,
-        )?;
-        write_test_change(&ws.path, &["journal-fault"])?;
-        let before = git(&ws.path, &["rev-list", "--count", "HEAD"])?;
-        let interrupted = run_release_with_fault_env(
-            &ws.path,
-            &[
-                "rail",
-                "release",
-                "run",
-                "--all",
-                "--bump",
-                "patch",
-                "--skip-tag",
-                "--yes",
-            ],
-            "CARGO_RAIL_RELEASE_FAIL_AFTER",
-            "journal:commit_observed:journal-fault",
-        )?;
-        assert!(!interrupted.status.success());
-        let state_path = only_release_state(&ws.path)?;
-        let after_fault = git(&ws.path, &["rev-list", "--count", "HEAD"])?;
-        assert_ne!(
-            before.stdout, after_fault.stdout,
-            "the commit effect should have completed"
-        );
+            )?;
+            write_test_change(&ws.path, &["journal-fault"])?;
+            let before = git(&ws.path, &["rev-list", "--count", "HEAD"])?;
+            let interrupted = run_with_lost_git_acknowledgment(
+                &ws.path,
+                &[
+                    "rail",
+                    "release",
+                    "run",
+                    "--all",
+                    "--bump",
+                    "patch",
+                    "--skip-tag",
+                    "--yes",
+                ],
+                "commit",
+            )?;
+            assert!(!interrupted.status.success());
+            let state_path = only_release_state(&ws.path)?;
+            let after_fault = git(&ws.path, &["rev-list", "--count", "HEAD"])?;
+            assert_ne!(
+                before.stdout, after_fault.stdout,
+                "the commit effect should have completed"
+            );
 
-        let resumed = run_cargo_rail(&ws.path, &["rail", "release", "resume", state_path.to_str().unwrap()])?;
-        assert!(resumed.status.success(), "{}", String::from_utf8_lossy(&resumed.stderr));
-        let after_resume = git(&ws.path, &["rev-list", "--count", "HEAD"])?;
-        assert_eq!(
-            after_fault.stdout, after_resume.stdout,
-            "resume must not duplicate the commit"
-        );
+            let mut state: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
+            assert_eq!(state["crates"][0]["commit"]["status"], "in_progress");
+            if observed {
+                let head = git(&ws.path, &["rev-parse", "HEAD"])?;
+                let head = String::from_utf8(head.stdout)?.trim().to_owned();
+                state["crates"][0]["commit"] = serde_json::json!({"status": "complete", "object": head});
+                std::fs::write(&state_path, serde_json::to_vec_pretty(&state)?)?;
+            }
+
+            let resumed = run_cargo_rail(&ws.path, &["rail", "release", "resume", state_path.to_str().unwrap()])?;
+            assert!(resumed.status.success(), "{}", String::from_utf8_lossy(&resumed.stderr));
+            let after_resume = git(&ws.path, &["rev-list", "--count", "HEAD"])?;
+            assert_eq!(
+                after_fault.stdout, after_resume.stdout,
+                "resume must not duplicate the commit"
+            );
+        }
         Ok(())
     })();
     super::helpers::finish_test(result);
 }
 
 #[test]
-fn clean_prunes_a_planned_journal_superseded_before_any_effect() {
+fn clean_refuses_a_superseded_active_journal_without_commit_effect() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_single_crate("superseded-journal", "0.1.0")?;
         ws.write_release_config(
@@ -5437,7 +5544,7 @@ fn clean_prunes_a_planned_journal_superseded_before_any_effect() {
 "#,
         )?;
         write_test_change(&ws.path, &["superseded-journal"])?;
-        let interrupted = run_release_with_fault_env(
+        let interrupted = run_with_rejected_commit(
             &ws.path,
             &[
                 "rail",
@@ -5449,8 +5556,6 @@ fn clean_prunes_a_planned_journal_superseded_before_any_effect() {
                 "--skip-tag",
                 "--yes",
             ],
-            "CARGO_RAIL_RELEASE_FAIL_AFTER",
-            "journal:planned",
         )?;
         assert!(!interrupted.status.success());
         let state_path = only_release_state(&ws.path)?;
@@ -5540,10 +5645,10 @@ fn test_release_abort_restores_local_state_before_remote_side_effects() {
         let initial = ws.commit("feat: abortable release")?;
         write_test_change(&ws.path, &["lib-a"])?;
 
-        let interrupted = run_release_with_fault(
+        let interrupted = run_with_lost_git_acknowledgment(
             &ws.path,
             &["rail", "release", "run", "lib-a", "--bump", "patch", "--yes"],
-            "commit:lib-a",
+            "commit",
         )?;
         assert!(!interrupted.status.success());
         let state_path = only_release_state(&ws.path)?;

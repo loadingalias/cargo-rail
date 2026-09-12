@@ -58,24 +58,6 @@ pub(crate) const ELF_LINK_ADAPTER_ENV: &str = "CARGO_RAIL_ELF_LINK_ADAPTER";
 pub(crate) const ELF_LINK_DRIVER_ENV: &str = "CARGO_RAIL_ELF_LINK_DRIVER";
 pub(crate) const ELF_LINK_DEPENDENCIES_ENV: &str = "CARGO_RAIL_ELF_LINK_DEPENDENCIES";
 pub(crate) const ELF_LINK_DRIVER_INPUTS_ENV: &str = "CARGO_RAIL_ELF_LINK_DRIVER_INPUTS";
-#[cfg(debug_assertions)]
-const RESTORE_FAULT_ENV: &str = "CARGO_RAIL_TEST_NATIVE_RESTORE_FAULT";
-#[cfg(debug_assertions)]
-const RESTORE_ABORT_ENV: &str = "CARGO_RAIL_TEST_NATIVE_RESTORE_ABORT";
-#[cfg(debug_assertions)]
-const RESTORE_CANCEL_ENV: &str = "CARGO_RAIL_TEST_NATIVE_RESTORE_CANCEL";
-#[cfg(debug_assertions)]
-const RESTORE_CRATE_ENV: &str = "CARGO_RAIL_TEST_NATIVE_RESTORE_CRATE";
-#[cfg(debug_assertions)]
-const CAPTURE_PAUSE_PHASE_ENV: &str = "CARGO_RAIL_TEST_NATIVE_CAPTURE_PAUSE_PHASE";
-#[cfg(debug_assertions)]
-const CAPTURE_PAUSE_CRATE_ENV: &str = "CARGO_RAIL_TEST_NATIVE_CAPTURE_PAUSE_CRATE";
-#[cfg(debug_assertions)]
-const CAPTURE_PAUSE_DIRECTORY_ENV: &str = "CARGO_RAIL_TEST_NATIVE_CAPTURE_PAUSE_DIRECTORY";
-#[cfg(debug_assertions)]
-const BENCH_COVERAGE_FAULT_ENV: &str = "CARGO_RAIL_TEST_BENCH_COVERAGE_FAULT";
-#[cfg(debug_assertions)]
-const NATIVE_ACTION_FAULT_ENV: &str = "CARGO_RAIL_TEST_NATIVE_ACTION_FAULT";
 pub(crate) const DIAGNOSTIC_EXECUTION_CONTRACT: &str = "diagnostic-workspace-wrapper-v23";
 pub(crate) const DIRECT_EXECUTION_CONTRACT: &str = "direct-global-wrapper-v23";
 #[cfg(not(windows))]
@@ -116,12 +98,6 @@ const MAX_SOURCE_DEPTH: usize = 128;
 const MAX_SOURCE_PATH_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SOURCE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_SOURCE_CAPTURE_TIME: Duration = Duration::from_secs(2);
-#[cfg(debug_assertions)]
-const TEST_CAPTURE_PAUSE_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(debug_assertions)]
-const TEST_CAPTURE_LIMIT_ENV: &str = "CARGO_RAIL_TEST_NATIVE_CAPTURE_LIMIT";
-#[cfg(debug_assertions)]
-const MAX_TEST_CAPTURE_LIMIT_BYTES: usize = 96;
 const MAX_COMPILER_ENVIRONMENT_NAMES: usize = 512;
 const MAX_COMPILER_ENVIRONMENT_NAME_BYTES: usize = 256;
 const MAX_COMPILER_ENVIRONMENT_BYTES: u64 = 16 * 1024 * 1024;
@@ -1310,22 +1286,6 @@ impl RemoteAuthorityId {
 }
 
 impl PreparedNativeResult {
-    #[cfg(test)]
-    pub(crate) fn from_verified_staging(
-        staging: tempfile::TempDir,
-        manifest: OutputManifest,
-        validation: NativeCompilerValidation,
-    ) -> Self {
-        Self {
-            staging,
-            staging_lock: None,
-            verified_generations: BTreeMap::new(),
-            manifest,
-            validation,
-            move_preverified_blobs: false,
-        }
-    }
-
     fn from_verified_local_cas_staging(
         staging: pack::NativeResultStaging,
         manifest: OutputManifest,
@@ -1659,12 +1619,7 @@ impl NativeActionCapture {
     /// The initial capture remains authoritative for every namespace
     /// it already observed, so rescanning those namespaces would add I/O without
     /// strengthening the action identity.
-    fn select_repository_inputs(
-        &mut self,
-        observation: &RawCompilerInvocation,
-        workspace_root: &Path,
-        paths: &[String],
-    ) -> RailResult<()> {
+    fn select_repository_inputs(&mut self, workspace_root: &Path, paths: &[String]) -> RailResult<()> {
         let toolchain_bytes = self.toolchain.as_ref().map_or(0, NativeToolchainInputs::bytes_hashed);
         let rust_input_bytes = self.rust_inputs.as_ref().map_or(0, RustInputCapture::bytes_hashed);
         let selected_entries = self.selected_repository_inputs.len();
@@ -1680,7 +1635,7 @@ impl NativeActionCapture {
             .ok_or_else(|| RailError::message("native selected repository byte usage overflowed"))?;
         let started = Instant::now();
         let mut budget = NativeCaptureBudget::resume(
-            native_capture_limits(observation)?,
+            NATIVE_CAPTURE_LIMITS,
             self.capture_entries
                 .checked_sub(selected_entries)
                 .ok_or_else(|| RailError::message("native selected repository entry usage is invalid"))?,
@@ -1843,7 +1798,7 @@ impl NativeActionCapture {
             .strip_prefix(&namespace)
             .map_err(|_| RailError::message("native crate root escaped its source namespace"))?;
         let crate_root_relative = native_relative_path(crate_root_relative)?;
-        let mut budget = NativeCaptureBudget::new(native_capture_limits(observation)?);
+        let mut budget = NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS);
         let source_exclusions = compiler_owned_source_exclusions(source_root)?;
         let (source_state, guard) = capture_native_source_namespace(
             &namespace,
@@ -1919,24 +1874,6 @@ impl NativeActionCapture {
                 .saturating_add(environment_bytes)
                 .saturating_add(toolchain_bytes),
         })
-    }
-
-    #[cfg(test)]
-    fn unchanged_from(&self, initial: &Self) -> bool {
-        self.toolchain.as_ref().map(NativeToolchainInputs::identity)
-            == initial.toolchain.as_ref().map(NativeToolchainInputs::identity)
-            && self.crate_root == initial.crate_root
-            && self.package_binding == initial.package_binding
-            && self.source_state == initial.source_state
-            && self.generated == initial.generated
-            && self.native_searches == initial.native_searches
-            && self.missing_native_searches == initial.missing_native_searches
-            && self.pathless_extern_searches == initial.pathless_extern_searches
-            && self.approved_environment == initial.approved_environment
-            && self.selected_repository_inputs == initial.selected_repository_inputs
-            && self.rust_inputs.as_ref().map(RustInputCapture::witness)
-                == initial.rust_inputs.as_ref().map(RustInputCapture::witness)
-            && self.guard == initial.guard
     }
 
     /// Revalidate the exact live generations retained by the initial byte capture.
@@ -3602,8 +3539,9 @@ fn capture_elf_linker_witness(
     }
     let started = Instant::now();
     let mut budget = NativeCaptureBudget::new(LINK_CAPTURE_LIMITS);
-    let capture_elf_file = |path: &Path, budget: &mut NativeCaptureBudget| {
-        let captured = capture_link_file(path, started, budget).map_err(|error| {
+    let mut files = LinkFileCapture::default();
+    let mut capture_elf_file = |path: &Path, budget: &mut NativeCaptureBudget| {
+        let captured = files.capture(path, started, budget).map_err(|error| {
             RailError::message(format!("ELF linker input '{}' is unavailable: {error}", path.display()))
         })?;
         if response_inputs
@@ -3991,17 +3929,54 @@ fn apple_rustc_object_prefix(role: NativeOutputRole, linked_name: &str) -> Optio
     (!stem.is_empty()).then(|| format!("{stem}."))
 }
 
+#[derive(Default)]
+struct LinkFileCapture {
+    files: BTreeMap<PathBuf, (LinkFileWitness, String)>,
+}
+
+impl LinkFileCapture {
+    fn capture(
+        &mut self,
+        path: &Path,
+        started: Instant,
+        budget: &mut NativeCaptureBudget,
+    ) -> RailResult<(LinkFileWitness, Option<String>)> {
+        let spelling = link_file_spelling(path)?;
+        let canonical = crate::utils::canonicalize_existing(path)?;
+        if let Some((captured, generation)) = self.files.get(&canonical) {
+            let mut alias = captured.clone();
+            alias.path = spelling.to_string();
+            if link_file_generation_matches(&alias, generation)? {
+                budget.account_entry(spelling)?;
+                budget.check(0, started.elapsed())?;
+                return Ok((alias, Some(generation.clone())));
+            }
+        }
+        let captured = capture_link_file(path, started, budget)?;
+        if let Some(generation) = &captured.1 {
+            let canonical = PathBuf::from(&captured.0.canonical_path);
+            if self.files.len() < MAX_LINK_INPUTS || self.files.contains_key(&canonical) {
+                self.files.insert(canonical, (captured.0.clone(), generation.clone()));
+            }
+        }
+        Ok(captured)
+    }
+}
+
+fn link_file_spelling(path: &Path) -> RailResult<&str> {
+    if !path.is_absolute() || path.as_os_str().as_encoded_bytes().contains(&0) {
+        return Err(RailError::message("Apple linker input path is invalid"));
+    }
+    path.to_str()
+        .ok_or_else(|| RailError::message("Apple linker input path is not valid UTF-8"))
+}
+
 fn capture_link_file(
     path: &Path,
     started: Instant,
     budget: &mut NativeCaptureBudget,
 ) -> RailResult<(LinkFileWitness, Option<String>)> {
-    if !path.is_absolute() || path.as_os_str().as_encoded_bytes().contains(&0) {
-        return Err(RailError::message("Apple linker input path is invalid"));
-    }
-    let spelling = path
-        .to_str()
-        .ok_or_else(|| RailError::message("Apple linker input path is not valid UTF-8"))?;
+    let spelling = link_file_spelling(path)?;
     budget.account_entry(spelling)?;
     let canonical = crate::utils::canonicalize_existing(path)?;
     let generation_before = linker_generation_identity(&canonical);
@@ -4036,22 +4011,25 @@ fn revalidate_link_file(
     started: Instant,
     budget: &mut NativeCaptureBudget,
 ) -> RailResult<()> {
-    if let Some(generation) = generation {
-        let canonical = crate::utils::canonicalize_existing(Path::new(&expected.path))?;
-        let generation_before = linker_generation_identity(&canonical);
-        if canonical == Path::new(&expected.canonical_path)
-            && generation_before.as_deref() == Some(generation)
-            && crate::utils::canonicalize_existing(Path::new(&expected.path))? == canonical
-            && linker_generation_identity(&canonical) == generation_before
-        {
-            return Ok(());
-        }
+    if let Some(generation) = generation
+        && link_file_generation_matches(expected, generation)?
+    {
+        return Ok(());
     }
     let (current, _) = capture_link_file(Path::new(&expected.path), started, budget)?;
     if current != *expected {
         return Err(RailError::message("Apple linker found input changed"));
     }
     Ok(())
+}
+
+fn link_file_generation_matches(expected: &LinkFileWitness, generation: &str) -> RailResult<bool> {
+    let canonical = crate::utils::canonicalize_existing(Path::new(&expected.path))?;
+    let generation_before = linker_generation_identity(&canonical);
+    Ok(canonical == Path::new(&expected.canonical_path)
+        && generation_before.as_deref() == Some(generation)
+        && crate::utils::canonicalize_existing(Path::new(&expected.path))? == canonical
+        && linker_generation_identity(&canonical) == generation_before)
 }
 
 fn revalidate_apple_linker_witness(
@@ -4213,73 +4191,6 @@ const LINK_CAPTURE_LIMITS: NativeCaptureLimits = NativeCaptureLimits {
     bytes_hashed: MAX_LINK_BYTES,
     elapsed: None,
 };
-
-#[cfg(debug_assertions)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TestCaptureLimit {
-    Entries,
-    Depth,
-    PathBytes,
-    BytesHashed,
-    Elapsed,
-}
-
-#[cfg(debug_assertions)]
-fn parse_test_capture_limit(value: &str) -> RailResult<(&str, TestCaptureLimit)> {
-    if value.is_empty() || value.len() > MAX_TEST_CAPTURE_LIMIT_BYTES {
-        return Err(RailError::message("native test capture limit is not bounded"));
-    }
-    let (crate_name, limit) = value
-        .split_once('/')
-        .ok_or_else(|| RailError::message("native test capture limit is not canonical"))?;
-    if crate_name.is_empty()
-        || crate_name.len() > 64
-        || !crate_name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-    {
-        return Err(RailError::message(
-            "native test capture limit has an invalid crate name",
-        ));
-    }
-    let limit = match limit {
-        "entries" => TestCaptureLimit::Entries,
-        "depth" => TestCaptureLimit::Depth,
-        "path_bytes" => TestCaptureLimit::PathBytes,
-        "bytes_hashed" => TestCaptureLimit::BytesHashed,
-        "elapsed" => TestCaptureLimit::Elapsed,
-        _ => return Err(RailError::message("native test capture limit is not canonical")),
-    };
-    Ok((crate_name, limit))
-}
-
-#[cfg(debug_assertions)]
-fn native_capture_limits(observation: &RawCompilerInvocation) -> RailResult<NativeCaptureLimits> {
-    let Some(value) = std::env::var_os(TEST_CAPTURE_LIMIT_ENV) else {
-        return Ok(NATIVE_CAPTURE_LIMITS);
-    };
-    let value = value
-        .to_str()
-        .ok_or_else(|| RailError::message("native test capture limit is not valid UTF-8"))?;
-    let (crate_name, selected) = parse_test_capture_limit(value)?;
-    if observation.crate_name.as_deref() != Some(crate_name) {
-        return Ok(NATIVE_CAPTURE_LIMITS);
-    }
-    let mut limits = NATIVE_CAPTURE_LIMITS;
-    match selected {
-        TestCaptureLimit::Entries => limits.entries = 1,
-        TestCaptureLimit::Depth => limits.depth = 0,
-        TestCaptureLimit::PathBytes => limits.path_bytes = 0,
-        TestCaptureLimit::BytesHashed => limits.bytes_hashed = 0,
-        TestCaptureLimit::Elapsed => limits.elapsed = Some(Duration::ZERO),
-    }
-    Ok(limits)
-}
-
-#[cfg(not(debug_assertions))]
-fn native_capture_limits(_observation: &RawCompilerInvocation) -> RailResult<NativeCaptureLimits> {
-    Ok(NATIVE_CAPTURE_LIMITS)
-}
 
 struct NativeCaptureBudget {
     limits: NativeCaptureLimits,
@@ -5257,9 +5168,6 @@ fn source_root_display_bytes(source_root: &Path) -> Vec<u8> {
 }
 
 fn private_compiler_environment(name: &OsStr) -> bool {
-    if private_test_compiler_environment(name) {
-        return true;
-    }
     matches!(
         name.to_str(),
         Some(
@@ -5301,30 +5209,6 @@ fn private_compiler_environment(name: &OsStr) -> bool {
                 | coff::EVIDENCE_ENV
         )
     )
-}
-
-#[cfg(debug_assertions)]
-fn private_test_compiler_environment(name: &OsStr) -> bool {
-    matches!(
-        name.to_str(),
-        Some(
-            RESTORE_FAULT_ENV
-                | RESTORE_ABORT_ENV
-                | RESTORE_CANCEL_ENV
-                | RESTORE_CRATE_ENV
-                | TEST_CAPTURE_LIMIT_ENV
-                | CAPTURE_PAUSE_PHASE_ENV
-                | CAPTURE_PAUSE_CRATE_ENV
-                | CAPTURE_PAUSE_DIRECTORY_ENV
-                | BENCH_COVERAGE_FAULT_ENV
-                | NATIVE_ACTION_FAULT_ENV
-        )
-    )
-}
-
-#[cfg(not(debug_assertions))]
-fn private_test_compiler_environment(_name: &OsStr) -> bool {
-    false
 }
 
 pub(crate) fn direct_wrapper_executable() -> RailResult<PathBuf> {
@@ -5930,24 +5814,6 @@ impl NativeCompilerValidation {
         Ok(selector)
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_action_key_for_test(&self, action_key: String) -> RailResult<Self> {
-        validate_action_key(&action_key)?;
-        let mut validation = self.clone();
-        validation.action_key = action_key;
-        validation.result_key = result_key(
-            &validation.action_key,
-            &validation.witness,
-            &validation.outputs,
-            &validation.stdout_digest,
-            validation.stdout_bytes,
-            &validation.stderr_digest,
-            validation.stderr_bytes,
-        )?;
-        validation.validate_object()?;
-        Ok(validation)
-    }
-
     fn revalidate_publication(
         &self,
         session: &NativeCompilerSession,
@@ -5981,8 +5847,6 @@ impl NativeCompilerValidation {
                 RailError::message("native publication proof does not match its compiler session"),
             ));
         }
-        capture_test_pause("before_admission_revalidation", &self.observation)
-            .map_err(|error| NativeInputFailure::new("cold_action_recapture_failed_before_admission", error))?;
         let capture = NativeActionCapture::capture_with_publication_proof(&self.observation, source_root, proof)
             .map_err(|error| NativeInputFailure::new("cold_action_recapture_failed_before_admission", error.into()))?;
         let pre_link_action = action_key(&session.identity, &session.class, &self.observation, &capture)
@@ -6748,16 +6612,6 @@ struct DistributedRustLibraryAuthority {
     source_relative_path: String,
     test_mode: bool,
     toolchain_proc_macro: bool,
-}
-
-#[cfg(test)]
-fn distributed_rust_library_authority(
-    observation: &RawCompilerInvocation,
-    capture: &NativeActionCapture,
-    output_paths: &NativeOutputPaths,
-    workspace_root: &Path,
-) -> Result<DistributedRustLibraryAuthority, &'static str> {
-    distributed_rust_library_authority_with_remap(observation, capture, output_paths, workspace_root, true)
 }
 
 fn distributed_rust_library_authority_with_remap(
@@ -9039,9 +8893,7 @@ fn configure_outer_inner(
         );
         return OuterCacheAction::Execute;
     }
-    let capture = native_action_test_fault("action_capture", recorder.observation())
-        .map_err(NativeInputFailure::from)
-        .and_then(|()| NativeActionCapture::capture(recorder.observation(), source_root));
+    let capture = NativeActionCapture::capture(recorder.observation(), source_root);
     let capture_bytes = capture.as_ref().map_or(0, |capture| capture.bytes_hashed);
     let mut capture = match capture {
         Ok(capture) => capture,
@@ -9276,12 +9128,12 @@ fn configure_outer_inner(
     let compiler_arguments = normalized_compiler_arguments.as_deref().unwrap_or(compiler_arguments);
     let observation = recorder.observation();
     let initial_input_bytes = estimated_input_bytes(observation, source_root);
-    let action_identity = native_action_test_fault("action_identity", observation).and_then(|()| {
+    let action_identity = (|| -> RailResult<_> {
         Ok((
             base_action_key(&session.identity, &session.class, observation, &capture)?,
             action_key(&session.identity, &session.class, observation, &capture)?,
         ))
-    });
+    })();
     let (base_action, provisional_action) = match action_identity {
         Ok(identity) => identity,
         Err(error) => {
@@ -9298,17 +9150,6 @@ fn configure_outer_inner(
         }
     };
     let mut distributed_placement = None;
-    if capture_test_pause("after_initial_capture", observation).is_err() {
-        configure_cold(
-            command,
-            CompilerCacheWrapperStatus::Bypassed,
-            "capture_test_pause_failed",
-            None,
-            initial_input_bytes.saturating_add(capture.bytes_hashed),
-            diagnostic_wrapper,
-        );
-        return OuterCacheAction::Execute;
-    }
     let mut metrics = NativeCacheMetrics {
         bytes_hashed: normalization_bytes.saturating_add(initial_input_bytes.saturating_add(capture.bytes_hashed)),
         ..NativeCacheMetrics::default()
@@ -9448,7 +9289,7 @@ fn configure_outer_inner(
         }
     };
     capture = match capture
-        .select_repository_inputs(observation, source_root, &dynamic_selector.repository_paths)
+        .select_repository_inputs(source_root, &dynamic_selector.repository_paths)
         .and_then(|()| capture.select_rust_inputs(observation, source_root, &dynamic_selector.rust_inputs))
         .inspect_err(|error| report_native_action_diagnostic("compiler dynamic input selection", error))
     {
@@ -11364,9 +11205,6 @@ fn restore_and_publish(
         validation.action_key(),
     )
     .map_err(before)?;
-    if let Err(error) = restore_commit_test_fault("after_registration", 0, current_observation) {
-        return Err(fail_restore_transaction(&mut transaction, error, 0));
-    }
     let restore_authority = NativeRestoreAuthority {
         initial_capture,
         current_observation,
@@ -11380,14 +11218,10 @@ fn restore_and_publish(
         Ok(prepared) => prepared,
         Err(error) => return Err(fail_restore_transaction(&mut transaction, error, 0)),
     };
-    if let Err(error) = restore_commit_test_fault("before_marker_publish", 0, current_observation) {
-        drop(prepared);
-        return Err(fail_restore_transaction(&mut transaction, error, 0));
-    }
     if let Err(error) = context
         .session_inputs
         .revalidate()
-        .and_then(|()| transaction.authorize(&prepared, observation_directory, current_observation))
+        .and_then(|()| transaction.authorize(&prepared, observation_directory))
     {
         drop(prepared);
         return Err(fail_restore_transaction(&mut transaction, error, 0));
@@ -11406,17 +11240,15 @@ fn restore_and_publish(
     } = prepared;
     let mut visible_effects = 0usize;
     let commit_result = (|| -> RailResult<()> {
-        restore_commit_test_fault("after_marker", 0, current_observation)?;
         let mut published_outputs = Vec::with_capacity(outputs.len());
         for output in outputs {
             let member = transaction.output_member(&output.destination)?;
             published_outputs.push(publish_prepared_restore_output(output, member)?);
             visible_effects = visible_effects.saturating_add(1);
-            restore_commit_test_fault("after_output", visible_effects, current_observation)?;
         }
         visible_effects = visible_effects.saturating_add(1);
         crate::compiler::observation::publish_prepared_raw(observation)?;
-        restore_commit_test_fault("after_observation", visible_effects, current_observation)?;
+
         if let (Some(session), Some(analysis)) = (context.analysis_session.as_ref(), analysis) {
             crate::compiler::analysis::publish_fact_imports(
                 session.observation_directory(),
@@ -11426,10 +11258,10 @@ fn restore_and_publish(
         }
         visible_effects = visible_effects.saturating_add(1);
         std::io::stdout().write_all(&stdout)?;
-        restore_commit_test_fault("after_stdout", visible_effects, current_observation)?;
+
         visible_effects = visible_effects.saturating_add(1);
         std::io::stderr().write_all(&stderr)?;
-        restore_commit_test_fault("after_stderr", visible_effects, current_observation)?;
+
         for output in &published_outputs {
             output.sync()?;
         }
@@ -11437,11 +11269,11 @@ fn restore_and_publish(
             output.revalidate()?;
         }
         sync_native_directory(&transaction.paths.output_parent)?;
-        restore_commit_test_fault("before_marker_removal", visible_effects, current_observation)?;
+
         transaction.complete()?;
-        restore_commit_test_fault("after_marker_removal", visible_effects, current_observation)?;
+
         transaction.cleanup_private()?;
-        restore_commit_test_fault("after_transaction_cleanup", visible_effects, current_observation)?;
+
         Ok(())
     })();
     if let Err(error) = commit_result {
@@ -11569,7 +11401,7 @@ fn prepare_registered_restore(
         };
         prepared_outputs.push(prepared);
     }
-    capture_test_pause("before_restore_revalidation", current_observation)?;
+
     let final_capture =
         initial_capture.revalidate_before_restore_commit(current_observation, source_root, source_root_spelling);
     let final_capture_bytes = final_capture?;
@@ -11948,12 +11780,7 @@ impl NativeRestoreTransaction {
         })
     }
 
-    fn authorize(
-        &mut self,
-        prepared: &PreparedNativeRestore,
-        observation_directory: &Path,
-        current_observation: &RawCompilerInvocation,
-    ) -> RailResult<()> {
+    fn authorize(&mut self, prepared: &PreparedNativeRestore, observation_directory: &Path) -> RailResult<()> {
         if !matches!(self.state, NativeRestoreTransactionState::Registered)
             || observation_directory != self.observation_directory
         {
@@ -12021,7 +11848,7 @@ impl NativeRestoreTransaction {
         // The record itself is durable. Its source-directory entry is transient:
         // the post-rename source and destination barriers below establish the only
         // name that can authorize visible output replacement.
-        restore_commit_test_fault("after_pending_commit", 0, current_observation)?;
+
         #[cfg(windows)]
         let marker = {
             if native_restore_file_identity(&pending)? != pending_identity
@@ -12048,7 +11875,7 @@ impl NativeRestoreTransaction {
         };
         self.state = NativeRestoreTransactionState::Committed(commit);
         drop(marker);
-        restore_commit_test_fault("after_marker_publish", 0, current_observation)?;
+
         sync_native_directory(&self.paths.transaction_directory)?;
         sync_native_directory(&self.paths.output_parent)
     }
@@ -12952,133 +12779,6 @@ fn native_unix_nanos() -> u128 {
         .map_or(0, |duration| duration.as_nanos())
 }
 
-#[cfg(debug_assertions)]
-fn restore_commit_test_fault(phase: &str, index: usize, observation: &RawCompilerInvocation) -> RailResult<()> {
-    if let Some(selected_crate) = std::env::var_os(RESTORE_CRATE_ENV) {
-        let selected_crate = selected_crate
-            .to_str()
-            .ok_or_else(|| RailError::message(format!("{RESTORE_CRATE_ENV} is not valid UTF-8")))?;
-        if observation.crate_name.as_deref() != Some(selected_crate) {
-            return Ok(());
-        }
-    }
-    let selected_abort = std::env::var_os(RESTORE_ABORT_ENV).and_then(|value| value.into_string().ok());
-    if selected_abort
-        .as_deref()
-        .is_some_and(|selected| selected == phase || selected == format!("{phase}:{index}"))
-    {
-        std::process::abort();
-    }
-    let selected_cancel = std::env::var_os(RESTORE_CANCEL_ENV).and_then(|value| value.into_string().ok());
-    if selected_cancel
-        .as_deref()
-        .is_some_and(|selected| selected == phase || selected == format!("{phase}:{index}"))
-    {
-        return Err(RailError::message(format!(
-            "cancelled native restore-commit at {phase}:{index}"
-        )));
-    }
-    let Some(selected) = std::env::var_os(RESTORE_FAULT_ENV) else {
-        return Ok(());
-    };
-    let selected = selected
-        .to_str()
-        .ok_or_else(|| RailError::message(format!("{RESTORE_FAULT_ENV} is not valid UTF-8")))?;
-    if selected == phase || selected == format!("{phase}:{index}") {
-        return Err(RailError::message(format!(
-            "injected native restore-commit fault at {phase}:{index}"
-        )));
-    }
-    Ok(())
-}
-
-#[cfg(not(debug_assertions))]
-fn restore_commit_test_fault(_phase: &str, _index: usize, _observation: &RawCompilerInvocation) -> RailResult<()> {
-    Ok(())
-}
-
-#[cfg(debug_assertions)]
-fn capture_test_pause(phase: &str, observation: &RawCompilerInvocation) -> RailResult<()> {
-    let Some(selected_phase) = std::env::var_os(CAPTURE_PAUSE_PHASE_ENV) else {
-        return Ok(());
-    };
-    let selected_phase = selected_phase
-        .to_str()
-        .ok_or_else(|| RailError::message(format!("{CAPTURE_PAUSE_PHASE_ENV} is not valid UTF-8")))?;
-    let sequenced = selected_phase.contains(',');
-    if !selected_phase.split(',').any(|selected| selected == phase) {
-        return Ok(());
-    }
-    let selected_crate = std::env::var_os(CAPTURE_PAUSE_CRATE_ENV)
-        .ok_or_else(|| RailError::message(format!("{CAPTURE_PAUSE_CRATE_ENV} is required")))?;
-    let selected_crate = selected_crate
-        .to_str()
-        .ok_or_else(|| RailError::message(format!("{CAPTURE_PAUSE_CRATE_ENV} is not valid UTF-8")))?;
-    if observation.crate_name.as_deref() != Some(selected_crate) {
-        return Ok(());
-    }
-    let directory = std::env::var_os(CAPTURE_PAUSE_DIRECTORY_ENV)
-        .map(PathBuf::from)
-        .ok_or_else(|| RailError::message(format!("{CAPTURE_PAUSE_DIRECTORY_ENV} is required")))?;
-    if !directory.is_absolute() {
-        return Err(RailError::message(format!(
-            "{CAPTURE_PAUSE_DIRECTORY_ENV} must be absolute"
-        )));
-    }
-    let metadata = fs::symlink_metadata(&directory)?;
-    if !metadata.is_dir() || crate::utils::is_symlink_or_reparse(&metadata) {
-        return Err(RailError::message(
-            "native capture pause directory is not a real directory",
-        ));
-    }
-    let ready = directory.join(if sequenced {
-        format!("ready-{phase}")
-    } else {
-        "ready".to_string()
-    });
-    write_private_command_file(&ready, b"ready\n")?;
-    let continued = directory.join(if sequenced {
-        format!("continue-{phase}")
-    } else {
-        "continue".to_string()
-    });
-    let started = Instant::now();
-    loop {
-        match fs::symlink_metadata(&continued) {
-            Ok(metadata) if metadata.is_file() && !crate::utils::is_symlink_or_reparse(&metadata) => return Ok(()),
-            Ok(_) => {
-                return Err(RailError::message(
-                    "native capture pause continuation is not a real file",
-                ));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        if started.elapsed() > TEST_CAPTURE_PAUSE_TIMEOUT {
-            return Err(RailError::message("native capture pause timed out"));
-        }
-        std::thread::park_timeout(Duration::from_millis(2));
-    }
-}
-
-#[cfg(not(debug_assertions))]
-fn capture_test_pause(_phase: &str, _observation: &RawCompilerInvocation) -> RailResult<()> {
-    Ok(())
-}
-
-#[cfg(debug_assertions)]
-fn native_action_test_fault(phase: &str, _observation: &RawCompilerInvocation) -> RailResult<()> {
-    if std::env::var_os(NATIVE_ACTION_FAULT_ENV).as_deref() == Some(OsStr::new(phase)) {
-        return Err(RailError::message(format!("injected native {phase} failure")));
-    }
-    Ok(())
-}
-
-#[cfg(not(debug_assertions))]
-fn native_action_test_fault(_phase: &str, _observation: &RawCompilerInvocation) -> RailResult<()> {
-    Ok(())
-}
-
 fn report_native_action_diagnostic(operation: &str, error: &RailError) {
     if BENCH_COVERAGE_DIRECTORY.get().is_some() {
         eprintln!("cargo-rail native coverage: {operation} unavailable: {error}");
@@ -13790,18 +13490,6 @@ fn digest(bytes: &[u8]) -> String {
 /// Remove cache-only authority while preserving an explicitly selected inner observation role.
 pub(crate) fn remove_cache_environment(command: &mut Command) {
     crate::remote_cache::scrub_child_environment(command);
-    #[cfg(debug_assertions)]
-    command
-        .env_remove(RESTORE_FAULT_ENV)
-        .env_remove(RESTORE_ABORT_ENV)
-        .env_remove(RESTORE_CANCEL_ENV)
-        .env_remove(RESTORE_CRATE_ENV)
-        .env_remove(TEST_CAPTURE_LIMIT_ENV)
-        .env_remove(CAPTURE_PAUSE_PHASE_ENV)
-        .env_remove(CAPTURE_PAUSE_CRATE_ENV)
-        .env_remove(CAPTURE_PAUSE_DIRECTORY_ENV)
-        .env_remove(BENCH_COVERAGE_FAULT_ENV)
-        .env_remove(NATIVE_ACTION_FAULT_ENV);
     command
         .env_remove(SESSION_ENV)
         .env_remove(DISPOSITION_ENV)
@@ -14925,15 +14613,16 @@ fn capture_gcc_link_driver(
     }
     let mut inputs = BTreeMap::new();
     let mut runtimes = Vec::new();
+    let mut files = LinkFileCapture::default();
     for (program, arguments) in gcc_runtime_requests(driver, &live) {
         let os_arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
         let (_, selection) = crate::executable::observe_executable_runtime(&program, &os_arguments, current_directory)?;
         let mut budget = NativeCaptureBudget::new(LINK_CAPTURE_LIMITS);
         let started = Instant::now();
         for path in selection.inputs() {
-            inputs.insert(path.clone(), capture_link_file(path, started, &mut budget)?.0);
+            inputs.insert(path.clone(), files.capture(path, started, &mut budget)?.0);
         }
-        inputs.insert(program.clone(), capture_link_file(&program, started, &mut budget)?.0);
+        inputs.insert(program.clone(), files.capture(&program, started, &mut budget)?.0);
         runtimes.push(LinkRuntimeProbe {
             program: program.to_string_lossy().into_owned(),
             invocation: LinkRuntimeInvocation::Information { arguments },
@@ -14943,7 +14632,7 @@ fn capture_gcc_link_driver(
     let mut budget = NativeCaptureBudget::new(LINK_CAPTURE_LIMITS);
     inputs.insert(
         live.plugin.clone(),
-        capture_link_file(&live.plugin, Instant::now(), &mut budget)?.0,
+        files.capture(&live.plugin, Instant::now(), &mut budget)?.0,
     );
     let evidence = LinkDriverExecution {
         probe: LinkDriverProbe {
@@ -16962,8 +16651,6 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
         crate::compiler::distributed::record_local_placement(receipt, placement, compiler_elapsed);
     }
 
-    let capture_pause_failed =
-        status.success() && capture_test_pause("after_compiler_execution", recorder.observation()).is_err();
     let debug_capture_failed = status.success() && recorder.capture_debug_object_outputs().is_err();
     let output_paths = recorder.native_output_paths();
     let mut raw = match recorder.complete(status.success()) {
@@ -17018,17 +16705,6 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
             ));
             return status.code().unwrap_or(1);
         }
-    }
-    if capture_pause_failed {
-        drop(publish_and_record_cold_observation(
-            &mut raw,
-            "capture_test_pause_failed",
-            None,
-            None,
-            0,
-            cache_bytes_read,
-        ));
-        return status.code().unwrap_or(1);
     }
     let Some(output_paths) = output_paths else {
         drop(publish_and_record_cold_observation(
@@ -17086,7 +16762,7 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
         .as_ref()
         .map(|inputs| inputs.witness().selector().clone())
         .unwrap_or_default();
-    capture = match capture.select_repository_inputs(&raw, source_root, &dynamic_selector.repository_paths) {
+    capture = match capture.select_repository_inputs(source_root, &dynamic_selector.repository_paths) {
         Ok(()) => capture,
         Err(error) => {
             report_native_action_diagnostic("selected repository input capture", &error);
@@ -17153,9 +16829,7 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
             return status.code().unwrap_or(1);
         }
     };
-    let mut witness = match native_action_test_fault("post_execution_witness", &raw)
-        .and_then(|()| capture.witness(&raw, source_root))
-    {
+    let mut witness = match capture.witness(&raw, source_root) {
         Ok(witness) => witness,
         Err(error) => {
             report_native_action_diagnostic("post-execution witness validation", &error);
@@ -18579,7 +18253,7 @@ fn write_benchmark_coverage_invocation(invocation: BenchmarkCoverageInvocation<'
         compiler,
         arguments,
     } = invocation;
-    benchmark_coverage_test_fault(status)?;
+
     let compiler = compiler
         .to_str()
         .ok_or_else(|| RailError::message("benchmark compiler coverage has a non-UTF-8 compiler argument"))?
@@ -18735,33 +18409,6 @@ pub(crate) fn benchmark_coverage_failure() -> Option<&'static str> {
 
 fn retain_benchmark_coverage_failure(error: String) {
     BENCH_COVERAGE_FAILURE.get_or_init(|| error);
-}
-
-#[cfg(debug_assertions)]
-fn benchmark_coverage_test_fault(status: CompilerCacheWrapperStatus) -> RailResult<()> {
-    let Some(selected) = std::env::var_os(BENCH_COVERAGE_FAULT_ENV) else {
-        return Ok(());
-    };
-    let selected = selected
-        .to_str()
-        .ok_or_else(|| RailError::message(format!("{BENCH_COVERAGE_FAULT_ENV} is not valid UTF-8")))?;
-    let status = match status {
-        CompilerCacheWrapperStatus::Hit => "hit",
-        CompilerCacheWrapperStatus::Miss => "miss",
-        CompilerCacheWrapperStatus::Disabled => "disabled",
-        CompilerCacheWrapperStatus::Bypassed => "bypassed",
-    };
-    if selected == status {
-        return Err(RailError::message(format!(
-            "injected benchmark compiler coverage {status} event failure"
-        )));
-    }
-    Ok(())
-}
-
-#[cfg(not(debug_assertions))]
-fn benchmark_coverage_test_fault(_status: CompilerCacheWrapperStatus) -> RailResult<()> {
-    Ok(())
 }
 
 fn validate_benchmark_coverage_directory(directory: &Path) -> RailResult<()> {
@@ -18966,6 +18613,18 @@ pub(crate) mod tests {
             Ok(())
         })();
         result.unwrap();
+    }
+
+    #[test]
+    fn benchmark_coverage_publication_reports_a_real_filesystem_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut temporary = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+        temporary.write_all(b"event\n").unwrap();
+        let blocked = directory.path().join("blocked");
+        fs::write(&blocked, b"preserved").unwrap();
+        let error = persist_benchmark_coverage_event(temporary, &blocked).unwrap_err();
+        assert!(matches!(error, RailError::Io(_)), "{error}");
+        assert_eq!(fs::read(blocked).unwrap(), b"preserved");
     }
 
     #[test]
@@ -20181,8 +19840,14 @@ pub(crate) mod tests {
 
             let mut closed = capture;
             closed.generated = None;
-            let authority = distributed_rust_library_authority(&observation, &closed, &output_paths, workspace.path())
-                .map_err(RailError::message)?;
+            let authority = distributed_rust_library_authority_with_remap(
+                &observation,
+                &closed,
+                &output_paths,
+                workspace.path(),
+                true,
+            )
+            .map_err(RailError::message)?;
             assert_eq!(authority.crate_name, "fixture");
             assert_eq!(authority.crate_type, "lib");
             assert_eq!(authority.edition, "2024");
@@ -20225,7 +19890,13 @@ pub(crate) mod tests {
                 .compiler_arguments
                 .retain(|argument| argument != "--remap-path-prefix" && !distributed_workspace_remap(argument));
             assert!(matches!(
-                distributed_rust_library_authority(&unnormalized, &closed, &output_paths, workspace.path()),
+                distributed_rust_library_authority_with_remap(
+                    &unnormalized,
+                    &closed,
+                    &output_paths,
+                    workspace.path(),
+                    true
+                ),
                 Err("distributed_argument_authority_mismatch")
             ));
             let normalization = distributed_rust_library_authority_with_remap(
@@ -20314,11 +19985,12 @@ pub(crate) mod tests {
             };
             let mut metadata_capture = NativeActionCapture::capture(&metadata_observation, workspace.path())?;
             metadata_capture.generated = None;
-            let metadata_authority = distributed_rust_library_authority(
+            let metadata_authority = distributed_rust_library_authority_with_remap(
                 &metadata_observation,
                 &metadata_capture,
                 &metadata_output_paths,
                 workspace.path(),
+                true,
             )
             .map_err(RailError::message)?;
             assert_eq!(
@@ -20376,22 +20048,35 @@ pub(crate) mod tests {
 
             let mut capped = observation.clone();
             capped.compiler_arguments.push("--cap-lints=allow".to_string());
-            let capped = distributed_rust_library_authority(&capped, &closed, &output_paths, workspace.path())
-                .map_err(RailError::message)?;
+            let capped =
+                distributed_rust_library_authority_with_remap(&capped, &closed, &output_paths, workspace.path(), true)
+                    .map_err(RailError::message)?;
             assert_eq!(capped.execution_options.cap_lints.as_deref(), Some("allow"));
 
             let mut unmodeled = observation.clone();
             unmodeled.compiler_arguments.push("--crate-attr=custom".to_string());
             assert!(matches!(
-                distributed_rust_library_authority(&unmodeled, &closed, &output_paths, workspace.path()),
+                distributed_rust_library_authority_with_remap(
+                    &unmodeled,
+                    &closed,
+                    &output_paths,
+                    workspace.path(),
+                    true
+                ),
                 Err("distributed_argument_shape_ineligible")
             ));
 
             fs::write(workspace.path().join("src/late.rs"), b"pub fn late() {}\n")?;
             let mut expanded = NativeActionCapture::capture(&observation, workspace.path())?;
             expanded.generated = None;
-            let expanded = distributed_rust_library_authority(&observation, &expanded, &output_paths, workspace.path())
-                .map_err(RailError::message)?;
+            let expanded = distributed_rust_library_authority_with_remap(
+                &observation,
+                &expanded,
+                &output_paths,
+                workspace.path(),
+                true,
+            )
+            .map_err(RailError::message)?;
             assert!(
                 expanded
                     .sources
@@ -20580,7 +20265,7 @@ pub(crate) mod tests {
                 crate::compiler::distributed::VIRTUAL_OUTPUT_DIRECTORY,
                 crate::compiler::distributed::VIRTUAL_WORKSPACE
             );
-            let result = crate::compiler::distributed::StagedExecutionResult::from_test_frames(
+            let result = crate::compiler::distributed::tests::decoded_frames(
                 &candidate,
                 dep_info.as_bytes(),
                 b"metadata bytes",
@@ -20633,7 +20318,7 @@ pub(crate) mod tests {
                 source_root_spelling: &workspace_root,
             };
             let (prepared, proof) = prepare_distributed_result(result_authority, result).map_err(RailError::message)?;
-            let drift_result = crate::compiler::distributed::StagedExecutionResult::from_test_frames(
+            let drift_result = crate::compiler::distributed::tests::decoded_frames(
                 &candidate,
                 dep_info.as_bytes(),
                 b"metadata bytes",
@@ -20739,7 +20424,7 @@ pub(crate) mod tests {
             })
             .unwrap_err();
 
-            let changed = crate::compiler::distributed::StagedExecutionResult::from_test_frames(
+            let changed = crate::compiler::distributed::tests::decoded_frames(
                 &candidate,
                 dep_info.as_bytes(),
                 b"metadata bytes",
@@ -21102,6 +20787,17 @@ pub(crate) mod tests {
         .expect("valid test dynamic-input selector")
     }
 
+    pub(crate) fn cas_validation_for_revision(revision: u64) -> NativeCompilerValidation {
+        let mut observation = graduated_observation();
+        let source = observed_file(
+            "src/lib.rs",
+            format!("pub const REVISION: u64 = {revision};\n").as_bytes(),
+        );
+        observation.declared_inputs = vec![source.clone()];
+        observation.observed_reads = vec![source];
+        graduated_validation(observation)
+    }
+
     pub(crate) fn cas_validation_with_stdout(stdout: &[u8]) -> NativeCompilerValidation {
         graduated_validation_with_streams(graduated_observation(), stdout, b"")
     }
@@ -21190,7 +20886,11 @@ pub(crate) mod tests {
             ),
         ] {
             let cache = tempfile::tempdir().expect("cache base");
-            let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+            let cas = LocalCas::open_selected(
+                &crate::cache::cas::LocalCacheSelection::new(cache.path().to_path_buf(), 1024 * 1024, None)
+                    .expect("cache selection"),
+            )
+            .expect("CAS should open");
             let key = sha256_identity(
                 BASE_ACTION_KEY_PREFIX,
                 b"cargo-rail-native-empty-selector-test\0",
@@ -21217,8 +20917,34 @@ pub(crate) mod tests {
         }
     }
 
+    pub(crate) fn prepared_cas_from_outputs(
+        output: &Path,
+        manifest: &OutputManifest,
+        validation: &NativeCompilerValidation,
+    ) -> PreparedNativeResult {
+        let staging = pack::NativeResultStaging::temporary_in(&std::env::temp_dir()).unwrap();
+        for entry in &manifest.entries {
+            let destination = staging.path().join(&entry.path);
+            match &entry.kind {
+                crate::cache::result::OutputEntryKind::Directory { mode } => {
+                    fs::create_dir(&destination).unwrap();
+                    #[cfg(unix)]
+                    set_native_output_mode(&destination, *mode).unwrap();
+                    #[cfg(windows)]
+                    assert_eq!(*mode, 0o755, "Windows manifest directory mode");
+                }
+                crate::cache::result::OutputEntryKind::File { mode, .. } => {
+                    fs::copy(output.join(&entry.path), &destination).unwrap();
+                    set_native_output_mode(&destination, *mode).unwrap();
+                }
+                crate::cache::result::OutputEntryKind::Symlink { .. } => panic!("fixture must contain regular outputs"),
+            }
+        }
+        PreparedNativeResult::from_verified_local_cas_staging(staging, manifest.clone(), validation.clone())
+    }
+
     pub(crate) fn prepared_cas_fixture(validation: NativeCompilerValidation) -> PreparedNativeResult {
-        let staging = tempfile::tempdir().expect("native result staging");
+        let staging = pack::NativeResultStaging::temporary_in(&std::env::temp_dir()).expect("native result staging");
         for directory in ["target", "target/outputs", "target/streams"] {
             let path = staging.path().join(directory);
             fs::create_dir(&path).expect("slot directory");
@@ -21235,19 +20961,34 @@ pub(crate) mod tests {
             fs::write(&path, bytes).expect("slot bytes");
             set_native_output_mode(&path, 0o644).expect("slot mode");
         }
-        let paths = [DEP_INFO_SLOT, METADATA_SLOT, STDOUT_SLOT, STDERR_SLOT]
+        let slots = [DEP_INFO_SLOT, METADATA_SLOT, STDOUT_SLOT, STDERR_SLOT]
             .into_iter()
-            .map(|slot| staging.path().join(slot))
+            .map(|slot| {
+                let bytes = fs::read(staging.path().join(slot)).unwrap();
+                (
+                    slot,
+                    format!("sha256:{}", ContentDigest::sha256(&bytes)),
+                    bytes.len() as u64,
+                    0o644,
+                )
+            })
             .collect::<Vec<_>>();
-        let manifest = crate::cache::result::capture_native_compiler_outputs(staging.path(), &paths)
-            .expect("native result manifest");
-        PreparedNativeResult::from_verified_staging(staging, manifest, validation)
+        let borrowed = slots
+            .iter()
+            .map(|(path, digest, bytes, mode)| (*path, digest.as_str(), *bytes, *mode))
+            .collect::<Vec<_>>();
+        let manifest = crate::cache::result::manifest_from_verified_native_slots(&borrowed).unwrap();
+        PreparedNativeResult::from_verified_local_cas_staging(staging, manifest, validation)
     }
 
     #[test]
     fn revalidated_store_runs_selector_publication_before_action_commit() {
         let cache = tempfile::tempdir().expect("cache base");
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let cas = LocalCas::open_selected(
+            &crate::cache::cas::LocalCacheSelection::new(cache.path().to_path_buf(), 1024 * 1024, None)
+                .expect("cache selection"),
+        )
+        .expect("CAS should open");
         let validation = graduated_validation_with_streams(graduated_observation(), b"portable stdout", b"");
         let action = validation.action_key().to_string();
         let base_action = sha256_identity(BASE_ACTION_KEY_PREFIX, b"cargo-rail-native-selector-order-test\0", &[]);
@@ -21291,7 +21032,11 @@ pub(crate) mod tests {
     #[test]
     fn aborted_revalidated_store_leaves_only_safe_selector_authority() {
         let cache = tempfile::tempdir().expect("cache base");
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let cas = LocalCas::open_selected(
+            &crate::cache::cas::LocalCacheSelection::new(cache.path().to_path_buf(), 1024 * 1024, None)
+                .expect("cache selection"),
+        )
+        .expect("CAS should open");
         let validation = graduated_validation_with_streams(graduated_observation(), b"portable stdout", b"");
         let action = validation.action_key().to_string();
         let base_action = sha256_identity(BASE_ACTION_KEY_PREFIX, b"cargo-rail-native-selector-abort-test\0", &[]);
@@ -21328,7 +21073,11 @@ pub(crate) mod tests {
                         second: Option<NativeDynamicInputSelector>|
          -> Result<(), RestorePublishFailure> {
             let cache = tempfile::tempdir().expect("cache base");
-            let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("local CAS");
+            let cas = LocalCas::open_selected(
+                &crate::cache::cas::LocalCacheSelection::new(cache.path().to_path_buf(), 1024 * 1024, None)
+                    .expect("cache selection"),
+            )
+            .expect("local CAS");
             let observation = graduated_observation();
             let capture = synthetic_capture(&observation);
             let session = graduated_session(digest(b"source-root"));
@@ -21336,7 +21085,7 @@ pub(crate) mod tests {
                 base_action_key(&session.identity, &session.class, &observation, &capture).expect("base action");
             let validation = graduated_validation_with_streams(observation.clone(), b"portable stdout", b"");
             let action = validation.action_key().to_string();
-            cas.store_native(prepared_cas_fixture(validation))
+            cas.store_native_revalidated(prepared_cas_fixture(validation), |_| Ok(()))
                 .expect("native result admission");
             if let Some(first) = first {
                 cas.publish_native_environment_selector(&base_action, &first)
@@ -21461,7 +21210,6 @@ pub(crate) mod tests {
         let mut current = observation;
         current.declared_inputs = vec![changed];
         let recaptured = NativeActionCapture::capture(&current, root.path()).expect("changed capture");
-        assert!(!recaptured.unchanged_from(&initial));
         assert_ne!(
             action_key(&session.identity, &session.class, &current, &recaptured).expect("changed action"),
             initial_action
@@ -21609,11 +21357,7 @@ pub(crate) mod tests {
             .and_then(|metadata| metadata.modified())
             .expect("generated mtime");
 
-        let source_observation =
-            FileObservation::capture(&source, root.path(), root.path()).expect("source observation");
-        let mut observation = graduated_observation();
-        observation.declared_inputs = vec![source_observation.clone()];
-        observation.observed_reads = vec![source_observation];
+        let observation = fixture_source_observation(root.path());
         let mut capture = NativeActionCapture::capture(&observation, root.path()).expect("source capture");
         attach_generated_capture(&mut capture, root.path(), &generated_root);
         capture
@@ -21778,15 +21522,29 @@ pub(crate) mod tests {
         fs::write(&compiler_output, b"second output").expect("mutated compiler output");
         let recaptured =
             NativeActionCapture::capture(&observation, root.path()).expect("recaptured build-script source");
-        assert!(recaptured.unchanged_from(&initial));
+        assert_eq!(recaptured.source_state, initial.source_state);
     }
 
-    fn native_static_observation(root: &Path, native_root: &Path) -> RawCompilerInvocation {
+    fn fixture_source_observation(root: &Path) -> RawCompilerInvocation {
         let source = root.join("src/lib.rs");
         let source_observation = FileObservation::capture(&source, root, root).expect("source observation");
         let mut observation = graduated_observation();
         observation.declared_inputs = vec![source_observation.clone()];
         observation.observed_reads = vec![source_observation];
+        let output_directory = root.join("target/debug/deps");
+        fs::create_dir_all(&output_directory).expect("compiler output directory");
+        let output = observation
+            .compiler_arguments
+            .iter()
+            .position(|argument| argument == "--out-dir")
+            .and_then(|index| observation.compiler_arguments.get_mut(index + 1))
+            .expect("compiler output argument");
+        *output = crate::utils::path_to_git_format(&output_directory);
+        observation
+    }
+
+    fn native_static_observation(root: &Path, native_root: &Path) -> RawCompilerInvocation {
+        let mut observation = fixture_source_observation(root);
         observation.compiler_arguments.extend([
             "-L".to_string(),
             format!("native={}", native_root.display()),
@@ -22216,11 +21974,7 @@ pub(crate) mod tests {
         let original_modified = fs::metadata(&source)
             .and_then(|metadata| metadata.modified())
             .expect("source mtime");
-        let source_observation =
-            FileObservation::capture(&source, root.path(), root.path()).expect("source observation");
-        let mut observation = graduated_observation();
-        observation.declared_inputs = vec![source_observation.clone()];
-        observation.observed_reads = vec![source_observation];
+        let observation = fixture_source_observation(root.path());
         let initial = NativeActionCapture::capture(&observation, root.path()).expect("initial capture");
         initial
             .revalidate_before_restore_commit(&observation, root.path(), root.path())
@@ -22250,11 +22004,7 @@ pub(crate) mod tests {
         fs::create_dir(root.path().join("src")).expect("source directory");
         let source = root.path().join("src/lib.rs");
         fs::write(&source, b"pub const VALUE: u8 = 1;\n").expect("source");
-        let source_observation =
-            FileObservation::capture(&source, root.path(), root.path()).expect("source observation");
-        let mut observation = graduated_observation();
-        observation.declared_inputs = vec![source_observation.clone()];
-        observation.observed_reads = vec![source_observation];
+        let observation = fixture_source_observation(root.path());
         let initial = NativeActionCapture::capture(&observation, root.path()).expect("initial capture");
 
         let transient = root.path().join("src/transient.rs");
@@ -22273,6 +22023,121 @@ pub(crate) mod tests {
             .revalidate_before_restore_commit(&observation, root.path(), root.path())
             .expect_err("a transient namespace member must alter its parent generation");
         assert!(error.to_string().contains("action input changed"), "{error}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn linker_alias_capture_hashes_once_and_preserves_each_spelling_and_bound() {
+        let root = tempfile::tempdir().expect("linker input directory");
+        let directory = crate::utils::canonicalize_existing(root.path()).expect("canonical fixture directory");
+        let path = directory.join("input.o");
+        let nested = directory.join("nested");
+        fs::create_dir(&nested).expect("alias traversal directory");
+        let alias = nested.join("../input.o");
+        fs::write(&path, b"abc").expect("linker input");
+        let limits = NativeCaptureLimits {
+            entries: 2,
+            path_bytes: path.to_str().expect("path").len() + alias.to_str().expect("alias").len(),
+            bytes_hashed: 3,
+            ..LINK_CAPTURE_LIMITS
+        };
+        let mut budget = NativeCaptureBudget::new(limits);
+        let mut files = LinkFileCapture::default();
+        let started = Instant::now();
+        let (original, _) = files.capture(&path, started, &mut budget).expect("original capture");
+        let (aliased, _) = files
+            .capture(&alias, started, &mut budget)
+            .expect("alias reuses captured bytes");
+        assert_eq!(
+            [original.path.as_str(), aliased.path.as_str()],
+            [path.to_str().unwrap(), alias.to_str().unwrap()]
+        );
+        for witness in [original, aliased] {
+            assert_eq!(witness.canonical_path, path.to_str().unwrap());
+            assert_eq!(
+                witness.content_digest,
+                "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+            );
+        }
+        assert_eq!(budget.bytes_hashed, 3);
+        assert_eq!(budget.entries, 2);
+        assert_eq!(budget.path_bytes, limits.path_bytes);
+        files
+            .capture(&alias, started, &mut budget)
+            .expect_err("reused bytes cannot evade the entry bound");
+    }
+
+    #[test]
+    fn linker_alias_capture_rehashes_replaced_generations() {
+        let root = tempfile::tempdir().expect("linker input directory");
+        let path = root.path().join("input.o");
+        let replacement = root.path().join("replacement.o");
+        fs::write(&path, b"abc").expect("original input");
+        let mut files = LinkFileCapture::default();
+        let mut budget = NativeCaptureBudget::new(LINK_CAPTURE_LIMITS);
+        let started = Instant::now();
+        let (original, generation) = files.capture(&path, started, &mut budget).expect("initial capture");
+
+        fs::write(&replacement, b"abc").expect("same-content replacement");
+        fs::rename(&replacement, &path).expect("replace file generation");
+        let (recaptured, _) = files
+            .capture(&path, started, &mut budget)
+            .expect("fresh generation with same bytes");
+        assert_eq!(
+            recaptured.content_digest,
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(budget.bytes_hashed, 6, "a new generation requires fresh bytes");
+
+        fs::write(&replacement, b"abd").expect("same-size changed replacement");
+        fs::rename(&replacement, &path).expect("replace content and generation");
+        let (changed, _) = files
+            .capture(&path, started, &mut budget)
+            .expect("fresh changed content");
+        assert_eq!(
+            changed.content_digest,
+            "sha256:a52d159f262b2c6ddb724a61840befc36eb30c88877a4030b65cbe86298449c9"
+        );
+        assert_eq!(budget.bytes_hashed, 9);
+        revalidate_link_file(&original, generation.as_deref(), started, &mut budget)
+            .expect_err("publication cannot accept the original content witness after replacement");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linker_alias_capture_rebinds_retargeted_directory_even_with_identical_bytes() {
+        let root = tempfile::tempdir().expect("linker input directory");
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        let alias_directory = root.path().join("selected");
+        for directory in [&first, &second] {
+            fs::create_dir(directory).expect("target directory");
+            fs::write(directory.join("input.o"), b"abc").expect("equal target bytes");
+        }
+        std::os::unix::fs::symlink(&first, &alias_directory).expect("initial directory alias");
+        let alias = alias_directory.join("input.o");
+        let mut files = LinkFileCapture::default();
+        let mut budget = NativeCaptureBudget::new(LINK_CAPTURE_LIMITS);
+        let started = Instant::now();
+        let (original, generation) = files.capture(&alias, started, &mut budget).expect("original target");
+        fs::remove_file(&alias_directory).expect("remove alias");
+        std::os::unix::fs::symlink(&second, &alias_directory).expect("retarget directory alias");
+        let (retargeted, _) = files.capture(&alias, started, &mut budget).expect("capture new target");
+        assert_eq!(retargeted.path, alias.to_str().unwrap());
+        assert_eq!(
+            retargeted.canonical_path,
+            fs::canonicalize(second.join("input.o")).unwrap().to_str().unwrap()
+        );
+        assert_eq!(
+            retargeted.content_digest,
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            budget.bytes_hashed, 6,
+            "equal content cannot authorize reuse across different canonical files"
+        );
+        revalidate_link_file(&original, generation.as_deref(), started, &mut budget)
+            .expect_err("the original alias binding cannot authorize publication after retargeting");
     }
 
     #[test]
@@ -22376,41 +22241,6 @@ pub(crate) mod tests {
         );
     }
 
-    #[cfg(debug_assertions)]
-    #[test]
-    fn test_capture_limit_override_is_one_strict_bounded_profile() {
-        for (name, expected) in [
-            ("entries", TestCaptureLimit::Entries),
-            ("depth", TestCaptureLimit::Depth),
-            ("path_bytes", TestCaptureLimit::PathBytes),
-            ("bytes_hashed", TestCaptureLimit::BytesHashed),
-            ("elapsed", TestCaptureLimit::Elapsed),
-        ] {
-            assert_eq!(
-                parse_test_capture_limit(&format!("wrapper_app/{name}")).expect("canonical test limit"),
-                ("wrapper_app", expected)
-            );
-        }
-        for malformed in [
-            "",
-            "wrapper_app",
-            "/entries",
-            "wrapper-app/entries",
-            "wrapper_app/Entries",
-            "wrapper_app/entries/extra",
-            "wrapper_app/unknown",
-        ] {
-            assert!(
-                parse_test_capture_limit(malformed).is_err(),
-                "accepted malformed test capture limit {malformed:?}"
-            );
-        }
-        assert!(
-            parse_test_capture_limit(&format!("{}/entries", "a".repeat(MAX_TEST_CAPTURE_LIMIT_BYTES))).is_err(),
-            "accepted an unbounded test capture limit"
-        );
-    }
-
     #[test]
     fn bounded_directory_collection_stops_consuming_at_the_first_limit_failure() {
         struct Children {
@@ -22467,39 +22297,6 @@ pub(crate) mod tests {
         )
         .expect_err("elapsed capture must fail after the final directory entry");
         assert!(error.to_string().contains("time bound exceeded"), "{error}");
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    fn test_controls_are_private_compiler_capabilities() {
-        let controls = [
-            RESTORE_FAULT_ENV,
-            RESTORE_ABORT_ENV,
-            RESTORE_CANCEL_ENV,
-            RESTORE_CRATE_ENV,
-            TEST_CAPTURE_LIMIT_ENV,
-            CAPTURE_PAUSE_PHASE_ENV,
-            CAPTURE_PAUSE_CRATE_ENV,
-            CAPTURE_PAUSE_DIRECTORY_ENV,
-            BENCH_COVERAGE_FAULT_ENV,
-        ];
-        for control in controls {
-            assert!(private_compiler_environment(OsStr::new(control)));
-        }
-
-        let mut command = Command::new("rustc");
-        for control in controls {
-            command.env(control, "must-not-reach-rustc");
-        }
-        remove_private_environment(&mut command);
-        for control in controls {
-            assert!(
-                command
-                    .get_envs()
-                    .any(|(name, value)| name == OsStr::new(control) && value.is_none()),
-                "{control} was not removed from the compiler child"
-            );
-        }
     }
 
     #[test]
@@ -23932,7 +23729,11 @@ pub(crate) mod tests {
     fn restore_recovery_discards_partial_private_records_before_authority() {
         let root = tempfile::tempdir().expect("restore root");
         let cache = tempfile::tempdir().expect("cache root");
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let cas = LocalCas::open_selected(
+            &crate::cache::cas::LocalCacheSelection::new(cache.path().to_path_buf(), 1024 * 1024, None)
+                .expect("cache selection"),
+        )
+        .expect("CAS should open");
         let output = root.path().join("target/debug/deps");
         let observations = root.path().join("observations");
         fs::create_dir_all(&output).expect("output directory");
@@ -23966,7 +23767,11 @@ pub(crate) mod tests {
     fn restore_recovery_owns_only_the_registered_separate_debug_objects() {
         let root = tempfile::tempdir().expect("restore root");
         let cache = tempfile::tempdir().expect("cache root");
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS");
+        let cas = LocalCas::open_selected(
+            &crate::cache::cas::LocalCacheSelection::new(cache.path().to_path_buf(), 1024 * 1024, None)
+                .expect("cache selection"),
+        )
+        .expect("CAS");
         let output = root.path().join("target/debug/deps");
         let observations = root.path().join("observations");
         fs::create_dir_all(&output).expect("output directory");
@@ -24023,7 +23828,7 @@ pub(crate) mod tests {
                 .expect("prepared observation"),
         };
         transaction
-            .authorize(&prepared, &observations, &raw)
+            .authorize(&prepared, &observations)
             .expect("exact output authority");
         let mut escaped: NativeRestoreCommit =
             read_restore_record(&transaction.paths.marker, "test authority marker").expect("committed transaction");
@@ -24115,7 +23920,11 @@ pub(crate) mod tests {
     fn completed_restore_bypasses_leave_no_transactions_and_keep_locks_bounded() {
         let root = tempfile::tempdir().expect("restore root");
         let cache = tempfile::tempdir().expect("cache root");
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let cas = LocalCas::open_selected(
+            &crate::cache::cas::LocalCacheSelection::new(cache.path().to_path_buf(), 1024 * 1024, None)
+                .expect("cache selection"),
+        )
+        .expect("CAS should open");
         let observations = root.path().join("observations");
         fs::create_dir(&observations).expect("observation directory");
         let action_key = format!("{ACTION_KEY_PREFIX}{}", "c".repeat(64));
@@ -24138,7 +23947,11 @@ pub(crate) mod tests {
             );
         }
 
-        let status = cas.status().expect("restore-lock status");
+        let selection =
+            crate::cache::cas::LocalCacheSelection::new(cache.path().to_path_buf(), 1024 * 1024, None).unwrap();
+        let status = crate::cache::cas::status_at_with_max(&selection.configured_root().unwrap().unwrap(), 1024 * 1024)
+            .unwrap()
+            .unwrap();
         assert_eq!(status.native_restore_lock_files, 64);
         assert_eq!(status.staging_entries, 0);
     }
@@ -24147,7 +23960,11 @@ pub(crate) mod tests {
     fn restore_transaction_rejects_an_rlib_for_a_metadata_only_action() {
         let root = tempfile::tempdir().expect("restore root");
         let cache = tempfile::tempdir().expect("cache root");
-        let cas = LocalCas::open_at(cache.path(), 1024 * 1024).expect("CAS should open");
+        let cas = LocalCas::open_selected(
+            &crate::cache::cas::LocalCacheSelection::new(cache.path().to_path_buf(), 1024 * 1024, None)
+                .expect("cache selection"),
+        )
+        .expect("CAS should open");
         let output = root.path().join("target/debug/deps");
         let observations = root.path().join("observations");
         fs::create_dir_all(&output).expect("output directory");

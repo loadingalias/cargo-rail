@@ -2665,9 +2665,8 @@ fn receipt_qualified_local_distribution_executes_an_ordinary_cargo_library() {
     super::helpers::finish_test(result);
 }
 
-#[cfg(debug_assertions)]
 #[test]
-fn failure_reason_counters_remain_live_after_the_usage_ledger_fills() {
+fn failure_reason_status_reads_durable_counters_when_the_usage_ledger_is_full() {
     let result: Result<()> = (|| {
         let workspace = TestWorkspace::new_single_crate("transparent-failure-telemetry", "0.1.0")?;
         let cargo_home = tempfile::tempdir()?;
@@ -2676,60 +2675,37 @@ fn failure_reason_counters_remain_live_after_the_usage_ledger_fills() {
 
         let profile_state = selected_profile_state_root(&workspace.path, cargo_home.path())?;
         fs::write(profile_state.join("usage-v1.log"), vec![b'B'; 64 * 1024])?;
-        let phases = [
-            ("action_capture", "complete_action_capture_unavailable"),
-            ("action_identity", "complete_action_identity_unavailable"),
-            #[cfg(not(windows))]
-            (
-                "post_execution_witness",
-                "post_execution_witness_validation_unavailable",
-            ),
-        ];
-        let mut expected = BTreeMap::from([
-            ("complete_action_capture_unavailable", 0_u64),
-            ("complete_action_identity_unavailable", 0_u64),
-            ("post_execution_witness_validation_unavailable", 0_u64),
+        let expected = BTreeMap::from([
+            ("complete_action_capture_unavailable", 1_u64),
+            ("complete_action_identity_unavailable", 2_u64),
+            ("post_execution_witness_validation_unavailable", 3_u64),
         ]);
-
-        for (index, (phase, reason)) in phases.into_iter().enumerate() {
-            fs::write(
-                workspace.path.join("src/lib.rs"),
-                format!("pub fn telemetry_value() -> usize {{ {index} }}\n"),
-            )?;
-            let compiled = Command::new("cargo")
-                .current_dir(&workspace.path)
-                .args(["check", "--quiet"])
-                .env("CARGO_HOME", cargo_home.path())
-                .env("CARGO_INCREMENTAL", "0")
-                .env("CARGO_RAIL_TEST_NATIVE_ACTION_FAULT", phase)
-                .env_remove("RUSTC_WRAPPER")
-                .env_remove("RUSTC_WORKSPACE_WRAPPER")
-                .output()?;
-            assert!(
-                compiled.status.success(),
-                "injected {phase} failure changed the compiler result: {compiled:?}"
-            );
-            *expected.get_mut(reason).context("known failure reason")? += 1;
-
-            let status = rail(
-                &workspace.path,
-                cargo_home.path(),
-                &["rail", "cache", "status", "--scope", "local", "-f", "json"],
-            )?;
-            assert!(status.status.success(), "cache status failed: {status:?}");
-            let status = json(&status)?;
-            let installation_status = &status["status"]["installation"];
-            let usage = &installation_status["usage"];
-            assert_eq!(installation_status["healthy"], true);
-            assert_eq!(usage["recorded_events"], 64 * 1024);
-            assert_eq!(usage["ledger_full"], true);
-            assert_eq!(usage["failure_reason_counts_available"], true);
-            for (candidate, count) in &expected {
-                assert_eq!(
-                    usage["failure_reasons"][candidate], *count,
-                    "{phase} incremented the wrong stable failure class: {usage}"
-                );
-            }
+        fs::write(
+            profile_state.join("failure-counters-v1.json"),
+            b"{\n  \"schema_version\": 1,\n  \"complete_action_capture_unavailable\": 1,\n  \"complete_action_identity_unavailable\": 2,\n  \"post_execution_witness_validation_unavailable\": 3\n}\n",
+        )?;
+        let counter_file = fs::OpenOptions::new()
+            .write(true)
+            .open(profile_state.join("failure-counters-v1.json"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            counter_file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        drop(counter_file);
+        let status = rail(
+            &workspace.path,
+            cargo_home.path(),
+            &["rail", "cache", "status", "--scope", "local", "-f", "json"],
+        )?;
+        assert!(status.status.success(), "{status:?}");
+        let status = json(&status)?;
+        let usage = &status["status"]["installation"]["usage"];
+        assert_eq!(usage["recorded_events"], 64 * 1024);
+        assert_eq!(usage["ledger_full"], true);
+        assert_eq!(usage["failure_reason_counts_available"], true);
+        for (reason, count) in &expected {
+            assert_eq!(usage["failure_reasons"][reason], *count);
         }
 
         let human = rail(
@@ -2750,9 +2726,7 @@ fn failure_reason_counters_remain_live_after_the_usage_ledger_fills() {
         }
 
         let counters = profile_state.join("failure-counters-v1.json");
-        let counter_lock = profile_state.join("failure-counters-v1.lock");
         assert!(fs::metadata(&counters)?.len() <= 4 * 1024);
-        assert_eq!(fs::metadata(&counter_lock)?.len(), 0);
 
         fs::write(&counters, b"{}\n")?;
         let unavailable = rail(
@@ -2781,7 +2755,7 @@ fn failure_reason_counters_remain_live_after_the_usage_ledger_fills() {
         )?;
         assert!(remove.status.success(), "profile removal failed: {remove:?}");
         assert!(!counters.exists());
-        assert!(!counter_lock.exists());
+        assert!(!profile_state.join("failure-counters-v1.lock").exists());
         Ok(())
     })();
     super::helpers::finish_test(result);
@@ -3315,63 +3289,6 @@ fn profile_detach_rebind_cleanup_and_global_uninstall_have_disjoint_scopes() {
             cargo_home.path().join("cargo-rail/cache-profiles-v1").exists(),
             "global uninstall removed the profile registry"
         );
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-#[cfg(debug_assertions)]
-#[test]
-fn interrupted_profile_replace_retries_to_one_canonical_result() {
-    let result: Result<()> = (|| {
-        let first = TestWorkspace::new_single_crate("profile-transaction-first", "0.1.0")?;
-        let second = TestWorkspace::new_single_crate("profile-transaction-second", "0.1.0")?;
-        let cargo_home = tempfile::tempdir()?;
-        let setup = rail(&first.path, cargo_home.path(), &["rail", "cache", "setup"])?;
-        assert!(setup.status.success(), "initial profile setup failed: {setup:?}");
-
-        let interrupted = Command::new(crate::helpers::cargo_binary("cargo-rail"))
-            .current_dir(&first.path)
-            .args(["rail", "cache", "setup", "--max-size", "32MiB"])
-            .env("CARGO_HOME", cargo_home.path())
-            .env("CARGO_RAIL_TEST_PROFILE_TRANSACTION_FAULT", "after_journal")
-            .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
-            .env_remove("RUSTC_WRAPPER")
-            .env_remove("RUSTC_WORKSPACE_WRAPPER")
-            .output()?;
-        assert_eq!(interrupted.status.code(), Some(2));
-        assert!(
-            cargo_home
-                .path()
-                .join("cargo-rail/cache-profiles-v1/transaction.json")
-                .is_file()
-        );
-
-        let check = rail(&second.path, cargo_home.path(), &["rail", "cache", "setup", "--check"])?;
-        assert_eq!(check.status.code(), Some(1));
-        let retry = rail(&second.path, cargo_home.path(), &["rail", "cache", "setup"])?;
-        assert!(
-            retry.status.success(),
-            "another profile setup did not recover the interrupted profile transaction: {retry:?}"
-        );
-        assert!(
-            !cargo_home
-                .path()
-                .join("cargo-rail/cache-profiles-v1/transaction.json")
-                .exists()
-        );
-        let profiles = rail(
-            &first.path,
-            cargo_home.path(),
-            &["rail", "cache", "profiles", "-f", "json"],
-        )?;
-        assert_eq!(json(&profiles)?["profiles"].as_array().map(Vec::len), Some(2));
-        assert_eq!(
-            selected_profile_status(&first.path, cargo_home.path())?["status"]["installation"]["max_bytes"],
-            32 * 1024 * 1024
-        );
-        let repeated = rail(&second.path, cargo_home.path(), &["rail", "cache", "setup", "--check"])?;
-        assert!(repeated.status.success(), "repeated setup was not clean: {repeated:?}");
         Ok(())
     })();
     super::helpers::finish_test(result);

@@ -379,6 +379,44 @@ fn test_unify_apply_restores_manifests_and_lockfile_when_a_late_output_fails() {
             .collect::<std::io::Result<Vec<_>>>()?;
         let original_lockfile = std::fs::read(&lockfile)?;
 
+        let shim_directory = TempDir::new()?;
+        let original_manifest = shim_directory.path().join("original-Cargo.toml");
+        std::fs::write(&original_manifest, &original_root)?;
+        let shim = shim_directory
+            .path()
+            .join(format!("cargo-proxy{}", std::env::consts::EXE_SUFFIX));
+        let shim_source = shim_directory.path().join("cargo_proxy.rs");
+        std::fs::write(
+            &shim_source,
+            r#"fn main() {
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    let status = std::process::Command::new(std::env::var_os("RAIL_FIXTURE_REAL_CARGO").unwrap())
+        .args(&arguments)
+        .status()
+        .unwrap();
+    let root = std::path::PathBuf::from(std::env::var_os("RAIL_FIXTURE_ROOT").unwrap());
+    let original = std::env::var_os("RAIL_FIXTURE_ORIGINAL_MANIFEST").unwrap();
+    if status.success()
+        && arguments.first().is_some_and(|argument| argument == "metadata")
+        && std::fs::read(root.join("Cargo.toml")).unwrap() != std::fs::read(original).unwrap()
+    {
+        std::fs::write(root.join("late-report"), b"concurrent obstruction").unwrap();
+    }
+    std::process::exit(status.code().unwrap_or(1));
+}
+"#,
+        )?;
+        let compiled = std::process::Command::new("rustc")
+            .arg(&shim_source)
+            .arg("-o")
+            .arg(&shim)
+            .output()?;
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let real_cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
         let apply = run_cargo_rail_with_env(
             &workspace.path,
             &[
@@ -391,15 +429,20 @@ fn test_unify_apply_restores_manifests_and_lockfile_when_a_late_output_fails() {
                 "--report-path",
                 "late-report/report.md",
             ],
-            &[("CARGO_RAIL_UNIFY_FAIL_AT", "report-write")],
+            &[
+                ("CARGO", shim.to_str().unwrap()),
+                ("RAIL_FIXTURE_REAL_CARGO", &real_cargo),
+                ("RAIL_FIXTURE_ROOT", workspace.path.to_str().unwrap()),
+                ("RAIL_FIXTURE_ORIGINAL_MANIFEST", original_manifest.to_str().unwrap()),
+            ],
         )?;
         assert!(!apply.status.success(), "late report failure must fail apply");
         let error: serde_json::Value = serde_json::from_slice(&apply.stdout)?;
         assert!(
             error["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("injected unify failure at report-write")),
-            "the report-write fault must be the late failure: {error:#?}"
+                .is_some_and(|message| message.contains("late-report")),
+            "the report-path filesystem error must be the late failure: {error:#?}"
         );
         assert!(
             error["help"]
@@ -413,6 +456,10 @@ fn test_unify_apply_restores_manifests_and_lockfile_when_a_late_output_fails() {
         }
         assert_eq!(std::fs::read(&lockfile)?, original_lockfile);
         assert!(!workspace.path.join("late-report/report.md").exists());
+        assert_eq!(
+            std::fs::read(workspace.path.join("late-report"))?,
+            b"concurrent obstruction"
+        );
 
         Ok(())
     })();

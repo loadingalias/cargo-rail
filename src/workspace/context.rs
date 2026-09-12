@@ -21,8 +21,6 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-// Cargo State (merged from cargo_state.rs)
-
 /// Cargo state for the workspace
 ///
 /// Provides cargo metadata and workspace information.
@@ -195,10 +193,9 @@ impl CargoState {
             .is_none_or(|registries| registries.iter().any(|candidate| candidate == registry))
     }
 
-    /// Check if a workspace member is binary-only (has `[[bin]]` targets but no library target).
+    /// Return whether a member has a binary target but no `lib` or `proc-macro` target.
     ///
-    /// This is used by planner/executor flows to optionally skip crates
-    /// that can't be selected by `cargo test -p <crate>` (no library target).
+    /// Returns `false` for an unknown member.
     pub fn is_binary_only(&self, crate_name: &str) -> bool {
         let Some(pkg) = self.get_package(crate_name) else {
             return false;
@@ -220,8 +217,6 @@ impl CargoState {
         has_bin && !has_lib_like
     }
 }
-
-// Git State (merged from git_state.rs)
 
 /// Git state for the workspace
 ///

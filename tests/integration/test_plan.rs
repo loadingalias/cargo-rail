@@ -68,10 +68,27 @@ fn historical_configuration_uses_historical_split_and_transitive_host_paths() {
         std::fs::write(ws.path.join(".config/rail.toml"), "")?;
         let head = ws.commit("remove former host")?;
         let value = plan(&ws, &["--since", &base])?;
-        assert_eq!(value["plan_contract_version"], 9);
         let historical = plan(&ws, &["--from", &base, "--to", &head])?;
-        assert_eq!(historical["plan_contract_version"], 9);
-        assert!(!ws.path.join("crates/old-host").exists());
+        for result in [&value, &historical] {
+            let changes = result["changes"]["config"]
+                .as_array()
+                .context("configuration changes")?;
+            assert_eq!(changes.len(), 2, "{changes:?}");
+            assert_eq!(changes[0]["path"], "crates.old-host");
+            assert_eq!(
+                changes[0]["before"]["split"]["members"],
+                serde_json::json!(["old-host"])
+            );
+            assert_eq!(changes[0]["after"], Value::Null);
+            assert_eq!(
+                changes[1],
+                serde_json::json!({
+                    "path": "unify.transitive_pinning",
+                    "before": {"host": "crates/old-host"},
+                    "after": null
+                })
+            );
+        }
         Ok(())
     })();
     super::helpers::finish_test(result);

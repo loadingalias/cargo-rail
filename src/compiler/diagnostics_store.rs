@@ -896,11 +896,6 @@ impl CompilerDiagnosticsStore {
         self.cas.is_some()
     }
 
-    #[cfg(test)]
-    fn load_with_cas(cas: Option<crate::cache::cas::LocalCas>) -> Self {
-        Self::load_with_cas_and_remote(cas, None)
-    }
-
     pub(crate) fn load_with_cas_and_remote(
         cas: Option<crate::cache::cas::LocalCas>,
         remote: Option<Arc<crate::remote_cache::RemoteStore>>,
@@ -1154,13 +1149,17 @@ mod tests {
         prior.collector_version = COLLECTOR_VERSION - 1;
         let validation = CompilerEvidenceValidation::from_entry(&prior).expect("validation should build");
         let evidence = CompilerEvidenceObject::from_entry(&prior);
-        let cas = crate::cache::cas::LocalCas::open_at(cache_root.path(), 1024 * 1024).expect("local CAS should open");
+        let cas = crate::cache::cas::LocalCas::open_selected(
+            &crate::cache::cas::LocalCacheSelection::new(cache_root.path().to_path_buf(), 1024 * 1024, None)
+                .expect("cache selection"),
+        )
+        .expect("local CAS should open");
         cas.store_compiler_evidence(crate::cache::cas::CompilerEvidenceStoreRequest {
             validation: &validation,
             evidence: &evidence,
         })
         .expect("prior evidence should publish");
-        let mut store = CompilerDiagnosticsStore::load_with_cas(Some(cas));
+        let mut store = CompilerDiagnosticsStore::load_with_cas_and_remote(Some(cas), None);
         assert!(
             store.get(&key).is_none(),
             "prior collector evidence must not be returned"
@@ -1171,18 +1170,24 @@ mod tests {
     #[test]
     fn compiler_evidence_round_trips_across_equivalent_package_roots() {
         let cache_root = tempfile::tempdir().expect("temporary cache should be created");
-        let first_cas =
-            crate::cache::cas::LocalCas::open_at(cache_root.path(), 1024 * 1024).expect("local CAS should open");
+        let first_cas = crate::cache::cas::LocalCas::open_selected(
+            &crate::cache::cas::LocalCacheSelection::new(cache_root.path().to_path_buf(), 1024 * 1024, None)
+                .expect("cache selection"),
+        )
+        .expect("local CAS should open");
         let original = entry("member", now_unix_ms(), 0);
-        let mut first = CompilerDiagnosticsStore::load_with_cas(Some(first_cas));
+        let mut first = CompilerDiagnosticsStore::load_with_cas_and_remote(Some(first_cas), None);
         first.put(original.clone());
         first.flush().expect("compiler evidence should publish");
 
-        let second_cas =
-            crate::cache::cas::LocalCas::open_at(cache_root.path(), 1024 * 1024).expect("local CAS should reopen");
+        let second_cas = crate::cache::cas::LocalCas::open_selected(
+            &crate::cache::cas::LocalCacheSelection::new(cache_root.path().to_path_buf(), 1024 * 1024, None)
+                .expect("cache selection"),
+        )
+        .expect("local CAS should reopen");
         let mut equivalent_key = original.key.clone();
         equivalent_key.package_id.repr = "path+file:///different/root#member@0.1.0".to_string();
-        let mut second = CompilerDiagnosticsStore::load_with_cas(Some(second_cas));
+        let mut second = CompilerDiagnosticsStore::load_with_cas_and_remote(Some(second_cas), None);
         let reused = second
             .get(&equivalent_key)
             .expect("equivalent root should reuse evidence");
@@ -1195,12 +1200,16 @@ mod tests {
     #[test]
     fn incomplete_evidence_is_never_published_or_reused() {
         let cache_root = tempfile::tempdir().expect("temporary cache should be created");
-        let cas = crate::cache::cas::LocalCas::open_at(cache_root.path(), 1024 * 1024).expect("local CAS should open");
+        let cas = crate::cache::cas::LocalCas::open_selected(
+            &crate::cache::cas::LocalCacheSelection::new(cache_root.path().to_path_buf(), 1024 * 1024, None)
+                .expect("cache selection"),
+        )
+        .expect("local CAS should open");
         let mut incomplete = entry("member", now_unix_ms(), 0);
         incomplete.evidence.completeness = DiagnosticsCompleteness::Incomplete;
         let key = incomplete.key.clone();
 
-        let mut store = CompilerDiagnosticsStore::load_with_cas(Some(cas));
+        let mut store = CompilerDiagnosticsStore::load_with_cas_and_remote(Some(cas), None);
         store.put(incomplete);
         store
             .flush()
@@ -1221,8 +1230,12 @@ mod tests {
     fn corrupt_compiler_evidence_is_a_fail_closed_miss() {
         let cache_root = tempfile::tempdir().expect("temporary cache should be created");
         let original = entry("member", now_unix_ms(), 0);
-        let cas = crate::cache::cas::LocalCas::open_at(cache_root.path(), 1024 * 1024).expect("local CAS should open");
-        let mut writer = CompilerDiagnosticsStore::load_with_cas(Some(cas));
+        let cas = crate::cache::cas::LocalCas::open_selected(
+            &crate::cache::cas::LocalCacheSelection::new(cache_root.path().to_path_buf(), 1024 * 1024, None)
+                .expect("cache selection"),
+        )
+        .expect("local CAS should open");
+        let mut writer = CompilerDiagnosticsStore::load_with_cas_and_remote(Some(cas), None);
         writer.put(original.clone());
         writer.flush().expect("compiler evidence should publish");
 
@@ -1244,9 +1257,12 @@ mod tests {
         bytes[index] = if bytes[index] == b'0' { b'1' } else { b'0' };
         fs::write(evidence, bytes).expect("evidence should be corrupted");
 
-        let reopened =
-            crate::cache::cas::LocalCas::open_at(cache_root.path(), 1024 * 1024).expect("local CAS should reopen");
-        let mut reader = CompilerDiagnosticsStore::load_with_cas(Some(reopened));
+        let reopened = crate::cache::cas::LocalCas::open_selected(
+            &crate::cache::cas::LocalCacheSelection::new(cache_root.path().to_path_buf(), 1024 * 1024, None)
+                .expect("cache selection"),
+        )
+        .expect("local CAS should reopen");
+        let mut reader = CompilerDiagnosticsStore::load_with_cas_and_remote(Some(reopened), None);
         assert!(reader.get(&original.key).is_none());
         assert_eq!(reader.miss_reason(&original.key), "local_cache_unreadable");
     }
@@ -1254,7 +1270,7 @@ mod tests {
     #[test]
     fn pending_evidence_remains_reusable_without_a_local_cas() {
         let original = entry("member", now_unix_ms(), 0);
-        let mut store = CompilerDiagnosticsStore::load_with_cas(None);
+        let mut store = CompilerDiagnosticsStore::load_with_cas_and_remote(None, None);
 
         store.put(original.clone());
         assert!(store.get(&original.key).is_some());
@@ -1275,8 +1291,11 @@ mod tests {
                 let validation = validation.clone();
                 let evidence = evidence.clone();
                 scope.spawn(move || {
-                    let cas = crate::cache::cas::LocalCas::open_at(&cache_root, 1024 * 1024)
-                        .expect("concurrent local CAS should open");
+                    let cas = crate::cache::cas::LocalCas::open_selected(
+                        &crate::cache::cas::LocalCacheSelection::new(cache_root.clone(), 1024 * 1024, None)
+                            .expect("cache selection"),
+                    )
+                    .expect("concurrent local CAS should open");
                     cas.store_compiler_evidence(crate::cache::cas::CompilerEvidenceStoreRequest {
                         validation: &validation,
                         evidence: &evidence,
@@ -1300,9 +1319,17 @@ mod tests {
                 .count(),
             1
         );
-        let reopened = crate::cache::cas::LocalCas::open_at(cache_root.path(), 1024 * 1024)
-            .expect("local CAS should reopen for status");
-        let status = reopened.status().expect("local CAS status should be readable");
+        let reopened = crate::cache::cas::LocalCas::open_selected(
+            &crate::cache::cas::LocalCacheSelection::new(cache_root.path().to_path_buf(), 1024 * 1024, None)
+                .expect("cache selection"),
+        )
+        .expect("local CAS should reopen for status");
+        drop(reopened);
+        let selection =
+            crate::cache::cas::LocalCacheSelection::new(cache_root.path().to_path_buf(), 1024 * 1024, None).unwrap();
+        let status = crate::cache::cas::status_at_with_max(&selection.configured_root().unwrap().unwrap(), 1024 * 1024)
+            .unwrap()
+            .unwrap();
         assert_eq!(status.results, 1);
         assert_eq!(status.pins, 1);
         assert_eq!(status.objects, 3);

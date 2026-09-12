@@ -639,19 +639,11 @@ struct Flight {
     followers: Vec<PendingFollower>,
 }
 
-enum ExecutionClaimGuard {
-    Held {
-        _claim: crate::cache::cas::NativeExecutionClaim,
-    },
-    #[cfg(test)]
-    Simulated,
-}
-
 enum FlightOutcome {
     Running,
     Completed {
         candidate: CandidateResult,
-        _claim: ExecutionClaimGuard,
+        _claim: crate::cache::cas::NativeExecutionClaim,
     },
     Failed(BrokerFailureClass),
 }
@@ -955,7 +947,12 @@ impl ActorState {
         self.validate()
     }
 
-    fn complete(&mut self, session: u64, candidate: CandidateResult, claim: ExecutionClaimGuard) -> Result<(), String> {
+    fn complete(
+        &mut self,
+        session: u64,
+        candidate: CandidateResult,
+        claim: crate::cache::cas::NativeExecutionClaim,
+    ) -> Result<(), String> {
         let key = self
             .leaders
             .get(&session)
@@ -1184,7 +1181,7 @@ fn run_actor(receiver: mpsc::Receiver<ActorEvent>, work_permits: usize) -> RailR
                 candidate,
                 claim,
                 reply,
-            } => drop(reply.send(state.complete(session, candidate, ExecutionClaimGuard::Held { _claim: claim }))),
+            } => drop(reply.send(state.complete(session, candidate, claim))),
             ActorEvent::Failed { session, class, reply } => {
                 let result = state.fail(session, class);
                 if let Some(reply) = reply {
@@ -1841,6 +1838,15 @@ fn wake_listener(endpoint: &str) {
 mod tests {
     use super::*;
 
+    fn execution_claim(directory: &std::path::Path) -> crate::cache::cas::NativeExecutionClaim {
+        let selection =
+            crate::cache::cas::LocalCacheSelection::new(directory.to_path_buf(), 1024 * 1024, None).unwrap();
+        let cas = crate::cache::cas::LocalCas::open_selected(&selection).unwrap();
+
+        cas.native_execution_claim(&crate::source::ContentDigest::sha256(b"broker flight"))
+            .unwrap()
+    }
+
     fn identity(prefix: &str, byte: char) -> String {
         format!("{prefix}{}", byte.to_string().repeat(64))
     }
@@ -1873,7 +1879,11 @@ mod tests {
 
     fn test_broker(work_permits: usize) -> (tempfile::TempDir, AcquisitionBroker) {
         let cache = tempfile::tempdir().expect("broker cache base");
-        let cas = crate::cache::cas::LocalCas::open_at(cache.path(), 1024 * 1024).expect("broker CAS");
+        let cas = crate::cache::cas::LocalCas::open_selected(
+            &crate::cache::cas::LocalCacheSelection::new(cache.path().to_path_buf(), 1024 * 1024, None)
+                .expect("cache selection"),
+        )
+        .expect("broker CAS");
         let broker = AcquisitionBroker::start(work_permits, cas).expect("broker");
         (cache, broker)
     }
@@ -1895,6 +1905,7 @@ mod tests {
 
     #[test]
     fn permit_ledger_yields_and_resumes_without_capacity_drift() {
+        let claim_directory_1 = tempfile::tempdir().unwrap();
         let mut state = ActorState::new(2);
         state.begin_view(1).expect("first permit");
         state.begin_view(2).expect("second permit");
@@ -1904,7 +1915,7 @@ mod tests {
         let (resume, resumed) = mpsc::sync_channel(1);
         state.yield_follower(11, 2, key, resume).expect("follower yield");
         state
-            .complete(10, candidate('b'), ExecutionClaimGuard::Simulated)
+            .complete(10, candidate('b'), execution_claim(claim_directory_1.path()))
             .expect("leader completion");
         assert!(matches!(resumed.try_recv(), Err(mpsc::TryRecvError::Empty)));
         state.finish_view(1).expect("first finish");
@@ -1941,7 +1952,11 @@ mod tests {
     #[test]
     fn independent_commands_hold_the_execution_claim_through_view_publication() {
         let cache = tempfile::tempdir().expect("shared broker cache base");
-        let cas = crate::cache::cas::LocalCas::open_at(cache.path(), 1024 * 1024).expect("shared broker CAS");
+        let cas = crate::cache::cas::LocalCas::open_selected(
+            &crate::cache::cas::LocalCacheSelection::new(cache.path().to_path_buf(), 1024 * 1024, None)
+                .expect("cache selection"),
+        )
+        .expect("shared broker CAS");
         let first_broker = AcquisitionBroker::start(1, cas.clone()).expect("first broker");
         let second_broker = AcquisitionBroker::start(1, cas).expect("second broker");
         let first_view = first_broker.begin_view_index(0).expect("first view");
@@ -2070,6 +2085,8 @@ mod tests {
 
     #[test]
     fn divergent_analysis_contracts_never_share_a_flight() {
+        let claim_directory_2 = tempfile::tempdir().unwrap();
+        let claim_directory_1 = tempfile::tempdir().unwrap();
         let mut state = ActorState::new(2);
         state.begin_view(1).expect("first permit");
         state.begin_view(2).expect("second permit");
@@ -2082,10 +2099,10 @@ mod tests {
         assert!(matches!(state.claim(30, 1, first), Ok(ClaimDisposition::Lead)));
         assert!(matches!(state.claim(31, 2, second), Ok(ClaimDisposition::Lead)));
         state
-            .complete(30, candidate_for('e', 'a'), ExecutionClaimGuard::Simulated)
+            .complete(30, candidate_for('e', 'a'), execution_claim(claim_directory_1.path()))
             .expect("first completion");
         state
-            .complete(31, candidate_for('e', 'b'), ExecutionClaimGuard::Simulated)
+            .complete(31, candidate_for('e', 'b'), execution_claim(claim_directory_2.path()))
             .expect("second completion");
         state.finish_view(1).expect("first finish");
         state.finish_view(2).expect("second finish");
@@ -2134,12 +2151,13 @@ mod tests {
 
     #[test]
     fn invalid_completion_is_failed_closed_and_cannot_escape_the_flight_contract() {
+        let claim_directory_1 = tempfile::tempdir().unwrap();
         let mut state = ActorState::new(1);
         state.begin_view(1).expect("view permit");
         assert!(matches!(state.claim(50, 1, flight('1')), Ok(ClaimDisposition::Lead)));
         assert!(
             state
-                .complete(50, candidate_for('1', 'b'), ExecutionClaimGuard::Simulated)
+                .complete(50, candidate_for('1', 'b'), execution_claim(claim_directory_1.path()))
                 .is_err()
         );
         assert_eq!(state.flights.len(), 1);

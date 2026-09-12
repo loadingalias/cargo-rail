@@ -2479,12 +2479,6 @@ fn sort_and_deduplicate_files(files: &mut Vec<FileObservation>) {
     files.dedup();
 }
 
-#[cfg(test)]
-fn portable_argument(argument: &str, source_root: &Path, canonical_source_root: &Path) -> String {
-    let roots = portable_argument_roots(source_root, canonical_source_root);
-    portable_argument_with_roots(argument, &roots, canonical_source_root, false)
-}
-
 fn portable_compiler_arguments(arguments: &[String], source_root: &Path, canonical_source_root: &Path) -> Vec<String> {
     let roots = portable_argument_roots(source_root, canonical_source_root);
     let mut reviewed_value = false;
@@ -3426,29 +3420,37 @@ mod tests {
         let source = Path::new("/var/workspace");
         let canonical = Path::new("/private/var/workspace");
         assert_eq!(
-            portable_argument("--out-dir=/var/workspace/target", source, canonical),
+            portable_compiler_arguments(&["--out-dir=/var/workspace/target".to_string()], source, canonical)[0],
             "--out-dir=repository:/target"
         );
         assert_eq!(
-            portable_argument("--out-dir=/private/var/workspace/target", source, canonical),
+            portable_compiler_arguments(
+                &["--out-dir=/private/var/workspace/target".to_string()],
+                source,
+                canonical
+            )[0],
             "--out-dir=repository:/target"
         );
 
         let windows = Path::new(r"C:\work\workspace");
         assert_eq!(
-            portable_argument(r"--out-dir=C:\work\workspace\target", windows, windows),
+            portable_compiler_arguments(&[r"--out-dir=C:\work\workspace\target".to_string()], windows, windows)[0],
             r"--out-dir=repository:\target"
         );
         assert_eq!(
-            portable_argument("--extern=dep=/var/workspace/target/libdep.rmeta", source, canonical),
+            portable_compiler_arguments(
+                &["--extern=dep=/var/workspace/target/libdep.rmeta".to_string()],
+                source,
+                canonical
+            )[0],
             "--extern=dep=repository:/target/libdep.rmeta"
         );
         assert_eq!(
-            portable_argument("metadata=/var/workspace", source, canonical),
+            portable_compiler_arguments(&["metadata=/var/workspace".to_string()], source, canonical)[0],
             "metadata=/var/workspace"
         );
         assert_eq!(
-            portable_argument("cfg(path=\"/var/workspace\")", source, canonical),
+            portable_compiler_arguments(&["cfg(path=\"/var/workspace\")".to_string()], source, canonical)[0],
             "cfg(path=\"/var/workspace\")"
         );
         assert_eq!(

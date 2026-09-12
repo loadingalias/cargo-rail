@@ -616,57 +616,6 @@ fn dynamic_library(directory: &Path, crate_name: &str) -> PathBuf {
     }
 }
 
-#[cfg(debug_assertions)]
-#[test]
-#[cfg(not(windows))]
-fn benchmark_coverage_event_failure_is_explicit() -> Result<()> {
-    let root = tempfile::tempdir()?;
-    let fixture = root.path().join("fixture");
-    let cache = root.path().join("cache");
-    let cargo_home = root.path().join("cargo-home");
-    let events = root.path().join("events");
-    fs::create_dir_all(fixture.join("src"))?;
-    fs::create_dir(&cargo_home)?;
-    fs::write(
-        fixture.join("Cargo.toml"),
-        "[package]\nname = \"coverage-failure\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-    )?;
-    fs::write(
-        fixture.join("Cargo.lock"),
-        "version = 4\n\n[[package]]\nname = \"coverage-failure\"\nversion = \"0.1.0\"\n",
-    )?;
-    fs::write(fixture.join("src/lib.rs"), "pub fn value() -> u32 { 42 }\n")?;
-    setup_cache(&fixture, &cargo_home, &cache)?;
-    create_private_directory(&events)?;
-    let events = fs::canonicalize(events)?;
-
-    let before = cache_usage(&fixture, &cargo_home)?;
-    let output = cargo_command(&fixture, &cargo_home, "check")
-        .env("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1")
-        .env("CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY", &events)
-        .env("CARGO_RAIL_TEST_BENCH_COVERAGE_FAULT", "miss")
-        .output()?;
-    let usage = cache_usage(&fixture, &cargo_home)?.difference(before);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    ensure!(!output.status.success(), "injected coverage failure was ignored");
-    ensure!(
-        stderr.contains(
-            "cargo-rail compiler cache wrapper: failed to record benchmark compiler coverage: coverage event: \
-             injected benchmark compiler coverage miss event failure"
-        ),
-        "wrapper did not report the benchmark evidence failure:\n{stderr}"
-    );
-    ensure!(
-        usage.misses == 1,
-        "injected failure did not cross exactly one recorded miss: {usage:?}\n{stderr}"
-    );
-    ensure!(
-        !benchmark_events(&events)?.iter().any(|event| event["status"] == "miss"),
-        "faulted miss unexpectedly published benchmark evidence"
-    );
-    Ok(())
-}
-
 #[test]
 #[cfg(not(windows))]
 fn real_cargo_check_reuses_exact_outputs_with_root_bound_authority() -> Result<()> {

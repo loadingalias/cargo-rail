@@ -872,14 +872,6 @@ pub(crate) fn apply_setup(plan: &ProfileSetupPlan) -> RailResult<InstalledCacheP
         transaction.validate()?;
         let bytes = encode_canonical(&transaction, MAX_TRANSACTION_BYTES)?;
         super::installation::write_private_atomic(&plan.store.transaction_path(), &bytes)?;
-        #[cfg(debug_assertions)]
-        if std::env::var_os("CARGO_RAIL_TEST_PROFILE_TRANSACTION_FAULT").as_deref()
-            == Some(std::ffi::OsStr::new("after_journal"))
-        {
-            return Err(RailError::message(
-                "injected cache profile interruption after transaction journal",
-            ));
-        }
         plan.store.reconcile(&transaction)?;
         remove_file_durable(&plan.store.transaction_path())?;
     }
@@ -1525,6 +1517,64 @@ fn valid_identity(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_recovers_pending_profile_replacement_before_enrolling_another_workspace() {
+        for partially_applied in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let first = tempfile::tempdir().unwrap();
+            let second = tempfile::tempdir().unwrap();
+            for workspace in [first.path(), second.path()] {
+                fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+            }
+            let authority = "a".repeat(64);
+            let request = |max_bytes| ProfileSetupRequest {
+                requested_profile: None,
+                local_dir: None,
+                max_bytes,
+                remote_url: None,
+                remote_mode: None,
+                remote_environment: &[],
+                root_portability: None,
+                local_only: true,
+            };
+            let initial = plan_setup(home.path(), first.path(), &authority, request(None)).unwrap();
+            apply_setup(&initial).unwrap();
+            let replacement =
+                plan_setup(home.path(), first.path(), &authority, request(Some(32 * 1024 * 1024))).unwrap();
+            let transaction = ProfileTransaction {
+                version: TRANSACTION_VERSION,
+                transaction_id: "b".repeat(64),
+                mutations: replacement.mutations.clone(),
+            };
+            super::super::installation::write_private_atomic(
+                &replacement.store.transaction_path(),
+                &encode_canonical(&transaction, MAX_TRANSACTION_BYTES).unwrap(),
+            )
+            .unwrap();
+            if partially_applied {
+                let mutation = &transaction.mutations[0];
+                replacement
+                    .store
+                    .write(&mutation.relative_path, mutation.after.as_deref().unwrap())
+                    .unwrap();
+            }
+            let enrollment = plan_setup(home.path(), second.path(), &authority, request(None)).unwrap();
+            assert!(enrollment.pending());
+            apply_setup(&enrollment).unwrap();
+            assert!(!replacement.store.transaction_path().exists());
+            let recovered = select(&replacement.store, replacement.desired.selected_root())
+                .unwrap()
+                .unwrap();
+            assert_eq!(recovered.cache.max_bytes(), 32 * 1024 * 1024);
+            assert_eq!(recovered.profile_id, initial.desired.profile_id);
+            assert_ne!(recovered.profile_id, enrollment.desired.profile_id);
+            for workspace in [first.path(), second.path()] {
+                let repeated = plan_setup(home.path(), workspace, &authority, request(None)).unwrap();
+                assert!(!repeated.pending(), "recovered enrollment must be idempotent");
+            }
+        }
+    }
 
     #[test]
     fn setup_accepts_exact_concurrent_transaction_completion_and_rejects_drift() {

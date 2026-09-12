@@ -79,20 +79,6 @@ pub(crate) fn version_header(version: &str, date: &str) -> String {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn insert_release(existing: &str, release: &str) -> String {
-    let insertion = existing.find("\n## ").map(|i| i + 1).unwrap_or(existing.len());
-    let mut out = String::with_capacity(existing.len() + release.len() + 1);
-    out.push_str(existing.get(..insertion).unwrap_or(existing));
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out.push_str(release.trim_end());
-    out.push('\n');
-    out.push_str(existing.get(insertion..).unwrap_or_default());
-    out
-}
-
 pub(crate) fn insert_release_at(existing: &str, version: &str, date: &str, body: &str) -> String {
     let section = format!("{}\n{}\n", version_header(version, date).trim_end(), body.trim());
     if existing.trim().is_empty() {
@@ -220,4 +206,32 @@ pub(crate) fn apply_changelog(root: &Path, path: &Path, write: &PlannedChangelog
             .map_err(|e| RailError::message(format!("failed to create {}: {e}", parent.display())))?;
     }
     crate::utils::write_file_atomic(&full, write.content.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::insert_release_at;
+
+    #[test]
+    fn inserts_release_before_history_preserving_the_preamble() {
+        let existing = "# Changelog\n\nProject notes.\n\n## [1.0.0] - 2026-01-01\n\nOld entry.\n";
+        assert_eq!(
+            insert_release_at(existing, "1.1.0", "2026-02-03", "  New entry.\n\n"),
+            "# Changelog\n\nProject notes.\n\n## [1.1.0] - 2026-02-03\nNew entry.\n## [1.0.0] - 2026-01-01\n\nOld entry.\n"
+        );
+    }
+
+    #[test]
+    fn inserts_first_release_with_optional_date_and_header() {
+        for existing in ["", " \n\t"] {
+            assert_eq!(
+                insert_release_at(existing, "1.0.0", "", "First entry."),
+                "## [1.0.0]\nFirst entry.\n"
+            );
+        }
+        assert_eq!(
+            insert_release_at("# Changelog", "1.0.0", "", "First entry."),
+            "# Changelog\n## [1.0.0]\nFirst entry.\n"
+        );
+    }
 }

@@ -43,7 +43,7 @@ impl TomlEditor {
     /// Set value at path (e.g., "package.version")
     pub fn set(&mut self, path: &str, value: impl Into<Value>) -> RailResult<()> {
         let parts: Vec<&str> = path.split('.').collect();
-        if parts.is_empty() {
+        if parts.iter().any(|part| part.is_empty()) {
             return Err(RailError::message("Empty path provided"));
         }
 
@@ -247,7 +247,7 @@ impl TomlEditor {
     }
 }
 
-/// Batch edit multiple TOML files atomically
+/// Validate a batch, then write each file atomically with backups for manual recovery.
 #[derive(Debug, Default)]
 pub struct TomlBatchEditor {
     editors: Vec<TomlEditor>,
@@ -273,8 +273,9 @@ impl TomlBatchEditor {
         Ok(())
     }
 
-    /// Write all (transactional - all or nothing)
-    /// Note: True filesystem transactionality isn't possible, but we validate all before writing any.
+    /// Validate all files and create backups before writing.
+    ///
+    /// A write failure can leave earlier files updated. Restore `.toml.bak` files to recover.
     pub fn commit(self) -> RailResult<()> {
         self.validate_all()?;
 
@@ -288,9 +289,6 @@ impl TomlBatchEditor {
 
         // Write all
         for editor in self.editors {
-            // If one fails, we should ideally rollback others, but `write` consumes editor.
-            // In a real transactional system we'd need more complex logic.
-            // For now, we rely on backups being present for manual recovery if needed.
             editor.write()?;
         }
 
@@ -302,6 +300,16 @@ impl TomlBatchEditor {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn set_rejects_empty_path_components_without_mutation() {
+        let file = NamedTempFile::new().unwrap();
+        let mut editor = TomlEditor::open(file.path()).unwrap();
+        for path in ["", ".package", "package.", "package..name"] {
+            assert!(editor.set(path, "bad").is_err());
+            assert_eq!(editor.doc.to_string(), "");
+        }
+    }
 
     #[test]
     fn test_editor_set_value() {

@@ -96,15 +96,6 @@ impl CompilerFactAnnouncementExpectation {
             unit_identity,
         }
     }
-
-    #[cfg(test)]
-    fn from_fragment(fragment: &CompilerFactFragment) -> Self {
-        Self {
-            run_authority: fragment.run_authority.clone(),
-            producer_authority: fragment.object.producer_authority.clone(),
-            unit_identity: fragment.object.unit.identity.clone(),
-        }
-    }
 }
 
 pub(crate) fn required_compiler_fact_coverage() -> BTreeSet<CompilerFactCoverage> {
@@ -174,14 +165,6 @@ impl ValidatedCompilerFactAnnouncement {
             .strip_prefix("sha256:")
             .ok_or_else(|| RailError::message("compiler fact announcement content digest is invalid"))?;
         Ok(directory.join(format!("compiler-fact-fragment-sha256-{digest}.json")))
-    }
-
-    #[cfg(test)]
-    fn encode_message(announcement: &CompilerFactAnnouncement) -> String {
-        format!(
-            "{COMPILER_FACT_ANNOUNCEMENT_PREFIX}{}",
-            serde_json::to_string(announcement).expect("encode announcement")
-        )
     }
 }
 
@@ -1376,8 +1359,15 @@ mod tests {
     fn announcement_reserves_one_canonical_authenticated_compiler_message() {
         let fragment = fragment();
         let (announcement, _) = announcement(&fragment);
-        let expected = CompilerFactAnnouncementExpectation::from_fragment(&fragment);
-        let message = ValidatedCompilerFactAnnouncement::encode_message(&announcement);
+        let expected = CompilerFactAnnouncementExpectation {
+            run_authority: fragment.run_authority.clone(),
+            producer_authority: fragment.object.producer_authority.clone(),
+            unit_identity: fragment.object.unit.identity.clone(),
+        };
+        let message = format!(
+            "{COMPILER_FACT_ANNOUNCEMENT_PREFIX}{}",
+            serde_json::to_string(&announcement).unwrap()
+        );
         let validated = ValidatedCompilerFactAnnouncement::from_compiler_message(
             Some(COMPILER_FACT_ANNOUNCEMENT_CODE),
             &message,
@@ -1401,8 +1391,15 @@ mod tests {
     fn announcement_rejects_malformed_noncanonical_or_wrong_authority() {
         let fragment = fragment();
         let (announcement, _) = announcement(&fragment);
-        let expected = CompilerFactAnnouncementExpectation::from_fragment(&fragment);
-        let message = ValidatedCompilerFactAnnouncement::encode_message(&announcement);
+        let expected = CompilerFactAnnouncementExpectation {
+            run_authority: fragment.run_authority.clone(),
+            producer_authority: fragment.object.producer_authority.clone(),
+            unit_identity: fragment.object.unit.identity,
+        };
+        let message = format!(
+            "{COMPILER_FACT_ANNOUNCEMENT_PREFIX}{}",
+            serde_json::to_string(&announcement).unwrap()
+        );
 
         assert!(
             ValidatedCompilerFactAnnouncement::from_compiler_message(
@@ -1451,9 +1448,16 @@ mod tests {
         let directory = tempfile::tempdir().expect("fact sidecar directory");
         let fragment = fragment();
         let expected_fragment = expectation(&fragment);
-        let expected_announcement = CompilerFactAnnouncementExpectation::from_fragment(&fragment);
+        let expected_announcement = CompilerFactAnnouncementExpectation {
+            run_authority: fragment.run_authority.clone(),
+            producer_authority: fragment.object.producer_authority.clone(),
+            unit_identity: fragment.object.unit.identity.clone(),
+        };
         let (announcement, bytes) = announcement(&fragment);
-        let message = ValidatedCompilerFactAnnouncement::encode_message(&announcement);
+        let message = format!(
+            "{COMPILER_FACT_ANNOUNCEMENT_PREFIX}{}",
+            serde_json::to_string(&announcement).unwrap()
+        );
         let validated = ValidatedCompilerFactAnnouncement::from_compiler_message(
             Some(COMPILER_FACT_ANNOUNCEMENT_CODE),
             &message,
@@ -1484,9 +1488,16 @@ mod tests {
         let directory = tempfile::tempdir().expect("fact sidecar directory");
         let fragment = fragment();
         let expected_fragment = expectation(&fragment);
-        let expected_announcement = CompilerFactAnnouncementExpectation::from_fragment(&fragment);
+        let expected_announcement = CompilerFactAnnouncementExpectation {
+            run_authority: fragment.run_authority.clone(),
+            producer_authority: fragment.object.producer_authority.clone(),
+            unit_identity: fragment.object.unit.identity.clone(),
+        };
         let (announcement, bytes) = announcement(&fragment);
-        let message = ValidatedCompilerFactAnnouncement::encode_message(&announcement);
+        let message = format!(
+            "{COMPILER_FACT_ANNOUNCEMENT_PREFIX}{}",
+            serde_json::to_string(&announcement).unwrap()
+        );
         let validated = ValidatedCompilerFactAnnouncement::from_compiler_message(
             Some(COMPILER_FACT_ANNOUNCEMENT_CODE),
             &message,

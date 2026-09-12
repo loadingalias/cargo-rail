@@ -802,7 +802,7 @@ pub(crate) fn record_compiler_acquisition_journal_write(
     }
 }
 
-#[cfg(any(unix, windows, test))]
+#[cfg(any(unix, windows))]
 pub(crate) fn record_cas_restore(bytes: u64) {
     add(|counters| &counters.cas_bytes_restored, bytes);
 }

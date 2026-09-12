@@ -59,11 +59,6 @@ impl TargetCfgSet {
             CfgApplicability::Maybe
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn from_test_lines(lines: &[&str]) -> Self {
-        Self::from_rustc_output(&lines.join("\n"))
-    }
 }
 
 /// Evaluate one Cargo `[target.'cfg(...)']` key against an exact rustc cfg set.
@@ -606,7 +601,7 @@ mod tests {
 
     #[test]
     fn test_cfg_expression_applicability_is_exact_for_platform_and_conservative_for_custom_cfg() {
-        let linux = TargetCfgSet::from_test_lines(&["unix", "target_os=\"linux\""]);
+        let linux = TargetCfgSet::from_rustc_output("unix\ntarget_os=\"linux\"");
         assert!(cfg_expression_may_apply(
             r#"all(target_os = "linux", feature = "api")"#,
             [Some(&linux)].into_iter()

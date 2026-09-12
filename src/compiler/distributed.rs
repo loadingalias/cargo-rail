@@ -1248,85 +1248,6 @@ impl StagedExecutionResult {
         fs::remove_dir(distributed)?;
         Ok(self.staging)
     }
-
-    #[cfg(test)]
-    pub(crate) fn from_test_frames(
-        candidate: &RustLibraryCandidate,
-        dep_info: &[u8],
-        metadata: &[u8],
-        rlib: &[u8],
-        stdout: &[u8],
-        stderr: &[u8],
-    ) -> RailResult<Self> {
-        let staging = NativeResultStaging::temporary_in(&std::env::temp_dir())?;
-        let distributed = staging.path().join("distributed");
-        fs::create_dir(&distributed)?;
-        let mut frames = BTreeMap::new();
-        let mut descriptors = BTreeMap::new();
-        let mut contents = vec![
-            (ResponseSlot::DepInfo, dep_info, 0o644),
-            (ResponseSlot::Metadata, metadata, 0o644),
-        ];
-        if candidate.operation.emission == RustLibraryEmission::MetadataAndLink {
-            contents.push((ResponseSlot::Rlib, rlib, 0o644));
-        }
-        contents.extend([(ResponseSlot::Stderr, stderr, 0), (ResponseSlot::Stdout, stdout, 0)]);
-        for (slot, bytes, mode) in contents {
-            let path = distributed.join(slot.file_name());
-            write_private_file(&path, bytes)?;
-            frames.insert(slot, path);
-            descriptors.insert(
-                slot,
-                ResponseFrame {
-                    bytes: bytes.len() as u64,
-                    content_digest: digest_bytes(bytes),
-                    mode,
-                    slot,
-                },
-            );
-        }
-        Ok(Self {
-            staging,
-            frames,
-            descriptors,
-            inputs: candidate.input_frames(),
-            operation: candidate.operation.clone(),
-        })
-    }
-
-    #[cfg(test)]
-    fn from_test_analysis_frames(
-        candidate: &RustLibraryCandidate,
-        observation: &[u8],
-        facts: &[u8],
-    ) -> RailResult<Self> {
-        let mut result = Self::from_test_frames(
-            candidate,
-            b"portable dep-info",
-            b"portable metadata",
-            b"portable rlib",
-            b"",
-            b"",
-        )?;
-        for (slot, bytes) in [
-            (ResponseSlot::AnalysisObservation, observation),
-            (ResponseSlot::CompilerFacts, facts),
-        ] {
-            let path = result.staging.path().join("distributed").join(slot.file_name());
-            write_private_file(&path, bytes)?;
-            result.frames.insert(slot, path);
-            result.descriptors.insert(
-                slot,
-                ResponseFrame {
-                    bytes: bytes.len() as u64,
-                    content_digest: digest_bytes(bytes),
-                    mode: 0,
-                    slot,
-                },
-            );
-        }
-        Ok(result)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6906,22 +6827,6 @@ fn write_candidate_request(
     Ok(())
 }
 
-#[cfg(test)]
-fn write_request(writer: &mut impl Write, request: &ExecutionRequest, source: &[u8]) -> RailResult<()> {
-    let [frame] = request.inputs.as_slice() else {
-        return Err(RailError::message("test request does not contain one input"));
-    };
-    if source.len() as u64 != frame.bytes || digest_bytes(source) != frame.content_digest {
-        return Err(RailError::message("test request input does not match its descriptor"));
-    }
-    let header = canonical_json(request)?;
-    write_sized_header(writer, REQUEST_MAGIC, &header)?;
-    writer.write_all(source)?;
-    writer.write_all(REQUEST_TRAILER)?;
-    writer.flush()?;
-    Ok(())
-}
-
 #[cfg(target_os = "linux")]
 fn write_envelope_request(writer: &mut impl Write, envelope: &RequestEnvelope) -> RailResult<()> {
     let header = canonical_json(&envelope.request)?;
@@ -7044,7 +6949,7 @@ fn digest_bytes(bytes: &[u8]) -> String {
     format!("sha256:{}", ContentDigest::sha256(bytes))
 }
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn write_private_file(path: &Path, bytes: &[u8]) -> RailResult<()> {
     let mut file = create_private_file(path)?;
     file.write_all(bytes)?;
@@ -7467,12 +7372,95 @@ fn read_end(reader: &mut impl Read, role: &str) -> RailResult<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::io::Cursor;
 
     use super::*;
 
     const SOURCE: &[u8] = b"pub fn answer() -> u8 { 42 }\n";
+
+    pub(crate) fn decoded_frames(
+        candidate: &RustLibraryCandidate,
+        dep_info: &[u8],
+        metadata: &[u8],
+        rlib: &[u8],
+        stdout: &[u8],
+        stderr: &[u8],
+    ) -> RailResult<StagedExecutionResult> {
+        decode_payloads(candidate, dep_info, metadata, rlib, stdout, stderr, None)
+    }
+
+    fn decoded_analysis_frames(
+        candidate: &RustLibraryCandidate,
+        observation: &[u8],
+        facts: &[u8],
+    ) -> RailResult<StagedExecutionResult> {
+        decode_payloads(
+            candidate,
+            b"portable dep-info",
+            b"portable metadata",
+            b"portable rlib",
+            b"",
+            b"",
+            Some((observation, facts)),
+        )
+    }
+
+    fn decode_payloads(
+        candidate: &RustLibraryCandidate,
+        dep_info: &[u8],
+        metadata: &[u8],
+        rlib: &[u8],
+        stdout: &[u8],
+        stderr: &[u8],
+        analysis: Option<(&[u8], &[u8])>,
+    ) -> RailResult<StagedExecutionResult> {
+        let mut request = request_for(SOURCE)?;
+        request.inputs = candidate.input_frames();
+        request.operation = candidate.operation.clone();
+        request.action_id = action_identity(&request)?;
+        let payloads = tempfile::tempdir()?;
+        let mut frames = Vec::new();
+        let mut outputs = vec![(ResponseSlot::DepInfo, dep_info), (ResponseSlot::Metadata, metadata)];
+        if candidate.operation.emission == RustLibraryEmission::MetadataAndLink {
+            outputs.push((ResponseSlot::Rlib, rlib));
+        }
+        for (slot, bytes) in outputs {
+            let path = payloads.path().join(slot.file_name());
+            create_private_file(&path)?.write_all(bytes)?;
+            frames.push(prepare_file_frame(slot, path, MAX_OUTPUT_BYTES)?);
+        }
+        for (slot, bytes) in [
+            (ResponseSlot::Stdout, stdout),
+            (ResponseSlot::Stderr, stderr),
+            (ResponseSlot::NativeInputs, b"native input record".as_slice()),
+        ] {
+            frames.push(prepare_bytes_frame(slot, bytes.to_vec(), MAX_STREAM_BYTES)?);
+        }
+        if let Some((observation, facts)) = analysis {
+            for (slot, bytes) in [
+                (ResponseSlot::AnalysisObservation, observation),
+                (ResponseSlot::CompilerFacts, facts),
+            ] {
+                frames.push(prepare_bytes_frame(slot, bytes.to_vec(), MAX_OUTPUT_BYTES)?);
+            }
+        }
+        frames.sort_unstable_by_key(|frame| frame.descriptor.slot);
+        let timing = worker_timing(&request, &frames);
+        let (response, frames) = successful_response(&request, frames, timing);
+        let mut encoded = Vec::new();
+        write_response(&mut encoded, &request, &response, &frames)?;
+        let staging = NativeResultStaging::temporary_in(&std::env::temp_dir())?;
+        match read_response_into(
+            &mut Cursor::new(encoded),
+            &request,
+            staging,
+            &mut ResponseTiming::default(),
+        )? {
+            DecodedExecution::Success(result) => Ok(result),
+            _ => Err(RailError::message("successful response did not decode as success")),
+        }
+    }
 
     fn fixed_identity(prefix: &str, digit: char) -> String {
         format!("{prefix}{}", digit.to_string().repeat(64))
@@ -7729,7 +7717,7 @@ mod tests {
             let observation_bytes =
                 crate::compiler::analysis::AnalysisObservation::distributed_success(&observation)?.canonical_bytes()?;
             let fact_bytes = canonical_json(&vec![object.clone()])?;
-            let staged = StagedExecutionResult::from_test_analysis_frames(&candidate, &observation_bytes, &fact_bytes)?;
+            let staged = decoded_analysis_frames(&candidate, &observation_bytes, &fact_bytes)?;
             let evidence = staged
                 .validated_analysis_evidence(&candidate, &observation)?
                 .ok_or_else(|| RailError::message("analysis fixture produced no evidence"))?;
@@ -7739,11 +7727,8 @@ mod tests {
             let mut wrong_object = object;
             wrong_object.producer_authority.driver_identity =
                 fixed_identity(crate::compiler::facts::DRIVER_IDENTITY_PREFIX, '0');
-            let rejected = StagedExecutionResult::from_test_analysis_frames(
-                &candidate,
-                &observation_bytes,
-                &canonical_json(&vec![wrong_object])?,
-            )?;
+            let rejected =
+                decoded_analysis_frames(&candidate, &observation_bytes, &canonical_json(&vec![wrong_object])?)?;
             assert!(rejected.validated_analysis_evidence(&candidate, &observation).is_err());
 
             let mut changed = observation;
@@ -7822,8 +7807,7 @@ mod tests {
         let result: RailResult<()> = (|| {
             let root = tempfile::tempdir()?;
             let candidate = placement_candidate(SOURCE)?;
-            let mut staged =
-                StagedExecutionResult::from_test_frames(&candidate, b"dep", b"metadata", b"rlib", b"", b"")?;
+            let mut staged = decoded_frames(&candidate, b"dep", b"metadata", b"rlib", b"", b"")?;
             let host = root.path().join("host-lib");
             staged
                 .validated_native_inputs(&candidate, root.path(), &host, None)
@@ -7930,7 +7914,7 @@ mod tests {
         let mut frames = Vec::new();
         for (slot, bytes) in files {
             let path = root.join(slot.file_name());
-            write_private_file(&path, bytes)?;
+            create_private_file(&path)?.write_all(bytes)?;
             frames.push(prepare_file_frame(slot, path, MAX_OUTPUT_BYTES)?);
         }
         frames.push(prepare_bytes_frame(
@@ -8024,7 +8008,9 @@ mod tests {
             let request = request_for(SOURCE)?;
             validate_request(&request, &capability()?)?;
             let mut encoded = Vec::new();
-            write_request(&mut encoded, &request, SOURCE)?;
+            let mut candidate = placement_candidate(SOURCE)?;
+            candidate.operation = request.operation.clone();
+            write_candidate_request(&mut encoded, &request, &candidate)?;
 
             let decoded = read_request(&mut Cursor::new(&encoded))?;
             assert_eq!(decoded.request, request);

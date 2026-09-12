@@ -455,16 +455,6 @@ pub fn detect_github_repo(workspace_root: &Path) -> Option<(String, String)> {
     Some((owner.to_string(), name.to_string()))
 }
 
-#[cfg(test)]
-fn parse_github_remote(value: &str) -> Option<(String, String)> {
-    let repository = crate::release::remote::RemoteRepository::parse(value)?;
-    if repository.host() != Some("github.com") {
-        return None;
-    }
-    let (owner, name) = repository.github_owner_repo()?;
-    Some((owner.to_string(), name.to_string()))
-}
-
 fn to_boxed_set(values: &[String]) -> FxHashSet<Box<str>> {
     values.iter().map(|v| Box::from(v.as_str())).collect()
 }
@@ -715,33 +705,47 @@ mod tests {
     }
 
     #[test]
-    fn parse_github_remote_supports_common_patterns() {
-        assert_eq!(
-            parse_github_remote("git@github.com:org/repo.git"),
-            Some(("org".to_string(), "repo".to_string()))
-        );
-        assert_eq!(
-            parse_github_remote("https://github.com/org/repo"),
-            Some(("org".to_string(), "repo".to_string()))
-        );
-        assert_eq!(
-            parse_github_remote("ssh://git@github.com/org/repo"),
-            Some(("org".to_string(), "repo".to_string()))
-        );
-        assert_eq!(parse_github_remote("git@gitlab.com:org/repo.git"), None);
-        assert_eq!(
-            parse_github_remote("https://github.com/org/repo.git/"),
-            Some(("org".to_string(), "repo".to_string()))
-        );
-        for invalid in [
+    fn detects_only_one_unambiguous_github_fetch_repository() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::git::init_repo(directory.path(), "main").unwrap();
+        let git = crate::git::SystemGit::open(directory.path()).unwrap();
+        assert_eq!(detect_github_repo(directory.path()), None);
+
+        for url in [
+            "git@github.com:org/repo.git",
+            "https://github.com/org/repo",
+            "ssh://git@github.com/org/repo",
+            "https://github.com/org/repo.git/",
+        ] {
+            git.run_git(&["config", "--local", "remote.origin.url", url]).unwrap();
+            assert_eq!(
+                detect_github_repo(directory.path()),
+                Some(("org".to_string(), "repo".to_string())),
+                "{url}"
+            );
+        }
+        for url in [
+            "git@gitlab.com:org/repo.git",
             "https://github.com/org/repo/extra",
             "https://github.com/org/repo.git?ref=main",
             "https://github.com/org/repo#readme",
             "https://github.com//repo",
             "https://github.com/org/",
         ] {
-            assert_eq!(parse_github_remote(invalid), None, "{invalid}");
+            git.run_git(&["config", "--local", "remote.origin.url", url]).unwrap();
+            assert_eq!(detect_github_repo(directory.path()), None, "{url}");
         }
+        git.run_git(&["config", "--local", "remote.origin.url", "https://github.com/org/repo"])
+            .unwrap();
+        git.run_git(&[
+            "config",
+            "--local",
+            "--add",
+            "remote.origin.url",
+            "https://github.com/other/repo",
+        ])
+        .unwrap();
+        assert_eq!(detect_github_repo(directory.path()), None, "multiple fetch URLs");
     }
 
     #[test]

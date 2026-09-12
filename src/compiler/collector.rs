@@ -4810,9 +4810,9 @@ const SYSROOT_MEMO_VERSION: u32 = 3;
 const MAX_SYSROOT_MEMO_BYTES: u64 = 4 * 1024 * 1024;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 const MAX_GENERATION_IDENTIFIER_BYTES: usize = 256;
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 const WINDOWS_SYSROOT_CAPTURE_ATTEMPTS: usize = 3;
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 const WINDOWS_SYSROOT_GENERATION_SETTLE_INTERVAL: Duration = Duration::from_millis(20);
 #[cfg(windows)]
 const WINDOWS_FILETIME_UNIX_EPOCH_SECONDS: u64 = 11_644_473_600;
@@ -5087,33 +5087,23 @@ fn fingerprint_compiler_inventory(
     memo_path: Option<&Path>,
     recapture: impl Fn() -> RailResult<CompilerSysrootInventory>,
 ) -> RailResult<(String, u64)> {
-    #[cfg(windows)]
-    let windows_before = retry_unstable_windows_sysroot_capture(|| Ok(capture_exact_sysroot_evidence(&inventory)))?;
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    if let Some(memo_path) = memo_path
-        && let Some(memo) = load_sysroot_identity_memo(memo_path, &inventory, selection)
-        && let Some(before) = capture_exact_sysroot_evidence(&inventory)
-        && before.volume_identifier == memo.volume_identifier
-        && before.entries == memo.entries
-        && capture_exact_sysroot_evidence(&inventory).as_ref() == Some(&before)
-    {
-        return Ok((memo.fingerprint, 0));
-    }
-
-    #[cfg(windows)]
-    if let Some(memo_path) = memo_path
-        && let Some(memo) = load_sysroot_identity_memo(memo_path, &inventory, selection)
-        && windows_before.volume_identifier == memo.volume_identifier
-        && windows_before.entries == memo.entries
-        && capture_exact_sysroot_evidence(&inventory).as_ref() == Some(&windows_before)
-    {
-        return Ok((memo.fingerprint, 0));
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let before = capture_exact_sysroot_evidence(&inventory)
-        .ok_or_else(|| RailError::message("compiler sysroot generation evidence is unavailable"))?;
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    let (inventory, before, _memo_lock) = {
+        let mut inventory = inventory;
+        let mut before = capture_sysroot_generation(&inventory)?;
+        if let Some(fingerprint) = verified_sysroot_memo(memo_path, &inventory, selection, &before) {
+            return Ok((fingerprint, 0));
+        }
+        let lock = memo_path.and_then(lock_sysroot_memo);
+        if lock.is_some() {
+            inventory = recapture()?;
+            before = capture_sysroot_generation(&inventory)?;
+            if let Some(fingerprint) = verified_sysroot_memo(memo_path, &inventory, selection, &before) {
+                return Ok((fingerprint, 0));
+            }
+        }
+        (inventory, before, lock)
+    };
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     let _ = memo_path;
     #[cfg(not(windows))]
@@ -5137,7 +5127,7 @@ fn fingerprint_compiler_inventory(
         // NTFS may finish a benign metadata update while the freshly installed sysroot is first inspected. Rehash the
         // whole inventory after drift; accepting only one fully bracketed attempt preserves the exact-byte claim.
         let mut retry_inventory = inventory;
-        let mut retry_before = windows_before;
+        let mut retry_before = before;
         let (fingerprint, stable_inventory, stable_evidence) = retry_unstable_windows_sysroot_capture(|| {
             let fingerprint = hash_compiler_sysroot(&retry_inventory)?;
             let after_inventory = recapture()?;
@@ -5165,7 +5155,63 @@ fn fingerprint_compiler_inventory(
     }
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn capture_sysroot_generation(inventory: &CompilerSysrootInventory) -> RailResult<ExactSysrootEvidence> {
+    #[cfg(windows)]
+    {
+        retry_unstable_windows_sysroot_capture(|| Ok(capture_exact_sysroot_evidence(inventory)))
+    }
+    #[cfg(not(windows))]
+    {
+        capture_exact_sysroot_evidence(inventory)
+            .ok_or_else(|| RailError::message("compiler sysroot generation evidence is unavailable"))
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn verified_sysroot_memo(
+    path: Option<&Path>,
+    inventory: &CompilerSysrootInventory,
+    selection: &str,
+    before: &ExactSysrootEvidence,
+) -> Option<String> {
+    let memo = load_sysroot_identity_memo(path?, inventory, selection)?;
+    (before.volume_identifier == memo.volume_identifier
+        && before.entries == memo.entries
+        && capture_exact_sysroot_evidence(inventory).as_ref() == Some(before))
+    .then_some(memo.fingerprint)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn lock_sysroot_memo(memo: &Path) -> Option<File> {
+    let path = memo.with_extension("lock");
+    // The advisory claim must not prevent cache deletion on Windows.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .ok()?;
+    if !crate::utils::private_file_matches_path(&file, &path, 0).ok()? {
+        return None;
+    }
+    let started = Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) if started.elapsed() < Duration::from_secs(5) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return None,
+        }
+    }
+    crate::utils::private_file_matches_path(&file, &path, 0)
+        .ok()?
+        .then_some(file)
+}
+
+#[cfg(windows)]
 fn retry_unstable_windows_sysroot_capture<T>(mut capture: impl FnMut() -> RailResult<Option<T>>) -> RailResult<T> {
     for attempt in 0..WINDOWS_SYSROOT_CAPTURE_ATTEMPTS {
         if let Some(captured) = capture()? {
@@ -7799,6 +7845,37 @@ mod tests {
         let memo_hit = compiler_sysroot_fingerprint(sysroot.path(), "test-host", Some(&memo)).expect("memo hit");
         assert_eq!(memo_hit, (baseline.0.clone(), 0));
 
+        let published = std::fs::read(&memo).expect("published memo");
+        std::fs::remove_file(&memo).expect("cold memo miss");
+        let recaptured = std::cell::Cell::new(false);
+        let follower = fingerprint_compiler_inventory(
+            compiler_sysroot_inventory(sysroot.path(), "test-host").expect("initial inventory"),
+            "test-host",
+            Some(&memo),
+            || {
+                assert!(!recaptured.replace(true), "published memo must avoid hashing");
+                let competing = crate::utils::open_cache_lock_file(&memo.with_extension("lock"), false)?;
+                assert!(matches!(competing.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
+                std::fs::write(&memo, &published)?;
+                compiler_sysroot_inventory(sysroot.path(), "test-host")
+            },
+        )
+        .expect("post-lock memo hit");
+        assert!(recaptured.get(), "cold miss must recapture under the memo lock");
+        assert_eq!(follower, (baseline.0.clone(), 0));
+
+        std::fs::write(memo.with_extension("lock"), b"not a private empty lock").expect("unusable lock");
+        assert_eq!(
+            compiler_sysroot_fingerprint(sysroot.path(), "test-host", Some(&memo)).expect("warm hit ignores lock"),
+            (baseline.0.clone(), 0)
+        );
+        std::fs::remove_file(&memo).expect("cold miss with unusable lock");
+        assert_eq!(
+            compiler_sysroot_fingerprint(sysroot.path(), "test-host", Some(&memo)).expect("uncached hashing fallback"),
+            baseline
+        );
+        std::fs::write(memo.with_extension("lock"), b"").expect("restore empty lock");
+
         let mut corrupted =
             serde_json::from_slice::<serde_json::Value>(&std::fs::read(&memo).expect("memo bytes")).expect("memo JSON");
         corrupted["fingerprint"] = serde_json::Value::String(
@@ -7815,22 +7892,45 @@ mod tests {
         let modified = std::fs::metadata(&target)
             .and_then(|metadata| metadata.modified())
             .expect("target modification time");
-        std::fs::write(&target, b"target-two").expect("same-size target mutation");
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&target)
-            .and_then(|file| file.set_times(std::fs::FileTimes::new().set_modified(modified)))
-            .expect("restore target modification time");
-
-        let changed =
-            compiler_sysroot_fingerprint(sysroot.path(), "test-host", Some(&memo)).expect("changed fingerprint");
+        std::fs::remove_file(&memo).expect("cold memo miss before generation change");
+        let changed_after_wait = std::cell::Cell::new(false);
+        let changed = fingerprint_compiler_inventory(
+            compiler_sysroot_inventory(sysroot.path(), "test-host").expect("inventory before waiting"),
+            "test-host",
+            Some(&memo),
+            || {
+                if !changed_after_wait.replace(true) {
+                    std::fs::write(&target, b"target-two")?;
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&target)?
+                        .set_times(std::fs::FileTimes::new().set_modified(modified))?;
+                    std::fs::write(&memo, &published)?;
+                }
+                compiler_sysroot_inventory(sysroot.path(), "test-host")
+            },
+        )
+        .expect("changed fingerprint after waiting");
         assert_eq!(changed.1, 20, "same-size content changes must force a full hash");
         assert_ne!(changed.0, baseline.0);
         let changed_hit =
             compiler_sysroot_fingerprint(sysroot.path(), "test-host", Some(&memo)).expect("changed memo hit");
         assert_eq!(changed_hit, (changed.0, 0));
+
+        let held = lock_sysroot_memo(&memo).expect("held memo lock");
+        std::fs::remove_dir_all(memo_directory.path()).expect("cache deletion while memo claim is held");
+        std::fs::create_dir(memo_directory.path()).expect("replacement cache directory");
+        let replacement = compiler_sysroot_fingerprint(sysroot.path(), "test-host", Some(&memo))
+            .expect("replacement cache must hash and publish normally");
+        assert_eq!(replacement, (changed_hit.0, 20));
+        assert_eq!(
+            compiler_sysroot_fingerprint(sysroot.path(), "test-host", Some(&memo)).expect("replacement memo hit"),
+            (replacement.0, 0)
+        );
+        drop(held);
     }
 
+    #[cfg(windows)]
     #[test]
     fn windows_sysroot_capture_retries_transient_generation_drift() {
         let mut attempts = 0;
@@ -7844,6 +7944,7 @@ mod tests {
         assert_eq!(attempts, 2);
     }
 
+    #[cfg(windows)]
     #[test]
     fn windows_sysroot_capture_rejects_persistent_generation_drift() {
         let mut attempts = 0;

@@ -149,29 +149,41 @@ mod tests {
     }
 
     #[test]
-    fn test_backup_metadata_save_load() {
-        let result: RailResult<()> = (|| {
-            let temp_dir = TempDir::new().unwrap();
-            let backup_dir = temp_dir.path();
+    fn metadata_save_uses_public_fields_and_omits_absent_options() {
+        let dir = TempDir::new().unwrap();
+        let metadata = BackupMetadata {
+            timestamp: "2024-01-15T14:30:22+00:00".to_owned(),
+            command: "cargo rail unify".to_owned(),
+            files_modified: vec![PathBuf::from("Cargo.toml")],
+            config_snapshot: None,
+            description: None,
+        };
+        metadata.save(dir.path()).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.path().join("metadata.json")).unwrap()).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "timestamp": "2024-01-15T14:30:22+00:00",
+                "command": "cargo rail unify",
+                "files_modified": ["Cargo.toml"]
+            })
+        );
+    }
 
-            // Create and save metadata
-            let mut original = BackupMetadata::new("cargo rail unify");
-            original.add_file("Cargo.toml");
-            original.add_file("crates/foo/Cargo.toml");
-            original = original.with_description("Test backup");
-
-            original.save(backup_dir)?;
-
-            // Load it back
-            let loaded = BackupMetadata::load(backup_dir)?;
-
-            assert_eq!(loaded.command, original.command);
-            assert_eq!(loaded.files_modified, original.files_modified);
-            assert_eq!(loaded.description, original.description);
-
-            Ok(())
-        })();
-        result.unwrap();
+    #[test]
+    fn metadata_load_reads_independently_authored_record() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("metadata.json"), r#"{"timestamp":"2024-01-15T14:30:22+00:00","command":"cargo rail unify","files_modified":["Cargo.toml","crates/foo/Cargo.toml"],"description":"Before unify"}"#).unwrap();
+        let metadata = BackupMetadata::load(dir.path()).unwrap();
+        assert_eq!(metadata.timestamp, "2024-01-15T14:30:22+00:00");
+        assert_eq!(metadata.command, "cargo rail unify");
+        assert_eq!(
+            metadata.files_modified,
+            [PathBuf::from("Cargo.toml"), PathBuf::from("crates/foo/Cargo.toml")]
+        );
+        assert_eq!(metadata.description.as_deref(), Some("Before unify"));
+        assert!(metadata.config_snapshot.is_none());
     }
 
     #[test]
@@ -187,7 +199,6 @@ mod tests {
         let record = BackupRecord::new("2024-01-15-143022".to_string(), metadata, PathBuf::from("/tmp/backup"));
 
         let display = record.timestamp_display();
-        assert!(display.contains("2024-01-15"));
-        assert!(display.contains("14:30:22"));
+        assert_eq!(display, "2024-01-15 14:30:22");
     }
 }

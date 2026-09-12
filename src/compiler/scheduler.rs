@@ -77,33 +77,9 @@ pub(crate) struct AnalysisSchedule {
 }
 
 impl AnalysisSchedule {
-    /// Derive stable-diagnostics views without filesystem access or subprocesses.
-    #[cfg(test)]
-    pub(crate) fn for_diagnostics(
-        manifests: &[ParsedManifest],
-        targets: &[&str],
-        candidates: &[CompilerCandidate],
-    ) -> RailResult<Self> {
-        Self::for_combined(manifests, targets, candidates, &BTreeSet::new(), &BTreeSet::new())
-    }
-
-    /// Derive and collapse stable-diagnostic plus typed-item acquisitions.
-    ///
-    /// `typed_packages` names captured workspace packages that need ordinary
-    /// target facts. `doctest_packages` is its exact subset whose library
-    /// targets enable doctests in Cargo metadata.
-    #[cfg(test)]
-    pub(crate) fn for_combined(
-        manifests: &[ParsedManifest],
-        targets: &[&str],
-        candidates: &[CompilerCandidate],
-        typed_packages: &BTreeSet<String>,
-        doctest_packages: &BTreeSet<String>,
-    ) -> RailResult<Self> {
-        Self::for_combined_with_features(manifests, targets, candidates, typed_packages, doctest_packages, None)
-    }
-
     /// Derive combined acquisitions with an optional exact feature-profile matrix.
+    /// `doctest_packages` must be a subset of `typed_packages`; both name captured
+    /// workspace packages.
     pub(crate) fn for_combined_with_features(
         manifests: &[ParsedManifest],
         targets: &[&str],
@@ -511,7 +487,6 @@ enum ViewAdmission {
 
 /// Dense, immutable command-lifetime input for compiler acquisition.
 #[derive(Debug, PartialEq, Eq)]
-#[cfg_attr(test, derive(Clone))]
 pub(crate) struct CompilerAcquisitionPlan {
     identity: CompilerAcquisitionPlanIdentity,
     candidate_set_identity: Box<str>,
@@ -527,29 +502,6 @@ pub(crate) struct CompilerAcquisitionPlan {
 }
 
 impl CompilerAcquisitionPlan {
-    #[cfg(test)]
-    pub(crate) fn journal_test_plan(packages: &[&str]) -> RailResult<Self> {
-        let package_names = packages
-            .iter()
-            .map(|package| (*package).to_string())
-            .collect::<BTreeSet<_>>();
-        let schedule = AnalysisSchedule {
-            packages: package_names.clone(),
-            views: package_names
-                .into_iter()
-                .map(|package| AnalysisView {
-                    acquisition: AnalysisAcquisition::CheckAllTargets,
-                    platform: PlatformTarget::from("default"),
-                    features: FeatureSelection::Default,
-                    packages: BTreeSet::from([package]),
-                    domains: BTreeSet::from([CompilerFactDomain::Production, CompilerFactDomain::NonProduction]),
-                    fact_families: BTreeSet::from([CompilerFactFamily::TypedRustItems]),
-                })
-                .collect(),
-        };
-        Self::from_schedule(&schedule, &[], &["default"])
-    }
-
     /// Freeze one typed schedule into canonical dense tables before any worker starts.
     pub(crate) fn from_schedule(
         schedule: &AnalysisSchedule,
@@ -1365,16 +1317,22 @@ mod tests {
     #[test]
     fn schedule_is_root_independent_and_collapses_duplicate_requirements() {
         let targets = ["default", "x86_64-unknown-linux-gnu"];
-        let left = AnalysisSchedule::for_diagnostics(
+        let left = AnalysisSchedule::for_combined_with_features(
             &[manifest("app", "first/root/app")],
             &targets,
             &[candidate("app", &targets), candidate("app", &targets)],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            None,
         )
         .expect("left schedule");
-        let right = AnalysisSchedule::for_diagnostics(
+        let right = AnalysisSchedule::for_combined_with_features(
             &[manifest("app", "another/root/app")],
             &[targets[1], targets[0]],
             &[candidate("app", &targets)],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            None,
         )
         .expect("right schedule");
 
@@ -1432,7 +1390,7 @@ mod tests {
         let targets = ["x86_64-unknown-linux-gnu"];
         let target_cfg_sets = HashMap::from([(
             "x86_64-unknown-linux-gnu".to_string(),
-            TargetCfgSet::from_test_lines(&[r#"target_os="linux""#]),
+            TargetCfgSet::from_rustc_output(r#"target_os="linux""#),
         )]);
         let left = planned_coverage_views(
             &[
@@ -1487,12 +1445,13 @@ mod tests {
         let manifests = [manifest("app", "app"), manifest("worker", "worker")];
         let typed = BTreeSet::from(["app".to_string(), "worker".to_string()]);
         let doctests = BTreeSet::from(["app".to_string()]);
-        let schedule = AnalysisSchedule::for_combined(
+        let schedule = AnalysisSchedule::for_combined_with_features(
             &manifests,
             &["default"],
             &[candidate("app", &["default"])],
             &typed,
             &doctests,
+            None,
         )
         .expect("combined schedule");
 
@@ -1553,22 +1512,34 @@ mod tests {
     #[test]
     fn combined_schedule_rejects_unknown_or_untyped_doctest_packages() {
         let manifests = [manifest("app", "app")];
-        AnalysisSchedule::for_combined(
+        let unknown_package = AnalysisSchedule::for_combined_with_features(
             &manifests,
             &["default"],
             &[],
             &BTreeSet::from(["unknown".to_string()]),
             &BTreeSet::new(),
+            None,
         )
         .unwrap_err();
-        AnalysisSchedule::for_combined(
+        assert!(
+            unknown_package
+                .to_string()
+                .contains("unknown workspace package 'unknown'")
+        );
+        let untyped_doctest = AnalysisSchedule::for_combined_with_features(
             &manifests,
             &["default"],
             &[],
             &BTreeSet::new(),
             &BTreeSet::from(["app".to_string()]),
+            None,
         )
         .unwrap_err();
+        assert!(
+            untyped_doctest
+                .to_string()
+                .contains("does not request typed ordinary-target facts")
+        );
     }
 
     #[test]
@@ -1652,10 +1623,13 @@ mod tests {
 
     #[test]
     fn schedule_rejects_a_candidate_outside_the_configured_target_matrix() {
-        let error = AnalysisSchedule::for_diagnostics(
+        let error = AnalysisSchedule::for_combined_with_features(
             &[manifest("app", "app")],
             &["default"],
             &[candidate("app", &["aarch64-unknown-linux-gnu"])],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            None,
         )
         .expect_err("unconfigured target must fail");
         assert!(error.to_string().contains("unconfigured target"), "{error}");
@@ -1671,13 +1645,22 @@ mod tests {
         development.kind = DepKind::Dev;
         let left_candidates = [normal.clone(), development.clone(), normal.clone()];
         let right_candidates = [development, normal];
-        let left_schedule =
-            AnalysisSchedule::for_diagnostics(&[manifest("app", "first/root/app")], &targets, &left_candidates)
-                .expect("left schedule");
-        let right_schedule = AnalysisSchedule::for_diagnostics(
+        let left_schedule = AnalysisSchedule::for_combined_with_features(
+            &[manifest("app", "first/root/app")],
+            &targets,
+            &left_candidates,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            None,
+        )
+        .expect("left schedule");
+        let right_schedule = AnalysisSchedule::for_combined_with_features(
             &[manifest("app", "another/root/app")],
             &[targets[1], targets[0]],
             &right_candidates,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            None,
         )
         .expect("right schedule");
 
@@ -1698,12 +1681,13 @@ mod tests {
     #[test]
     fn acquisition_plan_emits_exact_argv_and_binds_fact_identity_to_its_root() {
         let typed_packages = BTreeSet::from(["app".to_string()]);
-        let schedule = AnalysisSchedule::for_combined(
+        let schedule = AnalysisSchedule::for_combined_with_features(
             &[manifest("app", "app")],
             &["default"],
             &[],
             &typed_packages,
             &BTreeSet::new(),
+            None,
         )
         .expect("schedule");
         let plan = CompilerAcquisitionPlan::from_schedule(&schedule, &[], &["default"]).expect("plan");
@@ -1756,16 +1740,21 @@ mod tests {
 
     #[test]
     fn acquisition_plan_validation_rejects_corrupt_indices_and_order() {
-        let schedule = AnalysisSchedule::for_diagnostics(
+        let schedule = AnalysisSchedule::for_combined_with_features(
             &[manifest("app", "app")],
             &["default"],
             &[candidate("app", &["default"])],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            None,
         )
         .expect("schedule");
         let plan = CompilerAcquisitionPlan::from_schedule(&schedule, &[candidate("app", &["default"])], &["default"])
             .expect("plan");
 
-        let mut out_of_range = plan.clone();
+        let mut out_of_range =
+            CompilerAcquisitionPlan::from_schedule(&schedule, &[candidate("app", &["default"])], &["default"])
+                .expect("independent plan");
         out_of_range.views.last_mut().expect("non-empty plan").target = TargetIx(u32::MAX);
         let error = out_of_range.validate().expect_err("out-of-range target must fail");
         assert!(
@@ -1794,10 +1783,13 @@ mod tests {
 
     #[test]
     fn acquisition_plan_priority_preserves_membership_and_cheap_failure_order() {
-        let schedule = AnalysisSchedule::for_diagnostics(
+        let schedule = AnalysisSchedule::for_combined_with_features(
             &[manifest("app", "app")],
             &["default"],
             &[candidate("app", &["default"])],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            None,
         )
         .expect("schedule");
         let plan = CompilerAcquisitionPlan::from_schedule(&schedule, &[candidate("app", &["default"])], &["default"])
@@ -1829,9 +1821,15 @@ mod tests {
     #[test]
     fn acquisition_plan_rejects_candidates_outside_its_compiler_targets() {
         let typed = BTreeSet::from(["app".to_string()]);
-        let schedule =
-            AnalysisSchedule::for_combined(&[manifest("app", "app")], &["default"], &[], &typed, &BTreeSet::new())
-                .expect("typed schedule");
+        let schedule = AnalysisSchedule::for_combined_with_features(
+            &[manifest("app", "app")],
+            &["default"],
+            &[],
+            &typed,
+            &BTreeSet::new(),
+            None,
+        )
+        .expect("typed schedule");
         let error = CompilerAcquisitionPlan::from_schedule(
             &schedule,
             &[candidate("app", &["aarch64-unknown-linux-gnu"])],

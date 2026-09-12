@@ -321,9 +321,10 @@ impl ManifestWriter {
         // Handle target-specific vs regular sections
         let dep_item = if let Some(target_cfg) = target {
             // Target-specific: look in [target.'cfg(...)'.dependencies]
-            let path = format!("target.{}.{}", target_cfg, kind_section);
-            let table = manifest_ops::get_or_create_table(&mut doc, &path)?;
-            table.get_mut(dep_name)
+            doc.get_mut("target")
+                .and_then(|item| item.get_mut(target_cfg))
+                .and_then(|item| item.get_mut(kind_section))
+                .and_then(|item| item.get_mut(dep_name))
         } else {
             // Regular section
             doc.get_mut(kind_section)
@@ -372,5 +373,53 @@ impl ManifestWriter {
         manifest_ops::write_toml_file(member_toml_path, &doc)?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_features_uses_literal_target_key_and_preserves_other_dependencies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Cargo.toml");
+        std::fs::write(
+            &path,
+            r#"[target.'thumbv8m.main-none-eabi'.dependencies]
+serde = "1.0"
+keep = "2.0"
+[target.'cfg(unix)'.dependencies]
+serde = "3.0"
+"#,
+        )
+        .unwrap();
+        ManifestWriter::new()
+            .add_features(
+                &path,
+                "serde",
+                DepKind::Normal,
+                Some("thumbv8m.main-none-eabi"),
+                &["derive"],
+            )
+            .unwrap();
+        let doc: toml_edit::DocumentMut = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        let deps = &doc["target"]["thumbv8m.main-none-eabi"]["dependencies"];
+        assert_eq!(deps["serde"]["version"].as_str(), Some("1.0"));
+        assert_eq!(
+            deps["serde"]["features"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["derive"]
+        );
+        assert_eq!(deps["keep"].as_str(), Some("2.0"));
+        assert_eq!(
+            doc["target"]["cfg(unix)"]["dependencies"]["serde"].as_str(),
+            Some("3.0")
+        );
+        assert_eq!(doc["target"].as_table().unwrap().len(), 2);
     }
 }
