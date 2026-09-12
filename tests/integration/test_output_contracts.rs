@@ -1,7 +1,7 @@
 //! Integration tests for command-specific output format contracts.
 
 use crate::helpers::{TestWorkspace, cargo_rail_command, isolated_cargo_rail_command, run_cargo_rail};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::process::Stdio;
 
 #[test]
@@ -377,19 +377,27 @@ fn test_clean_text_uses_iec_units_and_verbose_owns_paths() {
 }
 
 #[test]
-fn test_root_help_groups_tasks_and_global_options() {
+fn test_root_help_exposes_starting_commands_and_global_options() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("root-help-groups")?;
         let output = run_cargo_rail(&ws.path, &["rail", "--help"])?;
         assert!(output.status.success());
         let help = String::from_utf8(output.stdout)?;
-        for heading in [
-            "Common inspection:",
-            "Workspace mutation:",
-            "Advanced and external operations:",
-            "Global Options:",
-        ] {
-            assert!(help.contains(heading), "missing {heading}: {help}");
+        let (introduction, commands) = help.split_once("Commands:").context("missing command list")?;
+        for command in ["cargo rail init", "cargo rail plan", "cargo rail unify --check"] {
+            assert!(
+                introduction.contains(command),
+                "missing starting command {command}: {help}"
+            );
+        }
+        let (_, global_options) = commands
+            .split_once("Global Options:")
+            .context("missing global options")?;
+        for option in ["--quiet", "--verbose", "--json", "--config", "--workspace-root"] {
+            assert!(
+                global_options.contains(option),
+                "missing global option {option}: {help}"
+            );
         }
         Ok(())
     })();

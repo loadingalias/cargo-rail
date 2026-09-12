@@ -2,7 +2,8 @@
 
 ## Supported releases
 
-Security fixes target the latest Cargo-Rail release. Report a vulnerability even if you found it in an older release;
+Security fixes target the latest Cargo-Rail release.
+Report a vulnerability even if you found it in an older release;
 include every version or commit you tested.
 
 ## Report a vulnerability privately
@@ -18,5 +19,10 @@ Include:
 - the smallest reliable reproduction or proof of concept; and
 - known mitigations or a suggested fix, if available.
 
-If GitHub Security Advisories are unavailable, email `thealiaslab@gmail.com` with the same information. Keep the report
-private until a fix is released or a disclosure timeline is agreed.
+Remove credentials, private source, and unrelated environment values from attached logs.
+For cache or installation reports, include the relevant hit, miss, bypass,
+or verification failure and whether the issue involves local storage, a remote provider,
+or a distributed worker.
+
+If GitHub Security Advisories are unavailable, email `thealiaslab@gmail.com` with the same information.
+Keep the report private until a fix is released or a disclosure timeline is agreed.

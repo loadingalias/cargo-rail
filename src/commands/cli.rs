@@ -15,43 +15,26 @@ use clap_complete::Shell;
 use std::path::PathBuf;
 
 const MAIN_HELP: &str = "\
-Cargo-Rail turns one captured Rust workspace into trustworthy plans, checks, mutations, releases, and compiler reuse.
+Plan workspace work, check dependencies and visibility, and manage releases and compiler reuse.
 
-Common inspection:
-  cargo rail plan                         # Decide required repository work
-  cargo rail surface --check              # Check Rust visibility findings
-  cargo rail config explain               # Show configured policy overrides
-  cargo rail cache status                 # Inspect compiler-cache health
-
-Workspace mutation:
-  cargo rail init                         # Create sparse repository policy
-  cargo rail unify apply                  # Apply dependency coherence edits
-  cargo rail change add --help            # Record release intent
-  cargo rail clean --help                 # Select owned artifacts to remove
-
-Advanced and external operations:
-  cargo rail split --help                 # Extract a crate with Git history
-  cargo rail sync --help                  # Synchronize split repositories
-  cargo rail release --help               # Prepare or publish exact-SHA releases
-  cargo rail doctor --help                # Inspect compiler integration
+Start here:
+  cargo rail init             # Create repository policy
+  cargo rail plan             # Decide required work
+  cargo rail unify --check    # Check dependency changes
 
 Docs: https://github.com/loadingalias/cargo-rail";
 
-/// Main CLI structure for cargo-rail
-///
-/// Contains global options and the subcommand to execute.
+/// Global options and the selected Cargo-Rail command.
 #[derive(Debug, Parser)]
 #[command(name = "cargo-rail")]
 #[command(bin_name = "cargo-rail")]
 #[command(version)]
-#[command(
-    about = "Turn one captured Rust workspace into trustworthy plans, checks, mutations, releases, and compiler reuse"
-)]
+#[command(about = "Plan workspace work, check dependencies and visibility, and manage releases and compiler reuse")]
 #[command(long_about = MAIN_HELP)]
 #[command(propagate_version = true)]
 #[command(styles = get_styles())]
 pub struct RailCli {
-    /// Suppress progress messages (for CI/automation)
+    /// Suppress progress messages
     #[arg(
         long,
         short,
@@ -61,7 +44,7 @@ pub struct RailCli {
     )]
     pub quiet: bool,
 
-    /// Show bounded operational detail
+    /// Show additional operational detail
     #[arg(
         long,
         short = 'v',
@@ -93,146 +76,104 @@ pub struct RailCli {
 }
 
 const PLAN_HELP: &str = "\
-Compare source:
-  cargo rail plan                           # Changes since the default-branch merge base
-  cargo rail plan --since HEAD~5            # Changes in last 5 commits
-  cargo rail plan --from abc --to def       # Changes between two SHAs
-  cargo rail plan --all                     # Require every registered work item
+Without comparison flags, use changes since the default-branch merge base.
 
-Inspect or transfer the contract:
-  cargo rail plan --explain                 # Explain required decisions
-  cargo rail plan --explain-work cargo.test # Explain one decision, even when skipped
-  cargo rail plan --evidence inputs.json    # Use compatible observed-input evidence
-  cargo rail plan --verify plan.json        # Revalidate a saved plan without executing it
-  cargo rail plan --verify -                # Revalidate a saved plan read from standard input
-  cargo rail plan --json > plan.json        # Redirect the exact plan to a file";
+  cargo rail plan --from abc --to def        # Compare two commits
+  cargo rail plan --explain-work cargo.test  # Explain one decision, even when skipped
+  cargo rail plan --json > plan.json         # Save the exact plan
+  cargo rail plan --verify plan.json         # Verify checkout binding without execution
+
+Use --verify - to read the saved plan from standard input.";
 
 const SURFACE_HELP: &str = "\
 Set `[surface] enabled = true` to include this gate in planner-selected CI.
-Set `[surface] consumer_scope = \"workspace\"` only when each closed compiler
-crate has no consumers outside the captured workspace.
+Use `consumer_scope = \"workspace\"` only when each closed compiler crate has no
+consumers outside the captured workspace.
 
-Inspect:
-  cargo rail surface                        # Inspect and report without modifying source
-  cargo rail surface --prepare              # Prove exact-toolchain producer readiness
-  cargo rail surface --check --explain      # Inspect complete Rust reachability
-  cargo rail surface --check --json         # Emit the versioned machine contract
-
-Resume or fix:
-  cargo rail surface --resume MANIFEST --json  # Resume a partial compiler acquisition
-  cargo rail surface --fix --dry-run --explain  # Preview exact visibility edits
-  cargo rail surface --fix --backup         # Apply verified edits with recovery evidence";
+  cargo rail surface --check --explain        # Check without modifying source
+  cargo rail surface --fix --dry-run          # Preview visibility edits
+  cargo rail surface --fix --backup           # Apply with recovery evidence
+  cargo rail surface --resume MANIFEST --json # Resume partial compiler acquisition";
 
 const UNIFY_HELP: &str = "\
-Inspect:
-  cargo rail unify                        # Preview dependency changes (exit 0)
-  cargo rail unify --check                # Check for pending changes (exit 1)
-  cargo rail unify --explain              # Show why each decision was made
-  cargo rail unify --show-diff            # Show manifest changes
+Without a subcommand, preview dependency changes without modifying manifests.
+Use --check to exit 1 when changes are pending.
 
-Apply or restore:
-  cargo rail unify apply                  # Apply the current decision
-  cargo rail unify apply --backup         # Apply with backup
-  cargo rail unify undo --list            # Inspect available backups";
+  cargo rail unify --show-diff     # Inspect manifest changes
+  cargo rail unify apply --backup # Apply with a backup
+  cargo rail unify undo --list    # Find a backup to restore";
 
 const SPLIT_HELP: &str = "\
-Split extracts crates to standalone repositories while preserving Git history.
-Run `cargo rail split run --check` before granting mutation authority.
+Extract crates to standalone repositories while preserving Git history.
 
-Examples:
-  cargo rail split init my-crate          # Configure split for my-crate
-  cargo rail split init my-crate --dry-run  # Preview generated config
-  cargo rail split run my-crate --check   # Check for a pending split (exit 1)
-  cargo rail split run my-crate           # Execute the split
-  cargo rail split run --all              # Split all configured crates";
+  cargo rail split init my-crate --dry-run # Preview configuration
+  cargo rail split run my-crate --check   # Check for pending changes (exit 1)
+  cargo rail split run my-crate           # Apply the split";
 
 const SYNC_HELP: &str = "\
-Sync requires an existing split configuration. Check mode reports the pending
-direction and exact mutation without changing either repository.
+Requires split configuration. Check mode reports pending changes without
+modifying either repository. Apply is bidirectional unless a direction is selected.
 
-Examples:
-  cargo rail sync my-crate                # Bidirectional sync
-  cargo rail sync my-crate --to-remote    # Push monorepo -> split repo
-  cargo rail sync my-crate --from-remote  # Pull split repo -> monorepo (PR branch)
-  cargo rail sync my-crate --to-remote --yes  # Non-interactive apply confirmation
-  cargo rail sync --all                   # Sync all configured crates";
+  cargo rail sync my-crate --check       # Inspect pending work (exit 1)
+  cargo rail sync my-crate --to-remote   # Push monorepo changes to the split repo
+  cargo rail sync my-crate --from-remote # Bring remote changes to a review branch
+
+Use --resume RECEIPT after resolving a recorded conflict.";
 
 const RELEASE_HELP: &str = "\
-Examples:
-  cargo rail release init my-crate --dry-run       # Preview release configuration
-  cargo rail release check --all --publication     # Validate publication authority
-  cargo rail release run my-crate --bump minor     # Execute one local release transaction
-  cargo rail release run --all --publish --wait --yes  # Publish and wait for exact-SHA checks
-  cargo rail release status --history              # Inspect current and terminal transactions";
+Publication requires explicit --publish authority. Interrupted transactions
+retain a state path for `release resume`; `release status` shows recovery actions.
+
+  cargo rail release check --all --publication # Validate publication authority
+  cargo rail release run my-crate --bump minor # Execute a release transaction
+  cargo rail release run --all --publish --wait --yes # Publish after exact-SHA checks";
 
 const CHANGE_HELP: &str = "\
-Record intent:
-  cargo rail change add rail-core --bump minor --message \"Added auto bump planning\"
-  cargo rail change add rail-core rail-cli --bump patch --message \"Fixed release notes\"
-  cargo rail change add rail-core --bump patch --name fix-parser
-
-Inspect intent:
-  cargo rail change status
+Record a user-facing entry and its release intent:
+  cargo rail change add my-crate --bump patch --message \"Fixed release notes\"
   cargo rail change check --merge-base
 
-Omit --message in an interactive terminal to author in $VISUAL or $EDITOR.
-Change files are consumed (deleted in the release commit) when released.
-Consumption is all-or-nothing: a release plan that covers only some of a
-file's crates is rejected so no pending intent is ever lost.";
+Omit --message in a terminal to use $VISUAL or $EDITOR.
+Release deletes consumed files in its commit. A plan covering only some of a
+file's crates is rejected; pending intent is never partially consumed.";
 
 const INIT_HELP: &str = "\
-Examples:
-  cargo rail init                       # Generate .config/rail.toml
-  cargo rail init --dry-run             # Preview generated config
-  cargo rail init --target wasm32-wasip1 # Declare one supported target
-  cargo rail init --detect-targets       # Opt in to repository target detection
-  cargo rail init --force               # Overwrite existing config";
+By default, write .config/rail.toml. Target detection requires --detect-targets;
+use repeated --target flags to select targets explicitly.
+
+  cargo rail init --dry-run             # Preview policy
+  cargo rail init --target wasm32-wasip1 # Declare a target";
 
 const CLEAN_HELP: &str = "\
-Examples:
-  cargo rail clean --all                # Clean every eligible current-workspace artifact
-  cargo rail clean --cache --check      # Preview current-workspace cache cleanup
-  cargo rail clean --prune-backups      # Prune backups beyond configured retention
-  cargo rail clean --reports            # Clean generated reports
-  cargo rail clean --release-journal ID # Delete one terminal release journal";
+Select an artifact class explicitly. --all covers eligible workspace artifacts;
+--release-journal selects one terminal transaction by ID or state path.
+
+  cargo rail clean --all --check         # Preview workspace cleanup (exit 1 if pending)
+  cargo rail clean --release-journal ID  # Delete one terminal journal";
 
 const CACHE_HELP: &str = "\
-Remote URLs, credentials, provider environments, and distributed execution are machine-owned authority. Use setup
-flags only after qualification has established the required trust domain, root portability, and worker identity.
+Cache setup enrolls this workspace for ordinary Cargo commands.
+Remote storage and distributed workers require explicit machine-owned authority;
+repository policy cannot enable them.
 
-Set up and inspect:
-  cargo rail cache setup --check                  # Preview transparent compiler reuse setup
-  cargo rail cache setup                          # Install or repair the Cargo wrapper
-  cargo rail cache setup --remote URL --root-portability remap  # Configure cross-root L2 reuse
-  cargo rail cache status                         # Inspect workspace and selected-profile cache state
-  cargo rail cache probe --json                   # Verify persisted remote authority
+  cargo rail cache setup --check               # Preview enrollment
+  cargo rail cache setup                       # Install or repair the wrapper
+  cargo rail cache clean --scope local --check # Preview selected-profile cleanup
 
-Reclaim state:
-  cargo rail cache clean --scope workspace --check  # Preview workspace cache reclamation
-  cargo rail cache clean --scope local --check    # Preview selected-profile CAS reclamation
-  cargo rail cache profiles                       # Inspect every installed workspace profile
-  cargo rail cache detach --check                 # Preview detaching the current workspace
-  cargo rail cache uninstall --check              # Preview global wrapper removal";
+Detach preserves the profile and CAS. Uninstall removes the global wrapper while
+preserving all profiles and their CAS data.";
 
 const CONFIG_HELP: &str = "\
-Inspect:
-  cargo rail config locate              # Show which config file is active
-  cargo rail config print               # Show effective config with defaults
-  cargo rail config validate            # Validate rail.toml
-  cargo rail config explain             # Explain effective values and sources
-  cargo rail config explain --all       # Explain the complete field inventory
+Bare `cargo rail config` explains configured overrides. Unknown fields and retired
+configuration spellings are rejected.
 
-Bare `cargo rail config` explains configured overrides. Supported older spellings
-are interpreted automatically without editing the file.";
+  cargo rail config explain --all # Inspect all effective values and sources
+  cargo rail config print         # Emit reusable effective configuration
+  cargo rail config validate      # Check configuration";
 
 const COMPLETIONS_HELP: &str = "\
-Examples:
-  cargo rail completions bash           # Output bash completions
-  cargo rail completions zsh            # Output zsh completions
-  cargo rail completions fish           # Output fish completions
-  cargo rail completions powershell     # Output PowerShell completions
+Add the matching command to your shell startup file:
 
-Installation:
   # Bash (~/.bashrc)
   eval \"$(cargo rail completions bash)\"
 
@@ -242,7 +183,7 @@ Installation:
   # Fish (~/.config/fish/config.fish)
   cargo rail completions fish | source
 
-  # PowerShell
+  # PowerShell ($PROFILE)
   cargo rail completions powershell | Out-String | Invoke-Expression";
 
 /// Available subcommands
@@ -266,7 +207,7 @@ pub enum Commands {
     /// Build an evidence-backed named-work plan
     #[command(after_long_help = PLAN_HELP)]
     Plan {
-        /// Git ref to compare against (auto-detects default branch)
+        /// Compare against this Git ref (default: default-branch merge base)
         #[arg(long)]
         since: Option<String>,
         /// Start ref (for SHA pair mode)
@@ -278,7 +219,7 @@ pub enum Commands {
         /// Machine output selected by the global --json flag
         #[arg(skip)]
         json: bool,
-        /// Show concise human reasoning chain
+        /// Explain required work decisions
         #[arg(long)]
         explain: bool,
         /// Explain one exact work decision, including when it was skipped
@@ -287,7 +228,7 @@ pub enum Commands {
         /// Require every registered work item with full valid scope
         #[arg(long)]
         all: bool,
-        /// Load portable compatible observed-input evidence
+        /// Load compatible observed-input evidence from a file
         #[arg(long, value_name = "PATH")]
         evidence: Option<PathBuf>,
         /// Verify that the current checkout matches one saved plan; use `-` for standard input
@@ -302,7 +243,7 @@ pub enum Commands {
         schema: bool,
     },
 
-    /// Analyze and repair complete Rust declaration reachability and visibility
+    /// Analyze declaration reachability and repair visibility
     #[command(after_long_help = SURFACE_HELP)]
     Surface {
         /// Prepare and authenticate the exact-toolchain Surface producer without analysis
@@ -311,7 +252,7 @@ pub enum Commands {
             conflicts_with_all = ["check", "fix", "dry_run", "backup", "explain", "only", "schema"]
         )]
         prepare: bool,
-        /// Fail on denied findings without modifying source (for CI)
+        /// Fail on denied findings without modifying source
         #[arg(long, conflicts_with = "fix")]
         check: bool,
         /// Apply exact visibility reductions
@@ -324,7 +265,7 @@ pub enum Commands {
             conflicts_with_all = ["prepare", "fix", "dry_run", "backup", "schema"]
         )]
         resume: Option<PathBuf>,
-        /// Render the exact mutation plan without writing
+        /// Preview visibility edits without modifying source
         #[arg(long, requires = "fix", conflicts_with = "backup")]
         dry_run: bool,
         /// Create a bounded backup before applying visibility edits
@@ -339,7 +280,7 @@ pub enum Commands {
         /// Show the reason chain for every finding
         #[arg(long)]
         explain: bool,
-        /// Restrict reported findings to one or more exact lint classes
+        /// Restrict findings and fixes to these lint classes
         #[arg(
             long,
             value_name = "LINT",
@@ -375,7 +316,7 @@ pub enum Commands {
         /// Generate the dependency report
         #[arg(long)]
         report: bool,
-        /// Durable report destination
+        /// Path for the dependency report
         #[arg(long, value_name = "PATH", requires = "report")]
         report_path: Option<PathBuf>,
         /// Write output to file (overwrites existing content)
@@ -384,7 +325,7 @@ pub enum Commands {
         /// Show diff of changes to each manifest
         #[arg(long)]
         show_diff: bool,
-        /// Explain why each decision was made
+        /// Explain each dependency decision
         #[arg(long)]
         explain: bool,
     },
@@ -451,10 +392,10 @@ pub enum Commands {
       conflicts_with_all = ["crate_name", "all", "remote", "from_remote", "to_remote", "check", "plan"]
     )]
         resume: Option<PathBuf>,
-        /// Allow running on dirty worktree (uncommitted changes)
+        /// Allow uncommitted worktree changes
         #[arg(long)]
         allow_dirty: bool,
-        /// Skip confirmation prompts (for CI/automation)
+        /// Skip confirmation prompts
         #[arg(short = 'y', long)]
         yes: bool,
         /// Output format
@@ -610,7 +551,7 @@ pub struct CacheSetupArgs {
     /// Local cache base directory (defaults to Cargo home).
     #[arg(long, value_name = "PATH")]
     pub local_dir: Option<PathBuf>,
-    /// Positive binary byte size such as 10GiB.
+    /// Maximum local cache size; use a positive integer with B, KiB, MiB, GiB, or TiB.
     #[arg(long, value_name = "SIZE", value_parser = parse_cache_size)]
     pub max_size: Option<u64>,
     /// Machine-owned remote cache URL to persist with this workspace profile.
@@ -622,7 +563,7 @@ pub struct CacheSetupArgs {
     /// Additional reviewed compiler environment name admitted to L2 identity.
     #[arg(long = "remote-environment", value_name = "NAME", requires = "remote")]
     pub remote_environment: Vec<String>,
-    /// Cross-checkout authority: physical roots remain exact; remap qualifies portable L2 results.
+    /// Root identity mode: physical binds exact paths; remap permits eligible cross-root reuse.
     #[arg(long, value_name = "MODE", value_parser = ["physical", "remap"])]
     pub root_portability: Option<String>,
     /// Remove persisted remote activation while preserving local reuse.
@@ -694,7 +635,7 @@ pub enum CacheCommand {
         #[arg(long, short = 'f', default_value_t, value_enum)]
         format: TextJsonOutputFormat,
     },
-    /// (Advanced) Validate and normalize one machine-owned remote cache URL without network access.
+    /// Validate and normalize a remote cache URL without network access.
     Normalize {
         /// AWS S3, Azure Blob Storage, or Cloudflare R2 URL.
         #[arg(value_name = "URL")]
@@ -817,7 +758,7 @@ fn parse_cache_size(value: &str) -> Result<u64, String> {
 pub enum ConfigCommand {
     /// Print the path to the active config file
     ///
-    /// Shows which config file is being used. Searches in order:
+    /// Without --config, searches in order:
     /// rail.toml, .rail.toml, .cargo/rail.toml, .config/rail.toml
     Locate {
         /// Output format
@@ -826,8 +767,7 @@ pub enum ConfigCommand {
     },
     /// Print canonical effective configuration with defaults
     ///
-    /// Shows the merged repository policy: user settings plus defaults for
-    /// any unset fields. Text output is reusable `rail.toml` input.
+    /// Text output is reusable `rail.toml` input.
     Print {
         /// Output format
         #[arg(long, short = 'f', default_value_t, value_enum)]
@@ -835,9 +775,8 @@ pub enum ConfigCommand {
     },
     /// Validate the configuration file
     ///
-    /// Checks for parse errors, unknown keys, and semantic issues.
-    /// Unknown keys always fail. Semantic warnings become errors in CI
-    /// unless --no-strict is selected. Supported older spellings never warn.
+    /// Parse errors and unknown keys always fail. Semantic warnings become errors
+    /// in CI unless --no-strict is selected.
     Validate {
         /// Output format
         #[arg(long, short = 'f', default_value_t, value_enum)]
@@ -877,7 +816,7 @@ pub enum UnifyCommand {
         /// Generate the dependency report
         #[arg(long)]
         report: bool,
-        /// Durable report destination
+        /// Path for the dependency report
         #[arg(long, value_name = "PATH", requires = "report")]
         report_path: Option<PathBuf>,
         /// Output format
@@ -907,7 +846,7 @@ pub enum UnifyCommand {
 /// Subcommands for `cargo rail split`
 #[derive(Debug, Subcommand)]
 pub enum SplitCommand {
-    /// Configure split for crate(s)
+    /// Configure crate splits
     Init {
         /// Crate name(s) to configure
         #[arg(value_name = "CRATE")]
@@ -916,7 +855,7 @@ pub enum SplitCommand {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Execute split operation
+    /// Extract the selected crates and their Git history
     Run {
         /// Crate name to split (mutually exclusive with --all)
         #[arg(conflicts_with = "all", value_name = "CRATE")]
@@ -933,10 +872,10 @@ pub enum SplitCommand {
         /// Apply from a previously generated mutation plan file
         #[arg(long, value_name = "PATH", conflicts_with = "check")]
         plan: Option<PathBuf>,
-        /// Allow running on dirty worktree (uncommitted changes)
+        /// Allow uncommitted worktree changes
         #[arg(long)]
         allow_dirty: bool,
-        /// Skip confirmation prompts (for CI/automation)
+        /// Skip confirmation prompts
         #[arg(short = 'y', long)]
         yes: bool,
         /// Output format
@@ -965,13 +904,13 @@ pub enum ReleaseCommand {
         /// Release all workspace crates
         #[arg(short, long)]
         all: bool,
-        /// Version bump [auto, major, minor, patch, prerelease, release, or "x.y.z"]
+        /// Version bump: auto, major, minor, patch, prerelease, release, or x.y.z
         #[arg(long, default_value = "auto")]
         bump: String,
         /// Apply from a previously generated mutation plan file
         #[arg(long, value_name = "PATH")]
         plan: Option<PathBuf>,
-        /// Positively authorize irreversible publication to crates.io
+        /// Authorize irreversible publication to crates.io
         #[arg(long, conflicts_with = "pr")]
         publish: bool,
         /// Skip git tag creation
@@ -1004,7 +943,7 @@ pub enum ReleaseCommand {
         /// Check all workspace crates (mutually exclusive with crate names)
         #[arg(short, long)]
         all: bool,
-        /// Version bump [auto, major, minor, patch, prerelease, release, or "x.y.z"]
+        /// Version bump: auto, major, minor, patch, prerelease, release, or x.y.z
         #[arg(long, default_value = "auto")]
         bump: String,
         /// Validate publication authority for the same release plan
@@ -1031,7 +970,7 @@ pub enum ReleaseCommand {
         /// Finalize all workspace crates with release notes for their current versions
         #[arg(short, long)]
         all: bool,
-        /// Positively authorize irreversible publication to crates.io
+        /// Authorize irreversible publication to crates.io
         #[arg(long)]
         publish: bool,
         /// Skip git tag creation

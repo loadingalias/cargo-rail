@@ -1,0 +1,56 @@
+[global]
+line-length = 100
+cache-dir = ".cache/rumdl"
+extend-enable = ["MD060", "MD070", "MD073", "MD080", "MD082", "MD084"]
+exclude = []
+
+[MD003]
+style = "atx"
+
+[MD004]
+style = "dash"
+
+[MD013]
+code-blocks = false
+code-spans = false
+math-blocks = false
+reflow = true
+reflow-mode = "semantic-line-breaks"
+reflow-length-exemptions = true
+
+[MD029]
+style = "one"
+
+[MD035]
+style = "---"
+
+[MD040]
+style = "consistent"
+preferred-aliases = { Shell = "bash" }
+unknown-language-action = "error"
+
+[MD046]
+style = "fenced"
+
+[MD048]
+style = "backtick"
+
+[MD049]
+style = "asterisk"
+
+[MD050]
+style = "asterisk"
+
+[MD051]
+ignore-case = false
+
+[MD055]
+style = "leading-and-trailing"
+
+[MD060]
+style = "aligned"
+max-width = 100
+loose-last-column = true
+
+[MD082]
+allow-parent-headings = true

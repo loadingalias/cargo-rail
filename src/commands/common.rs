@@ -662,10 +662,10 @@ pub(crate) fn publication_authority_json(snapshot: Option<&TargetPublicationSnap
 /// Output format for commands that support only human text and JSON.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum TextJsonOutputFormat {
-    /// Human-readable text output (default)
+    /// Human-readable text
     #[default]
     Text,
-    /// Machine-readable JSON output
+    /// JSON
     Json,
 }
 
@@ -684,10 +684,10 @@ impl TextJsonOutputFormat {
 /// Output format for `cargo rail split run`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum SplitOutputFormat {
-    /// Human-readable text output (default)
+    /// Human-readable text
     #[default]
     Text,
-    /// Machine-readable JSON output
+    /// JSON
     Json,
     /// Names only, one per line
     #[value(name = "names-only")]
@@ -712,10 +712,10 @@ impl SplitOutputFormat {
 /// Output format for `cargo rail change`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum ChangeOutputFormat {
-    /// Human-readable text output (default)
+    /// Human-readable text
     #[default]
     Text,
-    /// Machine-readable JSON output
+    /// JSON
     Json,
     /// Names only, one per line
     #[value(name = "names-only")]
@@ -740,10 +740,10 @@ impl ChangeOutputFormat {
 /// it does not produce list-like formats (cargo-args, github, jsonl, etc.).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum UnifyOutputFormat {
-    /// Human-readable text output (default)
+    /// Human-readable text
     #[default]
     Text,
-    /// Machine-readable JSON output
+    /// JSON
     Json,
 }
 
@@ -762,10 +762,10 @@ impl UnifyOutputFormat {
 /// Output format for `cargo rail surface`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum SurfaceOutputFormat {
-    /// Human-readable text output (default)
+    /// Human-readable text
     #[default]
     Text,
-    /// Machine-readable JSON output
+    /// JSON
     Json,
     /// GitHub Actions key/value output
     #[value(name = "github")]

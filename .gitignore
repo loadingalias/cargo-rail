@@ -16,9 +16,4 @@ AGENTS.md
 *.key
 
 # Personal
-notes/
 docs/tasks/
-docs/content/
-.ropeproject/
-docs/integration-contrib/
-.rumdl_cache/

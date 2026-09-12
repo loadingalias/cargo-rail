@@ -37,13 +37,13 @@ pub(super) enum Scenario {
 
 #[derive(Debug, Args)]
 pub(super) struct Options {
-    /// New private result directory; defaults to a retained temporary directory.
+    /// New result directory; parent must exist. Defaults to a retained temporary directory.
     #[arg(long)]
     output: Option<PathBuf>,
-    /// Samples per tool and scenario. One sample checks orchestration, not variability.
+    /// Samples per tool and scenario (1–100). One sample cannot measure variability.
     #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..=100))]
     runs: u32,
-    /// Fixed local scenarios to execute.
+    /// Scenarios to run (comma-separated).
     #[arg(
         long,
         value_enum,
@@ -51,7 +51,7 @@ pub(super) struct Options {
         default_value = "cold,rebuild,freshness,source-edit"
     )]
     scenario: Vec<Scenario>,
-    /// Disable incremental compilation equally for all tools; ordinary dev builds are the default.
+    /// Disable incremental compilation for every tool.
     #[arg(long)]
     non_incremental: bool,
     /// Exercise one sample per case without making a performance comparison.

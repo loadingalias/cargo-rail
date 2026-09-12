@@ -24,9 +24,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Operation {
-    /// Compare local caches; retain every sample and correctness check.
+    /// Compare local caches on Unix; retain samples and correctness evidence.
     Local(local::Options),
-    /// Materialize the bundled workload and prefetch its locked dependencies; does not measure performance.
+    /// Prepare the bundled workload and prefetch locked dependencies without timing.
     Prepare {
         /// New workspace directory; its parent must exist.
         #[arg(long)]

@@ -2,5 +2,7 @@
 "cargo-rail" = "minor"
 ---
 
-Permit native compiler caching on Linux RISC-V 64, IBM Z, and IBM POWER hosts while preserving the native-target-only
-bypass and exact platform, compiler, and sysroot identity.
+Enable compiler caching on Linux RISC-V 64, IBM Z, and little-endian IBM POWER hosts,
+with verified platform, compiler, and sysroot identity.
+IBM Z and POWER runtime qualification remains deferred pending runner access;
+eligibility alone is not proof of native validation.

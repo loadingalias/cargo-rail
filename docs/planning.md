@@ -1,15 +1,16 @@
 # Planning
 
-`cargo rail plan` decides which registered work is required and emits the exact scope for each required item. It does
-not execute repository commands. Cargo, nextest, Just, scripts, and CI retain execution semantics.
+`cargo rail plan` decides which registered work is required and emits the exact scope for each required item.
+It does not execute repository commands.
+Cargo, nextest, Just, scripts, and CI retain execution semantics.
 
-A successful plan exits `0` whether work is required or skipped. Invalid arguments, incompatible contracts, and
-operational failures exit `2`.
+A successful plan exits `0` whether work is required or skipped.
+Invalid arguments, incompatible contracts, and operational failures exit `2`.
 
 ## Compare source states
 
-By default, Cargo-Rail compares the default branch's merge base with the captured index, worktree, and untracked
-files:
+By default, Cargo-Rail compares the default branch's merge base with the captured index, worktree,
+and untracked files:
 
 ```bash
 cargo rail plan
@@ -17,19 +18,22 @@ cargo rail plan --explain
 cargo rail plan --json > plan.json
 ```
 
-Use `--since <REF>` for an exact base. Use `--from <REF> --to <REF>` for an exact Git-object comparison that ignores
-the live worktree. `--all` is the only normal override; it requires every registered item and never narrows work.
+Use `--since <REF>` for an exact base.
+Use `--from <REF> --to <REF>` for an exact Git-object comparison that ignores the live worktree.
+`--all` is the only normal override; it requires every registered item and never narrows work.
 
 One `WorkspaceContext` supplies the captured source, Cargo graph, dependency domains, effective configuration,
-toolchain, targets, and compatible evidence. Missing or incomplete evidence requires only the work item that owns the
-gap.
+toolchain, targets, and compatible evidence.
+Missing or incomplete evidence requires only the work item that owns the gap.
 
 ## Register repository work
 
-Pure Cargo workspaces need no planning configuration. Cargo-Rail already owns the built-in Cargo, dependency-policy,
-release-semver, and Surface decisions.
+Pure Cargo workspaces need no planning configuration.
+Cargo-Rail already owns the built-in Cargo, dependency-policy, release-semver,
+and Surface decisions.
 
-Register only positive inputs for repository-specific work. Keep commands in Just, scripts, or CI:
+Register only positive inputs for repository-specific work.
+Keep commands in Just, scripts, or CI:
 
 ```toml
 [plan.work.verification]
@@ -43,27 +47,33 @@ paths = ["deliverables/**"]
 variant_catalog = "variants.json"
 ```
 
-| Scope | Plan output | Use |
-|---|---|---|
-| `repository` | Required or skipped | Gate a whole-repository command |
-| `cargo` | Typed package and target selection | Pass the emitted Cargo arguments to a compatible command |
-| `variants` | Selected catalog rows or explicit `all` | Materialize only the emitted workflow variants |
+| Scope        | Plan output                             | Use |
+| ------------ | --------------------------------------- | --- |
+| `repository` | Required or skipped                     | Gate a whole-repository command |
+| `cargo`      | Typed package and target selection      | Pass the emitted Cargo arguments to a compatible command |
+| `variants`   | Selected catalog rows or explicit `all` | Materialize only the emitted workflow variants |
 
-`cargo` subscriptions inherit the selected built-in Cargo scope. A changed declared path adds its package scope. A
-changed configuration input widens the declared work to the Cargo workspace because policy can affect every member.
+`cargo` subscriptions inherit the selected built-in Cargo scope.
+A changed declared path adds its package scope.
+A changed configuration input widens the declared work to the Cargo workspace
+because policy can affect every member.
 
 Variant catalog v2 models deliverable impact without subscribing the deliverable to conservative `cargo.build`.
-Each row declares `cargo_roots` containing exact packages or targets and `external_paths` for inputs outside Cargo's
-graph. A root may add `features` to name one exact no-default-feature set. Cargo-Rail expands member-local Cargo
-feature edges and follows ordinary external Rust modules from the captured target root. Only a source path proved
-active for that feature set narrows selection; malformed attributes, path overrides, inline modules, platform or
-custom cfgs, and unattributed Rust files widen to every row.
+Each row declares `cargo_roots` containing exact packages or targets and `external_paths` for inputs outside Cargo's graph.
+A root may add `features` to name one exact no-default-feature set.
+Cargo-Rail expands member-local Cargo feature edges
+and follows ordinary external Rust modules from the captured target root.
+Only a source path proved active for that feature set narrows selection; malformed attributes,
+path overrides, inline modules, platform or custom cfgs,
+and unattributed Rust files widen to every row.
 
-An auxiliary root adds `manifest` with the exact repository-relative path of an entry in
-`release.auxiliary_cargo_manifests`. Cargo-Rail loads its locked metadata from the same captured source, keeps local
-packages inside that source root, and applies the normal structural reverse build closure. Auxiliary manifests,
-root lockfiles, shared inputs, and catalog changes remain all-row wideners. Root Cargo manifests, the primary
-lockfile, Cargo configuration, and the toolchain likewise select every Cargo-rooted row.
+An auxiliary root adds `manifest` with the exact repository-relative path of an entry in `release.auxiliary_cargo_manifests`.
+Cargo-Rail loads its locked metadata from the same captured source,
+keeps local packages inside that source root,
+and applies the normal structural reverse build closure.
+Auxiliary manifests, root lockfiles, shared inputs, and catalog changes remain all-row wideners.
+Root Cargo manifests, the primary lockfile, Cargo configuration,
+and the toolchain likewise select every Cargo-rooted row.
 
 ```json
 {
@@ -79,24 +89,31 @@ lockfile, Cargo configuration, and the toolchain likewise select every Cargo-roo
 }
 ```
 
-Cargo-Rail computes structural impact once across the captured Cargo domains and selects rows whose roots are
-affected. Unrelated external paths do not select a deliverable merely because compiler input evidence is incomplete.
-If a required path, configuration input, or Cargo input is not attributed by any selected catalog row, Cargo-Rail
-selects every row rather than treating the gap as evidence that a deliverable is unaffected.
+Cargo-Rail computes structural impact once across the captured Cargo domains
+and selects rows whose roots are affected.
+Unrelated external paths do not select a deliverable merely
+because compiler input evidence is incomplete.
+If a required path, configuration input,
+or Cargo input is not attributed by any selected catalog row,
+Cargo-Rail selects every row rather than treating the gap as evidence
+that a deliverable is unaffected.
 
-Runtime artifacts remain separate from test execution. A Cargo-scoped named work item with `cargo_prerequisites`
-emits only prerequisite packages and targets; the source `cargo.test` selector still owns which tests execute.
-Changing a declared artifact propagates back to its explicitly named test root. Relationships are one hop and contain
-no commands.
+Runtime artifacts remain separate from test execution.
+A Cargo-scoped named work item with `cargo_prerequisites` emits only prerequisite packages and targets;
+the source `cargo.test` selector still owns which tests execute.
+Changing a declared artifact propagates back to its explicitly named test root.
+Relationships are one hop and contain no commands.
 
-Work IDs use lowercase ASCII letters, digits, dots, and hyphens. Paths are positive repository-relative globs.
-Absolute paths, parent traversal, negative patterns, commands, unknown configuration fields, and malformed variant
-catalogs are rejected.
+Work IDs start with a lowercase ASCII letter and then use lowercase ASCII letters, digits, dots,
+and hyphens.
+Paths are positive repository-relative globs.
+Absolute paths, parent traversal, negative patterns, commands, unknown configuration fields,
+and malformed variant catalogs are rejected.
 
 ## Consume the machine contract
 
-`cargo rail plan --json` writes one schema-owned value. The checked-in contract is
-[`plan-v9.schema.json`](../schemas/plan-v9.schema.json):
+`cargo rail plan --json` writes one schema-owned value.
+The checked-in contract is [`plan-v9.schema.json`](../schemas/plan-v9.schema.json):
 
 ```bash
 cargo rail plan --schema > plan.schema.json
@@ -109,25 +126,27 @@ The fields with execution authority are:
 - `inputs`: comparison, source, Cargo, configuration, toolchain, platform, catalog, and evidence bindings;
 - `work`: every tagged required or skipped decision;
 - `required`: the sorted projection of required work IDs; and
-- `scope`: the selector attached only to required work.
+- `work.NAME.scope`: the selector attached only to required work.
 
-`changes`, causes, explanations, and evidence describe a decision; they are not selectors. Read
-`scope.selection.cargo_args` as an argument array, never as shell text. Treat variant `kind = "all"` as an instruction
-to materialize the owning workflow's complete checked-in catalog.
+`changes`, causes, explanations, and evidence describe a decision; they are not selectors.
+Read `work.NAME.scope.selection.cargo_args` as an argument array, never as shell text.
+Treat variant `kind = "all"` as an instruction to materialize the owning workflow's complete checked-in catalog.
 
 Before each executor:
 
 1. Validate the complete plan and required-work projection.
-2. Select one known required work item.
-3. Lower only that item's typed scope.
-4. Run the matching reader's checkout verification in the execution workspace.
-5. Start the executor only after verification succeeds.
+1. Select one known required work item.
+1. Lower only that item's typed scope.
+1. Run the matching reader's checkout verification in the execution workspace.
+1. Start the executor only after verification succeeds.
 
-The companion GitHub Action owns the independent strict consumer. It publishes the exact plan, reader, and Cargo-Rail
-version used to create the decision. Every execution job installs that exact version before the reader delegates
-checkout verification to Cargo-Rail. Comparing `HEAD` alone is insufficient; drift exits `2` before selectors are
-emitted or work starts. Readers that already captured a plan use `cargo rail plan --verify -` and pass those exact
-bytes on standard input so verification cannot reopen a different pathname.
+The companion GitHub Action owns the independent strict consumer.
+It publishes the exact plan, reader, and Cargo-Rail version used to create the decision.
+Every execution job installs that exact version
+before the reader delegates checkout verification to Cargo-Rail.
+Comparing `HEAD` alone is insufficient; drift exits `2` before selectors are emitted or work starts.
+Readers that already captured a plan use `cargo rail plan --verify -` and pass those exact bytes on standard input
+so verification cannot reopen a different pathname.
 
 ## Observed-input evidence
 
@@ -137,15 +156,16 @@ Pass compatible evidence explicitly:
 cargo rail plan --evidence planning-evidence.json --json
 ```
 
-[`planning-evidence-v1.schema.json`](../schemas/planning-evidence-v1.schema.json) binds evidence to its source, Cargo
-universe, configuration, toolchain, target, platform, provider capabilities, and work kind. Evidence proves a skip
-only when every relevant input class is complete and has no bypass. Missing, stale, malformed, or cross-platform
-evidence widens only its owning work.
+[`planning-evidence-v1.schema.json`](../schemas/planning-evidence-v1.schema.json) binds evidence to its source, Cargo universe, configuration,
+toolchain, target, platform, provider capabilities, and work kind.
+Evidence proves a skip only when every relevant input class is complete and has no bypass.
+Missing, stale, malformed, or cross-platform evidence widens only its owning work.
 
-A plan identity compares decisions. It is not a cache key and never authorizes compiler-result reuse.
+A plan identity compares decisions.
+It is not a cache key and never authorizes compiler-result reuse.
 
-The current planner executes only variant catalog v2. The v1 schema remains available to validate stored artifacts;
-convert active catalogs to v2 before planning with the current release.
+The current planner accepts variant catalog v2.
+Use the checked-in v2 schema when authoring a catalog.
 
 ## Diagnose a decision
 
@@ -155,20 +175,24 @@ cargo rail plan --explain
 cargo rail plan --json | jq '{inputs, changes, required, work}'
 ```
 
-See [Troubleshooting](troubleshooting.md) when the compared states, selected work, or executor scope differ from
-expectation.
+See [Troubleshooting](troubleshooting.md) when the compared states, selected work,
+or executor scope differ from expectation.
 
 ### Impact attribution
 
-Plan contract v9 adds `attribution`, keyed by exactly the required work IDs. It records typed triggering inputs and
-one relation for every selected package or variant: `direct`, `dependency`, or `unattributed`. Dependency relations
-name one captured originating package; they do not claim to enumerate every causal path. A directly changed package
-can also have affected dependencies and remains direct in the presentation.
+Plan contract v9 adds `attribution`, keyed by exactly the required work IDs.
+It records typed triggering inputs and one relation for every selected package or variant: `direct`, `dependency`, or `unattributed`.
+Dependency relations name one captured originating package;
+they do not claim to enumerate every causal path.
+A directly changed package can also have affected dependencies
+and remains direct in the presentation.
 
-Attribution is bound into the canonical plan identity. It explains the final selectors without changing their
-execution authority. Workspace scope, incomplete evidence, and `--all` remain explicit. Consumers must not reconstruct
-these relations from paths or the human evidence description. The Action keeps direct selections visible and places
-dependency details in expandable sections. CLI `--explain` includes the complete selected scope.
+Attribution is bound into the canonical plan identity.
+It explains the final selectors without changing their execution authority.
+Workspace scope, incomplete evidence, and `--all` remain explicit.
+Consumers must not reconstruct these relations from paths or the human evidence description.
+The Action keeps direct selections visible and places dependency details in expandable sections.
+CLI `--explain` includes the complete selected scope.
 
-The published v8 schema remains available for historical readers. Current source emits and verifies v9 plans;
-regenerate older saved plans and use a companion Action that independently validates v9 attribution.
+Cargo-Rail emits and verifies v9 plans.
+Regenerate older saved plans and use a companion Action that independently validates v9 attribution.
