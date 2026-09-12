@@ -37,7 +37,10 @@ def package(destination):
         'cargo-rail-distributed-worker' + suffix: 'distributed',
         'cargo-rail-fact-driver' + suffix: 'surface',
         'cargo-rail-fact-driver-source-v1.json': 'surface-source',
+        'LICENSE': 'license',
     }
+    sources = {name: components / name for name in names}
+    sources['LICENSE'] = root / 'LICENSE'
     authority = {}
     for line in (components / 'compiler-driver-authority.env').read_text().splitlines():
         words = shlex.split(line)
@@ -52,8 +55,9 @@ def package(destination):
             raise ValueError('compiler components do not match the selected native toolchain')
     files = {}
     for name, capability in sorted(names.items()):
-        path = components / name
-        if path.is_symlink() or not path.is_file() or not 0 < path.stat().st_size <= 256 * 1024 * 1024:
+        path = sources[name]
+        limit = 64 * 1024 if capability == 'license' else 256 * 1024 * 1024
+        if path.is_symlink() or not path.is_file() or not 0 < path.stat().st_size <= limit:
             raise ValueError(f'component is not a bounded regular file: {name}')
         files[name] = (digest(path), path.stat().st_size, capability)
     if sum(size for _, size, _ in files.values()) > 512 * 1024 * 1024:
@@ -78,7 +82,7 @@ def package(destination):
         archive_path = Path(stage) / archive_name
         with zipfile.ZipFile(archive_path, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
             for name in files:
-                archive.write(components / name, f'cargo-rail/{name}')
+                archive.write(sources[name], f'cargo-rail/{name}')
             archive.writestr('cargo-rail/cargo-rail-components-v1.tsv', manifest)
         if archive_path.stat().st_size > 512 * 1024 * 1024:
             raise ValueError('release archive exceeds its byte bound')
@@ -90,7 +94,7 @@ def package(destination):
                 if archive.getinfo(f'cargo-rail/{name}').file_size != size:
                     raise ValueError(f'archived component size changed: {name}')
         for name, (sha, size, _) in files.items():
-            if (components / name).stat().st_size != size or digest(components / name) != sha:
+            if sources[name].stat().st_size != size or digest(sources[name]) != sha:
                 raise ValueError(f'component changed while packaging: {name}')
         checksum = Path(stage) / 'SHA256SUMS'
         checksum.write_text(f'{digest(archive_path)}  {archive_name}\n')
