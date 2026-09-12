@@ -63,11 +63,18 @@ catalog_select() { python3 "$SCRIPT_DIR/catalog.py" select "$platform" "$operati
 # Resolve the complete selection before package installation; process substitutions do not propagate failures.
 catalog_select > /dev/null
 mapfile -t packages < <(catalog_select packages)
+# Ubuntu's perf dispatcher selects the complete running kernel release, including flavor.
+for package in "${packages[@]}"; do
+  if [[ "$package" == linux-tools-common ]]; then
+    packages+=("linux-tools-$(uname -r)")
+    break
+  fi
+done
 # Exact candidates come from the selected snapshot, including repeat installations.
 pinned_packages=()
 for package in "${packages[@]}"; do
   version="$(apt-cache "${apt_options[@]}" madison "$package" | awk 'NR == 1 {print $3}')"
-  [[ -n "$version" && "$version" != '(none)' ]] || { echo "missing Ubuntu package: $package" >&2; exit 1; }
+  [[ -n "$version" && "$version" != '(none)' ]] || { echo "missing Ubuntu package $package in snapshot $snapshot (running kernel $(uname -r))" >&2; exit 1; }
   pinned_packages+=("$package=$version")
 done
 "${apt[@]}" install -y --allow-downgrades --no-install-recommends "${pinned_packages[@]}"

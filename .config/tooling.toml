@@ -23,7 +23,7 @@ tomlkit = "0.15.1"
 components = ["clippy", "rustfmt", "rustc-dev", "llvm-tools"]
 cargo = ["cargo-deny", "cargo-nextest", "just"]
 assets = ["rustup", "cargo-binstall", "cmake", "llvm", "git", "python", "actionlint", "cargo-nextest"]
-packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "openssl", "pkgconf", "python3", "python3-venv", "ripgrep", "shellcheck", "unzip", "xz-utils", "zstd"]
+packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "linux-tools-common", "openssl", "pkgconf", "python3", "python3-venv", "ripgrep", "shellcheck", "unzip", "xz-utils", "zstd"]
 
 [operations.package]
 components = ["rustc-dev", "llvm-tools"]
@@ -63,7 +63,7 @@ bootstrap-sha256 = "352ac5776d592a4870c15756f9e140507b9ee64de62b401152e5929f7c0c
 sdk-component = "Microsoft.VisualStudio.Component.Windows11SDK.28000"
 
 [aarch64-linux]
-packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "pkgconf", "python3", "unzip", "xz-utils", "zstd"]
+packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "linux-tools-common", "pkgconf", "python3", "unzip", "xz-utils", "zstd"]
 os = "Ubuntu 24.04 LTS"
 rust-host = "aarch64-unknown-linux-gnu"
 components = ["clippy", "rustfmt", "rustc-dev", "llvm-tools"]
@@ -82,7 +82,7 @@ url = "https://github.com/Kitware/CMake/releases/download/v4.4.3/cmake-4.4.3-lin
 sha256 = "2efc974dbd63b4444c0e8494b92f2e80c2d7e635b4b80eac2916985ddd8f72a6"
 
 [x86_64-linux]
-packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "pkgconf", "python3", "python3-venv", "ripgrep", "shellcheck", "unzip", "xz-utils", "zstd", "perl", "gcc-riscv64-linux-gnu", "g++-riscv64-linux-gnu", "libc6-dev-riscv64-cross"]
+packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "linux-tools-common", "pkgconf", "python3", "python3-venv", "ripgrep", "shellcheck", "unzip", "xz-utils", "zstd", "perl", "gcc-riscv64-linux-gnu", "g++-riscv64-linux-gnu", "libc6-dev-riscv64-cross"]
 os = "Ubuntu 24.04 LTS"
 rust-host = "x86_64-unknown-linux-gnu"
 components = ["clippy", "rustfmt", "rustc-dev", "llvm-tools"]

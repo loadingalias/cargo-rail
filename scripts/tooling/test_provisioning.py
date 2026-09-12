@@ -87,5 +87,81 @@ else:
         self.assertEqual(self.provision('unknown-target', success=False), [])
 
 
+class LinuxPerfProvisioning(unittest.TestCase):
+    def provision(self, kernel, operation='ci', missing=False):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            scripts = root / 'scripts/tooling'
+            scripts.mkdir(parents=True)
+            for name in ('linux.sh', 'catalog.py'):
+                shutil.copy(catalog.ROOT / 'scripts/tooling' / name, scripts / name)
+            shutil.copytree(catalog.ROOT / '.config', root / '.config')
+            binaries = root / 'bin'
+            binaries.mkdir()
+            recorder = f'#!{sys.executable}\n' + '''
+import json, os, pathlib, sys
+name = pathlib.Path(sys.argv[0]).name
+if name == 'uname':
+    print({'-s': 'Linux', '-m': 'x86_64', '-r': os.environ['FIXTURE_KERNEL']}[sys.argv[1]])
+elif name == 'id':
+    print('0')
+elif name == 'apt-cache':
+    if not (os.environ['FIXTURE_MISSING'] == '1' and sys.argv[-1] == 'linux-tools-' + os.environ['FIXTURE_KERNEL']):
+        print(sys.argv[-1] + ' | 1.2.3 | snapshot')
+elif name == 'apt-get':
+    with open(os.environ['FIXTURE_LOG'], 'a') as log:
+        log.write(json.dumps(sys.argv[1:]) + '\\n')
+    if '--allow-downgrades' in sys.argv:
+        sys.exit(23)
+'''
+            for name in ('uname', 'id', 'apt-cache', 'apt-get'):
+                path = binaries / name
+                path.write_text(recorder)
+                path.chmod(0o755)
+            environment = dict(os.environ, PATH=str(binaries) + os.pathsep + os.environ['PATH'],
+                               FIXTURE_KERNEL=kernel, FIXTURE_MISSING='1' if missing else '0',
+                               FIXTURE_LOG=str(root / 'commands.jsonl'))
+            # Supply the Ubuntu OS boundary while running the actual installer on this host.
+            command = '''
+source() {
+  if [[ "$1" == /etc/os-release ]]; then
+    ID=ubuntu VERSION_ID=24.04 PRETTY_NAME=Ubuntu
+  else
+    builtin source "$@"
+  fi
+}
+source "$1" x86_64-linux "$2"
+'''
+            result = subprocess.run(['bash', '-c', command, 'fixture', str(scripts / 'linux.sh'), operation],
+                                    env=environment, text=True, capture_output=True)
+            log = root / 'commands.jsonl'
+            calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+            return result, calls
+
+    def test_perf_installs_the_running_kernel_flavor_from_the_snapshot(self):
+        for kernel in ('6.8.0-1030-aws', '6.8.0-79-generic', '6.8.0-79-generic-64k'):
+            with self.subTest(kernel=kernel):
+                result, calls = self.provision(kernel)
+                self.assertEqual(result.returncode, 23, result.stderr)
+                install = calls[-1]
+                self.assertIn('install', install)
+                self.assertIn('linux-tools-common=1.2.3', install)
+                self.assertIn(f'linux-tools-{kernel}=1.2.3', install)
+                self.assertIn('Dir::Etc::sourceparts=-', install)
+
+    def test_missing_kernel_tools_fails_before_installation(self):
+        result, calls = self.provision('6.8.0-1030-aws', missing=True)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('missing Ubuntu package linux-tools-', result.stderr)
+        self.assertIn(catalog.read()['linux']['snapshot'], result.stderr)
+        self.assertIn('6.8.0-1030-aws', result.stderr)
+        self.assertFalse(any('--allow-downgrades' in call for call in calls))
+
+    def test_package_provisioning_does_not_require_kernel_tools(self):
+        result, calls = self.provision('6.8.0-1030-aws', operation='package', missing=True)
+        self.assertEqual(result.returncode, 23, result.stderr)
+        self.assertFalse(any(argument.startswith('linux-tools-') for argument in calls[-1]))
+
+
 if __name__ == '__main__':
     unittest.main()
