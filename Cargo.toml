@@ -33,6 +33,14 @@ include = [
 [lints]
 workspace = true
 
+[features]
+bench = []
+
+[[bin]]
+name = "cargo-rail-bench"
+path = "src/bin/cargo-rail-bench.rs"
+required-features = ["bench"]
+
 [workspace]
 members = ["."]
 exclude = ["tools/compiler-fact-driver"]

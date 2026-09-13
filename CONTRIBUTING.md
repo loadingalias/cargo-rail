@@ -17,6 +17,11 @@ Install these tools:
 Run commands from the repository root.
 Use `just --list` to see the maintained command surface.
 
+After `just package-release OUTPUT_DIRECTORY`, run `python3 scripts/check-release-install.py OUTPUT_DIRECTORY`
+with cargo-binstall installed to verify the native archive's binary installation.
+The check uses a temporary installation and disables source fallback.
+The packaging workflow requires this check on every release host before uploading assets.
+
 Native runner installers require an operation: for example, `scripts/tooling/x86_64-linux.sh ci` or `scripts/tooling/x86_64-win.ps1 -Operation package`.
 The tooling catalog selects the operation's Cargo tools, Rust components, and native prerequisites.
 Package provisioning retains the compiler development components and native build tools

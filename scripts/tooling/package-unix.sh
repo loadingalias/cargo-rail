@@ -26,6 +26,7 @@ while IFS= read -r component; do components+=(--component "$component"); done < 
 )
 rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal "${components[@]}"
 [[ "$(rustc -vV | sed -n 's/^host: //p')" == "$1" ]]
+cargo install cargo-binstall --version "$(python3 "$SCRIPT_DIR/catalog.py" get versions cargo-binstall)" --locked
 while IFS= read -r tool; do
   cargo install "$tool" --version "$(python3 "$SCRIPT_DIR/catalog.py" get cargo "$tool")" --locked
 done < <(python3 "$SCRIPT_DIR/catalog.py" get operations package cargo)

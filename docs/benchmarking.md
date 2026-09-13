@@ -23,7 +23,7 @@ This builds the matching release components and invokes the single benchmark.
 The benchmark executable embeds its workload and also runs outside the checkout:
 
 ```bash
-cargo install --path . --locked --bin cargo-rail-bench
+cargo install --path . --locked --features bench --bin cargo-rail-bench
 cargo rail-bench local --rail /path/to/cargo-rail/target/release/cargo-rail
 ```
 
@@ -125,7 +125,7 @@ Existing output directories and mismatched Git sources are refused.
 Failed preparation retains partial output for diagnosis.
 This preparation command preserves the correctness fixture's controlled profiles;
 the local comparison selects ordinary dev settings separately.
-The benchmark binary is not included in release archives.
+The benchmark binary requires the `bench` feature and is not included in release archives.
 [Release packaging and publication](releases.md) have separate evidence requirements;
 benchmark results do not authorize a release.
 

@@ -39,6 +39,17 @@ def package(destination):
         'cargo-rail-fact-driver-source-v1.json': 'surface-source',
         'LICENSE': 'license',
     }
+    package_metadata = next(
+        item for item in metadata['packages']
+        if Path(item['manifest_path']).resolve() == root / 'Cargo.toml'
+    )
+    required_binaries = {
+        item['name'] + suffix for item in package_metadata['targets']
+        if 'bin' in item['kind'] and not item.get('required-features')
+    }
+    missing = required_binaries - names.keys()
+    if missing:
+        raise ValueError(f'release archive omits mandatory Cargo binaries: {", ".join(sorted(missing))}')
     sources = {name: components / name for name in names}
     sources['LICENSE'] = root / 'LICENSE'
     authority = {}

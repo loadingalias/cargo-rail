@@ -66,6 +66,7 @@ else:
             ['rustup', 'toolchain', 'install', catalog.rust_channel(), '--profile', 'minimal',
              '--component', 'rustc-dev', '--component', 'llvm-tools'],
             ['rustc', '-vV'],
+            ['cargo', 'install', 'cargo-binstall', '--version', catalog.read()['versions']['cargo-binstall'], '--locked'],
             ['cargo', 'install', 'just', '--version', catalog.read()['cargo']['just'], '--locked'],
         ])
         self.assertEqual((self.root / 'github-env').read_text(), f'RUSTUP_TOOLCHAIN={catalog.rust_channel()}\n')
