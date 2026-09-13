@@ -3,6 +3,184 @@
 Published versions are recorded below. Pending release intent lives in [`.changes/`](.changes/);
 see [releasing a workspace](docs/releases.md) for the current preparation and publication workflow.
 
+## [0.26.0] - 2026-09-13
+- Add `cargo-rail-bench` to compare native Cargo, Cargo-Rail, and sccache on a bundled mixed Rust/native workload.
+  Retain per-sample correctness evidence for cold, empty-target rebuild, Cargo freshness,
+  and source-edit scenarios.
+  Fixture preparation is portable; local timing requires Unix.
+  Run the benchmark from source with `just bench`.
+
+- Reduce repeated hashing during cold compiler-cache capture.
+  Concurrent sysroot memo misses share one capture when locking is available,
+  and linker aliases reuse a digest only while captured file generation evidence still matches.
+  Preserve every path witness, mutation check, and warm-hit validation;
+  fall back to normal capture when evidence or locking is unavailable.
+
+- Keep one transparent Cargo wrapper per Cargo home
+  while binding each enrolled workspace to its own local CAS trust domain, remote authority,
+  lifecycle state, and fail-closed runtime selection.
+
+- Close a compiler-acquisition race between completing leaders and selected followers.
+
+- Accept stable rustc-owned identities for remapped compiler sources whose bytes are unavailable,
+  and size the bounded compiler-sysroot inventory for supported `rustc-dev` installations.
+
+- Bind `build-std` cache results to sibling Rust library sources and reject source aliases
+  or ancestor replacement.
+  Keep Apple and COFF linker inputs paired with their generation evidence in canonical order.
+  Stage private Windows doctest executables without changing the shared compiler's file identity,
+  preventing concurrent Surface analysis from rejecting an unchanged compiler.
+
+- Let normally exiting compiler process trees drain before enforcing descendant ownership.
+  Keep slow-host native compatibility checks within bounded watchdogs.
+
+- Keep unused-dependency evidence acquisition valid
+  when a workspace denies warnings by forcing only Cargo-Rail's bounded diagnostic lint back to
+  warning level without changing ordinary Cargo compilation.
+
+- Bare `cargo rail config` explains active policy without rewriting input.
+  Inspection validates semantic policy, reports missing workspace context,
+  and preserves target inheritance in canonical exports.
+  Only current fields are accepted; explanation schema 2 removes compatibility provenance.
+
+- Cargo-Rail now accepts one current contract per operation.
+  Automatic configuration translation, old release and acquisition journal readers,
+  split/sync mapping conversion, and `cache drop-unbound` are removed.
+  
+  Breaking changes for v0.26.0:
+  
+  - Author current configuration explicitly.
+    For example, replace `unify.msrv = false` with `unify.msrv_policy = { mode = "disabled" }`, `release.push = false` with `release.remote_effects = "none"`, and split `paths` with Cargo member names in `members`.
+    Omit `transitive_pinning` to disable it; use `transitive_pinning = { host = "root" }` to enable it.
+    Inspect current fields with `cargo rail config explain --all` using supported input.
+  - Historical planning policy must also use current fields.
+    Unsupported comparisons fail with the revision and path.
+    Select a supported baseline only if it covers the intended work;
+    otherwise perform explicit full verification outside affected planning
+    while establishing a supported baseline.
+    Moving the baseline can omit changes.
+  - Preserve unsupported installation receipts.
+    Use the executable that created the installation to preview and perform its removal,
+    then run current `cargo rail cache setup` in each workspace.
+    If its originating release is unknown, determine that before removal;
+    a schema number alone does not identify the executable.
+  - Preserve unsupported release journals, conflict receipts, and prepared Git effects.
+    Finish or safely abort/reconcile them with their originating executable
+    before starting conflicting work.
+    Publication may already have occurred.
+  - Old split/sync mapping notes and trailers cannot continue through conversion.
+    Continue the established relationship with its originating executable,
+    or create a separate fresh target through an explicitly reviewed operation.
+    Deleting notes does not make existing history a safe fresh target.
+  - Regenerate unsupported disposable plans and compiler evidence.
+    Acquisition journal 3 uses a separate namespace;
+    explicit resume refuses unsupported progress without rewriting it.
+    Cache status 16, configuration explanation 2, release plan/state 9, sync conflict receipt 4,
+    and prepared Git effect 2 require current consumers.
+  - Retired schema files are removed from the active branch and package: `plan-v8`, `plan-variants-v1`, `surface-v1`, `surface-v2`, and `config-explain-v1`.
+    Historical tagged source remains available; URLs under `main` no longer serve those schemas.
+  
+  Use `release check` instead of `release run --check`, and omit retired `--skip-publish`, `plan --merge-base`, and `change check --required` flags.
+  Use `release run --pr` for review within the same transaction; the separate `release finalize` and `--wait` surfaces are removed.
+  Current cache lifecycle operations are `setup`, `detach`, `drop-profile`, and `uninstall`.
+  Current configuration, recovery, ownership validation,
+  and authenticated installation remain supported.
+  
+  Concurrent setup for separate workspaces no longer rejects another profile's exact completed
+  enrollment as transaction drift.
+
+- Capture linker inputs under explicit file,
+  path-byte and content-byte limits instead of the source-discovery deadline.
+  Slow native hosts can complete linker evidence capture while retaining content hashing,
+  mutation checks and restore validation.
+  Source discovery keeps its existing time limit.
+
+- Enable compiler caching on Linux RISC-V 64, IBM Z, and little-endian IBM POWER hosts,
+  with verified platform, compiler, and sysroot identity.
+  IBM Z and POWER runtime qualification remains deferred pending runner access;
+  eligibility alone is not proof of native validation.
+
+- Require authenticated compiler-selected Rust inputs for local and distributed cache reuse.
+  Capture supported cross-target linker outputs, debug objects, PDBs,
+  and import libraries as part of verified results.
+  Incomplete backend or linker evidence falls back to ordinary compiler execution.
+  Native archives include the matched compiler driver and its authenticated source bundle.
+
+- Observe GCC-selected Rust LLD inputs and verified process-image replacements for compiler reuse.
+  Recognize GNU and Darwin LLD flavors that use a C compiler driver.
+  Track parent traversal in ELF runtime searches while detecting symlink and candidate changes.
+  Normalize Windows executable paths consistently for compiler and wrapper verification.
+  
+  Provisioned toolchains are checked by native compilation and execution.
+  Preserve MSVC linker precedence and use the shared nextest policy on native runners.
+  Linux CI installs perf for the running kernel, including its distribution flavor.
+
+- Select variant rows from exact Cargo feature profiles and registered auxiliary manifests.
+  Project declared runtime-artifact prerequisites separately from the tests that consume them.
+  Plans and portable planning evidence reject Git object IDs unless they contain exactly 40
+  or 64 hexadecimal characters.
+
+- Include `LICENSE` as a checksummed component in every native release archive.
+  The companion Action requires, verifies, and installs the license with every component selection.
+
+- Prepare each selected release closure in one commit and retain portable,
+  identity-bound release records.
+  Recovery requires the original intent and sealed Cargo package bytes.
+  Registry reconciliation compares checksums and yank state;
+  uncertain uploads retain distinct attempt identities and are not repeated automatically.
+  
+  Preparation pushes require the captured remote branch tip.
+  Signed tags are created before registry publication and retain their exact objects
+  for recovery without another signature.
+  
+  GitHub releases now require `release.validation` workflow paths and required job names.
+  Validation binds the exact release commit, workflow, run, attempt, and successful jobs.
+  Unrelated check rollups, skipped jobs, and the publishing run itself cannot authorize a release.
+  
+  Required unavailable API evidence blocks release execution.
+  Finish or reconcile older active release records with their originating executable before upgrading.
+  
+  Bind optional native assets to exact validated producer attempts and retained digests
+  before publication.
+  Reconcile GitHub drafts and public releases against exact presentation and asset inventories.
+  
+  Submit configured hosted releases as one durable request.
+  Explicitly dispatch validation, recover original records and Cargo archives from Git,
+  and continue reviewed merges under the same intent.
+  Remove the separate finalization command and attached-wait flow.
+  Promote configured tag aliases only after verified immutable publication,
+  using the captured prior object as the Git lease.
+
+- Bind macro-expanded declarations to the expansion call-site source
+  that owns a captured visibility token,
+  allowing Surface to analyze cross-file macro-generated public items
+  while preserving strict compiler-fact span validation.
+
+- Build Cargo-Rail with Rust 1.98.1, which fixes the Rust 1.98.0 trait-object vtable miscompilation,
+  and align the GitHub Actions example with the native v9 Action and Cargo-Rail 0.26.0.
+  Saved-plan consumers can now verify captured plan bytes on standard input without reopening mutable
+  path authority.
+
+- Select a pinned nightly for RISC-V tooling so rscrypto SHA-2 can compile,
+  and verify the active compiler and Cargo against that exact toolchain.
+  Remove compiler-version guessing from crate-visibility capture
+  and use the supported atomic update API on stable and nightly.
+
+- Repositories with package-specific no-std
+  or WASM support can now keep those domains in target-aware dependency resolution without forcing
+  Unify to invent a workspace-wide default-feature compiler view for them.
+
+- Preserve literal target-table keys, including dotted target names and `cfg(...)` expressions,
+  when applying dependency repairs.
+  Quote TOML keys and escape string control characters correctly.
+  Reject empty dotted-path components before mutation and preserve neighboring target tables.
+
+- Resolve Cargo workspace, package,
+  dependency and target paths at capture so filesystem aliases preserve package ownership
+  and planner selections.
+  Index captured package roots for changed-file attribution.
+  Preserve symlink parent traversal when resolving missing paths, including containment checks,
+  and retain logical ownership for deleted source files.
 ## [0.25.0](https://github.com/loadingalias/cargo-rail/compare/v0.24.0...v0.25.0) - 2026-08-30
 
 - Allow repository checks invoked by Cargo-Rail's release push to recognize change files already consumed by that release transaction.
