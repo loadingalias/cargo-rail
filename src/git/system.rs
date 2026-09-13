@@ -322,17 +322,18 @@ impl SystemGit {
     /// Paths are repository-relative and sorted. Ignored files are intentionally excluded:
     /// they are outside Git's mutation boundary unless a command declares them explicitly.
     pub fn changed_paths(&self) -> RailResult<Vec<PathBuf>> {
-        let mut paths = if self.head_commit().is_ok() {
-            let staged = self.run_git_read_only(&["diff", "--cached", "--name-only", "-z", "HEAD"])?;
-            let unstaged = self.run_git_read_only(&["diff-files", "--name-only", "-z"])?;
+        let root = Self::open(&self.worktree_root)?;
+        let mut paths = if root.head_commit().is_ok() {
+            let staged = root.run_git_read_only(&["diff", "--cached", "--name-only", "-z", "HEAD"])?;
+            let unstaged = root.run_git_read_only(&["diff-files", "--name-only", "-z"])?;
             let mut paths = parse_nul_paths(&staged.stdout);
             paths.extend(parse_nul_paths(&unstaged.stdout));
             paths
         } else {
-            let staged = self.run_git_read_only(&["ls-files", "--cached", "-z"])?;
+            let staged = root.run_git_read_only(&["ls-files", "--cached", "-z"])?;
             parse_nul_paths(&staged.stdout)
         };
-        let untracked = self.run_git_read_only(&["ls-files", "--others", "--exclude-standard", "-z"])?;
+        let untracked = root.run_git_read_only(&["ls-files", "--others", "--exclude-standard", "-z"])?;
         paths.extend(parse_nul_paths(&untracked.stdout));
         paths.sort();
         paths.dedup();
@@ -638,7 +639,7 @@ impl SystemGit {
             return Ok(());
         }
 
-        let mut cmd = self.git_cmd();
+        let mut cmd = git_cmd_for_path(&self.worktree_root);
         cmd.args(["add", "-A", "--"]);
         for path in paths {
             cmd.arg(self.normalize_repo_path(path)?);

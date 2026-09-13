@@ -64,6 +64,19 @@ they do not pass through a workspace mutation plan.
 Release, split, and sync persist transaction identity before remote or irreversible effects.
 Recovery reconciles external publication; it cannot undo publication.
 
+## Release authority
+
+Local execution, GitHub dispatch, and reviewed merges continue one immutable release intent.
+A reviewed merge must preserve the complete preparation tree.
+Validation and native assets bind the final commit and exact producer attempts before publication.
+Git records retain progress and original Cargo archives; recovery reconciles registry, tag, forge,
+and alias effects against that evidence.
+
+The companion Action independently checks records and invocation authority, then calls Cargo-Rail.
+Repository workflows own runners, credentials, and product packaging.
+They do not implement another release planner or publisher.
+See [release records](release-records.md) and [the release guide](releases.md).
+
 ## Process and platform boundaries
 
 `src/main.rs` owns process entry, pre-Clap compiler-role dispatch, one context build, diagnostics,

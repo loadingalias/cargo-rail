@@ -88,13 +88,29 @@ pub struct ReleaseConfig {
     /// cargo-semver-checks integration policy (default: "warn").
     ///
     /// Requires the `cargo-semver-checks` binary; it is invoked as an external
-    /// tool, never vendored. Missing binary downgrades to an advisory note.
+    /// tool, never vendored. Comparisons use the prior release commit and default features.
     ///
     /// - "off": never run
-    /// - "warn": validate planned intent; extended checks remain advisory
-    /// - "deny": validate planned intent and fail extended checks on breakage
+    /// - "warn": reject incompatible reviewed intent; report unavailable evidence
+    /// - "deny": also block when required evidence is unavailable
     #[serde(default)]
     pub semver_check: SemverCheckPolicy,
+
+    /// Required GitHub workflow paths and the job names that must succeed for the release commit.
+    #[serde(default)]
+    pub validation: BTreeMap<String, Vec<String>>,
+
+    /// GitHub workflow that executes durable release requests; omission selects local execution.
+    #[serde(default)]
+    pub hosted_workflow: Option<String>,
+
+    /// Complete native asset inventories, keyed by released package name.
+    #[serde(default)]
+    pub artifacts: BTreeMap<String, ReleaseArtifacts>,
+
+    /// Explicit mutable tag aliases, promoted only after their immutable forge release is verified.
+    #[serde(default)]
+    pub aliases: BTreeMap<String, String>,
 
     /// Lockstep version groups. Each named group lists workspace members that
     /// must be released together at the maximum bump level any member earns.
@@ -133,11 +149,37 @@ impl Default for ReleaseConfig {
             change_dir: default_change_dir(),
             pre_1_breaking_bump: Pre1BreakingBump::default(),
             semver_check: SemverCheckPolicy::default(),
+            validation: BTreeMap::new(),
+            hosted_workflow: None,
+            artifacts: BTreeMap::new(),
+            aliases: BTreeMap::new(),
             version_groups: BTreeMap::new(),
             auxiliary_cargo_manifests: Vec::new(),
             changelog: ChangelogShape::default(),
         }
     }
+}
+
+/// A package's artifact producer and complete flat release-file inventory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseArtifacts {
+    /// Workflow path also declared in `release.validation`.
+    pub workflow: String,
+    /// Asset filename templates; supported variables are `{crate}` and `{version}`.
+    pub files: BTreeMap<String, ReleaseAsset>,
+}
+
+/// One required release asset supplied by the authorized producer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseAsset {
+    /// Target triple asserted by the product's build and package validation job.
+    #[serde(default)]
+    pub target: Option<String>,
+    /// Optional Git-root-relative regular file whose committed bytes must match this asset.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 /// Authoritative input used to select releases and render changelogs.
@@ -203,7 +245,21 @@ impl ReleaseConfig {
             }
         }
 
+        if self.aliases.keys().any(|package| !workspace_members.contains(package)) {
+            return Err(ConfigError::InvalidField {
+                field: "release.aliases".into(),
+                reason: "aliases must name workspace packages".into(),
+            });
+        }
         self.validate_version_groups(workspace_members)?;
+        for name in self.artifacts.keys() {
+            if !workspace_members.contains(name) {
+                return Err(ConfigError::InvalidField {
+                    field: "release.artifacts".to_owned(),
+                    reason: format!("artifact inventory names unknown package '{name}'"),
+                });
+            }
+        }
 
         Ok(warnings)
     }
@@ -226,6 +282,62 @@ impl ReleaseConfig {
         }
         self.changelog.filters.validate("release.changelog.filters")?;
         self.validate_auxiliary_cargo_manifests()?;
+        crate::release::artifacts::validate_config(self).map_err(|error| ConfigError::InvalidField {
+            field: "release.artifacts".to_owned(),
+            reason: error.to_string(),
+        })?;
+        if self.aliases.values().any(|alias| {
+            alias.is_empty()
+                || alias.len() > 128
+                || alias.contains("..")
+                || alias.ends_with('.')
+                || alias.ends_with(".lock")
+                || !alias.as_bytes()[0].is_ascii_alphanumeric()
+                || !alias
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        }) || self.aliases.values().collect::<std::collections::BTreeSet<_>>().len() != self.aliases.len()
+        {
+            return Err(ConfigError::InvalidField {
+                field: "release.aliases".into(),
+                reason: "aliases must be unique, bounded, pathless Git tag names".into(),
+            });
+        }
+        if let Some(workflow) = &self.hosted_workflow
+            && (!workflow.starts_with(".github/workflows/")
+                || workflow.split('/').count() != 3
+                || !matches!(workflow.rsplit('.').next(), Some("yml" | "yaml"))
+                || !workflow
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'/' | b'_' | b'-'))
+                || self.validation.contains_key(workflow)
+                || !self.remote_effects.pushes())
+        {
+            return Err(ConfigError::InvalidField {
+                field: "release.hosted_workflow".into(),
+                reason: "must name a separate GitHub workflow and authorize Git push effects".into(),
+            });
+        }
+        for (workflow, jobs) in &self.validation {
+            if !workflow.starts_with(".github/workflows/")
+                || !matches!(workflow.rsplit('.').next(), Some("yml" | "yaml"))
+                || workflow.split('/').count() != 3
+                || workflow
+                    .bytes()
+                    .any(|byte| byte.is_ascii_control() || matches!(byte, b'\\' | b':' | b'?' | b'#' | b'%'))
+                || jobs.is_empty()
+                || jobs
+                    .iter()
+                    .any(|job| job.trim().is_empty() || job.chars().any(char::is_control))
+                || jobs.iter().collect::<std::collections::BTreeSet<_>>().len() != jobs.len()
+            {
+                return Err(ConfigError::InvalidField {
+                    field: "release.validation".to_owned(),
+                    reason: "each workflow must name one .github/workflows YAML file and unique required job names"
+                        .to_owned(),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -328,10 +440,10 @@ pub enum CommitPolicy {
 pub enum SemverCheckPolicy {
     /// Never run cargo-semver-checks
     Off,
-    /// Validate planned intent and report extended-check findings (default)
+    /// Validate reviewed intent and report unavailable evidence (default)
     #[default]
     Warn,
-    /// Fail extended checks when detected API breakage exists
+    /// Also block release when required API evidence is unavailable
     Deny,
 }
 

@@ -1,11 +1,10 @@
 //! Pre-release validation checks
 
-use crate::config::{ChangelogRelativeTo, ReleaseConfig, SemverCheckPolicy};
+use crate::config::{ChangelogRelativeTo, ReleaseConfig};
 use crate::error::{RailError, RailResult};
-use crate::release::change_files::PendingChangeSet;
 use crate::release::planner::{RELEASE_REGISTRY, ReleasePlan};
 use crate::release::process;
-use crate::release::semver_checks;
+use crate::release::semver_checks::ApiOutcome;
 use crate::workspace::WorkspaceContext;
 use std::fs;
 use std::path::PathBuf;
@@ -521,100 +520,32 @@ impl<'a> ReleaseValidator<'a> {
         }
     }
 
-    /// Run cargo-semver-checks as an installed external binary.
-    ///
-    /// Only a confirmed breaking verdict can fail the check (under "deny").
-    /// Inconclusive runs — no published baseline, network or build failures —
-    /// report as skipped so a crate's first release never fails on a
-    /// comparison that cannot exist.
-    fn validate_semver_checks(
-        &self,
-        crate_name: &str,
-        policy: SemverCheckPolicy,
-        reviewed_level: Option<crate::release::version::BumpLevel>,
-        reviewed_source: bool,
-    ) -> ValidationResult {
-        use crate::release::semver_checks::SemverCheck;
-
-        match semver_checks::check_release(self.ctx, crate_name) {
-            Ok(SemverCheck::Pass) => {
-                ValidationResult::passed("semver-checks", "no semver-breaking API changes detected")
-            }
-            Ok(SemverCheck::Breaking { message }) => {
-                if reviewed_source && reviewed_level < Some(crate::release::version::BumpLevel::Major) {
-                    ValidationResult::failed(
-                        "semver-checks",
-                        format!(
-                            "{}; reviewed intent is {}: revise the change entry for '{}' to major",
-                            message,
-                            reviewed_level.map_or("none", |level| level.as_str()),
-                            crate_name
-                        ),
-                    )
-                } else if reviewed_source {
-                    ValidationResult::passed(
-                        "semver-checks",
-                        "breaking API change is covered by reviewed major intent",
-                    )
-                } else if policy == SemverCheckPolicy::Deny {
-                    ValidationResult::failed("semver-checks", message)
-                } else {
-                    ValidationResult::passed("semver-checks", format!("advisory: {}", message))
-                }
-            }
-            Ok(SemverCheck::Inconclusive { message }) => ValidationResult::skipped("semver-checks", message),
-            Err(e) => ValidationResult::skipped("semver-checks", format!("failed to run: {}", e)),
-        }
-    }
-
-    /// Run extended validation checks (dry-run publish, MSRV, optional semver checks)
-    ///
-    /// Runs all checks without fail-fast and returns grouped validation results.
-    pub fn validate_extended(
-        &self,
-        crate_names: &[String],
-        release_config: &ReleaseConfig,
-    ) -> RailResult<Vec<(String, Vec<ValidationResult>)>> {
-        let semver_policy = release_config.semver_check;
-        let semver_available =
-            semver_policy == SemverCheckPolicy::Off || semver_checks::is_available(self.ctx.workspace_root());
-        let mut emitted_semver_missing = false;
-        let pending_changes = PendingChangeSet::load(
-            self.ctx.workspace_root(),
-            &release_config.change_dir,
-            self.ctx.graph().workspace_members(),
-        )?;
-
-        Ok(crate_names
+    /// Run package and MSRV checks, retaining the plan's authoritative API evidence.
+    pub fn validate_extended(&self, plan: &ReleasePlan) -> RailResult<Vec<(String, Vec<ValidationResult>)>> {
+        Ok(plan
+            .crates
             .iter()
-            .map(|crate_name| {
-                let mut results = vec![
-                    self.validate_publish_dry_run(crate_name),
-                    self.validate_msrv(crate_name),
-                ];
-
-                if semver_policy != SemverCheckPolicy::Off {
-                    if !semver_available {
-                        if !emitted_semver_missing {
-                            results.push(ValidationResult::skipped(
-                                "semver-checks",
-                                "cargo-semver-checks not installed; install with: cargo install cargo-semver-checks",
-                            ));
-                            emitted_semver_missing = true;
-                        }
-                    } else if self.is_publishable(crate_name) && semver_checks::has_library_target(self.ctx, crate_name)
-                    {
-                        // Unpublished crates have no crates.io baseline to compare against.
-                        let reviewed_level = pending_changes
-                            .for_crate(crate_name)
-                            .iter()
-                            .filter_map(|intent| intent.bump.release_level())
-                            .max();
-                        results.push(self.validate_semver_checks(crate_name, semver_policy, reviewed_level, true));
+            .filter(|package| package.publish)
+            .map(|package| {
+                let evidence = &package.api_evidence;
+                let api = match evidence.outcome {
+                    ApiOutcome::Pass => ValidationResult::passed("semver-checks", &evidence.detail),
+                    ApiOutcome::Fail => ValidationResult::failed("semver-checks", &evidence.detail),
+                    ApiOutcome::Unavailable if evidence.required => {
+                        ValidationResult::failed("semver-checks", &evidence.detail)
                     }
-                }
-
-                (crate_name.clone(), results)
+                    ApiOutcome::Unavailable | ApiOutcome::NotApplicable => {
+                        ValidationResult::skipped("semver-checks", &evidence.detail)
+                    }
+                };
+                (
+                    package.name.clone(),
+                    vec![
+                        self.validate_publish_dry_run(&package.name),
+                        self.validate_msrv(&package.name),
+                        api,
+                    ],
+                )
             })
             .collect())
     }

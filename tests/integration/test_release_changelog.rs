@@ -757,7 +757,13 @@ semver_check = "off"
         let state_path = only_release_state(&ws.path)?;
         let aborted = run_cargo_rail(
             &ws.path,
-            &["rail", "release", "abort", state_path.to_str().unwrap(), "--yes"],
+            &[
+                "rail",
+                "release",
+                "abort",
+                state_path.file_stem().unwrap().to_str().unwrap(),
+                "--yes",
+            ],
         )?;
         assert!(
             aborted.status.success(),
@@ -925,17 +931,6 @@ exec "{}" "$@"
 }
 
 #[cfg(unix)]
-fn run_with_gh_shim(ws: &TestWorkspace, gh_script: &Path, args: &[&str]) -> Result<std::process::Output> {
-    run_with_path_prefix(
-        ws,
-        gh_script
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("GitHub shim has no parent directory"))?,
-        args,
-    )
-}
-
-#[cfg(unix)]
 fn run_with_path_prefix(ws: &TestWorkspace, prefix: &Path, args: &[&str]) -> Result<std::process::Output> {
     let path = format!("{}:{}", prefix.display(), std::env::var("PATH").unwrap_or_default());
     let mut command = if matches!(args.get(1), Some(&"cache" | &"clean")) {
@@ -947,7 +942,7 @@ fn run_with_path_prefix(ws: &TestWorkspace, prefix: &Path, args: &[&str]) -> Res
 }
 
 #[cfg(unix)]
-fn registry_shadow_cargo_shim(log_path: &Path, published_path: &Path) -> Result<tempfile::TempDir> {
+fn publication_boundary_shim(log_path: &Path, published_path: &Path) -> Result<tempfile::TempDir> {
     use std::os::unix::fs::PermissionsExt;
 
     let real_cargo = Command::new("sh").args(["-c", "command -v cargo"]).output()?;
@@ -966,63 +961,15 @@ if [ "$1" = "search" ]; then
   exit 0
 fi
 
-if [ "$1" = "info" ]; then
-  case " $* " in
-    *" --registry crates-io "*)
-      if [ -f "{}" ]; then
-        exit 0
-      fi
-      exit 101
-      ;;
-  esac
-  exit 0
-fi
-
 if [ "$1" = "publish" ]; then
-  if [ -f "{}.deny" ]; then
-    echo "registry temporarily rejected publication" >&2
-    exit 101
-  fi
-  if git show-ref --verify --quiet refs/tags/v0.1.1; then
-    echo "release tag existed before publication became observable" >&2
-    exit 1
-  fi
-  case " $* " in
-    *" --allow-dirty "*)
-      echo "publish must reject dirty package contents" >&2
-      exit 1
-      ;;
-  esac
-  case " $* " in
-    *" --locked "*) ;;
-    *)
-      echo "publish must use the committed lockfile" >&2
-      exit 1
-      ;;
-  esac
-  case " $* " in
-    *" --registry crates-io "*) ;;
-    *)
-      echo "publish must explicitly target crates.io" >&2
-      exit 1
-      ;;
-  esac
-  case " $* " in
-    *" -p registry-shadow "*) ;;
-    *)
-      echo "publish must select exactly one package" >&2
-      exit 1
-      ;;
-  esac
   touch "{}"
-  exit 0
+  echo "unexpected publication in preparation fixture" >&2
+  exit 101
 fi
 
 exec "{}" "$@"
 "#,
             log_path.display(),
-            published_path.display(),
-            published_path.display(),
             published_path.display(),
             real_cargo
         ),
@@ -1065,7 +1012,13 @@ case " $* " in
     done
     head=$("{}" -C "$repository" rev-parse HEAD)
     case " $* " in
-      *" refs/tags/"*) printf '%s\n' "$head" > "{}" ;;
+      *" refs/tags/"*)
+        tag=""
+        for argument in "$@"; do
+          case "$argument" in refs/tags/*) tag="$argument" ;; esac
+        done
+        "{}" -C "$repository" rev-parse "$tag" > "{}"
+        ;;
       *) printf '%s\n' "$head" > "{}" ;;
     esac
     exit 0
@@ -1077,6 +1030,7 @@ exec "{}" "$@"
             remote_head.display(),
             remote_tags.display(),
             remote_tags.display(),
+            real_git,
             real_git,
             remote_tags.display(),
             remote_head.display(),
@@ -1090,12 +1044,7 @@ exec "{}" "$@"
     let gh_path = dir.path().join("gh");
     std::fs::write(
         &gh_path,
-        r#"#!/bin/sh
-if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
-  printf '%s\n' '{"data":{"repository":{"object":{"statusCheckRollup":{"contexts":{"totalCount":1,"checkRunCount":1,"checkRunCountsByState":[{"state":"SUCCESS","count":1}],"statusContextCount":0,"statusContextCountsByState":[]}}}}}}'
-fi
-exit 0
-"#,
+        format!("#!/bin/sh\n{}\nexit 0\n", github_validation_response()),
     )?;
     let mut perms = std::fs::metadata(&gh_path)?.permissions();
     perms.set_mode(0o755);
@@ -1105,7 +1054,7 @@ exit 0
 
 #[cfg(unix)]
 #[test]
-fn release_publish_ignores_local_workspace_shadow_and_targets_crates_io() {
+fn release_rejects_failed_package_validation_before_remote_effects() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_single_crate("registry-shadow", "0.1.0")?;
         ws.write_release_config(
@@ -1113,18 +1062,21 @@ fn release_publish_ignores_local_workspace_shadow_and_targets_crates_io() {
 semver_check = "off"
 sign_tags = false
 remote_effects = "push"
+validation = { ".github/workflows/ci.yml" = ["tests"] }
 registry_publication = "crates-io"
 "#,
         )?;
         ws.set_remote("https://github.com/loadingalias/registry-shadow.git")?;
         ws.commit("Configure releases")?;
         ws.tag("v0.1.0", "Release registry-shadow 0.1.0")?;
+        std::fs::write(ws.path.join("src/lib.rs"), "pub fn invalid( {\n")?;
+        ws.commit("Introduce an invalid package for the validation boundary")?;
         write_test_change(&ws.path, &["registry-shadow"])?;
 
         let shim_state = tempfile::TempDir::new()?;
         let log_path = shim_state.path().join("cargo.log");
         let published_path = shim_state.path().join("published");
-        let shim = registry_shadow_cargo_shim(&log_path, &published_path)?;
+        let shim = publication_boundary_shim(&log_path, &published_path)?;
         let path = format!(
             "{}:{}",
             shim.path().display(),
@@ -1159,64 +1111,24 @@ registry_publication = "crates-io"
         std::fs::remove_file(rejection)?;
         let state_path = only_release_state(&ws.path)?;
         let pending: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
-        assert_eq!(pending["crates"][0]["publication"]["status"], "in_progress");
-        let output = run_with_path_prefix(
-            &ws,
-            shim.path(),
-            &["rail", "release", "resume", state_path.to_str().unwrap()],
-        )?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::ensure!(
-            output.status.success(),
-            "release should publish despite an unqualified local lookup succeeding\nstdout:\n{}\nstderr:\n{}",
-            stdout,
-            stderr
-        );
-
+        assert_eq!(pending["crates"][0]["publication"]["status"], "pending");
+        assert!(pending["package_seal"].is_null());
+        assert_eq!(pending["commit_push"]["status"], "pending");
+        assert_eq!(pending["crates"][0]["tag"]["status"], "pending");
         let log = std::fs::read_to_string(&log_path)?;
         assert!(
-            log.lines()
-                .any(|line| line == "info --registry crates-io registry-shadow@0.1.1"),
-            "registry reconciliation must bypass the local workspace package\ncargo calls:\n{}",
-            log
+            String::from_utf8_lossy(&interrupted.stderr)
+                .contains("Cargo could not validate the complete release package set"),
+            "{}",
+            String::from_utf8_lossy(&interrupted.stderr)
         );
-        let publishes = log
-            .lines()
-            .filter(|line| line.starts_with("publish "))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            publishes,
-            vec!["publish -p registry-shadow --locked --registry crates-io"; 2],
-            "the rejected request and retry must use exact publication arguments\ncargo calls:\n{}",
-            log
+        assert!(
+            !log.lines()
+                .any(|line| line.starts_with("publish ") || line.starts_with("info ")),
+            "{log}"
         );
-        assert!(published_path.exists(), "the registry shim should record a publication");
-        let state: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
-        assert_eq!(state["schema_version"], 8);
-        assert_eq!(state["plan"]["plan_contract_version"], 8);
-        assert_eq!(state["publish_registry"], "crates-io");
-        assert_eq!(state["release_config"]["registry_publication"], "crates-io");
-        assert_eq!(
-            state["crates"][0]["publication"]["object"],
-            "crates-io:registry-shadow@0.1.1"
-        );
-
-        let transaction_id = state["transaction_id"].as_str().unwrap();
-        let cleaned = run_with_path_prefix(
-            &ws,
-            shim.path(),
-            &["rail", "clean", "--release-journal", transaction_id],
-        )?;
-        assert!(cleaned.status.success(), "{}", String::from_utf8_lossy(&cleaned.stderr));
-        std::fs::remove_file(&published_path)?;
-        let status = run_with_path_prefix(&ws, shim.path(), &["rail", "release", "status", "--format", "json"])?;
-        let status: serde_json::Value = serde_json::from_slice(&status.stdout)?;
-        assert_eq!(
-            status["transactions"][0]["recoverability"], "reconstructable",
-            "a matching tag must not substitute for registry truth"
-        );
-        assert_eq!(status["transactions"][0]["ambiguity"], true);
+        assert_eq!(pending["intent"]["publish_registry"], "crates-io");
+        assert!(!published_path.exists());
 
         Ok(())
     })();
@@ -1242,6 +1154,27 @@ fn release_package_excludes_finder_metadata() {
 }
 
 #[cfg(unix)]
+fn github_validation_response() -> &'static str {
+    r#"
+if [ "$1" = "api" ]; then
+  for endpoint in "$@"; do :; done
+  repository=${endpoint#repos/}
+  repository=${repository%%/actions/*}
+  sha=$(git rev-parse HEAD)
+  run="{\"id\":42,\"run_attempt\":3,\"workflow_id\":7,\"head_sha\":\"$sha\",\"path\":\".github/workflows/ci.yml\",\"repository\":{\"full_name\":\"$repository\"},\"head_repository\":{\"full_name\":\"$repository\"},\"event\":\"workflow_dispatch\",\"status\":\"${fixture_status:-completed}\",\"conclusion\":\"success\"}"
+  case "$endpoint" in
+    */actions/workflows/ci.yml) printf '%s\n' '{"id":7,"path":".github/workflows/ci.yml","state":"active"}' ;;
+    */actions/workflows/7/runs*) printf '%s\n' "{\"total_count\":1,\"workflow_runs\":[$run]}" ;;
+    */actions/runs/42/attempts/3/jobs*) printf '%s\n' "{\"total_count\":1,\"jobs\":[{\"id\":17,\"name\":\"tests\",\"run_id\":42,\"run_attempt\":3,\"head_sha\":\"$sha\",\"status\":\"completed\",\"conclusion\":\"success\"}]}" ;;
+    */actions/runs/42|*/actions/runs/42/attempts/3) printf '%s\n' "$run" ;;
+    *) echo "unexpected validation endpoint: $endpoint" >&2; exit 1 ;;
+  esac
+  exit 0
+fi
+"#
+}
+
+#[cfg(unix)]
 fn gh_shim(log_path: &Path) -> Result<(tempfile::TempDir, PathBuf)> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1262,14 +1195,12 @@ fi
 if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
   exit 0
 fi
-if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
-  echo '{{"data":{{"repository":{{"object":{{"statusCheckRollup":{{"contexts":{{"totalCount":1,"checkRunCount":1,"checkRunCountsByState":[{{"state":"SUCCESS","count":1}}],"statusContextCount":0,"statusContextCountsByState":[]}}}}}}}}}}}}'
-  exit 0
-fi
+{}
 echo "unexpected gh args: $@" >&2
 exit 1
 "#,
-            log_path.display()
+            log_path.display(),
+            github_validation_response()
         ),
     )?;
     let mut perms = std::fs::metadata(&path)?.permissions();
@@ -1368,7 +1299,7 @@ semver_check = "warn"
 
     ws.add_crate("lib-a", "1.2.3", &[])?;
     ws.commit("Add lib-a")?;
-    tag_release(&ws, "lib-a", "1.2.3")?;
+    ws.tag("v1.2.3", "Initial release")?;
     ws.modify_file("lib-a", "src/lib.rs", "pub fn doc_only_bump_signal() {}\n")?;
     ws.commit("docs: update public API notes")?;
     Ok(ws)
@@ -1427,6 +1358,52 @@ fn release_plan_accepts_semver_breakage_covered_by_reviewed_major_intent() {
         assert!(stdout.contains("1.2.3 → 2.0.0"), "{}", stdout);
         assert!(stdout.contains("reviewed change files -> major"), "{}", stdout);
 
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(unix)]
+#[test]
+fn release_api_evidence_binds_baseline_and_blocks_required_unavailability() {
+    let result: Result<()> = (|| {
+        let ws = semver_shim_workspace("release-api-evidence")?;
+        write_test_change(&ws.path, &["lib-a"])?;
+        let baseline = String::from_utf8(git(&ws.path, &["rev-parse", "v1.2.3^{}"])?.stdout)?
+            .trim()
+            .to_owned();
+        let args = [
+            "rail", "release", "check", "lib-a", "--bump", "patch", "--format", "json",
+        ];
+        let script = format!(
+            r#"
+[ "$5" = "--baseline-rev" ] && [ "$6" = "{baseline}" ] && [ "$7" = "--default-features" ] && [ "$8" = "--target" ] && [ -n "$9" ] || {{ echo 'wrong comparison scope' >&2; exit 1; }}
+echo 'fixture API evidence is unavailable' >&2
+exit 1
+"#
+        );
+        let optional = run_with_semver_shim(&ws, &script, &args)?;
+        assert_eq!(optional.status.code(), Some(1), "{optional:?}");
+        let document: serde_json::Value = serde_json::from_slice(&optional.stdout)?;
+        let evidence = &document["release_plan"]["crates"][0]["api_evidence"];
+        assert_eq!(evidence["outcome"], "unavailable");
+        assert_eq!(evidence["baseline"], baseline);
+        assert_eq!(evidence["required"], false);
+        assert_eq!(evidence["detail"], "fixture API evidence is unavailable");
+        ws.write_release_config(
+            r#"tag_format = "{crate}-v{version}"
+semver_check = "deny"
+"#,
+        )?;
+        let required = run_with_semver_shim(&ws, &script, &args)?;
+        assert_eq!(required.status.code(), Some(2), "{required:?}");
+        assert!(
+            String::from_utf8_lossy(&required.stdout).contains("fixture API evidence is unavailable"),
+            "{required:?}"
+        );
+        let missing = run_with_semver_shim(&ws, "echo 'no such command: semver-checks' >&2; exit 101", &args)?;
+        assert_eq!(missing.status.code(), Some(2), "{missing:?}");
+        assert!(String::from_utf8_lossy(&missing.stdout).contains("no such command: semver-checks"));
         Ok(())
     })();
     super::helpers::finish_test(result);
@@ -1632,7 +1609,7 @@ auxiliary_cargo_manifests = ["aux-one/Cargo.toml", "aux-two/Cargo.toml"]
             String::from_utf8_lossy(&check.stderr)
         );
         let check: serde_json::Value = serde_json::from_slice(&check.stdout)?;
-        assert_eq!(check["release_plan"]["plan_contract_version"], 8);
+        assert_eq!(check["release_plan"]["plan_contract_version"], 9);
         let projections = check["release_plan"]["auxiliary_lockfiles"]
             .as_array()
             .expect("auxiliary lockfile projections");
@@ -2127,6 +2104,30 @@ auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
             "auxiliary/Cargo.lock"
         );
 
+        let applied = run_cargo_rail(
+            &ws.workspace_root,
+            &[
+                "rail",
+                "release",
+                "run",
+                "--all",
+                "--bump",
+                "patch",
+                "--skip-tag",
+                "--yes",
+            ],
+        )?;
+        assert!(applied.status.success(), "{}", String::from_utf8_lossy(&applied.stderr));
+        assert!(
+            std::fs::read_to_string(ws.workspace_root.join("crates/nested-release/Cargo.toml"))?
+                .contains("version = \"0.1.1\"")
+        );
+        assert!(
+            std::fs::read_to_string(auxiliary.join("Cargo.lock"))?
+                .contains("name = \"nested-release\"\nversion = \"0.1.1\"")
+        );
+        assert!(!ws.git_root.join("auxiliary").exists());
+
         Ok(())
     })();
     super::helpers::finish_test(result);
@@ -2375,10 +2376,21 @@ auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
 
         let state_path = only_release_state(&ws.path)?;
         let state: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
-        assert_eq!(state["schema_version"], 8);
-        assert_eq!(state["plan"]["plan_contract_version"], 8);
-        assert_eq!(state["plan"]["auxiliary_lockfiles"].as_array().unwrap().len(), 1);
-        let resumed = run_cargo_rail(&ws.path, &["rail", "release", "resume", state_path.to_str().unwrap()])?;
+        assert_eq!(state["schema_version"], 9);
+        assert_eq!(state["intent"]["plan"]["plan_contract_version"], 9);
+        assert_eq!(
+            state["intent"]["plan"]["auxiliary_lockfiles"].as_array().unwrap().len(),
+            1
+        );
+        let resumed = run_cargo_rail(
+            &ws.path,
+            &[
+                "rail",
+                "release",
+                "resume",
+                state_path.file_stem().unwrap().to_str().unwrap(),
+            ],
+        )?;
         assert!(resumed.status.success(), "{}", String::from_utf8_lossy(&resumed.stderr));
         let after = std::fs::read_to_string(ws.path.join("auxiliary/Cargo.lock"))?;
         assert!(after.contains("name = \"aux-recovery\"\nversion = \"0.1.1\""));
@@ -2549,7 +2561,7 @@ core = ["lib-a", "lib-b", "lib-c"]
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let json: serde_json::Value = serde_json::from_str(&stdout)?;
-        assert_eq!(json["release_plan"]["plan_contract_version"], 8);
+        assert_eq!(json["release_plan"]["plan_contract_version"], 9);
         assert!(
             json["release_plan"]["snapshot_id"]
                 .as_str()
@@ -2640,19 +2652,41 @@ core = ["lib-a", "lib-b"]
 
 #[cfg(unix)]
 #[test]
-fn release_pr_mode_round_trips_to_finalize_on_merge_commit() {
+fn release_review_continues_the_original_transaction_only_on_its_exact_merged_tree() {
+    reviewed_release_continuation(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn release_hosted_review_rediscovers_a_merge_after_the_original_runner_is_lost() {
+    reviewed_release_continuation(true);
+}
+
+#[cfg(unix)]
+fn reviewed_release_continuation(hosted: bool) {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("release-pr-mode")?;
-        write_release_config(&ws, "remote_effects = \"push\"")?;
+        write_release_config(
+            &ws,
+            &format!(
+                r#"remote_effects = "push"
+validation = {{ ".github/workflows/ci.yml" = ["tests"] }}
+{}"#,
+                if hosted {
+                    "hosted_workflow = \".github/workflows/release.yml\""
+                } else {
+                    ""
+                }
+            ),
+        )?;
         ws.add_crate("lib-a", "0.1.0", &[])?;
         ws.commit("Add lib-a")?;
         tag_release(&ws, "lib-a", "0.1.0")?;
 
         let remote_root = tempfile::TempDir::new()?;
         let remote = remote_root.path().join("origin.git");
-        std::fs::create_dir_all(remote.parent().unwrap())?;
         let output = Command::new("git")
-            .args(["init", "--bare", remote.to_str().unwrap()])
+            .args(["init", "--bare", remote.to_str().expect("UTF-8 fixture remote")])
             .output()?;
         assert!(output.status.success(), "bare remote init failed");
         let ssh = remote_root.path().join("ssh");
@@ -2677,7 +2711,14 @@ exit 1
             std::fs::set_permissions(&ssh, permissions)?;
         }
         ws.set_remote("git@github.com:org/repo.git")?;
-        git(&ws.path, &["config", "core.sshCommand", ssh.to_str().unwrap()])?;
+        git(
+            &ws.path,
+            &[
+                "config",
+                "core.sshCommand",
+                ssh.to_str().expect("UTF-8 fixture SSH path"),
+            ],
+        )?;
         git(&ws.path, &["push", "-u", "origin", "main"])?;
         install_pre_push_hook(
             &ws,
@@ -2709,11 +2750,59 @@ fi
         let gh_log_dir = tempfile::TempDir::new()?;
         let gh_log = gh_log_dir.path().join("gh.log");
         let (_gh_dir, gh_path) = gh_shim(&gh_log)?;
-        let output = run_with_gh_shim(
-            &ws,
-            &gh_path,
-            &["rail", "release", "run", "lib-a", "--bump", "auto", "--pr", "--yes"],
+        let review_api = _gh_dir.path().join("review.py");
+        std::fs::write(
+            &review_api,
+            r#"import json, pathlib, subprocess, sys
+root = pathlib.Path(subprocess.check_output(['git','rev-parse','--git-dir'], text=True).strip())
+p = root/'review.json'
+a = sys.argv[1:]
+if '--method' in a:
+    body = json.loads(pathlib.Path(a[a.index('--input')+1]).read_text())
+    sha = subprocess.check_output(['git','rev-parse','HEAD'], text=True).strip()
+    p.write_text(json.dumps({'number':7,'head':{'sha':sha,'ref':body['head'],'repo':{'full_name':'org/repo'}},'base':{'ref':'main','repo':{'full_name':'org/repo'}},'merged':False,'state':'open'}))
+if any('/pulls?' in x for x in a):
+    print(json.dumps([json.loads(p.read_text())] if p.exists() else []))
+else:
+    print(p.read_text())
+"#,
         )?;
+        let script = std::fs::read_to_string(&gh_path)?;
+        std::fs::write(&gh_path, script.replace("if [ \"$1\" = \"--version\" ]; then", &format!("case \"$*\" in *repos/org/repo/pulls*) exec python3 '{}' \"$@\" ;; esac\nif [ \"$1\" = \"--version\" ]; then", review_api.display())))?;
+        let initial = String::from_utf8_lossy(&git(&ws.path, &["rev-parse", "HEAD"])?.stdout)
+            .trim()
+            .to_owned();
+        let event = gh_log_dir.path().join("event.json");
+        std::fs::write(&event, "{}")?;
+        let execute = |args: &[&str]| -> Result<std::process::Output> {
+            let mut command = cargo_rail_command(&ws.path)?;
+            command
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        gh_path.parent().expect("fixture GitHub executable directory").display(),
+                        std::env::var("PATH").unwrap_or_default()
+                    ),
+                )
+                .args(args);
+            if hosted {
+                command
+                    .env("GITHUB_ACTIONS", "true")
+                    .env("GITHUB_REPOSITORY", "org/repo")
+                    .env(
+                        "GITHUB_WORKFLOW_REF",
+                        "org/repo/.github/workflows/release.yml@refs/heads/main",
+                    )
+                    .env("GITHUB_EVENT_NAME", "workflow_dispatch")
+                    .env("GITHUB_RUN_ID", "88")
+                    .env("GITHUB_SHA", &initial)
+                    .env("GITHUB_EVENT_PATH", &event)
+                    .arg("--executor");
+            }
+            Ok(command.output()?)
+        };
+        let output = execute(&["rail", "release", "run", "lib-a", "--bump", "auto", "--pr", "--yes"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -2736,26 +2825,38 @@ fi
         assert!(!ws.path.join(".changes").exists() || std::fs::read_dir(ws.path.join(".changes"))?.next().is_none());
         assert!(std::fs::read_to_string(ws.path.join("crates/lib-a/Cargo.toml"))?.contains("version = \"0.2.0\""));
         let gh_commands = std::fs::read_to_string(&gh_log)?;
-        assert!(gh_commands.contains("pr create") && gh_commands.contains("--repo org/repo"));
-        assert_eq!(
-            std::fs::read_to_string(ws.path.join(".git/release-pr-hook-context"))?,
-            "1:release\n",
-            "the cargo-rail-owned release PR push must provide the standard hook context"
+        assert!(gh_commands.contains("--method POST repos/org/repo/pulls"));
+        assert!(
+            std::fs::read_to_string(ws.path.join(".git/release-pr-hook-context"))?
+                .lines()
+                .all(|line| line == "1:release")
         );
         let prepared_message =
             String::from_utf8_lossy(&git(&ws.path, &["log", "-1", "--format=%B"])?.stdout).to_string();
         let transaction = prepared_message
             .lines()
             .find_map(|line| line.strip_prefix("Rail-Release: "))
-            .unwrap()
+            .expect("prepared release transaction trailer")
             .to_string();
 
+        let record_path = only_release_state(&ws.path)?;
+        let original: serde_json::Value = serde_json::from_slice(&std::fs::read(&record_path)?)?;
+        assert_eq!(original["phase"], "awaiting_review");
+        std::fs::write(
+            &event,
+            serde_json::to_vec(&serde_json::json!({"inputs": {
+                "transaction": transaction, "intent": original["intent"]["identity"], "source": initial
+            }}))?,
+        )?;
         git(&ws.path, &["checkout", "main"])?;
         git(&ws.path, &["merge", "--no-ff", &branch, "-m", "Merge release PR"])?;
         let merge_sha = String::from_utf8_lossy(&git(&ws.path, &["rev-parse", "HEAD"])?.stdout)
             .trim()
             .to_string();
-        git(&remote, &["fetch", ws.path.to_str().unwrap(), &merge_sha])?;
+        git(
+            &remote,
+            &["fetch", ws.path.to_str().expect("UTF-8 fixture checkout"), &merge_sha],
+        )?;
         git(&remote, &["update-ref", "refs/heads/main", &merge_sha])?;
         install_pre_push_hook(
             &ws,
@@ -2771,36 +2872,63 @@ done
 "#,
         )?;
 
-        let output = run_with_path_prefix(
-            &ws,
-            gh_path.parent().unwrap(),
-            &["rail", "release", "finalize", "lib-a", "--yes"],
-        )?;
+        let review_path = ws.path.join(".git/review.json");
+        let mut pull: serde_json::Value = serde_json::from_slice(&std::fs::read(&review_path)?)?;
+        pull["merged"] = true.into();
+        pull["state"] = "closed".into();
+        pull["merged_at"] = "2026-09-12T12:00:00Z".into();
+        pull["merge_commit_sha"] = merge_sha.clone().into();
+        std::fs::write(&review_path, serde_json::to_vec(&pull)?)?;
+        std::fs::write(ws.path.join("later.txt"), "unrelated merge tree change")?;
+        let later = ws.commit("Unrelated later change")?;
+        pull["merge_commit_sha"] = later.into();
+        std::fs::write(&review_path, serde_json::to_vec(&pull)?)?;
+        let rejected = execute(&["rail", "release", "resume", &transaction])?;
+        assert!(
+            !rejected.status.success(),
+            "changed merge tree was accepted: {rejected:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr).contains("merged release tree differs"),
+            "{rejected:?}"
+        );
+        git(&ws.path, &["reset", "--hard", &merge_sha])?;
+        pull["merge_commit_sha"] = merge_sha.clone().into();
+        std::fs::write(&review_path, serde_json::to_vec(&pull)?)?;
+        if hosted {
+            // No merge event ran: the retained record still names only the prepared PR commit.
+            git(&ws.path, &["switch", &branch])?;
+            assert!(original["review"]["merge"].is_null());
+        }
+        let output = execute(&["rail", "release", "resume", &transaction])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             output.status.success(),
-            "finalize should succeed\nstdout:\n{}\nstderr:\n{}",
+            "review continuation should succeed\nstdout:\n{}\nstderr:\n{}",
             stdout,
             stderr
         );
         let tag_target = String::from_utf8_lossy(&git(&ws.path, &["rev-list", "-n", "1", "v0.2.0"])?.stdout)
             .trim()
             .to_string();
-        let finalized_head = String::from_utf8_lossy(&git(&ws.path, &["rev-parse", "HEAD"])?.stdout)
+        let completed_head = String::from_utf8_lossy(&git(&ws.path, &["rev-parse", "HEAD"])?.stdout)
             .trim()
             .to_string();
         assert_eq!(
             tag_target, merge_sha,
-            "finalize should tag the merged commit covered by release evidence"
+            "review continuation should tag the merged commit covered by release evidence"
         );
-        assert_eq!(finalized_head, merge_sha, "finalize must not manufacture a new commit");
+        assert_eq!(
+            completed_head, merge_sha,
+            "review continuation must not manufacture a new commit"
+        );
         let remote_head = String::from_utf8_lossy(&git(&remote, &["rev-parse", "refs/heads/main"])?.stdout)
             .trim()
             .to_string();
         assert_eq!(
             remote_head, merge_sha,
-            "finalize must not push a protected branch update"
+            "review continuation must not push a protected branch update"
         );
         let remote_tag = String::from_utf8_lossy(&git(&remote, &["rev-list", "-n", "1", "v0.2.0"])?.stdout)
             .trim()
@@ -2808,66 +2936,15 @@ done
         assert_eq!(remote_tag, merge_sha, "the pushed tag must retain the proven commit");
         let gh_commands = std::fs::read_to_string(&gh_log)?;
         assert!(
-            gh_commands.contains("api graphql --hostname github.com"),
+            gh_commands.contains("api --hostname github.com repos/org/repo/actions/runs/42/attempts/3"),
             "GitHub readiness must target the bound host\n{}",
             gh_commands
         );
-        assert!(
-            !transaction.is_empty(),
-            "prepare transaction identity should be preserved in the journal"
-        );
-
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-#[test]
-fn release_finalize_requires_explicit_target_or_all() {
-    let result: Result<()> = (|| {
-        let ws = TestWorkspace::new_named("release-finalize-target-required")?;
-        write_release_config(&ws, "")?;
-        ws.add_crate("lib-a", "0.1.0", &[])?;
-        ws.commit("Add lib-a")?;
-
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "finalize", "--yes"])?;
-        let combined = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(output.status.code(), Some(2), "finalize should fail\n{}", combined);
-        assert!(
-            combined.contains("must specify crate name(s) or --all"),
-            "output:\n{}",
-            combined
-        );
-
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-#[test]
-fn release_finalize_refuses_without_merged_release_notes() {
-    let result: Result<()> = (|| {
-        let ws = TestWorkspace::new_named("release-finalize-refuses-unplanned")?;
-        write_release_config(&ws, "")?;
-        ws.add_crate("lib-a", "0.1.0", &[])?;
-        ws.commit("Add lib-a")?;
-
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "finalize", "lib-a", "--yes"])?;
-        let combined = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(output.status.code(), Some(2), "finalize should fail\n{}", combined);
-        assert!(
-            combined.contains("release finalize expected lib-a v0.1.0"),
-            "output:\n{}",
-            combined
-        );
+        let completed: serde_json::Value = serde_json::from_slice(&std::fs::read(&record_path)?)?;
+        assert_eq!(completed["intent"], original["intent"]);
+        assert_eq!(completed["preparation"], original["preparation"]);
+        assert_eq!(completed["review"]["merge"]["commit"], merge_sha);
+        assert_eq!(completed["status"], "complete");
 
         Ok(())
     })();
@@ -3644,6 +3721,7 @@ fn test_release_creates_gitlab_release_with_glab() {
             r#"tag_prefix = "v"
 tag_format = "v{version}"
 remote_effects = "gitlab"
+semver_check = "off"
 "#,
         )?;
         ws.tag("v0.1.0", "Initial release")?;
@@ -3704,6 +3782,7 @@ fn test_release_errors_when_gitlab_forge_binary_missing() {
             r#"tag_prefix = "v"
 tag_format = "v{version}"
 remote_effects = "gitlab"
+semver_check = "off"
 "#,
         )?;
         ws.tag("v0.1.0", "Initial release")?;
@@ -3858,79 +3937,182 @@ echo "release hook context accepted"
 
 #[cfg(unix)]
 #[test]
-fn release_wait_keeps_one_transaction_attached_until_checks_pass() {
+fn release_hosted_request_survives_the_requester_and_runs_the_original_intent() {
     let result: Result<()> = (|| {
         use std::os::unix::fs::PermissionsExt;
-
-        let ws = TestWorkspace::new_single_crate("release-wait", "0.1.0")?;
+        let ws = TestWorkspace::new_single_crate("hosted-fixture", "0.1.0")?;
         ws.write_release_config(
             r#"tag_format = "v{version}"
+semver_check = "off"
 remote_effects = "push"
+hosted_workflow = ".github/workflows/release.yml"
+validation = { ".github/workflows/ci.yml" = ["tests"] }
 "#,
         )?;
-        ws.set_remote("https://github.com/loadingalias/release-wait.git")?;
-        ws.commit("Configure release wait")?;
-        ws.tag("v0.1.0", "Initial release")?;
-        write_test_change(&ws.path, &["release-wait"])?;
-
-        let shim_state = tempfile::TempDir::new()?;
-        let shim = registry_shadow_cargo_shim(
-            &shim_state.path().join("cargo.log"),
-            &shim_state.path().join("published"),
+        write_test_change(&ws.path, &["hosted-fixture"])?;
+        generate_lockfile(&ws.path)?;
+        let initial = ws.commit("Review the complete hosted request")?;
+        let transport = tempfile::tempdir()?;
+        let remote = transport.path().join("origin.git");
+        git(
+            transport.path(),
+            &["init", "--bare", "--initial-branch=main", remote.to_str().unwrap()],
         )?;
-        let gh = shim.path().join("gh");
-        let readiness_count = shim.path().join("readiness-count");
+        let ssh = transport.path().join("ssh");
         std::fs::write(
-            &gh,
+            &ssh,
             format!(
-                r#"#!/bin/sh
-if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
-  count=0
-  [ -f "{0}" ] && count=$(cat "{0}")
-  count=$((count + 1))
-  printf '%s' "$count" > "{0}"
-  if [ "$count" -eq 1 ]; then
-    state=PENDING
-  else
-    state=SUCCESS
-  fi
-  printf '%s\n' "{{\"data\":{{\"repository\":{{\"object\":{{\"statusCheckRollup\":{{\"contexts\":{{\"totalCount\":1,\"checkRunCount\":1,\"checkRunCountsByState\":[{{\"state\":\"$state\",\"count\":1}}],\"statusContextCount\":0,\"statusContextCountsByState\":[]}}}}}}}}}}}}"
-  exit 0
-fi
-exit 0
-"#,
-                readiness_count.display()
+                "#!/bin/sh\ncase \"$*\" in *git-receive-pack*) exec git-receive-pack '{}' ;; *git-upload-pack*) exec git-upload-pack '{}' ;; esac\nexit 1\n",
+                remote.display(),
+                remote.display()
             ),
         )?;
-        let mut permissions = std::fs::metadata(&gh)?.permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&gh, permissions)?;
-
-        let output = cargo_rail_command(&ws.path)?
-            .env(
-                "PATH",
-                format!(
-                    "{}:{}",
-                    shim.path().display(),
-                    std::env::var("PATH").unwrap_or_default()
-                ),
-            )
-            .env("CARGO_RAIL_RELEASE_POLL_INTERVAL_MS", "1")
-            .args(["rail", "release", "run", "--all", "--wait", "--yes"])
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755))?;
+        ws.set_remote("git@github.com:org/repo.git")?;
+        git(&ws.path, &["config", "core.sshCommand", ssh.to_str().unwrap()])?;
+        git(&ws.path, &["push", "-u", "origin", "main"])?;
+        let (gh_dir, gh) = gh_shim(&transport.path().join("gh.log"))?;
+        let api = gh_dir.path().join("dispatch.py");
+        std::fs::write(
+            &api,
+            r#"import json, pathlib, subprocess, sys
+args=sys.argv[1:]
+root=pathlib.Path(__file__).parent
+endpoint=next(x for x in args if x.startswith('repos/'))
+sha=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+if endpoint.endswith('/dispatches'):
+    body=json.loads(pathlib.Path(args[args.index('--input')+1]).read_text())
+    workflow=7 if '/7/' in endpoint else 8
+    (root/('dispatch-'+str(workflow)+'.json')).write_text(json.dumps(body))
+    if (root/'lose-ack').exists():
+        sys.exit(1)
+    if workflow==7 and (root/'lose-ci-ack').exists():
+        (root/'lose-ci-ack').unlink()
+        sys.exit(1)
+    print(json.dumps({'workflow_run_id':42 if workflow==7 else 88}))
+elif endpoint.endswith('/release.yml'):
+    print(json.dumps({'id':8,'path':'.github/workflows/release.yml','state':'active'}))
+else:
+    print(json.dumps({'id':88,'run_attempt':1,'workflow_id':8,'head_sha':sha,'event':'workflow_dispatch','repository':{'full_name':'org/repo'}}))
+"#,
+        )?;
+        let script = std::fs::read_to_string(&gh)?;
+        std::fs::write(&gh,script.replace("if [ \"$1\" = \"--version\" ]; then",&format!("case \"$*\" in */dispatches*|*/release.yml|*/runs/88) exec python3 '{}' \"$@\" ;; esac\nif [ \"$1\" = \"--version\" ]; then",api.display())))?;
+        let script = std::fs::read_to_string(&gh)?;
+        std::fs::write(&gh,script.replace("if [ \"$1\" = \"--version\" ]; then",&format!("case \"$*\" in */actions/workflows/7/runs*) if [ ! -f '{}/dispatch-7.json' ]; then echo '{{\"total_count\":0,\"workflow_runs\":[]}}'; exit 0; fi ;; esac\nif [ \"$1\" = \"--version\" ]; then",gh_dir.path().display())))?;
+        let path = format!(
+            "{}:{}",
+            gh_dir.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        // The dispatch may have succeeded even when its acknowledgment is lost.
+        std::fs::write(gh_dir.path().join("lose-ack"), "")?;
+        let submitted = cargo_rail_command(&ws.path)?
+            .env("PATH", &path)
+            .args(["rail", "release", "run", "--all", "--yes"])
             .output()?;
         assert!(
-            output.status.success(),
-            "waited release failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            !submitted.status.success(),
+            "lost acknowledgment was not reported: {submitted:?}"
         );
-        assert_eq!(std::fs::read_to_string(readiness_count)?, "2");
         assert!(
-            String::from_utf8_lossy(&git(&ws.path, &["tag", "--list", "v0.1.1"])?.stdout)
-                .lines()
-                .any(|tag| tag == "v0.1.1")
+            String::from_utf8_lossy(&submitted.stderr).contains("workflow dispatch was not acknowledged"),
+            "{submitted:?}"
         );
-
+        let original: serde_json::Value = serde_json::from_slice(&std::fs::read(only_release_state(&ws.path)?)?)?;
+        assert_eq!(
+            git(&ws.path, &["rev-parse", "HEAD"])?.stdout,
+            format!("{initial}\n").as_bytes()
+        );
+        assert_eq!(original["phase"], "planned");
+        assert!(original["intent"]["hosted"] == true);
+        let request: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(gh_dir.path().join("dispatch-8.json"))?)?;
+        assert_eq!(request["inputs"]["intent"], original["intent"]["identity"]);
+        let transaction = original["transaction_id"].as_str().unwrap();
+        std::fs::remove_file(gh_dir.path().join("lose-ack"))?;
+        let runner = transport.path().join("runner");
+        git(
+            transport.path(),
+            &["clone", remote.to_str().unwrap(), runner.to_str().unwrap()],
+        )?;
+        git(&runner, &["remote", "set-url", "origin", "git@github.com:org/repo.git"])?;
+        git(&runner, &["config", "core.sshCommand", ssh.to_str().unwrap()])?;
+        git(&runner, &["config", "user.name", "Release fixture"])?;
+        git(&runner, &["config", "user.email", "release@example.invalid"])?;
+        let event = transport.path().join("event.json");
+        let mut payload = serde_json::json!({"repository":{"full_name":"org/repo"},"inputs":request["inputs"]});
+        payload["inputs"]["intent"] = "sha256:wrong".into();
+        std::fs::write(&event, serde_json::to_vec(&payload)?)?;
+        let execute = || -> Result<std::process::Output> {
+            Ok(cargo_rail_command(&runner)?
+                .env("PATH", &path)
+                .env("GITHUB_ACTIONS", "true")
+                .env("GITHUB_REPOSITORY", "org/repo")
+                .env("GITHUB_WORKSPACE", &runner)
+                .env(
+                    "GITHUB_WORKFLOW_REF",
+                    "org/repo/.github/workflows/release.yml@refs/heads/main",
+                )
+                .env("GITHUB_RUN_ID", "88")
+                .env("GITHUB_EVENT_NAME", "workflow_dispatch")
+                .env("GITHUB_EVENT_PATH", &event)
+                .args(["rail", "release", "resume", transaction, "--executor"])
+                .output()?)
+        };
+        let rejected = execute()?;
+        assert!(!rejected.status.success(), "wrong intent was executed: {rejected:?}");
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr).contains("does not authorize"),
+            "{rejected:?}"
+        );
+        assert_eq!(
+            git(&runner, &["rev-parse", "HEAD"])?.stdout,
+            format!("{initial}\n").as_bytes()
+        );
+        payload["inputs"] = request["inputs"].clone();
+        std::fs::write(&event, serde_json::to_vec(&payload)?)?;
+        // Destroy the requester's entire checkout before continuation.
+        std::fs::remove_dir_all(&ws.path)?;
+        std::fs::write(gh_dir.path().join("lose-ci-ack"), "")?;
+        let interrupted = execute()?;
+        assert!(
+            !interrupted.status.success(),
+            "lost validation acknowledgment was not reported: {interrupted:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&interrupted.stderr).contains("workflow dispatch was not acknowledged"),
+            "{interrupted:?}"
+        );
+        let completed = execute()?;
+        assert!(completed.status.success(), "hosted execution failed: {completed:?}");
+        let retained: serde_json::Value = serde_json::from_slice(&std::fs::read(only_release_state(&runner)?)?)?;
+        assert_eq!(retained["intent"], original["intent"]);
+        assert_eq!(retained["status"], "complete");
+        assert_eq!(retained["executor"], 88);
+        assert_eq!(retained["validation_dispatches"][".github/workflows/ci.yml"], 42);
+        assert_eq!(retained["validation"][0]["run_id"], 42);
+        let prepared = retained["preparation"]["commit"].as_str().unwrap();
+        assert_eq!(
+            git(&remote, &["rev-parse", "refs/tags/v0.1.1^{commit}"])?.stdout,
+            format!("{prepared}\n").as_bytes()
+        );
+        let ci: serde_json::Value = serde_json::from_slice(&std::fs::read(gh_dir.path().join("dispatch-7.json"))?)?;
+        assert_eq!(ci["ref"], "main");
+        let commands = std::fs::read_to_string(transport.path().join("gh.log"))?;
+        assert_eq!(
+            commands
+                .lines()
+                .filter(|line| line.contains("--method POST repos/org/repo/actions/workflows/7/dispatches"))
+                .count(),
+            1
+        );
+        let observed = cargo_rail_command(&runner)?
+            .env("PATH", &path)
+            .args(["rail", "release", "status", "--history", "--format", "json"])
+            .output()?;
+        assert!(observed.status.success(), "{observed:?}");
+        assert!(String::from_utf8_lossy(&observed.stdout).contains("actions/runs/88"));
         Ok(())
     })();
     super::helpers::finish_test(result);
@@ -4024,7 +4206,7 @@ fn test_release_rejects_multiple_origin_push_repositories() {
 
 #[cfg(unix)]
 #[test]
-fn release_reconstructs_missing_journal_from_git_in_a_second_checkout() {
+fn release_gitlab_handoff_requires_original_records_in_a_second_checkout() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_single_crate("cross-checkout", "0.1.0")?;
         ws.write_release_config(
@@ -4070,10 +4252,56 @@ remote_effects = "gitlab"
         assert!(status.status.success(), "{}", String::from_utf8_lossy(&status.stderr));
         let status: serde_json::Value = serde_json::from_slice(&status.stdout)?;
         let transaction = status["transactions"][0]["transaction_id"].as_str().unwrap();
-        assert_eq!(status["transactions"][0]["recoverability"], "reconstructable");
+        assert_eq!(status["transactions"][0]["recoverability"], "missing_record");
         assert_eq!(
             status["transactions"][0]["exact_sha"].as_str().unwrap().as_bytes(),
             remote_head.split(|b| *b == b'\t').next().unwrap()
+        );
+
+        let refused = run_cargo_rail(&clone, &["rail", "release", "resume", transaction])?;
+        assert!(!refused.status.success());
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("original release record"));
+        assert!(
+            git(&clone, &["ls-remote", "--tags", "origin", "v0.1.1"])?
+                .stdout
+                .is_empty()
+        );
+        let bundle = clone_root.path().join("records");
+        let exported = run_cargo_rail(
+            &ws.path,
+            &[
+                "rail",
+                "release",
+                "record",
+                "export",
+                transaction,
+                bundle.to_str().unwrap(),
+            ],
+        )?;
+        assert!(
+            exported.status.success(),
+            "{}",
+            String::from_utf8_lossy(&exported.stdout)
+        );
+        let exported: serde_json::Value = serde_json::from_slice(&exported.stdout)?;
+        let imported = run_cargo_rail(
+            &clone,
+            &[
+                "rail",
+                "release",
+                "record",
+                "import",
+                bundle.to_str().unwrap(),
+                "--intent",
+                exported["intent"].as_str().unwrap(),
+                "--source",
+                exported["source"].as_str().unwrap(),
+            ],
+        )?;
+        assert!(
+            imported.status.success(),
+            "{}",
+            String::from_utf8_lossy(&imported.stdout)
         );
 
         let green_log = shim_state.path().join("green.log");
@@ -4239,7 +4467,15 @@ remote_effects = "push"
         let state_path = only_release_state(&ws.path)?;
         let remote_before = git(&ws.path, &["ls-remote", "origin", "refs/heads/main"])?;
 
-        let resumed = run_cargo_rail(&ws.path, &["rail", "release", "resume", state_path.to_str().unwrap()])?;
+        let resumed = run_cargo_rail(
+            &ws.path,
+            &[
+                "rail",
+                "release",
+                "resume",
+                state_path.file_stem().unwrap().to_str().unwrap(),
+            ],
+        )?;
         assert!(
             resumed.status.success(),
             "resume stderr:\n{}",
@@ -4284,7 +4520,15 @@ fn test_release_resume_rejects_remote_repository_drift() {
             &["remote", "set-url", "origin", replacement.path().to_str().unwrap()],
         )?;
 
-        let resumed = run_cargo_rail(&ws.path, &["rail", "release", "resume", state_path.to_str().unwrap()])?;
+        let resumed = run_cargo_rail(
+            &ws.path,
+            &[
+                "rail",
+                "release",
+                "resume",
+                state_path.file_stem().unwrap().to_str().unwrap(),
+            ],
+        )?;
         let combined = format!(
             "{}\n{}",
             String::from_utf8_lossy(&resumed.stdout),
@@ -4327,7 +4571,13 @@ fn test_release_abort_remains_local_before_a_push_after_origin_drift() {
 
         let aborted = run_cargo_rail(
             &ws.path,
-            &["rail", "release", "abort", state_path.to_str().unwrap(), "--yes"],
+            &[
+                "rail",
+                "release",
+                "abort",
+                state_path.file_stem().unwrap().to_str().unwrap(),
+                "--yes",
+            ],
         )?;
         assert!(
             aborted.status.success(),
@@ -4390,7 +4640,13 @@ remote_effects = "push"
 
         let aborted = run_cargo_rail(
             &ws.path,
-            &["rail", "release", "abort", state_path.to_str().unwrap(), "--yes"],
+            &[
+                "rail",
+                "release",
+                "abort",
+                state_path.file_stem().unwrap().to_str().unwrap(),
+                "--yes",
+            ],
         )?;
         assert!(
             aborted.status.success(),
@@ -4532,7 +4788,7 @@ fn test_release_publication_is_default_deny() {
 fn publication_check_plan_is_accepted_by_the_matching_publish_run() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("publication-plan-parity")?;
-        write_publication_release_config(&ws, "")?;
+        write_publication_release_config(&ws, r#"validation = { ".github/workflows/ci.yml" = ["tests"] }"#)?;
         ws.add_crate("publication-core", "0.1.0", &[])?;
         ws.add_crate(
             "publication-app",
@@ -4599,7 +4855,7 @@ fn publication_check_plan_is_accepted_by_the_matching_publish_run() {
         let shim_state = tempfile::TempDir::new()?;
         let log_path = shim_state.path().join("cargo.log");
         let published_path = shim_state.path().join("published");
-        let shim = registry_shadow_cargo_shim(&log_path, &published_path)?;
+        let shim = publication_boundary_shim(&log_path, &published_path)?;
         let path = format!(
             "{}:{}",
             shim.path().display(),
@@ -4629,7 +4885,10 @@ fn publication_check_plan_is_accepted_by_the_matching_publish_run() {
         let stderr = String::from_utf8_lossy(&run.stderr);
         let stdout = String::from_utf8_lossy(&run.stdout);
         assert_eq!(run.status.code(), Some(2), "stdout:\n{}\nstderr:\n{stderr}", stdout);
-        assert!(stdout.contains("File exists"), "stdout:\n{stdout}\nstderr:\n{stderr}");
+        assert!(
+            stdout.contains("release state directory is not a contained real directory"),
+            "stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
         assert!(
             !published_path.exists(),
             "parity validation must stop before publication"
@@ -5288,7 +5547,15 @@ fn test_release_resume_reconciles_tag_created_before_failure() {
         let state_path = only_release_state(&ws.path)?;
         let before = git(&ws.path, &["rev-list", "--count", "HEAD"])?;
 
-        let resumed = run_cargo_rail(&ws.path, &["rail", "release", "resume", state_path.to_str().unwrap()])?;
+        let resumed = run_cargo_rail(
+            &ws.path,
+            &[
+                "rail",
+                "release",
+                "resume",
+                state_path.file_stem().unwrap().to_str().unwrap(),
+            ],
+        )?;
         assert!(
             resumed.status.success(),
             "resume failed:\n{}",
@@ -5303,6 +5570,267 @@ fn test_release_resume_reconciles_tag_created_before_failure() {
         assert_eq!(String::from_utf8_lossy(&tags.stdout).lines().count(), 1);
         let state: serde_json::Value = serde_json::from_slice(&std::fs::read(state_path)?)?;
         assert_eq!(state["status"], "complete");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(unix)]
+#[test]
+fn release_remote_records_survive_runner_loss_without_moving_the_source_branch() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_single_crate("remote-record", "0.1.0")?;
+        ws.write_release_config("semver_check = 'off'\nsign_tags = false\nremote_effects = 'gitlab'\n")?;
+        write_test_change(&ws.path, &["remote-record"])?;
+        let initial = ws.commit("Review remote release")?;
+        let remote = tempfile::TempDir::new()?;
+        git(remote.path(), &["init", "--bare", "--initial-branch=main"])?;
+        ws.set_remote(remote.path().to_str().unwrap())?;
+        git(&ws.path, &["push", "-u", "origin", "main"])?;
+        let logs = tempfile::tempdir()?;
+        let (_shim, glab) = glab_shim_with_status(&logs.path().join("glab.log"), "success")?;
+        let prepared = run_with_path_prefix(
+            &ws,
+            glab.parent().unwrap(),
+            &[
+                "rail",
+                "release",
+                "run",
+                "--all",
+                "--bump",
+                "patch",
+                "--prepare",
+                "--retain-remote",
+                "--yes",
+                "--format",
+                "json",
+            ],
+        )?;
+        assert!(
+            prepared.status.success(),
+            "{}",
+            String::from_utf8_lossy(&prepared.stdout)
+        );
+        let prepared: serde_json::Value = serde_json::from_slice(&prepared.stdout)?;
+        let transaction = prepared["transaction_id"].as_str().unwrap();
+        let source = prepared["source"].as_str().unwrap();
+        let intent = prepared["intent"].as_str().unwrap();
+        assert_ne!(source, initial);
+        assert_eq!(
+            git(remote.path(), &["rev-parse", "refs/heads/main"])?.stdout,
+            format!("{initial}\n").as_bytes()
+        );
+        let retained = git(remote.path(), &["show", "refs/notes/cargo-rail/active:record.json"])?;
+        let retained: serde_json::Value = serde_json::from_slice(&retained.stdout)?;
+        assert_eq!(retained["intent"]["identity"], intent);
+        assert_eq!(retained["preparation"]["commit"], source);
+        assert_eq!(retained["remote_storage"], true);
+        assert_eq!(retained["commit_push"]["status"], "pending");
+        let recovery = tempfile::tempdir()?;
+        let clone = recovery.path().join("clone");
+        let cloned = git(
+            recovery.path(),
+            &["clone", remote.path().to_str().unwrap(), clone.to_str().unwrap()],
+        )?;
+        assert!(cloned.status.success());
+        git(&clone, &["config", "user.name", "Release fixture"])?;
+        git(&clone, &["config", "user.email", "release@example.invalid"])?;
+        let fetched = run_cargo_rail(&clone, &["rail", "release", "record", "fetch"])?;
+        assert!(fetched.status.success(), "{}", String::from_utf8_lossy(&fetched.stdout));
+        let fetched: serde_json::Value = serde_json::from_slice(&fetched.stdout)?;
+        assert_eq!(fetched["transaction_id"], transaction);
+        assert_eq!(fetched["intent"], intent);
+        git(&clone, &["reset", "--hard", source])?;
+        let resumed = cargo_rail_command(&clone)?
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    glab.parent().unwrap().display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .args(["rail", "release", "resume"])
+            .output()?;
+        assert!(resumed.status.success(), "{}", String::from_utf8_lossy(&resumed.stderr));
+        let terminal = git(remote.path(), &["show", "refs/notes/cargo-rail/active:record.json"])?;
+        let terminal: serde_json::Value = serde_json::from_slice(&terminal.stdout)?;
+        assert_eq!(terminal["status"], "complete");
+        assert_eq!(terminal["intent"], retained["intent"]);
+        assert_eq!(
+            git(remote.path(), &["rev-parse", "refs/tags/v0.1.1^{}"])?.stdout,
+            format!("{source}\n").as_bytes()
+        );
+        let refs = git(&clone, &["for-each-ref", "--format=%(refname)", "refs/heads"])?;
+        assert_eq!(refs.stdout, b"refs/heads/main\n");
+        write_test_change(&clone, &["remote-record"])?;
+        git(&clone, &["add", ".changes"])?;
+        git(&clone, &["commit", "-m", "Review the next release"])?;
+        let second = cargo_rail_command(&clone)?
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    glab.parent().unwrap().display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .args([
+                "rail",
+                "release",
+                "run",
+                "--all",
+                "--bump",
+                "patch",
+                "--prepare",
+                "--retain-remote",
+                "--yes",
+                "--format",
+                "json",
+            ])
+            .output()?;
+        assert!(second.status.success(), "{}", String::from_utf8_lossy(&second.stdout));
+        let second: serde_json::Value = serde_json::from_slice(&second.stdout)?;
+        assert_ne!(second["transaction_id"], transaction);
+        let active = git(remote.path(), &["rev-parse", "refs/notes/cargo-rail/active"])?.stdout;
+        let fetched_old = run_cargo_rail(&clone, &["rail", "release", "record", "fetch", transaction])?;
+        assert!(
+            fetched_old.status.success(),
+            "{}",
+            String::from_utf8_lossy(&fetched_old.stdout)
+        );
+        assert_eq!(
+            git(remote.path(), &["rev-parse", "refs/notes/cargo-rail/active"])?.stdout,
+            active,
+            "reading an old transaction must not publish it as the active transaction"
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn release_record_handoff_preserves_intent_and_resumes_in_a_fresh_clone() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_single_crate("release-handoff", "0.1.0")?;
+        ws.write_release_config("semver_check = 'off'\nsign_tags = false\n")?;
+        write_test_change(&ws.path, &["release-handoff"])?;
+        ws.commit("Review the release intent")?;
+        let interrupted = run_with_lost_git_acknowledgment(
+            &ws.path,
+            &["rail", "release", "run", "--all", "--bump", "patch", "--yes"],
+            "tag",
+        )?;
+        assert!(!interrupted.status.success());
+        let state_path = only_release_state(&ws.path)?;
+        let state: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
+        let transaction = state["transaction_id"].as_str().unwrap();
+        let intent = state["intent"]["identity"].as_str().unwrap();
+        let source = state["preparation"]["commit"].as_str().unwrap();
+        let transport = tempfile::tempdir()?;
+        let bundle = transport.path().join("bundle");
+        let exported = run_cargo_rail(
+            &ws.path,
+            &[
+                "rail",
+                "release",
+                "record",
+                "export",
+                transaction,
+                bundle.to_str().unwrap(),
+            ],
+        )?;
+        assert!(
+            exported.status.success(),
+            "{}",
+            String::from_utf8_lossy(&exported.stdout)
+        );
+        let output: serde_json::Value = serde_json::from_slice(&exported.stdout)?;
+        assert_eq!(output["intent"], intent);
+        assert_eq!(output["source"], source);
+        let portable = std::fs::read_to_string(bundle.join("record.json"))?;
+        assert!(!portable.contains(ws.path.to_str().unwrap()));
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../schemas/release-record-v9.schema.json"))?;
+        let validator = jsonschema::validator_for(&schema)?;
+        let record: serde_json::Value = serde_json::from_str(&portable)?;
+        let errors = validator
+            .iter_errors(&record)
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            errors.is_empty(),
+            "source record violates the release schema: {errors:?}"
+        );
+        let clone = transport.path().join("clone");
+        let cloned = git(
+            transport.path(),
+            &[
+                "clone",
+                "--no-local",
+                ws.path.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        )?;
+        assert!(cloned.status.success(), "{}", String::from_utf8_lossy(&cloned.stderr));
+        git(&clone, &["config", "user.name", "Release fixture"])?;
+        git(&clone, &["config", "user.email", "release@example.invalid"])?;
+        assert!(!clone.join("target/cargo-rail/releases").exists());
+        let rejected = run_cargo_rail(
+            &clone,
+            &[
+                "rail",
+                "release",
+                "record",
+                "import",
+                bundle.to_str().unwrap(),
+                "--intent",
+                "sha256:wrong",
+                "--source",
+                source,
+            ],
+        )?;
+        assert!(!rejected.status.success());
+        assert!(String::from_utf8_lossy(&rejected.stdout).contains("authorized intent"));
+        assert!(
+            !clone
+                .join("target/cargo-rail/releases")
+                .join(format!("{transaction}.json"))
+                .exists()
+        );
+        let imported = run_cargo_rail(
+            &clone,
+            &[
+                "rail",
+                "release",
+                "record",
+                "import",
+                bundle.to_str().unwrap(),
+                "--intent",
+                intent,
+                "--source",
+                source,
+            ],
+        )?;
+        assert!(
+            imported.status.success(),
+            "{}",
+            String::from_utf8_lossy(&imported.stdout)
+        );
+        let received = only_release_state(&clone)?;
+        let resumed = run_cargo_rail(&clone, &["rail", "release", "resume"])?;
+        assert!(resumed.status.success(), "{}", String::from_utf8_lossy(&resumed.stderr));
+        let completed: serde_json::Value = serde_json::from_slice(&std::fs::read(received)?)?;
+        assert_eq!(completed["status"], "complete");
+        assert_eq!(completed["intent"], state["intent"]);
+        assert_eq!(
+            git(&clone, &["rev-parse", "HEAD"])?.stdout,
+            format!("{source}\n").as_bytes()
+        );
+        assert_eq!(
+            git(&clone, &["rev-parse", "v0.1.1^{}"])?.stdout,
+            format!("{source}\n").as_bytes()
+        );
         Ok(())
     })();
     super::helpers::finish_test(result);
@@ -5330,7 +5858,15 @@ fn release_resume_rejects_same_branch_head_movement() {
         ws.modify_file("lib-a", "src/lib.rs", "pub fn moved_after_release() {}")?;
         ws.commit("feat: move release branch")?;
 
-        let resumed = run_cargo_rail(&ws.path, &["rail", "release", "resume", state_path.to_str().unwrap()])?;
+        let resumed = run_cargo_rail(
+            &ws.path,
+            &[
+                "rail",
+                "release",
+                "resume",
+                state_path.file_stem().unwrap().to_str().unwrap(),
+            ],
+        )?;
         assert!(!resumed.status.success());
         let stderr = String::from_utf8_lossy(&resumed.stderr);
         assert!(
@@ -5375,7 +5911,12 @@ fn unsupported_release_journal_blocks_resume_and_new_transactions() {
         let unsupported = serde_json::to_vec(&state)?;
         std::fs::write(&state_path, &unsupported)?;
         for args in [
-            vec!["rail", "release", "resume", state_path.to_str().unwrap()],
+            vec![
+                "rail",
+                "release",
+                "resume",
+                state_path.file_stem().unwrap().to_str().unwrap(),
+            ],
             vec![
                 "rail",
                 "release",
@@ -5467,7 +6008,15 @@ fn release_recovery_survives_invalid_metadata_and_clean_refuses_active_state() {
         std::fs::write(&manifest_path, "not valid Cargo metadata again\n")?;
         let config_path = ws.path.join(".config/rail.toml");
         assert!(config_path.exists(), "test release config disappeared before recovery");
-        let resumed = run_cargo_rail(&ws.path, &["rail", "release", "resume", state_path.to_str().unwrap()])?;
+        let resumed = run_cargo_rail(
+            &ws.path,
+            &[
+                "rail",
+                "release",
+                "resume",
+                state_path.file_stem().unwrap().to_str().unwrap(),
+            ],
+        )?;
         assert!(resumed.status.success(), "{}", String::from_utf8_lossy(&resumed.stderr));
         let cleaned = run_cargo_rail(
             &ws.path,
@@ -5514,21 +6063,94 @@ fn release_resume_reconciles_commits_before_and_after_journal_observation() {
             );
 
             let mut state: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
-            assert_eq!(state["crates"][0]["commit"]["status"], "in_progress");
+            assert_eq!(state["preparation"]["status"], "committing");
             if observed {
                 let head = git(&ws.path, &["rev-parse", "HEAD"])?;
                 let head = String::from_utf8(head.stdout)?.trim().to_owned();
-                state["crates"][0]["commit"] = serde_json::json!({"status": "complete", "object": head});
+                state["preparation"] = serde_json::json!({"status": "complete", "commit": head});
                 std::fs::write(&state_path, serde_json::to_vec_pretty(&state)?)?;
             }
 
-            let resumed = run_cargo_rail(&ws.path, &["rail", "release", "resume", state_path.to_str().unwrap()])?;
+            let resumed = run_cargo_rail(
+                &ws.path,
+                &[
+                    "rail",
+                    "release",
+                    "resume",
+                    state_path.file_stem().unwrap().to_str().unwrap(),
+                ],
+            )?;
             assert!(resumed.status.success(), "{}", String::from_utf8_lossy(&resumed.stderr));
             let after_resume = git(&ws.path, &["rev-list", "--count", "HEAD"])?;
             assert_eq!(
                 after_fault.stdout, after_resume.stdout,
                 "resume must not duplicate the commit"
             );
+        }
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn release_resume_rejects_a_replaced_preparation_tree_or_message() {
+    let result: Result<()> = (|| {
+        for replace_tree in [false, true] {
+            let ws = TestWorkspace::new_single_crate("preparation-binding", "0.1.0")?;
+            write_test_change(&ws.path, &["preparation-binding"])?;
+            let interrupted = run_with_lost_git_acknowledgment(
+                &ws.path,
+                &[
+                    "rail",
+                    "release",
+                    "run",
+                    "--all",
+                    "--bump",
+                    "patch",
+                    "--skip-tag",
+                    "--yes",
+                ],
+                "commit",
+            )?;
+            assert!(!interrupted.status.success());
+            let state_path = only_release_state(&ws.path)?;
+            let saved = std::fs::read(&state_path)?;
+            if replace_tree {
+                std::fs::write(ws.path.join("unreviewed.txt"), "unreviewed commit content")?;
+                let stage = git(&ws.path, &["add", "unreviewed.txt"])?;
+                assert!(stage.status.success());
+                let amended = git(&ws.path, &["commit", "--amend", "--no-edit"])?;
+                assert!(amended.status.success());
+            } else {
+                let amended = git(
+                    &ws.path,
+                    &["commit", "--amend", "-m", "chore(release): preparation-binding v0.1.1"],
+                )?;
+                assert!(amended.status.success());
+            }
+            let head = git(&ws.path, &["rev-parse", "HEAD"])?;
+            let resumed = run_cargo_rail(
+                &ws.path,
+                &[
+                    "rail",
+                    "release",
+                    "resume",
+                    state_path.file_stem().unwrap().to_str().unwrap(),
+                ],
+            )?;
+            assert_eq!(resumed.status.code(), Some(2), "{resumed:?}");
+            assert!(
+                String::from_utf8_lossy(&resumed.stderr).contains("saved parent, tree, and message"),
+                "{resumed:?}"
+            );
+            assert_eq!(std::fs::read(&state_path)?, saved);
+            assert_eq!(git(&ws.path, &["rev-parse", "HEAD"])?.stdout, head.stdout);
+            if replace_tree {
+                assert_eq!(
+                    std::fs::read_to_string(ws.path.join("unreviewed.txt"))?,
+                    "unreviewed commit content"
+                );
+            }
         }
         Ok(())
     })();
@@ -5626,8 +6248,8 @@ fn release_transaction_id_is_recorded_in_commits_and_terminal_status() {
             &["rail", "release", "status", "--history", "--format", "json"],
         )?;
         let reconstructed: serde_json::Value = serde_json::from_slice(&reconstructed.stdout)?;
-        assert_eq!(reconstructed["transactions"][0]["state"], "released:git");
-        assert_eq!(reconstructed["transactions"][0]["recoverability"], "terminal");
+        assert_eq!(reconstructed["transactions"][0]["state"], "record_unavailable");
+        assert_eq!(reconstructed["transactions"][0]["recoverability"], "missing_record");
         Ok(())
     })();
     super::helpers::finish_test(result);
@@ -5654,7 +6276,13 @@ fn test_release_abort_restores_local_state_before_remote_side_effects() {
         let state_path = only_release_state(&ws.path)?;
         let aborted = run_cargo_rail(
             &ws.path,
-            &["rail", "release", "abort", state_path.to_str().unwrap(), "--yes"],
+            &[
+                "rail",
+                "release",
+                "abort",
+                state_path.file_stem().unwrap().to_str().unwrap(),
+                "--yes",
+            ],
         )?;
         assert!(
             aborted.status.success(),
@@ -6111,7 +6739,7 @@ fn release_check_uses_the_same_local_plan_for_an_unpublishable_workspace() {
 fn release_publication_check_preserves_unpublishable_release_plan_authority() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("release-check-publication-unpublishable")?;
-        write_publication_release_config(&ws, "")?;
+        write_publication_release_config(&ws, r#"validation = { ".github/workflows/ci.yml" = ["tests"] }"#)?;
         add_unpublishable_crate(&ws, "internal", "0.1.0")?;
         ws.commit("feat: add internal release")?;
         write_test_change(&ws.path, &["internal"])?;
@@ -6153,7 +6781,7 @@ fn release_publication_check_preserves_unpublishable_release_plan_authority() {
 fn test_release_check_all_skips_unpublishable_cargo_toml() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("check-skip-unpub")?;
-        write_publication_release_config(&ws, "")?;
+        write_publication_release_config(&ws, r#"validation = { ".github/workflows/ci.yml" = ["tests"] }"#)?;
 
         // Add a publishable crate
         ws.add_crate("lib-pub", "0.1.0", &[])?;
@@ -6202,7 +6830,7 @@ fn test_release_check_all_skips_unpublishable_cargo_toml() {
 fn test_release_check_path_deps_allowed_for_unpublishable() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("path-dep-unpub")?;
-        write_publication_release_config(&ws, "")?;
+        write_publication_release_config(&ws, r#"validation = { ".github/workflows/ci.yml" = ["tests"] }"#)?;
 
         // Add a publishable crate
         ws.add_crate("lib-core", "0.1.0", &[])?;
@@ -6237,7 +6865,7 @@ fn test_release_check_path_deps_allowed_for_unpublishable() {
 fn test_release_check_explicit_unpublishable_crate() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("explicit-unpub")?;
-        write_publication_release_config(&ws, "")?;
+        write_publication_release_config(&ws, r#"validation = { ".github/workflows/ci.yml" = ["tests"] }"#)?;
 
         // Add an unpublishable crate
         add_unpublishable_crate(&ws, "internal-tool", "0.1.0")?;
@@ -6269,7 +6897,7 @@ fn test_release_check_explicit_unpublishable_crate() {
 fn test_release_check_json_includes_skipped() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("json-skipped")?;
-        write_publication_release_config(&ws, "")?;
+        write_publication_release_config(&ws, r#"validation = { ".github/workflows/ci.yml" = ["tests"] }"#)?;
 
         // Add publishable and unpublishable crates
         ws.add_crate("lib-pub", "0.1.0", &[])?;
@@ -6501,6 +7129,51 @@ fn test_subset_release_only_mutates_selected_closure_tags_and_changelogs() {
         ws.commit("feat: change lib-a")?;
         write_test_change(&ws.path, &["lib-a"])?;
 
+        let preview = run_cargo_rail(
+            &ws.path,
+            &[
+                "rail",
+                "release",
+                "check",
+                "lib-a",
+                "--include-dependents",
+                "--bump",
+                "patch",
+                "--format",
+                "json",
+            ],
+        )?;
+        assert_eq!(preview.status.code(), Some(1));
+        let preview: serde_json::Value = serde_json::from_slice(&preview.stdout)?;
+        let actions = preview["mutation_plan"]["actions"].as_array().unwrap();
+        for code in ["COMMIT_RELEASE", "UPDATE_LOCKFILE"] {
+            assert_eq!(
+                actions.iter().filter(|action| action["code"] == code).count(),
+                1,
+                "{code}"
+            );
+        }
+        let commit = actions
+            .iter()
+            .position(|action| action["code"] == "COMMIT_RELEASE")
+            .unwrap();
+        for code in [
+            "BUMP_VERSION",
+            "UPDATE_CHANGELOG",
+            "DELETE_CHANGE_FILE",
+            "UPDATE_LOCKFILE",
+        ] {
+            assert!(
+                actions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, action)| action["code"] == code)
+                    .all(|(index, _)| index < commit)
+            );
+        }
+        let initial_head = String::from_utf8(git(&ws.path, &["rev-parse", "HEAD"])?.stdout)?
+            .trim()
+            .to_owned();
         let output = run_cargo_rail(
             &ws.path,
             &[
@@ -6523,6 +7196,35 @@ fn test_subset_release_only_mutates_selected_closure_tags_and_changelogs() {
             stdout,
             stderr
         );
+
+        let head = String::from_utf8(git(&ws.path, &["rev-parse", "HEAD"])?.stdout)?
+            .trim()
+            .to_owned();
+        let count = git(&ws.path, &["rev-list", "--count", &format!("{initial_head}..HEAD")])?;
+        assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "1");
+        for tag in ["lib-a-v0.1.1", "lib-b-v0.1.1"] {
+            let target = git(&ws.path, &["rev-parse", &format!("{tag}^{{commit}}")])?;
+            assert_eq!(String::from_utf8_lossy(&target.stdout).trim(), head);
+        }
+        let state_path = only_release_state(&ws.path)?;
+        let state: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
+        assert_eq!(
+            state["preparation"],
+            serde_json::json!({"status":"complete", "commit":head})
+        );
+        for package in state["crates"].as_array().unwrap() {
+            assert!(package.get("commit").is_none());
+        }
+        std::fs::remove_file(state_path)?;
+        let status = run_cargo_rail(
+            &ws.path,
+            &["rail", "release", "status", "--history", "--format", "json"],
+        )?;
+        let status: serde_json::Value = serde_json::from_slice(&status.stdout)?;
+        assert_eq!(status["transactions"][0]["exact_sha"], head);
+        assert_eq!(status["transactions"][0]["recoverability"], "missing_record");
+        assert_eq!(status["transactions"][0]["state"], "record_unavailable");
+        assert_eq!(status["transactions"][0]["ambiguity"], false);
 
         let lib_a_manifest = std::fs::read_to_string(ws.path.join("crates/lib-a/Cargo.toml"))?;
         let lib_b_manifest = std::fs::read_to_string(ws.path.join("crates/lib-b/Cargo.toml"))?;
@@ -6658,6 +7360,864 @@ fn test_subset_release_updates_shared_workspace_dependency_versions() {
             lib_b_manifest
         );
 
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(unix)]
+#[test]
+fn release_cannot_authorize_itself_or_replace_a_verified_workflow_attempt() {
+    let result: Result<()> = (|| {
+        for own_run in [true, false] {
+            let ws = TestWorkspace::new_single_crate("workflow-authority", "0.1.0")?;
+            ws.write_release_config(
+                r#"remote_effects = "push"
+semver_check = "off"
+sign_tags = false
+validation = { ".github/workflows/ci.yml" = ["tests"] }
+"#,
+            )?;
+            ws.set_remote("https://github.com/example/workflow-authority.git")?;
+            write_test_change(&ws.path, &["workflow-authority"])?;
+            ws.commit("Review workflow-bound release")?;
+            let boundary = tempfile::tempdir()?;
+            let shim =
+                publication_boundary_shim(&boundary.path().join("cargo.log"), &boundary.path().join("published"))?;
+            let git_proxy = shim.path().join("git");
+            let original_git_proxy = std::fs::read_to_string(&git_proxy)?;
+            if !own_run {
+                std::fs::write(&git_proxy, original_git_proxy.replacen("#!/bin/sh", "#!/bin/sh\ncase \" $* \" in *\" tag -a \"*) echo 'fixture tag creation interrupted' >&2; exit 1 ;; esac", 1))?;
+            }
+            let search = format!(
+                "{}:{}",
+                shim.path().display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            let interrupted = cargo_rail_command(&ws.path)?
+                .env("PATH", &search)
+                .env("GITHUB_RUN_ID", if own_run { "42" } else { "99" })
+                .args(["rail", "release", "run", "--all", "--bump", "patch", "--yes"])
+                .output()?;
+            assert!(!interrupted.status.success());
+            let state_path = only_release_state(&ws.path)?;
+            let retained = std::fs::read(&state_path)?;
+            let state: serde_json::Value = serde_json::from_slice(&retained)?;
+            let tags = git(&ws.path, &["tag", "--list", "v0.1.1"])?;
+            assert!(tags.stdout.is_empty(), "no release tag may precede required validation");
+            if own_run {
+                assert!(String::from_utf8_lossy(&interrupted.stderr).contains("cannot authorize itself"));
+                assert_eq!(state["validation"], serde_json::json!([]));
+                assert_ne!(state["readiness"]["status"], "complete");
+            } else {
+                assert!(String::from_utf8_lossy(&interrupted.stderr).contains("fixture tag creation interrupted"));
+                assert_eq!(
+                    state["validation"],
+                    serde_json::json!([{
+                        "workflow":".github/workflows/ci.yml", "workflow_id":7, "run_id":42, "attempt":3,
+                        "jobs":[{"name":"tests","id":17}]
+                    }])
+                );
+                let gh = shim.path().join("gh");
+                let response = std::fs::read_to_string(&gh)?;
+                let changed = response.replace("\\\"run_attempt\\\":3", "\\\"run_attempt\\\":4");
+                assert_ne!(response, changed);
+                std::fs::write(&gh, changed)?;
+                std::fs::write(&git_proxy, original_git_proxy)?;
+                let rejected = cargo_rail_command(&ws.path)?
+                    .env("PATH", &search)
+                    .env("GITHUB_RUN_ID", "99")
+                    .args(["rail", "release", "resume"])
+                    .output()?;
+                assert!(!rejected.status.success());
+                assert!(String::from_utf8_lossy(&rejected.stderr).contains("validation attempt changed"));
+                assert_eq!(
+                    std::fs::read(state_path)?,
+                    retained,
+                    "a rerun must not replace sealed validation"
+                );
+                assert!(git(&ws.path, &["tag", "--list", "v0.1.1"])?.stdout.is_empty());
+            }
+        }
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(unix)]
+#[test]
+fn remote_release_record_rejects_a_second_upload_attempt_identity() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_single_crate("upload-lease", "0.1.0")?;
+        ws.write_release_config(
+            "remote_effects = 'gitlab'\nregistry_publication = 'crates-io'\nsemver_check = 'off'\nsign_tags = false\n",
+        )?;
+        write_test_change(&ws.path, &["upload-lease"])?;
+        ws.commit("Review the publication request")?;
+        let remote = tempfile::tempdir()?;
+        git(remote.path(), &["init", "--bare", "--initial-branch=main"])?;
+        ws.set_remote(remote.path().to_str().unwrap())?;
+        git(&ws.path, &["push", "-u", "origin", "main"])?;
+        let logs = tempfile::tempdir()?;
+        let (_shim, glab) = glab_shim_with_status(&logs.path().join("glab.log"), "success")?;
+        let prepared = run_with_path_prefix(
+            &ws,
+            glab.parent().unwrap(),
+            &[
+                "rail",
+                "release",
+                "run",
+                "--all",
+                "--bump",
+                "patch",
+                "--publish",
+                "--skip-tag",
+                "--prepare",
+                "--retain-remote",
+                "--yes",
+                "--format",
+                "json",
+            ],
+        )?;
+        assert!(
+            prepared.status.success(),
+            "{}",
+            String::from_utf8_lossy(&prepared.stdout)
+        );
+        let summary: serde_json::Value = serde_json::from_slice(&prepared.stdout)?;
+        let transaction = summary["transaction_id"].as_str().unwrap();
+        let source = summary["source"].as_str().unwrap();
+        git(&ws.path, &["push", "origin", "main"])?;
+        let other = tempfile::tempdir()?;
+        let clone = other.path().join("clone");
+        git(
+            other.path(),
+            &["clone", remote.path().to_str().unwrap(), clone.to_str().unwrap()],
+        )?;
+        git(&clone, &["config", "user.name", "Second executor"])?;
+        git(&clone, &["config", "user.email", "second@example.invalid"])?;
+        let fetched = run_cargo_rail(&clone, &["rail", "release", "record", "fetch", transaction])?;
+        assert!(fetched.status.success(), "{}", String::from_utf8_lossy(&fetched.stdout));
+        let first_path = only_release_state(&ws.path)?;
+        let second_path = only_release_state(&clone)?;
+        let mut record: serde_json::Value = serde_json::from_slice(&std::fs::read(&first_path)?)?;
+        let archive_bytes = b"sealed upload lease fixture";
+        let checksum = rscrypto::Sha256::digest(archive_bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let archive_directory = first_path.with_extension("artifacts");
+        std::fs::create_dir_all(archive_directory.join("attempts"))?;
+        std::fs::write(archive_directory.join("upload-lease-0.1.1.crate"), archive_bytes)?;
+        record["package_seal"] = serde_json::json!({
+            "source_commit":source, "cargo_version":"cargo fixture", "registry_index":"https://github.com/rust-lang/crates.io-index",
+            "packages":[{"name":"upload-lease","version":"0.1.1","bytes":archive_bytes.len(),"sha256":checksum}]
+        });
+        record["phase"] = serde_json::json!("publishing");
+        record["commit_push"] = serde_json::json!({"status":"complete","object":source});
+        record["readiness"] = serde_json::json!({"status":"complete","object":"gitlab:success"});
+        record["crates"][0]["publication"] = serde_json::json!({"status":"in_progress","object":checksum});
+        record["crates"][0]["publication_attempt"] = serde_json::json!("1".repeat(64));
+        std::fs::write(&first_path, serde_json::to_vec(&record)?)?;
+        let claimed = run_cargo_rail(&ws.path, &["rail", "release", "record", "store", transaction])?;
+        assert!(claimed.status.success(), "{}", String::from_utf8_lossy(&claimed.stdout));
+        let first = git(remote.path(), &["rev-parse", "refs/notes/cargo-rail/active"])?.stdout;
+        record["crates"][0]["publication_attempt"] = serde_json::json!("2".repeat(64));
+        std::fs::write(second_path, serde_json::to_vec(&record)?)?;
+        let rejected = run_cargo_rail(&clone, &["rail", "release", "record", "store", transaction])?;
+        assert!(!rejected.status.success());
+        assert!(String::from_utf8_lossy(&rejected.stdout).contains("progress conflicts"));
+        assert_eq!(
+            git(remote.path(), &["rev-parse", "refs/notes/cargo-rail/active"])?.stdout,
+            first
+        );
+        let retained = git(remote.path(), &["show", "refs/notes/cargo-rail/active:record.json"])?;
+        let retained: serde_json::Value = serde_json::from_slice(&retained.stdout)?;
+        assert_eq!(retained["crates"][0]["publication_attempt"], "1".repeat(64));
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(unix)]
+#[test]
+fn release_push_rejects_a_changed_captured_branch_tip() {
+    let result: Result<()> = (|| {
+        for during_push in [false, true] {
+            let (ws, remote) = push_release_workspace("branch-lease")?;
+            let prior = String::from_utf8(git(&ws.path, &["rev-parse", "HEAD"])?.stdout)?;
+            ws.commit("Review the complete release request")?;
+            git(&ws.path, &["push", "origin", "main"])?;
+            let initial = String::from_utf8(git(&ws.path, &["rev-parse", "HEAD"])?.stdout)?;
+            let prepared = run_cargo_rail(
+                &ws.path,
+                &[
+                    "rail",
+                    "release",
+                    "run",
+                    "--all",
+                    "--bump",
+                    "patch",
+                    "--skip-tag",
+                    "--prepare",
+                    "--yes",
+                ],
+            )?;
+            assert!(
+                prepared.status.success(),
+                "{}",
+                String::from_utf8_lossy(&prepared.stderr)
+            );
+            let prepared_head = git(&ws.path, &["rev-parse", "HEAD"])?.stdout;
+            if during_push {
+                install_pre_push_hook(
+                    &ws,
+                    r#"#!/bin/sh
+git --git-dir="$FIXTURE_REMOTE" update-ref refs/heads/main "$FIXTURE_PRIOR" "$FIXTURE_INITIAL"
+"#,
+                )?;
+            } else {
+                git(
+                    remote.path(),
+                    &["update-ref", "refs/heads/main", prior.trim(), initial.trim()],
+                )?;
+            }
+            let rejected = cargo_rail_command(&ws.path)?
+                .env("FIXTURE_REMOTE", remote.path())
+                .env("FIXTURE_PRIOR", prior.trim())
+                .env("FIXTURE_INITIAL", initial.trim())
+                .args(["rail", "release", "resume"])
+                .output()?;
+            assert!(
+                !rejected.status.success(),
+                "a changed remote tip cannot authorize a release push"
+            );
+            assert_eq!(
+                git(remote.path(), &["rev-parse", "refs/heads/main"])?.stdout,
+                prior.as_bytes()
+            );
+            assert_eq!(git(&ws.path, &["rev-parse", "HEAD"])?.stdout, prepared_head);
+            let state: serde_json::Value = serde_json::from_slice(&std::fs::read(only_release_state(&ws.path)?)?)?;
+            assert_eq!(state["status"], "active");
+            assert_ne!(state["commit_push"]["status"], "complete");
+        }
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(unix)]
+#[test]
+fn signed_release_tag_recovers_original_object_without_the_private_key() {
+    let result: Result<()> = (|| {
+        let (ws, remote) = push_release_workspace("signed-handoff")?;
+        ws.write_release_config("remote_effects = 'gitlab'\nsemver_check = 'off'\nsign_tags = true\n")?;
+        ws.commit("Review the signed release")?;
+        git(&ws.path, &["push", "origin", "main"])?;
+        let key = ws.path.join(".git/release-key");
+        let generated = Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+            .arg(&key)
+            .output()?;
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        let public = std::fs::read_to_string(key.with_extension("pub"))?;
+        let signers = ws.path.join(".git/allowed-signers");
+        std::fs::write(&signers, format!("* {public}"))?;
+        git(&ws.path, &["config", "gpg.format", "ssh"])?;
+        git(&ws.path, &["config", "user.signingkey", key.to_str().unwrap()])?;
+        git(
+            &ws.path,
+            &["config", "gpg.ssh.allowedSignersFile", signers.to_str().unwrap()],
+        )?;
+        install_pre_push_hook(
+            &ws,
+            r#"#!/bin/sh
+while read local_ref local_oid remote_ref remote_oid; do
+  case "$local_ref" in refs/tags/*) echo 'fixture tag push interrupted' >&2; exit 1 ;; esac
+done
+"#,
+        )?;
+        let logs = tempfile::tempdir()?;
+        let (_shim, glab) = glab_shim(&logs.path().join("glab.log"))?;
+        let interrupted = run_with_path_prefix(
+            &ws,
+            glab.parent().unwrap(),
+            &["rail", "release", "run", "--all", "--bump", "patch", "--yes"],
+        )?;
+        assert!(!interrupted.status.success());
+        assert!(String::from_utf8_lossy(&interrupted.stderr).contains("fixture tag push interrupted"));
+        let record: serde_json::Value = serde_json::from_slice(&std::fs::read(only_release_state(&ws.path)?)?)?;
+        let tag = &record["crates"][0]["tag_object"];
+        assert!(tag["content"].as_str().unwrap().contains("BEGIN SSH SIGNATURE"));
+        let transaction = record["transaction_id"].as_str().unwrap();
+        let intent = record["intent"]["identity"].as_str().unwrap();
+        let source = record["preparation"]["commit"].as_str().unwrap();
+        let transfer = logs.path().join("transfer");
+        let exported = run_cargo_rail(
+            &ws.path,
+            &[
+                "rail",
+                "release",
+                "record",
+                "export",
+                transaction,
+                transfer.to_str().unwrap(),
+            ],
+        )?;
+        assert!(
+            exported.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&exported.stdout),
+            String::from_utf8_lossy(&exported.stderr)
+        );
+        std::fs::remove_file(&key)?;
+        let clone = logs.path().join("clone");
+        git(
+            logs.path(),
+            &["clone", remote.path().to_str().unwrap(), clone.to_str().unwrap()],
+        )?;
+        git(&clone, &["config", "user.name", "Recovery executor"])?;
+        git(&clone, &["config", "user.email", "recovery@example.invalid"])?;
+        git(&clone, &["config", "gpg.format", "ssh"])?;
+        let recovered_signers = clone.join(".git/allowed-signers");
+        std::fs::write(&recovered_signers, format!("* {public}"))?;
+        git(
+            &clone,
+            &[
+                "config",
+                "gpg.ssh.allowedSignersFile",
+                recovered_signers.to_str().unwrap(),
+            ],
+        )?;
+        let imported = run_cargo_rail(
+            &clone,
+            &[
+                "rail",
+                "release",
+                "record",
+                "import",
+                transfer.to_str().unwrap(),
+                "--intent",
+                intent,
+                "--source",
+                source,
+            ],
+        )?;
+        assert!(
+            imported.status.success(),
+            "{}",
+            String::from_utf8_lossy(&imported.stdout)
+        );
+        let resumed = cargo_rail_command(&clone)?
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    glab.parent().unwrap().display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .args(["rail", "release", "resume"])
+            .output()?;
+        assert!(resumed.status.success(), "{}", String::from_utf8_lossy(&resumed.stderr));
+        let restored = git(&clone, &["cat-file", "tag", "refs/tags/v0.1.1"])?;
+        assert_eq!(restored.stdout, tag["content"].as_str().unwrap().as_bytes());
+        assert_eq!(
+            String::from_utf8(git(remote.path(), &["rev-parse", "refs/tags/v0.1.1"])?.stdout)?.trim(),
+            tag["id"].as_str().unwrap()
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(unix)]
+#[test]
+fn release_abort_preserves_a_replaced_local_tag() {
+    let result: Result<()> = (|| {
+        for replacement in ["unchanged", "other-commit", "other-object"] {
+            let retained_object = replacement == "other-object";
+            let ws = TestWorkspace::new_single_crate("abort-tag-owner", "0.1.0")?;
+            ws.write_release_config("semver_check = 'off'\nsign_tags = false\n")?;
+            write_test_change(&ws.path, &["abort-tag-owner"])?;
+            let initial = ws.commit("Review local release")?;
+            let interrupted = run_with_lost_git_acknowledgment(
+                &ws.path,
+                &["rail", "release", "run", "--all", "--bump", "patch", "--yes"],
+                "tag",
+            )?;
+            assert!(!interrupted.status.success());
+            let prepared = git(&ws.path, &["rev-parse", "HEAD"])?.stdout;
+            let state_path = only_release_state(&ws.path)?;
+            if retained_object {
+                let resumed = run_cargo_rail(&ws.path, &["rail", "release", "resume"])?;
+                assert!(resumed.status.success(), "{}", String::from_utf8_lossy(&resumed.stderr));
+                // Arrange the durable state immediately before the final completion write.
+                let mut record: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
+                assert!(record["crates"][0]["tag_object"].is_object());
+                record["status"] = serde_json::json!("active");
+                record["phase"] = serde_json::json!("publishing");
+                std::fs::write(&state_path, serde_json::to_vec(&record)?)?;
+            }
+            if replacement != "unchanged" {
+                let replacement_target = if retained_object { "HEAD" } else { initial.as_str() };
+                git(
+                    &ws.path,
+                    &[
+                        "tag",
+                        "-f",
+                        "-a",
+                        "v0.1.1",
+                        replacement_target,
+                        "-m",
+                        "Independent tag replacement",
+                    ],
+                )?;
+            }
+            let replacement_object = git(&ws.path, &["rev-parse", "refs/tags/v0.1.1"])?.stdout;
+            let rejected = run_cargo_rail(&ws.path, &["rail", "release", "abort", "--yes"])?;
+            if replacement == "unchanged" {
+                assert!(rejected.status.success(), "{rejected:?}");
+                assert_eq!(
+                    String::from_utf8(git(&ws.path, &["rev-parse", "HEAD"])?.stdout)?.trim(),
+                    initial
+                );
+                assert!(git(&ws.path, &["tag", "--list", "v0.1.1"])?.stdout.is_empty());
+                let record: serde_json::Value = serde_json::from_slice(&std::fs::read(state_path)?)?;
+                assert_eq!(record["status"], "aborted");
+                assert_eq!(record["abort"]["status"], "complete");
+                continue;
+            }
+            assert!(!rejected.status.success());
+            assert!(
+                String::from_utf8_lossy(&rejected.stderr).contains("conflicting local tag object"),
+                "{rejected:?}"
+            );
+            assert_eq!(
+                git(&ws.path, &["rev-parse", "refs/tags/v0.1.1"])?.stdout,
+                replacement_object
+            );
+            assert_eq!(git(&ws.path, &["rev-parse", "HEAD"])?.stdout, prepared);
+            let record: serde_json::Value = serde_json::from_slice(&std::fs::read(state_path)?)?;
+            assert_eq!(record["status"], "active");
+            assert_eq!(record["abort"]["status"], "in_progress");
+        }
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(unix)]
+#[test]
+fn release_native_assets_are_bound_before_effects_and_recovered_after_upload_acknowledgment_loss() {
+    let result: Result<()> = (|| {
+        use std::os::unix::fs::PermissionsExt;
+        let ws = TestWorkspace::new_single_crate("registry-shadow", "0.1.0")?;
+        ws.write_release_config(
+            r#"tag_format = "v{version}"
+semver_check = "off"
+remote_effects = "github"
+validation = { ".github/workflows/ci.yml" = ["tests"] }
+[release.artifacts.registry-shadow]
+workflow = ".github/workflows/ci.yml"
+[release.artifacts.registry-shadow.files."app-{version}-x86_64-unknown-linux-gnu.zip"]
+target = "x86_64-unknown-linux-gnu"
+[release.artifacts.registry-shadow.files.LICENSE]
+source = "LICENSE"
+"#,
+        )?;
+        std::fs::write(ws.path.join("LICENSE"), "fixture license\n")?;
+        ws.set_remote("https://github.com/loadingalias/registry-shadow.git")?;
+        ws.commit("Configure complete native release inventory")?;
+        ws.tag("v0.1.0", "Initial release")?;
+        write_test_change(&ws.path, &["registry-shadow"])?;
+        let boundary = tempfile::TempDir::new()?;
+        let shim = publication_boundary_shim(&boundary.path().join("cargo.log"), &boundary.path().join("published"))?;
+        std::fs::write(
+            shim.path().join("remote-head"),
+            git(&ws.path, &["rev-parse", "HEAD"])?.stdout,
+        )?;
+        let gh = shim.path().join("gh");
+        let fixture = shim.path().join("forge.py");
+        std::fs::write(
+            &fixture,
+            r#"import sys,json,pathlib,subprocess,hashlib,io,zipfile
+root=pathlib.Path(__file__).parent
+args=sys.argv[1:]
+mode=(root/'mode').read_text().strip()
+sha=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+def emit(value): print(json.dumps(value))
+def record_effect(effect):
+ with (root/'effects').open('a') as f:f.write(effect+'\n')
+if args[0] in ['--version','auth']:sys.exit(0)
+if args[:2]==['release','view']:sys.exit(1)
+if args[:2]==['release','upload']:
+ release=json.loads((root/'release.json').read_text())
+ asset=pathlib.Path(args[3]);data=asset.read_bytes()
+ release['assets'].append({'id':len(release['assets'])+10,'name':asset.name,'size':len(data),'digest':'sha256:'+hashlib.sha256(data).hexdigest(),'state':'uploaded'})
+ (root/'release.json').write_text(json.dumps(release));record_effect('upload '+asset.name)
+ if mode=='lost-upload-ack':sys.exit(1)
+ sys.exit(0)
+endpoint=next((arg for arg in args if arg.startswith('repos/')),None)
+run={'id':42,'run_attempt':3,'workflow_id':7,'head_sha':sha,'path':'.github/workflows/ci.yml','repository':{'full_name':'loadingalias/registry-shadow'},'head_repository':{'full_name':'loadingalias/registry-shadow'},'event':'workflow_dispatch','status':'completed','conclusion':'success','run_started_at':'2026-01-01T00:00:00Z','updated_at':'2026-01-01T01:00:00Z'}
+if endpoint.endswith('/actions/workflows/ci.yml'):emit({'id':7,'path':'.github/workflows/ci.yml','state':'active'})
+elif '/actions/workflows/7/runs?' in endpoint:emit({'total_count':1,'workflow_runs':[run]})
+elif endpoint.endswith('/jobs?per_page=100'):emit({'total_count':1,'jobs':[{'id':17,'name':'tests','run_id':42,'head_sha':sha,'status':'completed','conclusion':'success'}]})
+elif endpoint.endswith('/actions/runs/42') or endpoint.endswith('/attempts/3'):emit(run)
+elif '/actions/' in endpoint:
+ data=io.BytesIO()
+ with zipfile.ZipFile(data,'w',compression=zipfile.ZIP_STORED) as archive:
+  def add(name,body):
+   info=zipfile.ZipInfo(name,date_time=(2026,1,1,0,0,0));archive.writestr(info,body)
+  add('app-0.1.1-aarch64-unknown-linux-gnu.zip' if mode=='wrong-target' else 'app-0.1.1-x86_64-unknown-linux-gnu.zip',b'product package')
+  if mode!='missing-file':add('../LICENSE' if mode=='unsafe-path' else 'LICENSE',b'wrong license' if mode=='wrong-license' else b'fixture license\n')
+  if mode=='extra-file':add('extra',b'undeclared')
+ raw=data.getvalue()
+ metadata={'id':92 if mode=='replacement' else 91,'name':'release-registry-shadow-42-3','size_in_bytes':len(raw),'digest':'sha256:'+hashlib.sha256(raw).hexdigest(),'expired':mode=='expired','created_at':'2026-01-01T00:30:00Z','expires_at':'2099-01-01T00:00:00Z','workflow_run':{'id':42,'head_sha':'0'*40 if mode=='wrong-source' else sha,'repository_id':1,'head_repository_id':1}}
+ if endpoint.endswith('/zip'):sys.stdout.buffer.write(bytes([raw[0]^1])+raw[1:] if mode=='tampered' else raw)
+ elif '/artifacts?' in endpoint:emit({'total_count':1,'artifacts':[metadata]})
+ else:emit(metadata)
+elif '/releases' in endpoint:
+ if '--method' in args:
+  method=args[args.index('--method')+1];body=json.loads(pathlib.Path(args[args.index('--input')+1]).read_text())
+  if method=='POST':body.update(id=81,assets=[]);record_effect('draft')
+  else:
+   release=json.loads((root/'release.json').read_text());release.update(body);body=release;record_effect('publish')
+  (root/'release.json').write_text(json.dumps(body));emit(body)
+ elif (root/'release.json').exists():
+  response=json.loads((root/'release.json').read_text())
+  if mode=='wrong-notes':response['body']='Another release'
+  if mode=='wrong-release-id':response['id']=82
+  if mode=='wrong-asset-digest':response['assets'][0]['digest']='sha256:'+'f'*64
+  if mode=='public-incomplete':response['draft']=False
+  print('HTTP/2.0 200 OK\r\n\r\n',end='');emit(response)
+ else:
+  print('HTTP/2.0 404 Not Found\r\n\r\n{}');sys.exit(1)
+else:raise RuntimeError(args)
+"#,
+        )?;
+        std::fs::write(&gh, format!("#!/bin/sh\nexec python3 '{}' \"$@\"\n", fixture.display()))?;
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755))?;
+        let path = format!(
+            "{}:{}",
+            shim.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let invoke = |arguments: &[&str]| -> Result<std::process::Output> {
+            Ok(cargo_rail_command(&ws.path)?
+                .env("PATH", &path)
+                .args(arguments)
+                .output()?)
+        };
+        std::fs::write(shim.path().join("mode"), "wrong-source")?;
+        let first = invoke(&["rail", "release", "run", "--all", "--yes"])?;
+        assert!(!first.status.success(), "{first:?}");
+        assert!(
+            String::from_utf8_lossy(&first.stderr).contains("wrong source"),
+            "{first:?}"
+        );
+        let state_path = only_release_state(&ws.path)?;
+        for (mode, diagnostic) in [
+            ("expired", "expired"),
+            ("wrong-target", "undeclared file"),
+            ("missing-file", "missing or extra"),
+            ("unsafe-path", "unsafe"),
+            ("tampered", "digest and size"),
+            ("extra-file", "missing or extra"),
+            ("wrong-license", "committed source"),
+        ] {
+            std::fs::write(shim.path().join("mode"), mode)?;
+            let rejected = invoke(&["rail", "release", "resume"])?;
+            assert!(!rejected.status.success(), "{mode}: {rejected:?}");
+            assert!(
+                String::from_utf8_lossy(&rejected.stderr).contains(diagnostic),
+                "{mode}: {rejected:?}"
+            );
+            let state: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
+            assert_eq!(state["artifacts"], serde_json::json!([]));
+            assert_eq!(state["crates"][0]["tag"]["status"], "pending");
+            assert!(!shim.path().join("effects").exists());
+        }
+        std::fs::write(shim.path().join("mode"), "lost-upload-ack")?;
+        let interrupted = invoke(&["rail", "release", "resume"])?;
+        assert!(!interrupted.status.success(), "{interrupted:?}");
+        assert!(
+            String::from_utf8_lossy(&interrupted.stderr).contains("not acknowledged"),
+            "{interrupted:?}"
+        );
+        let sealed: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
+        assert_eq!(sealed["artifacts"][0]["artifact_id"], 91);
+        assert_eq!(sealed["artifacts"][0]["files"].as_array().unwrap().len(), 2);
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../schemas/release-record-v9.schema.json"))?;
+        jsonschema::validator_for(&schema)?
+            .validate(&sealed)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        for mode in [
+            "replacement",
+            "expired",
+            "wrong-notes",
+            "wrong-release-id",
+            "wrong-asset-digest",
+            "public-incomplete",
+        ] {
+            std::fs::write(shim.path().join("mode"), mode)?;
+            let blocked = invoke(&["rail", "release", "resume"])?;
+            assert!(!blocked.status.success(), "{blocked:?}");
+            assert_eq!(
+                std::fs::read_to_string(shim.path().join("effects"))?,
+                "draft\nupload LICENSE\n"
+            );
+        }
+        std::fs::write(shim.path().join("mode"), "ok")?;
+        let resumed = invoke(&["rail", "release", "resume"])?;
+        assert!(resumed.status.success(), "{resumed:?}");
+        assert_eq!(
+            std::fs::read_to_string(shim.path().join("effects"))?,
+            "draft\nupload LICENSE\nupload app-0.1.1-x86_64-unknown-linux-gnu.zip\npublish\n"
+        );
+        let completed: serde_json::Value = serde_json::from_slice(&std::fs::read(state_path)?)?;
+        assert_eq!(completed["artifacts"], sealed["artifacts"]);
+        assert_eq!(completed["status"], "complete");
+        assert_eq!(completed["crates"][0]["forge_draft"]["object"], "81");
+        assert_eq!(completed["crates"][0]["forge_publication"]["object"], "81");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(unix)]
+#[test]
+fn release_remote_record_recovers_original_cargo_bytes_after_the_preparing_runner_is_lost() {
+    let result: Result<()> = (|| {
+        use std::os::unix::fs::PermissionsExt;
+        let ws = TestWorkspace::new_single_crate("retained-cargo-package", "0.1.0")?;
+        ws.write_release_config(
+            "remote_effects = 'gitlab'\nregistry_publication = 'crates-io'\nsemver_check = 'off'\nsign_tags = false\n",
+        )?;
+        write_test_change(&ws.path, &["retained-cargo-package"])?;
+        let initial = ws.commit("Review the retained package release")?;
+        let remote = tempfile::tempdir()?;
+        git(remote.path(), &["init", "--bare", "--initial-branch=main"])?;
+        ws.set_remote(remote.path().to_str().unwrap())?;
+        git(&ws.path, &["push", "-u", "origin", "main"])?;
+        let hook = remote.path().join("hooks/update");
+        std::fs::write(&hook, "#!/bin/sh\n[ \"$1\" != refs/heads/main ]\n")?;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))?;
+        let logs = tempfile::tempdir()?;
+        let (_shim, glab) = glab_shim_with_status(&logs.path().join("glab.log"), "success")?;
+        let interrupted = run_with_path_prefix(
+            &ws,
+            glab.parent().unwrap(),
+            &[
+                "rail",
+                "release",
+                "run",
+                "--all",
+                "--bump",
+                "patch",
+                "--publish",
+                "--skip-tag",
+                "--retain-remote",
+                "--yes",
+            ],
+        )?;
+        assert!(!interrupted.status.success(), "{interrupted:?}");
+        assert!(
+            String::from_utf8_lossy(&interrupted.stderr).contains("hook declined"),
+            "{interrupted:?}"
+        );
+        let state_path = only_release_state(&ws.path)?;
+        let state: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
+        let transaction = state["transaction_id"].as_str().unwrap();
+        let package = &state["package_seal"]["packages"][0];
+        let filename = "retained-cargo-package-0.1.1.crate";
+        let original = std::fs::read(state_path.with_extension("artifacts").join(filename))?;
+        assert_eq!(package["bytes"], original.len());
+        assert_eq!(
+            package["sha256"],
+            rscrypto::Sha256::digest(&original)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        assert_eq!(state["crates"][0]["publication"]["status"], "pending");
+        assert_eq!(
+            git(remote.path(), &["rev-parse", "refs/heads/main"])?.stdout,
+            format!("{initial}\n").as_bytes()
+        );
+        assert_eq!(
+            git(
+                remote.path(),
+                &["show", &format!("refs/notes/cargo-rail/active:packages/{filename}")]
+            )?
+            .stdout,
+            original
+        );
+        std::fs::remove_dir_all(&ws.path)?;
+        let recovery = tempfile::tempdir()?;
+        let clone = recovery.path().join("clone");
+        git(
+            recovery.path(),
+            &["clone", remote.path().to_str().unwrap(), clone.to_str().unwrap()],
+        )?;
+        let before = git(remote.path(), &["rev-parse", "refs/notes/cargo-rail/active"])?.stdout;
+        let fetched = run_cargo_rail(&clone, &["rail", "release", "record", "fetch", transaction])?;
+        assert!(fetched.status.success(), "{fetched:?}");
+        let recovered = only_release_state(&clone)?;
+        assert_eq!(
+            std::fs::read(recovered.with_extension("artifacts").join(filename))?,
+            original
+        );
+        let recovered: serde_json::Value = serde_json::from_slice(&std::fs::read(recovered)?)?;
+        assert_eq!(recovered, state);
+        assert_eq!(
+            git(remote.path(), &["rev-parse", "refs/notes/cargo-rail/active"])?.stdout,
+            before
+        );
+        // A local archive with different bytes cannot be overwritten by record recovery.
+        let archive = only_release_state(&clone)?.with_extension("artifacts").join(filename);
+        std::fs::write(&archive, "independent bytes")?;
+        let rejected = run_cargo_rail(&clone, &["rail", "release", "record", "fetch", transaction])?;
+        assert!(!rejected.status.success(), "{rejected:?}");
+        assert!(
+            String::from_utf8_lossy(&rejected.stdout).contains("differs from sealed evidence"),
+            "{rejected:?}"
+        );
+        assert_eq!(std::fs::read_to_string(archive)?, "independent bytes");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(unix)]
+#[test]
+fn release_alias_requires_verified_publication_and_reconciles_a_lost_push_acknowledgment() {
+    let result: Result<()> = (|| {
+        use std::os::unix::fs::PermissionsExt;
+        let ws = TestWorkspace::new_single_crate("alias-fixture", "0.1.0")?;
+        ws.write_release_config(
+            r#"tag_format = "v{version}"
+semver_check = "off"
+remote_effects = "github"
+aliases = { alias-fixture = "v1" }
+validation = { ".github/workflows/ci.yml" = ["tests"] }
+"#,
+        )?;
+        write_test_change(&ws.path, &["alias-fixture"])?;
+        generate_lockfile(&ws.path)?;
+        ws.commit("Review immutable release and alias promotion")?;
+        ws.tag("v1", "Existing action alias")?;
+        let previous = String::from_utf8(git(&ws.path, &["rev-parse", "refs/tags/v1"])?.stdout)?
+            .trim()
+            .to_owned();
+        let transport = tempfile::tempdir()?;
+        let remote = transport.path().join("origin.git");
+        git(
+            transport.path(),
+            &["init", "--bare", "--initial-branch=main", remote.to_str().unwrap()],
+        )?;
+        let ssh = transport.path().join("ssh");
+        std::fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in *git-receive-pack*) exec git-receive-pack '{}' ;; *git-upload-pack*) exec git-upload-pack '{}' ;; esac\nexit 1\n",
+                remote.display(),
+                remote.display()
+            ),
+        )?;
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755))?;
+        ws.set_remote("git@github.com:org/repo.git")?;
+        git(&ws.path, &["config", "core.sshCommand", ssh.to_str().unwrap()])?;
+        git(&ws.path, &["push", "-u", "origin", "main", "refs/tags/v1"])?;
+        let (shim, gh) = gh_shim(&transport.path().join("gh.log"))?;
+        let api = shim.path().join("forge.py");
+        std::fs::write(shim.path().join("remote"), remote.to_str().unwrap())?;
+        std::fs::write(shim.path().join("mode"), "drift")?;
+        std::fs::write(
+            &api,
+            r#"import json,pathlib,subprocess,sys
+root=pathlib.Path(__file__).parent
+args=sys.argv[1:]
+p=root/'release.json'
+if '--method' in args:
+ body=json.loads(pathlib.Path(args[args.index('--input')+1]).read_text())
+ if args[args.index('--method')+1]=='POST':body.update(id=81,assets=[])
+ else:
+  previous=json.loads(p.read_text());previous.update(body);body=previous
+  with (root/'publications').open('a') as output:output.write('publish\n')
+  if (root/'mode').read_text()=='drift':
+   sha=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+   subprocess.check_call(['git','--git-dir='+ (root/'remote').read_text(),'update-ref','refs/tags/v1',sha])
+ p.write_text(json.dumps(body));print(json.dumps(body))
+elif p.exists():
+ print('HTTP/2.0 200 OK\r\n\r\n',end='');print(p.read_text())
+else:
+ print('HTTP/2.0 404 Not Found\r\n\r\n{}');sys.exit(1)
+"#,
+        )?;
+        let script = std::fs::read_to_string(&gh)?;
+        std::fs::write(&gh,script.replace("if [ \"$1\" = \"--version\" ]; then",&format!("case \"$*\" in *repos/org/repo/releases*) exec python3 '{}' \"$@\" ;; esac\nif [ \"$1\" = \"release\" ]; then exit 1; fi\nif [ \"$1\" = \"--version\" ]; then",api.display())))?;
+        let path = format!(
+            "{}:{}",
+            shim.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let invoke = |args: &[&str]| -> Result<std::process::Output> {
+            Ok(cargo_rail_command(&ws.path)?.env("PATH", &path).args(args).output()?)
+        };
+        let interrupted = invoke(&["rail", "release", "run", "--all", "--yes"])?;
+        assert!(
+            !interrupted.status.success(),
+            "conflicting alias was overwritten: {interrupted:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&interrupted.stderr).contains("moved from its authorized prior object"),
+            "{interrupted:?}"
+        );
+        let state_path = only_release_state(&ws.path)?;
+        let partial: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
+        assert_eq!(partial["intent"]["alias_previous"]["alias-fixture"], previous);
+        assert_eq!(partial["crates"][0]["alias"]["status"], "pending");
+        assert_eq!(partial["crates"][0]["forge_publication"]["status"], "complete");
+        assert_eq!(
+            String::from_utf8(git(&remote, &["rev-parse", "refs/tags/v1"])?.stdout)?.trim(),
+            partial["preparation"]["commit"].as_str().unwrap()
+        );
+        git(&remote, &["update-ref", "refs/tags/v1", &previous])?;
+        std::fs::write(shim.path().join("mode"), "ok")?;
+        let real_git = String::from_utf8(Command::new("sh").args(["-c", "command -v git"]).output()?.stdout)?
+            .trim()
+            .to_owned();
+        let wrapper = shim.path().join("git");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\ncase \" $* \" in *\" push \"*\":refs/tags/v1 \"*) '{}' \"$@\" || exit $?; echo 'fixture lost alias push acknowledgment' >&2; exit 1 ;; esac\nexec '{}' \"$@\"\n",
+                real_git, real_git
+            ),
+        )?;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))?;
+        let uncertain = invoke(&["rail", "release", "resume"])?;
+        assert!(!uncertain.status.success(), "{uncertain:?}");
+        assert!(
+            String::from_utf8_lossy(&uncertain.stderr).contains("lost alias push acknowledgment"),
+            "{uncertain:?}"
+        );
+        let alias = git(&remote, &["rev-parse", "refs/tags/v1"])?.stdout;
+        assert_eq!(alias, git(&remote, &["rev-parse", "refs/tags/v0.1.1"])?.stdout);
+        // Leave the rejecting wrapper installed: a correct resume observes the completed push.
+        let resumed = invoke(&["rail", "release", "resume"])?;
+        assert!(resumed.status.success(), "{resumed:?}");
+        let complete: serde_json::Value = serde_json::from_slice(&std::fs::read(state_path)?)?;
+        assert_eq!(complete["intent"], partial["intent"]);
+        assert_eq!(complete["status"], "complete");
+        assert_eq!(complete["crates"][0]["alias"]["status"], "complete");
+        assert_eq!(std::fs::read_to_string(shim.path().join("publications"))?, "publish\n");
         Ok(())
     })();
     super::helpers::finish_test(result);

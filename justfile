@@ -1,7 +1,7 @@
 # Local repair, shared validation, cross-compilation, and dogfooding.
 check: fix ci-check
     @scripts/check-cross.sh
-    cargo rail unify --check --explain
+    cargo run --all-features --locked --bin cargo-rail -- rail unify --check --explain
 
 # Shared nonmutating checks, also run by the local check recipe.
 ci-check:
@@ -97,13 +97,3 @@ bench *args: build-release
             python3 -c 'import json, pathlib, sys; print((pathlib.Path(json.load(sys.stdin)["target_directory"]) / "release").as_posix())'
     )"
     exec "$component_directory/cargo-rail-bench" local "$@"
-
-# Regenerate the reference from current public CLI help.
-docs:
-    cargo build --locked --bin cargo-rail --bin cargo-rail-bench
-    python3 scripts/generate-command-docs.py
-
-# Reject command-reference drift without editing files.
-check-docs:
-    cargo build --locked --bin cargo-rail --bin cargo-rail-bench
-    python3 scripts/generate-command-docs.py --check

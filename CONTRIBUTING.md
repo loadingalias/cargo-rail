@@ -133,10 +133,8 @@ and do not generalize a result beyond the platforms and workload that were measu
 
 ## Update command documentation
 
-Edit the owning CLI help in `src/`, then run `just docs` to regenerate `docs/commands/`.
-The generator reads the built executables' public `--help` output, including nested commands.
-Use `just check-docs` to reject stale, missing, or obsolete reference pages without rewriting them.
-Do not edit generated pages by hand.
+Edit CLI help in `src/` and inspect the built command's `--help` output.
+Keep guides focused on decisions and complete tasks rather than repeating flag descriptions.
 
 ## Record release intent
 
@@ -160,9 +158,12 @@ avoid recording intermediate implementations or test-only cleanup.
 Use `none` when an entry needs tracking but no version bump.
 Keep breaking-contract migration and recovery instructions together.
 
-The [release workflow](.github/workflows/release.yml) requires prepared versions and changelog entries, consumed change files,
-and successful CI for the exact commit being released.
-Green CI alone does not prepare a release.
+The [release workflow](.github/workflows/release.yml) runs the source-built Cargo-Rail engine.
+One request prepares versions, changelogs, and consumed change files,
+then explicitly requests validation and [native packaging](.github/workflows/package.yml) for the exact release commit.
+The retained transaction owns publication and recovery.
+See [releasing a workspace](docs/releases.md) for reviewed merges, failed-run recovery,
+and the Cargo-Rail/Action bootstrap order.
 
 ## Open a pull request
 

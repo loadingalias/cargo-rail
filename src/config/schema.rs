@@ -324,6 +324,46 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
         "Defines named crate sets that version and release in lockstep.",
     ),
     policy(
+        "release.hosted_workflow",
+        "Selects the GitHub workflow that executes durable release requests.",
+    ),
+    policy(
+        "release.aliases",
+        "Authorizes explicit mutable tag promotion after immutable release verification.",
+    ),
+    policy(
+        "release.aliases.<name>",
+        "Names the mutable tag for one selected package.",
+    ),
+    policy(
+        "release.validation",
+        "Binds release authorization to exact GitHub workflows and required jobs.",
+    ),
+    policy(
+        "release.validation.<name>",
+        "Names the jobs that must succeed in this workflow's release-commit run.",
+    ),
+    policy(
+        "release.artifacts",
+        "Binds complete native release inventories to authorized producers.",
+    ),
+    policy(
+        "release.artifacts.<name>.workflow",
+        "Identifies the validated workflow producing this package's assets.",
+    ),
+    policy(
+        "release.artifacts.<name>.files",
+        "Declares the complete flat inventory published with the package.",
+    ),
+    policy(
+        "release.artifacts.<name>.files.<name>.target",
+        "Records the target asserted by the product's packaging validation.",
+    ),
+    policy(
+        "release.artifacts.<name>.files.<name>.source",
+        "Requires asset bytes to match this regular file at the release commit.",
+    ),
+    policy(
         "release.version_groups.<name>",
         "Defines crates that version and release in lockstep.",
     ),

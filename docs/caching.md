@@ -53,6 +53,8 @@ and an adjacent `SHA256SUMS`.
 Use a separate output directory for each host.
 The command verifies component digests and refuses existing release outputs;
 it does not publish them.
+The [packaging workflow](../.github/workflows/package.yml) produces these archives;
+the [release transaction](releases.md) verifies the exact producer attempt and bytes before publication.
 Extract the archive as a unit so the component files remain together.
 The companion cache Action requires core, wrapper, worker,
 matched driver and authenticated driver source components.

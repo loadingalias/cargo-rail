@@ -155,14 +155,33 @@ It performs no mutation or external effect.
 
 `remote_effects` controls Git and forge effects.
 Registry publication is separate and requires both `registry_publication = "crates-io"` and `--publish` on the exact release invocation.
-Remote modes persist transaction state before external effects.
-`release run --wait` stays attached while exact-SHA checks are pending; without it,
-Cargo-Rail stops at the readiness boundary
-and reports the recorded state to resume instead of replanning.
 
-`release run --pr` is a separate reviewed path.
-Its `release finalize` step accepts only the merge commit that introduces the exact prepared transaction;
-a later commit or unrelated merge cannot inherit that release.
+GitHub releases also require explicit validation workflows and job names:
+
+```toml
+[release.validation]
+".github/workflows/ci.yml" = ["tests", "lint"]
+```
+
+Use the jobs' displayed names, including matrix values where applicable.
+Cargo-Rail requires successful jobs from one exact workflow run and attempt for the release commit.
+Missing, skipped, failed, ambiguous, or unavailable required jobs block publication.
+The release executor cannot authorize itself as validation.
+Retained validation attempts cannot be replaced on retry.
+Each workflow query and job inventory is bounded to 100 results;
+a larger or incomplete response blocks release.
+Set `release.hosted_workflow` to submit durable requests to a separate GitHub workflow.
+The hosted executor dispatches validation explicitly and waits for its exact runs.
+Without that setting, execution is local; `--local` overrides it for a new request.
+`release run --pr` adds a review boundary to the same transaction.
+The merged tree must match preparation,
+and the merge event continues validation and publication on its exact commit.
+See [releasing a workspace](releases.md) for the workflow contract and recovery behavior.
+
+Optional `release.aliases = { my-action = "v9" }` authorizes a mutable tag for a package.
+Cargo-Rail captures its prior object in the intent and promotes it with a Git lease only
+after verifying the immutable forge release.
+Aliases require tags and forge publication.
 
 Standalone tools or fuzz workspaces
 that depend on released packages by path can declare their exact manifests with `auxiliary_cargo_manifests`.
@@ -261,3 +280,29 @@ and register only their positive inputs under `[plan.work.NAME]`.
 
 `config validate` enables strict mode in common CI environments.
 Use `--no-strict` only when warnings are deliberately non-blocking.
+
+### Native release assets
+
+Declare optional assets per package and name their producer in `release.validation`.
+A target is an assertion made by the authorized packaging job;
+that job must validate the product it builds.
+The executor verifies byte identity and producer authority.
+Use `source` to require an asset to match a regular committed file, including a license.
+
+```toml
+[release.validation]
+".github/workflows/build.yml" = ["package", "assemble"]
+
+[release.artifacts.my-cli]
+workflow = ".github/workflows/build.yml"
+
+[release.artifacts.my-cli.files."{crate}-{version}-x86_64-unknown-linux-gnu.zip"]
+target = "x86_64-unknown-linux-gnu"
+
+[release.artifacts.my-cli.files.LICENSE]
+source = "LICENSE"
+```
+
+Upload exactly these files in the producer's `release-my-cli-<run-id>-<attempt>` artifact.
+See [native asset verification and recovery](release-records.md#native-assets) for the transport contract and bounds.
+This integration requires GitHub release effects and tags.

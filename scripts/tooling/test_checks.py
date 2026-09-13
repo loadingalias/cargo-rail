@@ -95,7 +95,7 @@ else:
                 (['cargo', 'xwin', 'clippy'], 'x86_64-pc-windows-msvc'),
                 (['cargo', 'xwin', 'clippy'], 'aarch64-pc-windows-msvc'),
             ]
-        ] + [['cargo', 'rail', 'unify', '--check', '--explain']])
+        ] + [['cargo', 'run', '--all-features', '--locked', '--bin', 'cargo-rail', '--', 'rail', 'unify', '--check', '--explain']])
 
     def test_shared_check_failure_stops_later_checks(self):
         self.environment['CHECK_FAIL_COMMAND'] = 'clippy'

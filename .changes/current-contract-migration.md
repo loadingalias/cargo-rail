@@ -34,12 +34,13 @@ Breaking changes for v0.26.0:
 - Regenerate unsupported disposable plans and compiler evidence.
   Acquisition journal 3 uses a separate namespace;
   explicit resume refuses unsupported progress without rewriting it.
-  Cache status 16, configuration explanation 2, release plan/state 8, sync conflict receipt 4,
+  Cache status 16, configuration explanation 2, release plan/state 9, sync conflict receipt 4,
   and prepared Git effect 2 require current consumers.
 - Retired schema files are removed from the active branch and package: `plan-v8`, `plan-variants-v1`, `surface-v1`, `surface-v2`, and `config-explain-v1`.
   Historical tagged source remains available; URLs under `main` no longer serve those schemas.
 
 Use `release check` instead of `release run --check`, and omit retired `--skip-publish`, `plan --merge-base`, and `change check --required` flags.
+Use `release run --pr` for review within the same transaction; the separate `release finalize` and `--wait` surfaces are removed.
 Current cache lifecycle operations are `setup`, `detach`, `drop-profile`, and `uninstall`.
 Current configuration, recovery, ownership validation,
 and authenticated installation remain supported.

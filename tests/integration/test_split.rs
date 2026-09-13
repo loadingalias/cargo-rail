@@ -2373,7 +2373,9 @@ path = "CHANGELOG.md"
         git(split_root, &["tag", "-a", "v0.1.0", "-m", "Initial split tag"])?;
 
         // Make a change to release
-        std::fs::write(split_root.join("src/lib.rs"), "// bumped")?;
+        let source = split_root.join("src/lib.rs");
+        let content = std::fs::read_to_string(&source)?;
+        std::fs::write(source, format!("{content}\n// Patch release preparation.\n"))?;
         std::fs::create_dir_all(split_root.join(".changes"))?;
         std::fs::write(
             split_root.join(".changes/release.md"),

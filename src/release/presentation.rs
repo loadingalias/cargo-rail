@@ -9,6 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 /// A captured manual release-note input.
 pub struct ReleaseNoteInput {
     /// Workspace-relative source path.
@@ -18,6 +19,7 @@ pub struct ReleaseNoteInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 /// Exact changelog write captured during planning.
 pub struct PlannedChangelog {
     /// Changelog path.
@@ -31,6 +33,7 @@ pub struct PlannedChangelog {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 /// Captured user-facing release presentation.
 pub struct PlannedPresentation {
     /// Release date used in the heading.

@@ -211,11 +211,14 @@ See the [Action guide](https://github.com/loadingalias/cargo-rail-action).
 
 ## Carry release intent through the workflow
 
+See [Releasing a workspace](docs/releases.md) for hosted execution, review, and recovery.
+
 - `cargo rail unify --check` derives one reviewable dependency repair from the captured workspace;
   `cargo rail unify apply --backup` applies it with backups for recovery.
 - `cargo rail change` records bump and release-note intent in `.changes/` during the change itself.
 - `cargo rail release` carries that intent through versioning, changelogs, exact auxiliary Cargo lockfiles,
-  exact-SHA readiness, tags, publication, and durable resume state.
+  exact-SHA validation and native assets, tags, publication, and durable resume state.
+  Configured hosted requests survive terminal closure; reviewed merges continue the same intent.
 - `cargo rail split` moves relevant crate history into an OSS repository;
   `cargo rail sync` maps later changes in both directions and stops with a resumable receipt
   when Git three-way merge needs a human.
@@ -242,7 +245,7 @@ Contributions that remove complexity or strengthen correctness checks are welcom
 
 Start with [Planning](docs/planning.md), the [cache contract](docs/caching.md), or [Troubleshooting](docs/troubleshooting.md).
 [Configuration](docs/config.md) explains the repository policy boundary.
-Use `cargo rail <command> --help` or the [command reference](docs/commands/README.md) for the exact CLI.
+Use `cargo rail <command> --help` for the exact CLI.
 Contributors can start with [Architecture](docs/architecture.md).
 
 Cargo-Rail is licensed under [MIT](LICENSE).

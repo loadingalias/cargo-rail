@@ -48,8 +48,8 @@ pub use doctor::run_native_cache_doctor;
 pub use init::{run_init, run_init_standalone};
 pub use plan::{PlanOptions, run_plan};
 pub use release::{
-    ReleaseFinalizeOptions, run_release_finalize, run_release_init, run_release_plan, run_release_publication_check,
-    run_release_publish, run_release_status_standalone,
+    run_release_init, run_release_plan, run_release_publication_check, run_release_publish,
+    run_release_status_standalone,
 };
 pub use split::{run_split, run_split_init};
 pub use surface::{SurfaceOptions, run_surface};
@@ -376,6 +376,33 @@ pub fn try_dispatch_pre_context(
         }
 
         Commands::Release {
+            command: cli::ReleaseCommand::Record { command },
+        } => {
+            let result = match command {
+                cli::ReleaseRecordCommand::Inspect { transaction } => {
+                    let path = crate::release::state::resolve_active(workspace_root, Some(&transaction))?;
+                    serde_json::to_value(crate::release::state::ReleaseState::load(&path)?)?
+                }
+                cli::ReleaseRecordCommand::Store { transaction } => {
+                    crate::release::transfer::store(workspace_root, &transaction)?
+                }
+                cli::ReleaseRecordCommand::Fetch { transaction } => {
+                    crate::release::transfer::fetch(workspace_root, transaction.as_deref())?
+                }
+                cli::ReleaseRecordCommand::Export { transaction, directory } => {
+                    crate::release::transfer::export(workspace_root, &transaction, &directory)?
+                }
+                cli::ReleaseRecordCommand::Import {
+                    directory,
+                    intent,
+                    source,
+                } => crate::release::transfer::import(workspace_root, &directory, &intent, &source)?,
+            };
+            println!("{}", serde_json::to_string(&result)?);
+            Ok(PreContextDispatch::Handled)
+        }
+
+        Commands::Release {
             command: cli::ReleaseCommand::Status { state, history, format },
         } => {
             release::run_release_status_standalone(workspace_root, state.as_deref(), history, format)?;
@@ -383,26 +410,33 @@ pub fn try_dispatch_pre_context(
         }
 
         Commands::Release {
-            command: cli::ReleaseCommand::Resume { state },
+            command: cli::ReleaseCommand::Resume { transaction, executor },
         } => {
-            if state.exists() {
+            crate::release::hosted::refresh(workspace_root, transaction.as_deref())?;
+            let state = crate::release::state::resolve_active(workspace_root, transaction.as_deref())?;
+            let retained = crate::release::state::ReleaseState::load(&state)?;
+            if executor {
+                crate::release::hosted::checkout(workspace_root, &retained)?;
+            }
+            if !retained.intent.hosted || executor {
                 crate::release::state::prepare_recovery(workspace_root, &state)?;
             }
             Ok(PreContextDispatch::NeedsContext(PreparedContext::new(
                 Commands::Release {
-                    command: cli::ReleaseCommand::Resume { state },
+                    command: cli::ReleaseCommand::Resume { transaction, executor },
                 },
                 config_override,
             )?))
         }
 
         Commands::Release {
-            command: cli::ReleaseCommand::Abort { state, yes },
+            command: cli::ReleaseCommand::Abort { transaction, yes },
         } => {
+            let state = crate::release::state::resolve_active(workspace_root, transaction.as_deref())?;
             crate::release::state::prepare_recovery(workspace_root, &state)?;
             Ok(PreContextDispatch::NeedsContext(PreparedContext::new(
                 Commands::Release {
-                    command: cli::ReleaseCommand::Abort { state, yes },
+                    command: cli::ReleaseCommand::Abort { transaction, yes },
                 },
                 config_override,
             )?))
@@ -615,7 +649,10 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext, prepared_plan: Option<Pla
                 publish,
                 skip_tag,
                 pr,
-                wait,
+                local,
+                executor,
+                prepare,
+                retain_remote,
                 include_dependents,
                 yes,
                 allow_non_default_branch,
@@ -636,7 +673,10 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext, prepared_plan: Option<Pla
                         publish,
                         skip_tag,
                         pr,
-                        wait,
+                        local,
+                        executor,
+                        prepare,
+                        retain_remote,
                         include_dependents,
                         yes,
                         allow_non_default_branch,
@@ -677,40 +717,15 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext, prepared_plan: Option<Pla
                     run_release_plan(ctx, names, bump, false, skip_tag, include_dependents, format)
                 }
             }
-            cli::ReleaseCommand::Finalize {
-                crate_names,
-                all,
-                publish,
-                skip_tag,
-                include_dependents,
-                yes,
-                allow_non_default_branch,
-                format,
-            } => {
-                let names = if all || crate_names.is_empty() {
-                    None
-                } else {
-                    Some(crate_names)
-                };
-                release::run_release_finalize(
-                    ctx,
-                    release::ReleaseFinalizeOptions {
-                        crate_names: names,
-                        all,
-                        publish,
-                        skip_tag,
-                        include_dependents,
-                        yes,
-                        allow_non_default_branch,
-                        format,
-                    },
-                )
+            cli::ReleaseCommand::Resume { transaction, executor } => {
+                release::run_release_resume(ctx, transaction.as_deref(), executor)
             }
-            cli::ReleaseCommand::Resume { state } => release::run_release_resume(ctx, &state),
-            cli::ReleaseCommand::Status { .. } => Err(crate::error::RailError::message(
-                "release status reached workspace dispatch",
-            )),
-            cli::ReleaseCommand::Abort { state, yes } => release::run_release_abort(ctx, &state, yes),
+            cli::ReleaseCommand::Status { .. } | cli::ReleaseCommand::Record { .. } => Err(
+                crate::error::RailError::message("release status reached workspace dispatch"),
+            ),
+            cli::ReleaseCommand::Abort { transaction, yes } => {
+                release::run_release_abort(ctx, transaction.as_deref(), yes)
+            }
         },
 
         // Clean

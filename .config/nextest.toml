@@ -73,7 +73,7 @@ filter = 'binary(integration) & test(=test_compiler_observation::source_capture_
 leak-timeout = { period = "10s", result = "fail" }
 
 [[profile.default.overrides]]
-filter = 'binary(cache) | (binary(integration) & test(/test_(instrumentation|scale_fixture|source_snapshot|surface|unify|unused_detection|undeclared_features)/))'
+filter = 'binary(cache) | (binary(integration) & test(/test_(instrumentation|release_cargo|scale_fixture|source_snapshot|surface|unify|unused_detection|undeclared_features)/))'
 test-group = 'cargo-subprocess'
 
 [[profile.default.overrides]]

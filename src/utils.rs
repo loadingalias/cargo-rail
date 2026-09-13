@@ -493,12 +493,12 @@ fn destination_parent(path: &Path) -> &Path {
 }
 
 #[cfg(unix)]
-fn sync_parent_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_parent_directory(path: &Path) -> io::Result<()> {
     fs::File::open(path)?.sync_all()
 }
 
 #[cfg(not(unix))]
-fn sync_parent_directory(_path: &Path) -> io::Result<()> {
+pub(crate) fn sync_parent_directory(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 

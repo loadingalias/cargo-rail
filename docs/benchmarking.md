@@ -126,6 +126,8 @@ Failed preparation retains partial output for diagnosis.
 This preparation command preserves the correctness fixture's controlled profiles;
 the local comparison selects ordinary dev settings separately.
 The benchmark binary is not included in release archives.
+[Release packaging and publication](releases.md) have separate evidence requirements;
+benchmark results do not authorize a release.
 
 ## Measurement rules
 

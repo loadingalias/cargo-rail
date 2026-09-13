@@ -139,23 +139,33 @@ See [Caching](caching.md) for exact eligibility and support.
 
 ## A release stopped
 
-`release run` and `release finalize` persist a journal before their first side effect.
+`release run` persists the original record before its first side effect.
 Inspect it and run the exact recovery command Cargo-Rail reports:
 
 ```bash
-cargo rail release status --json
-cargo rail release resume target/cargo-rail/releases/release-<id>.json
+cargo rail release status --format json
+cargo rail release resume
 ```
 
 `resume` reconciles Git, readiness checks, registry versions, tags, and forge state before advancing.
 It does not replan from mutated manifests.
-Use `release run --wait` when the initiating process should stay attached until exact-SHA checks settle;
-an interrupted wait remains resumable from the same journal.
+Omit the transaction ID when exactly one active transaction exists.
+If several exist, supply the ID reported by `status`.
+Recovery requires the original record and sealed package bytes;
+commit trailers cannot recreate publication authority.
+Finish or reconcile an older record with the executable that created it before upgrading.
+Hosted execution continues remotely after terminal closure.
+`resume` redispatches the same request; `status` fetches its latest retained progress.
+If the merge-event runner stopped,
+a resumed dispatch rediscovers the recorded PR and requires the same prepared tree
+before binding its merge.
+A missing record remains `missing_record`; tags and commit trailers cannot prove completion.
+See [releases](releases.md).
 
 Abort only while the status says no external side effect may exist:
 
 ```bash
-cargo rail release abort target/cargo-rail/releases/release-<id>.json --yes
+cargo rail release abort release-<id> --yes
 ```
 
 After that boundary, resume and reconcile.

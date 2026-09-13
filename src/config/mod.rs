@@ -12,8 +12,8 @@ pub use plan::{
 };
 pub use release::{
     ChangelogConfig, ChangelogFilters, ChangelogRelativeTo, ChangelogShape, CommitPolicy, CrateReleaseConfig,
-    GroupSpec, Pre1BreakingBump, ReleaseConfig, ReleaseRegistryPublication, ReleaseRemoteEffects, ReleaseSource,
-    RequireChangeFiles, SemverCheckPolicy,
+    GroupSpec, Pre1BreakingBump, ReleaseArtifacts, ReleaseAsset, ReleaseConfig, ReleaseRegistryPublication,
+    ReleaseRemoteEffects, ReleaseSource, RequireChangeFiles, SemverCheckPolicy,
 };
 pub use split::{CrateSplitConfig, SplitConfig, SplitMode, WorkspaceMode};
 pub use surface::{

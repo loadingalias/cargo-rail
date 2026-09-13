@@ -20,3 +20,20 @@ msrv_policy = { mode = "compute", source = "workspace" }
 
 [surface]
 enabled = true
+
+[release]
+remote_effects = "github"
+registry_publication = "crates-io"
+hosted_workflow = ".github/workflows/release.yml"
+auxiliary_cargo_manifests = ["tools/compiler-fact-driver/Cargo.toml"]
+validation = { ".github/workflows/ci.yml" = ["aarch64-linux", "riscv64-linux", "x86_64-linux", "x86_64-win"], ".github/workflows/package.yml" = ["Collect release assets"] }
+
+[release.artifacts.cargo-rail]
+workflow = ".github/workflows/package.yml"
+[release.artifacts.cargo-rail.files]
+"cargo-rail-aarch64-apple-darwin.zip" = { target = "aarch64-apple-darwin" }
+"cargo-rail-aarch64-unknown-linux-gnu.zip" = { target = "aarch64-unknown-linux-gnu" }
+"cargo-rail-x86_64-pc-windows-msvc.zip" = { target = "x86_64-pc-windows-msvc" }
+"cargo-rail-x86_64-unknown-linux-gnu.zip" = { target = "x86_64-unknown-linux-gnu" }
+"SHA256SUMS" = {}
+"LICENSE" = { source = "LICENSE" }

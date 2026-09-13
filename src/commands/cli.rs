@@ -126,7 +126,7 @@ retain a state path for `release resume`; `release status` shows recovery action
 
   cargo rail release check --all --publication # Validate publication authority
   cargo rail release run my-crate --bump minor # Execute a release transaction
-  cargo rail release run --all --publish --wait --yes # Publish after exact-SHA checks";
+  cargo rail release run --all --publish --yes # Submit a configured hosted release";
 
 const CHANGE_HELP: &str = "\
 Record a user-facing entry and its release intent:
@@ -887,6 +887,13 @@ pub enum SplitCommand {
 /// Subcommands for `cargo rail release`
 #[derive(Debug, Subcommand)]
 pub enum ReleaseCommand {
+    /// Transport a bound release record between executors
+    #[command(hide = true)]
+    Record {
+        /// Record transport operation
+        #[command(subcommand)]
+        command: ReleaseRecordCommand,
+    },
     /// Configure release settings
     Init {
         /// Crate name(s) to configure (optional)
@@ -911,17 +918,26 @@ pub enum ReleaseCommand {
         #[arg(long, value_name = "PATH")]
         plan: Option<PathBuf>,
         /// Authorize irreversible publication to crates.io
-        #[arg(long, conflicts_with = "pr")]
+        #[arg(long)]
         publish: bool,
         /// Skip git tag creation
         #[arg(long)]
         skip_tag: bool,
-        /// Prepare a release PR branch instead of tagging or publishing
+        /// Review the preparation in a PR before continuing the same transaction
         #[arg(long)]
         pr: bool,
-        /// Wait for exact-SHA remote checks instead of stopping with a resume command
-        #[arg(long, conflicts_with = "pr")]
-        wait: bool,
+        /// Stop after retaining the exact preparation commit
+        #[arg(long, hide = true, conflicts_with = "pr")]
+        prepare: bool,
+        /// Retain execution records in the bound Git repository before effects
+        #[arg(long, hide = true)]
+        retain_remote: bool,
+        /// Execute locally instead of submitting to the configured hosted workflow
+        #[arg(long, conflicts_with = "executor")]
+        local: bool,
+        /// Continue inside the configured GitHub workflow
+        #[arg(long, hide = true)]
+        executor: bool,
         /// Expand explicit crate selection to include the full dependent closure
         #[arg(long)]
         include_dependents: bool,
@@ -962,38 +978,14 @@ pub enum ReleaseCommand {
         #[arg(long, short = 'f', default_value_t, value_enum)]
         format: TextJsonOutputFormat,
     },
-    /// Finalize the exact release transaction introduced by a merged release PR
-    Finalize {
-        /// Crate name(s) to finalize (required unless --all)
-        #[arg(conflicts_with = "all", value_name = "CRATE")]
-        crate_names: Vec<String>,
-        /// Finalize all workspace crates with release notes for their current versions
-        #[arg(short, long)]
-        all: bool,
-        /// Authorize irreversible publication to crates.io
-        #[arg(long)]
-        publish: bool,
-        /// Skip git tag creation
-        #[arg(long)]
-        skip_tag: bool,
-        /// Expand explicit crate selection to include the full dependent closure and version groups
-        #[arg(long)]
-        include_dependents: bool,
-        /// Skip the interactive confirmation prompt.
-        #[arg(short = 'y', long)]
-        yes: bool,
-        /// Authorize release execution from a non-default branch.
-        #[arg(long)]
-        allow_non_default_branch: bool,
-        /// Output format
-        #[arg(long, short = 'f', default_value_t, value_enum)]
-        format: TextJsonOutputFormat,
-    },
-    /// Resume an interrupted release from its durable state file
+    /// Resume the unique active release or one exact transaction
     Resume {
-        /// State path printed by the interrupted release
-        #[arg(value_name = "STATE")]
-        state: PathBuf,
+        /// Transaction identity; omit when exactly one release is active
+        #[arg(value_name = "TRANSACTION")]
+        transaction: Option<String>,
+        /// Execute inside the configured GitHub workflow
+        #[arg(long, hide = true)]
+        executor: bool,
     },
     /// Show durable release state and the safe recovery command
     Status {
@@ -1009,12 +1001,50 @@ pub enum ReleaseCommand {
     },
     /// Abort an active release that has not reached remote side effects
     Abort {
-        /// State path printed by the active release
-        #[arg(value_name = "STATE")]
-        state: PathBuf,
+        /// Transaction identity; omit when exactly one release is active
+        #[arg(value_name = "TRANSACTION")]
+        transaction: Option<String>,
         /// Confirm restoration of the pre-release local state
         #[arg(short = 'y', long)]
         yes: bool,
+    },
+}
+
+/// Machine release record transport for hosted executors.
+#[derive(Debug, Subcommand)]
+pub enum ReleaseRecordCommand {
+    /// Read the complete original release record
+    Inspect {
+        /// Exact transaction identity
+        transaction: String,
+    },
+    /// Persist execution records with an atomic repository lease
+    Store {
+        /// Exact transaction identity
+        transaction: String,
+    },
+    /// Recover the active remote execution record
+    Fetch {
+        /// Exact transaction identity; omit to discover the active request
+        transaction: Option<String>,
+    },
+    /// Export the original transaction and retained archives
+    Export {
+        /// Exact transaction identity
+        transaction: String,
+        /// New output directory
+        directory: PathBuf,
+    },
+    /// Import evidence bound by the invoking executor
+    Import {
+        /// Received record directory
+        directory: PathBuf,
+        /// Independently authorized immutable intent identity
+        #[arg(long)]
+        intent: String,
+        /// Independently authorized checkout commit
+        #[arg(long)]
+        source: String,
     },
 }
 
@@ -1122,13 +1152,14 @@ impl Commands {
                 },
             },
             Commands::Release { command } => match command {
+                ReleaseCommand::Record { .. } => OutputProtocol::Json,
                 ReleaseCommand::Init { .. } | ReleaseCommand::Resume { .. } | ReleaseCommand::Abort { .. } => {
                     OutputProtocol::Text
                 }
                 ReleaseCommand::Status { format, .. } => text_json_protocol(format.is_json()),
-                ReleaseCommand::Run { format, .. }
-                | ReleaseCommand::Check { format, .. }
-                | ReleaseCommand::Finalize { format, .. } => text_json_protocol(format.is_json()),
+                ReleaseCommand::Run { format, .. } | ReleaseCommand::Check { format, .. } => {
+                    text_json_protocol(format.is_json())
+                }
             },
             Commands::Change { command } => match command {
                 ChangeCommand::Add { format, .. }
@@ -1254,7 +1285,6 @@ impl Commands {
                 command:
                     ReleaseCommand::Run { format, .. }
                     | ReleaseCommand::Check { format, .. }
-                    | ReleaseCommand::Finalize { format, .. }
                     | ReleaseCommand::Status { format, .. },
             } => *format = TextJsonOutputFormat::Json,
             Commands::Release { .. } => {}

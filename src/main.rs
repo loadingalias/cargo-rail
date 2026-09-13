@@ -9,6 +9,9 @@ use clap::Parser;
 use std::time::Instant;
 
 fn main() {
+    if let Some(exit_code) = cargo_rail::release::dispatch_credential_provider() {
+        std::process::exit(exit_code);
+    }
     match cargo_rail::compiler::invocation::dispatch() {
         cargo_rail::compiler::invocation::PreClapDispatch::Cli => {}
         cargo_rail::compiler::invocation::PreClapDispatch::Exit(exit_code) => std::process::exit(exit_code),

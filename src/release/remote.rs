@@ -113,16 +113,6 @@ impl RemoteRepository {
             Some(host) => format!("{}/{}", host, self.path),
         }
     }
-
-    pub(crate) fn trailer_value(&self) -> RailResult<String> {
-        serde_json::to_string(self)
-            .map_err(|error| RailError::message(format!("failed to serialize release repository identity: {}", error)))
-    }
-
-    pub(crate) fn from_trailer(value: &str) -> RailResult<Self> {
-        serde_json::from_str(value)
-            .map_err(|error| RailError::message(format!("invalid release repository identity trailer: {}", error)))
-    }
 }
 
 fn ambiguous_hosted_path(path: &str) -> bool {
@@ -253,14 +243,5 @@ mod tests {
                 "{remote}"
             );
         }
-    }
-
-    #[test]
-    fn trailer_round_trip_preserves_repository_identity() {
-        let repository = RemoteRepository::parse("ssh://git@github.example/org/repo.git").unwrap();
-        assert_eq!(
-            RemoteRepository::from_trailer(&repository.trailer_value().unwrap()).unwrap(),
-            repository
-        );
     }
 }

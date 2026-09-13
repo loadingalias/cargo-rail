@@ -24,5 +24,9 @@ For cache or installation reports, include the relevant hit, miss, bypass,
 or verification failure and whether the issue involves local storage, a remote provider,
 or a distributed worker.
 
+For release reports, include the transaction ID, source commit, workflow run and attempt,
+and the failed boundary: record validation, package checksum, reviewed merge, tag, asset, or alias.
+Redact credentials and private release content from retained records before sharing them.
+
 If GitHub Security Advisories are unavailable, email `thealiaslab@gmail.com` with the same information.
 Keep the report private until a fix is released or a disclosure timeline is agreed.

@@ -1,7 +1,7 @@
 # Changelog
 
-
-
+Published versions are recorded below. Pending release intent lives in [`.changes/`](.changes/);
+see [releasing a workspace](docs/releases.md) for the current preparation and publication workflow.
 
 ## [0.25.0](https://github.com/loadingalias/cargo-rail/compare/v0.24.0...v0.25.0) - 2026-08-30
 
