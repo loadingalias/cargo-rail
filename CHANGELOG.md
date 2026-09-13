@@ -3,6 +3,10 @@
 Published versions are recorded below. Pending release intent lives in [`.changes/`](.changes/);
 see [releasing a workspace](docs/releases.md) for the current preparation and publication workflow.
 
+## [0.27.0] - 2026-09-13
+- Fix prebuilt installation through cargo-binstall by making the source-only benchmark executable opt-in with the
+  `bench` feature. Release packaging now rejects archives that omit mandatory Cargo binaries.
+  To install the benchmark from source, add `--features bench`.
 ## [0.26.0] - 2026-09-13
 - Add `cargo-rail-bench` to compare native Cargo, Cargo-Rail, and sccache on a bundled mixed Rust/native workload.
   Retain per-sample correctness evidence for cold, empty-target rebuild, Cargo freshness,
