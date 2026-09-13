@@ -272,6 +272,9 @@ impl Fixture {
         let mut command = cargo_command(&self.root);
         for (key, _) in std::env::vars_os() {
             let name = key.to_string_lossy();
+            if matches!(name.as_ref(), "RUSTUP_HOME" | "RUSTUP_TOOLCHAIN") {
+                continue;
+            }
             if name.starts_with("CARGO_") || name.starts_with("RUST") || name.starts_with("GIT_") {
                 command.env_remove(key);
             }
