@@ -7813,7 +7813,7 @@ fn release_abort_preserves_a_replaced_local_tag() {
 
 #[cfg(unix)]
 #[test]
-fn release_native_assets_are_bound_before_effects_and_recovered_after_upload_acknowledgment_loss() {
+fn release_native_assets_and_drafts_recover_lost_acknowledgments_without_repeating_effects() {
     let result: Result<()> = (|| {
         use std::os::unix::fs::PermissionsExt;
         let ws = TestWorkspace::new_single_crate("registry-shadow", "0.1.0")?;
@@ -7888,8 +7888,21 @@ elif '/releases' in endpoint:
   else:
    release=json.loads((root/'release.json').read_text());release.update(body);body=release;record_effect('publish')
   (root/'release.json').write_text(json.dumps(body));emit(body)
+  if mode=='lost-draft-ack' and method=='POST':sys.exit(1)
+  if mode=='lost-publish-ack' and method=='PATCH':sys.exit(1)
+ elif '/releases?per_page=100&page=' in endpoint:
+  if mode=='listing-unavailable':
+   print('HTTP/2.0 403 Forbidden\r\n\r\n{}');sys.exit(1)
+  response=json.loads((root/'release.json').read_text()) if (root/'release.json').exists() else None
+  page=int(endpoint.rsplit('=',1)[1])
+  values=[{'tag_name':'v0.0.'+str(i)} for i in range(100)] if page==1 else ([response] if response else [])
+  if mode=='duplicate-draft' and page==2:values.append(dict(response,id=82))
+  print('HTTP/2.0 200 OK\r\n\r\n',end='');emit(values)
  elif (root/'release.json').exists():
   response=json.loads((root/'release.json').read_text())
+  if mode=='missing-retained' or '/releases/tags/' in endpoint and response['draft']:
+   print('HTTP/2.0 404 Not Found\r\n\r\n{}');sys.exit(1)
+  if '/releases/tags/' not in endpoint and not endpoint.endswith('/releases/81'):raise RuntimeError(args)
   if mode=='wrong-notes':response['body']='Another release'
   if mode=='wrong-release-id':response['id']=82
   if mode=='wrong-asset-digest':response['assets'][0]['digest']='sha256:'+'f'*64
@@ -7942,6 +7955,27 @@ else:raise RuntimeError(args)
             assert_eq!(state["crates"][0]["tag"]["status"], "pending");
             assert!(!shim.path().join("effects").exists());
         }
+        std::fs::write(shim.path().join("mode"), "lost-draft-ack")?;
+        let lost_draft = invoke(&["rail", "release", "resume"])?;
+        assert!(!lost_draft.status.success(), "{lost_draft:?}");
+        assert!(String::from_utf8_lossy(&lost_draft.stderr).contains("not acknowledged"));
+        let unobserved: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
+        assert_eq!(unobserved["crates"][0]["forge_draft"]["status"], "in_progress");
+        assert!(unobserved["crates"][0]["forge_draft"]["object"].is_null());
+        assert_eq!(std::fs::read_to_string(shim.path().join("effects"))?, "draft\n");
+        for (mode, diagnostic) in [
+            ("listing-unavailable", "observation is unavailable"),
+            ("duplicate-draft", "multiple GitHub releases"),
+        ] {
+            std::fs::write(shim.path().join("mode"), mode)?;
+            let blocked = invoke(&["rail", "release", "resume"])?;
+            assert!(!blocked.status.success(), "{mode}: {blocked:?}");
+            assert!(
+                String::from_utf8_lossy(&blocked.stderr).contains(diagnostic),
+                "{blocked:?}"
+            );
+            assert_eq!(std::fs::read_to_string(shim.path().join("effects"))?, "draft\n");
+        }
         std::fs::write(shim.path().join("mode"), "lost-upload-ack")?;
         let interrupted = invoke(&["rail", "release", "resume"])?;
         assert!(!interrupted.status.success(), "{interrupted:?}");
@@ -7958,6 +7992,7 @@ else:raise RuntimeError(args)
             .validate(&sealed)
             .map_err(|error| anyhow::anyhow!("{error}"))?;
         for mode in [
+            "missing-retained",
             "replacement",
             "expired",
             "wrong-notes",
@@ -7973,6 +8008,10 @@ else:raise RuntimeError(args)
                 "draft\nupload LICENSE\n"
             );
         }
+        std::fs::write(shim.path().join("mode"), "lost-publish-ack")?;
+        let lost_publication = invoke(&["rail", "release", "resume"])?;
+        assert!(!lost_publication.status.success(), "{lost_publication:?}");
+        assert!(String::from_utf8_lossy(&lost_publication.stderr).contains("not acknowledged"));
         std::fs::write(shim.path().join("mode"), "ok")?;
         let resumed = invoke(&["rail", "release", "resume"])?;
         assert!(resumed.status.success(), "{resumed:?}");
@@ -8144,6 +8183,7 @@ validation = { ".github/workflows/ci.yml" = ["tests"] }
 root=pathlib.Path(__file__).parent
 args=sys.argv[1:]
 p=root/'release.json'
+endpoint=next(arg for arg in args if arg.startswith('repos/'))
 if '--method' in args:
  body=json.loads(pathlib.Path(args[args.index('--input')+1]).read_text())
  if args[args.index('--method')+1]=='POST':body.update(id=81,assets=[])
@@ -8154,7 +8194,12 @@ if '--method' in args:
    sha=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
    subprocess.check_call(['git','--git-dir='+ (root/'remote').read_text(),'update-ref','refs/tags/v1',sha])
  p.write_text(json.dumps(body));print(json.dumps(body))
+elif '/releases?per_page=100&page=' in endpoint:
+ print('HTTP/2.0 200 OK\r\n\r\n',end='');print('['+p.read_text()+']' if p.exists() else '[]')
 elif p.exists():
+ if '/releases/tags/' in endpoint and json.loads(p.read_text())['draft']:
+  print('HTTP/2.0 404 Not Found\r\n\r\n{}');sys.exit(1)
+ if '/releases/tags/' not in endpoint and not endpoint.endswith('/releases/81'):raise RuntimeError(args)
  print('HTTP/2.0 200 OK\r\n\r\n',end='');print(p.read_text())
 else:
  print('HTTP/2.0 404 Not Found\r\n\r\n{}');sys.exit(1)

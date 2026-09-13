@@ -34,13 +34,19 @@ impl GithubRelease<'_> {
             evidence,
             assets,
         } = *self;
-        let endpoint = format!(
-            "repos/{}/releases/tags/{}",
-            repository.path(),
-            encode(&package.tag_name)
-        );
-        let mut release = get(root, repository, &endpoint)?;
-        if release.is_none() {
+        let observed = if let Some(id) = retained_id {
+            let id = id
+                .parse::<u64>()
+                .ok()
+                .filter(|id| *id > 0)
+                .ok_or_else(|| RailError::message("retained GitHub release identity is invalid"))?;
+            get(root, repository, &format!("repos/{}/releases/{id}", repository.path()))?
+        } else {
+            find(root, repository, &package.tag_name)?
+        };
+        let release = if let Some(release) = observed {
+            release
+        } else {
             if retained_id.is_some() || publish {
                 return Err(RailError::message("retained GitHub release is missing"));
             }
@@ -57,10 +63,8 @@ impl GithubRelease<'_> {
                 "POST",
                 &format!("repos/{}/releases", repository.path()),
                 &body,
-            )?;
-            release = get(root, repository, &endpoint)?;
-        }
-        let release = release.ok_or_else(|| RailError::message("created GitHub release is not observable"))?;
+            )?
+        };
         let (id, missing) = inspect(&release, source, package, evidence)?;
         if retained_id.is_some_and(|previous| previous != id.to_string()) {
             return Err(RailError::message(
@@ -68,6 +72,7 @@ impl GithubRelease<'_> {
             ));
         }
         retain_id(&id.to_string())?;
+        let endpoint = format!("repos/{}/releases/{id}", repository.path());
         for name in missing {
             let path = assets.path(&package.name, &name);
             let output = process::run(
@@ -178,17 +183,30 @@ fn inspect(
     Ok((id, missing))
 }
 
-fn encode(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| {
-            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-                char::from(byte).to_string()
-            } else {
-                format!("%{byte:02X}")
+fn find(root: &Path, repository: &RemoteRepository, tag: &str) -> RailResult<Option<Value>> {
+    // The tag endpoint omits drafts, including a draft whose creation acknowledgment was lost.
+    let mut found = None;
+    let mut page = 1_u64;
+    loop {
+        let endpoint = format!("repos/{}/releases?per_page=100&page={page}", repository.path());
+        let releases = get(root, repository, &endpoint)?
+            .ok_or_else(|| RailError::message("GitHub release listing is unavailable"))?;
+        let releases = releases
+            .as_array()
+            .ok_or_else(|| RailError::message("GitHub release listing is not an array"))?;
+        for release in releases {
+            let observed_tag = release["tag_name"]
+                .as_str()
+                .ok_or_else(|| RailError::message("GitHub release listing has no tag name"))?;
+            if observed_tag == tag && found.replace(release.clone()).is_some() {
+                return Err(RailError::message("multiple GitHub releases have the intended tag"));
             }
-        })
-        .collect()
+        }
+        if releases.len() < 100 {
+            return Ok(found);
+        }
+        page += 1;
+    }
 }
 
 fn get(root: &Path, repository: &RemoteRepository, endpoint: &str) -> RailResult<Option<Value>> {
@@ -223,7 +241,13 @@ fn get(root: &Path, repository: &RemoteRepository, endpoint: &str) -> RailResult
     )?))
 }
 
-fn request(root: &Path, repository: &RemoteRepository, method: &str, endpoint: &str, body: &Value) -> RailResult<()> {
+fn request(
+    root: &Path,
+    repository: &RemoteRepository,
+    method: &str,
+    endpoint: &str,
+    body: &Value,
+) -> RailResult<Value> {
     let mut input = tempfile::NamedTempFile::new()?;
     input.write_all(&serde_json::to_vec(body)?)?;
     input.flush()?;
@@ -251,5 +275,5 @@ fn request(root: &Path, repository: &RemoteRepository, method: &str, endpoint: &
             "GitHub release effect was not acknowledged; resume to reconcile",
         ));
     }
-    Ok(())
+    super::contract::decode(&output.stdout)
 }
