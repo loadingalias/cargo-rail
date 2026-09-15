@@ -101,10 +101,11 @@ that exact merged commit under the original intent.
 If the merge-event runner is lost,
 `resume` rediscovers the retained PR merge and applies the same tree checks.
 
-The repository [release workflow](../.github/workflows/release.yml) demonstrates direct use of the source-built engine
+The Cargo-Rail repository [release workflow](../.github/workflows/release.yml) demonstrates direct use of the source-built engine
 for its own bootstrap.
-Product packaging is a separate [workflow](../.github/workflows/package.yml).
-Neither workflow makes version or publication decisions.
+Cargo-Rail Action uses one locked Cargo-Rail release and source commit for its package
+and publication workflows.
+Neither repository resolves a moving tool version while publishing.
 
 ## Recover and inspect
 
@@ -130,9 +131,10 @@ there is no legacy record translation.
 
 Qualify the source-built Cargo-Rail binary
 and authenticated archive against the Action's independent consumer before publication.
-Publish Cargo-Rail first, then verify that GitHub identifies it as the latest stable release.
-The Action's release workflow then resolves that release, validates its authenticated components,
-and releases the Action.
+Publish Cargo-Rail first, then verify its immutable release and executable attestations.
+Update the Action repository's Cargo-Rail lock with that exact version
+and dereferenced release commit.
+The Action's release workflow validates the locked authenticated components and releases the Action.
 Its configured `v9` alias moves only after the immutable release is verified and only
 if the prior alias object still matches the request.
 
