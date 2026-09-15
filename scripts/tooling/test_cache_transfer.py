@@ -58,9 +58,11 @@ class CacheTransfer(unittest.TestCase):
 
     def test_driver_preparation_rejects_an_unsupported_target_without_publishing(self):
         with tempfile.TemporaryDirectory() as temporary:
+            environment = os.environ.copy()
+            environment['PYTHONSAFEPATH'] = '1'
             result = subprocess.run(
                 ['scripts/check-compiler-fact-driver.sh', '--prepare', temporary, 'unsupported-target'],
-                cwd=cache.ROOT, capture_output=True, text=True,
+                cwd=cache.ROOT, env=environment, capture_output=True, text=True,
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('compiler driver cross preparation requires', result.stderr)

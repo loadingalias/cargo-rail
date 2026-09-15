@@ -15,9 +15,10 @@ import sys
 import tempfile
 import tomllib
 
+root = Path.cwd()
+sys.path.insert(0, str(root))
 from scripts.tooling.compiler_support import validate_compiler_support
 
-root = Path.cwd()
 source_only = sys.argv[2] == '--prepare-source'
 destination = Path(sys.argv[1]).resolve()
 destination.mkdir(parents=True, exist_ok=True)
