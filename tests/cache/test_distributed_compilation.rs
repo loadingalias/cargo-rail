@@ -27,6 +27,15 @@ const CAPABILITY_TRAILER: &[u8; 8] = b"CRXCPEN5";
 const VIRTUAL_ROOT: &str = "/cargo-rail/exec/v5";
 const VIRTUAL_WORKSPACE: &str = "/cargo-rail/exec/v5/workspace";
 
+fn isolated_cache_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    command
+        .env_remove("CARGO_RAIL_CACHE_REMOTE")
+        .env_remove("CARGO_RAIL_CACHE_MODE")
+        .env_remove("CARGO_RAIL_CACHE_REMOTE_ENVIRONMENT");
+    command
+}
+
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkerCapability {
@@ -443,7 +452,7 @@ fn first_seen_compiler_environment_executes_locally_before_distribution() -> Res
         fs::set_permissions(coverage.path(), fs::Permissions::from_mode(0o700))?;
     }
     let coverage = cargo_rail::utils::canonicalize_existing(coverage.path())?;
-    let setup = Command::new(crate::helpers::cargo_binary("cargo-rail"))
+    let setup = isolated_cache_command(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(&workspace.path)
         .args(["rail", "cache", "setup", "--local-dir"])
         .arg(cache.path())
@@ -455,7 +464,7 @@ fn first_seen_compiler_environment_executes_locally_before_distribution() -> Res
         .output()?;
     anyhow::ensure!(setup.status.success(), "distributed local setup failed: {setup:?}");
 
-    let built = Command::new("cargo")
+    let built = isolated_cache_command("cargo")
         .current_dir(&workspace.path)
         .args(["build", "--release", "--lib", "--message-format=json"])
         .env("CARGO_HOME", cargo_home.path())
@@ -532,7 +541,7 @@ fn ordinary_cargo_distributes_module_trees_and_exact_rust_dependencies() -> Resu
         fs::set_permissions(coverage.path(), fs::Permissions::from_mode(0o700))?;
     }
     let coverage = cargo_rail::utils::canonicalize_existing(coverage.path())?;
-    let setup = Command::new(crate::helpers::cargo_binary("cargo-rail"))
+    let setup = isolated_cache_command(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(&workspace.path)
         .args(["rail", "cache", "setup", "--local-dir"])
         .arg(cache.path())
@@ -545,7 +554,7 @@ fn ordinary_cargo_distributes_module_trees_and_exact_rust_dependencies() -> Resu
     anyhow::ensure!(setup.status.success(), "distributed local setup failed: {setup:?}");
 
     let build = || {
-        Command::new("cargo")
+        isolated_cache_command("cargo")
             .current_dir(&workspace.path)
             .args(["build", "--workspace", "--release", "--message-format=json"])
             .env("CARGO_HOME", cargo_home.path())
@@ -566,7 +575,6 @@ fn ordinary_cargo_distributes_module_trees_and_exact_rust_dependencies() -> Resu
         String::from_utf8_lossy(&seeded.stderr)
     );
 
-    fs::remove_dir_all(workspace.path.join("target"))?;
     let cargo_rail_cache = cache.path().join("cargo-rail");
     let roots = fs::read_dir(&cargo_rail_cache)?
         .filter_map(|entry| entry.ok())
@@ -577,48 +585,91 @@ fn ordinary_cargo_distributes_module_trees_and_exact_rust_dependencies() -> Resu
         anyhow::bail!("test cache did not contain one local CAS root: {roots:?}");
     };
     let native_actions = root.path().join("native-actions-v2");
-    for entry in fs::read_dir(&native_actions)? {
-        let path = entry?.path();
-        anyhow::ensure!(path.is_file(), "native action state contained a non-file entry");
-        fs::remove_file(path)?;
-    }
-    for entry in fs::read_dir(&coverage)? {
-        let path = entry?.path();
-        anyhow::ensure!(path.is_file(), "coverage directory contained a non-file entry");
-        fs::remove_file(path)?;
-    }
+    let clear_build_state = || -> Result<()> {
+        if workspace.path.join("target").exists() {
+            fs::remove_dir_all(workspace.path.join("target"))?;
+        }
+        for entry in fs::read_dir(&native_actions)? {
+            let path = entry?.path();
+            anyhow::ensure!(path.is_file(), "native action state contained a non-file entry");
+            fs::remove_file(path)?;
+        }
+        for entry in fs::read_dir(&coverage)? {
+            let path = entry?.path();
+            anyhow::ensure!(path.is_file(), "coverage directory contained a non-file entry");
+            fs::remove_file(path)?;
+        }
+        Ok(())
+    };
+    clear_build_state()?;
 
-    let distributed = build()?;
+    let transition = build()?;
     anyhow::ensure!(
-        distributed.status.success(),
-        "dependency-bearing distributed build failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&distributed.stdout),
-        String::from_utf8_lossy(&distributed.stderr)
+        transition.status.success(),
+        "dependency-bearing qualification build failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&transition.stdout),
+        String::from_utf8_lossy(&transition.stderr)
     );
-    let events = fs::read_dir(&coverage)?
+    let transition_events = fs::read_dir(&coverage)?
         .map(|entry| Ok(serde_json::from_slice::<serde_json::Value>(&fs::read(entry?.path())?)?))
         .collect::<Result<Vec<_>>>()?;
     #[cfg(not(windows))]
-    anyhow::ensure!(
-        events
+    {
+        let compiler_actions = transition_events
             .iter()
-            .filter(|event| event["status"] == "hit" && event["reason"] == "verified_distributed_execution")
-            .count()
-            == 3,
-        "module/dependency build did not distribute all three Rust actions: {events:?}"
-    );
+            .filter(|event| event["action_key"].is_string())
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            compiler_actions.len() == 3,
+            "module/dependency qualification did not execute exactly three Rust actions: {transition_events:?}"
+        );
+        anyhow::ensure!(
+            compiler_actions.iter().all(|event| {
+                (event["status"] == "hit" && event["reason"] == "verified_distributed_execution")
+                    || (event["status"] == "miss"
+                        && event["reason"].as_str().is_some_and(|reason| {
+                            reason.starts_with("environment_selector_not_found;stored_verified_result")
+                        }))
+            }),
+            "module/dependency qualification crossed an unverified transition: {transition_events:?}"
+        );
+        anyhow::ensure!(
+            compiler_actions
+                .iter()
+                .any(|event| event["status"] == "hit" && event["reason"] == "verified_distributed_execution"),
+            "module/dependency qualification made no distributed progress: {transition_events:?}"
+        );
+        if !compiler_actions
+            .iter()
+            .all(|event| event["status"] == "hit" && event["reason"] == "verified_distributed_execution")
+        {
+            clear_build_state()?;
+            let distributed = build()?;
+            anyhow::ensure!(
+                distributed.status.success(),
+                "dependency-bearing distributed build failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&distributed.stdout),
+                String::from_utf8_lossy(&distributed.stderr)
+            );
+            let events = fs::read_dir(&coverage)?
+                .map(|entry| Ok(serde_json::from_slice::<serde_json::Value>(&fs::read(entry?.path())?)?))
+                .collect::<Result<Vec<_>>>()?;
+            anyhow::ensure!(
+                events
+                    .iter()
+                    .filter(|event| { event["status"] == "hit" && event["reason"] == "verified_distributed_execution" })
+                    .count()
+                    == 3,
+                "module/dependency build did not converge to three verified distributed actions: {events:?}"
+            );
+        }
+    }
     #[cfg(windows)]
-    assert_native_driver_unavailable_bypass(&events, "module/dependency build");
+    assert_native_driver_unavailable_bypass(&transition_events, "module/dependency build");
 
-    fs::remove_dir_all(workspace.path.join("target"))?;
-    for entry in fs::read_dir(&native_actions)? {
-        fs::remove_file(entry?.path())?;
-    }
-    for entry in fs::read_dir(&coverage)? {
-        fs::remove_file(entry?.path())?;
-    }
+    clear_build_state()?;
     let check = || {
-        Command::new("cargo")
+        isolated_cache_command("cargo")
             .current_dir(&workspace.path)
             .args(["check", "--workspace", "--all-targets", "--message-format=json"])
             .env("CARGO_HOME", cargo_home.path())
@@ -636,23 +687,65 @@ fn ordinary_cargo_distributes_module_trees_and_exact_rust_dependencies() -> Resu
         seeded_check.status.success(),
         "metadata/test action seeding failed: {seeded_check:?}"
     );
-    fs::remove_dir_all(workspace.path.join("target"))?;
-    for entry in fs::read_dir(&native_actions)? {
-        fs::remove_file(entry?.path())?;
-    }
-    for entry in fs::read_dir(&coverage)? {
-        fs::remove_file(entry?.path())?;
-    }
-    let distributed_check = check()?;
+    clear_build_state()?;
+    let transition_check = check()?;
     anyhow::ensure!(
-        distributed_check.status.success(),
-        "metadata/test distributed check failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&distributed_check.stdout),
-        String::from_utf8_lossy(&distributed_check.stderr)
+        transition_check.status.success(),
+        "metadata/test qualification check failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&transition_check.stdout),
+        String::from_utf8_lossy(&transition_check.stderr)
     );
-    let check_events = fs::read_dir(&coverage)?
+    let transition_check_events = fs::read_dir(&coverage)?
         .map(|entry| Ok(serde_json::from_slice::<serde_json::Value>(&fs::read(entry?.path())?)?))
         .collect::<Result<Vec<_>>>()?;
+    #[cfg(not(windows))]
+    let (distributed_check, check_events) = {
+        let compiler_actions = transition_check_events
+            .iter()
+            .filter(|event| event["action_key"].is_string())
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            compiler_actions.len() >= 6,
+            "metadata/test qualification did not execute all compiler actions: {transition_check_events:?}"
+        );
+        anyhow::ensure!(
+            compiler_actions.iter().all(|event| {
+                (event["status"] == "hit" && event["reason"] == "verified_distributed_execution")
+                    || (event["status"] == "miss"
+                        && event["reason"].as_str().is_some_and(|reason| {
+                            reason.starts_with("environment_selector_not_found;stored_verified_result")
+                        }))
+            }),
+            "metadata/test qualification crossed an unverified transition: {transition_check_events:?}"
+        );
+        anyhow::ensure!(
+            compiler_actions
+                .iter()
+                .any(|event| event["status"] == "hit" && event["reason"] == "verified_distributed_execution"),
+            "metadata/test qualification made no distributed progress: {transition_check_events:?}"
+        );
+        if compiler_actions
+            .iter()
+            .all(|event| event["status"] == "hit" && event["reason"] == "verified_distributed_execution")
+        {
+            (transition_check, transition_check_events)
+        } else {
+            clear_build_state()?;
+            let distributed_check = check()?;
+            anyhow::ensure!(
+                distributed_check.status.success(),
+                "metadata/test distributed check failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&distributed_check.stdout),
+                String::from_utf8_lossy(&distributed_check.stderr)
+            );
+            let check_events = fs::read_dir(&coverage)?
+                .map(|entry| Ok(serde_json::from_slice::<serde_json::Value>(&fs::read(entry?.path())?)?))
+                .collect::<Result<Vec<_>>>()?;
+            (distributed_check, check_events)
+        }
+    };
+    #[cfg(windows)]
+    let (distributed_check, check_events) = (transition_check, transition_check_events);
     #[cfg(not(windows))]
     let compiler_actions = check_events
         .iter()
@@ -827,7 +920,7 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
         "-f",
         "json",
     ];
-    let preview = Command::new(crate::helpers::cargo_binary("cargo-rail"))
+    let preview = isolated_cache_command(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(&workspace.path)
         .args(setup_arguments)
         .arg("--check")
@@ -844,7 +937,7 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
         !cargo_home.path().join("cargo-rail/compiler-cache-v1").exists(),
         "mTLS setup preview mutated private state"
     );
-    let setup = Command::new(crate::helpers::cargo_binary("cargo-rail"))
+    let setup = isolated_cache_command(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(&workspace.path)
         .args(setup_arguments)
         .env("CARGO_HOME", cargo_home.path())
@@ -868,7 +961,7 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
         fs::metadata(&installed_key)?.permissions().mode() & 0o777 == 0o600,
         "installed client key is not private"
     );
-    let rejected_local_replacement = Command::new(crate::helpers::cargo_binary("cargo-rail"))
+    let rejected_local_replacement = isolated_cache_command(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(&workspace.path)
         .args(["rail", "cache", "setup", "--distributed-local"])
         .env("CARGO_HOME", cargo_home.path())
@@ -893,7 +986,7 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
     fs::write(&identity.client_private_key, b"source identity no longer valid")?;
 
     let build = || {
-        Command::new("cargo")
+        isolated_cache_command("cargo")
             .current_dir(&workspace.path)
             .args(["build", "--release", "--lib", "--message-format=json"])
             .env("CARGO_HOME", cargo_home.path())
@@ -958,7 +1051,7 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
         .with_context(|| format!("ordinary Cargo did not commit a mutually authenticated worker result: {events:?}"))?;
     assert_distributed_phase_timing(distributed_hit)?;
 
-    let clean_target = Command::new("cargo")
+    let clean_target = isolated_cache_command("cargo")
         .current_dir(&workspace.path)
         .arg("clean")
         .env("CARGO_HOME", cargo_home.path())
@@ -971,7 +1064,7 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
     fs::set_permissions(check_coverage.path(), fs::Permissions::from_mode(0o700))?;
     let check_coverage = cargo_rail::utils::canonicalize_existing(check_coverage.path())?;
     let check = || {
-        Command::new("cargo")
+        isolated_cache_command("cargo")
             .current_dir(&workspace.path)
             .args(["check", "--release", "--lib", "--message-format=json"])
             .env("CARGO_HOME", cargo_home.path())
@@ -1027,7 +1120,7 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
         "metadata-only execution produced an rlib or omitted metadata: {check_artifacts:?}"
     );
 
-    let automatic = Command::new(crate::helpers::cargo_binary("cargo-rail"))
+    let automatic = isolated_cache_command(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(&workspace.path)
         .args([
             "rail",
@@ -1049,13 +1142,13 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
         automatic["distributed_policy"] == "automatic",
         "automatic placement was not installed"
     );
-    let clean = Command::new(crate::helpers::cargo_binary("cargo-rail"))
+    let clean = isolated_cache_command(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(&workspace.path)
         .args(["rail", "cache", "clean", "--scope", "local"])
         .env("CARGO_HOME", cargo_home.path())
         .output()?;
     anyhow::ensure!(clean.status.success(), "test cache cleanup failed: {clean:?}");
-    let reinitialize = Command::new(crate::helpers::cargo_binary("cargo-rail"))
+    let reinitialize = isolated_cache_command(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(&workspace.path)
         .args(["rail", "cache", "setup", "--distributed-policy", "automatic"])
         .env("CARGO_HOME", cargo_home.path())
@@ -1071,7 +1164,7 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
     fs::set_permissions(automatic_coverage.path(), fs::Permissions::from_mode(0o700))?;
     let automatic_coverage = cargo_rail::utils::canonicalize_existing(automatic_coverage.path())?;
     let automatic_build = || {
-        Command::new("cargo")
+        isolated_cache_command("cargo")
             .current_dir(&workspace.path)
             .args(["build", "--release", "--lib", "--message-format=json"])
             .env("CARGO_HOME", cargo_home.path())
@@ -1130,7 +1223,7 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
             .all(|event| event["reason"] != "verified_distributed_execution"),
         "automatic placement ignored its conservative cost gate: {automatic_events:?}"
     );
-    let placement_status = Command::new(crate::helpers::cargo_binary("cargo-rail"))
+    let placement_status = isolated_cache_command(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(&workspace.path)
         .args(["rail", "cache", "status", "--scope", "local", "-f", "json"])
         .env("CARGO_HOME", cargo_home.path())
@@ -1203,7 +1296,7 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
     };
     let before_stale_setup = installation_files()?;
     for check in [true, false] {
-        let mut command = Command::new(crate::helpers::cargo_binary("cargo-rail"));
+        let mut command = isolated_cache_command(crate::helpers::cargo_binary("cargo-rail"));
         command
             .current_dir(&workspace.path)
             .args(["rail", "cache", "setup", "--max-size", "100MiB"])
@@ -1226,7 +1319,7 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
 
     let installed_key_bytes = fs::read(&installed_key)?;
     fs::write(&installed_key, b"drifted installed identity")?;
-    let status = Command::new(crate::helpers::cargo_binary("cargo-rail"))
+    let status = isolated_cache_command(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(&workspace.path)
         .args(["rail", "cache", "status", "--scope", "local", "-f", "json"])
         .env("CARGO_HOME", cargo_home.path())
@@ -1238,13 +1331,13 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
     );
     fs::write(&installed_key, installed_key_bytes)?;
     fs::write(&identity.client_private_key, original_client_key)?;
-    let repair = Command::new(crate::helpers::cargo_binary("cargo-rail"))
+    let repair = isolated_cache_command(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(&workspace.path)
         .args(setup_arguments)
         .env("CARGO_HOME", cargo_home.path())
         .output()?;
     anyhow::ensure!(repair.status.success(), "mTLS identity repair failed: {repair:?}");
-    let remove = Command::new(crate::helpers::cargo_binary("cargo-rail"))
+    let remove = isolated_cache_command(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(&workspace.path)
         .args(["rail", "cache", "uninstall"])
         .env("CARGO_HOME", cargo_home.path())
@@ -1299,7 +1392,7 @@ fn saturated_mutual_tls_worker_falls_excess_cargo_actions_back_locally() -> Resu
     fs::set_permissions(coverage.path(), fs::Permissions::from_mode(0o700))?;
     let coverage = cargo_rail::utils::canonicalize_existing(coverage.path())?;
 
-    let setup = Command::new(crate::helpers::cargo_binary("cargo-rail"))
+    let setup = isolated_cache_command(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(&workspace.path)
         .args([
             "rail",
@@ -1333,7 +1426,7 @@ fn saturated_mutual_tls_worker_falls_excess_cargo_actions_back_locally() -> Resu
     anyhow::ensure!(setup.status.success(), "parallel mTLS setup failed: {setup:?}");
 
     let build = || {
-        Command::new("cargo")
+        isolated_cache_command("cargo")
             .current_dir(&workspace.path)
             .args([
                 "build",
