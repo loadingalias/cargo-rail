@@ -19,6 +19,15 @@ class CheckRecipes(unittest.TestCase):
         self.root = Path(temporary.name)
         (self.root / 'scripts').mkdir()
         shutil.copy(ROOT / 'justfile', self.root)
+        justfile = (self.root / 'justfile').read_text()
+        start = justfile.index('test profile="default":')
+        end = justfile.index('# Native local, remote-storage', start)
+        justfile = (
+            justfile[:start]
+            + 'test profile="default":\n    cargo nextest run --workspace -P {{profile}} --all-features --locked\n\n'
+            + justfile[end:]
+        )
+        (self.root / 'justfile').write_text(justfile)
         for name in ['check.sh', 'check-cross.sh', 'check-compiler-fact-driver.sh']:
             shutil.copy(ROOT / 'scripts' / name, self.root / 'scripts' / name)
         binaries = self.root / 'bin'
@@ -85,7 +94,10 @@ else:
             ['cargo', 'fmt', '--all'],
         ])
         self.assertEqual(calls[3:10], shared)
-        self.assertEqual([call['args'] for call in calls[10:]], [
+        self.assertEqual(calls[10]['args'], [
+            'cargo', 'nextest', 'run', '--workspace', '-P', 'default', '--all-features', '--locked'
+        ])
+        self.assertEqual([call['args'] for call in calls[11:]], [
             [*command, '--target', target, '--workspace', '--all-targets', '--all-features', '--locked']
             for command, target in [
                 (['cargo-zigbuild', 'clippy'], 'x86_64-unknown-linux-gnu'),

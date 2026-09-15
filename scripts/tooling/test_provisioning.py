@@ -50,10 +50,13 @@ else:
         path.write_text(self.recorder)
         path.chmod(0o755)
 
-    def provision(self, target, success=True):
+    def provision(self, target, operation=None, success=True):
         log = Path(self.environment['PROVISION_LOG'])
         log.unlink(missing_ok=True)
-        result = subprocess.run([str(self.root / 'scripts/tooling/package-unix.sh'), target],
+        arguments = [str(self.root / 'scripts/tooling/package-unix.sh'), target]
+        if operation is not None:
+            arguments.append(operation)
+        result = subprocess.run(arguments,
                                 env=self.environment, capture_output=True, text=True)
         self.assertEqual(result.returncode == 0, success, result.stdout + result.stderr)
         return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
@@ -71,6 +74,23 @@ else:
         ])
         self.assertEqual((self.root / 'github-env').read_text(), f'RUSTUP_TOOLCHAIN={catalog.rust_channel()}\n')
 
+    def test_macos_ci_operation_installs_the_cataloged_check_tools(self):
+        calls = self.provision('aarch64-apple-darwin', 'ci')
+        data = catalog.read()
+        self.assertEqual(calls, [
+            ['xcrun', '--find', 'clang'],
+            ['cmake', '--version'],
+            ['rustup', 'toolchain', 'install', catalog.rust_channel(), '--profile', 'minimal',
+             '--component', 'clippy', '--component', 'rustfmt', '--component', 'rustc-dev',
+             '--component', 'llvm-tools'],
+            ['rustc', '-vV'],
+            ['cargo', 'install', 'cargo-binstall', '--version', data['versions']['cargo-binstall'], '--locked'],
+            *[
+                ['cargo', 'install', tool, '--version', data['cargo'][tool], '--locked']
+                for tool in ['cargo-deny', 'cargo-nextest', 'just']
+            ],
+        ])
+
     def test_linux_dispatches_the_package_selection_to_existing_installers(self):
         for target, installer in [('x86_64-unknown-linux-gnu', 'x86_64-linux.sh'),
                                   ('aarch64-unknown-linux-gnu', 'aarch64-linux.sh')]:
@@ -86,6 +106,9 @@ else:
 
     def test_unsupported_target_fails_before_provisioning(self):
         self.assertEqual(self.provision('unknown-target', success=False), [])
+
+    def test_unsupported_operation_fails_before_provisioning(self):
+        self.assertEqual(self.provision('aarch64-apple-darwin', 'unknown', success=False), [])
 
 
 class LinuxPerfProvisioning(unittest.TestCase):
