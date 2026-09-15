@@ -442,7 +442,7 @@ fn first_seen_compiler_environment_executes_locally_before_distribution() -> Res
 
         fs::set_permissions(coverage.path(), fs::Permissions::from_mode(0o700))?;
     }
-    let coverage = fs::canonicalize(coverage.path())?;
+    let coverage = cargo_rail::utils::canonicalize_existing(coverage.path())?;
     let setup = Command::new(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(&workspace.path)
         .args(["rail", "cache", "setup", "--local-dir"])
@@ -531,7 +531,7 @@ fn ordinary_cargo_distributes_module_trees_and_exact_rust_dependencies() -> Resu
 
         fs::set_permissions(coverage.path(), fs::Permissions::from_mode(0o700))?;
     }
-    let coverage = fs::canonicalize(coverage.path())?;
+    let coverage = cargo_rail::utils::canonicalize_existing(coverage.path())?;
     let setup = Command::new(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(&workspace.path)
         .args(["rail", "cache", "setup", "--local-dir"])
@@ -802,7 +802,7 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
     let cargo_home = tempfile::tempdir()?;
     let coverage = tempfile::tempdir()?;
     fs::set_permissions(coverage.path(), fs::Permissions::from_mode(0o700))?;
-    let coverage = fs::canonicalize(coverage.path())?;
+    let coverage = cargo_rail::utils::canonicalize_existing(coverage.path())?;
     let setup_arguments = [
         "rail",
         "cache",
@@ -969,7 +969,7 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
     );
     let check_coverage = tempfile::tempdir()?;
     fs::set_permissions(check_coverage.path(), fs::Permissions::from_mode(0o700))?;
-    let check_coverage = fs::canonicalize(check_coverage.path())?;
+    let check_coverage = cargo_rail::utils::canonicalize_existing(check_coverage.path())?;
     let check = || {
         Command::new("cargo")
             .current_dir(&workspace.path)
@@ -1069,7 +1069,7 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
     }
     let automatic_coverage = tempfile::tempdir()?;
     fs::set_permissions(automatic_coverage.path(), fs::Permissions::from_mode(0o700))?;
-    let automatic_coverage = fs::canonicalize(automatic_coverage.path())?;
+    let automatic_coverage = cargo_rail::utils::canonicalize_existing(automatic_coverage.path())?;
     let automatic_build = || {
         Command::new("cargo")
             .current_dir(&workspace.path)
@@ -1297,7 +1297,7 @@ fn saturated_mutual_tls_worker_falls_excess_cargo_actions_back_locally() -> Resu
     let cache = tempfile::tempdir()?;
     let coverage = tempfile::tempdir()?;
     fs::set_permissions(coverage.path(), fs::Permissions::from_mode(0o700))?;
-    let coverage = fs::canonicalize(coverage.path())?;
+    let coverage = cargo_rail::utils::canonicalize_existing(coverage.path())?;
 
     let setup = Command::new(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(&workspace.path)

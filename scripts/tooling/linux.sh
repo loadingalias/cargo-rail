@@ -60,6 +60,8 @@ apt=("${sudo_cmd[@]}" env DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[
 catalog_get() { python3 "$SCRIPT_DIR/catalog.py" get "$@"; }
 python3 "$SCRIPT_DIR/catalog.py" validate
 catalog_select() { python3 "$SCRIPT_DIR/catalog.py" select "$platform" "$operation" "$@"; }
+build_jobs="$(catalog_get "$platform" cargo-build-jobs 2>/dev/null || true)"
+if [[ -n "$build_jobs" ]]; then export CARGO_BUILD_JOBS="$build_jobs"; fi
 # Resolve the complete selection before package installation; process substitutions do not propagate failures.
 catalog_select > /dev/null
 mapfile -t packages < <(catalog_select packages)
@@ -124,9 +126,13 @@ environment="$prefix/environment.sh"
 {
   printf "export PATH=%q:\"\$PATH\"\n" "$(IFS=:; echo "${tool_paths[*]}")"
   printf 'export RUSTUP_TOOLCHAIN=%q\n' "$channel"
+  if [[ -n "$build_jobs" ]]; then printf 'export CARGO_BUILD_JOBS=%q\n' "$build_jobs"; fi
 } > "$environment"
 if [[ -n "${GITHUB_PATH:-}" ]]; then printf '%s\n' "${tool_paths[@]}" >> "$GITHUB_PATH"; fi
-if [[ -n "${GITHUB_ENV:-}" ]]; then printf 'RUSTUP_TOOLCHAIN=%s\n' "$channel" >> "$GITHUB_ENV"; fi
+if [[ -n "${GITHUB_ENV:-}" ]]; then
+  printf 'RUSTUP_TOOLCHAIN=%s\n' "$channel" >> "$GITHUB_ENV"
+  if [[ -n "$build_jobs" ]]; then printf 'CARGO_BUILD_JOBS=%s\n' "$build_jobs" >> "$GITHUB_ENV"; fi
+fi
 for startup in "$HOME/.profile" "$HOME/.bashrc"; do
   line="source \"$environment\""
   touch "$startup"

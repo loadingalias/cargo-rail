@@ -5,6 +5,7 @@
 Make cache installation upgrades recoverable,
 prevent registry reads from observing concurrent profile publication,
 add an explicit local readiness proof and schema 18 status,
+accept external-tool-compatible canonical paths in the Windows readiness probe,
 keep remote authority separate from local health,
 and qualify native stable and pinned nightly compilers against independent
 release and date bounds for authenticated driver sources.

@@ -359,7 +359,8 @@ fn cargo_check_remote(
             .env("REMOTE_ENV_LOG", workspace.join("remote-compiler-environment.log"));
     }
     if let Some(coverage) = coverage {
-        let coverage = fs::canonicalize(coverage).context("canonicalize native-cache coverage directory")?;
+        let coverage = cargo_rail::utils::canonicalize_existing(coverage)
+            .context("canonicalize native-cache coverage directory")?;
         command
             .env("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1")
             .env("CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY", coverage);
@@ -397,7 +398,8 @@ fn cargo_check_installed_remote_with_options(
     target: Option<&Path>,
     artifact_target: Option<&str>,
 ) -> Result<Output> {
-    let coverage = fs::canonicalize(coverage).context("canonicalize native-cache coverage directory")?;
+    let coverage =
+        cargo_rail::utils::canonicalize_existing(coverage).context("canonicalize native-cache coverage directory")?;
     let mut command = Command::new("cargo");
     command
         .current_dir(workspace)
@@ -1163,7 +1165,7 @@ fn explicit_linker_reuse(direct_lld: bool) -> Result<()> {
             .lines()
             .find_map(|line| line.strip_prefix("host: "))
             .context("rustc host target")?;
-        let (linker, flags) = if direct_lld {
+        let (linker, flags, source, expected_status, expected_stdout) = if direct_lld {
             let sysroot = Command::new("rustc").arg("--print=sysroot").output()?;
             anyhow::ensure!(sysroot.status.success(), "rustc sysroot query failed: {sysroot:?}");
             let sysroot = String::from_utf8(sysroot.stdout)?;
@@ -1173,22 +1175,30 @@ fn explicit_linker_reuse(direct_lld: bool) -> Result<()> {
                     .join(host)
                     .join("bin/rust-lld"),
                 "rustflags = [\"-Clinker-flavor=ld64.lld\"]\n",
+                "#![no_std]\n#![no_main]\n\
+                 #[panic_handler]\nfn panic(_: &core::panic::PanicInfo) -> ! { loop {} }\n\
+                 #[unsafe(no_mangle)]\npub extern \"C\" fn main() -> i32 { 42 }\n",
+                Some(42),
+                &b""[..],
             )
         } else {
-            (PathBuf::from("/usr/bin/cc"), "")
+            (
+                PathBuf::from("/usr/bin/cc"),
+                "",
+                "fn main() { println!(\"explicit linker result\"); }\n",
+                Some(0),
+                &b"explicit linker result\n"[..],
+            )
         };
         let workspace = TestWorkspace::new_single_crate("explicit-linker", "0.1.0")?;
         let cargo_home = tempfile::tempdir()?;
         fs::remove_file(workspace.path.join("src/lib.rs"))?;
-        fs::write(
-            workspace.path.join("src/main.rs"),
-            "fn main() { println!(\"explicit linker result\"); }\n",
-        )?;
+        fs::write(workspace.path.join("src/main.rs"), source)?;
         fs::create_dir(workspace.path.join(".cargo"))?;
         fs::write(
             workspace.path.join(".cargo/config.toml"),
             format!(
-                "[target.{host}]\nlinker = {}\n{flags}\n[profile.dev]\nsplit-debuginfo = \"off\"\n",
+                "[target.{host}]\nlinker = {}\n{flags}\n[profile.dev]\nsplit-debuginfo = \"off\"\npanic = \"abort\"\n",
                 serde_json::to_string(linker.to_str().context("linker path")?)?
             ),
         )?;
@@ -1201,11 +1211,11 @@ fn explicit_linker_reuse(direct_lld: bool) -> Result<()> {
         anyhow::ensure!(baseline_mode & 0o111 != 0, "upstream output has no executable mode");
         let baseline_output = Command::new(&executable).output()?;
         anyhow::ensure!(
-            baseline_output.status.success(),
+            baseline_output.status.code() == expected_status,
             "upstream executable failed: {baseline_output:?}"
         );
         anyhow::ensure!(
-            baseline_output.stdout == b"explicit linker result\n",
+            baseline_output.stdout == expected_stdout,
             "upstream executable stdout changed: {baseline_output:?}"
         );
         anyhow::ensure!(baseline_output.stderr.is_empty(), "upstream executable emitted stderr");
@@ -1251,7 +1261,7 @@ fn explicit_linker_reuse(direct_lld: bool) -> Result<()> {
             );
             let output = Command::new(&executable).output()?;
             anyhow::ensure!(
-                output.status.success(),
+                output.status == baseline_output.status,
                 "{phase} explicit-linker executable failed: {output:?}"
             );
             anyhow::ensure!(
@@ -2407,7 +2417,7 @@ fn distributed_worker_revalidates_a_cross_target_library_before_local_admission(
         let coverage = tempfile::tempdir()?;
         use std::os::unix::fs::PermissionsExt as _;
         fs::set_permissions(coverage.path(), fs::Permissions::from_mode(0o700))?;
-        let coverage = fs::canonicalize(coverage.path())?;
+        let coverage = cargo_rail::utils::canonicalize_existing(coverage.path())?;
         let build = || {
             Command::new("cargo")
                 .current_dir(&workspace.path)
@@ -2499,7 +2509,7 @@ fn receipt_qualified_local_distribution_executes_an_ordinary_cargo_library() {
             use std::os::unix::fs::PermissionsExt as _;
             fs::set_permissions(coverage.path(), fs::Permissions::from_mode(0o700))?;
         }
-        let coverage = fs::canonicalize(coverage.path())?;
+        let coverage = cargo_rail::utils::canonicalize_existing(coverage.path())?;
 
         let preview = rail(
             &workspace.path,
@@ -2761,6 +2771,7 @@ fn failure_reason_status_reads_durable_counters_when_the_usage_ledger_is_full() 
     super::helpers::finish_test(result);
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn readiness_probe_proves_uncached_cold_and_warm_execution() {
     let result: Result<()> = (|| {
@@ -5041,7 +5052,7 @@ resolver = "3"
             use std::os::unix::fs::PermissionsExt as _;
             fs::set_permissions(coverage.path(), fs::Permissions::from_mode(0o700))?;
         }
-        let coverage_path = fs::canonicalize(coverage.path())?;
+        let coverage_path = cargo_rail::utils::canonicalize_existing(coverage.path())?;
         let proc_macro = Command::new("cargo")
             .current_dir(&workspace.path)
             .args(["check", "--workspace", "--quiet"])
@@ -5136,7 +5147,7 @@ fn custom_target_and_deterministic_flags_reuse_without_runtime_residue() {
 
         let coverage = tempfile::tempdir()?;
         fs::set_permissions(coverage.path(), fs::Permissions::from_mode(0o700))?;
-        let coverage_path = fs::canonicalize(coverage.path())?;
+        let coverage_path = cargo_rail::utils::canonicalize_existing(coverage.path())?;
         let first_target_parent = tempfile::tempdir()?;
         let first_target = first_target_parent.path().join("producer-target");
         assert!(!first_target.exists(), "producer target existed before Cargo started");
@@ -5522,7 +5533,7 @@ fn ordinary_cargo_and_nextest_commands_receive_eligible_library_reuse() {
             fs::remove_dir_all(workspace.path.join("target"))?;
             let coverage = tempfile::tempdir()?;
             fs::set_permissions(coverage.path(), fs::Permissions::from_mode(0o700))?;
-            let coverage_path = fs::canonicalize(coverage.path())?;
+            let coverage_path = cargo_rail::utils::canonicalize_existing(coverage.path())?;
             let reused = Command::new("cargo")
                 .current_dir(&workspace.path)
                 .args(*arguments)
@@ -6190,7 +6201,7 @@ fn external_macho_order_file_invalidates_reuse_without_changing_source() {
         fs::write(
             &clang_config,
             format!(
-                "-fuse-ld={}\n-Wl,-order_file,{}\n",
+                "-fuse-ld={}\n-Wl,-platform_version,macos,11.0,11.0\n-Wl,-order_file,{}\n",
                 linker.display(),
                 order_file.display()
             ),
@@ -6198,9 +6209,11 @@ fn external_macho_order_file_invalidates_reuse_without_changing_source() {
         fs::remove_file(workspace.path.join("src/lib.rs"))?;
         fs::write(
             workspace.path.join("src/main.rs"),
-            "#[no_mangle]\n#[inline(never)]\npub extern \"C\" fn first() -> u64 { 41 }\n\
-             #[no_mangle]\n#[inline(never)]\npub extern \"C\" fn second() -> u64 { 42 }\n\
-             fn main() { println!(\"{} {}\", first(), second()); }\n",
+            "#![no_std]\n#![no_main]\n\
+             #[panic_handler]\nfn panic(_: &core::panic::PanicInfo) -> ! { loop {} }\n\
+             #[unsafe(no_mangle)]\n#[inline(never)]\npub extern \"C\" fn first() -> u64 { 41 }\n\
+             #[unsafe(no_mangle)]\n#[inline(never)]\npub extern \"C\" fn second() -> u64 { 42 }\n\
+             #[unsafe(no_mangle)]\npub extern \"C\" fn main() -> i32 { (first() + second() - 83) as i32 }\n",
         )?;
         let version = Command::new("rustc").arg("-vV").output()?;
         assert!(version.status.success(), "rustc prerequisite failed: {version:?}");
@@ -6213,7 +6226,8 @@ fn external_macho_order_file_invalidates_reuse_without_changing_source() {
         fs::write(
             workspace.path.join(".cargo/config.toml"),
             format!(
-                "[target.{host}]\nlinker = \"/usr/bin/clang\"\nrustflags = [{}]\n[profile.dev]\nsplit-debuginfo = \"off\"\n",
+                "[target.{host}]\nlinker = \"/usr/bin/clang\"\nrustflags = [{}]\n\
+                 [profile.dev]\nsplit-debuginfo = \"off\"\npanic = \"abort\"\n",
                 serde_json::to_string(&format!("-Clink-arg=--config={}", clang_config.display()))?
             ),
         )?;
@@ -6231,7 +6245,7 @@ fn external_macho_order_file_invalidates_reuse_without_changing_source() {
             explicit_target_cargo(&workspace.path, cargo_home.path(), "build", host, None)?;
             let run = Command::new(&executable).output()?;
             assert!(run.status.success(), "uncached executable failed: {run:?}");
-            assert_eq!(run.stdout, b"41 42\n");
+            assert!(run.stdout.is_empty());
             assert!(run.stderr.is_empty());
             baselines.push((
                 fs::read(&executable)?,
@@ -6399,7 +6413,7 @@ host_macros = { path = "../macros" }
             fs::remove_dir_all(&target)?;
             let coverage = tempfile::tempdir()?;
             fs::set_permissions(coverage.path(), fs::Permissions::from_mode(0o700))?;
-            let coverage_path = fs::canonicalize(coverage.path())?;
+            let coverage_path = cargo_rail::utils::canonicalize_existing(coverage.path())?;
             let output = compile(Some(&coverage_path))?;
             assert!(output.status.success(), "{phase} build failed: {output:?}");
             eprintln!(

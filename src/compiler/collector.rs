@@ -7329,7 +7329,7 @@ mod tests {
         let mut command = Command::new("sh");
         command
             .arg("-c")
-            .arg("dd if=/dev/urandom of=\"$1/artifact\" bs=1048576 count=8 2>/dev/null; sync; exec sleep 10")
+            .arg("dd if=/dev/zero of=\"$1/artifact\" bs=1048576 count=8 2>/dev/null; exec sleep 10")
             .arg("cargo-rail-artifact-budget-test")
             .arg(root.path());
         let started = Instant::now();

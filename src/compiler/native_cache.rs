@@ -18419,7 +18419,9 @@ fn validate_benchmark_coverage_directory(directory: &Path) -> RailResult<()> {
         ));
     }
     let metadata = fs::symlink_metadata(directory)?;
-    if !metadata.is_dir() || crate::utils::is_symlink_or_reparse(&metadata) || fs::canonicalize(directory)? != directory
+    if !metadata.is_dir()
+        || crate::utils::is_symlink_or_reparse(&metadata)
+        || crate::utils::canonicalize_existing(directory)? != directory
     {
         return Err(RailError::message(
             "benchmark compiler coverage directory is not one real canonical directory",
@@ -18626,6 +18628,21 @@ pub(crate) mod tests {
         let error = persist_benchmark_coverage_event(temporary, &blocked).unwrap_err();
         assert!(matches!(error, RailError::Io(_)), "{error}");
         assert_eq!(fs::read(blocked).unwrap(), b"preserved");
+    }
+
+    #[test]
+    fn benchmark_coverage_accepts_an_external_tool_compatible_canonical_directory() {
+        let directory = tempfile::tempdir().expect("coverage directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+                .expect("private coverage directory");
+        }
+        let directory = crate::utils::canonicalize_existing(directory.path()).expect("canonical coverage directory");
+
+        validate_benchmark_coverage_directory(&directory).expect("valid coverage directory");
     }
 
     #[test]

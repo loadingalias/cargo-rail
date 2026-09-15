@@ -43,8 +43,9 @@ def verify_rust(platform, operation=None):
 def verify(platform, operation):
     data = catalog.read()
     native = catalog.selection(data, platform, operation)
-    if platform.endswith('-win') and os.environ.get('CARGO_BUILD_JOBS') != str(data['windows']['cargo-build-jobs']):
-        raise ValueError('CARGO_BUILD_JOBS does not match the Windows tooling bound')
+    jobs = data['windows']['cargo-build-jobs'] if platform.endswith('-win') else data[platform].get('cargo-build-jobs')
+    if jobs is not None and os.environ.get('CARGO_BUILD_JOBS') != str(jobs):
+        raise ValueError(f'CARGO_BUILD_JOBS does not match the {platform} tooling bound')
     if 'linux-tools-common' in native.get('packages', []):
         run('perf', '--version')
     verify_rust(platform, operation)

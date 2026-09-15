@@ -26,10 +26,15 @@ pub(crate) enum RegistryObservation {
 pub(crate) struct RegistryObserver {
     index: reqwest::Url,
     client: Client,
+    request_timeout: Duration,
 }
 
 impl RegistryObserver {
     pub(crate) fn new(index: &str) -> RailResult<Self> {
+        Self::with_request_timeout(index, Duration::from_secs(30))
+    }
+
+    fn with_request_timeout(index: &str, request_timeout: Duration) -> RailResult<Self> {
         let source = index.strip_prefix("sparse+").unwrap_or(index);
         let index =
             reqwest::Url::parse(source).map_err(|_| RailError::message("invalid release registry index URL"))?;
@@ -63,7 +68,11 @@ impl RegistryObserver {
         let client = client
             .build()
             .map_err(|_| RailError::message("could not initialize release registry observation"))?;
-        Ok(Self { index, client })
+        Ok(Self {
+            index,
+            client,
+            request_timeout,
+        })
     }
 
     pub(crate) fn observe(&self, name: &str, version: &str, checksum: &str) -> RegistryObservation {
@@ -93,7 +102,7 @@ impl RegistryObserver {
         let response = self
             .client
             .get(url)
-            .timeout(Duration::from_secs(30))
+            .timeout(self.request_timeout)
             .header(reqwest::header::CACHE_CONTROL, "no-cache")
             .send()
             .map_err(|_| "registry index request failed or timed out")?;
@@ -354,16 +363,17 @@ mod tests {
                 .unwrap();
             // Keep every individual read active beyond the whole-request deadline.
             // The observer must cancel before this incomplete JSON reaches EOF.
-            for _ in 0..350 {
-                std::thread::sleep(Duration::from_millis(100));
+            for _ in 0..100 {
+                std::thread::sleep(Duration::from_millis(10));
                 if stream.get_mut().write_all(b" ").is_err() {
                     break;
                 }
             }
         });
-        let observation = RegistryObserver::new(&format!("http://{address}/index/"))
-            .unwrap()
-            .observe("Example_Crate", "1.2.3", DIGEST);
+        let observation =
+            RegistryObserver::with_request_timeout(&format!("http://{address}/index/"), Duration::from_millis(200))
+                .unwrap()
+                .observe("Example_Crate", "1.2.3", DIGEST);
         worker.join().unwrap();
         assert_eq!(
             observation,

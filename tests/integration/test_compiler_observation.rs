@@ -714,7 +714,7 @@ fn unsupported_incremental_invocation_bypasses_before_direct_context_load() {
 fn benchmark_coverage_records_fast_bypass_without_cache_context() {
     let result: Result<()> = (|| {
         let state = tempfile::tempdir()?;
-        let state_root = fs::canonicalize(state.path())?;
+        let state_root = cargo_rail::utils::canonicalize_existing(state.path())?;
         let coverage = state_root.join("coverage");
         fs::create_dir(&coverage)?;
         #[cfg(unix)]
@@ -752,7 +752,7 @@ fn benchmark_coverage_records_fast_bypass_without_cache_context() {
 fn benchmark_coverage_records_compiler_mode_cold_boundaries() {
     let result: Result<()> = (|| {
         let state = tempfile::tempdir()?;
-        let state_root = fs::canonicalize(state.path())?;
+        let state_root = cargo_rail::utils::canonicalize_existing(state.path())?;
         let coverage = state_root.join("coverage");
         let docs = state_root.join("docs");
         fs::create_dir(&coverage)?;
@@ -878,7 +878,7 @@ fn benchmark_coverage_rejects_a_symlink_before_compiler_execution() {
         use std::os::unix::fs::symlink;
 
         let state = tempfile::tempdir()?;
-        let state_root = fs::canonicalize(state.path())?;
+        let state_root = cargo_rail::utils::canonicalize_existing(state.path())?;
         let real = state_root.join("real-coverage");
         let selected = state_root.join("selected-coverage");
         let compiler = state_root.join("rustc");

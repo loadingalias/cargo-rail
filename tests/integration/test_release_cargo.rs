@@ -426,7 +426,11 @@ fn cargo_index_timeout_preserves_the_accepted_upload() {
         let fixture = Fixture::new(false)?;
         let sealed = fixture.seal()?;
         fixture.registry.state.lock().expect("fixture registry lock").hide_index = true;
-        let output = fixture.publish(&sealed, &["rail-fixture-base"]).output()?;
+        let output = fixture
+            .publish(&sealed, &["rail-fixture-base"])
+            .env("RUSTC_BOOTSTRAP", "1")
+            .args(["-Zpublish-timeout", "--config", "publish.timeout=1"])
+            .output()?;
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("timed out"), "{output:?}");
         let mut state = fixture.registry.state.lock().expect("fixture registry lock");

@@ -63,6 +63,8 @@ bootstrap-sha256 = "352ac5776d592a4870c15756f9e140507b9ee64de62b401152e5929f7c0c
 sdk-component = "Microsoft.VisualStudio.Component.Windows11SDK.28000"
 
 [aarch64-linux]
+# Bound simultaneous Rust links to the memory available on the native ARM runner.
+cargo-build-jobs = 2
 packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "linux-tools-common", "pkgconf", "python3", "unzip", "xz-utils", "zstd"]
 os = "Ubuntu 24.04 LTS"
 rust-host = "aarch64-unknown-linux-gnu"

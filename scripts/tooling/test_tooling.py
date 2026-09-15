@@ -175,16 +175,23 @@ aliased={package="serde",version="=1",features=["derive"]} # keep
 
 
 class CatalogPolicy(unittest.TestCase):
-    def test_windows_build_jobs_accepts_tomlkit_integer(self):
+    def test_build_jobs_accept_tomlkit_integers(self):
         data = tomlkit.parse(catalog.CATALOG.read_text())
         self.assertIsNone(catalog.validate(data))
 
-    def test_windows_build_jobs_require_a_positive_integer(self):
-        for value in (None, 0, -1, True, '2'):
-            data = catalog.read()
-            data['windows']['cargo-build-jobs'] = value
-            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'cargo-build-jobs'):
-                catalog.validate(data)
+    def test_build_jobs_require_positive_integers(self):
+        for platform in ('windows', 'aarch64-linux'):
+            for value in (0, -1, True, '2'):
+                data = catalog.read()
+                data[platform]['cargo-build-jobs'] = value
+                with self.subTest(platform=platform, value=value), self.assertRaisesRegex(ValueError, 'cargo-build-jobs'):
+                    catalog.validate(data)
+
+    def test_windows_build_jobs_are_required(self):
+        data = catalog.read()
+        del data['windows']['cargo-build-jobs']
+        with self.assertRaisesRegex(ValueError, 'cargo-build-jobs'):
+            catalog.validate(data)
 
     def test_full_ci_and_package_selections_preserve_native_build_tools(self):
         data = catalog.read()

@@ -111,8 +111,12 @@ def install_archive(name, asset, prefix):
 
 
 def validate(data):
-    jobs = data['windows'].get('cargo-build-jobs')
-    if isinstance(jobs, bool) or not isinstance(jobs, int) or jobs < 1:
+    bounded_platforms = {'windows': data['windows'], **{platform: data[platform] for platform in PLATFORMS}}
+    for platform, config in bounded_platforms.items():
+        jobs = config.get('cargo-build-jobs')
+        if jobs is not None and (isinstance(jobs, bool) or not isinstance(jobs, int) or jobs < 1):
+            raise ValueError(f'{platform}: cargo-build-jobs must be a positive integer')
+    if 'cargo-build-jobs' not in data['windows']:
         raise ValueError('windows: cargo-build-jobs must be a positive integer')
     if set(data['operations']) != {'ci', 'package', 'riscv-build'}:
         raise ValueError('tooling operations must be ci, package, and riscv-build')
