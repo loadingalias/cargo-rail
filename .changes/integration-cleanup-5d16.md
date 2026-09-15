@@ -3,6 +3,7 @@
 ---
 
 Make cache installation upgrades recoverable,
+prevent registry reads from observing concurrent profile publication,
 add an explicit local readiness proof and schema 18 status,
 keep remote authority separate from local health,
 and qualify native stable and pinned nightly compilers against independent

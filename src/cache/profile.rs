@@ -617,6 +617,34 @@ impl ProfileStore {
         Ok(file)
     }
 
+    fn lock_existing(&self) -> RailResult<Option<fs::File>> {
+        validate_existing_layout(&self.root)?;
+        let path = self.root.join(STORE_LOCK_FILE);
+        let file = match crate::utils::open_cache_lock_file(&path, false) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return if self.root.exists() {
+                    Err(RailError::message("cache profile registry lock is missing"))
+                } else {
+                    Ok(None)
+                };
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if !crate::utils::private_file_matches_path(&file, &path, 0)? {
+            return Err(RailError::message(
+                "cache profile registry lock is not a private regular file",
+            ));
+        }
+        file.lock()?;
+        if !crate::utils::private_file_matches_path(&file, &path, 0)? {
+            return Err(RailError::message(
+                "cache profile registry lock changed while it was acquired",
+            ));
+        }
+        Ok(Some(file))
+    }
+
     fn write(&self, relative: &Path, bytes: &[u8]) -> RailResult<()> {
         super::installation::write_private_atomic(&self.path(relative)?, bytes)
     }
@@ -1121,12 +1149,12 @@ pub(crate) fn lock_all_exclusive(cargo_home: &Path) -> RailResult<ProfileRegistr
             "rerun `cargo rail cache setup` for the affected workspace before changing the global installation",
         ));
     }
-    let profiles = load_all(cargo_home)?;
+    let profiles = load_all_locked(&store)?;
     let mut locks = Vec::with_capacity(profiles.len());
     for profile in &profiles {
         locks.push(store.lifecycle_lock(profile.profile_id(), false, true)?);
     }
-    if load_all(cargo_home)? != profiles {
+    if load_all_locked(&store)? != profiles {
         return Err(RailError::message(
             "cache profiles changed while global lifecycle authority was acquired",
         ));
@@ -1218,6 +1246,13 @@ pub(crate) fn list(cargo_home: &Path) -> RailResult<Vec<ProfileStatus>> {
 
 pub(crate) fn load_all(cargo_home: &Path) -> RailResult<Vec<InstalledCacheProfile>> {
     let store = ProfileStore::new(cargo_home)?;
+    let Some(_registry) = store.lock_existing()? else {
+        return Ok(Vec::new());
+    };
+    load_all_locked(&store)
+}
+
+fn load_all_locked(store: &ProfileStore) -> RailResult<Vec<InstalledCacheProfile>> {
     validate_existing_layout(&store.root)?;
     let directory = store.root.join(PROFILES_DIRECTORY);
     let entries = match fs::read_dir(&directory) {
