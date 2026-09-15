@@ -43,9 +43,10 @@ support = {
     'minimum_commit_date': support_policy['minimum-commit-date'],
     'maximum_commit_date': support_policy['maximum-commit-date'],
 }
+native_release = tomllib.loads((root / 'rust-toolchain.toml').read_text())['toolchain']['channel']
 target = sys.argv[3] or identity['host']
 try:
-    validate_compiler_support(identity, support, target)
+    validate_compiler_support(identity, support, target, native_release)
 except ValueError as error:
     raise SystemExit(str(error)) from error
 sysroot = Path(run(['rustc', '--print', 'sysroot'])).resolve()
@@ -94,6 +95,7 @@ selection = {'source_identity': source_identity, 'rustc_verbose': verbose, 'sysr
              'target': target, 'target_sysroot': str(target_sysroot),
              'preparation': preparation_identity,
              'compiler_library_digest': library_digest, 'source_support': support,
+             'native_release': native_release,
              'source_only': source_only}
 record_path = destination / '.cargo-rail-driver-preparation.json'
 env_path = destination / 'compiler-driver-authority.env'

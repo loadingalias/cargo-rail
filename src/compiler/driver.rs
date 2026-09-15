@@ -2903,25 +2903,38 @@ mod tests {
     }
 
     #[test]
-    fn source_bundle_rejects_rustc_outside_its_authenticated_interval() {
+    fn source_bundle_enforces_independent_rustc_release_and_date_bounds() {
         let support = CompilerFactDriverRustcSupport {
-            minimum_release: semver::Version::new(1, 98, 0),
-            maximum_release: semver::Version::new(1, 98, 1),
-            minimum_commit_date: "2026-08-20".to_string(),
+            minimum_release: semver::Version::parse("1.98.0-nightly").unwrap(),
+            maximum_release: semver::Version::parse("1.99.0-nightly").unwrap(),
+            minimum_commit_date: "2026-06-30".to_string(),
             maximum_commit_date: "2026-09-01".to_string(),
         };
         let commit = "b".repeat(40);
-        let supported =
+        let stable =
             format!("release: 1.98.1\ncommit-hash: {commit}\ncommit-date: 2026-09-01\nhost: {COMPILED_TARGET}");
         support
-            .validate_selected(&RustcVerboseIdentity::parse(&supported).expect("supported compiler identity"))
-            .expect("compiler inside interval");
+            .validate_selected(&RustcVerboseIdentity::parse(&stable).expect("stable compiler identity"))
+            .expect("stable compiler inside independent bounds");
+        let nightly =
+            format!("release: 1.99.0-nightly\ncommit-hash: {commit}\ncommit-date: 2026-07-05\nhost: {COMPILED_TARGET}");
+        support
+            .validate_selected(&RustcVerboseIdentity::parse(&nightly).expect("nightly compiler identity"))
+            .expect("nightly compiler inside independent bounds");
 
-        let unsupported = supported.replace("2026-09-01", "2026-09-02");
-        let error = support
-            .validate_selected(&RustcVerboseIdentity::parse(&unsupported).expect("unsupported compiler identity"))
-            .expect_err("compiler after interval must fail before driver preparation");
-        assert!(error.to_string().contains("supports rustc 1.98.0 through 1.98.1"));
+        for unsupported in [
+            stable.replace("2026-09-01", "2026-09-02"),
+            nightly.replace("1.99.0-nightly", "1.99.0"),
+        ] {
+            let error = support
+                .validate_selected(&RustcVerboseIdentity::parse(&unsupported).expect("unsupported compiler identity"))
+                .expect_err("compiler outside either bound must fail before driver preparation");
+            assert!(
+                error
+                    .to_string()
+                    .contains("supports rustc 1.98.0-nightly through 1.99.0-nightly")
+            );
+        }
     }
 
     #[test]

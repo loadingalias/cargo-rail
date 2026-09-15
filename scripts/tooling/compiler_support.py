@@ -37,20 +37,23 @@ def _date_key(value):
     return parsed
 
 
-def validate_compiler_support(identity, support, target):
+def validate_compiler_support(identity, support, target, native_release):
     selected_release = _release_key(identity['release'])
     minimum_release = _release_key(support['minimum_release'])
     maximum_release = _release_key(support['maximum_release'])
+    native_release_key = _release_key(native_release)
     selected_date = _date_key(identity['commit-date'])
     minimum_date = _date_key(support['minimum_commit_date'])
     maximum_date = _date_key(support['maximum_commit_date'])
     if minimum_release > maximum_release or minimum_date > maximum_date:
         raise ValueError('fact-driver source support interval is invalid')
+    if not minimum_release <= native_release_key <= maximum_release:
+        raise ValueError('native release compiler is outside the fact-driver source support interval')
     if target == identity['host']:
-        if selected_release != maximum_release or selected_date != maximum_date:
+        if selected_release != native_release_key or selected_date != maximum_date:
             raise ValueError(
-                'native release compiler must match the fact-driver source support maximum: '
-                f'expected rustc {support["maximum_release"]} ({support["maximum_commit_date"]}); '
+                'native release compiler must match rust-toolchain.toml and the support maximum date: '
+                f'expected rustc {native_release} ({support["maximum_commit_date"]}); '
                 f'found rustc {identity["release"]} ({identity["commit-date"]})'
             )
     elif not (minimum_release <= selected_release <= maximum_release
