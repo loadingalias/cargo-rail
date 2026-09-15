@@ -15,6 +15,8 @@ import sys
 import tempfile
 import tomllib
 
+from scripts.tooling.compiler_support import validate_compiler_support
+
 root = Path.cwd()
 source_only = sys.argv[2] == '--prepare-source'
 destination = Path(sys.argv[1]).resolve()
@@ -41,11 +43,12 @@ support = {
     'minimum_commit_date': support_policy['minimum-commit-date'],
     'maximum_commit_date': support_policy['maximum-commit-date'],
 }
-if (identity['release'] != support['maximum_release']
-        or identity['commit-date'] != support['maximum_commit_date']):
-    raise SystemExit('release compiler must match the fact-driver source support maximum')
-sysroot = Path(run(['rustc', '--print', 'sysroot'])).resolve()
 target = sys.argv[3] or identity['host']
+try:
+    validate_compiler_support(identity, support, target)
+except ValueError as error:
+    raise SystemExit(str(error)) from error
+sysroot = Path(run(['rustc', '--print', 'sysroot'])).resolve()
 target_sysroot = sysroot
 distribution = None
 if target != identity['host']:
@@ -82,9 +85,14 @@ sources = [root / path for path in (
 sources.extend((root / 'tools/compiler-fact-driver/src').rglob('*.rs'))
 source_bytes = {path.relative_to(root).as_posix(): path.read_bytes() for path in sorted(sources)}
 source_identity = digest(b''.join(name.encode() + b'\0' + data + b'\0' for name, data in source_bytes.items()))
+preparation_inputs = [root / 'scripts/check-compiler-fact-driver.sh', root / 'scripts/tooling/compiler_support.py']
+preparation_identity = digest(b''.join(
+    path.relative_to(root).as_posix().encode() + b'\0' + path.read_bytes() + b'\0'
+    for path in preparation_inputs
+))
 selection = {'source_identity': source_identity, 'rustc_verbose': verbose, 'sysroot': str(sysroot),
              'target': target, 'target_sysroot': str(target_sysroot),
-             'preparation': digest((root / 'scripts/check-compiler-fact-driver.sh').read_bytes()),
+             'preparation': preparation_identity,
              'compiler_library_digest': library_digest, 'source_support': support,
              'source_only': source_only}
 record_path = destination / '.cargo-rail-driver-preparation.json'

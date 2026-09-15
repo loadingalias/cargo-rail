@@ -12,12 +12,43 @@ import unittest
 from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
+import compiler_support
+
 SPEC = importlib.util.spec_from_file_location('cache_host', Path(__file__).resolve().parents[1] / 'check-cache-host.py')
 cache = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(cache)
 
 
 class CacheTransfer(unittest.TestCase):
+    def test_fact_driver_compiler_selection_distinguishes_native_and_cross_preparation(self):
+        support = {
+            'minimum_release': '1.98.0-nightly',
+            'maximum_release': '1.98.1',
+            'minimum_commit_date': '2026-06-30',
+            'maximum_commit_date': '2026-09-01',
+        }
+        stable = {
+            'release': '1.98.1',
+            'commit-date': '2026-09-01',
+            'host': 'x86_64-unknown-linux-gnu',
+        }
+        nightly = {
+            'release': '1.98.0-nightly',
+            'commit-date': '2026-07-05',
+            'host': 'x86_64-unknown-linux-gnu',
+        }
+        compiler_support.validate_compiler_support(stable, support, stable['host'])
+        compiler_support.validate_compiler_support(nightly, support, 'riscv64gc-unknown-linux-gnu')
+        for changed in ({**stable, 'release': '1.98.0'}, {**stable, 'commit-date': '2026-08-31'}):
+            with self.subTest(native=changed), self.assertRaisesRegex(ValueError, 'native release compiler must match'):
+                compiler_support.validate_compiler_support(changed, support, changed['host'])
+        before_interval = {**nightly, 'commit-date': '2026-06-29'}
+        with self.assertRaisesRegex(ValueError, 'cross compiler is outside'):
+            compiler_support.validate_compiler_support(before_interval, support, 'riscv64gc-unknown-linux-gnu')
+        after_interval = {**nightly, 'release': '1.98.2'}
+        with self.assertRaisesRegex(ValueError, 'cross compiler is outside'):
+            compiler_support.validate_compiler_support(after_interval, support, 'riscv64gc-unknown-linux-gnu')
+
     def test_driver_preparation_rejects_an_unsupported_target_without_publishing(self):
         with tempfile.TemporaryDirectory() as temporary:
             result = subprocess.run(

@@ -5,8 +5,8 @@ channel = "nightly-2026-07-01"
 profile = "minimal"
 components = ["rustc-dev", "rustc-codegen-cranelift"]
 
-# The authenticated source bundle is qualified at both endpoints. The release
-# compiler must match the maximum so widening this interval stays explicit.
+# The authenticated source bundle is qualified at both endpoints. Native release
+# preparation uses the maximum; cross preparation must remain inside the interval.
 [source-support]
 minimum-release = "1.98.0-nightly"
 maximum-release = "1.98.1"
