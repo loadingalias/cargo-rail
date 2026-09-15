@@ -1,4 +1,4 @@
-nextest-version = { required = "0.9.143", recommended = "0.9.143" }
+nextest-version = { required = "0.9.144", recommended = "0.9.144" }
 
 [profile.default]
 status-level = "pass"

@@ -1,5 +1,5 @@
 # Local repair, shared validation, cross-compilation, and dogfooding.
-check: fix ci-check
+check: fix ci-check test
     @scripts/check-cross.sh
     cargo run --all-features --locked --bin cargo-rail -- rail unify --check --explain
 
