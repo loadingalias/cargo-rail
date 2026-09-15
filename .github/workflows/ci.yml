@@ -33,7 +33,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - uses: loadingalias/cargo-rail-action@0528d59437a886e896770513bb4d6504f8cde18f # immutable source pin
+      - uses: loadingalias/cargo-rail-action@254886f5c0507318303b981d0fa269325cbf146b # immutable source pin
         id: rail
         with:
           all: ${{ github.event_name == 'workflow_dispatch' }}
@@ -110,13 +110,13 @@ jobs:
         if: runner.os == 'Windows'
         shell: powershell
         run: ./scripts/tooling/x86_64-win.ps1 -Operation ci
-      - uses: loadingalias/cargo-rail-action@0528d59437a886e896770513bb4d6504f8cde18f # immutable source pin
+      - uses: loadingalias/cargo-rail-action@254886f5c0507318303b981d0fa269325cbf146b # immutable source pin
         if: matrix.suite == 'full'
         id: rail
         with:
           components: surface
           all: ${{ github.event_name == 'workflow_dispatch' }}
-      - uses: loadingalias/cargo-rail-action/cache@0528d59437a886e896770513bb4d6504f8cde18f # immutable source pin
+      - uses: loadingalias/cargo-rail-action/cache@254886f5c0507318303b981d0fa269325cbf146b # immutable source pin
         if: matrix.suite == 'full' && github.event_name != 'pull_request'
         id: cache
         with:
@@ -182,7 +182,7 @@ jobs:
           retention-days: 7
       - name: Check worktree
         run: git diff --exit-code HEAD
-      - uses: loadingalias/cargo-rail-action/cache/collect@0528d59437a886e896770513bb4d6504f8cde18f # immutable source pin
+      - uses: loadingalias/cargo-rail-action/cache/collect@254886f5c0507318303b981d0fa269325cbf146b # immutable source pin
         if: always() && matrix.suite == 'full' && github.event_name != 'pull_request' && steps.cache.outcome == 'success'
         id: cache-record
         with:
@@ -234,7 +234,7 @@ jobs:
           pattern: cache-record-*
           merge-multiple: true
           path: ${{ runner.temp }}/cache-records
-      - uses: loadingalias/cargo-rail-action/cache/report@0528d59437a886e896770513bb4d6504f8cde18f # immutable source pin
+      - uses: loadingalias/cargo-rail-action/cache/report@254886f5c0507318303b981d0fa269325cbf146b # immutable source pin
         with:
           records-directory: ${{ runner.temp }}/cache-records
           expected-jobs: '["x86_64-linux", "aarch64-linux", "x86_64-win"]'
