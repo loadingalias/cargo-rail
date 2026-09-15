@@ -17,8 +17,7 @@ Install these tools:
 Run commands from the repository root.
 Use `just --list` to see the maintained command surface.
 
-After `just package-release OUTPUT_DIRECTORY`, run `python3 scripts/check-release-install.py OUTPUT_DIRECTORY`
-with cargo-binstall installed to verify the native archive's binary installation.
+After `just package-release OUTPUT_DIRECTORY`, run `python3 scripts/check-release-install.py OUTPUT_DIRECTORY` with cargo-binstall installed to verify the native archive's binary installation.
 The check uses a temporary installation and disables source fallback.
 The packaging workflow requires this check on every release host before uploading assets.
 

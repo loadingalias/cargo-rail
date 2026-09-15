@@ -2219,7 +2219,7 @@ fn setup_preview_apply_repeat_status_and_exact_remove_are_lossless() {
         )?;
         assert!(status.status.success(), "installation status failed: {status:?}");
         let status = json(&status)?;
-        assert_eq!(status["status"]["schema_version"], 16);
+        assert_eq!(status["status"]["schema_version"], 18);
         assert_eq!(status["status"]["installation"]["state"], "installed");
         assert_eq!(status["status"]["installation"]["healthy"], true);
         assert_eq!(status["status"]["installation"]["root_portability"], "physical");
@@ -2762,6 +2762,40 @@ fn failure_reason_status_reads_durable_counters_when_the_usage_ledger_is_full() 
 }
 
 #[test]
+fn readiness_probe_proves_uncached_cold_and_warm_execution() {
+    let result: Result<()> = (|| {
+        let workspace = TestWorkspace::new_single_crate("transparent-readiness", "0.1.0")?;
+        let cargo_home = tempfile::tempdir()?;
+        let setup = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "setup"])?;
+        assert!(setup.status.success(), "setup failed: {setup:?}");
+
+        let ready = rail(
+            &workspace.path,
+            cargo_home.path(),
+            &["rail", "cache", "ready", "-f", "json"],
+        )?;
+        assert!(ready.status.success(), "readiness probe failed: {ready:?}");
+        let ready = json(&ready)?;
+        assert_eq!(ready["ready"], true);
+        assert_eq!(ready["selected_toolchain_readiness"], "ready");
+        assert!(ready["cold"]["misses"].as_u64().is_some_and(|count| count > 0));
+        assert!(ready["warm"]["hits"].as_u64().is_some_and(|count| count > 0));
+
+        let status = rail(
+            &workspace.path,
+            cargo_home.path(),
+            &["rail", "cache", "status", "--scope", "all", "-f", "json"],
+        )?;
+        let status = json(&status)?;
+        assert_eq!(status["status"]["selected_toolchain_readiness"], "ready");
+        assert_eq!(status["status"]["installation"]["workspace_enrollment"], "enrolled");
+        assert_eq!(status["status"]["remote_authority"], "not_configured");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
 fn setup_refuses_global_conflicts_and_workspace_shadowing() {
     let result: Result<()> = (|| {
         let workspace = TestWorkspace::new_single_crate("transparent-conflict", "0.1.0")?;
@@ -2829,7 +2863,8 @@ fn cache_status_reports_only_redacted_machine_selected_remote_authority() {
             .output()?;
         assert!(output.status.success(), "remote status failed: {output:?}");
         let value = json(&output)?;
-        assert_eq!(value["status"]["schema_version"], 16);
+        assert_eq!(value["status"]["schema_version"], 18);
+        assert_eq!(value["status"]["remote_authority"], "read");
         assert_eq!(value["status"]["remote"]["activation"], "direct_transport_selected");
         assert_eq!(value["status"]["remote"]["provider"], "aws-s3");
         assert_eq!(value["status"]["remote"]["mode"], "read");
@@ -3295,15 +3330,14 @@ fn profile_detach_rebind_cleanup_and_global_uninstall_have_disjoint_scopes() {
 }
 
 #[test]
-fn pre_profile_receipt_is_refused_without_changing_installation_or_cache() {
+fn pre_profile_receipt_is_quarantined_and_migrated_without_losing_cache_authority() {
     let result: Result<()> = (|| {
         let workspace = TestWorkspace::new_single_crate("pre-profile-refusal", "0.1.0")?;
         let cargo_home = tempfile::tempdir()?;
         let setup = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "setup"])?;
         anyhow::ensure!(setup.status.success(), "fixture setup failed: {setup:?}");
         let cache_root = selected_profile_cache_root(&workspace.path, cargo_home.path())?;
-        let sentinel = cache_root.join("retained-user-data");
-        fs::write(&sentinel, b"preserve exact bytes")?;
+        let cache_before = directory_snapshot(&cache_root)?;
         let store = cargo_home.path().join("cargo-rail/cache-profiles-v1");
         let profile_path = fs::read_dir(store.join("profiles"))?
             .next()
@@ -3321,39 +3355,70 @@ fn pre_profile_receipt_is_refused_without_changing_installation_or_cache() {
         let config_path = cargo_home.path().join("config.toml");
         let config_before = fs::read(&config_path)?;
         fs::remove_dir_all(&store)?;
-        for args in [
-            vec!["rail", "cache", "setup", "--check"],
-            vec!["rail", "cache", "setup"],
-            vec!["rail", "cache", "uninstall"],
-        ] {
-            let refused = rail(&workspace.path, cargo_home.path(), &args)?;
-            anyhow::ensure!(
-                !refused.status.success(),
-                "pre-profile receipt was adopted: {refused:?}"
-            );
-            let diagnostic = String::from_utf8_lossy(&refused.stderr);
-            anyhow::ensure!(
-                diagnostic.contains("unsupported compiler-cache installation receipt version 3")
-                    && diagnostic.contains("originating release version is unknown"),
-                "missing explicit transition: {diagnostic}"
-            );
-            anyhow::ensure!(
-                fs::read(&receipt_path)? == receipt_bytes && fs::read(&config_path)? == config_before,
-                "refusal changed installation authority"
-            );
-            anyhow::ensure!(
-                fs::read(&sentinel)? == b"preserve exact bytes" && !store.exists(),
-                "refusal changed retained data or created profile state"
-            );
-        }
-        let compiled = cargo_check(&workspace.path, cargo_home.path(), None, None)?;
-        anyhow::ensure!(
-            compiled.status.success(),
-            "old receipt prevented ordinary Cargo compilation: {compiled:?}"
+        let stale = rail(
+            &workspace.path,
+            cargo_home.path(),
+            &["rail", "cache", "status", "--scope", "local", "-f", "json"],
+        )?;
+        anyhow::ensure!(stale.status.success(), "stale installation status failed: {stale:?}");
+        let stale = json(&stale)?;
+        assert_eq!(stale["status"]["installation"]["state"], "stale");
+        assert_eq!(stale["status"]["installation"]["receipt_version"], 3);
+        assert_eq!(
+            stale["status"]["installation"]["recovery_action"],
+            "cargo rail cache setup"
+        );
+
+        let check = rail(
+            &workspace.path,
+            cargo_home.path(),
+            &["rail", "cache", "setup", "--check", "-f", "json"],
+        )?;
+        assert_eq!(check.status.code(), Some(1), "migration preview: {check:?}");
+        let check = json(&check)?;
+        assert_eq!(check["private_state_action"], "quarantine_and_reinstall");
+        let quarantine = PathBuf::from(
+            check["quarantine_receipt_path"]
+                .as_str()
+                .context("quarantine receipt path")?,
         );
         anyhow::ensure!(
-            fs::read(&receipt_path)? == receipt_bytes && !store.exists(),
-            "compiler fallback adopted old installation state"
+            fs::read(&receipt_path)? == receipt_bytes
+                && fs::read(&config_path)? == config_before
+                && !quarantine.exists(),
+            "migration preview changed installation authority"
+        );
+
+        let migrated = rail(
+            &workspace.path,
+            cargo_home.path(),
+            &["rail", "cache", "setup", "-f", "json"],
+        )?;
+        anyhow::ensure!(migrated.status.success(), "migration failed: {migrated:?}");
+        assert_eq!(json(&migrated)?["private_state_action"], "quarantine_and_reinstall");
+        anyhow::ensure!(
+            fs::read(&quarantine)? == receipt_bytes,
+            "stale receipt evidence changed"
+        );
+        anyhow::ensure!(fs::read(&config_path)? == config_before, "owned Cargo config changed");
+        anyhow::ensure!(directory_snapshot(&cache_root)? == cache_before, "cache bytes changed");
+
+        let receipt: serde_json::Value = serde_json::from_slice(&fs::read(&receipt_path)?)?;
+        assert_eq!(receipt["version"], 5);
+        let repeated = rail(
+            &workspace.path,
+            cargo_home.path(),
+            &["rail", "cache", "setup", "--check", "-f", "json"],
+        )?;
+        anyhow::ensure!(repeated.status.success(), "migrated setup is not stable: {repeated:?}");
+        let status = selected_profile_status(&workspace.path, cargo_home.path())?;
+        assert_eq!(status["status"]["installation"]["state"], "installed");
+        assert_eq!(status["status"]["installation"]["quarantined_receipts"], 1);
+        assert!(
+            status["status"]["installation"]["reclaimable_bytes"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0
         );
         Ok(())
     })();
@@ -3609,6 +3674,35 @@ fn cross_target_l2_reuse_preserves_physical_and_remapped_root_authority() {
                 "same-size input mutation restored stale target metadata"
             );
         }
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn local_only_reports_its_root_portability_conflict_semantically() {
+    let result: Result<()> = (|| {
+        let workspace = TestWorkspace::new_single_crate("local-only-conflict", "0.1.0")?;
+        let cargo_home = tempfile::tempdir()?;
+        let output = rail(
+            &workspace.path,
+            cargo_home.path(),
+            &[
+                "rail",
+                "cache",
+                "setup",
+                "--local-only",
+                "--root-portability",
+                "physical",
+            ],
+        )?;
+        assert_eq!(output.status.code(), Some(2));
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            diagnostic.contains("--local-only cannot select --root-portability"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("fresh local profile"), "{diagnostic}");
         Ok(())
     })();
     super::helpers::finish_test(result);

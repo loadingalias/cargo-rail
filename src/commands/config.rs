@@ -314,16 +314,50 @@ pub fn run_config_explain(
     if !all && requested_fields.is_empty() {
         fields.retain(|field| field.configured.is_some() || field.source != "default");
     } else if !requested_fields.is_empty() {
-        let requested: BTreeSet<_> = requested_fields.iter().map(String::as_str).collect();
-        let known: BTreeSet<_> = fields.iter().map(|field| field.path.as_str()).collect();
-        let unknown: Vec<_> = requested.difference(&known).copied().collect();
+        let known = fields.iter().map(|field| field.path.clone()).collect::<BTreeSet<_>>();
+        let mut selected = BTreeSet::new();
+        let mut unknown = Vec::new();
+        for requested in requested_fields {
+            if known.contains(requested) {
+                selected.insert(requested.clone());
+                continue;
+            }
+            let prefix = format!("{requested}.");
+            let children = known
+                .iter()
+                .filter(|path| path.starts_with(&prefix))
+                .cloned()
+                .collect::<Vec<_>>();
+            if children.is_empty() {
+                unknown.push(requested.clone());
+            } else {
+                selected.extend(children);
+            }
+        }
         if !unknown.is_empty() {
+            let parent = unknown[0].rsplit_once('.').map_or("", |(parent, _)| parent);
+            let prefix = if parent.is_empty() {
+                String::new()
+            } else {
+                format!("{parent}.")
+            };
+            let valid = known
+                .iter()
+                .filter(|path| path.starts_with(&prefix))
+                .take(12)
+                .cloned()
+                .collect::<Vec<_>>();
+            let help = if valid.is_empty() {
+                "run `cargo rail config explain --all` to list known fields".to_string()
+            } else {
+                format!("valid child paths include: {}", valid.join(", "))
+            };
             return Err(RailError::with_help(
                 format!("unknown configuration field(s): {}", unknown.join(", ")),
-                "run `cargo rail config explain --all` to list known fields",
+                help,
             ));
         }
-        fields.retain(|field| requested.contains(field.path.as_str()));
+        fields.retain(|field| selected.contains(&field.path));
     }
 
     let result = ExplainResult {

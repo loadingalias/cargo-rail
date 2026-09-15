@@ -2,6 +2,7 @@
 
 use std::io;
 use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus};
+use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
@@ -14,6 +15,100 @@ const TERMINATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 pub(crate) struct ProcessTermination {
     pub(crate) forced: bool,
     pub(crate) elapsed: Duration,
+}
+
+#[derive(Debug)]
+pub(crate) struct BoundedProcessOutput {
+    pub(crate) status: ExitStatus,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+}
+
+/// Run one owned process tree with fixed output and elapsed-time bounds.
+pub(crate) fn run_bounded_process(
+    command: &mut Command,
+    timeout: Duration,
+    stdout_limit: usize,
+    stderr_limit: usize,
+) -> io::Result<BoundedProcessOutput> {
+    let mut process = ProcessTree::spawn(command)?;
+    let stdout = process.take_stdout()?;
+    let stderr = process.take_stderr()?;
+    let stdout_reader = thread::Builder::new()
+        .name("cargo-rail-bounded-stdout".to_string())
+        .spawn(move || read_bounded_stream(stdout, stdout_limit, false))?;
+    let stderr_reader = match thread::Builder::new()
+        .name("cargo-rail-bounded-stderr".to_string())
+        .spawn(move || read_bounded_stream(stderr, stderr_limit, true))
+    {
+        Ok(reader) => reader,
+        Err(error) => {
+            drop(process.terminate());
+            drop(stdout_reader.join());
+            return Err(error);
+        }
+    };
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match process.try_wait() {
+            Ok(Some(status)) => break process.finish(status),
+            Ok(None) => {}
+            Err(error) => {
+                drop(process.terminate());
+                break Err(error);
+            }
+        }
+        if process.cancellation_requested() {
+            process.terminate()?;
+            break Err(io::Error::new(io::ErrorKind::Interrupted, "process cancelled"));
+        }
+        if Instant::now() >= deadline {
+            process.terminate()?;
+            break Err(io::Error::new(io::ErrorKind::TimedOut, "process exceeded its deadline"));
+        }
+        thread::sleep(TERMINATION_POLL_INTERVAL);
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| io::Error::other("bounded stdout reader panicked"))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| io::Error::other("bounded stderr reader panicked"))??;
+    Ok(BoundedProcessOutput {
+        status: status?,
+        stdout,
+        stderr,
+    })
+}
+
+fn read_bounded_stream(mut reader: impl io::Read, limit: usize, retain_tail: bool) -> io::Result<Vec<u8>> {
+    let mut retained = Vec::with_capacity(limit.min(16 * 1024));
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        if limit == 0 {
+            continue;
+        }
+        if retain_tail {
+            if read >= limit {
+                retained.clear();
+                retained.extend_from_slice(&chunk[read - limit..read]);
+            } else {
+                let overflow = retained.len().saturating_add(read).saturating_sub(limit);
+                if overflow > 0 {
+                    retained.drain(..overflow);
+                }
+                retained.extend_from_slice(&chunk[..read]);
+            }
+        } else if retained.len() < limit {
+            let remaining = limit - retained.len();
+            retained.extend_from_slice(&chunk[..read.min(remaining)]);
+        }
+    }
+    Ok(retained)
 }
 
 /// One direct Cargo child and every descendant it creates.
@@ -265,6 +360,8 @@ fn signal_group(group: rustix::process::Pid, signal: rustix::process::Signal) ->
 #[cfg(test)]
 mod tests {
     use super::ProcessTree;
+    #[cfg(unix)]
+    use super::run_bounded_process;
     use std::process::Command;
 
     #[test]
@@ -344,6 +441,18 @@ mod tests {
         assert!(marker.is_file(), "descendant did not start");
         let termination = tree.terminate().expect("terminate descendant tree");
         assert!(termination.forced, "TERM-ignoring descendant did not require SIGKILL");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_runner_retains_stdout_prefix_and_stderr_tail() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf 0123456789; printf abcdefghij >&2"]);
+        let output =
+            run_bounded_process(&mut command, std::time::Duration::from_secs(5), 4, 4).expect("bounded process");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"0123");
+        assert_eq!(output.stderr, b"ghij");
     }
 
     #[cfg(windows)]

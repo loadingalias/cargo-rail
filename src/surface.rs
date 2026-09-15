@@ -502,13 +502,13 @@ impl SurfaceGraph {
                 .ok_or_else(|| RailError::message("surface item observation count overflow"))?;
             for source in &object.sources {
                 let authority = (source.identity.clone(), source.bytes);
-                if sources
-                    .insert(source.path.clone(), authority.clone())
-                    .is_some_and(|previous| previous != authority)
+                if let Some(previous) = sources.insert(source.path.clone(), authority.clone())
+                    && previous != authority
                 {
-                    return Err(RailError::message(
-                        "surface analysis cannot merge conflicting identities for one source path",
-                    ));
+                    return Err(RailError::message(format!(
+                        "surface analysis cannot merge conflicting identities for source path {:?}: previous {:?}, current {:?}",
+                        source.path, previous, authority
+                    )));
                 }
             }
         }

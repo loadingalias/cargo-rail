@@ -48,7 +48,8 @@ const BUILTIN_WORK: &[(&str, WorkSpecScope)] = &[
 ];
 
 /// Complete v9 named-work plan.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct WorkPlan {
     pub(crate) plan_contract_version: u32,
     pub(crate) identity: String,
@@ -61,19 +62,21 @@ pub(crate) struct WorkPlan {
 }
 
 /// Explanatory facts captured at the same boundary that selects executable work.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct WorkAttribution {
     pub(crate) inputs: BTreeSet<WorkInput>,
     pub(crate) selections: Vec<SelectionAttribution>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct WorkInput {
     pub(crate) kind: WorkInputKind,
     pub(crate) value: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum WorkInputKind {
     Path,
@@ -106,7 +109,8 @@ impl WorkInput {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SelectionAttribution {
     /// A package key or variant ID from this work item's exact scope.
     pub(crate) subject: String,
@@ -115,7 +119,7 @@ pub(crate) struct SelectionAttribution {
     pub(crate) origin: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ImpactRelation {
     Direct,
@@ -123,7 +127,8 @@ pub(crate) enum ImpactRelation {
     Unattributed,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct WorkPlanInputs {
     pub(crate) base: String,
     pub(crate) head: String,
@@ -149,21 +154,23 @@ pub(crate) struct WorkPlanAuthority {
     pub(crate) target_identity: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PlanOverride {
     None,
     All,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct WorkChanges {
     pub(crate) files: Vec<IndexedFileChange>,
     pub(crate) cargo: Vec<CargoStructuralDelta>,
     pub(crate) config: Vec<ConfigDelta>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CargoStructuralDelta {
     pub(crate) package: String,
     pub(crate) target: Option<String>,
@@ -171,8 +178,8 @@ pub(crate) struct CargoStructuralDelta {
 }
 
 /// A decision is tagged so skipped work cannot carry executable scope.
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum WorkDecision {
     Skipped {
         evidence: Vec<String>,
@@ -184,7 +191,7 @@ pub(crate) enum WorkDecision {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum WorkCause {
     ChangedInput,
@@ -192,16 +199,16 @@ pub(crate) enum WorkCause {
     ForcedAll,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum WorkScope {
     Repository,
     Cargo { selection: CargoSelection },
     Variants { selection: VariantSelection },
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum CargoSelection {
     Workspace {
         cargo_args: Vec<String>,
@@ -214,22 +221,24 @@ pub(crate) enum CargoSelection {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct PortablePackageSelector {
     pub(crate) key: String,
     pub(crate) name: String,
     pub(crate) cargo_spec: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CargoTargetSelector {
     pub(crate) package: String,
     pub(crate) name: String,
     pub(crate) kind: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum VariantSelection {
     All {
         evidence: String,
@@ -240,7 +249,8 @@ pub(crate) enum VariantSelection {
     },
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SelectedVariant {
     pub(crate) id: String,
     pub(crate) dimensions: BTreeMap<String, ScalarDimension>,
@@ -269,7 +279,8 @@ pub(crate) enum ScalarDimension {
     Boolean(bool),
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct EvidenceRecord {
     pub(crate) code: String,
     pub(crate) subject: String,
@@ -935,6 +946,349 @@ pub(crate) fn build_work_plan(
     };
     plan.identity = plan_identity(&plan)?;
     Ok(plan)
+}
+
+/// Validate every executable authority carried by a deserialized v9 plan.
+///
+/// Serde rejects missing, mistyped, and unknown fields. This layer verifies
+/// the cross-field invariants that JSON Schema cannot express and binds every
+/// selector to the current captured workspace catalog.
+pub(crate) fn validate_saved_work_plan(ctx: &WorkspaceContext, plan: &WorkPlan) -> RailResult<()> {
+    if plan.plan_contract_version != PLAN_CONTRACT_VERSION {
+        return Err(RailError::message(format!(
+            "saved plan uses unsupported contract version {}",
+            plan.plan_contract_version
+        )));
+    }
+
+    let mut cargo_model = PlanningCargoModel::new(ctx)?;
+    let specs = build_catalog(ctx, &mut cargo_model)?;
+    verify_saved_identity("Cargo resolution", &plan.inputs.cargo, &cargo_model.identity()?)?;
+    verify_saved_identity("work catalog", &plan.inputs.catalog, &catalog_identity(&specs)?)?;
+    validate_decisions(&specs, &plan.work, &plan.required, &plan.evidence)?;
+    validate_saved_changes(&plan.changes)?;
+    validate_saved_evidence(&plan.evidence)?;
+    validate_saved_attribution(&specs, plan)?;
+
+    for spec in &specs {
+        let WorkDecision::Required { scope, evidence, cause } = &plan.work[&spec.id] else {
+            continue;
+        };
+        validate_saved_scope(ctx, spec, scope, evidence)?;
+        if *cause == WorkCause::IncompleteEvidence && !evidence.iter().any(|id| !plan.evidence[id].complete) {
+            return Err(RailError::message(format!(
+                "saved work '{}' claims incomplete evidence without an incomplete record",
+                spec.id
+            )));
+        }
+    }
+
+    verify_saved_identity("canonical plan", &plan.identity, &plan_identity(plan)?)
+}
+
+fn verify_saved_identity(subject: &str, claimed: &str, current: &str) -> RailResult<()> {
+    if claimed == current {
+        Ok(())
+    } else {
+        Err(RailError::message(format!(
+            "saved {subject} identity '{claimed}' does not match '{current}'"
+        )))
+    }
+}
+
+fn validate_saved_changes(changes: &WorkChanges) -> RailResult<()> {
+    if !changes.files.windows(2).all(|pair| pair[0].path < pair[1].path)
+        || changes.files.iter().any(|change| {
+            change.path.is_empty()
+                || !matches!(change.kind.as_str(), "added" | "modified" | "type_changed" | "deleted")
+                || !is_sorted_unique(&change.provenance)
+                || change
+                    .provenance
+                    .iter()
+                    .any(|value| !matches!(value.as_str(), "committed" | "staged" | "unstaged" | "untracked"))
+        })
+    {
+        return Err(RailError::message("saved plan contains malformed file changes"));
+    }
+    if !changes.config.windows(2).all(|pair| pair[0].path < pair[1].path)
+        || changes.config.iter().any(|change| change.path.is_empty())
+    {
+        return Err(RailError::message(
+            "saved plan contains malformed configuration changes",
+        ));
+    }
+    if !changes.cargo.windows(2).all(|pair| {
+        (&pair[0].package, &pair[0].target, &pair[0].kind) < (&pair[1].package, &pair[1].target, &pair[1].kind)
+    }) || changes
+        .cargo
+        .iter()
+        .any(|change| change.package.is_empty() || change.kind.is_empty())
+    {
+        return Err(RailError::message("saved plan contains malformed Cargo changes"));
+    }
+    Ok(())
+}
+
+fn validate_saved_evidence(evidence: &BTreeMap<String, EvidenceRecord>) -> RailResult<()> {
+    for (claimed, record) in evidence {
+        if record.code.is_empty() || record.subject.is_empty() || record.description.is_empty() {
+            return Err(RailError::message(format!(
+                "saved evidence '{claimed}' contains an empty required field"
+            )));
+        }
+        let identity_value = EvidenceIdentity {
+            code: &record.code,
+            subject: &record.subject,
+            input: record.input.as_deref(),
+            complete: record.complete,
+        };
+        verify_saved_identity(
+            "evidence",
+            claimed,
+            &identity("evidence", &canonical_bytes(&identity_value)?)?,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_saved_attribution(specs: &[WorkSpec], plan: &WorkPlan) -> RailResult<()> {
+    if plan.attribution.keys().map(String::as_str).collect::<Vec<_>>()
+        != plan.required.iter().map(String::as_str).collect::<Vec<_>>()
+        || plan
+            .attribution
+            .keys()
+            .any(|id| !specs.iter().any(|spec| spec.id == *id))
+    {
+        return Err(RailError::message(
+            "saved plan attribution does not cover exactly the required work",
+        ));
+    }
+    for (work, attribution) in &plan.attribution {
+        if attribution.inputs.iter().any(|input| {
+            input.value.is_empty()
+                || input.kind == WorkInputKind::Work
+                    && !matches!(plan.work.get(&input.value), Some(WorkDecision::Required { .. }))
+        }) {
+            return Err(RailError::message(format!(
+                "saved work '{work}' has an empty or non-required attribution input"
+            )));
+        }
+        let mut subjects = BTreeSet::new();
+        let mut previous = None;
+        for selection in &attribution.selections {
+            if selection.subject.is_empty()
+                || !subjects.insert(selection.subject.as_str())
+                || previous.is_some_and(|prior| prior >= selection.subject.as_str())
+            {
+                return Err(RailError::message(format!(
+                    "saved work '{work}' has malformed selection attribution"
+                )));
+            }
+            previous = Some(selection.subject.as_str());
+            match (selection.relation, selection.origin.as_deref()) {
+                (ImpactRelation::Dependency, Some(origin)) if !origin.is_empty() && origin != selection.subject => {}
+                (ImpactRelation::Direct | ImpactRelation::Unattributed, None) => {}
+                _ => {
+                    return Err(RailError::message(format!(
+                        "saved work '{work}' has inconsistent selection attribution"
+                    )));
+                }
+            }
+        }
+        let Some(decision) = plan.work.get(work) else {
+            return Err(RailError::message(format!(
+                "saved attribution references unknown work '{work}'"
+            )));
+        };
+        let expected = match decision {
+            WorkDecision::Required {
+                scope:
+                    WorkScope::Cargo {
+                        selection: CargoSelection::Packages { packages, .. },
+                    },
+                ..
+            } => packages.iter().map(|package| package.key.as_str()).collect(),
+            WorkDecision::Required {
+                scope:
+                    WorkScope::Variants {
+                        selection: VariantSelection::Selected { variants, .. },
+                    },
+                ..
+            } => variants.iter().map(|variant| variant.id.as_str()).collect(),
+            WorkDecision::Required { .. } => BTreeSet::new(),
+            WorkDecision::Skipped { .. } => {
+                return Err(RailError::message(format!(
+                    "saved attribution references skipped work '{work}'"
+                )));
+            }
+        };
+        if subjects != expected {
+            return Err(RailError::message(format!(
+                "saved work '{work}' attribution does not cover its executable scope"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_saved_scope(
+    ctx: &WorkspaceContext,
+    spec: &WorkSpec,
+    scope: &WorkScope,
+    evidence: &[String],
+) -> RailResult<()> {
+    match (spec.scope, scope) {
+        (WorkSpecScope::Repository, WorkScope::Repository) => Ok(()),
+        (WorkSpecScope::Cargo, WorkScope::Cargo { selection }) => {
+            validate_saved_cargo_selection(ctx, &spec.id, selection)
+        }
+        (WorkSpecScope::Variants, WorkScope::Variants { selection }) => {
+            validate_saved_variant_selection(spec, selection, evidence)
+        }
+        _ => Err(RailError::message(format!(
+            "saved work '{}' has a scope that disagrees with the current catalog",
+            spec.id
+        ))),
+    }
+}
+
+fn validate_saved_cargo_selection(ctx: &WorkspaceContext, work: &str, selection: &CargoSelection) -> RailResult<()> {
+    let (packages, cargo_args, targets) = match selection {
+        CargoSelection::Packages {
+            packages,
+            cargo_args,
+            targets,
+        } => (packages, cargo_args, targets),
+        CargoSelection::Workspace { cargo_args, targets } => {
+            if cargo_args.is_empty() && targets.is_empty() {
+                return Ok(());
+            }
+            return Err(RailError::message(format!(
+                "saved work '{work}' has executable selectors in workspace Cargo scope"
+            )));
+        }
+    };
+    if packages.is_empty()
+        || !packages.windows(2).all(|pair| pair[0].key < pair[1].key)
+        || !targets.windows(2).all(|pair| pair[0] < pair[1])
+    {
+        return Err(RailError::message(format!(
+            "saved work '{work}' has empty, duplicate, or unordered Cargo selectors"
+        )));
+    }
+
+    let metadata = ctx.cargo().metadata();
+    let duplicate_names =
+        metadata
+            .workspace_packages()
+            .iter()
+            .fold(BTreeMap::<&str, usize>::new(), |mut counts, package| {
+                *counts.entry(package.name.as_str()).or_default() += 1;
+                counts
+            });
+    let current = metadata
+        .workspace_packages()
+        .iter()
+        .map(|package| (portable_package_key(ctx, package), *package))
+        .collect::<BTreeMap<_, _>>();
+    for package in packages {
+        let candidate = current.get(&package.key).ok_or_else(|| {
+            RailError::message(format!(
+                "saved work '{work}' selects unknown Cargo package '{}'",
+                package.key
+            ))
+        })?;
+        if &portable_package_selector(ctx, candidate, &duplicate_names)? != package {
+            return Err(RailError::message(format!(
+                "saved work '{work}' has a stale Cargo package selector '{}'",
+                package.key
+            )));
+        }
+    }
+    let expected_args = packages
+        .iter()
+        .flat_map(|package| ["-p".to_string(), package.cargo_spec.clone()])
+        .collect::<Vec<_>>();
+    if *cargo_args != expected_args {
+        return Err(RailError::message(format!(
+            "saved work '{work}' Cargo argv disagrees with its typed packages"
+        )));
+    }
+    let selected = packages
+        .iter()
+        .map(|package| package.key.as_str())
+        .collect::<BTreeSet<_>>();
+    for target in targets {
+        if !selected.contains(target.package.as_str()) {
+            return Err(RailError::message(format!(
+                "saved work '{work}' target '{}' belongs to an unselected package",
+                target.name
+            )));
+        }
+        let package = current[&target.package];
+        let Some(candidate) = package.targets.iter().find(|candidate| candidate.name == target.name) else {
+            return Err(RailError::message(format!(
+                "saved work '{work}' selects unknown Cargo target '{}:{}'",
+                target.package, target.name
+            )));
+        };
+        let mut kinds = candidate.kind.iter().map(ToString::to_string).collect::<Vec<_>>();
+        kinds.sort_unstable();
+        if target.kind != kinds {
+            return Err(RailError::message(format!(
+                "saved work '{work}' has stale kinds for Cargo target '{}:{}'",
+                target.package, target.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_saved_variant_selection(
+    spec: &WorkSpec,
+    selection: &VariantSelection,
+    evidence: &[String],
+) -> RailResult<()> {
+    let selection_evidence = match selection {
+        VariantSelection::All { evidence } => evidence,
+        VariantSelection::Selected { variants, evidence } => {
+            if variants.is_empty() || !variants.windows(2).all(|pair| pair[0].id < pair[1].id) {
+                return Err(RailError::message(format!(
+                    "saved work '{}' has empty, duplicate, or unordered variants",
+                    spec.id
+                )));
+            }
+            let catalog = spec.catalog.as_ref().ok_or_else(|| {
+                RailError::message(format!("saved variant work '{}' has no current catalog", spec.id))
+            })?;
+            let rows = catalog
+                .variants
+                .iter()
+                .map(|row| (row.id.as_str(), &row.dimensions))
+                .collect::<BTreeMap<_, _>>();
+            for variant in variants {
+                if rows.get(variant.id.as_str()).copied() != Some(&variant.dimensions) {
+                    return Err(RailError::message(format!(
+                        "saved work '{}' selects stale variant '{}'",
+                        spec.id, variant.id
+                    )));
+                }
+            }
+            evidence
+        }
+    };
+    if evidence.contains(selection_evidence) {
+        Ok(())
+    } else {
+        Err(RailError::message(format!(
+            "saved work '{}' variant selection cites unbound evidence",
+            spec.id
+        )))
+    }
+}
+
+fn is_sorted_unique(values: &[String]) -> bool {
+    values.windows(2).all(|pair| pair[0] < pair[1])
 }
 
 fn build_catalog(ctx: &WorkspaceContext, cargo_model: &mut PlanningCargoModel) -> RailResult<Vec<WorkSpec>> {
@@ -2880,9 +3234,20 @@ fn validate_decisions(
         let refs = match decision {
             WorkDecision::Skipped { evidence } | WorkDecision::Required { evidence, .. } => evidence,
         };
-        if refs.is_empty() || refs.iter().any(|id| !evidence.contains_key(id)) {
+        if refs.is_empty()
+            || !is_sorted_unique(refs)
+            || refs
+                .iter()
+                .any(|id| evidence.get(id).is_none_or(|record| record.subject != spec.id))
+        {
             return Err(RailError::message(format!(
-                "v8 work decision '{}' has missing evidence",
+                "v9 work decision '{}' has malformed or foreign evidence",
+                spec.id
+            )));
+        }
+        if matches!(decision, WorkDecision::Skipped { .. }) && refs.iter().any(|id| !evidence[id].complete) {
+            return Err(RailError::message(format!(
+                "v9 skipped work '{}' cites incomplete evidence",
                 spec.id
             )));
         }
@@ -2892,7 +3257,7 @@ fn validate_decisions(
         .filter_map(|(id, decision)| matches!(decision, WorkDecision::Required { .. }).then_some(id.as_str()))
         .collect::<Vec<_>>();
     if projected != required.iter().map(String::as_str).collect::<Vec<_>>() {
-        return Err(RailError::message("v8 required-work projection drifted from decisions"));
+        return Err(RailError::message("v9 required-work projection drifted from decisions"));
     }
     Ok(())
 }

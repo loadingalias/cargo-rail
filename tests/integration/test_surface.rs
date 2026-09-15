@@ -5,7 +5,7 @@ use std::fs;
 use crate::helpers::{NestedWorkspace, TestWorkspace, run_cargo_rail, run_cargo_rail_with_env};
 use anyhow::{Result, anyhow};
 
-const SURFACE_V3_SCHEMA: &str = include_str!("../../schemas/surface-v3.schema.json");
+const SURFACE_V4_SCHEMA: &str = include_str!("../../schemas/surface-v4.schema.json");
 
 #[test]
 fn compiler_observation_process_reports_its_private_protocol() {
@@ -32,9 +32,9 @@ fn surface_schema_is_pre_context_and_matches_the_published_contract() {
             output.status.success(),
             "surface --schema should not load workspace state"
         );
-        assert_eq!(String::from_utf8_lossy(&output.stdout), SURFACE_V3_SCHEMA);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), SURFACE_V4_SCHEMA);
         assert!(output.stderr.is_empty(), "schema output must keep stderr empty");
-        let schema: serde_json::Value = serde_json::from_str(SURFACE_V3_SCHEMA)?;
+        let schema: serde_json::Value = serde_json::from_str(SURFACE_V4_SCHEMA)?;
         jsonschema::validator_for(&schema).map_err(|error| anyhow::anyhow!("invalid surface schema: {error}"))?;
         Ok(())
     })();
@@ -232,7 +232,7 @@ reason = "fixture product"
         );
 
         let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-        let schema: serde_json::Value = serde_json::from_str(SURFACE_V3_SCHEMA)?;
+        let schema: serde_json::Value = serde_json::from_str(SURFACE_V4_SCHEMA)?;
         let validator =
             jsonschema::validator_for(&schema).map_err(|error| anyhow!("invalid surface schema: {error}"))?;
         let errors = validator

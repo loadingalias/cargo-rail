@@ -226,6 +226,33 @@ fn canonical_export_preserves_target_inheritance_after_policy_changes() {
     super::helpers::finish_test(result);
 }
 
+#[test]
+fn config_explain_expands_parent_nodes_and_suggests_valid_children() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_single_crate("demo", "0.1.0")?;
+        let node = run_cargo_rail(&ws.path, &["rail", "config", "explain", "surface", "-f", "json"])?;
+        assert!(node.status.success(), "parent explanation failed: {node:?}");
+        let node: serde_json::Value = serde_json::from_slice(&node.stdout)?;
+        let fields = node["fields"].as_array().expect("explained fields");
+        assert!(fields.len() > 5);
+        assert!(
+            fields
+                .iter()
+                .all(|field| { field["path"].as_str().is_some_and(|path| path.starts_with("surface.")) })
+        );
+
+        let unknown = run_cargo_rail(&ws.path, &["rail", "config", "explain", "surface.nope"])?;
+        assert_eq!(unknown.status.code(), Some(2));
+        let diagnostic = String::from_utf8_lossy(&unknown.stderr);
+        assert!(
+            diagnostic.contains("valid child paths include: surface."),
+            "{diagnostic}"
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
 // Config Locate Tests
 
 #[test]

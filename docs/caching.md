@@ -25,6 +25,7 @@ but each enrollment owns a separate cache profile:
 ```bash
 cargo rail cache setup --check
 cargo rail cache setup
+cargo rail cache ready
 cargo rail cache status --scope local
 cargo rail doctor native-cache
 ```
@@ -47,6 +48,13 @@ and the driver's locked dependencies in the local Cargo cache;
 it does not download missing components or crates.
 `just check-compiler-driver` runs the separate driver checks.
 Plain Cargo builds do not perform this preparation.
+
+`cache ready` runs one isolated uncached build, one cold cached build,
+and one verified warm restore with the selected toolchain.
+It requires an enrolled, authenticated local-only profile.
+A successful probe records readiness for that exact profile and rustc identity;
+a profile or toolchain change makes the recorded readiness stale.
+Qualify remote transport separately with `cache probe` and an explicit machine-owned authority.
 
 `just package-release OUTPUT_DIRECTORY` builds the native release components and writes a deflated ZIP, `cargo-rail-components-v1.tsv` inside that archive,
 and an adjacent `SHA256SUMS`.
@@ -268,6 +276,8 @@ Keep provider cleanup and lifecycle policy outside build credentials.
 L1 remains authoritative, so an L1 hit makes no remote request.
 Absence, conflict, corruption, credential failure, throttling, or outage executes the compiler.
 `--local-only` removes persisted L2 selection while preserving L1.
+It is unnecessary when creating a fresh local profile because local reuse is already the default.
+It cannot be combined with `--root-portability`: removing remote authority restores physical-root local reuse.
 
 Physical-root mode is the default.
 It shares only checkouts at the same canonical path.
@@ -372,13 +382,16 @@ for readers; rerun `cache setup` afterward.
 and installation receipt while preserving profiles and their CAS data.
 
 Setup repairs current installed component bytes from their authenticated source files.
-Unsupported installation receipts are preserved and rejected;
-they cannot be adopted by current setup.
+Status reads stale receipt versions without activating them.
+Setup quarantines the stale receipt and its owned installation state
+before it installs the current component set and updates Cargo's wrapper entry.
 Removal and reuse refuse changed, shadowed, linked, or unowned authority.
 Do not edit profile records, individual CAS objects, or Cargo fingerprints by hand.
 
-Status schema 16 reports the selected profile ID, workspace binding, trust domain,
-and redacted remote selection source.
+Status schema 18 reports installation integrity, component authentication,
+selected-toolchain readiness, workspace enrollment, remote authority, observed reuse,
+the selected profile and trust domain, and the redacted remote selection source as separate fields.
+It also separates required installation bytes from quarantined reclaimable bytes.
 It reports stable native failure-reason counters separately from the bounded 65,536-event usage
 ledger, so capture, identity, and post-execution witness failures remain visible after that ledger
 fills.

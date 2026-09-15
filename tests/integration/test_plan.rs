@@ -1324,6 +1324,66 @@ fn test_saved_plan_from_stdin_preserves_checkout_verification() {
     super::helpers::finish_test(result);
 }
 
+#[test]
+fn test_saved_plan_verifier_rejects_every_executable_contract_drift() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("plan-verify-contract")?;
+        let package = ws.add_crate("verify", "0.1.0", &[])?;
+        generate_lockfile(&ws)?;
+        ws.commit("establish saved-plan contract fixture")?;
+        std::fs::write(package.join("src/lib.rs"), "pub fn changed() {}\n")?;
+        let saved = plan(&ws, &["--since", "HEAD"])?;
+
+        let mut cases = Vec::new();
+
+        let mut unknown = saved.clone();
+        unknown["unexpected"] = Value::Bool(true);
+        cases.push(("unknown field", unknown, "unknown field"));
+
+        let mut identity = saved.clone();
+        identity["identity"] = Value::String(format!("plan-v9:sha256:{}", "0".repeat(64)));
+        cases.push(("canonical identity", identity, "canonical plan identity"));
+
+        let mut catalog = saved.clone();
+        catalog["inputs"]["catalog"] = Value::String(format!("work-catalog-v1:sha256:{}", "0".repeat(64)));
+        cases.push(("catalog identity", catalog, "work catalog identity"));
+
+        let mut projection = saved.clone();
+        projection["required"].as_array_mut().context("required work")?.pop();
+        cases.push(("required projection", projection, "required-work projection"));
+
+        let skipped_id = saved["work"]
+            .as_object()
+            .context("work catalog")?
+            .iter()
+            .find_map(|(id, decision)| (decision["state"] == "skipped").then_some(id.clone()))
+            .context("fixture has no skipped work")?;
+        let skipped_evidence = saved["work"][&skipped_id]["evidence"][0]
+            .as_str()
+            .context("skipped evidence")?
+            .to_string();
+        let mut incomplete_skip = saved.clone();
+        incomplete_skip["evidence"][&skipped_evidence]["complete"] = Value::Bool(false);
+        cases.push(("incomplete skip", incomplete_skip, "cites incomplete evidence"));
+
+        let mut selector = saved;
+        selector["work"]["cargo.build"]["scope"]["selection"]["packages"][0]["cargo_spec"] =
+            Value::String("stale-package".to_string());
+        cases.push(("typed selector", selector, "stale Cargo package selector"));
+
+        for (name, value, expected) in cases {
+            let path = write_saved_plan(&ws, &format!("saved-plan-{name}.json"), &value)?;
+            let rejected = verify_saved_plan(&ws, &path)?;
+            assert_eq!(rejected.status.code(), Some(2), "{name} was accepted");
+            assert!(rejected.stdout.is_empty(), "{name} emitted stdout");
+            let stderr = String::from_utf8_lossy(&rejected.stderr);
+            assert!(stderr.contains(expected), "{name}: {stderr}");
+        }
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
 #[cfg(unix)]
 #[test]
 fn test_saved_worktree_plan_rejects_executable_mode_drift() {

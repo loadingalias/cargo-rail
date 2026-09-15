@@ -24,6 +24,8 @@ const USAGE_FILE: &str = "usage-v1.log";
 const EARLY_BYPASS_FILE: &str = "early-bypass-v1.log";
 const FAILURE_COUNTERS_FILE: &str = "failure-counters-v1.json";
 const FAILURE_COUNTERS_LOCK_FILE: &str = "failure-counters-v1.lock";
+const INSTALLATION_QUARANTINE_DIRECTORY: &str = "installation-quarantine-v1";
+pub(crate) const READINESS_WORKSPACE_ENV: &str = "CARGO_RAIL_CACHE_READINESS_WORKSPACE";
 const COORDINATOR_STATE_PREFIX: &str = "remote-coordinator-v1-";
 const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
 const MAX_SESSION_MEMO_BYTES: u64 = 256 * 1024;
@@ -79,6 +81,7 @@ pub(crate) struct SetupPlan {
     config_before: Option<Vec<u8>>,
     config_after: Vec<u8>,
     receipt_before: Option<Vec<u8>>,
+    stale_receipt_quarantine: Option<PathBuf>,
     receipt: InstallationReceipt,
     wrapper: ExecutableSetup,
     worker: ExecutableSetup,
@@ -250,6 +253,20 @@ impl SetupPlan {
             Some(_) => "set_field",
         }
     }
+
+    pub(crate) const fn private_state_action(&self) -> &'static str {
+        if self.stale_receipt_quarantine.is_some() {
+            "quarantine_and_reinstall"
+        } else if self.pending {
+            "install_or_repair"
+        } else {
+            "verify"
+        }
+    }
+
+    pub(crate) fn quarantine_receipt_path(&self) -> Option<&Path> {
+        self.stale_receipt_quarantine.as_deref()
+    }
 }
 
 /// Private authority loaded by the installed wrapper after acquisition-free gates.
@@ -275,6 +292,19 @@ pub(crate) struct InstallationReceipt {
     active_profile: Option<crate::cache::profile::InstalledCacheProfile>,
     #[serde(skip)]
     active_profile_lock: Option<crate::cache::profile::ProfileLifecycleLock>,
+}
+
+#[derive(Deserialize)]
+struct LegacyInstallationReceipt {
+    version: u32,
+    authority: String,
+    cargo_home: PathBuf,
+    config_path: PathBuf,
+    wrapper_path: PathBuf,
+    #[serde(default)]
+    cache: Option<LocalCacheSelection>,
+    #[serde(default)]
+    root_portability: Option<InstalledRootPortability>,
 }
 
 /// Explicit machine authority for sharing remapped compiler results across checkout roots.
@@ -371,7 +401,7 @@ pub(crate) struct InstallationSessionLock {
     _file: File,
 }
 
-struct InstallationMutationLock {
+pub(super) struct InstallationMutationLock {
     _file: File,
 }
 
@@ -792,7 +822,7 @@ pub(crate) fn lock_session(receipt: &InstallationReceipt) -> RailResult<Installa
     Ok(InstallationSessionLock { _file: file })
 }
 
-fn lock_installation(cargo_home: &Path) -> RailResult<InstallationMutationLock> {
+pub(super) fn lock_installation(cargo_home: &Path) -> RailResult<InstallationMutationLock> {
     ensure_real_directory(cargo_home)?;
     let owner = cargo_home.join("cargo-rail");
     create_private_directory(&owner)?;
@@ -880,6 +910,14 @@ pub(crate) fn update_distributed_placement_history(
 pub(crate) struct InstallationStatus {
     pub(crate) state: &'static str,
     pub(crate) healthy: bool,
+    pub(crate) installation_integrity: &'static str,
+    pub(crate) component_authentication: &'static str,
+    pub(crate) workspace_enrollment: &'static str,
+    pub(crate) observed_reuse: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) receipt_version: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) recovery_action: Option<&'static str>,
     pub(crate) cargo_home: String,
     pub(crate) config_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -904,6 +942,10 @@ pub(crate) struct InstallationStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) distributed_placement_history: Option<crate::compiler::distributed::PlacementHistoryStatus>,
     pub(crate) cargo_l0: &'static str,
+    pub(crate) owned_bytes: u64,
+    pub(crate) required_bytes: u64,
+    pub(crate) reclaimable_bytes: u64,
+    pub(crate) quarantined_receipts: u64,
     pub(crate) usage: InstallationUsageStatus,
     pub(crate) issues: Vec<String>,
 }
@@ -1159,12 +1201,28 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
     let install_directory = cargo_home.join("cargo-rail").join(INSTALLATION_DIRECTORY);
     let receipt_path = install_directory.join(RECEIPT_FILE);
     let receipt_before = read_optional_regular(&receipt_path, MAX_RECEIPT_BYTES)?;
-    let existing = receipt_before
+    let receipt_version = receipt_before
         .as_deref()
-        .map(|bytes| parse_receipt(bytes, &receipt_path))
+        .map(|bytes| parse_receipt_version(bytes, &receipt_path))
         .transpose()?;
-
+    let existing = match (receipt_before.as_deref(), receipt_version) {
+        (Some(bytes), Some(INSTALLATION_VERSION)) => Some(parse_receipt(bytes, &receipt_path)?),
+        _ => None,
+    };
+    let stale_receipt_version = receipt_version.filter(|version| *version != INSTALLATION_VERSION);
     let config_path = selected_user_config(&cargo_home);
+    let legacy = stale_receipt_version
+        .zip(receipt_before.as_deref())
+        .map(|(_, bytes)| parse_legacy_receipt(bytes, &cargo_home, &config_path))
+        .transpose()?;
+    let stale_receipt_quarantine = stale_receipt_version
+        .zip(receipt_before.as_deref())
+        .map(|(version, bytes)| {
+            cargo_home
+                .join("cargo-rail")
+                .join(INSTALLATION_QUARANTINE_DIRECTORY)
+                .join(format!("setup-v{version}-{}.json", ContentDigest::sha256(bytes)))
+        });
     if let Some(existing) = &existing
         && (existing.cargo_home != cargo_home || existing.config_path != config_path)
     {
@@ -1190,7 +1248,11 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
     let distributed_authority_path = install_directory.join(DISTRIBUTED_AUTHORITY_FILE);
     let distributed_client_certificate_path = install_directory.join(DISTRIBUTED_CLIENT_CERTIFICATE_FILE);
     let distributed_client_private_key_path = install_directory.join(DISTRIBUTED_CLIENT_PRIVATE_KEY_FILE);
-    let (config_after, build_table_created) = install_wrapper_value(&original, &wrapper_path, existing.as_ref())?;
+    let owned_wrapper = existing
+        .as_ref()
+        .map(InstallationReceipt::wrapper_path)
+        .or_else(|| stale_receipt_version.map(|_| wrapper_path.as_path()));
+    let (config_after, build_table_created) = install_wrapper_value(&original, &wrapper_path, owned_wrapper)?;
     let wrapper = plan_executable_setup(
         crate::compiler::native_cache::direct_wrapper_executable()?,
         &wrapper_path,
@@ -1415,6 +1477,7 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
     let authority = existing
         .as_ref()
         .map(|receipt| receipt.authority.clone())
+        .or_else(|| legacy.as_ref().map(|receipt| receipt.authority.clone()))
         .map_or_else(random_authority, Ok)?;
     let mut receipt = InstallationReceipt {
         version: INSTALLATION_VERSION,
@@ -1457,12 +1520,31 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
         &receipt.authority,
         crate::cache::profile::ProfileSetupRequest {
             requested_profile: request.profile_id.as_deref(),
-            local_dir: request.local_dir.as_deref(),
-            max_bytes: request.max_bytes,
+            local_dir: request.local_dir.as_deref().or_else(|| {
+                legacy
+                    .as_ref()
+                    .and_then(|receipt| receipt.cache.as_ref())
+                    .map(LocalCacheSelection::base)
+            }),
+            max_bytes: request.max_bytes.or_else(|| {
+                legacy
+                    .as_ref()
+                    .and_then(|receipt| receipt.cache.as_ref())
+                    .map(LocalCacheSelection::max_bytes)
+            }),
+            trust_domain: legacy
+                .as_ref()
+                .and_then(|receipt| receipt.cache.as_ref())
+                .and_then(LocalCacheSelection::trust_domain),
             remote_url: request.remote_url.as_deref(),
             remote_mode: request.remote_mode.as_deref(),
             remote_environment: &request.remote_environment,
-            root_portability: request.root_portability.as_deref(),
+            root_portability: request.root_portability.as_deref().or_else(|| {
+                legacy
+                    .as_ref()
+                    .and_then(|receipt| receipt.root_portability)
+                    .map(InstalledRootPortability::as_str)
+            }),
             local_only: request.local_only,
         },
     )?;
@@ -1511,6 +1593,7 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
         config_before,
         config_after: config_after.into_bytes(),
         receipt_before,
+        stale_receipt_quarantine,
         receipt,
         wrapper,
         worker,
@@ -1550,7 +1633,6 @@ pub(crate) fn apply_setup(mut plan: SetupPlan) -> RailResult<()> {
     if !plan.pending {
         return Ok(());
     }
-    let _installation_lock = lock_installation(&plan.cargo_home)?;
     revalidate_optional(&plan.config_path, plan.config_before.as_deref(), 16 * 1024 * 1024)?;
     let receipt_path = plan
         .receipt
@@ -1629,7 +1711,10 @@ pub(crate) fn apply_setup(mut plan: SetupPlan) -> RailResult<()> {
     if let Some(existing) = plan
         .receipt_before
         .as_deref()
-        .map(|bytes| parse_receipt(bytes, &receipt_path))
+        .and_then(|bytes| {
+            (parse_receipt_version(bytes, &receipt_path).ok() == Some(INSTALLATION_VERSION))
+                .then(|| parse_receipt(bytes, &receipt_path))
+        })
         .transpose()?
     {
         for profile in crate::cache::profile::load_all(&plan.cargo_home)? {
@@ -1652,6 +1737,10 @@ pub(crate) fn apply_setup(mut plan: SetupPlan) -> RailResult<()> {
         crate::remote_cache::stop_installed_coordinators(&selected);
     }
     let _profile_lifecycles = crate::cache::profile::lock_all_exclusive(&plan.cargo_home)?;
+    // Global mutations wait for active profile work before taking the
+    // installation lock used by compiler children. The remaining order is
+    // registry/profile, installation, then session.
+    let _installation_lock = lock_installation(&plan.cargo_home)?;
     let _session_lock = lock_session(&plan.receipt)?;
     revalidate_executable_setup(&plan.receipt.wrapper_path, &plan.wrapper, "installed compiler wrapper")?;
     revalidate_executable_setup(&plan.receipt.worker_path, &plan.worker, "installed compiler worker")?;
@@ -1788,6 +1877,27 @@ pub(crate) fn apply_setup(mut plan: SetupPlan) -> RailResult<()> {
     }
     let encoded_receipt = encode_receipt(&plan.receipt)?;
     if plan.receipt_before.as_deref() != Some(encoded_receipt.as_slice()) {
+        if let (Some(stale), Some(quarantine)) = (
+            plan.receipt_before
+                .as_deref()
+                .filter(|_| plan.stale_receipt_quarantine.is_some()),
+            plan.stale_receipt_quarantine.as_deref(),
+        ) {
+            let directory = quarantine
+                .parent()
+                .ok_or_else(|| RailError::message("installation quarantine receipt has no parent"))?;
+            create_private_directory(directory)?;
+            match read_optional_regular(quarantine, MAX_RECEIPT_BYTES)? {
+                Some(existing) if existing == stale => {}
+                Some(_) => {
+                    return Err(RailError::message(
+                        "installation quarantine receipt conflicts with retained recovery evidence",
+                    ));
+                }
+                None => write_private_atomic(quarantine, stale)?,
+            }
+            revalidate_optional(&receipt_path, Some(stale), MAX_RECEIPT_BYTES)?;
+        }
         write_private_atomic(&receipt_path, &encoded_receipt)?;
     }
     revalidate_optional(&plan.config_path, plan.config_before.as_deref(), 16 * 1024 * 1024)?;
@@ -1917,7 +2027,6 @@ pub(crate) fn apply_removal(plan: RemovalPlan) -> RailResult<()> {
     let Some(receipt) = plan.receipt else {
         return Ok(());
     };
-    let _installation_lock = lock_installation(&receipt.cargo_home)?;
     let install_directory = receipt
         .wrapper_path
         .parent()
@@ -2001,6 +2110,7 @@ pub(crate) fn apply_removal(plan: RemovalPlan) -> RailResult<()> {
         crate::remote_cache::stop_installed_coordinators(&selected);
     }
     let _profile_lifecycles = crate::cache::profile::lock_all_exclusive(&receipt.cargo_home)?;
+    let _installation_lock = lock_installation(&receipt.cargo_home)?;
 
     match plan.config_after {
         Some(contents) => crate::utils::write_file_atomic(&plan.config_path, &contents)?,
@@ -2180,15 +2290,46 @@ pub(crate) fn load_for_wrapper(invoked: &Path, workspace_root: &Path) -> RailRes
             "installed compiler launcher or worker changed after verified setup",
         ));
     }
-    let (profile, lock) =
-        crate::cache::profile::load_locked(&receipt.cargo_home, workspace_root)?.ok_or_else(|| {
-            RailError::with_help(
-                "the compiler workspace has no installed cache profile",
-                "run `cargo rail cache setup` from that exact Cargo workspace",
-            )
-        })?;
+    let selected = crate::cache::profile::load_locked(&receipt.cargo_home, workspace_root)?;
+    let selected = match selected {
+        Some(selected) => Some(selected),
+        None => readiness_profile(&receipt.cargo_home, workspace_root)?,
+    };
+    let (profile, lock) = selected.ok_or_else(|| {
+        RailError::with_help(
+            "the compiler workspace has no installed cache profile",
+            "run `cargo rail cache setup` from that exact Cargo workspace",
+        )
+    })?;
     receipt.attach_locked_profile(profile, lock);
     Ok(receipt)
+}
+
+fn readiness_profile(
+    cargo_home: &Path,
+    source_root: &Path,
+) -> RailResult<
+    Option<(
+        crate::cache::profile::InstalledCacheProfile,
+        crate::cache::profile::ProfileLifecycleLock,
+    )>,
+> {
+    let Some(workspace) = std::env::var_os(READINESS_WORKSPACE_ENV).map(PathBuf::from) else {
+        return Ok(None);
+    };
+    let workspace = crate::utils::canonicalize_existing(&workspace)?;
+    let source_root = crate::utils::canonicalize_existing(source_root)?;
+    let parent = workspace.join("target/cargo-rail/compiler-artifacts-v1");
+    let source_parent = source_root.parent();
+    let source_name = source_root.file_name().and_then(std::ffi::OsStr::to_str);
+    if source_parent != Some(parent.as_path())
+        || source_name.is_none_or(|name| !name.starts_with("cargo-rail-cache-readiness-"))
+    {
+        return Err(RailError::message(
+            "cache readiness workspace capability does not authorize this compiler source root",
+        ));
+    }
+    crate::cache::profile::load_locked(cargo_home, &workspace)
 }
 
 /// Load and validate the receipt adjacent to a coordinator worker process.
@@ -2361,6 +2502,7 @@ pub(crate) fn stop_current_profile_coordinator(current_dir: &Path) -> RailResult
 pub(crate) fn status(current_dir: &Path) -> RailResult<InstallationStatus> {
     let cargo_home = resolve_cargo_home(current_dir)?;
     let config_path = selected_user_config(&cargo_home);
+    let storage = installation_storage_status(&cargo_home)?;
     let receipt_path = cargo_home
         .join("cargo-rail")
         .join(INSTALLATION_DIRECTORY)
@@ -2369,6 +2511,12 @@ pub(crate) fn status(current_dir: &Path) -> RailResult<InstallationStatus> {
         return Ok(InstallationStatus {
             state: "not_installed",
             healthy: true,
+            installation_integrity: "not_installed",
+            component_authentication: "not_installed",
+            workspace_enrollment: "not_enrolled",
+            observed_reuse: "not_observed",
+            receipt_version: None,
+            recovery_action: None,
             cargo_home: cargo_home.to_string_lossy().into_owned(),
             config_path: config_path.to_string_lossy().into_owned(),
             wrapper_path: None,
@@ -2383,27 +2531,83 @@ pub(crate) fn status(current_dir: &Path) -> RailResult<InstallationStatus> {
             distributed_policy: None,
             distributed_placement_history: None,
             cargo_l0: "owned_by_cargo_not_observable_when_rustc_is_not_launched",
+            owned_bytes: storage.owned_bytes,
+            required_bytes: storage.required_bytes,
+            reclaimable_bytes: storage.reclaimable_bytes,
+            quarantined_receipts: storage.quarantined_receipts,
             usage: empty_usage_status(),
             issues: Vec::new(),
         });
     };
+    let version = parse_receipt_version(&bytes, &receipt_path)?;
+    if version != INSTALLATION_VERSION {
+        let wrapper_path = receipt_path
+            .parent()
+            .ok_or_else(|| RailError::message("compiler-cache receipt has no parent directory"))?
+            .join(WRAPPER_FILE);
+        let mut issues = vec![format!(
+            "compiler-cache receipt version {version} requires quarantine and reinstallation"
+        )];
+        match read_optional_regular(&config_path, 16 * 1024 * 1024) {
+            Ok(Some(config)) => match std::str::from_utf8(&config)
+                .map_err(|_| RailError::message("Cargo user configuration is not valid UTF-8"))
+                .and_then(wrapper_value)
+            {
+                Ok(Some(selected)) if Path::new(&selected) == wrapper_path => {}
+                Ok(_) => issues.push("Cargo build.rustc-wrapper does not select the stale installation".to_string()),
+                Err(error) => issues.push(error.to_string()),
+            },
+            Ok(None) => issues.push("Cargo user configuration is missing".to_string()),
+            Err(error) => issues.push(error.to_string()),
+        }
+        return Ok(InstallationStatus {
+            state: "stale",
+            healthy: false,
+            installation_integrity: "stale_receipt",
+            component_authentication: "not_authenticated",
+            workspace_enrollment: "unknown",
+            observed_reuse: "not_observed",
+            receipt_version: Some(version),
+            recovery_action: Some("cargo rail cache setup"),
+            cargo_home: cargo_home.to_string_lossy().into_owned(),
+            config_path: config_path.to_string_lossy().into_owned(),
+            wrapper_path: Some(wrapper_path.to_string_lossy().into_owned()),
+            profile_id: None,
+            bound_workspace_root: None,
+            trust_domain: None,
+            selection_source: "stale_receipt",
+            cache_base: None,
+            max_bytes: None,
+            root_portability: None,
+            distributed: None,
+            distributed_policy: None,
+            distributed_placement_history: None,
+            cargo_l0: "owned_by_cargo_not_observable_when_rustc_is_not_launched",
+            owned_bytes: storage.owned_bytes,
+            required_bytes: storage.required_bytes,
+            reclaimable_bytes: storage.reclaimable_bytes,
+            quarantined_receipts: storage.quarantined_receipts,
+            usage: empty_usage_status(),
+            issues,
+        });
+    }
     let mut receipt = parse_receipt(&bytes, &receipt_path)?;
     let mut issues = Vec::new();
+    let mut installation_integrity = "verified";
+    let mut component_authentication = "authenticated";
     let profile = match crate::cache::profile::load(&cargo_home, current_dir) {
         Ok(Some(profile)) => {
             receipt.attach_profile(profile.clone());
             Some(profile)
         }
-        Ok(None) => {
-            issues.push("the selected workspace is not enrolled in a cache profile".to_string());
-            None
-        }
+        Ok(None) => None,
         Err(error) => {
             issues.push(format!("workspace cache profile is unavailable: {error}"));
             None
         }
     };
     if receipt.cargo_home != cargo_home || receipt.config_path != config_path {
+        installation_integrity = "drifted";
         issues.push("selected Cargo home or active user config changed".to_string());
     }
     match read_optional_regular(&config_path, 16 * 1024 * 1024) {
@@ -2412,21 +2616,45 @@ pub(crate) fn status(current_dir: &Path) -> RailResult<InstallationStatus> {
             .and_then(wrapper_value)
         {
             Ok(Some(value)) if Path::new(&value) == receipt.wrapper_path => {}
-            Ok(_) => issues.push("Cargo build.rustc-wrapper no longer selects the installed wrapper".to_string()),
-            Err(error) => issues.push(error.to_string()),
+            Ok(_) => {
+                installation_integrity = "drifted";
+                issues.push("Cargo build.rustc-wrapper no longer selects the installed wrapper".to_string());
+            }
+            Err(error) => {
+                installation_integrity = "drifted";
+                issues.push(error.to_string());
+            }
         },
-        Ok(None) => issues.push("Cargo user configuration is missing".to_string()),
-        Err(error) => issues.push(error.to_string()),
+        Ok(None) => {
+            installation_integrity = "drifted";
+            issues.push("Cargo user configuration is missing".to_string());
+        }
+        Err(error) => {
+            installation_integrity = "drifted";
+            issues.push(error.to_string());
+        }
     }
     match file_digest(&receipt.wrapper_path) {
         Ok(digest) if digest == receipt.wrapper_digest => {}
-        Ok(_) => issues.push("installed wrapper content changed".to_string()),
-        Err(error) => issues.push(format!("installed wrapper is unavailable: {error}")),
+        Ok(_) => {
+            component_authentication = "failed";
+            issues.push("installed wrapper content changed".to_string());
+        }
+        Err(error) => {
+            component_authentication = "failed";
+            issues.push(format!("installed wrapper is unavailable: {error}"));
+        }
     }
     match file_digest(&receipt.worker_path) {
         Ok(digest) if digest == receipt.worker_digest => {}
-        Ok(_) => issues.push("installed worker content changed".to_string()),
-        Err(error) => issues.push(format!("installed worker is unavailable: {error}")),
+        Ok(_) => {
+            component_authentication = "failed";
+            issues.push("installed worker content changed".to_string());
+        }
+        Err(error) => {
+            component_authentication = "failed";
+            issues.push(format!("installed worker is unavailable: {error}"));
+        }
     }
     for component in &receipt.compiler_components {
         match file_digest(&component.path) {
@@ -2434,14 +2662,20 @@ pub(crate) fn status(current_dir: &Path) -> RailResult<InstallationStatus> {
                 if digest == component.digest
                     && crate::utils::stable_file_generation(&component.path).as_ref()
                         == Some(&component.generation) => {}
-            Ok(_) => issues.push(format!(
-                "installed compiler component '{}' changed",
-                component.path.display()
-            )),
-            Err(error) => issues.push(format!(
-                "installed compiler component '{}' is unavailable: {error}",
-                component.path.display()
-            )),
+            Ok(_) => {
+                component_authentication = "failed";
+                issues.push(format!(
+                    "installed compiler component '{}' changed",
+                    component.path.display()
+                ));
+            }
+            Err(error) => {
+                component_authentication = "failed";
+                issues.push(format!(
+                    "installed compiler component '{}' is unavailable: {error}",
+                    component.path.display()
+                ));
+            }
         }
     }
     if let Some(distributed) = &receipt.distributed {
@@ -2450,8 +2684,14 @@ pub(crate) fn status(current_dir: &Path) -> RailResult<InstallationStatus> {
                 if digest == distributed.worker_digest
                     && crate::utils::stable_file_generation(&distributed.worker_path).as_ref()
                         == Some(&distributed.worker_generation) => {}
-            Ok(_) => issues.push("installed distributed worker content changed".to_string()),
-            Err(error) => issues.push(format!("installed distributed worker is unavailable: {error}")),
+            Ok(_) => {
+                component_authentication = "failed";
+                issues.push("installed distributed worker content changed".to_string());
+            }
+            Err(error) => {
+                component_authentication = "failed";
+                issues.push(format!("installed distributed worker is unavailable: {error}"));
+            }
         }
         if let Some(mutual_tls) = &distributed.mutual_tls {
             for (role, path, expected, generation) in [
@@ -2478,8 +2718,14 @@ pub(crate) fn status(current_dir: &Path) -> RailResult<InstallationStatus> {
                     Ok(digest)
                         if digest == *expected
                             && crate::utils::stable_file_generation(path).as_ref() == Some(generation) => {}
-                    Ok(_) => issues.push(format!("installed distributed TLS {role} changed")),
-                    Err(error) => issues.push(format!("installed distributed TLS {role} is unavailable: {error}")),
+                    Ok(_) => {
+                        component_authentication = "failed";
+                        issues.push(format!("installed distributed TLS {role} changed"));
+                    }
+                    Err(error) => {
+                        component_authentication = "failed";
+                        issues.push(format!("installed distributed TLS {role} is unavailable: {error}"));
+                    }
                 }
             }
             if let Err(error) = crate::compiler::distributed::validate_mutual_tls_client_identity(
@@ -2489,6 +2735,7 @@ pub(crate) fn status(current_dir: &Path) -> RailResult<InstallationStatus> {
                 &mutual_tls.client_certificate,
                 &mutual_tls.client_private_key,
             ) {
+                component_authentication = "failed";
                 issues.push(error.to_string());
             }
         }
@@ -2501,7 +2748,11 @@ pub(crate) fn status(current_dir: &Path) -> RailResult<InstallationStatus> {
         }
     }
     if let Err(error) = reject_shadowing_global_wrapper(current_dir, &config_path) {
+        installation_integrity = "drifted";
         issues.push(error.to_string());
+    }
+    if component_authentication == "failed" {
+        installation_integrity = "drifted";
     }
     let mut usage = if profile.is_some() {
         match usage_status(&receipt) {
@@ -2535,6 +2786,12 @@ pub(crate) fn status(current_dir: &Path) -> RailResult<InstallationStatus> {
     Ok(InstallationStatus {
         state: if issues.is_empty() { "installed" } else { "drifted" },
         healthy: issues.is_empty(),
+        installation_integrity,
+        component_authentication,
+        workspace_enrollment: if profile.is_some() { "enrolled" } else { "not_enrolled" },
+        observed_reuse: observed_reuse_state(&usage),
+        receipt_version: Some(INSTALLATION_VERSION),
+        recovery_action: (!issues.is_empty()).then_some("cargo rail cache setup"),
         cargo_home: cargo_home.to_string_lossy().into_owned(),
         config_path: config_path.to_string_lossy().into_owned(),
         wrapper_path: Some(receipt.wrapper_path.to_string_lossy().into_owned()),
@@ -2566,8 +2823,50 @@ pub(crate) fn status(current_dir: &Path) -> RailResult<InstallationStatus> {
             .map(DistributedPlacementPolicy::as_str),
         distributed_placement_history,
         cargo_l0: "owned_by_cargo_not_observable_when_rustc_is_not_launched",
+        owned_bytes: storage.owned_bytes,
+        required_bytes: storage.required_bytes,
+        reclaimable_bytes: storage.reclaimable_bytes,
+        quarantined_receipts: storage.quarantined_receipts,
         usage,
         issues,
+    })
+}
+
+fn observed_reuse_state(usage: &InstallationUsageStatus) -> &'static str {
+    if usage.hits > 0 {
+        "verified_hit_observed"
+    } else if usage.misses > 0 {
+        "misses_only"
+    } else if usage.bypasses > 0 {
+        "bypasses_only"
+    } else if usage.failures > 0 {
+        "failures_only"
+    } else {
+        "not_observed"
+    }
+}
+
+struct InstallationStorageStatus {
+    owned_bytes: u64,
+    required_bytes: u64,
+    reclaimable_bytes: u64,
+    quarantined_receipts: u64,
+}
+
+fn installation_storage_status(cargo_home: &Path) -> RailResult<InstallationStorageStatus> {
+    let owner = cargo_home.join("cargo-rail");
+    let owned_bytes = crate::cache::path_status(&owner)?.map_or(0, |(bytes, _, _)| bytes);
+    let quarantine = owner.join(INSTALLATION_QUARANTINE_DIRECTORY);
+    let (reclaimable_bytes, quarantined_receipts) =
+        crate::cache::path_status(&quarantine)?.map_or((0, 0), |(bytes, files, _)| (bytes, files));
+    let required_bytes = owned_bytes
+        .checked_sub(reclaimable_bytes)
+        .ok_or_else(|| RailError::message("compiler-cache installation storage accounting underflow"))?;
+    Ok(InstallationStorageStatus {
+        owned_bytes,
+        required_bytes,
+        reclaimable_bytes,
+        quarantined_receipts,
     })
 }
 
@@ -2724,11 +3023,7 @@ fn reject_shadowing_global_wrapper(current_dir: &Path, user_config: &Path) -> Ra
     Ok(())
 }
 
-fn install_wrapper_value(
-    original: &str,
-    wrapper: &Path,
-    existing: Option<&InstallationReceipt>,
-) -> RailResult<(String, bool)> {
+fn install_wrapper_value(original: &str, wrapper: &Path, owned_wrapper: Option<&Path>) -> RailResult<(String, bool)> {
     let mut document = if original.is_empty() {
         DocumentMut::new()
     } else {
@@ -2738,7 +3033,7 @@ fn install_wrapper_value(
     };
     let selected = wrapper_value_from_document(&document)?;
     if let Some(selected) = selected
-        && existing.is_none_or(|receipt| Path::new(selected) != receipt.wrapper_path)
+        && owned_wrapper.is_none_or(|owned| Path::new(selected) != owned)
     {
         return Err(RailError::with_help(
             format!("Cargo user configuration already selects rustc wrapper '{selected}'"),
@@ -3089,16 +3384,12 @@ fn revalidate_optional(path: &Path, expected: Option<&[u8]>, max_bytes: u64) -> 
 }
 
 fn parse_receipt(bytes: &[u8], path: &Path) -> RailResult<InstallationReceipt> {
-    #[derive(Deserialize)]
-    struct ReceiptVersion {
-        version: u32,
-    }
-    let version: ReceiptVersion = serde_json::from_slice(bytes)?;
-    if version.version != INSTALLATION_VERSION {
+    let version = parse_receipt_version(bytes, path)?;
+    if version != INSTALLATION_VERSION {
         return Err(RailError::with_help(
             format!(
                 "unsupported compiler-cache installation receipt version {} at '{}'",
-                version.version,
+                version,
                 path.display()
             ),
             "preserve the installation; use the executable that created it to preview and perform its removal, then run current `cargo rail cache setup`; the originating release version is unknown",
@@ -3110,6 +3401,49 @@ fn parse_receipt(bytes: &[u8], path: &Path) -> RailResult<InstallationReceipt> {
         return Err(RailError::message(
             "transparent compiler-cache installation receipt is not canonical",
         ));
+    }
+    Ok(receipt)
+}
+
+fn parse_receipt_version(bytes: &[u8], path: &Path) -> RailResult<u32> {
+    #[derive(Deserialize)]
+    struct ReceiptVersion {
+        version: u32,
+    }
+    let version: ReceiptVersion = serde_json::from_slice(bytes).map_err(|error| {
+        RailError::message(format!(
+            "compiler-cache installation receipt at '{}' has no readable version: {error}",
+            path.display()
+        ))
+    })?;
+    if version.version == 0 {
+        return Err(RailError::message(
+            "compiler-cache installation receipt version must be positive",
+        ));
+    }
+    Ok(version.version)
+}
+
+fn parse_legacy_receipt(bytes: &[u8], cargo_home: &Path, config_path: &Path) -> RailResult<LegacyInstallationReceipt> {
+    let receipt: LegacyInstallationReceipt = serde_json::from_slice(bytes)?;
+    let install_directory = cargo_home.join("cargo-rail").join(INSTALLATION_DIRECTORY);
+    if receipt.version == INSTALLATION_VERSION
+        || !valid_hex_digest(&receipt.authority)
+        || receipt.cargo_home != cargo_home
+        || receipt.config_path != config_path
+        || receipt.wrapper_path != install_directory.join(WRAPPER_FILE)
+    {
+        return Err(RailError::with_help(
+            "stale compiler-cache receipt does not contain safe migration authority",
+            "preserve the Cargo-Rail state and inspect the receipt before choosing a manual quarantine path",
+        ));
+    }
+    if let Some(cache) = &receipt.cache {
+        LocalCacheSelection::new(
+            cache.base().to_path_buf(),
+            cache.max_bytes(),
+            cache.trust_domain().map(str::to_string),
+        )?;
     }
     Ok(receipt)
 }

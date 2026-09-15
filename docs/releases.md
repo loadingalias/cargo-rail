@@ -12,7 +12,7 @@ cargo rail release resume
 
 Publication requires both `--publish` and `release.registry_publication = "crates-io"`.
 Omit them for a Git-only release.
-Use `--bump 0.26.0` when the intended version is already written in the manifest;
+Use an exact bump, such as `--bump 1.2.3`, when the intended version is already written in the manifest;
 `auto` applies the reviewed bump to the current version.
 Commit all inputs before submitting a hosted request.
 
@@ -84,11 +84,13 @@ and the configured signing authority.
 Keep registry credentials in this job, outside validation and packaging jobs.
 
 Invoke `loadingalias/cargo-rail-action/release` at a reviewed immutable Action commit.
-Its inputs are `version`, `packages` (a JSON array; `[]` selects all), `bump`, `publish`, and `review`.
+Its `version` input defaults to `latest`, which resolves the latest stable Cargo-Rail release.
+Set an exact stable version to pin the engine.
+The other inputs are `packages` (a JSON array; `[]` selects all), `bump`, `publish`, and `review`.
 It exposes `transaction-id`, `release-sha`, `state`, and `run-url`.
-The Action installs the compatible authenticated Cargo-Rail components,
+The Action installs the selected authenticated Cargo-Rail components,
 validates the record and invocation independently, and calls the core engine.
-It does not select versions or publish itself.
+It does not choose package bumps or publish by itself.
 
 For reviewed releases, also accept `pull_request_target: { types: [closed] }` and invoke the same Action for a merged,
 same-repository `rail/release-` branch.
@@ -124,12 +126,13 @@ and other policy.
 Finish an older active transaction using its originating executable before adopting this contract;
 there is no legacy record translation.
 
-## Coordinated first release
+## Coordinate Cargo-Rail and Action releases
 
 Qualify the source-built Cargo-Rail binary
 and authenticated archive against the Action's independent consumer before publication.
-Publish Cargo-Rail `0.26.0` first, using its own source-built workflow and an explicit `0.26.0` bump.
-The Action's workflow then installs that released engine and releases `9.0.0` with an explicit `9.0.0` bump.
+Publish Cargo-Rail first, then verify that GitHub identifies it as the latest stable release.
+The Action's release workflow then resolves that release, validates its authenticated components,
+and releases the Action.
 Its configured `v9` alias moves only after the immutable release is verified and only
 if the prior alias object still matches the request.
 

@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::RailConfig;
@@ -18,12 +18,13 @@ mod evidence;
 mod source_features;
 mod work;
 
-pub(crate) use work::{WorkPlan, WorkPlanAuthority, build_work_plan, format_work_plan};
+pub(crate) use work::{WorkPlan, WorkPlanAuthority, build_work_plan, format_work_plan, validate_saved_work_plan};
 
 const CONFIG_CANDIDATES: &[&str] = &["rail.toml", ".rail.toml", ".cargo/rail.toml", ".config/rail.toml"];
 
 /// One exact effective configuration leaf whose value changed.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ConfigDelta {
     pub(crate) path: String,
     pub(crate) before: Value,
@@ -31,13 +32,14 @@ pub(crate) struct ConfigDelta {
 }
 
 /// One portable changed-path fact retained from the captured source authority.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct IndexedFileChange {
     pub(crate) path: String,
     pub(crate) kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) relation: Option<String>,
-    pub(crate) provenance: Vec<&'static str>,
+    pub(crate) provenance: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) before: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -168,7 +170,7 @@ fn change_relation(relation: &crate::source::ChangeRelation) -> String {
     }
 }
 
-fn change_provenance(provenance: crate::source::ChangeProvenance) -> Vec<&'static str> {
+fn change_provenance(provenance: crate::source::ChangeProvenance) -> Vec<String> {
     [
         (crate::source::ChangeLayer::Committed, "committed"),
         (crate::source::ChangeLayer::Staged, "staged"),
@@ -176,7 +178,8 @@ fn change_provenance(provenance: crate::source::ChangeProvenance) -> Vec<&'stati
         (crate::source::ChangeLayer::Untracked, "untracked"),
     ]
     .into_iter()
-    .filter_map(|(layer, name)| provenance.contains(layer).then_some(name))
+    .filter(|(layer, _)| provenance.contains(*layer))
+    .map(|(_, name)| name.to_string())
     .collect()
 }
 

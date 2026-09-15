@@ -29,7 +29,7 @@ cargo rail config validate --strict
 
 Bare `cargo rail config` shows configured overrides and the active source, or reports that coded defaults apply.
 `config explain --all` reports configured and effective values, defaults, sources, and field rationale.
-To select fields, pass their exact paths, such as `config explain surface.enabled surface.targets --json`.
+Pass leaf paths for exact fields, or a parent node to enumerate its effective children, such as `config explain surface --json`.
 Both commands validate policy before reporting success.
 Unknown keys, unreadable files, and failed Cargo workspace discovery are errors;
 a missing explicit `--config PATH` never falls back to defaults.
@@ -55,7 +55,7 @@ Ordinary file inspection validates against the selected Cargo workspace.
 
 ## Compatibility
 
-Version 0.26 accepts only current configuration fields.
+The current Cargo-Rail release accepts only current configuration fields.
 Configuration inspection leaves the input file unchanged;
 unsupported keys fail before planning or mutation.
 Historical comparisons apply the same decoder and identify the revision and configuration path
@@ -130,16 +130,28 @@ Direct `cargo rail surface` inspection is available even when the gate is disabl
 Surface analyzes the host by default.
 Set `surface.targets = "workspace"` to analyze the host and every top-level target,
 or list a non-empty subset of `"host"` and the configured top-level targets.
+Top-level `targets` are supported dependency-resolution views.
+They do not assert that one host has every Rust target, SDK, linker,
+or native dependency needed to execute those views.
+Surface owns its execution matrix separately.
 
 Keep `consumer_scope = "open"` unless the workspace owns every consumer of its non-publishable compiler crates.
+Closed-world pruning requires reviewed evidence covering published APIs, downstream repositories,
+plugins, generated code, and build-script or proc-macro consumers.
+The current checkout's Cargo graph is not sufficient evidence by itself.
 Declare products, external crates, feature profiles, doctest coverage, lint levels, overrides,
 and exclusions only when Cargo-Rail's automatic workspace model does not express the intended
 boundary.
 
 `cargo rail surface --schema` exposes the report contract.
 `surface --check` does not modify source; `surface --fix --dry-run` previews exact source edits before `surface --fix` receives write authority.
+When JSON output is written with `--output`,
+long-running acquisition keeps one bounded progress update on stderr every 30 seconds.
+`--quiet` suppresses those updates.
+JSON written to stdout remains silent on stderr.
 
-Surface report contract v3 separates raw compiler observations from merged physical declarations.
+Surface report contract v4 separates raw compiler observations from merged physical declarations
+and reports target scope independently from complete product, feature-profile, and doctest coverage.
 Its `retention` section reports both denominators, per-predicate observation and unique-item counts,
 and at most three deterministic representatives per predicate.
 `--explain` additionally runs an omit-one-reason counterfactual before diagnostic policy;

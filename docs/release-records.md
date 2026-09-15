@@ -79,7 +79,8 @@ and 1 GiB for the archive and its expanded inventory.
 GitHub draft recovery checks the exact source, tag, title, body, prerelease flag,
 and asset inventory.
 The record retains the observed release ID before asset uploads.
-Recovery reads that release by ID. If creation succeeded before its ID was retained,
+Recovery reads that release by ID.
+If creation succeeded before its ID was retained,
 recovery searches the paginated release list and rejects multiple releases with the intended tag.
 A partial draft can receive its missing assets;
 existing assets must already match their sealed sizes and SHA-256 digests.

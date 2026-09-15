@@ -7,12 +7,14 @@ pub(crate) mod report;
 pub(crate) mod result;
 
 use crate::error::{RailError, RailResult};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
 const STATUS_SCAN_MAX_ENTRIES: usize = 1_000_000;
 const WORKSPACE_LOCK_BYTES: u64 = 0;
+const READINESS_RECEIPT_FILE: &str = "cache-readiness-v1.json";
+const MAX_READINESS_RECEIPT_BYTES: u64 = 16 * 1024;
 
 struct WorkspaceCachePaths {
     state_root: PathBuf,
@@ -107,6 +109,8 @@ pub(crate) struct SharedCacheStatus {
 pub(crate) struct CacheStatus {
     pub(crate) schema_version: u32,
     pub(crate) installation: crate::cache::installation::InstallationStatus,
+    pub(crate) selected_toolchain_readiness: &'static str,
+    pub(crate) remote_authority: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) workspace: Option<WorkspaceCacheStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -136,17 +140,34 @@ impl CacheRemoval {
 /// Inspect selected cache scopes without creating or modifying cache state.
 pub(crate) fn status(workspace_root: &Path, workspace: bool, local: bool) -> RailResult<CacheStatus> {
     let installation = crate::cache::installation::status(workspace_root)?;
-    let transparent_installed = installation.wrapper_path.is_some();
+    let transparent_installed = matches!(installation.state, "installed" | "drifted");
     let profile_scoped = installation.profile_id.is_some();
-    let remote = if local {
+    let remote_inspectable = !matches!(installation.state, "stale" | "drifted");
+    let remote = if local && remote_inspectable {
         crate::remote_cache::configuration_status(workspace_root)
             .map_err(|error| RailError::message(format!("remote cache configuration is unavailable: {error}")))?
     } else {
         None
     };
+    let selected_toolchain_readiness = readiness_state(
+        workspace_root,
+        installation.profile_id.as_deref(),
+        installation.component_authentication,
+    );
+    let remote_authority = if local {
+        if remote_inspectable {
+            remote.as_ref().map_or("not_configured", |remote| remote.mode)
+        } else {
+            "unavailable"
+        }
+    } else {
+        "not_inspected"
+    };
     Ok(CacheStatus {
-        schema_version: 16,
+        schema_version: 18,
         installation,
+        selected_toolchain_readiness,
+        remote_authority,
         workspace: workspace.then(|| workspace_status(workspace_root)).transpose()?,
         local: local
             .then(|| {
@@ -169,6 +190,113 @@ pub(crate) fn status(workspace_root: &Path, workspace: bool, local: bool) -> Rai
             .transpose()?,
         remote,
     })
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CacheReadinessReceipt {
+    version: u32,
+    profile_id: String,
+    rustc_identity: String,
+    uncached_success: bool,
+    cold_misses: u64,
+    warm_hits: u64,
+}
+
+pub(crate) fn record_readiness(
+    workspace_root: &Path,
+    profile_id: &str,
+    rustc_verbose: &str,
+    measurements: &crate::cache::report::Measurements,
+) -> RailResult<()> {
+    let _lock = lock_workspace(workspace_root)?;
+    let paths = workspace_cache_paths(workspace_root)?;
+    match fs::create_dir(&paths.compiler_artifacts) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    let metadata = fs::symlink_metadata(&paths.compiler_artifacts)?;
+    if !metadata.is_dir() || crate::utils::is_symlink_or_reparse(&metadata) {
+        return Err(RailError::message(
+            "cache readiness receipt directory is not a real directory",
+        ));
+    }
+    let receipt = CacheReadinessReceipt {
+        version: 1,
+        profile_id: profile_id.to_string(),
+        rustc_identity: rustc_readiness_identity(rustc_verbose),
+        uncached_success: true,
+        cold_misses: measurements.misses,
+        warm_hits: measurements.hits,
+    };
+    installation::write_private_atomic(
+        &paths.compiler_artifacts.join(READINESS_RECEIPT_FILE),
+        &serde_json::to_vec(&receipt)?,
+    )
+}
+
+pub(crate) fn readiness_probe_parent(workspace_root: &Path) -> RailResult<PathBuf> {
+    let _lock = lock_workspace(workspace_root)?;
+    let paths = workspace_cache_paths(workspace_root)?;
+    match fs::create_dir(&paths.compiler_artifacts) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    let parent = crate::utils::canonicalize_existing(&paths.compiler_artifacts)?;
+    if parent != paths.compiler_artifacts || !parent.starts_with(crate::utils::canonicalize_existing(workspace_root)?) {
+        return Err(RailError::message(
+            "cache readiness probe directory escaped the workspace",
+        ));
+    }
+    Ok(parent)
+}
+
+pub(crate) fn read_bounded_private_file(path: &Path, max_bytes: u64) -> RailResult<Option<Vec<u8>>> {
+    installation::read_optional_regular(path, max_bytes)
+}
+
+fn readiness_state(workspace_root: &Path, profile_id: Option<&str>, component_authentication: &str) -> &'static str {
+    let Some(profile_id) = profile_id else {
+        return "not_enrolled";
+    };
+    if component_authentication != "authenticated" {
+        return "components_unavailable";
+    }
+    match validate_readiness_receipt(workspace_root, profile_id) {
+        Ok(Some(true)) => "ready",
+        Ok(Some(false)) => "stale",
+        Ok(None) => "not_probed",
+        Err(_) => "unavailable",
+    }
+}
+
+fn validate_readiness_receipt(workspace_root: &Path, profile_id: &str) -> RailResult<Option<bool>> {
+    let path = workspace_cache_paths(workspace_root)?
+        .compiler_artifacts
+        .join(READINESS_RECEIPT_FILE);
+    let Some(bytes) = installation::read_optional_regular(&path, MAX_READINESS_RECEIPT_BYTES)? else {
+        return Ok(None);
+    };
+    let receipt: CacheReadinessReceipt = serde_json::from_slice(&bytes)?;
+    let config = crate::cargo::CargoConfigSnapshot::capture(workspace_root)?;
+    let rustc_verbose = config.direct_rustc_verbose_version(workspace_root)?;
+    Ok(Some(
+        receipt.version == 1
+            && receipt.profile_id == profile_id
+            && receipt.uncached_success
+            && receipt.cold_misses > 0
+            && receipt.warm_hits > 0
+            && receipt.rustc_identity == rustc_readiness_identity(&rustc_verbose),
+    ))
+}
+
+fn rustc_readiness_identity(rustc_verbose: &str) -> String {
+    format!(
+        "sha256:{}",
+        crate::source::ContentDigest::sha256(rustc_verbose.as_bytes())
+    )
 }
 
 /// Remove reconstructible cache state inside one workspace.
@@ -224,7 +352,7 @@ pub(crate) fn remove_local(workspace_root: &Path) -> RailResult<CacheRemoval> {
         })
 }
 
-fn workspace_status(workspace_root: &Path) -> RailResult<WorkspaceCacheStatus> {
+pub(crate) fn workspace_status(workspace_root: &Path) -> RailResult<WorkspaceCacheStatus> {
     let paths = workspace_cache_paths(workspace_root)?;
     workspace_status_for_paths(&paths)
 }

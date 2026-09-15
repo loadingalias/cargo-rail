@@ -63,8 +63,14 @@ use std::fs::{self, File};
 use std::io::{BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
-use std::sync::{Arc, atomic::AtomicBool, mpsc};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    mpsc,
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const ACQUISITION_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Compiler diagnostics collector and cache coordinator.
 pub(crate) struct CompilerDiagnosticsCollector<'a> {
@@ -90,6 +96,33 @@ impl CompilerArtifactBudget {
             hard_limit_bytes,
         }
     }
+
+    pub(crate) const fn soft_limit_bytes(self) -> u64 {
+        self.soft_limit_bytes
+    }
+
+    pub(crate) const fn hard_limit_bytes(self) -> u64 {
+        self.hard_limit_bytes
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct CompilerAcquisitionPreview {
+    pub(crate) view_count: usize,
+    pub(crate) process_slots: usize,
+    pub(crate) work_permits: usize,
+    pub(crate) sandbox_count: usize,
+    pub(crate) feature_profiles: Vec<String>,
+    pub(crate) doctest_profiles: Vec<CompilerDoctestProfile>,
+    pub(crate) artifact_soft_limit_bytes: u64,
+    pub(crate) artifact_hard_limit_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub(crate) struct CompilerDoctestProfile {
+    pub(crate) package: String,
+    pub(crate) target: String,
+    pub(crate) features: String,
 }
 
 impl Default for CompilerArtifactBudget {
@@ -111,6 +144,13 @@ pub(crate) struct CompilerAnalysisMetrics {
     pub(crate) analysis_views: usize,
     pub(crate) cargo_views_executed: usize,
     pub(crate) compiler_invocations: usize,
+    pub(crate) dependency_compilations: usize,
+    pub(crate) repeated_dependency_compilations: usize,
+    pub(crate) driver_preparations: usize,
+    pub(crate) driver_preparation_elapsed_ns: u64,
+    pub(crate) fresh_fact_objects: usize,
+    pub(crate) native_cache_bytes_hashed: u64,
+    pub(crate) retained_cargo_output_bytes: u64,
     pub(crate) diagnostic_cache_hits: usize,
     pub(crate) diagnostic_cache_misses: usize,
     pub(crate) fact_cache_hits: usize,
@@ -122,16 +162,79 @@ pub(crate) struct CompilerAnalysisMetrics {
     pub(crate) artifact_high_water_bytes: u64,
 }
 
+#[derive(Debug, Default)]
+struct ArtifactUsageLedger {
+    current_bytes: AtomicU64,
+    peak_bytes: AtomicU64,
+}
+
+impl ArtifactUsageLedger {
+    fn track(&self) -> ArtifactUsageGuard<'_> {
+        ArtifactUsageGuard { ledger: self, bytes: 0 }
+    }
+
+    fn snapshot(&self) -> (u64, u64) {
+        (
+            self.current_bytes.load(Ordering::Relaxed),
+            self.peak_bytes.load(Ordering::Relaxed),
+        )
+    }
+}
+
+struct ArtifactUsageGuard<'a> {
+    ledger: &'a ArtifactUsageLedger,
+    bytes: u64,
+}
+
+impl ArtifactUsageGuard<'_> {
+    fn observe(&mut self, bytes: u64) -> u64 {
+        let current = if bytes >= self.bytes {
+            self.ledger
+                .current_bytes
+                .fetch_add(bytes - self.bytes, Ordering::Relaxed)
+                .saturating_add(bytes - self.bytes)
+        } else {
+            self.ledger
+                .current_bytes
+                .fetch_sub(self.bytes - bytes, Ordering::Relaxed)
+                .saturating_sub(self.bytes - bytes)
+        };
+        self.bytes = bytes;
+        self.ledger.peak_bytes.fetch_max(current, Ordering::Relaxed);
+        current
+    }
+}
+
+impl Drop for ArtifactUsageGuard<'_> {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            let previous = self.ledger.current_bytes.fetch_sub(self.bytes, Ordering::Relaxed);
+            debug_assert!(previous >= self.bytes, "compiler artifact usage ledger underflowed");
+        }
+    }
+}
+
 fn compiler_artifact_bytes(root: &Path) -> RailResult<u64> {
     let started = crate::instrumentation::compiler_acquisition_timer();
     let result = (|| {
         let mut bytes = 0_u64;
         let mut pending = vec![root.to_path_buf()];
         while let Some(path) = pending.pop() {
-            let metadata = fs::symlink_metadata(&path)?;
+            let Some(metadata) = compiler_artifact_metadata(root, &path)? else {
+                continue;
+            };
             if metadata.is_dir() && !crate::utils::is_symlink_or_reparse(&metadata) {
-                for entry in fs::read_dir(&path)? {
-                    pending.push(entry?.path());
+                let entries = match fs::read_dir(&path) {
+                    Ok(entries) => entries,
+                    Err(error) if path != root && error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                for entry in entries {
+                    match entry {
+                        Ok(entry) => pending.push(entry.path()),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
                 }
             } else if metadata.is_file() && !crate::utils::is_symlink_or_reparse(&metadata) {
                 bytes = bytes
@@ -148,6 +251,14 @@ fn compiler_artifact_bytes(root: &Path) -> RailResult<u64> {
     })();
     crate::instrumentation::record_compiler_acquisition_artifact_tree_walk(started);
     result
+}
+
+fn compiler_artifact_metadata(root: &Path, path: &Path) -> RailResult<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if path != root && error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Exact snapshot-derived inputs shared by every compiler-evidence key.
@@ -1542,6 +1653,65 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
         self
     }
 
+    pub(crate) fn preview_typed_items(
+        &self,
+        typed_packages: &BTreeSet<String>,
+        doctest_packages: &BTreeSet<String>,
+        features: Option<&[FeatureSelection]>,
+    ) -> RailResult<CompilerAcquisitionPreview> {
+        let plan = self.acquisition_plan(&[], typed_packages, doctest_packages, features)?;
+        let execution = ExecutionPolicy::derive(
+            plan.view_count(),
+            self.identity.analysis_cache.is_some(),
+            self.identity.explicit_build_jobs,
+        );
+        let feature_profiles = plan
+            .views()
+            .map(|view| view.features().label())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let doctest_profiles = plan
+            .views()
+            .filter(|view| view.compiles_doctests())
+            .map(|view| CompilerDoctestProfile {
+                package: view.package().to_string(),
+                target: view.platform().to_string(),
+                features: view.features().label(),
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        Ok(CompilerAcquisitionPreview {
+            view_count: plan.view_count(),
+            process_slots: execution.process_slots(),
+            work_permits: execution.work_permits(),
+            sandbox_count: execution.sandbox_count(),
+            feature_profiles,
+            doctest_profiles,
+            artifact_soft_limit_bytes: self.artifact_budget.soft_limit_bytes(),
+            artifact_hard_limit_bytes: self.artifact_budget.hard_limit_bytes(),
+        })
+    }
+
+    fn acquisition_plan(
+        &self,
+        candidates: &[CompilerCandidate],
+        typed_packages: &BTreeSet<String>,
+        doctest_packages: &BTreeSet<String>,
+        features: Option<&[FeatureSelection]>,
+    ) -> RailResult<CompilerAcquisitionPlan> {
+        let schedule = AnalysisSchedule::for_combined_with_features(
+            &self.manifests.members,
+            &self.targets,
+            candidates,
+            typed_packages,
+            doctest_packages,
+            features,
+        )?;
+        CompilerAcquisitionPlan::from_schedule(&schedule, candidates, &self.targets)
+    }
+
     /// Collect diagnostics for selected workspace members.
     pub(crate) fn collect_for_candidates(
         &self,
@@ -1589,16 +1759,8 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
         features: Option<&[FeatureSelection]>,
         snapshot: Option<&WorkspaceSnapshot>,
     ) -> RailResult<CompilerAnalysisEvidence> {
-        let schedule = AnalysisSchedule::for_combined_with_features(
-            &self.manifests.members,
-            &self.targets,
-            candidates,
-            typed_packages,
-            doctest_packages,
-            features,
-        )?;
         let plan_started = crate::instrumentation::compiler_acquisition_timer();
-        let plan = CompilerAcquisitionPlan::from_schedule(&schedule, candidates, &self.targets)?;
+        let plan = self.acquisition_plan(candidates, typed_packages, doctest_packages, features)?;
         crate::instrumentation::record_compiler_acquisition_plan(
             plan_started,
             plan.identity().as_str(),
@@ -1681,6 +1843,7 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
         let mut stale_by_view = vec![Vec::<&str>::new(); plan.view_count()];
         let mut typed_view = vec![false; plan.view_count()];
         let mut retained_observations = HashMap::<String, CompilationObservationManifest>::new();
+        let mut dependency_compilation_counts = HashMap::<String, usize>::new();
         let mut surviving_unused: HashMap<String, BTreeSet<CandidateId>> = candidate_targets
             .iter()
             .map(|(member, candidates)| (member.clone(), candidates.keys().cloned().collect()))
@@ -1846,15 +2009,17 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
 
         let requires_typed = prepared_by_view.iter().flatten().any(|prepared| prepared.collect_typed);
         if requires_typed {
-            prepared_driver = Some(
-                PreparedCompilerFactDriver::prepare(
-                    typed_snapshot.ok_or_else(|| RailError::message("typed compiler fact snapshot disappeared"))?,
-                    producer_authority
-                        .as_ref()
-                        .ok_or_else(|| RailError::message("typed compiler fact producer authority disappeared"))?,
-                )
-                .with_context(|| "preparing authenticated compiler fact driver".to_string())?,
-            );
+            let started = Instant::now();
+            let driver = PreparedCompilerFactDriver::prepare(
+                typed_snapshot.ok_or_else(|| RailError::message("typed compiler fact snapshot disappeared"))?,
+                producer_authority
+                    .as_ref()
+                    .ok_or_else(|| RailError::message("typed compiler fact producer authority disappeared"))?,
+            )
+            .with_context(|| "preparing authenticated compiler fact driver".to_string())?;
+            metrics.driver_preparations = 1;
+            metrics.driver_preparation_elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            prepared_driver = Some(driver);
         }
         let requires_doctest = prepared_by_view
             .iter()
@@ -1943,9 +2108,16 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
             }
         }
         let cancellation = AtomicBool::new(false);
+        let artifact_usage = ArtifactUsageLedger::default();
         let worker_count = execution_policy
             .process_slots()
             .min(prepared_by_view.iter().flatten().count());
+        let progress_total = prepared_by_view.iter().flatten().count();
+        let progress_started = Instant::now();
+        let mut next_periodic_progress = progress_started + ACQUISITION_PROGRESS_INTERVAL;
+        let mut progress_completed = 0usize;
+        let mut progress_failed = 0usize;
+        let mut progress_skipped = 0usize;
         let mut failures = Vec::<AcquisitionFailure>::new();
         if worker_count > 0 {
             let worker_context = AcquisitionWorkerContext {
@@ -1957,6 +2129,7 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                 artifact_budget: self.artifact_budget,
                 package_to_member: &package_to_member,
                 cancellation: &cancellation,
+                artifact_usage: &artifact_usage,
                 broker: acquisition_broker.as_ref(),
             };
             let execution = std::thread::scope(|scope| -> RailResult<()> {
@@ -1986,6 +2159,7 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                     let mut idle_workers = (0..worker_count).collect::<VecDeque<_>>();
                     let mut diagnostic_dispatch_order = VecDeque::new();
                     let mut diagnostic_completions = HashMap::<ViewIx, AcquisitionCompletion<'_>>::new();
+                    let mut active_views = BTreeMap::<usize, CompilerAcquisitionView<'_>>::new();
                     loop {
                         let mut made_progress = false;
                         if let Some(journal) = acquisition_journal.as_mut()
@@ -2010,6 +2184,7 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                                 })
                             })?;
                             made_progress |= !skipped.is_empty();
+                            progress_skipped += skipped.len();
                             for index in skipped {
                                 skipped_member_targets += stale_by_view[index.offset()].len();
                                 prepared_by_view[index.offset()].take();
@@ -2034,6 +2209,7 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                                 &candidate_targets,
                                 &fact_store,
                                 &mut metrics,
+                                &mut dependency_compilation_counts,
                                 &mut compiler_facts,
                                 &mut retained_observations,
                                 &mut surviving_unused,
@@ -2126,13 +2302,18 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                                 || prepared.ordinal + 1 == acquisition_views
                                 || (prepared.ordinal + 1).is_multiple_of(acquisition_progress_interval);
                             if report_progress {
-                                progress!(
-                                    "  Collecting compiler evidence view {}/{} for target {} ({} package{})...",
-                                    prepared.ordinal + 1,
-                                    metrics.analysis_views,
-                                    format_args!("{} / {}", view.platform(), features.label()),
-                                    active_members,
-                                    if active_members == 1 { "" } else { "s" }
+                                let (current_bytes, peak_bytes) = artifact_usage.snapshot();
+                                report_acquisition_progress(
+                                    progress_total,
+                                    progress_completed,
+                                    runtime.running(),
+                                    progress_failed,
+                                    progress_skipped,
+                                    current_bytes,
+                                    peak_bytes,
+                                    progress_started,
+                                    "active",
+                                    view,
                                 );
                             }
                             let sandbox = match sandbox_pool.lease(SandboxCompatibility::new(
@@ -2209,6 +2390,7 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                                 && let Some((worker, index, job)) = staged_jobs.pop_front()
                             {
                                 let has_diagnostics = !job.diagnostic_members.is_empty();
+                                let active_view = job.prepared.view;
                                 if let Err(send_error) = job_senders[worker].send(job) {
                                     let job = send_error.0;
                                     let ordinal = job.prepared.ordinal;
@@ -2230,6 +2412,12 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                                     ));
                                     break;
                                 }
+                                let prior = active_views.insert(index.offset(), active_view);
+                                if prior.is_some() {
+                                    return Err(RailError::message(
+                                        "compiler acquisition started one active view twice",
+                                    ));
+                                }
                                 if has_diagnostics {
                                     diagnostic_dispatch_order.push_back(index);
                                 }
@@ -2248,39 +2436,77 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                                 "compiler acquisition runtime stalled with nonterminal views",
                             ));
                         }
-                        let outcome = if let Some(timeout) = acquisition_journal
+                        let progress_timeout = next_periodic_progress.saturating_duration_since(Instant::now());
+                        let journal_timeout = acquisition_journal
                             .as_ref()
-                            .and_then(CompilerAcquisitionJournal::completion_flush_timeout)
-                        {
-                            match outcome_rx.recv_timeout(timeout) {
-                                Ok(outcome) => outcome,
-                                Err(mpsc::RecvTimeoutError::Timeout) => {
-                                    if let Some(journal) = acquisition_journal.as_mut()
-                                        && let Err(error) = journal.flush_if_due()
-                                    {
-                                        cancellation.store(true, std::sync::atomic::Ordering::Release);
-                                        failures.push(AcquisitionFailure::global(FailureClass::Journal, error));
-                                        break;
+                            .and_then(CompilerAcquisitionJournal::completion_flush_timeout);
+                        let wait_timeout =
+                            journal_timeout.map_or(progress_timeout, |timeout| timeout.min(progress_timeout));
+                        let outcome = match outcome_rx.recv_timeout(wait_timeout) {
+                            Ok(outcome) => outcome,
+                            Err(mpsc::RecvTimeoutError::Timeout) => {
+                                if let Some(journal) = acquisition_journal.as_mut()
+                                    && let Err(error) = journal.flush_if_due()
+                                {
+                                    cancellation.store(true, std::sync::atomic::Ordering::Release);
+                                    failures.push(AcquisitionFailure::global(FailureClass::Journal, error));
+                                    break;
+                                }
+                                if Instant::now() >= next_periodic_progress {
+                                    if let Some((_, view)) = active_views.first_key_value() {
+                                        let (current_bytes, peak_bytes) = artifact_usage.snapshot();
+                                        report_acquisition_progress(
+                                            progress_total,
+                                            progress_completed,
+                                            runtime.running(),
+                                            progress_failed,
+                                            progress_skipped,
+                                            current_bytes,
+                                            peak_bytes,
+                                            progress_started,
+                                            if runtime.cancelled() { "cancelling" } else { "active" },
+                                            *view,
+                                        );
                                     }
-                                    continue;
+                                    next_periodic_progress = Instant::now() + ACQUISITION_PROGRESS_INTERVAL;
                                 }
-                                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                                    return Err(RailError::message(
-                                        "compiler acquisition workers stopped with live views",
-                                    ));
-                                }
+                                continue;
                             }
-                        } else {
-                            outcome_rx.recv().map_err(|_| {
-                                RailError::message("compiler acquisition workers stopped with live views")
-                            })?
+                            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                                return Err(RailError::message(
+                                    "compiler acquisition workers stopped with live views",
+                                ));
+                            }
                         };
                         idle_workers.push_back(outcome.worker);
                         sandbox_pool.reclaim(outcome.sandbox)?;
                         let completion = outcome.completion;
                         let index = completion.prepared.view.index();
+                        if active_views.remove(&index.offset()).is_none() {
+                            return Err(RailError::message(
+                                "compiler acquisition completed a view that was not active",
+                            ));
+                        }
+                        let progress_view = completion.prepared.view;
+                        let report_progress = completion.started.is_some();
                         if runtime.cancelled() {
                             runtime.discard_running(index)?;
+                            progress_failed += usize::from(completion.result.is_err());
+                            if report_progress {
+                                let (current_bytes, peak_bytes) = artifact_usage.snapshot();
+                                report_acquisition_progress(
+                                    progress_total,
+                                    progress_completed,
+                                    runtime.running(),
+                                    progress_failed,
+                                    progress_skipped,
+                                    current_bytes,
+                                    peak_bytes,
+                                    progress_started,
+                                    "cancelled",
+                                    progress_view,
+                                );
+                            }
                             if let Err(error) = completion.result {
                                 failures.push(AcquisitionFailure::view(
                                     completion.prepared.ordinal,
@@ -2295,6 +2521,22 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                         if completion.result.is_err() {
                             cancellation.store(true, std::sync::atomic::Ordering::Release);
                             runtime.fail(index)?;
+                            progress_failed += 1;
+                            if report_progress {
+                                let (current_bytes, peak_bytes) = artifact_usage.snapshot();
+                                report_acquisition_progress(
+                                    progress_total,
+                                    progress_completed,
+                                    runtime.running(),
+                                    progress_failed,
+                                    progress_skipped,
+                                    current_bytes,
+                                    peak_bytes,
+                                    progress_started,
+                                    "failed",
+                                    progress_view,
+                                );
+                            }
                             let AcquisitionCompletion {
                                 prepared,
                                 failed_cargo_targets,
@@ -2322,6 +2564,22 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                             diagnostic_dispatch_order.clear();
                         } else {
                             runtime.executed(index)?;
+                            progress_completed += 1;
+                            if report_progress {
+                                let (current_bytes, peak_bytes) = artifact_usage.snapshot();
+                                report_acquisition_progress(
+                                    progress_total,
+                                    progress_completed,
+                                    runtime.running(),
+                                    progress_failed,
+                                    progress_skipped,
+                                    current_bytes,
+                                    peak_bytes,
+                                    progress_started,
+                                    "completed",
+                                    progress_view,
+                                );
+                            }
                             if !completion.diagnostic_members.is_empty() {
                                 diagnostic_completions.insert(index, completion);
                                 continue;
@@ -2335,6 +2593,7 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                                 &candidate_targets,
                                 &fact_store,
                                 &mut metrics,
+                                &mut dependency_compilation_counts,
                                 &mut compiler_facts,
                                 &mut retained_observations,
                                 &mut surviving_unused,
@@ -2397,6 +2656,8 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                 failures.push(AcquisitionFailure::coordinator(error));
             }
         }
+        let (_, command_artifact_peak_bytes) = artifact_usage.snapshot();
+        metrics.artifact_high_water_bytes = metrics.artifact_high_water_bytes.max(command_artifact_peak_bytes);
         if let Some(broker) = acquisition_broker
             && let Err(error) = broker.close()
         {
@@ -2408,11 +2669,7 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
         if !failures.is_empty() {
             failures.sort_by_key(|failure| (failure.class == FailureClass::Cancelled, failure.ordinal, failure.view));
             let primary = failures.remove(0);
-            let mut error = primary.error.to_string();
-            for secondary in failures {
-                error.push_str("; cleanup or concurrent failure: ");
-                error.push_str(&secondary.error.to_string());
-            }
+            let error = render_acquisition_failures(&plan, &primary, &failures)?;
             if let Some(journal) = acquisition_journal.as_mut() {
                 let durable_primary = primary.view.map(|view| (view, primary.cargo_targets, primary.class));
                 if let Err(journal_error) = journal.fail(durable_primary, primary.class) {
@@ -2743,7 +3000,10 @@ struct WorkspaceCheckOutput {
     invocations: Vec<crate::compiler::observation::RawCompilerInvocation>,
     compiler_facts: Vec<ValidatedCompilerFactObject>,
     analysis_contract: AnalysisContract,
+    dependency_compilations: Vec<String>,
+    retained_output_bytes: u64,
     artifact_preflight: ArtifactPreflight,
+    artifact_current_bytes: u64,
     artifact_high_water_bytes: u64,
 }
 
@@ -2831,6 +3091,7 @@ struct AcquisitionWorkerContext<'a> {
     artifact_budget: CompilerArtifactBudget,
     package_to_member: &'a HashMap<String, String>,
     cancellation: &'a AtomicBool,
+    artifact_usage: &'a ArtifactUsageLedger,
     broker: Option<&'a crate::compiler::acquisition::broker::AcquisitionBroker>,
 }
 
@@ -2855,6 +3116,105 @@ struct AcquisitionFailure {
     cargo_targets: Vec<CompilerAcquisitionCargoTarget>,
     class: FailureClass,
     error: RailError,
+}
+
+fn render_acquisition_failures(
+    plan: &CompilerAcquisitionPlan,
+    primary: &AcquisitionFailure,
+    secondary: &[AcquisitionFailure],
+) -> RailResult<String> {
+    const MAX_AFFECTED_VIEWS: usize = 16;
+    const MAX_SECONDARY_CAUSES: usize = 4;
+
+    let primary_cause = acquisition_failure_cause(&primary.error);
+    let mut affected = primary.view.into_iter().collect::<BTreeSet<_>>();
+    let mut causes = BTreeMap::<String, BTreeSet<ViewIx>>::new();
+    let mut global_causes = BTreeMap::<String, usize>::new();
+    for failure in secondary {
+        affected.extend(failure.view);
+        let cause = acquisition_failure_cause(&failure.error);
+        if failure.class == FailureClass::Cancelled || cause == primary_cause {
+            continue;
+        }
+        if let Some(view) = failure.view {
+            causes.entry(cause).or_default().insert(view);
+        } else {
+            *global_causes.entry(cause).or_default() += 1;
+        }
+    }
+
+    let mut rendered = primary.error.to_string();
+    if !affected.is_empty() {
+        let mut labels = affected
+            .iter()
+            .take(MAX_AFFECTED_VIEWS)
+            .map(|view| plan.view(*view).map(acquisition_view_label))
+            .collect::<RailResult<Vec<_>>>()?;
+        let omitted = affected.len().saturating_sub(labels.len());
+        if omitted > 0 {
+            labels.push(format!("+{omitted} more"));
+        }
+        rendered.push_str("; affected views: ");
+        rendered.push_str(&labels.join(", "));
+    }
+
+    let mut additional = causes
+        .into_iter()
+        .map(|(cause, views)| format!("{cause} ({} view(s))", views.len()))
+        .chain(
+            global_causes
+                .into_iter()
+                .map(|(cause, count)| format!("{cause} ({count} global occurrence(s))")),
+        )
+        .take(MAX_SECONDARY_CAUSES + 1)
+        .collect::<Vec<_>>();
+    if additional.len() > MAX_SECONDARY_CAUSES {
+        additional.truncate(MAX_SECONDARY_CAUSES);
+        additional.push("additional causes omitted".to_string());
+    }
+    if !additional.is_empty() {
+        rendered.push_str("; distinct cleanup or concurrent failures: ");
+        rendered.push_str(&additional.join("; "));
+    }
+    Ok(rendered)
+}
+
+fn acquisition_failure_cause(error: &RailError) -> String {
+    match error {
+        RailError::Context { source, .. } => acquisition_failure_cause(source),
+        _ => error.to_string(),
+    }
+}
+
+fn acquisition_view_label(view: CompilerAcquisitionView<'_>) -> String {
+    format!("{} / {} / {}", view.package(), view.platform(), view.features().label())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one bounded progress snapshot reports the complete acquisition ledger"
+)]
+fn report_acquisition_progress(
+    total: usize,
+    completed: usize,
+    active: usize,
+    failed: usize,
+    skipped: usize,
+    current_bytes: u64,
+    peak_bytes: u64,
+    started: Instant,
+    state: &str,
+    view: CompilerAcquisitionView<'_>,
+) {
+    let remaining = total.saturating_sub(completed + active + failed + skipped);
+    progress!(
+        "  Compiler acquisition progress: completed={completed} active={active} failed={failed} remaining={remaining}; {state} view={} / target={}; elapsed={:.1}s; owned bytes={} current / {} peak",
+        acquisition_view_label(view),
+        view.platform(),
+        started.elapsed().as_secs_f64(),
+        current_bytes,
+        peak_bytes,
+    );
 }
 
 impl AcquisitionFailure {
@@ -2930,6 +3290,7 @@ fn execute_acquisition_job<'plan>(
                     .as_ref()
                     .map(crate::compiler::acquisition::broker::BrokerView::environment),
                 context.cancellation,
+                context.artifact_usage,
             );
             (broker_view, result)
         }
@@ -2973,6 +3334,7 @@ fn integrate_completed_acquisition(
     candidate_targets: &HashMap<String, BTreeMap<CandidateId, BTreeSet<String>>>,
     fact_store: &CompilerFactStore,
     metrics: &mut CompilerAnalysisMetrics,
+    dependency_compilation_counts: &mut HashMap<String, usize>,
     compiler_facts: &mut Vec<ValidatedCompilerFactObject>,
     retained_observations: &mut HashMap<String, CompilationObservationManifest>,
     surviving_unused: &mut HashMap<String, BTreeSet<CandidateId>>,
@@ -3001,6 +3363,7 @@ fn integrate_completed_acquisition(
         candidate_targets,
         fact_store,
         metrics,
+        dependency_compilation_counts,
         compiler_facts,
         retained_observations,
         surviving_unused,
@@ -3032,6 +3395,7 @@ fn integrate_acquisition_outcome(
     candidate_targets: &HashMap<String, BTreeMap<CandidateId, BTreeSet<String>>>,
     fact_store: &CompilerFactStore,
     metrics: &mut CompilerAnalysisMetrics,
+    dependency_compilation_counts: &mut HashMap<String, usize>,
     compiler_facts: &mut Vec<ValidatedCompilerFactObject>,
     retained_observations: &mut HashMap<String, CompilationObservationManifest>,
     surviving_unused: &mut HashMap<String, BTreeSet<CandidateId>>,
@@ -3044,19 +3408,40 @@ fn integrate_acquisition_outcome(
     let features = view.features();
     let preflight = run.artifact_preflight;
     progress!(
-        "    Compiler artifact preflight: {} bytes available; {} bytes soft; {} bytes hard; {} bytes reserved",
+        "    Compiler artifact preflight: {} bytes available; {} bytes command soft; {} bytes command hard; {} bytes reserved",
         preflight.initial_available_bytes,
         preflight.soft_limit_bytes,
         preflight.hard_limit_bytes,
         preflight.free_reserve_bytes
     );
     if let Some(observed) = preflight.soft_limit_observed_bytes {
-        progress!(
-            "    Compiler artifacts: at least {observed} bytes allocated since sandbox creation; soft limit reached"
-        );
+        progress!("    Compiler artifacts: command-owned working set reached {observed} bytes; soft limit reached");
     }
     metrics.cargo_views_executed += 1;
     metrics.compiler_invocations += run.invocations.len();
+    metrics.retained_cargo_output_bytes = metrics
+        .retained_cargo_output_bytes
+        .saturating_add(run.retained_output_bytes);
+    metrics.native_cache_bytes_hashed =
+        run.invocations
+            .iter()
+            .fold(metrics.native_cache_bytes_hashed, |total, invocation| {
+                total.saturating_add(
+                    invocation
+                        .cache_wrapper
+                        .as_ref()
+                        .map(CompilerCacheWrapperMetadata::bytes_hashed)
+                        .unwrap_or_default(),
+                )
+            });
+    for dependency in &run.dependency_compilations {
+        let count = dependency_compilation_counts.entry(dependency.clone()).or_default();
+        metrics.dependency_compilations += 1;
+        if *count > 0 {
+            metrics.repeated_dependency_compilations += 1;
+        }
+        *count += 1;
+    }
     metrics.artifact_high_water_bytes = metrics.artifact_high_water_bytes.max(run.artifact_high_water_bytes);
     let binding_invocations = run.invocations.clone();
     let binding_facts = run.compiler_facts.clone();
@@ -3071,6 +3456,7 @@ fn integrate_acquisition_outcome(
                         .ok_or_else(|| RailError::message("compiler fact fragment byte count overflow"))
                 })?;
         let fresh_facts = std::mem::take(&mut run.compiler_facts);
+        metrics.fresh_fact_objects += fresh_facts.len();
         if let Some(key) = &prepared.fact_cache_key {
             let bypasses = fact_invocation_cache_bypasses(&run.invocations, view.compiles_doctests());
             let complete_empty_view =
@@ -3100,9 +3486,11 @@ fn integrate_acquisition_outcome(
     }
     if let Some(started) = started {
         progress!(
-            "    Finished target {} in {:.1}s",
+            "    Finished target {} in {:.1}s ({} current view bytes / {} peak view bytes)",
             format_args!("{} / {}", target, features.label()),
-            started.elapsed().as_secs_f64()
+            started.elapsed().as_secs_f64(),
+            run.artifact_current_bytes,
+            run.artifact_high_water_bytes,
         );
     }
     if view.requires(crate::compiler::scheduler::CompilerFactFamily::StableDiagnostics)
@@ -3227,6 +3615,7 @@ fn run_workspace_check(
     failed_cargo_targets: &mut Vec<CompilerAcquisitionCargoTarget>,
     broker_environment: Option<&crate::compiler::acquisition::broker::BrokerEnvironment>,
     cancellation: &AtomicBool,
+    artifact_usage: &ArtifactUsageLedger,
 ) -> RailResult<WorkspaceCheckOutput> {
     if members != [view.package()] {
         return Err(RailError::message(
@@ -3343,10 +3732,11 @@ fn run_workspace_check(
 
     let bounded = run_artifact_bounded_command(
         &mut command,
-        &cargo_target,
+        sandbox.artifact_root(),
         artifact_budget,
         cancellation,
         broker_environment.is_some(),
+        artifact_usage,
     )
     .with_context(|| {
         format!(
@@ -3382,6 +3772,9 @@ fn run_workspace_check(
         doctest_sysroot.revalidate()?;
     }
 
+    let dependency_compilations = dependency_compilations(&bounded.stdout, package_to_member);
+    let retained_output_bytes =
+        u64::try_from(bounded.stdout.len().saturating_add(bounded.stderr.len())).unwrap_or(u64::MAX);
     let invocations = load_raw(observation_directory.path())?;
     crate::instrumentation::record_compiler_acquisition_actions(invocations.len());
     let compiler_fact_fragments = typed_session.as_ref().map_or_else(
@@ -3427,9 +3820,38 @@ fn run_workspace_check(
         invocations,
         compiler_facts,
         analysis_contract,
+        dependency_compilations,
+        retained_output_bytes,
         artifact_preflight: bounded.preflight,
+        artifact_current_bytes: bounded.current_bytes,
         artifact_high_water_bytes: bounded.high_water_bytes,
     })
+}
+
+fn dependency_compilations(stdout: &[u8], package_to_member: &HashMap<String, String>) -> Vec<String> {
+    Message::parse_stream(BufReader::new(stdout))
+        .filter_map(Result::ok)
+        .filter_map(|message| match message {
+            Message::CompilerArtifact(artifact)
+                if !artifact.fresh && !package_to_member.contains_key(artifact.package_id.repr.as_str()) =>
+            {
+                Some(format!(
+                    "{} / {} / {}",
+                    artifact.package_id,
+                    artifact.target.name,
+                    artifact
+                        .target
+                        .kind
+                        .iter()
+                        .filter_map(|kind| serde_json::to_value(kind).ok())
+                        .filter_map(|kind| kind.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                        .join("+")
+                ))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 fn compiler_error_targets(
@@ -3471,10 +3893,20 @@ fn compiler_error_targets(
 const MAX_COMPILER_ARTIFACT_FREE_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const COMPILER_ARTIFACT_FREE_RESERVE_DIVISOR: u64 = 10;
 const COMPILER_ARTIFACT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const COMPILER_ARTIFACT_ROUTINE_SCAN_INTERVAL: Duration = Duration::from_secs(5);
+const COMPILER_ARTIFACT_PRESSURE_SCAN_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Preserve ten percent on small volumes without reserving more than two GiB on normal workspace storage.
 fn compiler_artifact_free_reserve_bytes(total_space: u64) -> u64 {
     (total_space / COMPILER_ARTIFACT_FREE_RESERVE_DIVISOR).min(MAX_COMPILER_ARTIFACT_FREE_RESERVE_BYTES)
+}
+
+fn compiler_artifact_exact_scan_interval(command_bytes: u64, soft_limit_bytes: u64) -> Duration {
+    if command_bytes >= soft_limit_bytes {
+        COMPILER_ARTIFACT_PRESSURE_SCAN_INTERVAL
+    } else {
+        COMPILER_ARTIFACT_ROUTINE_SCAN_INTERVAL
+    }
 }
 
 #[derive(Debug)]
@@ -3483,6 +3915,7 @@ struct ArtifactBoundedCommandOutput {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     preflight: ArtifactPreflight,
+    current_bytes: u64,
     high_water_bytes: u64,
 }
 
@@ -3501,6 +3934,7 @@ fn run_artifact_bounded_command(
     budget: CompilerArtifactBudget,
     cancellation: &AtomicBool,
     broker_enabled: bool,
+    artifact_usage: &ArtifactUsageLedger,
 ) -> RailResult<ArtifactBoundedCommandOutput> {
     if budget.soft_limit_bytes == 0 || budget.hard_limit_bytes < budget.soft_limit_bytes {
         return Err(RailError::message("compiler artifact storage budget is invalid"));
@@ -3531,6 +3965,14 @@ fn run_artifact_bounded_command(
         ));
     }
     let effective_soft_limit = budget.soft_limit_bytes.min(effective_hard_limit);
+    let initial_artifact_bytes = compiler_artifact_bytes(artifact_root)?;
+    let mut owned_usage = artifact_usage.track();
+    let initial_command_bytes = owned_usage.observe(initial_artifact_bytes);
+    if initial_command_bytes > effective_hard_limit {
+        return Err(RailError::message(format!(
+            "compiler artifact preflight found {initial_command_bytes} bytes of command-owned artifacts, exceeding the {effective_hard_limit}-byte hard limit"
+        )));
+    }
     if cancellation.load(std::sync::atomic::Ordering::Acquire) {
         return Err(RailError::message(
             "compiler acquisition was cancelled before Cargo started",
@@ -3586,11 +4028,11 @@ fn run_artifact_bounded_command(
         }
     };
 
-    let probe_stride_bytes = (effective_hard_limit / 8).clamp(1024 * 1024, 8 * 1024 * 1024 * 1024);
-    let mut next_probe_bytes = effective_soft_limit;
-    let mut high_water_bytes = 0_u64;
+    let mut next_exact_scan = Instant::now();
+    let mut high_water_bytes = initial_artifact_bytes;
     let mut soft_reported = false;
     let mut budget_breach = None;
+    let mut capacity_breach = None;
     let mut monitor_error = None;
     let mut cancelled = false;
     let mut status = None;
@@ -3615,26 +4057,30 @@ fn run_artifact_bounded_command(
         }
         match fs2::available_space(artifact_root) {
             Ok(available) => {
-                let filesystem_delta = initial_available.saturating_sub(available);
-                high_water_bytes = high_water_bytes.max(filesystem_delta);
-                if !soft_reported && filesystem_delta >= effective_soft_limit {
-                    soft_reported = true;
+                if available < free_reserve {
+                    capacity_breach = Some(available);
+                    break;
                 }
-                if filesystem_delta >= next_probe_bytes {
-                    match compiler_artifact_bytes(artifact_root) {
+                if Instant::now() >= next_exact_scan {
+                    let scan_interval = match compiler_artifact_bytes(artifact_root) {
                         Ok(current_bytes) => {
+                            let command_bytes = owned_usage.observe(current_bytes);
                             high_water_bytes = high_water_bytes.max(current_bytes);
-                            if current_bytes > effective_hard_limit {
-                                budget_breach = Some(current_bytes);
+                            if !soft_reported && command_bytes >= effective_soft_limit {
+                                soft_reported = true;
+                            }
+                            if command_bytes > effective_hard_limit {
+                                budget_breach = Some(command_bytes);
                                 break;
                             }
+                            compiler_artifact_exact_scan_interval(command_bytes, effective_soft_limit)
                         }
                         Err(error) => {
                             monitor_error = Some(std::io::Error::other(error.to_string()));
                             break;
                         }
-                    }
-                    next_probe_bytes = filesystem_delta.saturating_add(probe_stride_bytes);
+                    };
+                    next_exact_scan = Instant::now() + scan_interval;
                 }
             }
             Err(error) => {
@@ -3679,6 +4125,10 @@ fn run_artifact_bounded_command(
             Some(format!("Cargo stdout {}: {stream_error}", stream_error.class()))
         } else if let Err(stream_error) = &stderr {
             Some(format!("Cargo stderr reader failure: {stream_error}"))
+        } else if let Some(available) = capacity_breach {
+            Some(format!(
+                "artifact storage fell to {available} available bytes below its {free_reserve}-byte reserve"
+            ))
         } else {
             budget_breach.map(|current_bytes| format!("artifact working set reached {current_bytes} bytes"))
         };
@@ -3696,23 +4146,32 @@ fn run_artifact_bounded_command(
         .map_err(|error| RailError::message(format!("Cargo compiler acquisition stdout {}: {error}", error.class())))?;
     let stderr = stderr
         .map_err(|error| RailError::message(format!("Cargo compiler acquisition stderr reader failure: {error}")))?;
+    if let Some(available) = capacity_breach {
+        return Err(RailError::with_help(
+            format!(
+                "compiler artifact storage fell to {available} available bytes, below its {free_reserve}-byte reserve"
+            ),
+            "free workspace storage or configure the operation on a filesystem with more available capacity",
+        ));
+    }
     if let Some(current_bytes) = budget_breach {
         return Err(RailError::with_help(
             format!(
-                "compiler artifact working set reached {current_bytes} bytes and exceeded its {effective_hard_limit}-byte hard limit"
+                "compiler artifact working set reached {current_bytes} bytes of command-owned artifacts and exceeded its {effective_hard_limit}-byte hard limit"
             ),
-            "increase unify.compiler_artifact_hard_limit_bytes only after verifying the workspace's required single-view working set",
+            "increase unify.compiler_artifact_hard_limit_bytes only after verifying the command's required working set",
         ));
     }
 
     let final_bytes = compiler_artifact_bytes(artifact_root)?;
+    let final_command_bytes = owned_usage.observe(final_bytes);
     high_water_bytes = high_water_bytes.max(final_bytes);
-    if final_bytes > effective_hard_limit {
+    if final_command_bytes > effective_hard_limit {
         return Err(RailError::with_help(
             format!(
-                "compiler artifact working set finished at {final_bytes} bytes and exceeded its {effective_hard_limit}-byte hard limit"
+                "compiler artifact working set finished at {final_command_bytes} bytes of command-owned artifacts and exceeded its {effective_hard_limit}-byte hard limit"
             ),
-            "increase unify.compiler_artifact_hard_limit_bytes only after verifying the workspace's required single-view working set",
+            "increase unify.compiler_artifact_hard_limit_bytes only after verifying the command's required working set",
         ));
     }
     let status = status.ok_or_else(|| RailError::message("Cargo compiler acquisition exited without a status"))?;
@@ -3725,8 +4184,9 @@ fn run_artifact_bounded_command(
             soft_limit_bytes: effective_soft_limit,
             hard_limit_bytes: effective_hard_limit,
             free_reserve_bytes: free_reserve,
-            soft_limit_observed_bytes: soft_reported.then_some(high_water_bytes),
+            soft_limit_observed_bytes: soft_reported.then_some(artifact_usage.snapshot().1),
         },
+        current_bytes: final_bytes,
         high_water_bytes,
     })
 }
@@ -6544,6 +7004,34 @@ mod tests {
     };
 
     #[test]
+    fn artifact_usage_ledger_sums_exact_concurrent_roots() {
+        let ledger = ArtifactUsageLedger::default();
+        let mut first = ledger.track();
+        let mut second = ledger.track();
+
+        assert_eq!(first.observe(3), 3);
+        assert_eq!(second.observe(5), 8);
+        assert_eq!(first.observe(2), 7);
+        assert_eq!(ledger.snapshot(), (7, 8));
+        drop(second);
+        assert_eq!(ledger.snapshot(), (2, 8));
+    }
+
+    #[test]
+    fn artifact_scan_tolerates_only_disappearing_descendants() {
+        let root = tempfile::tempdir().expect("artifact root");
+        let vanished = root.path().join("vanished");
+
+        assert!(
+            compiler_artifact_metadata(root.path(), &vanished)
+                .expect("disappearing descendant")
+                .is_none()
+        );
+        let missing_root = root.path().join("missing-root");
+        compiler_artifact_metadata(&missing_root, &missing_root).unwrap_err();
+    }
+
+    #[test]
     fn completed_compile_fail_doctest_ignores_only_its_absent_outputs() {
         let package = CompilerFactPackage {
             name: "member".to_string(),
@@ -6851,6 +7339,7 @@ mod tests {
             CompilerArtifactBudget::new(512 * 1024, 1024 * 1024),
             &AtomicBool::new(false),
             false,
+            &ArtifactUsageLedger::default(),
         )
         .expect_err("artifact growth must exceed the hard limit");
 
@@ -6874,6 +7363,7 @@ mod tests {
             CompilerArtifactBudget::default(),
             &AtomicBool::new(false),
             false,
+            &ArtifactUsageLedger::default(),
         )
         .expect_err("malformed Cargo output must fail");
 
@@ -6882,6 +7372,61 @@ mod tests {
             started.elapsed() < Duration::from_secs(8),
             "stream failure did not terminate the active process tree"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_terminates_descendants_and_removes_command_owned_artifacts() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut pool = SandboxPool::prepare(workspace.path(), 1).expect("sandbox pool");
+        let lease = pool
+            .lease(SandboxCompatibility::new(
+                "compiler",
+                "default",
+                "check",
+                "environment",
+                "wrapper",
+            ))
+            .expect("sandbox lease");
+        let generation = lease.artifact_root().to_path_buf();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let request = Arc::clone(&cancellation);
+        let requester = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            request.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "trap '' TERM; (trap '' TERM; while :; do sleep 1; done) & while :; do sleep 1; done",
+        ]);
+        let started = Instant::now();
+        let error = run_artifact_bounded_command(
+            &mut command,
+            lease.artifact_root(),
+            CompilerArtifactBudget::default(),
+            &cancellation,
+            false,
+            &ArtifactUsageLedger::default(),
+        )
+        .expect_err("cancellation must stop the owned process tree");
+        requester.join().expect("cancellation requester");
+        assert!(error.to_string().contains("cancelled"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(8));
+
+        drop(lease);
+        assert!(!generation.exists(), "cancelled sandbox generation survived its lease");
+        pool.close().expect("close sandbox pool");
+        let _reacquired = crate::cache::lock_workspace(workspace.path()).expect("workspace lock released");
+    }
+
+    #[test]
+    fn acquisition_failure_grouping_uses_the_shared_root_cause() {
+        let first = RailError::message("unsupported compiler preparation")
+            .context("acquiring compiler evidence for target 'host / default'");
+        let second = RailError::message("unsupported compiler preparation")
+            .context("acquiring compiler evidence for target 'host / all-features'");
+        assert_eq!(acquisition_failure_cause(&first), acquisition_failure_cause(&second));
     }
 
     #[cfg(unix)]
@@ -6899,6 +7444,7 @@ mod tests {
             CompilerArtifactBudget::default(),
             &AtomicBool::new(false),
             false,
+            &ArtifactUsageLedger::default(),
         )
         .expect("bounded noisy stderr");
 
@@ -6926,9 +7472,39 @@ mod tests {
     }
 
     #[test]
+    fn compiler_artifact_scans_accelerate_at_soft_limit_pressure() {
+        assert_eq!(
+            compiler_artifact_exact_scan_interval(1023, 1024),
+            COMPILER_ARTIFACT_ROUTINE_SCAN_INTERVAL
+        );
+        assert_eq!(
+            compiler_artifact_exact_scan_interval(1024, 1024),
+            COMPILER_ARTIFACT_PRESSURE_SCAN_INTERVAL
+        );
+        assert_eq!(
+            compiler_artifact_exact_scan_interval(2048, 1024),
+            COMPILER_ARTIFACT_PRESSURE_SCAN_INTERVAL
+        );
+    }
+
+    #[test]
     fn compiler_artifact_hard_limit_checks_exact_final_bytes() {
-        let root = tempfile::tempdir().expect("artifact root");
-        fs::write(root.path().join("artifact"), vec![7_u8; 2048]).expect("artifact");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut pool = SandboxPool::prepare(workspace.path(), 1).expect("sandbox pool");
+        let lease = pool
+            .lease(SandboxCompatibility::new(
+                "compiler",
+                "default",
+                "check",
+                "environment",
+                "wrapper",
+            ))
+            .expect("sandbox lease");
+        let marker_bytes = fs::metadata(lease.target_dir().join("CACHEDIR.TAG"))
+            .expect("cache marker")
+            .len();
+        let artifact_bytes = usize::try_from(2048 - marker_bytes).expect("fixture artifact bytes");
+        fs::write(lease.build_dir().join("artifact"), vec![7_u8; artifact_bytes]).expect("artifact");
         let mut command = if cfg!(windows) {
             let mut command = Command::new("cmd");
             command.args(["/c", "exit", "0"]);
@@ -6940,15 +7516,18 @@ mod tests {
         };
         let error = run_artifact_bounded_command(
             &mut command,
-            root.path(),
+            lease.artifact_root(),
             CompilerArtifactBudget::new(512, 1024),
             &AtomicBool::new(false),
             false,
+            &ArtifactUsageLedger::default(),
         )
         .expect_err("final logical bytes must remain bounded");
 
         assert!(error.to_string().contains("2048 bytes"), "{error}");
         assert!(error.to_string().contains("hard limit"), "{error}");
+        drop(lease);
+        pool.close().expect("close sandbox pool");
     }
 
     #[test]

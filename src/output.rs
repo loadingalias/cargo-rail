@@ -27,7 +27,10 @@ static INVOCATION_OUTPUT: OnceLock<InvocationOutput> = OnceLock::new();
 pub enum OutputProtocol {
     /// Human-readable stdout plus diagnostics on stderr.
     Text,
-    /// Exactly one complete JSON value on stdout and no stderr.
+    /// Exactly one complete JSON value on stdout, with diagnostics suppressed.
+    ///
+    /// A long-running command may explicitly retain progress on stderr when its
+    /// final JSON value is redirected to a file.
     Json,
     /// Command-owned raw stdout stream with failures reported on stderr.
     Raw,
@@ -38,6 +41,7 @@ pub enum OutputProtocol {
 pub struct InvocationOutput {
     protocol: OutputProtocol,
     quiet: bool,
+    progress: bool,
     verbose: bool,
     color: bool,
     stdout_terminal: bool,
@@ -61,12 +65,24 @@ impl InvocationOutput {
     /// Capture one explicitly selected transport and terminal state.
     #[doc(hidden)]
     pub fn capture_protocol(quiet: bool, verbose: bool, protocol: OutputProtocol) -> Self {
+        Self::capture_protocol_with_progress(quiet, verbose, protocol, false)
+    }
+
+    /// Capture one transport while retaining explicitly redirected progress.
+    #[doc(hidden)]
+    pub fn capture_protocol_with_progress(
+        quiet: bool,
+        verbose: bool,
+        protocol: OutputProtocol,
+        redirected_progress: bool,
+    ) -> Self {
         let stdout_terminal = std::io::stdout().is_terminal();
         let stderr_terminal = std::io::stderr().is_terminal();
         let raw_or_json = protocol != OutputProtocol::Text;
         Self {
             protocol,
             quiet: quiet || raw_or_json,
+            progress: !quiet && (!raw_or_json || redirected_progress),
             verbose: verbose && !raw_or_json,
             color: !raw_or_json && stderr_terminal && std::env::var_os("NO_COLOR").is_none(),
             stdout_terminal,
@@ -97,6 +113,11 @@ impl InvocationOutput {
     /// Whether diagnostic color is permitted for this invocation.
     pub const fn color_enabled(&self) -> bool {
         self.color
+    }
+
+    /// Whether operational progress may be written to stderr.
+    pub const fn progress_enabled(&self) -> bool {
+        self.progress
     }
 }
 
@@ -133,6 +154,12 @@ pub fn is_verbose() -> bool {
 /// Check whether terminal-aware diagnostic color is permitted.
 pub fn color_enabled() -> bool {
     invocation().color_enabled()
+}
+
+/// Check whether operational progress may be written to stderr.
+#[doc(hidden)]
+pub fn progress_enabled() -> bool {
+    invocation().progress_enabled()
 }
 
 /// Write one human or machine stdout fragment without panicking on a closed pipe.
@@ -280,7 +307,7 @@ macro_rules! help {
 #[macro_export]
 macro_rules! status {
   ($($arg:tt)*) => {
-    if !$crate::output::is_quiet() {
+    if $crate::output::progress_enabled() {
       eprintln!($($arg)*)
     }
   };
@@ -337,5 +364,23 @@ mod tests {
         assert!(output.quiet, "raw streams must suppress progress and advisory output");
         assert!(!output.verbose(), "raw streams must not enable text detail");
         assert!(!output.color_enabled(), "raw streams must remain byte-stable");
+        assert!(!output.progress_enabled(), "raw streams must suppress progress");
+    }
+
+    #[test]
+    fn redirected_json_can_retain_progress_without_enabling_advisories() {
+        let output = InvocationOutput::capture_protocol_with_progress(false, true, OutputProtocol::Json, true);
+
+        assert_eq!(output.protocol(), OutputProtocol::Json);
+        assert!(output.quiet, "JSON must continue suppressing advisory output");
+        assert!(
+            output.progress_enabled(),
+            "redirected JSON must retain operational progress"
+        );
+        assert!(!output.verbose(), "JSON must not enable text detail");
+        assert!(!output.color_enabled(), "JSON diagnostics must remain byte-stable");
+
+        let quiet = InvocationOutput::capture_protocol_with_progress(true, false, OutputProtocol::Json, true);
+        assert!(!quiet.progress_enabled(), "--quiet must suppress redirected progress");
     }
 }

@@ -13,6 +13,7 @@ use std::io::Seek as _;
 use std::io::{self, ErrorKind, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use rscrypto::Sha256;
 
@@ -72,7 +73,17 @@ struct CompilerFactDriverSourceAuthority {
 #[serde(deny_unknown_fields)]
 struct CompilerFactDriverSourceBundle {
     version: u32,
+    rustc: CompilerFactDriverRustcSupport,
     files: Vec<CompilerFactDriverSourceFile>,
+}
+
+#[derive(Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompilerFactDriverRustcSupport {
+    minimum_release: semver::Version,
+    maximum_release: semver::Version,
+    minimum_commit_date: String,
+    maximum_commit_date: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -89,6 +100,16 @@ struct CachedCompilerFactDriver {
     source_digest: String,
     rustc_verbose: String,
     authority: CompilerFactDriverAuthority,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CachedCompilerFactDriverFailure {
+    version: u32,
+    source_digest: String,
+    rustc_verbose: String,
+    compiler_library_digest: String,
+    message: String,
 }
 
 struct SelectedCompilerLibrary {
@@ -287,14 +308,24 @@ impl CompilerFactDriverAuthority {
     /// Fail before workspace acquisition when an installed surface command
     /// cannot authenticate its companion producer.
     pub(crate) fn require_surface_installation() -> RailResult<()> {
-        if Self::embedded()?.is_some() || CompilerFactDriverSourceAuthority::embedded()?.is_some() {
-            Ok(())
-        } else {
-            Err(RailError::with_help(
+        if Self::embedded()?.is_none() || CompilerFactDriverSourceAuthority::embedded()?.is_none() {
+            return Err(RailError::with_help(
                 "surface is unavailable in this source-built cargo-rail installation",
                 "install a supported native cargo-rail archive with its adjacent authenticated compiler-fact driver; cargo install does not provide surface",
-            ))
+            ));
         }
+        let executable = std::env::current_exe()
+            .map_err(|error| RailError::message(format!("failed to locate cargo-rail executable: {error}")))?;
+        let components = Self::installation_components(&executable).map_err(|error| {
+            error.context("reinstall a supported native cargo-rail archive with its complete adjacent component set")
+        })?;
+        if components.len() != 2 {
+            return Err(RailError::with_help(
+                "surface requires the complete authenticated cargo-rail component set",
+                "reinstall a supported native cargo-rail archive with its adjacent compiler-fact driver and source bundle",
+            ));
+        }
+        Ok(())
     }
 
     /// Prepare and authenticate the complete producer capability without
@@ -680,6 +711,7 @@ fn runtime_compiler_fact_driver(
     let bundle: CompilerFactDriverSourceBundle = serde_json::from_slice(&source_bytes)?;
     validate_source_bundle(&bundle)?;
     let selected = RustcVerboseIdentity::parse(toolchain.rustc_verbose)?;
+    bundle.rustc.validate_selected(&selected)?;
     let compiler_library = selected_compiler_library(toolchain, selected.host)?;
     let compiler_library_path = compiler_library.path.clone();
     let cache_key = ContentDigest::sha256(
@@ -704,6 +736,7 @@ fn runtime_compiler_fact_driver(
     let owner = create_private_real_directory(&cargo_home, "cargo-rail")?;
     let cache = create_private_real_directory(&owner, "fact-drivers-v1")?;
     let entry = cache.join(format!("driver-{cache_key}"));
+    let failure = cache.join(format!("driver-{cache_key}.failure.json"));
     let lock_path = cache.join(format!("driver-{cache_key}.lock"));
     let lock = crate::utils::open_cache_lock_file(&lock_path, true)?;
     lock.lock()?;
@@ -711,6 +744,14 @@ fn runtime_compiler_fact_driver(
         load_cached_runtime_driver(&entry, source, toolchain.rustc_verbose, &compiler_library_path)?
     {
         return Ok(component);
+    }
+    if let Some(failure) = load_cached_runtime_driver_failure(
+        &failure,
+        source,
+        toolchain.rustc_verbose,
+        &compiler_library.content_digest,
+    )? {
+        return Err(runtime_driver_build_failure(&selected, &failure));
     }
 
     let build = tempfile::Builder::new()
@@ -724,10 +765,12 @@ fn runtime_compiler_fact_driver(
         .join("bin")
         .join(if cfg!(windows) { "rustc.exe" } else { "rustc" });
     if !toolchain.install_development_support {
-        let output = Command::new(&rustc)
-            .current_dir(toolchain.current_directory)
-            .arg("-vV")
-            .output()?;
+        let output = crate::compiler::acquisition::process::run_bounded_process(
+            Command::new(&rustc).current_dir(toolchain.current_directory).arg("-vV"),
+            Duration::from_secs(30),
+            64 * 1024,
+            64 * 1024,
+        )?;
         if !output.status.success()
             || !output.stderr.is_empty()
             || std::str::from_utf8(&output.stdout).map(str::trim) != Ok(toolchain.rustc_verbose.trim())
@@ -756,22 +799,31 @@ fn runtime_compiler_fact_driver(
     if let Some(toolchain) = &compiler_library.rustup_toolchain {
         command.env("RUSTUP_TOOLCHAIN", toolchain);
     }
-    let output = command.output().map_err(|error| {
+    let output = crate::compiler::acquisition::process::run_bounded_process(
+        &mut command,
+        Duration::from_secs(180),
+        0,
+        16 * 1024,
+    )
+    .map_err(|error| {
         RailError::message(format!(
             "failed to build the compiler fact driver for selected rustc {}: {error}",
             selected.release
         ))
     })?;
     if !output.status.success() {
-        return Err(RailError::with_help(
-            format!(
-                "failed to build the compiler fact driver for selected rustc {} ({}): {}",
-                selected.release,
-                selected.commit,
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-            "ensure the selected toolchain supports this authenticated offline driver source and retry Surface",
-        ));
+        let message = bounded_driver_build_stderr(&output.stderr);
+        publish_cached_runtime_driver_failure(
+            &failure,
+            &CachedCompilerFactDriverFailure {
+                version: 1,
+                source_digest: source.content_digest.clone(),
+                rustc_verbose: toolchain.rustc_verbose.to_string(),
+                compiler_library_digest: compiler_library.content_digest.clone(),
+                message: message.clone(),
+            },
+        )?;
+        return Err(runtime_driver_build_failure(&selected, &message));
     }
     let built = target
         .join(selected.host)
@@ -821,8 +873,71 @@ fn runtime_compiler_fact_driver(
             entry.display()
         ))
     })?;
+    match fs::remove_file(&failure) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     load_cached_runtime_driver(&entry, source, toolchain.rustc_verbose, &compiler_library_path)?
         .ok_or_else(|| RailError::message("selected-toolchain fact driver disappeared after commit"))
+}
+
+fn bounded_driver_build_stderr(stderr: &[u8]) -> String {
+    const MAX_BYTES: usize = 16 * 1024;
+
+    let start = stderr.len().saturating_sub(MAX_BYTES);
+    String::from_utf8_lossy(&stderr[start..]).trim().to_string()
+}
+
+fn runtime_driver_build_failure(selected: &RustcVerboseIdentity<'_>, message: &str) -> RailError {
+    RailError::with_help(
+        format!(
+            "failed to build the compiler fact driver for selected rustc {} ({}): {message}",
+            selected.release, selected.commit,
+        ),
+        "ensure the selected toolchain supports this authenticated offline driver source and retry Surface",
+    )
+}
+
+fn load_cached_runtime_driver_failure(
+    path: &Path,
+    source: &CompilerFactDriverSourceAuthority,
+    rustc_verbose: &str,
+    compiler_library_digest: &str,
+) -> RailResult<Option<String>> {
+    const MAX_BYTES: u64 = 20 * 1024;
+
+    let bytes = match fs::symlink_metadata(path) {
+        Ok(_) => read_bounded_regular_file(path, MAX_BYTES)?,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let failure: CachedCompilerFactDriverFailure = serde_json::from_slice(&bytes)?;
+    if failure.version != 1
+        || failure.source_digest != source.content_digest
+        || failure.rustc_verbose != rustc_verbose
+        || failure.compiler_library_digest != compiler_library_digest
+        || failure.message.len() > 16 * 1024
+    {
+        return Err(RailError::message(
+            "cached compiler fact driver failure does not match its exact preparation authority",
+        ));
+    }
+    Ok(Some(failure.message))
+}
+
+fn publish_cached_runtime_driver_failure(path: &Path, failure: &CachedCompilerFactDriverFailure) -> RailResult<()> {
+    let bytes = serde_json::to_vec(failure)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| RailError::message("compiler fact driver failure path has no parent"))?;
+    let mut staged = tempfile::Builder::new()
+        .prefix(".cargo-rail-fact-driver-failure-")
+        .tempfile_in(parent)?;
+    staged.write_all(&bytes)?;
+    staged.as_file().sync_all()?;
+    staged.persist(path).map_err(|error| error.error)?;
+    Ok(())
 }
 
 fn runtime_fact_driver_rustflags(build_root: &Path, rustc_host: &str) -> String {
@@ -933,11 +1048,12 @@ fn validate_source_bundle(bundle: &CompilerFactDriverSourceBundle) -> RailResult
         "tools/compiler-fact-driver/src/output.rs",
     ];
 
-    if bundle.version != 1 || bundle.files.is_empty() || bundle.files.len() > MAX_SOURCE_FILES {
+    if bundle.version != 2 || bundle.files.is_empty() || bundle.files.len() > MAX_SOURCE_FILES {
         return Err(RailError::message(
             "compiler fact driver source bundle has an incompatible inventory",
         ));
     }
+    bundle.rustc.validate()?;
     let mut previous = None;
     let mut paths = BTreeSet::new();
     for file in &bundle.files {
@@ -959,6 +1075,50 @@ fn validate_source_bundle(bundle: &CompilerFactDriverSourceBundle) -> RailResult
         ));
     }
     Ok(())
+}
+
+impl CompilerFactDriverRustcSupport {
+    fn validate(&self) -> RailResult<()> {
+        if self.minimum_release > self.maximum_release
+            || !valid_iso_date(&self.minimum_commit_date)
+            || !valid_iso_date(&self.maximum_commit_date)
+            || self.minimum_commit_date > self.maximum_commit_date
+        {
+            return Err(RailError::message(
+                "compiler fact driver source bundle has an invalid rustc support interval",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_selected(&self, selected: &RustcVerboseIdentity<'_>) -> RailResult<()> {
+        self.validate()?;
+        let release = semver::Version::parse(selected.release)
+            .map_err(|error| RailError::message(format!("selected rustc release is invalid: {error}")))?;
+        if release < self.minimum_release
+            || release > self.maximum_release
+            || selected.commit_date < self.minimum_commit_date.as_str()
+            || selected.commit_date > self.maximum_commit_date.as_str()
+        {
+            return Err(RailError::with_help(
+                format!(
+                    "compiler fact driver source supports rustc {} through {} from {} through {}, but Cargo selected rustc {} ({})",
+                    self.minimum_release,
+                    self.maximum_release,
+                    self.minimum_commit_date,
+                    self.maximum_commit_date,
+                    selected.release,
+                    selected.commit_date,
+                ),
+                "select a rustc toolchain inside the authenticated support interval or install a cargo-rail release that supports the selected toolchain",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn valid_iso_date(value: &str) -> bool {
+    chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok_and(|date| date.format("%Y-%m-%d").to_string() == value)
 }
 
 fn validate_source_path(path: &str) -> RailResult<()> {
@@ -1990,6 +2150,7 @@ fn validate_windows_execution_file_observation(
 struct RustcVerboseIdentity<'a> {
     release: &'a str,
     commit: &'a str,
+    commit_date: &'a str,
     host: &'a str,
 }
 
@@ -1997,6 +2158,7 @@ impl<'a> RustcVerboseIdentity<'a> {
     fn parse(verbose: &'a str) -> RailResult<Self> {
         let release = unique_verbose_field(verbose, "release")?;
         let commit = unique_verbose_field(verbose, "commit-hash")?;
+        let commit_date = unique_verbose_field(verbose, "commit-date")?;
         let host = unique_verbose_field(verbose, "host")?;
         semver::Version::parse(release)
             .map_err(|error| RailError::message(format!("selected rustc release is invalid: {error}")))?;
@@ -2005,10 +2167,18 @@ impl<'a> RustcVerboseIdentity<'a> {
                 "selected rustc commit is not a lowercase 40-digit hash",
             ));
         }
+        if !valid_iso_date(commit_date) {
+            return Err(RailError::message("selected rustc commit date is invalid"));
+        }
         if host.is_empty() || host.bytes().any(|byte| byte.is_ascii_control()) {
             return Err(RailError::message("selected rustc host is invalid"));
         }
-        Ok(Self { release, commit, host })
+        Ok(Self {
+            release,
+            commit,
+            commit_date,
+            host,
+        })
     }
 }
 
@@ -2455,6 +2625,36 @@ mod tests {
         assert!(!gnu.contains("crt-static"));
     }
 
+    #[test]
+    fn exact_driver_preparation_failure_is_bounded_and_reusable() {
+        let directory = tempfile::tempdir().expect("failure cache");
+        let path = directory.path().join("failure.json");
+        let source = CompilerFactDriverSourceAuthority {
+            file_name: "source.json".to_string(),
+            content_digest: format!("sha256:{}", "a".repeat(64)),
+            provenance: format!("sha256:{}", "b".repeat(64)),
+        };
+        let stderr = vec![b'x'; 20 * 1024];
+        let message = bounded_driver_build_stderr(&stderr);
+        assert_eq!(message.len(), 16 * 1024);
+        let failure = CachedCompilerFactDriverFailure {
+            version: 1,
+            source_digest: source.content_digest.clone(),
+            rustc_verbose: "rustc 1.98.1".to_string(),
+            compiler_library_digest: format!("sha256:{}", "c".repeat(64)),
+            message: "unsupported rustc-private API".to_string(),
+        };
+        publish_cached_runtime_driver_failure(&path, &failure).expect("publish failure");
+        assert_eq!(
+            load_cached_runtime_driver_failure(&path, &source, "rustc 1.98.1", &format!("sha256:{}", "c".repeat(64)),)
+                .expect("load failure")
+                .as_deref(),
+            Some("unsupported rustc-private API")
+        );
+        load_cached_runtime_driver_failure(&path, &source, "rustc 1.98.2", &format!("sha256:{}", "c".repeat(64)))
+            .expect_err("different compiler identity must reject cached failure");
+    }
+
     #[cfg(unix)]
     #[test]
     fn doctest_runtime_clone_reuses_only_retained_authenticated_bytes() {
@@ -2548,6 +2748,12 @@ mod tests {
 
     #[test]
     fn source_bundle_requires_a_sorted_closed_offline_build_inventory() {
+        let rustc = CompilerFactDriverRustcSupport {
+            minimum_release: semver::Version::new(1, 98, 1),
+            maximum_release: semver::Version::new(1, 98, 1),
+            minimum_commit_date: "2026-09-01".to_string(),
+            maximum_commit_date: "2026-09-01".to_string(),
+        };
         let files = [
             ".cargo/config.toml",
             "src/compiler/fact_protocol.rs",
@@ -2568,11 +2774,16 @@ mod tests {
             hex: "00".to_string(),
         })
         .collect();
-        let bundle = CompilerFactDriverSourceBundle { version: 1, files };
+        let bundle = CompilerFactDriverSourceBundle {
+            version: 2,
+            rustc: rustc.clone(),
+            files,
+        };
         validate_source_bundle(&bundle).expect("closed source inventory");
 
         let missing_native_protocol = CompilerFactDriverSourceBundle {
-            version: 1,
+            version: 2,
+            rustc: rustc.clone(),
             files: bundle
                 .files
                 .iter()
@@ -2589,7 +2800,8 @@ mod tests {
         let mut traversal = bundle.files;
         traversal[0].path = "../outside".to_string();
         validate_source_bundle(&CompilerFactDriverSourceBundle {
-            version: 1,
+            version: 2,
+            rustc,
             files: traversal,
         })
         .unwrap_err();
@@ -2674,17 +2886,42 @@ mod tests {
     #[test]
     fn verbose_compiler_identity_requires_exact_unique_fields() {
         let commit = "b".repeat(40);
-        let verbose = format!("rustc 1.95.0\nrelease: 1.95.0\ncommit-hash: {commit}\nhost: {COMPILED_TARGET}");
+        let verbose = format!(
+            "rustc 1.95.0\nrelease: 1.95.0\ncommit-hash: {commit}\ncommit-date: 2026-08-01\nhost: {COMPILED_TARGET}"
+        );
         assert_eq!(
             RustcVerboseIdentity::parse(&verbose).expect("valid compiler"),
             RustcVerboseIdentity {
                 release: "1.95.0",
                 commit: &commit,
+                commit_date: "2026-08-01",
                 host: COMPILED_TARGET,
             }
         );
         RustcVerboseIdentity::parse("rustc 1.95.0").unwrap_err();
         RustcVerboseIdentity::parse(&format!("{verbose}\nhost: duplicate")).unwrap_err();
+    }
+
+    #[test]
+    fn source_bundle_rejects_rustc_outside_its_authenticated_interval() {
+        let support = CompilerFactDriverRustcSupport {
+            minimum_release: semver::Version::new(1, 98, 0),
+            maximum_release: semver::Version::new(1, 98, 1),
+            minimum_commit_date: "2026-08-20".to_string(),
+            maximum_commit_date: "2026-09-01".to_string(),
+        };
+        let commit = "b".repeat(40);
+        let supported =
+            format!("release: 1.98.1\ncommit-hash: {commit}\ncommit-date: 2026-09-01\nhost: {COMPILED_TARGET}");
+        support
+            .validate_selected(&RustcVerboseIdentity::parse(&supported).expect("supported compiler identity"))
+            .expect("compiler inside interval");
+
+        let unsupported = supported.replace("2026-09-01", "2026-09-02");
+        let error = support
+            .validate_selected(&RustcVerboseIdentity::parse(&unsupported).expect("unsupported compiler identity"))
+            .expect_err("compiler after interval must fail before driver preparation");
+        assert!(error.to_string().contains("supports rustc 1.98.0 through 1.98.1"));
     }
 
     #[test]

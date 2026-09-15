@@ -29,10 +29,13 @@ fn main() {
     } else {
         cli.command.output_protocol()
     };
-    cargo_rail::output::init(cargo_rail::output::InvocationOutput::capture_protocol(
+    let redirected_progress =
+        protocol == cargo_rail::output::OutputProtocol::Json && cli.command.retains_redirected_progress();
+    cargo_rail::output::init(cargo_rail::output::InvocationOutput::capture_protocol_with_progress(
         cli.quiet,
         cli.verbose,
         protocol,
+        redirected_progress,
     ));
 
     // Apply global --json flag to command format fields

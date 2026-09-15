@@ -13498,6 +13498,7 @@ pub(crate) fn remove_cache_environment(command: &mut Command) {
         .env_remove(crate::cache::cas::CACHE_MAX_BYTES_ENV)
         .env_remove(crate::cache::cas::CACHE_TRUST_DOMAIN_ENV)
         .env_remove(crate::cache::profile::COORDINATOR_PROFILE_ENV)
+        .env_remove(crate::cache::installation::READINESS_WORKSPACE_ENV)
         .env_remove(crate::compiler::invocation::CACHE_CONTROL_ENV)
         .env_remove(crate::compiler::invocation::CACHE_WRAPPER_MARKER);
 }

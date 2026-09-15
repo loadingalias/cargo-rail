@@ -43,7 +43,9 @@ fn build_sparse_config(targets: &[String]) -> String {
     let mut content =
         String::from("# cargo-rail configuration\n# Documentation: https://github.com/loadingalias/cargo-rail\n");
     if !targets.is_empty() {
-        content.push_str("\n# Additional supported Cargo target-resolution views detected from repository files.\n");
+        content.push_str(
+            "\n# Additional supported Cargo target-resolution views; not a compiler/linker execution matrix.\n",
+        );
         content.push_str(&format!("targets = {}\n", TomlFormatter::new().array_targets(targets)));
     }
     content

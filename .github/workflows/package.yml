@@ -72,6 +72,11 @@ jobs:
     needs: package
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write # Mint the Sigstore signing certificate.
+      attestations: write # Persist the signed provenance.
+      artifact-metadata: write # Record the attested artifact subjects.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -87,6 +92,10 @@ jobs:
           cat "$RUNNER_TEMP"/packages/*/SHA256SUMS | sort > "$RUNNER_TEMP/assets/SHA256SUMS"
           cp LICENSE "$RUNNER_TEMP/assets/LICENSE"
           (cd "$RUNNER_TEMP/assets"; sha256sum --check --strict SHA256SUMS)
+      - name: Attest component archives
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/assets/cargo-rail-*.zip
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: release-cargo-rail-${{ github.run_id }}-${{ github.run_attempt }}

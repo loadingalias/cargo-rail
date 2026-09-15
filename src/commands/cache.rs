@@ -3,8 +3,13 @@
 use super::TextJsonOutputFormat;
 use super::cli::CacheScope;
 use crate::cache::CacheStatus;
+use crate::compiler::acquisition::process::BoundedProcessOutput;
 use crate::error::{RailError, RailResult};
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Validate and normalize one machine-owned remote authority without contacting it.
 pub(crate) fn run_normalize(
@@ -103,6 +108,300 @@ pub(crate) fn run_probe(current_dir: &Path, format: TextJsonOutputFormat) -> Rai
     }
 }
 
+/// Prove local cache readiness with one fixed, isolated compilation sequence.
+pub(crate) fn run_ready(current_dir: &Path, format: TextJsonOutputFormat) -> RailResult<()> {
+    let status = crate::cache::installation::status(current_dir)?;
+    let profile_id = status.profile_id.as_deref().ok_or_else(|| {
+        RailError::with_help(
+            "cache readiness requires an enrolled workspace",
+            "run cargo rail cache setup before the readiness probe",
+        )
+    })?;
+    if !status.healthy || status.component_authentication != "authenticated" {
+        return Err(RailError::with_help(
+            "cache readiness requires an intact authenticated installation",
+            "run cargo rail cache setup to repair the installation before the readiness probe",
+        ));
+    }
+    if crate::remote_cache::configuration_status(current_dir)
+        .map_err(|error| RailError::message(format!("remote cache configuration is unavailable: {error}")))?
+        .is_some()
+    {
+        return Err(RailError::with_help(
+            "local cache readiness cannot be proved while remote cache authority is active",
+            "use a local-only cache profile for this probe, then qualify remote transport separately",
+        ));
+    }
+
+    let cargo_config = Arc::new(crate::cargo::CargoConfigSnapshot::capture(current_dir)?);
+    let inputs = crate::cargo::resolution::ResolutionInputs::capture_with_config(current_dir, cargo_config)?;
+    let probe_parent = crate::cache::readiness_probe_parent(current_dir)?;
+    let directory = tempfile::Builder::new()
+        .prefix("cargo-rail-cache-readiness-")
+        .tempdir_in(probe_parent)?;
+    let nonce = format!(
+        "{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| RailError::message("system clock is before the Unix epoch"))?
+            .as_nanos()
+    );
+    fs::create_dir(directory.path().join("src"))?;
+    fs::write(
+        directory.path().join("Cargo.toml"),
+        b"[package]\nname = \"cargo-rail-cache-readiness-probe\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[workspace]\n",
+    )?;
+    let source = directory.path().join("src/main.rs");
+    fs::write(
+        &source,
+        format!("fn main() {{ println!(\"cargo-rail-cache-readiness:{nonce}\"); }}\n"),
+    )?;
+    let uncached_target = directory.path().join("uncached-target");
+    let cached_target = directory.path().join("cached-target");
+    let cargo = inputs.toolchain.cargo_program();
+    let manifest = directory.path().join("Cargo.toml");
+
+    let uncached = run_readiness_cargo(cargo, current_dir, &manifest, &uncached_target, None, None, true)?;
+    require_readiness_cargo_success("uncached", &uncached)?;
+    let uncached_binary = readiness_binary(&uncached_target);
+    require_readiness_binary(&uncached_binary, &nonce)?;
+
+    let cold_report = directory.path().join("cold.json");
+    let cold_coverage = directory.path().join("cold-coverage");
+    fs::create_dir(&cold_coverage)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&cold_coverage, fs::Permissions::from_mode(0o700))?;
+    }
+    crate::cache::report::start(&cold_report)?;
+    let cold = run_readiness_cargo(
+        cargo,
+        current_dir,
+        &manifest,
+        &cached_target,
+        Some(&cold_report),
+        Some(&cold_coverage),
+        false,
+    )?;
+    require_readiness_cargo_success("cold cache", &cold)?;
+    let cached_binary = readiness_binary(&cached_target);
+    require_readiness_binary(&cached_binary, &nonce)?;
+    let cold_digest = crate::source::ContentDigest::sha256(&fs::read(&cached_binary)?);
+    let cold_measurements = crate::cache::report::finish(&cold_report)?;
+    if cold_measurements.misses == 0 || cold_measurements.failures > 0 || cold_measurements.incomplete {
+        let usage = crate::cache::installation::status(current_dir)?.usage;
+        let coverage = readiness_coverage_reasons(&cold_coverage)?;
+        return Err(RailError::message(format!(
+            "cold cache readiness expected at least one miss and no failures; observed {} misses, {} failures (durable usage: {} hits, {} misses, {} bypasses, {} failures; early bypasses: {:?}; coverage: {:?}): {}",
+            cold_measurements.misses,
+            cold_measurements.failures,
+            usage.hits,
+            usage.misses,
+            usage.bypasses,
+            usage.failures,
+            usage.early_bypass_reasons,
+            coverage,
+            bounded_command_stderr(&cold.stderr),
+        )));
+    }
+
+    fs::remove_dir_all(&cached_target)?;
+    let warm_report = directory.path().join("warm.json");
+    let warm_coverage = directory.path().join("warm-coverage");
+    fs::create_dir(&warm_coverage)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&warm_coverage, fs::Permissions::from_mode(0o700))?;
+    }
+    crate::cache::report::start(&warm_report)?;
+    let warm = run_readiness_cargo(
+        cargo,
+        current_dir,
+        &manifest,
+        &cached_target,
+        Some(&warm_report),
+        Some(&warm_coverage),
+        false,
+    )?;
+    require_readiness_cargo_success("warm cache", &warm)?;
+    let warm_binary = readiness_binary(&cached_target);
+    require_readiness_binary(&warm_binary, &nonce)?;
+    let warm_digest = crate::source::ContentDigest::sha256(&fs::read(&warm_binary)?);
+    let warm_measurements = crate::cache::report::finish(&warm_report)?;
+    if warm_measurements.hits == 0 || warm_measurements.failures > 0 || warm_measurements.incomplete {
+        return Err(RailError::message(format!(
+            "warm cache readiness expected at least one hit and no failures; observed {} hits, {} failures",
+            warm_measurements.hits, warm_measurements.failures
+        )));
+    }
+    if cold_digest != warm_digest {
+        return Err(RailError::message(
+            "verified warm cache output differs from the cold compiler output",
+        ));
+    }
+    let mut bypass_reasons = cold_measurements.bypass_reasons.clone();
+    for (reason, count) in &warm_measurements.bypass_reasons {
+        let total = bypass_reasons.entry(reason.clone()).or_default();
+        *total = total.saturating_add(*count);
+    }
+    let measurements = crate::cache::report::Measurements {
+        hits: warm_measurements.hits,
+        misses: cold_measurements.misses,
+        bypasses: cold_measurements.bypasses.saturating_add(warm_measurements.bypasses),
+        failures: 0,
+        local_bytes_read: warm_measurements.local_bytes_read,
+        remote_bytes_read: 0,
+        remote_bytes_written: 0,
+        bypass_reasons,
+        failure_reasons: Default::default(),
+        incomplete: false,
+    };
+    crate::cache::record_readiness(
+        current_dir,
+        profile_id,
+        inputs.toolchain.direct_rustc_verbose_version(),
+        &measurements,
+    )?;
+
+    if format.is_json() {
+        let output = crate::output::machine_json_envelope(
+            "cache",
+            "ready",
+            "ready",
+            0,
+            serde_json::json!({
+                "ready": true,
+                "installation_integrity": status.installation_integrity,
+                "component_authentication": status.component_authentication,
+                "selected_toolchain_readiness": "ready",
+                "workspace_enrollment": status.workspace_enrollment,
+                "remote_authority": "not_configured",
+                "observed_reuse": "verified_hit_observed",
+                "uncached_success": true,
+                "cold": cold_measurements,
+                "warm": warm_measurements,
+            }),
+        );
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("Cache ready: uncached success, cold miss, verified warm hit.");
+    }
+    Ok(())
+}
+
+fn run_readiness_cargo(
+    cargo: &std::ffi::OsStr,
+    current_dir: &Path,
+    manifest: &Path,
+    target: &Path,
+    report: Option<&Path>,
+    coverage: Option<&Path>,
+    uncached: bool,
+) -> RailResult<BoundedProcessOutput> {
+    let mut command = Command::new(cargo);
+    command
+        .current_dir(current_dir)
+        .args(["build", "--offline", "--quiet", "--manifest-path"])
+        .arg(manifest)
+        .arg("--target-dir")
+        .arg(target)
+        .env("CARGO_INCREMENTAL", "0")
+        .env("CARGO_TARGET_DIR", target)
+        .env(crate::cache::installation::READINESS_WORKSPACE_ENV, current_dir)
+        .env("CARGO_RAIL_CACHE_TRACE", "1")
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .env("RUSTUP_NO_UPDATE_CHECK", "1");
+    if let Some(report) = report {
+        command.env(crate::cache::report::REPORT_ENV, report);
+    }
+    if let Some(coverage) = coverage {
+        command
+            .env(
+                crate::compiler::invocation::CACHE_CONTROL_ENV,
+                crate::compiler::invocation::BENCH_COVERAGE_CACHE_CONTROL,
+            )
+            .env(crate::compiler::native_cache::BENCH_COVERAGE_DIRECTORY_ENV, coverage);
+    }
+    if uncached {
+        command
+            .env("RUSTC_WRAPPER", "")
+            .env("CARGO_BUILD_RUSTC_WRAPPER", "")
+            .env("RUSTC_WORKSPACE_WRAPPER", "")
+            .env("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "");
+    }
+    crate::compiler::acquisition::process::run_bounded_process(&mut command, Duration::from_secs(180), 0, 16 * 1024)
+        .map_err(Into::into)
+}
+
+fn readiness_coverage_reasons(directory: &Path) -> RailResult<Vec<(String, String)>> {
+    const MAX_EVENTS: usize = 64;
+    const MAX_EVENT_BYTES: u64 = 64 * 1024;
+
+    let mut events = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        if events.len() == MAX_EVENTS {
+            events.push(("truncated".to_string(), "too_many_events".to_string()));
+            break;
+        }
+        let entry = entry?;
+        let Some(bytes) = crate::cache::read_bounded_private_file(&entry.path(), MAX_EVENT_BYTES)? else {
+            continue;
+        };
+        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        events.push((
+            value["status"].as_str().unwrap_or("invalid").to_string(),
+            value["reason"].as_str().unwrap_or("invalid").to_string(),
+        ));
+    }
+    events.sort();
+    Ok(events)
+}
+
+fn require_readiness_cargo_success(phase: &str, output: &BoundedProcessOutput) -> RailResult<()> {
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(RailError::message(format!(
+        "{phase} readiness compilation failed with status {}: {}",
+        output.status,
+        bounded_command_stderr(&output.stderr)
+    )))
+}
+
+fn readiness_binary(target: &Path) -> PathBuf {
+    target.join("debug").join(if cfg!(windows) {
+        "cargo-rail-cache-readiness-probe.exe"
+    } else {
+        "cargo-rail-cache-readiness-probe"
+    })
+}
+
+fn require_readiness_binary(binary: &Path, nonce: &str) -> RailResult<()> {
+    let output = crate::compiler::acquisition::process::run_bounded_process(
+        &mut Command::new(binary),
+        Duration::from_secs(10),
+        4096,
+        4096,
+    )?;
+    let expected = format!("cargo-rail-cache-readiness:{nonce}\n");
+    if !output.status.success() || !output.stderr.is_empty() || output.stdout != expected.as_bytes() {
+        return Err(RailError::message(
+            "cache readiness binary did not preserve normal compiler behavior",
+        ));
+    }
+    Ok(())
+}
+
+fn bounded_command_stderr(stderr: &[u8]) -> String {
+    const MAX_BYTES: usize = 4096;
+
+    let start = stderr.len().saturating_sub(MAX_BYTES);
+    String::from_utf8_lossy(&stderr[start..]).trim().to_string()
+}
+
 /// Preview or apply one exact transparent compiler-cache installation.
 pub(crate) fn run_setup(
     current_dir: &Path,
@@ -133,7 +432,7 @@ pub(crate) fn run_setup(
     }
     if check && request == crate::cache::installation::SetupRequest::default() {
         let status = crate::cache::installation::status(current_dir)?;
-        if status.healthy && status.state == "installed" {
+        if status.healthy && status.state == "installed" && status.profile_id.is_some() {
             let details = serde_json::json!({
               "changed": false,
               "config_path": status.config_path,
@@ -162,7 +461,8 @@ pub(crate) fn run_setup(
       "config_action": plan.config_action(),
       "wrapper_path": plan.wrapper_path(),
       "receipt_path": receipt_path,
-      "private_state_action": if pending { "install_or_repair" } else { "verify" },
+      "private_state_action": plan.private_state_action(),
+      "quarantine_receipt_path": plan.quarantine_receipt_path(),
       "profile_id": plan.profile_id(),
       "cache_base": plan.cache_base(),
       "max_bytes": plan.max_bytes(),
@@ -366,6 +666,7 @@ pub(crate) fn run_detach(workspace_root: &Path, check: bool, format: TextJsonOut
     let cargo_home = crate::cache::installation::selected_cargo_home(workspace_root)?;
     let plan = crate::cache::profile::plan_detach(&cargo_home, workspace_root)?;
     let pending = plan.pending();
+    let reported_pending = check && pending;
     let profile_id = plan.profile_id().to_string();
     if !check {
         crate::cache::installation::stop_current_profile_coordinator(workspace_root)?;
@@ -378,7 +679,7 @@ pub(crate) fn run_detach(workspace_root: &Path, check: bool, format: TextJsonOut
             if check && pending { "pending_changes" } else { "success" },
             if check && pending { 1 } else { 0 },
             serde_json::json!({
-              "pending": pending,
+              "pending": reported_pending,
               "profile_id": profile_id,
               "cache_preserved": true,
             }),
@@ -590,15 +891,15 @@ fn total_bytes(status: &CacheStatus) -> u64 {
 }
 
 fn render_status(status: &CacheStatus) {
+    println!("Installation integrity: {}", status.installation.installation_integrity);
     println!(
-        "Installation: {} ({})",
-        if status.installation.healthy {
-            "healthy"
-        } else {
-            "unhealthy"
-        },
-        status.installation.state
+        "Component authentication: {}",
+        status.installation.component_authentication
     );
+    println!("Selected toolchain: {}", status.selected_toolchain_readiness);
+    println!("Workspace enrollment: {}", status.installation.workspace_enrollment);
+    println!("Remote authority: {}", status.remote_authority);
+    println!("Observed reuse: {}", status.installation.observed_reuse);
     println!(
         "Reuse: {} hits, {} misses, {} bypasses, {} failures",
         status.installation.usage.hits,
@@ -606,6 +907,14 @@ fn render_status(status: &CacheStatus) {
         status.installation.usage.bypasses,
         status.installation.usage.failures
     );
+    println!(
+        "Installation storage: {} required, {} reclaimable",
+        human_bytes(status.installation.required_bytes),
+        human_bytes(status.installation.reclaimable_bytes)
+    );
+    if let Some(action) = status.installation.recovery_action {
+        println!("Recovery: {action}");
+    }
     if status.installation.usage.failure_reason_counts_available {
         for (reason, count) in &status.installation.usage.failure_reasons {
             println!("Cache failure {reason}: {count}");

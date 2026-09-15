@@ -7,6 +7,10 @@ check: fix ci-check
 ci-check:
     @scripts/check.sh
 
+# Explain the named work selected by the current checkout.
+plan *args:
+    cargo rail plan --explain {{args}}
+
 check-compiler-driver:
     @scripts/check-compiler-fact-driver.sh
 

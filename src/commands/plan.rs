@@ -4,8 +4,6 @@ use std::io::{Read, Write as _};
 use std::path::Path;
 use std::path::PathBuf;
 
-use serde::Deserialize;
-
 use crate::error::{RailError, RailResult};
 use crate::utils::toolchain_fingerprint;
 use crate::workspace::WorkspaceContext;
@@ -113,19 +111,6 @@ pub fn print_plan_schema() {
     print!("{}", include_str!("../../schemas/plan-v9.schema.json"));
 }
 
-#[derive(Debug, Deserialize)]
-struct SavedPlanBinding {
-    plan_contract_version: u32,
-    inputs: SavedPlanInputs,
-}
-
-#[derive(Debug, Deserialize)]
-struct SavedPlanInputs {
-    head: String,
-    head_commit: String,
-    capture: Option<String>,
-}
-
 pub(crate) fn verify_saved_plan(
     workspace_root: &Path,
     config_override: Option<&Path>,
@@ -166,16 +151,20 @@ pub(crate) fn verify_saved_plan(
             format!("saved plan '{}'", plan_file.display()),
         )
     };
-    let saved: SavedPlanBinding = serde_json::from_slice(&bytes)
+    let saved: crate::planning::WorkPlan = serde_json::from_slice(&bytes)
         .map_err(|error| RailError::message(format!("failed to parse {subject}: {error}")))?;
-    if saved.plan_contract_version != 9 {
-        return Err(RailError::message(format!(
-            "saved plan uses unsupported contract version {}",
-            saved.plan_contract_version
-        )));
-    }
 
     let context = WorkspaceContext::build_with_planning_verification_and_config(workspace_root, config_override)?;
+    let configuration = context.planning_cargo_configuration_identity()?;
+    verify_saved_binding("Cargo configuration", &saved.inputs.configuration, &configuration)?;
+    let toolchain = planning_toolchain_identity(&context)?;
+    verify_saved_binding("toolchain", &saved.inputs.toolchain, &toolchain)?;
+    verify_saved_binding(
+        "target",
+        &saved.inputs.target,
+        &planning_target_identity(&configuration, &toolchain),
+    )?;
+    crate::planning::validate_saved_work_plan(&context, &saved)?;
     let current_head = context
         .planning_head_commit()
         .ok_or_else(|| RailError::message("saved-plan verification requires Git planning capture"))?;

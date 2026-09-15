@@ -88,7 +88,7 @@ const fn subscribed_policy(path: &'static str, why: &'static str, consumers: &'s
 pub const FIELD_SPECS: &[FieldSpec] = &[
     policy(
         "targets",
-        "Selects additional Cargo target-resolution views that the repository supports.",
+        "Selects additional Cargo target-resolution views; it does not define a compiler/linker execution matrix.",
     ),
     policy(
         "unify.compiler_targets",
@@ -382,11 +382,11 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
     ),
     policy(
         "surface.consumer_scope",
-        "Declares whether the workspace is the complete consumer universe for internal source visibility.",
+        "Declares whether reviewed external-consumer evidence proves the workspace is the complete consumer universe for internal source visibility.",
     ),
     policy(
         "surface.targets",
-        "Selects an explicit host/configured-target subset or inherits the top-level workspace target policy.",
+        "Selects Surface compiler environments explicitly or multiplies every automatic view across the host and top-level resolution targets.",
     ),
     policy(
         "surface.crate_visibility",

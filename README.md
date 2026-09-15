@@ -20,7 +20,7 @@ Cargo-Rail gives them one captured workspace model and exact scope.
 
 ## Installation
 
-The v0.26.0 release workflow packages these native archives:
+The release workflow packages these native archives:
 
 | Host                 | Archive target |
 | -------------------- | -------------- |
@@ -47,7 +47,7 @@ or archives for every host eligible for native caching.
 `cargo install cargo-rail --locked` builds the general CLI.
 `cargo binstall cargo-rail` can obtain a prebuilt CLI, but does not install the complete companion component set.
 Use the full native archive for Surface and authenticated compiler reuse.
-`surface --schema` also works without those components.
+`cargo rail surface --schema` also works without those components.
 When the workspace-selected rustup toolchain lacks `rustc-dev`, Surface preparation can install it;
 non-rustup toolchains require the matching compiler development files to be present already.
 
@@ -60,6 +60,7 @@ Before replacing an older cache installation, read the [cache upgrade and recove
    ```bash
    cargo rail cache setup --check
    cargo rail cache setup
+   cargo rail cache ready
    cargo rail cache status
    ```
 
@@ -82,6 +83,8 @@ The commands above have different effects:
 - `cache setup --check` does not write and exits `1` when setup or repair is pending.
 - `cache setup` owns Cargo's global `build.rustc-wrapper` and enrolls this workspace in a private cache profile.
   It rejects another global wrapper or any environment or workspace setting that would shadow it.
+- `cache ready` proves one uncached build, one cold miss,
+  and one verified warm restore for the selected local-only profile and toolchain.
 - `surface --prepare` may install `rustc-dev` for the selected rustup toolchain.
   It does not change the default toolchain.
 - `plan` and the Surface inspection commands do not edit tracked source.
@@ -140,7 +143,7 @@ features, and configured targets.
 It reports dead public declarations and visibility wider than actual consumers need.
 
 Surface can apply proven visibility reductions with `--fix`; dead code remains report-only.
-With `--explain`, report contract v3 separates raw observations from merged declarations,
+With `--explain`, report contract v4 separates raw observations from merged declarations,
 shows bounded retention examples,
 and measures the findings suppressed by one conservative reason without adding
 that graph work to the normal path.
@@ -181,14 +184,12 @@ See [Planning](docs/planning.md).
 
 ### GitHub Actions
 
-The native v9 Action accepts Cargo-Rail `0.26.PATCH` releases, runs the planner once,
+The native v9 Action installs the latest stable Cargo-Rail release, runs the planner once,
 and exposes the validated plan plus exact required-work selectors:
 
 ```yaml
 - uses: loadingalias/cargo-rail-action@v9
   id: rail
-  with:
-    version: 0.26.0
 
 - name: Test affected packages
   if: contains(fromJSON(steps.rail.outputs.required-work), 'cargo.test')
@@ -204,8 +205,12 @@ and exposes the validated plan plus exact required-work selectors:
     cargo nextest run "${CARGO_ARGS[@]}" --locked
 ```
 
-Use `loadingalias/cargo-rail-action/cache@v9` with `version: 0.26.0` separately in each execution job that needs remote compiler reuse.
-Its `mode` input is required: use `read` for untrusted jobs and grant `read-write` only to trusted seed jobs.
+Use `loadingalias/cargo-rail-action/cache@v9` separately in each execution job that needs remote compiler reuse.
+Both actions install the latest stable Cargo-Rail release by default.
+Set an exact `version` only when the workflow needs a reproducible pin.
+Its `mode` input is required.
+Do not provide remote credentials to untrusted jobs.
+Use `read` for trusted jobs that must not publish, and grant `read-write` only to trusted seed jobs.
 The Action exposes typed root portability and an optional strict authenticated provider probe.
 See the [Action guide](https://github.com/loadingalias/cargo-rail-action).
 

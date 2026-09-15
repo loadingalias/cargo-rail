@@ -27,24 +27,44 @@ jobs:
     name: Prepare RISC-V cache tests
     runs-on: runs-on=${{ github.run_id }}/runner=x86_64-linux/env=production
     timeout-minutes: 45
+    outputs:
+      cache-qualification: ${{ steps.cache-scope.outputs.required }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - name: Cross-build cache tests
+      - uses: loadingalias/cargo-rail-action@621828e59c21e2e0bf38f48fa201e0f22fcbe976 # v9.0.1
+        id: rail
+        with:
+          all: ${{ github.event_name == 'workflow_dispatch' }}
+      - name: Select RISC-V cache qualification
+        id: cache-scope
+        env:
+          PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
         run: |
-          scripts/tooling/x86_64-linux.sh riscv-build
+          required="$(cargo-rail-action plan is-required "$PLAN_FILE" cache-qualification)"
+          [[ "$required" == true || "$required" == false ]]
+          echo "required=$required" >> "$GITHUB_OUTPUT"
+      - name: Install Linux tooling
+        if: steps.cache-scope.outputs.required == 'true'
+        run: scripts/tooling/x86_64-linux.sh riscv-build
+      - name: Cross-build cache tests
+        if: steps.cache-scope.outputs.required == 'true'
+        env:
+          PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
+        run: |
+          [[ "$(cargo-rail-action plan is-required "$PLAN_FILE" cache-qualification)" == true ]]
           source "$HOME/.local/share/cargo-rail-tooling/environment.sh"
           just test-cache-host prepare riscv64gc-unknown-linux-gnu target/riscv-cache
           git diff --exit-code HEAD
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: steps.cache-scope.outputs.required == 'true'
         with:
           name: riscv-cache
           path: target/riscv-cache/
           if-no-files-found: error
           compression-level: 0
           retention-days: 2
-
   native:
     needs: riscv-build
     name: ${{ matrix.platform }}
@@ -70,12 +90,15 @@ jobs:
             timeout: 120
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout }}
+    env:
+      AWS_ACCESS_KEY_ID: ${{ matrix.suite == 'full' && github.event_name != 'pull_request' && secrets.CARGO_RAIL_R2_ACCESS_KEY_ID || '' }}
+      AWS_SECRET_ACCESS_KEY: ${{ matrix.suite == 'full' && github.event_name != 'pull_request' && secrets.CARGO_RAIL_R2_SECRET_ACCESS_KEY || '' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
       - name: Install Linux tooling
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && (matrix.platform != 'riscv64-linux' || needs.riscv-build.outputs.cache-qualification == 'true')
         env:
           PLATFORM: ${{ matrix.platform }}
         run: scripts/tooling/"$PLATFORM".sh ci
@@ -87,26 +110,67 @@ jobs:
         if: runner.os == 'Windows'
         shell: powershell
         run: ./scripts/tooling/x86_64-win.ps1 -Operation ci
+      - uses: loadingalias/cargo-rail-action@621828e59c21e2e0bf38f48fa201e0f22fcbe976 # v9.0.1
+        if: matrix.suite == 'full'
+        id: rail
+        with:
+          components: surface
+          all: ${{ github.event_name == 'workflow_dispatch' }}
+      - uses: loadingalias/cargo-rail-action/cache@621828e59c21e2e0bf38f48fa201e0f22fcbe976 # v9.0.1
+        if: matrix.suite == 'full' && github.event_name != 'pull_request'
+        id: cache
+        with:
+          remote: ${{ vars.CARGO_RAIL_CACHE_REMOTE }}
+          mode: read-write
+          max-size: 10GiB
+          root-portability: remap
+          verify-remote: true
       - name: Check tooling and workflows
-        if: matrix.platform == 'x86_64-linux'
-        run: just check-tooling
+        if: matrix.platform == 'x86_64-linux' && contains(fromJSON(steps.rail.outputs.required-work), 'tooling')
+        env:
+          PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
+        run: |
+          [[ "$(cargo-rail-action plan is-required "$PLAN_FILE" tooling)" == true ]]
+          just check-tooling
       - name: Check
-        if: matrix.suite == 'full'
-        run: just ci-check
+        if: matrix.suite == 'full' && contains(fromJSON(steps.rail.outputs.required-work), 'ci-check')
+        env:
+          PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
+        run: |
+          [[ "$(cargo-rail-action plan is-required "$PLAN_FILE" ci-check)" == true ]]
+          just ci-check
       - name: Test
-        if: matrix.suite == 'full'
-        run: just test
+        if: matrix.suite == 'full' && contains(fromJSON(steps.rail.outputs.required-work), 'test-suite')
+        env:
+          PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
+        run: |
+          [[ "$(cargo-rail-action plan is-required "$PLAN_FILE" test-suite)" == true ]]
+          just test
+      - name: Check dependency policy
+        if: matrix.platform == 'x86_64-linux' && contains(fromJSON(steps.rail.outputs.required-work), 'dependency-policy')
+        env:
+          PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
+        run: |
+          [[ "$(cargo-rail-action plan is-required "$PLAN_FILE" dependency-policy)" == true ]]
+          cargo rail unify --check --explain
+      - name: Check source surface
+        if: matrix.suite == 'full' && contains(fromJSON(steps.rail.outputs.required-work), 'surface')
+        env:
+          PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
+        run: |
+          [[ "$(cargo-rail-action plan is-required "$PLAN_FILE" surface)" == true ]]
+          cargo rail surface --check --explain
       - name: Download RISC-V cache tests
-        if: matrix.platform == 'riscv64-linux'
+        if: matrix.platform == 'riscv64-linux' && needs.riscv-build.outputs.cache-qualification == 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: riscv-cache
           path: target/riscv-cache
       - name: Qualify RISC-V cache
-        if: matrix.platform == 'riscv64-linux'
+        if: matrix.platform == 'riscv64-linux' && needs.riscv-build.outputs.cache-qualification == 'true'
         run: scripts/check-cache-host.sh run target/riscv-cache
       - name: Retain RISC-V cache evidence
-        if: ${{ always() && matrix.platform == 'riscv64-linux' }}
+        if: ${{ always() && matrix.platform == 'riscv64-linux' && needs.riscv-build.outputs.cache-qualification == 'true' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: riscv-cache-results
@@ -118,6 +182,18 @@ jobs:
           retention-days: 7
       - name: Check worktree
         run: git diff --exit-code HEAD
+      - uses: loadingalias/cargo-rail-action/cache/collect@621828e59c21e2e0bf38f48fa201e0f22fcbe976 # v9.0.1
+        if: always() && matrix.suite == 'full' && github.event_name != 'pull_request' && steps.cache.outcome == 'success'
+        id: cache-record
+        with:
+          job: ${{ matrix.platform }}
+          output-directory: ${{ runner.temp }}/cache-records
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always() && steps.cache-record.outcome == 'success'
+        with:
+          name: cache-record-${{ matrix.platform }}
+          path: ${{ steps.cache-record.outputs.record-file }}
+          if-no-files-found: error
 
   ibm:
     if: github.event_name == 'workflow_dispatch' && inputs.qualify_ibm
@@ -144,3 +220,21 @@ jobs:
         run: scripts/check-cache-host.sh
       - name: Check worktree
         run: git diff --exit-code HEAD
+
+  cache-report:
+    name: Compiler cache report
+    needs: [riscv-build, native]
+    if: always() && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        continue-on-error: true
+        with:
+          pattern: cache-record-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/cache-records
+      - uses: loadingalias/cargo-rail-action/cache/report@621828e59c21e2e0bf38f48fa201e0f22fcbe976 # v9.0.1
+        with:
+          records-directory: ${{ runner.temp }}/cache-records
+          expected-jobs: '["x86_64-linux", "aarch64-linux", "x86_64-win"]'

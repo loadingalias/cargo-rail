@@ -231,6 +231,7 @@ pub(crate) struct ProfileSetupRequest<'a> {
     pub(crate) requested_profile: Option<&'a str>,
     pub(crate) local_dir: Option<&'a Path>,
     pub(crate) max_bytes: Option<u64>,
+    pub(crate) trust_domain: Option<&'a str>,
     pub(crate) remote_url: Option<&'a str>,
     pub(crate) remote_mode: Option<&'a str>,
     pub(crate) remote_environment: &'a [String],
@@ -667,6 +668,12 @@ pub(crate) fn plan_setup(
     installation_authority: &str,
     request: ProfileSetupRequest<'_>,
 ) -> RailResult<ProfileSetupPlan> {
+    if request.local_only && request.root_portability.is_some() {
+        return Err(RailError::with_help(
+            "--local-only cannot select --root-portability",
+            "--local-only removes persisted remote activation and restores physical-root local reuse; omit it when creating a fresh local profile",
+        ));
+    }
     let identity = capture_workspace_identity(workspace_root)?;
     let store = ProfileStore::new(cargo_home)?;
     let loaded_transaction = store.load_transaction()?;
@@ -736,6 +743,7 @@ pub(crate) fn plan_setup(
     let trust_domain = existing_profile
         .as_ref()
         .and_then(|profile| profile.cache.trust_domain().map(str::to_string))
+        .or_else(|| request.trust_domain.map(str::to_string))
         .map_or_else(super::installation::random_authority, Ok)?;
     let cache = LocalCacheSelection::new(cache_base, max_bytes, Some(trust_domain))?;
     let remote = if request.local_only {
@@ -1532,6 +1540,7 @@ mod tests {
                 requested_profile: None,
                 local_dir: None,
                 max_bytes,
+                trust_domain: None,
                 remote_url: None,
                 remote_mode: None,
                 remote_environment: &[],
@@ -1577,6 +1586,58 @@ mod tests {
     }
 
     #[test]
+    fn active_profile_does_not_block_compiler_authentication_with_a_global_mutation_lock() {
+        let home = tempfile::tempdir().expect("cargo home");
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("Cargo.toml"), "[workspace]\n").expect("workspace manifest");
+        let authority = "a".repeat(64);
+        let request = ProfileSetupRequest {
+            requested_profile: None,
+            local_dir: None,
+            max_bytes: None,
+            trust_domain: None,
+            remote_url: None,
+            remote_mode: None,
+            remote_environment: &[],
+            root_portability: None,
+            local_only: true,
+        };
+        let setup = plan_setup(home.path(), workspace.path(), &authority, request).expect("profile setup");
+        apply_setup(&setup).expect("apply profile setup");
+        let (_active, active_lock) = load_locked(home.path(), workspace.path())
+            .expect("active profile")
+            .expect("selected profile");
+
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+        let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(0);
+        let cargo_home = home.path().to_path_buf();
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).expect("announce global mutation");
+            let result = lock_all_exclusive(&cargo_home).map(drop);
+            completed_tx.send(result).expect("complete global mutation");
+        });
+        started_rx.recv().expect("global mutation started");
+        assert!(
+            completed_rx.recv_timeout(std::time::Duration::from_millis(50)).is_err(),
+            "global mutation bypassed an active compiler profile"
+        );
+
+        let installation = super::super::installation::lock_installation(home.path())
+            .expect("installation lock remains available while profile work is active");
+        let (_concurrent, concurrent_lock) = load_locked(home.path(), workspace.path())
+            .expect("concurrent compiler authentication")
+            .expect("concurrent selected profile");
+        drop(installation);
+        drop(concurrent_lock);
+        drop(active_lock);
+        completed_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("global mutation did not finish after compiler work")
+            .expect("global mutation lock");
+        waiter.join().expect("global mutation waiter");
+    }
+
+    #[test]
     fn setup_accepts_exact_concurrent_transaction_completion_and_rejects_drift() {
         for drift in [false, true] {
             let home = tempfile::tempdir().unwrap();
@@ -1590,6 +1651,7 @@ mod tests {
                 requested_profile: None,
                 local_dir: None,
                 max_bytes: None,
+                trust_domain: None,
                 remote_url: None,
                 remote_mode: None,
                 remote_environment: &[],

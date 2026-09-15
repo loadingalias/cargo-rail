@@ -226,6 +226,10 @@ pub(crate) struct SandboxLease {
 }
 
 impl SandboxLease {
+    pub(crate) fn artifact_root(&self) -> &Path {
+        &self.generation.as_ref().expect("live sandbox lease").root
+    }
+
     pub(crate) fn target_dir(&self) -> &Path {
         &self.generation.as_ref().expect("live sandbox lease").target
     }

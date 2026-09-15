@@ -343,6 +343,7 @@ pub fn try_dispatch_pre_context(
                         format,
                     )?;
                 }
+                cli::CacheCommand::Ready { format } => cache::run_ready(workspace_root, format)?,
                 cli::CacheCommand::Normalize {
                     url,
                     mode,

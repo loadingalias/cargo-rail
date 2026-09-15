@@ -21,6 +21,52 @@ msrv_policy = { mode = "compute", source = "workspace" }
 [surface]
 enabled = true
 
+[plan.work.cache-qualification]
+scope = "repository"
+paths = [
+  ".github/workflows/ci.yml",
+  ".config/nextest.toml",
+  ".config/tooling.toml",
+  "justfile",
+  "scripts/check-cache-host.py",
+  "scripts/check-cache-host.sh",
+  "scripts/tooling/**",
+  "tests/fixtures/native_cache/**",
+  "tools/compiler-fact-driver/**",
+]
+config = ["targets"]
+cargo = ["cargo.test"]
+
+[plan.work.ci-check]
+scope = "repository"
+paths = [
+  ".config/tooling.toml",
+  "Cargo.lock",
+  "Cargo.toml",
+  "deny.toml",
+  "justfile",
+  "rust-toolchain.toml",
+  "rustfmt.toml",
+  "scripts/check-compiler-fact-driver.sh",
+  "scripts/check.sh",
+  "tools/compiler-fact-driver/**",
+]
+cargo = ["cargo.clippy", "cargo.doc"]
+
+[plan.work.test-suite]
+scope = "repository"
+paths = [
+  ".config/nextest.toml",
+  "justfile",
+  "scripts/check-compiler-fact-driver.sh",
+  "scripts/check-source-installation.sh",
+]
+cargo = ["cargo.doctest", "cargo.test"]
+
+[plan.work.tooling]
+scope = "repository"
+paths = [".github/**", ".config/tooling.toml", "justfile", "scripts/**"]
+
 [release]
 remote_effects = "github"
 registry_publication = "crates-io"

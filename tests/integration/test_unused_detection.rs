@@ -638,7 +638,7 @@ log = "0.4"
             "the exact failed authority was not reported:\n{stderr}"
         );
         assert_eq!(
-            stderr.matches("Collecting compiler evidence view").count(),
+            stderr.matches("active view=").count(),
             1,
             "Unify continued after its proof was already impossible:\n{stderr}"
         );
@@ -2217,7 +2217,9 @@ log = "0.4"
         let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stderr.contains("(1 package)"),
+            stderr.contains("Compiler evidence plan: 1 views")
+                && stderr.contains("active view=source-check")
+                && !stderr.contains("active view=graph-only"),
             "only source-check should require compiler diagnostics\nstderr:\n{}",
             stderr
         );

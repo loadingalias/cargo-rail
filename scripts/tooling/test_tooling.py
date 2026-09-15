@@ -175,6 +175,10 @@ aliased={package="serde",version="=1",features=["derive"]} # keep
 
 
 class CatalogPolicy(unittest.TestCase):
+    def test_windows_build_jobs_accepts_tomlkit_integer(self):
+        data = tomlkit.parse(catalog.CATALOG.read_text())
+        self.assertIsNone(catalog.validate(data))
+
     def test_windows_build_jobs_require_a_positive_integer(self):
         for value in (None, 0, -1, True, '2'):
             data = catalog.read()

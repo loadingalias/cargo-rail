@@ -81,16 +81,22 @@ Without comparison flags, use changes since the default-branch merge base.
   cargo rail plan --from abc --to def        # Compare two commits
   cargo rail plan --explain-work cargo.test  # Explain one decision, even when skipped
   cargo rail plan --json > plan.json         # Save the exact plan
-  cargo rail plan --verify plan.json         # Verify checkout binding without execution
+  cargo rail plan --verify plan.json         # Validate the saved plan and checkout without execution
 
 Use --verify - to read the saved plan from standard input.";
 
 const SURFACE_HELP: &str = "\
 Set `[surface] enabled = true` to include this gate in planner-selected CI.
 Use `consumer_scope = \"workspace\"` only when each closed compiler crate has no
-consumers outside the captured workspace.
+consumers outside the captured workspace. That requires reviewed evidence for
+published APIs, downstream repositories, plugins, generated code, and build or
+proc-macro consumers; Cargo metadata from this checkout alone is insufficient.
+Surface analyzes only the selected host by default. Top-level `targets` do not
+expand Surface. Set `surface.targets = \"workspace\"` to multiply every automatic
+product, feature-profile, and doctest view across the host and top-level targets.
 
   cargo rail surface --check --explain        # Check without modifying source
+  cargo rail surface --check --json --output report.json # Keep bounded progress on stderr
   cargo rail surface --fix --dry-run          # Preview visibility edits
   cargo rail surface --fix --backup           # Apply with recovery evidence
   cargo rail surface --resume MANIFEST --json # Resume partial compiler acquisition";
@@ -98,6 +104,8 @@ consumers outside the captured workspace.
 const UNIFY_HELP: &str = "\
 Without a subcommand, preview dependency changes without modifying manifests.
 Use --check to exit 1 when changes are pending.
+Top-level `targets` add dependency-resolution views. They do not create a
+cross-target compiler or linker execution matrix.
 
   cargo rail unify --show-diff     # Inspect manifest changes
   cargo rail unify apply --backup # Apply with a backup
@@ -139,7 +147,9 @@ file's crates is rejected; pending intent is never partially consumed.";
 
 const INIT_HELP: &str = "\
 By default, write .config/rail.toml. Target detection requires --detect-targets;
-use repeated --target flags to select targets explicitly.
+use repeated --target flags to select supported dependency-resolution views.
+These targets do not define a compiler/linker execution matrix. Each execution
+lane still needs its own installed Rust target, SDK, linker, and host tooling.
 
   cargo rail init --dry-run             # Preview policy
   cargo rail init --target wasm32-wasip1 # Declare a target";
@@ -155,6 +165,8 @@ const CACHE_HELP: &str = "\
 Cache setup enrolls this workspace for ordinary Cargo commands.
 Remote storage and distributed workers require explicit machine-owned authority;
 repository policy cannot enable them.
+`--local-only` removes remote activation from an existing profile. Omit it when
+creating a fresh local profile; local reuse is already the default.
 
   cargo rail cache setup --check               # Preview enrollment
   cargo rail cache setup                       # Install or repair the wrapper
@@ -166,6 +178,8 @@ preserving all profiles and their CAS data.";
 const CONFIG_HELP: &str = "\
 Bare `cargo rail config` explains configured overrides. Unknown fields and retired
 configuration spellings are rejected.
+`config explain NODE` expands effective child fields. Top-level `targets` are
+resolution views; command-specific execution matrices remain separate policy.
 
   cargo rail config explain --all # Inspect all effective values and sources
   cargo rail config print         # Emit reusable effective configuration
@@ -231,7 +245,7 @@ pub enum Commands {
         /// Load compatible observed-input evidence from a file
         #[arg(long, value_name = "PATH")]
         evidence: Option<PathBuf>,
-        /// Verify that the current checkout matches one saved plan; use `-` for standard input
+        /// Validate one saved plan and its checkout binding; use `-` for standard input
         #[arg(
             long,
             value_name = "PATH",
@@ -342,10 +356,10 @@ pub enum Commands {
         /// Preview generated config without writing
         #[arg(long)]
         dry_run: bool,
-        /// Add an exact supported Cargo target triple (repeatable)
+        /// Add an exact supported Cargo dependency-resolution target (repeatable)
         #[arg(long = "target", value_name = "TRIPLE", conflicts_with = "detect_targets")]
         targets: Vec<String>,
-        /// Detect target triples from repository files
+        /// Detect Cargo dependency-resolution targets from repository files
         #[arg(long, conflicts_with = "targets")]
         detect_targets: bool,
     },
@@ -566,8 +580,8 @@ pub struct CacheSetupArgs {
     /// Root identity mode: physical binds exact paths; remap permits eligible cross-root reuse.
     #[arg(long, value_name = "MODE", value_parser = ["physical", "remap"])]
     pub root_portability: Option<String>,
-    /// Remove persisted remote activation while preserving local reuse.
-    #[arg(long, conflicts_with_all = ["remote", "remote_mode", "remote_environment", "root_portability"])]
+    /// Remove persisted remote activation while preserving local reuse; unnecessary for a fresh local profile.
+    #[arg(long, conflicts_with_all = ["remote", "remote_mode", "remote_environment"])]
     pub local_only: bool,
     /// Enable the same-host distributed protocol qualification path.
     #[arg(long, conflicts_with = "distributed_endpoint")]
@@ -623,6 +637,12 @@ pub struct CacheSetupArgs {
 pub enum CacheCommand {
     /// Install or repair transparent verified compiler reuse.
     Setup(Box<CacheSetupArgs>),
+    /// Prove uncached execution, one cold miss, and one verified warm hit.
+    Ready {
+        /// Report format.
+        #[arg(long, short = 'f', default_value_t, value_enum)]
+        format: TextJsonOutputFormat,
+    },
     /// Start or finish one explicit cache measurement interval.
     Report {
         /// Create a new private recording; export CARGO_RAIL_CACHE_REPORT to this absolute path.
@@ -790,7 +810,7 @@ pub enum ConfigCommand {
     },
     /// Explain effective values, defaults, and sources
     Explain {
-        /// Exact configuration field path(s) to explain in full
+        /// Exact configuration field or parent node path(s) to explain in full
         #[arg(value_name = "FIELD", conflicts_with = "all")]
         fields: Vec<String>,
         /// Explain every known effective field
@@ -1114,7 +1134,8 @@ impl Commands {
             } => text_json_protocol(format.is_json()),
             Commands::Cache { command } => match command {
                 CacheCommand::Setup(setup) => text_json_protocol(setup.format.is_json()),
-                CacheCommand::Normalize { format, .. }
+                CacheCommand::Ready { format }
+                | CacheCommand::Normalize { format, .. }
                 | CacheCommand::Probe { format }
                 | CacheCommand::Status { format, .. }
                 | CacheCommand::Report { format, .. }
@@ -1182,6 +1203,19 @@ impl Commands {
             Commands::Completions { .. } => OutputProtocol::Raw,
             _ => OutputProtocol::Text,
         }
+    }
+
+    /// Whether a long-running command redirected its final machine output.
+    #[doc(hidden)]
+    pub fn retains_redirected_progress(&self) -> bool {
+        matches!(
+            self,
+            Commands::Surface {
+                output: Some(_),
+                schema: false,
+                ..
+            }
+        )
     }
 
     /// Check whether this command emits exactly one complete JSON value.
@@ -1252,7 +1286,8 @@ impl Commands {
             } => *format = TextJsonOutputFormat::Json,
             Commands::Cache { command } => match command {
                 CacheCommand::Setup(setup) => setup.format = TextJsonOutputFormat::Json,
-                CacheCommand::Normalize { format, .. }
+                CacheCommand::Ready { format }
+                | CacheCommand::Normalize { format, .. }
                 | CacheCommand::Probe { format }
                 | CacheCommand::Status { format, .. }
                 | CacheCommand::Report { format, .. }
@@ -1348,6 +1383,18 @@ mod tests {
                 "surface --format {format} selected the wrong JSON compatibility mode"
             );
         }
+    }
+
+    #[test]
+    fn surface_redirected_output_is_the_only_redirected_progress_contract() {
+        let redirected =
+            RailCli::try_parse_from(["cargo-rail", "surface", "--format", "json", "--output", "surface.json"])
+                .expect("redirected Surface JSON must parse");
+        assert!(redirected.command.retains_redirected_progress());
+
+        let stdout = RailCli::try_parse_from(["cargo-rail", "surface", "--format", "json"])
+            .expect("stdout Surface JSON must parse");
+        assert!(!stdout.command.retains_redirected_progress());
     }
 
     #[test]

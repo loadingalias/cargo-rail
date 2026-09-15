@@ -269,6 +269,7 @@ pub(crate) struct LocalCasStatus {
     pub(crate) trust_domain: String,
     pub(crate) bytes: u64,
     pub(crate) max_bytes: u64,
+    pub(crate) over_capacity_bytes: u64,
     pub(crate) committed_result_bytes: u64,
     pub(crate) results: u64,
     pub(crate) pins: u64,
@@ -1824,7 +1825,7 @@ impl LocalCas {
             .join(format!("{action_hex}.json"));
         match fs::symlink_metadata(&destination) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                self.reserve_result_capacity(expected_bytes, None)?;
+                self.reserve_result_capacity(expected_bytes, None, CapacityReservationSource::Staging)?;
                 rename_committed(&staging.path, &destination, false).map_err(|error| {
                     RailError::message(format!(
                         "failed to publish packed native action '{}': {error}",
@@ -2025,7 +2026,7 @@ impl LocalCas {
                 "run `cargo rail cache clean --scope local` to explicitly reset the complete authority root",
             ));
         }
-        self.reserve_result_capacity(incoming, Some(&action_result))?;
+        self.reserve_result_capacity(incoming, Some(&action_result), CapacityReservationSource::Staging)?;
         let mut stats = self.publish_staged_bundle(&action_result, &object, staged, true)?;
         self.publish_native_action_state(
             validation.action_key(),
@@ -2093,7 +2094,7 @@ impl LocalCas {
                 "verified compiler evidence is {incoming} bytes, above the local CAS limit"
             )));
         }
-        self.reserve_result_capacity(incoming, Some(&action_result))?;
+        self.reserve_result_capacity(incoming, Some(&action_result), CapacityReservationSource::External)?;
         let lease = self.create_lease(&action_result)?;
         let mut stats = self.publish_compiler_evidence_bundle(CompilerEvidencePublication {
             action_result: &action_result,
@@ -5099,21 +5100,42 @@ struct GcAuthority {
     kind: GcAuthorityKind,
 }
 
+#[derive(Clone, Copy)]
+enum CapacityReservationSource {
+    Staging,
+    External,
+}
+
 impl LocalCas {
-    fn reserve_result_capacity(&self, incoming: u64, protected_result: Option<&str>) -> RailResult<()> {
+    fn reserve_result_capacity(
+        &self,
+        incoming: u64,
+        protected_result: Option<&str>,
+        source: CapacityReservationSource,
+    ) -> RailResult<()> {
         let mut current = validate_capacity_state(&self.root)?.result_bytes;
-        if current.saturating_add(incoming) > self.max_bytes {
-            let target = self.max_bytes.saturating_sub(incoming);
+        let additional = match source {
+            CapacityReservationSource::Staging => 0,
+            CapacityReservationSource::External => incoming,
+        };
+        let mut owned = checked_tree_bytes(&self.root)?;
+        let non_result = owned.saturating_sub(current);
+        if owned.saturating_add(additional) > self.max_bytes {
+            let target = self.max_bytes.saturating_sub(non_result).saturating_sub(additional);
             self.garbage_collect(target, protected_result)?;
             current = validate_capacity_state(&self.root)?.result_bytes;
+            owned = checked_tree_bytes(&self.root)?;
         }
         let reserved = current
             .checked_add(incoming)
             .ok_or_else(|| RailError::message("local CAS size overflow"))?;
-        if reserved > self.max_bytes {
+        let required = owned
+            .checked_add(additional)
+            .ok_or_else(|| RailError::message("local CAS total size overflow"))?;
+        if required > self.max_bytes {
             return Err(RailError::with_help(
                 format!(
-                    "local CAS needs {incoming} bytes but its {}-byte bound cannot be satisfied",
+                    "local CAS needs {required} total owned bytes but its {}-byte bound cannot be satisfied",
                     self.max_bytes
                 ),
                 format!("raise {CACHE_MAX_BYTES_ENV} or run `cargo rail cache clean --scope local`"),
@@ -6019,11 +6041,13 @@ pub(crate) fn status_at_with_max(root: &Path, max_bytes: u64) -> RailResult<Opti
     let capacity = validate_capacity_state(&root)?;
     let ledger = validate_native_ledger(&root)?;
 
+    let bytes = checked_tree_bytes(&root)?;
     Ok(Some(LocalCasStatus {
         root: root.to_string_lossy().into_owned(),
         trust_domain: owner_trust_domain(&root)?,
-        bytes: checked_tree_bytes(&root)?,
+        bytes,
         max_bytes,
+        over_capacity_bytes: bytes.saturating_sub(max_bytes),
         committed_result_bytes: capacity.result_bytes,
         results,
         pins: pin_entries.len() as u64,
@@ -6376,6 +6400,19 @@ mod tests {
 
     fn status(cas: &LocalCas) -> RailResult<LocalCasStatus> {
         status_at_with_max(&cas.root, cas.max_bytes)?.ok_or_else(|| RailError::message("local CAS disappeared"))
+    }
+
+    #[test]
+    fn capacity_bound_includes_in_flight_staging_bytes() {
+        let cache = tempfile::tempdir().expect("cache base");
+        let cas = open_cas(cache.path(), 16 * 1024).expect("CAS should open");
+        let (staging, _lease) = cas.create_guarded_staging("capacity-").expect("guarded staging");
+        fs::write(staging.path().join("payload"), vec![0_u8; 12 * 1024]).expect("staging payload");
+
+        let error = cas
+            .reserve_result_capacity(8 * 1024, None, CapacityReservationSource::External)
+            .expect_err("uncommitted owned bytes must consume the same capacity bound");
+        assert!(error.to_string().contains("total owned bytes"));
     }
 
     #[test]

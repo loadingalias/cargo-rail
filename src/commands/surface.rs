@@ -1,21 +1,29 @@
 //! Complete Rust declaration reachability and visibility analysis.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
+use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
 
 use cargo_metadata::{Package, TargetKind};
 use serde::Serialize;
 
 use crate::backup::{BackupManager, BackupMetadata};
-use crate::cargo::{ManifestAnalyzer, TargetSpecificationIdentity};
+use crate::cargo::{ManifestAnalyzer, TargetIdentity, TargetSpecificationIdentity};
 use crate::commands::common::SurfaceOutputFormat;
 use crate::compiler::collector::{
-    CompilerAcquisitionProduct, CompilerAcquisitionRequest, validate_compiler_acquisition_resume,
+    CompilerAcquisitionProduct, CompilerAcquisitionRequest, CompilerDoctestProfile,
+    validate_compiler_acquisition_resume,
 };
 use crate::compiler::driver::{CompilerFactDriverAuthority, CompilerFactDriverReadiness};
 use crate::compiler::facts::{CompilerFactDomain, CompilerFactTargetKind, ValidatedCompilerFactObject};
-use crate::compiler::{CompilerAnalysisMetrics, CompilerCacheIdentity, CompilerDiagnosticsCollector, FeatureSelection};
+use crate::compiler::{
+    CompilerAcquisitionPreview, CompilerAnalysisMetrics, CompilerCacheIdentity, CompilerDiagnosticsCollector,
+    FeatureSelection,
+};
 use crate::config::{
     SurfaceConfig, SurfaceConsumerScope, SurfaceCrateVisibility, SurfaceDoctestCoverage, SurfaceExclude,
     SurfaceLintLevel, SurfaceOverride,
@@ -25,6 +33,7 @@ use crate::mutation::{
     ExpectedMutation, MutationAction, MutationEffect, MutationPlan, MutationRisk, MutationTrace, build_plan,
     validate_changed_paths_with_allowed_paths, validate_pre_apply, write_receipt,
 };
+use crate::progress;
 use crate::source::{ContentDigest, RepositoryPath};
 use crate::surface::{
     SurfaceAnalysis, SurfaceCompilerCrate, SurfaceFinding, SurfaceFindingKind, SurfaceGraph, SurfaceGraphMetrics,
@@ -33,9 +42,9 @@ use crate::surface::{
 };
 use crate::workspace::{CargoState, WorkspaceContext, WorkspaceSnapshot};
 
-const SURFACE_CONTRACT_VERSION: u32 = 3;
-const SURFACE_PREPARATION_CONTRACT_VERSION: u32 = 1;
-const SURFACE_SCHEMA_JSON: &str = include_str!("../../schemas/surface-v3.schema.json");
+const SURFACE_CONTRACT_VERSION: u32 = 4;
+const SURFACE_PREPARATION_CONTRACT_VERSION: u32 = 2;
+const SURFACE_SCHEMA_JSON: &str = include_str!("../../schemas/surface-v4.schema.json");
 
 /// Options for the `surface` domain command.
 #[derive(Debug)]
@@ -67,7 +76,32 @@ struct SurfacePreparationReport {
     surface_preparation_contract_version: u32,
     snapshot: SurfaceSnapshotReport,
     toolchain: SurfaceToolchainReport,
+    acquisition: SurfaceAcquisitionPlanReport,
+    targets: Vec<SurfaceTargetReadinessReport>,
     driver: SurfaceDriverReadinessReport,
+}
+
+#[derive(Debug, Serialize)]
+struct SurfaceAcquisitionPlanReport {
+    targets: Vec<String>,
+    products: Vec<CompilerAcquisitionProduct>,
+    feature_profiles: Vec<String>,
+    doctest_profiles: Vec<CompilerDoctestProfile>,
+    exact_view_count: usize,
+    process_slots: usize,
+    work_permits: usize,
+    sandbox_count: usize,
+    current_retained_bytes: u64,
+    soft_retained_bytes: u64,
+    maximum_retained_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct SurfaceTargetReadinessReport {
+    target: String,
+    rust_standard_library: String,
+    linker: String,
+    linked_probe: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -90,6 +124,7 @@ struct SurfaceReport {
     authority: SurfaceAuthorityReport,
     products: Vec<SurfaceProductReport>,
     targets: Vec<String>,
+    coverage: SurfaceCoverageReport,
     features: Vec<SurfaceFeatureView>,
     completeness: SurfaceCompleteness,
     retention: SurfaceRetentionSummary,
@@ -100,6 +135,19 @@ struct SurfaceReport {
     cache: SurfaceCacheReport,
     metrics: SurfaceMetricsReport,
     mutation: Option<SurfaceMutationReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct SurfaceCoverageReport {
+    target_scope: &'static str,
+    target_views: Vec<String>,
+    target_coverage_complete: bool,
+    product_coverage_complete: bool,
+    product_count: usize,
+    feature_profile_coverage_complete: bool,
+    feature_profile_count: usize,
+    doctest_coverage_complete: bool,
+    doctest_view_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -218,6 +266,13 @@ struct SurfaceAcquisitionMetricsReport {
     analysis_views: usize,
     cargo_views_executed: usize,
     compiler_invocations: usize,
+    dependency_compilations: usize,
+    repeated_dependency_compilations: usize,
+    driver_preparations: usize,
+    driver_preparation_elapsed_ns: u64,
+    fresh_fact_objects: usize,
+    native_cache_bytes_hashed: u64,
+    retained_cargo_output_bytes: u64,
     diagnostic_cache_hits: usize,
     diagnostic_cache_misses: usize,
     fact_cache_hits: usize,
@@ -226,6 +281,7 @@ struct SurfaceAcquisitionMetricsReport {
     fact_cache_bypass_reasons: BTreeMap<String, usize>,
     fresh_fragment_bytes: u64,
     retained_fact_object_bytes: u64,
+    artifact_high_water_bytes: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -397,6 +453,29 @@ pub fn run_surface(ctx: &WorkspaceContext, options: SurfaceOptions) -> RailResul
 
 fn prepare_surface(ctx: &WorkspaceContext, options: &SurfaceOptions) -> RailResult<()> {
     let snapshot = ctx.snapshot()?;
+    let config = ctx.config().map(|config| config.surface.clone()).unwrap_or_default();
+    config.validate().map_err(RailError::Config)?;
+    validate_workspace_policy(ctx, snapshot, &config)?;
+    let workspace_packages = ctx.cargo().workspace_members();
+    let manifests = ManifestAnalyzer::parse_snapshot(snapshot, &workspace_packages)?;
+    let cache_identity = CompilerCacheIdentity::capture(snapshot)?;
+    let workspace_targets = ctx.config().map(|config| config.targets.as_slice()).unwrap_or_default();
+    let selected_targets = selected_target_views(&config, workspace_targets);
+    let target_refs = selected_targets.iter().map(String::as_str).collect::<Vec<_>>();
+    let typed_packages = surface_typed_packages(&workspace_packages);
+    let doctest_packages = surface_doctest_packages(&config, &workspace_packages);
+    let products = acquisition_products(&config, &workspace_packages);
+    let feature_profiles = configured_feature_profiles(&config);
+    let collector =
+        CompilerDiagnosticsCollector::with_identity(ctx.workspace_root(), &manifests, target_refs, &cache_identity);
+    let preview = collector.preview_typed_items(
+        &typed_packages,
+        &doctest_packages,
+        (!feature_profiles.is_empty()).then_some(feature_profiles.as_slice()),
+    )?;
+    let acquisition =
+        surface_acquisition_plan_report(ctx.workspace_root(), selected_targets.clone(), products, preview)?;
+    let targets = preflight_surface_targets(snapshot, &selected_targets)?;
     let readiness = CompilerFactDriverAuthority::prepare_surface(snapshot)?;
     ctx.validate_snapshot_unchanged()?;
     let report = SurfacePreparationReport {
@@ -410,6 +489,8 @@ fn prepare_surface(ctx: &WorkspaceContext, options: &SurfaceOptions) -> RailResu
             rustc: snapshot.toolchain().direct_rustc_verbose_version().to_string(),
             host: snapshot.toolchain().host_target().to_string(),
         },
+        acquisition,
+        targets,
         driver: surface_driver_readiness_report(readiness),
     };
     let rendered = render_preparation_report(&report, options.format)?;
@@ -431,12 +512,17 @@ fn surface_driver_readiness_report(readiness: CompilerFactDriverReadiness) -> Su
 fn render_preparation_report(report: &SurfacePreparationReport, format: SurfaceOutputFormat) -> RailResult<String> {
     match format {
         SurfaceOutputFormat::Text => Ok(format!(
-            "surface: ready\nrustc: {} ({}, {})\ndriver: {}\nprotocol: {}",
+            "surface: ready\nrustc: {} ({}, {})\ndriver: {}\nprotocol: {}\nviews: {}\nconcurrency: {} Cargo processes / {} work permits\nretained bytes: {} current / {} maximum",
             report.driver.rustc_release,
             report.driver.rustc_commit,
             report.driver.rustc_host,
             report.driver.identity,
             report.driver.protocol,
+            report.acquisition.exact_view_count,
+            report.acquisition.process_slots,
+            report.acquisition.work_permits,
+            report.acquisition.current_retained_bytes,
+            report.acquisition.maximum_retained_bytes,
         )),
         SurfaceOutputFormat::Json => {
             let envelope =
@@ -474,38 +560,47 @@ fn analyze_surface(
     let cache_identity = CompilerCacheIdentity::capture(snapshot)?;
     let workspace_targets = ctx.config().map(|config| config.targets.as_slice()).unwrap_or_default();
     let targets = selected_target_views(config, workspace_targets);
+    let prerequisites = preflight_surface_targets(snapshot, &targets)?;
     let target_refs = targets.iter().map(String::as_str).collect::<Vec<_>>();
-    let typed_packages = workspace_packages
-        .iter()
-        .map(|package| package.name.to_string())
-        .collect::<BTreeSet<_>>();
-    let doctest_packages = if !config.doctest.is_empty() {
-        config
-            .doctest
-            .iter()
-            .map(|entry| entry.package.clone())
-            .collect::<BTreeSet<_>>()
-    } else if config.doctest_coverage == SurfaceDoctestCoverage::Automatic {
-        workspace_packages
-            .iter()
-            .filter(|package| package.targets.iter().any(|target| target.doctest))
-            .map(|package| package.name.to_string())
-            .collect::<BTreeSet<_>>()
-    } else {
-        BTreeSet::new()
-    };
+    let typed_packages = surface_typed_packages(&workspace_packages);
+    let doctest_packages = surface_doctest_packages(config, &workspace_packages);
+    let products = acquisition_products(config, &workspace_packages);
     let acquisition = CompilerAcquisitionRequest {
         workspace_identity: snapshot.id().to_string(),
         checkout_identity: ctx.planning_snapshot_id().unwrap_or_else(|| snapshot.id().to_string()),
         snapshot_identity: snapshot.id().to_string(),
         configuration_fingerprint: snapshot.configuration_fingerprint().to_string(),
-        products: acquisition_products(config, &workspace_packages),
+        products: products.clone(),
         resume_manifest: resume_manifest.map(Path::to_path_buf),
     };
     let collector =
         CompilerDiagnosticsCollector::with_identity(ctx.workspace_root(), &manifests, target_refs, &cache_identity)
             .with_acquisition_manifest(acquisition);
     let feature_profiles = configured_feature_profiles(config);
+    let preview = collector.preview_typed_items(
+        &typed_packages,
+        &doctest_packages,
+        (!feature_profiles.is_empty()).then_some(feature_profiles.as_slice()),
+    )?;
+    let acquisition_plan = surface_acquisition_plan_report(ctx.workspace_root(), targets.clone(), products, preview)?;
+    progress!(
+        "Surface acquisition: {} exact views across {} target(s) and {} product(s); up to {} Cargo processes / {} work permits; {} current retained bytes / {} maximum",
+        acquisition_plan.exact_view_count,
+        acquisition_plan.targets.len(),
+        acquisition_plan.products.len(),
+        acquisition_plan.process_slots,
+        acquisition_plan.work_permits,
+        acquisition_plan.current_retained_bytes,
+        acquisition_plan.maximum_retained_bytes,
+    );
+    for prerequisite in prerequisites {
+        progress!(
+            "  Target prerequisite: {} / rust-std={} / linker={} / linked probe=ready",
+            prerequisite.target,
+            prerequisite.rust_standard_library,
+            prerequisite.linker,
+        );
+    }
     let evidence = if feature_profiles.is_empty() {
         collector.collect_with_typed_items(snapshot, &[], &typed_packages, &doctest_packages)?
     } else {
@@ -558,6 +653,46 @@ fn analyze_surface(
             acquisition: evidence.metrics,
             graph: analysis.metrics,
         },
+    })
+}
+
+fn surface_typed_packages(packages: &[&Package]) -> BTreeSet<String> {
+    packages.iter().map(|package| package.name.to_string()).collect()
+}
+
+fn surface_doctest_packages(config: &SurfaceConfig, packages: &[&Package]) -> BTreeSet<String> {
+    if !config.doctest.is_empty() {
+        config.doctest.iter().map(|entry| entry.package.clone()).collect()
+    } else if config.doctest_coverage == SurfaceDoctestCoverage::Automatic {
+        packages
+            .iter()
+            .filter(|package| package.targets.iter().any(|target| target.doctest))
+            .map(|package| package.name.to_string())
+            .collect()
+    } else {
+        BTreeSet::new()
+    }
+}
+
+fn surface_acquisition_plan_report(
+    workspace_root: &Path,
+    targets: Vec<String>,
+    products: Vec<CompilerAcquisitionProduct>,
+    preview: CompilerAcquisitionPreview,
+) -> RailResult<SurfaceAcquisitionPlanReport> {
+    let current_retained_bytes = crate::cache::workspace_status(workspace_root)?.bytes;
+    Ok(SurfaceAcquisitionPlanReport {
+        targets,
+        products,
+        feature_profiles: preview.feature_profiles,
+        doctest_profiles: preview.doctest_profiles,
+        exact_view_count: preview.view_count,
+        process_slots: preview.process_slots,
+        work_permits: preview.work_permits,
+        sandbox_count: preview.sandbox_count,
+        current_retained_bytes,
+        soft_retained_bytes: preview.artifact_soft_limit_bytes,
+        maximum_retained_bytes: preview.artifact_hard_limit_bytes,
     })
 }
 
@@ -1221,6 +1356,163 @@ fn is_library_target(kind: &TargetKind) -> bool {
     )
 }
 
+fn preflight_surface_targets(
+    snapshot: &WorkspaceSnapshot,
+    selected_targets: &[String],
+) -> RailResult<Vec<SurfaceTargetReadinessReport>> {
+    const MAX_FAILURES: usize = 16;
+
+    let directory = tempfile::Builder::new()
+        .prefix("cargo-rail-surface-target-preflight-")
+        .tempdir()?;
+    let source = directory.path().join("main.rs");
+    fs::write(&source, b"fn main() {}\n")?;
+    let rustc = snapshot
+        .toolchain()
+        .direct_rustc_sysroot()
+        .join("bin")
+        .join(if cfg!(windows) { "rustc.exe" } else { "rustc" });
+    let mut reports = Vec::with_capacity(selected_targets.len());
+    let mut failures = Vec::new();
+    for (index, selected) in selected_targets.iter().enumerate() {
+        let name = if selected == "default" {
+            snapshot.toolchain().host_target()
+        } else {
+            selected
+        };
+        let Some(target) = snapshot.targets().iter().find(|target| target_name(target) == name) else {
+            failures.push(format!(
+                "{name}: target is absent from the captured Cargo configuration"
+            ));
+            continue;
+        };
+        let library = snapshot
+            .toolchain()
+            .direct_rustc_sysroot()
+            .join("lib")
+            .join("rustlib")
+            .join(name)
+            .join("lib");
+        if let Err(error) = validate_target_standard_library(&library) {
+            failures.push(format!("{name}: {error}"));
+            continue;
+        }
+        let output = directory.path().join(format!("probe-{index}"));
+        let mut command = Command::new(&rustc);
+        command
+            .current_dir(snapshot.cargo_current_dir())
+            .arg(&source)
+            .args([
+                "--crate-name",
+                "cargo_rail_surface_target_preflight",
+                "--edition",
+                "2024",
+                "--target",
+            ])
+            .arg(target_argument(target))
+            .arg("-o")
+            .arg(&output)
+            .env("RUSTUP_AUTO_INSTALL", "0")
+            .env("RUSTUP_NO_UPDATE_CHECK", "1");
+        if let Some(linker) = target.linker() {
+            let mut value = OsString::from("linker=");
+            value.push(linker);
+            command.arg("-C").arg(value);
+        }
+        match crate::compiler::acquisition::process::run_bounded_process(&mut command, Duration::from_secs(60), 0, 4096)
+        {
+            Ok(output) if output.status.success() => reports.push(SurfaceTargetReadinessReport {
+                target: name.to_string(),
+                rust_standard_library: library.to_string_lossy().into_owned(),
+                linker: target.linker().map_or_else(
+                    || "rustc_default".to_string(),
+                    |linker| linker.to_string_lossy().into_owned(),
+                ),
+                linked_probe: true,
+            }),
+            Ok(output) => failures.push(format!(
+                "{name}: linked compiler probe failed with status {}: {}",
+                output.status,
+                bounded_preflight_stderr(&output.stderr)
+            )),
+            Err(error) => failures.push(format!("{name}: failed to start selected rustc: {error}")),
+        }
+    }
+    if failures.is_empty() {
+        return Ok(reports);
+    }
+    failures.truncate(MAX_FAILURES);
+    Err(RailError::with_help(
+        format!(
+            "Surface target preflight failed before compiler acquisition:\n{}",
+            failures
+                .iter()
+                .map(|failure| format!("- {failure}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+        "install each selected Rust target library and configure its real SDK/linker environment before retrying Surface",
+    ))
+}
+
+fn validate_target_standard_library(directory: &Path) -> RailResult<()> {
+    const MAX_ENTRIES: usize = 4096;
+
+    let metadata = fs::symlink_metadata(directory).map_err(|error| {
+        RailError::message(format!(
+            "Rust target standard-library directory '{}' is unavailable: {error}",
+            directory.display()
+        ))
+    })?;
+    if !metadata.is_dir() || crate::utils::is_symlink_or_reparse(&metadata) {
+        return Err(RailError::message(format!(
+            "Rust target standard-library path '{}' is not a real directory",
+            directory.display()
+        )));
+    }
+    let mut entries = 0usize;
+    let mut core = false;
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        entries = entries
+            .checked_add(1)
+            .ok_or_else(|| RailError::message("Rust target library inventory overflow"))?;
+        if entries > MAX_ENTRIES {
+            return Err(RailError::message("Rust target library inventory exceeds its bound"));
+        }
+        let name = entry.file_name();
+        core |= name.to_string_lossy().starts_with("libcore-") && name.to_string_lossy().ends_with(".rlib");
+    }
+    if !core {
+        return Err(RailError::message(format!(
+            "Rust target standard-library path '{}' has no libcore rlib",
+            directory.display()
+        )));
+    }
+    Ok(())
+}
+
+fn target_name(target: &TargetIdentity) -> &str {
+    match target.specification() {
+        TargetSpecificationIdentity::BuiltIn(name) => name,
+        TargetSpecificationIdentity::Custom(specification) => specification.name(),
+    }
+}
+
+fn target_argument(target: &TargetIdentity) -> &std::ffi::OsStr {
+    match target.specification() {
+        TargetSpecificationIdentity::BuiltIn(name) => std::ffi::OsStr::new(name),
+        TargetSpecificationIdentity::Custom(specification) => specification.path().as_os_str(),
+    }
+}
+
+fn bounded_preflight_stderr(stderr: &[u8]) -> String {
+    const MAX_BYTES: usize = 4096;
+
+    let start = stderr.len().saturating_sub(MAX_BYTES);
+    String::from_utf8_lossy(&stderr[start..]).trim().to_string()
+}
+
 fn selected_target_views(config: &SurfaceConfig, workspace_targets: &[String]) -> Vec<String> {
     config
         .targets
@@ -1621,8 +1913,9 @@ fn build_report(
         })
         .collect::<BTreeSet<_>>()
         .into_iter()
-        .collect();
+        .collect::<Vec<_>>();
     let products = report_products(config, &facts);
+    let coverage = surface_coverage_report(config, &targets, &products, &features, &facts);
     let config_bytes = serde_json::to_vec(config)?;
     let findings = locate_and_sort_findings(snapshot, findings)?;
     let reasons = used_reasons(&findings);
@@ -1649,6 +1942,7 @@ fn build_report(
         authority,
         products,
         targets,
+        coverage,
         features,
         completeness: completeness(&facts)?,
         retention,
@@ -1664,6 +1958,13 @@ fn build_report(
                 analysis_views: metrics.acquisition.analysis_views,
                 cargo_views_executed: metrics.acquisition.cargo_views_executed,
                 compiler_invocations: metrics.acquisition.compiler_invocations,
+                dependency_compilations: metrics.acquisition.dependency_compilations,
+                repeated_dependency_compilations: metrics.acquisition.repeated_dependency_compilations,
+                driver_preparations: metrics.acquisition.driver_preparations,
+                driver_preparation_elapsed_ns: metrics.acquisition.driver_preparation_elapsed_ns,
+                fresh_fact_objects: metrics.acquisition.fresh_fact_objects,
+                native_cache_bytes_hashed: metrics.acquisition.native_cache_bytes_hashed,
+                retained_cargo_output_bytes: metrics.acquisition.retained_cargo_output_bytes,
                 diagnostic_cache_hits: metrics.acquisition.diagnostic_cache_hits,
                 diagnostic_cache_misses: metrics.acquisition.diagnostic_cache_misses,
                 fact_cache_hits: metrics.acquisition.fact_cache_hits,
@@ -1672,6 +1973,7 @@ fn build_report(
                 fact_cache_bypass_reasons: metrics.acquisition.fact_cache_bypass_reasons.clone(),
                 fresh_fragment_bytes: metrics.acquisition.fresh_fragment_bytes,
                 retained_fact_object_bytes: metrics.acquisition.retained_fact_object_bytes,
+                artifact_high_water_bytes: metrics.acquisition.artifact_high_water_bytes,
             },
             graph: SurfaceGraphMetricsReport {
                 nodes: metrics.graph.nodes,
@@ -1724,6 +2026,40 @@ fn report_products(config: &SurfaceConfig, facts: &[ValidatedCompilerFactObject]
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+fn surface_coverage_report(
+    config: &SurfaceConfig,
+    targets: &[String],
+    products: &[SurfaceProductReport],
+    features: &[SurfaceFeatureView],
+    facts: &[ValidatedCompilerFactObject],
+) -> SurfaceCoverageReport {
+    let target_scope = match config.targets.explicit() {
+        None => "workspace",
+        Some([target]) if target == "host" => "host_only",
+        Some(_) => "explicit",
+    };
+    let feature_profile_count = features
+        .iter()
+        .map(|view| (view.package.as_str(), view.features.as_slice()))
+        .collect::<BTreeSet<_>>()
+        .len();
+    let doctest_view_count = facts
+        .iter()
+        .filter(|fact| fact.object().unit.domain == CompilerFactDomain::Doctest)
+        .count();
+    SurfaceCoverageReport {
+        target_scope,
+        target_views: targets.to_vec(),
+        target_coverage_complete: true,
+        product_coverage_complete: true,
+        product_count: products.len(),
+        feature_profile_coverage_complete: true,
+        feature_profile_count,
+        doctest_coverage_complete: true,
+        doctest_view_count,
+    }
 }
 
 fn completeness(facts: &[ValidatedCompilerFactObject]) -> RailResult<SurfaceCompleteness> {
@@ -1904,6 +2240,14 @@ fn render_text(report: &SurfaceReport, explain: bool) -> String {
         output.push_str(&report.configuration_diagnostics.len().to_string());
         output.push_str(" configuration diagnostic(s)\n");
     }
+    output.push_str(&format!(
+        "Coverage: {} target scope ({} complete target view(s)); {} complete product(s); {} complete feature profile(s); {} complete doctest view(s)\n",
+        report.coverage.target_scope,
+        report.coverage.target_views.len(),
+        report.coverage.product_count,
+        report.coverage.feature_profile_count,
+        report.coverage.doctest_view_count,
+    ));
     if crate::output::is_verbose() {
         output.push_str("Snapshot: ");
         output.push_str(&report.snapshot.identity);
@@ -2087,6 +2431,33 @@ mod tests {
                 rustc: "rustc 1.99.0-nightly\ncommit-hash: 1111111111111111111111111111111111111111\nhost: aarch64-apple-darwin\nrelease: 1.99.0-nightly".to_string(),
                 host: "aarch64-apple-darwin".to_string(),
             },
+            acquisition: SurfaceAcquisitionPlanReport {
+                targets: vec!["default".to_string()],
+                products: vec![CompilerAcquisitionProduct {
+                    package: "cargo-rail".to_string(),
+                    cargo_target: "cargo-rail".to_string(),
+                    kind: "binary".to_string(),
+                }],
+                feature_profiles: vec!["default-features".to_string()],
+                doctest_profiles: vec![CompilerDoctestProfile {
+                    package: "cargo-rail".to_string(),
+                    target: "default".to_string(),
+                    features: "default-features".to_string(),
+                }],
+                exact_view_count: 2,
+                process_slots: 2,
+                work_permits: 2,
+                sandbox_count: 2,
+                current_retained_bytes: 1024,
+                soft_retained_bytes: 2048,
+                maximum_retained_bytes: 4096,
+            },
+            targets: vec![SurfaceTargetReadinessReport {
+                target: "aarch64-apple-darwin".to_string(),
+                rust_standard_library: "/toolchain/lib/rustlib/aarch64-apple-darwin/lib".to_string(),
+                linker: "rustc_default".to_string(),
+                linked_probe: true,
+            }],
             driver: SurfaceDriverReadinessReport {
                 protocol: 3,
                 identity: format!("{DRIVER_IDENTITY_PREFIX}{}", "d".repeat(64)),
@@ -2109,7 +2480,10 @@ mod tests {
         assert_eq!(value["mode"], "prepare");
         assert_eq!(value["result"], "ready");
         assert_eq!(value["exit_code"], 0);
-        assert_eq!(value["surface_preparation_contract_version"], 1);
+        assert_eq!(
+            value["surface_preparation_contract_version"],
+            SURFACE_PREPARATION_CONTRACT_VERSION
+        );
         assert_eq!(value["driver"]["protocol"], 3);
         assert_eq!(value["driver"]["rustc_release"], "1.99.0-nightly");
 

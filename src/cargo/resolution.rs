@@ -2550,6 +2550,29 @@ impl CargoConfigSnapshot {
             unmodeled_settings,
         })
     }
+
+    pub(crate) fn direct_rustc_verbose_version(&self, cargo_current_dir: &Path) -> RailResult<String> {
+        let cargo = selected_program(self, cargo_current_dir, &["CARGO"], &[], Some("cargo"), "Cargo")?
+            .ok_or_else(|| RailError::message("Cargo program selection is empty"))?;
+        let rustc = selected_program(
+            self,
+            cargo_current_dir,
+            RUSTC_ENV_PRECEDENCE,
+            &["build", "rustc"],
+            Some("rustc"),
+            "rustc",
+        )?
+        .ok_or_else(|| RailError::message("rustc program selection is empty"))?;
+        WrappedRustcQuery {
+            cargo_program: &cargo,
+            rustc_program: &rustc,
+            rustc_wrapper_program: None,
+            rustc_workspace_wrapper_program: None,
+            workspace_root: cargo_current_dir,
+            cargo_config: self,
+        }
+        .run("-vV", "unwrapped 'rustc -vV'")
+    }
 }
 
 fn discovered_cargo_configs(cargo_current_dir: &Path, cargo_home: &Path) -> RailResult<Vec<PathBuf>> {

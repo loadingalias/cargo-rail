@@ -41,7 +41,7 @@ A global `--config` option bypasses discovery.
 ## Surface is unavailable or reports unexpected findings
 
 A `cargo install` or single-binary `cargo binstall` installation lacks the complete Surface component set.
-`surface --schema` remains available without it.
+`cargo rail surface --schema` remains available without it.
 Install and extract a supported native ZIP with all its components kept together.
 Prepare the exact workspace-selected toolchain with:
 
@@ -66,6 +66,9 @@ Before changing policy, verify the report's audited and open targets, products, 
 feature views, and completeness.
 Any open compiler-crate observation preserves the declaration.
 Use `consumer_scope = "workspace"` only when the workspace contains every consumer of its private compiler crates.
+Prove that boundary with reviewed inventories of published APIs, downstream repositories, plugins,
+generated code, and build-script or proc-macro consumers.
+Cargo metadata from this checkout cannot prove that external set is empty.
 
 If one compiler view fails, correct the source failure
 and run the exact `surface --resume` command printed by the error.
@@ -96,7 +99,7 @@ Reuse requires the selected target's compiler distribution, target definition, s
 and target-library evidence; linked outputs also require complete linker evidence.
 Inspect the reported missing boundary before changing the build target.
 
-Status schema 16 keeps native failure-reason counters outside the bounded 65,536-event usage ledger.
+Status schema 18 keeps native failure-reason counters outside the bounded 65,536-event usage ledger.
 Inspect `status.installation.usage.failure_reason_counts_available` before interpreting `status.installation.usage.failure_reasons`.
 The ledger stops accepting events when full; the separate failure counters continue to advance.
 A strict `cache probe` verifies authenticated provider and protocol readiness without exposing the remote URL,

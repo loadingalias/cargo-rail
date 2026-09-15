@@ -34,6 +34,16 @@ def digest(data):
 
 verbose = run(['rustc', '-vV'])
 identity = dict(line.split(': ', 1) for line in verbose.splitlines() if ': ' in line)
+support_policy = tomllib.loads((root / '.config/cranelift-toolchain.toml').read_text())['source-support']
+support = {
+    'minimum_release': support_policy['minimum-release'],
+    'maximum_release': support_policy['maximum-release'],
+    'minimum_commit_date': support_policy['minimum-commit-date'],
+    'maximum_commit_date': support_policy['maximum-commit-date'],
+}
+if (identity['release'] != support['maximum_release']
+        or identity['commit-date'] != support['maximum_commit_date']):
+    raise SystemExit('release compiler must match the fact-driver source support maximum')
 sysroot = Path(run(['rustc', '--print', 'sysroot'])).resolve()
 target = sys.argv[3] or identity['host']
 target_sysroot = sysroot
@@ -75,7 +85,8 @@ source_identity = digest(b''.join(name.encode() + b'\0' + data + b'\0' for name,
 selection = {'source_identity': source_identity, 'rustc_verbose': verbose, 'sysroot': str(sysroot),
              'target': target, 'target_sysroot': str(target_sysroot),
              'preparation': digest((root / 'scripts/check-compiler-fact-driver.sh').read_bytes()),
-             'compiler_library_digest': library_digest, 'source_only': source_only}
+             'compiler_library_digest': library_digest, 'source_support': support,
+             'source_only': source_only}
 record_path = destination / '.cargo-rail-driver-preparation.json'
 env_path = destination / 'compiler-driver-authority.env'
 source_name = 'cargo-rail-fact-driver-source-v1.json'
@@ -141,7 +152,7 @@ with tempfile.TemporaryDirectory(prefix='.cargo-rail-driver-prepare-', dir=desti
             inventory[path.relative_to(stage).as_posix()] = path.read_bytes()
     if len(inventory) > 10_000:
         raise SystemExit('driver source inventory exceeds its file bound')
-    bundle = json.dumps({'version': 1, 'files': [{'path': name, 'hex': data.hex()} for name, data in sorted(inventory.items())]}, separators=(',', ':')).encode() + b'\n'
+    bundle = json.dumps({'version': 2, 'rustc': support, 'files': [{'path': name, 'hex': data.hex()} for name, data in sorted(inventory.items())]}, separators=(',', ':')).encode() + b'\n'
     if len(bundle) > 64 * 1024 * 1024:
         raise SystemExit('driver source bundle exceeds its byte bound')
     if (source_bytes != {path.relative_to(root).as_posix(): path.read_bytes() for path in sorted(sources)}
