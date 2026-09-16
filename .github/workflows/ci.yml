@@ -155,6 +155,7 @@ jobs:
         run: |
           [[ "$(cargo-rail-action plan is-required "$PLAN_FILE" test-suite)" == true ]]
           just test
+          cargo rail plan --verify "$PLAN_FILE"
       - name: Check dependency policy
         if: matrix.platform == 'x86_64-linux' && contains(fromJSON(steps.rail.outputs.required-work), 'dependency-policy')
         env:
@@ -183,7 +184,14 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
       - name: Check worktree
-        run: git diff --exit-code HEAD
+        if: always()
+        run: |
+          git diff --exit-code HEAD
+          status="$(git status --porcelain=v1 --untracked-files=all)"
+          if [[ -n "$status" ]]; then
+            printf '%s\n' "$status"
+            exit 1
+          fi
       - uses: loadingalias/cargo-rail-action/cache/collect@7424d06d2b0526d2cb922d262f7c031d2284cb5c # immutable source pin
         if: always() && matrix.suite == 'full' && github.event_name != 'pull_request' && steps.cache.outcome == 'success'
         id: cache-record

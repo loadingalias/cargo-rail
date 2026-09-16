@@ -16077,10 +16077,7 @@ struct ElfRuntimeSearchGuard {
 
 #[cfg(target_os = "linux")]
 impl ElfRuntimeSearchGuard {
-    fn new(missing: &BTreeSet<PathBuf>) -> RailResult<Self> {
-        use rustix::fs::inotify::{self, CreateFlags, WatchFlags};
-
-        let descriptor = inotify::init(CreateFlags::CLOEXEC | CreateFlags::NONBLOCK).map_err(std::io::Error::from)?;
+    fn watched_entries(missing: &BTreeSet<PathBuf>) -> RailResult<BTreeMap<PathBuf, BTreeSet<OsString>>> {
         let mut directories = BTreeMap::<PathBuf, BTreeSet<OsString>>::new();
         let mut pending = missing.clone();
         let mut visited = BTreeSet::new();
@@ -16118,12 +16115,19 @@ impl ElfRuntimeSearchGuard {
                 return Err(RailError::message("runtime search watches exceed their bound"));
             }
         }
+        Ok(directories)
+    }
+
+    fn new(missing: &BTreeSet<PathBuf>) -> RailResult<Self> {
+        use rustix::fs::inotify::{self, CreateFlags, WatchFlags};
+
+        let descriptor = inotify::init(CreateFlags::CLOEXEC | CreateFlags::NONBLOCK).map_err(std::io::Error::from)?;
+        let directories = Self::watched_entries(missing)?;
         let mut entries = BTreeMap::<i32, BTreeSet<OsString>>::new();
-        for (directory, names) in directories {
-            let generation = elf_default_search_generation(&directory)?;
+        for (directory, names) in &directories {
             let watch = inotify::add_watch(
                 &descriptor,
-                &directory,
+                directory,
                 WatchFlags::CREATE
                     | WatchFlags::DELETE
                     | WatchFlags::MOVED_FROM
@@ -16136,17 +16140,14 @@ impl ElfRuntimeSearchGuard {
                     | WatchFlags::ONLYDIR,
             )
             .map_err(std::io::Error::from)?;
-            if elf_default_search_generation(&directory)? != generation {
-                return Err(RailError::message(
-                    "runtime search directory changed while installing its watch",
-                ));
-            }
-            entries.entry(watch).or_default().extend(names);
+            entries.entry(watch).or_default().extend(names.iter().cloned());
         }
         let guard = Self { descriptor, entries };
-        if missing.iter().any(
+        if Self::watched_entries(missing)? != directories
+            || missing.iter().any(
             |path| !matches!(fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound),
-        ) || !guard.unchanged()
+        )
+            || !guard.unchanged()
         {
             return Err(RailError::message("runtime search changed while preparing execution"));
         }
@@ -21716,6 +21717,52 @@ pub(crate) mod tests {
         capture
             .revalidate_pathless_extern_searches_before_restore_commit(&observation, root.path())
             .expect("an unrelated candidate cannot invalidate an ordinary action");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runtime_search_watch_ignores_unrelated_ancestor_directory_churn() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct StopOnDrop<'a>(&'a AtomicBool);
+
+        impl Drop for StopOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let root = tempfile::tempdir().expect("runtime search fixture");
+        let shared = root.path().join("shared");
+        let fixture = shared.join("fixture");
+        let selected = fixture.join("selected");
+        fs::create_dir_all(&selected).expect("selected directory");
+        let alias = fixture.join("alias");
+        std::os::unix::fs::symlink(&selected, &alias).expect("search alias");
+        let missing = BTreeSet::from([alias.join("optional.so")]);
+        let unrelated = shared.join("unrelated-output");
+        let stop = AtomicBool::new(false);
+
+        std::thread::scope(|scope| {
+            let stop_signal = &stop;
+            let unrelated_output = &unrelated;
+            let churn = scope.spawn(move || {
+                while !stop_signal.load(Ordering::Relaxed) {
+                    fs::write(unrelated_output, b"unrelated").expect("create unrelated output");
+                    fs::remove_file(unrelated_output).expect("remove unrelated output");
+                }
+            });
+            let stop_on_drop = StopOnDrop(&stop);
+            for _ in 0..64 {
+                let guard = ElfRuntimeSearchGuard::new(&missing).expect("runtime watch amid unrelated churn");
+                assert!(
+                    guard.unchanged(),
+                    "unrelated sibling changes must not invalidate a search"
+                );
+            }
+            drop(stop_on_drop);
+            churn.join().expect("unrelated churn thread");
+        });
     }
 
     #[cfg(target_os = "linux")]

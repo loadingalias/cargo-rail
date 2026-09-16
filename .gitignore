@@ -21,4 +21,4 @@ docs/tasks/
 # graft's local graph cache — regenerable, not committed (run `graft build`).
 /graft/
 .ignore
-scripts/tooling/__pycache__/compiler_support.cpython-314.pyc
+scripts/tooling/__pycache__/

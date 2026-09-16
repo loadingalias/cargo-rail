@@ -20,6 +20,21 @@ import update
 import verify
 
 
+class RepositoryHygiene(unittest.TestCase):
+    def test_python_bytecode_is_ignored_independent_of_interpreter_version(self):
+        subprocess.run(
+            [
+                'git',
+                'check-ignore',
+                '--quiet',
+                '--no-index',
+                'scripts/tooling/__pycache__/compiler_support.cpython-999.pyc',
+            ],
+            cwd=catalog.ROOT,
+            check=True,
+        )
+
+
 class CatalogCommand(unittest.TestCase):
     def test_empty_tool_inventory_emits_no_shell_array_element(self):
         output = subprocess.run(
