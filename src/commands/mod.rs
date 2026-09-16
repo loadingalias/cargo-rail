@@ -738,7 +738,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext, prepared_plan: Option<Pla
                 transaction,
                 retain_preparation,
                 yes,
-            } => release::run_release_abort(ctx, transaction.as_deref(), retain_preparation, yes),
+            } => release::run_release_abort_with_options(ctx, transaction.as_deref(), retain_preparation, yes),
         },
 
         // Clean

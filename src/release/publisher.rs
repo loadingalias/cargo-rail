@@ -372,8 +372,16 @@ impl<'a> ReleasePublisher<'a> {
         self.execute_state(&mut state, &state_path, executor, false)
     }
 
-    /// Abort an active release, optionally retaining its exact pushed preparation.
-    pub fn abort(&self, state_path: &std::path::Path, retain_preparation: bool) -> RailResult<()> {
+    /// Abort an active release while it is still entirely local.
+    pub fn abort(&self, state_path: &std::path::Path) -> RailResult<()> {
+        self.abort_with_options(state_path, false)
+    }
+
+    pub(crate) fn abort_retaining_preparation(&self, state_path: &Path) -> RailResult<()> {
+        self.abort_with_options(state_path, true)
+    }
+
+    fn abort_with_options(&self, state_path: &Path, retain_preparation: bool) -> RailResult<()> {
         let _lock = crate::release::state::lock(self.ctx.workspace_root())?;
         let state_path = validate_state_path(self.ctx.workspace_root(), state_path)?;
         let mut state = ReleaseState::load_for_recovery(&state_path)?;
@@ -382,7 +390,7 @@ impl<'a> ReleasePublisher<'a> {
             return Err(RailError::message(format!("release state is {:?}", state.status)));
         }
         if retain_preparation {
-            return self.abort_retaining_preparation(&mut state, &state_path);
+            return self.retain_pushed_preparation_and_abort(&mut state, &state_path);
         }
         let pushes = state.intent.release_config.remote_effects.pushes();
         let forge = state.intent.release_config.remote_effects.creates_forge_release() && !state.intent.skip_tag;
@@ -467,7 +475,7 @@ impl<'a> ReleasePublisher<'a> {
         Ok(())
     }
 
-    fn abort_retaining_preparation(&self, state: &mut ReleaseState, state_path: &Path) -> RailResult<()> {
+    fn retain_pushed_preparation_and_abort(&self, state: &mut ReleaseState, state_path: &Path) -> RailResult<()> {
         let release_commit = state
             .release_commit()
             .map(str::to_owned)

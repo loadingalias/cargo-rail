@@ -1238,8 +1238,12 @@ pub fn run_release_resume(ctx: &WorkspaceContext, transaction: Option<&str>, exe
     ReleasePublisher::new(ctx, release_config).resume(&path, executor)
 }
 
-/// Abort an active release before publication.
-pub fn run_release_abort(
+/// Abort an active release before any external side effect has occurred.
+pub fn run_release_abort(ctx: &WorkspaceContext, transaction: Option<&str>, yes: bool) -> RailResult<()> {
+    run_release_abort_with_options(ctx, transaction, false, yes)
+}
+
+pub(crate) fn run_release_abort_with_options(
     ctx: &WorkspaceContext,
     transaction: Option<&str>,
     retain_preparation: bool,
@@ -1256,7 +1260,12 @@ pub fn run_release_abort(
         .as_ref()
         .map(|config| &config.release)
         .ok_or_else(|| RailError::with_help("no release configuration", "run 'cargo rail init' first"))?;
-    ReleasePublisher::new(ctx, release_config).abort(&state, retain_preparation)
+    let publisher = ReleasePublisher::new(ctx, release_config);
+    if retain_preparation {
+        publisher.abort_retaining_preparation(&state)
+    } else {
+        publisher.abort(&state)
+    }
 }
 
 fn build_release_mutation_plan(
