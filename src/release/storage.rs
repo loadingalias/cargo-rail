@@ -94,9 +94,9 @@ pub(crate) fn store(root: &Path, state: &ReleaseState) -> RailResult<()> {
     let expected = previous.as_ref().map_or("", |(head, _)| head.as_str());
     let active_expected = active.as_ref().map_or("", |(head, _)| head.as_str());
     let git = SystemGit::open(root)?;
-    // The record and active pointer move together. A failed acknowledgment is
-    // reconciled by comparing the next fetched record, never by blind force.
-    git.run_git_observable_with_env(
+    // The record and active pointer move together. Accept a lost acknowledgment
+    // only when both remote refs contain the exact commit constructed above.
+    let push = git.run_git_observable_with_env(
         &[
             "push",
             "--atomic",
@@ -107,26 +107,25 @@ pub(crate) fn store(root: &Path, state: &ReleaseState) -> RailResult<()> {
             &format!("{commit}:{ACTIVE}"),
         ],
         super::publisher::RELEASE_PUSH_ENV,
-    )?;
+    );
+    if let Err(error) = push {
+        let transaction_head = remote_head(&git, &reference).ok().flatten();
+        let active_head = remote_head(&git, ACTIVE).ok().flatten();
+        if transaction_head.as_deref() == Some(commit.as_str()) && active_head.as_deref() == Some(commit.as_str()) {
+            return Ok(());
+        }
+        return Err(error);
+    }
     Ok(())
 }
 
 fn read(root: &Path, reference: &str) -> RailResult<Option<(String, ReleaseState)>> {
     let git = SystemGit::open(root)?;
-    let listing = git.run_git_stdout(&["ls-remote", "--refs", "origin", reference])?;
-    if listing.is_empty() {
+    let Some(head) = remote_head(&git, reference)? else {
         return Ok(None);
-    }
-    let rows = listing.lines().collect::<Vec<_>>();
-    let (head, actual_ref) = rows
-        .first()
-        .and_then(|row| row.split_once('\t'))
-        .ok_or_else(|| RailError::message("remote release reference is malformed"))?;
-    if rows.len() != 1 || actual_ref != reference || !oid(head) {
-        return Err(RailError::message("remote release reference is ambiguous"));
-    }
-    git.run_git(&["fetch", "--no-tags", "--no-write-fetch-head", "origin", head])?;
-    let tree = tree_entries(&git, head)?;
+    };
+    git.run_git(&["fetch", "--no-tags", "--no-write-fetch-head", "origin", &head])?;
+    let tree = tree_entries(&git, &head)?;
     let blob = tree
         .get("record.json")
         .and_then(|entry| entry.strip_prefix("100644 blob "))
@@ -147,8 +146,24 @@ fn read(root: &Path, reference: &str) -> RailResult<Option<(String, ReleaseState
             "remote record does not retain remote execution authority",
         ));
     }
-    package_blobs(&git, head, &state)?;
-    Ok(Some((head.to_owned(), state)))
+    package_blobs(&git, &head, &state)?;
+    Ok(Some((head, state)))
+}
+
+fn remote_head(git: &SystemGit, reference: &str) -> RailResult<Option<String>> {
+    let listing = git.run_git_stdout(&["ls-remote", "--refs", "origin", reference])?;
+    if listing.is_empty() {
+        return Ok(None);
+    }
+    let rows = listing.lines().collect::<Vec<_>>();
+    let (head, actual_ref) = rows
+        .first()
+        .and_then(|row| row.split_once('\t'))
+        .ok_or_else(|| RailError::message("remote release reference is malformed"))?;
+    if rows.len() != 1 || actual_ref != reference || !oid(head) {
+        return Err(RailError::message("remote release reference is ambiguous"));
+    }
+    Ok(Some(head.to_owned()))
 }
 
 fn tree_entries(git: &SystemGit, object: &str) -> RailResult<BTreeMap<String, String>> {

@@ -108,7 +108,7 @@ def package(destination):
             if sources[name].stat().st_size != size or digest(sources[name]) != sha:
                 raise ValueError(f'component changed while packaging: {name}')
         checksum = Path(stage) / 'SHA256SUMS'
-        checksum.write_text(f'{digest(archive_path)}  {archive_name}\n')
+        checksum.write_bytes(f'{digest(archive_path)}  {archive_name}\n'.encode())
         # Exclusive creation preserves any output written by another packager.
         for source in [archive_path, checksum]:
             with source.open('rb') as reader, (destination / source.name).open('xb') as writer:

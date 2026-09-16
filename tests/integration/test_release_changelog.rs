@@ -161,6 +161,16 @@ fn run_with_rejected_commit(cwd: &Path, args: &[&str]) -> Result<std::process::O
 
 #[cfg(unix)]
 fn run_with_lost_git_acknowledgment(cwd: &Path, args: &[&str], operation: &str) -> Result<std::process::Output> {
+    run_with_lost_git_acknowledgment_and_path_prefix(cwd, args, operation, None)
+}
+
+#[cfg(unix)]
+fn run_with_lost_git_acknowledgment_and_path_prefix(
+    cwd: &Path,
+    args: &[&str],
+    operation: &str,
+    path_prefix: Option<&Path>,
+) -> Result<std::process::Output> {
     use std::os::unix::fs::PermissionsExt;
     let real_git = Command::new("sh").args(["-c", "command -v git"]).output()?;
     anyhow::ensure!(real_git.status.success(), "cannot locate Git");
@@ -170,10 +180,12 @@ fn run_with_lost_git_acknowledgment(cwd: &Path, args: &[&str], operation: &str) 
         "tag" => "*\" tag -a \"*|*\" tag -s \"*",
         "push" => "*\" push \"*",
         "release-push" => "*\" push --atomic --force-with-lease=refs/heads/\"*",
+        "record-push" => "*\" push --atomic --force-with-lease=refs/notes/cargo-rail/release-\"*",
         _ => anyhow::bail!("unsupported Git operation"),
     };
     let dir = tempfile::tempdir()?;
     let wrapper = dir.path().join("git");
+    let completed = dir.path().join("completed");
     std::fs::write(
         &wrapper,
         format!(
@@ -181,19 +193,24 @@ fn run_with_lost_git_acknowledgment(cwd: &Path, args: &[&str], operation: &str) 
 case " $* " in
   {pattern})
     "{real_git}" "$@" || exit $?
+    : > "{}"
     echo 'fixture Git transport lost acknowledgment after successful operation' >&2
     exit 1
     ;;
 esac
 exec "{real_git}" "$@"
-"#
+"#,
+            completed.display()
         ),
     )?;
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))?;
-    let path = format!("{}:{}", dir.path().display(), std::env::var("PATH").unwrap_or_default());
+    let mut paths = vec![dir.path().to_path_buf()];
+    paths.extend(path_prefix.map(Path::to_path_buf));
+    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+    let path = std::env::join_paths(paths)?;
     let output = cargo_rail_command(cwd)?.env("PATH", path).args(args).output()?;
     anyhow::ensure!(
-        String::from_utf8_lossy(&output.stderr).contains("fixture Git transport lost acknowledgment"),
+        completed.is_file(),
         "release did not reach the completed Git operation: {output:?}"
     );
     Ok(output)
@@ -223,6 +240,9 @@ fn main() {{
         "tag" => args.windows(2).any(|pair| pair[0] == "tag" && (pair[1] == "-a" || pair[1] == "-s")),
         "push" => args.iter().any(|arg| arg == "push"),
         "release-push" => args.iter().any(|arg| arg.to_string_lossy().starts_with("--force-with-lease=refs/heads/")),
+        "record-push" => args
+            .iter()
+            .any(|arg| arg.to_string_lossy().starts_with("--force-with-lease=refs/notes/cargo-rail/release-")),
         _ => panic!("unsupported Git operation"),
     }};
     let status = std::process::Command::new({real_git:?}).args(&args).status().unwrap();
@@ -5705,6 +5725,56 @@ fn release_remote_records_survive_runner_loss_without_moving_the_source_branch()
             git(remote.path(), &["rev-parse", "refs/notes/cargo-rail/active"])?.stdout,
             active,
             "reading an old transaction must not publish it as the active transaction"
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(unix)]
+#[test]
+fn release_remote_record_accepts_a_lost_push_acknowledgment() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_single_crate("remote-record-ack", "0.1.0")?;
+        ws.write_release_config("semver_check = 'off'\nsign_tags = false\nremote_effects = 'gitlab'\n")?;
+        write_test_change(&ws.path, &["remote-record-ack"])?;
+        ws.commit("Review remote release")?;
+        let remote = tempfile::TempDir::new()?;
+        git(remote.path(), &["init", "--bare", "--initial-branch=main"])?;
+        ws.set_remote(remote.path().to_str().unwrap())?;
+        git(&ws.path, &["push", "-u", "origin", "main"])?;
+        let logs = tempfile::tempdir()?;
+        let (_shim, glab) = glab_shim_with_status(&logs.path().join("glab.log"), "success")?;
+        let prepared = run_with_lost_git_acknowledgment_and_path_prefix(
+            &ws.path,
+            &[
+                "rail",
+                "release",
+                "run",
+                "--all",
+                "--bump",
+                "patch",
+                "--prepare",
+                "--retain-remote",
+                "--yes",
+                "--format",
+                "json",
+            ],
+            "record-push",
+            glab.parent(),
+        )?;
+        assert!(
+            prepared.status.success(),
+            "{}",
+            String::from_utf8_lossy(&prepared.stderr)
+        );
+        let prepared: serde_json::Value = serde_json::from_slice(&prepared.stdout)?;
+        let transaction = prepared["transaction_id"].as_str().unwrap();
+        let transaction_ref = format!("refs/notes/cargo-rail/{transaction}");
+        assert_eq!(
+            git(remote.path(), &["rev-parse", &transaction_ref])?.stdout,
+            git(remote.path(), &["rev-parse", "refs/notes/cargo-rail/active"])?.stdout,
+            "the acknowledged transaction and active refs must name the same stored record"
         );
         Ok(())
     })();

@@ -104,8 +104,10 @@ class ReleasePackage(unittest.TestCase):
                         content = archive.read(f'cargo-rail/{name}')
                         self.assertEqual(hashlib.sha256(content).hexdigest(), digest)
                         self.assertEqual(len(content), int(size))
-                self.assertEqual((self.destination / 'SHA256SUMS').read_text(),
-                                 f'{hashlib.sha256(archive_path.read_bytes()).hexdigest()}  {archive_path.name}\n')
+                self.assertEqual(
+                    (self.destination / 'SHA256SUMS').read_bytes(),
+                    f'{hashlib.sha256(archive_path.read_bytes()).hexdigest()}  {archive_path.name}\n'.encode(),
+                )
 
     def test_mandatory_binary_omission_rejects_packaging_before_output(self):
         self.prepare('aarch64-apple-darwin')
