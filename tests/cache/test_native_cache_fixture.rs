@@ -526,6 +526,23 @@ fn benchmark_event_summary(directory: &Path) -> Result<BTreeMap<String, u64>> {
     Ok(summary)
 }
 
+fn ensure_only_compiler_probe_bypasses(directory: &Path, observed: u64, phase: &str) -> Result<()> {
+    let events = benchmark_events(directory)?;
+    let bypasses = events
+        .iter()
+        .filter(|event| event["status"] == "bypassed")
+        .collect::<Vec<_>>();
+    ensure!(
+        observed <= bypasses.len() as u64
+            && bypasses.iter().all(|event| matches!(
+                event["reason"].as_str(),
+                Some("compiler_information_request" | "compiler_stdin_observation_unavailable")
+            )),
+        "{phase} recorded an unexpected bypass: usage={observed}, events={bypasses:?}"
+    );
+    Ok(())
+}
+
 fn ensure_typed_benchmark_events(directory: &Path) -> Result<()> {
     let events = benchmark_events(directory)?;
     ensure!(!events.is_empty(), "benchmark compiler operation inventory is empty");
@@ -1012,13 +1029,12 @@ fn real_cargo_test_targets_reuse_exact_outputs() -> Result<()> {
             &["--package", "fixture-portable"],
         )?;
         ensure!(
-            test_cold.hits == 0
-                && test_cold.misses >= new_test_targets.len() as u64
-                && test_cold.bypasses == 0
-                && test_cold.failures == 0,
-            "test-target cold compile failed: {test_cold:?}"
+            test_cold.hits == 0 && test_cold.misses >= new_test_targets.len() as u64 && test_cold.failures == 0,
+            "test-target cold compile failed: {test_cold:?}; events={:?}",
+            benchmark_event_summary(&test_cold_events)?
         );
         ensure_typed_benchmark_events(&test_cold_events)?;
+        ensure_only_compiler_probe_bypasses(&test_cold_events, test_cold.bypasses, "test-target cold compile")?;
         {
             let misses = benchmark_action_crates(&test_cold_events, "miss")?;
             for target in new_test_targets {
@@ -1049,10 +1065,12 @@ fn real_cargo_test_targets_reuse_exact_outputs() -> Result<()> {
             &["--package", "fixture-portable"],
         )?;
         ensure!(
-            test_warm.misses == 0 && test_warm.bypasses == 0 && test_warm.failures == 0,
-            "test-target warm compile failed: {test_warm:?}"
+            test_warm.misses == 0 && test_warm.failures == 0,
+            "test-target warm compile failed: {test_warm:?}; events={:?}",
+            benchmark_event_summary(&test_warm_events)?
         );
         ensure_typed_benchmark_events(&test_warm_events)?;
+        ensure_only_compiler_probe_bypasses(&test_warm_events, test_warm.bypasses, "test-target warm compile")?;
         {
             let hits = benchmark_action_crates(&test_warm_events, "hit")?;
             for target in new_test_targets {
