@@ -3,6 +3,8 @@
 Published versions are recorded below. Pending release intent lives in [`.changes/`](.changes/);
 see [releasing a workspace](docs/releases.md) for the current preparation and publication workflow.
 
+## [0.28.1] - 2026-09-16
+- Make release checksum manifests portable across platforms and reconcile lost acknowledgments only when both remote release refs contain the exact intended record.
 ## [0.28.0] - 2026-09-16
 - Make cache installation upgrades recoverable,
   prevent registry reads from observing concurrent profile publication,
