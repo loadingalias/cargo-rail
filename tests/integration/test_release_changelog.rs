@@ -169,6 +169,7 @@ fn run_with_lost_git_acknowledgment(cwd: &Path, args: &[&str], operation: &str) 
         "commit" => "*\" commit -m \"*",
         "tag" => "*\" tag -a \"*|*\" tag -s \"*",
         "push" => "*\" push \"*",
+        "release-push" => "*\" push --atomic --force-with-lease=refs/heads/\"*",
         _ => anyhow::bail!("unsupported Git operation"),
     };
     let dir = tempfile::tempdir()?;
@@ -221,6 +222,7 @@ fn main() {{
         "commit" => args.windows(2).any(|pair| pair[0] == "commit" && pair[1] == "-m"),
         "tag" => args.windows(2).any(|pair| pair[0] == "tag" && (pair[1] == "-a" || pair[1] == "-s")),
         "push" => args.iter().any(|arg| arg == "push"),
+        "release-push" => args.iter().any(|arg| arg.to_string_lossy().starts_with("--force-with-lease=refs/heads/")),
         _ => panic!("unsupported Git operation"),
     }};
     let status = std::process::Command::new({real_git:?}).args(&args).status().unwrap();
@@ -6294,6 +6296,99 @@ fn test_release_abort_restores_local_state_before_remote_side_effects() {
         assert!(!String::from_utf8_lossy(&git(&ws.path, &["tag", "--list", "v0.1.1"])?.stdout).contains("v0.1.1"));
         let manifest = std::fs::read_to_string(ws.path.join("crates/lib-a/Cargo.toml"))?;
         assert!(manifest.contains("version = \"0.1.0\""));
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn release_abort_retires_a_pushed_preparation_without_rewriting_its_successors() {
+    let result: Result<()> = (|| {
+        let (ws, _remote) = push_release_workspace("retain-pushed-preparation")?;
+        let interrupted = run_with_lost_git_acknowledgment(
+            &ws.path,
+            &[
+                "rail",
+                "release",
+                "run",
+                "--all",
+                "--bump",
+                "patch",
+                "--skip-tag",
+                "--retain-remote",
+                "--yes",
+            ],
+            "release-push",
+        )?;
+        assert!(!interrupted.status.success());
+        let state_path = only_release_state(&ws.path)?;
+        let transaction = state_path.file_stem().unwrap().to_str().unwrap();
+        let prepared = git(&ws.path, &["rev-parse", "HEAD"])?.stdout;
+        let prepared = String::from_utf8(prepared)?.trim().to_owned();
+
+        let ordinary_abort = run_cargo_rail(&ws.path, &["rail", "release", "abort", transaction, "--yes"])?;
+        let ordinary_stderr = String::from_utf8_lossy(&ordinary_abort.stderr);
+        assert_eq!(ordinary_abort.status.code(), Some(2), "{ordinary_stderr}");
+        assert!(
+            ordinary_stderr.contains("remote or registry side effect may already exist"),
+            "{ordinary_stderr}"
+        );
+
+        std::fs::write(ws.path.join("src/lib.rs"), "pub fn corrected_after_preparation() {}\n")?;
+        let successor = ws.commit("fix: correct release preparation")?;
+        git(&ws.path, &["push", "origin", "main"])?;
+
+        let retained = run_cargo_rail(
+            &ws.path,
+            &["rail", "release", "abort", transaction, "--retain-preparation", "--yes"],
+        )?;
+        assert!(
+            retained.status.success(),
+            "retain stderr:\n{}",
+            String::from_utf8_lossy(&retained.stderr)
+        );
+        assert_eq!(
+            git(&ws.path, &["rev-parse", "HEAD"])?.stdout,
+            format!("{successor}\n").as_bytes()
+        );
+        assert_eq!(
+            git(&ws.path, &["ls-remote", "origin", "refs/heads/main"])?.stdout,
+            format!("{successor}\trefs/heads/main\n").as_bytes()
+        );
+        assert!(std::fs::read_to_string(ws.path.join("Cargo.toml"))?.contains("version = \"0.1.1\""));
+        assert!(!ws.path.join(".changes/release-test.md").exists());
+
+        let record: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
+        assert_eq!(record["status"], "aborted");
+        assert_eq!(record["commit_push"]["status"], "complete");
+        assert_eq!(record["commit_push"]["object"], prepared);
+        assert_eq!(record["abort"]["status"], "complete");
+        assert_eq!(record["abort"]["object"], prepared);
+
+        write_test_change(&ws.path, &["retain-pushed-preparation"])?;
+        ws.commit("feat: prepare a replacement release")?;
+        let replacement = run_cargo_rail(
+            &ws.path,
+            &[
+                "rail",
+                "release",
+                "run",
+                "--all",
+                "--bump",
+                "patch",
+                "--skip-tag",
+                "--prepare",
+                "--retain-remote",
+                "--yes",
+            ],
+        )?;
+        assert!(
+            replacement.status.success(),
+            "replacement stderr:\n{}",
+            String::from_utf8_lossy(&replacement.stderr)
+        );
+        assert!(std::fs::read_to_string(ws.path.join("Cargo.toml"))?.contains("version = \"0.1.2\""));
+
         Ok(())
     })();
     super::helpers::finish_test(result);

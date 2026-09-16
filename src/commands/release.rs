@@ -1067,13 +1067,22 @@ fn release_status_report(state: ReleaseState, path: PathBuf) -> ReleaseStatusRep
         }
     }
     let abort_in_progress = state.abort.status == StepStatus::InProgress;
+    let abort_retains_preparation = abort_in_progress && state.abort.object.as_deref() == state.release_commit();
     if state.status == ReleaseStatus::Aborted {
         ambiguity = false;
     }
     let (recoverability, safe_operator_command) = match state.status {
         ReleaseStatus::Active if abort_in_progress => (
             "reconcile_abort".to_string(),
-            format!("cargo rail release abort {} --yes", state.transaction_id),
+            format!(
+                "cargo rail release abort {}{} --yes",
+                state.transaction_id,
+                if abort_retains_preparation {
+                    " --retain-preparation"
+                } else {
+                    ""
+                }
+            ),
         ),
         ReleaseStatus::Active => (
             if ambiguity { "reconcile" } else { "resumable" }.to_string(),
@@ -1229,8 +1238,13 @@ pub fn run_release_resume(ctx: &WorkspaceContext, transaction: Option<&str>, exe
     ReleasePublisher::new(ctx, release_config).resume(&path, executor)
 }
 
-/// Abort an active release before any external side effect has occurred.
-pub fn run_release_abort(ctx: &WorkspaceContext, transaction: Option<&str>, yes: bool) -> RailResult<()> {
+/// Abort an active release before publication.
+pub fn run_release_abort(
+    ctx: &WorkspaceContext,
+    transaction: Option<&str>,
+    retain_preparation: bool,
+    yes: bool,
+) -> RailResult<()> {
     let state = crate::release::state::resolve_active(ctx.workspace_root(), transaction)?;
     enforce_safety_gate("release abort", yes, None, io::stdin().is_terminal())?;
     if !yes && io::stdin().is_terminal() && !crate::utils::prompt_for_confirmation()? {
@@ -1242,7 +1256,7 @@ pub fn run_release_abort(ctx: &WorkspaceContext, transaction: Option<&str>, yes:
         .as_ref()
         .map(|config| &config.release)
         .ok_or_else(|| RailError::with_help("no release configuration", "run 'cargo rail init' first"))?;
-    ReleasePublisher::new(ctx, release_config).abort(&state)
+    ReleasePublisher::new(ctx, release_config).abort(&state, retain_preparation)
 }
 
 fn build_release_mutation_plan(

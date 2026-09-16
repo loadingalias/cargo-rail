@@ -372,14 +372,17 @@ impl<'a> ReleasePublisher<'a> {
         self.execute_state(&mut state, &state_path, executor, false)
     }
 
-    /// Abort an active release while it is still entirely local.
-    pub fn abort(&self, state_path: &std::path::Path) -> RailResult<()> {
+    /// Abort an active release, optionally retaining its exact pushed preparation.
+    pub fn abort(&self, state_path: &std::path::Path, retain_preparation: bool) -> RailResult<()> {
         let _lock = crate::release::state::lock(self.ctx.workspace_root())?;
         let state_path = validate_state_path(self.ctx.workspace_root(), state_path)?;
         let mut state = ReleaseState::load_for_recovery(&state_path)?;
         state.validate_recovery_paths(&self.ctx.git()?.git().worktree_root)?;
         if state.status != ReleaseStatus::Active {
             return Err(RailError::message(format!("release state is {:?}", state.status)));
+        }
+        if retain_preparation {
+            return self.abort_retaining_preparation(&mut state, &state_path);
         }
         let pushes = state.intent.release_config.remote_effects.pushes();
         let forge = state.intent.release_config.remote_effects.creates_forge_release() && !state.intent.skip_tag;
@@ -461,6 +464,102 @@ impl<'a> ReleasePublisher<'a> {
         state.status = ReleaseStatus::Aborted;
         state.save(&state_path)?;
         progress!("release aborted and restored to {}", state.intent.initial_head);
+        Ok(())
+    }
+
+    fn abort_retaining_preparation(&self, state: &mut ReleaseState, state_path: &Path) -> RailResult<()> {
+        let release_commit = state
+            .release_commit()
+            .map(str::to_owned)
+            .ok_or_else(|| RailError::message("release has no exact preparation commit to retain"))?;
+        let package_attempt = state.package_seal.as_ref().is_some_and(|seal| {
+            seal.packages
+                .iter()
+                .any(|archive| archive.attempt_path(&packages::directory(state_path)).exists())
+        });
+        let forge = state.intent.release_config.remote_effects.creates_forge_release() && !state.intent.skip_tag;
+        let publication_effect = state
+            .crates
+            .iter()
+            .zip(&state.intent.plan.crates)
+            .any(|(crate_state, planned)| {
+                (!state.intent.skip_tag
+                    && (step_may_have_side_effect(&crate_state.tag) || crate_state.tag_object.is_some()))
+                    || (!state.intent.skip_publish
+                        && planned.publish
+                        && (step_may_have_side_effect(&crate_state.publication)
+                            || crate_state.publication_attempt.is_some()))
+                    || (forge
+                        && (step_may_have_side_effect(&crate_state.forge_draft)
+                            || step_may_have_side_effect(&crate_state.forge_publication)))
+                    || step_may_have_side_effect(&crate_state.alias)
+            });
+        if state.review.is_some() || package_attempt || step_may_have_side_effect(&state.tag_push) || publication_effect
+        {
+            return Err(RailError::with_help(
+                "release preparation cannot be retained because a tag, registry, review, forge, or alias effect may exist",
+                format!(
+                    "resume with 'cargo rail release resume {}'; cargo-rail will reconcile the external state",
+                    state.transaction_id
+                ),
+            ));
+        }
+        if !state.intent.release_config.remote_effects.pushes()
+            || state.commit_push.status == StepStatus::Pending
+            || state.commit_push.object.as_deref() != Some(release_commit.as_str())
+        {
+            return Err(RailError::with_help(
+                "release has no observed pushed preparation to retain",
+                format!(
+                    "use 'cargo rail release abort {} --yes' while the transaction is still local",
+                    state.transaction_id
+                ),
+            ));
+        }
+
+        self.validate_remote_repository(state)?;
+        let git = self.ctx.git()?.git();
+        if git.current_branch()? != state.intent.branch {
+            return Err(RailError::with_help(
+                format!("release abort requires branch '{}'", state.intent.branch),
+                format!("git switch {}", state.intent.branch),
+            ));
+        }
+        if git.is_dirty()? {
+            return Err(RailError::with_help(
+                format!(
+                    "release checkout has uncommitted content: {}",
+                    git.dirty_files()?.join(", ")
+                ),
+                "commit or restore the worktree before retaining the pushed preparation",
+            ));
+        }
+        let current_head = git.head_commit()?;
+        let remote_head = self
+            .remote_ref_target(&format!("refs/heads/{}", state.intent.branch))?
+            .ok_or_else(|| RailError::message("release branch is absent from the retained remote"))?;
+        if current_head != remote_head {
+            return Err(RailError::with_help(
+                format!("release branch differs between the checkout ({current_head}) and origin ({remote_head})"),
+                "synchronize the exact release branch before retaining the pushed preparation",
+            ));
+        }
+        if !git.run_git_check(&["merge-base", "--is-ancestor", &release_commit, &current_head]) {
+            return Err(RailError::with_help(
+                format!("release preparation {release_commit} is not an ancestor of {current_head}"),
+                "restore a branch that contains the exact pushed preparation before aborting",
+            ));
+        }
+
+        state.commit_push.status = StepStatus::Complete;
+        state.commit_push.object = Some(release_commit.clone());
+        state.abort.status = StepStatus::InProgress;
+        state.abort.object = Some(release_commit.clone());
+        state.save(state_path)?;
+        state.abort.status = StepStatus::Complete;
+        state.status = ReleaseStatus::Aborted;
+        state.save(state_path)?;
+        progress!("release aborted; retained pushed preparation {release_commit}");
         Ok(())
     }
 

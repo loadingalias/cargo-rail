@@ -431,13 +431,23 @@ pub fn try_dispatch_pre_context(
         }
 
         Commands::Release {
-            command: cli::ReleaseCommand::Abort { transaction, yes },
+            command:
+                cli::ReleaseCommand::Abort {
+                    transaction,
+                    retain_preparation,
+                    yes,
+                },
         } => {
+            crate::release::hosted::refresh(workspace_root, transaction.as_deref())?;
             let state = crate::release::state::resolve_active(workspace_root, transaction.as_deref())?;
             crate::release::state::prepare_recovery(workspace_root, &state)?;
             Ok(PreContextDispatch::NeedsContext(PreparedContext::new(
                 Commands::Release {
-                    command: cli::ReleaseCommand::Abort { transaction, yes },
+                    command: cli::ReleaseCommand::Abort {
+                        transaction,
+                        retain_preparation,
+                        yes,
+                    },
                 },
                 config_override,
             )?))
@@ -724,9 +734,11 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext, prepared_plan: Option<Pla
             cli::ReleaseCommand::Status { .. } | cli::ReleaseCommand::Record { .. } => Err(
                 crate::error::RailError::message("release status reached workspace dispatch"),
             ),
-            cli::ReleaseCommand::Abort { transaction, yes } => {
-                release::run_release_abort(ctx, transaction.as_deref(), yes)
-            }
+            cli::ReleaseCommand::Abort {
+                transaction,
+                retain_preparation,
+                yes,
+            } => release::run_release_abort(ctx, transaction.as_deref(), retain_preparation, yes),
         },
 
         // Clean

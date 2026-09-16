@@ -1019,12 +1019,15 @@ pub enum ReleaseCommand {
         #[arg(long, short = 'f', default_value_t, value_enum)]
         format: TextJsonOutputFormat,
     },
-    /// Abort an active release that has not reached remote side effects
+    /// Abort an active release before publication
     Abort {
         /// Transaction identity; omit when exactly one release is active
         #[arg(value_name = "TRANSACTION")]
         transaction: Option<String>,
-        /// Confirm restoration of the pre-release local state
+        /// Retain an exact pushed preparation that is an ancestor of the current branch
+        #[arg(long)]
+        retain_preparation: bool,
+        /// Confirm the abort operation
         #[arg(short = 'y', long)]
         yes: bool,
     },
