@@ -3,6 +3,23 @@
 Published versions are recorded below. Pending release intent lives in [`.changes/`](.changes/);
 see [releasing a workspace](docs/releases.md) for the current preparation and publication workflow.
 
+## [0.28.0] - 2026-09-16
+- Make cache installation upgrades recoverable,
+  prevent registry reads from observing concurrent profile publication,
+  add an explicit local readiness proof and schema 18 status,
+  accept external-tool-compatible canonical paths in the Windows readiness probe,
+  keep remote authority separate from local health,
+  and qualify native stable and pinned nightly compilers against independent
+  release and date bounds for authenticated driver sources.
+  Add bounded Surface preflight, progress, cancellation, storage accounting, and target scope;
+  Surface reports now use contract v4 and planner consumers use v9 attribution.
+  Regenerate older Surface reports and update strict cache-status consumers
+  before adopting this release.
+
+- Prevent Linux compiler-cache qualification from failing when unrelated files change in shared ancestor directories.
+
+- Allow an exact pushed release preparation to be retired before publication when it remains an ancestor of the clean
+  local and remote release branch.
 ## [0.27.1] - 2026-09-13
 - Fix GitHub release creation and recovery by retaining the release ID returned by GitHub and observing drafts by ID.
   Recover a draft after a lost creation response through the paginated release list, and reject ambiguous matches
