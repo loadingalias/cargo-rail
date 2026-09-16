@@ -745,7 +745,7 @@ fn ordinary_cargo_distributes_module_trees_and_exact_rust_dependencies() -> Resu
         }
     };
     #[cfg(windows)]
-    let (distributed_check, check_events) = (transition_check, transition_check_events);
+    let (_distributed_check, check_events) = (transition_check, transition_check_events);
     #[cfg(not(windows))]
     let compiler_actions = check_events
         .iter()

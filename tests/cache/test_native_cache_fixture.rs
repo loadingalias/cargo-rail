@@ -526,6 +526,7 @@ fn benchmark_event_summary(directory: &Path) -> Result<BTreeMap<String, u64>> {
     Ok(summary)
 }
 
+#[cfg(not(windows))]
 fn ensure_only_compiler_probe_bypasses(directory: &Path, observed: u64, phase: &str) -> Result<()> {
     let events = benchmark_events(directory)?;
     let bypasses = events
