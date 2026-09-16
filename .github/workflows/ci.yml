@@ -117,6 +117,13 @@ jobs:
           runtime-source: source
           components: surface
           all: ${{ github.event_name == 'workflow_dispatch' }}
+      - name: Check source surface
+        if: matrix.suite == 'full' && contains(fromJSON(steps.rail.outputs.required-work), 'surface')
+        env:
+          PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
+        run: |
+          [[ "$(cargo-rail-action plan is-required "$PLAN_FILE" surface)" == true ]]
+          cargo rail surface --check --explain
       - uses: loadingalias/cargo-rail-action/cache@7424d06d2b0526d2cb922d262f7c031d2284cb5c # immutable source pin
         if: matrix.suite == 'full' && github.event_name != 'pull_request'
         id: cache
@@ -155,13 +162,6 @@ jobs:
         run: |
           [[ "$(cargo-rail-action plan is-required "$PLAN_FILE" dependency-policy)" == true ]]
           cargo rail unify --check --explain
-      - name: Check source surface
-        if: matrix.suite == 'full' && contains(fromJSON(steps.rail.outputs.required-work), 'surface')
-        env:
-          PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
-        run: |
-          [[ "$(cargo-rail-action plan is-required "$PLAN_FILE" surface)" == true ]]
-          cargo rail surface --check --explain
       - name: Download RISC-V cache tests
         if: matrix.platform == 'riscv64-linux' && needs.riscv-build.outputs.cache-qualification == 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
