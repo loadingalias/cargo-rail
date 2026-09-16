@@ -18,5 +18,5 @@ runners:
     family: [c7a.2xlarge, c8a.2xlarge]
     cpu: 8
     image: windows25-full-x64
-    spot: price-capacity-optimized
+    spot: false
     volume: 200gb:gp3
