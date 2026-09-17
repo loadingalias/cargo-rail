@@ -1,85 +1,91 @@
-# Repository policy. Omitted fields use cargo-rail's coded defaults.
+# cargo-rail configuration
+# Documentation: https://github.com/loadingalias/cargo-rail
 
+# Additional supported Cargo target-resolution views; not a compiler/linker execution matrix.
 targets = [
+  # Tier 1 (Guaranteed)
   "aarch64-apple-darwin",
-  "aarch64-pc-windows-msvc",
   "aarch64-unknown-linux-gnu",
-  "aarch64-unknown-linux-musl",
-  "riscv64gc-unknown-linux-gnu",
   "x86_64-pc-windows-msvc",
   "x86_64-unknown-linux-gnu",
+  # Tier 2 (Common)
+  "aarch64-pc-windows-msvc",
+  "aarch64-unknown-linux-musl",
   "x86_64-unknown-linux-musl",
-  # IBM Z, POWER are missing.
+  # Other
+  "powerpc64le-unknown-linux-gnu",
+  "riscv64gc-unknown-linux-gnu",
+  "s390x-unknown-linux-gnu",
 ]
 
 [unify]
 include_renamed = true
 major_version_conflict = "bump"
-max_backups = 2
-msrv_policy = { mode = "compute", source = "workspace" }
 
-[surface]
-enabled = true
-
-[plan.work.cache-qualification]
+[plan.work.check-compiler-driver]
 scope = "repository"
 paths = [
-  ".github/workflows/ci.yml",
+  "justfile",
+  "rust-toolchain.toml",
+  "rustfmt.toml",
+  "scripts/check-compiler-fact-driver.sh",
+  "tools/compiler-fact-driver/**",
+]
+cargo = ["cargo.test"]
+
+[plan.work.check-cross]
+scope = "repository"
+paths = [
+  ".config/tooling.toml",
+  "justfile",
+  "rust-toolchain.toml",
+  "scripts/check-cross.sh",
+]
+config = ["targets"]
+cargo = ["cargo.clippy"]
+
+[plan.work.check-tooling]
+scope = "repository"
+paths = [
+  ".config/tooling.toml",
+  ".github/**",
+  ".gitignore",
+  "Cargo.toml",
+  "LICENSE",
+  "justfile",
+  "rust-toolchain.toml",
+  "scripts/**",
+]
+
+[plan.work.test-cache-host]
+scope = "repository"
+paths = [
   ".config/nextest.toml",
   ".config/tooling.toml",
   "justfile",
   "scripts/check-cache-host.py",
   "scripts/check-cache-host.sh",
-  "scripts/tooling/**",
+  "scripts/check-compiler-fact-driver.sh",
+  "scripts/tooling/compiler_support.py",
+  "scripts/tooling/test_cache_transfer.py",
   "tests/fixtures/native_cache/**",
   "tools/compiler-fact-driver/**",
 ]
 config = ["targets"]
 cargo = ["cargo.test"]
 
-[plan.work.ci-check]
+[plan.work.test-cranelift]
 scope = "repository"
 paths = [
-  ".config/tooling.toml",
-  "Cargo.lock",
-  "Cargo.toml",
-  "deny.toml",
-  "justfile",
-  "rust-toolchain.toml",
-  "rustfmt.toml",
-  "scripts/check-compiler-fact-driver.sh",
-  "scripts/check.sh",
-  "tools/compiler-fact-driver/**",
-]
-cargo = ["cargo.clippy", "cargo.doc"]
-
-[plan.work.test-suite]
-scope = "repository"
-paths = [
+  ".config/cranelift-toolchain.toml",
   ".config/nextest.toml",
   "justfile",
   "scripts/check-compiler-fact-driver.sh",
   "scripts/check-source-installation.sh",
+  "scripts/prepare-cranelift.sh",
+  "tools/compiler-fact-driver/**",
 ]
-cargo = ["cargo.doctest", "cargo.test"]
-
-[plan.work.tooling]
-scope = "repository"
-paths = [".github/**", ".config/tooling.toml", "justfile", "scripts/**"]
+cargo = ["cargo.test"]
 
 [release]
-remote_effects = "github"
-registry_publication = "crates-io"
-hosted_workflow = ".github/workflows/release.yml"
 auxiliary_cargo_manifests = ["tools/compiler-fact-driver/Cargo.toml"]
-validation = { ".github/workflows/ci.yml" = ["aarch64-linux", "riscv64-linux", "x86_64-linux", "x86_64-win"], ".github/workflows/package.yml" = ["Collect release assets"] }
-
-[release.artifacts.cargo-rail]
-workflow = ".github/workflows/package.yml"
-[release.artifacts.cargo-rail.files]
-"cargo-rail-aarch64-apple-darwin.zip" = { target = "aarch64-apple-darwin" }
-"cargo-rail-aarch64-unknown-linux-gnu.zip" = { target = "aarch64-unknown-linux-gnu" }
-"cargo-rail-x86_64-pc-windows-msvc.zip" = { target = "x86_64-pc-windows-msvc" }
-"cargo-rail-x86_64-unknown-linux-gnu.zip" = { target = "x86_64-unknown-linux-gnu" }
-"SHA256SUMS" = {}
-"LICENSE" = { source = "LICENSE" }

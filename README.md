@@ -184,11 +184,11 @@ See [Planning](docs/planning.md).
 
 ### GitHub Actions
 
-The native v9 Action installs the latest stable Cargo-Rail release, runs the planner once,
+The native v10 Action installs Cargo-Rail v0.28.1, runs the planner once,
 and exposes the validated plan plus exact required-work selectors:
 
 ```yaml
-- uses: loadingalias/cargo-rail-action@v9
+- uses: loadingalias/cargo-rail-action@v10
   id: rail
 
 - name: Test affected packages
@@ -205,8 +205,8 @@ and exposes the validated plan plus exact required-work selectors:
     cargo nextest run "${CARGO_ARGS[@]}" --locked
 ```
 
-Use `loadingalias/cargo-rail-action/cache@v9` separately in each execution job that needs remote compiler reuse.
-Both actions install the latest stable Cargo-Rail release by default.
+Use `loadingalias/cargo-rail-action/cache@v10` separately in each execution job that needs remote compiler reuse.
+Both actions install Cargo-Rail v0.28.1 by default.
 Set an exact `version` only when the workflow needs a reproducible pin.
 Its `mode` input is required.
 Do not provide remote credentials to untrusted jobs.

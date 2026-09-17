@@ -42,15 +42,26 @@ jobs:
       contents: write
       actions: write
       pull-requests: write
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.CARGO_RAIL_R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.CARGO_RAIL_R2_SECRET_ACCESS_KEY }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: main
           fetch-depth: 0
+      - name: Install release tooling
+        run: scripts/tooling/package-unix.sh x86_64-unknown-linux-gnu
+      - uses: loadingalias/cargo-rail-action/cache@e706767c343acb6a2ab1917f243b1616ae9eb05b # v10.0.0
+        id: cache
+        with:
+          remote: ${{ vars.CARGO_RAIL_CACHE_REMOTE }}
+          mode: read-write
+          max-size: 10GiB
+          root-portability: remap
+          verify-remote: true
       - name: Build this release engine
-        run: |
-          scripts/tooling/package-unix.sh x86_64-unknown-linux-gnu
-          cargo build --locked --bin cargo-rail
+        run: cargo build --locked --bin cargo-rail
       - name: Execute the durable request
         env:
           GH_TOKEN: ${{ github.token }}
@@ -72,3 +83,14 @@ jobs:
             if [[ -n "$TRANSACTION" ]]; then args+=("$TRANSACTION"); fi
           fi
           "$core" "${args[@]}"
+      - uses: loadingalias/cargo-rail-action/cache/collect@e706767c343acb6a2ab1917f243b1616ae9eb05b # v10.0.0
+        if: always() && steps.cache.outcome == 'success'
+        id: cache-record
+        with:
+          job: release
+          output-directory: ${{ runner.temp }}/cache-records
+      - uses: loadingalias/cargo-rail-action/cache/report@e706767c343acb6a2ab1917f243b1616ae9eb05b # v10.0.0
+        if: always() && steps.cache-record.outcome == 'success'
+        with:
+          records-directory: ${{ runner.temp }}/cache-records
+          expected-jobs: '["release"]'

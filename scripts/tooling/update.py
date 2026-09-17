@@ -74,9 +74,9 @@ def release(repo):
     return result
 
 
-def pinned_url(url):
+def pinned_url(url, *, preserve_source=False):
     data, resolved = fetch(url)
-    return {'url': resolved, 'sha256': hashlib.sha256(data).hexdigest()}
+    return {'url': url if preserve_source else resolved, 'sha256': hashlib.sha256(data).hexdigest()}
 
 
 def github_asset(repo, name):
@@ -163,7 +163,9 @@ def update_catalog():
             release_data = api(f'https://api.github.com/repos/nextest-rs/nextest/releases/tags/cargo-nextest-{version}')
             name = f'cargo-nextest-{version}-{host}.tar.gz'
             asset = next(item for item in release_data['assets'] if item['name'] == name)
-            assets['cargo-nextest'] = pinned_url(asset['browser_download_url'])
+            # GitHub redirects release assets through expiring signed URLs. Keep
+            # the stable release URL while pinning the bytes it serves.
+            assets['cargo-nextest'] = pinned_url(asset['browser_download_url'], preserve_source=True)
         if not platform['cargo']:
             continue
         assets['cargo-binstall'] = github_asset(REPOS['cargo-binstall'], f'cargo-binstall-{host}.' + ('zip' if windows else 'tgz'))

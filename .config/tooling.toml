@@ -7,12 +7,12 @@
 [cargo]
 cargo-audit = "0.22.2"
 cargo-deny = "0.20.2"
-cargo-nextest = "0.9.144"
+cargo-nextest = "0.9.145"
 cargo-xwin = "0.23.1"
 cargo-mutants = "27.1.0"
 just = "1.58.0"
 ripgrep = "15.2.0"
-rumdl = "0.2.71"
+rumdl = "0.2.73"
 lychee = "0.24.2"
 samply = "0.13.1"
 
@@ -49,17 +49,17 @@ python = "3.14.7"
 [linux]
 ubuntu = "24.04"
 codename = "noble"
-snapshot = "20260906T053626Z"
+snapshot = "20260917T172128Z"
 
 [windows]
 # Bound simultaneous Rust links on the smallest provisioned Windows runner.
 cargo-build-jobs = 2
-visual-studio = "18.9.2"
-build-version = "18.9.12120.119"
-channel-url = "https://download.visualstudio.microsoft.com/download/pr/fe4fb3e6-ea32-4ae3-b154-72821a274f0d/8ae0a45312cd28cec640174c5df11085f4efcb3bf210bd94cea932fb42c36778/VisualStudio.18.Release.chman"
-channel-sha256 = "d3aa7336680097d007876ffb85c9d2b5c32c21796e0125407c4e3b88ebe4fc31"
-bootstrap-url = "https://download.visualstudio.microsoft.com/download/pr/fe4fb3e6-ea32-4ae3-b154-72821a274f0d/352ac5776d592a4870c15756f9e140507b9ee64de62b401152e5929f7c0c52a6/vs_BuildTools.exe"
-bootstrap-sha256 = "352ac5776d592a4870c15756f9e140507b9ee64de62b401152e5929f7c0c52a6"
+visual-studio = "18.10.1"
+build-version = "18.10.12210.168"
+channel-url = "https://download.visualstudio.microsoft.com/download/pr/7437128c-6580-48ab-9c69-f7452be2ee7f/786b2b2f4fd0ff1816e6f71e7989d90b794c9349850d289be07564e8eaff40cf/VisualStudio.18.Release.chman"
+channel-sha256 = "8420bf592e38cb522d433dcc19eaeecfc9b35b2a0b0508adbeab37cc9c410654"
+bootstrap-url = "https://download.visualstudio.microsoft.com/download/pr/7437128c-6580-48ab-9c69-f7452be2ee7f/c71a953a56448193b971b21a5a79ed8c32b4376b9e88fb0365e5c46a6013a804/vs_BuildTools.exe"
+bootstrap-sha256 = "c71a953a56448193b971b21a5a79ed8c32b4376b9e88fb0365e5c46a6013a804"
 sdk-component = "Microsoft.VisualStudio.Component.Windows11SDK.28000"
 
 [aarch64-linux]
@@ -182,8 +182,8 @@ url = "https://static.rust-lang.org/rustup/archive/1.29.1/riscv64gc-unknown-linu
 sha256 = "e94134ed99fed1a3a1f13a3bf0a05d616fc1c2496ec0b557aaee4856cd34b2f2"
 
 [riscv64-linux.assets.cargo-nextest]
-url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.144/cargo-nextest-0.9.144-riscv64gc-unknown-linux-gnu.tar.gz"
-sha256 = "1d5d081245e73e9f7cfa462a4bcb37bf055c69f6bb7988b278523a8f8ead79ba"
+url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.145/cargo-nextest-0.9.145-riscv64gc-unknown-linux-gnu.tar.gz"
+sha256 = "b7ba8a7b6fa48bdd4da90411d487be290c81ae29195518c68d5bc49cd686f956"
 
 [s390x-linux]
 os = "Ubuntu 24.04 LTS"

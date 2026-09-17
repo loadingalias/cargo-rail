@@ -84,8 +84,8 @@ and the configured signing authority.
 Keep registry credentials in this job, outside validation and packaging jobs.
 
 Invoke `loadingalias/cargo-rail-action/release` at a reviewed immutable Action commit.
-Its `version` input defaults to `latest`, which resolves the latest stable Cargo-Rail release.
-Set an exact stable version to pin the engine.
+Its `version` input defaults to Cargo-Rail v0.28.1.
+Set a different exact stable version only when the workflow requires another compatible engine.
 The other inputs are `packages` (a JSON array; `[]` selects all), `bump`, `publish`, and `review`.
 It exposes `transaction-id`, `release-sha`, `state`, and `run-url`.
 The Action installs the selected authenticated Cargo-Rail components,

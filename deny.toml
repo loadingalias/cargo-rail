@@ -35,6 +35,9 @@ wildcards = "deny"
 highlight = "all"
 
 skip = [
+  # reqwest has advanced to base64 0.23 while hyper-util and Typespec still
+  # require 0.22; remove this skip when those constraints converge.
+  "base64@0.22.1",
   # The AWS SDK currently spans the RustCrypto 0.10 and 0.11 dependency lines;
   # remove these skips when its graph converges on one compatible line.
   "block-buffer@0.10.4",

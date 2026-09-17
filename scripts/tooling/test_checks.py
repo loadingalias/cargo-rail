@@ -28,7 +28,7 @@ class CheckRecipes(unittest.TestCase):
             + justfile[end:]
         )
         (self.root / 'justfile').write_text(justfile)
-        for name in ['check.sh', 'check-cross.sh', 'check-compiler-fact-driver.sh']:
+        for name in ['check-cross.sh', 'check-compiler-fact-driver.sh']:
             shutil.copy(ROOT / 'scripts' / name, self.root / 'scripts' / name)
         binaries = self.root / 'bin'
         binaries.mkdir()
@@ -42,6 +42,9 @@ else:
         log.write(json.dumps({'args': [name, *sys.argv[1:]],
                               'rustdocflags': os.environ.get('RUSTDOCFLAGS'),
                               'bootstrap': os.environ.get('RUSTC_BOOTSTRAP')}) + '\\n')
+    fail_args = os.environ.get('CHECK_FAIL_ARGS')
+    if fail_args and [name, *sys.argv[1:]] == json.loads(fail_args):
+        sys.exit(int(os.environ['CHECK_FAIL_CODE']))
     if sys.argv[1:2] == [os.environ.get('CHECK_FAIL_COMMAND')]:
         sys.exit(23)
 '''
@@ -77,13 +80,14 @@ else:
                     ['cargo', 'fmt', '--all', '--', '--check'],
                     ['cargo', 'clippy', '--workspace', '--all-targets', '--all-features', '--locked'],
                     ['cargo', 'deny', '--locked', '--workspace', '--all-features', 'check', '-D', 'warnings', 'all'],
+                    ['cargo', 'rail', 'unify', '--check', '--explain'],
                     ['cargo', 'doc', '--workspace', '--no-deps', '--all-features', '--locked'],
                     ['cargo', 'fmt', '--manifest-path', driver, '--all', '--', '--check'],
                     ['cargo', 'clippy', '--manifest-path', driver, '--all-targets', '--all-features', '--locked', '--', '-D', 'warnings'],
                     ['cargo', 'test', '--manifest-path', driver, '--all-targets', '--all-features', '--locked'],
                 ])
-                self.assertEqual(calls[3]['rustdocflags'], '-C debuginfo=0 -D warnings')
-                self.assertEqual([call['bootstrap'] for call in calls[4:]], ['cargo_rail_fact_driver'] * 3)
+                self.assertEqual(calls[4]['rustdocflags'], '-C debuginfo=0 -D warnings')
+                self.assertEqual([call['bootstrap'] for call in calls[5:]], ['cargo_rail_fact_driver'] * 3)
 
     def test_local_check_wraps_the_shared_lane_with_fixing_and_workstation_checks(self):
         shared = self.run_recipe('ci-check')
@@ -93,11 +97,12 @@ else:
             ['cargo', 'clippy', '--workspace', '--all-targets', '--all-features', '--locked', '--fix', '--allow-dirty', '--allow-staged'],
             ['cargo', 'fmt', '--all'],
         ])
-        self.assertEqual(calls[3:10], shared)
-        self.assertEqual(calls[10]['args'], [
+        shared_end = 3 + len(shared)
+        self.assertEqual(calls[3:shared_end], shared)
+        self.assertEqual(calls[shared_end]['args'], [
             'cargo', 'nextest', 'run', '--workspace', '-P', 'default', '--all-features', '--locked'
         ])
-        self.assertEqual([call['args'] for call in calls[11:]], [
+        self.assertEqual([call['args'] for call in calls[shared_end + 1:]], [
             [*command, '--target', target, '--workspace', '--all-targets', '--all-features', '--locked']
             for command, target in [
                 (['cargo-zigbuild', 'clippy'], 'x86_64-unknown-linux-gnu'),
@@ -107,7 +112,56 @@ else:
                 (['cargo', 'xwin', 'clippy'], 'x86_64-pc-windows-msvc'),
                 (['cargo', 'xwin', 'clippy'], 'aarch64-pc-windows-msvc'),
             ]
-        ] + [['cargo', 'run', '--all-features', '--locked', '--bin', 'cargo-rail', '--', 'rail', 'unify', '--check', '--explain']])
+        ])
+
+    def test_cache_setup_keeps_authority_machine_owned(self):
+        calls = self.run_recipe('rail-cache-setup', '--max-size', '10GiB')
+        self.assertEqual([call['args'] for call in calls], [
+            ['cargo', 'rail', 'cache', 'setup', '--local-only', '--check', '--max-size', '10GiB'],
+            ['cargo', 'rail', 'cache', 'setup', '--local-only', '--max-size', '10GiB'],
+            ['cargo', 'rail', 'cache', 'ready'],
+        ])
+
+        self.environment['CARGO_RAIL_CACHE_REMOTE'] = 'r2://0123456789abcdef0123456789abcdef/cargo-rail-cache'
+        self.environment['CARGO_RAIL_CACHE_MODE'] = 'read-write'
+        calls = self.run_recipe('rail-cache-setup', '--max-size', '10GiB')
+        remote = [
+            '--remote', self.environment['CARGO_RAIL_CACHE_REMOTE'],
+            '--remote-mode', 'read-write',
+            '--root-portability', 'remap',
+        ]
+        self.assertEqual([call['args'] for call in calls], [
+            ['cargo', 'rail', 'cache', 'setup', *remote, '--check', '--max-size', '10GiB'],
+            ['cargo', 'rail', 'cache', 'setup', *remote, '--max-size', '10GiB'],
+            ['cargo', 'rail', 'cache', 'ready'],
+        ])
+
+        calls = self.run_recipe('cache-status')
+        self.assertEqual([call['args'] for call in calls], [
+            ['cargo', 'rail', 'cache', 'status', '--scope', 'local', '--format', 'json'],
+        ])
+
+    def test_plan_and_release_recipes_preserve_their_authority_boundaries(self):
+        calls = self.run_recipe('plan', '--all')
+        self.assertEqual([call['args'] for call in calls], [
+            ['cargo', 'rail', 'plan', '--explain', '--all'],
+        ])
+
+        check = ['cargo', 'rail', 'release', 'check', '--all', '--bump', 'patch']
+        self.environment['CHECK_FAIL_ARGS'] = json.dumps(check)
+        self.environment['CHECK_FAIL_CODE'] = '1'
+        calls = self.run_recipe('release', 'patch')
+        self.assertEqual([call['args'] for call in calls], [
+            check,
+            ['cargo', 'rail', 'surface', '--check', '--explain'],
+            ['cargo', 'rail', 'release', 'run', '--all', '--local', '--bump', 'patch'],
+        ])
+
+        self.environment['CHECK_FAIL_CODE'] = '2'
+        calls = self.run_recipe('release', 'patch', success=False)
+        self.assertEqual([call['args'] for call in calls], [
+            check,
+        ])
 
     def test_shared_check_failure_stops_later_checks(self):
         self.environment['CHECK_FAIL_COMMAND'] = 'clippy'

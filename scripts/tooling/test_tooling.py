@@ -97,6 +97,13 @@ class CacheQualification(unittest.TestCase):
 
 
 class ReleaseSelection(unittest.TestCase):
+    def test_release_asset_hashing_can_retain_a_stable_source_url(self):
+        source = 'https://github.com/example/tool/releases/download/v1/tool.tar.gz'
+        with patch.object(update, 'fetch', return_value=(b'archive', 'https://signed.example/temporary')):
+            asset = update.pinned_url(source, preserve_source=True)
+        self.assertEqual(asset['url'], source)
+        self.assertEqual(asset['sha256'], update.hashlib.sha256(b'archive').hexdigest())
+
     def test_latest_stable_release_respects_rust_floor_and_yanks_without_age_filter(self):
         versions = [{'num': '1.0.0'}, {'num': '2.0.0', 'rust_version': '1.98.1'},
                     {'num': '3.0.0', 'yanked': True}, {'num': '4.0.0-rc.1'},

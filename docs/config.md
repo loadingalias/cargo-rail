@@ -190,7 +190,7 @@ The merged tree must match preparation,
 and the merge event continues validation and publication on its exact commit.
 See [releasing a workspace](releases.md) for the workflow contract and recovery behavior.
 
-Optional `release.aliases = { my-action = "v9" }` authorizes a mutable tag for a package.
+Optional `release.aliases = { my-action = "v10" }` authorizes a mutable tag for a package.
 Cargo-Rail captures its prior object in the intent and promotes it with a Git lease only
 after verifying the immutable forge release.
 Aliases require tags and forge publication.

@@ -30,22 +30,36 @@ jobs:
     timeout-minutes: ${{ matrix.timeout }}
     permissions:
       contents: read
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.CARGO_RAIL_R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.CARGO_RAIL_R2_SECRET_ACCESS_KEY }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install Windows tooling and package
+      - name: Install Windows tooling
         if: runner.os == 'Windows'
         shell: powershell
-        run: |
-          ./scripts/tooling/x86_64-win.ps1 -Operation package
-          just package-release "$env:RUNNER_TEMP/release"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        run: ./scripts/tooling/x86_64-win.ps1 -Operation package
       - name: Install native release tooling
         if: runner.os != 'Windows'
         env:
           TARGET: ${{ matrix.target }}
         run: scripts/tooling/package-unix.sh "$TARGET"
+      - uses: loadingalias/cargo-rail-action/cache@e706767c343acb6a2ab1917f243b1616ae9eb05b # v10.0.0
+        id: cache
+        with:
+          remote: ${{ vars.CARGO_RAIL_CACHE_REMOTE }}
+          mode: read-write
+          max-size: 10GiB
+          root-portability: remap
+          verify-remote: true
+      - name: Package native release
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          just package-release "$env:RUNNER_TEMP/release"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Package native release
         if: runner.os != 'Windows'
         env:
@@ -59,6 +73,18 @@ jobs:
         run: python3 scripts/check-release-install.py "$RUNNER_TEMP/release"
       - name: Require unchanged sources
         run: git diff --exit-code HEAD
+      - uses: loadingalias/cargo-rail-action/cache/collect@e706767c343acb6a2ab1917f243b1616ae9eb05b # v10.0.0
+        if: always() && steps.cache.outcome == 'success'
+        id: cache-record
+        with:
+          job: ${{ matrix.target }}
+          output-directory: ${{ runner.temp }}/cache-records
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always() && steps.cache-record.outcome == 'success'
+        with:
+          name: cache-record-package-${{ matrix.target }}
+          path: ${{ steps.cache-record.outputs.record-file }}
+          if-no-files-found: error
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: package-${{ matrix.target }}
@@ -103,3 +129,23 @@ jobs:
           if-no-files-found: error
           retention-days: 30
           compression-level: 0
+
+  cache-report:
+    name: Compiler cache report
+    needs: package
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          pattern: cache-record-package-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/cache-records
+      - uses: loadingalias/cargo-rail-action/cache/report@e706767c343acb6a2ab1917f243b1616ae9eb05b # v10.0.0
+        with:
+          records-directory: ${{ runner.temp }}/cache-records
+          expected-jobs: '["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]'

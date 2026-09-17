@@ -1,11 +1,57 @@
 # Local repair, shared validation, cross-compilation, and dogfooding.
 check: fix ci-check test
-    @scripts/check-cross.sh
-    cargo run --all-features --locked --bin cargo-rail -- rail unify --check --explain
+    @just check-cross
+
+# Enroll this workspace under explicit machine cache authority, then prove reuse.
+rail-cache-setup *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    setup=(cargo rail cache setup)
+    if [[ -n "${CARGO_RAIL_CACHE_REMOTE:-}" ]]; then
+        setup+=(--remote "$CARGO_RAIL_CACHE_REMOTE" --remote-mode "${CARGO_RAIL_CACHE_MODE:?}" --root-portability remap)
+    else
+        setup+=(--local-only)
+    fi
+    status=0
+    "${setup[@]}" --check {{args}} || status=$?
+    (( status <= 1 )) || exit "$status"
+    "${setup[@]}" {{args}}
+    cargo rail cache ready
+
+# Report the selected local and remote cache authority without credentials.
+cache-status:
+    cargo rail cache status --scope local --format json
+
+# Validate reviewed release intent before heavy source-surface analysis.
+release-check bump="auto":
+    #!/usr/bin/env bash
+    status=0
+    cargo rail release check --all --bump {{quote(bump)}} || status=$?
+    (( status <= 1 )) || exit "$status"
+
+# Run the heavy source-surface gate only after release intent is valid.
+pre-release bump="auto": (release-check bump)
+    cargo rail surface --check --explain
+
+# Execute the checked release transaction locally without publication authority.
+release bump="auto": (pre-release bump)
+    cargo rail release run --all --local --bump {{quote(bump)}}
 
 # Shared nonmutating checks, also run by the local check recipe.
-ci-check:
-    @scripts/check.sh
+ci-check: check-format check-clippy check-dependencies check-docs check-compiler-driver
+
+check-format:
+    cargo fmt --all -- --check
+
+check-clippy:
+    cargo clippy --workspace --all-targets --all-features --locked
+
+check-dependencies:
+    cargo deny --locked --workspace --all-features check -D warnings all
+    cargo rail unify --check --explain
+
+check-docs:
+    RUSTDOCFLAGS="${RUSTDOCFLAGS:+$RUSTDOCFLAGS }-D warnings" cargo doc --workspace --no-deps --all-features --locked
 
 # Explain the named work selected by the current checkout.
 plan *args:
@@ -13,6 +59,9 @@ plan *args:
 
 check-compiler-driver:
     @scripts/check-compiler-fact-driver.sh
+
+check-cross:
+    @scripts/check-cross.sh
 
 fix:
     cargo fmt --all
