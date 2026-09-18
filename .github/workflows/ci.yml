@@ -109,11 +109,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: powershell
         run: ./scripts/tooling/x86_64-win.ps1 -Operation ci
-      - uses: loadingalias/cargo-rail-action@e706767c343acb6a2ab1917f243b1616ae9eb05b # v10.0.0
-        if: matrix.suite == 'full'
-        id: rail
-        with:
-          all: ${{ github.event_name == 'workflow_dispatch' }}
+      # Cache setup changes Cargo configuration, so planning must capture it afterward.
       - uses: loadingalias/cargo-rail-action/cache@e706767c343acb6a2ab1917f243b1616ae9eb05b # v10.0.0
         if: matrix.suite == 'full' && github.event_name != 'pull_request'
         id: cache
@@ -123,6 +119,11 @@ jobs:
           max-size: 10GiB
           root-portability: remap
           verify-remote: true
+      - uses: loadingalias/cargo-rail-action@e706767c343acb6a2ab1917f243b1616ae9eb05b # v10.0.0
+        if: matrix.suite == 'full'
+        id: rail
+        with:
+          all: ${{ github.event_name == 'workflow_dispatch' }}
       - name: Check tooling and workflows
         if: matrix.platform == 'x86_64-linux' && contains(fromJSON(steps.rail.outputs.required-work), 'check-tooling')
         env:

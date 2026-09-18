@@ -381,6 +381,22 @@ class SelectedVerification(unittest.TestCase):
 
 
 class ToolingLane(unittest.TestCase):
+    def test_native_ci_configures_cache_before_plan_capture(self):
+        lines = (catalog.ROOT / '.github/workflows/ci.yml').read_text().splitlines()
+        start = lines.index('  native:')
+        end = next(
+            index for index, line in enumerate(lines[start + 1:], start + 1)
+            if line.startswith('  ') and not line.startswith('    ') and line.endswith(':')
+        )
+        actions = [
+            line.strip()
+            for line in lines[start:end]
+            if line.strip().startswith('- uses: loadingalias/cargo-rail-action')
+        ]
+        self.assertGreaterEqual(len(actions), 2)
+        self.assertTrue(actions[0].startswith('- uses: loadingalias/cargo-rail-action/cache@'))
+        self.assertTrue(actions[1].startswith('- uses: loadingalias/cargo-rail-action@'))
+
     def test_shared_recipe_rejects_invalid_workflow(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
