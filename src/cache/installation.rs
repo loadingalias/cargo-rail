@@ -4,6 +4,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use rscrypto::Sha256;
 use serde::{Deserialize, Serialize};
@@ -292,6 +293,8 @@ pub(crate) struct InstallationReceipt {
     active_profile: Option<crate::cache::profile::InstalledCacheProfile>,
     #[serde(skip)]
     active_profile_lock: Option<crate::cache::profile::ProfileLifecycleLock>,
+    #[serde(skip)]
+    readiness_local_only: bool,
 }
 
 #[derive(Deserialize)]
@@ -542,6 +545,9 @@ impl InstallationReceipt {
     }
 
     pub(crate) fn remote(&self) -> Option<&crate::remote_cache::InstalledRemoteCache> {
+        if self.readiness_local_only {
+            return None;
+        }
         self.active_profile
             .as_ref()
             .and_then(crate::cache::profile::InstalledCacheProfile::remote)
@@ -1253,16 +1259,14 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
         .map(InstallationReceipt::wrapper_path)
         .or_else(|| stale_receipt_version.map(|_| wrapper_path.as_path()));
     let (config_after, build_table_created) = install_wrapper_value(&original, &wrapper_path, owned_wrapper)?;
-    let wrapper = plan_executable_setup(
-        crate::compiler::native_cache::direct_wrapper_executable()?,
-        &wrapper_path,
-        "installed compiler wrapper",
-    )?;
-    let worker = plan_executable_setup(
-        crate::compiler::native_cache::direct_worker_executable()?,
-        &worker_path,
-        "installed compiler worker",
-    )?;
+    let wrapper_source = crate::compiler::native_cache::direct_wrapper_executable()?;
+    let worker_source = crate::compiler::native_cache::direct_worker_executable()?;
+    require_consistent_component_versions(&[
+        ("cargo-rail-native-rustc-wrapper", &wrapper_source),
+        ("cargo-rail-native-rustc-worker", &worker_source),
+    ])?;
+    let wrapper = plan_executable_setup(wrapper_source, &wrapper_path, "installed compiler wrapper")?;
+    let worker = plan_executable_setup(worker_source, &worker_path, "installed compiler worker")?;
     let sources =
         crate::compiler::driver::CompilerFactDriverAuthority::installation_components(&std::env::current_exe()?)?;
     let mut compiler_components = Vec::with_capacity(sources.len());
@@ -1384,8 +1388,10 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
         || existing.as_ref().is_some_and(|receipt| receipt.distributed.is_some());
     let distributed_worker = distributed_enabled
         .then(|| {
+            let source = crate::compiler::native_cache::direct_distributed_worker_executable()?;
+            require_consistent_component_versions(&[("cargo-rail-distributed-worker", &source)])?;
             plan_executable_setup(
-                crate::compiler::native_cache::direct_distributed_worker_executable()?,
+                source,
                 &distributed_worker_path,
                 "installed distributed compiler worker",
             )
@@ -1513,6 +1519,7 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
             }),
         active_profile: None,
         active_profile_lock: None,
+        readiness_local_only: false,
     };
     let profile = crate::cache::profile::plan_setup(
         &cargo_home,
@@ -2291,20 +2298,25 @@ pub(crate) fn load_for_wrapper(invoked: &Path, workspace_root: &Path) -> RailRes
         ));
     }
     let selected = crate::cache::profile::load_locked(&receipt.cargo_home, workspace_root)?;
-    let selected = match selected {
-        Some(selected) => Some(selected),
-        None => readiness_profile(&receipt.cargo_home, workspace_root)?,
+    let (profile, lock, readiness_local_only) = match selected {
+        Some((profile, lock)) => (profile, lock, false),
+        None => {
+            let (profile, lock) = readiness_profile(&receipt.cargo_home, workspace_root)?.ok_or_else(|| {
+                RailError::with_help(
+                    "the compiler workspace has no installed cache profile",
+                    "run `cargo rail cache setup` from that exact Cargo workspace",
+                )
+            })?;
+            (profile, lock, true)
+        }
     };
-    let (profile, lock) = selected.ok_or_else(|| {
-        RailError::with_help(
-            "the compiler workspace has no installed cache profile",
-            "run `cargo rail cache setup` from that exact Cargo workspace",
-        )
-    })?;
+    receipt.readiness_local_only = readiness_local_only;
     receipt.attach_locked_profile(profile, lock);
     Ok(receipt)
 }
 
+// The readiness workspace is deliberately not enrolled. Its capability names
+// the enrolled workspace whose local installation it may exercise.
 fn readiness_profile(
     cargo_home: &Path,
     source_root: &Path,
@@ -3168,6 +3180,66 @@ fn ensure_real_directory(path: &Path) -> RailResult<()> {
     Ok(())
 }
 
+fn require_consistent_component_versions(components: &[(&str, &Path)]) -> RailResult<()> {
+    const RECOVERY: &str =
+        "reinstall one complete Cargo-Rail component set, then verify it with `cargo rail cache setup --check`";
+
+    let current_executable = std::env::current_exe()?;
+    let mut releases = vec![(env!("CARGO_PKG_VERSION").to_string(), vec!["cargo-rail"])];
+    for &(name, path) in components {
+        let version = if path == current_executable {
+            env!("CARGO_PKG_VERSION").to_string()
+        } else {
+            let output = Command::new(path)
+                .arg(crate::compiler::component_version::ARGUMENT)
+                .output()
+                .map_err(|error| {
+                    RailError::with_help(
+                        format!("cannot read the Cargo-Rail release version from compiler component '{name}': {error}"),
+                        RECOVERY,
+                    )
+                })?;
+            let response = std::str::from_utf8(&output.stdout).ok().and_then(|stdout| {
+                let line = stdout.strip_suffix('\n').unwrap_or(stdout);
+                let line = line.strip_suffix('\r').unwrap_or(line);
+                line.strip_prefix(crate::compiler::component_version::RESPONSE_PREFIX)
+                    .and_then(|version| version.strip_prefix('\t'))
+                    .filter(|version| {
+                        !version.is_empty()
+                            && version.len() <= 64
+                            && version
+                                .bytes()
+                                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
+                    })
+            });
+            let Some(response) = response.filter(|_| output.status.success() && output.stderr.is_empty()) else {
+                return Err(RailError::with_help(
+                    format!("compiler component '{name}' did not report a valid Cargo-Rail release version"),
+                    RECOVERY,
+                ));
+            };
+            response.to_string()
+        };
+        if let Some((_, names)) = releases.iter_mut().find(|(release, _)| release == &version) {
+            names.push(name);
+        } else {
+            releases.push((version, vec![name]));
+        }
+    }
+    if releases.len() == 1 {
+        return Ok(());
+    }
+    let versions = releases
+        .into_iter()
+        .map(|(version, names)| format!("{version} ({})", names.join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(RailError::with_help(
+        format!("compiler components come from inconsistent Cargo-Rail releases: {versions}"),
+        RECOVERY,
+    ))
+}
+
 fn plan_executable_setup(source: PathBuf, destination: &Path, description: &str) -> RailResult<ExecutableSetup> {
     Ok(ExecutableSetup {
         source_digest: installation_source_digest(&source)?,
@@ -3617,6 +3689,7 @@ mod tests {
             distributed: None,
             active_profile: None,
             active_profile_lock: None,
+            readiness_local_only: false,
         }
     }
 

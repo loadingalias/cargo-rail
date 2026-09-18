@@ -14,6 +14,10 @@ fn test_init_creates_config() {
 
         // Verify success
         assert!(output.status.success(), "init should succeed");
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("no Cargo workspace detected"),
+            "explicit workspace should be recognized"
+        );
 
         // Verify config was created
         let config_path = &ws.path.join(".config/rail.toml");
@@ -26,6 +30,43 @@ fn test_init_creates_config() {
         assert!(!config_content.contains("[release]"));
         assert!(!config_content.contains("[change-detection]"));
         assert!(!config_content.contains("[run]"));
+
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_init_recognizes_implicit_single_package_workspace() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_single_crate("init-implicit", "0.1.0")?;
+        ws.remove_config()?;
+
+        let output = run_cargo_rail(&ws.path, &["rail", "init"])?;
+
+        assert!(output.status.success(), "init should succeed");
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("no Cargo workspace detected"),
+            "root package should be recognized as an implicit workspace"
+        );
+
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_init_warns_without_cargo_manifest() {
+    let result: Result<()> = (|| {
+        let root = tempfile::tempdir()?;
+
+        let output = run_cargo_rail(root.path(), &["rail", "init"])?;
+
+        assert!(output.status.success(), "init should succeed with a warning");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("no Cargo workspace detected"),
+            "missing Cargo manifest should produce the workspace warning"
+        );
 
         Ok(())
     })();

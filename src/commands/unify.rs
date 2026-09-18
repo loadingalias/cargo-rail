@@ -118,6 +118,17 @@ fn mutation_targets(actions: &[MutationAction]) -> Vec<String> {
         .collect()
 }
 
+fn manifest_mutation_count(actions: &[MutationAction]) -> usize {
+    actions
+        .iter()
+        .filter(|action| action.code != "WRITE_REPORT")
+        .flat_map(|action| action.expected_mutations.iter())
+        .filter(|mutation| mutation.path.file_name() == Some(std::ffi::OsStr::new("Cargo.toml")))
+        .map(|mutation| mutation.path.as_path())
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
 fn blocked_issue_lines(plan: &crate::cargo::UnificationPlan) -> Vec<String> {
     plan.issues
         .iter()
@@ -184,11 +195,7 @@ fn write_compact_summary(
         }
         outln!(sink, "Next: cargo rail unify --explain");
     } else if has_changes && !nothing_changed {
-        let root_manifest_changed = !workspace_dep_names.is_empty()
-            || !plan.transitive_pins.is_empty()
-            || msrv_write_needed
-            || plan.package_inheritance_edit_count() > 0;
-        let manifests = plan.member_edits.len() + usize::from(root_manifest_changed);
+        let manifests = manifest_mutation_count(actions);
         let dependency_names = changed_dependency_names(plan);
         outln!(sink, "Pending: {manifests} manifest(s).");
         if !dependency_names.is_empty() {
@@ -1068,7 +1075,13 @@ pub fn run_unify_analyze(ctx: &WorkspaceContext, options: UnifyAnalyzeOptions<'_
 
     // Show explain output if requested
     if explain {
-        display_explain(&mut sink, &plan);
+        display_explain(
+            &mut sink,
+            &plan,
+            ctx.workspace_root(),
+            msrv_write_needed,
+            ctx.config().is_some_and(|config| config.unify.include_renamed),
+        );
     }
 
     // Show diff if requested
@@ -2352,8 +2365,21 @@ pub fn run_unify_undo(
     Ok(())
 }
 
-/// Display detailed explanation of unification decisions
-fn display_explain(sink: &mut UnifyTextSink, plan: &crate::cargo::UnificationPlan) {
+fn member_manifest_label(plan: &crate::cargo::UnificationPlan, workspace_root: &Path, member: &str) -> String {
+    plan.member_paths.get(member).map_or_else(
+        || member.to_string(),
+        |path| path.strip_prefix(workspace_root).unwrap_or(path).display().to_string(),
+    )
+}
+
+/// Display detailed explanation of unification decisions.
+fn display_explain(
+    sink: &mut UnifyTextSink,
+    plan: &crate::cargo::UnificationPlan,
+    workspace_root: &Path,
+    msrv_write_needed: bool,
+    include_renamed: bool,
+) {
     use std::collections::BTreeMap;
 
     outln!(sink);
@@ -2366,7 +2392,15 @@ fn display_explain(sink: &mut UnifyTextSink, plan: &crate::cargo::UnificationPla
         for field in &plan.package_inheritance {
             outln!(sink, "  {}", field.field);
             if !field.planned.is_empty() {
-                outln!(sink, "    inherit: {}", format_preview_list(&field.planned, 10));
+                outln!(sink, "    planned:");
+                for member in &field.planned {
+                    outln!(
+                        sink,
+                        "      {}: [package].{} = {{ workspace = true }}",
+                        member_manifest_label(plan, workspace_root, member),
+                        field.field
+                    );
+                }
             }
             if !field.local_overrides.is_empty() {
                 outln!(
@@ -2385,6 +2419,36 @@ fn display_explain(sink: &mut UnifyTextSink, plan: &crate::cargo::UnificationPla
                     field.retention_reason.unwrap_or("domain-owned"),
                     format_preview_list(&field.retained_equivalent, 10)
                 );
+            }
+        }
+        outln!(sink);
+    }
+
+    let mut msrv_members = plan
+        .member_edits
+        .iter()
+        .filter(|(_, edits)| {
+            edits
+                .iter()
+                .any(|edit| matches!(edit, crate::cargo::MemberEdit::EnforceMsrvInheritance))
+        })
+        .collect::<Vec<_>>();
+    msrv_members.sort_by_key(|(member, _)| *member);
+    if msrv_write_needed || !msrv_members.is_empty() {
+        outln!(sink, "MSRV edits:");
+        if msrv_write_needed && let Some(msrv) = &plan.computed_msrv {
+            outln!(
+                sink,
+                "  Cargo.toml: [workspace.package].rust-version = \"{}\"",
+                msrv.version
+            );
+        }
+        for (member, edits) in msrv_members {
+            let path = member_manifest_label(plan, workspace_root, member);
+            for edit in edits {
+                if matches!(edit, crate::cargo::MemberEdit::EnforceMsrvInheritance) {
+                    outln!(sink, "  {path}: [package].rust-version = {{ workspace = true }}");
+                }
             }
         }
         outln!(sink);
@@ -2559,6 +2623,7 @@ fn display_explain(sink: &mut UnifyTextSink, plan: &crate::cargo::UnificationPla
         && plan.member_edits.is_empty()
         && plan.transitive_pins.is_empty()
         && plan.unused_deps.is_empty()
+        && !msrv_write_needed
     {
         outln!(sink, "No unification opportunities found.");
         outln!(sink);
@@ -2566,7 +2631,9 @@ fn display_explain(sink: &mut UnifyTextSink, plan: &crate::cargo::UnificationPla
         outln!(sink, "  - Dependencies are already unified");
         outln!(sink, "  - Dependencies have incompatible versions (see issues above)");
         outln!(sink, "  - Dependencies are excluded via [unify].exclude config");
-        outln!(sink, "  - Dependencies are renamed (use include_renamed = true)");
+        if !include_renamed {
+            outln!(sink, "  - Dependencies are renamed (use include_renamed = true)");
+        }
         outln!(sink, "  - Single-use dependencies (not shared across crates)");
     }
 }
@@ -3131,7 +3198,7 @@ mod tests {
         );
 
         let mut sink = UnifyTextSink::new(true);
-        display_explain(&mut sink, &plan);
+        display_explain(&mut sink, &plan, Path::new("."), false, false);
         let output = sink.finish().expect("captured output");
 
         assert!(output.contains("Dependency decisions:"));

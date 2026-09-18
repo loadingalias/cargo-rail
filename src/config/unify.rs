@@ -443,7 +443,7 @@ pub struct TransitivePinning {
 }
 
 /// MSRV computation and member-inheritance policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
 pub enum MsrvPolicy {
     /// Do not compute or write workspace MSRV.
@@ -457,6 +457,42 @@ pub enum MsrvPolicy {
         #[serde(default)]
         inherit: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum MsrvPolicyMode {
+    Disabled,
+    #[default]
+    Compute,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MsrvPolicyInput {
+    #[serde(default)]
+    mode: MsrvPolicyMode,
+    source: Option<MsrvSource>,
+    inherit: Option<bool>,
+}
+
+impl<'de> Deserialize<'de> for MsrvPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let input = MsrvPolicyInput::deserialize(deserializer)?;
+        match input.mode {
+            MsrvPolicyMode::Disabled if input.source.is_some() || input.inherit.is_some() => Err(
+                serde::de::Error::custom("disabled MSRV policy does not accept `source` or `inherit`"),
+            ),
+            MsrvPolicyMode::Disabled => Ok(Self::Disabled),
+            MsrvPolicyMode::Compute => Ok(Self::Compute {
+                source: input.source.unwrap_or_default(),
+                inherit: input.inherit.unwrap_or_default(),
+            }),
+        }
+    }
 }
 
 impl Default for MsrvPolicy {
@@ -631,6 +667,36 @@ mod tests {
                 source: MsrvSource::Workspace,
                 inherit: true
             }
+        );
+    }
+
+    #[test]
+    fn msrv_policy_defaults_partial_compute_and_preserves_explicit_modes() {
+        let partial: UnifyConfig = toml_edit::de::from_str("msrv_policy = { inherit = true }").unwrap();
+        assert_eq!(
+            partial.msrv_policy,
+            MsrvPolicy::Compute {
+                source: MsrvSource::Max,
+                inherit: true,
+            }
+        );
+
+        let complete: UnifyConfig =
+            toml_edit::de::from_str(r#"msrv_policy = { mode = "compute", source = "workspace", inherit = false }"#)
+                .unwrap();
+        assert_eq!(
+            complete.msrv_policy,
+            MsrvPolicy::Compute {
+                source: MsrvSource::Workspace,
+                inherit: false,
+            }
+        );
+
+        let disabled: UnifyConfig = toml_edit::de::from_str(r#"msrv_policy = { mode = "disabled" }"#).unwrap();
+        assert_eq!(disabled.msrv_policy, MsrvPolicy::Disabled);
+        assert!(
+            toml_edit::de::from_str::<UnifyConfig>(r#"msrv_policy = { mode = "disabled", inherit = false }"#,).is_err(),
+            "disabled policy must reject compute-only fields"
         );
     }
 

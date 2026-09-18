@@ -1449,6 +1449,28 @@ repository = "https://example.invalid/repository"
             })
         }));
 
+        let explain = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--explain"])?;
+        assert_eq!(explain.status.code(), Some(1));
+        let explain = String::from_utf8_lossy(&explain.stdout);
+        let crate_a_manifest = std::path::Path::new("crates").join("crate-a").join("Cargo.toml");
+        let crate_b_manifest = std::path::Path::new("crates").join("crate-b").join("Cargo.toml");
+        for field in ["authors", "description", "edition", "license", "publish", "repository"] {
+            assert!(
+                explain.contains(&format!(
+                    "{}: [package].{field} = {{ workspace = true }}",
+                    crate_a_manifest.display()
+                )),
+                "missing crate-a {field} edit:\n{explain}"
+            );
+        }
+        assert!(
+            explain.contains(&format!(
+                "{}: [package].repository = {{ workspace = true }}",
+                crate_b_manifest.display()
+            )),
+            "missing crate-b repository edit:\n{explain}"
+        );
+
         let apply = run_cargo_rail(
             &workspace.path,
             &["rail", "unify", "apply", "--report", "--format", "json"],
@@ -2270,12 +2292,21 @@ msrv_policy = { mode = "disabled" }
         )?;
 
         // Run unify with include_renamed config
-        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--explain"])?;
 
         assert!(
             output.status.success(),
             "unify with include_renamed config should succeed. stderr: {}",
             String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("No unification opportunities found."),
+            "empty plan explanation should be rendered: {stdout}"
+        );
+        assert!(
+            !stdout.contains("use include_renamed = true"),
+            "enabled policy must not be recommended"
         );
 
         Ok(())

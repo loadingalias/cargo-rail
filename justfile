@@ -134,6 +134,17 @@ build-release:
 package-release output-directory: build-release
     python3 scripts/package-release.py {{quote(output-directory)}}
 
+# Publish the protocol-compatible source pack independently of Cargo-Rail core.
+package-compiler-adapter output-directory:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    component_directory="$(
+        cargo metadata --no-deps --format-version 1 --locked --offline |
+            python3 -c 'import json, pathlib, sys; print((pathlib.Path(json.load(sys.stdin)["target_directory"]) / "release").as_posix())'
+    )"
+    scripts/check-compiler-fact-driver.sh --prepare-source "$component_directory"
+    python3 scripts/package-compiler-adapter.py "$component_directory/cargo-rail-fact-driver-source-v1.json" {{quote(output-directory)}}
+
 update:
     @scripts/update-all.sh
 

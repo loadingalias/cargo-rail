@@ -46,7 +46,8 @@ or archives for every host eligible for native caching.
 
 `cargo install cargo-rail --locked` builds the general CLI.
 `cargo binstall cargo-rail` can obtain a prebuilt CLI, but does not install the complete companion component set.
-Use the full native archive for Surface and authenticated compiler reuse.
+Use the full native archive for immediately available Surface and authenticated compiler reuse,
+or select an independently authenticated [compiler adapter pack](docs/caching.md#select-an-independent-compiler-adapter).
 `cargo rail surface --schema` also works without those components.
 When the workspace-selected rustup toolchain lacks `rustc-dev`, Surface preparation can install it;
 non-rustup toolchains require the matching compiler development files to be present already.
@@ -84,7 +85,7 @@ The commands above have different effects:
 - `cache setup` owns Cargo's global `build.rustc-wrapper` and enrolls this workspace in a private cache profile.
   It rejects another global wrapper or any environment or workspace setting that would shadow it.
 - `cache ready` proves one uncached build, one cold miss,
-  and one verified warm restore for the selected local-only profile and toolchain.
+  and one verified warm restore for the selected profile and toolchain while making no L2 requests.
 - `surface --prepare` may install `rustc-dev` for the selected rustup toolchain.
   It does not change the default toolchain.
 - `plan` and the Surface inspection commands do not edit tracked source.
@@ -184,7 +185,7 @@ See [Planning](docs/planning.md).
 
 ### GitHub Actions
 
-The native v10 Action installs Cargo-Rail v0.28.1, runs the planner once,
+The native v10 Action installs the exact Cargo-Rail release in its lock, runs the planner once,
 and exposes the validated plan plus exact required-work selectors:
 
 ```yaml
@@ -206,7 +207,7 @@ and exposes the validated plan plus exact required-work selectors:
 ```
 
 Use `loadingalias/cargo-rail-action/cache@v10` separately in each execution job that needs remote compiler reuse.
-Both actions install Cargo-Rail v0.28.1 by default.
+Both actions install the exact Cargo-Rail release recorded by the Action by default.
 Set an exact `version` only when the workflow needs a reproducible pin.
 Its `mode` input is required.
 Do not provide remote credentials to untrusted jobs.

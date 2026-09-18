@@ -123,15 +123,9 @@ pub(crate) fn run_ready(current_dir: &Path, format: TextJsonOutputFormat) -> Rai
             "run cargo rail cache setup to repair the installation before the readiness probe",
         ));
     }
-    if crate::remote_cache::configuration_status(current_dir)
+    let remote = crate::remote_cache::configuration_status(current_dir)
         .map_err(|error| RailError::message(format!("remote cache configuration is unavailable: {error}")))?
-        .is_some()
-    {
-        return Err(RailError::with_help(
-            "local cache readiness cannot be proved while remote cache authority is active",
-            "use a local-only cache profile for this probe, then qualify remote transport separately",
-        ));
-    }
+        .map(|status| status.mode);
 
     let cargo_config = Arc::new(crate::cargo::CargoConfigSnapshot::capture(current_dir)?);
     let inputs = crate::cargo::resolution::ResolutionInputs::capture_with_config(current_dir, cargo_config)?;
@@ -278,7 +272,8 @@ pub(crate) fn run_ready(current_dir: &Path, format: TextJsonOutputFormat) -> Rai
                 "component_authentication": status.component_authentication,
                 "selected_toolchain_readiness": "ready",
                 "workspace_enrollment": status.workspace_enrollment,
-                "remote_authority": "not_configured",
+                "remote_authority": remote.unwrap_or("not_configured"),
+                "probe_scope": "local_only",
                 "observed_reuse": "verified_hit_observed",
                 "uncached_success": true,
                 "cold": cold_measurements,
@@ -314,6 +309,7 @@ fn run_readiness_cargo(
         .env("CARGO_RAIL_CACHE_TRACE", "1")
         .env("RUSTUP_AUTO_INSTALL", "0")
         .env("RUSTUP_NO_UPDATE_CHECK", "1");
+    crate::remote_cache::scrub_child_environment(&mut command);
     if let Some(report) = report {
         command.env(crate::cache::report::REPORT_ENV, report);
     }

@@ -27,6 +27,9 @@ cargo rail config explain --all --json
 cargo rail config validate --strict
 ```
 
+`init` recognizes either an explicit `[workspace]` manifest or a root `[package]` manifest.
+Without a Cargo manifest it still writes the requested configuration but reports that no workspace was detected.
+
 Bare `cargo rail config` shows configured overrides and the active source, or reports that coded defaults apply.
 `config explain --all` reports configured and effective values, defaults, sources, and field rationale.
 Pass leaf paths for exact fields, or a parent node to enumerate its effective children, such as `config explain surface --json`.
@@ -58,6 +61,8 @@ Ordinary file inspection validates against the selected Cargo workspace.
 The current Cargo-Rail release accepts only current configuration fields.
 Configuration inspection leaves the input file unchanged;
 unsupported keys fail before planning or mutation.
+The retired no-op field `release.require_changelog_entries` is no longer accepted.
+Use `release.require_release_notes` to require nonempty release prose before publication or tagging.
 Historical comparisons apply the same decoder and identify the revision and configuration path
 when decoding fails.
 
@@ -122,6 +127,9 @@ Published packages remain open-world.
 A major-version unification requires explicit `major_version_conflict = "bump"` authority.
 Exact pins, renamed dependencies, MSRV policy, preserved features,
 and backup retention remain independent choices; inspect their current defaults with `config explain --all`.
+`unify.msrv_policy` defaults to compute mode with `source = "max"` and `inherit = false`.
+A partial compute table inherits omitted values; disabled mode rejects compute-only `source` and `inherit` fields.
+`unify --explain` shows the exact planned package-inheritance and MSRV manifest edits.
 
 ### Surface policy
 
@@ -164,6 +172,11 @@ Without `--explain`, the counterfactual is `null` and Surface performs only its 
 Reviewed `.changes/*.md` files are the default source for bumps and release prose.
 `cargo rail release check` previews the local plan and exits `1` when a release is pending.
 It performs no mutation or external effect.
+
+The default `release.tag_format` is `{crate}-{prefix}{version}`.
+With the default `tag_prefix = "v"`, it produces tags such as `my-crate-v1.2.3` for both single-crate and
+multi-crate repositories.
+Repositories that use unqualified tags such as `v1.2.3` must set `tag_format = "{prefix}{version}"` explicitly.
 
 `remote_effects` controls Git and forge effects.
 Registry publication is separate and requires both `registry_publication = "crates-io"` and `--publish` on the exact release invocation.
@@ -214,6 +227,8 @@ auxiliary_cargo_manifests = ["fuzz/Cargo.toml", "tools/check/Cargo.toml"]
 Release changelogs use a small fixed-placeholder formatter for commit sourced releases.
 Reviewed change files remain the default release source and may carry optional presentation metadata
 for authored Markdown.
+When an existing GitHub changelog uses linked `/compare/` version headings,
+Cargo-Rail preserves that style and links the previous tag to the planned tag.
 Configure section order, labels, filters, links, and per-crate changelog paths under `[release.changelog]` or `[crates.NAME.changelog]`;
 configure an independently authored forge body with files in `release_notes_dir`.
 

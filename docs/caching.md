@@ -37,9 +37,10 @@ and driver-source components declared by the build's embedded authority beside t
 Missing or changed declared files beside the invoked Cargo-Rail executable reject setup
 before writes.
 Setup does not build or download these components.
-Native reuse requires an authenticated driver for the selected compiler;
-source builds without embedded component authority, including an ordinary `cargo install`,
-execute the compiler normally and bypass reuse.
+Native reuse requires an authenticated driver for the selected compiler.
+An installation without embedded component authority, including an ordinary `cargo install`,
+can use an independently authenticated adapter pack.
+Without either authority, compiler work executes normally and bypasses reuse.
 
 For development in this checkout, `just build` and `just test` prepare the authenticated driver and source bundle,
 then build Cargo-Rail with that component authority.
@@ -51,10 +52,41 @@ Plain Cargo builds do not perform this preparation.
 
 `cache ready` runs one isolated uncached build, one cold cached build,
 and one verified warm restore with the selected toolchain.
-It requires an enrolled, authenticated local-only profile.
+It requires an enrolled, authenticated profile and forces those three builds to use only L1.
+An L2 selection remains installed but receives no requests from this probe.
 A successful probe records readiness for that exact profile and rustc identity;
 a profile or toolchain change makes the recorded readiness stale.
 Qualify remote transport separately with `cache probe` and an explicit machine-owned authority.
+
+## Select an independent compiler adapter
+
+An adapter pack contains the closed, vendored fact-driver source inventory and both compiler protocols.
+Cargo-Rail authenticates the selected pack by an operator-supplied SHA-256 digest, checks protocol compatibility,
+builds it with the exact selected compiler, and runs a metadata-compilation calibration before use.
+The pack sets a minimum compiler release and commit date. It does not set an upper bound.
+Build or calibration failure makes native cache work bypass to ordinary rustc execution;
+a Surface command still fails when it requires compiler facts.
+
+Publish a pack without publishing Cargo-Rail core:
+
+```bash
+just package-compiler-adapter ./adapter-assets
+```
+
+The command writes one content-addressed JSON pack and its adjacent `.sha256` file.
+It refuses existing outputs and does not upload them.
+
+After verifying the downloaded checksum, select the extracted JSON file with an absolute path:
+
+```bash
+export CARGO_RAIL_COMPILER_ADAPTER_PACK=/absolute/path/cargo-rail-compiler-adapter-DIGEST.json
+export CARGO_RAIL_COMPILER_ADAPTER_PACK_SHA256=sha256:FULL_DIGEST
+cargo rail surface --prepare
+```
+
+Set both variables together. The digest is the explicit machine trust decision.
+Cargo-Rail caches the calibrated executable by the pack digest, complete `rustc -vV` identity,
+compiler-library digest, build target, and both protocol versions.
 
 `just package-release OUTPUT_DIRECTORY` builds the native release components and writes a deflated ZIP, `cargo-rail-components-v1.tsv` inside that archive,
 and an adjacent `SHA256SUMS`.

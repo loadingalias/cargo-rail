@@ -88,6 +88,25 @@ fn rail(workspace: &Path, cargo_home: &Path, arguments: &[&str]) -> Result<Outpu
         .context("run cargo-rail cache command")
 }
 
+#[cfg(unix)]
+fn authenticated_component_bundle() -> Result<tempfile::TempDir> {
+    let manufactured = PathBuf::from(std::env::var_os("CARGO_RAIL_TEST_COMPONENT_BINARY").context(
+        "set CARGO_RAIL_TEST_COMPONENT_BINARY to the cargo-rail binary from the authenticated component preparation route",
+    )?);
+    let source = manufactured.parent().context("manufactured component directory")?;
+    let bundle = tempfile::tempdir()?;
+    for name in [
+        "cargo-rail",
+        "cargo-rail-native-rustc-wrapper",
+        "cargo-rail-native-rustc-worker",
+        "cargo-rail-fact-driver",
+        "cargo-rail-fact-driver-source-v1.json",
+    ] {
+        fs::copy(source.join(name), bundle.path().join(name))?;
+    }
+    Ok(bundle)
+}
+
 fn selected_profile_status(workspace: &Path, cargo_home: &Path) -> Result<serde_json::Value> {
     let output = rail(
         workspace,
@@ -112,20 +131,7 @@ fn authenticated_compiler_components_follow_installation_ownership() {
     let result: Result<()> = (|| {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let manufactured = PathBuf::from(std::env::var_os("CARGO_RAIL_TEST_COMPONENT_BINARY").context(
-            "set CARGO_RAIL_TEST_COMPONENT_BINARY to the cargo-rail binary from the authenticated component preparation route",
-        )?);
-        let source = manufactured.parent().context("manufactured component directory")?;
-        let bundle = tempfile::tempdir()?;
-        for name in [
-            "cargo-rail",
-            "cargo-rail-native-rustc-wrapper",
-            "cargo-rail-native-rustc-worker",
-            "cargo-rail-fact-driver",
-            "cargo-rail-fact-driver-source-v1.json",
-        ] {
-            fs::copy(source.join(name), bundle.path().join(name))?;
-        }
+        let bundle = authenticated_component_bundle()?;
         let workspace = TestWorkspace::new_single_crate("installed-components", "0.1.0")?;
         let cargo_home = tempfile::tempdir()?;
         let run = |arguments: &[&str]| -> Result<Output> {
@@ -255,6 +261,57 @@ fn authenticated_compiler_components_follow_installation_ownership() {
         assert!(!installation.join("cargo-rail-fact-driver").exists());
         assert!(!receipt_path.exists());
         assert_eq!(fs::read(sentinel)?, b"retain this file");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(unix)]
+#[test]
+fn setup_diagnoses_mixed_compiler_component_versions() {
+    let result: Result<()> = (|| {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let bundle = authenticated_component_bundle()?;
+        let worker = bundle.path().join("cargo-rail-native-rustc-worker");
+        fs::write(
+            &worker,
+            b"#!/bin/sh\nprintf 'cargo-rail-component-version-v1\\t0.0.0\\n'\n",
+        )?;
+        fs::set_permissions(&worker, fs::Permissions::from_mode(0o700))?;
+        let workspace = TestWorkspace::new_single_crate("mixed-component-versions", "0.1.0")?;
+        let cargo_home = tempfile::tempdir()?;
+        let mut command = Command::new(bundle.path().join("cargo-rail"));
+        for (name, _) in std::env::vars_os() {
+            if name.to_str().is_some_and(|name| name.starts_with("CARGO_RAIL_")) {
+                command.env_remove(name);
+            }
+        }
+        let output = command
+            .args(["rail", "cache", "setup", "--check"])
+            .current_dir(&workspace.path)
+            .env("CARGO_HOME", cargo_home.path())
+            .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
+            .output()?;
+        anyhow::ensure!(!output.status.success(), "mixed component set was accepted: {output:?}");
+        let stderr = String::from_utf8(output.stderr)?;
+        for expected in [
+            "compiler components come from inconsistent Cargo-Rail releases",
+            concat!(
+                env!("CARGO_PKG_VERSION"),
+                " (cargo-rail, cargo-rail-native-rustc-wrapper)"
+            ),
+            "0.0.0 (cargo-rail-native-rustc-worker)",
+            "reinstall one complete Cargo-Rail component set, then verify it with `cargo rail cache setup --check`",
+        ] {
+            anyhow::ensure!(stderr.contains(expected), "missing '{expected}' in:\n{stderr}");
+        }
+        anyhow::ensure!(
+            fs::read_dir(cargo_home.path())?.next().is_none(),
+            "rejected setup wrote Cargo state"
+        );
         Ok(())
     })();
     super::helpers::finish_test(result);
@@ -2801,6 +2858,119 @@ fn readiness_probe_proves_uncached_cold_and_warm_execution() {
         assert_eq!(status["status"]["selected_toolchain_readiness"], "ready");
         assert_eq!(status["status"]["installation"]["workspace_enrollment"], "enrolled");
         assert_eq!(status["status"]["remote_authority"], "not_configured");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn readiness_probe_is_local_only_without_replacing_the_remote_profile() {
+    let result: Result<()> = (|| {
+        let workspace = TestWorkspace::new_single_crate("remote-profile-readiness", "0.1.0")?;
+        let cargo_home = tempfile::tempdir()?;
+        let remote = LoopbackS3::start()?;
+        let remote_url = remote.remote_url();
+        let setup = rail(
+            &workspace.path,
+            cargo_home.path(),
+            &[
+                "rail",
+                "cache",
+                "setup",
+                "--remote",
+                &remote_url,
+                "--remote-mode",
+                "read-write",
+            ],
+        )?;
+        assert!(setup.status.success(), "remote setup failed: {setup:?}");
+        let status_before = selected_profile_status(&workspace.path, cargo_home.path())?;
+        let profile_id = status_before["status"]["installation"]["profile_id"]
+            .as_str()
+            .context("selected profile ID")?;
+        let profile = cargo_home
+            .path()
+            .join("cargo-rail/cache-profiles-v1/profiles")
+            .join(format!("{profile_id}.json"));
+        let profile_before = fs::read(&profile)?;
+        let requests_before = remote.request_count();
+
+        let ready = rail(
+            &workspace.path,
+            cargo_home.path(),
+            &["rail", "cache", "ready", "-f", "json"],
+        )?;
+        assert!(ready.status.success(), "local readiness probe failed: {ready:?}");
+        let ready = json(&ready)?;
+        assert_eq!(ready["ready"], true);
+        assert_eq!(ready["probe_scope"], "local_only");
+        assert_eq!(ready["remote_authority"], "read-write");
+        assert_eq!(remote.request_count(), requests_before, "readiness accessed the remote");
+        assert_eq!(
+            fs::read(&profile)?,
+            profile_before,
+            "readiness replaced the selected profile"
+        );
+
+        let status_after = selected_profile_status(&workspace.path, cargo_home.path())?;
+        assert_eq!(status_after["status"]["installation"]["profile_id"], profile_id);
+        assert_eq!(status_after["status"]["remote"]["mode"], "read-write");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn incompatible_adapter_pack_bypasses_cache_without_blocking_cargo() {
+    let result: Result<()> = (|| {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let workspace = TestWorkspace::new_single_crate("incompatible-adapter", "0.1.0")?;
+        let cargo_home = tempfile::tempdir()?;
+        let setup = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "setup"])?;
+        assert!(setup.status.success(), "setup failed: {setup:?}");
+
+        let component = PathBuf::from(
+            std::env::var_os("CARGO_RAIL_TEST_COMPONENT_BINARY").context("authenticated component binary")?,
+        );
+        let source = component
+            .parent()
+            .context("component directory")?
+            .join("cargo-rail-fact-driver-source-v1.json");
+        let mut pack: serde_json::Value = serde_json::from_slice(&fs::read(source)?)?;
+        pack["fact_protocol"] = serde_json::json!(u64::MAX);
+        let mut bytes = serde_json::to_vec(&pack)?;
+        bytes.push(b'\n');
+        let selected = tempfile::NamedTempFile::new()?;
+        fs::write(selected.path(), &bytes)?;
+        let selected = cargo_rail::utils::canonicalize_existing(selected.path())?;
+        let digest = format!("sha256:{}", cargo_rail::source::ContentDigest::sha256(&bytes));
+        let coverage = tempfile::tempdir()?;
+        fs::set_permissions(coverage.path(), fs::Permissions::from_mode(0o700))?;
+        let coverage = cargo_rail::utils::canonicalize_existing(coverage.path())?;
+
+        let output = Command::new("cargo")
+            .current_dir(&workspace.path)
+            .args(["check", "--quiet"])
+            .env("CARGO_HOME", cargo_home.path())
+            .env("CARGO_INCREMENTAL", "0")
+            .env("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1")
+            .env("CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY", &coverage)
+            .env("CARGO_RAIL_COMPILER_ADAPTER_PACK", &selected)
+            .env("CARGO_RAIL_COMPILER_ADAPTER_PACK_SHA256", digest)
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
+            .output()?;
+        assert!(output.status.success(), "adapter failure blocked Cargo: {output:?}");
+        let events = coverage_events(&coverage)?;
+        assert!(
+            events.iter().any(|event| {
+                event["status"] == "bypassed" && event["reason"] == "compiler_native_input_evidence_unavailable"
+            }),
+            "incompatible adapter did not produce the expected cache bypass: {events:?}"
+        );
         Ok(())
     })();
     super::helpers::finish_test(result);

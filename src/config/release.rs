@@ -43,10 +43,6 @@ pub struct ReleaseConfig {
     #[serde(default = "default_true")]
     pub require_release_notes: bool,
 
-    /// If true, error when there are no changelog entries for a crate
-    #[serde(default)]
-    pub require_changelog_entries: bool,
-
     /// Authoritative source for release bump selection and changelog prose.
     #[serde(default)]
     pub source: ReleaseSource,
@@ -55,8 +51,8 @@ pub struct ReleaseConfig {
     #[serde(default = "default_tag_prefix")]
     pub tag_prefix: String,
 
-    /// Tag format template (default: "{crate}-v{version}" for monorepos, "v{version}" for single crates)
-    /// Variables: {crate}, {version}
+    /// Tag format template (default: "{crate}-{prefix}{version}").
+    /// Variables: {crate}, {prefix}, {version}
     #[serde(default = "default_tag_format")]
     pub tag_format: String,
 
@@ -139,7 +135,6 @@ impl Default for ReleaseConfig {
             unconventional_commits: CommitPolicy::default(),
             release_notes_dir: default_release_notes_dir(),
             require_release_notes: true,
-            require_changelog_entries: false,
             source: ReleaseSource::default(),
             tag_prefix: default_tag_prefix(),
             tag_format: default_tag_format(),
@@ -811,6 +806,7 @@ mod tests {
     #[test]
     fn release_policy_defaults() {
         let config = ReleaseConfig::default();
+        assert_eq!(config.tag_format, "{crate}-{prefix}{version}");
         assert_eq!(config.pre_1_breaking_bump, Pre1BreakingBump::Minor);
         assert_eq!(config.semver_check, SemverCheckPolicy::Warn);
         assert_eq!(config.remote_effects, ReleaseRemoteEffects::None);

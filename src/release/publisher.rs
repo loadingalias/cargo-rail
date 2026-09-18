@@ -1734,7 +1734,7 @@ mod tests {
     fn test_extract_changelog_section_returns_only_requested_version() {
         let changelog = r#"# Changelog
 
-## [0.2.0] - 2026-06-01
+## [0.2.0](https://github.com/example/project/compare/project-v0.1.0...project-v0.2.0) - 2026-06-01
 
 ### Features
 
@@ -1746,6 +1746,7 @@ mod tests {
 "#;
 
         let section = extract_section(changelog, "0.2.0").unwrap();
+        assert!(section.starts_with("## [0.2.0](https://github.com/example/project/compare/"));
         assert!(section.contains("new API"));
         assert!(!section.contains("old API"));
     }
@@ -1753,7 +1754,7 @@ mod tests {
     #[test]
     fn changelog_release_follows_the_preamble() {
         let existing = "# Changelog\n\nThis file records user-visible changes.\n\n## [0.15.0] - 2026-06-01\n\n- old\n";
-        let updated = insert_release_at(existing, "0.16.0", "2026-07-11", "- new");
+        let updated = insert_release_at(existing, "0.16.0", "2026-07-11", "- new", None);
 
         assert_eq!(
             updated,

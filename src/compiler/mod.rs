@@ -5,6 +5,7 @@ pub(crate) mod analysis;
 pub(crate) mod capability;
 pub mod cfg_eval;
 pub mod collector;
+pub(crate) mod component_version;
 pub mod diagnostics_store;
 pub(crate) mod distributed;
 pub(crate) mod driver;

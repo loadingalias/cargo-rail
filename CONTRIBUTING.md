@@ -125,6 +125,13 @@ just check-compiler-driver
 ```
 
 The driver is built separately because it is tied to one exact Rust compiler toolchain.
+To package the closed driver source inventory for another compatible toolchain without publishing Cargo-Rail core, run:
+
+```bash
+just package-compiler-adapter OUTPUT_DIRECTORY
+```
+
+The recipe writes one content-addressed adapter pack and its checksum, refuses existing outputs, and does not upload them.
 
 ## Support performance claims with evidence
 

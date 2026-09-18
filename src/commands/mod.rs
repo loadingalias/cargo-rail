@@ -725,7 +725,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext, prepared_plan: Option<Pla
                         },
                     )
                 } else {
-                    run_release_plan(ctx, names, bump, false, skip_tag, include_dependents, format)
+                    run_release_plan(ctx, names, bump, extended, skip_tag, include_dependents, format)
                 }
             }
             cli::ReleaseCommand::Resume { transaction, executor } => {

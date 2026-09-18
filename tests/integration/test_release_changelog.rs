@@ -468,10 +468,25 @@ fn release_plan_works_on_single_crate_repo() {
         // Add release config (what a split repo would have)
         ws.write_release_config(
             r#"tag_prefix = "v"
-tag_format = "v{version}"
+tag_format = "release-{crate}-{prefix}{version}"
+semver_check = "off"
 "#,
         )?;
+        ws.commit("Configure custom release tags")?;
+        ws.tag("release-private-tool-v0.1.0", "Initial release")?;
         write_test_change(&ws.path, &["private-tool"])?;
+
+        let explained = run_cargo_rail(
+            &ws.path,
+            &["rail", "config", "explain", "release.tag_format", "-f", "json"],
+        )?;
+        assert!(explained.status.success(), "config explain failed: {explained:?}");
+        let explained: serde_json::Value = serde_json::from_slice(&explained.stdout)?;
+        assert_eq!(
+            explained["fields"][0]["configured"],
+            "release-{crate}-{prefix}{version}"
+        );
+        assert_eq!(explained["fields"][0]["effective"], "release-{crate}-{prefix}{version}");
 
         // Run release plan
         let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--bump", "patch"])?;
@@ -493,6 +508,87 @@ tag_format = "v{version}"
             "Plan should not show 0 crates. Output:\n{}",
             stdout
         );
+        assert!(
+            stdout.contains("Tag: release-private-tool-v0.1.1"),
+            "explicit tag format must control the single-package plan. Output:\n{stdout}"
+        );
+
+        let output = run_cargo_rail(
+            &ws.path,
+            &["rail", "release", "check", "--format", "json", "--bump", "patch"],
+        )?;
+        assert_eq!(output.status.code(), Some(1), "release check: {output:?}");
+        let output: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(
+            output["release_plan"]["crates"][0]["tag_name"],
+            "release-private-tool-v0.1.1"
+        );
+        assert_eq!(
+            output["release_plan"]["crates"][0]["previous_tag"],
+            "release-private-tool-v0.1.0"
+        );
+
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn release_tag_defaults_align_across_init_explain_and_planning() {
+    let result: Result<()> = (|| {
+        let single = TestWorkspace::new_single_crate("single", "0.1.0")?;
+        single.write_release_config("semver_check = \"off\"\n")?;
+        single.commit("Configure release checks")?;
+        let single_init = run_cargo_rail(&single.path, &["rail", "release", "init", "--dry-run"])?;
+        assert!(single_init.status.success(), "release init failed: {single_init:?}");
+        let single_init = String::from_utf8(single_init.stdout)?;
+        assert!(
+            single_init.contains("tag_format = \"{crate}-{prefix}{version}\""),
+            "single-package initialization used a different default: {single_init}"
+        );
+        let single_explain = run_cargo_rail(
+            &single.path,
+            &["rail", "config", "explain", "release.tag_format", "-f", "json"],
+        )?;
+        assert!(
+            single_explain.status.success(),
+            "config explain failed: {single_explain:?}"
+        );
+        let single_explain: serde_json::Value = serde_json::from_slice(&single_explain.stdout)?;
+        assert_eq!(single_explain["fields"][0]["default"], "{crate}-{prefix}{version}");
+        assert_eq!(single_explain["fields"][0]["effective"], "{crate}-{prefix}{version}");
+        write_test_change(&single.path, &["single"])?;
+        let single_plan = run_cargo_rail(&single.path, &["rail", "release", "check", "--bump", "patch"])?;
+        let single_plan = String::from_utf8(single_plan.stdout)?;
+        assert!(single_plan.contains("Tag: single-v0.1.1"), "single plan: {single_plan}");
+
+        let multi = TestWorkspace::new_named("release-default-tag-multi")?;
+        multi.add_crate("crate-a", "0.1.0", &[])?;
+        multi.add_crate("crate-b", "0.1.0", &[])?;
+        multi.write_release_config("semver_check = \"off\"\n")?;
+        multi.commit("Add workspace packages")?;
+        let multi_init = run_cargo_rail(&multi.path, &["rail", "release", "init", "--dry-run"])?;
+        assert!(multi_init.status.success(), "release init failed: {multi_init:?}");
+        let multi_init = String::from_utf8(multi_init.stdout)?;
+        assert!(
+            multi_init.contains("tag_format = \"{crate}-{prefix}{version}\""),
+            "multi-package initialization used a different default: {multi_init}"
+        );
+        let multi_explain = run_cargo_rail(
+            &multi.path,
+            &["rail", "config", "explain", "release.tag_format", "-f", "json"],
+        )?;
+        assert!(
+            multi_explain.status.success(),
+            "config explain failed: {multi_explain:?}"
+        );
+        let multi_explain: serde_json::Value = serde_json::from_slice(&multi_explain.stdout)?;
+        assert_eq!(multi_explain["fields"][0]["default"], "{crate}-{prefix}{version}");
+        assert_eq!(multi_explain["fields"][0]["effective"], "{crate}-{prefix}{version}");
+        write_test_change(&multi.path, &["crate-a"])?;
+        let multi_plan = run_cargo_rail(&multi.path, &["rail", "release", "check", "crate-a", "--bump", "patch"])?;
+        let multi_plan = String::from_utf8(multi_plan.stdout)?;
+        assert!(multi_plan.contains("Tag: crate-a-v0.1.1"), "multi plan: {multi_plan}");
 
         Ok(())
     })();
@@ -1321,7 +1417,7 @@ semver_check = "warn"
 
     ws.add_crate("lib-a", "1.2.3", &[])?;
     ws.commit("Add lib-a")?;
-    ws.tag("v1.2.3", "Initial release")?;
+    ws.tag("lib-a-v1.2.3", "Initial release")?;
     ws.modify_file("lib-a", "src/lib.rs", "pub fn doc_only_bump_signal() {}\n")?;
     ws.commit("docs: update public API notes")?;
     Ok(ws)
@@ -1391,7 +1487,7 @@ fn release_api_evidence_binds_baseline_and_blocks_required_unavailability() {
     let result: Result<()> = (|| {
         let ws = semver_shim_workspace("release-api-evidence")?;
         write_test_change(&ws.path, &["lib-a"])?;
-        let baseline = String::from_utf8(git(&ws.path, &["rev-parse", "v1.2.3^{}"])?.stdout)?
+        let baseline = String::from_utf8(git(&ws.path, &["rev-parse", "lib-a-v1.2.3^{}"])?.stdout)?
             .trim()
             .to_owned();
         let args = [
@@ -2398,7 +2494,7 @@ auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
 
         let state_path = only_release_state(&ws.path)?;
         let state: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
-        assert_eq!(state["schema_version"], 9);
+        assert_eq!(state["schema_version"], 10);
         assert_eq!(state["intent"]["plan"]["plan_contract_version"], 9);
         assert_eq!(
             state["intent"]["plan"]["auxiliary_lockfiles"].as_array().unwrap().len(),
@@ -2931,7 +3027,7 @@ done
             stdout,
             stderr
         );
-        let tag_target = String::from_utf8_lossy(&git(&ws.path, &["rev-list", "-n", "1", "v0.2.0"])?.stdout)
+        let tag_target = String::from_utf8_lossy(&git(&ws.path, &["rev-list", "-n", "1", "lib-a-v0.2.0"])?.stdout)
             .trim()
             .to_string();
         let completed_head = String::from_utf8_lossy(&git(&ws.path, &["rev-parse", "HEAD"])?.stdout)
@@ -2952,7 +3048,7 @@ done
             remote_head, merge_sha,
             "review continuation must not push a protected branch update"
         );
-        let remote_tag = String::from_utf8_lossy(&git(&remote, &["rev-list", "-n", "1", "v0.2.0"])?.stdout)
+        let remote_tag = String::from_utf8_lossy(&git(&remote, &["rev-list", "-n", "1", "lib-a-v0.2.0"])?.stdout)
             .trim()
             .to_string();
         assert_eq!(remote_tag, merge_sha, "the pushed tag must retain the proven commit");
@@ -5064,7 +5160,7 @@ fn test_changelog_relative_to_crate_default() {
 
         // Don't set relative_to - should default to "crate"
         ws.write_release_config(
-            r#"
+            r#"semver_check = "off"
 [release.changelog]
 path = "CHANGELOG.md"
 "#,
@@ -5111,6 +5207,67 @@ path = "CHANGELOG.md"
     super::helpers::finish_test(result);
 }
 
+#[test]
+fn compare_linked_changelog_round_trips_through_preview_and_apply() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("compare-linked-changelog")?;
+        ws.set_remote("git@github.com:org/repo.git")?;
+        write_release_config(&ws, "")?;
+        ws.add_crate("lib-a", "0.1.0", &[])?;
+        let changelog_path = ws.path.join("crates/lib-a/CHANGELOG.md");
+        std::fs::write(
+            &changelog_path,
+            "# Changelog\n\n## [0.1.0](https://github.com/org/repo/compare/lib-a-v0.0.0...lib-a-v0.1.0) - 2026-01-01\n\n- Initial release.\n",
+        )?;
+        ws.commit("Add lib-a")?;
+        tag_release(&ws, "lib-a", "0.1.0")?;
+        write_test_change(&ws.path, &["lib-a"])?;
+
+        let preview = run_cargo_rail(
+            &ws.path,
+            &[
+                "rail", "release", "check", "lib-a", "--bump", "patch", "--format", "json",
+            ],
+        )?;
+        assert_eq!(preview.status.code(), Some(1), "{preview:?}");
+        let document: serde_json::Value = serde_json::from_slice(&preview.stdout)?;
+        let expected = "## [0.1.1](https://github.com/org/repo/compare/lib-a-v0.1.0...lib-a-v0.1.1) - ";
+        let planned = document["release_plan"]["crates"][0]["presentation"]["changelog"]["content"]
+            .as_str()
+            .unwrap();
+        assert!(planned.contains(expected), "planned changelog:\n{planned}");
+
+        let plan_path = ws.path.join("target/compare-linked-release-plan.json");
+        std::fs::create_dir_all(plan_path.parent().unwrap())?;
+        std::fs::write(&plan_path, &preview.stdout)?;
+        let apply = run_cargo_rail(
+            &ws.path,
+            &[
+                "rail",
+                "release",
+                "run",
+                "lib-a",
+                "--bump",
+                "patch",
+                "--yes",
+                "--plan",
+                plan_path.to_str().unwrap(),
+            ],
+        )?;
+        assert!(
+            apply.status.success(),
+            "release apply failed:\n{}",
+            String::from_utf8_lossy(&apply.stderr)
+        );
+        let applied = std::fs::read_to_string(changelog_path)?;
+        assert!(applied.contains(expected), "applied changelog:\n{applied}");
+        assert!(applied.contains("## [0.1.0](https://github.com/org/repo/compare/"));
+
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
 /// Test release.changelog.relative_to = "workspace" creates changelog at workspace root
 #[test]
 fn test_changelog_relative_to_workspace() {
@@ -5120,7 +5277,7 @@ fn test_changelog_relative_to_workspace() {
 
         // Explicitly set relative_to = "workspace"
         ws.write_release_config(
-            r#"
+            r#"semver_check = "off"
 [release.changelog]
 path = "CHANGELOG.md"
 relative_to = "workspace"
@@ -5183,7 +5340,7 @@ fn release_rejects_an_absolute_changelog_path_outside_the_workspace() {
         let outside = tempfile::TempDir::new()?;
         let outside_path = outside.path().join("CHANGELOG.md");
         ws.write_release_config(&format!(
-            r#"
+            r#"semver_check = "off"
 [release.changelog]
 path = "{}"
 relative_to = "workspace"
@@ -5253,7 +5410,7 @@ fn test_changelog_parent_directories_auto_created() {
 
         // Use a nested path that doesn't exist
         ws.write_release_config(
-            r#"
+            r#"semver_check = "off"
 [release.changelog]
 path = "docs/changelogs/CHANGELOG.md"
 relative_to = "workspace"
@@ -5311,7 +5468,7 @@ fn test_changelog_relative_to_crate_custom_path() {
 
         // Use custom path with crate-relative
         ws.write_release_config(
-            r#"
+            r#"semver_check = "off"
 [release.changelog]
 path = "docs/CHANGES.md"
 relative_to = "crate"
@@ -5430,29 +5587,29 @@ fn test_bump_release_strips_prerelease() {
 
 // Extended Check Tests
 
-/// Test release check --extended runs dry-run publish validation
+/// Extended checks run under local-only release authority.
 #[test]
-fn test_release_check_extended_validates_publish() {
+fn test_release_check_extended_runs_with_local_authority() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_single_crate("ext-check", "0.1.0")?;
-        ws.write_release_config("remote_effects = \"push\"\nregistry_publication = \"crates-io\"\n")?;
+        ws.write_release_config("remote_effects = \"none\"\n")?;
         write_test_change(&ws.path, &["ext-check"])?;
 
-        // Run release check with --extended --all (single-crate needs explicit crate name or --all)
         let output = run_cargo_rail(
             &ws.path,
-            &["rail", "release", "check", "--publication", "--extended", "--all"],
+            &["rail", "release", "check", "--extended", "--all", "--format", "json"],
         )?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        // Should run the extended checks
-        assert!(
-            stdout.contains("extended") || stdout.contains("publish-dry-run") || stdout.contains("msrv"),
-            "Extended check should run dry-run and/or msrv checks.\nstdout:\n{}\nstderr:\n{}",
-            stdout,
-            stderr
-        );
+        assert!(matches!(output.status.code(), Some(1 | 2)), "{output:?}");
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(json["readiness"]["scope"], "local");
+        assert_eq!(json["readiness"]["planned_effects"]["registry_publication"], false);
+        let checks = json["extended"][0]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|check| check["check"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(checks, ["publish-dry-run", "msrv", "semver-checks"]);
 
         Ok(())
     })();
@@ -5506,6 +5663,8 @@ fn test_release_check_extended_json() {
             "JSON should contain 'extended' field.\nJSON:\n{}",
             serde_json::to_string_pretty(&json).unwrap_or_default()
         );
+        assert_eq!(json["readiness"]["scope"], "publication");
+        assert_eq!(json["readiness"]["planned_effects"]["registry_publication"], true);
 
         Ok(())
     })();
@@ -5520,6 +5679,7 @@ fn release_rejects_unsafe_tag_names_before_mutation() {
         let ws = TestWorkspace::new_single_crate("unsafe-release-tag", "0.1.0")?;
         ws.write_release_config(
             r#"tag_prefix = "-"
+tag_format = "{prefix}{version}"
 "#,
         )?;
         ws.commit("Configure unsafe release tag")?;
@@ -5588,7 +5748,7 @@ fn test_release_resume_reconciles_tag_created_before_failure() {
             before.stdout, after.stdout,
             "resume must not duplicate the release commit"
         );
-        let tags = git(&ws.path, &["tag", "--list", "v0.1.1"])?;
+        let tags = git(&ws.path, &["tag", "--list", "lib-a-v0.1.1"])?;
         assert_eq!(String::from_utf8_lossy(&tags.stdout).lines().count(), 1);
         let state: serde_json::Value = serde_json::from_slice(&std::fs::read(state_path)?)?;
         assert_eq!(state["status"], "complete");
@@ -5602,7 +5762,9 @@ fn test_release_resume_reconciles_tag_created_before_failure() {
 fn release_remote_records_survive_runner_loss_without_moving_the_source_branch() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_single_crate("remote-record", "0.1.0")?;
-        ws.write_release_config("semver_check = 'off'\nsign_tags = false\nremote_effects = 'gitlab'\n")?;
+        ws.write_release_config(
+            "tag_format = 'v{version}'\nsemver_check = 'off'\nsign_tags = false\nremote_effects = 'gitlab'\n",
+        )?;
         write_test_change(&ws.path, &["remote-record"])?;
         let initial = ws.commit("Review remote release")?;
         let remote = tempfile::TempDir::new()?;
@@ -5785,7 +5947,7 @@ fn release_remote_record_accepts_a_lost_push_acknowledgment() {
 fn release_record_handoff_preserves_intent_and_resumes_in_a_fresh_clone() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_single_crate("release-handoff", "0.1.0")?;
-        ws.write_release_config("semver_check = 'off'\nsign_tags = false\n")?;
+        ws.write_release_config("tag_format = 'v{version}'\nsemver_check = 'off'\nsign_tags = false\n")?;
         write_test_change(&ws.path, &["release-handoff"])?;
         ws.commit("Review the release intent")?;
         let interrupted = run_with_lost_git_acknowledgment(
@@ -5823,7 +5985,7 @@ fn release_record_handoff_preserves_intent_and_resumes_in_a_fresh_clone() {
         let portable = std::fs::read_to_string(bundle.join("record.json"))?;
         assert!(!portable.contains(ws.path.to_str().unwrap()));
         let schema: serde_json::Value =
-            serde_json::from_str(include_str!("../../schemas/release-record-v9.schema.json"))?;
+            serde_json::from_str(include_str!("../../schemas/release-record-v10.schema.json"))?;
         let validator = jsonschema::validator_for(&schema)?;
         let record: serde_json::Value = serde_json::from_str(&portable)?;
         let errors = validator
@@ -6771,7 +6933,7 @@ fn test_release_non_default_branch_requires_confirmation_and_branch_flags() {
             String::from_utf8_lossy(&branch.stdout).trim() == "hotfix-1.0",
             "release should remain on the explicitly accepted branch"
         );
-        let tag = git(&ws.path, &["rev-list", "-n", "1", "v0.1.1"])?;
+        let tag = git(&ws.path, &["rev-list", "-n", "1", "lib-a-v0.1.1"])?;
         let head = git(&ws.path, &["rev-parse", "HEAD"])?;
         assert_eq!(
             String::from_utf8_lossy(&tag.stdout).trim(),
@@ -7776,7 +7938,9 @@ git --git-dir="$FIXTURE_REMOTE" update-ref refs/heads/main "$FIXTURE_PRIOR" "$FI
 fn signed_release_tag_recovers_original_object_without_the_private_key() {
     let result: Result<()> = (|| {
         let (ws, remote) = push_release_workspace("signed-handoff")?;
-        ws.write_release_config("remote_effects = 'gitlab'\nsemver_check = 'off'\nsign_tags = true\n")?;
+        ws.write_release_config(
+            "tag_format = 'v{version}'\nremote_effects = 'gitlab'\nsemver_check = 'off'\nsign_tags = true\n",
+        )?;
         ws.commit("Review the signed release")?;
         git(&ws.path, &["push", "origin", "main"])?;
         let key = ws.path.join(".git/release-key");
@@ -7907,7 +8071,7 @@ fn release_abort_preserves_a_replaced_local_tag() {
         for replacement in ["unchanged", "other-commit", "other-object"] {
             let retained_object = replacement == "other-object";
             let ws = TestWorkspace::new_single_crate("abort-tag-owner", "0.1.0")?;
-            ws.write_release_config("semver_check = 'off'\nsign_tags = false\n")?;
+            ws.write_release_config("tag_format = 'v{version}'\nsemver_check = 'off'\nsign_tags = false\n")?;
             write_test_change(&ws.path, &["abort-tag-owner"])?;
             let initial = ws.commit("Review local release")?;
             let interrupted = run_with_lost_git_acknowledgment(
@@ -8152,7 +8316,7 @@ else:raise RuntimeError(args)
         assert_eq!(sealed["artifacts"][0]["artifact_id"], 91);
         assert_eq!(sealed["artifacts"][0]["files"].as_array().unwrap().len(), 2);
         let schema: serde_json::Value =
-            serde_json::from_str(include_str!("../../schemas/release-record-v9.schema.json"))?;
+            serde_json::from_str(include_str!("../../schemas/release-record-v10.schema.json"))?;
         jsonschema::validator_for(&schema)?
             .validate(&sealed)
             .map_err(|error| anyhow::anyhow!("{error}"))?;

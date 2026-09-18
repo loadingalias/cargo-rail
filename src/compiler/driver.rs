@@ -21,6 +21,10 @@ use crate::cargo::ToolchainIdentity;
 use crate::compiler::facts::{
     COMPILER_FACT_PROTOCOL_VERSION, COMPILER_IDENTITY_PREFIX, CompilerFactProducerAuthority, DRIVER_IDENTITY_PREFIX,
 };
+use crate::compiler::native_input_protocol::{
+    NATIVE_INPUT_INVOCATION_ARGUMENT, NativeAssemblyObservation, NativeCodegenObservation, NativeInputInvocation,
+    NativeInputObservation, native_invocation_digest,
+};
 use crate::compiler::native_input_protocol::{NATIVE_INPUT_PROTOCOL_VERSION, NATIVE_INPUT_PROTOCOL_VERSION_ARGUMENT};
 use crate::error::{RailError, RailResult};
 use crate::source::ContentDigest;
@@ -30,10 +34,13 @@ const MAX_FACT_DRIVER_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_FACT_DRIVER_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_COMPILER_LIBRARY_BYTES: u64 = 1024 * 1024 * 1024;
 const FACT_DRIVER_PROTOCOL_ARGUMENT: &str = "--cargo-rail-fact-protocol-version";
+const COMPILER_ADAPTER_CALIBRATION_VERSION: u32 = 1;
 #[cfg(windows)]
 const MAX_DOCTEST_EXECUTABLE_BYTES: u64 = 1024 * 1024 * 1024;
 const COMPILED_TARGET: &str = env!("CARGO_RAIL_COMPILED_TARGET");
 pub(crate) const COMPILER_DRIVER_SOURCE_FILE_NAME: &str = "cargo-rail-fact-driver-source-v1.json";
+pub(crate) const COMPILER_ADAPTER_PACK_ENV: &str = "CARGO_RAIL_COMPILER_ADAPTER_PACK";
+pub(crate) const COMPILER_ADAPTER_PACK_SHA256_ENV: &str = "CARGO_RAIL_COMPILER_ADAPTER_PACK_SHA256";
 
 const FACT_DRIVER_FILE: Option<&str> = option_env!("CARGO_RAIL_FACT_DRIVER_FILE");
 const FACT_DRIVER_SHA256: Option<&str> = option_env!("CARGO_RAIL_FACT_DRIVER_SHA256");
@@ -65,6 +72,7 @@ pub(crate) struct CompilerFactDriverAuthority {
 #[derive(Debug, Clone)]
 struct CompilerFactDriverSourceAuthority {
     file_name: String,
+    selected_path: Option<PathBuf>,
     content_digest: String,
     provenance: String,
 }
@@ -73,6 +81,8 @@ struct CompilerFactDriverSourceAuthority {
 #[serde(deny_unknown_fields)]
 struct CompilerFactDriverSourceBundle {
     version: u32,
+    fact_protocol: u32,
+    native_input_protocol: u32,
     rustc: CompilerFactDriverRustcSupport,
     files: Vec<CompilerFactDriverSourceFile>,
 }
@@ -81,9 +91,7 @@ struct CompilerFactDriverSourceBundle {
 #[serde(deny_unknown_fields)]
 struct CompilerFactDriverRustcSupport {
     minimum_release: semver::Version,
-    maximum_release: semver::Version,
     minimum_commit_date: String,
-    maximum_commit_date: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -308,11 +316,14 @@ impl CompilerFactDriverAuthority {
     /// Fail before workspace acquisition when an installed surface command
     /// cannot authenticate its companion producer.
     pub(crate) fn require_surface_installation() -> RailResult<()> {
-        if Self::embedded()?.is_none() || CompilerFactDriverSourceAuthority::embedded()?.is_none() {
+        if Self::embedded()?.is_none() && CompilerFactDriverSourceAuthority::selected()?.is_none() {
             return Err(RailError::with_help(
                 "surface is unavailable in this source-built cargo-rail installation",
-                "install a supported native cargo-rail archive with its adjacent authenticated compiler-fact driver; cargo install does not provide surface",
+                "install a native cargo-rail archive or select an authenticated compiler adapter pack; cargo install does not provide surface",
             ));
+        }
+        if CompilerFactDriverSourceAuthority::selected()?.is_some_and(|source| source.is_external()) {
+            return Ok(());
         }
         let executable = std::env::current_exe()
             .map_err(|error| RailError::message(format!("failed to locate cargo-rail executable: {error}")))?;
@@ -606,6 +617,7 @@ impl CompilerFactDriverSourceAuthority {
             [Some(file_name), Some(content_digest), Some(provenance)] => {
                 let source = Self {
                     file_name: file_name.to_string(),
+                    selected_path: None,
                     content_digest: content_digest.to_string(),
                     provenance: provenance.to_string(),
                 };
@@ -618,10 +630,65 @@ impl CompilerFactDriverSourceAuthority {
         }
     }
 
+    fn selected() -> RailResult<Option<Self>> {
+        match (
+            std::env::var_os(COMPILER_ADAPTER_PACK_ENV),
+            std::env::var_os(COMPILER_ADAPTER_PACK_SHA256_ENV),
+        ) {
+            (None, None) => Self::embedded(),
+            (Some(path), Some(content_digest)) => {
+                let path = PathBuf::from(path);
+                let content_digest = content_digest
+                    .into_string()
+                    .map_err(|_| RailError::message("compiler adapter pack digest must be valid UTF-8"))?;
+                let file_name = path
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .ok_or_else(|| RailError::message("compiler adapter pack has no valid UTF-8 file name"))?
+                    .to_string();
+                let source = Self {
+                    file_name,
+                    selected_path: Some(path),
+                    provenance: content_digest.clone(),
+                    content_digest,
+                };
+                source.validate()?;
+                Ok(Some(source))
+            }
+            _ => Err(RailError::message(format!(
+                "{COMPILER_ADAPTER_PACK_ENV} and {COMPILER_ADAPTER_PACK_SHA256_ENV} must be set together"
+            ))),
+        }
+    }
+
+    fn path(&self, cargo_rail_executable: &Path) -> RailResult<PathBuf> {
+        if let Some(path) = &self.selected_path {
+            return Ok(crate::utils::canonicalize_existing(path)?);
+        }
+        let executable = crate::utils::canonicalize_existing(cargo_rail_executable)?;
+        Ok(executable
+            .parent()
+            .ok_or_else(|| RailError::message("cargo-rail executable has no component directory"))?
+            .join(&self.file_name))
+    }
+
+    fn is_external(&self) -> bool {
+        self.selected_path.is_some()
+    }
+
     fn validate(&self) -> RailResult<()> {
-        if self.file_name != COMPILER_DRIVER_SOURCE_FILE_NAME {
+        if self.selected_path.is_none() && self.file_name != COMPILER_DRIVER_SOURCE_FILE_NAME {
             return Err(RailError::message(
                 "compiler fact driver source authority has an invalid component file name",
+            ));
+        }
+        if self
+            .selected_path
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute() || path.file_name() != Some(OsStr::new(&self.file_name)))
+        {
+            return Err(RailError::message(
+                "compiler adapter pack path must be absolute and name its selected file",
             ));
         }
         validate_sha256(&self.content_digest, "compiler fact driver source digest")?;
@@ -633,6 +700,15 @@ impl CompilerFactDriverComponent {
     /// Authenticate the release sibling selected at build time.
     pub(crate) fn discover(snapshot: &WorkspaceSnapshot, cargo_rail_executable: &Path) -> RailResult<Option<Self>> {
         let toolchain = snapshot.toolchain();
+        let source = CompilerFactDriverSourceAuthority::selected()?;
+        if let Some(source) = source.as_ref().filter(|source| source.is_external()) {
+            return runtime_compiler_fact_driver(
+                &CompilerDriverToolchain::surface(snapshot),
+                cargo_rail_executable,
+                source,
+            )
+            .map(Some);
+        }
         if let Some(authority) = CompilerFactDriverAuthority::embedded()?
             && authority.validate_toolchain_identity(toolchain).is_ok()
         {
@@ -640,7 +716,7 @@ impl CompilerFactDriverComponent {
             return Self::discover_with_authority(&authority, cargo_rail_executable, compiler_library_directory)
                 .map(Some);
         }
-        if let Some(source) = CompilerFactDriverSourceAuthority::embedded()? {
+        if let Some(source) = source {
             return runtime_compiler_fact_driver(
                 &CompilerDriverToolchain::surface(snapshot),
                 cargo_rail_executable,
@@ -701,11 +777,7 @@ fn runtime_compiler_fact_driver(
     cargo_rail_executable: &Path,
     source: &CompilerFactDriverSourceAuthority,
 ) -> RailResult<CompilerFactDriverComponent> {
-    let executable = crate::utils::canonicalize_existing(cargo_rail_executable)?;
-    let source_path = executable
-        .parent()
-        .ok_or_else(|| RailError::message("cargo-rail executable has no component directory"))?
-        .join(&source.file_name);
+    let source_path = source.path(cargo_rail_executable)?;
     let source_bytes =
         read_authenticated_component(&source_path, &source.content_digest, MAX_FACT_DRIVER_SOURCE_BYTES)?;
     let bundle: CompilerFactDriverSourceBundle = serde_json::from_slice(&source_bytes)?;
@@ -716,12 +788,13 @@ fn runtime_compiler_fact_driver(
     let compiler_library_path = compiler_library.path.clone();
     let cache_key = ContentDigest::sha256(
         format!(
-            "cargo-rail-runtime-fact-driver-v2\0{}\0{}\0{}\0{}\0{}",
+            "cargo-rail-runtime-fact-driver-v3\0{}\0{}\0{}\0{}\0{}\0{}",
             source.content_digest,
             toolchain.rustc_verbose,
             compiler_library.content_digest,
             COMPILER_FACT_PROTOCOL_VERSION,
-            NATIVE_INPUT_PROTOCOL_VERSION
+            NATIVE_INPUT_PROTOCOL_VERSION,
+            COMPILER_ADAPTER_CALIBRATION_VERSION,
         )
         .as_bytes(),
     );
@@ -865,6 +938,30 @@ fn runtime_compiler_fact_driver(
         fs::set_permissions(&staged_driver, fs::Permissions::from_mode(0o700))?;
     }
     authenticate_component_file(&staged_driver, &authority.content_digest)?;
+    let compiler_library_directory = compiler_library_path
+        .parent()
+        .ok_or_else(|| RailError::message("compiler fact runtime library has no parent"))?
+        .to_path_buf();
+    let staged_component = CompilerFactDriverComponent {
+        authority: authority.clone(),
+        path: staged_driver,
+        compiler_library_directory,
+        compiler_library_path: compiler_library_path.clone(),
+    };
+    if let Err(error) = calibrate_runtime_driver(&staged_component, &rustc, build.path()) {
+        let message = error.to_string();
+        publish_cached_runtime_driver_failure(
+            &failure,
+            &CachedCompilerFactDriverFailure {
+                version: 1,
+                source_digest: source.content_digest.clone(),
+                rustc_verbose: toolchain.rustc_verbose.to_string(),
+                compiler_library_digest: authority.compiler_library_digest,
+                message: message.clone(),
+            },
+        )?;
+        return Err(runtime_driver_build_failure(&selected, &message));
+    }
     fs::write(staged.path().join("authority.json"), serde_json::to_vec(&cached)?)?;
     let staged = staged.keep();
     fs::rename(&staged, &entry).map_err(|error| {
@@ -880,6 +977,95 @@ fn runtime_compiler_fact_driver(
     }
     load_cached_runtime_driver(&entry, source, toolchain.rustc_verbose, &compiler_library_path)?
         .ok_or_else(|| RailError::message("selected-toolchain fact driver disappeared after commit"))
+}
+
+fn calibrate_runtime_driver(component: &CompilerFactDriverComponent, rustc: &Path, root: &Path) -> RailResult<()> {
+    let execution = component.stage()?;
+    probe_fact_driver_protocol(&execution, component.compiler_library_directory())?;
+    let runtime_library_path = Some(component.compiler_library_directory().as_os_str());
+    let native_protocol = execution
+        .native_command(runtime_library_path)
+        .arg(NATIVE_INPUT_PROTOCOL_VERSION_ARGUMENT)
+        .output()
+        .map_err(|error| RailError::message(format!("failed to probe compiler adapter native protocol: {error}")))?;
+    if !native_protocol.status.success()
+        || !native_protocol.stderr.is_empty()
+        || std::str::from_utf8(&native_protocol.stdout).map(str::trim)
+            != Ok(NATIVE_INPUT_PROTOCOL_VERSION.to_string().as_str())
+    {
+        return Err(RailError::message(
+            "compiler adapter failed its native-input protocol calibration",
+        ));
+    }
+
+    let source = root.join("cargo-rail-adapter-calibration.rs");
+    let output_path = root.join("cargo-rail-adapter-calibration.rmeta");
+    let observation_path = root.join("cargo-rail-adapter-calibration.json");
+    let invocation_path = root.join("cargo-rail-adapter-calibration-invocation.json");
+    fs::write(
+        &source,
+        b"pub fn cargo_rail_adapter_calibration(value: u8) -> u8 { value.wrapping_add(1) }\n",
+    )?;
+    let arguments = vec![
+        "--crate-name".to_string(),
+        "cargo_rail_adapter_calibration".to_string(),
+        "--crate-type".to_string(),
+        "lib".to_string(),
+        "--edition=2024".to_string(),
+        "--emit=metadata".to_string(),
+        "-o".to_string(),
+        output_path.to_string_lossy().into_owned(),
+        source.to_string_lossy().into_owned(),
+    ];
+    let invocation = NativeInputInvocation {
+        version: NATIVE_INPUT_PROTOCOL_VERSION,
+        nonce: ContentDigest::sha256(b"cargo-rail-adapter-calibration-v1").to_string(),
+        action_identity: "compiler-adapter-calibration-v1".to_string(),
+        invocation_digest: native_invocation_digest(&arguments, root).map_err(RailError::message)?,
+        result_path: observation_path.to_string_lossy().into_owned(),
+        source_working_directory: None,
+    };
+    let invocation_bytes = serde_json::to_vec(&invocation)?;
+    NativeInputInvocation::decode(&invocation_bytes).map_err(RailError::message)?;
+    fs::write(&invocation_path, invocation_bytes)?;
+    let mut command = execution.native_command(runtime_library_path);
+    command
+        .arg(NATIVE_INPUT_INVOCATION_ARGUMENT)
+        .arg(&invocation_path)
+        .arg(rustc)
+        .args(&arguments)
+        .current_dir(root)
+        .env("RUSTC_WRAPPER", "")
+        .env("CARGO_BUILD_RUSTC_WRAPPER", "")
+        .env("RUSTC_WORKSPACE_WRAPPER", "")
+        .env("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "");
+    let output = crate::compiler::acquisition::process::run_bounded_process(
+        &mut command,
+        Duration::from_secs(60),
+        16 * 1024,
+        16 * 1024,
+    )?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        return Err(RailError::message(format!(
+            "compiler adapter semantic calibration failed: {}",
+            bounded_driver_build_stderr(&output.stderr)
+        )));
+    }
+    let observation = NativeInputObservation::decode(&fs::read(&observation_path)?, &invocation).map_err(|error| {
+        RailError::message(format!(
+            "compiler adapter emitted invalid calibration evidence: {error}"
+        ))
+    })?;
+    if observation.assembly != NativeAssemblyObservation::NoCodegen
+        || observation.codegen != NativeCodegenObservation::NotRun
+        || !observation.crates.iter().any(|source| source.name == "std")
+        || !output_path.is_file()
+    {
+        return Err(RailError::message(
+            "compiler adapter failed semantic calibration for metadata compilation",
+        ));
+    }
+    Ok(())
 }
 
 fn bounded_driver_build_stderr(stderr: &[u8]) -> String {
@@ -1048,9 +1234,14 @@ fn validate_source_bundle(bundle: &CompilerFactDriverSourceBundle) -> RailResult
         "tools/compiler-fact-driver/src/output.rs",
     ];
 
-    if bundle.version != 2 || bundle.files.is_empty() || bundle.files.len() > MAX_SOURCE_FILES {
+    if bundle.version != 3
+        || bundle.fact_protocol != COMPILER_FACT_PROTOCOL_VERSION
+        || bundle.native_input_protocol != NATIVE_INPUT_PROTOCOL_VERSION
+        || bundle.files.is_empty()
+        || bundle.files.len() > MAX_SOURCE_FILES
+    {
         return Err(RailError::message(
-            "compiler fact driver source bundle has an incompatible inventory",
+            "compiler adapter pack has incompatible protocols or inventory",
         ));
     }
     bundle.rustc.validate()?;
@@ -1079,13 +1270,9 @@ fn validate_source_bundle(bundle: &CompilerFactDriverSourceBundle) -> RailResult
 
 impl CompilerFactDriverRustcSupport {
     fn validate(&self) -> RailResult<()> {
-        if self.minimum_release > self.maximum_release
-            || !valid_iso_date(&self.minimum_commit_date)
-            || !valid_iso_date(&self.maximum_commit_date)
-            || self.minimum_commit_date > self.maximum_commit_date
-        {
+        if !valid_iso_date(&self.minimum_commit_date) {
             return Err(RailError::message(
-                "compiler fact driver source bundle has an invalid rustc support interval",
+                "compiler adapter pack has an invalid minimum rustc identity",
             ));
         }
         Ok(())
@@ -1095,22 +1282,13 @@ impl CompilerFactDriverRustcSupport {
         self.validate()?;
         let release = semver::Version::parse(selected.release)
             .map_err(|error| RailError::message(format!("selected rustc release is invalid: {error}")))?;
-        if release < self.minimum_release
-            || release > self.maximum_release
-            || selected.commit_date < self.minimum_commit_date.as_str()
-            || selected.commit_date > self.maximum_commit_date.as_str()
-        {
+        if release < self.minimum_release || selected.commit_date < self.minimum_commit_date.as_str() {
             return Err(RailError::with_help(
                 format!(
-                    "compiler fact driver source supports rustc {} through {} from {} through {}, but Cargo selected rustc {} ({})",
-                    self.minimum_release,
-                    self.maximum_release,
-                    self.minimum_commit_date,
-                    self.maximum_commit_date,
-                    selected.release,
-                    selected.commit_date,
+                    "compiler adapter pack requires rustc {} or newer from {} or later, but Cargo selected rustc {} ({})",
+                    self.minimum_release, self.minimum_commit_date, selected.release, selected.commit_date,
                 ),
-                "select a rustc toolchain inside the authenticated support interval or install a cargo-rail release that supports the selected toolchain",
+                "select a newer rustc toolchain or an authenticated adapter pack with an earlier minimum",
             ));
         }
         Ok(())
@@ -1589,7 +1767,7 @@ impl PreparedNativeCompilerDriver {
             return Ok(None);
         }
         let authority = CompilerFactDriverAuthority::embedded()?;
-        let source = CompilerFactDriverSourceAuthority::embedded()?;
+        let source = CompilerFactDriverSourceAuthority::selected()?;
         if authority.is_none() && source.is_none() {
             return Ok(None);
         }
@@ -1600,7 +1778,8 @@ impl PreparedNativeCompilerDriver {
         let executable = std::env::current_exe()
             .map_err(|error| RailError::message(format!("failed to locate native compiler wrapper: {error}")))?;
         let rustc_sysroot = crate::utils::canonicalize_existing(rustc_sysroot)?;
-        let component = if let Some(authority) = authority
+        let component = if source.as_ref().is_none_or(|source| !source.is_external())
+            && let Some(authority) = authority
             && authority.validate_rustc_identity(rustc_verbose).is_ok()
         {
             let compiler_library_path = rustc_sysroot.join(&authority.compiler_library);
@@ -2631,6 +2810,7 @@ mod tests {
         let path = directory.path().join("failure.json");
         let source = CompilerFactDriverSourceAuthority {
             file_name: "source.json".to_string(),
+            selected_path: None,
             content_digest: format!("sha256:{}", "a".repeat(64)),
             provenance: format!("sha256:{}", "b".repeat(64)),
         };
@@ -2750,9 +2930,7 @@ mod tests {
     fn source_bundle_requires_a_sorted_closed_offline_build_inventory() {
         let rustc = CompilerFactDriverRustcSupport {
             minimum_release: semver::Version::new(1, 98, 1),
-            maximum_release: semver::Version::new(1, 98, 1),
             minimum_commit_date: "2026-09-01".to_string(),
-            maximum_commit_date: "2026-09-01".to_string(),
         };
         let files = [
             ".cargo/config.toml",
@@ -2775,14 +2953,18 @@ mod tests {
         })
         .collect();
         let bundle = CompilerFactDriverSourceBundle {
-            version: 2,
+            version: 3,
+            fact_protocol: COMPILER_FACT_PROTOCOL_VERSION,
+            native_input_protocol: NATIVE_INPUT_PROTOCOL_VERSION,
             rustc: rustc.clone(),
             files,
         };
         validate_source_bundle(&bundle).expect("closed source inventory");
 
         let missing_native_protocol = CompilerFactDriverSourceBundle {
-            version: 2,
+            version: 3,
+            fact_protocol: COMPILER_FACT_PROTOCOL_VERSION,
+            native_input_protocol: NATIVE_INPUT_PROTOCOL_VERSION,
             rustc: rustc.clone(),
             files: bundle
                 .files
@@ -2797,10 +2979,29 @@ mod tests {
         validate_source_bundle(&missing_native_protocol)
             .expect_err("driver source must include its independent native-input protocol");
 
+        let incompatible_protocol = CompilerFactDriverSourceBundle {
+            version: 3,
+            fact_protocol: COMPILER_FACT_PROTOCOL_VERSION + 1,
+            native_input_protocol: NATIVE_INPUT_PROTOCOL_VERSION,
+            rustc: rustc.clone(),
+            files: bundle
+                .files
+                .iter()
+                .map(|file| CompilerFactDriverSourceFile {
+                    path: file.path.clone(),
+                    hex: file.hex.clone(),
+                })
+                .collect(),
+        };
+        validate_source_bundle(&incompatible_protocol)
+            .expect_err("adapter pack must match the core compiler protocols");
+
         let mut traversal = bundle.files;
         traversal[0].path = "../outside".to_string();
         validate_source_bundle(&CompilerFactDriverSourceBundle {
-            version: 2,
+            version: 3,
+            fact_protocol: COMPILER_FACT_PROTOCOL_VERSION,
+            native_input_protocol: NATIVE_INPUT_PROTOCOL_VERSION,
             rustc,
             files: traversal,
         })
@@ -2903,37 +3104,28 @@ mod tests {
     }
 
     #[test]
-    fn source_bundle_enforces_independent_rustc_release_and_date_bounds() {
+    fn adapter_pack_accepts_supported_and_newer_compilers_but_rejects_older_ones() {
         let support = CompilerFactDriverRustcSupport {
             minimum_release: semver::Version::parse("1.98.0-nightly").unwrap(),
-            maximum_release: semver::Version::parse("1.99.0-nightly").unwrap(),
             minimum_commit_date: "2026-06-30".to_string(),
-            maximum_commit_date: "2026-09-01".to_string(),
         };
         let commit = "b".repeat(40);
-        let stable =
-            format!("release: 1.98.1\ncommit-hash: {commit}\ncommit-date: 2026-09-01\nhost: {COMPILED_TARGET}");
-        support
-            .validate_selected(&RustcVerboseIdentity::parse(&stable).expect("stable compiler identity"))
-            .expect("stable compiler inside independent bounds");
-        let nightly =
-            format!("release: 1.99.0-nightly\ncommit-hash: {commit}\ncommit-date: 2026-07-05\nhost: {COMPILED_TARGET}");
-        support
-            .validate_selected(&RustcVerboseIdentity::parse(&nightly).expect("nightly compiler identity"))
-            .expect("nightly compiler inside independent bounds");
-
+        for supported in [
+            format!("release: 1.98.1\ncommit-hash: {commit}\ncommit-date: 2026-09-01\nhost: {COMPILED_TARGET}"),
+            format!("release: 2.0.0\ncommit-hash: {commit}\ncommit-date: 2027-01-01\nhost: {COMPILED_TARGET}"),
+        ] {
+            support
+                .validate_selected(&RustcVerboseIdentity::parse(&supported).expect("supported compiler identity"))
+                .expect("compiler at or above the authenticated minimum");
+        }
         for unsupported in [
-            stable.replace("2026-09-01", "2026-09-02"),
-            nightly.replace("1.99.0-nightly", "1.99.0"),
+            format!("release: 1.97.0\ncommit-hash: {commit}\ncommit-date: 2026-09-01\nhost: {COMPILED_TARGET}"),
+            format!("release: 1.98.1\ncommit-hash: {commit}\ncommit-date: 2026-06-29\nhost: {COMPILED_TARGET}"),
         ] {
             let error = support
                 .validate_selected(&RustcVerboseIdentity::parse(&unsupported).expect("unsupported compiler identity"))
-                .expect_err("compiler outside either bound must fail before driver preparation");
-            assert!(
-                error
-                    .to_string()
-                    .contains("supports rustc 1.98.0-nightly through 1.99.0-nightly")
-            );
+                .expect_err("compiler below either minimum must fail before driver preparation");
+            assert!(error.to_string().contains("requires rustc 1.98.0-nightly or newer"));
         }
     }
 

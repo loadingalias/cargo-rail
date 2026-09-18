@@ -40,9 +40,10 @@ A global `--config` option bypasses discovery.
 
 ## Surface is unavailable or reports unexpected findings
 
-A `cargo install` or single-binary `cargo binstall` installation lacks the complete Surface component set.
+A `cargo install` or single-binary `cargo binstall` installation lacks the embedded Surface component set.
 `cargo rail surface --schema` remains available without it.
-Install and extract a supported native ZIP with all its components kept together.
+Install and extract a supported native ZIP with all its components kept together,
+or select an independently authenticated [compiler adapter pack](caching.md#select-an-independent-compiler-adapter).
 Prepare the exact workspace-selected toolchain with:
 
 ```bash
@@ -86,6 +87,10 @@ cargo rail doctor native-cache --json
 
 A missing compiler identity, incremental compilation, unsupported compiler class,
 conflicting wrapper, or incomplete input evidence executes the original compiler.
+An installation without embedded component authority also needs an independently authenticated
+[compiler adapter pack](caching.md#select-an-independent-compiler-adapter).
+Pack authentication, compilation, or calibration failure safely bypasses native reuse;
+Surface fails when it requires those compiler facts.
 Physical-root mode also binds the canonical checkout;
 use `--root-portability remap` only for certified cross-root Rust metadata and library results.
 External `CARGO_TARGET_DIR` locations are supported for eligible native results.

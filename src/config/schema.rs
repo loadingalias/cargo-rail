@@ -161,10 +161,6 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
         "Selects release input or reviewed presentation policy.",
     ),
     policy(
-        "release.require_changelog_entries",
-        "Selects release input or reviewed presentation policy.",
-    ),
-    policy(
         "release.require_release_notes",
         "Selects release input or reviewed presentation policy.",
     ),

@@ -868,35 +868,20 @@ impl<'a> ReleasePlanner<'a> {
     /// - {crate} - the crate name
     /// - {version} - the version number
     fn format_tag(&self, crate_name: &str, version: &Version) -> String {
-        let workspace_members = self.ctx.graph().workspace_members();
-        let is_single_crate = workspace_members.len() == 1;
+        self.format_tag_value(crate_name, &version.to_string())
+    }
 
-        // For single-crate repos, use simple "{prefix}{version}" format
-        // For monorepos, use tag_format with all placeholders
-        if is_single_crate {
-            format!("{}{}", self.release_config.tag_prefix, version)
-        } else {
-            // Apply all placeholders including {prefix}
-            const VERSION_PLACEHOLDER: &str = "\u{7b}version\u{7d}";
-            self.release_config
-                .tag_format
-                .replace("{prefix}", &self.release_config.tag_prefix)
-                .replace("{crate}", crate_name)
-                .replace(VERSION_PLACEHOLDER, &version.to_string())
-        }
+    fn format_tag_value(&self, crate_name: &str, version: &str) -> String {
+        const VERSION_PLACEHOLDER: &str = "\u{7b}version\u{7d}";
+        self.release_config
+            .tag_format
+            .replace("{prefix}", &self.release_config.tag_prefix)
+            .replace("{crate}", crate_name)
+            .replace(VERSION_PLACEHOLDER, version)
     }
 
     fn find_previous_tag(&self, crate_name: &str) -> RailResult<Option<String>> {
-        let workspace_members = self.ctx.graph().workspace_members();
-        let is_single_crate = workspace_members.len() == 1;
-        let pattern = if is_single_crate {
-            format!("{}*", self.release_config.tag_prefix)
-        } else {
-            self.release_config
-                .tag_format
-                .replace("{crate}", crate_name)
-                .replace("{version}", "*")
-        };
+        let pattern = self.format_tag_value(crate_name, "*");
 
         self.ctx.git()?.git().find_latest_tag(&pattern)
     }

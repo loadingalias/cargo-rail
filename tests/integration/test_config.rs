@@ -925,6 +925,33 @@ fn test_unknown_keys_fail_normal_loading_even_without_strict_validation() {
 }
 
 #[test]
+fn removed_release_changelog_entry_gate_is_rejected() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("config-removed-release-gate")?;
+        ws.add_crate("test-crate", "0.1.0", &[])?;
+        ws.commit("Add removed release gate fixture")?;
+        fs::write(
+            ws.path.join(".config/rail.toml"),
+            "[release]\nrequire_changelog_entries = true\n",
+        )?;
+
+        let output = run_cargo_rail(&ws.path, &["rail", "config", "validate", "--no-strict"])?;
+        assert_eq!(output.status.code(), Some(2), "removed field was accepted: {output:?}");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            combined.contains("unknown configuration key 'release.require_changelog_entries'"),
+            "{combined}"
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
 fn test_semantic_config_failures_match_validation_and_plan_consumers() {
     let result: Result<()> = (|| {
         let fixtures = [

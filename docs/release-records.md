@@ -2,7 +2,7 @@
 
 Cargo-Rail retains the original release intent and execution progress
 so another executor can recover the same release.
-The [record schema](../schemas/release-record-v9.schema.json) owns the portable JSON shape.
+The [record schema](../schemas/release-record-v10.schema.json) owns the portable JSON shape.
 Records contain no credentials or absolute runner paths.
 
 ## Identity and strict reading
@@ -20,7 +20,9 @@ Numbers must be integers.
 Readers reject duplicate fields, unknown fields, omitted serialized defaults, unsafe paths,
 inconsistent selections, and records larger than 16 MiB.
 The schema alone does not prove identity, checkout binding, or invocation authority.
-The companion Action validates the shared contract independently before exposing record outputs.
+The companion Action validates the record version it embeds before exposing record outputs.
+Release-record v10 therefore requires an Action runtime with an independent v10 schema and reader;
+an older Action rejects the record instead of translating it.
 
 A saved intent, package seal, verified workflow attempt, or completed effect cannot be replaced.
 Annotated tag objects retain their complete bytes, including signatures.

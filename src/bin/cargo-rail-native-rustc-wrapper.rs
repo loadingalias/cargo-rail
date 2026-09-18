@@ -4,7 +4,13 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(not(test), deny(clippy::expect_used))]
 
+#[path = "shared/component_version.rs"]
+mod component_version;
+
 fn main() {
+    if component_version::report_if_requested() {
+        return;
+    }
     let mut arguments = std::env::args_os().skip(1);
     let Some(program) = arguments.next() else {
         eprintln!("cargo-rail compiler cache wrapper: missing compiler executable");

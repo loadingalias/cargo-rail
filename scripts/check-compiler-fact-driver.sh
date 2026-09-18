@@ -40,9 +40,7 @@ identity = dict(line.split(': ', 1) for line in verbose.splitlines() if ': ' in 
 support_policy = tomllib.loads((root / '.config/cranelift-toolchain.toml').read_text())['source-support']
 support = {
     'minimum_release': support_policy['minimum-release'],
-    'maximum_release': support_policy['maximum-release'],
     'minimum_commit_date': support_policy['minimum-commit-date'],
-    'maximum_commit_date': support_policy['maximum-commit-date'],
 }
 native_release = tomllib.loads((root / 'rust-toolchain.toml').read_text())['toolchain']['channel']
 target = sys.argv[3] or identity['host']
@@ -163,7 +161,20 @@ with tempfile.TemporaryDirectory(prefix='.cargo-rail-driver-prepare-', dir=desti
             inventory[path.relative_to(stage).as_posix()] = path.read_bytes()
     if len(inventory) > 10_000:
         raise SystemExit('driver source inventory exceeds its file bound')
-    bundle = json.dumps({'version': 2, 'rustc': support, 'files': [{'path': name, 'hex': data.hex()} for name, data in sorted(inventory.items())]}, separators=(',', ':')).encode() + b'\n'
+    def protocol_version(path, name):
+        marker = f'pub(crate) const {name}: u32 = '.encode()
+        line = next((line for line in inventory[path].splitlines() if line.startswith(marker)), None)
+        if line is None or not line.endswith(b';'):
+            raise SystemExit(f'compiler adapter protocol constant is unavailable: {name}')
+        return int(line[len(marker):-1])
+
+    bundle = json.dumps({
+        'version': 3,
+        'fact_protocol': protocol_version('src/compiler/fact_protocol.rs', 'COMPILER_FACT_PROTOCOL_VERSION'),
+        'native_input_protocol': protocol_version('src/compiler/native_input_protocol.rs', 'NATIVE_INPUT_PROTOCOL_VERSION'),
+        'rustc': support,
+        'files': [{'path': name, 'hex': data.hex()} for name, data in sorted(inventory.items())],
+    }, separators=(',', ':')).encode() + b'\n'
     if len(bundle) > 64 * 1024 * 1024:
         raise SystemExit('driver source bundle exceeds its byte bound')
     if (source_bytes != {path.relative_to(root).as_posix(): path.read_bytes() for path in sorted(sources)}

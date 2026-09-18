@@ -23,9 +23,7 @@ class CacheTransfer(unittest.TestCase):
     def test_fact_driver_compiler_selection_distinguishes_native_and_cross_preparation(self):
         support = {
             'minimum_release': '1.98.0-nightly',
-            'maximum_release': '1.99.0-nightly',
             'minimum_commit_date': '2026-06-30',
-            'maximum_commit_date': '2026-09-01',
         }
         stable = {
             'release': '1.98.1',
@@ -42,19 +40,18 @@ class CacheTransfer(unittest.TestCase):
         compiler_support.validate_compiler_support(
             nightly, support, 'riscv64gc-unknown-linux-gnu', native_release
         )
-        for changed in ({**stable, 'release': '1.98.0'}, {**stable, 'commit-date': '2026-08-31'}):
+        for changed in ({**stable, 'release': '1.98.0'},):
             with self.subTest(native=changed), self.assertRaisesRegex(ValueError, 'native release compiler must match'):
                 compiler_support.validate_compiler_support(changed, support, changed['host'], native_release)
         before_interval = {**nightly, 'commit-date': '2026-06-29'}
-        with self.assertRaisesRegex(ValueError, 'cross compiler is outside'):
+        with self.assertRaisesRegex(ValueError, 'cross compiler is below'):
             compiler_support.validate_compiler_support(
                 before_interval, support, 'riscv64gc-unknown-linux-gnu', native_release
             )
-        after_interval = {**nightly, 'release': '1.99.0'}
-        with self.assertRaisesRegex(ValueError, 'cross compiler is outside'):
-            compiler_support.validate_compiler_support(
-                after_interval, support, 'riscv64gc-unknown-linux-gnu', native_release
-            )
+        newer = {**nightly, 'release': '2.0.0', 'commit-date': '2027-01-01'}
+        compiler_support.validate_compiler_support(
+            newer, support, 'riscv64gc-unknown-linux-gnu', native_release
+        )
 
     def test_driver_preparation_rejects_an_unsupported_target_without_publishing(self):
         with tempfile.TemporaryDirectory() as temporary:

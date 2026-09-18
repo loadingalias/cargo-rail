@@ -6,7 +6,7 @@ use crate::error::{RailError, RailResult};
 use crate::mutation::{
     self, ExpectedMutation, MutationAction, MutationEffect, MutationInput, MutationObject, MutationRisk, MutationTrace,
 };
-use crate::release::planner::{DependentPolicy, RELEASE_REGISTRY, ReleasePlanner};
+use crate::release::planner::{DependentPolicy, RELEASE_REGISTRY, ReleasePlan, ReleasePlanner};
 use crate::release::publisher::ReleasePublisher;
 use crate::release::state::{Preparation, ReleaseState, ReleaseStatus, StepStatus, state_dir, validate_state_path};
 use crate::release::validator::ReleaseValidator;
@@ -45,7 +45,7 @@ pub fn run_release_plan(
     ctx: &WorkspaceContext,
     crate_names: Option<Vec<String>>,
     bump: String,
-    publish: bool,
+    extended: bool,
     skip_tag: bool,
     include_dependents: bool,
     format: TextJsonOutputFormat,
@@ -65,7 +65,7 @@ pub fn run_release_plan(
     let config = ctx.config().map(|c| &c.release);
     let release_config =
         config.ok_or_else(|| RailError::with_help("no release configuration", "run 'cargo rail init' first"))?;
-    let skip_publish = registry_publication_skipped(publish, release_config)?;
+    let skip_publish = true;
 
     // Validate release config (tag format, changelog shape, release policies)
     let warnings = release_config.validate(workspace_members).map_err(RailError::Config)?;
@@ -109,18 +109,7 @@ pub fn run_release_plan(
     validator.validate_changelog_paths(&target_crates, release_config)?;
     validator.validate_apply_preconditions(&plan, true, skip_tag, false)?;
 
-    if json {
-        let payload = serde_json::json!({
-          "release_plan": plan,
-          "mutation_plan": mutation_plan,
-          "check": true,
-          "readiness": readiness,
-        });
-        let output = crate::output::machine_json_envelope("release", "check", "pending_changes", 1, payload);
-        let json_output = serde_json::to_string_pretty(&output)
-            .map_err(|e| RailError::message(format!("JSON serialization failed: {}", e)))?;
-        println!("{}", json_output);
-    } else {
+    if !json {
         println!("{}", plan.format_summary_with_flags(skip_publish, skip_tag));
 
         // Show additional config info
@@ -133,8 +122,42 @@ pub fn run_release_plan(
         if release_config.sign_tags && !skip_tag {
             println!("Tag signing: enabled");
         }
+    }
 
+    let (extended_results, has_extended_failures) = if extended {
+        run_extended_checks(&validator, &plan, json)?
+    } else {
+        (Vec::new(), false)
+    };
+
+    if json {
+        let mut payload = serde_json::json!({
+          "release_plan": plan,
+          "mutation_plan": mutation_plan,
+          "check": true,
+          "readiness": readiness,
+        });
+        if extended {
+            payload["extended"] = serde_json::json!(extended_results);
+        }
+        let (result, exit_code) = if has_extended_failures {
+            ("failed", 2)
+        } else {
+            ("pending_changes", 1)
+        };
+        let output = crate::output::machine_json_envelope("release", "check", result, exit_code, payload);
+        let json_output = serde_json::to_string_pretty(&output)
+            .map_err(|e| RailError::message(format!("JSON serialization failed: {}", e)))?;
+        println!("{}", json_output);
+    } else if !has_extended_failures {
         println!("\nChanges detected. Run without --check to apply.");
+    }
+
+    if has_extended_failures {
+        if json {
+            return Err(RailError::ExitWithCode { code: 2 });
+        }
+        return Err(RailError::message("extended validation failed"));
     }
 
     // Exit code 1 in --check mode indicates changes are pending (consistent across text/json)
@@ -613,54 +636,11 @@ pub(super) fn run_release_publication_check_with_plan_inputs(
         }
     }
 
-    let mut extended_results = Vec::with_capacity(publishable_crates.len());
-    let mut has_extended_failures = false;
-    if extended {
-        if !json {
-            println!("\nrunning extended checks...");
-        }
-        for (crate_name, checks) in validator.validate_extended(&plan)? {
-            let mut crate_checks = Vec::with_capacity(checks.len());
-            for check in checks {
-                if !json {
-                    if check.is_skipped() {
-                        println!(
-                            "  {}: {} - SKIPPED: {}",
-                            crate_name,
-                            check.check_name,
-                            check.details.as_deref().unwrap_or("no evidence")
-                        );
-                    } else if check.passed {
-                        println!(
-                            "  {}: {} - {}",
-                            crate_name,
-                            check.check_name,
-                            check.details.as_deref().unwrap_or("ok")
-                        );
-                    } else {
-                        crate::error!(
-                            "  {}: {} - FAILED: {}",
-                            crate_name,
-                            check.check_name,
-                            check.error.as_deref().unwrap_or("unknown error")
-                        );
-                    }
-                }
-                has_extended_failures |= !check.passed && !check.is_skipped();
-                crate_checks.push(serde_json::json!({
-                  "check": check.check_name,
-                  "passed": check.passed,
-                  "skipped": check.is_skipped(),
-                  "details": check.details,
-                  "error": check.error
-                }));
-            }
-            extended_results.push(serde_json::json!({
-              "crate": crate_name,
-              "checks": crate_checks
-            }));
-        }
-    }
+    let (extended_results, has_extended_failures) = if extended {
+        run_extended_checks(&validator, &plan, json)?
+    } else {
+        (Vec::new(), false)
+    };
 
     let validation_failed = has_extended_failures || has_change_file_failures || has_shallow_failures || commit_failed;
     if json {
@@ -727,6 +707,61 @@ pub(super) fn run_release_publication_check_with_plan_inputs(
         println!("\nNo release-worthy changes detected.");
     }
     Ok(())
+}
+
+fn run_extended_checks(
+    validator: &ReleaseValidator<'_>,
+    plan: &ReleasePlan,
+    json: bool,
+) -> RailResult<(Vec<serde_json::Value>, bool)> {
+    if !json {
+        println!("\nrunning extended checks...");
+    }
+    let results = validator.validate_extended(plan)?;
+    let mut rendered = Vec::with_capacity(results.len());
+    let mut failed = false;
+    for (crate_name, checks) in results {
+        let mut crate_checks = Vec::with_capacity(checks.len());
+        for check in checks {
+            if !json {
+                if check.is_skipped() {
+                    println!(
+                        "  {}: {} - SKIPPED: {}",
+                        crate_name,
+                        check.check_name,
+                        check.details.as_deref().unwrap_or("no evidence")
+                    );
+                } else if check.passed {
+                    println!(
+                        "  {}: {} - {}",
+                        crate_name,
+                        check.check_name,
+                        check.details.as_deref().unwrap_or("ok")
+                    );
+                } else {
+                    crate::error!(
+                        "  {}: {} - FAILED: {}",
+                        crate_name,
+                        check.check_name,
+                        check.error.as_deref().unwrap_or("unknown error")
+                    );
+                }
+            }
+            failed |= !check.passed && !check.is_skipped();
+            crate_checks.push(serde_json::json!({
+              "check": check.check_name,
+              "passed": check.passed,
+              "skipped": check.is_skipped(),
+              "details": check.details,
+              "error": check.error
+            }));
+        }
+        rendered.push(serde_json::json!({
+          "crate": crate_name,
+          "checks": crate_checks
+        }));
+    }
+    Ok((rendered, failed))
 }
 
 fn release_check_readiness(
@@ -1786,7 +1821,7 @@ mod tests {
         test_git(root.path(), &["init", "-q", "-b", "main"]);
         test_git(root.path(), &["config", "user.name", "Cargo-Rail Test"]);
         test_git(root.path(), &["config", "user.email", "cargo-rail@example.invalid"]);
-        let message = "prepare\n\nRail-Release: release-fixture\nRail-Release-Contract: 9\nRail-Release-Intent: first\nRail-Release-Intent: second";
+        let message = "prepare\n\nRail-Release: release-fixture\nRail-Release-Contract: 10\nRail-Release-Intent: first\nRail-Release-Intent: second";
         test_git(root.path(), &["commit", "--allow-empty", "-qm", message]);
         let transaction = git_release_transactions(root.path()).unwrap().remove(0);
         let status = history_status_report(root.path(), transaction);

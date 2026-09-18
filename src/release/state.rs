@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-pub(crate) const RELEASE_STATE_SCHEMA_VERSION: u32 = 9;
+pub(crate) const RELEASE_STATE_SCHEMA_VERSION: u32 = 10;
 
 #[derive(Deserialize)]
 struct ReleaseStateSchema {

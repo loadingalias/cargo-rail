@@ -304,6 +304,57 @@ msrv_policy = { mode = "compute", source = "workspace" }
 }
 
 #[test]
+fn test_msrv_explain_counts_and_describes_multiple_root_manifest_edits() {
+    let result: Result<()> = (|| {
+        let workspace = TestWorkspace::new()?;
+        std::fs::write(
+            workspace.path.join("Cargo.toml"),
+            r#"[package]
+name = "root"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.72.0"
+
+[workspace]
+members = []
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+"#,
+        )?;
+        std::fs::create_dir_all(workspace.path.join("src"))?;
+        std::fs::write(workspace.path.join("src/lib.rs"), "pub fn root() {}\n")?;
+        std::fs::write(
+            workspace.path.join(".config/rail.toml"),
+            "[unify]\nmsrv_policy = { source = \"workspace\", inherit = true }\n",
+        )?;
+        workspace.commit("Plan two MSRV edits in the root manifest")?;
+
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--explain"])?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "MSRV edits should be pending. stdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains("Pending: 1 manifest(s)."), "stdout:\n{stdout}");
+        assert!(
+            stdout.contains("Cargo.toml: [workspace.package].rust-version = \"1.72.0\""),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("Cargo.toml: [package].rust-version = { workspace = true }"),
+            "stdout:\n{stdout}"
+        );
+
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
 fn test_msrv_enforce_inheritance_sets_members_to_workspace() {
     let result: Result<()> = (|| {
         let workspace = create_workspace_with_rust_version("1.72.0")?;

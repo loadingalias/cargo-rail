@@ -70,18 +70,13 @@ fn write_config_file(config_path: &Path, content: &str) -> RailResult<()> {
     crate::utils::write_file_atomic(config_path, content.as_bytes())
 }
 
-/// Check if this is a valid Cargo workspace
+/// Check whether the root manifest defines a Cargo workspace.
 fn is_cargo_workspace(workspace_root: &Path) -> bool {
     let cargo_toml = workspace_root.join("Cargo.toml");
-    if !cargo_toml.exists() {
-        return false;
-    }
-    // Check if it's a workspace (has [workspace] section or is a virtual workspace)
-    if let Ok(content) = fs::read_to_string(&cargo_toml) {
-        content.contains("[workspace]")
-    } else {
-        false
-    }
+    fs::read_to_string(cargo_toml)
+        .ok()
+        .and_then(|content| content.parse::<toml_edit::DocumentMut>().ok())
+        .is_some_and(|manifest| manifest.get("workspace").is_some() || manifest.get("package").is_some())
 }
 
 /// Shared implementation for both run_init and run_init_standalone

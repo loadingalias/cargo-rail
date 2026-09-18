@@ -3,6 +3,8 @@
 Use `cargo rail release check --all` to review the selected packages, versions, notes, and effects.
 Pending changes produce exit code `1`.
 Checking performs no release effects.
+Add `--extended` to run package publish dry-runs, MSRV checks, and configured semver checks locally.
+`--extended` does not require `--publication`; the latter separately validates publication authority for the same plan.
 
 ```bash
 cargo rail release run --all --publish
@@ -34,6 +36,12 @@ Replace its release job with the configured Cargo-Rail workflow,
 review tag formats and published versions, and add change files for the next release.
 Existing history and published versions remain inputs; migration does not rewrite them.
 Use an explicit bump when the manifests already contain the intended release version.
+
+The default tag format is `{crate}-{prefix}{version}` for every repository shape.
+With the default `tag_prefix = "v"`, package `my-crate` version `1.2.3` receives `my-crate-v1.2.3`.
+Set `tag_format = "{prefix}{version}"` explicitly when an existing single-crate repository uses `v1.2.3` tags.
+When an existing GitHub changelog uses linked `/compare/` headings,
+generated headings preserve that style and compare the previous tag with the planned tag.
 
 ## Choose execution
 
@@ -84,7 +92,7 @@ and the configured signing authority.
 Keep registry credentials in this job, outside validation and packaging jobs.
 
 Invoke `loadingalias/cargo-rail-action/release` at a reviewed immutable Action commit.
-Its `version` input defaults to Cargo-Rail v0.28.1.
+Its `version` input defaults to the exact Cargo-Rail release in the Action's lock.
 Set a different exact stable version only when the workflow requires another compatible engine.
 The other inputs are `packages` (a JSON array; `[]` selects all), `bump`, `publish`, and `review`.
 It exposes `transaction-id`, `release-sha`, `state`, and `run-url`.
@@ -134,8 +142,11 @@ and authenticated archive against the Action's independent consumer before publi
 Publish Cargo-Rail first, then verify its immutable release and executable attestations.
 Update the Action repository's Cargo-Rail lock with that exact version
 and dereferenced release commit.
+If Cargo-Rail changes the release-record contract, update and qualify the Action's independent schema and reader
+before moving the lock; an older reader rejects the new record version.
+The source-built Cargo-Rail bootstrap can publish core before that consumer transition.
 The Action's release workflow validates the locked authenticated components and releases the Action.
-Its configured `v9` alias moves only after the immutable release is verified and only
+Its configured `v10` alias moves only after the immutable release is verified and only
 if the prior alias object still matches the request.
 
 Local tests do not qualify Linux or Windows runtime behavior.

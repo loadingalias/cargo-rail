@@ -168,7 +168,7 @@ repository policy cannot enable them.
 `--local-only` removes remote activation from an existing profile. Omit it when
 creating a fresh local profile; local reuse is already the default.
 
-  cargo rail cache setup --check               # Preview enrollment
+  cargo rail cache setup --check               # Preview enrollment (exit 1 if pending)
   cargo rail cache setup                       # Install or repair the wrapper
   cargo rail cache clean --scope local --check # Preview selected-profile cleanup
 
@@ -985,8 +985,8 @@ pub enum ReleaseCommand {
         /// Validate publication authority for the same release plan
         #[arg(long)]
         publication: bool,
-        /// Run extended publication validation (publish dry-run, MSRV, optional semver checks)
-        #[arg(long, short = 'e', requires = "publication")]
+        /// Run extended local validation (package dry-run, MSRV, and semver checks)
+        #[arg(long, short = 'e')]
         extended: bool,
         /// Exclude git tag creation from the release plan
         #[arg(long)]

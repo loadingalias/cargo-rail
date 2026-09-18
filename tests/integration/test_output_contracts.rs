@@ -405,6 +405,22 @@ fn test_root_help_exposes_starting_commands_and_global_options() {
 }
 
 #[test]
+fn test_cache_help_documents_pending_setup_exit_status() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("cache-help-exit-status")?;
+        let output = run_cargo_rail(&ws.path, &["rail", "cache", "--help"])?;
+        assert!(output.status.success());
+        let help = String::from_utf8(output.stdout)?;
+        assert!(
+            help.contains("cargo rail cache setup --check               # Preview enrollment (exit 1 if pending)"),
+            "{help}"
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
 fn test_split_and_sync_share_the_empty_selection_contract() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("split-sync-empty-selection")?;

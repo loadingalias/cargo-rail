@@ -74,16 +74,27 @@ pub(crate) fn extract_section(content: &str, version: &str) -> Option<String> {
     Some(rest.get(..end)?.trim_end().to_string())
 }
 
-pub(crate) fn version_header(version: &str, date: &str) -> String {
-    if date.is_empty() {
-        format!("## [{version}]\n")
-    } else {
-        format!("## [{version}] - {date}\n")
+pub(crate) fn version_header(version: &str, date: &str, compare_url: Option<&str>) -> String {
+    match (compare_url, date.is_empty()) {
+        (Some(url), true) => format!("## [{version}]({url})\n"),
+        (Some(url), false) => format!("## [{version}]({url}) - {date}\n"),
+        (None, true) => format!("## [{version}]\n"),
+        (None, false) => format!("## [{version}] - {date}\n"),
     }
 }
 
-pub(crate) fn insert_release_at(existing: &str, version: &str, date: &str, body: &str) -> String {
-    let section = format!("{}\n{}\n", version_header(version, date).trim_end(), body.trim());
+pub(crate) fn insert_release_at(
+    existing: &str,
+    version: &str,
+    date: &str,
+    body: &str,
+    compare_url: Option<&str>,
+) -> String {
+    let section = format!(
+        "{}\n{}\n",
+        version_header(version, date, compare_url).trim_end(),
+        body.trim()
+    );
     if existing.trim().is_empty() {
         return section;
     }
@@ -110,7 +121,7 @@ pub(crate) fn capture(
     config: &ReleaseConfig,
     plan: &CrateReleasePlan,
     date: &str,
-    _github: Option<&(String, String)>,
+    github: Option<&(String, String)>,
 ) -> RailResult<PlannedPresentation> {
     validate_entry(&plan.changelog_body)?;
     let existing = read_optional(root, &plan.changelog_path)?;
@@ -118,11 +129,26 @@ pub(crate) fn capture(
         let before_digest = existing
             .as_ref()
             .map(|s| ContentDigest::sha256(s.as_bytes()).to_string());
+        let compare_url = existing
+            .as_deref()
+            .filter(|content| {
+                content
+                    .lines()
+                    .any(|line| line.starts_with("## [") && line.contains("](") && line.contains("/compare/"))
+            })
+            .and_then(|_| github.zip(plan.previous_tag.as_deref()))
+            .map(|((owner, repo), previous_tag)| {
+                format!(
+                    "https://github.com/{owner}/{repo}/compare/{previous_tag}...{}",
+                    plan.tag_name
+                )
+            });
         let content = insert_release_at(
             existing.as_deref().unwrap_or("# Changelog\n\n"),
             &plan.new_version.to_string(),
             date,
             &plan.changelog_body,
+            compare_url.as_deref(),
         );
         let after_digest = ContentDigest::sha256(content.as_bytes()).to_string();
         Some(PlannedChangelog {
@@ -219,7 +245,7 @@ mod tests {
     fn inserts_release_before_history_preserving_the_preamble() {
         let existing = "# Changelog\n\nProject notes.\n\n## [1.0.0] - 2026-01-01\n\nOld entry.\n";
         assert_eq!(
-            insert_release_at(existing, "1.1.0", "2026-02-03", "  New entry.\n\n"),
+            insert_release_at(existing, "1.1.0", "2026-02-03", "  New entry.\n\n", None),
             "# Changelog\n\nProject notes.\n\n## [1.1.0] - 2026-02-03\nNew entry.\n## [1.0.0] - 2026-01-01\n\nOld entry.\n"
         );
     }
@@ -228,12 +254,12 @@ mod tests {
     fn inserts_first_release_with_optional_date_and_header() {
         for existing in ["", " \n\t"] {
             assert_eq!(
-                insert_release_at(existing, "1.0.0", "", "First entry."),
+                insert_release_at(existing, "1.0.0", "", "First entry.", None),
                 "## [1.0.0]\nFirst entry.\n"
             );
         }
         assert_eq!(
-            insert_release_at("# Changelog", "1.0.0", "", "First entry."),
+            insert_release_at("# Changelog", "1.0.0", "", "First entry.", None),
             "# Changelog\n## [1.0.0]\nFirst entry.\n"
         );
     }

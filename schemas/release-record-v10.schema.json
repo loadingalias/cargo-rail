@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/loadingalias/cargo-rail/blob/main/schemas/release-record-v9.schema.json",
-  "title": "Cargo-Rail release execution record v9",
+  "$id": "https://github.com/loadingalias/cargo-rail/blob/main/schemas/release-record-v10.schema.json",
+  "title": "Cargo-Rail release execution record v10",
   "description": "Complete portable release intent and progress. Consumers must also verify canonical intent identity, semantic consistency, checkout and invocation authority. Credentials are never record fields.",
   "type": "object",
   "additionalProperties": false,
@@ -28,7 +28,7 @@
   "properties": {
     "schema_version": {
       "enum": [
-        9
+        10
       ]
     },
     "transaction_id": {
@@ -1160,7 +1160,6 @@
         "unconventional_commits",
         "release_notes_dir",
         "require_release_notes",
-        "require_changelog_entries",
         "source",
         "tag_prefix",
         "tag_format",
@@ -1202,9 +1201,6 @@
           "type": "string"
         },
         "require_release_notes": {
-          "type": "boolean"
-        },
-        "require_changelog_entries": {
           "type": "boolean"
         },
         "source": {
