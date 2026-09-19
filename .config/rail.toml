@@ -89,3 +89,19 @@ cargo = ["cargo.test"]
 
 [release]
 auxiliary_cargo_manifests = ["tools/compiler-fact-driver/Cargo.toml"]
+hosted_workflow = ".github/workflows/release.yml"
+registry_publication = "crates-io"
+remote_effects = "github"
+tag_format = "{prefix}{version}"
+validation = { ".github/workflows/package.yml" = ["Package / aarch64-apple-darwin", "Package / aarch64-unknown-linux-gnu", "Package / x86_64-pc-windows-msvc", "Package / x86_64-unknown-linux-gnu", "Collect release assets"] }
+
+[release.artifacts.cargo-rail]
+workflow = ".github/workflows/package.yml"
+
+[release.artifacts.cargo-rail.files]
+"cargo-rail-aarch64-apple-darwin.zip" = { target = "aarch64-apple-darwin" }
+"cargo-rail-aarch64-unknown-linux-gnu.zip" = { target = "aarch64-unknown-linux-gnu" }
+"cargo-rail-x86_64-pc-windows-msvc.zip" = { target = "x86_64-pc-windows-msvc" }
+"cargo-rail-x86_64-unknown-linux-gnu.zip" = { target = "x86_64-unknown-linux-gnu" }
+"LICENSE" = { source = "LICENSE" }
+"SHA256SUMS" = {}
