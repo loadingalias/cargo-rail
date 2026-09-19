@@ -70,7 +70,8 @@ else:
              '--component', 'rustc-dev', '--component', 'llvm-tools'],
             ['rustc', '-vV'],
             ['cargo', 'install', 'cargo-binstall', '--version', catalog.read()['versions']['cargo-binstall'], '--locked'],
-            ['cargo', 'install', 'just', '--version', catalog.read()['cargo']['just'], '--locked'],
+            ['cargo', 'binstall', '--locked', '--no-confirm', '--targets', 'aarch64-apple-darwin',
+             '--strategies', 'crate-meta-data', f"just@{catalog.read()['cargo']['just']}"],
         ])
         self.assertEqual((self.root / 'github-env').read_text(), f'RUSTUP_TOOLCHAIN={catalog.rust_channel()}\n')
 
@@ -86,7 +87,8 @@ else:
             ['rustc', '-vV'],
             ['cargo', 'install', 'cargo-binstall', '--version', data['versions']['cargo-binstall'], '--locked'],
             *[
-                ['cargo', 'install', tool, '--version', data['cargo'][tool], '--locked']
+                ['cargo', 'binstall', '--locked', '--no-confirm', '--targets', 'aarch64-apple-darwin',
+                 '--strategies', 'crate-meta-data', f"{tool}@{data['cargo'][tool]}"]
                 for tool in ['cargo-deny', 'cargo-nextest', 'just']
             ],
         ])

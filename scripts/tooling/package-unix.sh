@@ -32,6 +32,7 @@ rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal "${components[@]}
 [[ "$(rustc -vV | sed -n 's/^host: //p')" == "$1" ]]
 cargo install cargo-binstall --version "$(python3 "$SCRIPT_DIR/catalog.py" get versions cargo-binstall)" --locked
 while IFS= read -r tool; do
-  cargo install "$tool" --version "$(python3 "$SCRIPT_DIR/catalog.py" get cargo "$tool")" --locked
+  cargo binstall --locked --no-confirm --targets "$1" --strategies crate-meta-data \
+    "$tool@$(python3 "$SCRIPT_DIR/catalog.py" get cargo "$tool")"
 done < <(python3 "$SCRIPT_DIR/catalog.py" get operations "$operation" cargo)
 if [[ -n "${GITHUB_ENV:-}" ]]; then printf 'RUSTUP_TOOLCHAIN=%s\n' "$RUSTUP_TOOLCHAIN" >> "$GITHUB_ENV"; fi
