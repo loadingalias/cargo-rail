@@ -141,6 +141,40 @@ fn shallow_clone(ws: &TestWorkspace, name: &str) -> Result<(tempfile::TempDir, P
     Ok((root, clone_path))
 }
 
+#[cfg(unix)]
+fn seed_legacy_release_lease(remote: &Path, status: &str) -> Result<String> {
+    let fixture = tempfile::tempdir()?;
+    git(fixture.path(), &["init", "--initial-branch=main"])?;
+    git(fixture.path(), &["config", "user.name", "Release fixture"])?;
+    git(fixture.path(), &["config", "user.email", "release@example.invalid"])?;
+    std::fs::write(
+        fixture.path().join("record.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 9,
+            "transaction_id": "release-legacy-v9",
+            "status": status,
+            "require_changelog_entries": false
+        }))?,
+    )?;
+    git(fixture.path(), &["add", "record.json"])?;
+    git(fixture.path(), &["commit", "-m", "Retain legacy release"])?;
+    let head = git(fixture.path(), &["rev-parse", "HEAD"])?;
+    let remote = remote
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("release fixture remote is not UTF-8"))?;
+    git(
+        fixture.path(),
+        &[
+            "push",
+            "--atomic",
+            remote,
+            "HEAD:refs/notes/cargo-rail/release-legacy-v9",
+            "HEAD:refs/notes/cargo-rail/active",
+        ],
+    )?;
+    Ok(String::from_utf8(head.stdout)?.trim().to_owned())
+}
+
 fn run_with_rejected_commit(cwd: &Path, args: &[&str]) -> Result<std::process::Output> {
     let hook = cwd.join(".git/hooks/pre-commit");
     std::fs::write(&hook, "#!/bin/sh\necho 'fixture commit policy rejected' >&2\nexit 1\n")?;
@@ -5887,6 +5921,118 @@ fn release_remote_records_survive_runner_loss_without_moving_the_source_branch()
             git(remote.path(), &["rev-parse", "refs/notes/cargo-rail/active"])?.stdout,
             active,
             "reading an old transaction must not publish it as the active transaction"
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_remote_lease_from_an_older_schema_does_not_block_a_new_release() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_single_crate("remote-schema-upgrade", "0.1.0")?;
+        ws.write_release_config("semver_check = 'off'\nsign_tags = false\nremote_effects = 'gitlab'\n")?;
+        write_test_change(&ws.path, &["remote-schema-upgrade"])?;
+        ws.commit("Review release after schema upgrade")?;
+        let remote = tempfile::TempDir::new()?;
+        git(remote.path(), &["init", "--bare", "--initial-branch=main"])?;
+        ws.set_remote(remote.path().to_str().unwrap())?;
+        git(&ws.path, &["push", "-u", "origin", "main"])?;
+        let legacy_head = seed_legacy_release_lease(remote.path(), "complete")?;
+        let logs = tempfile::tempdir()?;
+        let (_shim, glab) = glab_shim_with_status(&logs.path().join("glab.log"), "success")?;
+
+        let prepared = run_with_path_prefix(
+            &ws,
+            glab.parent().unwrap(),
+            &[
+                "rail",
+                "release",
+                "run",
+                "--all",
+                "--bump",
+                "patch",
+                "--prepare",
+                "--retain-remote",
+                "--yes",
+                "--format",
+                "json",
+            ],
+        )?;
+        assert!(
+            prepared.status.success(),
+            "{}",
+            String::from_utf8_lossy(&prepared.stderr)
+        );
+        let prepared: serde_json::Value = serde_json::from_slice(&prepared.stdout)?;
+        let transaction = prepared["transaction_id"].as_str().unwrap();
+        assert_ne!(transaction, "release-legacy-v9");
+        assert_eq!(
+            git(remote.path(), &["rev-parse", "refs/notes/cargo-rail/release-legacy-v9"])?.stdout,
+            format!("{legacy_head}\n").as_bytes(),
+            "starting a new transaction must preserve the older transaction record"
+        );
+        assert_eq!(
+            git(remote.path(), &["rev-parse", "refs/notes/cargo-rail/active"])?.stdout,
+            git(
+                remote.path(),
+                &["rev-parse", &format!("refs/notes/cargo-rail/{transaction}")]
+            )?
+            .stdout,
+            "the active lease must move to the new transaction"
+        );
+        let fetched = run_cargo_rail(&ws.path, &["rail", "release", "record", "fetch", "release-legacy-v9"])?;
+        assert!(
+            !fetched.status.success(),
+            "transaction records from older schemas must remain strict"
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(unix)]
+#[test]
+fn active_remote_lease_from_an_older_schema_still_blocks_a_new_release() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_single_crate("remote-active-upgrade", "0.1.0")?;
+        ws.write_release_config("semver_check = 'off'\nsign_tags = false\nremote_effects = 'gitlab'\n")?;
+        write_test_change(&ws.path, &["remote-active-upgrade"])?;
+        ws.commit("Review concurrent release")?;
+        let remote = tempfile::TempDir::new()?;
+        git(remote.path(), &["init", "--bare", "--initial-branch=main"])?;
+        ws.set_remote(remote.path().to_str().unwrap())?;
+        git(&ws.path, &["push", "-u", "origin", "main"])?;
+        let legacy_head = seed_legacy_release_lease(remote.path(), "active")?;
+        let logs = tempfile::tempdir()?;
+        let (_shim, glab) = glab_shim_with_status(&logs.path().join("glab.log"), "success")?;
+
+        let rejected = run_with_path_prefix(
+            &ws,
+            glab.parent().unwrap(),
+            &[
+                "rail",
+                "release",
+                "run",
+                "--all",
+                "--bump",
+                "patch",
+                "--prepare",
+                "--retain-remote",
+                "--yes",
+            ],
+        )?;
+        assert!(!rejected.status.success(), "a concurrent remote lease was accepted");
+        let error = String::from_utf8_lossy(&rejected.stderr);
+        assert!(
+            error.contains("remote release transaction 'release-legacy-v9' is already active"),
+            "{error}"
+        );
+        assert_eq!(
+            git(remote.path(), &["rev-parse", "refs/notes/cargo-rail/active"])?.stdout,
+            format!("{legacy_head}\n").as_bytes(),
+            "rejecting concurrent work must not move the active lease"
         );
         Ok(())
     })();

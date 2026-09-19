@@ -46,7 +46,7 @@ pub(crate) fn store(root: &Path, state: &ReleaseState) -> RailResult<()> {
     validate_repository(root, state)?;
     let reference = reference(&state.transaction_id)?;
     let previous = read(root, &reference)?;
-    let active = read(root, ACTIVE)?;
+    let active = read_active_lease(root)?;
     if let Some((_, active)) = &active
         && active.status == ReleaseStatus::Active
         && active.transaction_id != state.transaction_id
@@ -121,11 +121,52 @@ pub(crate) fn store(root: &Path, state: &ReleaseState) -> RailResult<()> {
 
 fn read(root: &Path, reference: &str) -> RailResult<Option<(String, ReleaseState)>> {
     let git = SystemGit::open(root)?;
-    let Some(head) = remote_head(&git, reference)? else {
+    let Some((head, bytes)) = read_record(&git, reference)? else {
+        return Ok(None);
+    };
+    let state: ReleaseState = contract::decode(bytes.as_bytes())?;
+    state.validate_contract()?;
+    if !state.remote_storage {
+        return Err(RailError::message(
+            "remote record does not retain remote execution authority",
+        ));
+    }
+    package_blobs(&git, &head, &state)?;
+    Ok(Some((head, state)))
+}
+
+struct ReleaseLease {
+    transaction_id: String,
+    status: ReleaseStatus,
+}
+
+fn read_active_lease(root: &Path) -> RailResult<Option<(String, ReleaseLease)>> {
+    let git = SystemGit::open(root)?;
+    let Some((head, bytes)) = read_record(&git, ACTIVE)? else {
+        return Ok(None);
+    };
+    let record: serde_json::Value = contract::decode(bytes.as_bytes())?;
+    let transaction_id = record
+        .get("transaction_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| RailError::message("remote release lease has no transaction identity"))?
+        .to_owned();
+    reference(&transaction_id)?;
+    let status = match record.get("status").and_then(serde_json::Value::as_str) {
+        Some("active") => ReleaseStatus::Active,
+        Some("complete") => ReleaseStatus::Complete,
+        Some("aborted") => ReleaseStatus::Aborted,
+        _ => return Err(RailError::message("remote release lease has an invalid status")),
+    };
+    Ok(Some((head, ReleaseLease { transaction_id, status })))
+}
+
+fn read_record(git: &SystemGit, reference: &str) -> RailResult<Option<(String, String)>> {
+    let Some(head) = remote_head(git, reference)? else {
         return Ok(None);
     };
     git.run_git(&["fetch", "--no-tags", "--no-write-fetch-head", "origin", &head])?;
-    let tree = tree_entries(&git, &head)?;
+    let tree = tree_entries(git, &head)?;
     let blob = tree
         .get("record.json")
         .and_then(|entry| entry.strip_prefix("100644 blob "))
@@ -139,15 +180,7 @@ fn read(root: &Path, reference: &str) -> RailResult<Option<(String, ReleaseState
         return Err(RailError::message("remote release record exceeds its size limit"));
     }
     let bytes = git.run_git_stdout(&["cat-file", "blob", blob])?;
-    let state: ReleaseState = contract::decode(bytes.as_bytes())?;
-    state.validate_contract()?;
-    if !state.remote_storage {
-        return Err(RailError::message(
-            "remote record does not retain remote execution authority",
-        ));
-    }
-    package_blobs(&git, &head, &state)?;
-    Ok(Some((head, state)))
+    Ok(Some((head, bytes)))
 }
 
 fn remote_head(git: &SystemGit, reference: &str) -> RailResult<Option<String>> {

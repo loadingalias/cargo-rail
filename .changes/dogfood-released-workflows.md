@@ -11,4 +11,5 @@ Make Cargo-Rail's hosted release enforce the existing package workflow, crates.i
 GitHub release, release assets, and historical `v{version}` tag namespace.
 Remove the no-op `release.require_changelog_entries` configuration field;
 `release.require_release_notes` remains the release-prose gate.
+Keep the remote active-release lease readable across record-schema upgrades without accepting older transaction records.
 Correct cache readiness, initialization, and dependency-unification edge cases.
