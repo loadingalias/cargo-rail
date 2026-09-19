@@ -10,7 +10,7 @@ use rscrypto::Sha256;
 
 fn materialize_fixture(destination: &Path, git_source: &Path) -> Result<()> {
     let output = Command::new(crate::helpers::cargo_binary("cargo-rail-bench"))
-        .args(["prepare", "--offline", "--output"])
+        .args(["prepare", "--output"])
         .arg(destination)
         .arg("--git-source")
         .arg(git_source)
@@ -55,12 +55,14 @@ fn benchmark_prepare_uses_embedded_locked_inputs_outside_the_checkout() -> Resul
     fs::copy(crate::helpers::cargo_binary("cargo-rail-bench"), &binary)?;
     let fixture = root.path().join("fixture with spaces ü # %");
     let source = root.path().join("fixture with spaces ü # %.git-source");
+    let cargo_home = root.path().join("cargo-home");
     let mut selected = fixture.as_os_str().to_os_string();
     selected.push(std::path::MAIN_SEPARATOR_STR);
     let output = Command::new(&binary)
         .current_dir(root.path())
-        .args(["rail-bench", "prepare", "--offline", "--output"])
+        .args(["rail-bench", "prepare", "--output"])
         .arg(&selected)
+        .env("CARGO_HOME", &cargo_home)
         .output()?;
     ensure!(
         output.status.success(),
@@ -68,7 +70,7 @@ fn benchmark_prepare_uses_embedded_locked_inputs_outside_the_checkout() -> Resul
         String::from_utf8_lossy(&output.stderr)
     );
     let lock = fs::read(fixture.join("Cargo.lock"))?;
-    let metadata = cargo_metadata(&fixture, None)?;
+    let metadata = cargo_metadata(&fixture, Some(&cargo_home))?;
     let packages = metadata["packages"].as_array().context("resolved workload packages")?;
     let git_package = packages
         .iter()
@@ -89,7 +91,18 @@ fn benchmark_prepare_uses_embedded_locked_inputs_outside_the_checkout() -> Resul
     ensure!(fixture.join("crates/fixture-native-sys/native/value.c").is_file());
     ensure!(!fixture.join("git-prefetch").exists());
     let second = root.path().join("second");
-    materialize_fixture(&second, &source)?;
+    let output = Command::new(&binary)
+        .args(["rail-bench", "prepare", "--offline", "--output"])
+        .arg(&second)
+        .arg("--git-source")
+        .arg(&source)
+        .env("CARGO_HOME", &cargo_home)
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "offline materializer failed after exact input preparation: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     ensure!(
         fs::read(second.join("Cargo.lock"))? == lock,
         "shared-source materialization changed the graph"
