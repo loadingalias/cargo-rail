@@ -745,7 +745,19 @@ impl CargoConfigSnapshot {
         if let Ok(default) = resolve_executable_program(OsStr::new("cargo"), current_dir) {
             let rustup = default.with_file_name(format!("rustup{}", std::env::consts::EXE_SUFFIX));
             let configured_env = self.effective_file_settings.get("env");
-            if selected_path == default && !configured_env.is_some_and(|env| env.get("CARGO").is_some()) {
+            // Windows PATH lookup can return cargo.EXE while Cargo exports cargo.exe.
+            // Compare filesystem identities, retaining the selected basename for multicall tools.
+            let same_default = selected_path == default
+                || (cfg!(windows)
+                    && selected_path
+                        .file_name()
+                        .zip(default.file_name())
+                        .is_some_and(|(left, right)| {
+                            left.to_string_lossy().eq_ignore_ascii_case(&right.to_string_lossy())
+                        })
+                    && crate::utils::canonicalize_existing(&selected_path)?
+                        == crate::utils::canonicalize_existing(&default)?);
+            if same_default && !configured_env.is_some_and(|env| env.get("CARGO").is_some()) {
                 normalized_selection = default.as_os_str().to_owned();
                 config.environment.insert(
                     "CARGO".into(),
@@ -782,7 +794,7 @@ impl CargoConfigSnapshot {
                             .map_err(|_| RailError::message("rustup planning authority is not valid UTF-8"))
                     };
                     let implementation = query(&["which", "cargo"])?;
-                    if selected_path == default || selected_path == Path::new(&implementation) {
+                    if same_default || selected_path == Path::new(&implementation) {
                         let active = query(&["show", "active-toolchain"])?;
                         let active = active.rsplit_once(" (").map_or(active.as_str(), |(name, _)| name);
                         if active.is_empty() {
