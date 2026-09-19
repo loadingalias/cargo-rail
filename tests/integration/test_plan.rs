@@ -164,6 +164,113 @@ fn verify_saved_plan_stdin(ws: &TestWorkspace, plan: &[u8]) -> Result<std::proce
 }
 
 #[test]
+fn saved_plan_accepts_equivalent_cargo_invocations_and_rejects_changed_authority() -> Result<()> {
+    for use_proxy in [true, false] {
+        let ws = TestWorkspace::new_single_crate("invocation", "0.1.0")?;
+        let active = Command::new("rustup").args(["show", "active-toolchain"]).output()?;
+        ensure!(active.status.success(), "rustup failed: {active:?}");
+        let active = String::from_utf8(active.stdout)?;
+        let active = active.split_whitespace().next().context("active toolchain")?;
+        std::fs::write(
+            ws.path.join("rust-toolchain.toml"),
+            format!("[toolchain]\nchannel = '{active}'\n"),
+        )?;
+        ws.commit("pin invocation fixture toolchain")?;
+        let cargo = Command::new("rustup")
+            .current_dir(&ws.path)
+            .env("RUSTUP_TOOLCHAIN", active)
+            .args(["which", "cargo"])
+            .output()?;
+        ensure!(cargo.status.success(), "cargo selection failed: {cargo:?}");
+        let cargo = String::from_utf8(cargo.stdout)?;
+        let native_directory = std::path::Path::new(cargo.trim()).parent().context("Cargo directory")?;
+        let binary = crate::helpers::cargo_binary("cargo-rail");
+        let path = std::env::join_paths(
+            std::iter::once(binary.parent().context("binary directory")?.to_path_buf())
+                .chain((!use_proxy).then(|| native_directory.to_path_buf()))
+                .chain(std::env::split_paths(&std::env::var_os("PATH").context("PATH")?)),
+        )?;
+        let invocation = |through_cargo: bool| -> Result<Command> {
+            let template = cargo_rail_command(&ws.path)?;
+            let mut command = if through_cargo {
+                Command::new("cargo")
+            } else {
+                Command::new(&binary)
+            };
+            for (key, value) in template.get_envs() {
+                if let Some(value) = value {
+                    command.env(key, value);
+                } else {
+                    command.env_remove(key);
+                }
+            }
+            command
+                .current_dir(&ws.path)
+                .env("PATH", &path)
+                .env_remove("CARGO")
+                .env_remove("RUSTUP_TOOLCHAIN");
+            command.arg("rail");
+            Ok(command)
+        };
+        let mut plans = Vec::new();
+        for through_cargo in [false, true] {
+            let output = invocation(through_cargo)?.args(["plan", "--all", "--json"]).output()?;
+            ensure!(output.status.success(), "plan failed: {output:?}");
+            plans.push(output.stdout);
+        }
+        ensure!(
+            serde_json::from_slice::<Value>(&plans[0])? == serde_json::from_slice::<Value>(&plans[1])?,
+            "equivalent invocations produced different plans (rustup proxy: {use_proxy})"
+        );
+        for saved in &plans {
+            for through_cargo in [false, true] {
+                let mut child = invocation(through_cargo)?
+                    .args(["plan", "--verify", "-"])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()?;
+                child.stdin.take().context("verifier stdin")?.write_all(saved)?;
+                let output = child.wait_with_output()?;
+                ensure!(output.status.code() == Some(0), "{output:?}");
+                ensure!(output.stdout.is_empty(), "{output:?}");
+            }
+        }
+        let saved = ws.path.join("target/invocation-plan.json");
+        std::fs::create_dir_all(saved.parent().context("plan directory")?)?;
+        std::fs::write(&saved, &plans[0])?;
+        let changed = invocation(false)?
+            .env("RUSTFLAGS", "--cfg changed_plan_authority")
+            .args(["plan", "--verify"])
+            .arg(&saved)
+            .output()?;
+        ensure!(changed.status.code() == Some(2), "{changed:?}");
+        ensure!(
+            String::from_utf8_lossy(&changed.stderr).contains("Cargo configuration"),
+            "{changed:?}"
+        );
+
+        // A separate Cargo executable can print the same version without being the
+        // selected rustup implementation. Its identity must not collapse into it.
+        let alternate = ws
+            .path
+            .join(format!("target/alternate-cargo{}", std::env::consts::EXE_SUFFIX));
+        std::fs::copy(cargo.trim(), &alternate)?;
+        let changed = invocation(false)?
+            .env("CARGO", &alternate)
+            .args(["plan", "--verify"])
+            .arg(&saved)
+            .output()?;
+        ensure!(changed.status.code() == Some(2), "{changed:?}");
+        ensure!(
+            String::from_utf8_lossy(&changed.stderr).contains("Cargo configuration"),
+            "{changed:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn test_plan_identity_ignores_equivalent_empty_cargo_home_locations() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("plan-cargo-home-equivalence")?;

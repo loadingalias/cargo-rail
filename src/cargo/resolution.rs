@@ -728,6 +728,83 @@ impl CargoConfigSnapshot {
         }
         Ok(identity)
     }
+
+    pub(crate) fn planning_snapshot_identity(&self, current_dir: &Path, source_root: &Path) -> RailResult<Vec<u8>> {
+        use crate::executable::ExecutableIdentity;
+
+        let selected = selected_program(self, current_dir, &["CARGO"], &[], Some("cargo"), "Cargo")?
+            .ok_or_else(|| RailError::message("Cargo program selection is empty"))?;
+        let selected_path = resolve_executable_program(&selected, current_dir)?;
+        let mut normalized_selection = selected;
+        let mut config = self.clone();
+        let mut identity = Vec::from(&b"planning-cargo-config-v1\0"[..]);
+
+        // Cargo's rustup proxy injects CARGO and RUSTUP_TOOLCHAIN into external
+        // subcommands. Normalize only a proven proxy/implementation selection;
+        // custom Cargo programs retain their exact environment and argv[0].
+        if let Ok(default) = resolve_executable_program(OsStr::new("cargo"), current_dir) {
+            let rustup = default.with_file_name(format!("rustup{}", std::env::consts::EXE_SUFFIX));
+            let configured_env = self.effective_file_settings.get("env");
+            if selected_path == default && !configured_env.is_some_and(|env| env.get("CARGO").is_some()) {
+                normalized_selection = default.as_os_str().to_owned();
+                config.environment.insert(
+                    "CARGO".into(),
+                    default
+                        .to_str()
+                        .ok_or_else(|| RailError::message("Cargo path is not valid UTF-8"))?
+                        .into(),
+                );
+            }
+            if !configured_env.is_some_and(|env| env.get("CARGO").is_some() || env.get("RUSTUP_TOOLCHAIN").is_some())
+                && rustup.is_file()
+            {
+                let proxy = ExecutableIdentity::capture(default.as_os_str(), current_dir, source_root)?;
+                let manager = ExecutableIdentity::capture(rustup.as_os_str(), current_dir, source_root)?;
+                if proxy.content_digest() == manager.content_digest() {
+                    let query = |args: &[&str]| -> RailResult<String> {
+                        let mut command = Command::new(&rustup);
+                        command
+                            .current_dir(current_dir)
+                            .args(args)
+                            .env_remove("RUSTUP_TOOLCHAIN");
+                        if let Some(toolchain) = self.environment.get("RUSTUP_TOOLCHAIN") {
+                            command.env("RUSTUP_TOOLCHAIN", toolchain);
+                        }
+                        let output = command.output()?;
+                        if !output.status.success() {
+                            return Err(RailError::message(format!(
+                                "failed to resolve rustup planning authority: {}",
+                                String::from_utf8_lossy(&output.stderr).trim()
+                            )));
+                        }
+                        String::from_utf8(output.stdout)
+                            .map(|value| value.trim().to_owned())
+                            .map_err(|_| RailError::message("rustup planning authority is not valid UTF-8"))
+                    };
+                    let implementation = query(&["which", "cargo"])?;
+                    if selected_path == default || selected_path == Path::new(&implementation) {
+                        let active = query(&["show", "active-toolchain"])?;
+                        let active = active.rsplit_once(" (").map_or(active.as_str(), |(name, _)| name);
+                        if active.is_empty() {
+                            return Err(RailError::message("rustup selected no active toolchain"));
+                        }
+                        config.environment.remove("CARGO");
+                        config.environment.insert("RUSTUP_TOOLCHAIN".into(), active.into());
+                        normalized_selection = implementation.into();
+                        append_frame(&mut identity, b"rustup-proxy", &proxy.identity_bytes()?);
+                    }
+                }
+            }
+        }
+        let executable = ExecutableIdentity::capture(&normalized_selection, current_dir, source_root)?;
+        append_frame(&mut identity, b"cargo", &executable.identity_bytes()?);
+        append_frame(
+            &mut identity,
+            b"configuration",
+            &config.portable_snapshot_identity(source_root)?,
+        );
+        Ok(identity)
+    }
 }
 
 fn portable_environment(

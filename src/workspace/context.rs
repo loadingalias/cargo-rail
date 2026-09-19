@@ -868,7 +868,7 @@ impl WorkspaceContext {
         let identity = self
             .derived_views
             .cargo_config()?
-            .portable_snapshot_identity(&self.authority_source_root)?;
+            .planning_snapshot_identity(self.derived_views.cargo_current_dir(), &self.authority_source_root)?;
         Ok(format!(
             "cargo-configuration-v1:sha256:{}",
             ContentDigest::sha256(&identity)

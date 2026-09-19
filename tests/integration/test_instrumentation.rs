@@ -80,9 +80,36 @@ fn plan_diagnostics_are_out_of_band_and_count_real_boundaries() {
         assert_eq!(counters["target_view_loads"], 0);
         assert!(counters["hash_operations"].as_u64().is_some_and(|count| count >= 3));
         assert!(counters["hash_input_bytes"].as_u64().is_some_and(|bytes| bytes > 0));
+        assert!(
+            counters["hashed_file_bytes_read"]
+                .as_u64()
+                .is_some_and(|bytes| bytes > 0),
+            "planning must bind the selected Cargo executable bytes"
+        );
+        ws.modify_file(
+            "member-a",
+            "src/lib.rs",
+            &format!("// {}\npub fn changed() {{}}\n", "x".repeat(64 * 1024)),
+        )?;
+        ws.commit("Enlarge committed source")?;
+        let enlarged_diagnostics = output_dir.path().join("enlarged-plan.json");
+        let enlarged = run_cargo_rail(
+            &ws.path,
+            &[
+                "rail",
+                "--diagnostics-file",
+                enlarged_diagnostics.to_str().context("non-UTF-8 diagnostics path")?,
+                "plan",
+                "--since",
+                "HEAD~1",
+                "--json",
+            ],
+        )?;
+        ensure!(enlarged.status.success(), "enlarged-source plan failed: {enlarged:?}");
         assert_eq!(
-            counters["hashed_file_bytes_read"], 0,
-            "a committed one-file plan must use captured Git object identities without hashing tracked files"
+            counters["hashed_file_bytes_read"],
+            read_counters(&enlarged_diagnostics)?["hashed_file_bytes_read"],
+            "committed source growth must not add file hashing beyond the selected executable authority"
         );
         assert!(
             counters["git_subprocesses"].as_u64().is_some_and(|count| count <= 10),

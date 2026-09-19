@@ -178,8 +178,9 @@ jobs:
         env:
           PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
         run: |
+          cargo-rail rail plan --verify "$PLAN_FILE"
           just test
-          cargo rail plan --verify "$PLAN_FILE"
+          cargo-rail rail plan --verify "$PLAN_FILE"
       - name: Download RISC-V cache tests
         if: matrix.platform == 'riscv64-linux' && needs.riscv-build.outputs.cache-host-tests == 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
