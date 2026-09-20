@@ -1,20 +1,27 @@
-#!/usr/bin/env python3
 """Package the native release build and its authenticated compiler components."""
 import hashlib
 import json
-from pathlib import Path
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
-import tomllib
 import zipfile
+from pathlib import Path
+
+import tomllib
+
+
+def digest_stream(source):
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: source.read(1024 * 1024), b''):
+        digest.update(chunk)
+    return digest.hexdigest()
 
 
 def digest(path):
     with path.open('rb') as source:
-        return hashlib.file_digest(source, 'sha256').hexdigest()
+        return digest_stream(source)
 
 
 def package(destination):
@@ -100,7 +107,7 @@ def package(destination):
         with zipfile.ZipFile(archive_path) as archive:
             for name, (sha, size, _) in files.items():
                 with archive.open(f'cargo-rail/{name}') as entry:
-                    if hashlib.file_digest(entry, 'sha256').hexdigest() != sha:
+                    if digest_stream(entry) != sha:
                         raise ValueError(f'archived component differs from its authority: {name}')
                 if archive.getinfo(f'cargo-rail/{name}').file_size != size:
                     raise ValueError(f'archived component size changed: {name}')

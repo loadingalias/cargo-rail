@@ -1,15 +1,14 @@
-#!/usr/bin/env python3
 """Install a native release archive with cargo-binstall and source fallback disabled."""
 import functools
 import http.server
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import threading
 import zipfile
+from pathlib import Path
 
 
 class ArchiveHandler(http.server.SimpleHTTPRequestHandler):

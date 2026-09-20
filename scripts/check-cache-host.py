@@ -1,17 +1,16 @@
-#!/usr/bin/env python3
 """Run the native cache contract through Cargo-built standard Rust test harnesses."""
 import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
 import shlex
 import shutil
 import subprocess
 import tempfile
 import time
+from pathlib import Path
+
 import tomllib
-import sys
 
 # Exact cases are shared with the full primary-platform suite. Missing or ignored
 # cases are errors: platform gating must not silently reduce cache qualification.
@@ -262,7 +261,7 @@ def execute(directory):
                 '--profile', 'cache-host', '-E', filters]
         listing = subprocess.run(['cargo', 'nextest', 'list', *args, '--archive-file', str(directory / 'tests.tar.zst'),
                                   '--extract-to', str(out / 'extracted'), '--message-format', 'json'],
-                                 cwd=ROOT, env=env, text=True, capture_output=True)
+                                 cwd=ROOT, env=env, text=True, capture_output=True, check=False)
         (out / 'list.log').write_text(listing.stderr)
         (out / 'tests.json').write_text(listing.stdout)
         print(listing.stderr, end='', flush=True)
@@ -277,6 +276,7 @@ def execute(directory):
         with (out / 'nextest.log').open('w') as log, subprocess.Popen(
             command, cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         ) as process:
+            assert process.stdout is not None
             for line in process.stdout:
                 print(line, end='', flush=True)
                 log.write(line)

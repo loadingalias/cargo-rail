@@ -3,16 +3,17 @@ import copy
 import hashlib
 import importlib.util
 import json
-from pathlib import Path
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
 import zipfile
-
+from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location('package_release', ROOT / 'scripts/package-release.py')
+if SPEC is None or SPEC.loader is None:
+    raise ImportError('cannot load the release packager')
 PACKAGER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PACKAGER)
 
@@ -35,8 +36,9 @@ class ReleasePackage(unittest.TestCase):
         self.version = self.package['version']
         (self.root / 'Cargo.toml').write_text(f'[package]\nversion = "{self.version}"\n')
         (self.root / 'LICENSE').write_bytes(b'MIT license fixture\n')
-        self.metadata = {'target_directory': str(self.root / 'target'), 'packages': [copy.deepcopy(self.package)]}
-        self.metadata['packages'][0]['manifest_path'] = str(self.root / 'Cargo.toml')
+        self.packages = [copy.deepcopy(self.package)]
+        self.packages[0]['manifest_path'] = str(self.root / 'Cargo.toml')
+        self.metadata = {'target_directory': str(self.root / 'target'), 'packages': self.packages}
 
     def prepare(self, target):
         self.target = target
@@ -111,7 +113,7 @@ class ReleasePackage(unittest.TestCase):
 
     def test_mandatory_binary_omission_rejects_packaging_before_output(self):
         self.prepare('aarch64-apple-darwin')
-        benchmark = next(item for item in self.metadata['packages'][0]['targets'] if item['name'] == 'cargo-rail-bench')
+        benchmark = next(item for item in self.packages[0]['targets'] if item['name'] == 'cargo-rail-bench')
         benchmark.pop('required-features')
         with self.assertRaisesRegex(ValueError, 'release archive omits mandatory Cargo binaries: cargo-rail-bench'):
             self.package_release()

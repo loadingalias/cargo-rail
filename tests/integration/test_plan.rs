@@ -2281,6 +2281,20 @@ cargo_prerequisites = [
         assert!(!package_names(&artifact, "cargo.test").contains("cli"));
         std::fs::write(server_path, server_original)?;
 
+        let plugin_path = ws.path.join("crates/connector-plugin/src/main.rs");
+        let plugin_original = std::fs::read(&plugin_path)?;
+        std::fs::write(&plugin_path, "fn main() { println!(\"changed\"); }\n")?;
+        let cold_plugin = plan(&ws, &["--since", "HEAD"])?;
+        let evidence = complete_evidence(&cold_plugin, HashMap::new())?;
+        let evidence_path = write_evidence(&ws, "runtime-plugin-evidence.json", &evidence)?;
+        let plugin = plan(&ws, &["--since", "HEAD", "--evidence", &evidence_path])?;
+        assert_eq!(
+            package_names(&plugin, "cargo.test"),
+            BTreeSet::from(["connector-plugin".to_string(), "integration".to_string()]),
+            "runtime plugin changes must select their declared integration test root without widening"
+        );
+        std::fs::write(plugin_path, plugin_original)?;
+
         ws.modify_file("unit", "src/lib.rs", "pub fn changed() {}\n")?;
         let unit = plan(&ws, &["--since", "HEAD"])?;
         assert_eq!(package_names(&unit, "cargo.test"), BTreeSet::from(["unit".to_string()]));
