@@ -1,5 +1,5 @@
-# Local repair, shared validation, cross-compilation, and dogfooding.
-check: fix ci-check test
+# Complete local validation, cross-compilation, and dogfooding.
+check: ci-check test
     @just check-cross
 
 # Enroll this workspace under explicit machine cache authority, then prove reuse.

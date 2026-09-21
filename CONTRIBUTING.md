@@ -1,6 +1,30 @@
 # Contributing to Cargo-Rail
 
-## Set up the repository
+## Validate a change
+
+Run commands from the repository root. Use `just --list` for the maintained command surface.
+Start with the smallest lane that reaches the changed behavior:
+
+| Change | Start with |
+| --- | --- |
+| Markdown | `git diff --check` |
+| Rustdoc | `just check-docs` |
+| CLI or mutation | `just test` |
+| Planning | `just test`, then `just plan` |
+| Compiler | `just test`; add `just check-compiler-driver` for driver changes |
+| Cache | `just test-cache-host` |
+| Release | `just test`; add `just release-check` for current release intent |
+| Cross-target compilation | `just check-cross` |
+| Tooling or GitHub Actions | `just check-tooling` |
+
+`just ci-check` runs the shared nonmutating checks on any development host.
+On the macOS maintainer workstation, `just check` adds tests and cross-target checks.
+It does not repair source; run `just fix` explicitly and review its diff.
+
+Cross-compilation proves that code builds for a target.
+Run on that target to prove runtime, filesystem, architecture, or performance behavior.
+
+## Set up the selected lane
 
 Install these tools:
 
@@ -13,9 +37,6 @@ Install these tools:
   and ripgrep (`rg`).
 - For `just test` on macOS: clang with COFF support, `lld-link`, and `ld64.lld` on `PATH`, plus `cargo-xwin` with its x86_64 MSVC SDK already cached.
   The cross-link test runs offline.
-
-Run commands from the repository root.
-Use `just --list` to see the maintained command surface.
 
 After `just package-release OUTPUT_DIRECTORY`, run `python3 scripts/check-release-install.py OUTPUT_DIRECTORY` with cargo-binstall installed to verify the native archive's binary installation.
 The check uses a temporary installation and disables source fallback.
@@ -39,22 +60,7 @@ CMake, Python, and rustup.
 - Update documentation when commands, configuration, output, side effects, compatibility,
   or recovery behavior changes.
 
-## Validate the worktree
-
-With the prerequisites installed, run the workspace build and test lanes:
-
-```bash
-just build
-just test
-git diff --check
-```
-
-Run the complete quality lane when a change crosses planner, mutation, cache, compiler, release,
-platform, or public-contract boundaries:
-
-```bash
-just check
-```
+## Lane details
 
 `just build` prepares the authenticated compiler driver and source bundle beside Cargo’s debug binaries.
 `just test` also prepares source-installation authority for its integration fixtures.
@@ -70,17 +76,10 @@ including its matched development files and backend.
 The first run may download these components; later runs reuse the installed toolchain.
 Advance that separate nightly pin only after the focused lane passes.
 
-Local work and CI use the same nonmutating `just ci-check` lane: formatting,
+Local work and CI use the same `just ci-check` lane: formatting,
 host Clippy with all Cargo targets and features, dependency policy using `deny.toml`'s target scope,
 documentation, and the excluded compiler driver's dedicated checks.
-
-On the macOS workstation, `just check` first runs `just fix`, then `just ci-check`,
-followed by cross-target Clippy for Linux GNU/musl and Windows MSVC on x86-64 and ARM64,
-and `cargo rail unify --check --explain` against the repository.
-Fixing applies workspace Rustfmt and host Clippy repairs, including to dirty or staged files;
-review the resulting diff.
-Cross-target checks do not execute tests or prove final executable linking.
-CI calls `just ci-check` for this lane; workstation cross-compilation and dogfooding remain outside it.
+CI calls this lane directly; workstation cross-compilation and dogfooding remain outside it.
 
 Run `just test` separately for runtime tests, including native cache tests and doctests.
 Local work and CI use the default nextest profile and the same concurrency policy

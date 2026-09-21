@@ -70,7 +70,7 @@ else:
         self.assertEqual(result.returncode == 0, success, result.stdout + result.stderr)
         return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
 
-    def test_shared_check_has_one_nonmutating_policy_on_every_host(self):
+    def test_shared_check_is_nonmutating_on_every_host(self):
         driver = 'tools/compiler-fact-driver/Cargo.toml'
         for host in ['Darwin', 'Linux', 'MINGW64_NT']:
             with self.subTest(host=host):
@@ -89,16 +89,11 @@ else:
                 self.assertEqual(calls[4]['rustdocflags'], '-C debuginfo=0 -D warnings')
                 self.assertEqual([call['bootstrap'] for call in calls[5:]], ['cargo_rail_fact_driver'] * 3)
 
-    def test_local_check_wraps_the_shared_lane_with_fixing_and_workstation_checks(self):
+    def test_local_check_runs_only_shared_tests_and_workstation_checks(self):
         shared = self.run_recipe('ci-check')
         calls = self.run_recipe('check')
-        self.assertEqual([call['args'] for call in calls[:3]], [
-            ['cargo', 'fmt', '--all'],
-            ['cargo', 'clippy', '--workspace', '--all-targets', '--all-features', '--locked', '--fix', '--allow-dirty', '--allow-staged'],
-            ['cargo', 'fmt', '--all'],
-        ])
-        shared_end = 3 + len(shared)
-        self.assertEqual(calls[3:shared_end], shared)
+        shared_end = len(shared)
+        self.assertEqual(calls[:shared_end], shared)
         self.assertEqual(calls[shared_end]['args'], [
             'cargo', 'nextest', 'run', '--workspace', '-P', 'default', '--all-features', '--locked'
         ])
@@ -171,7 +166,7 @@ else:
     def test_shared_failure_stops_local_cross_checks_and_dogfooding(self):
         self.environment['CHECK_FAIL_COMMAND'] = 'deny'
         calls = self.run_recipe('check', success=False)
-        self.assertEqual([call['args'][1] for call in calls], ['fmt', 'clippy', 'fmt', 'fmt', 'clippy', 'deny'])
+        self.assertEqual([call['args'][1] for call in calls], ['fmt', 'clippy', 'deny'])
 
 
 if __name__ == '__main__':
