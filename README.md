@@ -1,22 +1,23 @@
 # Cargo-Rail
 
-Cargo-Rail is a Rust workspace engine for affected-work planning, verified compiler reuse,
-dependency repair, Surface analysis, releases, and crate split/sync.
-Cargo, nextest, Just, and CI remain the executors;
-Cargo-Rail gives them one captured workspace model and exact scope.
+Cargo-Rail makes Rust workspaces faster to change and safer to release.
+It selects required work, reuses verified compiler results, repairs dependency drift,
+and carries reviewed per-crate intent through durable releases.
+Cargo, nextest, Just, and CI remain the executors.
 
 [![Crates.io](https://img.shields.io/crates/v/cargo-rail.svg)](https://crates.io/crates/cargo-rail)
 [![MSRV](https://img.shields.io/crates/msrv/cargo-rail)](https://github.com/loadingalias/cargo-rail/blob/main/Cargo.toml)
 
 ## Workspace operations
 
-| Operation                      | Result |
-| ------------------------------ | ------ |
-| Compiler reuse                 | Verified local and remote compiler results, with measured placement for distributed misses |
-| Affected-work planning         | Dependency-aware plans with exact package, target, and variant selectors |
-| Surface analysis               | Compiler-derived product reachability and proven visibility reductions |
-| Dependency repair and releases | Coherent manifests, `.changes/` release intent, and resumable publication |
-| Split and sync                 | Cargo-aware Git history extraction and bidirectional three-way sync |
+| Operation | Result |
+| --- | --- |
+| Compiler reuse | Restore verified results across ordinary Cargo, nextest, Just, IDE, and CI work |
+| Affected-work planning | Select exact jobs, packages, targets, and variants from one captured workspace |
+| Dependency coherence | Review one dependency, feature, and MSRV repair before explicit apply |
+| Rust changesets and releases | Record per-crate intent in `.changes/` and resume the exact release transaction |
+| Surface analysis | Derive product reachability and proven visibility reductions from compiler facts |
+| Split and sync | Extract Cargo-aware Git history and synchronize later changes in both directions |
 
 ## Installation
 
@@ -56,39 +57,79 @@ Before replacing an older cache installation, read the [cache upgrade and recove
 
 ## Start here
 
-1. Enable transparent local compiler reuse:
+Inspect the current branch first:
 
-   ```bash
-   cargo rail cache setup --check
-   cargo rail cache setup
-   cargo rail cache ready
-   cargo rail cache status
-   ```
+```bash
+cargo rail plan
+```
 
-1. Inspect exactly what a branch affects:
+`plan` selects required work without editing tracked source.
+Then use the workflows that match the change.
 
-   ```bash
-   cargo rail plan
-   ```
+### Reuse compiler work
 
-1. Audit the workspace's real Rust surface:
+```bash
+cargo rail cache setup --check
+cargo rail cache setup
+cargo rail cache ready
+cargo rail cache status
+```
 
-   ```bash
-   cargo rail surface --prepare
-   cargo rail surface --check --explain
-   cargo rail surface --fix --dry-run --explain
-   ```
+`cache setup --check` previews enrollment and exits `1` when work is pending.
+`cache setup` installs the global Cargo wrapper and enrolls this workspace.
+`cache ready` proves one cold miss and one verified warm restore.
+After setup, ordinary Cargo, nextest, Just, IDE, and CI commands on that machine use the same verified cache path.
 
-The commands above have different effects:
+### Keep dependencies coherent
 
-- `cache setup --check` does not write and exits `1` when setup or repair is pending.
-- `cache setup` owns Cargo's global `build.rustc-wrapper` and enrolls this workspace in a private cache profile.
-  It rejects another global wrapper or any environment or workspace setting that would shadow it.
-- `cache ready` proves one uncached build, one cold miss,
-  and one verified warm restore for the selected profile and toolchain while making no L2 requests.
-- `surface --prepare` may install `rustc-dev` for the selected rustup toolchain.
-  It does not change the default toolchain.
-- `plan` and the Surface inspection commands do not edit tracked source.
+```bash
+cargo rail unify --show-diff
+cargo rail unify --check
+```
+
+Both commands leave manifests unchanged.
+After review, apply the exact repair with a recovery backup:
+
+```bash
+cargo rail unify apply --backup
+```
+
+### Record and check release intent
+
+```bash
+cargo rail change add my-crate --bump patch --message "Fixed connection retries"
+cargo rail change check --merge-base
+cargo rail release check --all --publication
+```
+
+`change add` writes the crate bump and release note to `.changes/` for review.
+`release check` validates the release plan without publishing.
+Publication still requires explicit `--publish` authority.
+
+### Audit product reachability
+
+```bash
+cargo rail surface --prepare
+cargo rail surface --check --explain
+cargo rail surface --fix --dry-run --explain
+```
+
+`surface --prepare` may install `rustc-dev` for the selected rustup toolchain.
+The inspection and dry-run commands do not edit tracked source.
+
+## Reduce work at each layer
+
+```text
+all declared workflow work
+└─ plan keeps required jobs, packages, targets, and variants
+   └─ cache restores compatible compiler results
+      └─ Cargo runs freshness checks and the remaining misses
+```
+
+These reductions stack because they remove different work.
+Unify can also resolve duplicate dependency declarations before the next build.
+Reviewed change intent bounds version, changelog, and publication work to the selected crates and required dependents.
+Use the plan summary and cache report to measure the actual result; Cargo-Rail does not invent a time-saved estimate.
 
 ## Reuse verified compiler work
 
