@@ -45,10 +45,6 @@ skip = [
   "crypto-common@0.1.7",
   "digest@0.10.7",
   "sha1@0.10.7",
-  # The AWS SDK deliberately supports both HTTP 0.2 and 1.x; remove these skips
-  # when its compatibility surface no longer requires HTTP 0.2.
-  "http@0.2.12",
-  "http-body@0.4.6",
   # petgraph, the AWS SDK's LRU cache, and indexmap use successive hashbrown
   # lines; remove these skips when those constraints converge.
   "hashbrown@0.15.5",
