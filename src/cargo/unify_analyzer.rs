@@ -20,6 +20,7 @@ use crate::compiler::CompilerCacheIdentity;
 use crate::compiler::cfg_eval::{TargetCfgSet, target_constraint_matches_target};
 use crate::config::{ExactPinHandling, MajorVersionConflict, UnifyConfig};
 use crate::error::RailResult;
+use crate::output::Activity;
 use crate::progress;
 use crate::workspace::WorkspaceContext;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -493,7 +494,11 @@ impl UnifyAnalyzer {
             })
             .collect::<Vec<_>>();
 
-        progress!("Analyzing {} dependencies...", self.manifests.all_dependencies().len());
+        crate::phase!(
+            Activity::Analysis,
+            "Analyzing {} dependencies...",
+            self.manifests.all_dependencies().len()
+        );
 
         // Process each dependency using the CandidateIterator
         // This encapsulates include_renamed branching and filtering logic
@@ -982,7 +987,7 @@ impl UnifyAnalyzer {
 
         // Compute MSRV if enabled
         let computed_msrv = if let Some(source) = self.config.msrv_policy.source() {
-            progress!("Computing MSRV from dependency graph...");
+            crate::phase!(Activity::Analysis, "Computing MSRV from dependency graph...");
             self.metadata
                 .compute_msrv_with_config(&self.workspace_manifest_path, &self.workspace_manifest, source)?
         } else {
@@ -1021,7 +1026,7 @@ impl UnifyAnalyzer {
         // Diagnostics are unconditional. Destructive feature edits still require
         // the explicit closed-consumer proof carried by `consumer_scope`.
         let feature_pruner = FeaturePruner::new(&self.metadata, &self.manifests, &self.config, &self.target_cfg_sets);
-        progress!("Scanning for dead features in resolved graph...");
+        crate::phase!(Activity::Analysis, "Scanning for dead features in resolved graph...");
         let (mut pruned_features, optional_features, reachable_features) = feature_pruner.scan();
 
         // Detect unused dependencies
@@ -1035,7 +1040,7 @@ impl UnifyAnalyzer {
             &self.compiler_cache_identity,
         )
         .with_target_preflight(&self.target_preflight);
-        progress!("Detecting unused dependencies...");
+        crate::phase!(Activity::Analysis, "Detecting unused dependencies...");
         let mut unused_deps = unused_finder.find()?;
         issues.extend(unused_finder.uncertainty_issues());
 
@@ -1049,7 +1054,7 @@ impl UnifyAnalyzer {
         // Detect undeclared features
         // Find cases where a crate uses features that it didn't declare in Cargo.toml
         // This happens when Cargo's feature unification "borrows" features from other members
-        progress!("Checking for undeclared feature dependencies...");
+        crate::phase!(Activity::Analysis, "Checking for undeclared feature dependencies...");
         let (undeclared_features, causality_issues) = self.detect_undeclared_features()?;
         issues.extend(causality_issues);
 

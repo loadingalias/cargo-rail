@@ -54,7 +54,7 @@ fn plan_diagnostics_are_out_of_band_and_count_real_boundaries() {
         assert_eq!(measured.stderr, expected.stderr, "diagnostics changed normal stderr");
 
         let counters = read_counters(&diagnostics)?;
-        assert_eq!(counters["schema_version"], 15);
+        assert_eq!(counters["schema_version"], 16);
         assert_eq!(counters["phases"]["cli_pre_context_preparation"]["invocations"], 1);
         assert!(
             counters["phases"]["cli_pre_context_preparation"]["elapsed_ns"]
@@ -376,7 +376,7 @@ fn unify_diagnostics_measure_bounded_compiler_acquisition_and_warm_outcome() {
         );
         let cold = read_counters(&cold_path)?;
         let acquisition = &cold["compiler_acquisition"];
-        assert_eq!(cold["schema_version"], 15);
+        assert_eq!(cold["schema_version"], 16);
         assert_eq!(acquisition["plans"], 1);
         assert!(
             acquisition["plan_identity"]
@@ -552,7 +552,7 @@ fn pre_context_diagnostics_have_one_fixed_phase_schema() {
         ensure!(measured.status.success(), "schema output failed");
 
         let counters = read_counters(&diagnostics)?;
-        assert_eq!(counters["schema_version"], 15);
+        assert_eq!(counters["schema_version"], 16);
         assert_eq!(counters["phases"]["cli_pre_context_preparation"]["invocations"], 1);
         assert_eq!(counters["phases"]["workspace_capture_cargo_metadata"]["invocations"], 0);
         assert_eq!(

@@ -976,6 +976,7 @@ pub fn run_unify_analyze(ctx: &WorkspaceContext, options: UnifyAnalyzeOptions<'_
     // Run analysis
     ctx.validate_snapshot_unchanged()?;
     let plan = analyzer.analyze()?;
+    let _assembly = crate::output::nested_phase(crate::output::Activity::Analysis, "assembling the Unify decision");
     let coverage_views = analyzer.coverage_views()?;
     ctx.validate_snapshot_unchanged()?;
     let msrv_write_needed = if let Some(msrv) = plan.computed_msrv.as_ref() {
@@ -1785,10 +1786,10 @@ fn verify_applied_coverage_views(
         validate_post_mutation_lockfile(&lockfile_path, post_mutation_lock_fingerprint)?;
         let identity = view.identity()?;
         let request = crate::cargo::resolution::coverage_resolution_request(view, post_mutation_metadata)
-            .map_err(|error| RailError::message(format!("reconstructing {identity}: {error}")))?;
+            .map_err(|error| error.context(format!("reconstructing {identity}")))?;
         snapshot
             .post_mutation_resolution_view(request, post_mutation_metadata)
-            .map_err(|error| RailError::message(format!("resolving {identity}: {error}")))?;
+            .map_err(|error| error.context(format!("resolving {identity}")))?;
         snapshot.validate_post_mutation_environment_unchanged()?;
         validate_post_mutation_lockfile(&lockfile_path, post_mutation_lock_fingerprint)?;
         identities.push(identity);
@@ -2131,9 +2132,9 @@ pub fn run_unify_apply(
             }
         }
 
-        progress!("verifying planned Cargo graph...");
-        let graph_delta = verify_applied_unify_graph(ctx, &plan)
-            .map_err(|error| RailError::message(format!("unify graph verification failed: {error}")))?;
+        crate::phase!(crate::output::Activity::Cargo, "verifying planned Cargo graph...");
+        let graph_delta =
+            verify_applied_unify_graph(ctx, &plan).map_err(|error| error.context("unify graph verification failed"))?;
         progress!(
             "  Authorized graph delta: {} addition(s), {} removal(s), {}",
             graph_delta.added,
@@ -2141,14 +2142,18 @@ pub fn run_unify_apply(
             graph_delta.fingerprint
         );
 
-        progress!("verifying {} captured coverage views...", coverage_views.len());
+        crate::phase!(
+            crate::output::Activity::Cargo,
+            "verifying {} captured coverage views...",
+            coverage_views.len()
+        );
         let coverage_verification = verify_applied_coverage_views(
             ctx,
             &coverage_views,
             graph_delta.post_mutation_metadata.as_ref(),
             &graph_delta.post_mutation_lock_fingerprint,
         )
-        .map_err(|error| RailError::message(format!("unify coverage verification failed: {error}")))?;
+        .map_err(|error| error.context("unify coverage verification failed"))?;
         progress!(
             "  Verified {} coverage views: {}",
             coverage_verification.identities.len(),
@@ -2166,10 +2171,13 @@ pub fn run_unify_apply(
             .map(|(member, _)| member.as_ref())
             .collect();
         if !repaired_members.is_empty() {
-            progress!("verifying standalone feature repairs...");
+            crate::phase!(
+                crate::output::Activity::Cargo,
+                "verifying standalone feature repairs..."
+            );
             for member in repaired_members {
                 crate::compiler::verify_standalone_member(ctx.workspace_root(), member)
-                    .map_err(|error| RailError::message(format!("unify standalone verification failed: {error}")))?;
+                    .map_err(|error| error.context("unify standalone verification failed"))?;
             }
         }
 
@@ -2202,11 +2210,10 @@ pub fn run_unify_apply(
     let (graph_delta, coverage_verification, written_report_path) = match apply_result {
         Ok(applied) => applied,
         Err(error) => {
-            manifest_transaction.restore().map_err(|rollback| {
-                RailError::message(format!("unify apply failed: {error}; rollback also failed: {rollback}"))
-            })?;
-            return Err(RailError::with_help(
-                format!("unify apply failed: {error}"),
+            if let Err(rollback) = manifest_transaction.restore() {
+                return Err(error.context(format!("unify apply failed; rollback also failed: {rollback}")));
+            }
+            return Err(error.context("unify apply failed").with_additional_help(
                 "all authorized manifests, Cargo.lock, and report output were restored; resolve the failure and regenerate the plan",
             ));
         }

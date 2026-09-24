@@ -15,7 +15,9 @@
 
 use std::io::IsTerminal as _;
 use std::io::Write as _;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock, mpsc};
+use std::time::{Duration, Instant};
 
 // Global State
 
@@ -29,8 +31,8 @@ pub enum OutputProtocol {
     Text,
     /// Exactly one complete JSON value on stdout, with diagnostics suppressed.
     ///
-    /// A long-running command may explicitly retain progress on stderr when its
-    /// final JSON value is redirected to a file.
+    /// A long-running command may explicitly retain progress on stderr; stdout still
+    /// carries exactly one JSON value.
     Json,
     /// Command-owned raw stdout stream with failures reported on stderr.
     Raw,
@@ -118,6 +120,243 @@ impl InvocationOutput {
     /// Whether operational progress may be written to stderr.
     pub const fn progress_enabled(&self) -> bool {
         self.progress
+    }
+}
+
+// Phase heartbeat
+
+/// Longest interval without progress output while a phase runs.
+pub(crate) const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
+
+/// What the current phase is doing, as the heartbeat reports it.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Activity {
+    /// Cargo-Rail computes in its own process.
+    Analysis,
+    /// Cargo-Rail waits for a Cargo subprocess.
+    Cargo,
+}
+
+impl Activity {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Analysis => "analysis",
+            Self::Cargo => "cargo",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Phase {
+    label: String,
+    activity: Activity,
+    started: Instant,
+    lock_wait: Option<String>,
+}
+
+/// The command's current phase plus nested phases that concurrent threads entered.
+#[derive(Debug)]
+struct Phases {
+    base: Option<Phase>,
+    nested: Vec<(u64, Phase)>,
+    next_id: u64,
+}
+
+impl Phases {
+    fn current(&mut self) -> Option<&mut Phase> {
+        match self.nested.last_mut() {
+            Some((_, phase)) => Some(phase),
+            None => self.base.as_mut(),
+        }
+    }
+}
+
+static PHASES: Mutex<Phases> = Mutex::new(Phases {
+    base: None,
+    nested: Vec::new(),
+    next_id: 0,
+});
+static PROGRESS_EPOCH: OnceLock<Instant> = OnceLock::new();
+static LAST_PROGRESS_MILLIS: AtomicU64 = AtomicU64::new(0);
+
+fn progress_epoch() -> Instant {
+    *PROGRESS_EPOCH.get_or_init(Instant::now)
+}
+
+fn phases() -> std::sync::MutexGuard<'static, Phases> {
+    PHASES.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Record that a progress line was written now.
+#[doc(hidden)]
+pub fn record_progress() {
+    let elapsed = u64::try_from(progress_epoch().elapsed().as_millis()).unwrap_or(u64::MAX);
+    LAST_PROGRESS_MILLIS.store(elapsed, Ordering::Relaxed);
+}
+
+fn quiet_for() -> Duration {
+    let last = Duration::from_millis(LAST_PROGRESS_MILLIS.load(Ordering::Relaxed));
+    progress_epoch().elapsed().saturating_sub(last)
+}
+
+impl Phase {
+    fn record(&self) {
+        crate::instrumentation::record_progress_phase(
+            &self.label,
+            self.activity.as_str(),
+            self.lock_wait.is_some(),
+            self.started.elapsed(),
+        );
+    }
+}
+
+fn new_phase(activity: Activity, label: String) -> Phase {
+    Phase {
+        label,
+        activity,
+        started: Instant::now(),
+        lock_wait: None,
+    }
+}
+
+/// Print `label` as progress and make it the command's current phase.
+#[doc(hidden)]
+pub fn begin_phase(activity: Activity, label: String) {
+    crate::status!("{label}");
+    let label = label.trim().trim_end_matches("...").to_string();
+    let previous = phases().base.replace(new_phase(activity, label));
+    if let Some(previous) = previous {
+        previous.record();
+    }
+}
+
+/// End the command's current phase and record its duration.
+#[doc(hidden)]
+pub fn end_phase() {
+    let phase = phases().base.take();
+    if let Some(phase) = phase {
+        phase.record();
+    }
+}
+
+/// The command's current phase, without nested phases.
+pub(crate) fn command_phase() -> Option<String> {
+    phases().base.as_ref().map(|phase| phase.label.clone())
+}
+
+/// A nested phase that ends when dropped.
+#[must_use = "the nested phase ends when the guard is dropped"]
+pub(crate) struct NestedPhase {
+    id: u64,
+}
+
+/// Enter a nested phase without printing a line; the heartbeat names it if it runs long.
+pub(crate) fn nested_phase(activity: Activity, label: impl Into<String>) -> NestedPhase {
+    let mut phases = phases();
+    let id = phases.next_id;
+    phases.next_id += 1;
+    phases.nested.push((id, new_phase(activity, label.into())));
+    NestedPhase { id }
+}
+
+impl Drop for NestedPhase {
+    fn drop(&mut self) {
+        let ended = {
+            let mut phases = phases();
+            let index = phases.nested.iter().position(|(id, _)| *id == self.id);
+            index.map(|index| phases.nested.remove(index).1)
+        };
+        if let Some(phase) = ended {
+            phase.record();
+        }
+    }
+}
+
+/// Report that Cargo is blocked on a file lock during the current phase.
+pub(crate) fn report_lock_wait(subject: &str, lock: &str) {
+    crate::status!("  {subject}: Cargo is waiting for a file lock on {lock}");
+    if let Some(phase) = phases().current() {
+        phase.lock_wait = Some(lock.to_string());
+    }
+}
+
+/// The lock that a Cargo stderr line reports waiting for.
+pub(crate) fn cargo_lock_wait(line: &str) -> Option<&str> {
+    let lock = line.trim().strip_prefix("Blocking waiting for file lock")?.trim();
+    Some(lock.strip_prefix("on ").unwrap_or(lock)).filter(|lock| !lock.is_empty())
+}
+
+fn heartbeat_line(phase: &Phase) -> String {
+    let activity = match (&phase.lock_wait, phase.activity) {
+        (Some(lock), _) => format!("waiting for Cargo's file lock on {lock}"),
+        (None, Activity::Cargo) => "waiting for a Cargo subprocess".to_string(),
+        (None, Activity::Analysis) => "in-process analysis".to_string(),
+    };
+    format!(
+        "  Still running: {} ({activity}; {}s in this phase)",
+        phase.label,
+        phase.started.elapsed().as_secs()
+    )
+}
+
+/// Background reporter that fills every quiet interval of a running phase with one line.
+#[derive(Debug)]
+#[must_use = "the heartbeat stops when dropped"]
+pub struct Heartbeat {
+    stop: Option<mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Heartbeat {
+    /// Start the heartbeat when progress output is enabled.
+    #[doc(hidden)]
+    pub fn start() -> Self {
+        if !progress_enabled() {
+            return Self {
+                stop: None,
+                thread: None,
+            };
+        }
+        Self::start_with(PROGRESS_INTERVAL, |line| crate::status!("{line}"))
+    }
+
+    fn start_with(interval: Duration, emit: impl Fn(String) + Send + 'static) -> Self {
+        record_progress();
+        let (stop, stopped) = mpsc::channel::<()>();
+        let thread = std::thread::Builder::new()
+            .name("cargo-rail-heartbeat".to_string())
+            .spawn(move || {
+                loop {
+                    let wait = interval.saturating_sub(quiet_for()).max(Duration::from_millis(1));
+                    match stopped.recv_timeout(wait) {
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                    if quiet_for() < interval {
+                        continue;
+                    }
+                    let line = phases().current().map(|phase| heartbeat_line(phase));
+                    if let Some(line) = line {
+                        emit(line);
+                    }
+                    record_progress();
+                }
+            })
+            .ok();
+        Self {
+            stop: thread.as_ref().map(|_| stop),
+            thread,
+        }
+    }
+}
+
+impl Drop for Heartbeat {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        if let Some(thread) = self.thread.take() {
+            let _joined = thread.join();
+        }
     }
 }
 
@@ -308,8 +547,20 @@ macro_rules! help {
 macro_rules! status {
   ($($arg:tt)*) => {
     if $crate::output::progress_enabled() {
-      eprintln!($($arg)*)
+      eprintln!($($arg)*);
+      $crate::output::record_progress();
     }
+  };
+}
+
+/// Print a progress line and make it the current phase that the heartbeat reports.
+///
+/// The first argument is the phase's [`Activity`](crate::output::Activity).
+#[doc(hidden)]
+#[macro_export]
+macro_rules! phase {
+  ($activity:expr, $($arg:tt)*) => {
+    $crate::output::begin_phase($activity, format!($($arg)*))
   };
 }
 
@@ -354,7 +605,70 @@ macro_rules! verbose_progress {
 
 #[cfg(test)]
 mod tests {
-    use super::{InvocationOutput, OutputProtocol};
+    use super::{Activity, Heartbeat, InvocationOutput, OutputProtocol};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    #[test]
+    fn heartbeat_fills_each_quiet_interval_and_names_the_current_activity() {
+        const INTERVAL: Duration = Duration::from_millis(40);
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&lines);
+        let taken = || std::mem::take(&mut *lines.lock().unwrap());
+        let heartbeat = Heartbeat::start_with(INTERVAL, move |line| sink.lock().unwrap().push(line));
+
+        crate::phase!(Activity::Analysis, "Detecting unused dependencies...");
+        std::thread::sleep(INTERVAL * 3);
+        let analysis = taken();
+        assert!(analysis.len() >= 2, "each quiet interval needs one line: {analysis:?}");
+        assert!(
+            analysis
+                .iter()
+                .all(|line| line.contains("Detecting unused dependencies (in-process analysis;")),
+            "{analysis:?}"
+        );
+
+        {
+            let _metadata = super::nested_phase(Activity::Cargo, "running cargo metadata");
+            std::thread::sleep(INTERVAL * 2);
+            super::report_lock_wait("cargo metadata", "package cache");
+            std::thread::sleep(INTERVAL * 2);
+        }
+        let nested = taken();
+        assert!(
+            nested
+                .iter()
+                .any(|line| line.contains("running cargo metadata (waiting for a Cargo subprocess;")),
+            "{nested:?}"
+        );
+        assert!(
+            nested
+                .iter()
+                .any(|line| line.contains("running cargo metadata (waiting for Cargo's file lock on package cache;")),
+            "{nested:?}"
+        );
+
+        // Other progress output resets the quiet interval.
+        for _ in 0..6 {
+            super::record_progress();
+            std::thread::sleep(INTERVAL / 4);
+        }
+        assert!(
+            taken().is_empty(),
+            "progress within the interval must suppress the heartbeat"
+        );
+
+        std::thread::sleep(INTERVAL * 2);
+        assert!(
+            taken()
+                .iter()
+                .all(|line| line.contains("Detecting unused dependencies (in-process analysis;")),
+            "the enclosing phase resumes when the nested phase ends"
+        );
+        drop(heartbeat);
+        std::thread::sleep(INTERVAL * 2);
+        assert!(taken().is_empty(), "no line after the heartbeat stops");
+    }
 
     #[test]
     fn raw_protocol_suppresses_advisory_output_without_becoming_json() {

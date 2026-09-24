@@ -5,7 +5,6 @@
 
 use crate::cargo::multi_target_metadata::MultiTargetMetadata;
 use crate::cargo::unify_types::TransitivePin;
-use crate::progress;
 use std::sync::Arc;
 
 /// Plans transitive dependency pinning
@@ -23,7 +22,10 @@ impl<'a> TransitivePlanner<'a> {
     ///
     /// Produces transitive pins needed to unify versions across targets.
     pub fn find_pins(&self) -> Vec<TransitivePin> {
-        progress!("Analyzing transitive dependencies...");
+        crate::phase!(
+            crate::output::Activity::Analysis,
+            "Analyzing transitive dependencies..."
+        );
         let fragmented = self.metadata.find_fragmented_transitives();
 
         fragmented

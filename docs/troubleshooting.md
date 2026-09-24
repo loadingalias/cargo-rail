@@ -50,6 +50,49 @@ Cargo's output is withheld because it can contain provider output.
 Manifest failures are the exception: Cargo reports them before it contacts a registry.
 Run the reproduction command to see Cargo's complete output.
 
+A JSON error names its class in `failure_class`: `lockfile`, `manifest`, `toolchain`, or `cargo`.
+
+## Unify compiler evidence fails
+
+Unify compiles the workspace to prove which dependencies are unused.
+When one compiler-evidence view fails, Unify stops, exits `2`, and reports one cause,
+one recovery section, and a `reproduce with Cargo:` command.
+That command runs the view's Cargo command in the workspace root,
+outside Cargo-Rail's private target directory.
+
+| `failure_class` | Cause | Recovery |
+| --- | --- | --- |
+| `build_script` | A package's build script failed | Provide the tools, files, or environment it needs |
+| `source` | Rust source failed to compile | Fix the compiler errors shown under the cause |
+| `toolchain` | A target library, linker, `rustc`, or `RUSTC_WRAPPER` is missing or cannot run | Install or correct it, or narrow `unify.compiler_targets` |
+| `cargo_rail` | Cargo-Rail's compiler adapter failed | Report the `--verbose` output as a Cargo-Rail defect |
+| `cargo` | Any other Cargo failure | Run the reproduction command |
+| `interrupted` | SIGINT or SIGTERM stopped compiler acquisition | Rerun the same command |
+
+A build-script failure lists the environment variable names that the script declares with `rerun-if-env-changed`.
+Unify never prints their values.
+Text mode shows the last lines of the build script's own stderr under the cause.
+Any exact value of an inherited environment variable in that text appears as `<env:NAME>`.
+Cargo's complete output appears only with `--verbose`, and never when a Cargo credential capability is active.
+JSON errors never contain Cargo or build-script output.
+
+Setting `unify.compiler_targets = "none"` runs Unify without compiler evidence.
+Unify then keeps every dependency whose use it cannot prove.
+
+Unify writes progress to stderr, including with `--format json`; stdout stays one JSON value.
+When a phase prints nothing for 30 seconds,
+a `Still running:` line names the phase and whether Cargo-Rail is analyzing, waiting for a Cargo subprocess,
+or waiting for Cargo's file lock.
+A Cargo file-lock wait is reported as soon as Cargo reports it.
+`--quiet` suppresses progress.
+`--diagnostics-file` records each completed phase in `progress_phases`, with its activity, whether Cargo waited for a file lock,
+and its duration.
+
+An interrupted acquisition stops its Cargo process tree and names the phase it interrupted.
+Compiler acquisition writes only to its private target directory, so no workspace file has changed.
+Outside compiler acquisition, SIGINT and SIGTERM end the process immediately;
+a second signal always does.
+
 ## Surface is unavailable or reports unexpected findings
 
 A `cargo install` or single-binary `cargo binstall` installation lacks the embedded Surface component set.

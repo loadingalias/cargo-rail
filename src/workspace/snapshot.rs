@@ -264,7 +264,11 @@ impl DerivedViews {
     pub(crate) fn multi_target_metadata(&self) -> RailResult<Arc<MultiTargetMetadata>> {
         cached_snapshot_view(self.multi_target_metadata.get_or_init(|| {
             if !self.analysis_targets.is_empty() {
-                crate::progress!("Loading metadata for {} target(s)...", self.analysis_targets.len());
+                crate::phase!(
+                    crate::output::Activity::Cargo,
+                    "Loading metadata for {} target(s)...",
+                    self.analysis_targets.len()
+                );
             }
             MultiTargetMetadata::load_parallel(&self.resolutions, &self.analysis_targets)
                 .map(Arc::new)

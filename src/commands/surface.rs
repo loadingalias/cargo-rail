@@ -1100,26 +1100,28 @@ fn recover_failed_verification(
             format!("verification failed; {rollback_message}: {verification_error}"),
         )],
     );
+    // Keep the verification failure typed so its class, recovery, and text detail survive.
     match (rollback, receipt) {
-        (Ok(()), Ok(receipt)) => Err(RailError::with_help(
-            format!("surface post-apply verification failed; source files were restored: {verification_error}"),
-            format!("failure receipt: {}", display_repository_path(git_root, &receipt)),
-        )),
-        (rollback, receipt) => Err(RailError::with_help(
-            format!(
-                "surface post-apply verification failed: {verification_error}; rollback: {}; failure receipt: {}",
+        (Ok(()), Ok(receipt)) => Err(verification_error
+            .context("surface post-apply verification failed; source files were restored")
+            .with_additional_help(format!(
+                "failure receipt: {}",
+                display_repository_path(git_root, &receipt)
+            ))),
+        (rollback, receipt) => Err(verification_error
+            .context(format!(
+                "surface post-apply verification failed; rollback: {}; failure receipt: {}",
                 rollback
                     .err()
                     .map_or_else(|| "succeeded".to_string(), |error| error.to_string()),
                 receipt
                     .err()
                     .map_or_else(|| "written".to_string(), |error| error.to_string())
-            ),
-            applied.backup.as_ref().map_or_else(
+            ))
+            .with_additional_help(applied.backup.as_ref().map_or_else(
                 || "restore the affected files from version control before retrying".to_string(),
                 |backup| format!("restore backup '{backup}' before retrying"),
-            ),
-        )),
+            ))),
     }
 }
 

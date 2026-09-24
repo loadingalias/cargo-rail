@@ -1,6 +1,7 @@
 //! Command-lifetime ownership for compiler-acquisition resources.
 
 pub(crate) mod broker;
+pub(crate) mod failure;
 pub(crate) mod journal;
 pub(crate) mod output;
 pub(crate) mod process;

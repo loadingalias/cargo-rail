@@ -37,6 +37,74 @@ impl ExitCode {
     }
 }
 
+/// Stable class of a failure that an external executor reported.
+///
+/// Machine output names the class in `failure_class`; each class has one recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FailureClass {
+    /// A Rust toolchain, target library, linker, Cargo, or configured wrapper is missing or unusable.
+    Toolchain,
+    /// A build script failed; its prerequisites belong to the package.
+    BuildScript,
+    /// Rust source failed to compile.
+    Source,
+    /// Cargo cannot load a manifest.
+    Manifest,
+    /// `Cargo.lock` does not match the manifests.
+    Lockfile,
+    /// Cargo-Rail's own compiler adapter failed inside Cargo.
+    CargoRail,
+    /// SIGINT or SIGTERM stopped the operation.
+    Interrupted,
+    /// Cargo failed for a cause Cargo-Rail does not classify.
+    Cargo,
+}
+
+impl FailureClass {
+    /// Stable machine name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Toolchain => "toolchain",
+            Self::BuildScript => "build_script",
+            Self::Source => "source",
+            Self::Manifest => "manifest",
+            Self::Lockfile => "lockfile",
+            Self::CargoRail => "cargo_rail",
+            Self::Interrupted => "interrupted",
+            Self::Cargo => "cargo",
+        }
+    }
+}
+
+/// One classified executor failure: a safe primary cause and one recovery section.
+#[derive(Debug)]
+pub struct ClassifiedFailure {
+    class: FailureClass,
+    message: String,
+    help: String,
+    detail: Option<String>,
+}
+
+impl ClassifiedFailure {
+    /// Stable failure class.
+    pub const fn class(&self) -> FailureClass {
+        self.class
+    }
+
+    /// Bounded executor output that text output shows after the cause; machine output omits it.
+    pub fn detail(&self) -> Option<&str> {
+        self.detail.as_deref()
+    }
+}
+
+fn joined_help(help: Option<String>, additional: String) -> String {
+    match help {
+        Some(help) => format!("{help}\n{additional}"),
+        None => additional,
+    }
+}
+
 /// Main error type for cargo-rail
 #[derive(Debug)]
 pub enum RailError {
@@ -73,6 +141,9 @@ pub enum RailError {
         help: Option<String>,
     },
 
+    /// An executor failure with a stable class and one recovery section.
+    Failure(Box<ClassifiedFailure>),
+
     /// Check mode found pending changes (not an error, but exits with code 1)
     ///
     /// Used by --check commands to signal that changes would be made.
@@ -105,6 +176,57 @@ impl RailError {
         RailError::Message {
             message: msg.into(),
             help: Some(help.into()),
+        }
+    }
+
+    /// Create a classified executor failure.
+    ///
+    /// `detail` is bounded executor output for text mode only; pass it only when it is safe to show.
+    pub fn failure(
+        class: FailureClass,
+        message: impl Into<String>,
+        help: impl Into<String>,
+        detail: Option<String>,
+    ) -> Self {
+        RailError::Failure(Box::new(ClassifiedFailure {
+            class,
+            message: message.into(),
+            help: help.into(),
+            detail: detail.filter(|detail| !detail.trim().is_empty()),
+        }))
+    }
+
+    /// The classified failure at the root of this error chain.
+    pub fn classified(&self) -> Option<&ClassifiedFailure> {
+        match self {
+            RailError::Failure(failure) => Some(failure),
+            RailError::Context { source, .. } => source.classified(),
+            _ => None,
+        }
+    }
+
+    /// Append one more recovery line to the root error's help.
+    pub(crate) fn with_additional_help(self, additional: impl Into<String>) -> Self {
+        let additional = additional.into();
+        match self {
+            RailError::Failure(mut failure) => {
+                failure.help.push('\n');
+                failure.help.push_str(&additional);
+                RailError::Failure(failure)
+            }
+            RailError::Context { context, source } => RailError::Context {
+                context,
+                source: Box::new(source.with_additional_help(additional)),
+            },
+            RailError::Message { message, help } => RailError::Message {
+                message,
+                help: Some(joined_help(help, additional)),
+            },
+            RailError::CheckHasPendingChanges | RailError::ExitWithCode { .. } => self,
+            other => {
+                let help = joined_help(other.help_message(), additional);
+                RailError::with_help(other.to_string(), help)
+            }
         }
     }
 
@@ -142,6 +264,7 @@ impl RailError {
             RailError::Config(e) => e.help_message(),
             RailError::Git(e) => e.help_message(),
             RailError::Message { help, .. } => help.clone(),
+            RailError::Failure(failure) => Some(failure.help.clone()),
             RailError::Context { source, .. } => source.help_message(),
             _ => None,
         }
@@ -166,6 +289,7 @@ impl RailError {
 
         let message = match current {
             RailError::Message { message, .. } => message.clone(),
+            RailError::Failure(failure) => failure.message.clone(),
             _ => current.to_string(),
         };
 
@@ -183,6 +307,7 @@ impl fmt::Display for RailError {
             RailError::External { message, source } => write!(f, "{}: {}", message, source),
             RailError::Context { context, source } => write!(f, "{}\n{}", source, context),
             RailError::Message { message, .. } => write!(f, "{}", message),
+            RailError::Failure(failure) => write!(f, "{}", failure.message),
             RailError::CheckHasPendingChanges => Ok(()), // Silent - CI signal
             RailError::ExitWithCode { .. } => Ok(()),    // Silent - exit code only
         }
@@ -540,6 +665,8 @@ struct JsonError {
     context: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     help: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_class: Option<&'static str>,
 }
 
 /// Print an error to stderr with optional help text
@@ -560,6 +687,9 @@ pub fn print_error(error: &RailError) {
         print_error_json(error);
     } else {
         crate::error!("{}", error);
+        if let Some(detail) = error.classified().and_then(ClassifiedFailure::detail) {
+            eprintln!("{}", detail.trim_end());
+        }
 
         if let Some(help) = error.help_message() {
             crate::help!("{}", help);
@@ -577,6 +707,7 @@ fn print_error_json(error: &RailError) {
         message,
         context,
         help: error.help_message(),
+        failure_class: error.classified().map(|failure| failure.class().as_str()),
     };
 
     // JSON errors go to stdout for consistent machine parsing
@@ -598,6 +729,33 @@ mod tests {
             .source()
             .and_then(|source| source.downcast_ref::<RailError>())
             .expect("context must retain its RailError source")
+    }
+
+    #[test]
+    fn additional_help_keeps_the_failure_class_through_context() {
+        let failure = RailError::failure(FailureClass::BuildScript, "cause", "recover", None)
+            .context("affected views: a, b")
+            .with_additional_help("resume with 'cargo rail surface --resume'");
+        assert_eq!(
+            failure.classified().map(ClassifiedFailure::class),
+            Some(FailureClass::BuildScript)
+        );
+        assert_eq!(
+            failure.help_message().as_deref(),
+            Some("recover\nresume with 'cargo rail surface --resume'")
+        );
+        assert_eq!(
+            failure.machine_parts(),
+            ("cause".to_string(), Some("affected views: a, b".to_string()))
+        );
+
+        let message = RailError::message("cause").with_additional_help("resume");
+        assert_eq!(message.help_message().as_deref(), Some("resume"));
+        let typed = RailError::Io(io::Error::other("disk")).with_additional_help("resume");
+        assert_eq!(
+            (typed.to_string(), typed.help_message()),
+            ("disk".to_string(), Some("resume".to_string()))
+        );
     }
 
     #[test]

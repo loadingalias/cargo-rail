@@ -30,7 +30,7 @@ fn main() {
         cli.command.output_protocol()
     };
     let redirected_progress =
-        protocol == cargo_rail::output::OutputProtocol::Json && cli.command.retains_redirected_progress();
+        protocol == cargo_rail::output::OutputProtocol::Json && cli.command.retains_machine_progress();
     cargo_rail::output::init(cargo_rail::output::InvocationOutput::capture_protocol_with_progress(
         cli.quiet,
         cli.verbose,
@@ -48,7 +48,12 @@ fn main() {
         Ok(diagnostics) => diagnostics,
         Err(error) => exit_with_error(error),
     };
-    let result = run(cli, cli_preparation_started);
+    let result = {
+        let _heartbeat = cargo_rail::output::Heartbeat::start();
+        let result = run(cli, cli_preparation_started);
+        cargo_rail::output::end_phase();
+        result
+    };
     let diagnostics_result = diagnostics.finish();
 
     if let Err(error) = result {

@@ -1954,6 +1954,7 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
             )?;
         }
 
+        let _acquisition = crate::output::nested_phase(crate::output::Activity::Cargo, "acquiring compiler evidence");
         progress!(
             "  Compiler evidence plan: {} views; up to {} Cargo acquisitions; {} diagnostic cache hits; {} diagnostic cache misses",
             metrics.analysis_views,
@@ -2583,11 +2584,16 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                                     "compiler acquisition failure lost its failed outcome",
                                 ));
                             };
-                            let error = error.context(format!(
-                                "acquiring compiler evidence for target '{} / {}'",
-                                prepared.view.platform(),
-                                prepared.view.features().label()
-                            ));
+                            // A classified failure already names its view.
+                            let error = if error.classified().is_some() {
+                                error
+                            } else {
+                                error.context(format!(
+                                    "acquiring compiler evidence for target '{} / {}'",
+                                    prepared.view.platform(),
+                                    prepared.view.features().label()
+                                ))
+                            };
                             failures.push(AcquisitionFailure::view(
                                 prepared.ordinal,
                                 index,
@@ -2703,19 +2709,28 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
         }
         if !failures.is_empty() {
             failures.sort_by_key(|failure| (failure.class == FailureClass::Cancelled, failure.ordinal, failure.view));
-            let primary = failures.remove(0);
-            let error = render_acquisition_failures(&plan, &primary, &failures)?;
+            let AcquisitionFailure {
+                view: primary_view,
+                cargo_targets: primary_targets,
+                class: primary_class,
+                error: primary_error,
+                ..
+            } = failures.remove(0);
+            let error = match render_acquisition_failures(&plan, primary_view, &primary_error, &failures)? {
+                Some(summary) => primary_error.context(summary),
+                None => primary_error,
+            };
             if let Some(journal) = acquisition_journal.as_mut() {
-                let durable_primary = primary.view.map(|view| (view, primary.cargo_targets, primary.class));
-                if let Err(journal_error) = journal.fail(durable_primary, primary.class) {
-                    return Err(RailError::message(format!(
-                        "{error}; failed to finalize Surface acquisition manifest '{}': {journal_error}",
+                let durable_primary = primary_view.map(|view| (view, primary_targets, primary_class));
+                if let Err(journal_error) = journal.fail(durable_primary, primary_class) {
+                    return Err(error.context(format!(
+                        "failed to finalize Surface acquisition manifest '{}': {journal_error}",
                         journal.path().display()
                     )));
                 }
-                return Err(RailError::with_help(error, journal.resume_help()));
+                return Err(error.with_additional_help(journal.resume_help()));
             }
-            return Err(RailError::message(error));
+            return Err(error);
         }
 
         let cache_started = crate::instrumentation::compiler_acquisition_timer();
@@ -3153,16 +3168,18 @@ struct AcquisitionFailure {
     error: RailError,
 }
 
+/// Affected views and distinct secondary causes, as context for the primary failure.
 fn render_acquisition_failures(
     plan: &CompilerAcquisitionPlan,
-    primary: &AcquisitionFailure,
+    primary_view: Option<ViewIx>,
+    primary_error: &RailError,
     secondary: &[AcquisitionFailure],
-) -> RailResult<String> {
+) -> RailResult<Option<String>> {
     const MAX_AFFECTED_VIEWS: usize = 16;
     const MAX_SECONDARY_CAUSES: usize = 4;
 
-    let primary_cause = acquisition_failure_cause(&primary.error);
-    let mut affected = primary.view.into_iter().collect::<BTreeSet<_>>();
+    let primary_cause = acquisition_failure_cause(primary_error);
+    let mut affected = primary_view.into_iter().collect::<BTreeSet<_>>();
     let mut causes = BTreeMap::<String, BTreeSet<ViewIx>>::new();
     let mut global_causes = BTreeMap::<String, usize>::new();
     for failure in secondary {
@@ -3178,8 +3195,9 @@ fn render_acquisition_failures(
         }
     }
 
-    let mut rendered = primary.error.to_string();
-    if !affected.is_empty() {
+    let mut rendered = Vec::new();
+    // A classified failure names its own view; list views only when others are affected.
+    if affected.len() > usize::from(primary_error.classified().is_some()) {
         let mut labels = affected
             .iter()
             .take(MAX_AFFECTED_VIEWS)
@@ -3189,8 +3207,7 @@ fn render_acquisition_failures(
         if omitted > 0 {
             labels.push(format!("+{omitted} more"));
         }
-        rendered.push_str("; affected views: ");
-        rendered.push_str(&labels.join(", "));
+        rendered.push(format!("affected views: {}", labels.join(", ")));
     }
 
     let mut additional = causes
@@ -3208,10 +3225,12 @@ fn render_acquisition_failures(
         additional.push("additional causes omitted".to_string());
     }
     if !additional.is_empty() {
-        rendered.push_str("; distinct cleanup or concurrent failures: ");
-        rendered.push_str(&additional.join("; "));
+        rendered.push(format!(
+            "distinct cleanup or concurrent failures: {}",
+            additional.join("; ")
+        ));
     }
-    Ok(rendered)
+    Ok((!rendered.is_empty()).then(|| rendered.join("\n")))
 }
 
 fn acquisition_failure_cause(error: &RailError) -> String {
@@ -3766,6 +3785,7 @@ fn run_workspace_check(
     }
 
     let bounded = run_artifact_bounded_command(
+        &format!("compiler evidence view {}", acquisition_view_label(view)),
         &mut command,
         sandbox.artifact_root(),
         artifact_budget,
@@ -3782,26 +3802,26 @@ fn run_workspace_check(
     })?;
     if !bounded.status.success() {
         *failed_cargo_targets = compiler_error_targets(&bounded.stdout, package_to_member);
-        let diagnostics = cargo_failure_diagnostics(&bounded.stdout);
-        let stderr = if diagnostics.is_empty() {
-            bounded_cargo_failure_stderr(&bounded.stderr)
-        } else {
-            String::new()
-        };
-        return Err(RailError::message(format!(
-            "compiler-evidence Cargo acquisition failed with status {}{}{}",
-            bounded.status,
-            if stderr.is_empty() {
-                String::new()
-            } else {
-                format!(": {stderr}")
+        let error_targets = failed_cargo_targets
+            .iter()
+            .map(|target| format!("`{}` ({} `{}`)", target.package, target.kinds.join("/"), target.target))
+            .collect::<Vec<_>>();
+        let label = acquisition_view_label(view);
+        let status = bounded.status.to_string();
+        return Err(crate::compiler::acquisition::failure::classify(
+            &crate::compiler::acquisition::failure::FailedView {
+                label: &label,
+                platform: view.platform(),
+                status: &status,
+                cargo_program: identity.cargo_program.as_os_str(),
+                cargo_arguments: &args,
+                workspace_root,
+                error_targets: &error_targets,
+                stdout: &bounded.stdout,
+                stderr: &bounded.stderr,
+                show_cargo_output: crate::cargo::metadata::CargoOutput::DiscoverFrom(workspace_root).is_shown(),
             },
-            if diagnostics.is_empty() {
-                String::new()
-            } else {
-                format!("\n{diagnostics}")
-            }
-        )));
+        ));
     }
     if let Some(doctest_sysroot) = doctest_sysroot {
         doctest_sysroot.revalidate()?;
@@ -3964,6 +3984,7 @@ struct ArtifactPreflight {
 }
 
 fn run_artifact_bounded_command(
+    subject: &str,
     command: &mut Command,
     artifact_root: &Path,
     budget: CompilerArtifactBudget,
@@ -4040,10 +4061,11 @@ fn run_artifact_bounded_command(
         }
     };
     let stderr_failed = Arc::clone(&stream_failed);
+    let subject = subject.to_string();
     let stderr_reader = match std::thread::Builder::new()
         .name("cargo-rail-cargo-stderr".to_string())
         .spawn(move || {
-            let result = read_cargo_stderr_tail(stderr);
+            let result = read_cargo_stderr_tail(stderr, |lock| crate::output::report_lock_wait(&subject, lock));
             if result.is_err() {
                 stderr_failed.store(true, std::sync::atomic::Ordering::Release);
             }
@@ -4070,6 +4092,7 @@ fn run_artifact_bounded_command(
     let mut capacity_breach = None;
     let mut monitor_error = None;
     let mut cancelled = false;
+    let mut signalled = false;
     let mut status = None;
     loop {
         match process.try_wait() {
@@ -4085,6 +4108,7 @@ fn run_artifact_bounded_command(
         }
         if process.cancellation_requested() || cancellation.load(std::sync::atomic::Ordering::Acquire) {
             cancelled = true;
+            signalled = process.cancellation_requested();
             break;
         }
         if stream_failed.load(std::sync::atomic::Ordering::Acquire) {
@@ -4173,9 +4197,12 @@ fn run_artifact_bounded_command(
         )));
     }
     if cancelled {
-        return Err(RailError::message(
-            "compiler acquisition was cancelled by SIGINT or SIGTERM",
-        ));
+        // Another view or journal failure also cancels this view; only a signal interrupts the command.
+        return Err(if signalled {
+            acquisition_interrupted()
+        } else {
+            RailError::message("compiler acquisition was cancelled after another acquisition failure")
+        });
     }
     let stdout = stdout
         .map_err(|error| RailError::message(format!("Cargo compiler acquisition stdout {}: {error}", error.class())))?;
@@ -4226,6 +4253,18 @@ fn run_artifact_bounded_command(
     })
 }
 
+/// Cancellation of a compiler-evidence view, with the command phase it interrupted.
+fn acquisition_interrupted() -> RailError {
+    let phase = crate::output::command_phase().map_or_else(String::new, |phase| format!(" during `{phase}`"));
+    RailError::failure(
+        crate::error::FailureClass::Interrupted,
+        format!("compiler acquisition was interrupted by SIGINT or SIGTERM{phase}"),
+        "compiler acquisition writes only to its private target directory and changed no workspace files; \
+         rerun the same command",
+        None,
+    )
+}
+
 fn terminate_process_tree(process: &mut ProcessTree) -> std::io::Result<ProcessTermination> {
     process.terminate()
 }
@@ -4242,36 +4281,6 @@ fn stage_view_workspace_wrapper(wrapper: &Path, directory: &Path) -> RailResult<
             )
         })?;
     Ok(staged)
-}
-
-fn cargo_failure_diagnostics(stdout: &[u8]) -> String {
-    const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
-    let mut diagnostics = String::new();
-    for line in String::from_utf8_lossy(stdout).lines() {
-        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if event["reason"] != "compiler-message" || event["message"]["level"] != "error" {
-            continue;
-        }
-        let message = event["message"]["rendered"]
-            .as_str()
-            .or_else(|| event["message"]["message"].as_str())
-            .unwrap_or("compiler reported an error");
-        if diagnostics.len().saturating_add(message.len()) > MAX_DIAGNOSTIC_BYTES {
-            diagnostics.push_str("compiler diagnostics truncated");
-            break;
-        }
-        diagnostics.push_str(message.trim_end());
-        diagnostics.push('\n');
-    }
-    diagnostics
-}
-
-fn bounded_cargo_failure_stderr(stderr: &[u8]) -> String {
-    const MAX_STDERR_BYTES: usize = 16 * 1024;
-    let start = stderr.len().saturating_sub(MAX_STDERR_BYTES);
-    String::from_utf8_lossy(&stderr[start..]).trim().to_string()
 }
 
 fn fact_invocation_cache_bypasses(
@@ -7365,6 +7374,7 @@ mod tests {
             .arg(root.path());
         let started = Instant::now();
         let error = run_artifact_bounded_command(
+            "test view",
             &mut command,
             root.path(),
             CompilerArtifactBudget::new(512 * 1024, 1024 * 1024),
@@ -7389,6 +7399,7 @@ mod tests {
         command.args(["-c", "printf '{\"reason\":17}\\n'; exec sleep 10"]);
         let started = Instant::now();
         let error = run_artifact_bounded_command(
+            "test view",
             &mut command,
             root.path(),
             CompilerArtifactBudget::default(),
@@ -7433,6 +7444,7 @@ mod tests {
         ]);
         let started = Instant::now();
         let error = run_artifact_bounded_command(
+            "test view",
             &mut command,
             lease.artifact_root(),
             CompilerArtifactBudget::default(),
@@ -7470,6 +7482,7 @@ mod tests {
             "i=0; while [ \"$i\" -lt 20000 ]; do printf '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'; i=$((i + 1)); done >&2; printf '{\"reason\":\"build-finished\",\"success\":true}\\n'",
         ]);
         let output = run_artifact_bounded_command(
+            "test view",
             &mut command,
             root.path(),
             CompilerArtifactBudget::default(),
@@ -7546,6 +7559,7 @@ mod tests {
             command
         };
         let error = run_artifact_bounded_command(
+            "test view",
             &mut command,
             lease.artifact_root(),
             CompilerArtifactBudget::new(512, 1024),

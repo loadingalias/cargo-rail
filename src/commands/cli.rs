@@ -1208,16 +1208,20 @@ impl Commands {
         }
     }
 
-    /// Whether a long-running command redirected its final machine output.
+    /// Whether a long-running command keeps stderr progress in machine mode.
+    ///
+    /// Surface keeps it only when its final value is redirected to a file.
+    /// Unify always keeps it, because compiler evidence can take minutes and its
+    /// stdout remains one JSON value.
     #[doc(hidden)]
-    pub fn retains_redirected_progress(&self) -> bool {
+    pub fn retains_machine_progress(&self) -> bool {
         matches!(
             self,
             Commands::Surface {
                 output: Some(_),
                 schema: false,
                 ..
-            }
+            } | Commands::Unify { .. }
         )
     }
 
@@ -1401,15 +1405,26 @@ mod tests {
     }
 
     #[test]
-    fn surface_redirected_output_is_the_only_redirected_progress_contract() {
+    fn machine_progress_is_kept_only_for_redirected_surface_and_unify() {
         let redirected =
             RailCli::try_parse_from(["cargo-rail", "surface", "--format", "json", "--output", "surface.json"])
                 .expect("redirected Surface JSON must parse");
-        assert!(redirected.command.retains_redirected_progress());
+        assert!(redirected.command.retains_machine_progress());
 
         let stdout = RailCli::try_parse_from(["cargo-rail", "surface", "--format", "json"])
             .expect("stdout Surface JSON must parse");
-        assert!(!stdout.command.retains_redirected_progress());
+        assert!(!stdout.command.retains_machine_progress());
+
+        for arguments in [
+            &["cargo-rail", "unify", "--check", "--format", "json"][..],
+            &["cargo-rail", "unify", "apply", "--format", "json"][..],
+        ] {
+            let unify = RailCli::try_parse_from(arguments).expect("Unify JSON must parse");
+            assert!(unify.command.retains_machine_progress(), "{arguments:?}");
+        }
+        let config = RailCli::try_parse_from(["cargo-rail", "config", "print", "--format", "json"])
+            .expect("config JSON must parse");
+        assert!(!config.command.retains_machine_progress());
     }
 
     #[test]

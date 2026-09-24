@@ -5,9 +5,11 @@
 //! appears only when no credential capability is active.
 
 use crate::cargo::resolution::CargoConfigSnapshot;
-use crate::error::{RailError, RailResult};
+use crate::error::{FailureClass, RailError, RailResult};
 use cargo_metadata::{Metadata, MetadataCommand};
+use std::io::{BufRead as _, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 /// Cargo output retained in a failure report.
 const MAX_CARGO_OUTPUT_BYTES: usize = 8 * 1024;
@@ -28,7 +30,7 @@ impl CargoOutput<'_> {
         if active { Self::Withheld } else { Self::Shown }
     }
 
-    fn is_shown(self) -> bool {
+    pub(crate) fn is_shown(self) -> bool {
         match self {
             Self::Shown => true,
             Self::Withheld => false,
@@ -42,9 +44,60 @@ impl CargoOutput<'_> {
 
 /// Run `command` for the Cargo workspace rooted at `workspace_root`.
 pub(crate) fn exec(command: &MetadataCommand, workspace_root: &Path, output: CargoOutput<'_>) -> RailResult<Metadata> {
-    command
-        .exec()
-        .map_err(|error| failure(command, workspace_root, output, error))
+    let _phase = crate::output::nested_phase(crate::output::Activity::Cargo, "running cargo metadata");
+    run(command).map_err(|error| failure(command, workspace_root, output, error))
+}
+
+/// `MetadataCommand::exec`, reading stderr as Cargo writes it so a file-lock wait is reported live.
+fn run(command: &MetadataCommand) -> Result<Metadata, cargo_metadata::Error> {
+    let mut invocation = command.cargo_command();
+    invocation
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = invocation.spawn()?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("cargo metadata has no stderr pipe"))?;
+    let reader = std::thread::Builder::new()
+        .name("cargo-rail-metadata-stderr".to_string())
+        .spawn(move || read_stderr(stderr))?;
+    let mut stdout = Vec::new();
+    let read = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("cargo metadata has no stdout pipe"))
+        .and_then(|mut pipe| pipe.read_to_end(&mut stdout));
+    let status = child.wait();
+    let stderr = reader
+        .join()
+        .map_err(|_| std::io::Error::other("cargo metadata stderr reader panicked"))??;
+    read?;
+    if !status?.success() {
+        return Err(cargo_metadata::Error::CargoMetadata {
+            stderr: String::from_utf8(stderr)?,
+        });
+    }
+    let stdout = std::str::from_utf8(&stdout)?
+        .lines()
+        .find(|line| line.starts_with('{'))
+        .ok_or(cargo_metadata::Error::NoJson)?;
+    MetadataCommand::parse(stdout)
+}
+
+fn read_stderr(stderr: impl Read) -> std::io::Result<Vec<u8>> {
+    let mut reader = BufReader::new(stderr);
+    let mut retained = Vec::new();
+    loop {
+        let start = retained.len();
+        if reader.read_until(b'\n', &mut retained)? == 0 {
+            return Ok(retained);
+        }
+        if let Some(lock) = crate::output::cargo_lock_wait(&String::from_utf8_lossy(&retained[start..])) {
+            crate::output::report_lock_wait("cargo metadata", lock);
+        }
+    }
 }
 
 /// A failure class that Cargo-Rail can name without quoting Cargo's output.
@@ -63,6 +116,15 @@ impl Cause {
     /// provider has run and Cargo's output describes only local files.
     fn precedes_registry_access(&self) -> bool {
         matches!(self, Self::Manifest(_))
+    }
+
+    fn class(&self) -> FailureClass {
+        match self {
+            Self::StaleLockfile => FailureClass::Lockfile,
+            Self::Manifest(_) => FailureClass::Manifest,
+            Self::Target(_) | Self::HostRustc | Self::CargoUnavailable(_) => FailureClass::Toolchain,
+            Self::Unclassified => FailureClass::Cargo,
+        }
     }
 
     fn message(&self) -> String {
@@ -128,7 +190,7 @@ fn failure(
         }
         None => {}
     }
-    RailError::with_help(message, help)
+    RailError::failure(cause.class(), message, help, None)
 }
 
 fn classify(

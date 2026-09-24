@@ -648,9 +648,14 @@ log = "0.4"
             "a failed required Cargo view must be an operational error\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
         assert!(
-            stderr.contains("compiler-evidence Cargo acquisition failed"),
-            "the exact failed authority was not reported:\n{stderr}"
+            stderr.contains(
+                "error: `test-crate` (lib `test_crate`) did not compile in compiler evidence view `test-crate / "
+            ) && stderr.contains("crates/test-crate/src/lib.rs:1:"),
+            "the failed view and its compiler diagnostic were not reported:\n{stderr}"
         );
+        let json = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--format", "json"])?;
+        let value: serde_json::Value = serde_json::from_slice(&json.stdout)?;
+        assert_eq!(value["failure_class"], "source", "{value:#}");
         assert_eq!(
             stderr.matches("active view=").count(),
             1,

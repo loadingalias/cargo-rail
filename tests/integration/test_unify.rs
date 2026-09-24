@@ -241,9 +241,12 @@ fn test_unify_apply_json_is_a_single_machine_envelope() {
             output.status.success(),
             "JSON apply should succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
+        // Unify keeps progress on stderr in JSON mode; stdout remains the single machine value.
         assert!(
-            stderr.is_empty(),
-            "JSON success must not leak progress or warnings: {stderr}"
+            !stderr
+                .lines()
+                .any(|line| line.starts_with("warning:") || line.starts_with("error:")),
+            "JSON success must not report warnings or errors: {stderr}"
         );
 
         let value: serde_json::Value = serde_json::from_str(&stdout)?;

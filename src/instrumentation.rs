@@ -3,21 +3,24 @@
 use std::fs::File;
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
 use crate::error::{RailError, RailResult};
 
-const SCHEMA_VERSION: u32 = 15;
+const SCHEMA_VERSION: u32 = 16;
+/// Completed progress phases retained in one diagnostic snapshot.
+const MAX_PROGRESS_PHASES: usize = 256;
 
 static COUNTERS: OnceLock<Counters> = OnceLock::new();
 
 struct Counters {
     snapshot_id: OnceLock<String>,
     phases: PhaseCounters,
+    progress_phases: Mutex<Vec<ProgressPhaseSnapshot>>,
     cargo_metadata_loads: AtomicU64,
     cargo_metadata_cache_hits: AtomicU64,
     target_view_loads: AtomicU64,
@@ -44,6 +47,7 @@ impl Counters {
         Self {
             snapshot_id: OnceLock::new(),
             phases: PhaseCounters::new(),
+            progress_phases: Mutex::new(Vec::new()),
             cargo_metadata_loads: AtomicU64::new(0),
             cargo_metadata_cache_hits: AtomicU64::new(0),
             target_view_loads: AtomicU64::new(0),
@@ -71,6 +75,11 @@ impl Counters {
             schema_version: SCHEMA_VERSION,
             snapshot_id: self.snapshot_id.get().cloned(),
             phases: self.phases.snapshot(),
+            progress_phases: self
+                .progress_phases
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
             cargo_metadata_loads: self.cargo_metadata_loads.load(Ordering::Relaxed),
             cargo_metadata_cache_hits: self.cargo_metadata_cache_hits.load(Ordering::Relaxed),
             target_view_loads: self.target_view_loads.load(Ordering::Relaxed),
@@ -301,11 +310,40 @@ struct PhaseSnapshot {
     elapsed_ns: u64,
 }
 
+/// One completed progress phase, in completion order.
+#[derive(Clone, Serialize)]
+struct ProgressPhaseSnapshot {
+    phase: String,
+    activity: &'static str,
+    cargo_lock_wait: bool,
+    elapsed_ns: u64,
+}
+
+/// Record one completed progress phase when diagnostics are enabled.
+pub(crate) fn record_progress_phase(phase: &str, activity: &'static str, cargo_lock_wait: bool, elapsed: Duration) {
+    let Some(counters) = COUNTERS.get() else {
+        return;
+    };
+    let mut phases = counters
+        .progress_phases
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if phases.len() < MAX_PROGRESS_PHASES {
+        phases.push(ProgressPhaseSnapshot {
+            phase: phase.to_string(),
+            activity,
+            cargo_lock_wait,
+            elapsed_ns: u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
+        });
+    }
+}
+
 #[derive(Serialize)]
 struct CounterSnapshot {
     schema_version: u32,
     snapshot_id: Option<String>,
     phases: PhaseSnapshots,
+    progress_phases: Vec<ProgressPhaseSnapshot>,
     cargo_metadata_loads: u64,
     cargo_metadata_cache_hits: u64,
     target_view_loads: u64,

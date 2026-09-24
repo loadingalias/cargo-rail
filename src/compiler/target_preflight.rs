@@ -230,12 +230,14 @@ pub(crate) fn require_ready(
     recovery: &str,
 ) -> RailResult<Vec<TargetReadiness>> {
     result.map_err(|failures| {
-        RailError::with_help(
+        RailError::failure(
+            crate::error::FailureClass::Toolchain,
             format!(
                 "{subject} target preflight failed before compiler acquisition:\n{}",
                 render_failures(&failures)
             ),
             recovery,
+            None,
         )
     })
 }

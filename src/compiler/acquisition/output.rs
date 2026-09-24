@@ -207,18 +207,37 @@ fn read_cargo_stdout_with_limits(
     })
 }
 
-pub(crate) fn read_cargo_stderr_tail(reader: impl Read) -> io::Result<CargoStderr> {
-    read_cargo_stderr_tail_with_limit(reader, MAX_RETAINED_STDERR_BYTES)
+/// Read Cargo's stderr, retaining its tail and passing each file-lock wait to `on_lock_wait`.
+pub(crate) fn read_cargo_stderr_tail(reader: impl Read, on_lock_wait: impl FnMut(&str)) -> io::Result<CargoStderr> {
+    read_cargo_stderr_tail_with_limit(reader, MAX_RETAINED_STDERR_BYTES, on_lock_wait)
 }
 
-fn read_cargo_stderr_tail_with_limit(mut reader: impl Read, limit: usize) -> io::Result<CargoStderr> {
+/// Longest stderr line inspected for a file-lock wait; Cargo's status lines are short.
+const MAX_STATUS_LINE_BYTES: usize = 512;
+
+fn read_cargo_stderr_tail_with_limit(
+    mut reader: impl Read,
+    limit: usize,
+    mut on_lock_wait: impl FnMut(&str),
+) -> io::Result<CargoStderr> {
     let mut tail = VecDeque::with_capacity(limit);
     let mut chunk = [0_u8; 8192];
     let mut bytes_read = 0_u64;
+    let mut line = Vec::with_capacity(MAX_STATUS_LINE_BYTES);
     loop {
         let read = reader.read(&mut chunk)?;
         if read == 0 {
             break;
+        }
+        for &byte in &chunk[..read] {
+            if byte == b'\n' {
+                if let Some(lock) = crate::output::cargo_lock_wait(&String::from_utf8_lossy(&line)) {
+                    on_lock_wait(lock);
+                }
+                line.clear();
+            } else if line.len() < MAX_STATUS_LINE_BYTES {
+                line.push(byte);
+            }
         }
         bytes_read = bytes_read
             .checked_add(u64::try_from(read).map_err(|_| io::Error::other("stderr read size exceeds u64"))?)
@@ -371,8 +390,33 @@ mod tests {
     }
 
     #[test]
+    fn stderr_reader_reports_each_file_lock_wait_as_cargo_writes_it() {
+        // Cargo 1.98 status lines; a one-byte reader splits every line across reads.
+        let stderr = b"    Blocking waiting for file lock on package cache\n   Compiling a v0.1.0\n\
+    Blocking waiting for file lock on build directory\n  --- stderr\n  Blocking waiting for file lock\n";
+        let mut waits = Vec::new();
+        read_cargo_stderr_tail_with_limit(stderr as &[u8], 16, |lock| waits.push(lock.to_string())).expect("stderr");
+        assert_eq!(waits, ["package cache", "build directory"]);
+
+        struct OneByte<'a>(&'a [u8]);
+        impl std::io::Read for OneByte<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let Some((&first, rest)) = self.0.split_first() else {
+                    return Ok(0);
+                };
+                buffer[0] = first;
+                self.0 = rest;
+                Ok(1)
+            }
+        }
+        let mut split = Vec::new();
+        read_cargo_stderr_tail_with_limit(OneByte(stderr), 16, |lock| split.push(lock.to_string())).expect("stderr");
+        assert_eq!(split, waits);
+    }
+
+    #[test]
     fn stderr_reader_retains_only_the_configured_tail() {
-        let stderr = read_cargo_stderr_tail_with_limit(b"0123456789" as &[u8], 4).expect("stderr tail");
+        let stderr = read_cargo_stderr_tail_with_limit(b"0123456789" as &[u8], 4, |_| {}).expect("stderr tail");
         assert_eq!(stderr.bytes_read(), 10);
         assert_eq!(stderr.tail(), b"6789");
     }
