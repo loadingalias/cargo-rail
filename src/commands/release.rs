@@ -70,7 +70,6 @@ pub fn run_release_plan(
     // Validate release config (tag format, changelog shape, release policies)
     let warnings = release_config.validate(workspace_members).map_err(RailError::Config)?;
 
-    // Print warnings
     for warning in &warnings {
         crate::warn!("{}", warning);
     }
@@ -1590,8 +1589,8 @@ fn release_declared_inputs(
     let git = ctx.git()?.git();
     let git_root = &git.worktree_root;
     let mut paths = Vec::new();
-    if let Some(config_path) = crate::config::RailConfig::find_config_path(ctx.workspace_root()) {
-        paths.push(config_path);
+    if let Some(config_path) = ctx.config_path() {
+        paths.push(config_path.to_path_buf());
     }
 
     for planned in &plan.crates {

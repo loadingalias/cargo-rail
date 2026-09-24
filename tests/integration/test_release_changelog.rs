@@ -11,7 +11,7 @@ use crate::helpers::isolated_cargo_rail_command;
 use crate::helpers::{
     NestedWorkspace, TestWorkspace, cargo_command, cargo_rail_command, file_url, git, git_command, run_cargo_rail,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -4849,6 +4849,43 @@ fn test_release_json_output() {
     super::helpers::finish_test(result);
 }
 
+#[test]
+fn release_mutation_plan_binds_the_captured_config_override() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_single_crate("release-config-override", "0.1.0")?;
+        ws.write_release_config("")?;
+        let config = ws.path.join("custom-rail.toml");
+        std::fs::rename(ws.path.join(".config/rail.toml"), &config)?;
+        write_test_change(&ws.path, &["release-config-override"])?;
+
+        let output = run_cargo_rail(
+            &ws.path,
+            &[
+                "rail",
+                "--config",
+                "custom-rail.toml",
+                "release",
+                "check",
+                "--format",
+                "json",
+                "--bump",
+                "patch",
+            ],
+        )?;
+        assert_eq!(output.status.code(), Some(1), "release check: {output:?}");
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let inputs = json["mutation_plan"]["declared_inputs"]
+            .as_array()
+            .context("release mutation declared inputs")?;
+        assert!(
+            inputs.iter().any(|input| input["path"] == "custom-rail.toml"),
+            "captured config override was not drift-bound: {inputs:?}"
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
 /// Test release --skip-tag flag
 #[test]
 fn test_release_skip_tag_flag() {
@@ -5208,7 +5245,6 @@ path = "CHANGELOG.md"
         ws.commit("feat: add v2 function")?;
         write_test_change(&ws.path, &["lib-a"])?;
 
-        // Run release
         let output = run_cargo_rail(
             &ws.path,
             &["rail", "release", "run", "lib-a", "--bump", "patch", "--yes"],
@@ -5326,7 +5362,6 @@ relative_to = "workspace"
         ws.commit("feat: add v2 function")?;
         write_test_change(&ws.path, &["lib-a"])?;
 
-        // Run release
         let output = run_cargo_rail(
             &ws.path,
             &["rail", "release", "run", "lib-a", "--bump", "patch", "--yes"],
@@ -5462,7 +5497,6 @@ relative_to = "workspace"
         // docs/changelogs/ doesn't exist yet - should be auto-created
         assert!(!ws.path.join("docs/changelogs").exists());
 
-        // Run release
         let output = run_cargo_rail(
             &ws.path,
             &["rail", "release", "run", "lib-a", "--bump", "patch", "--yes"],
@@ -5517,7 +5551,6 @@ relative_to = "crate"
         ws.commit("feat: add v2 function")?;
         write_test_change(&ws.path, &["lib-a"])?;
 
-        // Run release
         let output = run_cargo_rail(
             &ws.path,
             &["rail", "release", "run", "lib-a", "--bump", "patch", "--yes"],
@@ -7265,7 +7298,6 @@ fn test_release_check_all_skips_unpublishable_cargo_toml() {
         ws.commit("Add crates")?;
         write_test_change(&ws.path, &["lib-pub", "lib-internal"])?;
 
-        // Run release check --all
         let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--publication", "--all"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -7314,7 +7346,6 @@ fn test_release_check_path_deps_allowed_for_unpublishable() {
         ws.commit("Add crates")?;
         write_test_change(&ws.path, &["lib-core", "wasm-bindings"])?;
 
-        // Run release check --all
         let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--publication", "--all"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -7378,7 +7409,6 @@ fn test_release_check_json_includes_skipped() {
         ws.commit("Add crates")?;
         write_test_change(&ws.path, &["lib-pub", "lib-internal"])?;
 
-        // Run release check --all --json
         let output = run_cargo_rail(
             &ws.path,
             &["rail", "release", "check", "--publication", "--all", "--json"],
@@ -7439,7 +7469,6 @@ publish = false
         )?;
         write_test_change(&ws.path, &["lib-a", "lib-b"])?;
 
-        // Run release check --all
         let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--publication", "--all"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
