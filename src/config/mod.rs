@@ -110,6 +110,22 @@ pub(crate) fn load_decoded(path: &Path) -> RailResult<(DecodedConfig, Vec<u8>)> 
     Ok((decoded, bytes))
 }
 
+/// Report independent configuration errors together; a single error is returned unchanged.
+pub(crate) fn combine_errors(mut errors: Vec<RailError>) -> RailResult<()> {
+    match errors.len() {
+        0 => Ok(()),
+        1 => Err(errors.remove(0)),
+        count => Err(RailError::message(format!(
+            "{count} configuration errors:\n{}",
+            errors
+                .iter()
+                .map(|error| format!("  - {error}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ))),
+    }
+}
+
 pub(crate) fn workspace_context_required(field: &str) -> RailError {
     RailError::message(format!(
         "{field} requires Cargo workspace context; inspect a configuration file in its owning workspace"
@@ -130,25 +146,37 @@ impl RailConfig {
     }
 
     /// Validate policy independently of any filesystem or workspace membership.
+    ///
+    /// Independent sections are all checked. One violation is returned unchanged; several are reported together.
     pub(crate) fn validate_policy(&self) -> RailResult<()> {
-        self.plan.validate().map_err(RailError::Config)?;
-        self.surface.validate().map_err(RailError::Config)?;
-        self.surface
-            .validate_workspace_targets(&self.targets)
-            .map_err(RailError::Config)?;
-        self.unify
-            .validate_workspace_targets(&self.targets)
-            .map_err(RailError::Config)?;
-        self.unify.validate_policy().map_err(RailError::Config)?;
-        self.release.validate_policy().map_err(RailError::Config)?;
-        for split in self.build_split_configs() {
-            split.validate()?;
-        }
-        crate::release::changelog::ChangelogSpec::resolve(&self.release.changelog, None)?;
-        for config in self.crates.values().filter_map(|config| config.changelog.as_ref()) {
-            crate::release::changelog::ChangelogSpec::resolve(&self.release.changelog, Some(config))?;
-        }
-        Ok(())
+        combine_errors(self.policy_errors())
+    }
+
+    /// Every independent workspace-free policy violation: the first error of each section.
+    pub(crate) fn policy_errors(&self) -> Vec<RailError> {
+        let mut checks = vec![
+            self.plan.validate().map_err(RailError::Config),
+            self.surface
+                .validate()
+                .and_then(|()| self.surface.validate_workspace_targets(&self.targets))
+                .map_err(RailError::Config),
+            self.unify
+                .validate_workspace_targets(&self.targets)
+                .and_then(|()| self.unify.validate_policy())
+                .map_err(RailError::Config),
+            self.release.validate_policy().map_err(RailError::Config),
+            crate::release::changelog::ChangelogSpec::resolve(&self.release.changelog, None).map(drop),
+        ];
+        checks.extend(self.build_split_configs().iter().map(SplitConfig::validate));
+        checks.extend(
+            self.crates
+                .values()
+                .filter_map(|config| config.changelog.as_ref())
+                .map(|config| {
+                    crate::release::changelog::ChangelogSpec::resolve(&self.release.changelog, Some(config)).map(drop)
+                }),
+        );
+        checks.into_iter().filter_map(Result::err).collect()
     }
 
     /// A standalone source cannot claim validation of repository-dependent policy.
@@ -179,6 +207,15 @@ impl RailConfig {
         workspace_members: Option<&[String]>,
     ) -> RailResult<Vec<String>> {
         self.validate_policy()?;
+        self.validate_workspace(workspace_root, workspace_members)
+    }
+
+    /// Validate repository-bound rules for policy whose [`Self::validate_policy`] passed.
+    pub(crate) fn validate_workspace(
+        &self,
+        workspace_root: &Path,
+        workspace_members: Option<&[String]>,
+    ) -> RailResult<Vec<String>> {
         self.unify.validate_host(workspace_root).map_err(RailError::Config)?;
         let Some(workspace_members) = workspace_members else {
             return Ok(Vec::new());
@@ -234,12 +271,10 @@ impl RailConfig {
             return Some(found.to_path_buf());
         }
 
-        // On Windows, if path is canonicalized (e.g., from cargo metadata),
-        // we may need to check using the original non-canonicalized path.
+        // Cargo and Win32 can expose one directory through long and 8.3 spellings.
+        // Search the canonical spelling and enumerate entries before declaring the config absent.
         #[cfg(target_os = "windows")]
         {
-            // 1. Try canonicalizing the path and searching there
-            // This handles 8.3 short paths vs long paths issues (RUNNER~1 vs runneradmin)
             if let Ok(canonical) = path.canonicalize() {
                 let canonical_candidates = [
                     canonical.join("rail.toml"),
@@ -255,7 +290,6 @@ impl RailConfig {
                 }
             }
 
-            // 2. Try to find the config by reading the directory entries
             if let Ok(entries) = std::fs::read_dir(path) {
                 for entry in entries.flatten() {
                     let file_name = entry.file_name();
@@ -267,7 +301,6 @@ impl RailConfig {
                 }
             }
 
-            // Also check subdirectories .cargo and .config via read_dir
             for subdir in &[".cargo", ".config"] {
                 let subdir_path = path.join(subdir);
                 if let Ok(entries) = std::fs::read_dir(&subdir_path) {

@@ -41,7 +41,7 @@ impl CleanContext {
             Err(error) => return Err(error),
         };
         let config_path = config_override.map_or_else(
-            || RailConfig::find_config_path(&workspace_root),
+            || RailConfig::find_config_path(&crate::workspace::discovery_root(&workspace_root)),
             |path| {
                 Some(if path.is_absolute() {
                     path.to_path_buf()
@@ -184,7 +184,6 @@ pub fn run_clean(ctx: &CleanContext, options: CleanOptions) -> RailResult<()> {
         .then(|| crate::cache::status(ctx.workspace_root(), true, false))
         .transpose()?;
 
-    // Collect artifacts to clean
     let mut artifacts = CleanArtifacts::new();
 
     if let Some(status) = &cache_status {
@@ -214,7 +213,6 @@ pub fn run_clean(ctx: &CleanContext, options: CleanOptions) -> RailResult<()> {
         crate::cache::status(ctx.workspace_root(), true, false)?;
     }
 
-    // Check mode: preview what would be cleaned
     if options.check {
         if json {
             let has_changes = !artifacts.is_empty();
@@ -254,7 +252,6 @@ pub fn run_clean(ctx: &CleanContext, options: CleanOptions) -> RailResult<()> {
         return Ok(());
     }
 
-    // Execute cleaning
     ctx.revalidate_artifact_root()?;
     let mut cleaned = CleanArtifacts::new();
 
@@ -275,7 +272,6 @@ pub fn run_clean(ctx: &CleanContext, options: CleanOptions) -> RailResult<()> {
         cleaned.release_journals = clean_release_journals(ctx, &artifacts.release_journals)?;
     }
 
-    // Output results
     if json {
         let payload = serde_json::json!({
           "command": "clean",
@@ -648,7 +644,6 @@ fn clean_backups_handler(ctx: &CleanContext, delete_all: bool) -> RailResult<Vec
         return Ok(Vec::new());
     }
 
-    // Get list of backups that will be cleaned before cleaning
     let backup_list = backup_manager.list_backups()?;
     let mut cleaned = Vec::with_capacity(backup_list.len());
 

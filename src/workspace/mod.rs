@@ -11,6 +11,8 @@
 
 use std::path::{Path, PathBuf};
 
+mod config_preflight;
+pub(crate) use config_preflight::discovery_root;
 /// Unified workspace context (includes optional GitState and CargoState)
 pub mod context;
 /// Immutable authoritative workspace capture.

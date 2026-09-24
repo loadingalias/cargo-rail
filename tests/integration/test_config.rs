@@ -262,7 +262,6 @@ fn test_config_locate_finds_config() {
         ws.add_crate("test-crate", "0.1.0", &[])?;
         ws.commit("Add test crate")?;
 
-        // Run config locate
         let output = run_cargo_rail(&ws.path, &["rail", "config", "locate"])?;
 
         // Verify success
@@ -285,7 +284,6 @@ fn test_config_locate_no_config() {
         ws.commit("Add test crate")?;
         ws.remove_config()?;
 
-        // Run config locate
         let output = run_cargo_rail(&ws.path, &["rail", "config", "locate"])?;
 
         // Absence is a successful query result, not an operational failure.
@@ -314,7 +312,6 @@ fn test_config_locate_json_output() {
         ws.add_crate("test-crate", "0.1.0", &[])?;
         ws.commit("Add test crate")?;
 
-        // Run config locate with JSON format
         let output = run_cargo_rail(&ws.path, &["rail", "config", "locate", "-f", "json"])?;
 
         // Verify success
@@ -353,7 +350,6 @@ fn test_config_locate_with_config_flag() {
         let custom_config = ws.path.join("custom-rail.toml");
         fs::write(&custom_config, "targets = []\n")?;
 
-        // Run config locate with --config flag
         let output = run_cargo_rail(&ws.path, &["rail", "--config", "custom-rail.toml", "config", "locate"])?;
 
         // Verify success
@@ -370,8 +366,6 @@ fn test_config_locate_with_config_flag() {
     })();
     super::helpers::finish_test(result);
 }
-
-// Config Print Tests
 
 fn config_print_body(output: &str) -> &str {
     output
@@ -391,7 +385,6 @@ fn test_config_print_shows_defaults() {
         let config_path = ws.path.join(".config").join("rail.toml");
         fs::write(&config_path, "targets = []\n")?;
 
-        // Run config print
         let output = run_cargo_rail(&ws.path, &["rail", "config", "print"])?;
 
         // Verify success
@@ -419,7 +412,6 @@ fn test_config_print_json_output() {
         ws.add_crate("test-crate", "0.1.0", &[])?;
         ws.commit("Add test crate")?;
 
-        // Run config print with JSON format
         let output = run_cargo_rail(&ws.path, &["rail", "config", "print", "-f", "json"])?;
 
         // Verify success
@@ -567,7 +559,6 @@ fn test_config_print_no_config() {
         ws.commit("Add test crate")?;
         ws.remove_config()?;
 
-        // Run config print
         let output = run_cargo_rail(&ws.path, &["rail", "config", "print"])?;
 
         assert!(output.status.success(), "{output:?}");
@@ -918,6 +909,199 @@ fn test_unknown_keys_fail_normal_loading_even_without_strict_validation() {
                 String::from_utf8_lossy(&output.stderr)
             );
             assert!(combined.contains("unknown configuration key 'targtes'"), "{combined}");
+        }
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn member_invocation_keeps_workspace_configuration_authoritative() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("config-member-invocation")?;
+        let member = ws.add_crate("test-crate", "0.1.0", &[])?;
+        fs::create_dir_all(member.join(".config"))?;
+        fs::write(member.join(".config/rail.toml"), "targtes = []\n")?;
+        ws.commit("Add member-local non-workspace configuration")?;
+
+        let output = run_cargo_rail(&member, &["rail", "plan", "--since", "HEAD", "--json"])?;
+        assert!(
+            output.status.success(),
+            "member-local configuration replaced workspace policy: {output:?}"
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+/// Run cargo-rail where every Git, Cargo, and rustc spawn fails.
+fn run_cargo_rail_without_tools(cwd: &std::path::Path, args: &[&str]) -> Result<std::process::Output> {
+    let tools = tempfile::tempdir()?;
+    let absent = tools.path().join("absent");
+    Ok(cargo_rail_command(cwd)?
+        .args(args)
+        .env("PATH", tools.path())
+        .env("CARGO", &absent)
+        .env("RUSTC", &absent)
+        .output()?)
+}
+
+#[test]
+fn discovered_policy_is_rejected_before_git_or_cargo() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("config-early-discovered")?;
+        let member = ws.add_crate("test-crate", "0.1.0", &[])?;
+        ws.commit("Add early-validation fixture")?;
+        let package = TestWorkspace::new_single_crate("demo", "0.1.0")?;
+        let plan = &["rail", "plan", "--since", "HEAD", "--json"][..];
+        let invocations = [
+            (&ws.path, &ws.path, plan),
+            (&ws.path, &ws.path, &["rail", "unify", "--check"][..]),
+            (&ws.path, &member, plan),
+            (&package.path, &package.path, plan),
+        ];
+        for (input, needle) in [
+            ("targtes = []\n", "unknown configuration key 'targtes'"),
+            ("[release]\ntag_format = \"\"\n", "tag_format cannot be empty"),
+        ] {
+            for (root, cwd, args) in invocations {
+                fs::write(root.join(".config/rail.toml"), input)?;
+                let output = run_cargo_rail_without_tools(cwd, args)?;
+                let combined = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(
+                    output.status.code(),
+                    Some(2),
+                    "{args:?} in {}: {combined}",
+                    cwd.display()
+                );
+                assert!(combined.contains(needle), "{args:?} in {}: {combined}", cwd.display());
+                for generated in [root.join("target"), cwd.join("target")] {
+                    assert!(!generated.exists(), "{args:?} created {}", generated.display());
+                }
+            }
+        }
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn excluded_package_policy_is_selected_by_cargo_not_the_enclosing_workspace() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("config-excluded-package")?;
+        let manifest = ws.path.join("Cargo.toml");
+        let workspace = fs::read_to_string(&manifest)?.replace(
+            "members = [\"crates/*\"]\n",
+            "members = [\"crates/*\"]\nexclude = [\"standalone\"]\n",
+        );
+        fs::write(&manifest, workspace)?;
+        let standalone = ws.path.join("standalone");
+        fs::create_dir_all(standalone.join("src"))?;
+        fs::create_dir_all(standalone.join(".config"))?;
+        fs::write(
+            standalone.join("Cargo.toml"),
+            "[package]\nname = \"standalone\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )?;
+        fs::write(standalone.join("src/lib.rs"), "")?;
+        fs::write(standalone.join(".config/rail.toml"), "")?;
+        fs::write(ws.path.join(".config/rail.toml"), "targtes = []\n")?;
+        ws.commit("Add excluded package with its own policy")?;
+
+        let output = run_cargo_rail(&standalone, &["rail", "plan", "--since", "HEAD", "--json"])?;
+        assert!(
+            output.status.success(),
+            "enclosing workspace policy replaced the excluded package policy: {output:?}"
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn inspection_from_a_member_uses_the_workspace_policy_like_consuming_commands() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("config-member-inspection")?;
+        let member = ws.add_crate("test-crate", "0.1.0", &[])?;
+        fs::write(
+            ws.path.join(".config/rail.toml"),
+            "[unify]\nmsrv_policy = { mode = 'disabled' }\n",
+        )?;
+        fs::create_dir_all(member.join(".config"))?;
+        fs::write(member.join(".config/rail.toml"), "targtes = []\n")?;
+        ws.commit("Add member-local non-workspace configuration")?;
+        let workspace_policy = fs::canonicalize(ws.path.join(".config/rail.toml"))?
+            .display()
+            .to_string();
+
+        for args in [
+            &["rail", "config", "validate", "--strict", "-f", "json"][..],
+            &["rail", "config", "print", "-f", "json"][..],
+            &["rail", "config", "explain", "-f", "json"][..],
+            &["rail", "plan", "--since", "HEAD", "--json"][..],
+        ] {
+            let output = run_cargo_rail(&member, args)?;
+            assert!(output.status.success(), "{args:?} used member-local policy: {output:?}");
+        }
+        let located = run_cargo_rail(&member, &["rail", "config", "locate", "-f", "json"])?;
+        let located: serde_json::Value = serde_json::from_slice(&located.stdout)?;
+        assert_eq!(located["path"], workspace_policy.as_str(), "{located}");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn independent_configuration_errors_are_reported_together_everywhere() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("config-independent-errors")?;
+        ws.add_crate("test-crate", "0.1.0", &[])?;
+        ws.commit("Add independent-errors fixture")?;
+        fs::write(
+            ws.path.join(".config/rail.toml"),
+            "[release]\ntag_format = \"\"\n\n[plan.work.Invalid]\nscope = \"repository\"\npaths = [\"docs/**\"]\n",
+        )?;
+        let needles = ["tag_format cannot be empty", "must match [a-z][a-z0-9.-]*"];
+
+        let validated = run_cargo_rail(&ws.path, &["rail", "config", "validate", "--strict", "-f", "json"])?;
+        assert_eq!(validated.status.code(), Some(2), "{validated:?}");
+        let validated: serde_json::Value = serde_json::from_slice(&validated.stdout)?;
+        let messages = validated["errors"]
+            .as_array()
+            .expect("validation errors")
+            .iter()
+            .filter_map(|issue| issue["message"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages.len(),
+            2,
+            "each independent error is its own issue: {validated}"
+        );
+        for needle in needles {
+            assert!(
+                messages.iter().any(|message| message.contains(needle)),
+                "{needle}: {validated}"
+            );
+        }
+
+        for args in [
+            &["rail", "config", "print"][..],
+            &["rail", "plan", "--since", "HEAD"][..],
+        ] {
+            let output = run_cargo_rail(&ws.path, args)?;
+            assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(combined.contains("2 configuration errors"), "{args:?}: {combined}");
+            for needle in needles {
+                assert!(combined.contains(needle), "{args:?} omitted {needle}: {combined}");
+            }
         }
         Ok(())
     })();

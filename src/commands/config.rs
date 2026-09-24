@@ -90,8 +90,6 @@ fn is_ci_environment() -> bool {
         || std::env::var("CIRCLECI").is_ok()
 }
 
-// Config Locate
-
 /// Result of config locate for JSON output
 #[derive(Serialize)]
 struct LocateResult {
@@ -113,7 +111,6 @@ pub fn run_config_locate(
 ) -> RailResult<()> {
     let json = format.is_json();
 
-    // If config path was explicitly provided, use it
     if let Some(explicit_path) = config_override {
         let path = if explicit_path.is_absolute() {
             explicit_path.to_path_buf()
@@ -143,15 +140,16 @@ pub fn run_config_locate(
         }
     }
 
-    // Search standard locations
+    // Policy belongs to the Cargo workspace root, even when invoked from a member directory.
+    let discovery_root = crate::workspace::discovery_root(workspace_root);
     let search_paths = [
-        workspace_root.join("rail.toml"),
-        workspace_root.join(".rail.toml"),
-        workspace_root.join(".cargo").join("rail.toml"),
-        workspace_root.join(".config").join("rail.toml"),
+        discovery_root.join("rail.toml"),
+        discovery_root.join(".rail.toml"),
+        discovery_root.join(".cargo").join("rail.toml"),
+        discovery_root.join(".config").join("rail.toml"),
     ];
 
-    let config_path = RailConfig::find_config_path(workspace_root);
+    let config_path = RailConfig::find_config_path(&discovery_root);
 
     if json {
         let result = LocateResult {
@@ -183,8 +181,6 @@ pub fn run_config_locate(
     Ok(())
 }
 
-// Config Print
-
 /// Print the effective configuration with defaults merged
 ///
 /// Shows what cargo-rail will actually use: user settings plus defaults
@@ -196,12 +192,10 @@ pub fn run_config_print(
 ) -> RailResult<()> {
     let json = format.is_json();
 
-    // Load config from explicit path or search
     let (source, decoded, _) = inspect_config(workspace_root, config_override)?;
     let config = decoded.config;
 
     if json {
-        // JSON output: serialize the config struct
         #[derive(Serialize)]
         struct PrintResult {
             command: &'static str,
@@ -218,7 +212,6 @@ pub fn run_config_print(
         };
         print_config_json("print", "success", 0, &result)?;
     } else {
-        // TOML output: serialize to TOML with a header comment
         println!("# Effective configuration ({})", source.label());
         println!("# This shows all settings including defaults for unset fields.");
         println!();
@@ -486,12 +479,16 @@ fn read_config_source(workspace_root: &Path, config_override: Option<&Path>) -> 
                 workspace_root.join(path)
             }
         })
-        .or_else(|| RailConfig::find_config_path(workspace_root));
+        .or_else(|| RailConfig::find_config_path(&crate::workspace::discovery_root(workspace_root)));
+    read_config_path(path, config_override.is_some())
+}
+
+fn read_config_path(path: Option<PathBuf>, explicit: bool) -> RailResult<ConfigSource> {
     let bytes = path
         .as_ref()
         .map(|path| {
             std::fs::read(path).map_err(|error| {
-                if config_override.is_some() && error.kind() == std::io::ErrorKind::NotFound {
+                if explicit && error.kind() == std::io::ErrorKind::NotFound {
                     RailError::message(format!("specified config file not found: {}", path.display()))
                 } else {
                     RailError::message(format!("failed to read {}: {error}", path.display()))
@@ -503,21 +500,86 @@ fn read_config_source(workspace_root: &Path, config_override: Option<&Path>) -> 
     Ok(ConfigSource { path, bytes })
 }
 
+enum Inspection {
+    Complete(Box<DecodedConfig>, Vec<String>),
+    /// Cargo selected a workspace whose discovered policy is a different file.
+    Relocated(PathBuf),
+}
+
+/// Every independent violation found in one configuration source, with that source's label.
+struct InspectionFailure {
+    label: Option<String>,
+    /// The inspected source file, when one was selected.
+    path: Option<PathBuf>,
+    errors: Vec<RailError>,
+}
+
+impl InspectionFailure {
+    fn single(error: RailError) -> Self {
+        Self {
+            label: None,
+            path: None,
+            errors: vec![error],
+        }
+    }
+
+    /// The same combined error a consuming command reports for this source.
+    fn into_error(self) -> RailError {
+        let error = match config::combine_errors(self.errors) {
+            Err(error) => error,
+            Ok(()) => RailError::message("configuration inspection failed without a cause"),
+        };
+        match self.label {
+            Some(label) => error.context(format!("configuration {label}")),
+            None => error,
+        }
+    }
+}
+
 fn inspect_config(
     workspace_root: &Path,
     config_override: Option<&Path>,
 ) -> RailResult<(ConfigSource, DecodedConfig, Vec<String>)> {
-    let source = read_config_source(workspace_root, config_override)?;
+    inspect_config_issues(workspace_root, config_override).map_err(InspectionFailure::into_error)
+}
+
+fn inspect_config_issues(
+    workspace_root: &Path,
+    config_override: Option<&Path>,
+) -> Result<(ConfigSource, DecodedConfig, Vec<String>), InspectionFailure> {
+    let source = read_config_source(workspace_root, config_override).map_err(InspectionFailure::single)?;
+    inspect_config_source(workspace_root, config_override, source)
+}
+
+fn inspect_config_source(
+    workspace_root: &Path,
+    config_override: Option<&Path>,
+    source: ConfigSource,
+) -> Result<(ConfigSource, DecodedConfig, Vec<String>), InspectionFailure> {
     let standalone = config_override == Some(Path::new("-"));
-    let inspect = || -> RailResult<(DecodedConfig, Vec<String>)> {
-        let decoded = config::decode(&source.bytes)?;
+    let inspect = || -> Result<Inspection, Vec<RailError>> {
+        let decoded = config::decode(&source.bytes).map_err(|error| vec![error])?;
         // Intrinsic errors remain diagnostic even if the surrounding Cargo workspace is broken.
-        decoded.config.validate_policy()?;
+        let policy_errors = decoded.config.policy_errors();
+        if !policy_errors.is_empty() {
+            return Err(policy_errors);
+        }
         let metadata = if standalone {
             None
         } else {
-            standalone_workspace_metadata(workspace_root)?
+            standalone_workspace_metadata(workspace_root).map_err(|error| vec![error])?
         };
+        // Cargo's reported root is authoritative when manifests alone could not prove it.
+        if let Some(metadata) = &metadata
+            && config_override.is_none()
+        {
+            let authoritative = RailConfig::find_config_path(metadata.workspace_root.as_std_path());
+            if authoritative != source.path {
+                return Ok(Inspection::Relocated(
+                    metadata.workspace_root.clone().into_std_path_buf(),
+                ));
+            }
+        }
         let warnings = if let Some(metadata) = metadata {
             let members = metadata
                 .packages
@@ -527,18 +589,30 @@ fn inspect_config(
                 .collect::<Vec<_>>();
             decoded
                 .config
-                .validate(metadata.workspace_root.as_std_path(), Some(&members))?
+                .validate_workspace(metadata.workspace_root.as_std_path(), Some(&members))
+                .map_err(|error| vec![error])?
         } else {
-            decoded.config.validate_without_workspace()?;
+            decoded
+                .config
+                .validate_without_workspace()
+                .map_err(|error| vec![error])?;
             Vec::new()
         };
-        Ok((decoded, warnings))
+        Ok(Inspection::Complete(Box::new(decoded), warnings))
     };
-    let (decoded, warnings) = inspect().map_err(|error| error.context(format!("configuration {}", source.label())))?;
-    Ok((source, decoded, warnings))
+    match inspect().map_err(|errors| InspectionFailure {
+        label: Some(source.label()),
+        path: source.path.clone(),
+        errors,
+    })? {
+        Inspection::Complete(decoded, warnings) => Ok((source, *decoded, warnings)),
+        Inspection::Relocated(cargo_root) => {
+            let relocated = read_config_path(RailConfig::find_config_path(&cargo_root), false)
+                .map_err(InspectionFailure::single)?;
+            inspect_config_source(&cargo_root, config_override, relocated)
+        }
+    }
 }
-
-// Config Validate
 
 /// Validate configuration file standalone (without WorkspaceContext)
 ///
@@ -555,7 +629,7 @@ pub fn run_config_validate_standalone(
 
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
-    let config_path = match inspect_config(workspace_root, config_override) {
+    let config_path = match inspect_config_issues(workspace_root, config_override) {
         Ok((source, _, config_warnings)) => {
             warnings.extend(
                 config_warnings
@@ -564,19 +638,25 @@ pub fn run_config_validate_standalone(
             );
             source.path.map(|path| path.display().to_string())
         }
-        Err(error) => {
-            let mut issue = validation_issue_from_error(&error);
-            if let Some((line, column)) = extract_toml_error_location(&error.to_string()) {
-                issue = issue.with_location(line, column);
+        Err(failure) => {
+            // Each independent violation is its own issue, so one run reports them all.
+            for error in &failure.errors {
+                let mut issue = validation_issue_from_error(error);
+                if let Some((line, column)) = extract_toml_error_location(&error.to_string()) {
+                    issue = issue.with_location(line, column);
+                }
+                errors.push(issue);
             }
-            errors.push(issue);
-            config_override
-                .map(|path| path.display().to_string())
-                .or_else(|| RailConfig::find_config_path(workspace_root).map(|path| path.display().to_string()))
+            match failure.label {
+                Some(_) => failure.path.map(|path| path.display().to_string()),
+                None => config_override.map(|path| path.display().to_string()).or_else(|| {
+                    RailConfig::find_config_path(&crate::workspace::discovery_root(workspace_root))
+                        .map(|path| path.display().to_string())
+                }),
+            }
         }
     };
 
-    // In strict mode, warnings become errors
     let (final_errors, final_warnings) = if strict {
         let mut all_errors = errors;
         all_errors.extend(warnings);
@@ -587,7 +667,6 @@ pub fn run_config_validate_standalone(
 
     let valid = final_errors.is_empty();
 
-    // Output
     if json {
         let result = ValidationResult {
             command: "config",

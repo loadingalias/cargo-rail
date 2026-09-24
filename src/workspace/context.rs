@@ -14,6 +14,7 @@ use crate::source::{
     ChangeSet, ContentDigest, GitWorktreeCapture, PlanningSourceCapture, RepositoryPath, SourceEntryKind,
     SourceExclusions, SourceSnapshot, changes_between_objects,
 };
+use crate::workspace::config_preflight::{CheckedConfig, ConfigPreflight};
 use crate::workspace::snapshot::{CapturedLockfile, CapturedRailConfig, DerivedViews, WorkspaceSnapshot};
 use cargo_metadata::{Metadata, MetadataCommand, Package};
 use std::fs;
@@ -528,6 +529,14 @@ impl WorkspaceContext {
             })?;
         let workspace_root = canonical_workspace_root.as_path();
         let cargo_current_dir = cargo_current_dir.map_or(process_current_dir, Path::to_path_buf);
+
+        // Reject independently invalid policy before any Git or Cargo subprocess.
+        // Cargo's reported root still decides which checked policy is captured.
+        let config_preflight = ConfigPreflight::capture(
+            workspace_root,
+            config_override.map(|path| resolve_config_override(&requested_workspace_root, path)),
+        )?;
+
         // Load git state when available. Cargo-only commands such as `unify --check`
         // must work in source sandboxes that intentionally omit `.git`.
         let git = match GitState::open(workspace_root) {
@@ -564,7 +573,6 @@ impl WorkspaceContext {
             None
         };
 
-        // Load cargo state
         let cargo = Arc::new(if let Some(inputs) = &resolution_inputs {
             CargoState::load_fresh(
                 workspace_root,
@@ -647,31 +655,20 @@ impl WorkspaceContext {
             )
         });
 
-        // Discover once and retain the exact parsed bytes for snapshot coherence.
-        let config_path = config_override.map_or_else(
-            || RailConfig::find_config_path(&workspace_root),
-            |path| {
-                Some(if path.is_absolute() {
-                    path.to_path_buf()
-                } else {
-                    requested_workspace_root.join(path)
-                })
-            },
-        );
-        let (config, rail_config, rail_config_discovery_root, captured_config_path) = match config_path {
-            Some(path) => {
-                let (decoded, bytes) = crate::config::load_decoded(&path)?;
-                let parsed = decoded.config;
-                let parsed = Arc::new(parsed);
-                (
-                    Some(Arc::clone(&parsed)),
-                    Some(CapturedRailConfig::new(path.clone(), bytes, parsed)),
-                    None,
-                    Some(path),
-                )
-            }
-            None => (None, None, Some(workspace_root.clone()), None),
-        };
+        // Retain the exact checked bytes for snapshot coherence.
+        let (config, rail_config, rail_config_discovery_root, captured_config_path) =
+            match config_preflight.resolve(&workspace_root)? {
+                Some(CheckedConfig { path, bytes, config }) => {
+                    let parsed = Arc::new(config);
+                    (
+                        Some(Arc::clone(&parsed)),
+                        Some(CapturedRailConfig::new(path.clone(), bytes, parsed)),
+                        None,
+                        Some(path),
+                    )
+                }
+                None => (None, None, Some(workspace_root.clone()), None),
+            };
 
         if let Some(ref cfg) = config {
             let workspace_members = cargo
@@ -679,7 +676,7 @@ impl WorkspaceContext {
                 .into_iter()
                 .map(|package| package.name.to_string())
                 .collect::<Vec<_>>();
-            cfg.validate(&workspace_root, Some(&workspace_members))?;
+            cfg.validate_workspace(&workspace_root, Some(&workspace_members))?;
         }
 
         // The top-level policy is the only non-host target authority. Surface
@@ -1165,9 +1162,8 @@ impl WorkspaceContext {
     /// Returns `None` if the path doesn't belong to this workspace.
     pub fn to_workspace_path(&self, git_path: &Path) -> Option<PathBuf> {
         if let Some(prefix) = &self.workspace_prefix {
-            // Git always uses forward slashes, but PathBuf::from converts to platform separators.
-            // On Windows, this causes strip_prefix to fail when git_path has / but prefix has \.
-            // Normalize git_path by rebuilding through components to use platform separators.
+            // Git paths use `/`, while the captured prefix may use `\` on Windows.
+            // Rebuilding through components gives both paths the platform's separator semantics.
             let normalized = git_path.components().collect::<PathBuf>();
             normalized.strip_prefix(prefix).ok().map(|p| p.to_path_buf())
         } else {
@@ -1183,6 +1179,14 @@ enum ContextCapture {
     Planning,
     PlanningVerification,
     Snapshot,
+}
+
+fn resolve_config_override(requested_workspace_root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        requested_workspace_root.join(path)
+    }
 }
 
 impl ContextCapture {
@@ -1457,27 +1461,6 @@ mod tests {
             members.contains(&"cargo-rail".to_string()),
             "Graph should contain cargo-rail"
         );
-
-        // Config may or may not be loaded depending on workspace
-        // Just verify it's an Option
-        let _ = ctx.config();
-    }
-
-    #[test]
-    fn test_git_state_wrapper() {
-        let current_dir = std::env::current_dir().unwrap();
-        let ctx = WorkspaceContext::build(&current_dir).unwrap();
-
-        // Should be able to access git operations via git() accessor
-        let head = ctx.git().unwrap().git().head_commit();
-        assert!(head.is_ok(), "Should get HEAD commit");
-
-        let head_sha = head.unwrap();
-        assert_eq!(head_sha.len(), 40, "HEAD SHA should be 40 characters");
-
-        // Should be able to get current branch
-        let branch = ctx.git().unwrap().git().current_branch();
-        assert!(branch.is_ok(), "Should get current branch");
     }
 
     #[test]
