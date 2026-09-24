@@ -1218,13 +1218,18 @@ fn validate_saved_cargo_selection(ctx: &WorkspaceContext, work: &str, selection:
         .iter()
         .map(|package| package.key.as_str())
         .collect::<BTreeSet<_>>();
+    if !targets.is_empty()
+        && targets
+            .iter()
+            .map(|target| target.package.as_str())
+            .collect::<BTreeSet<_>>()
+            != selected
+    {
+        return Err(RailError::message(format!(
+            "saved work '{work}' target selectors do not cover every selected package"
+        )));
+    }
     for target in targets {
-        if !selected.contains(target.package.as_str()) {
-            return Err(RailError::message(format!(
-                "saved work '{work}' target '{}' belongs to an unselected package",
-                target.name
-            )));
-        }
         let package = current[&target.package];
         let Some(candidate) = package.targets.iter().find(|candidate| candidate.name == target.name) else {
             return Err(RailError::message(format!(
@@ -2612,7 +2617,7 @@ fn merge_cargo_selections(selections: Vec<CargoSelection>) -> RailResult<CargoSe
         });
     }
     let mut packages = BTreeMap::<String, PortablePackageSelector>::new();
-    let mut targets = BTreeSet::new();
+    let mut targets = Some(BTreeSet::new());
     for selection in selections {
         let (selected, selected_targets) = match selection {
             CargoSelection::Packages { packages, targets, .. } => (packages, targets),
@@ -2633,17 +2638,18 @@ fn merge_cargo_selections(selections: Vec<CargoSelection>) -> RailResult<CargoSe
                 )));
             }
         }
-        targets.extend(selected_targets);
+        if selected_targets.is_empty() {
+            targets = None;
+        } else if let Some(targets) = &mut targets {
+            targets.extend(selected_targets);
+        }
     }
     let packages = packages.into_values().collect::<Vec<_>>();
-    let cargo_args = packages
-        .iter()
-        .flat_map(|package| ["-p".to_string(), package.cargo_spec.clone()])
-        .collect();
+    let cargo_args = cargo_package_args(&packages);
     Ok(CargoSelection::Packages {
         packages,
         cargo_args,
-        targets: targets.into_iter().collect(),
+        targets: targets.unwrap_or_default().into_iter().collect(),
     })
 }
 
@@ -2658,18 +2664,23 @@ fn selection_for_roots(ctx: &WorkspaceContext, roots: &[ResolvedCargoRoot]) -> R
         .copied()
         .collect::<Vec<_>>();
     let mut selection = selection_for_packages(ctx, &mut packages, &[])?;
-    let targets = roots
-        .iter()
-        .filter_map(|root| {
-            root.target.as_ref().map(|target| CargoTargetSelector {
-                package: root.package_key.clone(),
-                name: target.name.clone(),
-                kind: target.kinds.clone(),
+    let targets = if roots.iter().all(|root| root.target.is_some()) {
+        roots
+            .iter()
+            .map(|root| {
+                let target = root.target.as_ref().expect("checked target");
+                CargoTargetSelector {
+                    package: root.package_key.clone(),
+                    name: target.name.clone(),
+                    kind: target.kinds.clone(),
+                }
             })
-        })
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    } else {
+        Vec::new()
+    };
     match &mut selection {
         CargoSelection::Packages {
             targets: selected_targets,
@@ -2913,6 +2924,20 @@ fn selection_for_packages(
     packages: &mut Vec<&Package>,
     paths: &[&str],
 ) -> RailResult<CargoSelection> {
+    let selectors = portable_package_selectors(ctx, packages)?;
+    let cargo_args = cargo_package_args(&selectors);
+    let targets = target_selectors(ctx, packages, paths);
+    Ok(CargoSelection::Packages {
+        packages: selectors,
+        cargo_args,
+        targets,
+    })
+}
+
+fn portable_package_selectors(
+    ctx: &WorkspaceContext,
+    packages: &mut Vec<&Package>,
+) -> RailResult<Vec<PortablePackageSelector>> {
     packages.sort_unstable_by_key(|package| portable_package_key(ctx, package));
     packages.dedup_by(|left, right| left.id == right.id);
     let duplicate_names = ctx.cargo().metadata().workspace_packages().iter().fold(
@@ -2923,20 +2948,17 @@ fn selection_for_packages(
         },
     );
 
-    let selectors = packages
+    packages
         .iter()
         .map(|package| portable_package_selector(ctx, package, &duplicate_names))
-        .collect::<RailResult<Vec<_>>>()?;
-    let cargo_args = selectors
+        .collect()
+}
+
+fn cargo_package_args(packages: &[PortablePackageSelector]) -> Vec<String> {
+    packages
         .iter()
         .flat_map(|package| ["-p".to_string(), package.cargo_spec.clone()])
-        .collect();
-    let targets = target_selectors(ctx, packages, paths);
-    Ok(CargoSelection::Packages {
-        packages: selectors,
-        cargo_args,
-        targets,
-    })
+        .collect()
 }
 
 fn portable_package_selector(
@@ -2991,10 +3013,19 @@ fn portable_package_key(ctx: &WorkspaceContext, package: &Package) -> String {
 }
 
 fn target_selectors(ctx: &WorkspaceContext, packages: &[&Package], paths: &[&str]) -> Vec<CargoTargetSelector> {
-    let path_set = paths.iter().copied().collect::<BTreeSet<_>>();
+    let mut paths_by_package = BTreeMap::<PackageId, BTreeSet<&str>>::new();
+    for path in paths {
+        if let Some(package) = ctx.graph().file_to_package(Path::new(path)) {
+            paths_by_package.entry(package.id.clone()).or_default().insert(path);
+        }
+    }
     let mut targets = Vec::new();
     for package in packages {
+        let Some(owned_paths) = paths_by_package.get(&package.id) else {
+            return Vec::new();
+        };
         let package_key = portable_package_key(ctx, package);
+        let mut matched_paths = BTreeSet::new();
         for target in &package.targets {
             let Some(path) = target
                 .src_path
@@ -3005,9 +3036,10 @@ fn target_selectors(ctx: &WorkspaceContext, packages: &[&Package], paths: &[&str
             else {
                 continue;
             };
-            if !path_set.contains(path.as_str()) {
+            if !owned_paths.contains(path.as_str()) {
                 continue;
             }
+            matched_paths.insert(path.clone());
             let mut kind = target.kind.iter().map(ToString::to_string).collect::<Vec<_>>();
             kind.sort_unstable();
             targets.push(CargoTargetSelector {
@@ -3015,6 +3047,9 @@ fn target_selectors(ctx: &WorkspaceContext, packages: &[&Package], paths: &[&str
                 name: target.name.clone(),
                 kind,
             });
+        }
+        if matched_paths.len() != owned_paths.len() {
+            return Vec::new();
         }
     }
     targets.sort();
@@ -3087,23 +3122,8 @@ fn observed_cargo_selection(ctx: &WorkspaceContext, inputs: &[ObservedInput]) ->
     if packages.len() != package_keys.len() {
         return None;
     }
-    packages.sort_unstable_by_key(|package| portable_package_key(ctx, package));
-    let duplicate_names = ctx.cargo().metadata().workspace_packages().iter().fold(
-        BTreeMap::<&str, usize>::new(),
-        |mut counts, package| {
-            *counts.entry(package.name.as_str()).or_default() += 1;
-            counts
-        },
-    );
-    let selectors = packages
-        .iter()
-        .map(|package| portable_package_selector(ctx, package, &duplicate_names))
-        .collect::<RailResult<Vec<_>>>()
-        .ok()?;
-    let cargo_args = selectors
-        .iter()
-        .flat_map(|package| ["-p".to_string(), package.cargo_spec.clone()])
-        .collect();
+    let selectors = portable_package_selectors(ctx, &mut packages).ok()?;
+    let cargo_args = cargo_package_args(&selectors);
     let mut targets = inputs
         .iter()
         .filter_map(|input| input.package.as_ref().zip(input.target.as_ref()))

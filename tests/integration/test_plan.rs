@@ -669,6 +669,7 @@ fn test_plan_all_is_monotonic_and_variant_fallback_is_explicit() {
         ws.commit("establish work catalog")?;
         let normal = plan(&ws, &["--since", "HEAD"])?;
         let all = plan(&ws, &["--since", "HEAD", "--all"])?;
+        let all_without_base = plan(&ws, &["--all"])?;
         let required = |value: &Value| {
             value["required"]
                 .as_array()
@@ -684,6 +685,11 @@ fn test_plan_all_is_monotonic_and_variant_fallback_is_explicit() {
                 .all(|decision| decision["state"] == "required" && decision["cause"] == "forced_all")
         }));
         assert_eq!(all["work"]["compatibility"]["scope"]["selection"]["kind"], "all");
+        assert_eq!(
+            all_without_base["inputs"]["base"],
+            all_without_base["inputs"]["head_commit"]
+        );
+        assert_eq!(all_without_base["work"], all["work"]);
         Ok(())
     })();
     super::helpers::finish_test(result);
@@ -1144,10 +1150,16 @@ fn test_plan_cargo_selectors_exclude_non_workspace_dependency_packages() {
 }
 
 #[test]
-fn test_plan_integration_target_and_manifest_noop_are_exact() {
+fn test_plan_target_selectors_require_complete_exact_coverage() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("plan-target-and-manifest")?;
         let package = ws.add_crate("target-case", "0.1.0", &[])?;
+        std::fs::write(
+            package.join("src/lib.rs"),
+            "mod helper;\npub fn value() -> u8 { helper::value() }\n",
+        )?;
+        let helper = package.join("src/helper.rs");
+        std::fs::write(&helper, "pub fn value() -> u8 { 1 }\n")?;
         generate_lockfile(&ws)?;
         ws.commit("establish package")?;
         std::fs::create_dir_all(package.join("tests"))?;
@@ -1161,7 +1173,16 @@ fn test_plan_integration_target_and_manifest_noop_are_exact() {
                 .is_some_and(|targets| targets.iter().any(|target| target["name"] == "contract"))
         );
 
+        std::fs::write(&helper, "pub fn value() -> u8 { 2 }\n")?;
+        let mixed = plan(&ws, &["--since", "HEAD"])?;
+        assert_eq!(
+            mixed["work"]["cargo.test"]["scope"]["selection"]["targets"],
+            serde_json::json!([]),
+            "a partial exact-target match must not narrow package work"
+        );
+
         git(&ws.path, &["clean", "-fd"])?;
+        std::fs::write(&helper, "pub fn value() -> u8 { 1 }\n")?;
         let manifest = std::fs::read_to_string(package.join("Cargo.toml"))?;
         std::fs::write(package.join("Cargo.toml"), format!("# formatting only\n{manifest}"))?;
         let formatting = plan(&ws, &["--since", "HEAD"])?;

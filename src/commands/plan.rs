@@ -59,10 +59,11 @@ impl PlanComparison {
             .map_or(Self::DefaultMergeBase, |since| Self::Since(since.clone())))
     }
 
-    fn resolve(self, ctx: &WorkspaceContext) -> RailResult<ResolvedComparison> {
+    fn resolve(self, ctx: &WorkspaceContext, all: bool) -> RailResult<ResolvedComparison> {
         match self {
             Self::Objects { from, to } => Ok(ResolvedComparison::Objects { from, to }),
             Self::Since(base) => Ok(ResolvedComparison::Worktree { base }),
+            Self::DefaultMergeBase if all => Ok(ResolvedComparison::Worktree { base: "HEAD".into() }),
             Self::DefaultMergeBase => {
                 let git = ctx.git()?.git();
                 let default_branch = crate::git::detect_default_base_ref(git)?;
@@ -259,7 +260,7 @@ pub fn run_plan(ctx: &WorkspaceContext, opts: PlanOptions) -> RailResult<()> {
 }
 
 fn build_work_plan(ctx: &WorkspaceContext, opts: &PlanOptions) -> RailResult<crate::planning::WorkPlan> {
-    let comparison = opts.comparison.clone().resolve(ctx)?;
+    let comparison = opts.comparison.clone().resolve(ctx, opts.all)?;
     let planning_index = collect_planning_index(ctx, &comparison)?;
     let semantic_changes = crate::change_detection::semantic::analyze(
         ctx,
