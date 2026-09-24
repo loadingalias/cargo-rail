@@ -569,6 +569,53 @@ fn pre_context_diagnostics_have_one_fixed_phase_schema() {
 }
 
 #[test]
+fn explicit_invalid_configuration_fails_before_workspace_discovery() {
+    let result: Result<()> = (|| {
+        let workspace = TestWorkspace::new_single_crate("diagnostic-config-preflight", "0.1.0")?;
+        std::fs::write(workspace.path.join(".config/rail.toml"), "targtes = []\n")?;
+        std::fs::write(workspace.path.join("Cargo.toml"), "[broken manifest")?;
+
+        let output = TempDir::new()?;
+        let diagnostics = output.path().join("invalid-config.json");
+        let measured = run_cargo_rail(
+            &workspace.path,
+            &[
+                "rail",
+                "--diagnostics-file",
+                diagnostics.to_str().context("non-UTF-8 diagnostics path")?,
+                "--config",
+                ".config/rail.toml",
+                "plan",
+                "--since",
+                "HEAD",
+            ],
+        )?;
+
+        assert_eq!(measured.status.code(), Some(2), "invalid configuration was accepted");
+        let stderr = String::from_utf8_lossy(&measured.stderr);
+        assert!(stderr.contains("unknown configuration key 'targtes'"), "{stderr}");
+        assert!(
+            !stderr.contains("manifest"),
+            "Cargo failure hid the configuration error: {stderr}"
+        );
+
+        let counters = read_counters(&diagnostics)?;
+        assert!(
+            counters["phases"]["workspace_capture_cargo_metadata"]["elapsed_ns"]
+                .as_u64()
+                .is_some_and(|elapsed| elapsed < 1_000_000_000),
+            "configuration preflight exceeded one second: {counters}"
+        );
+        assert_eq!(counters["cargo_metadata_loads"], 0);
+        assert_eq!(counters["git_subprocesses"], 0);
+        assert_eq!(counters["compiler_acquisition"]["plans"], 0);
+        assert_eq!(counters["compiler_acquisition"]["sandboxes_created"], 0);
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
 fn clean_captures_no_cargo_metadata_or_dependency_graph() {
     let result: Result<()> = (|| {
         let workspace = TestWorkspace::new_named("diagnostic-clean-context")?;

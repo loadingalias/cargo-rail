@@ -1029,22 +1029,42 @@ fn fact_driver_preserves_compiler_signal_status_after_publication() {
 #[test]
 fn overlapping_observation_markers_dispatch_by_cargo_wrapper_shape() {
     let result: Result<()> = (|| {
+        let rustdoc_program = which_rustdoc()?;
+        let expected_rustdoc = Command::new(&rustdoc_program).arg("--version").output()?;
+        anyhow::ensure!(
+            expected_rustdoc.status.success(),
+            "selected rustdoc failed: {expected_rustdoc:?}"
+        );
         let rustdoc = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
             .arg("--version")
             .env("CARGO_RAIL_RUSTC_WRAPPER", "1")
             .env("CARGO_RAIL_RUSTDOC_WRAPPER", "1")
-            .env("CARGO_RAIL_INNER_RUSTDOC", which_rustdoc()?)
+            .env("CARGO_RAIL_INNER_RUSTDOC", rustdoc_program)
             .env_remove(CACHE_WRAPPER_MARKER)
             .env_remove(CACHE_CONTROL_ENV)
             .env_remove("CARGO_RAIL_COMPILER_FACT_SESSION")
             .output()?;
-        assert!(
-            rustdoc.status.success(),
-            "Cargo's rustdoc role was not selected: {rustdoc:?}"
+        assert_eq!(
+            rustdoc.status, expected_rustdoc.status,
+            "wrong rustdoc role: {rustdoc:?}"
+        );
+        assert_eq!(
+            rustdoc.stdout, expected_rustdoc.stdout,
+            "wrong rustdoc role: {rustdoc:?}"
+        );
+        assert_eq!(
+            rustdoc.stderr, expected_rustdoc.stderr,
+            "wrong rustdoc role: {rustdoc:?}"
         );
 
+        let rustc_program = which_rustc()?;
+        let expected_rustc = Command::new(&rustc_program).arg("--version").output()?;
+        anyhow::ensure!(
+            expected_rustc.status.success(),
+            "selected rustc failed: {expected_rustc:?}"
+        );
         let rustc = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
-            .arg(which_rustc()?)
+            .arg(rustc_program)
             .arg("--version")
             .env("CARGO_RAIL_RUSTC_WRAPPER", "1")
             .env("CARGO_RAIL_RUSTDOC_WRAPPER", "1")
@@ -1053,10 +1073,9 @@ fn overlapping_observation_markers_dispatch_by_cargo_wrapper_shape() {
             .env_remove(CACHE_CONTROL_ENV)
             .env_remove("CARGO_RAIL_COMPILER_FACT_SESSION")
             .output()?;
-        assert!(
-            rustc.status.success(),
-            "Cargo's rustc workspace-wrapper role was not selected: {rustc:?}"
-        );
+        assert_eq!(rustc.status, expected_rustc.status, "wrong rustc role: {rustc:?}");
+        assert_eq!(rustc.stdout, expected_rustc.stdout, "wrong rustc role: {rustc:?}");
+        assert_eq!(rustc.stderr, expected_rustc.stderr, "wrong rustc role: {rustc:?}");
         Ok(())
     })();
     super::helpers::finish_test(result);
@@ -1091,6 +1110,51 @@ fn absent_fact_capability_executes_the_original_compiler_without_collection() {
             .output()?;
 
         assert!(output.status.success(), "fact-free compiler bypass failed: {output:?}");
+        assert!(fs::read_dir(state.path().join("out"))?.next().is_some());
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(unix)]
+#[test]
+fn absent_fact_capability_preserves_the_inner_workspace_wrapper() {
+    let result: Result<()> = (|| {
+        let state = tempfile::tempdir()?;
+        fs::create_dir_all(state.path().join("src"))?;
+        fs::create_dir_all(state.path().join("out"))?;
+        fs::write(state.path().join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n")?;
+        let inner_wrapper = state.path().join("inner-workspace-wrapper");
+        let wrapper_log = state.path().join("inner-workspace-wrapper.log");
+        write_executable(
+            &inner_wrapper,
+            "#!/bin/sh\nprintf 'called\\n' >> \"$INNER_WRAPPER_LOG\"\nexec \"$@\"\n",
+        )?;
+
+        let output = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+            .current_dir(state.path())
+            .args([
+                "rustc",
+                "--crate-name",
+                "fixture",
+                "--crate-type=lib",
+                "--emit=metadata",
+                "--out-dir",
+                "out",
+                "src/lib.rs",
+            ])
+            .env("CARGO_RAIL_RUSTC_WRAPPER", "1")
+            .env("CARGO_RAIL_INNER_WORKSPACE_WRAPPER", &inner_wrapper)
+            .env("INNER_WRAPPER_LOG", &wrapper_log)
+            .env_remove("CARGO_RAIL_COMPILER_FACT_SESSION")
+            .env_remove("CARGO_RAIL_COMPILER_OBSERVATION_DIRECTORY")
+            .env_remove("CARGO_RAIL_COMPILER_OBSERVATION_SOURCE_ROOT")
+            .env_remove(CACHE_WRAPPER_MARKER)
+            .env_remove("CARGO_RAIL_RUSTDOC_WRAPPER")
+            .output()?;
+
+        assert!(output.status.success(), "fact-free wrapper chain failed: {output:?}");
+        assert_eq!(fs::read_to_string(wrapper_log)?, "called\n");
         assert!(fs::read_dir(state.path().join("out"))?.next().is_some());
         Ok(())
     })();
