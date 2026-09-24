@@ -624,7 +624,7 @@ pub struct CacheSetupArgs {
         conflicts_with = "distributed_local"
     )]
     pub distributed_policy: Option<String>,
-    /// Preview exact Cargo configuration and private-state changes.
+    /// Preview exact Cargo configuration and private-state changes; exits 1 when changes are pending.
     #[arg(long, short = 'c')]
     pub check: bool,
     /// Report format.
@@ -1364,7 +1364,19 @@ pub fn generate_completions(shell: Shell) {
 mod tests {
     use super::{RailCli, parse_cache_size};
     use crate::output::OutputProtocol;
-    use clap::Parser as _;
+    use clap::{CommandFactory as _, Parser as _};
+
+    #[test]
+    fn cache_setup_help_states_the_pending_preview_exit_code() {
+        let mut command = RailCli::command();
+        let cache = command.find_subcommand_mut("cache").expect("cache command");
+        let setup = cache.find_subcommand_mut("setup").expect("cache setup command");
+        let help = setup.render_long_help().to_string();
+        assert!(
+            help.contains("exits 1 when changes are pending"),
+            "cache setup help omitted its preview exit contract:\n{help}"
+        );
+    }
 
     #[test]
     fn surface_formats_select_distinct_output_protocols() {
