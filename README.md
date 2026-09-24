@@ -10,14 +10,14 @@ Cargo, nextest, Just, and CI remain the executors.
 
 ## Workspace operations
 
-| Operation | Result |
-| --- | --- |
-| Compiler reuse | Restore verified results across ordinary Cargo, nextest, Just, IDE, and CI work |
-| Affected-work planning | Select exact jobs, packages, targets, and variants from one captured workspace |
-| Dependency coherence | Review one dependency, feature, and MSRV repair before explicit apply |
+| Operation                    | Result |
+| ---------------------------- | ------ |
+| Compiler reuse               | Restore verified results across ordinary Cargo, nextest, Just, IDE, and CI work |
+| Affected-work planning       | Select exact jobs, packages, targets, and variants from one captured workspace |
+| Dependency coherence         | Review one dependency, feature, and MSRV repair before explicit apply |
 | Rust changesets and releases | Record per-crate intent in `.changes/` and resume the exact release transaction |
-| Surface analysis | Derive product reachability and proven visibility reductions from compiler facts |
-| Split and sync | Extract Cargo-aware Git history and synchronize later changes in both directions |
+| Surface analysis             | Derive product reachability and proven visibility reductions from compiler facts |
+| Split and sync               | Extract Cargo-aware Git history and synchronize later changes in both directions |
 
 ## Installation
 
@@ -78,7 +78,8 @@ cargo rail cache status
 `cache setup --check` previews enrollment and exits `1` when work is pending.
 `cache setup` installs the global Cargo wrapper and enrolls this workspace.
 `cache ready` proves one cold miss and one verified warm restore.
-After setup, ordinary Cargo, nextest, Just, IDE, and CI commands on that machine use the same verified cache path.
+After setup, ordinary Cargo, nextest, Just, IDE,
+and CI commands on that machine use the same verified cache path.
 
 ### Keep dependencies coherent
 
@@ -106,7 +107,7 @@ cargo rail release check --all --publication
 `release check` validates the release plan without publishing.
 Publication still requires explicit `--publish` authority.
 
-### Audit product reachability
+### Check product reachability
 
 ```bash
 cargo rail surface --prepare
@@ -128,8 +129,10 @@ all declared workflow work
 
 These reductions stack because they remove different work.
 Unify can also resolve duplicate dependency declarations before the next build.
-Reviewed change intent bounds version, changelog, and publication work to the selected crates and required dependents.
-Use the plan summary and cache report to measure the actual result; Cargo-Rail does not invent a time-saved estimate.
+Reviewed change intent bounds version, changelog,
+and publication work to the selected crates and required dependents.
+Use the plan summary and cache report to measure the actual result;
+Cargo-Rail does not invent a time-saved estimate.
 
 ## Reuse verified compiler work
 

@@ -2,19 +2,20 @@
 
 ## Validate a change
 
-Run commands from the repository root. Use `just --list` for the maintained command surface.
+Run commands from the repository root.
+Use `just --list` for the maintained command surface.
 Start with the smallest lane that reaches the changed behavior:
 
-| Change | Start with |
-| --- | --- |
-| Markdown | `git diff --check` |
-| Rustdoc | `just check-docs` |
-| CLI or mutation | `just test` |
-| Planning | `just test`, then `just plan` |
-| Compiler | `just test`; add `just check-compiler-driver` for driver changes |
-| Cache | `just test-cache-host` |
-| Release | `just test`; add `just release-check` for current release intent |
-| Cross-target compilation | `just check-cross` |
+| Change                    | Start with |
+| ------------------------- | ---------- |
+| Markdown                  | `git diff --check` |
+| Rustdoc                   | `just check-docs` |
+| CLI or mutation           | `just test` |
+| Planning                  | `just test`, then `just plan` |
+| Compiler                  | `just test`; add `just check-compiler-driver` for driver changes |
+| Cache                     | `just test-cache-host` |
+| Release                   | `just test`; add `just release-check` for current release intent |
+| Cross-target compilation  | `just check-cross` |
 | Tooling or GitHub Actions | `just check-tooling` |
 
 `just ci-check` runs the shared nonmutating checks on any development host.
@@ -76,9 +77,9 @@ including its matched development files and backend.
 The first run may download these components; later runs reuse the installed toolchain.
 Advance that separate nightly pin only after the focused lane passes.
 
-Local work and CI use the same `just ci-check` lane: formatting,
-host Clippy with all Cargo targets and features, dependency policy using `deny.toml`'s target scope,
-documentation, and the excluded compiler driver's dedicated checks.
+Local work and CI use the same `just ci-check` lane: formatting, host Clippy with all Cargo targets and features,
+dependency policy using `deny.toml`'s target scope, documentation,
+and the excluded compiler driver's dedicated checks.
 CI calls this lane directly; workstation cross-compilation and dogfooding remain outside it.
 
 Run `just test` separately for runtime tests, including native cache tests and doctests.
@@ -124,13 +125,15 @@ just check-compiler-driver
 ```
 
 The driver is built separately because it is tied to one exact Rust compiler toolchain.
-To package the closed driver source inventory for another compatible toolchain without publishing Cargo-Rail core, run:
+To package the closed driver source inventory
+for another compatible toolchain without publishing Cargo-Rail core, run:
 
 ```bash
 just package-compiler-adapter OUTPUT_DIRECTORY
 ```
 
-The recipe writes one content-addressed adapter pack and its checksum, refuses existing outputs, and does not upload them.
+The recipe writes one content-addressed adapter pack and its checksum, refuses existing outputs,
+and does not upload them.
 
 ## Support performance claims with evidence
 

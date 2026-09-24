@@ -38,10 +38,13 @@ release bump="auto": (pre-release bump)
     cargo rail release run --all --local --bump {{quote(bump)}}
 
 # Shared nonmutating checks, also run by the local check recipe.
-ci-check: check-format check-clippy check-dependencies check-docs check-compiler-driver
+ci-check: check-format check-markdown check-clippy check-dependencies check-docs check-compiler-driver
 
 check-format:
     cargo fmt --all -- --check
+
+check-markdown:
+    rumdl check .
 
 check-clippy:
     cargo clippy --workspace --all-targets --all-features --locked
@@ -67,6 +70,7 @@ fix:
     cargo fmt --all
     cargo clippy --workspace --all-targets --all-features --locked --fix --allow-dirty --allow-staged
     cargo fmt --all
+    rumdl fmt .
 
 test profile="default":
     #!/usr/bin/env bash

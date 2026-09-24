@@ -142,8 +142,9 @@ and authenticated archive against the Action's independent consumer before publi
 Publish Cargo-Rail first, then verify its immutable release and executable attestations.
 Update the Action repository's Cargo-Rail lock with that exact version
 and dereferenced release commit.
-If Cargo-Rail changes the release-record contract, update and qualify the Action's independent schema and reader
-before moving the lock; an older reader rejects the new record version.
+If Cargo-Rail changes the release-record contract,
+update and qualify the Action's independent schema and reader before moving the lock;
+an older reader rejects the new record version.
 The source-built Cargo-Rail bootstrap can publish core before that consumer transition.
 The Action's release workflow validates the locked authenticated components and releases the Action.
 Its configured `v10` alias moves only after the immutable release is verified and only

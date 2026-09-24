@@ -176,15 +176,15 @@ Abort and restore only while the status says no external side effect may exist:
 cargo rail release abort release-<id> --yes
 ```
 
-If the preparation commit was pushed but no tag, registry upload, review, forge release, or alias effect exists, keep
-the current branch and retire the transaction explicitly:
+If the preparation commit was pushed but no tag, registry upload, review, forge release,
+or alias effect exists, keep the current branch and retire the transaction explicitly:
 
 ```bash
 cargo rail release abort release-<id> --retain-preparation --yes
 ```
 
-The pushed preparation must be an ancestor of the clean local and remote branch tip. After any publication boundary,
-resume and reconcile.
+The pushed preparation must be an ancestor of the clean local and remote branch tip.
+After any publication boundary, resume and reconcile.
 Do not move a published tag or replace a release asset.
 
 Commit-driven releases need complete tag history.

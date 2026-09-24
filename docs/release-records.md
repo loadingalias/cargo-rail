@@ -94,9 +94,11 @@ Conflicting published releases block recovery.
 Local execution uses a filesystem lock.
 Optional remote retention stores records in per-transaction Git notes refs, with one active pointer.
 Transaction refs remain strict current-schema records.
-The active pointer is a leased coordination envelope: only its `transaction_id` and `status` remain readable across
-record-schema upgrades, so a terminal older record cannot block a new transaction.
-An older record that is still active continues to block concurrent work and must be finished with its originating executable.
+The active pointer is a leased coordination envelope:
+only its `transaction_id` and `status` remain readable across record-schema upgrades,
+so a terminal older record cannot block a new transaction.
+An older record that is still active continues to block concurrent work
+and must be finished with its originating executable.
 Each record commit contains `record.json` and, once Cargo packages are sealed,
 a `packages` tree containing exactly those original `.crate` blobs.
 Their sizes and SHA-256 digests must match the package seal.

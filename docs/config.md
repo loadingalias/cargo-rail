@@ -28,7 +28,8 @@ cargo rail config validate --strict
 ```
 
 `init` recognizes either an explicit `[workspace]` manifest or a root `[package]` manifest.
-Without a Cargo manifest it still writes the requested configuration but reports that no workspace was detected.
+Without a Cargo manifest it still writes the requested configuration but reports
+that no workspace was detected.
 
 Bare `cargo rail config` shows configured overrides and the active source, or reports that coded defaults apply.
 `config explain --all` reports configured and effective values, defaults, sources, and field rationale.
@@ -174,8 +175,7 @@ Reviewed `.changes/*.md` files are the default source for bumps and release pros
 It performs no mutation or external effect.
 
 The default `release.tag_format` is `{crate}-{prefix}{version}`.
-With the default `tag_prefix = "v"`, it produces tags such as `my-crate-v1.2.3` for both single-crate and
-multi-crate repositories.
+With the default `tag_prefix = "v"`, it produces tags such as `my-crate-v1.2.3` for both single-crate and multi-crate repositories.
 Repositories that use unqualified tags such as `v1.2.3` must set `tag_format = "{prefix}{version}"` explicitly.
 
 `remote_effects` controls Git and forge effects.
