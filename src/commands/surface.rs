@@ -612,12 +612,6 @@ fn analyze_surface(
             &feature_profiles,
         )?
     };
-    if evidence.compiler_facts.is_empty() {
-        return Err(RailError::message(
-            "surface analysis produced no authenticated compiler facts",
-        ));
-    }
-
     let graph = SurfaceGraph::from_compiler_facts(&evidence.compiler_facts)?;
     let closed_world_crates = closed_world_crates(&workspace_packages, &evidence.compiler_facts, config)?;
     let all_compiler_crates = evidence

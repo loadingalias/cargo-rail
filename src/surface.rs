@@ -478,6 +478,11 @@ impl SurfaceGraph {
     }
 
     fn from_objects(objects: &[&CompilerFactObject]) -> RailResult<Self> {
+        if objects.is_empty() {
+            return Err(RailError::message(
+                "surface analysis produced no authenticated compiler facts",
+            ));
+        }
         let required_coverage = required_compiler_fact_coverage();
         let mut producer = None;
         let mut sources = BTreeMap::<CompilerFactSourcePath, (CompilerFactSourceIdentity, u64)>::new();
@@ -1271,9 +1276,10 @@ fn finding_identity(key: &SurfaceItemKey, kind: SurfaceFindingKind) -> RailResul
 mod tests {
     use super::*;
     use crate::compiler::facts::{
-        COMPILER_FACT_PROTOCOL_VERSION, CompilerFactCompletion, CompilerFactEdge, CompilerFactEntryPoint,
-        CompilerFactEntryPointKind, CompilerFactPhysicalIdentity, CompilerFactProducerAuthority, CompilerFactRetention,
-        CompilerFactSource, CompilerFactStringId, CompilerFactUnit,
+        COMPILER_FACT_PROTOCOL_VERSION, CompilerFactCompletion, CompilerFactCoverage, CompilerFactEdge,
+        CompilerFactEntryPoint, CompilerFactEntryPointKind, CompilerFactPhysicalIdentity,
+        CompilerFactProducerAuthority, CompilerFactRetention, CompilerFactSource, CompilerFactStringId,
+        CompilerFactUnit,
     };
 
     const CRATE_A: u64 = 10;
@@ -1492,6 +1498,42 @@ mod tests {
         assert!(states.contains(&(true, false, false)));
         assert!(states.contains(&(false, true, false)));
         assert!(states.contains(&(false, false, false)));
+    }
+
+    #[test]
+    fn unavailable_or_incomplete_facts_fail_before_surface_classification() {
+        let absent = SurfaceGraph::from_objects(&[])
+            .err()
+            .expect("empty evidence must fail closed");
+        assert_eq!(
+            absent.to_string(),
+            "surface analysis produced no authenticated compiler facts"
+        );
+
+        let mut incomplete = object(
+            "app",
+            CompilerFactDomain::Production,
+            vec![item(
+                (CRATE_A, 1),
+                (0, 10),
+                CompilerFactItemKind::Function,
+                CompilerFactVisibility::Public,
+            )],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        incomplete
+            .completion
+            .coverage
+            .remove(&CompilerFactCoverage::TraitDispatch);
+        let incomplete = SurfaceGraph::from_objects(&[&incomplete])
+            .err()
+            .expect("incomplete compiler facts must fail closed");
+        assert_eq!(
+            incomplete.to_string(),
+            "surface analysis received compiler facts without complete required coverage"
+        );
     }
 
     #[test]
