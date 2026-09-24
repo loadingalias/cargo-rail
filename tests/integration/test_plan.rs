@@ -2324,3 +2324,172 @@ cargo_prerequisites = [
     })();
     super::helpers::finish_test(result);
 }
+
+/// Integration test that loads the `plugin` cdylib at runtime; Cargo metadata has no edge to it.
+const RUNTIME_PLUGIN_TEST: &str = r#"use std::ffi::{CString, c_char, c_void};
+use std::path::PathBuf;
+
+#[cfg(unix)]
+extern "C" {
+    fn dlopen(filename: *const c_char, flags: std::ffi::c_int) -> *mut c_void;
+    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn LoadLibraryA(name: *const c_char) -> *mut c_void;
+    fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *mut c_void;
+}
+
+#[test]
+fn loaded_plugin_reports_the_expected_value() {
+    let target = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let library = target.parent().unwrap().join("debug").join(format!(
+        "{}plugin{}",
+        std::env::consts::DLL_PREFIX,
+        std::env::consts::DLL_SUFFIX
+    ));
+    let path = CString::new(library.to_str().unwrap()).unwrap();
+    let symbol = CString::new("plugin_value").unwrap();
+    let value = unsafe {
+        #[cfg(unix)]
+        let handle = dlopen(path.as_ptr(), 2);
+        #[cfg(windows)]
+        let handle = LoadLibraryA(path.as_ptr());
+        assert!(!handle.is_null(), "plugin library was not built: {}", library.display());
+        #[cfg(unix)]
+        let function = dlsym(handle, symbol.as_ptr());
+        #[cfg(windows)]
+        let function = GetProcAddress(handle, symbol.as_ptr());
+        assert!(!function.is_null(), "plugin_value is not exported");
+        let function: extern "C" fn() -> u32 = std::mem::transmute(function);
+        function()
+    };
+    assert_eq!(value, 7);
+}
+"#;
+
+#[test]
+fn declared_runtime_plugin_relationship_selects_and_executes_its_loading_test() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("plan-runtime-plugin")?;
+        let integration = ws.add_crate("integration", "0.1.0", &[])?;
+        std::fs::create_dir_all(integration.join("tests"))?;
+        std::fs::write(integration.join("tests/plugin.rs"), RUNTIME_PLUGIN_TEST)?;
+        let plugin = ws.add_crate("plugin", "0.1.0", &[])?;
+        let manifest = plugin.join("Cargo.toml");
+        let mut manifest_text = std::fs::read_to_string(&manifest)?;
+        manifest_text.push_str("\n[lib]\ncrate-type = [\"cdylib\"]\n");
+        std::fs::write(&manifest, manifest_text)?;
+        let plugin_source = plugin.join("src/lib.rs");
+        std::fs::write(
+            &plugin_source,
+            "#[no_mangle]\npub extern \"C\" fn plugin_value() -> u32 {\n    7\n}\n",
+        )?;
+        generate_lockfile(&ws)?;
+        ws.commit("add a dynamically loaded plugin without a Cargo edge")?;
+
+        let selected = |planned: &Value, work: &str| {
+            planned["work"][work]["scope"]["selection"]["packages"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|package| package["name"].as_str().map(str::to_string))
+                .collect::<BTreeSet<_>>()
+        };
+        // Lower one typed package selection to ordinary Cargo with compiler wrappers disabled.
+        let cargo = |subcommand: &str, packages: &BTreeSet<String>| -> Result<std::process::Output> {
+            let mut command = Command::new("cargo");
+            command
+                .current_dir(&ws.path)
+                .env("RUSTC_WRAPPER", "")
+                .env("RUSTC_WORKSPACE_WRAPPER", "")
+                .args([subcommand, "--locked"]);
+            for package in packages {
+                command.args(["-p", package]);
+            }
+            Ok(command.output()?)
+        };
+        let evidence_plan = |name: &str| -> Result<Value> {
+            let cold = plan(&ws, &["--since", "HEAD"])?;
+            let evidence = complete_evidence(&cold, HashMap::new())?;
+            let evidence_path = write_evidence(&ws, name, &evidence)?;
+            plan(&ws, &["--since", "HEAD", "--evidence", &evidence_path])
+        };
+        let changed_plugin = "#[no_mangle]\npub extern \"C\" fn plugin_value() -> u32 {\n    8\n}\n";
+        let original_plugin = std::fs::read(&plugin_source)?;
+
+        // Without a declared relationship, complete compiler evidence cannot see the runtime load.
+        std::fs::write(&plugin_source, changed_plugin)?;
+        let undeclared = evidence_plan("undeclared-plugin-evidence.json")?;
+        let undeclared_tests = selected(&undeclared, "cargo.test");
+        assert_eq!(undeclared_tests, BTreeSet::from(["plugin".to_string()]));
+        let built = cargo("build", &BTreeSet::from(["plugin".to_string()]))?;
+        ensure!(built.status.success(), "plugin build failed: {built:?}");
+        let missed = cargo("test", &undeclared_tests)?;
+        ensure!(
+            missed.status.success(),
+            "the undeclared selection should run no loading test: {missed:?}"
+        );
+        std::fs::write(&plugin_source, &original_plugin)?;
+
+        std::fs::write(
+            ws.path.join(".config/rail.toml"),
+            r#"[plan.work.runtime-artifacts]
+scope = "cargo"
+cargo_prerequisites = [
+  { source_work = "cargo.test", when = [{ package = "integration" }], require = [
+    { package = "plugin", target = { name = "plugin", kind = "cdylib" } },
+  ] },
+]
+"#,
+        )?;
+        ws.commit("declare the runtime plugin relationship")?;
+        let baseline = BTreeSet::from(["plugin".to_string()]);
+        let built = cargo("build", &baseline)?;
+        ensure!(built.status.success(), "plugin build failed: {built:?}");
+        let passed = cargo("test", &BTreeSet::from(["integration".to_string()]))?;
+        ensure!(passed.status.success(), "the unchanged plugin must load: {passed:?}");
+        ensure!(
+            String::from_utf8_lossy(&passed.stdout).contains("loaded_plugin_reports_the_expected_value ... ok"),
+            "the loading test did not run: {passed:?}"
+        );
+
+        std::fs::write(&plugin_source, changed_plugin)?;
+        let cold = plan(&ws, &["--since", "HEAD"])?;
+        assert!(
+            selected(&cold, "cargo.test").contains("integration"),
+            "missing evidence must retain the loading test: {cold:#}"
+        );
+        let declared = evidence_plan("declared-plugin-evidence.json")?;
+        assert_eq!(
+            selected(&declared, "cargo.test"),
+            BTreeSet::from(["integration".to_string(), "plugin".to_string()]),
+            "a plugin change must select its declared loading test without widening"
+        );
+        let artifacts = selected(&declared, "runtime-artifacts");
+        assert_eq!(artifacts, BTreeSet::from(["plugin".to_string()]));
+        assert_eq!(
+            declared["work"]["runtime-artifacts"]["scope"]["selection"]["targets"],
+            serde_json::json!([{"package": "plugin@0.1.0#path:crates/plugin", "name": "plugin", "kind": ["cdylib"]}])
+        );
+
+        // Executing the emitted selections builds the new plugin and catches its changed behavior.
+        let built = cargo("build", &artifacts)?;
+        ensure!(built.status.success(), "runtime artifact build failed: {built:?}");
+        let caught = cargo("test", &selected(&declared, "cargo.test"))?;
+        let caught_stdout = String::from_utf8_lossy(&caught.stdout);
+        ensure!(
+            !caught.status.success(),
+            "the loading test must detect the plugin change: {caught:?}"
+        );
+        ensure!(
+            caught_stdout.contains("loaded_plugin_reports_the_expected_value ... FAILED"),
+            "the failure must come from the loading test: {caught_stdout}"
+        );
+        std::fs::write(&plugin_source, original_plugin)?;
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}

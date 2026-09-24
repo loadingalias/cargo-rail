@@ -109,6 +109,16 @@ the source `cargo.test` selector still owns which tests execute.
 Changing a declared artifact propagates back to its explicitly named test root.
 Relationships are one hop and contain no commands.
 
+Declare every runtime load.
+Compiler evidence records compile-time inputs only.
+It cannot see a test that opens a dynamic library, spawns an executable,
+or reads a build output at run time.
+With complete evidence and no declaration, a changed plugin selects only its own package,
+and the test that loads it is skipped.
+Without compatible evidence, that test is retained through conservative widening.
+Cargo-Rail does not check that a test loads the declared artifact, and it does not order execution.
+The consumer builds the `require` selection before it runs the source work.
+
 Work IDs start with a lowercase ASCII letter and then use lowercase ASCII letters, digits, dots,
 and hyphens.
 Paths are positive repository-relative globs.
