@@ -27,3 +27,4 @@ scripts/__pycache__/check-release-install.cpython-314.pyc
 scripts/__pycache__/package-release.cpython-314.pyc
 .ropeproject/
 .ruff_cache/
+.claude/
