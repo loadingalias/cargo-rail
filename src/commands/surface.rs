@@ -1,18 +1,14 @@
 //! Complete Rust declaration reachability and visibility analysis.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
-use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Duration;
 
 use cargo_metadata::{Package, TargetKind};
 use serde::Serialize;
 
 use crate::backup::{BackupManager, BackupMetadata};
-use crate::cargo::{ManifestAnalyzer, TargetIdentity, TargetSpecificationIdentity};
+use crate::cargo::{ManifestAnalyzer, TargetSpecificationIdentity};
 use crate::commands::common::SurfaceOutputFormat;
 use crate::compiler::collector::{
     CompilerAcquisitionProduct, CompilerAcquisitionRequest, CompilerDoctestProfile,
@@ -1354,157 +1350,30 @@ fn preflight_surface_targets(
     snapshot: &WorkspaceSnapshot,
     selected_targets: &[String],
 ) -> RailResult<Vec<SurfaceTargetReadinessReport>> {
-    const MAX_FAILURES: usize = 16;
+    use crate::compiler::target_preflight::{TargetPreflight, TargetUse, require_ready};
 
-    let directory = tempfile::Builder::new()
-        .prefix("cargo-rail-surface-target-preflight-")
-        .tempdir()?;
-    let source = directory.path().join("main.rs");
-    fs::write(&source, b"fn main() {}\n")?;
-    let rustc = snapshot
-        .toolchain()
-        .direct_rustc_sysroot()
-        .join("bin")
-        .join(if cfg!(windows) { "rustc.exe" } else { "rustc" });
-    let mut reports = Vec::with_capacity(selected_targets.len());
-    let mut failures = Vec::new();
-    for (index, selected) in selected_targets.iter().enumerate() {
-        let name = if selected == "default" {
-            snapshot.toolchain().host_target()
-        } else {
-            selected
-        };
-        let Some(target) = snapshot.targets().iter().find(|target| target_name(target) == name) else {
-            failures.push(format!(
-                "{name}: target is absent from the captured Cargo configuration"
-            ));
-            continue;
-        };
-        let library = snapshot
-            .toolchain()
-            .direct_rustc_sysroot()
-            .join("lib")
-            .join("rustlib")
-            .join(name)
-            .join("lib");
-        if let Err(error) = validate_target_standard_library(&library) {
-            failures.push(format!("{name}: {error}"));
-            continue;
-        }
-        let output = directory.path().join(format!("probe-{index}"));
-        let mut command = Command::new(&rustc);
-        command
-            .current_dir(snapshot.cargo_current_dir())
-            .arg(&source)
-            .args([
-                "--crate-name",
-                "cargo_rail_surface_target_preflight",
-                "--edition",
-                "2024",
-                "--target",
-            ])
-            .arg(target_argument(target))
-            .arg("-o")
-            .arg(&output)
-            .env("RUSTUP_AUTO_INSTALL", "0")
-            .env("RUSTUP_NO_UPDATE_CHECK", "1");
-        if let Some(linker) = target.linker() {
-            let mut value = OsString::from("linker=");
-            value.push(linker);
-            command.arg("-C").arg(value);
-        }
-        match crate::compiler::acquisition::process::run_bounded_process(&mut command, Duration::from_secs(60), 0, 4096)
-        {
-            Ok(output) if output.status.success() => reports.push(SurfaceTargetReadinessReport {
-                target: name.to_string(),
-                rust_standard_library: library.to_string_lossy().into_owned(),
-                linker: target.linker().map_or_else(
-                    || "rustc_default".to_string(),
-                    |linker| linker.to_string_lossy().into_owned(),
-                ),
-                linked_probe: true,
-            }),
-            Ok(output) => failures.push(format!(
-                "{name}: linked compiler probe failed with status {}: {}",
-                output.status,
-                bounded_preflight_stderr(&output.stderr)
-            )),
-            Err(error) => failures.push(format!("{name}: failed to start selected rustc: {error}")),
-        }
-    }
-    if failures.is_empty() {
-        return Ok(reports);
-    }
-    failures.truncate(MAX_FAILURES);
-    Err(RailError::with_help(
-        format!(
-            "Surface target preflight failed before compiler acquisition:\n{}",
-            failures
-                .iter()
-                .map(|failure| format!("- {failure}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        ),
+    // Surface compiles a standard-library driver, so every selected target must link.
+    let selected = selected_targets
+        .iter()
+        .map(|target| (target.as_str(), TargetUse::Link))
+        .collect::<Vec<_>>();
+    let ready = require_ready(
+        TargetPreflight::capture(snapshot).check(&selected),
+        "Surface",
         "install each selected Rust target library and configure its real SDK/linker environment before retrying Surface",
-    ))
-}
-
-fn validate_target_standard_library(directory: &Path) -> RailResult<()> {
-    const MAX_ENTRIES: usize = 4096;
-
-    let metadata = fs::symlink_metadata(directory).map_err(|error| {
-        RailError::message(format!(
-            "Rust target standard-library directory '{}' is unavailable: {error}",
-            directory.display()
-        ))
-    })?;
-    if !metadata.is_dir() || crate::utils::is_symlink_or_reparse(&metadata) {
-        return Err(RailError::message(format!(
-            "Rust target standard-library path '{}' is not a real directory",
-            directory.display()
-        )));
-    }
-    let mut entries = 0usize;
-    let mut core = false;
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        entries = entries
-            .checked_add(1)
-            .ok_or_else(|| RailError::message("Rust target library inventory overflow"))?;
-        if entries > MAX_ENTRIES {
-            return Err(RailError::message("Rust target library inventory exceeds its bound"));
-        }
-        let name = entry.file_name();
-        core |= name.to_string_lossy().starts_with("libcore-") && name.to_string_lossy().ends_with(".rlib");
-    }
-    if !core {
-        return Err(RailError::message(format!(
-            "Rust target standard-library path '{}' has no libcore rlib",
-            directory.display()
-        )));
-    }
-    Ok(())
-}
-
-fn target_name(target: &TargetIdentity) -> &str {
-    match target.specification() {
-        TargetSpecificationIdentity::BuiltIn(name) => name,
-        TargetSpecificationIdentity::Custom(specification) => specification.name(),
-    }
-}
-
-fn target_argument(target: &TargetIdentity) -> &std::ffi::OsStr {
-    match target.specification() {
-        TargetSpecificationIdentity::BuiltIn(name) => std::ffi::OsStr::new(name),
-        TargetSpecificationIdentity::Custom(specification) => specification.path().as_os_str(),
-    }
-}
-
-fn bounded_preflight_stderr(stderr: &[u8]) -> String {
-    const MAX_BYTES: usize = 4096;
-
-    let start = stderr.len().saturating_sub(MAX_BYTES);
-    String::from_utf8_lossy(&stderr[start..]).trim().to_string()
+    )?;
+    Ok(ready
+        .into_iter()
+        .map(|target| SurfaceTargetReadinessReport {
+            target: target.target,
+            rust_standard_library: target.standard_library.to_string_lossy().into_owned(),
+            linker: target.linker.map_or_else(
+                || "rustc_default".to_string(),
+                |linker| linker.to_string_lossy().into_owned(),
+            ),
+            linked_probe: target.linked_probe,
+        })
+        .collect())
 }
 
 fn selected_target_views(config: &SurfaceConfig, workspace_targets: &[String]) -> Vec<String> {

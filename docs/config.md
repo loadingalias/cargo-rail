@@ -121,13 +121,22 @@ paths = ["verification/**"]
 `cargo rail unify apply` revalidates and writes the planned manifest changes.
 
 Top-level `targets` always remain the dependency-resolution authority.
-By default, Unify acquires compiler evidence on every one of those domains.
-A workspace whose supported target policy is package-
-or feature-specific can set `unify.compiler_targets` to the exact top-level subset
-where Unify's workspace compiler command is valid.
-Dependencies that require an omitted resolution domain are retained
+`unify.compiler_targets` selects where Unify acquires compiler evidence:
+
+| Value             | Evidence targets |
+| ----------------- | ---------------- |
+| `"all"` (default) | Every top-level target. An empty list written by earlier releases means the same. |
+| `["TARGET", ...]` | The exact top-level subset where Unify's workspace compiler command is valid. |
+| `"none"`          | No target. Unify resolves dependencies but removes nothing that needs compiler proof. |
+
+Dependencies that require an unobserved resolution target are retained
 unless another complete proof makes the compiler view unnecessary;
 the narrower evidence set never narrows Cargo resolution.
+Before acquisition, Unify checks each target that needs new evidence:
+its Rust target library must be installed,
+and a target that compiles doctests must link a probe with its configured linker.
+A failure names the target and stops before Cargo runs.
+`cargo rail unify doctor` reports the same readiness and the unobserved targets.
 
 Use `consumer_scope = "workspace"` only when the workspace contains every consumer of the affected private packages.
 Published packages remain open-world.

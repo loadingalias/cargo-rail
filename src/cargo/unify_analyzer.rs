@@ -54,6 +54,7 @@ pub struct UnifyAnalyzer {
     /// Exact rustc cfg sets shared across target-aware unify analyses.
     target_cfg_sets: Arc<std::collections::HashMap<String, TargetCfgSet>>,
     compiler_cache_identity: CompilerCacheIdentity,
+    target_preflight: crate::compiler::target_preflight::TargetPreflight,
 }
 
 struct BorrowedFeatureUsage<'a> {
@@ -113,6 +114,7 @@ impl UnifyAnalyzer {
         let workspace_root = ctx.workspace_root().to_path_buf();
         let canonical_workspace_root = workspace_root.canonicalize().unwrap_or_else(|_| workspace_root.clone());
         let compiler_cache_identity = CompilerCacheIdentity::capture(snapshot)?;
+        let target_preflight = crate::compiler::target_preflight::TargetPreflight::capture(snapshot);
 
         Ok(Self {
             metadata,
@@ -127,6 +129,7 @@ impl UnifyAnalyzer {
             canonical_workspace_root,
             target_cfg_sets,
             compiler_cache_identity,
+            target_preflight,
         })
     }
 
@@ -1030,7 +1033,8 @@ impl UnifyAnalyzer {
             &pruned_features,
             &self.config,
             &self.compiler_cache_identity,
-        );
+        )
+        .with_target_preflight(&self.target_preflight);
         progress!("Detecting unused dependencies...");
         let mut unused_deps = unused_finder.find()?;
         issues.extend(unused_finder.uncertainty_issues());

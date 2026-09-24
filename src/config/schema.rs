@@ -92,7 +92,7 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
     ),
     policy(
         "unify.compiler_targets",
-        "Selects the exact resolution-target subset where Unify acquires compiler diagnostics.",
+        "Selects where Unify acquires compiler diagnostics: every resolution target, an exact subset, or none on hosts that cannot compile them.",
     ),
     policy(
         "unify.include_paths",

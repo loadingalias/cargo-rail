@@ -1,6 +1,70 @@
 //! Unify configuration - controls workspace dependency unification behavior
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+
+/// Top-level resolution domains where Unify acquires compiler evidence.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum CompilerTargetSelection {
+    /// Every top-level resolution domain: `"all"`. A legacy empty list means the same.
+    #[default]
+    All,
+    /// No domain: `"none"`. Unify resolves dependencies but withholds compiler-proven removals.
+    None,
+    /// One exact non-empty subset of the top-level targets.
+    Explicit(Vec<String>),
+}
+
+impl Serialize for CompilerTargetSelection {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::All => serializer.serialize_str("all"),
+            Self::None => serializer.serialize_str("none"),
+            Self::Explicit(targets) => targets.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CompilerTargetSelection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Representation {
+            Mode(String),
+            Explicit(Vec<String>),
+        }
+
+        match Representation::deserialize(deserializer)? {
+            Representation::Mode(mode) if mode == "all" => Ok(Self::All),
+            Representation::Mode(mode) if mode == "none" => Ok(Self::None),
+            Representation::Mode(mode) => Err(de::Error::custom(format!(
+                "unify.compiler_targets mode must be 'all' or 'none', found '{mode}'"
+            ))),
+            // Earlier releases printed the inherited default as an empty list.
+            Representation::Explicit(targets) if targets.is_empty() => Ok(Self::All),
+            Representation::Explicit(targets) => Ok(Self::Explicit(targets)),
+        }
+    }
+}
+
+impl CompilerTargetSelection {
+    /// Whether the selection inherits every resolution domain.
+    pub(crate) fn inherits_all(&self) -> bool {
+        matches!(self, Self::All)
+    }
+
+    fn explicit(&self) -> &[String] {
+        match self {
+            Self::Explicit(targets) => targets,
+            Self::All | Self::None => &[],
+        }
+    }
+}
 
 /// Defines which consumers may activate private workspace configuration.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,15 +92,15 @@ impl ConsumerScope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UnifyConfig {
-    /// Exact subset of top-level target-resolution domains used for compiler evidence.
+    /// Top-level target-resolution domains used for compiler evidence.
     ///
-    /// An empty list inherits every top-level target. Repositories whose full
-    /// workspace does not compile under one Cargo package/feature shape on every
-    /// resolution target can select only the domains where Unify's compiler
-    /// evidence command is valid. Omitted domains remain part of dependency
-    /// resolution and conservatively prevent edits that require missing evidence.
+    /// `"all"` (the default) selects every top-level target. A list selects only
+    /// the domains where Unify's compiler evidence command is valid on this host.
+    /// `"none"` acquires no compiler evidence. Unselected domains remain part of
+    /// dependency resolution and conservatively prevent edits that require their
+    /// missing evidence.
     #[serde(default)]
-    pub compiler_targets: Vec<String>,
+    pub compiler_targets: CompilerTargetSelection,
 
     /// Handle path dependencies? (default: true)
     /// If false, path dependencies are excluded from unification
@@ -128,7 +192,7 @@ pub struct UnifyConfig {
 impl Default for UnifyConfig {
     fn default() -> Self {
         Self {
-            compiler_targets: Vec::new(),
+            compiler_targets: CompilerTargetSelection::All,
             include_paths: default_include_paths(),
             include_renamed: false,
             transitive_pinning: None,
@@ -151,20 +215,21 @@ impl Default for UnifyConfig {
 impl UnifyConfig {
     /// Resolve compiler-evidence targets from the captured resolution domains.
     pub fn effective_compiler_targets<'a>(&self, workspace_targets: &[&'a str]) -> Vec<&'a str> {
-        if self.compiler_targets.is_empty() {
-            return workspace_targets.to_vec();
+        match &self.compiler_targets {
+            CompilerTargetSelection::All => workspace_targets.to_vec(),
+            CompilerTargetSelection::None => Vec::new(),
+            CompilerTargetSelection::Explicit(selected) => workspace_targets
+                .iter()
+                .copied()
+                .filter(|target| selected.iter().any(|configured| configured == target))
+                .collect(),
         }
-        workspace_targets
-            .iter()
-            .copied()
-            .filter(|target| self.compiler_targets.iter().any(|configured| configured == target))
-            .collect()
     }
 
     /// Validate compiler-evidence targets against the top-level resolution authority.
     pub fn validate_workspace_targets(&self, workspace_targets: &[String]) -> Result<(), crate::error::ConfigError> {
         let mut unique = std::collections::BTreeSet::new();
-        for target in &self.compiler_targets {
+        for target in self.compiler_targets.explicit() {
             if target.trim().is_empty() || target != target.trim() {
                 return Err(crate::error::ConfigError::InvalidValue {
                     field: "unify.compiler_targets".to_string(),
@@ -545,7 +610,7 @@ mod tests {
     #[test]
     fn test_unify_config_defaults() {
         let config = UnifyConfig::default();
-        assert!(config.compiler_targets.is_empty());
+        assert_eq!(config.compiler_targets, CompilerTargetSelection::All);
         assert!(config.include_paths); // Default: true
         assert!(!config.include_renamed); // Default: false
         assert!(config.transitive_pinning.is_none());
@@ -579,6 +644,38 @@ mod tests {
         let duplicate: UnifyConfig =
             toml_edit::de::from_str(r#"compiler_targets = ["aarch64-apple-darwin", "aarch64-apple-darwin"]"#).unwrap();
         assert!(duplicate.validate_workspace_targets(&workspace_targets).is_err());
+    }
+
+    #[test]
+    fn compiler_target_modes_keep_legacy_empty_lists_on_every_target() {
+        let resolution_targets = ["aarch64-apple-darwin", "thumbv6m-none-eabi"];
+        // Omitted, "all", and the empty list printed by earlier releases all select every target.
+        for input in ["", "compiler_targets = \"all\"", "compiler_targets = []"] {
+            let config: UnifyConfig = toml_edit::de::from_str(input).unwrap();
+            assert_eq!(config.compiler_targets, CompilerTargetSelection::All, "{input}");
+            assert_eq!(
+                config.effective_compiler_targets(&resolution_targets),
+                resolution_targets,
+                "{input}"
+            );
+            assert!(
+                toml_edit::ser::to_string(&config)
+                    .unwrap()
+                    .contains("compiler_targets = \"all\""),
+                "{input}"
+            );
+        }
+        let none: UnifyConfig = toml_edit::de::from_str("compiler_targets = \"none\"").unwrap();
+        none.validate_workspace_targets(&resolution_targets.map(str::to_string))
+            .unwrap();
+        assert!(none.effective_compiler_targets(&resolution_targets).is_empty());
+        assert!(
+            toml_edit::ser::to_string(&none)
+                .unwrap()
+                .contains("compiler_targets = \"none\"")
+        );
+        let error = toml_edit::de::from_str::<UnifyConfig>("compiler_targets = \"host\"").unwrap_err();
+        assert!(error.to_string().contains("must be 'all' or 'none'"), "{error}");
     }
 
     #[test]

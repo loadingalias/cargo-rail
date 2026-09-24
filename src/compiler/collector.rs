@@ -80,6 +80,8 @@ pub(crate) struct CompilerDiagnosticsCollector<'a> {
     identity: CompilerCacheIdentity,
     artifact_budget: CompilerArtifactBudget,
     acquisition: Option<CompilerAcquisitionRequest>,
+    /// Host checks for the targets whose views must run Cargo.
+    target_preflight: Option<crate::compiler::target_preflight::TargetPreflight>,
 }
 
 /// Storage authority for the command-owned Cargo working set shared across evidence views.
@@ -1640,11 +1642,21 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
             identity: identity.clone(),
             artifact_budget: CompilerArtifactBudget::default(),
             acquisition: None,
+            target_preflight: None,
         }
     }
 
     pub(crate) fn with_artifact_budget(mut self, budget: CompilerArtifactBudget) -> Self {
         self.artifact_budget = budget;
+        self
+    }
+
+    /// Check each target with missing views before any Cargo acquisition starts.
+    pub(crate) fn with_target_preflight(
+        mut self,
+        preflight: crate::compiler::target_preflight::TargetPreflight,
+    ) -> Self {
+        self.target_preflight = Some(preflight);
         self
     }
 
@@ -1918,6 +1930,29 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
             .execution_order()
             .filter(|view| typed_view[view.index().offset()] || !stale_by_view[view.index().offset()].is_empty())
             .collect::<Vec<_>>();
+
+        if let Some(preflight) = &self.target_preflight {
+            use crate::compiler::target_preflight::{TargetUse, require_ready};
+            // Only views that miss the cache run Cargo; only doctest views link.
+            let mut uses = BTreeMap::<&str, TargetUse>::new();
+            for view in &stale_configurations {
+                let use_ = if view.compiles_doctests() {
+                    TargetUse::Link
+                } else {
+                    TargetUse::Check
+                };
+                let entry = uses.entry(view.platform()).or_insert(use_);
+                *entry = (*entry).max(use_);
+            }
+            let selected = uses.into_iter().collect::<Vec<_>>();
+            require_ready(
+                preflight.check(&selected),
+                "Unify",
+                "install each target with `rustup target add` and configure its linker, \
+                 narrow `unify.compiler_targets` to the targets this host can compile, \
+                 or set it to \"none\" to run Unify without compiler evidence",
+            )?;
+        }
 
         progress!(
             "  Compiler evidence plan: {} views; up to {} Cargo acquisitions; {} diagnostic cache hits; {} diagnostic cache misses",

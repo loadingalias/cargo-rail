@@ -270,6 +270,17 @@ pub fn run_config_explain(
         *surface_targets = serde_json::to_value(config.surface.targets.effective(&config.targets))
             .map_err(|error| RailError::message(error.to_string()))?;
     }
+    // `"all"` inherits every resolution domain; show that exact set.
+    if config.unify.compiler_targets.inherits_all()
+        && let Some(compiler_targets) = effective.pointer_mut("/unify/compiler_targets")
+    {
+        let domains = if config.targets.is_empty() {
+            vec!["default"]
+        } else {
+            config.targets.iter().map(String::as_str).collect()
+        };
+        *compiler_targets = serde_json::json!(domains);
+    }
     let defaults =
         serde_json::to_value(RailConfig::default()).map_err(|error| RailError::message(error.to_string()))?;
 
@@ -293,6 +304,15 @@ pub fn run_config_explain(
                 && config.surface.targets.inherits_workspace()
             {
                 format!("{} (inherited from targets)", source.label())
+            } else if path == schema::ConfigPath::from_dotted("unify.compiler_targets")
+                && config.unify.compiler_targets.inherits_all()
+            {
+                let origin = if configured_value.is_some() {
+                    source.label()
+                } else {
+                    "default".to_string()
+                };
+                format!("{origin} (inherited from targets)")
             } else if configured_value.is_some() {
                 source.label()
             } else {

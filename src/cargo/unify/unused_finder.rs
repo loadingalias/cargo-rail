@@ -30,8 +30,10 @@ pub struct UnusedDepFinder<'a> {
     unreachable_features: HashMap<String, BTreeSet<String>>,
     workspace_is_consumer_scope: bool,
     compiler_cache_identity: &'a CompilerCacheIdentity,
+    target_preflight: Option<&'a crate::compiler::target_preflight::TargetPreflight>,
     compiler_artifact_budget: CompilerArtifactBudget,
-    compiler_targets: Vec<String>,
+    /// Effective compiler-evidence targets; empty when the policy selects none.
+    compiler_targets: Vec<&'a str>,
 }
 
 struct DependencyDeclaration<'a> {
@@ -66,12 +68,22 @@ impl<'a> UnusedDepFinder<'a> {
             unreachable_features,
             workspace_is_consumer_scope: config.consumer_scope == ConsumerScope::Workspace,
             compiler_cache_identity,
+            target_preflight: None,
             compiler_artifact_budget: CompilerArtifactBudget::new(
                 config.compiler_artifact_soft_limit_bytes,
                 config.compiler_artifact_hard_limit_bytes,
             ),
-            compiler_targets: config.compiler_targets.clone(),
+            compiler_targets: config.effective_compiler_targets(&metadata.targets()),
         }
+    }
+
+    /// Check each target with missing evidence on this host before acquisition starts.
+    pub(crate) fn with_target_preflight(
+        mut self,
+        preflight: &'a crate::compiler::target_preflight::TargetPreflight,
+    ) -> Self {
+        self.target_preflight = Some(preflight);
+        self
     }
 
     /// Detect unused dependencies in workspace members.
@@ -79,16 +91,8 @@ impl<'a> UnusedDepFinder<'a> {
         let mut unused = Vec::new();
         let declarations = self.dependency_declarations();
         let configured_targets: Vec<&str> = self.metadata.targets();
-        let compiler_targets = if self.compiler_targets.is_empty() {
-            configured_targets.clone()
-        } else {
-            configured_targets
-                .iter()
-                .copied()
-                .filter(|target| self.compiler_targets.iter().any(|configured| configured == target))
-                .collect()
-        };
-        let source_unused = self.detect_source_unused_deps(&declarations, &compiler_targets, self.target_cfg_sets)?;
+        let compiler_targets = &self.compiler_targets;
+        let source_unused = self.detect_source_unused_deps(&declarations, compiler_targets, self.target_cfg_sets)?;
 
         for declaration in declarations {
             if let Some(resolved) = declaration.resolved {
@@ -380,6 +384,10 @@ impl<'a> UnusedDepFinder<'a> {
         configured_targets: &[&str],
         cfg_sets: &HashMap<String, TargetCfgSet>,
     ) -> RailResult<HashMap<PackageId, MemberEvidence>> {
+        // No evidence targets means no observation: every compiler-proven removal is withheld.
+        if configured_targets.is_empty() {
+            return Ok(HashMap::new());
+        }
         let candidates = self.compiler_candidates(declarations, configured_targets, cfg_sets);
         if candidates.is_empty() {
             return Ok(HashMap::new());
@@ -392,6 +400,10 @@ impl<'a> UnusedDepFinder<'a> {
             self.compiler_cache_identity,
         )
         .with_artifact_budget(self.compiler_artifact_budget);
+        let collector = match self.target_preflight {
+            Some(preflight) => collector.with_target_preflight(preflight.clone()),
+            None => collector,
+        };
         collector.collect_for_candidates(&candidates)
     }
 

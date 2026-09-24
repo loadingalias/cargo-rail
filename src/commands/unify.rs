@@ -771,6 +771,14 @@ pub fn run_unify_doctor(ctx: &WorkspaceContext, format: UnifyOutputFormat) -> Ra
         .config()
         .map(|config| config.unify.effective_compiler_targets(&metadata_targets))
         .unwrap_or_else(|| metadata_targets.clone());
+    // Check readiness now so a host that cannot compile a target learns it before a full run.
+    let readiness = compiler_evidence_readiness(snapshot, &compiler_targets);
+    let unobserved_targets = metadata_targets
+        .iter()
+        .filter(|target| !compiler_targets.contains(target))
+        .copied()
+        .collect::<Vec<_>>();
+    let unready_targets = readiness.iter().filter(|target| target["ready"] == false).count();
     let mut target_domains = Vec::with_capacity(metadata_targets.len());
     for target in metadata_targets {
         let resolved_nodes = metadata
@@ -800,7 +808,12 @@ pub fn run_unify_doctor(ctx: &WorkspaceContext, format: UnifyOutputFormat) -> Ra
             })
         })
         .collect::<Vec<_>>();
-    let (recommendation_code, recommendation) = if !aliases.is_empty() {
+    let (recommendation_code, recommendation) = if unready_targets > 0 {
+        (
+            "fix_compiler_targets",
+            "install the missing Rust targets and linkers, narrow unify.compiler_targets to the targets this host can compile, or set it to \"none\"",
+        )
+    } else if !aliases.is_empty() {
         (
             "disambiguate_aliases",
             "make each dependency alias resolve to one PackageId per workspace member and selected target",
@@ -835,6 +848,8 @@ pub fn run_unify_doctor(ctx: &WorkspaceContext, format: UnifyOutputFormat) -> Ra
               },
               "target_domains": target_domains,
               "compiler_evidence_targets": compiler_targets,
+              "compiler_evidence_readiness": readiness,
+              "unobserved_targets": unobserved_targets,
               "ambiguous_aliases": aliases,
               "recommended_action": {
                 "code": recommendation_code,
@@ -870,6 +885,18 @@ pub fn run_unify_doctor(ctx: &WorkspaceContext, format: UnifyOutputFormat) -> Ra
     rendered.push_str("compiler evidence targets: ");
     rendered.push_str(&format_preview_list(&compiler_targets, 8));
     rendered.push('\n');
+    for target in &readiness {
+        if target["ready"] == false {
+            rendered.push_str("  ");
+            rendered.push_str(target["target"].as_str().unwrap_or("unknown"));
+            rendered.push_str(": not ready: ");
+            rendered.push_str(target["cause"].as_str().unwrap_or("unknown"));
+            rendered.push('\n');
+        }
+    }
+    rendered.push_str("unobserved targets (dependencies they need are retained): ");
+    rendered.push_str(&format_preview_list(&unobserved_targets, 8));
+    rendered.push('\n');
     rendered.push_str("cargo source overrides: ");
     rendered.push_str(&format_preview_list(&cargo_overrides, 8));
     rendered.push_str("\nunify policy overrides: ");
@@ -890,6 +917,26 @@ pub fn run_unify_doctor(ctx: &WorkspaceContext, format: UnifyOutputFormat) -> Ra
     rendered.push_str(recommendation);
     rendered.push('\n');
     write_output(&rendered, None)
+}
+
+/// Check whether each evidence target can compile on this host, without linking.
+fn compiler_evidence_readiness(
+    snapshot: &crate::workspace::WorkspaceSnapshot,
+    compiler_targets: &[&str],
+) -> Vec<serde_json::Value> {
+    use crate::compiler::target_preflight::{TargetPreflight, TargetUse};
+    let preflight = TargetPreflight::capture(snapshot);
+    compiler_targets
+        .iter()
+        .map(|target| match preflight.check(&[(target, TargetUse::Check)]) {
+            Ok(_) => serde_json::json!({ "target": target, "ready": true }),
+            Err(failures) => serde_json::json!({
+                "target": target,
+                "ready": false,
+                "cause": failures.first().map_or("unknown", |failure| failure.cause.as_str()),
+            }),
+        })
+        .collect()
 }
 
 /// Prepared options for dependency-coherence check mode.

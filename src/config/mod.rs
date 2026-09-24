@@ -22,8 +22,8 @@ pub use surface::{
     SurfaceProduct, SurfaceTargetSelection,
 };
 pub use unify::{
-    ConsumerScope, ExactPinHandling, MajorVersionConflict, MsrvPolicy, MsrvSource, TransitiveFeatureHost,
-    TransitivePinning, UnifyConfig,
+    CompilerTargetSelection, ConsumerScope, ExactPinHandling, MajorVersionConflict, MsrvPolicy, MsrvSource,
+    TransitiveFeatureHost, TransitivePinning, UnifyConfig,
 };
 
 use crate::error::{ConfigError, RailError, RailResult};

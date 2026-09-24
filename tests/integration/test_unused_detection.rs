@@ -753,6 +753,179 @@ log = "0.4"
     super::helpers::finish_test(result);
 }
 
+fn host_target() -> Result<String> {
+    let rustc = std::process::Command::new("rustc").arg("-vV").output()?;
+    anyhow::ensure!(rustc.status.success(), "rustc -vV failed");
+    String::from_utf8(rustc.stdout)?
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("rustc -vV did not report a host target"))
+}
+
+#[test]
+fn explicit_empty_compiler_targets_acquire_no_evidence_and_retain_dependencies() {
+    let result: Result<()> = (|| {
+        let workspace = create_workspace_with_unused_detection()?;
+        add_crate_with_manifest(
+            &workspace,
+            "test-crate",
+            "[package]\nname = \"test-crate\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nlog = \"0.4\"\n",
+        )?;
+        let host = host_target()?;
+        fs::write(
+            workspace.path.join(".config/rail.toml"),
+            format!("targets = [\"{host}\", \"thumbv6m-none-eabi\"]\n\n[unify]\ncompiler_targets = \"none\"\n"),
+        )?;
+        workspace.commit("Keep resolution targets and select no compiler evidence")?;
+
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--explain"])?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_ne!(output.status.code(), Some(2), "stdout:\n{stdout}\nstderr:\n{stderr}");
+        assert!(
+            !stderr.contains(" / "),
+            "an empty evidence selection must acquire no compiler view:\n{stderr}"
+        );
+        assert!(
+            !stdout.contains("Remove log"),
+            "without compiler evidence the dependency must be retained:\n{stdout}"
+        );
+
+        let doctor = run_cargo_rail(&workspace.path, &["rail", "unify", "doctor", "--format", "json"])?;
+        anyhow::ensure!(doctor.status.success(), "unify doctor failed: {doctor:?}");
+        let doctor: serde_json::Value = serde_json::from_slice(&doctor.stdout)?;
+        assert_eq!(doctor["compiler_evidence_targets"], serde_json::json!([]));
+        assert_eq!(doctor["compiler_evidence_readiness"], serde_json::json!([]));
+        assert_eq!(
+            doctor["unobserved_targets"].as_array().map(Vec::len),
+            Some(2),
+            "every resolution target is unobserved without evidence: {doctor:#}"
+        );
+        assert_eq!(doctor["target_domains"].as_array().map(Vec::len), Some(2));
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn uninstalled_evidence_target_fails_before_compiler_acquisition() {
+    let result: Result<()> = (|| {
+        let workspace = create_workspace_with_unused_detection()?;
+        add_crate_with_manifest(
+            &workspace,
+            "test-crate",
+            "[package]\nname = \"test-crate\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nlog = \"0.4\"\n",
+        )?;
+        let host = host_target()?;
+        // Cargo resolves any built-in target, but this host has no library installed for it.
+        let foreign = "sparc64-unknown-linux-gnu";
+        fs::write(
+            workspace.path.join(".config/rail.toml"),
+            format!("targets = [\"{host}\", \"{foreign}\"]\n"),
+        )?;
+        workspace.commit("Select a target this host cannot compile")?;
+
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{stderr}");
+        assert!(
+            stderr.contains("Unify target preflight failed before compiler acquisition"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("- {foreign}: Rust target library")),
+            "{stderr}"
+        );
+        assert!(
+            !stderr.contains(&format!("- {host}:")),
+            "the installed host target must pass: {stderr}"
+        );
+        assert!(
+            stderr.contains("unify.compiler_targets") && stderr.contains("\"none\""),
+            "the recovery must name the evidence-target choices: {stderr}"
+        );
+        assert!(
+            !stderr.contains("Compiler acquisition progress"),
+            "no Cargo acquisition may start before the preflight passes: {stderr}"
+        );
+
+        // Doctor reports the same readiness without starting acquisition.
+        let doctor = run_cargo_rail(&workspace.path, &["rail", "unify", "doctor", "--format", "json"])?;
+        anyhow::ensure!(doctor.status.success(), "unify doctor failed: {doctor:?}");
+        let doctor: serde_json::Value = serde_json::from_slice(&doctor.stdout)?;
+        assert_eq!(
+            doctor["recommended_action"]["code"], "fix_compiler_targets",
+            "{doctor:#}"
+        );
+        let readiness = doctor["compiler_evidence_readiness"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            readiness
+                .iter()
+                .any(|target| target["target"] == foreign && target["ready"] == false),
+            "{doctor:#}"
+        );
+        assert!(
+            readiness
+                .iter()
+                .any(|target| target["target"] == host.as_str() && target["ready"] == true),
+            "{doctor:#}"
+        );
+
+        // A missing compiler wrapper is rejected by toolchain identity capture, also before acquisition.
+        let wrapped = run_cargo_rail_with_env(
+            &workspace.path,
+            &["rail", "unify", "--check"],
+            &[("RUSTC_WRAPPER", "/nonexistent/cargo-rail-test-wrapper")],
+        )?;
+        let wrapped_stderr = String::from_utf8_lossy(&wrapped.stderr);
+        assert_eq!(wrapped.status.code(), Some(2), "{wrapped_stderr}");
+        assert!(
+            !wrapped_stderr.contains("Compiler acquisition progress"),
+            "a missing wrapper must fail before acquisition: {wrapped_stderr}"
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn unobserved_foreign_target_never_proves_a_target_only_dependency_unused() {
+    let result: Result<()> = (|| {
+        let workspace = create_workspace_with_unused_detection()?;
+        add_crate_with_manifest(
+            &workspace,
+            "test-crate",
+            "[package]\nname = \"test-crate\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [target.thumbv6m-none-eabi.dependencies]\nlog = \"0.4\"\n",
+        )?;
+        let host = host_target()?;
+        fs::write(
+            workspace.path.join(".config/rail.toml"),
+            format!("targets = [\"{host}\", \"thumbv6m-none-eabi\"]\n\n[unify]\ncompiler_targets = [\"{host}\"]\n"),
+        )?;
+        workspace.commit("Observe only the host target")?;
+
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--explain"])?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_ne!(output.status.code(), Some(2), "stdout:\n{stdout}\nstderr:\n{stderr}");
+        assert!(
+            !stderr.contains("target thumbv6m-none-eabi /"),
+            "the unobserved target escaped into compiler acquisition:\n{stderr}"
+        );
+        assert!(
+            !stdout.contains("Remove log"),
+            "host evidence must never remove a dependency that only the foreign target uses:\n{stdout}"
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
 #[test]
 fn test_unused_detection_single_crate_issue_11_repro() {
     let result: Result<()> = (|| {
