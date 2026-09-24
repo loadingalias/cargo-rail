@@ -222,7 +222,7 @@ impl NativeInputObservation {
     }
 }
 
-/// Bind the unmodified rustc arguments (excluding argv[0]) and working directory.
+/// Bind the unmodified rustc arguments (excluding `argv[0]`) and working directory.
 pub(crate) fn native_invocation_digest(arguments: &[String], current_directory: &Path) -> Result<String, String> {
     let current_directory = current_directory
         .to_str()

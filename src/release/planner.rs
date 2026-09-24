@@ -300,7 +300,6 @@ impl<'a> ReleasePlanner<'a> {
         let ordered_targets = self.resolve_targets(crate_names, dependent_policy)?;
         self.validate_touched_version_groups(&ordered_targets)?;
 
-        // Build plan for each crate
         let mut crate_plans = Vec::with_capacity(ordered_targets.len());
         let mut version_map: FxHashMap<String, Version> = FxHashMap::default();
         let mut inputs = self.planning_inputs()?;
@@ -338,7 +337,6 @@ impl<'a> ReleasePlanner<'a> {
                 .collect();
         }
 
-        // Build summary
         let crates_to_publish = crate_plans.iter().filter(|p| p.publish).count();
         let summary = ReleaseSummary {
             total_crates: crate_plans.len(),
@@ -515,7 +513,6 @@ impl<'a> ReleasePlanner<'a> {
         inputs: &mut PlanningInputs,
         version_group_force: Option<&VersionGroupForce>,
     ) -> RailResult<CratePlanOutcome> {
-        // Get crate metadata
         let package = self
             .ctx
             .cargo()
@@ -524,12 +521,10 @@ impl<'a> ReleasePlanner<'a> {
 
         let manifest_path = package.manifest_path.clone().into_std_path_buf();
 
-        // Get current version from cargo_metadata (already resolves workspace inheritance)
         let current_version = package.version.clone();
 
         let previous_tag = self.find_previous_tag(crate_name)?;
 
-        // Get per-crate config (if any)
         let crate_config = self.ctx.config().and_then(|c| c.crates.get(crate_name));
 
         let changelog_config = crate_config.and_then(|c| c.changelog.as_ref());
@@ -651,10 +646,8 @@ impl<'a> ReleasePlanner<'a> {
             }
         };
 
-        // Calculate new version
         let new_version = bump_type.apply(&current_version);
 
-        // Determine tag name
         let tag_name = self.format_tag(crate_name, &new_version);
 
         let version_group_entry = version_group_force.and_then(|force| {
@@ -1070,7 +1063,6 @@ impl ReleasePlan {
                 crate_plan.api_evidence.outcome, crate_plan.api_evidence.detail
             ));
 
-            // Show tag status
             let tag_status = if skip_tag {
                 "✗ (--skip-tag)"
             } else {
@@ -1078,7 +1070,6 @@ impl ReleasePlan {
             };
             output.push_str(&format!("   Tag: {}\n", tag_status));
 
-            // Show publish status
             let publish_status = if skip_publish {
                 "✗ (not authorized; pass --publish)".to_string()
             } else if crate_plan.publish {
@@ -1131,7 +1122,6 @@ impl ReleasePlan {
             output.push('\n');
         }
 
-        // Adjust summary counts based on flags
         let effective_publish_count = if skip_publish {
             0
         } else {

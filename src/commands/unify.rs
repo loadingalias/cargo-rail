@@ -2638,9 +2638,9 @@ fn display_explain(
     }
 }
 
-/// Check if a workspace is a "virtual" workspace (has [workspace] but no [package])
+/// Check whether a workspace is virtual (has a `[workspace]` table but no `[package]` table).
 ///
-/// Virtual workspaces cannot have [dev-dependencies] directly in their manifest,
+/// Virtual workspaces cannot have `[dev-dependencies]` directly in their manifest,
 /// which affects transitive dependency pinning.
 fn is_virtual_workspace(ctx: &WorkspaceContext) -> RailResult<bool> {
     let doc = root_manifest_document(ctx)?;

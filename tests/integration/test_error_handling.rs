@@ -171,7 +171,6 @@ fn test_not_a_workspace() {
         // Just create an empty directory
         fs::create_dir_all(path)?;
 
-        // Try to run a command
         let output = run_cargo_rail(path, &["rail", "status"])?;
         assert!(!output.status.success(), "running outside workspace should fail");
 

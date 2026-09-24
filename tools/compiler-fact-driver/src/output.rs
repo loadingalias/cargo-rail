@@ -4,9 +4,9 @@ use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::Path;
 
-use rscrypto::Sha256;
 use serde_json::json;
 
+use crate::digest::hex_digest;
 use crate::fact_protocol::{
     COMPILER_FACT_ANNOUNCEMENT_CODE, COMPILER_FACT_ANNOUNCEMENT_PREFIX, COMPILER_FACT_PROTOCOL_VERSION,
     CompilerFactAnnouncement, CompilerFactFragment, CompilerFactInvocation, CompilerFactObject,
@@ -84,14 +84,4 @@ pub(crate) fn publish(invocation: &CompilerFactInvocation, object: CompilerFactO
     });
     eprintln!("{diagnostic}");
     Ok(())
-}
-
-fn hex_digest(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut encoded = String::with_capacity(64);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(encoded, "{byte:02x}");
-    }
-    encoded
 }

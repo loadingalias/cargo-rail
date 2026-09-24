@@ -8,7 +8,6 @@ fn test_unify_undo_restores_latest_backup() {
     let result: Result<()> = (|| {
         let workspace = TestWorkspace::new()?;
 
-        // Add some crates
         workspace.add_crate("crate-a", "0.1.0", &[("serde", r#""1.0""#)])?;
         workspace.add_crate("crate-b", "0.1.0", &[("serde", r#""1.0""#)])?;
         workspace.commit("Add test crates")?;
@@ -31,7 +30,6 @@ fn test_unify_undo_restores_latest_backup() {
             "Workspace Cargo.toml should be modified"
         );
 
-        // Run undo
         let undo_output = run_cargo_rail(&workspace.path, &["rail", "unify", "undo"])?;
         let undo_stdout = String::from_utf8_lossy(&undo_output.stdout);
 
@@ -67,7 +65,6 @@ fn test_unify_undo_list() {
     let result: Result<()> = (|| {
         let workspace = TestWorkspace::new()?;
 
-        // Add some crates
         workspace.add_crate("crate-a", "0.1.0", &[("serde", r#""1.0""#)])?;
         workspace.add_crate("crate-b", "0.1.0", &[("serde", r#""1.0""#)])?;
         workspace.commit("Add test crates")?;
@@ -76,7 +73,6 @@ fn test_unify_undo_list() {
         let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply", "--backup"])?;
         assert!(apply_output.status.success());
 
-        // Run undo --list
         let list_output = run_cargo_rail(&workspace.path, &["rail", "unify", "undo", "--list"])?;
         let list_stdout = String::from_utf8_lossy(&list_output.stdout);
 
@@ -99,11 +95,9 @@ fn test_unify_undo_no_backups() {
     let result: Result<()> = (|| {
         let workspace = TestWorkspace::new()?;
 
-        // Add some crates
         workspace.add_crate("crate-a", "0.1.0", &[("serde", r#""1.0""#)])?;
         workspace.commit("Add test crates")?;
 
-        // Run undo without any backups - should fail
         let undo_output = run_cargo_rail(&workspace.path, &["rail", "unify", "undo"])?;
         let undo_stderr = String::from_utf8_lossy(&undo_output.stderr);
 
@@ -124,7 +118,6 @@ fn test_unify_undo_specific_backup_id() {
     let result: Result<()> = (|| {
         let workspace = TestWorkspace::new()?;
 
-        // Add some crates
         workspace.add_crate("crate-a", "0.1.0", &[("serde", r#""1.0""#)])?;
         workspace.add_crate("crate-b", "0.1.0", &[("serde", r#""1.0""#)])?;
         workspace.commit("Add test crates")?;
@@ -136,7 +129,6 @@ fn test_unify_undo_specific_backup_id() {
         run_cargo_rail(&workspace.path, &["rail", "unify", "apply", "--backup"])?;
         run_cargo_rail(&workspace.path, &["rail", "unify", "apply", "--backup"])?;
 
-        // Get list of backups
         let list_output = run_cargo_rail(&workspace.path, &["rail", "unify", "undo", "--list"])?;
         let list_stdout = String::from_utf8_lossy(&list_output.stdout);
 

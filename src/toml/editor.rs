@@ -49,10 +49,8 @@ impl TomlEditor {
 
         let mut current = self.doc.as_item_mut();
 
-        // Navigate to parent table
         for (i, part) in parts.iter().enumerate() {
             if i == parts.len() - 1 {
-                // Last part - set value
                 if let Some(table) = current.as_table_mut() {
                     table.insert(part, Item::Value(value.into()));
                 } else if let Some(table) = current.as_inline_table_mut() {
@@ -65,7 +63,6 @@ impl TomlEditor {
                 }
                 return Ok(());
             } else {
-                // Navigate down
                 if let Some(table) = current.as_table_mut() {
                     current = table.entry(part).or_insert(Item::Table(Table::new()));
                 } else {
@@ -166,7 +163,6 @@ impl TomlEditor {
             .ok_or_else(|| RailError::message(format!("Failed to extract value from '{}'", toml_value)))?
             .clone();
 
-        // Add inline comment if provided
         if let Some(c) = comment {
             value.decor_mut().set_suffix(format!("  # {}", c));
         }
@@ -213,7 +209,6 @@ impl TomlEditor {
 
     /// Validate current state
     pub fn validate(&self) -> RailResult<()> {
-        // Basic syntax check by printing and re-parsing
         let content = self.doc.to_string();
         content
             .parse::<DocumentMut>()
@@ -279,7 +274,6 @@ impl TomlBatchEditor {
     pub fn commit(self) -> RailResult<()> {
         self.validate_all()?;
 
-        // Create backups for all
         for editor in &self.editors {
             let backup_path = editor.path.with_extension("toml.bak");
             fs::write(&backup_path, &editor.original_content).map_err(|e| {
@@ -287,7 +281,6 @@ impl TomlBatchEditor {
             })?;
         }
 
-        // Write all
         for editor in self.editors {
             editor.write()?;
         }

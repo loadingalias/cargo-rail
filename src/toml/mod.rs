@@ -9,7 +9,6 @@ pub(crate) mod builder; // Internal - used by init command
 pub mod editor;
 pub mod format;
 
-// Re-exports
 #[doc(hidden)]
 pub use builder::WorkspaceDepsBuilder;
 pub use editor::TomlEditor;

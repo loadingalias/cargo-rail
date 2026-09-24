@@ -184,7 +184,6 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
     )?;
     let pre_heads = collect_sync_heads(ctx.workspace_root(), &configs);
 
-    // Check mode
     if args.check {
         let pending_commits = configs
             .iter()
@@ -343,7 +342,6 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
         progress!("plan receipt: {}", plan_receipt.display());
     }
 
-    // Execute syncs and collect per-crate results
     let configs_for_exec = configs.clone();
     let crate_results: Vec<CrateSyncResult> =
         if config_count > 1 && args.all && matches!(direction, SyncDirection::MonoToRemote) {
@@ -437,7 +435,6 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
             results
         };
 
-    // Print summary
     print_sync_summary(&crate_results, json, Some(&direction), &selected_repositories)?;
     let post_heads = collect_sync_heads(ctx.workspace_root(), &configs);
     let audit_path =
@@ -679,7 +676,6 @@ fn print_sync_summary(
         return Ok(());
     }
 
-    // Text output
     let active_results: Vec<_> = results.iter().filter(|r| !r.skipped).collect();
     let total_commits: usize = active_results.iter().map(|r| r.result.commits_synced).sum();
     let total_conflicts: usize = active_results.iter().map(|r| r.result.conflicts.len()).sum();
@@ -724,7 +720,6 @@ fn print_sync_summary(
         }
     }
 
-    // Summary line
     let commit_word = if total_commits == 1 { "commit" } else { "commits" };
     if conflicted {
         println!(

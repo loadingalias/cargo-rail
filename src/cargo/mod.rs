@@ -5,7 +5,6 @@
 //! - Manifest analysis for feature classification
 //! - Clean unification with minimal features
 
-// Core modules
 mod cargo_transform;
 pub mod feature_scanner;
 pub mod manifest_analyzer;

@@ -34,13 +34,10 @@ impl ManifestWriter {
     /// IMPORTANT: This MERGES new deps with existing workspace.dependencies.
     /// It does NOT replace the entire section.
     pub fn write_workspace_deps(&self, workspace_toml_path: &Path, deps: &[UnifiedDep]) -> RailResult<()> {
-        // Read workspace Cargo.toml
         let mut doc = manifest_ops::read_toml_file(workspace_toml_path)?;
 
-        // Ensure [workspace] section exists
         manifest_ops::ensure_section(&mut doc, "workspace").context("Failed to create [workspace] section")?;
 
-        // Write all dependencies to [workspace.dependencies]
         // Note: Target constraints stay in member manifests (e.g., [target.'cfg(unix)'.dependencies])
         // with `workspace = true`. We never write [target] sections to workspace Cargo.toml.
         let deps_table = manifest_ops::get_or_create_table(&mut doc, "workspace.dependencies")
@@ -51,7 +48,6 @@ impl ManifestWriter {
             manifest_ops::insert_dependency(deps_table, &dep.name, entry).context("Failed to insert dependency")?;
         }
 
-        // Format and write
         self.formatter.format_manifest(&mut doc)?;
         manifest_ops::write_toml_file(workspace_toml_path, &doc)?;
 
@@ -71,16 +67,12 @@ impl ManifestWriter {
         local_features: Option<&[S]>,
         is_optional: bool,
     ) -> RailResult<()> {
-        // Read member Cargo.toml
         let mut doc = manifest_ops::read_toml_file(member_toml_path)?;
 
-        // Get section name from kind
-        let kind_section = self.dep_kind_to_section(dep_kind);
+        let kind_section = manifest_ops::dep_kind_to_section(dep_kind);
 
-        // Build workspace-inherited entry
         let entry = manifest_ops::build_workspace_dep_entry(local_features, is_optional);
 
-        // Handle target-specific vs regular sections
         if let Some(target_cfg) = target {
             // Target-specific: write to [target.'cfg(...)'.dependencies]
             manifest_ops::insert_target_dependency(&mut doc, target_cfg, kind_section, dep_name, entry)
@@ -92,7 +84,6 @@ impl ManifestWriter {
             manifest_ops::insert_dependency(deps, dep_name, entry).context("Failed to insert workspace dependency")?;
         }
 
-        // Format and write
         self.formatter.format_manifest(&mut doc)?;
         manifest_ops::write_toml_file(member_toml_path, &doc)?;
 
@@ -105,21 +96,17 @@ impl ManifestWriter {
     /// IMPORTANT: The caller must ensure these deps are already in [workspace.dependencies]
     /// before calling this function. Use `write_transitive_workspace_deps` first.
     pub fn add_transitive_pins(&self, host_toml_path: &Path, transitives: &[TransitivePin]) -> RailResult<()> {
-        // Read host Cargo.toml (usually workspace root)
         let mut doc = manifest_ops::read_toml_file(host_toml_path)?;
 
-        // Ensure [dev-dependencies] exists
         let dev_deps = manifest_ops::get_or_create_table(&mut doc, "dev-dependencies")
             .context("Failed to create [dev-dependencies]")?;
 
-        // Add each transitive as a dev dependency with workspace = true
         for pin in transitives {
             let entry = manifest_ops::build_transitive_entry(&pin.features);
             manifest_ops::insert_dependency(dev_deps, &pin.name, entry)
                 .context("Failed to insert transitive dependency")?;
         }
 
-        // Format and write
         self.formatter.format_manifest(&mut doc)?;
         manifest_ops::write_toml_file(host_toml_path, &doc)?;
 
@@ -135,31 +122,22 @@ impl ManifestWriter {
         workspace_toml_path: &Path,
         transitives: &[TransitivePin],
     ) -> RailResult<()> {
-        // Read workspace Cargo.toml
         let mut doc = manifest_ops::read_toml_file(workspace_toml_path)?;
 
-        // Ensure [workspace.dependencies] exists
         manifest_ops::ensure_section(&mut doc, "workspace").context("Failed to create [workspace] section")?;
         let deps_table = manifest_ops::get_or_create_table(&mut doc, "workspace.dependencies")
             .context("Failed to create [workspace.dependencies]")?;
 
-        // Add each transitive dependency with version and features
         for pin in transitives {
             let entry = manifest_ops::build_versioned_dep_entry(&pin.version, &pin.features);
             manifest_ops::insert_dependency(deps_table, &pin.name, entry)
                 .context("Failed to insert transitive to workspace.dependencies")?;
         }
 
-        // Format and write
         self.formatter.format_manifest(&mut doc)?;
         manifest_ops::write_toml_file(workspace_toml_path, &doc)?;
 
         Ok(())
-    }
-
-    /// Convert DepKind to Cargo.toml section name
-    fn dep_kind_to_section(&self, dep_kind: DepKind) -> &'static str {
-        manifest_ops::dep_kind_to_section(dep_kind)
     }
 
     /// Write MSRV (rust-version) to workspace manifest
@@ -167,23 +145,18 @@ impl ManifestWriter {
     /// Writes to [workspace.package].rust-version so that members can inherit it
     /// via `rust-version = { workspace = true }`
     pub fn write_workspace_msrv(&self, workspace_toml_path: &Path, msrv: &semver::Version) -> RailResult<()> {
-        // Read workspace Cargo.toml
         let mut doc = manifest_ops::read_toml_file(workspace_toml_path)?;
 
-        // Ensure [workspace] section exists
         manifest_ops::ensure_section(&mut doc, "workspace").context("Failed to create [workspace] section")?;
 
-        // Get or create [workspace.package] section
         let ws_package = manifest_ops::get_or_create_table(&mut doc, "workspace.package")
             .context("Failed to create [workspace.package]")?;
 
         // Format MSRV as "major.minor.patch" (explicit and unambiguous)
         let msrv_str = format!("{}.{}.{}", msrv.major, msrv.minor, msrv.patch);
 
-        // Insert or update rust-version
         ws_package.insert("rust-version", toml_edit::value(&msrv_str));
 
-        // Format and write
         self.formatter.format_manifest(&mut doc)?;
         manifest_ops::write_toml_file(workspace_toml_path, &doc)?;
 
@@ -253,13 +226,10 @@ impl ManifestWriter {
         dep_kind: DepKind,
         target: Option<&str>,
     ) -> RailResult<()> {
-        // Read member Cargo.toml
         let mut doc = manifest_ops::read_toml_file(member_toml_path)?;
 
-        // Get section name from kind
-        let kind_section = self.dep_kind_to_section(dep_kind);
+        let kind_section = manifest_ops::dep_kind_to_section(dep_kind);
 
-        // Handle target-specific vs regular sections
         if let Some(target_cfg) = target {
             // Target-specific: remove from [target.'cfg(...)'.dependencies]
             manifest_ops::remove_target_dependency(&mut doc, target_cfg, kind_section, dep_name)
@@ -271,7 +241,6 @@ impl ManifestWriter {
             }
         }
 
-        // Format and write
         self.formatter.format_manifest(&mut doc)?;
         manifest_ops::write_toml_file(member_toml_path, &doc)?;
 
@@ -282,15 +251,12 @@ impl ManifestWriter {
     ///
     /// No-ops if the manifest has no `[features]` table or the feature is absent.
     pub fn remove_feature(&self, member_toml_path: &Path, feature_name: &str) -> RailResult<()> {
-        // Read member Cargo.toml
         let mut doc = manifest_ops::read_toml_file(member_toml_path)?;
 
-        // Remove from [features] section
         if let Some(features) = doc.get_mut("features").and_then(|f| f.as_table_like_mut()) {
             features.remove(feature_name);
         }
 
-        // Format and write
         self.formatter.format_manifest(&mut doc)?;
         manifest_ops::write_toml_file(member_toml_path, &doc)?;
 
@@ -312,13 +278,10 @@ impl ManifestWriter {
         target: Option<&str>,
         features_to_add: &[S],
     ) -> RailResult<()> {
-        // Read member Cargo.toml
         let mut doc = manifest_ops::read_toml_file(member_toml_path)?;
 
-        // Get section name from kind
-        let kind_section = self.dep_kind_to_section(dep_kind);
+        let kind_section = manifest_ops::dep_kind_to_section(dep_kind);
 
-        // Handle target-specific vs regular sections
         let dep_item = if let Some(target_cfg) = target {
             // Target-specific: look in [target.'cfg(...)'.dependencies]
             doc.get_mut("target")
@@ -326,7 +289,6 @@ impl ManifestWriter {
                 .and_then(|item| item.get_mut(kind_section))
                 .and_then(|item| item.get_mut(dep_name))
         } else {
-            // Regular section
             doc.get_mut(kind_section)
                 .and_then(|t| t.as_table_mut())
                 .and_then(|t| t.get_mut(dep_name))
@@ -341,10 +303,8 @@ impl ManifestWriter {
             return Ok(());
         };
 
-        // Get existing features (if any)
         let mut existing_features: Vec<String> = manifest_ops::extract_features(dep_item).unwrap_or_default();
 
-        // Add new features (dedup)
         for feature in features_to_add {
             let feat_str = feature.as_ref();
             if !existing_features.iter().any(|f| f == feat_str) {
@@ -352,10 +312,8 @@ impl ManifestWriter {
             }
         }
 
-        // Sort for consistency
         existing_features.sort();
 
-        // Update the dependency entry
         // If it's a simple string like `serde = "1.0"`, we need to convert it to a table
         if let Some(version) = dep_item.as_str() {
             // Convert simple string (e.g., `dep = "1.0"`) to inline table with features
@@ -364,11 +322,9 @@ impl ManifestWriter {
             inline_table.insert("features", manifest_ops::build_feature_array(&existing_features));
             *dep_item = toml_edit::Item::Value(toml_edit::Value::InlineTable(inline_table));
         } else {
-            // Already a table, just update features
             manifest_ops::set_features(dep_item, &existing_features)?;
         }
 
-        // Format and write
         self.formatter.format_manifest(&mut doc)?;
         manifest_ops::write_toml_file(member_toml_path, &doc)?;
 

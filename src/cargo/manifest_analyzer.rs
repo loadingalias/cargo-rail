@@ -1094,8 +1094,6 @@ fn parse_workspace_dep_entry(value: &Item) -> ExistingWorkspaceDep {
     dep
 }
 
-// Unit Tests
-
 #[cfg(test)]
 mod tests {
     use super::*;

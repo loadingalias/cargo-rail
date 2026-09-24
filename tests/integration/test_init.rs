@@ -9,7 +9,6 @@ fn test_init_creates_config() {
         let ws = TestWorkspace::new_named("init-basic")?;
         ws.remove_config()?; // Remove default config for init test
 
-        // Run init command
         let output = run_cargo_rail(&ws.path, &["rail", "init"])?;
 
         // Verify success

@@ -566,7 +566,6 @@ fn test_unify_resolution_based_merging_no_false_positives() {
         )?;
         workspace.commit("Add crates with compatible version requirements")?;
 
-        // Run unify analyze
         let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -646,8 +645,7 @@ fn test_unify_major_version_conflict_warns_and_skips() {
     let result: Result<()> = (|| {
         let workspace = TestWorkspace::new()?;
 
-        // Create crates with different major versions of the same dependency
-        // This simulates the derive_more bug: 0.99.3 vs 2.0
+        // Incompatible dependency requirements must remain separate during unification.
         workspace.add_crate(
             "crate-a",
             "0.1.0",
@@ -956,7 +954,6 @@ fn test_unify_end_to_end_analyze_then_apply() {
             "Analyze should show serde can be unified"
         );
 
-        // Apply unification
         let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         let apply_stdout = String::from_utf8_lossy(&apply_output.stdout);
 
@@ -1121,7 +1118,6 @@ tempfile = "3.0"
 
         workspace.commit("Add crates with dev-dependencies")?;
 
-        // Run unify
         let output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(
             output.status.success(),
@@ -1206,7 +1202,6 @@ cc = "1.0"
 
         workspace.commit("Add crates with build-dependencies")?;
 
-        // Run unify
         let output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(
             output.status.success(),
@@ -1278,7 +1273,6 @@ serde = { version = "1.0", features = ["derive"] }
 
         workspace.commit("Add crates with existing workspace.dependencies")?;
 
-        // Run unify
         let output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(
             output.status.success(),
@@ -1589,7 +1583,6 @@ fn test_unify_local_features_calculation() {
 
         workspace.commit("Add crates with different features")?;
 
-        // Run unify
         let output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(
             output.status.success(),
@@ -1734,7 +1727,6 @@ tokio = { version = "1.0", features = ["signal"] }
 "#,
         )?;
 
-        // Run apply
         let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(
             apply_output.status.success(),
@@ -1757,8 +1749,7 @@ tokio = { version = "1.0", features = ["signal"] }
             workspace_toml
         );
 
-        // CRITICAL: workspace.dependencies should NOT have the target-specific "signal" feature
-        // This is the BUG 2 fix - target-specific features stay local
+        // Target-specific features must remain outside workspace dependencies.
         assert!(
             !workspace_toml.contains("signal"),
             "Target-specific 'signal' feature should NOT be in workspace.dependencies.\n\
@@ -2461,9 +2452,7 @@ fn test_unify_renamed_dependencies_hard_blocker() {
     let result: Result<()> = (|| {
         let workspace = TestWorkspace::new()?;
 
-        // Create crates with renamed dependency
-        // With the bug fix, renamed deps (package = "...") are now properly separated
-        // from direct deps of the same package. This prevents feature confusion.
+        // Direct and renamed dependencies are separate unification candidates.
         workspace.add_crate("crate-a", "0.1.0", &[("serde", r#""1.0""#)])?;
         std::fs::write(
             workspace.path.join("crates/crate-a/src/lib.rs"),
@@ -2611,7 +2600,6 @@ serde = "1.0"
 
         workspace.commit("Add crates")?;
 
-        // Run unify analyze
         let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--show-diff"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -2904,7 +2892,6 @@ fn test_unify_report_generation() {
         // configuration sparse instead of relying on the retired `unify.output` table.
         std::fs::write(workspace.path.join("rail.toml"), "")?;
 
-        // Run apply
         let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply", "--report"])?;
         assert!(
             apply_output.status.success(),
@@ -2977,7 +2964,6 @@ fn test_unify_toml_comments() {
 "#,
         )?;
 
-        // Run apply
         let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(apply_output.status.success(), "Apply should succeed");
 
@@ -3023,7 +3009,6 @@ fn test_unify_backup_flag() {
 "#,
         )?;
 
-        // Run apply with --backup
         let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply", "--backup"])?;
         let apply_stdout = String::from_utf8_lossy(&apply_output.stdout);
 

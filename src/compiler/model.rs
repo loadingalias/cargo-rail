@@ -177,6 +177,26 @@ pub struct CompilationUnitId {
     pub test_mode: bool,
 }
 
+impl CompilationUnitId {
+    pub(crate) fn matches_dependency_kind(&self, kind: DepKind) -> bool {
+        match kind {
+            // Cargo can reuse a normal artifact when constructing the test
+            // harness and does not promise to replay its diagnostics. The
+            // non-test unit is therefore the authoritative normal-dependency
+            // domain; test-mode units belong to the dev-dependency domain.
+            DepKind::Normal => !self.test_mode && self.kind != CargoTargetKind::CustomBuild,
+            DepKind::Dev => {
+                self.test_mode
+                    || matches!(
+                        self.kind,
+                        CargoTargetKind::Test | CargoTargetKind::Example | CargoTargetKind::Benchmark
+                    )
+            }
+            DepKind::Build => self.kind == CargoTargetKind::CustomBuild,
+        }
+    }
+}
+
 /// Unused-dependency diagnostics emitted by one exact compilation unit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompilationUnitEvidence {
@@ -284,21 +304,7 @@ impl TargetEvidence {
         let relevant: Vec<_> = self
             .compiled_units
             .iter()
-            .filter(|unit| match kind {
-                // Cargo can reuse a normal artifact when constructing the test
-                // harness and does not promise to replay its diagnostics.  The
-                // non-test unit is therefore the authoritative normal-dependency
-                // domain; test-mode units belong to the dev-dependency domain.
-                DepKind::Normal => !unit.test_mode && unit.kind != CargoTargetKind::CustomBuild,
-                DepKind::Dev => {
-                    unit.test_mode
-                        || matches!(
-                            unit.kind,
-                            CargoTargetKind::Test | CargoTargetKind::Example | CargoTargetKind::Benchmark
-                        )
-                }
-                DepKind::Build => unit.kind == CargoTargetKind::CustomBuild,
-            })
+            .filter(|unit| unit.matches_dependency_kind(kind))
             .collect();
         if relevant.is_empty() {
             return DependencyEvidenceState::Incomplete;

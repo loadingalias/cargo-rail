@@ -74,7 +74,6 @@ pub fn build_workspace_dep_entry<S: AsRef<str>>(local_features: Option<&[S]>, is
         table.insert("features", build_feature_array(features));
     }
 
-    // Add optional if needed
     if is_optional {
         table.insert("optional", Value::from(true));
     }

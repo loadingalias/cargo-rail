@@ -115,7 +115,6 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
     let snapshots = collect_split_snapshots(ctx, &configs, &mapping_snapshots)?;
     let expected_mutation_plan = build_split_mutation_plan(ctx, &configs, &mapping_snapshots, args.allow_dirty)?;
 
-    // Check mode: show plan
     if args.check {
         let pending_commits = configs
             .iter()
@@ -284,7 +283,6 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
         progress!("plan receipt: {}", plan_receipt.display());
     }
 
-    // Execute splits
     let output_crates = if config_count > 1 && args.all {
         progress!("splitting {} crates...", config_count);
         let results: Vec<RailResult<SplitAppliedCrate>> = configs
@@ -563,24 +561,18 @@ fn detect_workspace_splits(
     let mut splits = Vec::new();
 
     for pkg in members {
-        // Filter by requested crates if specified
         if let Some(requested) = requested_crates
             && !requested.contains(&pkg.name)
         {
             continue;
         }
 
-        // Get relative path from workspace root to crate directory
         let Some(crate_dir) = pkg.manifest_path.parent() else {
-            // manifest_path always has a parent directory - skip if somehow malformed
             continue;
         };
-        // Detect per-crate CHANGELOG file
         let changelog_path = crate::utils::detect_crate_changelog(crate_dir);
-        // Generate a reasonable remote URL placeholder (GitHub org/repo pattern)
         let remote = format!("git@github.com:org/{}.git", pkg.name);
 
-        // Check if crate has publish = false in Cargo.toml
         let publish = crate::workspace::CargoState::is_package_publishable(pkg);
 
         splits.push(SplitConfig {

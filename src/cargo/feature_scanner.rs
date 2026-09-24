@@ -429,7 +429,6 @@ impl FeatureScanner {
         let mut results = Vec::with_capacity(workspace_pkg_count);
 
         for pkg in metadata.workspace_packages() {
-            // Skip crates with no declared features
             if pkg.features.is_empty() {
                 continue;
             }
@@ -471,7 +470,6 @@ impl FeatureScanner {
         let mut map: HashMap<String, HashSet<String>> = HashMap::new();
 
         for pkg in metadata.workspace_packages() {
-            // Scan all feature definitions in this package
             for feature_deps in pkg.features.values() {
                 for dep_str in feature_deps {
                     // Parse feature references like "dep/feature" or "dep?/feature"
@@ -726,17 +724,14 @@ mod tests {
         extract_cfg_features(r#"#[cfg(feature = "my_feature")]"#, &mut features);
         assert!(features.contains("my_feature"), "should handle underscores");
 
-        // Variable assignment like `let feature = "value"` technically matches our pattern
-        // This is a safe false positive - we'll keep the feature rather than prune it
-        // The alternative would require a full Rust parser, which is overkill
+        // Conservative scanning accepts syntactic matches outside cfg expressions.
         features.clear();
         extract_cfg_features(r#"let feature = "not-a-cfg";"#, &mut features);
-        // False positives are acceptable - they just prevent pruning a dead feature
+        assert_eq!(features, HashSet::from(["not-a-cfg".to_string()]));
 
-        // Should NOT match: feature in a string literal
         features.clear();
-        extract_cfg_features(r#"println!("feature = \"quoted\"");"#, &mut features);
-        // This might match - that's acceptable, false positives are safe (we keep the feature)
+        extract_cfg_features(r##"println!(r#"feature = "quoted""#);"##, &mut features);
+        assert_eq!(features, HashSet::from(["quoted".to_string()]));
 
         // Should NOT match: invalid feature names
         features.clear();

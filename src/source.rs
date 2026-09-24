@@ -90,12 +90,12 @@ impl fmt::Display for RepositoryPath {
     }
 }
 
-/// SHA-256 identity of exact regular-file bytes.
+/// A SHA-256 digest of an exact byte sequence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ContentDigest([u8; 32]);
 
 impl ContentDigest {
-    /// Digest exact file bytes.
+    /// Hash bytes exactly, without framing or normalization.
     pub fn sha256(bytes: &[u8]) -> Self {
         crate::instrumentation::record_hash(bytes.len());
         Self(Sha256::digest(bytes))

@@ -34,6 +34,7 @@ mod native_input_protocol;
 
 mod codegen;
 mod collection;
+mod digest;
 mod native_inputs;
 mod output;
 

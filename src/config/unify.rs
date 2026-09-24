@@ -201,34 +201,14 @@ impl UnifyConfig {
     ///
     /// Supports glob patterns (e.g., "unstable-*", "bench*")
     pub fn should_preserve_feature(&self, feature_name: &str) -> bool {
-        self.preserve_features.iter().any(|pattern| {
-            if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
-                // Use glob matching for patterns with wildcards
-                glob::Pattern::new(pattern)
-                    .map(|p| p.matches(feature_name))
-                    .unwrap_or(false)
-            } else {
-                // Exact match for literal patterns
-                pattern == feature_name
-            }
-        })
+        matches_feature_pattern(&self.preserve_features, feature_name)
     }
 
     /// Check if a feature should be skipped in undeclared feature detection
     ///
     /// Supports glob patterns (e.g., "*_backend", "*_impl")
     pub fn should_skip_undeclared_feature(&self, feature_name: &str) -> bool {
-        self.skip_undeclared_patterns.iter().any(|pattern| {
-            if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
-                // Use glob matching for patterns with wildcards
-                glob::Pattern::new(pattern)
-                    .map(|p| p.matches(feature_name))
-                    .unwrap_or(false)
-            } else {
-                // Exact match for literal patterns
-                pattern == feature_name
-            }
-        })
+        matches_feature_pattern(&self.skip_undeclared_patterns, feature_name)
     }
 
     /// Validate unify configuration against the workspace
@@ -311,6 +291,16 @@ impl UnifyConfig {
 
         Ok(())
     }
+}
+
+fn matches_feature_pattern(patterns: &[String], feature_name: &str) -> bool {
+    patterns.iter().any(|pattern| {
+        if pattern.contains(['*', '?', '[']) {
+            glob::Pattern::new(pattern).is_ok_and(|pattern| pattern.matches(feature_name))
+        } else {
+            pattern == feature_name
+        }
+    })
 }
 
 fn validate_glob_patterns(field: &str, patterns: &[String]) -> Result<(), crate::error::ConfigError> {

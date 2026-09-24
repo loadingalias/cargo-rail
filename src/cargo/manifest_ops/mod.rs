@@ -26,7 +26,6 @@ pub use navigation::{
     ensure_section, get_or_create_table, insert_dependency, insert_target_dependency, remove_target_dependency,
 };
 
-// Feature Operations
 pub use fields::{build_feature_array, extract_features, remove_path, set_features};
 
 // Batch Transformation Operations

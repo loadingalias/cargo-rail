@@ -2,6 +2,7 @@
 
 use std::fs::File;
 use std::io::{BufReader, Seek as _, Write as _};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -33,6 +34,33 @@ pub(crate) struct TransferMetrics {
     pub(crate) payload_bytes_read: u64,
     pub(crate) payload_bytes_written: u64,
     pub(crate) service_elapsed_ns: u64,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct TransferCounters {
+    pub(super) request_attempts: AtomicU64,
+    pub(super) payload_bytes_read: AtomicU64,
+    pub(super) payload_bytes_written: AtomicU64,
+}
+
+impl TransferCounters {
+    pub(super) fn snapshot(&self) -> TransferMetrics {
+        TransferMetrics {
+            request_attempts: self.request_attempts.load(Ordering::Relaxed),
+            payload_bytes_read: self.payload_bytes_read.load(Ordering::Relaxed),
+            payload_bytes_written: self.payload_bytes_written.load(Ordering::Relaxed),
+            service_elapsed_ns: 0,
+        }
+    }
+
+    pub(super) fn take(&self) -> TransferMetrics {
+        TransferMetrics {
+            request_attempts: self.request_attempts.swap(0, Ordering::AcqRel),
+            payload_bytes_read: self.payload_bytes_read.swap(0, Ordering::AcqRel),
+            payload_bytes_written: self.payload_bytes_written.swap(0, Ordering::AcqRel),
+            service_elapsed_ns: 0,
+        }
+    }
 }
 
 pub(crate) enum Lookup {
@@ -763,6 +791,24 @@ mod tests {
             .read_exact(&mut header)
             .map_err(|_| RemoteStoreError::integrity("remote entry header is truncated"))?;
         decode_entry_record(&header, base_action_key)
+    }
+
+    #[test]
+    fn transfer_counters_snapshot_without_reset_and_take_atomically() {
+        let counters = TransferCounters::default();
+        counters.request_attempts.store(3, Ordering::Relaxed);
+        counters.payload_bytes_read.store(5, Ordering::Relaxed);
+        counters.payload_bytes_written.store(7, Ordering::Relaxed);
+
+        let expected = TransferMetrics {
+            request_attempts: 3,
+            payload_bytes_read: 5,
+            payload_bytes_written: 7,
+            service_elapsed_ns: 0,
+        };
+        assert_eq!(counters.snapshot(), expected);
+        assert_eq!(counters.take(), expected);
+        assert_eq!(counters.snapshot(), TransferMetrics::default());
     }
 
     #[test]

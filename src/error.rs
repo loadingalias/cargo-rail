@@ -584,7 +584,6 @@ fn print_error_json(error: &RailError) {
     if let Ok(json) = serde_json::to_string_pretty(&json_error) {
         println!("{}", json);
     } else {
-        // Fallback to text if JSON serialization fails
         crate::error!("{}", error);
     }
 }

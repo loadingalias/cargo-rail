@@ -642,7 +642,6 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext, prepared_plan: Option<Pla
             ),
         },
 
-        // Release
         Commands::Release { command } => match command {
             cli::ReleaseCommand::Init { crate_names, dry_run } => {
                 let crates = if crate_names.is_empty() {

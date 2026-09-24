@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{Read as _, Seek as _};
 use std::num::NonZero;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -20,7 +20,7 @@ use futures_util::TryStreamExt as _;
 
 use super::object::{
     ENTRY_PRELUDE_BYTES, ENTRY_PRELUDE_LEN, EntryBody, EntryState, MAX_ENTRY_BYTES, PutCondition, PutOutcome,
-    STREAM_BUFFER_BYTES, StoredBytes, StoredEntry, TransferMetrics,
+    STREAM_BUFFER_BYTES, StoredBytes, StoredEntry, TransferCounters, TransferMetrics,
 };
 use super::{RemoteCacheSelection, RemoteStoreError, RemoteStoreResult};
 
@@ -28,33 +28,6 @@ const OPERATION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const SERVICE_TIMEOUT_SECONDS: i32 = 15 * 60;
 const DOWNLOAD_PARTITION_BYTES: usize = 8 * 1024 * 1024;
 const CREDENTIAL_UNSELECTED: usize = usize::MAX;
-
-#[derive(Debug, Default)]
-struct TransferCounters {
-    request_attempts: AtomicU64,
-    payload_bytes_read: AtomicU64,
-    payload_bytes_written: AtomicU64,
-}
-
-impl TransferCounters {
-    fn snapshot(&self) -> TransferMetrics {
-        TransferMetrics {
-            request_attempts: self.request_attempts.load(Ordering::Relaxed),
-            payload_bytes_read: self.payload_bytes_read.load(Ordering::Relaxed),
-            payload_bytes_written: self.payload_bytes_written.load(Ordering::Relaxed),
-            service_elapsed_ns: 0,
-        }
-    }
-
-    fn take(&self) -> TransferMetrics {
-        TransferMetrics {
-            request_attempts: self.request_attempts.swap(0, Ordering::AcqRel),
-            payload_bytes_read: self.payload_bytes_read.swap(0, Ordering::AcqRel),
-            payload_bytes_written: self.payload_bytes_written.swap(0, Ordering::AcqRel),
-            service_elapsed_ns: 0,
-        }
-    }
-}
 
 #[derive(Debug)]
 struct RequestMetricsPolicy {

@@ -1197,7 +1197,6 @@ fn test_split_single_crate_basic() {
         let split_dir = initialized_split_target("main")?;
         let split_path = split_dir.path();
 
-        // Create rail.toml config
         let config = format!(
             r#"[crates.mylib.split]
 remote = "{}"
@@ -1208,7 +1207,6 @@ mode = "single"
         );
         std::fs::write(ws.path.join("rail.toml"), config)?;
 
-        // Perform split
         run_cargo_rail(&ws.path, &["rail", "split", "run", "mylib", "--yes", "--allow-dirty"])?;
 
         // Verify split structure
@@ -2345,7 +2343,6 @@ mode = "single"
         );
         std::fs::write(ws.path.join("rail.toml"), config)?;
 
-        // Perform split
         run_cargo_rail(
             &ws.path,
             &["rail", "split", "run", "lib-release", "--yes", "--allow-dirty"],
@@ -3270,7 +3267,6 @@ mode = "single"
         );
         std::fs::write(ws.path.join("rail.toml"), config)?;
 
-        // First split
         let output1 = run_cargo_rail(
             &ws.path,
             &["rail", "split", "run", "idempotent-lib", "--yes", "--allow-dirty"],
@@ -3285,7 +3281,6 @@ mode = "single"
         let log1 = git(split_dir.path(), &["rev-list", "--count", "HEAD"])?;
         let commit_count1: usize = String::from_utf8_lossy(&log1.stdout).trim().parse()?;
 
-        // Get HEAD SHA after first split
         let head1 = git(split_dir.path(), &["rev-parse", "HEAD"])?;
         let head_sha1 = String::from_utf8_lossy(&head1.stdout).trim().to_string();
 
@@ -3347,7 +3342,6 @@ mode = "single"
         );
         std::fs::write(ws.path.join("rail.toml"), config)?;
 
-        // First split
         let output1 = run_cargo_rail(
             &ws.path,
             &["rail", "split", "run", "incremental-lib", "--yes", "--allow-dirty"],
@@ -3433,7 +3427,6 @@ members = ["lib-core", "service-api"]
         );
         std::fs::write(ws.path.join("rail.toml"), config)?;
 
-        // First split
         let output1 = run_cargo_rail(
             &ws.path,
             &["rail", "split", "run", "combined", "--yes", "--allow-dirty"],
@@ -3511,7 +3504,6 @@ mode = "single"
         );
         std::fs::write(ws.path.join("rail.toml"), config)?;
 
-        // First split - creates full history
         run_cargo_rail(
             &ws.path,
             &["rail", "split", "run", "partial-lib", "--yes", "--allow-dirty"],
@@ -3600,7 +3592,6 @@ include = ["rustfmt.toml", ".editorconfig"]
         );
         std::fs::write(ws.path.join("rail.toml"), config)?;
 
-        // First split
         run_cargo_rail(&ws.path, &["rail", "split", "run", "aux-lib", "--yes", "--allow-dirty"])?;
 
         // Count commits including auxiliary files commit

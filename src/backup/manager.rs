@@ -429,7 +429,6 @@ mod tests {
             let workspace = create_test_workspace();
             let manager = BackupManager::new(workspace.path());
 
-            // Files to backup
             let files = vec![PathBuf::from("Cargo.toml"), PathBuf::from("crates/foo/Cargo.toml")];
 
             // Create backup (use max_backups=10 to keep multiple backups)
@@ -446,7 +445,6 @@ mod tests {
             // Modify original files
             fs::write(workspace.path().join("Cargo.toml"), "# Modified").unwrap();
 
-            // Restore backup
             manager.restore_backup(&backup_id)?;
 
             // Verify restoration
@@ -474,7 +472,6 @@ mod tests {
             let metadata = BackupMetadata::new("test 1");
             manager.create_backup(&files, metadata, 10)?;
 
-            // Should now have 1 backup
             assert!(manager.has_backups());
             let backups = manager.list_backups()?;
             assert_eq!(backups.len(), 1);
@@ -482,11 +479,9 @@ mod tests {
 
             std::thread::sleep(std::time::Duration::from_millis(10));
 
-            // Create another backup
             let metadata2 = BackupMetadata::new("test 2");
             manager.create_backup(&files, metadata2, 10)?;
 
-            // Should have 2 backups
             let backups = manager.list_backups()?;
             assert_eq!(backups.len(), 2);
 

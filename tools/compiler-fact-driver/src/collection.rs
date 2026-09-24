@@ -20,6 +20,7 @@ use rustc_session::config::CrateType;
 use rustc_span::def_id::LOCAL_CRATE;
 use rustc_span::{FileName, Pos};
 
+use crate::digest::hex_digest;
 use crate::fact_protocol::{
     COMPILER_FACT_PROTOCOL_VERSION, CompilerFactCompletion, CompilerFactCoverage, CompilerFactEdge,
     CompilerFactEdgeKind, CompilerFactEntryPoint, CompilerFactEntryPointKind, CompilerFactInvocation,
@@ -700,16 +701,6 @@ fn protocol_path(path: &Path) -> String {
         .map(|component| component.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/")
-}
-
-fn hex_digest(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut encoded = String::with_capacity(64);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(encoded, "{byte:02x}");
-    }
-    encoded
 }
 
 fn generated_source_path(identity: &str) -> CompilerFactSourcePath {

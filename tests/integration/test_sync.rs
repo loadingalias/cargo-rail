@@ -686,7 +686,6 @@ fn test_sync_to_remote_basic() {
         ws.modify_file("mylib", "src/lib.rs", "// Changed in mono")?;
         ws.commit("Update mylib in mono")?;
 
-        // Sync to remote
         run_cargo_rail(
             &ws.path,
             &["rail", "sync", "mylib", "--to-remote", "--yes", "--allow-dirty"],
@@ -1746,7 +1745,6 @@ fn test_sync_skips_already_synced_commits() {
     let result: Result<()> = (|| {
         let (ws, split_dir) = setup_split_scenario("mylib")?;
 
-        // First sync
         ws.modify_file("mylib", "src/lib.rs", "// First change")?;
         ws.commit("First change")?;
 
@@ -2038,7 +2036,6 @@ fn test_sync_to_remote_idempotent() {
         ws.modify_file("sync-idempotent-lib", "src/lib.rs", "// Synced change")?;
         ws.commit("Sync this change")?;
 
-        // First sync to remote
         let output1 = run_cargo_rail(
             &ws.path,
             &[
@@ -2527,7 +2524,6 @@ fn test_sync_from_remote_pr_branch_exists_adds_commits() {
         let pr_head_after_first = git(&ws.path, &["rev-parse", pr_branch_name])?;
         let pr_sha_first = String::from_utf8_lossy(&pr_head_after_first.stdout).trim().to_string();
 
-        // Go back to main
         git(&ws.path, &["checkout", "main"])?;
 
         // Make second change in split repo

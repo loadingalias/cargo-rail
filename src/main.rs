@@ -38,7 +38,6 @@ fn main() {
         redirected_progress,
     ));
 
-    // Apply global --json flag to command format fields
     if cli.json
         && let Err(error) = cli.command.apply_json_override()
     {
@@ -61,7 +60,6 @@ fn main() {
 }
 
 fn run(cli: RailCli, cli_preparation_started: Instant) -> RailResult<()> {
-    // Get workspace root (from --workspace-root flag or current directory)
     let workspace_root = if let Some(ref root) = cli.workspace_root {
         if root.is_absolute() {
             root.clone()
@@ -84,7 +82,6 @@ fn run(cli: RailCli, cli_preparation_started: Instant) -> RailResult<()> {
         }
     };
 
-    // Store config override path for commands that need it
     let config_override = cli.config.as_deref();
 
     let prepared = commands::try_dispatch_pre_context(cli.command, &workspace_root, config_override, cli.json);
@@ -95,7 +92,6 @@ fn run(cli: RailCli, cli_preparation_started: Instant) -> RailResult<()> {
         Err(error) => return Err(error),
     };
 
-    // Build one workspace context for the selected command.
     let workspace_capture_started = Instant::now();
     let context = prepared.build(&workspace_root);
     cargo_rail::instrumentation::record_workspace_capture_cargo_metadata(workspace_capture_started);
@@ -104,7 +100,6 @@ fn run(cli: RailCli, cli_preparation_started: Instant) -> RailResult<()> {
         cargo_rail::instrumentation::record_snapshot_id(snapshot_id);
     }
 
-    // Dispatch to command handler
     commands::dispatch(command, &ctx, prepared_plan)
 }
 

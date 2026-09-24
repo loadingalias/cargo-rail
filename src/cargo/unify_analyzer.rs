@@ -407,7 +407,7 @@ impl UnifyAnalyzer {
             return relative.to_path_buf();
         }
 
-        // Fallback: if canonicalization moved outside workspace, try non-canonicalized path
+        // Preserve a lexically workspace-relative declaration when its resolved target is external.
         if let Ok(relative) = absolute_dep_path.strip_prefix(&self.workspace_root) {
             return relative.to_path_buf();
         }
@@ -1289,7 +1289,7 @@ impl UnifyAnalyzer {
     ///
     /// This catches cases where a crate relies on Cargo's feature unification to
     /// "borrow" features from other workspace members. After workspace dependency
-    /// unification, standalone builds (cargo test -p <crate>) will fail because
+    /// unification, standalone builds (`cargo test -p <crate>`) will fail because
     /// the borrowed features are no longer available.
     ///
     /// Key distinctions:
@@ -1471,7 +1471,6 @@ impl UnifyAnalyzer {
                 continue;
             }
 
-            // Skip if configured to skip this feature pattern
             if self.config.should_skip_undeclared_feature(feat) {
                 continue;
             }

@@ -5,7 +5,7 @@ use std::future::Future;
 use std::io::Seek as _;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use aws_config::BehaviorVersion;
@@ -23,7 +23,7 @@ use tokio::io::{AsyncRead, AsyncReadExt as _};
 
 use super::object::{
     ENTRY_PRELUDE_BYTES, ENTRY_PRELUDE_LEN, EntryBody, EntryRecord, EntryState, PutCondition, PutOutcome,
-    STREAM_BUFFER_BYTES, StoredBytes, StoredEntry, TransferMetrics,
+    STREAM_BUFFER_BYTES, StoredBytes, StoredEntry, TransferCounters, TransferMetrics,
 };
 use super::{RemoteCacheSelection, RemoteProbeFailureCause, RemoteStoreError, RemoteStoreResult};
 
@@ -32,33 +32,6 @@ const CREDENTIAL_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const STREAM_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-
-#[derive(Debug, Default)]
-struct TransferCounters {
-    request_attempts: AtomicU64,
-    payload_bytes_read: AtomicU64,
-    payload_bytes_written: AtomicU64,
-}
-
-impl TransferCounters {
-    fn snapshot(&self) -> TransferMetrics {
-        TransferMetrics {
-            request_attempts: self.request_attempts.load(Ordering::Relaxed),
-            payload_bytes_read: self.payload_bytes_read.load(Ordering::Relaxed),
-            payload_bytes_written: self.payload_bytes_written.load(Ordering::Relaxed),
-            service_elapsed_ns: 0,
-        }
-    }
-
-    fn take(&self) -> TransferMetrics {
-        TransferMetrics {
-            request_attempts: self.request_attempts.swap(0, Ordering::AcqRel),
-            payload_bytes_read: self.payload_bytes_read.swap(0, Ordering::AcqRel),
-            payload_bytes_written: self.payload_bytes_written.swap(0, Ordering::AcqRel),
-            service_elapsed_ns: 0,
-        }
-    }
-}
 
 #[derive(Debug)]
 struct RequestMetricsInterceptor {

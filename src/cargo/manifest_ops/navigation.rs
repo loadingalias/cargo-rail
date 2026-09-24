@@ -141,7 +141,6 @@ mod tests {
         let table = get_or_create_table(&mut doc, "workspace.dependencies").unwrap();
         assert!(table.is_empty());
 
-        // Should work again without error
         let table2 = get_or_create_table(&mut doc, "workspace.dependencies").unwrap();
         assert!(table2.is_empty());
     }

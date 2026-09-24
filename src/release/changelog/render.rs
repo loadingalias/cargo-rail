@@ -13,7 +13,7 @@ enum Segment {
     Literal(String),
     /// "**scope**: " when the commit has a scope
     Scope,
-    /// "[**breaking**] " for breaking changes
+    /// `[**breaking**] ` for breaking changes
     Breaking,
     /// Commit description
     Description,

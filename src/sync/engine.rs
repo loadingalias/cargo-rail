@@ -1596,7 +1596,6 @@ impl<'a> SyncEngine<'a> {
     ) -> RailResult<SyncResult> {
         progress!("Syncing local source to remote target...");
 
-        // Open remote repo
         let target_repo_path = self.config.target_repo_path.clone();
         let remote_git = SystemGit::open(&target_repo_path)?;
 
@@ -1667,7 +1666,6 @@ impl<'a> SyncEngine<'a> {
         // Check current branch - NEVER commit directly to protected branches
         let _current_branch = self.ctx.git()?.git().current_branch()?;
 
-        // Open remote repo
         let target_repo_path = self.config.target_repo_path.clone();
         let remote_git = SystemGit::open(&target_repo_path)?;
 
