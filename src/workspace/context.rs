@@ -1,5 +1,6 @@
 //! Capture one authoritative workspace view and share its derived state.
 
+use crate::cargo::metadata::{self, CargoOutput};
 use crate::cargo::multi_target_metadata::MultiTargetMetadata;
 use crate::cargo::resolution::{
     CargoConfigSnapshot, ResolutionInputs, ResolutionRequest, ResolutionView, ResolutionViews,
@@ -47,9 +48,9 @@ impl CargoState {
     /// Load fresh Cargo-owned workspace metadata.
     fn load(workspace_root: &Path) -> RailResult<Self> {
         crate::instrumentation::record_cargo_metadata_load(false);
-        let metadata = MetadataCommand::new()
-            .manifest_path(workspace_root.join("Cargo.toml"))
-            .exec()?;
+        let mut command = MetadataCommand::new();
+        command.manifest_path(workspace_root.join("Cargo.toml"));
+        let metadata = metadata::exec(&command, workspace_root, CargoOutput::DiscoverFrom(Path::new(".")))?;
         Ok(Self::from_metadata(Arc::new(super::capture_metadata_paths(metadata)?)))
     }
 
@@ -68,16 +69,11 @@ impl CargoState {
         if workspace_root.join("Cargo.lock").is_file() {
             command.other_options(vec!["--locked".to_string()]);
         }
-        let metadata = command.exec().map_err(|error| {
-      if credential_sensitive {
-        RailError::with_help(
-          "Cargo metadata failed while credential capabilities were active",
-          "run cargo metadata directly for provider diagnostics; cargo-rail suppresses credential-provider output",
-        )
-      } else {
-        error.into()
-      }
-    })?;
+        let metadata = metadata::exec(
+            &command,
+            workspace_root,
+            CargoOutput::for_credential_capability(credential_sensitive),
+        )?;
         Ok(Self::from_metadata(Arc::new(super::capture_metadata_paths(metadata)?)))
     }
 
@@ -90,7 +86,7 @@ impl CargoState {
         if require_existing_lock || workspace_root.join("Cargo.lock").is_file() {
             command.other_options(vec!["--locked".to_string()]);
         }
-        let metadata = command.exec()?;
+        let metadata = metadata::exec(&command, workspace_root, CargoOutput::DiscoverFrom(cargo_current_dir))?;
         Ok(Self::from_metadata(Arc::new(super::capture_metadata_paths(metadata)?)))
     }
 

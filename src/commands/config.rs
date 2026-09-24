@@ -21,12 +21,16 @@ fn print_config_json<T: Serialize>(mode: &str, result: &str, exit_code: i32, pay
     Ok(())
 }
 
+/// Context that marks a Cargo workspace failure rather than a policy error.
+const WORKSPACE_VALIDATION: &str = "cannot validate Cargo workspace configuration";
+
 /// Validation result for JSON output
 #[derive(Serialize)]
 struct ValidationResult {
     command: &'static str,
     action: &'static str,
     valid: bool,
+    evidence: ValidationEvidence,
     config_path: Option<String>,
     errors: Vec<ValidationIssue>,
     warnings: Vec<ValidationIssue>,
@@ -38,6 +42,8 @@ struct ValidationIssue {
     section: String,
     message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    help: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     line: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     column: Option<usize>,
@@ -48,6 +54,7 @@ impl ValidationIssue {
         Self {
             section: section.into(),
             message: message.into(),
+            help: None,
             line: None,
             column: None,
         }
@@ -556,7 +563,6 @@ fn inspect_config_source(
     config_override: Option<&Path>,
     source: ConfigSource,
 ) -> Result<(ConfigSource, DecodedConfig, Vec<String>), InspectionFailure> {
-    let standalone = config_override == Some(Path::new("-"));
     let inspect = || -> Result<Inspection, Vec<RailError>> {
         let decoded = config::decode(&source.bytes).map_err(|error| vec![error])?;
         // Intrinsic errors remain diagnostic even if the surrounding Cargo workspace is broken.
@@ -564,10 +570,9 @@ fn inspect_config_source(
         if !policy_errors.is_empty() {
             return Err(policy_errors);
         }
-        let metadata = if standalone {
-            None
-        } else {
-            standalone_workspace_metadata(workspace_root).map_err(|error| vec![error])?
+        let metadata = match validation_evidence(workspace_root, config_override) {
+            ValidationEvidence::Schema => None,
+            ValidationEvidence::Workspace => Some(workspace_metadata(workspace_root).map_err(|error| vec![error])?),
         };
         // Cargo's reported root is authoritative when manifests alone could not prove it.
         if let Some(metadata) = &metadata
@@ -642,7 +647,9 @@ pub fn run_config_validate_standalone(
             // Each independent violation is its own issue, so one run reports them all.
             for error in &failure.errors {
                 let mut issue = validation_issue_from_error(error);
-                if let Some((line, column)) = extract_toml_error_location(&error.to_string()) {
+                if issue.section != "cargo"
+                    && let Some((line, column)) = extract_toml_error_location(&error.to_string())
+                {
                     issue = issue.with_location(line, column);
                 }
                 errors.push(issue);
@@ -666,12 +673,14 @@ pub fn run_config_validate_standalone(
     };
 
     let valid = final_errors.is_empty();
+    let evidence = validation_evidence(workspace_root, config_override);
 
     if json {
         let result = ValidationResult {
             command: "config",
             action: "validate",
             valid,
+            evidence,
             config_path,
             errors: final_errors,
             warnings: final_warnings,
@@ -698,7 +707,12 @@ pub fn run_config_validate_standalone(
             }
             eprintln!();
         }
-        println!("configuration is valid");
+        match evidence {
+            ValidationEvidence::Workspace => println!("configuration is valid for the Cargo workspace"),
+            ValidationEvidence::Schema => {
+                println!("configuration is valid (schema only; no Cargo workspace was checked)")
+            }
+        }
     } else {
         eprintln!("config: {}", config_path.as_deref().unwrap_or("coded defaults"));
         if strict {
@@ -707,10 +721,14 @@ pub fn run_config_validate_standalone(
         eprintln!();
         eprintln!("errors:");
         for error in &final_errors {
+            let message = error.message.replace('\n', "\n    ");
             if let (Some(line), Some(column)) = (error.line, error.column) {
-                eprintln!("  [{}:{}:{}] {}", error.section, line, column, error.message);
+                eprintln!("  [{}:{}:{}] {}", error.section, line, column, message);
             } else {
-                eprintln!("  [{}] {}", error.section, error.message);
+                eprintln!("  [{}] {}", error.section, message);
+            }
+            if let Some(help) = &error.help {
+                eprintln!("    help: {}", help.replace('\n', "\n          "));
             }
         }
         eprintln!();
@@ -741,26 +759,62 @@ fn extract_toml_error_location(err: &str) -> Option<(usize, usize)> {
 }
 
 fn validation_issue_from_error(error: &RailError) -> ValidationIssue {
-    let (field, message) = match error {
+    let mut issue = match error {
+        RailError::Context { context, source } if context == WORKSPACE_VALIDATION => {
+            ValidationIssue::new("cargo", source.to_string())
+        }
         RailError::Context { source, .. } => return validation_issue_from_error(source),
-        RailError::Config(ConfigError::InvalidField { field, reason }) => (field.as_str(), reason.clone()),
-        RailError::Config(ConfigError::InvalidValue { field, .. }) => (field.as_str(), error.to_string()),
-        RailError::Config(ConfigError::MissingField { field }) => (field.as_str(), error.to_string()),
-        _ => return ValidationIssue::new("config", error.to_string()),
+        RailError::Config(ConfigError::InvalidField { field, reason }) => {
+            ValidationIssue::new(field.split('.').next().unwrap_or("config"), reason.clone())
+        }
+        RailError::Config(ConfigError::InvalidValue { field, .. } | ConfigError::MissingField { field }) => {
+            ValidationIssue::new(field.split('.').next().unwrap_or("config"), error.to_string())
+        }
+        _ => ValidationIssue::new("config", error.to_string()),
     };
-    ValidationIssue::new(field.split('.').next().unwrap_or("config"), message)
+    issue.help = error.help_message();
+    issue
 }
 
-fn standalone_workspace_metadata(workspace_root: &Path) -> RailResult<Option<cargo_metadata::Metadata>> {
-    match workspace_root.join("Cargo.toml").symlink_metadata() {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(RailError::message(format!("cannot inspect Cargo workspace: {error}"))),
-        Ok(_) => {}
+/// What validation can prove: policy alone, or policy bound to the Cargo workspace.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ValidationEvidence {
+    /// Configuration syntax, fields, and values only; no Cargo workspace was loaded.
+    Schema,
+    /// Configuration checked against the workspace Cargo resolves, including its lockfile.
+    Workspace,
+}
+
+fn validation_evidence(workspace_root: &Path, config_override: Option<&Path>) -> ValidationEvidence {
+    let no_manifest = workspace_root
+        .join("Cargo.toml")
+        .symlink_metadata()
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+    if config_override == Some(Path::new("-")) || no_manifest {
+        ValidationEvidence::Schema
+    } else {
+        ValidationEvidence::Workspace
     }
+}
+
+fn workspace_metadata(workspace_root: &Path) -> RailResult<cargo_metadata::Metadata> {
     let mut command = cargo_metadata::MetadataCommand::new();
-    command.current_dir(workspace_root).no_deps();
-    let metadata = command
-        .exec()
-        .map_err(|error| RailError::message(format!("cannot validate Cargo workspace configuration: {error}")))?;
-    crate::workspace::capture_metadata_paths(metadata).map(Some)
+    command.current_dir(workspace_root);
+    // Resolve against an existing lockfile exactly as consuming commands do; never create one.
+    if crate::workspace::discovery_root(workspace_root)
+        .join("Cargo.lock")
+        .is_file()
+    {
+        command.other_options(vec!["--locked".to_string()]);
+    } else {
+        command.no_deps();
+    }
+    let metadata = crate::cargo::metadata::exec(
+        &command,
+        workspace_root,
+        crate::cargo::metadata::CargoOutput::DiscoverFrom(workspace_root),
+    )
+    .map_err(|error| error.context(WORKSPACE_VALIDATION))?;
+    crate::workspace::capture_metadata_paths(metadata)
 }

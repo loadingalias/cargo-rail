@@ -56,6 +56,12 @@ Policy requiring workspace facts, such as split paths, package selections,
 or a transitive host path, reports the missing context;
 inspect that policy from a file in its owning workspace.
 Ordinary file inspection validates against the selected Cargo workspace.
+When `Cargo.lock` exists, validation resolves it with `--locked`, as consuming commands do,
+so a stale lockfile fails validation.
+Validation never creates a lockfile.
+`config validate` states what it checked: `workspace` evidence binds policy to the Cargo workspace,
+and `schema` evidence covers stdin or a directory without `Cargo.toml`.
+JSON output reports this in `evidence`.
 
 ## Compatibility
 
@@ -303,7 +309,7 @@ and register only their positive inputs under `[plan.work.NAME]`.
 | Command                    | Exit `0`                     | Exit `1`         | Exit `2` |
 | -------------------------- | ---------------------------- | ---------------- | -------- |
 | Mutation command `--check` | No mutation                  | Mutation pending | Invalid input or operation |
-| `config validate`          | Valid at selected strictness | —                | Invalid or unreadable configuration |
+| `config validate`          | Valid at selected strictness | —                | Invalid or unreadable configuration, or a Cargo workspace that fails to load |
 
 `config validate` enables strict mode in common CI environments.
 Use `--no-strict` only when warnings are deliberately non-blocking.

@@ -711,6 +711,19 @@ pub fn path_to_git_format(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
+/// Quote one argument for a POSIX shell, leaving plain words unquoted.
+pub(crate) fn shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/'))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;

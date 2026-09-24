@@ -664,13 +664,13 @@ impl PlanningCargoModel {
             .manifest_path(&manifest_path)
             .other_options(vec!["--locked".to_string()]);
         crate::instrumentation::record_cargo_metadata_load(false);
-        let metadata = Arc::new(crate::workspace::capture_metadata_paths(command.exec().map_err(
-            |error| {
-                RailError::message(format!(
-                    "failed to load configured auxiliary Cargo manifest '{manifest}': {error}"
-                ))
-            },
-        )?)?);
+        let metadata = crate::cargo::metadata::exec(
+            &command,
+            source_root,
+            crate::cargo::metadata::CargoOutput::DiscoverFrom(source_root),
+        )
+        .map_err(|error| error.context(format!("loading configured auxiliary Cargo manifest '{manifest}'")))?;
+        let metadata = Arc::new(crate::workspace::capture_metadata_paths(metadata)?);
         for package in metadata.packages.iter().filter(|package| package.source.is_none()) {
             let package_manifest = package.manifest_path.as_std_path();
             if package_manifest.strip_prefix(source_root).is_err() {

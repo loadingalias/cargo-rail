@@ -10,6 +10,7 @@ pub mod feature_scanner;
 pub mod manifest_analyzer;
 mod manifest_ops; // Internal - used only by manifest_writer and cargo_transform
 pub mod manifest_writer;
+pub(crate) mod metadata;
 pub mod multi_target_metadata;
 pub mod resolution;
 mod unify; // Internal - implementation details for UnifyAnalyzer

@@ -2,8 +2,8 @@
 //!
 //! Tests that the CLI handles errors gracefully and provides useful feedback.
 
-use super::helpers::{TestWorkspace, run_cargo_rail};
-use anyhow::Result;
+use super::helpers::{TestWorkspace, run_cargo_rail, run_cargo_rail_with_env};
+use anyhow::{Context as _, Result};
 use std::fs;
 
 // Invalid Git Reference Tests
@@ -311,6 +311,72 @@ edition.workspace = true
             String::from_utf8_lossy(&output.stderr)
         );
 
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+// Cargo Metadata Failure Tests
+
+/// Every metadata consumer names a stale lockfile as the cause without exposing credentials.
+#[test]
+fn stale_lockfile_is_the_primary_cause_everywhere_even_with_credentials() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("stale-lockfile")?;
+        ws.add_crate("member", "0.1.0", &[])?;
+        let lockfile = std::process::Command::new("cargo")
+            .current_dir(&ws.path)
+            .args(["generate-lockfile", "--offline"])
+            .env("RUSTC_WRAPPER", "")
+            .output()?;
+        anyhow::ensure!(
+            lockfile.status.success(),
+            "offline lockfile generation failed: {lockfile:?}"
+        );
+        ws.commit("Add member and lockfile")?;
+
+        fs::create_dir_all(ws.path.join(".cargo"))?;
+        fs::write(
+            ws.path.join(".cargo/config.toml"),
+            "[registries.private]\ntoken = \"secret-token-value\"\n",
+        )?;
+        let manifest = ws.path.join("crates/member/Cargo.toml");
+        let bumped = fs::read_to_string(&manifest)?.replace("version = \"0.1.0\"", "version = \"0.2.0\"");
+        fs::write(&manifest, bumped)?;
+        let lock_before = fs::read(ws.path.join("Cargo.lock"))?;
+        let cargo_home = tempfile::TempDir::new()?;
+        let cargo_home = cargo_home.path().to_str().context("non-UTF-8 CARGO_HOME")?;
+
+        for args in [
+            &["rail", "config", "validate", "--strict"][..],
+            &["rail", "plan", "--since", "HEAD"][..],
+            &["rail", "unify", "--check"][..],
+        ] {
+            let output = run_cargo_rail_with_env(&ws.path, args, &[("CARGO_HOME", cargo_home)])?;
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.status.code(), Some(2), "{args:?}: {text}");
+            for expected in [
+                "Cargo.lock is out of date with the workspace manifests",
+                "cargo update --workspace",
+                "--locked",
+                "withheld because a Cargo credential capability is active",
+            ] {
+                assert!(text.contains(expected), "{args:?} missing {expected:?}: {text}");
+            }
+            assert!(
+                !text.contains("secret-token-value"),
+                "{args:?} exposed a credential: {text}"
+            );
+        }
+        assert_eq!(
+            fs::read(ws.path.join("Cargo.lock"))?,
+            lock_before,
+            "no command may rewrite the lockfile"
+        );
         Ok(())
     })();
     super::helpers::finish_test(result);

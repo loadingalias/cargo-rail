@@ -433,21 +433,10 @@ fn clean_apply_command(options: &CleanOptions) -> String {
         }
         if let Some(journal) = &options.release_journal {
             command.push_str(" --release-journal ");
-            command.push_str(&shell_quote(journal));
+            command.push_str(&crate::utils::shell_quote(journal));
         }
     }
     command
-}
-
-fn shell_quote(value: &str) -> String {
-    if value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/'))
-    {
-        value.to_string()
-    } else {
-        format!("'{}'", value.replace('\'', "'\\''"))
-    }
 }
 
 fn collect_cache_artifacts(status: &crate::cache::CacheStatus, artifacts: &mut CleanArtifacts) {

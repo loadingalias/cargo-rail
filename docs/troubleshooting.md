@@ -38,6 +38,18 @@ cargo rail config validate --strict
 `explain` shows defaults, effective values, and sources.
 A global `--config` option bypasses discovery.
 
+## Cargo metadata fails
+
+Every Cargo metadata failure names one cause, one recovery,
+and a `reproduce:` command that repeats the exact Cargo invocation, including `--locked`.
+Named causes are a stale `Cargo.lock`, an unloadable manifest, an unavailable target or `rustc`,
+and a missing Cargo executable.
+
+When a Cargo credential capability is active, such as a registry token or credential provider,
+Cargo's output is withheld because it can contain provider output.
+Manifest failures are the exception: Cargo reports them before it contacts a registry.
+Run the reproduction command to see Cargo's complete output.
+
 ## Surface is unavailable or reports unexpected findings
 
 A `cargo install` or single-binary `cargo binstall` installation lacks the embedded Surface component set.

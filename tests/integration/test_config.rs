@@ -138,7 +138,7 @@ fn inspection_never_treats_failed_workspace_discovery_as_valid_policy() {
             let output = run_cargo_rail(&ws.path, &["rail", "config", action])?;
             assert_eq!(output.status.code(), Some(2), "{action}: {output:?}");
             assert!(
-                String::from_utf8_lossy(&output.stderr).contains("cannot validate Cargo workspace configuration"),
+                String::from_utf8_lossy(&output.stderr).contains("Cargo cannot load manifest `Cargo.toml:1:"),
                 "{output:?}"
             );
         }
@@ -1434,6 +1434,87 @@ fn test_config_explain_text_uses_same_field_values_as_json() {
         assert!(stdout.contains("default: compute"));
         assert!(stdout.contains("source:"));
 
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn broken_member_manifest_is_named_and_never_validated() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("broken-member-manifest")?;
+        ws.add_crate("member", "0.1.0", &[("absent", "{ workspace = true }")])?;
+        let root_manifest = fs::read(ws.path.join("Cargo.toml"))?;
+        let member_manifest = fs::read(ws.path.join("crates/member/Cargo.toml"))?;
+
+        let json = run_cargo_rail(&ws.path, &["rail", "config", "validate", "--strict", "-f", "json"])?;
+        assert_eq!(json.status.code(), Some(2), "{json:?}");
+        let value: serde_json::Value = serde_json::from_slice(&json.stdout)?;
+        assert_eq!(value["valid"], false);
+        assert_eq!(value["evidence"], "workspace");
+        let issue = &value["errors"][0];
+        assert_eq!(issue["section"], "cargo", "{value:#}");
+        let message = issue["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with("Cargo cannot load manifest `crates/member/Cargo.toml`"),
+            "{message}"
+        );
+        assert!(message.contains("absent"), "Cargo's cause must be retained: {message}");
+        assert!(
+            issue["help"].as_str().is_some_and(|help| help.contains("reproduce: ")),
+            "{issue:#}"
+        );
+
+        let text = run_cargo_rail(&ws.path, &["rail", "config", "validate", "--strict"])?;
+        assert_eq!(text.status.code(), Some(2), "{text:?}");
+        let stderr = String::from_utf8_lossy(&text.stderr);
+        assert!(
+            stderr.contains("[cargo] Cargo cannot load manifest `crates/member/Cargo.toml`"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("    help: "), "{stderr}");
+        assert!(!String::from_utf8_lossy(&text.stdout).contains("configuration is valid"));
+
+        assert_eq!(fs::read(ws.path.join("Cargo.toml"))?, root_manifest);
+        assert_eq!(fs::read(ws.path.join("crates/member/Cargo.toml"))?, member_manifest);
+        assert!(
+            !ws.path.join("Cargo.lock").exists(),
+            "validation must not create a lockfile"
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn validation_states_whether_it_checked_the_cargo_workspace() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_single_crate("demo", "0.1.0")?;
+        let workspace = run_cargo_rail(&ws.path, &["rail", "config", "validate", "--strict", "-f", "json"])?;
+        assert!(workspace.status.success(), "{workspace:?}");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&workspace.stdout)?["evidence"],
+            "workspace"
+        );
+        let text = run_cargo_rail(&ws.path, &["rail", "config", "validate", "--strict"])?;
+        assert!(
+            String::from_utf8_lossy(&text.stdout).contains("configuration is valid for the Cargo workspace"),
+            "{text:?}"
+        );
+
+        let outside = tempfile::tempdir()?;
+        let schema = stdin_validation(outside.path(), b"")?;
+        assert!(schema.status.success(), "{schema:?}");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&schema.stdout)?["evidence"],
+            "schema"
+        );
+        let no_manifest = run_cargo_rail(outside.path(), &["rail", "config", "validate", "--strict"])?;
+        assert!(
+            String::from_utf8_lossy(&no_manifest.stdout)
+                .contains("configuration is valid (schema only; no Cargo workspace was checked)"),
+            "{no_manifest:?}"
+        );
         Ok(())
     })();
     super::helpers::finish_test(result);

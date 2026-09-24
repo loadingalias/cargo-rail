@@ -1259,11 +1259,18 @@ impl ResolutionViews {
         }
         command.other_options(other_options);
         crate::instrumentation::record_cargo_metadata_load(key.request.target_filter().is_some());
-        let metadata = command.exec();
+        let metadata = crate::cargo::metadata::exec(
+            &command,
+            &self.workspace_root,
+            crate::cargo::metadata::CargoOutput::for_credential_capability(key.credential_sensitive),
+        );
         self.validate_cargo_config_unchanged(key.cargo_config)?;
-        let metadata = Arc::new(crate::workspace::capture_metadata_paths(
-            metadata.map_err(|error| resolution_load_error(&key.request, error, key.credential_sensitive))?,
-        )?);
+        let metadata = Arc::new(crate::workspace::capture_metadata_paths(metadata.map_err(
+            |error| match key.request.target_filter() {
+                Some(target) => error.context(format!("loading Cargo resolution for target '{target}'")),
+                None => error.context("loading exact Cargo resolution"),
+            },
+        )?)?);
         if metadata.resolve.is_none() {
             return Err(RailError::message(
                 "Cargo returned no resolve graph for a full resolution view",
@@ -1479,44 +1486,6 @@ fn package_feature(package: &Package, feature: &str, package_names: &FxHashMap<&
         ));
     }
     Ok(format!("{}/{}", package.name, feature))
-}
-
-fn resolution_load_error(
-    request: &ResolutionRequest,
-    error: cargo_metadata::Error,
-    credential_sensitive: bool,
-) -> RailError {
-    let message = error.to_string();
-    if let Some(target) = request.target_filter()
-        && (message.contains("error[E0463]")
-            || message.contains("can't find crate")
-            || message.contains("target may not be installed"))
-    {
-        return RailError::with_help(
-            format!("Target '{target}' is not installed on this machine"),
-            format!("Install the target with: rustup target add {target}"),
-        );
-    }
-    if credential_sensitive {
-        return RailError::with_help(
-            "Failed to load exact Cargo resolution while credential capabilities were active",
-            "run cargo metadata directly for provider diagnostics; cargo-rail suppresses credential-provider output",
-        );
-    }
-    request.target_filter().map_or_else(
-        || {
-            RailError::with_help(
-                "Failed to load exact Cargo resolution",
-                format!("Cargo metadata error: {message}"),
-            )
-        },
-        |target| {
-            RailError::with_help(
-                format!("Failed to load Cargo resolution for target '{target}'"),
-                format!("Cargo metadata error: {message}"),
-            )
-        },
-    )
 }
 
 impl ToolchainIdentity {
