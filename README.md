@@ -34,11 +34,20 @@ The release workflow packages these native archives:
    [release](https://github.com/loadingalias/cargo-rail/releases).
 1. Compare the archive's SHA-256 with its entry in `SHA256SUMS`.
    Use `sha256sum` on Linux, `shasum -a 256` on macOS, or `Get-FileHash -Algorithm SHA256` in PowerShell.
+1. Verify the archive's build provenance with `gh attestation verify cargo-rail-<target>.zip -R loadingalias/cargo-rail`.
 1. Extract the archive into a private installation directory.
    Keep all files in its `cargo-rail/` directory together, including the compiler driver, source bundle, helpers,
    and component manifest.
    On Unix, preserve executable permissions.
 1. Add that directory to `PATH`, then run `cargo rail --version` to confirm the selected installation.
+
+Each check proves something different.
+`SHA256SUMS` comes from the same release as the archive,
+so it detects corrupted or inconsistent bytes but does not identify the publisher.
+Releases are immutable, so their assets cannot be replaced after publication.
+The attestation proves that the packaging workflow built the archive from a recorded commit.
+The companion GitHub Action verifies checksums, the component manifest, and the license on install,
+but not attestations.
 
 The archives contain authenticated compiler components for cache reuse and Surface analysis.
 GNU Linux archives require glibc 2.39 or newer.
@@ -287,6 +296,8 @@ Cargo-Rail is under active pre-1.0 development.
 Breaking CLI, configuration, and machine-contract changes should be expected.
 Security fixes target the latest release;
 keep Cargo-Rail and its GitHub Action current and compatible.
+Each Action release supports exactly the Cargo-Rail version in its lock;
+see the Action's [supported version pairs](https://github.com/loadingalias/cargo-rail-action#supported-version-pairs).
 
 Report cache hit/miss/bypass evidence and minimized failures from real workspaces.
 Contributions that remove complexity or strengthen correctness checks are welcome.
