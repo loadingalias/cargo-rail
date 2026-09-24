@@ -1216,7 +1216,7 @@ mod tests {
             .expect("an incomplete result should require no persistence");
 
         assert!(store.get(&key).is_none(), "incomplete evidence authorized reuse");
-        let results = cache_root.path().join("cargo-rail/local-cas-v2/results");
+        let results = cache_root.path().join("cargo-rail/local-cas-v3/results");
         assert!(
             fs::read_dir(results)
                 .expect("results directory should remain readable")
@@ -1239,7 +1239,7 @@ mod tests {
         writer.put(original.clone());
         writer.flush().expect("compiler evidence should publish");
 
-        let results = cache_root.path().join("cargo-rail/local-cas-v2/results");
+        let results = cache_root.path().join("cargo-rail/local-cas-v3/results");
         let bundle = fs::read_dir(results)
             .expect("results should be readable")
             .next()
@@ -1305,7 +1305,7 @@ mod tests {
             }
         });
 
-        let root = cache_root.path().join("cargo-rail/local-cas-v2");
+        let root = cache_root.path().join("cargo-rail/local-cas-v3");
         assert_eq!(fs::read_dir(root.join("results")).expect("results").count(), 1);
         assert_eq!(fs::read_dir(root.join("pins")).expect("pins").count(), 1);
         let candidate_directories = fs::read_dir(root.join("compiler-evidence-candidates"))

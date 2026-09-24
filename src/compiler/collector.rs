@@ -3531,7 +3531,7 @@ fn integrate_acquisition_outcome(
                 .unwrap_or_default();
             let normal_units = compiled
                 .iter()
-                .filter(|unit| !unit.test_mode && unit.kind != CargoTargetKind::CustomBuild)
+                .filter(|unit| unit.matches_dependency_kind(DepKind::Normal))
                 .collect::<Vec<_>>();
             if !normal_units.is_empty() {
                 for candidate in candidates
@@ -4772,19 +4772,10 @@ fn parse_target_run(
                 .filter(|candidate| candidate.member == member && candidate.crate_name == *crate_name)
                 .map(|candidate| candidate.kind)
                 .collect();
-            for target_id in matching.iter().filter(|unit| {
-                kinds.iter().any(|kind| match kind {
-                    DepKind::Normal => !unit.test_mode && unit.kind != CargoTargetKind::CustomBuild,
-                    DepKind::Dev => {
-                        unit.test_mode
-                            || matches!(
-                                unit.kind,
-                                CargoTargetKind::Test | CargoTargetKind::Example | CargoTargetKind::Benchmark
-                            )
-                    }
-                    DepKind::Build => unit.kind == CargoTargetKind::CustomBuild,
-                })
-            }) {
+            for target_id in matching
+                .iter()
+                .filter(|unit| kinds.iter().any(|kind| unit.matches_dependency_kind(*kind)))
+            {
                 parsed_member
                     .warned_targets_by_dep
                     .entry(crate_name.clone())
@@ -6847,6 +6838,11 @@ fn native_compiler_process_environment(name: &str) -> bool {
     // session-wide partition: setup-owned wrappers prepend their installation
     // directory, even though the selected toolchain is unchanged. Per-unit
     // environment observation still binds any additional values rustc reads.
+    // Cargo reads its wrapper selections; rustc never does. A unit Cargo routes
+    // through the workspace wrapper bypasses before its action is keyed.
+    if matches!(name, "RUSTC_WRAPPER" | "RUSTC_WORKSPACE_WRAPPER") {
+        return false;
+    }
     matches!(
         name,
         "AR" | "DEVELOPER_DIR"

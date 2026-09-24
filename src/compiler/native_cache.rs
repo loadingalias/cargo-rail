@@ -645,6 +645,9 @@ pub(crate) struct NativeDynamicInputSelector {
     pub(crate) environment_names: Vec<String>,
     pub(crate) repository_paths: Vec<String>,
     rust_inputs: RustInputSelector,
+    /// Earlier execution rendered diagnostics, whose text depends on `--diagnostic-width`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    diagnostic_width: bool,
 }
 
 impl NativeDynamicInputSelector {
@@ -654,6 +657,7 @@ impl NativeDynamicInputSelector {
             environment_names,
             repository_paths,
             rust_inputs: RustInputSelector::default(),
+            diagnostic_width: false,
         };
         selector.validate()?;
         Ok(selector)
@@ -1163,6 +1167,8 @@ pub(crate) struct NativeActionCapture {
     approved_environment: ApprovedEnvState,
     selected_repository_inputs: Vec<NativeSelectedRepositoryInput>,
     rust_inputs: Option<RustInputCapture>,
+    /// `Some` when rendered diagnostics bind the invocation's `--diagnostic-width` value.
+    diagnostic_width: Option<Option<String>>,
     guard: NativeCaptureGuard,
     capture_entries: usize,
     capture_path_bytes: usize,
@@ -1208,6 +1214,8 @@ struct NativePublicationProof {
     rust_inputs: RustInputSelector,
     guard_identity: String,
     environment_bytes_hashed: u64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    diagnostic_width: bool,
 }
 
 #[derive(Debug)]
@@ -1409,14 +1417,7 @@ fn authenticate_native_pack(
     observation.success = true;
     observation.cache_wrapper = None;
 
-    let validation = NativeCompilerValidation::new(
-        session,
-        observation,
-        &initial_capture.approved_environment,
-        &initial_capture.selected_repository_inputs,
-        None,
-        descriptor,
-    )?;
+    let validation = NativeCompilerValidation::new(session, observation, initial_capture, None, descriptor)?;
     let slots = validation
         .cas_output_bindings()
         .chain(validation.cas_stream_bindings())
@@ -1572,7 +1573,14 @@ impl NativeActionCapture {
         if let Some(inputs) = &self.rust_inputs {
             selector.rust_inputs = inputs.witness().selector().clone();
         }
+        selector.diagnostic_width = self.diagnostic_width.is_some();
         Ok(selector)
+    }
+
+    /// Bind `--diagnostic-width` into the action only when its rendered diagnostics depend on it.
+    fn bind_diagnostic_width(&mut self, rendered: bool, observation: &RawCompilerInvocation) {
+        self.diagnostic_width =
+            rendered.then(|| diagnostic_width_argument(&observation.compiler_arguments).map(str::to_string));
     }
 
     fn capture(observation: &RawCompilerInvocation, source_root: &Path) -> Result<Self, NativeInputFailure> {
@@ -1696,6 +1704,7 @@ impl NativeActionCapture {
                 .collect::<Vec<_>>(),
         )?;
         capture.select_rust_inputs(observation, source_root, &proof.rust_inputs)?;
+        capture.bind_diagnostic_width(proof.diagnostic_width, observation);
         Ok(capture)
     }
 
@@ -1866,6 +1875,7 @@ impl NativeActionCapture {
             approved_environment,
             selected_repository_inputs,
             rust_inputs: None,
+            diagnostic_width: None,
             guard: NativeCaptureGuard { entries: guard_entries },
             capture_entries: budget.entries,
             capture_path_bytes: budget.path_bytes,
@@ -4887,6 +4897,14 @@ fn capture_guarded_file(
         return Err(RailError::message("native source entry is not a real regular file"));
     }
     let before = native_metadata_guard(path, &before_metadata)?;
+    let memo = crate::cache::digest_memo::active();
+    let generation = memo.and_then(|_| crate::utils::stable_file_generation(path));
+    if let (Some(memo), Some(generation)) = (memo, generation.as_deref())
+        && let Some((content_digest, bytes)) = memo.lookup(generation)
+        && bytes == before.len
+    {
+        return Ok((content_digest, before, bytes));
+    }
     #[cfg(windows)]
     let mut file = crate::windows_fs::open_for_stable_byte_observation(path)?;
     #[cfg(not(windows))]
@@ -4915,11 +4933,14 @@ fn capture_guarded_file(
     crate::instrumentation::record_hash_operation();
     crate::instrumentation::record_hash_input_bytes(usize::try_from(bytes).unwrap_or(usize::MAX));
     crate::instrumentation::record_hashed_file_bytes_read(usize::try_from(bytes).unwrap_or(usize::MAX));
-    Ok((
-        format!("sha256:{}", ContentDigest::from_sha256_bytes(hasher.finalize())),
-        before,
-        bytes,
-    ))
+    let content_digest = format!("sha256:{}", ContentDigest::from_sha256_bytes(hasher.finalize()));
+    if let (Some(memo), Some(generation)) = (memo, generation)
+        && crate::utils::stable_file_generation(path).as_deref() == Some(generation.as_slice())
+        && let Ok(modified) = after_metadata.modified()
+    {
+        memo.record(&generation, modified, &content_digest, bytes);
+    }
+    Ok((content_digest, before, bytes))
 }
 
 fn capture_selected_repository_inputs(
@@ -5326,6 +5347,7 @@ impl NativeCacheContext {
             .map_err(|_| "native_cache_installation_unavailable")?;
         let local_cas = LocalCas::open_initialized_selected(receipt.cache().map_err(|_| "local_cache_unavailable")?)
             .map_err(|_| "local_cache_unavailable")?;
+        crate::cache::digest_memo::activate(local_cas.root());
         let (session, session_inputs) =
             installed_native_session(&receipt, &source_root, &target_root_authority, rustc_program)
                 .map_err(|_| "native_cache_session_unavailable")?;
@@ -5706,17 +5728,21 @@ pub(crate) struct NativeCompilerValidation {
     stdout_bytes: u64,
     stderr_digest: String,
     stderr_bytes: u64,
+    /// The action binds `--diagnostic-width` because its stored stderr renders diagnostics.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    diagnostic_width_bound: bool,
 }
 
 impl NativeCompilerValidation {
     fn new(
         session: &NativeCompilerSession,
         observation: RawCompilerInvocation,
-        approved_environment: &ApprovedEnvState,
-        selected_repository_inputs: &[NativeSelectedRepositoryInput],
+        capture: &NativeActionCapture,
         linker_generations: Option<LinkerGenerationWitness>,
         descriptor: pack::NativeResultDescriptor,
     ) -> RailResult<Self> {
+        let approved_environment = &capture.approved_environment;
+        let selected_repository_inputs = &capture.selected_repository_inputs;
         let result_key = descriptor.result_key()?;
         let pack::NativeResultDescriptor {
             action_key,
@@ -5748,6 +5774,7 @@ impl NativeCompilerValidation {
             stdout_bytes,
             stderr_digest,
             stderr_bytes,
+            diagnostic_width_bound: capture.diagnostic_width.is_some(),
         };
         validation.validate_object()?;
         Ok(validation)
@@ -5786,11 +5813,15 @@ impl NativeCompilerValidation {
                 })
                 .collect(),
         };
+        let diagnostic_width = self
+            .diagnostic_width_bound
+            .then(|| diagnostic_width_argument(&self.observation.compiler_arguments).map(str::to_string));
         let pre_link_action = action_key_from_base(
             base_action_key,
             &approved_environment,
             &self.selected_repository_inputs,
             Some(&self.witness.rust_inputs),
+            diagnostic_width.as_ref(),
         )?;
         let selected_action = if linked_observation(&self.observation) {
             witnessed_action_key(&pre_link_action, &self.witness)?
@@ -5810,6 +5841,7 @@ impl NativeCompilerValidation {
                 .collect(),
         )?;
         selector.rust_inputs = self.witness.rust_inputs.selector().clone();
+        selector.diagnostic_width = self.diagnostic_width_bound;
         selector.validate()?;
         Ok(selector)
     }
@@ -6228,6 +6260,7 @@ fn action_key(
         &capture.approved_environment,
         &capture.selected_repository_inputs,
         capture.rust_inputs.as_ref().map(RustInputCapture::witness),
+        capture.diagnostic_width.as_ref(),
     )
 }
 
@@ -6302,6 +6335,7 @@ fn action_key_from_base(
     approved_environment: &ApprovedEnvState,
     selected_repository_inputs: &[NativeSelectedRepositoryInput],
     rust_inputs: Option<&RustInputWitness>,
+    diagnostic_width: Option<&Option<String>>,
 ) -> RailResult<String> {
     validate_identity(base_action, BASE_ACTION_KEY_PREFIX)?;
     approved_environment.validate_object()?;
@@ -6312,15 +6346,18 @@ fn action_key_from_base(
     let approved_environment = serde_json::to_vec(approved_environment)?;
     let selected_repository_inputs = serde_json::to_vec(selected_repository_inputs)?;
     let rust_inputs = serde_json::to_vec(&rust_inputs)?;
+    // The base action omits the width; rendered diagnostics alone make it an input.
+    let diagnostic_width = serde_json::to_vec(&diagnostic_width)?;
     Ok(sha256_identity(
         ACTION_KEY_PREFIX,
         b"cargo-rail-native-compiler-action\0",
         &[
-            (b"version", &15_u32.to_le_bytes()),
+            (b"version", &16_u32.to_le_bytes()),
             (b"base-action", base_action.as_bytes()),
             (b"approved-environment", &approved_environment),
             (b"selected-repository-inputs", &selected_repository_inputs),
             (b"compiler-selected-rust-inputs", &rust_inputs),
+            (b"diagnostic-width", &diagnostic_width),
         ],
     ))
 }
@@ -7478,6 +7515,14 @@ fn cache_key_compiler_arguments(
         let argument = &arguments[index];
         let next = arguments.get(index + 1);
         match argument.as_str() {
+            // Width changes only rendered diagnostics; the final action binds it when those exist.
+            "--diagnostic-width" => {
+                next.ok_or_else(|| RailError::message("native compiler diagnostic width is missing"))?;
+                index += 2;
+            }
+            _ if argument.starts_with("--diagnostic-width=") => {
+                index += 1;
+            }
             "--out-dir" | "--output" => {
                 next.ok_or_else(|| RailError::message("native compiler output directory is missing"))?;
                 identity.push(argument.clone());
@@ -7593,6 +7638,39 @@ fn cache_key_extern_argument(value: &str, dependencies: &BTreeMap<&str, &str>) -
     Ok(format!("{name}=\0cargo-rail-native-dependency:{artifact_name}"))
 }
 
+/// Return the `--diagnostic-width` value rustc receives, if Cargo passed one.
+fn diagnostic_width_argument(arguments: &[String]) -> Option<&str> {
+    let mut width = None;
+    let mut index = 0usize;
+    while index < arguments.len() {
+        if arguments[index] == "--diagnostic-width" {
+            width = arguments.get(index + 1).map(String::as_str);
+            index += 2;
+            continue;
+        }
+        if let Some(value) = arguments[index].strip_prefix("--diagnostic-width=") {
+            width = Some(value);
+        }
+        index += 1;
+    }
+    width
+}
+
+/// Whether stderr holds text whose layout depends on `--diagnostic-width`.
+///
+/// rustc's JSON artifact notifications carry no rendered text. Any other stderr line is treated as a rendered
+/// diagnostic, so the width becomes part of the action and a replay is exact.
+fn stderr_depends_on_diagnostic_width(stderr: &[u8]) -> bool {
+    stderr
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+        .any(|line| {
+            !serde_json::from_slice::<serde_json::Value>(line).is_ok_and(|message| {
+                message.get("$message_type").and_then(serde_json::Value::as_str) == Some("artifact")
+            })
+        })
+}
+
 fn cache_key_library_search_argument(value: &str, relocatable_directories: &BTreeSet<String>) -> String {
     if value
         .strip_prefix("dependency=")
@@ -7647,7 +7725,7 @@ fn release_from_verbose(verbose: &str, program: &str) -> String {
         .to_string()
 }
 
-fn host_from_verbose(verbose: &str) -> String {
+fn rustc_host_from_verbose(verbose: &str) -> String {
     verbose
         .lines()
         .find_map(|line| line.strip_prefix("host:"))
@@ -7655,10 +7733,6 @@ fn host_from_verbose(verbose: &str) -> String {
         .filter(|host| !host.is_empty())
         .unwrap_or("unknown")
         .to_string()
-}
-
-fn rustc_host_from_verbose(verbose: &str) -> String {
-    host_from_verbose(verbose)
 }
 
 fn validate_file_observation(file: &FileObservation) -> RailResult<()> {
@@ -9352,6 +9426,7 @@ fn configure_outer_inner(
     ) {
         Ok((environment, bytes_hashed)) => {
             capture.approved_environment = environment;
+            capture.bind_diagnostic_width(dynamic_selector.diagnostic_width, observation);
             metrics.bytes_hashed = metrics.bytes_hashed.saturating_add(bytes_hashed);
         }
         Err(_) => {
@@ -10592,10 +10667,11 @@ pub(crate) fn admit_distributed_rust_library_result(
         Ok(prepared) => prepared,
         Err(reason) => return LocalAdmission::RejectedBeforeEffect(reason),
     };
-    let dynamic_selector = match initial_capture.dynamic_input_selector() {
+    let mut dynamic_selector = match initial_capture.dynamic_input_selector() {
         Ok(selector) => selector,
         Err(_) => return LocalAdmission::RejectedBeforeEffect("distributed_dynamic_input_selector_invalid"),
     };
+    dynamic_selector.diagnostic_width = proof.diagnostic_width;
     let mut recapture_bytes = 0_u64;
     let (validation, _) = match cas.store_native_revalidated(prepared, |validation| {
         context.session_inputs.revalidate()?;
@@ -11239,6 +11315,10 @@ fn restore_and_publish(
         observation,
     } = prepared;
     let mut visible_effects = 0usize;
+    let output_digests = outputs
+        .iter()
+        .map(|output| output.observation.content_digest.clone())
+        .collect::<Vec<_>>();
     let commit_result = (|| -> RailResult<()> {
         let mut published_outputs = Vec::with_capacity(outputs.len());
         for output in outputs {
@@ -11267,6 +11347,10 @@ fn restore_and_publish(
         }
         for output in &published_outputs {
             output.revalidate()?;
+        }
+        // Dependents read these outputs next; their verified digests spare each of them a rehash.
+        for (output, content_digest) in published_outputs.iter().zip(&output_digests) {
+            crate::cache::digest_memo::seed_verified(&output.opened, &output.destination, content_digest, output.bytes);
         }
         sync_native_directory(&transaction.paths.output_parent)?;
 
@@ -16801,6 +16885,37 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
         }
     };
     capture.approved_environment = approved_environment;
+    let stdout = match stdout.into_bytes() {
+        Some(bytes) => bytes,
+        None => {
+            drop(publish_and_record_cold_observation(
+                &mut raw,
+                "compiler_stdout_unavailable",
+                None,
+                None,
+                0,
+                cache_bytes_read,
+            ));
+            return status.code().unwrap_or(1);
+        }
+    };
+    let stderr = match stderr.into_bytes() {
+        Some(bytes) => bytes,
+        None => {
+            drop(publish_and_record_cold_observation(
+                &mut raw,
+                "compiler_stderr_unavailable",
+                None,
+                None,
+                0,
+                cache_bytes_read,
+            ));
+            return status.code().unwrap_or(1);
+        }
+    };
+    let rendered_diagnostics = stderr_depends_on_diagnostic_width(&stderr);
+    capture.bind_diagnostic_width(rendered_diagnostics, &raw);
+    dynamic_selector.diagnostic_width = rendered_diagnostics;
     if !crate::compiler::native_cache::base_action_key(&session.identity, &session.class, &raw, &capture)
         .is_ok_and(|current| current == base_action_key)
     {
@@ -16899,34 +17014,6 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
                 link_candidate,
                 None,
                 bytes_hashed,
-                cache_bytes_read,
-            ));
-            return status.code().unwrap_or(1);
-        }
-    };
-    let stdout = match stdout.into_bytes() {
-        Some(bytes) => bytes,
-        None => {
-            drop(publish_and_record_cold_observation(
-                &mut raw,
-                "compiler_stdout_unavailable",
-                None,
-                None,
-                0,
-                cache_bytes_read,
-            ));
-            return status.code().unwrap_or(1);
-        }
-    };
-    let stderr = match stderr.into_bytes() {
-        Some(bytes) => bytes,
-        None => {
-            drop(publish_and_record_cold_observation(
-                &mut raw,
-                "compiler_stderr_unavailable",
-                None,
-                None,
-                0,
                 cache_bytes_read,
             ));
             return status.code().unwrap_or(1);
@@ -17406,6 +17493,9 @@ fn prepare_distributed_result(
                 ));
             }
         }
+        let mut bound_capture = initial_capture.clone();
+        bound_capture.bind_diagnostic_width(stderr_depends_on_diagnostic_width(&stderr), current_observation);
+        let initial_capture = &bound_capture;
 
         let mut frame_descriptors = BTreeMap::from([("dep_info", (digest(&dep_info), dep_info.len() as u64, 0o644))]);
         for (role, _, _) in bindings.iter().skip(1) {
@@ -17479,8 +17569,7 @@ fn prepare_distributed_result(
         let validation = NativeCompilerValidation::new(
             session,
             cache_observation,
-            &initial_capture.approved_environment,
-            &initial_capture.selected_repository_inputs,
+            initial_capture,
             None,
             pack::NativeResultDescriptor {
                 action_key: selected_action,
@@ -17549,10 +17638,11 @@ fn prepare_distributed_result(
             .collect::<Vec<_>>();
         let manifest = crate::cache::result::manifest_from_verified_native_slots(&slots)?;
         let staging = result.into_native_staging()?;
-        Ok((staging, manifest, validation))
+        Ok((staging, manifest, validation, bound_capture))
     })();
-    let (staging, manifest, validation) = prepared.map_err(|_| "distributed_result_preparation_failed")?;
-    let proof = native_publication_proof(initial_capture, source_root, source_root_spelling)?;
+    let (staging, manifest, validation, bound_capture) =
+        prepared.map_err(|_| "distributed_result_preparation_failed")?;
+    let proof = native_publication_proof(&bound_capture, source_root, source_root_spelling)?;
     Ok((
         PreparedNativeResult::from_verified_local_cas_staging(staging, manifest, validation),
         proof,
@@ -17670,6 +17760,7 @@ fn native_publication_proof(
             .guard_identity()
             .map_err(|_| "cold_final_capture_failed")?,
         environment_bytes_hashed,
+        diagnostic_width: initial_capture.diagnostic_width.is_some(),
     })
 }
 
@@ -17754,8 +17845,7 @@ fn prepare_cold_result(
         let validation = NativeCompilerValidation::new(
             session,
             cache_observation,
-            &initial_capture.approved_environment,
-            &initial_capture.selected_repository_inputs,
+            initial_capture,
             linker_generations,
             pack::NativeResultDescriptor {
                 action_key: selected_action,
@@ -20712,6 +20802,7 @@ pub(crate) mod tests {
                 )
                 .expect("empty selected Rust input capture"),
             ),
+            diagnostic_width: None,
             guard: NativeCaptureGuard { entries: Vec::new() },
             capture_entries: 0,
             capture_path_bytes: 0,
@@ -20778,8 +20869,7 @@ pub(crate) mod tests {
         NativeCompilerValidation::new(
             &session,
             observation,
-            &capture.approved_environment,
-            &capture.selected_repository_inputs,
+            &capture,
             None,
             pack::NativeResultDescriptor {
                 action_key: action,
@@ -20807,6 +20897,11 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn cas_validation_for_revision(revision: u64) -> NativeCompilerValidation {
+        cas_validation_for_revision_with_stdout(revision, b"")
+    }
+
+    /// A distinct action per revision whose stdout the caller controls, so outputs may differ too.
+    pub(crate) fn cas_validation_for_revision_with_stdout(revision: u64, stdout: &[u8]) -> NativeCompilerValidation {
         let mut observation = graduated_observation();
         let source = observed_file(
             "src/lib.rs",
@@ -20814,7 +20909,7 @@ pub(crate) mod tests {
         );
         observation.declared_inputs = vec![source.clone()];
         observation.observed_reads = vec![source];
-        graduated_validation(observation)
+        graduated_validation_with_streams(observation, stdout, b"")
     }
 
     pub(crate) fn cas_validation_with_stdout(stdout: &[u8]) -> NativeCompilerValidation {
@@ -21152,6 +21247,56 @@ pub(crate) mod tests {
             };
             assert!(error.to_string().contains(expected), "{error}");
         }
+    }
+
+    #[test]
+    fn diagnostic_width_is_an_action_input_only_for_rendered_diagnostics() {
+        let session = graduated_session(digest(b"source-root"));
+        let with_width = |width: Option<&str>| {
+            let mut observation = graduated_observation();
+            observation
+                .compiler_arguments
+                .retain(|argument| !argument.starts_with("--diagnostic-width"));
+            if let Some(width) = width {
+                observation
+                    .compiler_arguments
+                    .push(format!("--diagnostic-width={width}"));
+            }
+            observation
+        };
+        let (narrow, wide, absent) = (with_width(Some("80")), with_width(Some("200")), with_width(None));
+        let key = |observation: &RawCompilerInvocation, rendered: bool| {
+            let mut capture = synthetic_capture(observation);
+            capture.bind_diagnostic_width(rendered, observation);
+            (
+                base_action_key(&session.identity, &session.class, observation, &capture).expect("base action"),
+                action_key(&session.identity, &session.class, observation, &capture).expect("action"),
+            )
+        };
+
+        let (narrow_base, narrow_action) = key(&narrow, false);
+        for observation in [&wide, &absent] {
+            assert_eq!(key(observation, false), (narrow_base.clone(), narrow_action.clone()));
+        }
+        let (rendered_base, rendered_narrow) = key(&narrow, true);
+        assert_eq!(rendered_base, narrow_base, "the base action never binds the width");
+        assert_ne!(rendered_narrow, narrow_action, "rendered diagnostics bind the width");
+        assert_ne!(key(&wide, true).1, rendered_narrow);
+        assert_ne!(key(&absent, true).1, rendered_narrow);
+
+        let artifact = br#"{"$message_type":"artifact","artifact":"/t/libx.rmeta","emit":"metadata"}"#;
+        assert!(!stderr_depends_on_diagnostic_width(b""));
+        assert!(!stderr_depends_on_diagnostic_width(
+            &[artifact.as_slice(), b"\n"].concat()
+        ));
+        assert!(stderr_depends_on_diagnostic_width(
+            br#"{"$message_type":"diagnostic","rendered":"warning: unused"}"#
+        ));
+        assert!(stderr_depends_on_diagnostic_width(b"warning: unused variable\n"));
+        assert_eq!(
+            diagnostic_width_argument(&["--diagnostic-width".into(), "91".into()]),
+            Some("91")
+        );
     }
 
     #[test]
@@ -24280,8 +24425,7 @@ pub(crate) mod tests {
         let validation = NativeCompilerValidation::new(
             &session,
             observation,
-            &capture.approved_environment,
-            &capture.selected_repository_inputs,
+            &capture,
             None,
             pack::NativeResultDescriptor {
                 action_key: action,

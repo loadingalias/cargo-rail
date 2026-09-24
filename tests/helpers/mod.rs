@@ -48,11 +48,8 @@ fn isolated_git_config() -> PathBuf {
         .join("tests/fixtures/isolated.gitconfig")
 }
 
-/// Build a Git command isolated from ambient identity and line-ending policy.
-pub fn git_command(cwd: &Path) -> Command {
-    let mut command = Command::new("git");
+fn apply_isolated_git_environment(command: &mut Command) {
     command
-        .current_dir(cwd)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", isolated_git_config())
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -60,8 +57,15 @@ pub fn git_command(cwd: &Path) -> Command {
         .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
         .env("GIT_CONFIG_VALUE_0", "false")
         .env("GIT_CONFIG_KEY_1", "tag.gpgsign")
-        .env("GIT_CONFIG_VALUE_1", "false")
-        .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"]);
+        .env("GIT_CONFIG_VALUE_1", "false");
+}
+
+/// Build a Git command isolated from ambient identity and line-ending policy.
+pub fn git_command(cwd: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.current_dir(cwd);
+    apply_isolated_git_environment(&mut command);
+    command.args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"]);
     command
 }
 
@@ -108,19 +112,11 @@ pub fn rustc_host_target() -> Result<String> {
 
 /// Build a cargo-rail command isolated from developer compiler wrappers and Git configuration.
 pub fn cargo_rail_command(cwd: &Path) -> Result<Command> {
-    let git_config = isolated_git_config();
     let mut command = Command::new(crate::helpers::cargo_binary("cargo-rail"));
     command
         .current_dir(cwd)
-        .env("CARGO_RAIL_CACHE_DIR", cwd.join("target/cargo-rail-test-cache"))
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", git_config)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_CONFIG_COUNT", "2")
-        .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
-        .env("GIT_CONFIG_VALUE_0", "false")
-        .env("GIT_CONFIG_KEY_1", "tag.gpgsign")
-        .env("GIT_CONFIG_VALUE_1", "false");
+        .env("CARGO_RAIL_CACHE_DIR", cwd.join("target/cargo-rail-test-cache"));
+    apply_isolated_git_environment(&mut command);
     disable_ambient_cargo_wrappers(&mut command);
     Ok(command)
 }
@@ -221,7 +217,6 @@ authors = ["Test Author"]
         )?;
         std::fs::write(path.join(".gitignore"), "target/\n")?;
 
-        // Create src/lib.rs
         std::fs::create_dir_all(path.join("src"))?;
         std::fs::write(
             path.join("src/lib.rs"),
@@ -246,7 +241,6 @@ mod tests {{
             ),
         )?;
 
-        // Create README
         std::fs::write(path.join("README.md"), format!("# {}\n\nA test crate.\n", crate_name))?;
 
         // Create .config/rail.toml
@@ -310,7 +304,6 @@ mod tests {{
             ),
         )?;
 
-        // Create README
         std::fs::write(crate_path.join("README.md"), format!("# {}\n\nA test crate.\n", name))?;
 
         Ok(crate_path)
@@ -357,7 +350,6 @@ mod tests {{
         git(&self.path, &["add", "."])?;
         git(&self.path, &["commit", "-m", message])?;
 
-        // Get the commit SHA
         let output = git(&self.path, &["rev-parse", "HEAD"])?;
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
@@ -587,7 +579,7 @@ pub fn compiler_evidence_cache(workspace_root: &Path) -> Result<serde_json::Valu
 
 /// Reconstruct compiler-evidence entries from an explicitly configured cache base.
 pub fn compiler_evidence_cache_at(cache_base: &Path) -> Result<serde_json::Value> {
-    let root = cache_base.join("cargo-rail/local-cas-v2");
+    let root = cache_base.join("cargo-rail/local-cas-v3");
     let mut pin_created = std::collections::HashMap::new();
     for pin in std::fs::read_dir(root.join("pins"))? {
         let pin: serde_json::Value = serde_json::from_slice(&std::fs::read(pin?.path())?)?;

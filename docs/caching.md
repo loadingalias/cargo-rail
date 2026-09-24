@@ -393,6 +393,23 @@ This store contains diagnostic evidence, not restorable Cargo artifacts.
 Check mode may update evidence under `target/cargo-rail/`.
 Inspect `evidence_cache` in JSON output for hits, misses, and reasons.
 
+## Local storage budget
+
+Each enrolled profile has its own local store and budget. `cache setup --max-size SIZE` sets the budget; otherwise
+setup keeps the profile's current budget, and a new profile starts at 10 GiB. Identical output files are stored once
+and shared by every result that produced them. When a new result would exceed the budget, Cargo-Rail evicts
+least-recently-used results until usage is at most 90% of the budget, so a full store collects once per batch of new
+results rather than on every compilation. A hit refreshes an entry's last-use time at most once per hour.
+`cache setup` applies a lowered budget immediately. Results held by an active reader are not evicted.
+
+On Linux and macOS, the store also remembers each input file's SHA-256 while its device, inode, size, and
+modification and change times are unchanged, so dependents do not rehash the same dependency artifacts. Files modified
+within the last two seconds are always rehashed, and entries expire after seven days. Windows always hashes, because
+its file generation does not include a change time.
+
+`cache profiles` reports each profile's `bytes`, `max_bytes`, and `over_capacity_bytes`. The installation storage
+in `cache status` totals every profile, so compare it with the sum of profile budgets, not with one `max_bytes`.
+
 ## Inspect, clean, detach, or uninstall
 
 ```bash
@@ -407,7 +424,9 @@ cargo rail cache uninstall --check
 
 Workspace cleanup removes reconstructible state for the current checkout.
 Local cleanup removes only the current profile's CAS after validating ownership and waiting
-for readers; rerun `cache setup` afterward.
+for readers; rerun `cache setup` afterward. It also removes that profile's store in the retired `local-cas-v2`
+layout, which current versions never read; `cache status` counts retired stores as reclaimable, and
+`cache clean --scope local --check` includes them in its preview.
 `cache detach` removes the current root binding but preserves the profile and CAS.
 `cache drop-profile` accepts an opaque ID from `cache profiles` and removes only a detached profile with no enrolled roots.
 `cache uninstall` removes the global wrapper, worker, receipt-owned compiler components, Cargo field,

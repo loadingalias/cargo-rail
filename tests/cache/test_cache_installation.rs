@@ -2634,7 +2634,7 @@ fn receipt_qualified_local_distribution_executes_an_ordinary_cargo_library() {
         fs::remove_dir_all(workspace.path.join("target"))?;
         let cache_roots = fs::read_dir(cargo_home.path().join("cargo-rail"))?
             .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_name().to_string_lossy().starts_with("local-cas-v2"))
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("local-cas-v3"))
             .filter(|entry| entry.path().is_dir())
             .collect::<Vec<_>>();
         let [cache_root] = cache_roots.as_slice() else {

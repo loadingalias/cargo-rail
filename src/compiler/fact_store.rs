@@ -394,7 +394,7 @@ mod tests {
         let (key, object) = fact_fixture();
         store.put(&key, &[object]).expect("publish complete fact set");
 
-        let results = cache.path().join("cargo-rail/local-cas-v2/results");
+        let results = cache.path().join("cargo-rail/local-cas-v3/results");
         let evidence = fs::read_dir(results)
             .expect("results directory")
             .filter_map(Result::ok)

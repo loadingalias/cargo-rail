@@ -538,7 +538,27 @@ fn cache_fast_bypass_reason(invocation: &CompilerInvocation, observation_wrapper
     let Some((program, arguments)) = invocation.compiler_selection(observation_wrapper) else {
         return Some("compiler_argv_unavailable");
     };
-    crate::compiler::native_cache::fast_bypass_reason(program, arguments)
+    crate::compiler::native_cache::fast_bypass_reason(program, arguments).or_else(|| {
+        if observation_wrapper {
+            return None;
+        }
+        workspace_wrapper_bypass_reason(
+            &invocation.program,
+            std::env::var_os("RUSTC_WORKSPACE_WRAPPER").as_deref(),
+        )
+    })
+}
+
+/// Cargo routes workspace members through `RUSTC_WORKSPACE_WRAPPER`, which then owns their outputs.
+/// Action identity binds rustc, not that wrapper, so those units never enter the cache.
+fn workspace_wrapper_bypass_reason(
+    program: &std::ffi::OsStr,
+    configured: Option<&std::ffi::OsStr>,
+) -> Option<&'static str> {
+    let program = std::path::Path::new(program);
+    let configured = std::path::Path::new(configured.filter(|configured| !configured.is_empty())?);
+    (program == configured || program.file_name() == configured.file_name())
+        .then_some("workspace_wrapper_identity_unavailable")
 }
 
 fn direct_fact_observation_wrapper(
@@ -1379,6 +1399,22 @@ mod tests {
     use std::io::Read as _;
 
     use super::*;
+
+    #[test]
+    fn units_routed_through_the_workspace_wrapper_bypass_by_path_or_name() {
+        let wrapper = OsStr::new("/opt/tools/rustc-lint-wrapper");
+        for program in [wrapper, OsStr::new("rustc-lint-wrapper")] {
+            assert_eq!(
+                workspace_wrapper_bypass_reason(program, Some(wrapper)),
+                Some("workspace_wrapper_identity_unavailable"),
+                "{program:?}"
+            );
+        }
+        let rustc = OsStr::new("/toolchains/stable/bin/rustc");
+        assert_eq!(workspace_wrapper_bypass_reason(rustc, Some(wrapper)), None);
+        assert_eq!(workspace_wrapper_bypass_reason(rustc, Some(OsStr::new(""))), None);
+        assert_eq!(workspace_wrapper_bypass_reason(rustc, None), None);
+    }
 
     #[test]
     fn captured_doctest_input_is_replayable_and_content_bound() {

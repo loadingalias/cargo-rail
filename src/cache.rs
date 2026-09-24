@@ -1,6 +1,7 @@
 //! Exact ownership, measurement, and reclamation for cargo-rail cache state.
 
 pub(crate) mod cas;
+pub(crate) mod digest_memo;
 pub(crate) mod installation;
 pub(crate) mod profile;
 pub(crate) mod report;
@@ -325,19 +326,29 @@ pub(crate) fn remove_workspace(workspace_root: &Path) -> RailResult<CacheRemoval
     Ok(CacheRemoval { paths, bytes })
 }
 
-/// Remove the validated local CAS in the selected profile's cache domain.
+/// The retired-layout store that [`remove_local`] would remove, with its bytes.
+pub(crate) fn retired_local(workspace_root: &Path) -> RailResult<Option<(PathBuf, u64)>> {
+    match crate::cache::installation::retired_local_cache(workspace_root)? {
+        Some(retired) => Ok(retired),
+        None => crate::cache::cas::LocalCacheSelection::from_environment()?
+            .configured_root()?
+            .map_or(Ok(None), |root| crate::cache::cas::retired_root_bytes(&root)),
+    }
+}
+
+/// Remove the validated local CAS in the selected profile's cache domain, and its retired-layout sibling.
 pub(crate) fn remove_local(workspace_root: &Path) -> RailResult<CacheRemoval> {
     let removed = match crate::cache::installation::remove_local_cache(workspace_root)? {
         Some(removed) => removed,
         None => {
             let selection = crate::cache::cas::LocalCacheSelection::from_environment()?;
-            selection
-                .configured_root()?
-                .map(|root| crate::cache::cas::remove_owned_root_at(&root))
-                .transpose()?
-                .flatten()
-                .into_iter()
-                .collect()
+            match selection.configured_root()? {
+                Some(root) => crate::cache::cas::remove_owned_root_at(&root)?
+                    .into_iter()
+                    .chain(crate::cache::cas::remove_retired_root(&root)?)
+                    .collect(),
+                None => Vec::new(),
+            }
         }
     };
     removed

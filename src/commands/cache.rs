@@ -647,8 +647,10 @@ pub(crate) fn run_profiles(workspace_root: &Path, format: TextJsonOutputFormat) 
         println!("Installed cache profiles: {}", profiles.len());
         for profile in profiles {
             println!(
-                "  {}: {} root(s), {}, {}",
+                "  {}: {} / {}, {} root(s), {}, {}",
                 profile.profile_id,
+                human_bytes(profile.bytes),
+                human_bytes(profile.max_bytes),
                 profile.roots.len(),
                 profile.state,
                 profile.root_portability
@@ -791,7 +793,13 @@ pub(crate) fn run_clean(
 ) -> RailResult<()> {
     if check {
         let status = crate::cache::status(workspace_root, scope.includes_workspace(), scope.includes_local())?;
-        let pending = has_state(&status);
+        let retired = if scope.includes_local() {
+            crate::cache::retired_local(workspace_root)?
+        } else {
+            None
+        };
+        let retired_bytes = retired.as_ref().map_or(0, |(_, bytes)| *bytes);
+        let pending = has_state(&status) || retired.is_some();
         if format.is_json() {
             let output = crate::output::machine_json_envelope(
                 "cache",
@@ -800,13 +808,16 @@ pub(crate) fn run_clean(
                 if pending { 1 } else { 0 },
                 serde_json::json!({
                   "scope": scope.as_str(),
-                  "would_reclaim_bytes": total_bytes(&status),
+                  "would_reclaim_bytes": total_bytes(&status).saturating_add(retired_bytes),
                   "status": status,
                 }),
             );
             println!("{}", serde_json::to_string_pretty(&output)?);
         } else {
             render_status(&status);
+            if let Some((path, bytes)) = &retired {
+                println!("Retired cache layout: {} at {}", human_bytes(*bytes), path.display());
+            }
             if pending {
                 println!("\ncache state would be reclaimed; run without --check to apply");
             } else {
@@ -904,7 +915,7 @@ fn render_status(status: &CacheStatus) {
         status.installation.usage.failures
     );
     println!(
-        "Installation storage: {} required, {} reclaimable",
+        "Installation storage (all profiles): {} required, {} reclaimable",
         human_bytes(status.installation.required_bytes),
         human_bytes(status.installation.reclaimable_bytes)
     );

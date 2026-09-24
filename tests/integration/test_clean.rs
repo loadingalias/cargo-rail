@@ -80,19 +80,23 @@ fn run_cache_command(workspace: &TempDir, cache: &TempDir, args: &[&str]) -> std
 fn create_empty_local_cas(cache: &TempDir) -> Result<std::path::PathBuf> {
     const TRUST_DOMAIN: &str = "0000000000000000000000000000000000000000000000000000000000000000";
     let owner = cache.path().join("cargo-rail");
-    let root = owner.join("local-cas-v2");
+    let root = owner.join("local-cas-v3");
     fs::create_dir_all(&root)?;
     fs::write(owner.join("LOCAL_TRUST_DOMAIN"), format!("{TRUST_DOMAIN}\n"))?;
     fs::write(
         root.join("OWNER"),
-        format!("cargo-rail-local-cas\nschema=2\ntrust-domain={TRUST_DOMAIN}\n"),
+        format!("cargo-rail-local-cas\nschema=3\ntrust-domain={TRUST_DOMAIN}\n"),
     )?;
-    fs::write(root.join("CAPACITY.json"), b"{\"version\":2,\"result_bytes\":0}")?;
+    fs::write(
+        root.join("CAPACITY.json"),
+        b"{\"version\":3,\"result_bytes\":0,\"metadata_bytes\":0}",
+    )?;
     fs::write(
         root.join("NATIVE_LEDGER.json"),
         b"{\"version\":2,\"terminal_states\":0,\"terminal_bytes\":0,\"disabled\":false}",
     )?;
     for directory in [
+        "blobs",
         "results",
         "pins",
         "leases",
@@ -113,7 +117,7 @@ fn create_empty_local_cas(cache: &TempDir) -> Result<std::path::PathBuf> {
     }
     #[cfg(target_os = "macos")]
     fs::create_dir(root.join("sysroot-identities"))?;
-    fs::write(owner.join("local-cas-v2.lock"), b"")?;
+    fs::write(owner.join("local-cas-v3.lock"), b"")?;
     Ok(root)
 }
 
@@ -157,9 +161,68 @@ fn local_status_and_cleanup_use_the_configured_domain_without_workspace_state() 
             "an unchanged cache must report the bytes actually removed"
         );
         assert!(!root.exists());
-        let lock = cache.path().join("cargo-rail/local-cas-v2.lock");
+        let lock = cache.path().join("cargo-rail/local-cas-v3.lock");
         assert!(lock.is_file(), "the lifecycle authority must survive root reclamation");
         assert_eq!(fs::metadata(lock).unwrap().len(), 0);
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn local_cleanup_previews_and_removes_only_the_owned_retired_store() {
+    let result: Result<()> = (|| {
+        const TRUST_DOMAIN: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+        let workspace = create_test_workspace()?;
+        let cache = TempDir::new().unwrap();
+        let root = create_empty_local_cas(&cache)?;
+        let owner = cache.path().join("cargo-rail");
+        let retired = owner.join("local-cas-v2");
+        fs::create_dir_all(retired.join("results/old-result"))?;
+        fs::write(
+            retired.join("OWNER"),
+            format!("cargo-rail-local-cas\nschema=2\ntrust-domain={TRUST_DOMAIN}\n"),
+        )?;
+        fs::write(retired.join("results/old-result/blob"), vec![0_u8; 4096])?;
+        // Another directory with a retired-looking name but no provable ownership is never touched.
+        let decoy = owner.join("local-cas-v2-not-a-trust-domain");
+        fs::create_dir_all(&decoy)?;
+        fs::write(decoy.join("data"), b"not cargo-rail state")?;
+
+        let preview = run_cache_command(
+            &workspace,
+            &cache,
+            &["rail", "cache", "clean", "--scope", "local", "--check", "-f", "json"],
+        );
+        assert_eq!(preview.status.code(), Some(1), "retired preview: {preview:?}");
+        let preview_json: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
+        let current_bytes = preview_json["status"]["local"]["cache"]["bytes"].as_u64().unwrap();
+        let would_reclaim = preview_json["would_reclaim_bytes"].as_u64().unwrap();
+        assert!(
+            would_reclaim >= current_bytes + 4096,
+            "the preview includes the retired store: {preview_json}"
+        );
+        assert!(retired.is_dir(), "a preview removes nothing");
+
+        let cleaned = run_cache_command(
+            &workspace,
+            &cache,
+            &["rail", "cache", "clean", "--scope", "local", "-f", "json"],
+        );
+        assert!(cleaned.status.success(), "local cleanup failed: {cleaned:?}");
+        let cleaned_json: serde_json::Value = serde_json::from_slice(&cleaned.stdout).unwrap();
+        assert_eq!(cleaned_json["reclaimed_bytes"], preview_json["would_reclaim_bytes"]);
+        let expected = fs::canonicalize(&owner)?.join("local-cas-v2").display().to_string();
+        assert!(
+            cleaned_json["removed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|path| path.as_str() == Some(expected.as_str())),
+            "{cleaned_json}"
+        );
+        assert!(!root.exists() && !retired.exists());
+        assert_eq!(fs::read(decoy.join("data"))?, b"not cargo-rail state");
         Ok(())
     })();
     super::helpers::finish_test(result);
@@ -172,7 +235,7 @@ fn workspace_cleanup_never_removes_the_shared_local_cas() {
             let workspace = create_test_workspace()?;
             let cache = TempDir::new().unwrap();
             let root = create_empty_local_cas(&cache)?;
-            let lock = cache.path().join("cargo-rail/local-cas-v2.lock");
+            let lock = cache.path().join("cargo-rail/local-cas-v3.lock");
             let shared_result = root.join("results/shared-result");
             fs::write(&shared_result, b"shared across workspaces")?;
 

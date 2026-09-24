@@ -1102,6 +1102,61 @@ fn real_cargo_test_targets_reuse_exact_outputs() -> Result<()> {
     result
 }
 
+/// `cargo clippy` routes only workspace members through `clippy-driver`; dependencies still run plain rustc.
+#[test]
+#[cfg(not(windows))]
+fn clippy_reuses_dependency_results_from_an_ordinary_check() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let result: Result<()> = (|| {
+        let fixture = root.path().join("fixture");
+        let cargo_home = root.path().join("cargo-home");
+        materialize_fixture(&fixture, &root.path().join("git-source"))?;
+        seed_isolated_cargo_home(&fixture, &cargo_home)?;
+        setup_cache(&fixture, &cargo_home, &root.path().join("cache"))?;
+        let run = |workload: &str| -> Result<(BTreeSet<String>, BTreeSet<String>)> {
+            let events = create_private_benchmark_directory(&root.path().join(format!("{workload}-events")))?;
+            run_cargo(
+                &fixture,
+                &cargo_home,
+                workload,
+                &[
+                    ("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1"),
+                    (
+                        "CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY",
+                        events.to_str().context("events path")?,
+                    ),
+                ],
+                &["--package", "fixture-storage"],
+            )?;
+            ensure_typed_benchmark_events(&events)?;
+            Ok((
+                benchmark_action_crates(&events, "miss")?.into_iter().collect(),
+                benchmark_action_crates(&events, "hit")?.into_iter().collect(),
+            ))
+        };
+
+        let (checked, _) = run("check")?;
+        let members = BTreeSet::from(["fixture_storage".to_string(), "fixture_types".to_string()]);
+        let dependencies = checked.difference(&members).cloned().collect::<BTreeSet<_>>();
+        ensure!(
+            dependencies.contains("fixture_git") && dependencies.contains("serde_json"),
+            "fixture no longer compiles non-member dependencies: {checked:?}"
+        );
+
+        fs::remove_dir_all(fixture.join("target"))?;
+        let (_, clippy_hits) = run("clippy")?;
+        ensure!(
+            clippy_hits == dependencies,
+            "clippy must reuse exactly the ordinary dependency results: hits={clippy_hits:?}, dependencies={dependencies:?}"
+        );
+        Ok(())
+    })();
+    if result.is_err() {
+        eprintln!("retained failed compiler-cache fixture: {}", root.keep().display());
+    }
+    result
+}
+
 #[test]
 fn real_world_native_cache_fixture_exercises_required_compiler_classes() -> Result<()> {
     let root = tempfile::tempdir()?;

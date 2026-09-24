@@ -228,12 +228,36 @@ impl FileObservation {
                 absolute.display()
             )));
         }
+        // Inside a cache invocation, an unchanged file generation reuses its recorded digest.
+        let memo = crate::cache::digest_memo::active();
+        let generation = memo.and_then(|_| crate::utils::stable_file_generation(&absolute));
+        if let (Some(memo), Some(generation)) = (memo, generation.as_deref())
+            && let Some((content_digest, bytes)) = memo.lookup(generation)
+            && bytes == metadata.len()
+        {
+            return Ok((
+                Self {
+                    path: ObservationPath::capture(&absolute, current_dir, source_root),
+                    content_digest,
+                    executable: is_executable(&metadata),
+                    symlink_target,
+                },
+                0,
+            ));
+        }
         let bytes = read_observed_file(&absolute, &metadata)?;
         let bytes_read = bytes.len() as u64;
+        let content_digest = format!("sha256:{}", ContentDigest::sha256(&bytes));
+        if let (Some(memo), Some(generation)) = (memo, generation)
+            && crate::utils::stable_file_generation(&absolute).as_deref() == Some(generation.as_slice())
+            && let Ok(modified) = metadata.modified()
+        {
+            memo.record(&generation, modified, &content_digest, bytes_read);
+        }
         Ok((
             Self {
                 path: ObservationPath::capture(&absolute, current_dir, source_root),
-                content_digest: format!("sha256:{}", ContentDigest::sha256(&bytes)),
+                content_digest,
                 executable: is_executable(&metadata),
                 symlink_target,
             },
@@ -2592,6 +2616,46 @@ fn is_executable(_metadata: &fs::Metadata) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// nextest runs each test in its own process, so this activation cannot leak into other tests.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn unchanged_settled_files_reuse_their_memoized_digest_exactly() {
+        let store = tempfile::tempdir().expect("store root");
+        let workspace = tempfile::tempdir().expect("workspace");
+        crate::cache::digest_memo::activate(store.path());
+        let path = workspace.path().join("libdependency.rmeta");
+        let settled = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(60))
+            .expect("settled time");
+        let write_settled = |bytes: &[u8]| {
+            fs::write(&path, bytes).expect("artifact");
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .expect("artifact")
+                .set_modified(settled)
+                .expect("settle artifact");
+        };
+        let capture = || FileObservation::capture_counted(&path, workspace.path(), workspace.path()).expect("capture");
+
+        write_settled(b"first artifact bytes");
+        let (first, first_read) = capture();
+        assert_eq!(first_read, 20, "a new generation is read and hashed");
+        let (memoized, memoized_read) = capture();
+        assert_eq!(memoized_read, 0, "an unchanged generation reuses its digest");
+        assert_eq!(memoized.content_digest, first.content_digest);
+
+        // Same size and restored modification time: the change time still changes the generation.
+        write_settled(b"other artifact bytes");
+        let (changed, changed_read) = capture();
+        assert_eq!(changed_read, 20);
+        assert_ne!(changed.content_digest, first.content_digest);
+        assert_eq!(
+            changed.content_digest,
+            format!("sha256:{}", ContentDigest::sha256(b"other artifact bytes"))
+        );
+    }
 
     #[test]
     fn separate_debug_capture_excludes_unchanged_leftovers_and_owns_replaced_objects() {

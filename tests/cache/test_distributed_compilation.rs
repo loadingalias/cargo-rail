@@ -578,7 +578,7 @@ fn ordinary_cargo_distributes_module_trees_and_exact_rust_dependencies() -> Resu
     let cargo_rail_cache = cache.path().join("cargo-rail");
     let roots = fs::read_dir(&cargo_rail_cache)?
         .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with("local-cas-v2"))
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("local-cas-v3"))
         .filter(|entry| entry.path().is_dir())
         .collect::<Vec<_>>();
     let [root] = roots.as_slice() else {
@@ -1025,7 +1025,7 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
     fs::remove_dir_all(workspace.path.join("target"))?;
     let cache_roots = fs::read_dir(cargo_home.path().join("cargo-rail"))?
         .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with("local-cas-v2"))
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("local-cas-v3"))
         .filter(|entry| entry.path().is_dir())
         .collect::<Vec<_>>();
     let [cache_root] = cache_roots.as_slice() else {
@@ -1186,7 +1186,7 @@ fn mutual_tls_worker_executes_through_machine_owned_cargo_setup() -> Result<()> 
     fs::remove_dir_all(workspace.path.join("target"))?;
     let automatic_cache_roots = fs::read_dir(cargo_home.path().join("cargo-rail"))?
         .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with("local-cas-v2"))
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("local-cas-v3"))
         .filter(|entry| entry.path().is_dir())
         .collect::<Vec<_>>();
     let [automatic_cache_root] = automatic_cache_roots.as_slice() else {
@@ -1459,7 +1459,7 @@ fn saturated_mutual_tls_worker_falls_excess_cargo_actions_back_locally() -> Resu
     fs::remove_dir_all(workspace.path.join("target"))?;
     let cache_roots = fs::read_dir(cache.path().join("cargo-rail"))?
         .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with("local-cas-v2"))
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("local-cas-v3"))
         .filter(|entry| entry.path().is_dir())
         .collect::<Vec<_>>();
     let [cache_root] = cache_roots.as_slice() else {

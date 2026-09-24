@@ -24,9 +24,11 @@ use crate::compiler::native_cache::{
 use crate::error::{RailError, RailResult};
 use crate::source::ContentDigest;
 
-const CAS_VERSION: u32 = 2;
-const CAS_ROOT_NAME: &str = "local-cas-v2";
-const OWNER_MARKER_PREFIX: &str = "cargo-rail-local-cas\nschema=2\ntrust-domain=";
+const CAS_VERSION: u32 = 3;
+const CAS_ROOT_NAME: &str = "local-cas-v3";
+const OWNER_MARKER_PREFIX: &str = "cargo-rail-local-cas\nschema=3\ntrust-domain=";
+/// Content-addressed blobs shared by every result, sharded by their first identity byte.
+const BLOB_DIRECTORY: &str = "blobs";
 const DEFAULT_TRUST_DOMAIN_FILE: &str = "LOCAL_TRUST_DOMAIN";
 pub(crate) const CACHE_BASE_ENV: &str = "CARGO_RAIL_CACHE_DIR";
 pub(crate) const CACHE_MAX_BYTES_ENV: &str = "CARGO_RAIL_CACHE_MAX_BYTES";
@@ -103,7 +105,7 @@ pub(crate) struct PackedNativeActionStagingRequest<'a> {
 
 #[cfg(any(unix, windows))]
 struct MaterializeBlobRequest<'a> {
-    bundle: &'a Path,
+    root: &'a Path,
     identity: &'a str,
     content_digest: &'a str,
     expected_bytes: u64,
@@ -410,7 +412,7 @@ impl NativeActionHit<'_> {
         crate::compiler::native_cache::pack::export(&self.validation, writer, |slot| {
             let identity = blob_id(slot.digest, slot.bytes).map_err(fault_to_error)?;
             let hex = validated_id_hex(&identity, BLOB_PREFIX)?;
-            let path = self.verified.bundle.join("blobs").join(format!("{hex}.blob"));
+            let path = shared_blob_path(&self.cas.root, hex);
             let file = File::open(&path)?;
             if !crate::utils::private_file_matches_path(&file, &path, slot.bytes)? {
                 return Err(RailError::message(
@@ -706,7 +708,10 @@ struct LeaseRecord {
 #[serde(deny_unknown_fields)]
 struct CapacityState {
     version: u32,
+    /// Committed result, shared blob, and packed-action bytes, maintained on every publication.
     result_bytes: u64,
+    /// Authority and index bytes outside results, blobs, and staging, measured at each collection.
+    metadata_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -794,7 +799,16 @@ struct StagedBundle {
     _temporary: tempfile::TempDir,
     _active: File,
     payload: PathBuf,
+    blobs: Vec<StagedBlob>,
     stats: StoreStats,
+}
+
+/// One blob a staged result references. `staged` holds a private copy unless the shared
+/// store already held the blob during staging; commit revalidates either case under its lock.
+struct StagedBlob {
+    hex: String,
+    bytes: u64,
+    staged: Option<PathBuf>,
 }
 
 /// One native result whose immutable bundle is ready for its authority commit.
@@ -1378,6 +1392,11 @@ impl LocalCas {
 
     /// Return the private candidate location for one verified sysroot identity memo.
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    /// Validated root of this store.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub(crate) fn sysroot_identity_memo_path(&self, lookup: &crate::source::ContentDigest) -> PathBuf {
         self.root
             .join(SYSROOT_IDENTITY_MEMO_DIRECTORY)
@@ -1445,6 +1464,7 @@ impl LocalCas {
         ensure_owner_marker_existing(&root, Some(&authority.trust_domain))?;
         for name in [
             "staging",
+            BLOB_DIRECTORY,
             "results",
             "pins",
             "leases",
@@ -2123,8 +2143,9 @@ struct VerifiedResult {
     validation: StoredValidation,
     #[cfg(any(unix, windows))]
     trees: BTreeMap<String, TreeObject>,
+    /// Store root whose shared blob directory backs this result.
     #[cfg(any(unix, windows))]
-    bundle: PathBuf,
+    root: PathBuf,
 }
 
 struct VerifiedCompilerEvidence {
@@ -2161,6 +2182,7 @@ fn initialize_selected_root(
     ensure_owner_marker(&root, &authority.trust_domain)?;
     create_real_directory(&root, "staging")?;
     for name in [
+        BLOB_DIRECTORY,
         "results",
         "pins",
         "leases",
@@ -2177,8 +2199,9 @@ fn initialize_selected_root(
     create_real_directory(&root, SYSROOT_IDENTITY_MEMO_DIRECTORY)?;
     validate_root_entries(&root)?;
     clear_staging(&root.join("staging"))?;
-    reconcile_capacity_state(&root)?;
+    // Capacity measures every other root file, so it is reconciled last.
     reconcile_native_ledger(&root)?;
+    reconcile_capacity_state(&root)?;
     Ok(LocalCas {
         root,
         lifecycle_lock,
@@ -2642,6 +2665,8 @@ fn validate_root_entries(root: &Path) -> RailResult<()> {
         CAPACITY_STATE_FILE,
         NATIVE_LEDGER_STATE_FILE,
         "OWNER",
+        BLOB_DIRECTORY,
+        crate::cache::digest_memo::DIGEST_MEMO_DIRECTORY,
         EVIDENCE_CANDIDATE_INDEX_DIRECTORY,
         "leases",
         NATIVE_ACTION_STATE_DIRECTORY,
@@ -3553,7 +3578,14 @@ impl LocalCas {
             TREE_PREFIX,
             "json",
         )?;
-        validate_object_directory(&bundle.join("blobs"), &blobs, BLOB_PREFIX, "blob")?;
+        for blob in &blobs {
+            let hex = validated_id_hex(blob, BLOB_PREFIX).map_err(|_| Fault::corrupt("blob_identity_encoding"))?;
+            let metadata = fs::symlink_metadata(shared_blob_path(&self.root, hex))
+                .map_err(|error| Fault::corrupt(format!("blob_missing: {error}")))?;
+            if !metadata.is_file() || is_link_or_reparse(&metadata) {
+                return Err(Fault::corrupt("blob_not_regular_file"));
+            }
+        }
         validate_object_directory(
             &bundle.join("manifests"),
             &BTreeSet::from([output_manifest.to_string()]),
@@ -3576,7 +3608,7 @@ impl LocalCas {
             #[cfg(any(unix, windows))]
             trees,
             #[cfg(any(unix, windows))]
-            bundle,
+            root: self.root.clone(),
         })
     }
 
@@ -3720,7 +3752,7 @@ fn materialize_from_staging(
     // handle owns the barrier before the write-through rename.
     let durable = cfg!(windows);
     materialize_tree(
-        &verified.bundle,
+        &verified.root,
         output_tree,
         &verified.trees,
         &payload,
@@ -3807,7 +3839,7 @@ fn validate_real_directory_fault(path: &Path, description: &str) -> Result<(), F
 }
 
 fn validate_bundle_root_entries(bundle: &Path) -> Result<(), Fault> {
-    let expected = ["action-result.json", "blobs", "manifests", "trees", "validations"]
+    let expected = ["action-result.json", "manifests", "trees", "validations"]
         .into_iter()
         .map(str::to_string)
         .collect::<BTreeSet<_>>();
@@ -3826,7 +3858,7 @@ fn validate_bundle_root_entries(bundle: &Path) -> Result<(), Fault> {
     if actual != expected {
         return Err(Fault::corrupt("bundle_entries_mismatch"));
     }
-    for directory in ["blobs", "manifests", "trees", "validations"] {
+    for directory in ["manifests", "trees", "validations"] {
         validate_real_directory_fault(&bundle.join(directory), "bundle object directory")?;
     }
     Ok(())
@@ -4026,7 +4058,7 @@ fn validate_object_directory(
 
 #[cfg(any(unix, windows))]
 fn materialize_tree(
-    bundle: &Path,
+    root: &Path,
     identity: &str,
     trees: &BTreeMap<String, TreeObject>,
     destination: &Path,
@@ -4051,7 +4083,7 @@ fn materialize_tree(
                 mode,
             } => {
                 materialize_blob(MaterializeBlobRequest {
-                    bundle,
+                    root,
                     identity: blob,
                     content_digest,
                     expected_bytes: *bytes,
@@ -4063,7 +4095,7 @@ fn materialize_tree(
             }
             TreeEntryKind::Directory { tree, mode } => {
                 fs::create_dir(&path).map_err(|error| Fault::corrupt(format!("directory_materialization: {error}")))?;
-                materialize_tree(bundle, tree, trees, &path, stats, depth + 1, durable)?;
+                materialize_tree(root, tree, trees, &path, stats, depth + 1, durable)?;
                 set_exact_mode(&path, *mode)?;
             }
             TreeEntryKind::Symlink { target, directory } => {
@@ -4078,7 +4110,7 @@ fn materialize_tree(
 #[cfg(any(unix, windows))]
 fn materialize_blob(request: MaterializeBlobRequest<'_>) -> Result<(), Fault> {
     let MaterializeBlobRequest {
-        bundle,
+        root,
         identity,
         content_digest,
         expected_bytes,
@@ -4088,7 +4120,7 @@ fn materialize_blob(request: MaterializeBlobRequest<'_>) -> Result<(), Fault> {
         durable,
     } = request;
     let hex = validated_id_hex(identity, BLOB_PREFIX).map_err(|_| Fault::corrupt("blob_identity_encoding"))?;
-    let source = bundle.join("blobs").join(format!("{hex}.blob"));
+    let source = shared_blob_path(root, hex);
     let metadata = fs::symlink_metadata(&source).map_err(|error| Fault::corrupt(format!("blob_missing: {error}")))?;
     if !metadata.is_file()
         || is_link_or_reparse(&metadata)
@@ -4281,11 +4313,14 @@ impl LocalCas {
         let payload = temporary.path().join("payload");
         fs::create_dir(&payload)?;
         make_directory_private(&payload)?;
-        for name in ["blobs", "manifests", "trees", "validations"] {
+        for name in ["manifests", "trees", "validations"] {
             let directory = payload.join(name);
             fs::create_dir(&directory)?;
             make_directory_private(&directory)?;
         }
+        let staged_blobs = temporary.path().join(BLOB_DIRECTORY);
+        fs::create_dir(&staged_blobs)?;
+        make_directory_private(&staged_blobs)?;
         let mut stats = StoreStats::default();
         write_new_before_commit(&payload.join("action-result.json"), object_bytes)?;
         stats.objects_written = stats.objects_written.saturating_add(1);
@@ -4319,9 +4354,19 @@ impl LocalCas {
             stats.objects_written = stats.objects_written.saturating_add(1);
             stats.bytes_written = stats.bytes_written.saturating_add(bytes.len() as u64);
         }
+        let mut blobs = Vec::with_capacity(prepared.blobs.len());
         for (identity, blob) in &prepared.blobs {
-            let hex = validated_id_hex(identity, BLOB_PREFIX)?;
-            let destination = payload.join("blobs").join(format!("{hex}.blob"));
+            let hex = validated_id_hex(identity, BLOB_PREFIX)?.to_string();
+            // An identical blob from another result is reused; commit proves it still exists.
+            if shared_blob_present(&shared_blob_path(&self.root, &hex), blob.bytes)? {
+                blobs.push(StagedBlob {
+                    hex,
+                    bytes: blob.bytes,
+                    staged: None,
+                });
+                continue;
+            }
+            let destination = staged_blobs.join(format!("{hex}.blob"));
             let written = if move_preverified_blobs {
                 move_blob_verified(
                     blob,
@@ -4334,8 +4379,13 @@ impl LocalCas {
             };
             stats.objects_written = stats.objects_written.saturating_add(1);
             stats.bytes_written = stats.bytes_written.saturating_add(written);
+            blobs.push(StagedBlob {
+                hex,
+                bytes: written,
+                staged: Some(destination),
+            });
         }
-        sync_directory_before_commit(&payload.join("blobs"))?;
+        sync_directory_before_commit(&staged_blobs)?;
         sync_directory_before_commit(&payload.join("manifests"))?;
         sync_directory_before_commit(&payload.join("trees"))?;
         sync_directory_before_commit(&payload.join("validations"))?;
@@ -4344,6 +4394,7 @@ impl LocalCas {
             _temporary: temporary,
             _active: active,
             payload,
+            blobs,
             stats,
         })
     }
@@ -4377,8 +4428,37 @@ impl LocalCas {
             _temporary,
             _active,
             payload,
-            stats,
+            blobs,
+            mut stats,
         } = staged;
+        // Every referenced blob is durable in the shared store before the result becomes visible.
+        let mut shards = BTreeSet::new();
+        for blob in &blobs {
+            let shared = shared_blob_path(&self.root, &blob.hex);
+            match &blob.staged {
+                Some(staged) => {
+                    let stored = publish_shared_blob(&self.root, blob, staged)?;
+                    if stored == 0 {
+                        stats.objects_written = stats.objects_written.saturating_sub(1);
+                        stats.bytes_written = stats.bytes_written.saturating_sub(blob.bytes);
+                    } else if let Some(shard) = shared.parent() {
+                        shards.insert(shard.to_path_buf());
+                    }
+                }
+                None if shared_blob_present(&shared, blob.bytes)? => {}
+                None => {
+                    return Err(RailError::message(format!(
+                        "local CAS blob '{}' was collected before its result committed",
+                        shared.display()
+                    )));
+                }
+            }
+        }
+        if commit_durability {
+            for shard in &shards {
+                sync_directory_before_commit(shard)?;
+            }
+        }
         match rename_committed(&payload, &destination, false) {
             Ok(()) => {
                 if commit_durability {
@@ -5107,29 +5187,60 @@ enum CapacityReservationSource {
 }
 
 impl LocalCas {
+    /// Evict least-recently-used results until this store fits its configured budget.
+    ///
+    /// Publication enforces the budget for new results; this applies a changed budget immediately.
+    pub(crate) fn enforce_capacity(&self) -> RailResult<()> {
+        let _lock = self.lock()?;
+        let state = validate_capacity_state(&self.root)?;
+        let staging = checked_tree_bytes(&self.root.join("staging"))?;
+        // A store within its budget is left byte-for-byte unchanged.
+        if state
+            .result_bytes
+            .saturating_add(state.metadata_bytes)
+            .saturating_add(staging)
+            <= self.max_bytes
+        {
+            return Ok(());
+        }
+        self.reserve_result_capacity(0, None, CapacityReservationSource::External)
+    }
+
     fn reserve_result_capacity(
         &self,
         incoming: u64,
         protected_result: Option<&str>,
         source: CapacityReservationSource,
     ) -> RailResult<()> {
-        let mut current = validate_capacity_state(&self.root)?.result_bytes;
         let additional = match source {
             CapacityReservationSource::Staging => 0,
             CapacityReservationSource::External => incoming,
         };
-        let mut owned = checked_tree_bytes(&self.root)?;
-        let non_result = owned.saturating_sub(current);
-        if owned.saturating_add(additional) > self.max_bytes {
-            let target = self.max_bytes.saturating_sub(non_result).saturating_sub(additional);
+        // Committed bytes come from the maintained counters; only in-flight staging is walked.
+        let owned = |state: &CapacityState| -> RailResult<u64> {
+            let staging = checked_tree_bytes(&self.root.join("staging"))?;
+            state
+                .result_bytes
+                .checked_add(state.metadata_bytes)
+                .and_then(|bytes| bytes.checked_add(staging))
+                .ok_or_else(|| RailError::message("local CAS total size overflow"))
+        };
+        let mut state = validate_capacity_state(&self.root)?;
+        let mut owned_bytes = owned(&state)?;
+        if owned_bytes.saturating_add(additional) > self.max_bytes {
+            // Collect to a low-water mark so a full store collects once per batch, not per publication.
+            let low_water = self.max_bytes - self.max_bytes / 10;
+            let non_result = owned_bytes.saturating_sub(state.result_bytes);
+            let target = low_water.saturating_sub(non_result).saturating_sub(additional);
             self.garbage_collect(target, protected_result)?;
-            current = validate_capacity_state(&self.root)?.result_bytes;
-            owned = checked_tree_bytes(&self.root)?;
+            state = validate_capacity_state(&self.root)?;
+            owned_bytes = owned(&state)?;
         }
-        let reserved = current
+        let reserved = state
+            .result_bytes
             .checked_add(incoming)
             .ok_or_else(|| RailError::message("local CAS size overflow"))?;
-        let required = owned
+        let required = owned_bytes
             .checked_add(additional)
             .ok_or_else(|| RailError::message("local CAS total size overflow"))?;
         if required > self.max_bytes {
@@ -5141,7 +5252,7 @@ impl LocalCas {
                 format!("raise {CACHE_MAX_BYTES_ENV} or run `cargo rail cache clean --scope local`"),
             ));
         }
-        write_capacity_state(&self.root, reserved)?;
+        write_capacity_state(&self.root, reserved, state.metadata_bytes)?;
         Ok(())
     }
 
@@ -5157,7 +5268,7 @@ impl LocalCas {
             .checked_sub(reserved)
             .and_then(|bytes| bytes.checked_add(written))
             .ok_or_else(|| RailError::message("local CAS capacity settlement underflow"))?;
-        write_capacity_state(&self.root, result_bytes)
+        write_capacity_state(&self.root, result_bytes, state.metadata_bytes)
     }
 
     fn garbage_collect(&self, target_bytes: u64, protected_result: Option<&str>) -> RailResult<()> {
@@ -5329,22 +5440,45 @@ impl LocalCas {
             );
         }
 
+        // Shared blobs are reference-counted by the tree objects of the results they back.
+        let mut result_blobs = BTreeMap::<String, BTreeMap<String, u64>>::new();
+        let mut blob_references = BTreeMap::<String, (usize, u64)>::new();
+        for result in result_sizes.keys() {
+            let blobs = result_blob_references(&result_path(&self.root, result)?)?;
+            for (hex, bytes) in &blobs {
+                blob_references.entry(hex.clone()).or_insert((0, *bytes)).0 += 1;
+            }
+            result_blobs.insert(result.clone(), blobs);
+        }
+        let mut touched_shards = BTreeSet::new();
+
         let mut references = BTreeMap::<String, usize>::new();
         for authority in &authorities {
             if let Some(result) = &authority.result {
                 *references.entry(result.clone()).or_default() += 1;
             }
         }
-        for (result, size) in result_sizes.clone() {
+        for result in result_sizes.keys().cloned().collect::<Vec<_>>() {
             if !references.contains_key(&result) && !leased.contains(&result) {
-                let path = result_path(&self.root, &result)?;
-                safe_remove_tree(&path)?;
+                safe_remove_tree(&result_path(&self.root, &result)?)?;
                 result_sizes.remove(&result);
-                let _ = size;
+                release_result_blobs(
+                    &self.root,
+                    result_blobs.remove(&result).unwrap_or_default(),
+                    &mut blob_references,
+                    &mut touched_shards,
+                )?;
             }
         }
+        // A crash between blob publication and result commit leaves only unreferenced blobs.
+        remove_unreferenced_blobs(&self.root, &blob_references, &mut touched_shards)?;
 
-        let materialized = result_sizes.values().try_fold(0u64, |total, size| {
+        let blob_bytes = blob_references.values().try_fold(0u64, |total, (_, bytes)| {
+            total
+                .checked_add(*bytes)
+                .ok_or_else(|| RailError::message("local CAS blob size overflow"))
+        })?;
+        let materialized = result_sizes.values().try_fold(blob_bytes, |total, size| {
             total
                 .checked_add(*size)
                 .ok_or_else(|| RailError::message("local CAS result size overflow"))
@@ -5381,7 +5515,12 @@ impl LocalCas {
                     references.remove(&result);
                     if let Some(size) = result_sizes.remove(&result) {
                         safe_remove_tree(&result_path(&self.root, &result)?)?;
-                        current = current.saturating_sub(size);
+                        current = current.saturating_sub(size).saturating_sub(release_result_blobs(
+                            &self.root,
+                            result_blobs.remove(&result).unwrap_or_default(),
+                            &mut blob_references,
+                            &mut touched_shards,
+                        )?);
                     }
                 }
             }
@@ -5389,9 +5528,130 @@ impl LocalCas {
         sync_directory(&pins_directory)?;
         sync_directory(&native_actions_directory)?;
         sync_directory(&results_directory)?;
-        write_capacity_state(&self.root, current)?;
+        for shard in &touched_shards {
+            sync_directory(shard)?;
+        }
+        crate::cache::digest_memo::prune(&self.root)?;
+        write_capacity_state(&self.root, current, measured_metadata_bytes(&self.root, current)?)?;
         Ok(())
     }
+}
+
+/// Blobs one committed result references, keyed by blob identity hex with their exact sizes.
+fn result_blob_references(bundle: &Path) -> RailResult<BTreeMap<String, u64>> {
+    let mut blobs = BTreeMap::new();
+    for entry in bounded_optional_directory_entries(&bundle.join("trees"), "local CAS result trees")? {
+        let mut stats = ReadStats::default();
+        let tree: TreeObject =
+            read_canonical_json(&entry.path(), MAX_OBJECT_METADATA_BYTES, &mut stats).map_err(fault_to_error)?;
+        for entry in tree.entries {
+            if let TreeEntryKind::File { blob, bytes, .. } = entry.kind {
+                blobs.insert(validated_id_hex(&blob, BLOB_PREFIX)?.to_string(), bytes);
+            }
+        }
+    }
+    Ok(blobs)
+}
+
+/// Drop one removed result's blob references, deleting blobs no surviving result needs.
+/// Returns the bytes freed.
+fn release_result_blobs(
+    root: &Path,
+    blobs: BTreeMap<String, u64>,
+    references: &mut BTreeMap<String, (usize, u64)>,
+    touched_shards: &mut BTreeSet<PathBuf>,
+) -> RailResult<u64> {
+    let mut freed = 0u64;
+    for hex in blobs.into_keys() {
+        let Some((count, bytes)) = references.get_mut(&hex) else {
+            continue;
+        };
+        *count = count.saturating_sub(1);
+        if *count > 0 {
+            continue;
+        }
+        freed = freed.saturating_add(*bytes);
+        references.remove(&hex);
+        let path = shared_blob_path(root, &hex);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        if let Some(shard) = path.parent() {
+            touched_shards.insert(shard.to_path_buf());
+        }
+    }
+    Ok(freed)
+}
+
+/// Delete shared blobs that no committed result references.
+fn remove_unreferenced_blobs(
+    root: &Path,
+    references: &BTreeMap<String, (usize, u64)>,
+    touched_shards: &mut BTreeSet<PathBuf>,
+) -> RailResult<()> {
+    for shard in bounded_optional_directory_entries(&root.join(BLOB_DIRECTORY), "local CAS blob shards")? {
+        let shard = shard.path();
+        validate_real_directory(&shard, "local CAS blob shard")?;
+        for entry in bounded_directory_entries(&shard, "local CAS blob shard")? {
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| RailError::message("local CAS blob has a non-UTF-8 name"))?;
+            let hex = name
+                .strip_suffix(".blob")
+                .ok_or_else(|| RailError::message(format!("local CAS blob '{name}' has a noncanonical name")))?;
+            if !references.contains_key(hex) {
+                fs::remove_file(entry.path())?;
+                touched_shards.insert(shard.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Path of one shared content-addressed blob; `hex` is a validated blob identity.
+fn shared_blob_path(root: &Path, hex: &str) -> PathBuf {
+    root.join(BLOB_DIRECTORY)
+        .join(hex.get(..2).unwrap_or(hex))
+        .join(format!("{hex}.blob"))
+}
+
+/// Whether the shared store already holds this blob as a private regular file of the expected size.
+fn shared_blob_present(path: &Path, bytes: u64) -> RailResult<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !is_link_or_reparse(&metadata) && has_single_link(&metadata) => {
+            Ok(metadata.len() == bytes)
+        }
+        Ok(_) => Err(RailError::with_help(
+            format!("local CAS blob '{}' is not a private regular file", path.display()),
+            "run `cargo rail cache clean --scope local`; cargo-rail will not replace a hostile object",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Move one privately staged blob into the shared store. Callers hold the exclusive lifecycle lock,
+/// so an existing blob cannot be removed or replaced concurrently. Returns the bytes newly stored.
+fn publish_shared_blob(root: &Path, blob: &StagedBlob, staged: &Path) -> RailResult<u64> {
+    let shared = shared_blob_path(root, &blob.hex);
+    if shared_blob_present(&shared, blob.bytes)? {
+        fs::remove_file(staged)?;
+        return Ok(0);
+    }
+    let shard = shared
+        .parent()
+        .ok_or_else(|| RailError::message("local CAS blob has no shard directory"))?;
+    match fs::create_dir(shard) {
+        Ok(()) => make_directory_private(shard)?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    validate_real_directory(shard, "local CAS blob shard")?;
+    rename_committed(staged, &shared, false)?;
+    Ok(blob.bytes)
 }
 
 fn result_path(root: &Path, identity: &str) -> RailResult<PathBuf> {
@@ -5405,7 +5665,9 @@ fn checked_tree_bytes(root: &Path) -> RailResult<u64> {
 }
 
 fn reconcile_capacity_state(root: &Path) -> RailResult<()> {
-    let materialized = checked_tree_bytes(&root.join("results"))?;
+    let materialized = checked_tree_bytes(&root.join("results"))?
+        .checked_add(checked_tree_bytes(&root.join(BLOB_DIRECTORY))?)
+        .ok_or_else(|| RailError::message("local CAS result size overflow"))?;
     let mut packed = 0_u64;
     for entry in bounded_optional_directory_entries(
         &root.join(NATIVE_ACTION_STATE_DIRECTORY),
@@ -5426,12 +5688,10 @@ fn reconcile_capacity_state(root: &Path) -> RailResult<()> {
                 .ok_or_else(|| RailError::message("local CAS packed result size overflow"))?;
         }
     }
-    write_capacity_state(
-        root,
-        materialized
-            .checked_add(packed)
-            .ok_or_else(|| RailError::message("local CAS result size overflow"))?,
-    )
+    let result_bytes = materialized
+        .checked_add(packed)
+        .ok_or_else(|| RailError::message("local CAS result size overflow"))?;
+    write_capacity_state(root, result_bytes, measured_metadata_bytes(root, result_bytes)?)
 }
 
 fn validate_capacity_state(root: &Path) -> RailResult<CapacityState> {
@@ -5447,14 +5707,30 @@ fn validate_capacity_state(root: &Path) -> RailResult<CapacityState> {
     Ok(state)
 }
 
-fn write_capacity_state(root: &Path, result_bytes: u64) -> RailResult<()> {
+fn write_capacity_state(root: &Path, result_bytes: u64, metadata_bytes: u64) -> RailResult<()> {
     write_file_atomic_committed(
         &root.join(CAPACITY_STATE_FILE),
         &canonical_json(&CapacityState {
             version: CAS_VERSION,
             result_bytes,
+            metadata_bytes,
         })?,
     )
+}
+
+/// Measure bytes outside results, blobs, staging, and packed actions by one full walk.
+/// Only collection and reconciliation call this, never an ordinary publication.
+/// The capacity file is excluded so that rewriting it with this value is a fixed point.
+fn measured_metadata_bytes(root: &Path, result_bytes: u64) -> RailResult<u64> {
+    let capacity_file = match fs::symlink_metadata(root.join(CAPACITY_STATE_FILE)) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error.into()),
+    };
+    Ok(checked_tree_bytes(root)?
+        .saturating_sub(result_bytes)
+        .saturating_sub(checked_tree_bytes(&root.join("staging"))?)
+        .saturating_sub(capacity_file))
 }
 
 #[cfg(target_os = "macos")]
@@ -5845,6 +6121,8 @@ pub(crate) fn existing_root_at(root: &Path) -> RailResult<Option<PathBuf>> {
     ensure_owner_marker_existing(root, None)?;
     validate_root_entries(root)?;
     for name in [
+        BLOB_DIRECTORY,
+        crate::cache::digest_memo::DIGEST_MEMO_DIRECTORY,
         "results",
         "pins",
         "leases",
@@ -6023,6 +6301,7 @@ pub(crate) fn status_at_with_max(root: &Path, max_bytes: u64) -> RailResult<Opti
             reclaimable_bytes = reclaimable_bytes.saturating_add(bytes);
         }
     }
+    objects = objects.saturating_add(optional_tree_file_stats(&root.join(BLOB_DIRECTORY))?.0);
 
     let staging = &root.join("staging");
     let staging_entries = bounded_optional_directory_entries(staging, "local CAS staging")?.len() as u64;
@@ -6104,6 +6383,123 @@ pub(crate) fn remove_owned_root_at(root: &Path) -> RailResult<Option<(PathBuf, u
             .ok_or_else(|| RailError::message("local CAS root has no owner directory"))?,
     )?;
     Ok(Some((root, bytes)))
+}
+
+/// Store layout replaced by `local-cas-v3`. Its bytes are never read again and are reclaimable.
+const RETIRED_ROOT_NAME: &str = "local-cas-v2";
+const RETIRED_OWNER_MARKER_PREFIX: &str = "cargo-rail-local-cas\nschema=2\ntrust-domain=";
+
+/// The retired store beside one current root: same owner directory and trust-domain suffix.
+fn retired_sibling(root: &Path) -> RailResult<PathBuf> {
+    let owner = root
+        .parent()
+        .filter(|parent| parent.file_name() == Some(OsStr::new("cargo-rail")))
+        .ok_or_else(|| RailError::message("local CAS root has no canonical cargo-rail owner directory"))?;
+    let suffix = root
+        .file_name()
+        .and_then(OsStr::to_str)
+        .and_then(|name| name.strip_prefix(CAS_ROOT_NAME))
+        .ok_or_else(|| RailError::message("local CAS root name is not a current store name"))?;
+    Ok(owner.join(format!("{RETIRED_ROOT_NAME}{suffix}")))
+}
+
+/// Prove that `root` is a retired cargo-rail store: owned name, real canonical directory, and a
+/// schema-2 marker naming the same trust domain as its suffix. `None` when it does not exist.
+fn validated_retired_root(root: &Path) -> RailResult<Option<PathBuf>> {
+    let suffix = root
+        .file_name()
+        .and_then(OsStr::to_str)
+        .and_then(|name| name.strip_prefix(RETIRED_ROOT_NAME))
+        .filter(|suffix| {
+            suffix.is_empty()
+                || suffix
+                    .strip_prefix('-')
+                    .is_some_and(|trust| validate_trust_domain(trust).is_ok())
+        })
+        .ok_or_else(|| RailError::message(format!("'{}' is not a retired cache store name", root.display())))?;
+    match fs::symlink_metadata(root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+        Ok(_) => validate_real_directory(root, "retired local CAS root")?,
+    }
+    if fs::canonicalize(root)? != root {
+        return Err(RailError::message(format!(
+            "retired local CAS '{}' is not canonical",
+            root.display()
+        )));
+    }
+    let marker = root.join("OWNER");
+    let metadata = fs::symlink_metadata(&marker)?;
+    let bytes = if metadata.is_file() && metadata.len() == (RETIRED_OWNER_MARKER_PREFIX.len() + 65) as u64 {
+        fs::read(&marker)?
+    } else {
+        Vec::new()
+    };
+    let trust_domain = bytes
+        .strip_prefix(RETIRED_OWNER_MARKER_PREFIX.as_bytes())
+        .and_then(|value| value.strip_suffix(b"\n"))
+        .and_then(|value| std::str::from_utf8(value).ok());
+    if trust_domain.is_none_or(|value| {
+        validate_trust_domain(value).is_err() || suffix.strip_prefix('-').is_some_and(|expected| value != expected)
+    }) {
+        return Err(RailError::with_help(
+            format!("retired local CAS '{}' has an invalid ownership marker", root.display()),
+            "remove it manually only after confirming cargo-rail created it",
+        ));
+    }
+    Ok(Some(root.to_path_buf()))
+}
+
+/// Bytes held by the retired store beside one current root, when it exists.
+pub(crate) fn retired_root_bytes(root: &Path) -> RailResult<Option<(PathBuf, u64)>> {
+    let Some(retired) = validated_retired_root(&retired_sibling(root)?)? else {
+        return Ok(None);
+    };
+    let bytes = removable_tree_bytes(&retired)?;
+    Ok(Some((retired, bytes)))
+}
+
+/// Remove the retired store beside one current root under that store's own lifecycle lock,
+/// which waits for any older cargo-rail process still using it.
+pub(crate) fn remove_retired_root(root: &Path) -> RailResult<Option<(PathBuf, u64)>> {
+    let retired = retired_sibling(root)?;
+    if validated_retired_root(&retired)?.is_none() {
+        return Ok(None);
+    }
+    let lifecycle_lock = lifecycle_lock_path(&retired)?;
+    let _lock = lock_local_cas(&lifecycle_lock, true, LockMode::Exclusive)?
+        .ok_or_else(|| RailError::message("retired local CAS lifecycle lock was not created"))?;
+    let Some(retired) = validated_retired_root(&retired)? else {
+        return Ok(None);
+    };
+    let bytes = removable_tree_bytes(&retired)?;
+    safe_remove_tree(&retired)?;
+    sync_directory_before_commit(
+        retired
+            .parent()
+            .ok_or_else(|| RailError::message("retired local CAS has no owner directory"))?,
+    )?;
+    Ok(Some((retired, bytes)))
+}
+
+/// Total bytes of every provably owned retired store in one cargo-rail owner directory.
+/// Entries that cannot be proven owned are not counted.
+pub(crate) fn retired_owner_bytes(owner: &Path) -> RailResult<u64> {
+    let mut bytes = 0u64;
+    for entry in bounded_optional_directory_entries(owner, "cargo-rail owner directory")? {
+        let path = entry.path();
+        let retired_name = path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| name == RETIRED_ROOT_NAME || name.starts_with(&format!("{RETIRED_ROOT_NAME}-")));
+        if !retired_name || !entry.file_type()?.is_dir() {
+            continue;
+        }
+        if let Ok(Some(retired)) = validated_retired_root(&path) {
+            bytes = bytes.saturating_add(removable_tree_bytes(&retired)?);
+        }
+    }
+    Ok(bytes)
 }
 
 #[derive(Serialize)]
@@ -6413,6 +6809,330 @@ mod tests {
             .reserve_result_capacity(8 * 1024, None, CapacityReservationSource::External)
             .expect_err("uncommitted owned bytes must consume the same capacity bound");
         assert!(error.to_string().contains("total owned bytes"));
+    }
+
+    /// Store one distinct native action per revision and return each validation.
+    /// Store one distinct native action per revision, each with a distinct stdout output.
+    fn store_native_revisions(cas: &LocalCas, output: &Path, revisions: u64) -> Vec<NativeCompilerValidation> {
+        (0..revisions)
+            .map(|revision| {
+                let stdout = format!("revision {revision}\n");
+                let (manifest, _) = native_fixture_with_stdout(output, stdout.as_bytes());
+                let validation = crate::compiler::native_cache::tests::cas_validation_for_revision_with_stdout(
+                    revision,
+                    stdout.as_bytes(),
+                );
+                store_native_fixture(cas, output, &manifest, &validation);
+                validation
+            })
+            .collect()
+    }
+
+    fn shared_blob_files(cas: &LocalCas) -> usize {
+        fs::read_dir(cas.root.join(BLOB_DIRECTORY))
+            .expect("blob shards")
+            .map(|shard| {
+                fs::read_dir(shard.expect("blob shard").path())
+                    .expect("blob shard")
+                    .count()
+            })
+            .sum()
+    }
+
+    #[test]
+    fn identical_outputs_are_stored_once_and_survive_until_their_last_result() {
+        let cache = tempfile::tempdir().expect("cache base");
+        let output = tempfile::tempdir().expect("output root");
+        let cas = open_cas(cache.path(), 64 * 1024 * 1024).expect("CAS should open");
+        let (manifest, _) = native_fixture(output.path());
+        let revisions = (0..3)
+            .map(|revision| {
+                let validation = crate::compiler::native_cache::tests::cas_validation_for_revision(revision);
+                store_native_fixture(&cas, output.path(), &manifest, &validation);
+                validation
+            })
+            .collect::<Vec<_>>();
+        let single = {
+            let isolated = tempfile::tempdir().expect("isolated cache base");
+            let isolated = open_cas(isolated.path(), 64 * 1024 * 1024).expect("isolated CAS");
+            store_native_fixture(&isolated, output.path(), &manifest, &revisions[0]);
+            shared_blob_files(&isolated)
+        };
+        assert_eq!(
+            shared_blob_files(&cas),
+            single,
+            "three results with identical outputs share one blob set"
+        );
+        assert_eq!(fs::read_dir(cas.root.join("results")).expect("results").count(), 3);
+
+        for (hours, validation) in [3_u64, 2, 1].into_iter().zip(&revisions) {
+            set_native_last_used(&cas, validation, Duration::from_secs(hours * 60 * 60));
+        }
+        let before = validate_capacity_state(&cas.root).expect("capacity").result_bytes;
+        cas.garbage_collect(before - 1, None).expect("evict the oldest result");
+        assert!(!native_action_retained(&cas, &revisions[0]));
+        assert_eq!(
+            shared_blob_files(&cas),
+            single,
+            "surviving results keep their shared blobs"
+        );
+        let restore = tempfile::tempdir().expect("restore parent");
+        let NativeActionLookup::Hit(cached) = cas.native_action(revisions[1].action_key()).expect("lookup") else {
+            panic!("a result sharing blobs with an evicted result must stay authoritative");
+        };
+        assert!(matches!(
+            cached.restore_registered(&restore.path().join("output"), &restore.path().join("staging")),
+            NativeCacheLookup::Hit(_)
+        ));
+        drop(cached);
+
+        cas.garbage_collect(0, None).expect("evict every result");
+        assert_eq!(shared_blob_files(&cas), 0, "the last result's removal frees its blobs");
+        assert_eq!(validate_capacity_state(&cas.root).expect("capacity").result_bytes, 0);
+    }
+
+    /// Record `age` as the time since this action was last used.
+    fn set_native_last_used(cas: &LocalCas, validation: &NativeCompilerValidation, age: Duration) {
+        let action_hex = validated_action_key_hex(validation.action_key()).expect("native action key");
+        OpenOptions::new()
+            .write(true)
+            .open(
+                cas.root
+                    .join(NATIVE_ACTION_STATE_DIRECTORY)
+                    .join(format!("{action_hex}.json")),
+            )
+            .expect("native action state")
+            .set_modified(SystemTime::now().checked_sub(age).expect("last-use time"))
+            .expect("set last-use time");
+    }
+
+    fn native_action_retained(cas: &LocalCas, validation: &NativeCompilerValidation) -> bool {
+        !matches!(
+            cas.native_action(validation.action_key()).expect("native lookup"),
+            NativeActionLookup::Miss(_)
+        )
+    }
+
+    #[test]
+    fn capacity_pressure_evicts_least_recently_used_results_first() {
+        let cache = tempfile::tempdir().expect("cache base");
+        let output = tempfile::tempdir().expect("output root");
+        let cas = open_cas(cache.path(), 64 * 1024 * 1024).expect("CAS should open");
+        let empty = status(&cas).expect("empty status").bytes;
+        let stored = store_native_revisions(&cas, output.path(), 4);
+        let full = status(&cas).expect("full status").bytes;
+        let per_result = (full - empty) / 4;
+
+        // Revision 0 is the oldest entry but was used most recently; FIFO would evict it.
+        // `native_access_refresh_batches_hot_hits_but_retains_lru_evidence` proves hits refresh this time.
+        for (revision, validation) in (0_u64..).zip(&stored) {
+            let hours = if revision == 0 { 0 } else { 10 - revision };
+            set_native_last_used(&cas, validation, Duration::from_secs(hours * 60 * 60));
+        }
+        drop(cas);
+
+        let max_bytes = full + per_result / 2;
+        let cas = open_cas(cache.path(), max_bytes).expect("bounded CAS should open");
+        let (manifest, _) = native_fixture(output.path());
+        let incoming = crate::compiler::native_cache::tests::cas_validation_for_revision(4);
+        store_native_fixture(&cas, output.path(), &manifest, &incoming);
+
+        assert!(
+            !native_action_retained(&cas, &stored[1]),
+            "least recently used entry must go first"
+        );
+        for validation in [&stored[0], &stored[3], &incoming] {
+            assert!(native_action_retained(&cas, validation), "recent entries must survive");
+        }
+        let bounded = status(&cas).expect("bounded status");
+        assert!(bounded.bytes <= max_bytes, "{} > {max_bytes}", bounded.bytes);
+        assert_eq!(bounded.over_capacity_bytes, 0);
+    }
+
+    #[test]
+    fn retired_stores_are_reclaimable_only_with_proven_ownership() {
+        let cache = tempfile::tempdir().expect("cache base");
+        let cas = open_cas(cache.path(), 64 * 1024 * 1024).expect("CAS should open");
+        let owner = cas.root.parent().expect("owner directory").to_path_buf();
+        let retired = retired_sibling(&cas.root).expect("retired sibling");
+        let trust = retired
+            .file_name()
+            .and_then(OsStr::to_str)
+            .and_then(|name| name.strip_prefix(&format!("{RETIRED_ROOT_NAME}-")))
+            .map_or_else(|| "0".repeat(64), str::to_string);
+        fs::create_dir_all(retired.join("results")).expect("retired results");
+        fs::write(retired.join("results/payload"), vec![0_u8; 1024]).expect("retired payload");
+        let marker = retired.join("OWNER");
+
+        fs::write(&marker, b"not a cargo-rail marker").expect("invalid marker");
+        assert_eq!(
+            retired_owner_bytes(&owner).expect("owner scan"),
+            0,
+            "unproven stores are not reclaimable"
+        );
+        remove_retired_root(&cas.root).expect_err("unproven stores are never removed");
+        assert!(retired.join("results/payload").is_file());
+
+        fs::write(&marker, format!("{RETIRED_OWNER_MARKER_PREFIX}{trust}\n")).expect("retired marker");
+        assert!(retired_owner_bytes(&owner).expect("owner scan") >= 1024);
+        let (path, bytes) = retired_root_bytes(&cas.root)
+            .expect("retired bytes")
+            .expect("retired store");
+        let (removed, removed_bytes) = remove_retired_root(&cas.root).expect("removal").expect("removed store");
+        assert_eq!((removed, removed_bytes), (path, bytes));
+        assert!(!retired.exists());
+        assert!(cas.root.is_dir(), "the current store is untouched");
+        assert!(remove_retired_root(&cas.root).expect("repeat removal").is_none());
+    }
+
+    #[test]
+    fn collection_sweeps_blobs_orphaned_by_an_interrupted_commit() {
+        let cache = tempfile::tempdir().expect("cache base");
+        let output = tempfile::tempdir().expect("output root");
+        let cas = open_cas(cache.path(), 64 * 1024 * 1024).expect("CAS should open");
+        let stored = store_native_revisions(&cas, output.path(), 2);
+        let referenced = shared_blob_files(&cas);
+        // A process that dies after publishing a blob but before committing its result leaves this.
+        let orphan = shared_blob_path(&cas.root, &"ab".repeat(32));
+        fs::create_dir_all(orphan.parent().expect("orphan shard")).expect("orphan shard");
+        fs::write(&orphan, b"orphaned output").expect("orphaned blob");
+
+        let current = validate_capacity_state(&cas.root).expect("capacity").result_bytes;
+        cas.garbage_collect(current, None).expect("collection within budget");
+        assert!(!orphan.exists(), "unreferenced blobs are swept");
+        assert_eq!(shared_blob_files(&cas), referenced, "referenced blobs survive");
+        for validation in &stored {
+            assert!(native_action_retained(&cas, validation));
+        }
+    }
+
+    #[test]
+    fn reopening_a_store_leaves_its_capacity_state_unchanged() {
+        let cache = tempfile::tempdir().expect("cache base");
+        let output = tempfile::tempdir().expect("output root");
+        let cas = open_cas(cache.path(), 64 * 1024 * 1024).expect("CAS should open");
+        let capacity = cas.root.join(CAPACITY_STATE_FILE);
+        let created = fs::read(&capacity).expect("created capacity state");
+        drop(cas);
+        let cas = open_cas(cache.path(), 64 * 1024 * 1024).expect("CAS should reopen");
+        assert_eq!(fs::read(&capacity).expect("reopened capacity state"), created);
+        store_native_revisions(&cas, output.path(), 2);
+        let published = validate_capacity_state(&cas.root).expect("published capacity state");
+        drop(cas);
+        // Publications maintain result bytes exactly; reopening re-measures only metadata.
+        let cas = open_cas(cache.path(), 64 * 1024 * 1024).expect("CAS should reopen after publication");
+        assert_eq!(
+            validate_capacity_state(&cas.root).expect("reconciled").result_bytes,
+            published.result_bytes
+        );
+        let reconciled = fs::read(&capacity).expect("reconciled capacity state");
+        drop(cas);
+        open_cas(cache.path(), 64 * 1024 * 1024).expect("CAS should reopen again");
+        assert_eq!(fs::read(&capacity).expect("stable capacity state"), reconciled);
+    }
+
+    /// Publication below the budget reads maintained counters and staging, never committed results.
+    #[cfg(unix)]
+    #[test]
+    fn publication_below_budget_never_walks_committed_results() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let cache = tempfile::tempdir().expect("cache base");
+        let output = tempfile::tempdir().expect("output root");
+        let cas = open_cas(cache.path(), 64 * 1024 * 1024).expect("CAS should open");
+        store_native_revisions(&cas, output.path(), 3);
+        let sealed = fs::read_dir(cas.root.join("results"))
+            .expect("results")
+            .next()
+            .expect("one committed result")
+            .expect("result entry")
+            .path();
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o000)).expect("seal a committed result");
+        let stdout = b"revision 3\n";
+        let (manifest, _) = native_fixture_with_stdout(output.path(), stdout);
+        let validation = crate::compiler::native_cache::tests::cas_validation_for_revision_with_stdout(3, stdout);
+        let published = cas
+            .store_native_revalidated(prepared_native_fixture(output.path(), &manifest, &validation), |_| {
+                Ok(())
+            });
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o700)).expect("unseal the committed result");
+        published.expect("publication must not open unrelated committed results");
+        assert!(native_action_retained(&cas, &validation));
+    }
+
+    #[test]
+    fn a_full_store_collects_to_its_low_water_mark_once_per_batch() {
+        let cache = tempfile::tempdir().expect("cache base");
+        let output = tempfile::tempdir().expect("output root");
+        let cas = open_cas(cache.path(), 64 * 1024 * 1024).expect("CAS should open");
+        let stored = store_native_revisions(&cas, output.path(), 20);
+        let full = status(&cas).expect("full status").bytes;
+        for (revision, validation) in (0_u64..).zip(&stored) {
+            set_native_last_used(&cas, validation, Duration::from_secs((30 - revision) * 60 * 60));
+        }
+        drop(cas);
+
+        let cas = open_cas(cache.path(), full).expect("CAS at its budget");
+        let results = |cas: &LocalCas| fs::read_dir(cas.root.join("results")).expect("results").count();
+        let publish = |revision: u64| {
+            let stdout = format!("revision {revision}\n");
+            let (manifest, _) = native_fixture_with_stdout(output.path(), stdout.as_bytes());
+            let validation = crate::compiler::native_cache::tests::cas_validation_for_revision_with_stdout(
+                revision,
+                stdout.as_bytes(),
+            );
+            store_native_fixture(&cas, output.path(), &manifest, &validation);
+        };
+
+        publish(20);
+        let collected = results(&cas);
+        assert!(collected < 20, "a publication over budget must collect");
+        let low_water = full - full / 10;
+        assert!(status(&cas).expect("collected status").bytes <= low_water);
+        assert!(
+            !native_action_retained(&cas, &stored[0]),
+            "collection starts with the oldest entry"
+        );
+
+        publish(21);
+        assert_eq!(
+            results(&cas),
+            collected + 1,
+            "the low-water margin absorbs the next publication"
+        );
+        assert_eq!(status(&cas).expect("bounded status").over_capacity_bytes, 0);
+    }
+
+    #[test]
+    fn lowered_budget_is_enforced_without_waiting_for_a_publication() {
+        let cache = tempfile::tempdir().expect("cache base");
+        let output = tempfile::tempdir().expect("output root");
+        let cas = open_cas(cache.path(), 64 * 1024 * 1024).expect("CAS should open");
+        let empty = status(&cas).expect("empty status").bytes;
+        let stored = store_native_revisions(&cas, output.path(), 4);
+        let per_result = (status(&cas).expect("full status").bytes - empty) / 4;
+        for (revision, validation) in (0_u64..).zip(&stored) {
+            set_native_last_used(&cas, validation, Duration::from_secs((10 - revision) * 60 * 60));
+        }
+        drop(cas);
+
+        let max_bytes = empty + 2 * per_result + per_result / 2;
+        let cas = open_cas(cache.path(), max_bytes).expect("bounded CAS should open");
+        assert!(status(&cas).expect("over-budget status").over_capacity_bytes > 0);
+        cas.enforce_capacity().expect("budget enforcement");
+
+        let retained = stored
+            .iter()
+            .map(|validation| native_action_retained(&cas, validation))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            retained,
+            [false, false, true, true],
+            "oldest entries must be evicted first"
+        );
+        let bounded = status(&cas).expect("bounded status");
+        assert!(bounded.bytes <= max_bytes, "{} > {max_bytes}", bounded.bytes);
+        assert_eq!(bounded.over_capacity_bytes, 0);
     }
 
     #[test]

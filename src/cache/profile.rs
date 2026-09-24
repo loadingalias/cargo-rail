@@ -248,6 +248,10 @@ pub(crate) struct ProfileStatus {
     pub(crate) cache_base: String,
     pub(crate) trust_domain: String,
     pub(crate) max_bytes: u64,
+    /// Bytes this profile's local store owns, including in-flight staging.
+    pub(crate) bytes: u64,
+    /// Bytes above `max_bytes`; publication and `cache setup` evict least-recently-used results.
+    pub(crate) over_capacity_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) remote_authority: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1219,6 +1223,13 @@ pub(crate) fn list(cargo_home: &Path) -> RailResult<Vec<ProfileStatus>> {
         .into_iter()
         .map(|profile| {
             let remote = profile.remote_selection()?;
+            let bytes = profile
+                .cache
+                .configured_root()?
+                .map(|root| crate::cache::cas::status_at_with_max(&root, profile.cache.max_bytes()))
+                .transpose()?
+                .flatten()
+                .map_or(0, |status| status.bytes);
             Ok(ProfileStatus {
                 profile_id: profile.profile_id.clone(),
                 generation: profile.generation.clone(),
@@ -1234,6 +1245,8 @@ pub(crate) fn list(cargo_home: &Path) -> RailResult<Vec<ProfileStatus>> {
                 cache_base: profile.cache.base().to_string_lossy().into_owned(),
                 trust_domain: profile.cache.trust_domain().unwrap_or_default().to_string(),
                 max_bytes: profile.cache.max_bytes(),
+                bytes,
+                over_capacity_bytes: bytes.saturating_sub(profile.cache.max_bytes()),
                 remote_authority: remote
                     .as_ref()
                     .map(|selection| selection.authority().as_str().to_string()),

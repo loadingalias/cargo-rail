@@ -1763,7 +1763,8 @@ pub(crate) fn apply_setup(mut plan: SetupPlan) -> RailResult<()> {
     if read_optional_regular(&plan.receipt.session_memo_path()?, MAX_SESSION_MEMO_BYTES)?.is_some() {
         fs::remove_file(plan.receipt.session_memo_path()?)?;
     }
-    LocalCas::open_selected(plan.receipt.cache()?)?;
+    // A lowered budget applies now, not at the next publication.
+    LocalCas::open_selected(plan.receipt.cache()?)?.enforce_capacity()?;
     install_planned_executable(&plan.wrapper, &plan.receipt.wrapper_path)?;
     install_planned_executable(&plan.worker, &plan.receipt.worker_path)?;
     for (component, setup) in plan
@@ -2869,8 +2870,12 @@ fn installation_storage_status(cargo_home: &Path) -> RailResult<InstallationStor
     let owner = cargo_home.join("cargo-rail");
     let owned_bytes = crate::cache::path_status(&owner)?.map_or(0, |(bytes, _, _)| bytes);
     let quarantine = owner.join(INSTALLATION_QUARANTINE_DIRECTORY);
-    let (reclaimable_bytes, quarantined_receipts) =
+    let (quarantined_bytes, quarantined_receipts) =
         crate::cache::path_status(&quarantine)?.map_or((0, 0), |(bytes, files, _)| (bytes, files));
+    // Stores in the retired layout are never read again; `cache clean --scope local` removes them.
+    let reclaimable_bytes = quarantined_bytes
+        .saturating_add(crate::cache::cas::retired_owner_bytes(&owner)?)
+        .min(owned_bytes);
     let required_bytes = owned_bytes
         .checked_sub(reclaimable_bytes)
         .ok_or_else(|| RailError::message("compiler-cache installation storage accounting underflow"))?;
@@ -2979,12 +2984,35 @@ pub(crate) fn remove_local_cache(current_dir: &Path) -> RailResult<Option<Vec<(P
     let Some((profile, _profile_lock)) = crate::cache::profile::load_exclusive(&cargo_home, current_dir)? else {
         return Ok(Some(removed));
     };
-    if let Some(root) = profile.cache().configured_root()?
-        && let Some(entry) = crate::cache::cas::remove_owned_root_at(&root)?
-    {
-        removed.push(entry);
+    if let Some(root) = profile.cache().configured_root()? {
+        if let Some(entry) = crate::cache::cas::remove_owned_root_at(&root)? {
+            removed.push(entry);
+        }
+        if let Some(entry) = crate::cache::cas::remove_retired_root(&root)? {
+            removed.push(entry);
+        }
     }
     Ok(Some(removed))
+}
+
+/// Bytes of the retired-layout store beside the profile's current store, which local cleanup removes.
+/// The outer `None` means no installation receipt selects the store, matching [`remove_local_cache`].
+pub(crate) fn retired_local_cache(current_dir: &Path) -> RailResult<Option<Option<(PathBuf, u64)>>> {
+    let cargo_home = resolve_cargo_home(current_dir)?;
+    let receipt_path = cargo_home
+        .join("cargo-rail")
+        .join(INSTALLATION_DIRECTORY)
+        .join(RECEIPT_FILE);
+    if read_optional_regular(&receipt_path, MAX_RECEIPT_BYTES)?.is_none() {
+        return Ok(None);
+    }
+    let Some((profile, _profile_lock)) = crate::cache::profile::load_locked(&cargo_home, current_dir)? else {
+        return Ok(Some(None));
+    };
+    let Some(root) = profile.cache().configured_root()? else {
+        return Ok(Some(None));
+    };
+    crate::cache::cas::retired_root_bytes(&root).map(Some)
 }
 
 fn resolve_cargo_home(current_dir: &Path) -> RailResult<PathBuf> {
