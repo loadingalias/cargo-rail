@@ -324,6 +324,22 @@ fn summarize_instructions(instructions: &[String], reasons: &mut BTreeSet<String
     summary
 }
 
+/// One `rerun-if-changed` or `rerun-if-env-changed` declaration from a build script's stdout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RerunDeclaration<'a> {
+    Changed(&'a str),
+    EnvironmentChanged(&'a str),
+}
+
+/// Parse one stdout line as a rerun declaration in either instruction syntax.
+pub(crate) fn rerun_declaration(line: &str) -> Option<RerunDeclaration<'_>> {
+    match instruction_parts(line)? {
+        (_, "rerun-if-changed", path) => Some(RerunDeclaration::Changed(path)),
+        (_, "rerun-if-env-changed", name) => Some(RerunDeclaration::EnvironmentChanged(name)),
+        _ => None,
+    }
+}
+
 fn instruction_parts(instruction: &str) -> Option<(InstructionSyntax, &str, &str)> {
     if instruction.contains(['\n', '\r', '\0']) {
         return None;

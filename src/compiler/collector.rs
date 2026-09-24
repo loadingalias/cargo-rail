@@ -159,6 +159,8 @@ pub(crate) struct CompilerAnalysisMetrics {
     pub(crate) fact_cache_misses: usize,
     pub(crate) fact_cache_store_failures: usize,
     pub(crate) fact_cache_bypass_reasons: BTreeMap<String, usize>,
+    /// Members whose fresh evidence was not stored, with the reason.
+    pub(crate) evidence_publication_bypasses: BTreeMap<String, BTreeMap<String, usize>>,
     pub(crate) fresh_fragment_bytes: u64,
     pub(crate) retained_fact_object_bytes: u64,
     pub(crate) artifact_high_water_bytes: u64,
@@ -292,7 +294,13 @@ pub(crate) struct CompilerCacheIdentity {
     analysis_cache: Option<CompilerAnalysisCache>,
     explicit_build_jobs: Option<usize>,
     executable_bypasses: BTreeSet<String>,
+    /// Why no Unify evidence can be reused for this snapshot.
     cache_bypass_reason: Option<CompilerCacheBypass>,
+    /// Why no typed compiler facts can be reused; facts do not yet bind build-script freshness.
+    fact_cache_bypass_reason: Option<CompilerCacheBypass>,
+    /// Root-independent label, package root, and whether the package source is immutable,
+    /// for build-script freshness.
+    package_roots: HashMap<PackageId, (String, PathBuf, bool)>,
 }
 
 /// One installed local-cache domain held stable for a complete compiler
@@ -1236,6 +1244,21 @@ impl CompilerCacheIdentity {
         )?;
         let executables = snapshot.executable_identities()?;
         let cache_bypass_reason = compiler_cache_bypass_reason(snapshot);
+        let fact_cache_bypass_reason = cache_bypass_reason.or_else(|| compiler_fact_cache_bypass_reason(snapshot));
+        let package_roots = snapshot
+            .base_resolution()
+            .metadata()
+            .packages
+            .iter()
+            .map(|package| {
+                let root = package
+                    .manifest_path
+                    .parent()
+                    .map_or_else(PathBuf::new, |root| root.as_std_path().to_path_buf());
+                let label = format!("{} {}", package.name, package.version);
+                (package.id.clone(), (label, root, package.source.is_some()))
+            })
+            .collect();
         let toolchain_fingerprint =
             executable_toolchain_fingerprint(snapshot.toolchain(), executables, &cargo_rail_executable)?;
         let target_fingerprints = target_fingerprints(snapshot)?;
@@ -1361,6 +1384,8 @@ impl CompilerCacheIdentity {
             explicit_build_jobs,
             executable_bypasses,
             cache_bypass_reason,
+            fact_cache_bypass_reason,
+            package_roots,
         })
     }
 
@@ -1886,10 +1911,8 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
             let mut cache_hit = false;
             let cache_started = crate::instrumentation::compiler_acquisition_timer();
             let observation_miss = if self.identity.cache_bypass_reason.is_none() {
-                store.get(&key).and_then(|entry| {
-                    let miss =
-                        compiler_observation_miss_reason(&entry.observations, self.workspace_root).map(str::to_string);
-                    if miss.is_none() {
+                match store.get_valid(&key, |entry| compiler_evidence_miss_reason(entry, self.workspace_root)) {
+                    Ok(entry) => {
                         cache_hit = true;
                         metrics.diagnostic_cache_hits += 1;
                         cache_by_member.entry(member.to_string()).or_default().hits += 1;
@@ -1901,9 +1924,10 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                             &entry.evidence,
                         );
                         record_target_evidence(&mut result, package_id, &entry.evidence);
+                        None
                     }
-                    miss
-                })
+                    Err(reason) => reason,
+                }
             } else {
                 None
             };
@@ -1981,7 +2005,7 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
             } else {
                 BTreeSet::new()
             };
-            let fact_cache_key = if typed_members.is_empty() || self.identity.cache_bypass_reason.is_some() {
+            let fact_cache_key = if typed_members.is_empty() || self.identity.fact_cache_bypass_reason.is_some() {
                 None
             } else {
                 Some(
@@ -2010,7 +2034,7 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                     metrics.fact_cache_hits += 1;
                 } else {
                     metrics.fact_cache_misses += 1;
-                    if let Some(reason) = self.identity.cache_bypass_reason {
+                    if let Some(reason) = self.identity.fact_cache_bypass_reason {
                         *metrics
                             .fact_cache_bypass_reasons
                             .entry(reason.as_str().to_string())
@@ -2576,10 +2600,10 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                             let AcquisitionCompletion {
                                 prepared,
                                 failed_cargo_targets,
-                                result,
+                                result: outcome,
                                 ..
                             } = completion;
-                            let Err(error) = result else {
+                            let Err(error) = outcome else {
                                 return Err(RailError::message(
                                     "compiler acquisition failure lost its failed outcome",
                                 ));
@@ -2601,8 +2625,40 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                                 FailureClass::Worker,
                                 error,
                             ));
+                            // This run fails, but views that already completed are independent
+                            // evidence. Publish them so a retry reuses them instead of recompiling.
+                            while let Some(pending) = diagnostic_dispatch_order.pop_front() {
+                                let Some(completed) = diagnostic_completions.remove(&pending) else {
+                                    continue;
+                                };
+                                match integrate_completed_acquisition(
+                                    self,
+                                    completed,
+                                    acquisition_journal.is_some(),
+                                    candidates,
+                                    &package_to_member,
+                                    &candidate_targets,
+                                    &fact_store,
+                                    &mut metrics,
+                                    &mut dependency_compilation_counts,
+                                    &mut compiler_facts,
+                                    &mut retained_observations,
+                                    &mut surviving_unused,
+                                    &mut result,
+                                    &mut store,
+                                ) {
+                                    Ok((_, Some(evidence), durable)) => {
+                                        if let Some(journal) = acquisition_journal.as_mut()
+                                            && let Err(error) = journal.complete(pending, evidence, durable)
+                                        {
+                                            crate::verbose_progress!("    Completed view not journaled: {error}");
+                                        }
+                                    }
+                                    Ok((_, None, _)) => {}
+                                    Err(error) => crate::verbose_progress!("    Completed view not published: {error}"),
+                                }
+                            }
                             diagnostic_completions.clear();
-                            diagnostic_dispatch_order.clear();
                         } else {
                             runtime.executed(index)?;
                             progress_completed += 1;
@@ -2764,6 +2820,9 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                 skipped_member_targets,
                 if skipped_member_targets == 1 { "" } else { "s" }
             );
+        }
+        for (member, reasons) in std::mem::take(&mut metrics.evidence_publication_bypasses) {
+            cache_by_member.entry(member).or_default().publication_bypasses = reasons;
         }
         for member in &self.manifests.members {
             if let Some(evidence) = result.get_mut(&member.package_id) {
@@ -3047,6 +3106,8 @@ fn update_candidate_survivors(
 
 struct WorkspaceCheckOutput {
     stdout: String,
+    /// Rerun inputs of every build script in the view, or why they cannot support reuse.
+    build_scripts: Result<Vec<crate::build_script::freshness::BuildScriptFreshness>, &'static str>,
     invocations: Vec<crate::compiler::observation::RawCompilerInvocation>,
     compiler_facts: Vec<ValidatedCompilerFactObject>,
     analysis_contract: AnalysisContract,
@@ -3563,6 +3624,20 @@ fn integrate_acquisition_outcome(
             parse_compilation_observations(&run.stdout, invocations, &collector.identity, target)?;
         reconcile_exact_artifact_observations(&mut compilation_observations, retained_observations);
         let completeness = DiagnosticsCompleteness::Complete;
+        let build_scripts = match &run.build_scripts {
+            Ok(build_scripts) => Some(build_scripts),
+            Err(reason) => {
+                for member in &diagnostic_members {
+                    *metrics
+                        .evidence_publication_bypasses
+                        .entry(member.clone())
+                        .or_default()
+                        .entry((*reason).to_string())
+                        .or_default() += 1;
+                }
+                None
+            }
+        };
 
         for member in diagnostic_members {
             let manifests_member = collector
@@ -3622,17 +3697,21 @@ fn integrate_acquisition_outcome(
                         .collect()
                 })
                 .unwrap_or_default();
-            let entry = CompilerDiagEntry {
-                key,
-                evidence: evidence.clone(),
-                generated_at_unix_ms: now_unix_ms(),
-                collector_version: COLLECTOR_VERSION,
-                observations,
-            };
-            update_candidate_survivors(surviving_unused, candidate_targets, &member, target, &entry.evidence);
-            record_target_evidence(result, &manifests_member.package_id, &entry.evidence);
-            store.put(entry);
+            update_candidate_survivors(surviving_unused, candidate_targets, &member, target, &evidence);
+            record_target_evidence(result, &manifests_member.package_id, &evidence);
+            if let Some(build_scripts) = build_scripts {
+                store.put(CompilerDiagEntry {
+                    key,
+                    evidence,
+                    generated_at_unix_ms: now_unix_ms(),
+                    collector_version: COLLECTOR_VERSION,
+                    observations,
+                    build_scripts: build_scripts.clone(),
+                });
+            }
         }
+        // Publish each view as it completes, so a later failure or cancellation keeps it.
+        store.flush()?;
     }
     if fact_set_published
         && let Err(error) = publish_native_analysis_bindings(
@@ -3827,6 +3906,7 @@ fn run_workspace_check(
         doctest_sysroot.revalidate()?;
     }
 
+    let build_scripts = executed_build_script_freshness(&bounded.stdout, identity);
     let dependency_compilations = dependency_compilations(&bounded.stdout, package_to_member);
     let retained_output_bytes =
         u64::try_from(bounded.stdout.len().saturating_add(bounded.stderr.len())).unwrap_or(u64::MAX);
@@ -3872,6 +3952,7 @@ fn run_workspace_check(
     }
     Ok(WorkspaceCheckOutput {
         stdout: String::from_utf8_lossy(&bounded.stdout).into_owned(),
+        build_scripts,
         invocations,
         compiler_facts,
         analysis_contract,
@@ -4251,6 +4332,35 @@ fn run_artifact_bounded_command(
         current_bytes: final_bytes,
         high_water_bytes,
     })
+}
+
+/// Rerun inputs of every build script Cargo executed or replayed for one view.
+fn executed_build_script_freshness(
+    stdout: &[u8],
+    identity: &CompilerCacheIdentity,
+) -> Result<Vec<crate::build_script::freshness::BuildScriptFreshness>, &'static str> {
+    let mut scripts = BTreeSet::new();
+    for message in Message::parse_stream(BufReader::new(stdout)) {
+        // An unreadable message could hide a build script, so it prevents reuse.
+        let Message::BuildScriptExecuted(script) = message.map_err(|_| "cargo_message_unavailable")? else {
+            continue;
+        };
+        let (label, root, immutable_source) = identity
+            .package_roots
+            .get(&script.package_id)
+            .ok_or("build_script_package_unavailable")?;
+        scripts.insert(crate::build_script::freshness::capture(
+            &crate::build_script::freshness::ExecutedBuildScript {
+                package: label,
+                out_dir: script.out_dir.as_std_path(),
+                package_root: root,
+                immutable_source: *immutable_source,
+                rustc_environment: &script.env.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>(),
+            },
+            &identity.observation_context.source_root,
+        )?);
+    }
+    Ok(scripts.into_iter().collect())
 }
 
 /// Cancellation of a compiler-evidence view, with the command phase it interrupted.
@@ -5101,22 +5211,69 @@ fn attach_build_script_results(
     }
 }
 
+/// Why stored evidence no longer matches its inputs: its compilation observations, or the
+/// declared rerun inputs of a build script in its view.
+fn compiler_evidence_miss_reason(entry: &CompilerDiagEntry, workspace_root: &Path) -> Option<String> {
+    let generated_root = ObservationPath::capture(
+        &crate::workspace::cargo_rail_state_root(workspace_root).join("compiler-artifacts-v1"),
+        workspace_root,
+        workspace_root,
+    );
+    let script_environment = entry
+        .build_scripts
+        .iter()
+        .flat_map(crate::build_script::freshness::BuildScriptFreshness::rustc_environment)
+        .collect::<BTreeSet<_>>();
+    if let Some(reason) = compiler_observation_miss_reason(
+        &entry.observations,
+        workspace_root,
+        &generated_root,
+        &script_environment,
+    ) {
+        return Some(reason.to_string());
+    }
+    entry
+        .build_scripts
+        .iter()
+        .find_map(|script| script.revalidation_reason(workspace_root))
+        .map(str::to_string)
+}
+
+/// Native-cache bypasses on consuming units that stored Unify evidence proves another way.
+/// Build-script output is bound through Cargo's rerun inputs. Proc-macro reads are bound as
+/// Cargo binds them: through the consuming unit's dep-info files and tracked environment.
+const SUPERSEDED_NATIVE_BYPASSES: [&str; 4] = [
+    "build_script_result_unavailable",
+    "build_script_action_key_unavailable",
+    "build_script_dependency_graph_incomplete",
+    "proc_macro_filesystem_observations_unavailable",
+];
+
 fn compiler_observation_miss_reason<'a>(
     observations: &'a [CompilationObservationManifest],
     workspace_root: &Path,
+    generated_root: &ObservationPath,
+    script_environment: &BTreeSet<&str>,
 ) -> Option<&'a str> {
     if observations.is_empty() {
         return Some("compilation_observations_absent");
     }
     if let Some(reason) = observations
         .iter()
+        // A build script's own compilation cannot change the member's diagnostics: its
+        // sources and dependencies are keyed, and its output is bound by its rerun inputs.
+        .filter(|manifest| {
+            manifest.unit.target_kind != crate::compiler::observation::CompilationTargetKind::BuildScript
+        })
         .flat_map(|manifest| manifest.bypasses.iter().map(String::as_str))
-        .next()
+        .find(|reason| !SUPERSEDED_NATIVE_BYPASSES.contains(reason))
     {
         return Some(reason);
     }
     for manifest in observations {
-        if let Some(reason) = manifest.diagnostic_revalidation_reason(workspace_root) {
+        if let Some(reason) =
+            manifest.diagnostic_revalidation_reason(workspace_root, Some(generated_root), script_environment)
+        {
             return Some(reason);
         }
     }
@@ -6427,29 +6584,31 @@ fn compiler_cache_bypass_reason(snapshot: &WorkspaceSnapshot) -> Option<Compiler
     {
         return Some(CompilerCacheBypass::ResponseFileConfiguration);
     }
-    for package in &snapshot.base_resolution().metadata().packages {
-        if package
-            .targets
-            .iter()
-            .flat_map(|target| target.kind.iter())
-            .any(|kind| *kind == TargetKind::CustomBuild)
-        {
-            return Some(CompilerCacheBypass::BuildScriptObservations);
-        }
-        if package
-            .targets
-            .iter()
-            .flat_map(|target| target.kind.iter())
-            .any(|kind| *kind == TargetKind::ProcMacro)
-        {
-            return Some(CompilerCacheBypass::ProcMacroObservations);
-        }
-    }
     snapshot
         .packages()
         .iter()
         .any(|package| package.source().is_some() && package.checksum().is_none())
         .then_some(CompilerCacheBypass::ExternalSourceDigest)
+}
+
+/// Build scripts and proc macros also bypass typed-fact reuse, whose key binds no
+/// build-script freshness. Unify evidence binds it per view instead.
+fn compiler_fact_cache_bypass_reason(snapshot: &WorkspaceSnapshot) -> Option<CompilerCacheBypass> {
+    let has_kind = |kind: TargetKind| {
+        snapshot
+            .base_resolution()
+            .metadata()
+            .packages
+            .iter()
+            .any(|package| package.targets.iter().any(|target| target.kind.contains(&kind)))
+    };
+    if has_kind(TargetKind::CustomBuild) {
+        Some(CompilerCacheBypass::BuildScriptObservations)
+    } else if has_kind(TargetKind::ProcMacro) {
+        Some(CompilerCacheBypass::ProcMacroObservations)
+    } else {
+        None
+    }
 }
 
 fn target_name(target: &crate::cargo::resolution::TargetIdentity) -> &str {

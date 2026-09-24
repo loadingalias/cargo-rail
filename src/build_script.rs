@@ -10,6 +10,7 @@ use crate::compiler::observation::{CompilationProfile, CompilationRole, FileObse
 use crate::error::RailResult;
 use crate::source::ContentDigest;
 
+pub(crate) mod freshness;
 pub(crate) mod result;
 
 pub(crate) use result::{

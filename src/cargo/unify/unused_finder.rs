@@ -551,6 +551,12 @@ fn compiler_proof(
             .iter()
             .map(|(reason, count)| Arc::from(format!("{reason}={count}")))
             .collect(),
+        cache_publication_bypasses: evidence
+            .cache
+            .publication_bypasses
+            .iter()
+            .map(|(reason, count)| Arc::from(format!("{reason}={count}")))
+            .collect(),
         uncertainties: Vec::new(),
     }
 }
@@ -584,6 +590,12 @@ fn compiler_feature_proof(
             .iter()
             .map(|(reason, count)| Arc::from(format!("{reason}={count}")))
             .collect(),
+        cache_publication_bypasses: evidence
+            .cache
+            .publication_bypasses
+            .iter()
+            .map(|(reason, count)| Arc::from(format!("{reason}={count}")))
+            .collect(),
         uncertainties: Vec::new(),
     }
 }
@@ -602,6 +614,7 @@ fn graph_proof(applicable_targets: usize) -> DependencyProof {
         cache_hits: 0,
         cache_misses: 0,
         cache_miss_reasons: Vec::new(),
+        cache_publication_bypasses: Vec::new(),
         uncertainties: Vec::new(),
     }
 }

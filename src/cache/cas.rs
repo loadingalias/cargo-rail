@@ -1699,16 +1699,38 @@ impl LocalCas {
     }
 
     /// Load fully verified compiler evidence discovered by one non-authoritative configuration key.
+    ///
+    /// Any unverifiable candidate fails the whole lookup.
     pub(crate) fn compiler_evidence_candidates(
         &self,
         candidate_key: &str,
     ) -> RailResult<Vec<CompilerEvidenceCandidate>> {
+        self.evidence_candidates(candidate_key, false)
+            .map(|(candidates, _)| candidates)
+    }
+
+    /// Load every verifiable candidate and count the ones that fail verification.
+    ///
+    /// A corrupt, mismatched, or unreadable candidate is never returned, but it does not
+    /// hide the other candidates for the same key. Directory-level faults still fail.
+    pub(crate) fn verified_compiler_evidence_candidates(
+        &self,
+        candidate_key: &str,
+    ) -> RailResult<(Vec<CompilerEvidenceCandidate>, usize)> {
+        self.evidence_candidates(candidate_key, true)
+    }
+
+    fn evidence_candidates(
+        &self,
+        candidate_key: &str,
+        skip_faults: bool,
+    ) -> RailResult<(Vec<CompilerEvidenceCandidate>, usize)> {
         let _lock = self.read_lock()?;
         let candidate_hex = validated_id_hex(candidate_key, EVIDENCE_CANDIDATE_KEY_PREFIX)?;
         let directory = self.root.join(EVIDENCE_CANDIDATE_INDEX_DIRECTORY).join(candidate_hex);
         let mut entries = match fs::read_dir(&directory) {
             Ok(entries) => entries.collect::<Result<Vec<_>, _>>()?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
             Err(error) => return Err(error.into()),
         };
         validate_real_directory(&directory, "local CAS compiler-evidence candidate")?;
@@ -1720,75 +1742,89 @@ impl LocalCas {
         }
 
         let mut candidates = Vec::with_capacity(entries.len());
+        let mut faults = 0;
         for entry in entries {
-            let path = entry.path();
-            let metadata = fs::symlink_metadata(&path)?;
-            if !metadata.is_file() || is_link_or_reparse(&metadata) || !has_single_link(&metadata) {
-                return Err(RailError::message(format!(
-                    "local CAS compiler-evidence candidate entry '{}' is not a bounded regular file",
-                    path.display()
-                )));
+            match self.evidence_candidate(candidate_key, &entry) {
+                Ok(Some(candidate)) => candidates.push(candidate),
+                Ok(None) => {}
+                Err(_) if skip_faults => faults += 1,
+                Err(error) => return Err(error),
             }
-            let file_name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| RailError::message("local CAS compiler-evidence candidate entry has a non-UTF-8 name"))?;
-            let action_hex = file_name.strip_suffix(".json").ok_or_else(|| {
-                RailError::message(format!(
-                    "local CAS compiler-evidence candidate entry '{file_name}' has an invalid name"
-                ))
-            })?;
-            let mut stats = ReadStats::default();
-            let indexed: EvidenceCandidateIndexEntry =
-                read_canonical_json(&path, MAX_OBJECT_METADATA_BYTES, &mut stats).map_err(fault_to_error)?;
-            if indexed.version != EVIDENCE_CANDIDATE_INDEX_VERSION
-                || indexed.candidate_key != candidate_key
-                || validated_id_hex(&indexed.action_key, EVIDENCE_ACTION_KEY_PREFIX)? != action_hex
-            {
-                return Err(RailError::message(
-                    "local CAS compiler-evidence candidate entry does not match its directory and action key",
-                ));
-            }
-
-            let pin_path = self.root.join("pins").join(&file_name);
-            let pin_metadata = match fs::symlink_metadata(&pin_path) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.into()),
-            };
-            if !pin_metadata.is_file() || is_link_or_reparse(&pin_metadata) || !has_single_link(&pin_metadata) {
-                return Err(RailError::message(format!(
-                    "local CAS compiler-evidence pin '{}' is not a bounded regular file",
-                    pin_path.display()
-                )));
-            }
-            let pin: ActionPin =
-                read_canonical_json(&pin_path, MAX_OBJECT_METADATA_BYTES, &mut stats).map_err(fault_to_error)?;
-            if pin.version != CAS_VERSION
-                || pin.action_key != indexed.action_key
-                || pin.lookup_key != candidate_key
-                || validated_id_hex(&pin.action_result, ACTION_RESULT_PREFIX).is_err()
-            {
-                return Err(RailError::message(
-                    "local CAS compiler-evidence pin does not match its discovery entry",
-                ));
-            }
-            let verified = self
-                .load_verified_compiler_evidence(&pin.action_key, &pin.action_result, &mut stats)
-                .map_err(fault_to_error)?;
-            if verified.validation.candidate_key() != candidate_key {
-                return Err(RailError::message(
-                    "local CAS compiler-evidence result does not match its discovery key",
-                ));
-            }
-            candidates.push(CompilerEvidenceCandidate {
-                validation: verified.validation,
-                evidence: verified.evidence,
-                created_unix_nanos: pin.created_unix_nanos,
-            });
         }
         candidates.sort_unstable_by_key(|candidate| std::cmp::Reverse(candidate.created_unix_nanos));
-        Ok(candidates)
+        Ok((candidates, faults))
+    }
+
+    fn evidence_candidate(
+        &self,
+        candidate_key: &str,
+        entry: &fs::DirEntry,
+    ) -> RailResult<Option<CompilerEvidenceCandidate>> {
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_file() || is_link_or_reparse(&metadata) || !has_single_link(&metadata) {
+            return Err(RailError::message(format!(
+                "local CAS compiler-evidence candidate entry '{}' is not a bounded regular file",
+                path.display()
+            )));
+        }
+        let file_name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| RailError::message("local CAS compiler-evidence candidate entry has a non-UTF-8 name"))?;
+        let action_hex = file_name.strip_suffix(".json").ok_or_else(|| {
+            RailError::message(format!(
+                "local CAS compiler-evidence candidate entry '{file_name}' has an invalid name"
+            ))
+        })?;
+        let mut stats = ReadStats::default();
+        let indexed: EvidenceCandidateIndexEntry =
+            read_canonical_json(&path, MAX_OBJECT_METADATA_BYTES, &mut stats).map_err(fault_to_error)?;
+        if indexed.version != EVIDENCE_CANDIDATE_INDEX_VERSION
+            || indexed.candidate_key != candidate_key
+            || validated_id_hex(&indexed.action_key, EVIDENCE_ACTION_KEY_PREFIX)? != action_hex
+        {
+            return Err(RailError::message(
+                "local CAS compiler-evidence candidate entry does not match its directory and action key",
+            ));
+        }
+
+        let pin_path = self.root.join("pins").join(&file_name);
+        let pin_metadata = match fs::symlink_metadata(&pin_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if !pin_metadata.is_file() || is_link_or_reparse(&pin_metadata) || !has_single_link(&pin_metadata) {
+            return Err(RailError::message(format!(
+                "local CAS compiler-evidence pin '{}' is not a bounded regular file",
+                pin_path.display()
+            )));
+        }
+        let pin: ActionPin =
+            read_canonical_json(&pin_path, MAX_OBJECT_METADATA_BYTES, &mut stats).map_err(fault_to_error)?;
+        if pin.version != CAS_VERSION
+            || pin.action_key != indexed.action_key
+            || pin.lookup_key != candidate_key
+            || validated_id_hex(&pin.action_result, ACTION_RESULT_PREFIX).is_err()
+        {
+            return Err(RailError::message(
+                "local CAS compiler-evidence pin does not match its discovery entry",
+            ));
+        }
+        let verified = self
+            .load_verified_compiler_evidence(&pin.action_key, &pin.action_result, &mut stats)
+            .map_err(fault_to_error)?;
+        if verified.validation.candidate_key() != candidate_key {
+            return Err(RailError::message(
+                "local CAS compiler-evidence result does not match its discovery key",
+            ));
+        }
+        Ok(Some(CompilerEvidenceCandidate {
+            validation: verified.validation,
+            evidence: verified.evidence,
+            created_unix_nanos: pin.created_unix_nanos,
+        }))
     }
 
     /// Publish one already-authenticated compressed result as the action's sole L1 result authority.

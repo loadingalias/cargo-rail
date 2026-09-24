@@ -29,6 +29,7 @@ mod test_sync;
 mod test_undeclared_features;
 mod test_unify;
 mod test_unify_diagnostics;
+mod test_unify_evidence_reuse;
 mod test_unify_undo;
 mod test_unused_detection;
 mod test_workspace_snapshot;

@@ -1636,24 +1636,34 @@ once_cell = "1"
         )?;
         workspace.commit("Use dependency only from procedural macro expansion")?;
 
-        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "-f", "json"])?;
-        let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-        assert!(
-            evidence_cache_reports_reason(&json, "proc_macro_observations_unavailable="),
-            "proc-macro state must bypass compiler-fact reuse explicitly\n{}",
-            serde_json::to_string_pretty(&json)?
-        );
-        assert!(
-            !json["proof_certificates"].as_array().is_some_and(|certificates| {
-                certificates.iter().any(|certificate| {
-                    certificate["member"] == "consumer"
-                        && certificate["decision"] == "remove"
-                        && certificate["subject"]["declaration"] == "log"
-                })
-            }),
-            "rustc expansion evidence must preserve the generated dependency use\n{}",
-            serde_json::to_string_pretty(&json)?
-        );
+        // The cold run records the expansion; the repeated run reuses that evidence, which the
+        // consuming unit's dep-info binds as Cargo binds a proc macro's reads.
+        for run in ["cold", "reused"] {
+            let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "-f", "json"])?;
+            let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+            if run == "reused" {
+                let cache = json["evidence_cache"]
+                    .as_array()
+                    .and_then(|entries| entries.iter().find(|entry| entry["member"] == "consumer"))
+                    .expect("consumer evidence telemetry");
+                assert!(
+                    cache["hits"].as_u64().is_some_and(|hits| hits > 0) && cache["misses"] == 0,
+                    "proc-macro expansion evidence must be reused\n{}",
+                    serde_json::to_string_pretty(&json)?
+                );
+            }
+            assert!(
+                !json["proof_certificates"].as_array().is_some_and(|certificates| {
+                    certificates.iter().any(|certificate| {
+                        certificate["member"] == "consumer"
+                            && certificate["decision"] == "remove"
+                            && certificate["subject"]["declaration"] == "log"
+                    })
+                }),
+                "{run}: rustc expansion evidence must preserve the generated dependency use\n{}",
+                serde_json::to_string_pretty(&json)?
+            );
+        }
 
         Ok(())
     })();
@@ -1941,14 +1951,11 @@ glob = "0.3"
             .as_array()
             .and_then(|entries| entries.iter().find(|entry| entry["member"] == "test-crate"))
             .expect("build-script compiler evidence telemetry");
-        assert_eq!(cache["hits"], 0, "unobserved build-script state must never be reused");
+        // The script declares no rerun input, so Cargo reruns it only when its package sources
+        // change; the member's source fingerprint binds them, and the evidence is reused.
         assert!(
-            cache["miss_reasons"]
-                .as_array()
-                .is_some_and(|reasons| reasons.iter().any(|reason| reason
-                    .as_str()
-                    .is_some_and(|value| value.starts_with("build_script_observations_unavailable=")))),
-            "build-script cache bypass must be explicit\n{}",
+            cache["hits"].as_u64().is_some_and(|hits| hits > 0) && cache["misses"] == 0,
+            "complete build-script freshness must authorize reuse\n{}",
             serde_json::to_string_pretty(&repeated_json)?
         );
         let output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
@@ -2191,8 +2198,8 @@ edition = "2021"
         let entries = cache["entries"].as_object().expect("cache entries object");
         let entry = entries.values().next().expect("at least one cache entry");
         assert_eq!(
-            entry["collector_version"], 15,
-            "native compiler result reuse requires collector semantics version 15"
+            entry["collector_version"], 16,
+            "native compiler result reuse requires collector semantics version 16"
         );
         assert!(
             entry["key"]["package_id"].as_str().is_some(),

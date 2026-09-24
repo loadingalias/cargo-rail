@@ -4927,6 +4927,12 @@ fn compiler_analysis_reuses_native_result_only_after_an_exact_binding() {
         assert_eq!(cold_usage["hits"], 0, "{cold_usage}");
         assert!(String::from_utf8_lossy(&cold.stdout).contains("Dependencies: helper"));
 
+        // A package description is part of the Unify evidence key but of no rustc invocation,
+        // so the warm run misses stored evidence, reaches Cargo, and exercises native-result reuse.
+        fs::write(
+            &manifest,
+            fs::read_to_string(&manifest)?.replacen("[package]\n", "[package]\ndescription = \"warm\"\n", 1),
+        )?;
         let warm = run(None)?;
         assert_eq!(warm.status.code(), Some(1), "warm analysis failed: {warm:?}");
         assert!(
@@ -6629,6 +6635,67 @@ host_macros = { path = "../macros" }
             assert_eq!(executed.stdout, b"42\n");
             assert!(executed.stderr.is_empty());
         }
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+/// Adjacent Unify commands under the installed Cargo-Rail compiler wrapper reuse complete
+/// evidence, including a view whose package runs a build script.
+#[cfg(unix)]
+#[test]
+fn unify_evidence_is_reused_under_the_installed_cache_wrapper() {
+    let result: Result<()> = (|| {
+        let workspace = TestWorkspace::new_single_crate("wrapped-evidence-reuse", "0.1.0")?;
+        fs::create_dir_all(workspace.path.join("helper/src"))?;
+        fs::write(
+            workspace.path.join("helper/Cargo.toml"),
+            "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )?;
+        fs::write(workspace.path.join("helper/src/lib.rs"), "pub fn helper() {}\n")?;
+        let manifest = workspace.path.join("Cargo.toml");
+        fs::write(
+            &manifest,
+            fs::read_to_string(&manifest)?
+                .replace("[dependencies]\n", "[dependencies]\nhelper = { path = \"helper\" }\n"),
+        )?;
+        fs::write(
+            workspace.path.join("build.rs"),
+            "fn main() { println!(\"cargo::rerun-if-changed=build.rs\"); }\n",
+        )?;
+        let lock = Command::new("cargo")
+            .current_dir(&workspace.path)
+            .args(["generate-lockfile"])
+            .output()?;
+        assert!(lock.status.success(), "lockfile generation failed: {lock:?}");
+        workspace.commit("Add a build script and an unused path dependency")?;
+
+        let cargo_home = tempfile::tempdir()?;
+        let setup = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "setup"])?;
+        assert!(setup.status.success(), "cache setup failed: {setup:?}");
+
+        let diagnostics = tempfile::tempdir()?;
+        let cargo_views = |run: &str| -> Result<u64> {
+            let file = diagnostics.path().join(format!("{run}.json"));
+            let output = rail(
+                &workspace.path,
+                cargo_home.path(),
+                &[
+                    "rail",
+                    "--diagnostics-file",
+                    file.to_str().context("non-UTF-8 diagnostics path")?,
+                    "unify",
+                    "--check",
+                ],
+            )?;
+            assert_eq!(output.status.code(), Some(1), "{run}: {output:?}");
+            let counters: serde_json::Value = serde_json::from_slice(&fs::read(&file)?)?;
+            counters["compiler_acquisition"]["cargo_views"]
+                .as_u64()
+                .context("Cargo view count")
+        };
+        assert!(cargo_views("cold")? >= 1, "the cold run acquires evidence");
+        assert_eq!(cargo_views("warm")?, 0, "the installed wrapper must not prevent reuse");
         Ok(())
     })();
     super::helpers::finish_test(result);

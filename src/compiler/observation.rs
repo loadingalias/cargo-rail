@@ -154,6 +154,16 @@ impl ObservationPath {
         Self::Host(crate::utils::path_to_git_format(&absolute))
     }
 
+    /// Whether this path lies strictly below `root` in the same root domain.
+    pub(crate) fn is_below(&self, root: &Self) -> bool {
+        match (self, root) {
+            (Self::Repository(path), Self::Repository(root)) | (Self::Host(path), Self::Host(root)) => path
+                .strip_prefix(root.as_str())
+                .is_some_and(|rest| rest.starts_with('/')),
+            _ => false,
+        }
+    }
+
     pub(crate) fn resolve(&self, source_root: &Path) -> PathBuf {
         match self {
             Self::Repository(path) => source_root.join(path),
@@ -507,7 +517,16 @@ impl CompilationObservationManifest {
     /// inputs, so their continued presence does not affect already-derived
     /// diagnostic evidence. Executables are bound once by the enclosing cache
     /// identity rather than re-digested for every compilation unit.
-    pub(crate) fn diagnostic_revalidation_reason(&self, source_root: &Path) -> Option<&'static str> {
+    ///
+    /// Reads below `generated_root` are build-script outputs in a recycled sandbox, and
+    /// `script_environment` names variables that build scripts set with `rustc-env`. The
+    /// caller binds both through build-script freshness instead.
+    pub(crate) fn diagnostic_revalidation_reason(
+        &self,
+        source_root: &Path,
+        generated_root: Option<&ObservationPath>,
+        script_environment: &BTreeSet<&str>,
+    ) -> Option<&'static str> {
         if self.version != COMPILATION_OBSERVATION_VERSION
             || self
                 .execution
@@ -522,6 +541,9 @@ impl CompilationObservationManifest {
             (&self.observed_reads, "observed_compiler_read_changed"),
         ] {
             for file in files {
+                if generated_root.is_some_and(|root| file.path.is_below(root)) {
+                    continue;
+                }
                 if !file.revalidate(source_root) {
                     return Some(reason);
                 }
@@ -531,7 +553,9 @@ impl CompilationObservationManifest {
             if environment.secret_capability {
                 return Some("secret_compiler_environment");
             }
-            if is_cargo_provided_environment(&environment.name) {
+            if is_cargo_provided_environment(&environment.name)
+                || script_environment.contains(environment.name.as_str())
+            {
                 continue;
             }
             let current = std::env::var_os(&environment.name);
@@ -2593,11 +2617,22 @@ pub(crate) fn is_secret_name(name: &str) -> bool {
         || normalized.contains("private-key")
 }
 
+/// Variables Cargo sets for each compilation. Package identity is keyed, and the location
+/// variables name sandbox or checkout paths whose contents are bound elsewhere.
 fn is_cargo_provided_environment(name: &str) -> bool {
     name.starts_with("CARGO_PKG_")
+        || name.starts_with("CARGO_BIN_EXE_")
         || matches!(
             name,
-            "CARGO_BIN_NAME" | "CARGO_CRATE_NAME" | "CARGO_MANIFEST_DIR" | "CARGO_PRIMARY_PACKAGE"
+            "CARGO"
+                | "CARGO_BIN_NAME"
+                | "CARGO_CRATE_NAME"
+                | "CARGO_MANIFEST_DIR"
+                | "CARGO_MANIFEST_PATH"
+                | "CARGO_PRIMARY_PACKAGE"
+                | "CARGO_RUSTC_CURRENT_DIR"
+                | "CARGO_TARGET_TMPDIR"
+                | "OUT_DIR"
         )
 }
 
@@ -3680,15 +3715,21 @@ mod tests {
         assert_eq!(manifest.emitted_outputs.len(), 2);
         assert!(manifest.bypasses.contains("rustdoc_output_tree_unavailable"));
         assert!(!manifest.bypasses.contains("rustdoc_dep_info_unavailable"));
-        assert_eq!(manifest.diagnostic_revalidation_reason(source_root), None);
+        assert_eq!(
+            manifest.diagnostic_revalidation_reason(source_root, None, &BTreeSet::new()),
+            None
+        );
 
         fs::write(&index, "<html>changed</html>").expect("output mutation");
-        assert_eq!(manifest.diagnostic_revalidation_reason(source_root), None);
+        assert_eq!(
+            manifest.diagnostic_revalidation_reason(source_root, None, &BTreeSet::new()),
+            None
+        );
         fs::write(&index, "<html>docs</html>").expect("restore output");
 
         fs::write(&nested, "pub fn other() {}\n").expect("same-size nested mutation");
         assert_eq!(
-            manifest.diagnostic_revalidation_reason(source_root),
+            manifest.diagnostic_revalidation_reason(source_root, None, &BTreeSet::new()),
             Some("observed_compiler_read_changed")
         );
     }

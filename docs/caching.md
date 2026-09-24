@@ -389,13 +389,36 @@ before Cargo sees output.
 
 ## Compiler-evidence cache
 
-`cargo rail unify --check` may reuse compiler observations after revalidating their compiler, source, manifests, targets,
-features, Cargo configuration, dependencies, outputs, executable identity,
+Unify stores the compiler evidence of each view in the selected cache profile's local store.
+Preview, `--check`, `--explain`, and `apply` reuse a view after revalidating its compiler, sources, manifests, targets,
+features, Cargo configuration, lockfile, executable identity, observed file reads,
 and observed environment reads.
 This store contains diagnostic evidence, not restorable Cargo artifacts.
 
-Check mode may update evidence under `target/cargo-rail/`.
-Inspect `evidence_cache` in JSON output for hits, misses, and reasons.
+A view stays reusable while Cargo would keep the output of every build script in it:
+
+- Each path declared with `rerun-if-changed` keeps its content.
+  A declared directory keeps every entry.
+- Each variable declared with `rerun-if-env-changed` keeps its value.
+  Only a digest of the value is stored.
+- A script that declares no path depends on its package sources,
+  which the lockfile checksum or the workspace source fingerprint already binds.
+
+Files a build script generates and variables it sets with `rustc-env` are bound through those inputs.
+Proc-macro reads are bound as Cargo binds them:
+through the consuming unit's dep-info and tracked environment.
+Changing one declared input reruns only the views whose Cargo graph ran that build script.
+Several variants of a view can be stored, so returning to an earlier input reuses its evidence.
+
+Unify does not store a view when a build script declares a secret-named variable,
+declares a missing path, or declares a directory with more than 10,000 entries.
+`evidence_cache[].publication_bypasses` names the reason.
+A view is stored as soon as it completes, so a later failure or interruption keeps it for the retry.
+A corrupt stored view is never reused, and it does not hide other stored views of the same key.
+Runs under an unverified `RUSTC_WRAPPER` never reuse evidence, because the wrapper can read anything;
+runs under Cargo-Rail's installed wrapper do.
+
+Inspect `evidence_cache` in JSON output for hits, misses, miss reasons, and publication bypasses.
 
 ## Local storage budget
 

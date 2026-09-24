@@ -279,6 +279,7 @@ fn evidence_cache_to_json(plan: &crate::cargo::UnificationPlan) -> Vec<serde_jso
               "hits": unused.proof.cache_hits,
               "misses": unused.proof.cache_misses,
               "miss_reasons": unused.proof.cache_miss_reasons.iter().map(|value| &**value).collect::<Vec<_>>(),
+              "publication_bypasses": unused.proof.cache_publication_bypasses.iter().map(|value| &**value).collect::<Vec<_>>(),
             })
         })
         .collect()
@@ -2592,6 +2593,13 @@ fn display_explain(
                     format!(" ({})", unused.proof.cache_miss_reasons.join(", "))
                 }
             );
+            if !unused.proof.cache_publication_bypasses.is_empty() {
+                outln!(
+                    sink,
+                    "    not stored for reuse: {}",
+                    unused.proof.cache_publication_bypasses.join(", ")
+                );
+            }
             outln!(sink);
         }
     }

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Collector version used to invalidate stale semantic behavior.
-pub const COLLECTOR_VERSION: u32 = 15;
+pub const COLLECTOR_VERSION: u32 = 16;
 
 /// A rustc platform target or `default` for the workspace's native target.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -243,6 +243,8 @@ pub struct EvidenceCacheSummary {
     pub misses: usize,
     /// Stable miss reason and occurrence count.
     pub miss_reasons: BTreeMap<String, usize>,
+    /// Stable reason fresh evidence was not stored for reuse, and occurrence count.
+    pub publication_bypasses: BTreeMap<String, usize>,
 }
 
 /// Stable identity for one dependency declaration and its resolved packages.
@@ -605,6 +607,8 @@ pub struct CompilerDiagEntry {
     pub collector_version: u32,
     /// Immutable exact-byte compilation observations supporting this evidence.
     pub(crate) observations: Vec<crate::compiler::observation::CompilationObservationManifest>,
+    /// Rerun inputs of every build script Cargo executed for this evidence.
+    pub(crate) build_scripts: Vec<crate::build_script::freshness::BuildScriptFreshness>,
 }
 
 #[cfg(test)]

@@ -248,6 +248,8 @@ pub struct DependencyProof {
     pub cache_misses: usize,
     /// Stable reasons why evidence could not be reused.
     pub cache_miss_reasons: Vec<Arc<str>>,
+    /// Stable reasons why fresh evidence was not stored for later reuse.
+    pub cache_publication_bypasses: Vec<Arc<str>>,
     /// Named uncertainties that would block this decision.
     pub uncertainties: Vec<Arc<str>>,
 }

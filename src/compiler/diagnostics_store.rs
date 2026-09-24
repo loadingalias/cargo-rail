@@ -30,7 +30,7 @@ const NATIVE_BINDING_OBJECT_VERSION: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum CompilerEvidenceValidation {
-    Diagnostics(CompilerDiagnosticsEvidenceValidation),
+    Diagnostics(Box<CompilerDiagnosticsEvidenceValidation>),
     CompilerFacts(CompilerFactEvidenceValidation),
     Observation(CompilerObservationEvidenceValidation),
     NativeBinding(NativeEvidenceBindingValidation),
@@ -45,6 +45,10 @@ pub(crate) struct CompilerDiagnosticsEvidenceValidation {
     collector_version: u32,
     key: CompilerDiagKey,
     observations: Vec<crate::compiler::observation::CompilationObservationManifest>,
+    /// Omitted when empty, so objects without build scripts keep the encoding and action key
+    /// that earlier collector versions wrote, and the CAS still reads them canonically.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    build_scripts: Vec<crate::build_script::freshness::BuildScriptFreshness>,
 }
 
 /// One root-independent scheduled compiler-fact acquisition identity.
@@ -116,15 +120,16 @@ impl CompilerEvidenceValidation {
     fn from_entry(entry: &CompilerDiagEntry) -> RailResult<Self> {
         let key = canonical_evidence_key(&entry.key);
         let candidate_key = evidence_candidate_key(&key)?;
-        let action_key = evidence_action_key(&key, entry.collector_version, &entry.observations)?;
-        Ok(Self::Diagnostics(CompilerDiagnosticsEvidenceValidation {
+        let action_key = evidence_action_key(&key, entry.collector_version, &entry.observations, &entry.build_scripts)?;
+        Ok(Self::Diagnostics(Box::new(CompilerDiagnosticsEvidenceValidation {
             version: EVIDENCE_VALIDATION_VERSION,
             action_key,
             candidate_key,
             collector_version: entry.collector_version,
             key,
             observations: entry.observations.clone(),
-        }))
+            build_scripts: entry.build_scripts.clone(),
+        })))
     }
 
     pub(crate) fn action_key(&self) -> &str {
@@ -301,6 +306,10 @@ impl CompilerDiagnosticsEvidenceValidation {
         &self.observations
     }
 
+    fn build_scripts(&self) -> &[crate::build_script::freshness::BuildScriptFreshness] {
+        &self.build_scripts
+    }
+
     fn matches(&self, key: &CompilerDiagKey) -> bool {
         semantic_key_bytes(&self.key).is_ok_and(|stored| semantic_key_bytes(key).is_ok_and(|current| stored == current))
     }
@@ -312,7 +321,12 @@ impl CompilerDiagnosticsEvidenceValidation {
             ));
         }
         if evidence_candidate_key(&self.key)? != self.candidate_key
-            || evidence_action_key(&self.key, self.collector_version, &self.observations)? != self.action_key
+            || evidence_action_key(
+                &self.key,
+                self.collector_version,
+                &self.observations,
+                &self.build_scripts,
+            )? != self.action_key
         {
             return Err(RailError::message(
                 "compiler evidence validation identity does not match its observed inputs",
@@ -771,17 +785,25 @@ fn evidence_action_key(
     key: &CompilerDiagKey,
     collector_version: u32,
     observations: &[crate::compiler::observation::CompilationObservationManifest],
+    build_scripts: &[crate::build_script::freshness::BuildScriptFreshness],
 ) -> RailResult<String> {
     let key = semantic_key_bytes(key)?;
     let observations = serde_json::to_vec(observations)?;
+    let build_scripts = serde_json::to_vec(build_scripts)?;
+    let collector_version = collector_version.to_le_bytes();
+    let mut frames: Vec<(&[u8], &[u8])> = vec![
+        (b"collector-version", &collector_version),
+        (b"key", &key),
+        (b"observations", &observations),
+    ];
+    // An empty list adds no frame, so evidence without build scripts keeps its earlier key.
+    if build_scripts != b"[]" {
+        frames.push((b"build-scripts", &build_scripts));
+    }
     Ok(framed_sha256(
         EVIDENCE_ACTION_KEY_PREFIX,
         b"cargo-rail-compiler-evidence-action\0",
-        &[
-            (b"collector-version", &collector_version.to_le_bytes()),
-            (b"key", &key),
-            (b"observations", &observations),
-        ],
+        &frames,
     ))
 }
 
@@ -914,6 +936,19 @@ impl CompilerDiagnosticsStore {
 
     /// Return cached entry for the exact key.
     pub fn get(&mut self, key: &CompilerDiagKey) -> Option<&CompilerDiagEntry> {
+        self.get_valid(key, |_| None::<String>).ok()
+    }
+
+    /// Return the first entry for the exact key that `revalidate` accepts.
+    ///
+    /// Several entries can share one key when inputs outside the key differ, such as a build
+    /// script's declared environment. When entries exist but none is accepted, the error is
+    /// the first rejection reason; `Err(None)` means no entry exists.
+    pub(crate) fn get_valid(
+        &mut self,
+        key: &CompilerDiagKey,
+        revalidate: impl Fn(&CompilerDiagEntry) -> Option<String>,
+    ) -> Result<&CompilerDiagEntry, Option<String>> {
         let id = key.stable_id();
         let memory_hit = self
             .pending
@@ -926,41 +961,49 @@ impl CompilerDiagnosticsStore {
                         .is_ok_and(|stored| semantic_key_bytes(key).is_ok_and(|current| stored == current))
             });
         if memory_hit {
-            return self.pending.get(&id).or_else(|| self.entries.get(&id));
+            return self.pending.get(&id).or_else(|| self.entries.get(&id)).ok_or(None);
         }
 
         let candidate_key = match evidence_candidate_key(key) {
             Ok(candidate_key) => candidate_key,
             Err(_) => {
                 self.discarded_reason = Some("cache_identity_unavailable");
-                return None;
+                return Err(None);
             }
         };
         let candidates = match self
             .cas
             .as_ref()
             .map(|cas| {
-                let candidates = cas.compiler_evidence_candidates(&candidate_key)?;
-                if candidates.is_empty()
+                let loaded = cas.verified_compiler_evidence_candidates(&candidate_key)?;
+                if loaded.0.is_empty()
                     && let Some(remote) = &self.remote
                 {
                     match remote.import_compiler_evidence(cas, &candidate_key) {
-                        Ok(_) => return cas.compiler_evidence_candidates(&candidate_key),
+                        Ok(_) => return cas.verified_compiler_evidence_candidates(&candidate_key),
                         Err(error) => self.discarded_reason = Some(error.cold_reason()),
                     }
                 }
-                Ok(candidates)
+                Ok(loaded)
             })
             .transpose()
         {
-            Ok(Some(candidates)) => candidates,
-            Ok(None) => return None,
+            // An unverifiable candidate is never reused; it fails this lookup only when no
+            // other candidate for the key verifies.
+            Ok(Some((candidates, faults))) => {
+                if candidates.is_empty() && faults > 0 {
+                    self.discarded_reason = Some("local_cache_unreadable");
+                }
+                candidates
+            }
+            Ok(None) => return Err(None),
             Err(_) => {
                 self.discarded_reason = Some("local_cache_unreadable");
-                return None;
+                return Err(None);
             }
         };
         let mut hit = None;
+        let mut rejected = None;
         for candidate in candidates {
             let Some(validation) = candidate.validation.diagnostics() else {
                 continue;
@@ -974,19 +1017,29 @@ impl CompilerDiagnosticsStore {
             let generated_at_unix_ms = u64::try_from(candidate.created_unix_nanos / 1_000_000).unwrap_or(u64::MAX);
             self.record_prior(generated_at_unix_ms, &validation.key, validation.collector_version());
             if hit.is_none() && validation.collector_version() == COLLECTOR_VERSION && validation.matches(key) {
-                hit = Some(CompilerDiagEntry {
+                let entry = CompilerDiagEntry {
                     key: key.clone(),
                     evidence: evidence.clone(),
                     generated_at_unix_ms,
                     collector_version: validation.collector_version(),
                     observations: validation.observations().to_vec(),
-                });
+                    build_scripts: validation.build_scripts().to_vec(),
+                };
+                match revalidate(&entry) {
+                    None => hit = Some(entry),
+                    Some(reason) => {
+                        rejected.get_or_insert(reason);
+                    }
+                }
             }
         }
-        if let Some(entry) = hit {
-            self.entries.insert(id.clone(), entry);
+        match hit {
+            Some(entry) => {
+                self.entries.insert(id.clone(), entry);
+                self.entries.get(&id).ok_or(None)
+            }
+            None => Err(rejected),
         }
-        self.entries.get(&id)
     }
 
     /// Explain why an exact semantic key was not reusable.
@@ -1091,6 +1144,7 @@ mod tests {
     use cargo_metadata::PackageId;
     use std::collections::BTreeSet;
     use std::fs;
+    use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn now_unix_ms() -> u64 {
@@ -1138,7 +1192,126 @@ mod tests {
             generated_at_unix_ms,
             collector_version: COLLECTOR_VERSION,
             observations: Vec::new(),
+            build_scripts: Vec::new(),
         }
+    }
+
+    /// One build-script freshness record declaring `name` with the given value digest.
+    fn declared_environment(
+        name: &str,
+        value_digest: Option<&str>,
+    ) -> crate::build_script::freshness::BuildScriptFreshness {
+        serde_json::from_value(serde_json::json!({
+            "package": "native 0.1.0",
+            "paths": [],
+            "environment": [{"name": name, "value_digest": value_digest}],
+        }))
+        .expect("freshness record")
+    }
+
+    /// Two variants of one key: `stale` declares a value the environment no longer has,
+    /// `fresh` declares a variable that is unset, as it still is.
+    fn variants() -> (CompilerDiagEntry, CompilerDiagEntry) {
+        let mut stale = entry("member", now_unix_ms(), 0);
+        stale.build_scripts = vec![declared_environment("D3_STORE_UNIT_UNSET", Some("sha256:stale"))];
+        stale.evidence.unused_crates.insert("stale_only".to_string());
+        let mut fresh = entry("member", now_unix_ms(), 0);
+        fresh.build_scripts = vec![declared_environment("D3_STORE_UNIT_UNSET", None)];
+        (stale, fresh)
+    }
+
+    fn open_store(root: &Path) -> CompilerDiagnosticsStore {
+        let cas = crate::cache::cas::LocalCas::open_selected(
+            &crate::cache::cas::LocalCacheSelection::new(root.to_path_buf(), 1024 * 1024, None).expect("selection"),
+        )
+        .expect("local CAS");
+        CompilerDiagnosticsStore::load_with_cas_and_remote(Some(cas), None)
+    }
+
+    fn revalidate(entry: &CompilerDiagEntry) -> Option<String> {
+        entry
+            .build_scripts
+            .iter()
+            .find_map(|script| script.revalidation_reason(Path::new("/")))
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn a_stale_variant_never_hides_a_fresh_one_for_the_same_key() {
+        let cache_root = tempfile::tempdir().expect("cache root");
+        let (stale, fresh) = variants();
+        let mut writer = open_store(cache_root.path());
+        writer.put(stale.clone());
+        writer.flush().expect("publish stale variant");
+        writer.put(fresh.clone());
+        writer.flush().expect("publish fresh variant");
+
+        let mut reader = open_store(cache_root.path());
+        let hit = reader.get_valid(&fresh.key, revalidate).expect("fresh variant");
+        assert_eq!(hit.build_scripts, fresh.build_scripts);
+        assert!(
+            hit.evidence.unused_crates.is_empty(),
+            "the stale variant's evidence was reused"
+        );
+
+        let only_stale_root = tempfile::tempdir().expect("cache root");
+        let mut writer = open_store(only_stale_root.path());
+        writer.put(stale.clone());
+        writer.flush().expect("publish stale variant");
+        let mut reader = open_store(only_stale_root.path());
+        assert_eq!(
+            reader.get_valid(&stale.key, revalidate).err(),
+            Some(Some("build_script_environment_changed".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_corrupt_variant_is_skipped_without_hiding_a_valid_one() {
+        let cache_root = tempfile::tempdir().expect("cache root");
+        let (stale, fresh) = variants();
+        let mut writer = open_store(cache_root.path());
+        writer.put(stale);
+        writer.flush().expect("publish first variant");
+        writer.put(fresh.clone());
+        writer.flush().expect("publish second variant");
+
+        // Corrupt the evidence object that only the stale variant references.
+        let results = cache_root.path().join("cargo-rail/local-cas-v3");
+        let corrupted = walk_files(&results)
+            .into_iter()
+            .find(|path| fs::read(path).is_ok_and(|bytes| bytes.windows(10).any(|window| window == b"stale_only")))
+            .expect("stale variant evidence");
+        let mut bytes = fs::read(&corrupted).expect("evidence bytes");
+        let index = bytes
+            .windows(10)
+            .position(|window| window == b"stale_only")
+            .expect("marker");
+        bytes[index] = b'S';
+        fs::write(&corrupted, bytes).expect("corrupt evidence");
+
+        let mut reader = open_store(cache_root.path());
+        let hit = reader
+            .get_valid(&fresh.key, revalidate)
+            .expect("valid variant still reusable");
+        assert_eq!(hit.build_scripts, fresh.build_scripts);
+    }
+
+    fn walk_files(root: &Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(&directory)
+                .expect("directory")
+                .map(|entry| entry.expect("entry").path())
+            {
+                if entry.is_dir() {
+                    pending.push(entry);
+                } else {
+                    files.push(entry);
+                }
+            }
+        }
+        files
     }
 
     #[test]
