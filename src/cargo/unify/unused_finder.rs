@@ -261,9 +261,9 @@ impl<'a> UnusedDepFinder<'a> {
                         continue;
                     }
                     issues.push(UnifyIssue {
-                        kind: UnifyIssueKind::General,
+                        kind: UnifyIssueKind::Preserved,
                         dep_name: Arc::clone(&usage.cargo_toml_key),
-                        severity: IssueSeverity::Warning,
+                        severity: IssueSeverity::Info,
                         message: Arc::from(format!(
                             "preserved {} dependency `{}` in `{}`: {reason}",
                             usage.kind.as_str(),

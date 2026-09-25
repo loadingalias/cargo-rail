@@ -525,6 +525,15 @@ pub fn toolchain_fingerprint(workspace_root: &Path) -> String {
         .unwrap_or_else(|| "none".to_string())
 }
 
+/// Return the running executable with symlinks resolved.
+///
+/// Release components are siblings of the real executable. A launcher symlink
+/// elsewhere on `PATH` must not move that directory; macOS reports the invoked
+/// symlink path from `std::env::current_exe`.
+pub fn current_executable() -> io::Result<PathBuf> {
+    canonicalize_existing(&std::env::current_exe()?)
+}
+
 /// Canonicalize an existing path and return a form suitable for both Rust and
 /// external tools on the current platform.
 ///

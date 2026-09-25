@@ -1,0 +1,304 @@
+exit: Some(1)
+--- stdout
+{
+  "action_plan": [
+    {
+      "code": "APPLY_MEMBER_EDITS",
+      "detail": "1 member(s)",
+      "expected_mutations": [
+        {
+          "before_fingerprint": "fnv1a64:<hex>",
+          "effect": "write",
+          "path": "crates/app/Cargo.toml"
+        }
+      ],
+      "target": "workspace member manifests"
+    },
+    {
+      "code": "CREATE_BACKUP",
+      "target": "target/cargo-rail/backups"
+    },
+    {
+      "code": "REFRESH_CARGO_LOCK",
+      "detail": "Cargo resolves the authorized manifest graph",
+      "expected_mutations": [
+        {
+          "before_fingerprint": "fnv1a64:<hex>",
+          "effect": "write",
+          "path": "Cargo.lock"
+        }
+      ],
+      "target": "Cargo.lock"
+    },
+    {
+      "code": "VERIFY_PROOF_SET",
+      "detail": "sha256:<hex>",
+      "payload": {
+        "proof_fingerprint": "sha256:<hex>",
+        "schema_version": 1
+      },
+      "target": "portable unify proof certificates"
+    }
+  ],
+  "check": true,
+  "command": "unify",
+  "coverage": {
+    "schema_version": 1,
+    "views": [
+      {
+        "cargo": {
+          "args": [
+            "check",
+            "--locked",
+            "--all-targets",
+            "--package",
+            "app"
+          ],
+          "program": "cargo"
+        },
+        "features": {
+          "mode": "default",
+          "selected": []
+        },
+        "id": "coverage:v1-sha256-<hex>",
+        "nextest": {
+          "args": [
+            "nextest",
+            "run",
+            "--locked",
+            "--package",
+            "app"
+          ],
+          "program": "cargo"
+        },
+        "packages": [
+          "app"
+        ],
+        "target": "default"
+      }
+    ]
+  },
+  "dependency_decisions": [],
+  "evidence_cache": [
+    {
+      "dependency": "helper",
+      "hits": 1,
+      "member": "app",
+      "miss_reasons": [],
+      "misses": 0,
+      "publication_bypasses": []
+    }
+  ],
+  "exit_code": 1,
+  "feature_reachability": [],
+  "has_blocking_issues": false,
+  "has_changes": true,
+  "issues": [],
+  "mode": "check",
+  "msrv": {
+    "candidate": null,
+    "compiler_probe": {
+      "lowering_authorized": false,
+      "meaning": "the candidate is a manifest/dependency lower bound; validation requires builds under that compiler",
+      "required_scope": "all configured coverage views",
+      "status": "not_run"
+    },
+    "policy": {
+      "inherit": false,
+      "mode": "compute",
+      "source": "max"
+    },
+    "schema_version": 1,
+    "selected_toolchain": {
+      "channel": "stable",
+      "fingerprint": "sha256:<hex>",
+      "host": "<host>",
+      "rustc_release": "<n>"
+    },
+    "toolchain_constraint": {
+      "evidence_source": "captured_rustc_identity",
+      "meaning": "no MSRV candidate was computed",
+      "required": null,
+      "selected": null,
+      "status": "not_applicable"
+    },
+    "write_needed": false
+  },
+  "msrv_write_needed": false,
+  "mutation_plan": {
+    "actions": [
+      {
+        "code": "VERIFY_PROOF_SET",
+        "detail": "sha256:<hex>",
+        "payload": {
+          "proof_fingerprint": "sha256:<hex>",
+          "schema_version": 1
+        },
+        "target": "portable unify proof certificates"
+      },
+      {
+        "code": "APPLY_MEMBER_EDITS",
+        "detail": "1 member(s)",
+        "expected_mutations": [
+          {
+            "before_fingerprint": "fnv1a64:<hex>",
+            "effect": "write",
+            "path": "crates/app/Cargo.toml"
+          }
+        ],
+        "target": "workspace member manifests"
+      },
+      {
+        "code": "REFRESH_CARGO_LOCK",
+        "detail": "Cargo resolves the authorized manifest graph",
+        "expected_mutations": [
+          {
+            "before_fingerprint": "fnv1a64:<hex>",
+            "effect": "write",
+            "path": "Cargo.lock"
+          }
+        ],
+        "target": "Cargo.lock"
+      },
+      {
+        "code": "CREATE_BACKUP",
+        "target": "target/cargo-rail/backups"
+      }
+    ],
+    "contract_version": 2,
+    "inputs_fingerprint": "git-object:<hex>",
+    "operation": "unify",
+    "operation_id": "unify-<hex>",
+    "pre_apply": {
+      "changed_paths": [],
+      "config_fingerprint": "sha256:<hex>",
+      "git_head": "<hex>",
+      "lock_fingerprint": "sha256:<hex>",
+      "metadata_fingerprint": "snapshot:v1-sha256-<hex>",
+      "toolchain_fingerprint": "sha256:<hex>",
+      "worktree_fingerprint": "git-object:<hex>"
+    },
+    "resolved_refs": {
+      "git_branch": "main",
+      "git_head": "<hex>"
+    },
+    "risks": [],
+    "trace": [
+      {
+        "code": "UNIFY_ANALYSIS_COMPLETE",
+        "message": "planned 0 workspace dep(s), 2 member edit(s), 0 transitive pin(s)"
+      },
+      {
+        "code": "UNIFY_PACKAGE_INHERITANCE_DECISIONS",
+        "message": "planned 1 equivalent package declaration(s) for workspace inheritance"
+      }
+    ]
+  },
+  "mutation_plan_available": true,
+  "package_inheritance": {
+    "authority": "workspace.package",
+    "fields": [
+      {
+        "field": "authors",
+        "inherited": [],
+        "local_overrides": [],
+        "missing": [
+          "app"
+        ],
+        "planned": [],
+        "retained_equivalent": [],
+        "retention_reason": null
+      },
+      {
+        "field": "edition",
+        "inherited": [
+          "app"
+        ],
+        "local_overrides": [],
+        "missing": [],
+        "planned": [],
+        "retained_equivalent": [],
+        "retention_reason": null
+      },
+      {
+        "field": "license",
+        "inherited": [],
+        "local_overrides": [],
+        "missing": [],
+        "planned": [
+          "app"
+        ],
+        "retained_equivalent": [],
+        "retention_reason": null
+      }
+    ],
+    "schema_version": 1
+  },
+  "proof_certificates": [
+    {
+      "applicable_configurations": 1,
+      "complete_configurations": 1,
+      "decision": "remove",
+      "evidence_source": "compiler",
+      "incomplete_observations": 0,
+      "member": "app",
+      "schema_version": 1,
+      "subject": {
+        "crate_names": [
+          "helper"
+        ],
+        "declaration": "helper",
+        "dependency_kind": "normal",
+        "kind": "dependency",
+        "package_ids": [
+          "path+file://<workspace>/vendor/helper#0.1.0"
+        ],
+        "target": null
+      },
+      "uncertainties": [],
+      "unused_observations": 1,
+      "used_observations": 0
+    },
+    {
+      "decision": "inherit_workspace",
+      "evidence_source": "captured_semantic_manifest_equality",
+      "member": "app",
+      "schema_version": 1,
+      "subject": {
+        "declaration": "package.license",
+        "kind": "package_field"
+      },
+      "uncertainties": []
+    }
+  ],
+  "proof_fingerprint": "sha256:<hex>",
+  "reason_codes": [
+    "UNIFY_ANALYSIS_COMPLETE",
+    "UNIFY_PACKAGE_INHERITANCE_DECISIONS"
+  ],
+  "result": "pending_changes",
+  "schema_version": 1,
+  "summary": {
+    "dead_features_pruned": 0,
+    "duplicates_unified": 0,
+    "member_edits_count": 2,
+    "members_affected": 1,
+    "optional_features_detected": 0,
+    "package_fields_inherited": 1,
+    "transitive_pins_count": 0,
+    "unused_deps": 1,
+    "version_mismatches": 0,
+    "workspace_deps_count": 0
+  },
+  "workspace_deps": []
+}
+--- stderr
+Analyzing 1 dependencies...
+Computing MSRV from dependency graph...
+Scanning for dead features in resolved graph...
+Detecting unused dependencies...
+  Compiler sandbox pool: <workspace>/target/cargo-rail/compiler-artifacts-v1 (one Cargo process at a time; up to 1 resident sandboxes; <n> planned views; <n> bytes soft; <n> bytes hard)
+  Compiler evidence plan: 1 views; up to 0 Cargo acquisitions; 1 diagnostic cache hits; 0 diagnostic cache misses; nothing to compile
+  Found 1 potentially unused dependencies
+Checking for undeclared feature dependencies...
+Generating removal edits for 1 unused dependencies...

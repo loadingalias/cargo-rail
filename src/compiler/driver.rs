@@ -325,7 +325,7 @@ impl CompilerFactDriverAuthority {
         if CompilerFactDriverSourceAuthority::selected()?.is_some_and(|source| source.is_external()) {
             return Ok(());
         }
-        let executable = std::env::current_exe()
+        let executable = crate::utils::current_executable()
             .map_err(|error| RailError::message(format!("failed to locate cargo-rail executable: {error}")))?;
         let components = Self::installation_components(&executable).map_err(|error| {
             error.context("reinstall a supported native cargo-rail archive with its complete adjacent component set")
@@ -342,7 +342,7 @@ impl CompilerFactDriverAuthority {
     /// Prepare and authenticate the complete producer capability without
     /// acquiring workspace compiler facts.
     pub(crate) fn prepare_surface(snapshot: &WorkspaceSnapshot) -> RailResult<CompilerFactDriverReadiness> {
-        let cargo_rail_executable = std::env::current_exe()
+        let cargo_rail_executable = crate::utils::current_executable()
             .map_err(|error| RailError::message(format!("failed to locate cargo-rail executable: {error}")))?;
         let component = CompilerFactDriverComponent::discover(snapshot, &cargo_rail_executable)?.ok_or_else(|| {
             RailError::with_help(
@@ -535,7 +535,7 @@ impl CompilerFactDriverAuthority {
         snapshot: &WorkspaceSnapshot,
         compiler_identity_seed: &str,
     ) -> RailResult<CompilerFactProducerAuthority> {
-        let cargo_rail_executable = std::env::current_exe()
+        let cargo_rail_executable = crate::utils::current_executable()
             .map_err(|error| RailError::message(format!("failed to locate cargo-rail executable: {error}")))?;
         let driver_identity = if let Some(authority) = CompilerFactDriverAuthority::embedded()?
             && authority.validate_toolchain_identity(snapshot.toolchain()).is_ok()
@@ -1675,7 +1675,7 @@ impl PreparedCompilerFactDriver {
         snapshot: &WorkspaceSnapshot,
         expected_producer: &CompilerFactProducerAuthority,
     ) -> RailResult<Self> {
-        let cargo_rail_executable = std::env::current_exe()
+        let cargo_rail_executable = crate::utils::current_executable()
             .map_err(|error| RailError::message(format!("failed to locate cargo-rail executable: {error}")))?;
         let component = CompilerFactDriverComponent::discover(snapshot, &cargo_rail_executable)?.ok_or_else(|| {
       RailError::with_help(

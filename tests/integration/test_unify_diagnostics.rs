@@ -443,3 +443,228 @@ fn diagnostics_record_each_progress_phase_and_its_activity() {
     })();
     crate::helpers::finish_test(result);
 }
+
+/// The member from `failing_build_script_workspace`, with `build.rs` and `lib.rs` replaced.
+fn consumer_workspace(build_script: Option<&str>, library: &str) -> Result<TestWorkspace> {
+    let ws = failing_build_script_workspace()?;
+    let consumer = ws.path.join("crates/consumer");
+    match build_script {
+        Some(script) => fs::write(consumer.join("build.rs"), script)?,
+        None => fs::remove_file(consumer.join("build.rs"))?,
+    }
+    fs::write(consumer.join("src/lib.rs"), library)?;
+    ws.commit("Replace the consumer failure")?;
+    Ok(ws)
+}
+
+#[test]
+fn missing_native_compiler_and_generated_file_name_their_cause_and_recovery() {
+    let result: Result<()> = (|| {
+        let compiler = consumer_workspace(
+            Some(
+                r#"use std::io::Write as _;
+
+// Reports a missing tool the way the `cc` crate does.
+fn main() {
+    println!("cargo:rerun-if-env-changed=CC");
+    let tool = std::env::var("CC").unwrap_or_else(|_| "rail-fixture-cc".to_string());
+    if let Err(error) = std::process::Command::new(&tool).arg("--version").status() {
+        let message = String::from("error occurred in cc-rs: failed to find tool \"") + &tool + "\": " + &error.to_string() + "\n";
+        std::io::stderr().write_all(message.as_bytes()).unwrap();
+        std::process::exit(1);
+    }
+}
+"#,
+            ),
+            "pub fn hello() {}\n",
+        )?;
+        let cargo_home = tempfile::TempDir::new()?;
+        let output = unify(&compiler, cargo_home.path(), &["rail", "unify", "--check"], &[])?;
+        let (_, stderr) = text(&output);
+        assert_eq!(output.status.code(), Some(2), "{stderr}");
+        assert_eq!(
+            stderr.matches("\nerror: ").count() + usize::from(stderr.starts_with("error: ")),
+            1,
+            "{stderr}"
+        );
+        for expected in [
+            "error: the build script of `consumer v0.1.0` cannot run `rail-fixture-cc`, which is not installed",
+            "help: install `rail-fixture-cc`, or point the build script at an installed tool \
+             (the build script declares that it reads `CC`)",
+            "reproduce with Cargo: cd ",
+        ] {
+            assert!(stderr.contains(expected), "missing `{expected}`:\n{stderr}");
+        }
+        // A tool chosen through the environment is named by its variable, never its value.
+        let private = "d6-private-compiler-path";
+        let json = unify(
+            &compiler,
+            cargo_home.path(),
+            &["rail", "unify", "--check", "--format", "json"],
+            &[("CC", private)],
+        )?;
+        let (json_stdout, json_stderr) = text(&json);
+        let value: serde_json::Value = serde_json::from_str(&json_stdout).context("one JSON value")?;
+        assert_eq!(value["failure_class"], "build_script", "{value:#}");
+        assert!(
+            value["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("cannot run `<env:CC>`")),
+            "{value:#}"
+        );
+        assert!(
+            !json_stdout.contains(private) && !json_stderr.contains(private),
+            "{json_stdout}\n{json_stderr}"
+        );
+
+        let generated = consumer_workspace(
+            None,
+            "pub static DATA: &[u8] = include_bytes!(\"../generated/data.bin\");\n",
+        )?;
+        let output = unify(&generated, cargo_home.path(), &["rail", "unify", "--check"], &[])?;
+        let (_, stderr) = text(&output);
+        assert_eq!(output.status.code(), Some(2), "{stderr}");
+        for expected in [
+            "error: `consumer` (lib `consumer`) reads `crates/consumer/generated/data.bin`, which does not exist",
+            "help: create or generate `crates/consumer/generated/data.bin` before running Unify, \
+             the same way your build does; Unify compiles the checkout as it is",
+        ] {
+            assert!(stderr.contains(expected), "missing `{expected}`:\n{stderr}");
+        }
+        assert_eq!(
+            stderr.matches("error: couldn't read").count(),
+            1,
+            "the lib and lib-test compilations report one error:\n{stderr}"
+        );
+        let json = unify(
+            &generated,
+            cargo_home.path(),
+            &["rail", "unify", "--check", "--format", "json"],
+            &[],
+        )?;
+        let value: serde_json::Value = serde_json::from_slice(&json.stdout).context("one JSON value")?;
+        assert_eq!(value["failure_class"], "source", "{value:#}");
+        Ok(())
+    })();
+    crate::helpers::finish_test(result);
+}
+
+/// A repository wrapper relays stderr as it arrives and captures the JSON result from stdout.
+/// Progress must reach the wrapper's caller while Cargo-Rail still runs.
+#[cfg(unix)]
+#[test]
+fn a_repository_wrapper_relays_progress_and_captures_the_result() {
+    let result: Result<()> = (|| {
+        let ws = consumer_workspace(
+            Some("fn main() { std::thread::sleep(std::time::Duration::from_secs(4)); }\n"),
+            "pub fn hello() {}\n",
+        )?;
+        let cargo_home = tempfile::TempDir::new()?;
+        let wrapper = ws.path.join("target/unify-wrapper.sh");
+        fs::create_dir_all(wrapper.parent().context("wrapper directory")?)?;
+        fs::write(
+            &wrapper,
+            "#!/usr/bin/env bash\nset -uo pipefail\n\"$CARGO_RAIL\" rail unify --check --format json > \"$RESULT\"\n\
+             status=$?\necho \"wrapper: unify exited $status\" >&2\nexit \"$status\"\n",
+        )?;
+        let result_file = ws.path.join("target/unify.json");
+        // Run the wrapper with the same isolated environment as a direct Cargo-Rail command.
+        let template = cargo_rail_command(&ws.path)?;
+        let mut command = std::process::Command::new("bash");
+        for (name, value) in template.get_envs() {
+            match value {
+                Some(value) => command.env(name, value),
+                None => command.env_remove(name),
+            };
+        }
+        let mut child = command
+            .arg(&wrapper)
+            .current_dir(&ws.path)
+            .env("CARGO_HOME", cargo_home.path())
+            .env("CARGO_RAIL", template.get_program())
+            .env("RESULT", &result_file)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut stderr = BufReader::new(child.stderr.take().context("stderr pipe")?);
+        let mut seen = String::new();
+        loop {
+            let mut line = String::new();
+            ensure!(stderr.read_line(&mut line)? > 0, "no progress before exit:\n{seen}");
+            seen.push_str(&line);
+            if line.contains("Compiler acquisition progress:") {
+                break;
+            }
+        }
+        ensure!(
+            child.try_wait()?.is_none(),
+            "progress arrived only after Cargo-Rail finished:\n{seen}"
+        );
+        std::io::Read::read_to_string(&mut stderr, &mut seen)?;
+        let output = child.wait_with_output()?;
+        // `--check` exits 1: the fixture's `helper` dependency is unused.
+        assert_eq!(output.status.code(), Some(1), "{seen}");
+        assert!(output.stdout.is_empty(), "the wrapper's own stdout stays free");
+        assert!(seen.contains("wrapper: unify exited 1"), "{seen}");
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&result_file)?).context("the captured result is one JSON value")?;
+        assert!(value.is_object(), "{value:#}");
+        Ok(())
+    })();
+    crate::helpers::finish_test(result);
+}
+
+/// A native dependency built for a configured foreign compiler target needs that target's
+/// C compiler, which the host lacks. The cause names the tool and the view's target.
+#[test]
+fn a_foreign_compiler_target_names_its_missing_cross_compiler() {
+    let result: Result<()> = (|| {
+        let host = crate::helpers::rustc_host_target()?;
+        let installed = std::process::Command::new("rustup")
+            .args(["target", "list", "--installed"])
+            .output()?;
+        let installed = String::from_utf8(installed.stdout)?;
+        let target = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+            .into_iter()
+            .find(|target| *target != host && installed.lines().any(|line| line == *target))
+            .context("install a foreign Linux target: rustup target add x86_64-unknown-linux-gnu")?;
+        let ws = consumer_workspace(
+            Some(
+                r#"use std::io::Write as _;
+
+// Needs the target's C compiler for a cross build, as the `cc` crate does.
+fn main() {
+    let target = std::env::var("TARGET").unwrap();
+    if target != std::env::var("HOST").unwrap() {
+        let tool = target.replace("-unknown", "") + "-gcc";
+        let message = String::from("error occurred in cc-rs: failed to find tool \"") + &tool + "\": No such file or directory (os error 2)\n";
+        std::io::stderr().write_all(message.as_bytes()).unwrap();
+        std::process::exit(1);
+    }
+}
+"#,
+            ),
+            "pub fn hello() {}\n",
+        )?;
+        fs::write(
+            ws.path.join(".config/rail.toml"),
+            format!("targets = [\"{host}\", \"{target}\"]\n\n[unify]\ncompiler_targets = [\"{target}\"]\n"),
+        )?;
+        ws.commit("Acquire evidence for a foreign target")?;
+        let cargo_home = tempfile::TempDir::new()?;
+        let output = unify(&ws, cargo_home.path(), &["rail", "unify", "--check"], &[])?;
+        let (_, stderr) = text(&output);
+        assert_eq!(output.status.code(), Some(2), "{stderr}");
+        let tool = format!("{}-gcc", target.replace("-unknown", ""));
+        for expected in [
+            format!("error: the build script of `consumer v0.1.0` cannot run `{tool}`, which is not installed"),
+            format!("/ target={target}"),
+            format!("help: install `{tool}`, or point the build script at an installed tool"),
+            "narrow `unify.compiler_targets` to targets this host can build for".to_string(),
+        ] {
+            assert!(stderr.contains(&expected), "missing `{expected}`:\n{stderr}");
+        }
+        Ok(())
+    })();
+    crate::helpers::finish_test(result);
+}

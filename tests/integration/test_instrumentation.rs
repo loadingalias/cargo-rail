@@ -725,11 +725,14 @@ fn unify_compiles_each_shared_dependency_unit_once() {
             "base, shared, and unused compile: {cold:#}"
         );
         assert_eq!(cold["repeated_dependency_compilations"], 0, "{cold:#}");
+        // Budget: 447,519 bytes measured on native macOS arm64 (2026-09-25), with headroom for
+        // platform artifact sizes. Retained outputs or full builds instead of checks exceed it.
+        const PEAK_OWNED_BYTES_BUDGET: u64 = 2 * 1024 * 1024;
         assert!(
             cold["artifact_high_water_bytes"]
                 .as_u64()
-                .is_some_and(|bytes| bytes > 0),
-            "{cold:#}"
+                .is_some_and(|bytes| bytes > 0 && bytes <= PEAK_OWNED_BYTES_BUDGET),
+            "peak owned bytes exceed the {PEAK_OWNED_BYTES_BUDGET}-byte budget: {cold:#}"
         );
 
         let warm = run("warm-shared.json")?;

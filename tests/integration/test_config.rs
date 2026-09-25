@@ -1,7 +1,7 @@
 //! Integration tests for `cargo rail config` commands (locate, print, validate, explain)
 
 use crate::helpers::{TestWorkspace, cargo_rail_command, run_cargo_rail, run_cargo_rail_with_env};
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use std::fs;
 use std::io::Write as _;
 use std::process::Stdio;
@@ -954,6 +954,8 @@ fn discovered_policy_is_rejected_before_git_or_cargo() {
         ws.commit("Add early-validation fixture")?;
         let package = TestWorkspace::new_single_crate("demo", "0.1.0")?;
         let plan = &["rail", "plan", "--since", "HEAD", "--json"][..];
+        // macOS scans a newly linked executable before its first launch; keep that out of the budget.
+        run_cargo_rail_without_tools(&ws.path, &["--version"])?;
         let invocations = [
             (&ws.path, &ws.path, plan),
             (&ws.path, &ws.path, &["rail", "unify", "--check"][..]),
@@ -966,7 +968,15 @@ fn discovered_policy_is_rejected_before_git_or_cargo() {
         ] {
             for (root, cwd, args) in invocations {
                 fs::write(root.join(".config/rail.toml"), input)?;
+                let started = std::time::Instant::now();
                 let output = run_cargo_rail_without_tools(cwd, args)?;
+                // Budget: B1 measured 11-16 ms with no Git or Cargo reachable; the bound
+                // leaves room for a loaded host while catching any subprocess or capture.
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(1),
+                    "{args:?} took {:?} to reject invalid policy",
+                    started.elapsed()
+                );
                 let combined = format!(
                     "{}{}",
                     String::from_utf8_lossy(&output.stdout),
@@ -1127,7 +1137,11 @@ fn removed_release_changelog_entry_gate_is_rejected() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(
-            combined.contains("unknown configuration key 'release.require_changelog_entries'"),
+            combined.contains(
+                "configuration key 'release.require_changelog_entries' was removed in Cargo-Rail 0.29.0; \
+                 `release.require_release_notes` remains the release-prose gate; \
+                 `cargo rail config migrate` previews its removal"
+            ),
             "{combined}"
         );
         Ok(())
@@ -1612,6 +1626,100 @@ fn config_migrate_deletes_a_default_only_file_and_rejects_drift() {
         let applied = run_cargo_rail(&ws.path, &["rail", "config", "migrate", "apply", "--plan", plan])?;
         assert!(applied.status.success(), "{applied:?}");
         assert!(!path.exists(), "a default-only file is deleted");
+        Ok(())
+    })();
+    crate::helpers::finish_test(result);
+}
+
+/// A previous-minor policy file with keys that later releases removed.
+const PREVIOUS_MINOR_POLICY: &str = "# Project policy\n[run]\nprofile = \"ci\"\n\n[release]\n\
+     require_changelog_entries = true\n\n[unify]\ninclude_paths = false\n";
+
+#[test]
+fn removed_configuration_keys_name_their_release_everywhere_and_migrate_away() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("config-retired-keys")?;
+        ws.add_crate("member", "0.1.0", &[])?;
+        let path = ws.path.join(".config/rail.toml");
+        fs::write(&path, PREVIOUS_MINOR_POLICY)?;
+        let base = ws.commit("Previous-minor policy")?;
+
+        let expected = [
+            "configuration key 'release.require_changelog_entries' was removed in Cargo-Rail 0.29.0; \
+             `release.require_release_notes` remains the release-prose gate; \
+             `cargo rail config migrate` previews its removal",
+            "configuration key 'run' was removed in Cargo-Rail 0.22.0",
+        ];
+        for arguments in [
+            &["rail", "unify", "--check"][..],
+            &["rail", "config", "validate", "--strict"][..],
+        ] {
+            let output = run_cargo_rail(&ws.path, arguments)?;
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.status.code(), Some(2), "{arguments:?}: {text}");
+            for message in expected {
+                assert!(text.contains(message), "{arguments:?} omits `{message}`:\n{text}");
+            }
+            assert!(
+                text.contains(".config/rail.toml"),
+                "{arguments:?} names the file:\n{text}"
+            );
+        }
+
+        let preview = run_cargo_rail(&ws.path, &["rail", "config", "migrate", "-f", "json"])?;
+        assert!(preview.status.success(), "{preview:?}");
+        let value: serde_json::Value = serde_json::from_slice(&preview.stdout)?;
+        let retired = value["removed"]
+            .as_array()
+            .context("removed settings")?
+            .iter()
+            .filter_map(|setting| Some((setting["path"].as_str()?, setting["removed_in"].as_str()?)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            retired,
+            [("release.require_changelog_entries", "0.29.0"), ("run", "0.22.0")],
+            "{value:#}"
+        );
+        let applied = run_cargo_rail(&ws.path, &["rail", "config", "migrate", "apply"])?;
+        assert!(applied.status.success(), "{applied:?}");
+        assert_eq!(
+            fs::read_to_string(&path)?,
+            "# Project policy\n\n[unify]\ninclude_paths = false\n"
+        );
+        let validated = run_cargo_rail(&ws.path, &["rail", "config", "validate", "--strict"])?;
+        assert!(validated.status.success(), "{validated:?}");
+
+        // Planning the migration compares against a base whose policy still has retired keys.
+        ws.commit("Migrate policy")?;
+        let planned = run_cargo_rail(&ws.path, &["rail", "plan", "--since", &base, "--json"])?;
+        assert!(planned.status.success(), "{}", String::from_utf8_lossy(&planned.stderr));
+        let plan: serde_json::Value = serde_json::from_slice(&planned.stdout)?;
+        assert_eq!(
+            plan["changes"]["config"],
+            serde_json::json!([]),
+            "retired keys had no policy: {plan:#}"
+        );
+
+        // A key that needs a manual edit is never removed automatically.
+        fs::write(
+            &path,
+            "[crates.member.split]\nremote = \"../member\"\nbranch = \"main\"\nmode = \"single\"\n\
+             paths = [{ crate = \"crates/member\" }]\n",
+        )?;
+        let manual = run_cargo_rail(&ws.path, &["rail", "config", "migrate"])?;
+        let stderr = String::from_utf8_lossy(&manual.stderr);
+        assert_eq!(manual.status.code(), Some(2), "{stderr}");
+        assert!(
+            stderr.contains(
+                "configuration key 'crates.member.split.paths' was removed in Cargo-Rail 0.26.0; \
+                             list the split's Cargo package names in `members`; change it by hand"
+            ),
+            "{stderr}"
+        );
         Ok(())
     })();
     crate::helpers::finish_test(result);

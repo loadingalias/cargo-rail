@@ -381,3 +381,43 @@ fn stale_lockfile_is_the_primary_cause_everywhere_even_with_credentials() {
     })();
     super::helpers::finish_test(result);
 }
+
+#[test]
+fn removed_commands_name_their_release_and_replacement() -> anyhow::Result<()> {
+    let workspace = tempfile::TempDir::new()?;
+    for (arguments, message, help) in [
+        (
+            &["rail", "run"][..],
+            "`cargo rail run` was removed in Cargo-Rail 0.22.0",
+            "run the planner's Cargo arguments with Cargo, cargo-nextest, or Just directly",
+        ),
+        (
+            &["rail", "-q", "release", "finalize"][..],
+            "`cargo rail release finalize` was removed in Cargo-Rail 0.26.0",
+            "`cargo rail release run` completes a release in one transaction",
+        ),
+        (
+            &["graph"][..],
+            "`cargo rail graph` was removed in Cargo-Rail 0.24.0",
+            "there is no direct replacement",
+        ),
+    ] {
+        let output = crate::helpers::run_cargo_rail(workspace.path(), arguments)?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::ensure!(output.status.code() == Some(2), "{arguments:?}: {stderr}");
+        anyhow::ensure!(output.stdout.is_empty(), "{arguments:?}");
+        anyhow::ensure!(stderr.contains(&format!("error: {message}")), "{stderr}");
+        anyhow::ensure!(stderr.contains(&format!("help: {help}")), "{stderr}");
+    }
+    let json = crate::helpers::run_cargo_rail(workspace.path(), &["rail", "--json", "diff-hash"])?;
+    anyhow::ensure!(json.status.code() == Some(2), "unexpected exit status");
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout)?;
+    anyhow::ensure!(
+        value["message"] == "`cargo rail diff-hash` was removed in Cargo-Rail 0.24.0",
+        "{value:#}"
+    );
+    let unknown = crate::helpers::run_cargo_rail(workspace.path(), &["rail", "nope"])?;
+    anyhow::ensure!(unknown.status.code() == Some(2), "unexpected exit status");
+    anyhow::ensure!(String::from_utf8_lossy(&unknown.stderr).contains("unrecognized subcommand 'nope'"));
+    Ok(())
+}

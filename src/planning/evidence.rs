@@ -277,7 +277,7 @@ fn validate(
             "planning evidence is bound to a different target identity".to_string(),
         ));
     }
-    let current_platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+    let current_platform = super::work::host_platform();
     if manifest.platform != current_platform {
         return Err(incompatible(
             "planning_evidence_platform_mismatch",

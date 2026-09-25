@@ -3,6 +3,8 @@
 //! A setting is removed only when removing it leaves the decoded effective policy unchanged,
 //! so the migration compares policy, not TOML text. That prunes explicit current defaults and
 //! legacy spellings of a default, and keeps comments, ordering, and every other setting.
+//! Keys that an earlier release removed have no current meaning and are removed first;
+//! the preview names the release that retired each one.
 
 use serde::Serialize;
 use toml_edit::{DocumentMut, Item, Table};
@@ -17,6 +19,9 @@ pub(crate) struct RemovedSetting {
     pub(crate) path: String,
     /// The removed TOML value, or `table` for an emptied table header.
     pub(crate) value: String,
+    /// The release that retired this key, when the key no longer exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) removed_in: Option<&'static str>,
 }
 
 /// The file content after migration.
@@ -78,10 +83,16 @@ enum Segment {
 /// `deletable` states whether deleting the file leaves the default policy in effect; it is false
 /// when the file was selected explicitly or shadows another discovery candidate.
 pub(crate) fn plan(bytes: &[u8], deletable: bool) -> RailResult<ConfigMigration> {
-    let original = decode(bytes)?;
+    let content = std::str::from_utf8(bytes)
+        .map_err(|error| RailError::message(format!("configuration is not valid UTF-8: {error}")))?;
+    let mut document: DocumentMut = content
+        .parse()
+        .map_err(|error: toml_edit::TomlError| RailError::message(error.to_string()))?;
+    // Retired keys have no current meaning, so removing them cannot change policy.
+    let mut removed = strip_retired(&mut document);
+    let original = decode(document.to_string().as_bytes())?;
     let policy = effective(&original.config)?;
     let mut document = original.document;
-    let mut removed = Vec::new();
 
     for path in leaf_paths(document.as_table()) {
         try_remove(&mut document, &path, &policy, &mut removed)?;
@@ -128,6 +139,41 @@ pub(crate) fn plan(bytes: &[u8], deletable: bool) -> RailResult<ConfigMigration>
         removed_comments,
         file,
     })
+}
+
+/// Delete every removable retired key and report each one.
+pub(crate) fn strip_retired(document: &mut DocumentMut) -> Vec<RemovedSetting> {
+    let mut removed = Vec::new();
+    for path in crate::config::schema::document_paths(document) {
+        let Some((retired, key)) = crate::config::schema::retired_key(&path) else {
+            continue;
+        };
+        if !retired.removable || key != path {
+            continue;
+        }
+        let segments = path
+            .segments()
+            .iter()
+            .map(|segment| Segment::Key(segment.clone()))
+            .collect::<Vec<_>>();
+        let value = item_at(document, &segments).map(|item| {
+            if item.is_table_like() {
+                "table".to_string()
+            } else {
+                item.to_string().trim().to_string()
+            }
+        });
+        if let Some(value) = value
+            && remove_at(document, &segments)
+        {
+            removed.push(RemovedSetting {
+                path: path.to_string(),
+                value,
+                removed_in: Some(retired.removed_in),
+            });
+        }
+    }
+    removed
 }
 
 /// Keep the source's leading comment block, which toml_edit attaches to the first setting.
@@ -180,6 +226,7 @@ fn try_remove(
         removed.push(RemovedSetting {
             path: render(path),
             value,
+            removed_in: None,
         });
     }
     Ok(())

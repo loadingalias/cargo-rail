@@ -103,6 +103,12 @@ It keeps every other setting, comments, and ordering, and removes the header com
 A file containing only defaults is deleted
 when no other discovery location holds a configuration file; otherwise,
 and for a file outside the discovery locations, the emptied file is kept.
+Keys that an earlier release removed, such as `[run]` or `release.require_changelog_entries`, have no current meaning,
+so the migration removes them first and names the release that removed each one;
+the JSON preview marks them with `removed_in`.
+Every other command rejects such a key, names its release and replacement,
+and points to this migration.
+A removed key that needs a manual edit, such as a split's `paths`, is reported but never changed.
 The JSON preview includes `mutation_plan`.
 `apply --plan` accepts that plan, saved to a file, only while the configuration and checkout are unchanged.
 

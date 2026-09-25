@@ -111,6 +111,9 @@ impl LockedPackageIdentity {
 pub struct LockfileSnapshot {
     file: SnapshotFile,
     packages: Vec<LockedPackageIdentity>,
+    /// Resolved dependency edges, aligned with `packages`. `None` when any edge is
+    /// ambiguous or the lockfile keeps checksums outside its package entries.
+    edges: Option<Vec<Vec<usize>>>,
 }
 
 impl LockfileSnapshot {
@@ -122,6 +125,57 @@ impl LockfileSnapshot {
     /// Return locked package identities in deterministic order.
     pub fn packages(&self) -> &[LockedPackageIdentity] {
         &self.packages
+    }
+
+    /// Indices of the locked packages reachable from one package, including itself.
+    ///
+    /// Returns `None` when the package or an edge cannot be resolved exactly.
+    pub(crate) fn closure(&self, name: &str, version: &str, source: Option<&str>) -> Option<BTreeSet<usize>> {
+        let edges = self.edges.as_ref()?;
+        let root = self.packages.iter().position(|package| {
+            package.name == name && package.version == version && package.source.as_deref() == source
+        })?;
+        let mut reached = BTreeSet::from([root]);
+        let mut pending = vec![root];
+        while let Some(index) = pending.pop() {
+            for &dependency in &edges[index] {
+                if reached.insert(dependency) {
+                    pending.push(dependency);
+                }
+            }
+        }
+        Some(reached)
+    }
+
+    /// Identify the locked packages reachable from one package.
+    ///
+    /// Cargo.lock records every dependency edge for every feature and target, so this
+    /// closure contains everything any build of the package can compile. A lockfile
+    /// change outside it cannot change that package's compilation. Returns `None` when
+    /// the package or an edge cannot be resolved exactly; callers then bind the whole file.
+    pub(crate) fn closure_fingerprint(&self, name: &str, version: &str, source: Option<&str>) -> Option<String> {
+        let edges = self.edges.as_ref()?;
+        let reached = self.closure(name, version, source)?;
+        let mut identity = Vec::from(&b"lock-closure-v1\0"[..]);
+        let mut frame = |bytes: &[u8]| {
+            identity.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            identity.extend_from_slice(bytes);
+        };
+        // `packages` is sorted, so ascending indices give a canonical order.
+        for &index in &reached {
+            let package = &self.packages[index];
+            frame(package.name.as_bytes());
+            frame(package.version.as_bytes());
+            frame(package.source.as_deref().unwrap_or_default().as_bytes());
+            frame(package.checksum.as_deref().unwrap_or_default().as_bytes());
+            let mut dependencies = edges[index].clone();
+            dependencies.sort_unstable();
+            frame(&(dependencies.len() as u64).to_le_bytes());
+            for dependency in dependencies {
+                frame(&(dependency as u64).to_le_bytes());
+            }
+        }
+        Some(format!("sha256:{}", ContentDigest::sha256(&identity)))
     }
 }
 
@@ -1200,6 +1254,7 @@ impl LockfileSnapshot {
         struct Document {
             #[serde(default)]
             package: Vec<Package>,
+            metadata: Option<serde::de::IgnoredAny>,
         }
         #[derive(Deserialize)]
         struct Package {
@@ -1207,6 +1262,8 @@ impl LockfileSnapshot {
             version: String,
             source: Option<String>,
             checksum: Option<String>,
+            #[serde(default)]
+            dependencies: Vec<String>,
         }
 
         let text = std::str::from_utf8(file.bytes())
@@ -1217,16 +1274,23 @@ impl LockfileSnapshot {
                 "fix Cargo.lock syntax; raw parser context is suppressed because source URLs may contain credentials",
             )
         })?;
-        let mut packages = document
+        let mut entries = document
             .package
             .into_iter()
-            .map(|package| LockedPackageIdentity {
-                name: package.name,
-                version: package.version,
-                source: package.source,
-                checksum: package.checksum,
+            .map(|package| {
+                (
+                    LockedPackageIdentity {
+                        name: package.name,
+                        version: package.version,
+                        source: package.source,
+                        checksum: package.checksum,
+                    },
+                    package.dependencies,
+                )
             })
             .collect::<Vec<_>>();
+        entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let (packages, dependencies): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
         if let Some(package) = packages
             .iter()
             .find(|package| package.source.as_deref().is_some_and(credential_bearing_url))
@@ -1239,7 +1303,6 @@ impl LockfileSnapshot {
                 "move credentials to Cargo's credential provider and regenerate Cargo.lock with a secret-free source URL",
             ));
         }
-        packages.sort_unstable();
         if let Some(duplicate) = packages.windows(2).find(|pair| {
             pair[0].name == pair[1].name && pair[0].version == pair[1].version && pair[0].source == pair[1].source
         }) {
@@ -1248,8 +1311,46 @@ impl LockfileSnapshot {
                 duplicate[0].name, duplicate[0].version
             )));
         }
-        Ok(Self { file, packages })
+        // Lockfile v1 keeps checksums in `[metadata]`, outside each package entry.
+        let edges = document
+            .metadata
+            .is_none()
+            .then(|| resolve_lock_edges(&packages, &dependencies))
+            .flatten();
+        Ok(Self { file, packages, edges })
     }
+}
+
+/// Resolve Cargo.lock dependency references (`name`, `name version`, or
+/// `name version (source)`) to package indices, or `None` if any is not exact.
+fn resolve_lock_edges(packages: &[LockedPackageIdentity], dependencies: &[Vec<String>]) -> Option<Vec<Vec<usize>>> {
+    let mut by_name = BTreeMap::<&str, Vec<usize>>::new();
+    for (index, package) in packages.iter().enumerate() {
+        by_name.entry(package.name.as_str()).or_default().push(index);
+    }
+    dependencies
+        .iter()
+        .map(|references| {
+            references
+                .iter()
+                .map(|reference| {
+                    let mut parts = reference.splitn(3, ' ');
+                    let name = parts.next()?;
+                    let version = parts.next();
+                    let source = parts
+                        .next()
+                        .map(|source| source.strip_prefix('(')?.strip_suffix(')'))
+                        .map_or(Some(None), |source| source.map(Some))?;
+                    let mut matches = by_name.get(name)?.iter().copied().filter(|&index| {
+                        version.is_none_or(|version| packages[index].version == version)
+                            && source.is_none_or(|source| packages[index].source.as_deref() == Some(source))
+                    });
+                    let found = matches.next()?;
+                    matches.next().is_none().then_some(found)
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+        .collect()
 }
 
 /// Repository-relative manifest and root of every local package, plus each manifest's physical path.
@@ -1562,6 +1663,84 @@ mod tests {
             Some("registry+https://example.invalid/index")
         );
         assert_eq!(snapshot.packages()[0].checksum(), Some("abc123"));
+    }
+
+    fn locked(packages: &[(&str, &str, &str, &[&str])]) -> LockfileSnapshot {
+        let mut text = String::from("version = 4\n");
+        for (name, version, checksum, dependencies) in packages {
+            text.push_str(&format!("\n[[package]]\nname = \"{name}\"\nversion = \"{version}\"\n"));
+            if !checksum.is_empty() {
+                text.push_str(&format!(
+                    "source = \"registry+https://example.invalid/index\"\nchecksum = \"{checksum}\"\n"
+                ));
+            }
+            let dependencies = dependencies
+                .iter()
+                .map(|dependency| format!("\"{dependency}\""))
+                .collect::<Vec<_>>();
+            text.push_str(&format!("dependencies = [{}]\n", dependencies.join(", ")));
+        }
+        LockfileSnapshot::from_file(lockfile(text.as_bytes())).expect("valid lockfile")
+    }
+
+    #[test]
+    fn lock_closure_binds_only_reachable_packages_and_their_edges() {
+        let base = [
+            ("app", "0.1.0", "", &["shared", "a"][..]),
+            ("tool", "0.1.0", "", &["b"][..]),
+            ("shared", "1.0.0", "s1", &[][..]),
+            ("a", "1.0.0", "a1", &[][..]),
+            ("b", "1.0.0", "b1", &[][..]),
+        ];
+        let closure =
+            |packages: &[(&str, &str, &str, &[&str])]| locked(packages).closure_fingerprint("app", "0.1.0", None);
+        let original = closure(&base).expect("exact closure");
+
+        let mut unrelated = base;
+        unrelated[4] = ("b", "1.0.0", "b2", &[][..]);
+        assert_eq!(
+            closure(&unrelated).as_deref(),
+            Some(original.as_str()),
+            "tool's dependency is outside app"
+        );
+
+        let mut checksum = base;
+        checksum[3] = ("a", "1.0.0", "a2", &[][..]);
+        assert_ne!(
+            closure(&checksum).as_deref(),
+            Some(original.as_str()),
+            "a checksum inside the closure"
+        );
+
+        let mut edge = base;
+        edge[2] = ("shared", "1.0.0", "s1", &["b"][..]);
+        assert_ne!(
+            closure(&edge).as_deref(),
+            Some(original.as_str()),
+            "a new edge inside the closure"
+        );
+
+        let ambiguous = [
+            ("app", "0.1.0", "", &["dup"][..]),
+            ("dup", "1.0.0", "d1", &[][..]),
+            ("dup", "2.0.0", "d2", &[][..]),
+        ];
+        assert_eq!(
+            closure(&ambiguous),
+            None,
+            "an ambiguous reference falls back to the whole file"
+        );
+        assert_eq!(locked(&base).closure_fingerprint("missing", "0.1.0", None), None);
+
+        let legacy = LockfileSnapshot::from_file(lockfile(
+            b"[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\n[metadata]\n\"checksum x 1.0.0 (registry+https://example.invalid/index)\" = \"abc\"\n",
+        ))
+        .expect("v1 lockfile");
+        assert_eq!(
+            legacy.closure_fingerprint("app", "0.1.0", None),
+            None,
+            "v1 checksums live outside package entries"
+        );
     }
 
     #[test]

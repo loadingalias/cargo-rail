@@ -141,9 +141,16 @@ fn adjacent_unify_commands_reuse_evidence_with_build_scripts_and_proc_macros() {
         let cold = unify(&ws, &["unify", "--check"], &[])?;
         assert_eq!(cold.status, Some(1), "{}", cold.stderr);
         assert_eq!(cold.cargo_views(), 2, "one view per member on a cold cache");
+        // app reaches app and helper; other reaches other, helper, and marker.
+        assert!(
+            cold.stderr.contains("at most 4 packages to compile"),
+            "the plan estimates cold work before acquiring:\n{}",
+            cold.stderr
+        );
 
         for arguments in [&["unify"][..], &["unify", "--check"][..], &["unify", "--explain"][..]] {
             let warm = unify(&ws, arguments, &[])?;
+            assert!(warm.stderr.contains("nothing to compile"), "{}", warm.stderr);
             assert_eq!(
                 warm.cargo_views(),
                 0,
@@ -499,7 +506,8 @@ fn a_git_dependency_pinned_to_a_commit_keeps_evidence_reusable() {
             warm.value["evidence_cache"]
         );
 
-        // A new upstream commit is a new source identity. The lockfile binds every view.
+        // A new upstream commit is a new source identity. Each view binds only its own
+        // locked closure, so the lockfile change reaches `other` and not `app`.
         fs::write(upstream.path().join("src/lib.rs"), "pub fn value() -> u8 { 2 }\n")?;
         git(upstream.path(), &["commit", "-am", "Change upstream"])?;
         let update = cargo_command(&ws.path)
@@ -509,7 +517,13 @@ fn a_git_dependency_pinned_to_a_commit_keeps_evidence_reusable() {
         ensure!(update.status.success(), "Git dependency update failed: {update:?}");
         ws.commit("Update the Git package")?;
         let updated = unify(&ws, &["unify", "--check"], &environment)?;
-        assert_eq!(updated.cargo_views(), 2, "{}", updated.stderr);
+        assert_eq!(updated.cargo_views(), 1, "only other's view reruns\n{}", updated.stderr);
+        let app = updated.helper_cache("app").context("helper stays unused in app")?;
+        assert_eq!(
+            (app["hits"].as_u64(), app["misses"].as_u64()),
+            (Some(1), Some(0)),
+            "{app:#}"
+        );
         let rewarmed = unify(&ws, &["unify", "--check"], &environment)?;
         assert_eq!(rewarmed.cargo_views(), 0, "{:#}", rewarmed.value["evidence_cache"]);
         Ok(())
@@ -561,6 +575,159 @@ fn a_workspace_below_its_repository_root_reuses_its_evidence() {
             "a nested workspace must reuse its evidence\n{:#}",
             warm.value["evidence_cache"]
         );
+        Ok(())
+    })();
+    crate::helpers::finish_test(result);
+}
+
+/// Every file under `root` whose bytes contain `needle`, relative to `root`.
+fn files_containing(root: &Path, needle: &[u8], skip: &[&str]) -> Result<Vec<String>> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry?.path();
+            let relative = path.strip_prefix(root)?.to_string_lossy().into_owned();
+            if skip.iter().any(|skipped| relative.starts_with(skipped)) {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.is_dir() {
+                pending.push(path);
+            } else if metadata.is_file() && fs::read(&path)?.windows(needle.len()).any(|window| window == needle) {
+                found.push(relative);
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// A build script echoes a declared and an undeclared inherited value into warnings and
+/// `rustc-env`. Neither value may reach any stored evidence, diagnostic, or journal file.
+#[test]
+fn inherited_environment_values_never_enter_stored_evidence() {
+    let result: Result<()> = (|| {
+        let ws = reuse_workspace()?;
+        let build_script = ws.path.join("crates/app/build.rs");
+        let declared = fs::read_to_string(&build_script)?.replacen(
+            "fn main() {\n",
+            "fn main() {\n    println!(\"cargo::rerun-if-env-changed=D6_REGION\");\n    \
+             use std::io::Write as _;\n    \
+             for name in [\"D6_REGION\", \"D6_UNDECLARED\"] {\n        \
+             let line = String::from(\"cargo::warning=\") + name + \"=\" + &std::env::var(name).unwrap_or_default() + \"\\n\";\n        \
+             std::io::stdout().write_all(line.as_bytes()).unwrap();\n    }\n    \
+             let line = String::from(\"cargo::rustc-env=D6_EMBEDDED=\") + &std::env::var(\"D6_UNDECLARED\").unwrap_or_default() + \"\\n\";\n    \
+             std::io::stdout().write_all(line.as_bytes()).unwrap();\n",
+            1,
+        );
+        fs::write(&build_script, declared)?;
+        ws.commit("Declare build-script inputs")?;
+        let values = [
+            ("D6_UNDECLARED", "d6-undeclared-value-51c2"),
+            ("D6_REGION", "d6-region-value-3ab9"),
+        ];
+        let mut runs = Vec::new();
+        for _ in 0..2 {
+            runs.push(unify(&ws, &["unify", "--check"], &values)?);
+        }
+        assert_eq!(
+            runs[1].cargo_views(),
+            0,
+            "both views were stored and reused\n{}",
+            runs[1].stderr
+        );
+        // Positive control: the scan reads stored evidence, which records the build script's input path.
+        let store = ws.path.join("target/cargo-rail-test-cache");
+        ensure!(
+            !files_containing(&store, b"switch.txt", &[])?.is_empty(),
+            "the evidence store records no build-script input; the scan would prove nothing"
+        );
+        for (name, value) in values {
+            let found = files_containing(&ws.path.join("target"), value.as_bytes(), &[])?;
+            assert!(found.is_empty(), "{name}'s value was stored in {found:?}");
+        }
+        Ok(())
+    })();
+    crate::helpers::finish_test(result);
+}
+
+/// A CI cancellation kills the whole process tree with no cleanup handler. The next ordinary
+/// run must recover without manual cleanup and reuse the view that completed first.
+#[cfg(unix)]
+#[test]
+fn a_hard_killed_run_recovers_and_reuses_its_completed_view() {
+    use std::io::BufRead as _;
+    use std::os::unix::process::CommandExt as _;
+
+    let result: Result<()> = (|| {
+        let ws = reuse_workspace()?;
+        fs::write(
+            ws.path.join("crates/other/build.rs"),
+            "fn main() {\n    if std::env::var_os(\"D6_HOLD\").is_some() {\n        \
+             std::thread::sleep(std::time::Duration::from_secs(300));\n    }\n}\n",
+        )?;
+        ws.commit("Let other's build script wait until killed")?;
+
+        let mut child = cargo_rail_command(&ws.path)?
+            .args(["rail", "unify", "--check", "--format", "json"])
+            .env("D6_HOLD", "1")
+            .env_remove("D3_APP_USE_HELPER")
+            .process_group(0)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        let mut stderr = std::io::BufReader::new(child.stderr.take().context("stderr pipe")?);
+        let mut seen = String::new();
+        loop {
+            let mut line = String::new();
+            ensure!(stderr.read_line(&mut line)? > 0, "acquisition ended early:\n{seen}");
+            seen.push_str(&line);
+            if line.contains("Compiler acquisition progress:") && line.contains("active view=other") {
+                break;
+            }
+        }
+        let script = format!("{}.*build-script-build", ws.path.display());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while !std::process::Command::new("pgrep")
+            .args(["-f", &script])
+            .output()?
+            .status
+            .success()
+        {
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "other's build script never started:\n{seen}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        ensure!(
+            seen.contains("completed view=app"),
+            "app must complete before the kill:\n{seen}"
+        );
+        rustix::process::kill_process_group(rustix::process::Pid::from_child(&child), rustix::process::Signal::KILL)?;
+        child.wait()?;
+
+        // No cleanup between runs.
+        let recovered = unify(&ws, &["unify", "--check"], &[])?;
+        assert!(matches!(recovered.status, Some(0 | 1)), "{}", recovered.stderr);
+        assert_eq!(
+            recovered.cargo_views(),
+            1,
+            "only the killed view reruns\n{}",
+            recovered.stderr
+        );
+        let app = recovered.helper_cache("app").context("helper unused in app")?;
+        assert_eq!(
+            (app["hits"].as_u64(), app["misses"].as_u64()),
+            (Some(1), Some(0)),
+            "{app:#}"
+        );
+        let warm = unify(&ws, &["unify", "--check"], &[])?;
+        assert_eq!(warm.cargo_views(), 0, "{}", warm.stderr);
         Ok(())
     })();
     crate::helpers::finish_test(result);

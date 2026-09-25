@@ -74,7 +74,10 @@ Unify never prints their values.
 Text mode shows the last lines of the build script's own stderr under the cause.
 Any exact value of an inherited environment variable in that text appears as `<env:NAME>`.
 Cargo's complete output appears only with `--verbose`, and never when a Cargo credential capability is active.
-JSON errors never contain Cargo or build-script output.
+When a build script reports a missing native tool through the `cc`, `cmake`, or `pkg-config` crates,
+or source reads a file that does not exist, the cause names that tool or file,
+redacted the same way.
+JSON errors contain no other Cargo or build-script output.
 
 Setting `unify.compiler_targets = "none"` runs Unify without compiler evidence.
 Unify then keeps every dependency whose use it cannot prove.
@@ -85,6 +88,16 @@ a `Still running:` line names the phase and whether Cargo-Rail is analyzing, wai
 or waiting for Cargo's file lock.
 A Cargo file-lock wait is reported as soon as Cargo reports it.
 `--quiet` suppresses progress.
+
+A repository wrapper should pass stderr through as it arrives and capture only stdout:
+
+```bash
+cargo rail unify --check --format json > target/unify.json
+```
+
+Progress is plain lines on stderr, written as each event happens, in every output format.
+A wrapper relays it unchanged without parsing it.
+Capturing both streams until the command exits, as `$(cargo rail unify --check 2>&1)` does, hides all progress for the whole run.
 `--diagnostics-file` records each completed phase in `progress_phases`, with its activity, whether Cargo waited for a file lock,
 and its duration.
 

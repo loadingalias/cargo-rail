@@ -14,6 +14,7 @@ mod test_instrumentation;
 mod test_msrv;
 mod test_nested_workspace;
 mod test_output_contracts;
+mod test_output_snapshots;
 mod test_ownership_index;
 mod test_plan;
 mod test_plan_apply;

@@ -986,19 +986,39 @@ fn print_migration_text(report: &MigrationReport, applied: bool) {
         return;
     }
     let verb = if applied { "Removed" } else { "Would remove" };
-    println!(
-        "{path}: {verb} {} setting(s) that restate current defaults:",
-        report.removed.len()
-    );
-    for setting in &report.removed {
-        println!("  - {} = {}", setting.path, setting.value);
+    let (retired, defaults): (Vec<_>, Vec<_>) = report.removed.iter().partition(|setting| setting.removed_in.is_some());
+    if !retired.is_empty() {
+        println!("{path}: {verb} {} key(s) that earlier releases removed:", retired.len());
+        for setting in retired {
+            println!(
+                "  - {} = {} (removed in Cargo-Rail {})",
+                setting.path,
+                setting.value,
+                setting.removed_in.unwrap_or_default()
+            );
+        }
+    }
+    if !defaults.is_empty() {
+        println!(
+            "{path}: {verb} {} setting(s) that restate current defaults:",
+            defaults.len()
+        );
+        for setting in defaults {
+            println!("  - {} = {}", setting.path, setting.value);
+        }
     }
     if !report.removed_comments.is_empty() {
         println!("  - the header comment written by `cargo rail config print`");
     }
     match (&report.content, applied) {
-        (None, false) => println!("Would delete {path}: every setting is a default."),
-        (None, true) => println!("Deleted {path}: every setting was a default."),
+        (None, false) => println!(
+            "Would delete {path}: every setting is a default. \
+             The coded defaults then apply; `cargo rail config explain --all` lists them."
+        ),
+        (None, true) => println!(
+            "Deleted {path}: every setting was a default. \
+             The coded defaults apply; `cargo rail config explain --all` lists them."
+        ),
         (Some(content), false) => println!("Resulting file:\n{content}"),
         (Some(_), true) => {}
     }

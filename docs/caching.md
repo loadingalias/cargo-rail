@@ -34,9 +34,22 @@ cargo rail doctor native-cache
 Setup owns one global `build.rustc-wrapper`, private launcher and worker bytes, and an installation receipt.
 It copies the compiler fact driver
 and driver-source components declared by the build's embedded authority beside the worker.
-Missing or changed declared files beside the invoked Cargo-Rail executable reject setup
-before writes.
+Missing or changed declared files beside the real Cargo-Rail executable,
+after resolving launcher symlinks, reject setup before writes.
 Setup does not build or download these components.
+
+Setup checks the three kinds of components differently:
+
+| Component | Before installation | After installation |
+| --- | --- | --- |
+| Compiler fact driver and its source | Digest against the authority embedded in `cargo-rail` | Digest against the setup receipt |
+| Wrapper and worker | Same Cargo-Rail release as `cargo-rail`, by version query | Digest against the setup receipt |
+| `cargo-rail` itself | Trusted as the invoked executable | Not installed |
+
+The embedded authority protects against a driver built for a different compiler
+or from different source.
+It is not a boundary against someone who can write beside `cargo-rail`, because they can also replace `cargo-rail`.
+Verify the archive before extraction; `cache status` then reports any installed component that changes.
 Native reuse requires an authenticated driver for the selected compiler.
 An installation without embedded component authority, including an ordinary `cargo install`,
 can use an independently authenticated adapter pack.

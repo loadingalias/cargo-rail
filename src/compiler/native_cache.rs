@@ -5233,7 +5233,7 @@ fn private_compiler_environment(name: &OsStr) -> bool {
 }
 
 pub(crate) fn direct_wrapper_executable() -> RailResult<PathBuf> {
-    let cargo_rail_executable = std::env::current_exe()?;
+    let cargo_rail_executable = crate::utils::current_executable()?;
     Ok(cargo_rail_executable
         .parent()
         .map(|directory| directory.join(DIRECT_WRAPPER_NAME))
@@ -5244,7 +5244,7 @@ pub(crate) fn direct_wrapper_executable() -> RailResult<PathBuf> {
 }
 
 pub(crate) fn direct_worker_executable() -> RailResult<PathBuf> {
-    let cargo_rail_executable = std::env::current_exe()?;
+    let cargo_rail_executable = crate::utils::current_executable()?;
     cargo_rail_executable
         .parent()
         .map(|directory| directory.join(DIRECT_WORKER_NAME))
@@ -5255,7 +5255,7 @@ pub(crate) fn direct_worker_executable() -> RailResult<PathBuf> {
 }
 
 pub(crate) fn direct_distributed_worker_executable() -> RailResult<PathBuf> {
-    let cargo_rail_executable = std::env::current_exe()?;
+    let cargo_rail_executable = crate::utils::current_executable()?;
     cargo_rail_executable
         .parent()
         .map(|directory| directory.join(DISTRIBUTED_WORKER_NAME))

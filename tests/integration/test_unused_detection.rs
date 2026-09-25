@@ -7,7 +7,7 @@
 //! This is critical - false positives would cause users to remove deps they need!
 
 use crate::helpers::{TestWorkspace, cargo_command, compiler_evidence_cache, run_cargo_rail, run_cargo_rail_with_env};
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use std::collections::BTreeSet;
 use std::fs;
 
@@ -1422,11 +1422,22 @@ cc = "1"
             !stdout.contains("cc in test-crate"),
             "no build script means build evidence is incomplete\n{stdout}"
         );
+        // A preserved declaration is a decision grouped by reason, not a warning to judge.
+        let preserved = stdout
+            .split_once("Preserved on purpose (")
+            .map(|(_, rest)| rest)
+            .with_context(|| format!("published optional dependency must remain with an explicit reason\n{stdout}"))?;
         assert!(
-            stdout.contains("preserved normal dependency `serde` in `test-crate`"),
-            "published optional dependency must remain with an explicit reason\n{stdout}"
+            preserved.contains("optional activation reachability and compiler evidence are incomplete (")
+                && preserved.contains("    test-crate: serde"),
+            "{stdout}"
         );
-        assert!(stdout.contains("optional activation reachability"), "{stdout}");
+        assert!(
+            !stdout
+                .split_once("Preserved on purpose")
+                .is_some_and(|(before, _)| before.contains("serde: preserved")),
+            "preservation is not listed as an issue\n{stdout}"
+        );
 
         Ok(())
     })();
@@ -2416,6 +2427,68 @@ log = "0.4"
             stderr
         );
 
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn every_edit_class_is_named_and_preservations_group_by_reason() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("unify-grouped-output")?;
+        let manifest = ws.path.join("Cargo.toml");
+        let root = fs::read_to_string(&manifest)?.replace(
+            "members = [\"crates/*\"]",
+            "members = [\"crates/*\"]\nexclude = [\"vendor\"]",
+        );
+        fs::write(&manifest, root)?;
+        for name in ["alpha", "beta", "gamma"] {
+            let package = ws.path.join("vendor").join(name);
+            fs::create_dir_all(package.join("src"))?;
+            fs::write(
+                package.join("Cargo.toml"),
+                format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+            )?;
+            fs::write(package.join("src/lib.rs"), "pub fn value() {}\n")?;
+        }
+        let member = ws.path.join("crates/app");
+        fs::create_dir_all(member.join("src"))?;
+        fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition.workspace = true\nlicense = \"MIT\"\n\n\
+             [dependencies]\nalpha = { path = \"../../vendor/alpha\", optional = true }\n\
+             beta = { path = \"../../vendor/beta\", optional = true }\n\
+             gamma = { path = \"../../vendor/gamma\", optional = true }\n\n\
+             [features]\nextras = [\"dep:alpha\", \"dep:beta\", \"dep:gamma\"]\n",
+        )?;
+        fs::write(member.join("src/lib.rs"), "pub fn value() {}\n")?;
+        let lockfile = std::process::Command::new("cargo")
+            .current_dir(&ws.path)
+            .args(["generate-lockfile", "--offline"])
+            .output()?;
+        anyhow::ensure!(lockfile.status.success(), "{lockfile:?}");
+        ws.commit("Feature-gated dependencies and a restated package field")?;
+        // The default output names every edit class on one screen.
+        let check = run_cargo_rail(&ws.path, &["rail", "unify", "--check"])?;
+        assert_eq!(check.status.code(), Some(1), "{check:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&check.stdout),
+            "Pending: 1 manifest(s).\nPackage fields inherited: license\nNext: cargo rail unify apply\n"
+        );
+        // The explanation keeps each proof, grouped by reason and apart from issues to judge.
+        let explain = run_cargo_rail(&ws.path, &["rail", "unify", "--check", "--explain"])?;
+        let stdout = String::from_utf8_lossy(&explain.stdout);
+        assert!(
+            stdout.contains(
+                "Preserved on purpose (3; no action needed):\n  \
+                 a manifest feature edge references this declaration (3):\n    app: alpha, beta, gamma\n"
+            ),
+            "{stdout}"
+        );
+        assert!(
+            !stdout.contains("Issues detected") && !stdout.contains("Warning ("),
+            "{stdout}"
+        );
         Ok(())
     })();
     super::helpers::finish_test(result);

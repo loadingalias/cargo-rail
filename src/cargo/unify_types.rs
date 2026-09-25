@@ -133,6 +133,8 @@ pub enum UnifyIssueKind {
     General,
     /// A workspace-member cohort would be split across local and registry sources
     WorkspaceMemberCohortSplitRisk,
+    /// A declaration Cargo-Rail kept on purpose; nothing for a maintainer to decide
+    Preserved,
 }
 
 /// Severity level of a unification issue
@@ -142,6 +144,8 @@ pub enum IssueSeverity {
     Error,
     /// Proceeds but with caution
     Warning,
+    /// Records a decision; requires no action
+    Info,
 }
 
 /// Record of a duplicate version that was cleaned up
@@ -611,13 +615,16 @@ impl UnificationPlan {
         s.push_str(&format!("Member edits: {}\n", self.member_edits.len()));
         s.push_str(&format!("Transitive pins: {}\n", self.transitive_pins.len()));
 
-        if !self.issues.is_empty() {
-            s.push_str(&format!("\nIssues requiring attention: {}\n", self.issues.len()));
-            for issue in &self.issues {
-                let kind_suffix = if issue.kind == UnifyIssueKind::General {
-                    ""
-                } else {
-                    " [WorkspaceMemberCohortSplitRisk]"
+        let (preserved, attention): (Vec<_>, Vec<_>) = self
+            .issues
+            .iter()
+            .partition(|issue| issue.kind == UnifyIssueKind::Preserved);
+        if !attention.is_empty() {
+            s.push_str(&format!("\nIssues requiring attention: {}\n", attention.len()));
+            for issue in attention {
+                let kind_suffix = match issue.kind {
+                    UnifyIssueKind::WorkspaceMemberCohortSplitRisk => " [WorkspaceMemberCohortSplitRisk]",
+                    UnifyIssueKind::General | UnifyIssueKind::Preserved => "",
                 };
                 s.push_str(&format!(
                     "  - [{}]{} {}: {}\n",
@@ -631,6 +638,12 @@ impl UnificationPlan {
                     issue.message
                 ));
             }
+        }
+        if !preserved.is_empty() {
+            s.push_str(&format!(
+                "\nPreserved on purpose: {} declarations (see --explain)\n",
+                preserved.len()
+            ));
         }
 
         // Show computed MSRV if available

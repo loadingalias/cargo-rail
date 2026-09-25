@@ -1,7 +1,8 @@
 //! Reduce a failed compiler-evidence Cargo view to one safe cause and one recovery.
 //!
-//! The message, recovery, and machine output never contain Cargo or build-script output.
-//! Text mode adds bounded detail after the cause: rendered compiler errors, the last lines
+//! The message, recovery, and machine output never contain Cargo or build-script output,
+//! except one missing tool name or source path parsed from a fixed pattern, bounded to
+//! path-safe characters and redacted like the detail. Text mode adds bounded detail after the cause: rendered compiler errors, the last lines
 //! of a failing build script's own stderr, and, with `--verbose`, Cargo's stderr unless a
 //! Cargo credential capability is configured. Every exact value of an inherited environment
 //! variable in that detail is replaced with `<env:NAME>`.
@@ -20,6 +21,8 @@ const MAX_ENVIRONMENT_NAMES: usize = 8;
 /// Build-script stderr lines retained in text output.
 const MAX_BUILD_SCRIPT_LINES: usize = 20;
 const MAX_BUILD_SCRIPT_BYTES: usize = 2 * 1024;
+/// Longest tool name or path accepted into a message.
+const MAX_NAMED_INPUT_BYTES: usize = 128;
 /// Shorter environment values are too common to identify an inherited value.
 const MIN_REDACTED_VALUE_BYTES: usize = 8;
 /// Location variables whose values appear in ordinary paths and are not secrets.
@@ -66,7 +69,12 @@ enum Cause {
     MissingTargetLibrary,
     MissingLinker(String),
     CompilerProbe,
-    BuildScript { package: String, environment: Vec<String> },
+    BuildScript {
+        package: String,
+        environment: Vec<String>,
+        missing_tool: Option<String>,
+    },
+    MissingSourceFile(String),
     Source,
     Unclassified,
 }
@@ -145,7 +153,11 @@ pub(crate) fn classify(view: &FailedView<'_>) -> RailError {
             .collect(),
             cargo_detail(),
         ),
-        Cause::BuildScript { package, environment } => {
+        Cause::BuildScript {
+            package,
+            environment,
+            missing_tool,
+        } => {
             let reads = if environment.is_empty() {
                 String::new()
             } else {
@@ -158,16 +170,47 @@ pub(crate) fn classify(view: &FailedView<'_>) -> RailError {
                         .join(", ")
                 )
             };
+            let missing_tool = missing_tool.map(|tool| redact_environment(&tool, std::env::vars_os()));
             (
                 FailureClass::BuildScript,
-                format!("the build script of `{package}` failed in compiler evidence view `{view_label}`"),
-                std::iter::once(format!(
-                    "provide the native tools, files, or environment that this build script requires{reads}"
-                ))
-                .chain(std::iter::once(without_evidence.to_string()))
+                match &missing_tool {
+                    Some(tool) => format!(
+                        "the build script of `{package}` cannot run `{tool}`, which is not installed \
+                         (compiler evidence view `{view_label}`)"
+                    ),
+                    None => format!("the build script of `{package}` failed in compiler evidence view `{view_label}`"),
+                },
+                std::iter::once(match &missing_tool {
+                    Some(tool) => format!("install `{tool}`, or point the build script at an installed tool{reads}"),
+                    None => format!(
+                        "provide the native tools, files, or environment that this build script requires{reads}"
+                    ),
+                })
+                .chain(std::iter::once(match view.platform {
+                    // A cross build needs native tools for its target, which this host may lack.
+                    "default" => without_evidence.to_string(),
+                    _ => format!(
+                        "narrow `unify.compiler_targets` to targets this host can build for, {without_evidence}"
+                    ),
+                }))
                 .chain(verbose_hint.clone().map(str::to_string))
                 .collect(),
                 build_script_detail(),
+            )
+        }
+        Cause::MissingSourceFile(path) => {
+            let path = redact_environment(&path, std::env::vars_os());
+            (
+                FailureClass::Source,
+                format!(
+                    "{} reads `{path}`, which does not exist (compiler evidence view `{view_label}`)",
+                    view.error_targets.join(", ")
+                ),
+                vec![format!(
+                    "create or generate `{path}` before running Unify, the same way your build does; \
+                     Unify compiles the checkout as it is"
+                )],
+                (!diagnostics.is_empty()).then(|| head(&diagnostics.join("\n"), MAX_DIAGNOSTIC_BYTES)),
             )
         }
         Cause::Source => (
@@ -265,6 +308,15 @@ fn cause(stderr: &str, diagnostics: &[String], error_targets: &[String]) -> Caus
         {
             return Cause::MissingLinker(linker.to_string());
         }
+        // The OS wording varies; error 2 is "not found" on every supported platform.
+        if let Some(path) = first
+            .strip_prefix("error: couldn't read `")
+            .and_then(|rest| rest.split_once("`: "))
+            .filter(|(_, reason)| reason.ends_with("(os error 2)"))
+            .and_then(|(path, _)| named_input(path))
+        {
+            return Cause::MissingSourceFile(lexically_normal(&path));
+        }
     }
     if let Some(package) = stderr.lines().find_map(|line| {
         line.strip_prefix("error: failed to run custom build command for `")?
@@ -274,6 +326,7 @@ fn cause(stderr: &str, diagnostics: &[String], error_targets: &[String]) -> Caus
         return Cause::BuildScript {
             package,
             environment: build_script_environment(stderr),
+            missing_tool: build_script_stderr(stderr).as_deref().and_then(missing_tool),
         };
     }
     // Cargo probes `rustc -vV` through the configured wrapper before compiling anything.
@@ -288,6 +341,48 @@ fn cause(stderr: &str, diagnostics: &[String], error_targets: &[String]) -> Caus
         return Cause::Source;
     }
     Cause::Unclassified
+}
+
+/// A native tool that a build script reported as not installed, from the messages of the
+/// `cc`, `cmake`, and `pkg-config` crates that most build scripts use.
+fn missing_tool(stderr: &str) -> Option<String> {
+    stderr.lines().find_map(|line| {
+        if let Some(rest) = line.split_once("failed to find tool \"").map(|(_, rest)| rest) {
+            return rest.split_once('"').and_then(|(tool, _)| named_input(tool));
+        }
+        if let Some(rest) = line.split_once("is `").map(|(_, rest)| rest)
+            && let Some((tool, _)) = rest.split_once("` not installed?")
+        {
+            return named_input(tool);
+        }
+        line.contains("The pkg-config command could not be found")
+            .then(|| "pkg-config".to_string())
+    })
+}
+
+/// Accept a tool name or path into a message only when it is short and path-safe.
+fn named_input(value: &str) -> Option<String> {
+    (!value.is_empty()
+        && value.len() <= MAX_NAMED_INPUT_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-+/\\:".contains(&byte)))
+    .then(|| value.to_string())
+}
+
+/// Remove `.` and `name/..` components without touching the filesystem.
+fn lexically_normal(path: &str) -> String {
+    let mut parts = Vec::<&str>::new();
+    for part in path.split('/') {
+        match part {
+            "." => {}
+            ".." if parts.last().is_some_and(|last| !last.is_empty() && *last != "..") => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    parts.join("/")
 }
 
 /// `name v1.2.3 (path+file:///...)` becomes `name v1.2.3`.
@@ -321,8 +416,12 @@ fn build_script_environment(stderr: &str) -> Vec<String> {
         .collect()
 }
 
-/// Rendered error diagnostics from Cargo's JSON messages.
+/// Rendered error diagnostics from Cargo's JSON messages, each distinct one once.
+///
+/// `--all-targets` compiles a library for both its lib and test targets, so the same
+/// error can arrive twice.
 fn compiler_errors(stdout: &[u8]) -> Vec<String> {
+    let mut seen = BTreeSet::new();
     String::from_utf8_lossy(stdout)
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
@@ -333,6 +432,7 @@ fn compiler_errors(stdout: &[u8]) -> Vec<String> {
                 .or_else(|| event["message"]["message"].as_str())
                 .map(|rendered| rendered.trim_end().to_string())
         })
+        .filter(|rendered| seen.insert(rendered.clone()))
         .collect()
 }
 
@@ -490,6 +590,90 @@ Caused by:
         assert_eq!(
             build_script_stderr("error: failed to run custom build command for `a`\n  --- stderr\n\n"),
             None
+        );
+    }
+
+    #[test]
+    fn missing_native_tools_and_files_are_named_only_from_fixed_patterns() {
+        assert_eq!(
+            missing_tool(
+                "error occurred in cc-rs: failed to find tool \"aarch64-linux-gnu-gcc\": No such file or directory (os error 2)"
+            ),
+            Some("aarch64-linux-gnu-gcc".to_string())
+        );
+        assert_eq!(
+            missing_tool(
+                "failed to execute command: No such file or directory (os error 2)\nis `cmake` not installed?"
+            ),
+            Some("cmake".to_string())
+        );
+        assert_eq!(
+            missing_tool("The pkg-config command could not be found."),
+            Some("pkg-config".to_string())
+        );
+        assert_eq!(missing_tool("error: SECRET_TOKEN=hunter2"), None);
+        assert_eq!(
+            missing_tool("failed to find tool \"cc; rm -rf /\": x"),
+            None,
+            "unsafe characters"
+        );
+        assert_eq!(named_input(&"a".repeat(MAX_NAMED_INPUT_BYTES + 1)), None);
+        assert_eq!(
+            lexically_normal("crates/a/src/../generated/data.bin"),
+            "crates/a/generated/data.bin"
+        );
+        assert_eq!(lexically_normal("../outside/./x"), "../outside/x");
+
+        let arguments = arguments();
+        let targets = vec!["a (lib)".to_string()];
+        let missing = message(
+            "error: couldn't read `a/src/../generated/data.bin`: No such file or directory (os error 2)\n --> a/src/lib.rs:1:26\n",
+        );
+        let twice = format!("{missing}\n{missing}\n");
+        let error = classify(&view(twice.as_bytes(), b"", &targets, &arguments));
+        let failure = error.classified().expect("classified");
+        assert_eq!(failure.class(), FailureClass::Source);
+        assert!(
+            error
+                .to_string()
+                .starts_with("a (lib) reads `a/generated/data.bin`, which does not exist"),
+            "{error}"
+        );
+        assert!(
+            error
+                .help_message()
+                .expect("recovery")
+                .starts_with("create or generate `a/generated/data.bin`"),
+            "{error:?}"
+        );
+        let detail = failure.detail().expect("diagnostics");
+        assert_eq!(
+            detail.matches("couldn't read").count(),
+            1,
+            "identical errors appear once:\n{detail}"
+        );
+
+        let stderr = BUILD_SCRIPT.replace(
+            "error: SECRET_TOKEN=hunter2",
+            "error occurred in cc-rs: failed to find tool \"rail-fixture-cc\": No such file or directory (os error 2)",
+        );
+        let error = classify(&view(b"", stderr.as_bytes(), &[], &arguments));
+        assert_eq!(
+            error.classified().expect("classified").class(),
+            FailureClass::BuildScript
+        );
+        assert!(
+            error
+                .to_string()
+                .starts_with("the build script of `a v0.1.0` cannot run `rail-fixture-cc`, which is not installed"),
+            "{error}"
+        );
+        assert!(
+            error
+                .help_message()
+                .expect("recovery")
+                .starts_with("install `rail-fixture-cc`, or point the build script at an installed tool (the build script declares that it reads `CC_aarch64`, `NATIVE_SDK_ROOT`)"),
+            "{error:?}"
         );
     }
 

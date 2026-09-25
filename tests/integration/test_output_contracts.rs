@@ -244,7 +244,10 @@ fn test_removed_top_level_run_is_rejected_during_cli_parsing() {
         assert_eq!(output.status.code(), Some(2));
         assert!(output.stdout.is_empty());
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("unrecognized subcommand 'run'"), "{stderr}");
+        assert!(
+            stderr.contains("error: `cargo rail run` was removed in Cargo-Rail 0.22.0"),
+            "{stderr}"
+        );
 
         Ok(())
     })();

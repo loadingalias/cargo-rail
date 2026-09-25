@@ -39,7 +39,9 @@ The release workflow packages these native archives:
    Keep all files in its `cargo-rail/` directory together, including the compiler driver, source bundle, helpers,
    and component manifest.
    On Unix, preserve executable permissions.
-1. Add that directory to `PATH`, then run `cargo rail --version` to confirm the selected installation.
+1. Add that directory to `PATH`, or link `cargo-rail` from a directory already on `PATH`.
+   Cargo-Rail finds its components beside the real file.
+   Run `cargo rail --version` to confirm the selected installation.
 
 Each check proves something different.
 `SHA256SUMS` comes from the same release as the archive,
@@ -64,6 +66,34 @@ When the workspace-selected rustup toolchain lacks `rustc-dev`, Surface preparat
 non-rustup toolchains require the matching compiler development files to be present already.
 
 Before replacing an older cache installation, read the [cache upgrade and recovery instructions](docs/troubleshooting.md#compiler-reuse-did-not-happen).
+
+### Installation paths
+
+| Path | Provides | Rust needed to install |
+| --- | --- | --- |
+| Native archive | CLI, remote cache providers, authenticated compiler driver and its source | None |
+| `cargo binstall cargo-rail` | Prebuilt CLI only | None |
+| `cargo install cargo-rail --locked` | CLI without remote cache providers; add `--features s3,azure` | Cargo-Rail's `rust-version` or newer |
+| GitHub Action (planner, `setup`, `cache`) | Authenticated archive components for the version in the Action's lock | None |
+| Compiler adapter pack | A compiler driver for installations without one | The exact compiler it serves |
+
+Install one exact version with `cargo install cargo-rail --locked --version X.Y.Z`, then confirm it with `cargo rail --version`.
+
+Three Rust versions stay separate:
+
+- **Cargo-Rail's build version.**
+  A source install needs at least the `rust-version` in Cargo-Rail's manifest.
+  Prebuilt archives and the Action need no Rust to install Cargo-Rail.
+- **The workspace toolchain.**
+  Cargo-Rail runs the Cargo and rustc that your workspace selects, such as through `rust-toolchain.toml`.
+  Your MSRV does not have to match Cargo-Rail's build version.
+- **Compiler driver compilers.**
+  The archive's driver matches the exact compiler that built the release.
+  For another workspace compiler,
+  Cargo-Rail builds the authenticated driver source or an adapter pack with that exact compiler,
+  which needs its `rustc-dev` component.
+  A pack sets a minimum compiler release and no maximum.
+  Without a working driver, compiler work runs normally without reuse, and Surface fails.
 
 ## Start here
 
@@ -268,6 +298,8 @@ Do not provide remote credentials to untrusted jobs.
 Use `read` for trusted jobs that must not publish, and grant `read-write` only to trusted seed jobs.
 The Action exposes typed root portability and an optional strict authenticated provider probe.
 See the [Action guide](https://github.com/loadingalias/cargo-rail-action).
+To match CI locally, install the version that the Action's `version` output reports,
+as shown in [installation paths](#installation-paths).
 
 ## Carry release intent through the workflow
 

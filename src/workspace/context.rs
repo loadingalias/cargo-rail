@@ -446,6 +446,7 @@ impl WorkspaceContext {
             ContextCapture::Planning,
             mapped_config.as_deref(),
             Some(&materialized_requested_root),
+            crate::config::RetiredKeys::Reject,
         )
         .map_err(|error| {
             error.context(format!(
@@ -497,7 +498,28 @@ impl WorkspaceContext {
     }
 
     fn build_inner(workspace_root: &Path, capture: ContextCapture, config_override: Option<&Path>) -> RailResult<Self> {
-        Self::build_inner_at(workspace_root, capture, config_override, None)
+        Self::build_inner_at(
+            workspace_root,
+            capture,
+            config_override,
+            None,
+            crate::config::RetiredKeys::Reject,
+        )
+    }
+
+    /// Capture a snapshot whose policy may still contain keys an earlier release removed,
+    /// so `config migrate` can preview and apply their removal.
+    pub(crate) fn build_for_config_migration(
+        workspace_root: &Path,
+        config_override: Option<&Path>,
+    ) -> RailResult<Self> {
+        Self::build_inner_at(
+            workspace_root,
+            ContextCapture::Snapshot,
+            config_override,
+            None,
+            crate::config::RetiredKeys::Strip,
+        )
     }
 
     fn build_inner_at(
@@ -505,6 +527,7 @@ impl WorkspaceContext {
         capture: ContextCapture,
         config_override: Option<&Path>,
         cargo_current_dir: Option<&Path>,
+        retired: crate::config::RetiredKeys,
     ) -> RailResult<Self> {
         let process_current_dir = std::env::current_dir().map_err(|error| {
             RailError::message(format!("failed to determine Cargo metadata current directory: {error}"))
@@ -531,6 +554,7 @@ impl WorkspaceContext {
         let config_preflight = ConfigPreflight::capture(
             workspace_root,
             config_override.map(|path| resolve_config_override(&requested_workspace_root, path)),
+            retired,
         )?;
 
         // Load git state when available. Cargo-only commands such as `unify --check`
@@ -653,7 +677,7 @@ impl WorkspaceContext {
 
         // Retain the exact checked bytes for snapshot coherence.
         let (config, rail_config, rail_config_discovery_root, captured_config_path) =
-            match config_preflight.resolve(&workspace_root)? {
+            match config_preflight.resolve(&workspace_root, retired)? {
                 Some(CheckedConfig { path, bytes, config }) => {
                     let parsed = Arc::new(config);
                     (

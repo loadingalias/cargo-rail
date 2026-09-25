@@ -58,6 +58,14 @@ variant_catalog = "variants.json"
 | `cargo`      | Typed package and target selection      | Pass the emitted Cargo arguments to a compatible command |
 | `variants`   | Selected catalog rows or explicit `all` | Materialize only the emitted workflow variants |
 
+Give each command's configuration files their own work item.
+List the files each command reads, such as a test-runner or formatter configuration,
+and route only the jobs that run that command on that item.
+One broad work item that lists every configuration file runs every job when any one of them changes.
+Built-in Cargo work already covers manifests, lockfiles, Cargo configuration, and the toolchain;
+do not repeat them.
+Check the routes with [`cargo rail plan --cases`](#check-route-parity-before-a-migration).
+
 `cargo` subscriptions inherit the selected built-in Cargo scope.
 A changed declared path adds its package scope.
 A changed configuration input widens the declared work to the Cargo workspace
@@ -163,6 +171,14 @@ Comparing `HEAD` alone is insufficient; drift exits `2` before selectors are emi
 Readers that already captured a plan use `cargo rail plan --verify -` and pass those exact bytes on standard input
 so verification cannot reopen a different pathname.
 
+Verification binds the plan to the current platform, Cargo configuration, toolchain, workspace,
+and source.
+Another platform's `required` list can route a job,
+but only a plan created on the job's platform passes verification there.
+The checkout can move: the same commit at another path verifies,
+but another workspace in the same repository does not.
+Store a transferred plan outside the checkout; an unignored plan file inside it is untracked drift.
+
 ## Observed-input evidence
 
 Pass compatible evidence explicitly:
@@ -211,3 +227,51 @@ CLI `--explain` includes the complete selected scope.
 
 Cargo-Rail emits and verifies v9 plans.
 Regenerate older saved plans and use a companion Action that independently validates v9 attribution.
+
+## Check route parity before a migration
+
+Before you replace path filters or another CI selector,
+record the routes you expect and compare them with the planner:
+
+```toml
+[[case]]
+name = "test runner configuration"
+change = [".config/nextest.toml"]
+required = ["test-runner"]
+skipped = ["format-config"]
+
+[[case]]
+name = "unrelated file"
+change = ["notes/new.txt"]
+required = ["cargo.test"]
+```
+
+```bash
+cargo rail plan --cases routes.toml
+```
+
+Each case appends `append` (default: one newline) to each repository-relative `change` path, or creates the file.
+Cargo-Rail writes the result as an unreferenced commit on top of `HEAD` and plans it in object mode.
+The worktree, index, refs, and untracked files do not change and do not affect a case.
+`required` fails when the work is skipped, and names the missing work ID.
+`skipped` fails when the work is required.
+Set `precise = true` to fail when expected work is required only by conservative expansion.
+The report lists every decision as `direct` or `expanded: incomplete evidence`, and the reasons for each expansion.
+The command exits `1` when a case fails and `2` when the case file is invalid; it has no JSON output.
+
+A passing case is diagnostic.
+It never becomes evidence that work can be skipped.
+Without compatible portable evidence, an unrelated file can still widen Cargo work,
+because compiler macros, build scripts, and procedural macros can read repository files.
+Record that expansion as a limitation, not as a routing failure to work around with path patterns.
+
+Each check proves one claim:
+
+| Command                                  | Proves |
+| ---------------------------------------- | ------ |
+| `cargo rail config validate --strict`    | Policy is valid for this workspace's Cargo graph. |
+| `cargo rail plan --all --json`           | Every registered work item has valid full scope. It proves no routing decision. |
+| `cargo rail plan --cases FILE`           | The reviewed path cases route as expected from `HEAD`. |
+| `cargo rail plan --explain-work WORK_ID` | Why one work item was required or skipped, including its paths and evidence. |
+
+Start with `--explain-work` when one job runs or skips unexpectedly.

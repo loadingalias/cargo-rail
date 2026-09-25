@@ -682,6 +682,79 @@ pub fn field_consumers(path: &str) -> &'static [&'static str] {
     }
 }
 
+/// A configuration key that an earlier release removed.
+#[derive(Debug)]
+pub(crate) struct RetiredKey {
+    /// Dotted path; `<name>` matches any one key.
+    pub(crate) path: &'static str,
+    pub(crate) removed_in: &'static str,
+    /// What replaces it, or why nothing does.
+    pub(crate) instead: &'static str,
+    /// Whether `config migrate` deletes it without changing effective policy.
+    pub(crate) removable: bool,
+}
+
+/// Keys that earlier releases removed, so upgrades name the release and the action.
+pub(crate) const RETIRED_KEYS: &[RetiredKey] = &[
+    RetiredKey {
+        path: "run",
+        removed_in: "0.22.0",
+        instead: "Cargo, cargo-nextest, Just, or CI now run commands; configuration holds no commands",
+        removable: true,
+    },
+    RetiredKey {
+        path: "change_detection",
+        removed_in: "0.24.0",
+        instead: "register repository work as `[plan.work.NAME]` with `paths`",
+        removable: true,
+    },
+    RetiredKey {
+        path: "release.publish_delay",
+        removed_in: "0.26.0",
+        instead: "it had no effect",
+        removable: true,
+    },
+    RetiredKey {
+        path: "release.require_clean",
+        removed_in: "0.26.0",
+        instead: "it had no effect",
+        removable: true,
+    },
+    RetiredKey {
+        path: "release.require_changelog_entries",
+        removed_in: "0.29.0",
+        instead: "`release.require_release_notes` remains the release-prose gate",
+        removable: true,
+    },
+    RetiredKey {
+        path: "crates.<name>.split.paths",
+        removed_in: "0.26.0",
+        instead: "list the split's Cargo package names in `members`",
+        removable: false,
+    },
+];
+
+/// The retired key at or above `path`, with the concrete path of that key.
+pub(crate) fn retired_key(path: &ConfigPath) -> Option<(&'static RetiredKey, ConfigPath)> {
+    RETIRED_KEYS.iter().find_map(|retired| {
+        let pattern = retired.path.split('.').collect::<Vec<_>>();
+        let segments = path.segments();
+        (segments.len() >= pattern.len()
+            && pattern
+                .iter()
+                .zip(segments)
+                .all(|(expected, actual)| expected.starts_with('<') || expected == actual))
+        .then(|| {
+            (
+                retired,
+                ConfigPath {
+                    segments: segments[..pattern.len()].to_vec(),
+                },
+            )
+        })
+    })
+}
+
 pub(crate) fn is_known_config_path(path: &ConfigPath) -> bool {
     field_spec_path(path).is_some() || FIELD_SPECS.iter().any(|spec| path_prefix_matches(spec.path, path))
 }

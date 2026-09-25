@@ -22,7 +22,28 @@ fn main() {
     if argv.get(1).is_some_and(|argument| argument == "rail") {
         argv.remove(1);
     }
-    let mut cli = RailCli::parse_from(argv);
+    let mut cli = match RailCli::try_parse_from(&argv) {
+        Ok(cli) => cli,
+        Err(error) => {
+            if error.kind() == clap::error::ErrorKind::InvalidSubcommand
+                && let Some(removed) = commands::removed::removed_command(&argv[1..])
+            {
+                let json = argv.iter().any(|argument| argument == "--json");
+                cargo_rail::output::init(cargo_rail::output::InvocationOutput::capture_protocol_with_progress(
+                    false,
+                    false,
+                    if json {
+                        cargo_rail::output::OutputProtocol::Json
+                    } else {
+                        cargo_rail::output::OutputProtocol::Text
+                    },
+                    false,
+                ));
+                exit_with_error(removed);
+            }
+            error.exit();
+        }
+    };
 
     let protocol = if cli.json {
         cargo_rail::output::OutputProtocol::Json

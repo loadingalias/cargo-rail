@@ -55,6 +55,10 @@ check-dependencies:
     cargo deny --locked --workspace --all-features check -D warnings all
     cargo rail unify --check --explain
 
+# Qualify one native release archive beyond --version on this host.
+check-installation archive *args:
+    python3 scripts/check-installation.py {{quote(archive)}} {{args}}
+
 check-docs:
     RUSTDOCFLAGS="${RUSTDOCFLAGS:+$RUSTDOCFLAGS }-D warnings" cargo doc --workspace --no-deps --all-features --locked
 

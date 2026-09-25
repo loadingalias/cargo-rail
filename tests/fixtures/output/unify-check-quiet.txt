@@ -1,0 +1,7 @@
+exit: Some(1)
+--- stdout
+Pending: 1 manifest(s).
+Dependencies: helper
+Package fields inherited: license
+Next: cargo rail unify apply
+--- stderr

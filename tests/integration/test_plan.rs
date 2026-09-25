@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::Write as _;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context as _, Result, anyhow, ensure};
@@ -1532,6 +1533,304 @@ fn test_saved_worktree_plan_rejects_executable_mode_drift() {
         let rejected = verify_saved_plan(&ws, &path)?;
         assert_eq!(rejected.status.code(), Some(2));
         assert!(rejected.stdout.is_empty());
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+/// Recompute the canonical v9 identity so a fixture can change one binding
+/// without also failing the canonical identity check.
+fn resign_plan(mut plan: Value) -> Result<Value> {
+    fn canonicalize(value: Value) -> Value {
+        match value {
+            Value::Object(object) => {
+                let mut entries = object.into_iter().collect::<Vec<_>>();
+                entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+                Value::Object(
+                    entries
+                        .into_iter()
+                        .map(|(key, value)| (key, canonicalize(value)))
+                        .collect(),
+                )
+            }
+            Value::Array(values) => Value::Array(values.into_iter().map(canonicalize).collect()),
+            other => other,
+        }
+    }
+    let mut evidence = plan["evidence"]
+        .as_object()
+        .context("plan evidence")?
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    evidence.sort_unstable();
+    let portable = serde_json::json!({
+        "plan_contract_version": plan["plan_contract_version"],
+        "inputs": plan["inputs"],
+        "changes": plan["changes"],
+        "work": plan["work"],
+        "required": plan["required"],
+        "evidence": evidence,
+        "attribution": plan["attribution"],
+    });
+    let digest = Sha256::digest(&serde_json::to_vec(&canonicalize(portable))?);
+    plan["identity"] = Value::String(format!(
+        "plan-v9:sha256:{}",
+        digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+    ));
+    Ok(plan)
+}
+
+fn saved_plan_workspace(name: &str) -> Result<(TestWorkspace, PathBuf, Value)> {
+    let ws = TestWorkspace::new_named(name)?;
+    let package = ws.add_crate("verify", "0.1.0", &[])?;
+    generate_lockfile(&ws)?;
+    ws.commit("establish saved-plan binding fixture")?;
+    let saved = plan(&ws, &["--since", "HEAD"])?;
+    Ok((ws, package, saved))
+}
+
+#[test]
+fn test_plan_cases_report_route_parity_without_touching_the_worktree() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("plan-cases")?;
+        ws.add_crate("alpha", "0.1.0", &[])?;
+        ws.add_crate("leaf", "0.1.0", &[("alpha", "{ path = \"../alpha\" }")])?;
+        std::fs::write(
+            ws.path.join(".config/rail.toml"),
+            "[plan.work.test-runner]\nscope = 'repository'\npaths = ['.config/nextest.toml']\n\n\
+             [plan.work.format-config]\nscope = 'repository'\npaths = ['rustfmt.toml']\n\n\
+             [plan.work.ci]\nscope = 'repository'\npaths = ['.github/workflows/**']\n",
+        )?;
+        std::fs::write(ws.path.join("rustfmt.toml"), "max_width = 100\n")?;
+        std::fs::write(ws.path.join("README.md"), "# Route parity fixture\n")?;
+        std::fs::create_dir_all(ws.path.join(".github/workflows"))?;
+        std::fs::write(ws.path.join(".github/workflows/ci.yml"), "name: ci\n")?;
+        generate_lockfile(&ws)?;
+        ws.commit("establish route parity fixture")?;
+
+        let corpus = tempfile::TempDir::new()?;
+        let cases = corpus.path().join("routes.toml");
+        std::fs::write(
+            &cases,
+            "[[case]]\nname = 'source'\nchange = ['crates/leaf/src/lib.rs']\nrequired = ['cargo.test']\n\
+             skipped = ['test-runner', 'format-config', 'ci']\n\n\
+             [[case]]\nname = 'test-runner'\nchange = ['.config/nextest.toml']\nrequired = ['test-runner']\n\
+             skipped = ['format-config']\n\n\
+             [[case]]\nname = 'formatter'\nchange = ['rustfmt.toml']\nrequired = ['format-config']\n\
+             skipped = ['test-runner']\n\n\
+             [[case]]\nname = 'workflow'\nchange = ['.github/workflows/ci.yml']\nrequired = ['ci']\n\n\
+             [[case]]\nname = 'unrelated'\nchange = ['notes/new.txt']\nrequired = ['cargo.test']\n\n\
+             [[case]]\nname = 'readme'\nchange = ['README.md']\nrequired = ['cargo.test']\n\n\
+             [[case]]\nname = 'test-source'\nchange = ['crates/leaf/tests/probe.rs']\nrequired = ['cargo.test']\n\
+             skipped = ['format-config']\n\n\
+             [[case]]\nname = 'manifest'\nchange = ['crates/leaf/Cargo.toml']\nappend = \"\\n[features]\\nprobe = []\\n\"\n\
+             required = ['cargo.build', 'cargo.test']\n\n\
+             [[case]]\nname = 'lockfile'\nchange = ['Cargo.lock']\nskipped = ['test-runner', 'format-config', 'ci']\n",
+        )?;
+
+        // Worktree state that would change a worktree plan must not reach any case.
+        std::fs::write(ws.path.join(".github/workflows/untracked.yml"), "name: extra\n")?;
+        std::fs::write(ws.path.join("rustfmt.toml"), "max_width = 80\n")?;
+        let state = |ws: &TestWorkspace| -> Result<(Vec<u8>, Vec<u8>)> {
+            Ok((
+                git(&ws.path, &["status", "--porcelain=v1", "-z", "--untracked-files=all"])?.stdout,
+                git(&ws.path, &["for-each-ref", "--format=%(refname) %(objectname)"])?.stdout,
+            ))
+        };
+        let before = state(&ws)?;
+
+        let cases_path = cases.to_str().context("UTF-8 case path")?;
+        let output = run_cargo_rail(&ws.path, &["rail", "plan", "--cases", cases_path])?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        for expected in [
+            "pass  source",
+            "pass  test-runner",
+            "pass  formatter",
+            "pass  workflow",
+            "pass  unrelated",
+            "required  test-runner  direct  from .config/nextest.toml",
+            "required  cargo.test  expanded: incomplete evidence",
+            "expanded because",
+            "9 of 9 cases passed; 2 passed only through conservative expansion, not precise routing",
+        ] {
+            assert!(stdout.contains(expected), "missing {expected:?}:\n{stdout}");
+        }
+        assert_eq!(state(&ws)?, before, "a case changed the worktree, index, or refs");
+
+        std::fs::write(
+            &cases,
+            "[[case]]\nname = 'false-negative'\nchange = ['rustfmt.toml']\nrequired = ['test-runner']\n\n\
+             [[case]]\nname = 'precise'\nchange = ['notes/new.txt']\nrequired = ['cargo.test']\nprecise = true\n",
+        )?;
+        let failed = run_cargo_rail(&ws.path, &["rail", "plan", "--cases", cases_path])?;
+        let stdout = String::from_utf8_lossy(&failed.stdout);
+        assert_eq!(failed.status.code(), Some(1), "{failed:?}");
+        assert!(stdout.contains("error: missing required work test-runner"), "{stdout}");
+        assert!(
+            stdout.contains("error: cargo.test was required only by conservative expansion"),
+            "{stdout}"
+        );
+        assert!(stdout.contains("0 of 2 cases passed"), "{stdout}");
+
+        std::fs::write(
+            &cases,
+            "[[case]]\nname = 'unknown'\nchange = ['rustfmt.toml']\nrequired = ['no-such-work']\n",
+        )?;
+        let unknown = run_cargo_rail(&ws.path, &["rail", "plan", "--cases", cases_path])?;
+        assert_eq!(unknown.status.code(), Some(2), "{unknown:?}");
+        assert!(unknown.stdout.is_empty(), "{unknown:?}");
+        assert!(String::from_utf8_lossy(&unknown.stderr).contains("names unregistered work 'no-such-work'"));
+
+        let json = run_cargo_rail(&ws.path, &["rail", "plan", "--cases", cases_path, "--json"])?;
+        assert_eq!(json.status.code(), Some(2), "{json:?}");
+        assert!(json.stdout.is_empty(), "{json:?}");
+        assert!(String::from_utf8_lossy(&json.stderr).contains("--json is not supported by 'cargo rail plan --cases'"));
+        assert_eq!(state(&ws)?, before, "a case changed the worktree, index, or refs");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_saved_plan_binds_platform_and_target_to_the_verifying_host() {
+    let result: Result<()> = (|| {
+        let (ws, _, saved) = saved_plan_workspace("plan-verify-platform")?;
+        let transfer = tempfile::TempDir::new()?;
+        let resigned = resign_plan(saved.clone())?;
+        ensure!(
+            resigned["identity"] == saved["identity"],
+            "fixture identity differs from the planner"
+        );
+
+        let mut foreign_target = saved.clone();
+        foreign_target["inputs"]["target"] = Value::String(format!("planning-target-v1:sha256:{}", "0".repeat(64)));
+        let mut foreign_platform = saved;
+        foreign_platform["inputs"]["platform"] = Value::String("foreign-os-foreign-arch".to_string());
+        for (name, value, binding) in [
+            ("target", foreign_target, "saved target"),
+            ("platform", foreign_platform, "saved platform"),
+        ] {
+            let path = transfer.path().join(format!("{name}.json"));
+            std::fs::write(&path, serde_json::to_vec(&resign_plan(value)?)?)?;
+            let rejected = verify_saved_plan(&ws, path.to_str().context("UTF-8 plan path")?)?;
+            assert_eq!(
+                rejected.status.code(),
+                Some(2),
+                "foreign {name} was accepted: {rejected:?}"
+            );
+            assert!(rejected.stdout.is_empty(), "foreign {name} emitted stdout");
+            let stderr = String::from_utf8_lossy(&rejected.stderr);
+            assert!(stderr.contains(binding), "foreign {name}: {stderr}");
+        }
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_saved_plan_follows_the_repository_and_rejects_another_workspace() {
+    let result: Result<()> = (|| {
+        let (ws, package, _) = saved_plan_workspace("plan-verify-relocation")?;
+        let other = ws.path.join("tools/other");
+        std::fs::create_dir_all(other.join("src"))?;
+        std::fs::write(
+            other.join("Cargo.toml"),
+            "[workspace]\n\n[package]\nname = 'other'\nversion = '0.1.0'\nedition = '2021'\n",
+        )?;
+        std::fs::write(other.join("src/lib.rs"), "pub fn other() {}\n")?;
+        let output = Command::new("cargo")
+            .current_dir(&other)
+            .args(["generate-lockfile", "--offline"])
+            .output()?;
+        ensure!(output.status.success(), "nested lockfile failed: {output:?}");
+        ws.commit("add an independent nested workspace")?;
+        let saved = plan(&ws, &["--since", "HEAD"])?;
+        let transfer = tempfile::TempDir::new()?;
+        let path = transfer.path().join("plan.json");
+        std::fs::write(&path, serde_json::to_vec(&saved)?)?;
+        let path = path.to_str().context("UTF-8 plan path")?;
+
+        let member = run_cargo_rail(&package, &["rail", "plan", "--verify", path])?;
+        assert_eq!(member.status.code(), Some(0), "member directory rejected: {member:?}");
+
+        let relocated = tempfile::TempDir::new()?;
+        let clone = relocated.path().join("checkout");
+        git(
+            relocated.path(),
+            &[
+                "clone",
+                "--quiet",
+                ws.path.to_str().context("UTF-8 workspace")?,
+                "checkout",
+            ],
+        )?;
+        let moved = run_cargo_rail(&clone, &["rail", "plan", "--verify", path])?;
+        assert_eq!(moved.status.code(), Some(0), "relocated checkout rejected: {moved:?}");
+        assert!(moved.stdout.is_empty(), "{moved:?}");
+
+        let substituted = run_cargo_rail(&other, &["rail", "plan", "--verify", path])?;
+        assert_eq!(
+            substituted.status.code(),
+            Some(2),
+            "another workspace accepted the plan: {substituted:?}"
+        );
+        assert!(substituted.stdout.is_empty(), "{substituted:?}");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_saved_plan_inside_the_checkout_is_untracked_drift() {
+    let result: Result<()> = (|| {
+        let (ws, _, saved) = saved_plan_workspace("plan-verify-inside-checkout")?;
+        let path = ws.path.join("plan.json");
+        std::fs::write(&path, serde_json::to_vec(&saved)?)?;
+        let rejected = verify_saved_plan(&ws, path.to_str().context("UTF-8 plan path")?)?;
+        assert_eq!(rejected.status.code(), Some(2), "{rejected:?}");
+        assert!(rejected.stdout.is_empty(), "{rejected:?}");
+        let stderr = String::from_utf8_lossy(&rejected.stderr);
+        assert!(stderr.contains("saved worktree capture"), "{stderr}");
+        assert!(stderr.contains("create a new plan"), "{stderr}");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_saved_plan_rejects_a_different_compiler() {
+    // Cargo configuration captures RUSTC and the active rustup toolchain, and
+    // verification checks that binding before the toolchain binding.
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let result: Result<()> = (|| {
+        let (ws, _, saved) = saved_plan_workspace("plan-verify-toolchain")?;
+        let path = write_saved_plan(&ws, "saved-plan.json", &saved)?;
+        let rustc = Command::new("rustc").args(["--print", "sysroot"]).output()?;
+        ensure!(rustc.status.success(), "rustc sysroot failed: {rustc:?}");
+        let rustc = PathBuf::from(String::from_utf8(rustc.stdout)?.trim()).join("bin/rustc");
+        let wrapper_directory = tempfile::TempDir::new()?;
+        let wrapper = wrapper_directory.path().join("rustc");
+        std::fs::write(&wrapper, format!("#!/bin/sh\nexec '{}' \"$@\"\n", rustc.display()))?;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))?;
+
+        let rejected = run_cargo_rail_with_env(
+            &ws.path,
+            &["rail", "plan", "--verify", &path],
+            &[("RUSTC", wrapper.to_str().context("UTF-8 wrapper path")?)],
+        )?;
+        assert_eq!(
+            rejected.status.code(),
+            Some(2),
+            "different compiler accepted: {rejected:?}"
+        );
+        assert!(rejected.stdout.is_empty(), "{rejected:?}");
+        let stderr = String::from_utf8_lossy(&rejected.stderr);
+        assert!(stderr.contains("saved Cargo configuration"), "{stderr}");
+        assert!(stderr.contains("create a new plan"), "{stderr}");
         Ok(())
     })();
     super::helpers::finish_test(result);

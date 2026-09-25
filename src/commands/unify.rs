@@ -201,6 +201,41 @@ fn write_compact_summary(
         if !dependency_names.is_empty() {
             outln!(sink, "Dependencies: {}", format_preview_list(&dependency_names, 8));
         }
+        let package_fields = plan
+            .member_edits
+            .values()
+            .flatten()
+            .filter_map(|edit| match edit {
+                crate::cargo::MemberEdit::InheritPackageField { field } => Some(field.to_string()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if !package_fields.is_empty() {
+            outln!(
+                sink,
+                "Package fields inherited: {}",
+                format_preview_list(&package_fields, 8)
+            );
+        }
+        if !plan.pruned_features.is_empty() {
+            let features = plan
+                .pruned_features
+                .iter()
+                .map(|feature| format!("{} in {}", feature.feature_name, feature.crate_name))
+                .collect::<Vec<_>>();
+            outln!(sink, "Features pruned: {}", format_preview_list(&features, 8));
+        }
+        if msrv_write_needed && let Some(msrv) = &plan.computed_msrv {
+            outln!(
+                sink,
+                "rust-version: {}.{}.{}",
+                msrv.version.major,
+                msrv.version.minor,
+                msrv.version.patch
+            );
+        }
         if crate::output::is_verbose() {
             let targets = mutation_targets(actions);
             outln!(
@@ -1860,7 +1895,7 @@ fn display_unify_apply_summary(
             msrv.version.major, msrv.version.minor, msrv.version.patch, source_desc
         );
     }
-    println!("\nnext: cargo nextest run -P commit --locked --config-file .config/nextest.toml");
+    println!("\nnext: review the manifest diff, then build and test the workspace");
     if let Some(backup_id) = backup_id {
         println!("undo: cargo rail unify undo  (backup: {backup_id})");
     }
@@ -2634,14 +2669,19 @@ fn display_explain(
         }
     }
 
-    // Explain issues/blockers
-    if !plan.issues.is_empty() {
+    // Explain issues/blockers. Preserved declarations are decisions, not problems, so they
+    // follow the issues, grouped by reason.
+    let (preserved, issues): (Vec<_>, Vec<_>) = plan
+        .issues
+        .iter()
+        .partition(|issue| issue.kind == crate::cargo::unify_types::UnifyIssueKind::Preserved);
+    if !issues.is_empty() {
         outln!(sink, "Issues detected:");
         outln!(sink);
 
         // Group by severity
         let mut by_severity: BTreeMap<String, Vec<_>> = BTreeMap::new();
-        for issue in &plan.issues {
+        for issue in issues {
             let severity = format!("{:?}", issue.severity);
             by_severity.entry(severity).or_default().push(issue);
         }
@@ -2653,6 +2693,31 @@ fn display_explain(
             }
             outln!(sink);
         }
+    }
+    if !preserved.is_empty() {
+        outln!(sink, "Preserved on purpose ({}; no action needed):", preserved.len());
+        let mut by_reason = BTreeMap::<&str, BTreeMap<&str, Vec<&str>>>::new();
+        for issue in preserved {
+            // "preserved KIND dependency `NAME` in `MEMBER`: REASON"
+            let (subject, reason) = issue.message.split_once(": ").unwrap_or((&issue.message, ""));
+            let member = subject
+                .rsplit_once(" in `")
+                .map_or("", |(_, member)| member.trim_end_matches('`'));
+            by_reason
+                .entry(reason)
+                .or_default()
+                .entry(member)
+                .or_default()
+                .push(&issue.dep_name);
+        }
+        for (reason, members) in by_reason {
+            let count = members.values().map(Vec::len).sum::<usize>();
+            outln!(sink, "  {reason} ({count}):");
+            for (member, dependencies) in members {
+                outln!(sink, "    {member}: {}", dependencies.join(", "));
+            }
+        }
+        outln!(sink);
     }
 
     if !plan.undeclared_features.is_empty() {

@@ -24,6 +24,9 @@ pub mod init;
 pub mod plan;
 /// Durable exact-SHA release transactions.
 pub mod release;
+/// Migration diagnostics for commands removed by earlier releases.
+#[doc(hidden)]
+pub mod removed;
 /// Crate extraction with preserved Git history.
 pub mod split;
 /// Complete Rust declaration reachability and visibility analysis.
@@ -116,6 +119,13 @@ impl PreparedContext {
                 options.comparison.replace_objects(from, to);
             }
             context
+        } else if matches!(
+            *self.command,
+            Commands::Config {
+                command: Some(cli::ConfigCommand::Migrate { .. })
+            }
+        ) {
+            WorkspaceContext::build_for_config_migration(workspace_root, self.config_override.as_deref())
         } else if self.command.requires_workspace_snapshot() {
             WorkspaceContext::build_with_snapshot_and_config(workspace_root, self.config_override.as_deref())
         } else if self.command.requires_planning_source_capture() {
@@ -156,6 +166,14 @@ pub fn try_dispatch_pre_context(
         }
 
         Commands::Plan {
+            cases: Some(cases_file),
+            ..
+        } => {
+            plan::run_plan_cases(workspace_root, config_override, &cases_file)?;
+            Ok(PreContextDispatch::Handled)
+        }
+
+        Commands::Plan {
             since,
             from,
             to,
@@ -166,6 +184,7 @@ pub fn try_dispatch_pre_context(
             evidence,
             verify: None,
             schema: false,
+            cases: None,
         } => {
             let comparison = plan::PlanComparison::from_cli(&since, &from, &to)?;
             let command = Commands::Plan {
@@ -179,6 +198,7 @@ pub fn try_dispatch_pre_context(
                 evidence: evidence.clone(),
                 verify: None,
                 schema: false,
+                cases: None,
             };
             Ok(PreContextDispatch::NeedsContext(PreparedContext::new_plan(
                 command,

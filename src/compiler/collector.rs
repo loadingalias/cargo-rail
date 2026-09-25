@@ -274,6 +274,10 @@ pub(crate) struct CompilerCacheIdentity {
     toolchain_fingerprint: String,
     target_fingerprints: HashMap<String, String>,
     lock_fingerprint: String,
+    /// Locked dependency closure of each local package; absent packages bind `lock_fingerprint`.
+    lock_closures: HashMap<PackageId, String>,
+    /// Lockfile indices of each local package's closure, for cold-work estimates.
+    lock_closure_packages: HashMap<PackageId, BTreeSet<usize>>,
     compiler_env_fingerprint: String,
     cargo_config_fingerprint: String,
     cargo_program: OsString,
@@ -1186,7 +1190,7 @@ fn compiler_observation_wrapper() -> RailResult<PathBuf> {
     if let Some(process) = COMPILER_OBSERVATION_PROCESS.get() {
         return Ok(process.clone());
     }
-    let executable = std::env::current_exe()
+    let executable = crate::utils::current_executable()
         .with_context(|| "locating cargo-rail while selecting its compiler-observation process".to_string())?;
     let observation = executable.with_file_name(format!(
         "cargo-rail-compiler-observation{}",
@@ -1224,6 +1228,14 @@ fn compatible_observation_process(path: &Path) -> bool {
 }
 
 impl CompilerCacheIdentity {
+    /// Lockfile identity for one local package: its locked closure, or the whole file.
+    fn lock_closure(&self, package: &PackageId) -> String {
+        self.lock_closures
+            .get(package)
+            .cloned()
+            .unwrap_or_else(|| self.lock_fingerprint.clone())
+    }
+
     /// Capture exact compiler-cache identity from one immutable workspace snapshot.
     pub fn capture(snapshot: &WorkspaceSnapshot) -> RailResult<Self> {
         let rustc_version = snapshot.toolchain().rustc_verbose_version().to_string();
@@ -1255,6 +1267,25 @@ impl CompilerCacheIdentity {
             executable_toolchain_fingerprint(snapshot.toolchain(), executables, &cargo_rail_executable)?;
         let target_fingerprints = target_fingerprints(snapshot)?;
         let lock_fingerprint = snapshot.lockfile_fingerprint();
+        let mut lock_closures = HashMap::new();
+        let mut lock_closure_packages = HashMap::new();
+        if let Some(lockfile) = snapshot.lockfile() {
+            for package in evidence
+                .metadata()
+                .packages
+                .iter()
+                .filter(|package| package.source.is_none())
+            {
+                let version = package.version.to_string();
+                if let (Some(fingerprint), Some(closure)) = (
+                    lockfile.closure_fingerprint(&package.name, &version, None),
+                    lockfile.closure(&package.name, &version, None),
+                ) {
+                    lock_closures.insert(package.id.clone(), fingerprint);
+                    lock_closure_packages.insert(package.id.clone(), closure);
+                }
+            }
+        }
         let compiler_env_fingerprint = compiler_env_fingerprint(snapshot.cargo_config())?;
         let cargo_config_fingerprint = cargo_config_fingerprint(snapshot.cargo_config(), snapshot.source_root())?;
         let cargo_program = snapshot.toolchain().cargo_program().to_owned();
@@ -1354,6 +1385,8 @@ impl CompilerCacheIdentity {
             toolchain_fingerprint,
             target_fingerprints,
             lock_fingerprint,
+            lock_closures,
+            lock_closure_packages,
             compiler_env_fingerprint,
             cargo_config_fingerprint,
             cargo_program,
@@ -1959,13 +1992,32 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
             )?;
         }
 
+        // Upper bound: the lockfile holds every edge for every feature and target, and
+        // views that share a dependency compile it once.
+        let cold_packages = stale_configurations
+            .iter()
+            .map(|view| {
+                member_ids
+                    .get(view.package())
+                    .and_then(|package| self.identity.lock_closure_packages.get(package))
+            })
+            .try_fold(BTreeSet::<usize>::new(), |mut union, closure| {
+                union.extend(closure?);
+                Some(union)
+            })
+            .map(|union| union.len());
         let _acquisition = crate::output::nested_phase(crate::output::Activity::Cargo, "acquiring compiler evidence");
         progress!(
-            "  Compiler evidence plan: {} views; up to {} Cargo acquisitions; {} diagnostic cache hits; {} diagnostic cache misses",
+            "  Compiler evidence plan: {} views; up to {} Cargo acquisitions; {} diagnostic cache hits; {} diagnostic cache misses; {}",
             metrics.analysis_views,
             stale_configurations.len(),
             metrics.diagnostic_cache_hits,
-            metrics.diagnostic_cache_misses
+            metrics.diagnostic_cache_misses,
+            match cold_packages {
+                Some(0) => "nothing to compile".to_string(),
+                Some(count) => format!("at most {count} packages to compile"),
+                None => "cold compile size unknown".to_string(),
+            }
         );
 
         let mut skipped_member_targets = 0usize;
@@ -2832,7 +2884,7 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                 .get(target)
                 .cloned()
                 .ok_or_else(|| RailError::message(format!("missing compiler target identity for '{target}'")))?,
-            lock_fingerprint: identity.lock_fingerprint.clone(),
+            lock_fingerprint: identity.lock_closure(&member.package_id),
             manifest_fingerprint: identity
                 .manifest_fingerprints
                 .get(&member.package_id)
@@ -5177,7 +5229,10 @@ fn attach_build_script_action_keys(
             source_inputs,
             manifest_closure: package
                 .and_then(|package| identity.manifest_fingerprints.get(&package.package_id).cloned()),
-            lock_closure: Some(identity.lock_fingerprint.clone()),
+            lock_closure: Some(package.map_or_else(
+                || identity.lock_fingerprint.clone(),
+                |package| identity.lock_closure(&package.package_id),
+            )),
             toolchain: Some(identity.toolchain_fingerprint.clone()),
             action_id: format!("build-script:{}", manifest.unit_identity),
             package: manifest.unit.package.clone(),

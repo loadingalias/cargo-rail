@@ -317,6 +317,43 @@ fn setup_diagnoses_mixed_compiler_component_versions() {
     super::helpers::finish_test(result);
 }
 
+#[cfg(unix)]
+#[test]
+fn setup_through_a_symlinked_launcher_uses_the_real_installation() {
+    let result: Result<()> = (|| {
+        let bundle = authenticated_component_bundle()?;
+        let launcher = tempfile::tempdir()?;
+        std::os::unix::fs::symlink(bundle.path().join("cargo-rail"), launcher.path().join("cargo-rail"))?;
+        let workspace = TestWorkspace::new_single_crate("symlinked-launcher", "0.1.0")?;
+        let cargo_home = tempfile::tempdir()?;
+        let mut command = Command::new(launcher.path().join("cargo-rail"));
+        for (name, _) in std::env::vars_os() {
+            if name.to_str().is_some_and(|name| name.starts_with("CARGO_RAIL_")) {
+                command.env_remove(name);
+            }
+        }
+        let output = command
+            .args(["rail", "cache", "setup", "--check"])
+            .current_dir(&workspace.path)
+            .env("CARGO_HOME", cargo_home.path())
+            .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
+            .output()?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::ensure!(
+            !stderr.contains("unavailable") && !stderr.contains("reinstall"),
+            "a symlinked launcher hid the adjacent components: {output:?}"
+        );
+        anyhow::ensure!(
+            output.status.code() == Some(1) && stderr.is_empty(),
+            "setup check did not report pending installation: {output:?}"
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
 fn selected_profile_state_root(workspace: &Path, cargo_home: &Path) -> Result<PathBuf> {
     let status = selected_profile_status(workspace, cargo_home)?;
     let profile_id = status["status"]["installation"]["profile_id"]

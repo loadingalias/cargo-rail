@@ -651,16 +651,26 @@ mod tests {
 
         // Other progress output resets the quiet interval. A heartbeat may already have fired for the
         // preceding quiet phase, so resume progress before discarding it.
+        // A loaded host can stretch one sleep past the interval, which makes a
+        // heartbeat correct; make the suppression claim only when every gap stayed inside it.
         super::record_progress();
+        let mut last = std::time::Instant::now();
         drop(taken());
+        let mut longest = Duration::ZERO;
         for _ in 0..6 {
             super::record_progress();
+            longest = longest.max(last.elapsed());
+            last = std::time::Instant::now();
             std::thread::sleep(INTERVAL / 4);
         }
-        assert!(
-            taken().is_empty(),
-            "progress within the interval must suppress the heartbeat"
-        );
+        let suppressed = taken();
+        longest = longest.max(last.elapsed());
+        if longest < INTERVAL {
+            assert!(
+                suppressed.is_empty(),
+                "progress within the interval must suppress the heartbeat"
+            );
+        }
 
         std::thread::sleep(INTERVAL * 2);
         assert!(

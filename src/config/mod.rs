@@ -92,22 +92,46 @@ pub(crate) struct DecodedConfig {
     pub(crate) document: toml_edit::DocumentMut,
 }
 
+/// How decoding treats keys that an earlier release removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetiredKeys {
+    /// Name the release and the action; consuming commands use this.
+    Reject,
+    /// Delete removable retired keys, which have no current meaning. Migration and
+    /// historical planning use this; a key that needs a manual edit is still rejected.
+    Strip,
+}
+
 /// Decode captured input using the current configuration contract.
 pub(crate) fn decode(bytes: &[u8]) -> RailResult<DecodedConfig> {
+    decode_with(bytes, RetiredKeys::Reject)
+}
+
+/// Decode captured input, treating retired keys as `retired` selects.
+pub(crate) fn decode_with(bytes: &[u8], retired: RetiredKeys) -> RailResult<DecodedConfig> {
     let content = std::str::from_utf8(bytes)
         .map_err(|error| RailError::message(format!("configuration is not valid UTF-8: {error}")))?;
-    let document: toml_edit::DocumentMut = content
+    let mut document: toml_edit::DocumentMut = content
         .parse()
         .map_err(|error: toml_edit::TomlError| RailError::message(error.to_string()))?;
+    if retired == RetiredKeys::Strip {
+        migration::strip_retired(&mut document);
+    }
     let config = RailConfig::from_document(document.clone()).map_err(RailError::message)?;
     Ok(DecodedConfig { config, document })
 }
 
 /// Decode a file while retaining its exact bytes for capture and drift validation.
 pub(crate) fn load_decoded(path: &Path) -> RailResult<(DecodedConfig, Vec<u8>)> {
+    load_decoded_with(path, RetiredKeys::Reject)
+}
+
+/// Decode a file with an explicit retired-key treatment, retaining its exact bytes.
+pub(crate) fn load_decoded_with(path: &Path, retired: RetiredKeys) -> RailResult<(DecodedConfig, Vec<u8>)> {
     let bytes =
         fs::read(path).map_err(|error| RailError::message(format!("failed to read {}: {error}", path.display())))?;
-    let decoded = decode(&bytes).map_err(|error| error.context(format!("configuration {}", path.display())))?;
+    let decoded =
+        decode_with(&bytes, retired).map_err(|error| error.context(format!("configuration {}", path.display())))?;
     Ok((decoded, bytes))
 }
 
@@ -135,13 +159,48 @@ pub(crate) fn workspace_context_required(field: &str) -> RailError {
 
 impl RailConfig {
     fn from_document(doc: toml_edit::DocumentMut) -> Result<Self, String> {
-        if let Some(path) = schema::document_paths(&doc)
-            .into_iter()
-            .find(|path| !schema::is_known_config_path(path))
-        {
-            return Err(format!(
-                "unknown configuration key '{path}'; run `cargo rail config explain --all` with supported configuration to inspect current fields"
-            ));
+        // Report every unknown key at once; a key below a reported one adds nothing.
+        let mut errors = Vec::new();
+        let mut reported = Vec::<schema::ConfigPath>::new();
+        for path in schema::document_paths(&doc) {
+            if schema::is_known_config_path(&path)
+                || reported
+                    .iter()
+                    .any(|parent| path.segments().starts_with(parent.segments()))
+            {
+                continue;
+            }
+            if let Some((retired, key)) = schema::retired_key(&path) {
+                let action = if retired.removable {
+                    "`cargo rail config migrate` previews its removal"
+                } else {
+                    "change it by hand"
+                };
+                errors.push(format!(
+                    "configuration key '{key}' was removed in Cargo-Rail {}; {}; {action}",
+                    retired.removed_in, retired.instead
+                ));
+                reported.push(key);
+            } else {
+                errors.push(format!(
+                    "unknown configuration key '{path}'; run `cargo rail config explain --all` with supported configuration to inspect current fields"
+                ));
+                reported.push(path);
+            }
+        }
+        match errors.len() {
+            0 => {}
+            1 => return Err(errors.remove(0)),
+            count => {
+                return Err(format!(
+                    "{count} configuration errors:\n{}",
+                    errors
+                        .iter()
+                        .map(|error| format!("  - {error}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ));
+            }
         }
         toml_edit::de::from_document(doc).map_err(|error| error.to_string())
     }

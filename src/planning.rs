@@ -18,7 +18,10 @@ mod evidence;
 mod source_features;
 mod work;
 
-pub(crate) use work::{WorkPlan, WorkPlanAuthority, build_work_plan, format_work_plan, validate_saved_work_plan};
+pub(crate) use work::{
+    WorkCause, WorkDecision, WorkInputKind, WorkPlan, WorkPlanAuthority, build_work_plan, format_work_plan,
+    host_platform, validate_saved_work_plan,
+};
 
 const CONFIG_CANDIDATES: &[&str] = &["rail.toml", ".rail.toml", ".cargo/rail.toml", ".config/rail.toml"];
 
@@ -302,7 +305,9 @@ fn config_at_ref(ctx: &WorkspaceContext, revision: &str, candidates: &[String]) 
             .ok_or_else(|| RailError::message(format!("historical configuration has no {}", manifest.display())))
     };
     let decode = || -> RailResult<RailConfig> {
-        let decoded = crate::config::decode(&bytes[0])?;
+        // A removable retired key has no current meaning; the base policy is what the
+        // current release applies without it, so migrating it away plans normally.
+        let decoded = crate::config::decode_with(&bytes[0], crate::config::RetiredKeys::Strip)?;
         decoded.config.validate_policy()?;
         if let Some(host) = decoded.config.unify.transitive_host_path() {
             read_manifest(std::path::Path::new(host))?;

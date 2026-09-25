@@ -8,6 +8,9 @@ use crate::error::{RailError, RailResult};
 use crate::utils::toolchain_fingerprint;
 use crate::workspace::WorkspaceContext;
 
+mod cases;
+pub(crate) use cases::run_plan_cases;
+
 /// Options for the `plan` command.
 #[derive(Debug)]
 pub struct PlanOptions {
@@ -165,6 +168,7 @@ pub(crate) fn verify_saved_plan(
         &saved.inputs.target,
         &planning_target_identity(&configuration, &toolchain),
     )?;
+    verify_saved_binding("platform", &saved.inputs.platform, &crate::planning::host_platform())?;
     crate::planning::validate_saved_work_plan(&context, &saved)?;
     let current_head = context
         .planning_head_commit()

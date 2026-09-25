@@ -925,7 +925,7 @@ pub(crate) fn build_work_plan(
             configuration: authority.cargo_configuration_identity,
             toolchain: authority.toolchain_identity,
             target: authority.target_identity,
-            platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+            platform: host_platform(),
             catalog,
             evidence: observed.identity().map(str::to_string).into_iter().collect(),
             r#override: if force_all {
@@ -946,6 +946,11 @@ pub(crate) fn build_work_plan(
     };
     plan.identity = plan_identity(&plan)?;
     Ok(plan)
+}
+
+/// Return the host label that plans and planning evidence bind to.
+pub(crate) fn host_platform() -> String {
+    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }
 
 /// Validate every executable authority carried by a deserialized v9 plan.

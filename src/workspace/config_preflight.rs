@@ -7,7 +7,7 @@
 //! the same file that post-metadata discovery would select, and Cargo's reported
 //! root still decides which checked policy the context captures.
 
-use crate::config::RailConfig;
+use crate::config::{RailConfig, RetiredKeys};
 use crate::error::RailResult;
 use std::path::{Path, PathBuf};
 
@@ -20,8 +20,8 @@ pub(super) struct CheckedConfig {
 }
 
 impl CheckedConfig {
-    fn load(path: PathBuf) -> RailResult<Self> {
-        let (decoded, bytes) = crate::config::load_decoded(&path)?;
+    fn load(path: PathBuf, retired: RetiredKeys) -> RailResult<Self> {
+        let (decoded, bytes) = crate::config::load_decoded_with(&path, retired)?;
         decoded
             .config
             .validate_policy()
@@ -52,26 +52,34 @@ impl ConfigPreflight {
     /// Check an explicit override, or policy discovered at a provable Cargo root.
     ///
     /// `manifest_root` is the canonical directory whose `Cargo.toml` Cargo receives.
-    pub(super) fn capture(manifest_root: &Path, config_override: Option<PathBuf>) -> RailResult<Self> {
+    pub(super) fn capture(
+        manifest_root: &Path,
+        config_override: Option<PathBuf>,
+        retired: RetiredKeys,
+    ) -> RailResult<Self> {
         if let Some(path) = config_override {
-            return CheckedConfig::load(path).map(Self::Explicit);
+            return CheckedConfig::load(path, retired).map(Self::Explicit);
         }
         let Some(workspace_root) = cargo_workspace_root(manifest_root) else {
             return Ok(Self::Deferred);
         };
         let config = RailConfig::find_config_path(&workspace_root)
-            .map(CheckedConfig::load)
+            .map(|path| CheckedConfig::load(path, retired))
             .transpose()?;
         Ok(Self::Discovered { workspace_root, config })
     }
 
     /// Return checked policy for the workspace root Cargo reported.
-    pub(super) fn resolve(self, cargo_workspace_root: &Path) -> RailResult<Option<CheckedConfig>> {
+    pub(super) fn resolve(
+        self,
+        cargo_workspace_root: &Path,
+        retired: RetiredKeys,
+    ) -> RailResult<Option<CheckedConfig>> {
         match self {
             Self::Explicit(config) => Ok(Some(config)),
             Self::Discovered { workspace_root, config } if workspace_root == cargo_workspace_root => Ok(config),
             Self::Discovered { .. } | Self::Deferred => RailConfig::find_config_path(cargo_workspace_root)
-                .map(CheckedConfig::load)
+                .map(|path| CheckedConfig::load(path, retired))
                 .transpose(),
         }
     }

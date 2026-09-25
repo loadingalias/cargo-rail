@@ -82,6 +82,7 @@ Without comparison flags, use changes since the default-branch merge base.
   cargo rail plan --explain-work cargo.test  # Explain one decision, even when skipped
   cargo rail plan --json > plan.json         # Save the exact plan
   cargo rail plan --verify plan.json         # Validate the saved plan and checkout without execution
+  cargo rail plan --cases routes.toml        # Compare reviewed path cases with planner decisions
 
 Use --verify - to read the saved plan from standard input.";
 
@@ -249,12 +250,19 @@ pub enum Commands {
         #[arg(
             long,
             value_name = "PATH",
-            conflicts_with_all = ["since", "from", "to", "explain", "explain_work", "all", "evidence", "schema"]
+            conflicts_with_all = ["since", "from", "to", "explain", "explain_work", "all", "evidence", "schema", "cases"]
         )]
         verify: Option<PathBuf>,
         /// Print the versioned planner JSON Schema and exit
-        #[arg(long, conflicts_with_all = ["since", "from", "to", "explain", "explain_work", "all", "evidence", "verify"])]
+        #[arg(long, conflicts_with_all = ["since", "from", "to", "explain", "explain_work", "all", "evidence", "verify", "cases"])]
         schema: bool,
+        /// Plan each reviewed path case in a TOML file against HEAD without touching the worktree
+        #[arg(
+            long,
+            value_name = "PATH",
+            conflicts_with_all = ["since", "from", "to", "explain", "explain_work", "all", "evidence"]
+        )]
+        cases: Option<PathBuf>,
     },
 
     /// Analyze declaration reachability and repair visibility
@@ -1289,6 +1297,7 @@ impl Commands {
                 command: ReleaseCommand::Abort { .. },
             } => Some("release abort"),
             Commands::Completions { .. } => Some("completions"),
+            Commands::Plan { cases: Some(_), .. } => Some("plan --cases"),
             _ => None,
         };
         if let Some(command) = unsupported {

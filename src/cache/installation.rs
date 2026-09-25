@@ -1267,8 +1267,9 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
     ])?;
     let wrapper = plan_executable_setup(wrapper_source, &wrapper_path, "installed compiler wrapper")?;
     let worker = plan_executable_setup(worker_source, &worker_path, "installed compiler worker")?;
-    let sources =
-        crate::compiler::driver::CompilerFactDriverAuthority::installation_components(&std::env::current_exe()?)?;
+    let sources = crate::compiler::driver::CompilerFactDriverAuthority::installation_components(
+        &crate::utils::current_executable()?,
+    )?;
     let mut compiler_components = Vec::with_capacity(sources.len());
     let mut installed_compiler_components = Vec::with_capacity(sources.len());
     for source in sources {
@@ -3212,7 +3213,7 @@ fn require_consistent_component_versions(components: &[(&str, &Path)]) -> RailRe
     const RECOVERY: &str =
         "reinstall one complete Cargo-Rail component set, then verify it with `cargo rail cache setup --check`";
 
-    let current_executable = std::env::current_exe()?;
+    let current_executable = crate::utils::current_executable()?;
     let mut releases = vec![(env!("CARGO_PKG_VERSION").to_string(), vec!["cargo-rail"])];
     for &(name, path) in components {
         let version = if path == current_executable {
