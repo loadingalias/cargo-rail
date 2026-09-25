@@ -6565,8 +6565,23 @@ fn compiler_cache_bypass_reason(snapshot: &WorkspaceSnapshot) -> Option<Compiler
     snapshot
         .packages()
         .iter()
-        .any(|package| package.source().is_some() && package.checksum().is_none())
+        .any(|package| {
+            package
+                .source()
+                .is_some_and(|source| package.checksum().is_none() && !git_source_pins_commit(&source.repr))
+        })
         .then_some(CompilerCacheBypass::ExternalSourceDigest)
+}
+
+/// Whether a Git package source names its exact resolved commit, which identifies its tree
+/// as a registry checksum identifies a crate archive. Package identities include the source.
+fn git_source_pins_commit(source: &str) -> bool {
+    source
+        .strip_prefix("git+")
+        .and_then(|locator| locator.rsplit_once('#'))
+        .is_some_and(|(_, commit)| {
+            matches!(commit.len(), 40 | 64) && commit.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        })
 }
 
 fn target_name(target: &crate::cargo::resolution::TargetIdentity) -> &str {
@@ -7172,6 +7187,25 @@ mod tests {
         assert_eq!(ledger.snapshot(), (7, 8));
         drop(second);
         assert_eq!(ledger.snapshot(), (2, 8));
+    }
+
+    #[test]
+    fn only_exact_git_commits_stand_in_for_a_source_checksum() {
+        let sha1 = "afc03c18f3fe1b2dc8fa9032512d1dafa2cff28c";
+        let sha256 = "0".repeat(64);
+        assert!(git_source_pins_commit(&format!(
+            "git+https://host/repo?branch=main#{sha1}"
+        )));
+        assert!(git_source_pins_commit(&format!("git+file:///repo#{sha256}")));
+        for unpinned in [
+            "git+https://host/repo?branch=main".to_string(),
+            "git+https://host/repo#afc03c18".to_string(),
+            format!("git+https://host/repo#{}", sha1.to_ascii_uppercase()),
+            format!("sparse+https://index.crates.io/#{sha1}"),
+            format!("path+file:///repo#{sha1}"),
+        ] {
+            assert!(!git_source_pins_commit(&unpinned), "{unpinned}");
+        }
     }
 
     #[test]

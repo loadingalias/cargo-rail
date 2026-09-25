@@ -6,9 +6,7 @@
 //!
 //! This is critical - false positives would cause users to remove deps they need!
 
-use crate::helpers::{
-    TestWorkspace, cargo_command, compiler_evidence_cache, file_url, run_cargo_rail, run_cargo_rail_with_env,
-};
+use crate::helpers::{TestWorkspace, cargo_command, compiler_evidence_cache, run_cargo_rail, run_cargo_rail_with_env};
 use anyhow::Result;
 use std::collections::BTreeSet;
 use std::fs;
@@ -45,18 +43,6 @@ fn compiler_key_fingerprints(cache: &serde_json::Value, package: &str, field: &s
         })
         .filter_map(|entry| entry["key"][field].as_str().map(str::to_string))
         .collect()
-}
-
-fn evidence_cache_reports_reason(report: &serde_json::Value, expected: &str) -> bool {
-    report["evidence_cache"].as_array().is_some_and(|entries| {
-        entries.iter().any(|entry| {
-            entry["miss_reasons"].as_array().is_some_and(|reasons| {
-                reasons
-                    .iter()
-                    .any(|reason| reason.as_str().is_some_and(|reason| reason.starts_with(expected)))
-            })
-        })
-    })
 }
 
 // TEST 1: Crate name normalization (hyphens vs underscores)
@@ -1665,44 +1651,6 @@ once_cell = "1"
             );
         }
 
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-#[test]
-fn test_external_git_dependency_without_checksum_bypasses_compiler_fact_reuse() {
-    let result: Result<()> = (|| {
-        let external = TestWorkspace::new_single_crate("external-evidence", "0.1.0")?;
-        let workspace = create_workspace_with_unused_detection()?;
-        add_crate_with_manifest(
-            &workspace,
-            "consumer",
-            &format!(
-                r#"[package]
-name = "consumer"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-external-evidence = {{ git = "{}" }}
-"#,
-                file_url(&external.path)
-            ),
-        )?;
-        fs::write(
-            workspace.path.join("crates/consumer/src/lib.rs"),
-            "pub fn value() -> u8 { 1 }\n",
-        )?;
-        workspace.commit("Use an external Git dependency without a registry checksum")?;
-
-        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "-f", "json"])?;
-        let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-        assert!(
-            evidence_cache_reports_reason(&json, "external_source_digest_unavailable="),
-            "external source without a checksum must bypass compiler-fact reuse explicitly\n{}",
-            serde_json::to_string_pretty(&json)?
-        );
         Ok(())
     })();
     super::helpers::finish_test(result);

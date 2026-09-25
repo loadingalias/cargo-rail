@@ -4,7 +4,7 @@
 //! rerun rules. A changed declared input invalidates only the views that ran that script, and
 //! views that completed before another view failed survive for the retry.
 
-use crate::helpers::{NestedWorkspace, TestWorkspace, cargo_command, cargo_rail_command};
+use crate::helpers::{NestedWorkspace, TestWorkspace, cargo_command, cargo_rail_command, file_url, git};
 use anyhow::{Context as _, Result, ensure};
 use std::fs;
 use std::path::Path;
@@ -354,6 +354,68 @@ fn a_dependency_build_script_input_invalidates_its_consumers() {
             "stale evidence would still report helper unused: {:#}",
             used.value["evidence_cache"]
         );
+        Ok(())
+    })();
+    crate::helpers::finish_test(result);
+}
+
+/// A Git dependency has no lockfile checksum; its resolved commit is its source identity.
+/// Reuse must follow that commit instead of being disabled for the whole workspace.
+#[test]
+fn a_git_dependency_pinned_to_a_commit_keeps_evidence_reusable() {
+    let result: Result<()> = (|| {
+        let upstream = tempfile::TempDir::new()?;
+        write_package(upstream.path(), ".", "upstream", "", "pub fn value() -> u8 { 1 }\n")?;
+        git(upstream.path(), &["init", "--initial-branch=main"])?;
+        git(upstream.path(), &["config", "user.name", "Test User"])?;
+        git(upstream.path(), &["config", "user.email", "test@example.com"])?;
+        git(upstream.path(), &["add", "."])?;
+        git(upstream.path(), &["commit", "-m", "Publish upstream"])?;
+
+        let ws = reuse_workspace()?;
+        write_package(
+            &ws.path,
+            "crates/other",
+            "other",
+            &format!(
+                "[dependencies]\nhelper = {{ path = \"../../vendor/helper\" }}\nupstream = {{ git = \"{}\", branch = \"main\" }}\n",
+                file_url(upstream.path())
+            ),
+            "pub fn value() -> u8 { upstream::value() }\n",
+        )?;
+        let cargo_home = ws.path.join("target/cargo-home");
+        let cargo_home = cargo_home.to_str().context("non-UTF-8 Cargo home")?;
+        let lockfile = cargo_command(&ws.path)
+            .env("CARGO_HOME", cargo_home)
+            .arg("generate-lockfile")
+            .output()?;
+        ensure!(lockfile.status.success(), "lockfile generation failed: {lockfile:?}");
+        ws.commit("Depend on a Git package")?;
+        let environment = [("CARGO_HOME", cargo_home)];
+
+        let cold = unify(&ws, &["unify", "--check"], &environment)?;
+        assert_eq!(cold.cargo_views(), 2, "{}", cold.stderr);
+        let warm = unify(&ws, &["unify", "--check"], &environment)?;
+        assert_eq!(
+            warm.cargo_views(),
+            0,
+            "a pinned Git source must not disable reuse\n{:#}",
+            warm.value["evidence_cache"]
+        );
+
+        // A new upstream commit is a new source identity. The lockfile binds every view.
+        fs::write(upstream.path().join("src/lib.rs"), "pub fn value() -> u8 { 2 }\n")?;
+        git(upstream.path(), &["commit", "-am", "Change upstream"])?;
+        let update = cargo_command(&ws.path)
+            .env("CARGO_HOME", cargo_home)
+            .args(["update", "--package", "upstream"])
+            .output()?;
+        ensure!(update.status.success(), "Git dependency update failed: {update:?}");
+        ws.commit("Update the Git package")?;
+        let updated = unify(&ws, &["unify", "--check"], &environment)?;
+        assert_eq!(updated.cargo_views(), 2, "{}", updated.stderr);
+        let rewarmed = unify(&ws, &["unify", "--check"], &environment)?;
+        assert_eq!(rewarmed.cargo_views(), 0, "{:#}", rewarmed.value["evidence_cache"]);
         Ok(())
     })();
     crate::helpers::finish_test(result);
