@@ -118,6 +118,9 @@ struct CompilerAcquisitionCounters {
     live_cargo_processes: AtomicU64,
     max_live_cargo_processes: AtomicU64,
     compiler_actions: AtomicU64,
+    dependency_compilations: AtomicU64,
+    repeated_dependency_compilations: AtomicU64,
+    artifact_high_water_bytes: AtomicU64,
     cargo_messages_read: AtomicU64,
     stdout_bytes_read: AtomicU64,
     stderr_bytes_read: AtomicU64,
@@ -161,6 +164,9 @@ impl CompilerAcquisitionCounters {
             live_cargo_processes: AtomicU64::new(0),
             max_live_cargo_processes: AtomicU64::new(0),
             compiler_actions: AtomicU64::new(0),
+            dependency_compilations: AtomicU64::new(0),
+            repeated_dependency_compilations: AtomicU64::new(0),
+            artifact_high_water_bytes: AtomicU64::new(0),
             cargo_messages_read: AtomicU64::new(0),
             stdout_bytes_read: AtomicU64::new(0),
             stderr_bytes_read: AtomicU64::new(0),
@@ -204,6 +210,9 @@ impl CompilerAcquisitionCounters {
             live_cargo_processes: self.live_cargo_processes.load(Ordering::Relaxed),
             max_live_cargo_processes: self.max_live_cargo_processes.load(Ordering::Relaxed),
             compiler_actions: self.compiler_actions.load(Ordering::Relaxed),
+            dependency_compilations: self.dependency_compilations.load(Ordering::Relaxed),
+            repeated_dependency_compilations: self.repeated_dependency_compilations.load(Ordering::Relaxed),
+            artifact_high_water_bytes: self.artifact_high_water_bytes.load(Ordering::Relaxed),
             cargo_messages_read: self.cargo_messages_read.load(Ordering::Relaxed),
             stdout_bytes_read: self.stdout_bytes_read.load(Ordering::Relaxed),
             stderr_bytes_read: self.stderr_bytes_read.load(Ordering::Relaxed),
@@ -366,6 +375,12 @@ struct CompilerAcquisitionSnapshot {
     live_cargo_processes: u64,
     max_live_cargo_processes: u64,
     compiler_actions: u64,
+    /// Dependency units Cargo compiled rather than found fresh, across every view.
+    dependency_compilations: u64,
+    /// Compilations of a dependency unit that an earlier view in the command already compiled.
+    repeated_dependency_compilations: u64,
+    /// Peak bytes owned by the command's Cargo sandboxes.
+    artifact_high_water_bytes: u64,
     cargo_messages_read: u64,
     stdout_bytes_read: u64,
     stderr_bytes_read: u64,
@@ -729,6 +744,26 @@ pub(crate) fn record_compiler_acquisition_actions(actions: usize) {
             .compiler_acquisition
             .compiler_actions
             .fetch_add(amount(actions), Ordering::Relaxed);
+    }
+}
+
+/// Record one command's dependency compilation and sandbox storage totals.
+pub(crate) fn record_compiler_acquisition_work(
+    dependency_compilations: usize,
+    repeated_dependency_compilations: usize,
+    artifact_high_water_bytes: u64,
+) {
+    if let Some(counters) = COUNTERS.get() {
+        let acquisition = &counters.compiler_acquisition;
+        acquisition
+            .dependency_compilations
+            .fetch_add(amount(dependency_compilations), Ordering::Relaxed);
+        acquisition
+            .repeated_dependency_compilations
+            .fetch_add(amount(repeated_dependency_compilations), Ordering::Relaxed);
+        acquisition
+            .artifact_high_water_bytes
+            .fetch_max(artifact_high_water_bytes, Ordering::Relaxed);
     }
 }
 

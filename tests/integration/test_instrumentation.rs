@@ -634,3 +634,108 @@ fn clean_captures_no_cargo_metadata_or_dependency_graph() {
     })();
     super::helpers::finish_test(result);
 }
+
+/// Views of one target share one sandbox in turn, so a dependency unit shared by every view
+/// compiles once per command, and a warm command runs no Cargo process at all.
+#[test]
+fn unify_compiles_each_shared_dependency_unit_once() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("diagnostic-shared-dependencies")?;
+        let root_manifest_path = ws.path.join("Cargo.toml");
+        let root_manifest = std::fs::read_to_string(&root_manifest_path)?.replace(
+            "members = [\"crates/*\"]",
+            "members = [\"crates/*\"]\nexclude = [\"vendor\"]",
+        );
+        std::fs::write(root_manifest_path, root_manifest)?;
+        for (name, dependencies, source) in [
+            ("base", "", "pub fn base() -> u8 { 1 }\n"),
+            (
+                "shared",
+                "base = { path = \"../base\" }\n",
+                "pub fn shared() -> u8 { base::base() }\n",
+            ),
+            ("unused", "", "pub fn unused() {}\n"),
+        ] {
+            let package = ws.path.join("vendor").join(name);
+            std::fs::create_dir_all(package.join("src"))?;
+            std::fs::write(
+                package.join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{dependencies}"
+                ),
+            )?;
+            std::fs::write(package.join("src/lib.rs"), source)?;
+        }
+        for member in ["alpha", "beta", "gamma"] {
+            let package = ws.add_crate(
+                member,
+                "0.1.0",
+                &[
+                    ("shared", "{ path = \"../../vendor/shared\" }"),
+                    ("unused", "{ path = \"../../vendor/unused\" }"),
+                ],
+            )?;
+            let manifest_path = package.join("Cargo.toml");
+            let mut manifest = std::fs::read_to_string(&manifest_path)?;
+            manifest.push_str("\n[features]\nextra = []\n");
+            std::fs::write(manifest_path, manifest)?;
+            std::fs::write(
+                package.join("src/lib.rs"),
+                "pub fn value() -> u8 { shared::shared() }\n",
+            )?;
+        }
+        let lockfile = cargo_command(&ws.path)
+            .args(["generate-lockfile", "--offline"])
+            .output()?;
+        ensure!(
+            lockfile.status.success(),
+            "offline lockfile generation failed: {}",
+            String::from_utf8_lossy(&lockfile.stderr)
+        );
+        ws.commit("Share one dependency graph across feature views")?;
+
+        let run = |name: &str| -> Result<serde_json::Value> {
+            let diagnostics = ws.path.join(name);
+            let output = run_cargo_rail(
+                &ws.path,
+                &[
+                    "rail",
+                    "--diagnostics-file",
+                    diagnostics.to_str().context("non-UTF-8 diagnostics path")?,
+                    "unify",
+                    "--check",
+                    "--json",
+                ],
+            )?;
+            ensure!(
+                output.status.code() == Some(1),
+                "unify must plan removals: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Ok(read_counters(&diagnostics)?["compiler_acquisition"].clone())
+        };
+
+        let cold = run("cold-shared.json")?;
+        assert!(cold["views"].as_u64().is_some_and(|views| views >= 9), "{cold:#}");
+        assert_eq!(cold["cargo_views"], cold["views"], "{cold:#}");
+        assert_eq!(cold["max_live_cargo_processes"], 1, "{cold:#}");
+        assert_eq!(cold["sandboxes_created"], 1, "{cold:#}");
+        assert!(
+            cold["dependency_compilations"].as_u64().is_some_and(|units| units >= 3),
+            "base, shared, and unused compile: {cold:#}"
+        );
+        assert_eq!(cold["repeated_dependency_compilations"], 0, "{cold:#}");
+        assert!(
+            cold["artifact_high_water_bytes"]
+                .as_u64()
+                .is_some_and(|bytes| bytes > 0),
+            "{cold:#}"
+        );
+
+        let warm = run("warm-shared.json")?;
+        assert_eq!(warm["cargo_views"], 0, "{warm:#}");
+        assert_eq!(warm["dependency_compilations"], 0, "{warm:#}");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}

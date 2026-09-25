@@ -2729,6 +2729,11 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
         }
         let (_, command_artifact_peak_bytes) = artifact_usage.snapshot();
         metrics.artifact_high_water_bytes = metrics.artifact_high_water_bytes.max(command_artifact_peak_bytes);
+        crate::instrumentation::record_compiler_acquisition_work(
+            metrics.dependency_compilations,
+            metrics.repeated_dependency_compilations,
+            metrics.artifact_high_water_bytes,
+        );
         if let Err(error) = sandbox_pool.close() {
             failures.push(AcquisitionFailure::global(FailureClass::Sandbox, error));
         }
@@ -3943,6 +3948,10 @@ fn run_workspace_check(
     })
 }
 
+/// Exact dependency units Cargo compiled in one view.
+///
+/// Artifact file names carry Cargo's `-C metadata` hash, so one key names one unit
+/// configuration: a dependency rebuilt with different features is a different unit.
 fn dependency_compilations(stdout: &[u8], package_to_member: &HashMap<String, String>) -> Vec<String> {
     Message::parse_stream(BufReader::new(stdout))
         .filter_map(Result::ok)
@@ -3950,18 +3959,17 @@ fn dependency_compilations(stdout: &[u8], package_to_member: &HashMap<String, St
             Message::CompilerArtifact(artifact)
                 if !artifact.fresh && !package_to_member.contains_key(artifact.package_id.repr.as_str()) =>
             {
+                let mut files = artifact
+                    .filenames
+                    .iter()
+                    .filter_map(|path| path.file_name())
+                    .collect::<Vec<_>>();
+                files.sort_unstable();
                 Some(format!(
                     "{} / {} / {}",
                     artifact.package_id,
                     artifact.target.name,
-                    artifact
-                        .target
-                        .kind
-                        .iter()
-                        .filter_map(|kind| serde_json::to_value(kind).ok())
-                        .filter_map(|kind| kind.as_str().map(str::to_string))
-                        .collect::<Vec<_>>()
-                        .join("+")
+                    files.join("+")
                 ))
             }
             _ => None,
