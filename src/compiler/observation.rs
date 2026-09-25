@@ -511,7 +511,7 @@ pub(crate) struct CompilationObservationManifest {
 }
 
 impl CompilationObservationManifest {
-    /// Revalidate only the authority that can change compiler diagnostics.
+    /// Revalidate only the authority that can change compiler output: diagnostics and typed facts.
     ///
     /// Dependency artifacts and emitted outputs are products of the captured
     /// inputs, so their continued presence does not affect already-derived
@@ -521,7 +521,7 @@ impl CompilationObservationManifest {
     /// Reads below `generated_root` are build-script outputs in a recycled sandbox, and
     /// `script_environment` names variables that build scripts set with `rustc-env`. The
     /// caller binds both through build-script freshness instead.
-    pub(crate) fn diagnostic_revalidation_reason(
+    pub(crate) fn input_revalidation_reason(
         &self,
         source_root: &Path,
         generated_root: Option<&ObservationPath>,
@@ -3716,20 +3716,20 @@ mod tests {
         assert!(manifest.bypasses.contains("rustdoc_output_tree_unavailable"));
         assert!(!manifest.bypasses.contains("rustdoc_dep_info_unavailable"));
         assert_eq!(
-            manifest.diagnostic_revalidation_reason(source_root, None, &BTreeSet::new()),
+            manifest.input_revalidation_reason(source_root, None, &BTreeSet::new()),
             None
         );
 
         fs::write(&index, "<html>changed</html>").expect("output mutation");
         assert_eq!(
-            manifest.diagnostic_revalidation_reason(source_root, None, &BTreeSet::new()),
+            manifest.input_revalidation_reason(source_root, None, &BTreeSet::new()),
             None
         );
         fs::write(&index, "<html>docs</html>").expect("restore output");
 
         fs::write(&nested, "pub fn other() {}\n").expect("same-size nested mutation");
         assert_eq!(
-            manifest.diagnostic_revalidation_reason(source_root, None, &BTreeSet::new()),
+            manifest.input_revalidation_reason(source_root, None, &BTreeSet::new()),
             Some("observed_compiler_read_changed")
         );
     }

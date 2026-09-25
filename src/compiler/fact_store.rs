@@ -7,6 +7,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use crate::build_script::freshness::BuildScriptFreshness;
+use crate::compiler::input_proof::CompilerInputProof;
+use crate::compiler::observation::CompilationObservationManifest;
+
 use crate::cache::cas::{CompilerEvidenceStoreRequest, LocalCas};
 use crate::compiler::diagnostics_store::{
     CompilerEvidenceObject, CompilerFactCacheKey, CompilerFactEvidenceValidation, CompilerFactObjectReference,
@@ -34,8 +38,13 @@ impl CompilerFactStore {
         self.cas.is_some()
     }
 
-    /// Load one complete exact set. Any missing or mismatched object is a miss.
-    pub(crate) fn get(&self, key: &CompilerFactCacheKey) -> RailResult<Option<Vec<ValidatedCompilerFactObject>>> {
+    /// Load the newest complete exact set whose input proof `accept` approves.
+    /// Any missing or mismatched object, or any rejected proof, is a miss.
+    pub(crate) fn get(
+        &self,
+        key: &CompilerFactCacheKey,
+        accept: impl Fn(&CompilerInputProof<'_>) -> bool,
+    ) -> RailResult<Option<Vec<ValidatedCompilerFactObject>>> {
         let Some(cas) = &self.cas else {
             return Ok(None);
         };
@@ -64,6 +73,10 @@ impl CompilerFactStore {
             if references != stored_set || !set_covers_requested_packages(key, references) {
                 continue;
             }
+            // An empty set compiled no typed unit, so its key alone binds every input.
+            if !references.is_empty() && !validation.set_input_proof().is_some_and(|proof| accept(&proof)) {
+                continue;
+            }
             let mut objects = Vec::with_capacity(references.len());
             let mut complete = true;
             for reference in references {
@@ -83,8 +96,14 @@ impl CompilerFactStore {
         Ok(None)
     }
 
-    /// Publish objects first and the completeness set last.
-    pub(crate) fn put(&self, key: &CompilerFactCacheKey, objects: &[ValidatedCompilerFactObject]) -> RailResult<()> {
+    /// Publish objects first and the completeness set, with its input proof, last.
+    pub(crate) fn put(
+        &self,
+        key: &CompilerFactCacheKey,
+        objects: &[ValidatedCompilerFactObject],
+        observations: Vec<CompilationObservationManifest>,
+        build_scripts: Vec<BuildScriptFreshness>,
+    ) -> RailResult<()> {
         let Some(cas) = &self.cas else {
             return Ok(());
         };
@@ -127,7 +146,8 @@ impl CompilerFactStore {
             remote_complete &= published;
         }
 
-        let validation = CompilerFactEvidenceValidation::set(key.clone(), references.clone())?;
+        let validation =
+            CompilerFactEvidenceValidation::set(key.clone(), references.clone(), observations, build_scripts)?;
         let evidence = CompilerEvidenceObject::from_compiler_fact_set(references)?;
         cas.store_compiler_evidence(CompilerEvidenceStoreRequest {
             validation: &validation,
@@ -251,7 +271,9 @@ mod tests {
         let (key, object) = fact_fixture();
         let identity = object.identity().to_string();
 
-        store.put(&key, &[object]).expect("publish complete fact set");
+        store
+            .put(&key, &[object], Vec::new(), Vec::new())
+            .expect("publish complete fact set");
         drop(store);
 
         let reopened = CompilerFactStore {
@@ -264,9 +286,55 @@ mod tests {
             ),
             remote: None,
         };
-        let hit = reopened.get(&key).expect("fact lookup").expect("complete hit");
+        let hit = reopened
+            .get(&key, |_| true)
+            .expect("fact lookup")
+            .expect("complete hit");
         assert_eq!(hit.len(), 1);
         assert_eq!(hit[0].identity(), identity);
+    }
+
+    #[test]
+    fn a_rejected_input_proof_is_a_miss_except_for_an_empty_set() {
+        let cache = tempfile::tempdir().expect("cache root");
+        let cas = LocalCas::open_selected(
+            &crate::cache::cas::LocalCacheSelection::new(cache.path().to_path_buf(), 16 * 1024 * 1024, None)
+                .expect("cache selection"),
+        )
+        .expect("local CAS");
+        let store = CompilerFactStore {
+            cas: Some(cas),
+            remote: None,
+        };
+        let (key, object) = fact_fixture();
+        store
+            .put(&key, &[object], Vec::new(), Vec::new())
+            .expect("publish complete fact set");
+        assert!(store.get(&key, |_| false).expect("fact lookup").is_none());
+        assert!(store.get(&key, |_| true).expect("fact lookup").is_some());
+
+        let empty_cache = tempfile::tempdir().expect("cache root");
+        let empty = CompilerFactStore {
+            cas: Some(
+                LocalCas::open_selected(
+                    &crate::cache::cas::LocalCacheSelection::new(
+                        empty_cache.path().to_path_buf(),
+                        16 * 1024 * 1024,
+                        None,
+                    )
+                    .expect("cache selection"),
+                )
+                .expect("local CAS"),
+            ),
+            remote: None,
+        };
+        empty
+            .put(&key, &[], Vec::new(), Vec::new())
+            .expect("publish empty fact set");
+        assert!(
+            empty.get(&key, |_| false).expect("fact lookup").is_some(),
+            "an empty set compiled no typed unit, so its key alone authorizes it"
+        );
     }
 
     #[test]
@@ -283,8 +351,13 @@ mod tests {
         };
         let (key, _) = fact_fixture();
 
-        store.put(&key, &[]).expect("publish empty fact set");
-        let hit = store.get(&key).expect("fact lookup").expect("complete empty hit");
+        store
+            .put(&key, &[], Vec::new(), Vec::new())
+            .expect("publish empty fact set");
+        let hit = store
+            .get(&key, |_| true)
+            .expect("fact lookup")
+            .expect("complete empty hit");
         assert!(hit.is_empty());
     }
 
@@ -304,7 +377,8 @@ mod tests {
         )
         .expect("object reference");
         let validation =
-            CompilerFactEvidenceValidation::set(key.clone(), vec![reference.clone()]).expect("set validation");
+            CompilerFactEvidenceValidation::set(key.clone(), vec![reference.clone()], Vec::new(), Vec::new())
+                .expect("set validation");
         let evidence = CompilerEvidenceObject::from_compiler_fact_set(vec![reference]).expect("set evidence");
         cas.store_compiler_evidence(CompilerEvidenceStoreRequest {
             validation: &validation,
@@ -316,7 +390,7 @@ mod tests {
             cas: Some(cas),
             remote: None,
         };
-        assert!(store.get(&key).expect("fact lookup").is_none());
+        assert!(store.get(&key, |_| true).expect("fact lookup").is_none());
     }
 
     #[test]
@@ -332,12 +406,14 @@ mod tests {
             remote: None,
         };
         let (key, object) = fact_fixture();
-        store.put(&key, &[object]).expect("publish complete fact set");
+        store
+            .put(&key, &[object], Vec::new(), Vec::new())
+            .expect("publish complete fact set");
 
         let mut package = package_fixture();
         package.package_id.repr = "path+file:///different/root#demo@1.0.0".to_string();
         let moved = fact_key(package, producer_fixture(), coverage_fixture(), '4');
-        assert!(store.get(&moved).expect("moved-root lookup").is_some());
+        assert!(store.get(&moved, |_| true).expect("moved-root lookup").is_some());
     }
 
     #[test]
@@ -353,7 +429,9 @@ mod tests {
             remote: None,
         };
         let (key, object) = fact_fixture();
-        store.put(&key, &[object]).expect("publish complete fact set");
+        store
+            .put(&key, &[object], Vec::new(), Vec::new())
+            .expect("publish complete fact set");
 
         let mut source = package_fixture();
         source.source_fingerprint = "sha256:changed-source".to_string();
@@ -375,7 +453,12 @@ mod tests {
             fact_key(package_fixture(), producer_fixture(), coverage_fixture(), '7'),
         ];
         for changed in misses {
-            assert!(store.get(&changed).expect("changed-authority lookup").is_none());
+            assert!(
+                store
+                    .get(&changed, |_| true)
+                    .expect("changed-authority lookup")
+                    .is_none()
+            );
         }
     }
 
@@ -392,7 +475,9 @@ mod tests {
             remote: None,
         };
         let (key, object) = fact_fixture();
-        store.put(&key, &[object]).expect("publish complete fact set");
+        store
+            .put(&key, &[object], Vec::new(), Vec::new())
+            .expect("publish complete fact set");
 
         let results = cache.path().join("cargo-rail/local-cas-v3/results");
         let evidence = fs::read_dir(results)
@@ -412,7 +497,10 @@ mod tests {
         bytes[index] = if bytes[index] == b'0' { b'1' } else { b'0' };
         fs::write(evidence, bytes).expect("corrupt fact object");
 
-        assert!(store.get(&key).is_err(), "corrupt fact evidence authorized reuse");
+        assert!(
+            store.get(&key, |_| true).is_err(),
+            "corrupt fact evidence authorized reuse"
+        );
     }
 
     fn fact_fixture() -> (CompilerFactCacheKey, ValidatedCompilerFactObject) {

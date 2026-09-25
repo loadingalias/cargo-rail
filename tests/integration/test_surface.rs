@@ -727,8 +727,6 @@ reason = "resume fixture product"
 #[test]
 fn surface_keeps_std_and_alloc_roots_package_local_across_resume_and_reuse() {
     let result: Result<()> = (|| {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let workspace = TestWorkspace::new_named("surface-package-feature-isolation")?;
         workspace.add_feature_isolation_crates()?;
         fs::write(
@@ -760,27 +758,52 @@ features = ["isolate"]
 
         let trace_directory = workspace.path.join("target/cargo-rail-cargo-argv");
         fs::create_dir_all(&trace_directory)?;
-        let cargo_recorder = workspace.path.join("target/cargo-rail-cargo-recorder");
+        // A compiled recorder, because a script Cargo has unobserved runtime inputs and never
+        // supports compiler-evidence reuse.
+        let recorder_source = workspace.path.join("target/cargo-rail-cargo-recorder.rs");
+        let cargo_recorder = workspace.path.join(format!(
+            "target/cargo-rail-cargo-recorder{}",
+            std::env::consts::EXE_SUFFIX
+        ));
         fs::write(
-            &cargo_recorder,
-            r#"#!/bin/sh
-set -eu
-case " $* " in
-  *" --package shared "*)
-    if [ -e "$CARGO_RAIL_TEST_CARGO_LOG/../fail-shared" ]; then
-      echo "fixture Cargo executor unavailable for shared" >&2
-      exit 74
-    fi
-    ;;
-esac
-trace="$(mktemp "$CARGO_RAIL_TEST_CARGO_LOG/argv.XXXXXX")"
-printf '%s\0' "$@" > "$trace"
-exec cargo "$@"
+            &recorder_source,
+            format!(
+                r#"use std::io::Write as _;
+
+fn main() {{
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let log = std::path::PathBuf::from(std::env::var_os("CARGO_RAIL_TEST_CARGO_LOG").expect("trace directory"));
+    let package_shared = args.windows(2).any(|pair| pair[0] == "--package" && pair[1] == "shared");
+    if package_shared && log.join("../fail-shared").exists() {{
+        eprintln!("fixture Cargo executor unavailable for shared");
+        std::process::exit(74);
+    }}
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let mut trace = std::fs::File::create_new(log.join(format!("argv.{{}}.{{nanos}}", std::process::id())))
+        .expect("trace file");
+    for argument in &args {{
+        trace.write_all(argument.to_string_lossy().as_bytes()).expect("trace argument");
+        trace.write_all(b"\0").expect("trace separator");
+    }}
+    let status = std::process::Command::new({cargo:?}).args(&args).status().expect("run Cargo");
+    std::process::exit(status.code().unwrap_or(1));
+}}
 "#,
+                cargo = env!("CARGO"),
+            ),
         )?;
-        let mut permissions = fs::metadata(&cargo_recorder)?.permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&cargo_recorder, permissions)?;
+        let compiled = std::process::Command::new("rustc")
+            .arg(&recorder_source)
+            .args(["--edition", "2021", "--crate-name", "cargo_recorder", "-o"])
+            .arg(&cargo_recorder)
+            .output()?;
+        assert!(
+            compiled.status.success(),
+            "compile Cargo recorder fixture: {compiled:?}"
+        );
         let cargo_recorder = cargo_recorder
             .to_str()
             .ok_or_else(|| anyhow!("Cargo recorder path is not UTF-8"))?;
@@ -1063,6 +1086,162 @@ reason = "the configured item must exist"
         assert!(explained.contains("1 configuration diagnostic(s)"));
         assert!(explained.contains("configuration unknown-item at surface.override[0]"));
         assert!(explained.contains("reason: the configured item must exist"));
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+/// One Surface product workspace: `app` is a binary whose items come partly from files and
+/// generated code that its package sources do not contain.
+fn fact_reuse_workspace(name: &str, main: &str, manifest_tail: &str) -> Result<TestWorkspace> {
+    let workspace = TestWorkspace::new_named(name)?;
+    let package = workspace.path.join("crates/app");
+    fs::create_dir_all(package.join("src"))?;
+    fs::write(
+        package.join("Cargo.toml"),
+        format!("[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{manifest_tail}"),
+    )?;
+    fs::write(package.join("src/main.rs"), main)?;
+    fs::write(
+        workspace.path.join(".config/rail.toml"),
+        r#"[surface]
+consumer_scope = "workspace"
+doctest_coverage = "disabled"
+
+[[surface.product]]
+package = "app"
+bin = "app"
+reason = "fact reuse fixture product"
+"#,
+    )?;
+    fs::write(
+        workspace.path.join("rust-toolchain.toml"),
+        include_str!("../../rust-toolchain.toml"),
+    )?;
+    Ok(workspace)
+}
+
+/// Run Surface as JSON; return its fact-cache hits, executed Cargo views, and the report text.
+fn surface_run(workspace: &TestWorkspace, environment: &[(&str, &str)]) -> Result<(u64, u64, String)> {
+    let output = run_cargo_rail_with_env(&workspace.path, &["rail", "surface", "--format", "json"], environment)?;
+    anyhow::ensure!(
+        output.status.success(),
+        "surface failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let acquisition = &report["metrics"]["acquisition"];
+    Ok((
+        acquisition["fact_cache_hits"].as_u64().unwrap_or(u64::MAX),
+        acquisition["cargo_views_executed"].as_u64().unwrap_or(u64::MAX),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+    ))
+}
+
+#[test]
+fn surface_fact_reuse_revalidates_files_read_outside_the_package() {
+    let result: Result<()> = (|| {
+        let workspace = fact_reuse_workspace(
+            "surface-fact-include",
+            "fn main() {\n    live();\n}\n\npub fn live() {}\n\ninclude!(\"../../../shared/items.rs\");\n",
+            "",
+        )?;
+        fs::create_dir_all(workspace.path.join("shared"))?;
+        fs::write(workspace.path.join("shared/items.rs"), "pub fn first_dead() {}\n")?;
+        workspace.commit("Include items from outside the package")?;
+
+        let (_, cold_views, cold) = surface_run(&workspace, &[])?;
+        assert_eq!(cold_views, 1, "{cold}");
+        let (warm_hits, warm_views, _) = surface_run(&workspace, &[])?;
+        assert_eq!((warm_hits, warm_views), (1, 0), "unchanged inputs reuse the fact set");
+
+        fs::write(
+            workspace.path.join("shared/items.rs"),
+            "pub fn first_dead() {}\npub fn second_dead() {}\n",
+        )?;
+        let (changed_hits, changed_views, changed) = surface_run(&workspace, &[])?;
+        assert_eq!(
+            (changed_hits, changed_views),
+            (0, 1),
+            "a changed included file must invalidate the fact set"
+        );
+        assert!(
+            changed.contains("second_dead"),
+            "stale facts hid the new item:\n{changed}"
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn surface_reuses_facts_with_build_scripts_and_proc_macros_until_a_declared_input_changes() {
+    let result: Result<()> = (|| {
+        let workspace = fact_reuse_workspace(
+            "surface-fact-build-script",
+            "fn main() {\n    live();\n}\n\n#[derive(marker::Marker)]\npub struct Tagged;\n\npub fn live() {}\n\n\
+             pub fn baseline_dead() {}\n\n#[cfg(declared_item)]\npub fn declared_dead() {}\n\n\
+             include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\n",
+            "build = \"build.rs\"\n\n[dependencies]\nmarker = { path = \"../../vendor/marker\" }\n",
+        )?;
+        let root = workspace.path.join("Cargo.toml");
+        let manifest = fs::read_to_string(&root)?.replace(
+            "members = [\"crates/*\"]",
+            "members = [\"crates/*\"]\nexclude = [\"vendor\"]",
+        );
+        fs::write(&root, manifest)?;
+        let marker = workspace.path.join("vendor/marker");
+        fs::create_dir_all(marker.join("src"))?;
+        fs::write(
+            marker.join("Cargo.toml"),
+            "[package]\nname = \"marker\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\nproc-macro = true\n",
+        )?;
+        fs::write(
+            marker.join("src/lib.rs"),
+            "use proc_macro::TokenStream;\n\n#[proc_macro_derive(Marker)]\npub fn marker(_: TokenStream) -> TokenStream {\n    TokenStream::new()\n}\n",
+        )?;
+        fs::write(
+            workspace.path.join("crates/app/build.rs"),
+            r#"fn main() {
+    println!("cargo::rustc-check-cfg=cfg(declared_item)");
+    println!("cargo::rerun-if-env-changed=SURFACE_DECLARED_ITEM");
+    if std::env::var("SURFACE_DECLARED_ITEM").as_deref() == Ok("1") {
+        println!("cargo::rustc-cfg=declared_item");
+    }
+    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR");
+    std::fs::write(std::path::Path::new(&out_dir).join("generated.rs"), "pub fn generated_item() {}\n")
+        .expect("generated items");
+}
+"#,
+        )?;
+        let lockfile = std::process::Command::new("cargo")
+            .current_dir(&workspace.path)
+            .args(["generate-lockfile", "--offline"])
+            .env("RUSTC_WRAPPER", "")
+            .output()?;
+        anyhow::ensure!(lockfile.status.success(), "{lockfile:?}");
+        workspace.commit("Generate items with a build script and derive with a proc macro")?;
+
+        let (_, cold_views, cold) = surface_run(&workspace, &[])?;
+        assert_eq!(cold_views, 1, "{cold}");
+        assert!(
+            cold.contains("baseline_dead") && !cold.contains("declared_dead"),
+            "{cold}"
+        );
+        let (warm_hits, warm_views, _) = surface_run(&workspace, &[])?;
+        assert_eq!(
+            (warm_hits, warm_views),
+            (1, 0),
+            "build scripts and proc macros must not prevent fact reuse"
+        );
+
+        let (changed_hits, changed_views, changed) = surface_run(&workspace, &[("SURFACE_DECLARED_ITEM", "1")])?;
+        assert_eq!((changed_hits, changed_views), (0, 1), "a declared input changed");
+        assert!(
+            changed.contains("declared_dead"),
+            "stale facts after a declared input changed:\n{changed}"
+        );
         Ok(())
     })();
     super::helpers::finish_test(result);

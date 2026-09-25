@@ -83,6 +83,13 @@ enum CompilerFactEvidenceValidationKind {
     Set {
         cache_key: CompilerFactCacheKey,
         objects: Vec<CompilerFactObjectReference>,
+        /// Compilation observations of the typed packages' units, for input revalidation.
+        /// Omitted when empty, so sets written before they were recorded keep their encoding.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        observations: Vec<crate::compiler::observation::CompilationObservationManifest>,
+        /// Rerun inputs of every build script in the view.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        build_scripts: Vec<crate::build_script::freshness::BuildScriptFreshness>,
     },
 }
 
@@ -457,11 +464,18 @@ impl CompilerFactEvidenceValidation {
     pub(crate) fn set(
         cache_key: CompilerFactCacheKey,
         objects: Vec<CompilerFactObjectReference>,
+        observations: Vec<crate::compiler::observation::CompilationObservationManifest>,
+        build_scripts: Vec<crate::build_script::freshness::BuildScriptFreshness>,
     ) -> RailResult<CompilerEvidenceValidation> {
         cache_key.validate()?;
         validate_fact_references(&objects)?;
-        Self::bind(CompilerFactEvidenceValidationKind::Set { cache_key, objects })
-            .map(CompilerEvidenceValidation::CompilerFacts)
+        Self::bind(CompilerFactEvidenceValidationKind::Set {
+            cache_key,
+            objects,
+            observations,
+            build_scripts,
+        })
+        .map(CompilerEvidenceValidation::CompilerFacts)
     }
 
     pub(crate) fn set_candidate_key(cache_key: &CompilerFactCacheKey) -> RailResult<String> {
@@ -496,8 +510,25 @@ impl CompilerFactEvidenceValidation {
         expected: &CompilerFactCacheKey,
     ) -> Option<&'a [CompilerFactObjectReference]> {
         match &self.validation {
-            CompilerFactEvidenceValidationKind::Set { cache_key, objects } if cache_key == expected => Some(objects),
+            CompilerFactEvidenceValidationKind::Set { cache_key, objects, .. } if cache_key == expected => {
+                Some(objects)
+            }
             CompilerFactEvidenceValidationKind::Object { .. } | CompilerFactEvidenceValidationKind::Set { .. } => None,
+        }
+    }
+
+    /// The input proof a fact set was published with.
+    pub(crate) fn set_input_proof(&self) -> Option<crate::compiler::input_proof::CompilerInputProof<'_>> {
+        match &self.validation {
+            CompilerFactEvidenceValidationKind::Set {
+                observations,
+                build_scripts,
+                ..
+            } => Some(crate::compiler::input_proof::CompilerInputProof::new(
+                observations,
+                build_scripts,
+            )),
+            CompilerFactEvidenceValidationKind::Object { .. } => None,
         }
     }
 
@@ -535,7 +566,7 @@ impl CompilerFactEvidenceValidation {
                     return Err(RailError::message("compiler fact object cache coverage is empty"));
                 }
             }
-            CompilerFactEvidenceValidationKind::Set { cache_key, objects } => {
+            CompilerFactEvidenceValidationKind::Set { cache_key, objects, .. } => {
                 cache_key.validate()?;
                 validate_fact_references(objects)?;
             }

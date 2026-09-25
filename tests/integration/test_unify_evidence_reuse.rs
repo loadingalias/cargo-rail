@@ -4,7 +4,7 @@
 //! rerun rules. A changed declared input invalidates only the views that ran that script, and
 //! views that completed before another view failed survive for the retry.
 
-use crate::helpers::{TestWorkspace, cargo_command, cargo_rail_command};
+use crate::helpers::{NestedWorkspace, TestWorkspace, cargo_command, cargo_rail_command};
 use anyhow::{Context as _, Result, ensure};
 use std::fs;
 use std::path::Path;
@@ -106,9 +106,13 @@ impl Run {
 }
 
 fn unify(ws: &TestWorkspace, arguments: &[&str], environment: &[(&str, &str)]) -> Result<Run> {
+    unify_at(&ws.path, arguments, environment)
+}
+
+fn unify_at(root: &Path, arguments: &[&str], environment: &[(&str, &str)]) -> Result<Run> {
     let diagnostics = tempfile::TempDir::new()?;
     let file = diagnostics.path().join("counters.json");
-    let mut command = cargo_rail_command(&ws.path)?;
+    let mut command = cargo_rail_command(root)?;
     command
         .args(["rail", "--diagnostics-file", file.to_str().context("non-UTF-8 path")?])
         .args(arguments)
@@ -349,6 +353,55 @@ fn a_dependency_build_script_input_invalidates_its_consumers() {
             used.helper_cache("consumer").is_none(),
             "stale evidence would still report helper unused: {:#}",
             used.value["evidence_cache"]
+        );
+        Ok(())
+    })();
+    crate::helpers::finish_test(result);
+}
+
+/// Observed paths are recorded relative to the repository root, so a workspace below it must
+/// revalidate them there rather than at the workspace root.
+#[test]
+fn a_workspace_below_its_repository_root_reuses_its_evidence() {
+    let result: Result<()> = (|| {
+        let ws = NestedWorkspace::new("rust")?;
+        let root = ws.workspace_root.join("Cargo.toml");
+        let manifest = fs::read_to_string(&root)?.replace(
+            "members = [\"crates/*\"]",
+            "members = [\"crates/*\"]\nexclude = [\"vendor\"]",
+        );
+        fs::write(&root, manifest)?;
+        write_package(
+            &ws.workspace_root,
+            "vendor/helper",
+            "helper",
+            "",
+            "pub fn help() -> u8 { 1 }\n",
+        )?;
+        write_package(
+            &ws.workspace_root,
+            "crates/app",
+            "app",
+            "[dependencies]\nhelper = { path = \"../../vendor/helper\" }\n",
+            "pub fn value() -> u8 { 0 }\n",
+        )?;
+        let lockfile = cargo_command(&ws.workspace_root)
+            .args(["generate-lockfile", "--offline"])
+            .output()?;
+        ensure!(
+            lockfile.status.success(),
+            "offline lockfile generation failed: {lockfile:?}"
+        );
+        ws.commit("Add a nested workspace with an unused path dependency")?;
+
+        let cold = unify_at(&ws.workspace_root, &["unify", "--check"], &[])?;
+        assert_eq!(cold.cargo_views(), 1, "{}", cold.stderr);
+        let warm = unify_at(&ws.workspace_root, &["unify", "--check"], &[])?;
+        assert_eq!(
+            warm.cargo_views(),
+            0,
+            "a nested workspace must reuse its evidence\n{:#}",
+            warm.value["evidence_cache"]
         );
         Ok(())
     })();

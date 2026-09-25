@@ -389,13 +389,17 @@ before Cargo sees output.
 
 ## Compiler-evidence cache
 
-Unify stores the compiler evidence of each view in the selected cache profile's local store.
-Preview, `--check`, `--explain`, and `apply` reuse a view after revalidating its compiler, sources, manifests, targets,
-features, Cargo configuration, lockfile, executable identity, observed file reads,
-and observed environment reads.
-This store contains diagnostic evidence, not restorable Cargo artifacts.
+Unify diagnostics and Surface's typed compiler facts are stored per view in the selected cache
+profile's local store.
+They are separate records with one reuse rule.
+A view is reused after revalidating its compiler, sources, manifests, targets, features,
+Cargo configuration, lockfile, and executable identity,
+plus every file and environment variable that rustc reported reading for the view's units,
+including files outside the package.
+Unify preview, `--check`, `--explain`, and `apply`, and Surface runs and resumes, all apply this rule.
+This store contains compiler evidence, not restorable Cargo artifacts.
 
-A view stays reusable while Cargo would keep the output of every build script in it:
+A view also stays reusable only while Cargo would keep the output of every build script in it:
 
 - Each path declared with `rerun-if-changed` keeps its content.
   A declared directory keeps every entry.
@@ -418,7 +422,8 @@ A corrupt stored view is never reused, and it does not hide other stored views o
 Runs under an unverified `RUSTC_WRAPPER` never reuse evidence, because the wrapper can read anything;
 runs under Cargo-Rail's installed wrapper do.
 
-Inspect `evidence_cache` in JSON output for hits, misses, miss reasons, and publication bypasses.
+Inspect Unify's `evidence_cache` for hits, misses, miss reasons, and publication bypasses,
+and Surface's `metrics.acquisition` for fact-cache hits, misses, and bypass reasons.
 
 ## Local storage budget
 

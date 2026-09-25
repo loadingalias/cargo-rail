@@ -28,6 +28,7 @@ use crate::compiler::facts::{
     ValidatedCompilerFactObject, load_announced_fragment, load_discovered_doctest_fragment,
     required_compiler_fact_coverage,
 };
+use crate::compiler::input_proof::CompilerInputProof;
 use crate::compiler::invocation::{
     CACHE_WRAPPER_MARKER, INNER_RUSTDOC_ENV, INNER_WRAPPER_ENV, OBSERVATION_DIRECTORY_ENV, OBSERVATION_SOURCE_ROOT_ENV,
     RUSTDOC_WRAPPER_MARKER, WRAPPER_MARKER,
@@ -294,10 +295,8 @@ pub(crate) struct CompilerCacheIdentity {
     analysis_cache: Option<CompilerAnalysisCache>,
     explicit_build_jobs: Option<usize>,
     executable_bypasses: BTreeSet<String>,
-    /// Why no Unify evidence can be reused for this snapshot.
+    /// Why no compiler evidence or typed facts can be reused for this snapshot.
     cache_bypass_reason: Option<CompilerCacheBypass>,
-    /// Why no typed compiler facts can be reused; facts do not yet bind build-script freshness.
-    fact_cache_bypass_reason: Option<CompilerCacheBypass>,
     /// Root-independent label, package root, and whether the package source is immutable,
     /// for build-script freshness.
     package_roots: HashMap<PackageId, (String, PathBuf, bool)>,
@@ -1170,8 +1169,6 @@ enum CargoBuildScriptOutput {
 enum CompilerCacheBypass {
     CargoConfiguration,
     ResponseFileConfiguration,
-    BuildScriptObservations,
-    ProcMacroObservations,
     ExternalSourceDigest,
 }
 
@@ -1180,8 +1177,6 @@ impl CompilerCacheBypass {
         match self {
             Self::CargoConfiguration => "cargo_configuration_unmodeled",
             Self::ResponseFileConfiguration => "response_file_configuration_unmodeled",
-            Self::BuildScriptObservations => "build_script_observations_unavailable",
-            Self::ProcMacroObservations => "proc_macro_observations_unavailable",
             Self::ExternalSourceDigest => "external_source_digest_unavailable",
         }
     }
@@ -1244,7 +1239,6 @@ impl CompilerCacheIdentity {
         )?;
         let executables = snapshot.executable_identities()?;
         let cache_bypass_reason = compiler_cache_bypass_reason(snapshot);
-        let fact_cache_bypass_reason = cache_bypass_reason.or_else(|| compiler_fact_cache_bypass_reason(snapshot));
         let package_roots = snapshot
             .base_resolution()
             .metadata()
@@ -1384,7 +1378,6 @@ impl CompilerCacheIdentity {
             explicit_build_jobs,
             executable_bypasses,
             cache_bypass_reason,
-            fact_cache_bypass_reason,
             package_roots,
         })
     }
@@ -1911,7 +1904,10 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
             let mut cache_hit = false;
             let cache_started = crate::instrumentation::compiler_acquisition_timer();
             let observation_miss = if self.identity.cache_bypass_reason.is_none() {
-                match store.get_valid(&key, |entry| compiler_evidence_miss_reason(entry, self.workspace_root)) {
+                match store.get_valid(&key, |entry| {
+                    CompilerInputProof::new(&entry.observations, &entry.build_scripts)
+                        .revalidation_reason(&self.identity.observation_context.source_root, self.workspace_root)
+                }) {
                     Ok(entry) => {
                         cache_hit = true;
                         metrics.diagnostic_cache_hits += 1;
@@ -2005,7 +2001,7 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
             } else {
                 BTreeSet::new()
             };
-            let fact_cache_key = if typed_members.is_empty() || self.identity.fact_cache_bypass_reason.is_some() {
+            let fact_cache_key = if typed_members.is_empty() || self.identity.cache_bypass_reason.is_some() {
                 None
             } else {
                 Some(
@@ -2022,7 +2018,14 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
             };
             let cached_facts = if let Some(key) = fact_cache_key.as_ref() {
                 let cache_started = crate::instrumentation::compiler_acquisition_timer();
-                let cached = fact_store.get(key).ok().flatten();
+                let cached = fact_store
+                    .get(key, |proof| {
+                        proof
+                            .revalidation_reason(&self.identity.observation_context.source_root, self.workspace_root)
+                            .is_none()
+                    })
+                    .ok()
+                    .flatten();
                 crate::instrumentation::record_compiler_acquisition_cache_lookup(cache_started, cached.is_some());
                 cached
             } else {
@@ -2034,7 +2037,7 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                     metrics.fact_cache_hits += 1;
                 } else {
                     metrics.fact_cache_misses += 1;
-                    if let Some(reason) = self.identity.fact_cache_bypass_reason {
+                    if let Some(reason) = self.identity.cache_bypass_reason {
                         *metrics
                             .fact_cache_bypass_reasons
                             .entry(reason.as_str().to_string())
@@ -3561,6 +3564,17 @@ fn integrate_acquisition_outcome(
     let binding_invocations = run.invocations.clone();
     let binding_facts = run.compiler_facts.clone();
     let mut fact_set_published = !prepared.collect_typed;
+    let diagnostics_needed = view.requires(crate::compiler::scheduler::CompilerFactFamily::StableDiagnostics)
+        && !diagnostic_members.is_empty();
+    let compilation_observations =
+        if diagnostics_needed || (prepared.collect_typed && prepared.fact_cache_key.is_some()) {
+            let mut observations =
+                parse_compilation_observations(&run.stdout, run.invocations.clone(), &collector.identity, target)?;
+            reconcile_exact_artifact_observations(&mut observations, retained_observations);
+            observations
+        } else {
+            Vec::new()
+        };
     if prepared.collect_typed {
         metrics.fresh_fragment_bytes =
             run.compiler_facts
@@ -3576,18 +3590,7 @@ fn integrate_acquisition_outcome(
             let bypasses = fact_invocation_cache_bypasses(&run.invocations, view.compiles_doctests());
             let complete_empty_view =
                 fresh_facts.is_empty() && bypasses == BTreeSet::from(["no_typed_compiler_invocation".to_string()]);
-            if bypasses.is_empty() || complete_empty_view {
-                let cache_started = crate::instrumentation::compiler_acquisition_timer();
-                let stored = fact_store.put(key, &fresh_facts);
-                crate::instrumentation::record_compiler_acquisition_cache_write(cache_started);
-                match stored {
-                    Ok(()) => fact_set_published = true,
-                    Err(error) => {
-                        metrics.fact_cache_store_failures += 1;
-                        progress!("    Compiler fact cache store bypassed: {error}");
-                    }
-                }
-            } else {
+            if !bypasses.is_empty() && !complete_empty_view {
                 for bypass in &bypasses {
                     *metrics.fact_cache_bypass_reasons.entry(bypass.clone()).or_default() += 1;
                 }
@@ -3595,6 +3598,42 @@ fn integrate_acquisition_outcome(
                     "    Compiler fact cache bypassed: {}",
                     bypasses.into_iter().collect::<Vec<_>>().join(", ")
                 );
+            } else {
+                match &run.build_scripts {
+                    Err(reason) => {
+                        *metrics
+                            .fact_cache_bypass_reasons
+                            .entry((*reason).to_string())
+                            .or_default() += 1;
+                        progress!("    Compiler fact cache bypassed: {reason}");
+                    }
+                    Ok(build_scripts) => {
+                        let observations = key
+                            .typed_packages()
+                            .iter()
+                            .filter_map(|package| {
+                                collector
+                                    .manifests
+                                    .members
+                                    .iter()
+                                    .find(|member| member.package_name == *package)
+                            })
+                            .flat_map(|member| {
+                                package_observations(&collector.identity, &compilation_observations, &member.package_id)
+                            })
+                            .collect();
+                        let cache_started = crate::instrumentation::compiler_acquisition_timer();
+                        let stored = fact_store.put(key, &fresh_facts, observations, build_scripts.clone());
+                        crate::instrumentation::record_compiler_acquisition_cache_write(cache_started);
+                        match stored {
+                            Ok(()) => fact_set_published = true,
+                            Err(error) => {
+                                metrics.fact_cache_store_failures += 1;
+                                progress!("    Compiler fact cache store bypassed: {error}");
+                            }
+                        }
+                    }
+                }
             }
         }
         compiler_facts.extend(fresh_facts);
@@ -3608,9 +3647,7 @@ fn integrate_acquisition_outcome(
             run.artifact_high_water_bytes,
         );
     }
-    if view.requires(crate::compiler::scheduler::CompilerFactFamily::StableDiagnostics)
-        && !diagnostic_members.is_empty()
-    {
+    if diagnostics_needed {
         let stale_set = diagnostic_members.iter().map(String::as_str).collect::<HashSet<_>>();
         let parsed = parse_target_run(
             &run.stdout,
@@ -3619,10 +3656,6 @@ fn integrate_acquisition_outcome(
             &stale_set,
             candidates,
         );
-        let invocations = std::mem::take(&mut run.invocations);
-        let mut compilation_observations =
-            parse_compilation_observations(&run.stdout, invocations, &collector.identity, target)?;
-        reconcile_exact_artifact_observations(&mut compilation_observations, retained_observations);
         let completeness = DiagnosticsCompleteness::Complete;
         let build_scripts = match &run.build_scripts {
             Ok(build_scripts) => Some(build_scripts),
@@ -3685,18 +3718,11 @@ fn integrate_acquisition_outcome(
                 unit_evidence,
                 completeness,
             };
-            let observations = collector
-                .identity
-                .package_observation_identities
-                .get(&manifests_member.package_id)
-                .map(|package| {
-                    compilation_observations
-                        .iter()
-                        .filter(|manifest| manifest.unit.package == *package)
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_default();
+            let observations = package_observations(
+                &collector.identity,
+                &compilation_observations,
+                &manifests_member.package_id,
+            );
             update_candidate_survivors(surviving_unused, candidate_targets, &member, target, &evidence);
             record_target_evidence(result, &manifests_member.package_id, &evidence);
             if let Some(build_scripts) = build_scripts {
@@ -3797,7 +3823,9 @@ fn run_workspace_check(
     } else {
         BTreeSet::from([crate::compiler::scheduler::CompilerFactFamily::StableDiagnostics])
     };
-    let source_root = typed.map_or(workspace_root, |typed| typed.snapshot.source_root());
+    // Every observation is relative to the snapshot's repository root, which differs from the
+    // workspace root when the workspace sits below it. Cargo artifacts use the same root.
+    let source_root = identity.observation_context.source_root.as_path();
     let configuration_identity = format!(
         "sha256:{}",
         ContentDigest::sha256(&serde_json::to_vec(&(
@@ -4332,6 +4360,25 @@ fn run_artifact_bounded_command(
         current_bytes: final_bytes,
         high_water_bytes,
     })
+}
+
+/// Observations of one workspace package's own compilation units.
+fn package_observations(
+    identity: &CompilerCacheIdentity,
+    observations: &[CompilationObservationManifest],
+    package_id: &PackageId,
+) -> Vec<CompilationObservationManifest> {
+    identity
+        .package_observation_identities
+        .get(package_id)
+        .map(|package| {
+            observations
+                .iter()
+                .filter(|manifest| manifest.unit.package == *package)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Rerun inputs of every build script Cargo executed or replayed for one view.
@@ -5209,75 +5256,6 @@ fn attach_build_script_results(
             cargo_output,
         ));
     }
-}
-
-/// Why stored evidence no longer matches its inputs: its compilation observations, or the
-/// declared rerun inputs of a build script in its view.
-fn compiler_evidence_miss_reason(entry: &CompilerDiagEntry, workspace_root: &Path) -> Option<String> {
-    let generated_root = ObservationPath::capture(
-        &crate::workspace::cargo_rail_state_root(workspace_root).join("compiler-artifacts-v1"),
-        workspace_root,
-        workspace_root,
-    );
-    let script_environment = entry
-        .build_scripts
-        .iter()
-        .flat_map(crate::build_script::freshness::BuildScriptFreshness::rustc_environment)
-        .collect::<BTreeSet<_>>();
-    if let Some(reason) = compiler_observation_miss_reason(
-        &entry.observations,
-        workspace_root,
-        &generated_root,
-        &script_environment,
-    ) {
-        return Some(reason.to_string());
-    }
-    entry
-        .build_scripts
-        .iter()
-        .find_map(|script| script.revalidation_reason(workspace_root))
-        .map(str::to_string)
-}
-
-/// Native-cache bypasses on consuming units that stored Unify evidence proves another way.
-/// Build-script output is bound through Cargo's rerun inputs. Proc-macro reads are bound as
-/// Cargo binds them: through the consuming unit's dep-info files and tracked environment.
-const SUPERSEDED_NATIVE_BYPASSES: [&str; 4] = [
-    "build_script_result_unavailable",
-    "build_script_action_key_unavailable",
-    "build_script_dependency_graph_incomplete",
-    "proc_macro_filesystem_observations_unavailable",
-];
-
-fn compiler_observation_miss_reason<'a>(
-    observations: &'a [CompilationObservationManifest],
-    workspace_root: &Path,
-    generated_root: &ObservationPath,
-    script_environment: &BTreeSet<&str>,
-) -> Option<&'a str> {
-    if observations.is_empty() {
-        return Some("compilation_observations_absent");
-    }
-    if let Some(reason) = observations
-        .iter()
-        // A build script's own compilation cannot change the member's diagnostics: its
-        // sources and dependencies are keyed, and its output is bound by its rerun inputs.
-        .filter(|manifest| {
-            manifest.unit.target_kind != crate::compiler::observation::CompilationTargetKind::BuildScript
-        })
-        .flat_map(|manifest| manifest.bypasses.iter().map(String::as_str))
-        .find(|reason| !SUPERSEDED_NATIVE_BYPASSES.contains(reason))
-    {
-        return Some(reason);
-    }
-    for manifest in observations {
-        if let Some(reason) =
-            manifest.diagnostic_revalidation_reason(workspace_root, Some(generated_root), script_environment)
-        {
-            return Some(reason);
-        }
-    }
-    None
 }
 
 fn reconcile_exact_artifact_observations(
@@ -6589,26 +6567,6 @@ fn compiler_cache_bypass_reason(snapshot: &WorkspaceSnapshot) -> Option<Compiler
         .iter()
         .any(|package| package.source().is_some() && package.checksum().is_none())
         .then_some(CompilerCacheBypass::ExternalSourceDigest)
-}
-
-/// Build scripts and proc macros also bypass typed-fact reuse, whose key binds no
-/// build-script freshness. Unify evidence binds it per view instead.
-fn compiler_fact_cache_bypass_reason(snapshot: &WorkspaceSnapshot) -> Option<CompilerCacheBypass> {
-    let has_kind = |kind: TargetKind| {
-        snapshot
-            .base_resolution()
-            .metadata()
-            .packages
-            .iter()
-            .any(|package| package.targets.iter().any(|target| target.kind.contains(&kind)))
-    };
-    if has_kind(TargetKind::CustomBuild) {
-        Some(CompilerCacheBypass::BuildScriptObservations)
-    } else if has_kind(TargetKind::ProcMacro) {
-        Some(CompilerCacheBypass::ProcMacroObservations)
-    } else {
-        None
-    }
 }
 
 fn target_name(target: &crate::cargo::resolution::TargetIdentity) -> &str {

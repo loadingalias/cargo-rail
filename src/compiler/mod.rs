@@ -12,6 +12,7 @@ pub(crate) mod driver;
 pub(crate) mod fact_protocol;
 pub(crate) mod fact_store;
 pub(crate) mod facts;
+pub(crate) mod input_proof;
 /// Exact pre-Clap compiler process classification and execution.
 pub mod invocation;
 pub mod model;
