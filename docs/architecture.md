@@ -44,8 +44,10 @@ Compiler-backed Unify and Surface work uses one acquisition engine:
 
 1. Build a deterministic target and feature schedule from the captured workspace.
 1. Admit only identity-matched, complete cached evidence.
-1. Run remaining views one Cargo process at a time. Views of one target and command class reuse one sandbox,
-   so Cargo compiles each shared dependency unit once. Cargo owns job parallelism inside each view.
+1. Run remaining views one Cargo process at a time.
+   Views of one target and command class reuse one sandbox,
+   so Cargo compiles each shared dependency unit once.
+   Cargo owns job parallelism inside each view.
    Output and artifact storage stay bounded.
 1. Persist resumable progress before dispatch and cancel complete process trees after a failure.
 1. Integrate completed work in deterministic order, independent of worker completion order.
