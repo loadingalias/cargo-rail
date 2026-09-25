@@ -359,6 +359,54 @@ fn a_dependency_build_script_input_invalidates_its_consumers() {
     crate::helpers::finish_test(result);
 }
 
+/// A dependency enabled only by a feature is absent from Cargo's default resolution. A view that
+/// enables it still runs its build script, and that view's evidence must be stored and reused.
+#[test]
+fn a_build_script_enabled_only_by_a_feature_keeps_evidence_reusable() {
+    let result: Result<()> = (|| {
+        let ws = reuse_workspace()?;
+        write_package(
+            &ws.path,
+            "vendor/generated",
+            "generated",
+            "",
+            "pub fn value() -> u8 { 2 }\n",
+        )?;
+        fs::write(
+            ws.path.join("vendor/generated/build.rs"),
+            "fn main() {\n    println!(\"cargo::rerun-if-changed=build.rs\");\n}\n",
+        )?;
+        write_package(
+            &ws.path,
+            "crates/other",
+            "other",
+            "[features]\nextra = [\"dep:generated\"]\n\n[dependencies]\nhelper = { path = \"../../vendor/helper\" }\ngenerated = { path = \"../../vendor/generated\", optional = true }\n",
+            "#[cfg(feature = \"extra\")]\npub fn value() -> u8 { generated::value() }\n",
+        )?;
+        let lockfile = cargo_command(&ws.path)
+            .args(["generate-lockfile", "--offline"])
+            .output()?;
+        ensure!(
+            lockfile.status.success(),
+            "offline lockfile generation failed: {lockfile:?}"
+        );
+        ws.commit("Add a build script behind an optional feature")?;
+
+        let cold = unify(&ws, &["unify", "--check"], &[])?;
+        assert_eq!(cold.status, Some(1), "{:#}\n{}", cold.value, cold.stderr);
+        assert!(cold.cargo_views() > 2, "feature views run\n{}", cold.stderr);
+        let warm = unify(&ws, &["unify", "--check"], &[])?;
+        assert_eq!(
+            warm.cargo_views(),
+            0,
+            "feature-enabled build scripts must not prevent reuse\n{:#}",
+            warm.value["evidence_cache"]
+        );
+        Ok(())
+    })();
+    crate::helpers::finish_test(result);
+}
+
 /// A Git dependency has no lockfile checksum; its resolved commit is its source identity.
 /// Reuse must follow that commit instead of being disabled for the whole workspace.
 #[test]

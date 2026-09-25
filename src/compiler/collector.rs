@@ -55,6 +55,7 @@ use crate::executable::{ExecutableIdentity, ToolchainExecutableIdentities};
 use crate::progress;
 use crate::source::{ContentDigest, SourceEntryKind};
 use crate::workspace::WorkspaceSnapshot;
+use crate::workspace::snapshot::EvidencePackages;
 use cargo_metadata::{Message, PackageId, TargetKind};
 use rscrypto::Sha256;
 use serde::{Deserialize, Serialize};
@@ -1236,9 +1237,9 @@ impl CompilerCacheIdentity {
             snapshot.source_root(),
         )?;
         let executables = snapshot.executable_identities()?;
-        let cache_bypass_reason = compiler_cache_bypass_reason(snapshot);
-        let package_roots = snapshot
-            .base_resolution()
+        let evidence = snapshot.evidence_packages()?;
+        let cache_bypass_reason = compiler_cache_bypass_reason(snapshot, evidence);
+        let package_roots = evidence
             .metadata()
             .packages
             .iter()
@@ -1265,15 +1266,15 @@ impl CompilerCacheIdentity {
             .toolchain()
             .rustc_workspace_wrapper_program()
             .map(OsString::from);
-        let local_dependencies = declared_local_dependency_graph(snapshot)?;
-        let manifest_fingerprints = manifest_closure_fingerprints(snapshot, &local_dependencies)?;
-        let source_fingerprints = source_closure_fingerprints(snapshot, &local_dependencies)?;
+        let local_dependencies = declared_local_dependency_graph(evidence)?;
+        let manifest_fingerprints = manifest_closure_fingerprints(evidence, &local_dependencies)?;
+        let source_fingerprints = source_closure_fingerprints(snapshot, evidence, &local_dependencies)?;
         let observation_context = CompilationObservationContext::capture(snapshot)?;
-        let package_observation_identities = package_observation_identities(snapshot)?;
+        let package_observation_identities = package_observation_identities(snapshot, evidence)?;
         let package_observation_manifests =
-            package_observation_manifest_identities(snapshot, &package_observation_identities)?;
-        let package_dependencies = package_dependency_graph(snapshot, &package_observation_identities)?;
-        let build_script_packages = build_script_package_contexts(snapshot, &package_observation_identities)?;
+            package_observation_manifest_identities(evidence, &package_observation_identities)?;
+        let package_dependencies = package_dependency_graph(evidence, &package_observation_identities)?;
+        let build_script_packages = build_script_package_contexts(evidence, &package_observation_identities)?;
         let rustc_executable = executables.rustc().clone();
         let configured_wrappers = [executables.rustc_wrapper(), executables.rustc_workspace_wrapper()];
         if configured_wrappers
@@ -6325,9 +6326,11 @@ fn compiler_runtime_library(name: &str) -> bool {
     name.ends_with(".dll") || name.ends_with(".dylib") || name.ends_with(".so") || name.contains(".so.")
 }
 
-fn package_observation_identities(snapshot: &WorkspaceSnapshot) -> RailResult<HashMap<PackageId, String>> {
-    snapshot
-        .base_resolution()
+fn package_observation_identities(
+    snapshot: &WorkspaceSnapshot,
+    evidence: EvidencePackages<'_>,
+) -> RailResult<HashMap<PackageId, String>> {
+    evidence
         .metadata()
         .packages
         .iter()
@@ -6350,7 +6353,7 @@ fn package_observation_identities(snapshot: &WorkspaceSnapshot) -> RailResult<Ha
                     checksum.unwrap_or("unverified")
                 )
             } else {
-                let snapshot_package = snapshot
+                let snapshot_package = evidence
                     .packages()
                     .iter()
                     .find(|candidate| candidate.id() == &package.id)
@@ -6366,11 +6369,10 @@ fn package_observation_identities(snapshot: &WorkspaceSnapshot) -> RailResult<Ha
 }
 
 fn package_observation_manifest_identities(
-    snapshot: &WorkspaceSnapshot,
+    evidence: EvidencePackages<'_>,
     identities: &HashMap<PackageId, String>,
 ) -> RailResult<HashMap<PathBuf, String>> {
-    snapshot
-        .base_resolution()
+    evidence
         .metadata()
         .packages
         .iter()
@@ -6386,7 +6388,7 @@ fn package_observation_manifest_identities(
 }
 
 fn package_dependency_graph(
-    snapshot: &WorkspaceSnapshot,
+    evidence: EvidencePackages<'_>,
     identities: &HashMap<PackageId, String>,
 ) -> RailResult<HashMap<String, BTreeSet<String>>> {
     let mut graph = identities
@@ -6394,8 +6396,7 @@ fn package_dependency_graph(
         .cloned()
         .map(|identity| (identity, BTreeSet::new()))
         .collect::<HashMap<_, _>>();
-    let resolve = snapshot
-        .base_resolution()
+    let resolve = evidence
         .metadata()
         .resolve
         .as_ref()
@@ -6424,11 +6425,10 @@ fn package_dependency_graph(
 }
 
 fn build_script_package_contexts(
-    snapshot: &WorkspaceSnapshot,
+    evidence: EvidencePackages<'_>,
     observation_identities: &HashMap<PackageId, String>,
 ) -> RailResult<HashMap<String, BuildScriptPackageContext>> {
-    let package_ids = snapshot
-        .base_resolution()
+    let package_ids = evidence
         .metadata()
         .packages
         .iter()
@@ -6441,7 +6441,7 @@ fn build_script_package_contexts(
         })
         .map(|package| package.id.clone())
         .collect::<HashSet<_>>();
-    snapshot
+    evidence
         .packages()
         .iter()
         .filter(|package| package_ids.contains(package.id()))
@@ -6487,7 +6487,10 @@ fn target_fingerprints(snapshot: &WorkspaceSnapshot) -> RailResult<HashMap<Strin
     Ok(fingerprints)
 }
 
-fn compiler_cache_bypass_reason(snapshot: &WorkspaceSnapshot) -> Option<CompilerCacheBypass> {
+fn compiler_cache_bypass_reason(
+    snapshot: &WorkspaceSnapshot,
+    evidence: EvidencePackages<'_>,
+) -> Option<CompilerCacheBypass> {
     if !snapshot.cargo_config().unmodeled_settings().is_empty() {
         return Some(CompilerCacheBypass::CargoConfiguration);
     }
@@ -6498,7 +6501,7 @@ fn compiler_cache_bypass_reason(snapshot: &WorkspaceSnapshot) -> Option<Compiler
     {
         return Some(CompilerCacheBypass::ResponseFileConfiguration);
     }
-    snapshot
+    evidence
         .packages()
         .iter()
         .any(|package| {
@@ -6527,8 +6530,11 @@ fn target_name(target: &crate::cargo::resolution::TargetIdentity) -> &str {
     }
 }
 
-fn package_source_fingerprints(snapshot: &WorkspaceSnapshot) -> RailResult<HashMap<PackageId, String>> {
-    let manifest_paths = snapshot
+fn package_source_fingerprints(
+    snapshot: &WorkspaceSnapshot,
+    evidence: EvidencePackages<'_>,
+) -> RailResult<HashMap<PackageId, String>> {
+    let manifest_paths = evidence
         .manifests()
         .iter()
         .map(|manifest| manifest.path())
@@ -6536,7 +6542,7 @@ fn package_source_fingerprints(snapshot: &WorkspaceSnapshot) -> RailResult<HashM
     let mut package_roots = HashMap::new();
     let mut roots_by_package = HashMap::new();
     let mut identities = HashMap::new();
-    for package in snapshot
+    for package in evidence
         .packages()
         .iter()
         .filter(|package| package.package_root().is_some())
@@ -6606,15 +6612,15 @@ fn package_source_fingerprints(snapshot: &WorkspaceSnapshot) -> RailResult<HashM
         .collect())
 }
 
-fn declared_local_dependency_graph(snapshot: &WorkspaceSnapshot) -> RailResult<HashMap<PackageId, Vec<PackageId>>> {
-    let local_packages = snapshot
+fn declared_local_dependency_graph(evidence: EvidencePackages<'_>) -> RailResult<HashMap<PackageId, Vec<PackageId>>> {
+    let local_packages = evidence
         .packages()
         .iter()
         .filter(|package| package.source().is_none())
         .map(|package| package.id())
         .collect::<HashSet<_>>();
     let mut roots = HashMap::new();
-    for package in &snapshot.base_resolution().metadata().packages {
+    for package in &evidence.metadata().packages {
         if !local_packages.contains(&package.id) {
             continue;
         }
@@ -6637,14 +6643,14 @@ fn declared_local_dependency_graph(snapshot: &WorkspaceSnapshot) -> RailResult<H
     }
 
     let mut graph = HashMap::new();
-    for package in &snapshot.base_resolution().metadata().packages {
+    for package in &evidence.metadata().packages {
         if !local_packages.contains(&package.id) {
             continue;
         }
         let mut dependencies = BTreeSet::new();
         for dependency in &package.dependencies {
             let Some(path) = dependency.path.as_ref() else {
-                for candidate in &snapshot.base_resolution().metadata().packages {
+                for candidate in &evidence.metadata().packages {
                     if local_packages.contains(&candidate.id)
                         && candidate.name == dependency.name
                         && dependency.req.matches(&candidate.version)
@@ -6674,26 +6680,26 @@ fn declared_local_dependency_graph(snapshot: &WorkspaceSnapshot) -> RailResult<H
 }
 
 fn manifest_closure_fingerprints(
-    snapshot: &WorkspaceSnapshot,
+    evidence: EvidencePackages<'_>,
     dependencies: &HashMap<PackageId, Vec<PackageId>>,
 ) -> RailResult<HashMap<PackageId, String>> {
-    let manifests = snapshot
+    let manifests = evidence
         .manifests()
         .iter()
         .map(|manifest| (manifest.path(), manifest))
         .collect::<HashMap<_, _>>();
-    let packages = snapshot
+    let packages = evidence
         .packages()
         .iter()
         .map(|package| (package.id(), package))
         .collect::<HashMap<_, _>>();
-    let root_manifest = snapshot
+    let root_manifest = evidence
         .manifests()
         .iter()
         .find(|manifest| manifest.path().as_path() == Path::new("Cargo.toml"));
     let mut fingerprints = HashMap::new();
 
-    for member in snapshot
+    for member in evidence
         .packages()
         .iter()
         .filter(|package| package.is_workspace_member())
@@ -6736,17 +6742,18 @@ fn manifest_closure_fingerprints(
 
 fn source_closure_fingerprints(
     snapshot: &WorkspaceSnapshot,
+    evidence: EvidencePackages<'_>,
     dependencies: &HashMap<PackageId, Vec<PackageId>>,
 ) -> RailResult<HashMap<PackageId, String>> {
-    let package_sources = package_source_fingerprints(snapshot)?;
-    let packages = snapshot
+    let package_sources = package_source_fingerprints(snapshot, evidence)?;
+    let packages = evidence
         .packages()
         .iter()
         .map(|package| (package.id(), package))
         .collect::<HashMap<_, _>>();
     let mut fingerprints = HashMap::new();
 
-    for member in snapshot
+    for member in evidence
         .packages()
         .iter()
         .filter(|package| package.is_workspace_member())

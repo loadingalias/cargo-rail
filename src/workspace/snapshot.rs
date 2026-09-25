@@ -13,8 +13,8 @@ use serde::Deserialize;
 
 use crate::cargo::MultiTargetMetadata;
 use crate::cargo::resolution::{
-    CargoConfigSnapshot, ResolutionInputs, ResolutionRequest, ResolutionView, ResolutionViews, TargetIdentity,
-    TargetSpecificationIdentity, ToolchainIdentity, credential_bearing_url,
+    CargoConfigSnapshot, ResolutionFeatures, ResolutionInputs, ResolutionPackages, ResolutionRequest, ResolutionView,
+    ResolutionViews, TargetIdentity, TargetSpecificationIdentity, ToolchainIdentity, credential_bearing_url,
 };
 use crate::compiler::cfg_eval::{TargetCfgSet, load_target_cfg_sets};
 use crate::config::RailConfig;
@@ -51,7 +51,7 @@ impl fmt::Display for SnapshotId {
 }
 
 /// Exact bytes of one authoritative workspace file.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SnapshotFile {
     path: RepositoryPath,
     bytes: Arc<[u8]>,
@@ -213,7 +213,42 @@ pub struct WorkspaceSnapshot {
     compilation_executable_identities: OnceLock<Result<ToolchainExecutableIdentities, String>>,
     targets: Vec<TargetIdentity>,
     base_resolution: Arc<ResolutionView>,
+    /// `None` when the base resolution already contains every locked package.
+    feature_complete_packages: OnceLock<Result<Option<Arc<FeatureCompletePackages>>, SnapshotViewError>>,
     derived: Arc<DerivedViews>,
+}
+
+/// Packages reachable only through optional features, captured from the all-features resolution.
+#[derive(Debug)]
+struct FeatureCompletePackages {
+    resolution: Arc<ResolutionView>,
+    packages: Vec<SnapshotPackage>,
+    manifests: Vec<SnapshotFile>,
+}
+
+/// Every package a compiler-evidence view can activate, with its captured local manifests.
+///
+/// Cargo's default resolution omits packages reachable only through optional features, but an
+/// evidence view that enables those features compiles them and runs their build scripts.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EvidencePackages<'a> {
+    metadata: &'a Metadata,
+    packages: &'a [SnapshotPackage],
+    manifests: &'a [SnapshotFile],
+}
+
+impl<'a> EvidencePackages<'a> {
+    pub(crate) fn metadata(self) -> &'a Metadata {
+        self.metadata
+    }
+
+    pub(crate) fn packages(self) -> &'a [SnapshotPackage] {
+        self.packages
+    }
+
+    pub(crate) fn manifests(self) -> &'a [SnapshotFile] {
+        self.manifests
+    }
 }
 
 #[derive(Debug)]
@@ -400,40 +435,8 @@ impl WorkspaceSnapshot {
         manifest_paths.insert(relative_path(&source_root, &root_manifest)?, root_manifest);
 
         let workspace_members: BTreeSet<_> = metadata.workspace_members.iter().collect();
-        let mut package_locations = BTreeMap::new();
-        let mut local_manifest_owners = BTreeMap::new();
-        for package in &metadata.packages {
-            if package.source.is_some() {
-                continue;
-            }
-            let manifest = package.manifest_path.as_std_path();
-            let relative = relative_path(&source_root, manifest).map_err(|_| {
-        RailError::with_help(
-          format!(
-            "Local package '{}' manifest '{}' is outside snapshot source root '{}'",
-            package.id,
-            manifest.display(),
-            source_root.display()
-          ),
-          "place local path packages inside the captured repository/workspace boundary before creating a workspace snapshot",
-        )
-      })?;
-            let package_root = relative
-                .as_path()
-                .parent()
-                .unwrap_or_else(|| Path::new(""))
-                .to_path_buf();
-            if let Some(existing) = local_manifest_owners.insert(relative.clone(), package.id.clone()) {
-                let mut package_ids = [existing.to_string(), package.id.to_string()];
-                package_ids.sort_unstable();
-                return Err(RailError::message(format!(
-                    "Local packages '{}' and '{}' claim the same manifest '{}'",
-                    package_ids[0], package_ids[1], relative
-                )));
-            }
-            manifest_paths.insert(relative.clone(), manifest.to_path_buf());
-            package_locations.insert(package.id.clone(), (relative, package_root));
-        }
+        let (package_locations, local_manifests) = local_package_locations(&source_root, metadata)?;
+        manifest_paths.extend(local_manifests);
 
         let manifests = manifest_paths
             .into_values()
@@ -515,6 +518,7 @@ impl WorkspaceSnapshot {
             packages,
             toolchain: resolution_inputs.toolchain,
             compilation_executable_identities: OnceLock::new(),
+            feature_complete_packages: OnceLock::new(),
             targets,
             base_resolution,
             derived,
@@ -646,6 +650,89 @@ impl WorkspaceSnapshot {
     /// Return host and selected target identities in deterministic order.
     pub fn targets(&self) -> &[TargetIdentity] {
         &self.targets
+    }
+
+    /// Return every package a compiler-evidence view can activate.
+    ///
+    /// When the lockfile names packages absent from the default resolution, the first call loads
+    /// the all-features workspace resolution, a superset of every feature selection, and
+    /// captures its local manifests against this snapshot's source tree.
+    pub(crate) fn evidence_packages(&self) -> RailResult<EvidencePackages<'_>> {
+        let complete = self
+            .feature_complete_packages
+            .get_or_init(|| {
+                self.capture_feature_complete_packages()
+                    .map_err(SnapshotViewError::capture)
+            })
+            .as_ref()
+            .map_err(SnapshotViewError::to_error)?;
+        Ok(match complete.as_deref() {
+            Some(complete) => EvidencePackages {
+                metadata: complete.resolution.metadata(),
+                packages: &complete.packages,
+                manifests: &complete.manifests,
+            },
+            None => EvidencePackages {
+                metadata: self.base_resolution.metadata(),
+                packages: &self.packages,
+                manifests: &self.manifests,
+            },
+        })
+    }
+
+    fn capture_feature_complete_packages(&self) -> RailResult<Option<Arc<FeatureCompletePackages>>> {
+        let Some(lockfile) = &self.lockfile else {
+            return Ok(None);
+        };
+        let resolved = self
+            .base_resolution
+            .metadata()
+            .packages
+            .iter()
+            .map(|package| {
+                (
+                    package.name.as_str(),
+                    package.version.to_string(),
+                    package.source.as_ref().map(|source| source.repr.as_str()),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        if lockfile
+            .packages()
+            .iter()
+            .all(|locked| resolved.contains(&(locked.name(), locked.version().to_string(), locked.source())))
+        {
+            return Ok(None);
+        }
+        let resolution = self.derived.resolution_view(ResolutionRequest::new(
+            ResolutionPackages::Workspace,
+            ResolutionFeatures::AllFeatures,
+            None,
+        )?)?;
+        let metadata = resolution.metadata();
+        let workspace_members = metadata.workspace_members.iter().collect::<BTreeSet<_>>();
+        let (locations, manifest_paths) = local_package_locations(&self.source_root, metadata)?;
+        let packages = package_snapshots(metadata, &workspace_members, &locations, Some(lockfile))?;
+        let mut manifests = self
+            .manifests
+            .iter()
+            .map(|manifest| (manifest.path().clone(), manifest.clone()))
+            .collect::<BTreeMap<_, _>>();
+        for (path, physical) in manifest_paths {
+            if let std::collections::btree_map::Entry::Vacant(entry) = manifests.entry(path) {
+                entry.insert(capture_required_file(
+                    &self.source,
+                    &self.source_root,
+                    &physical,
+                    "Cargo manifest",
+                )?);
+            }
+        }
+        Ok(Some(Arc::new(FeatureCompletePackages {
+            resolution,
+            packages,
+            manifests: manifests.into_values().collect(),
+        })))
     }
 
     /// Return the already-loaded canonical native/default resolution.
@@ -1163,6 +1250,51 @@ impl LockfileSnapshot {
         }
         Ok(Self { file, packages })
     }
+}
+
+/// Repository-relative manifest and root of every local package, plus each manifest's physical path.
+type LocalPackageLocations = (
+    BTreeMap<PackageId, (RepositoryPath, PathBuf)>,
+    BTreeMap<RepositoryPath, PathBuf>,
+);
+
+fn local_package_locations(source_root: &Path, metadata: &Metadata) -> RailResult<LocalPackageLocations> {
+    let mut package_locations = BTreeMap::new();
+    let mut manifest_paths = BTreeMap::new();
+    let mut local_manifest_owners = BTreeMap::new();
+    for package in &metadata.packages {
+        if package.source.is_some() {
+            continue;
+        }
+        let manifest = package.manifest_path.as_std_path();
+        let relative = relative_path(source_root, manifest).map_err(|_| {
+            RailError::with_help(
+                format!(
+                    "Local package '{}' manifest '{}' is outside snapshot source root '{}'",
+                    package.id,
+                    manifest.display(),
+                    source_root.display()
+                ),
+                "place local path packages inside the captured repository/workspace boundary before creating a workspace snapshot",
+            )
+        })?;
+        let package_root = relative
+            .as_path()
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .to_path_buf();
+        if let Some(existing) = local_manifest_owners.insert(relative.clone(), package.id.clone()) {
+            let mut package_ids = [existing.to_string(), package.id.to_string()];
+            package_ids.sort_unstable();
+            return Err(RailError::message(format!(
+                "Local packages '{}' and '{}' claim the same manifest '{}'",
+                package_ids[0], package_ids[1], relative
+            )));
+        }
+        manifest_paths.insert(relative.clone(), manifest.to_path_buf());
+        package_locations.insert(package.id.clone(), (relative, package_root));
+    }
+    Ok((package_locations, manifest_paths))
 }
 
 fn package_snapshots(
