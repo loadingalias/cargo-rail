@@ -611,7 +611,8 @@ mod tests {
 
     #[test]
     fn heartbeat_fills_each_quiet_interval_and_names_the_current_activity() {
-        const INTERVAL: Duration = Duration::from_millis(40);
+        // Long enough that a delayed wakeup on a loaded host stays inside one interval.
+        const INTERVAL: Duration = Duration::from_millis(100);
         let lines = Arc::new(Mutex::new(Vec::<String>::new()));
         let sink = Arc::clone(&lines);
         let taken = || std::mem::take(&mut *lines.lock().unwrap());
@@ -648,7 +649,10 @@ mod tests {
             "{nested:?}"
         );
 
-        // Other progress output resets the quiet interval.
+        // Other progress output resets the quiet interval. A heartbeat may already have fired for the
+        // preceding quiet phase, so resume progress before discarding it.
+        super::record_progress();
+        drop(taken());
         for _ in 0..6 {
             super::record_progress();
             std::thread::sleep(INTERVAL / 4);
