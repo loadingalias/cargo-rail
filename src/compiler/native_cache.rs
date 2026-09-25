@@ -548,6 +548,24 @@ impl NativePackageBinding {
         Ok(())
     }
 
+    /// Return the canonical root and spelling of the namespace captured for this package.
+    ///
+    /// A registry package is immutable once Cargo unpacks it (marked by `.cargo-ok`), and crates
+    /// commonly read package files outside their source directory, such as
+    /// `#![doc = include_str!("../README.md")]`. Capturing the whole package binds those reads
+    /// instead of bypassing reuse. Other external packages, which can hold build output of their
+    /// own, and compiler library sources keep the crate's source directory.
+    fn captured_namespace(&self) -> (PathBuf, PathBuf) {
+        if self.compiler_library_ancestors.is_none() && self.root.join(".cargo-ok").is_file() {
+            (self.root.clone(), self.spelling.clone())
+        } else {
+            (
+                self.root.join(&self.source_relative),
+                self.spelling.join(&self.source_relative),
+            )
+        }
+    }
+
     fn validate_live(&self, source_root: &Path, source_root_spelling: &Path) -> RailResult<()> {
         self.validate_object()?;
         let metadata = fs::symlink_metadata(&self.spelling)?;
@@ -1793,10 +1811,11 @@ impl NativeActionCapture {
             }),
         };
         let (namespace, namespace_spelling) = if let Some(binding) = &package_binding {
-            let namespace = binding.root.join(&binding.source_relative);
-            let spelling = binding.spelling.join(&binding.source_relative);
-            binding.validate_live(&namespace, &spelling)?;
-            (namespace, spelling)
+            binding.validate_live(
+                &binding.root.join(&binding.source_relative),
+                &binding.spelling.join(&binding.source_relative),
+            )?;
+            binding.captured_namespace()
         } else {
             (namespace, namespace_spelling)
         };
@@ -1934,10 +1953,7 @@ impl NativeActionCapture {
             ));
         }
         let (namespace, namespace_spelling) = if let Some(binding) = &package_binding {
-            (
-                binding.root.join(&binding.source_relative),
-                binding.spelling.join(&binding.source_relative),
-            )
+            binding.captured_namespace()
         } else {
             (namespace, namespace_spelling.to_path_buf())
         };
@@ -9424,7 +9440,7 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
             ) {
                 Ok(()) => return OuterCacheAction::Hit(0),
                 Err(RestorePublishFailure::BeforeEffect(error)) => {
-                    drop(error);
+                    report_native_action_diagnostic("verified result materialization", &error);
                     ("verified_result_materialization_failed".to_string(), false)
                 }
                 Err(RestorePublishFailure::AfterEffect(error) | RestorePublishFailure::Operational(error)) => {

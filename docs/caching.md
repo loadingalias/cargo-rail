@@ -134,6 +134,11 @@ while keeping the executor's physical output directory out of the portable opera
 Stored descriptors and every output byte are reverified before restore.
 The bounded source capture deliberately over-invalidates when it cannot prove
 that an unused path was irrelevant.
+An unpacked registry package is captured whole,
+so a crate that reads a package file outside its source directory, such as `#![doc = include_str!("../README.md")]`, is reusable,
+and a change to any file in the package invalidates its results.
+Other packages outside the workspace capture only the crate's source directory,
+and a read outside it runs the compiler normally.
 
 Eligible cold compilation uses the shared,
 compiler-matched fact driver to record the Rust libraries rustc selects,
@@ -461,6 +466,13 @@ size, and modification and change times are unchanged,
 so dependents do not rehash the same dependency artifacts.
 Files modified within the last two seconds are always rehashed, and entries expire after seven days.
 Windows always hashes, because its file generation does not include a change time.
+
+When collection evicts a result within a day of that result's last use,
+the budget did not hold the working set in use, and the next build of that work misses again.
+`cache status` then reports `recent_evictions` (results, bytes, and the time of the last such eviction)
+and prints a budget-pressure line; raise the budget with `cargo rail cache setup --max-size SIZE`.
+The count accumulates until the local cache is cleaned.
+One validation lane of this repository, `just check` across seven targets, stores about 3 GiB.
 
 `cache profiles` reports each profile's `bytes`, `max_bytes`, and `over_capacity_bytes`.
 The installation storage in `cache status` totals every profile, so compare it with the sum of profile budgets,

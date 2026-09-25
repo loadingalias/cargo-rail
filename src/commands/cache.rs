@@ -948,6 +948,14 @@ fn render_status(status: &CacheStatus) {
                 cache.results,
                 cache.objects
             );
+            if let Some(recent) = &cache.recent_evictions {
+                println!(
+                    "Budget pressure: collection evicted {} result(s) ({}) within a day of their last use; \
+                     raise the budget with `cargo rail cache setup --max-size SIZE`",
+                    recent.results,
+                    human_bytes(recent.bytes)
+                );
+            }
         } else {
             println!("Local cache: absent");
         }

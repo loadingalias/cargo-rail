@@ -6745,3 +6745,110 @@ fn unify_evidence_is_reused_under_the_installed_cache_wrapper() {
     })();
     super::helpers::finish_test(result);
 }
+
+#[cfg(unix)]
+#[test]
+fn registry_package_files_outside_src_bind_reuse_instead_of_bypassing() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let result: Result<()> = (|| {
+        let root = tempfile::tempdir()?;
+        let workspace = root.path().join("workspace");
+        let package = root.path().join("registry/readme-dep-0.1.0");
+        fs::create_dir_all(package.join("src"))?;
+        fs::write(
+            package.join("Cargo.toml"),
+            "[package]\nname = \"readme-dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )?;
+        fs::write(
+            package.join("src/lib.rs"),
+            "#![doc = include_str!(\"../README.md\")]\npub fn value() -> u8 { 1 }\n",
+        )?;
+        fs::write(package.join("README.md"), "Readme dependency.\n")?;
+        // Cargo writes this marker after it unpacks a registry package.
+        fs::write(package.join(".cargo-ok"), "{\"v\":1}")?;
+        fs::create_dir_all(workspace.join("src"))?;
+        fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname = \"readme-consumer\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nreadme-dep = { path = \"../registry/readme-dep-0.1.0\" }\n",
+        )?;
+        fs::write(
+            workspace.join("src/lib.rs"),
+            "pub fn value() -> u8 { readme_dep::value() }\n",
+        )?;
+        for arguments in [vec!["init", "--quiet"], vec!["add", "."]] {
+            let output = Command::new("git").current_dir(&workspace).args(arguments).output()?;
+            anyhow::ensure!(output.status.success(), "git: {output:?}");
+        }
+        let lock = Command::new("cargo")
+            .current_dir(&workspace)
+            .args(["generate-lockfile", "--offline"])
+            .output()?;
+        anyhow::ensure!(lock.status.success(), "lockfile: {lock:?}");
+        let cargo_home = tempfile::tempdir()?;
+        let setup = rail(&workspace, cargo_home.path(), &["rail", "cache", "setup"])?;
+        anyhow::ensure!(setup.status.success(), "cache setup: {setup:?}");
+
+        let dependency_outcome = |label: &str| -> Result<(String, String)> {
+            let coverage = tempfile::tempdir()?;
+            fs::set_permissions(coverage.path(), fs::Permissions::from_mode(0o700))?;
+            let coverage_path = cargo_rail::utils::canonicalize_existing(coverage.path())?;
+            let clean = Command::new("cargo")
+                .current_dir(&workspace)
+                .args(["clean", "--quiet"])
+                .env("CARGO_HOME", cargo_home.path())
+                .output()?;
+            anyhow::ensure!(clean.status.success(), "{label} clean: {clean:?}");
+            let check = Command::new("cargo")
+                .current_dir(&workspace)
+                .args(["check", "--offline", "--quiet"])
+                .env("CARGO_HOME", cargo_home.path())
+                .env("CARGO_INCREMENTAL", "0")
+                .env("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1")
+                .env("CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY", &coverage_path)
+                .env_remove("RUSTC_WRAPPER")
+                .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+                .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("RUSTFLAGS")
+                .env_remove("CARGO_ENCODED_RUSTFLAGS")
+                .env_remove("CARGO_RAIL_CACHE_REMOTE")
+                .env_remove("CARGO_RAIL_CACHE_MODE")
+                .env_remove("CARGO_RAIL_CACHE_REMOTE_ENVIRONMENT")
+                .env_remove("CARGO_RAIL_CACHE_REPORT")
+                .output()?;
+            anyhow::ensure!(check.status.success(), "{label} check: {check:?}");
+            let event = coverage_events(&coverage_path)?
+                .into_iter()
+                .find(|event| event["action"]["crate_name"] == "readme_dep")
+                .with_context(|| format!("{label}: no coverage event for readme_dep"))?;
+            Ok((
+                event["status"].as_str().unwrap_or_default().to_string(),
+                format!(
+                    "{}; {}",
+                    event["reason"].as_str().unwrap_or_default(),
+                    String::from_utf8_lossy(&check.stderr)
+                ),
+            ))
+        };
+
+        let (cold, reason) = dependency_outcome("cold")?;
+        assert_eq!(
+            cold, "miss",
+            "a README-including registry crate must be cacheable: {reason}"
+        );
+        let (warm, reason) = dependency_outcome("warm")?;
+        assert_eq!(
+            warm, "hit",
+            "unchanged package files must hit after cargo clean: {reason}"
+        );
+        fs::write(package.join("README.md"), "Changed readme dependency.\n")?;
+        let (changed, reason) = dependency_outcome("changed README")?;
+        assert_eq!(
+            changed, "miss",
+            "a changed package file must not restore the stale result: {reason}"
+        );
+        Ok(())
+    })();
+    crate::helpers::finish_test(result);
+}

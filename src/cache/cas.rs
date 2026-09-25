@@ -70,6 +70,12 @@ const MAX_PACKED_NATIVE_ACTION_HEADER_BYTES: u64 = 1024 * 1024;
 const MAX_PACKED_NATIVE_ACTION_BYTES: u64 = crate::compiler::native_cache::pack::MAX_PACK_BYTES + 1024 * 1024;
 const CAPACITY_STATE_FILE: &str = "CAPACITY.json";
 const NATIVE_LEDGER_STATE_FILE: &str = "NATIVE_LEDGER.json";
+/// Collection's record of results it evicted soon after their last use.
+const EVICTION_STATE_FILE: &str = "EVICTIONS.json";
+const EVICTION_STATE_VERSION: u32 = 1;
+/// An eviction within this long after the result's last use means the budget did not hold the
+/// working set. Hits refresh last use at most hourly, so a day is well above that granularity.
+const RECENT_EVICTION_WINDOW_NANOS: u128 = 24 * 60 * 60 * 1_000_000_000;
 const MAX_NATIVE_TERMINAL_STATES: u64 = 32 * 1024;
 const MAX_NATIVE_TERMINAL_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -301,6 +307,30 @@ pub(crate) struct LocalCasStatus {
     pub(crate) oldest_used_unix_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) newest_used_unix_ms: Option<u64>,
+    /// Present once collection has evicted a result within a day of its last use.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) recent_evictions: Option<RecentEvictions>,
+}
+
+/// Results that collection evicted within a day of their last use, since the store was created.
+///
+/// Any count means the budget could not hold the working set that was in use, so the next
+/// build of that work misses again. Raise the budget with `cargo rail cache setup --max-size`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecentEvictions {
+    pub(crate) results: u64,
+    pub(crate) bytes: u64,
+    pub(crate) last_unix_ms: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EvictionState {
+    version: u32,
+    results: u64,
+    bytes: u64,
+    last_unix_ms: u64,
 }
 
 /// Exact recoverable move for one selected markerless CAS root.
@@ -2633,6 +2663,7 @@ fn ensure_owner_marker(root: &Path, trust_domain: &str) -> RailResult<()> {
 fn validate_root_entries(root: &Path) -> RailResult<()> {
     let allowed = BTreeSet::from([
         CAPACITY_STATE_FILE,
+        EVICTION_STATE_FILE,
         NATIVE_LEDGER_STATE_FILE,
         "OWNER",
         BLOB_DIRECTORY,
@@ -5458,6 +5489,8 @@ impl LocalCas {
                 .checked_add(authority.packed_bytes)
                 .ok_or_else(|| RailError::message("local CAS packed result size overflow"))
         })?;
+        let recent_since = unix_nanos().saturating_sub(RECENT_EVICTION_WINDOW_NANOS);
+        let (mut recent_results, mut recent_bytes) = (0u64, 0u64);
         for authority in authorities {
             if current <= target_bytes {
                 break;
@@ -5465,6 +5498,8 @@ impl LocalCas {
             if authority.result.as_ref().is_some_and(|result| leased.contains(result)) {
                 continue;
             }
+            let recent = authority.last_used >= recent_since;
+            let before = current;
             fs::remove_file(&authority.path)?;
             current = current.saturating_sub(authority.packed_bytes);
             match &authority.kind {
@@ -5491,9 +5526,16 @@ impl LocalCas {
                             &mut blob_references,
                             &mut touched_shards,
                         )?);
+                        if recent {
+                            recent_results = recent_results.saturating_add(1);
+                            recent_bytes = recent_bytes.saturating_add(before.saturating_sub(current));
+                        }
                     }
                 }
             }
+        }
+        if recent_results > 0 {
+            record_recent_evictions(&self.root, recent_results, recent_bytes)?;
         }
         sync_directory(&pins_directory)?;
         sync_directory(&native_actions_directory)?;
@@ -5662,6 +5704,49 @@ fn reconcile_capacity_state(root: &Path) -> RailResult<()> {
         .checked_add(packed)
         .ok_or_else(|| RailError::message("local CAS result size overflow"))?;
     write_capacity_state(root, result_bytes, measured_metadata_bytes(root, result_bytes)?)
+}
+
+fn read_recent_evictions(root: &Path) -> RailResult<Option<RecentEvictions>> {
+    let path = root.join(EVICTION_STATE_FILE);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let mut stats = ReadStats::default();
+    let state: EvictionState =
+        read_canonical_json(&path, MAX_OBJECT_METADATA_BYTES, &mut stats).map_err(fault_to_error)?;
+    if state.version != EVICTION_STATE_VERSION {
+        return Err(RailError::message(
+            "local CAS eviction state has an incompatible schema",
+        ));
+    }
+    Ok(Some(RecentEvictions {
+        results: state.results,
+        bytes: state.bytes,
+        last_unix_ms: state.last_unix_ms,
+    }))
+}
+
+fn record_recent_evictions(root: &Path, results: u64, bytes: u64) -> RailResult<()> {
+    let previous = read_recent_evictions(root)?;
+    let recent = RecentEvictions {
+        results: previous
+            .as_ref()
+            .map_or(0, |recent| recent.results)
+            .saturating_add(results),
+        bytes: previous.as_ref().map_or(0, |recent| recent.bytes).saturating_add(bytes),
+        last_unix_ms: u64::try_from(unix_nanos() / 1_000_000).unwrap_or(u64::MAX),
+    };
+    write_file_atomic_committed(
+        &root.join(EVICTION_STATE_FILE),
+        &canonical_json(&EvictionState {
+            version: EVICTION_STATE_VERSION,
+            results: recent.results,
+            bytes: recent.bytes,
+            last_unix_ms: recent.last_unix_ms,
+        })?,
+    )
 }
 
 fn validate_capacity_state(root: &Path) -> RailResult<CapacityState> {
@@ -6319,6 +6404,7 @@ pub(crate) fn status_at_with_max(root: &Path, max_bytes: u64) -> RailResult<Opti
         reclaimable_bytes,
         oldest_used_unix_ms: oldest_used.map(|value| u64::try_from(value / 1_000_000).unwrap_or(u64::MAX)),
         newest_used_unix_ms: newest_used.map(|value| u64::try_from(value / 1_000_000).unwrap_or(u64::MAX)),
+        recent_evictions: read_recent_evictions(&root)?,
     }))
 }
 
@@ -7028,6 +7114,31 @@ mod tests {
         fs::set_permissions(&sealed, fs::Permissions::from_mode(0o700)).expect("unseal the committed result");
         published.expect("publication must not open unrelated committed results");
         assert!(native_action_retained(&cas, &validation));
+    }
+
+    #[test]
+    fn collection_reports_only_evictions_of_recently_used_results() {
+        let collect_after_idle = |idle: Duration| {
+            let cache = tempfile::tempdir().expect("cache base");
+            let output = tempfile::tempdir().expect("output root");
+            let cas = open_cas(cache.path(), 64 * 1024 * 1024).expect("CAS should open");
+            let stored = store_native_revisions(&cas, output.path(), 10);
+            for validation in &stored {
+                set_native_last_used(&cas, validation, idle);
+            }
+            let full = status(&cas).expect("full status").bytes;
+            drop(cas);
+            let cas = open_cas(cache.path(), full / 2).expect("CAS at half its size");
+            cas.enforce_capacity().expect("collection");
+            status(&cas).expect("collected status").recent_evictions
+        };
+
+        let recent = collect_after_idle(Duration::from_secs(60 * 60)).expect("recent evictions are reported");
+        assert!(recent.results > 0 && recent.bytes > 0, "{recent:?}");
+        assert!(
+            collect_after_idle(Duration::from_secs(48 * 60 * 60)).is_none(),
+            "evicting results idle for two days does not mean the budget is too small"
+        );
     }
 
     #[test]
