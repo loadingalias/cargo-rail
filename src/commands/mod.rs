@@ -231,6 +231,13 @@ pub fn try_dispatch_pre_context(
             Ok(PreContextDispatch::Handled)
         }
 
+        migrate @ Commands::Config {
+            command: Some(cli::ConfigCommand::Migrate { .. }),
+        } => Ok(PreContextDispatch::NeedsContext(PreparedContext::new(
+            migrate,
+            config_override,
+        )?)),
+
         Commands::Config { command } => {
             match command.unwrap_or(cli::ConfigCommand::Explain {
                 fields: Vec::new(),
@@ -259,6 +266,11 @@ pub fn try_dispatch_pre_context(
                 }
                 cli::ConfigCommand::Explain { fields, all, format } => {
                     config::run_config_explain(workspace_root, config_override, &fields, all, format)?
+                }
+                cli::ConfigCommand::Migrate { .. } => {
+                    return Err(crate::error::RailError::message(
+                        "config migrate requires its workspace context",
+                    ));
                 }
             }
             Ok(PreContextDispatch::Handled)
@@ -503,6 +515,14 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext, prepared_plan: Option<Pla
             },
         ),
 
+        Commands::Config {
+            command: Some(cli::ConfigCommand::Migrate { command, check, format }),
+        } => match command {
+            Some(cli::ConfigMigrateCommand::Apply { plan, format }) => {
+                config::run_config_migrate_apply(ctx, plan.as_deref(), format)
+            }
+            None => config::run_config_migrate(ctx, check, format),
+        },
         // Init is handled before WorkspaceContext is built
         Commands::Init { .. } => Err(crate::error::RailError::message(
             "init command reached workspace dispatch",
@@ -749,7 +769,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext, prepared_plan: Option<Pla
             "cache command reached workspace dispatch",
         )),
 
-        // Config commands are handled before WorkspaceContext is built
+        // Config commands other than migrate are handled before WorkspaceContext is built
         Commands::Config { .. } => Err(crate::error::RailError::message(
             "config command reached workspace dispatch",
         )),

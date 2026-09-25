@@ -1,5 +1,6 @@
 //! Typed `rail.toml` configuration and discovery.
 
+pub(crate) mod migration;
 pub(crate) mod plan;
 mod release;
 pub(crate) mod schema;

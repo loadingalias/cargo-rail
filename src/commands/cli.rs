@@ -491,7 +491,10 @@ impl Commands {
             | Self::Sync { .. }
             | Self::Surface { schema: false, .. }
             | Self::Release { .. }
-            | Self::Change { .. } => true,
+            | Self::Change { .. }
+            | Self::Config {
+                command: Some(ConfigCommand::Migrate { .. }),
+            } => true,
             Self::Plan { .. } => false,
             _ => false,
         }
@@ -816,6 +819,36 @@ pub enum ConfigCommand {
         /// Explain every known effective field
         #[arg(long, conflicts_with = "fields")]
         all: bool,
+        /// Output format
+        #[arg(long, short = 'f', default_value_t, value_enum)]
+        format: TextJsonOutputFormat,
+    },
+    /// Remove settings that restate current defaults, keeping effective policy
+    ///
+    /// Previews by default. A setting is removed only when removing it leaves the effective
+    /// policy unchanged, which also removes older spellings of a default. A file that contains
+    /// only defaults is deleted when no other configuration file would take its place.
+    /// Comments and every other setting are kept.
+    Migrate {
+        #[command(subcommand)]
+        command: Option<ConfigMigrateCommand>,
+        /// Exit 1 when a migration is pending, without changing files
+        #[arg(long, short = 'c')]
+        check: bool,
+        /// Output format
+        #[arg(long, short = 'f', default_value_t, value_enum)]
+        format: TextJsonOutputFormat,
+    },
+}
+
+/// Subcommands for `cargo rail config migrate`
+#[derive(Debug, Subcommand)]
+pub enum ConfigMigrateCommand {
+    /// Write the previewed sparse configuration after revalidating drift
+    Apply {
+        /// Apply a mutation plan from `cargo rail config migrate -f json`
+        #[arg(long)]
+        plan: Option<PathBuf>,
         /// Output format
         #[arg(long, short = 'f', default_value_t, value_enum)]
         format: TextJsonOutputFormat,
@@ -1200,7 +1233,14 @@ impl Commands {
                         ConfigCommand::Locate { format }
                         | ConfigCommand::Print { format }
                         | ConfigCommand::Explain { format, .. }
-                        | ConfigCommand::Validate { format, .. },
+                        | ConfigCommand::Validate { format, .. }
+                        | ConfigCommand::Migrate {
+                            command: Some(ConfigMigrateCommand::Apply { format, .. }),
+                            ..
+                        }
+                        | ConfigCommand::Migrate {
+                            command: None, format, ..
+                        },
                     ),
             } => text_json_protocol(format.is_json()),
             Commands::Completions { .. } => OutputProtocol::Raw,
@@ -1343,6 +1383,12 @@ impl Commands {
                     | ConfigCommand::Explain { format, .. }
                     | ConfigCommand::Validate { format, .. },
                 ) => *format = TextJsonOutputFormat::Json,
+                Some(ConfigCommand::Migrate { command, format, .. }) => {
+                    *format = TextJsonOutputFormat::Json;
+                    if let Some(ConfigMigrateCommand::Apply { format, .. }) = command {
+                        *format = TextJsonOutputFormat::Json;
+                    }
+                }
                 None => {
                     *command = Some(ConfigCommand::Explain {
                         fields: Vec::new(),

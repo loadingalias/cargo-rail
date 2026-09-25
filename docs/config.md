@@ -25,6 +25,7 @@ cargo rail config locate
 cargo rail config print
 cargo rail config explain --all --json
 cargo rail config validate --strict
+cargo rail config migrate
 ```
 
 `init` recognizes either an explicit `[workspace]` manifest or a root `[package]` manifest.
@@ -76,6 +77,8 @@ when decoding fails.
 Review existing policy against `config explain --all` from a workspace with supported configuration.
 Update the configuration file explicitly, then run `cargo rail config validate --strict`;
 Cargo-Rail does not rewrite unsupported fields automatically.
+For supported configuration, `config migrate` removes settings that only restate current defaults;
+see [Start sparse](#start-sparse).
 
 Plans use contract v9 and variant catalogs use v2.
 Regenerate older saved plans and validate catalogs against the current schemas before execution.
@@ -83,7 +86,25 @@ See [Planning](planning.md#consume-the-machine-contract).
 
 ## Start sparse
 
-Keep only choices that differ from defaults:
+Keep only choices that differ from defaults.
+`config migrate` reduces an existing file, such as saved `config print` output, to that form:
+
+```bash
+cargo rail config migrate                 # preview; changes no files
+cargo rail config migrate --check         # exit 1 when a migration is pending
+cargo rail config migrate apply           # revalidate drift, then write
+cargo rail config migrate -f json > migrate.json
+cargo rail config migrate apply --plan migrate.json
+```
+
+The migration removes a setting only when removing it leaves the effective policy unchanged,
+so an older spelling of a default, such as `unify.compiler_targets = []`, is removed as well.
+It keeps every other setting, comments, and ordering, and removes the header comment that `config print` writes.
+A file containing only defaults is deleted
+when no other discovery location holds a configuration file; otherwise,
+and for a file outside the discovery locations, the emptied file is kept.
+The JSON preview includes `mutation_plan`.
+`apply --plan` accepts that plan, saved to a file, only while the configuration and checkout are unchanged.
 
 ```toml
 targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]

@@ -1519,3 +1519,100 @@ fn validation_states_whether_it_checked_the_cargo_workspace() {
     })();
     super::helpers::finish_test(result);
 }
+
+fn effective_config(ws: &TestWorkspace) -> Result<serde_json::Value> {
+    let output = run_cargo_rail(&ws.path, &["rail", "config", "print", "-f", "json"])?;
+    anyhow::ensure!(output.status.success(), "config print failed: {output:?}");
+    Ok(serde_json::from_slice::<serde_json::Value>(&output.stdout)?["config"].clone())
+}
+
+/// `config print` writes every default. Migration reduces such a file to intentional policy,
+/// keeps comments, never changes effective policy, and applies exactly what it previewed.
+#[test]
+fn config_migrate_reduces_printed_defaults_to_intentional_policy() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("config-migrate")?;
+        ws.add_crate("member", "0.1.0", &[])?;
+        ws.commit("fixture")?;
+        let printed = run_cargo_rail(&ws.path, &["rail", "config", "print"])?;
+        anyhow::ensure!(printed.status.success(), "config print failed: {printed:?}");
+        let printed = String::from_utf8(printed.stdout)?;
+        let intentional = printed.replacen(
+            "include_renamed = false",
+            "# Renamed dependencies are unified on purpose.\ninclude_renamed = true",
+            1,
+        );
+        anyhow::ensure!(intentional != printed, "printed configuration lacks include_renamed");
+        let path = ws.path.join(".config/rail.toml");
+        fs::write(&path, format!("# Repository policy.\n\n{intentional}"))?;
+        ws.commit("Adopt printed configuration")?;
+        let before = effective_config(&ws)?;
+
+        let check = run_cargo_rail(&ws.path, &["rail", "config", "migrate", "--check", "-f", "json"])?;
+        assert_eq!(check.status.code(), Some(1), "{check:?}");
+        let preview: serde_json::Value = serde_json::from_slice(&check.stdout)?;
+        assert_eq!(preview["migration"], "rewrite", "{preview:#}");
+        let expected =
+            "# Repository policy.\n\n[unify]\n# Renamed dependencies are unified on purpose.\ninclude_renamed = true\n";
+        assert_eq!(preview["content"], expected, "{preview:#}");
+        assert!(
+            preview["removed"].as_array().is_some_and(|removed| removed.len() > 20),
+            "{preview:#}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path)?,
+            format!("# Repository policy.\n\n{intentional}"),
+            "preview must not write"
+        );
+
+        let apply = run_cargo_rail(&ws.path, &["rail", "config", "migrate", "apply", "-f", "json"])?;
+        assert!(apply.status.success(), "{apply:?}");
+        assert_eq!(fs::read_to_string(&path)?, expected);
+        assert_eq!(effective_config(&ws)?, before, "migration must keep effective policy");
+        let validate = run_cargo_rail(&ws.path, &["rail", "config", "validate", "--strict"])?;
+        assert!(validate.status.success(), "{validate:?}");
+        let clean = run_cargo_rail(&ws.path, &["rail", "config", "migrate", "--check"])?;
+        assert_eq!(clean.status.code(), Some(0), "{clean:?}");
+        Ok(())
+    })();
+    crate::helpers::finish_test(result);
+}
+
+#[test]
+fn config_migrate_deletes_a_default_only_file_and_rejects_drift() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("config-migrate-delete")?;
+        ws.add_crate("member", "0.1.0", &[])?;
+        let path = ws.path.join(".config/rail.toml");
+        fs::write(&path, "[unify]\ncompiler_targets = []\n\n[surface]\nenabled = false\n")?;
+        ws.commit("Default-only configuration")?;
+
+        let preview = run_cargo_rail(&ws.path, &["rail", "config", "migrate", "-f", "json"])?;
+        assert!(preview.status.success(), "{preview:?}");
+        let value: serde_json::Value = serde_json::from_slice(&preview.stdout)?;
+        assert_eq!(value["migration"], "delete", "{value:#}");
+        let plan_path = ws.path.join("target/config-migrate-plan.json");
+        fs::create_dir_all(plan_path.parent().ok_or_else(|| anyhow::anyhow!("plan directory"))?)?;
+        // The saved preview is the plan file; apply reads its `mutation_plan`.
+        fs::write(&plan_path, &preview.stdout)?;
+
+        // The approved plan binds the previewed file; an edit after preview is drift.
+        fs::write(
+            &path,
+            "[unify]\ncompiler_targets = []\n\n[surface]\nenabled = false\n# edited\n",
+        )?;
+        let plan = plan_path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("non-UTF-8 plan path"))?;
+        let drifted = run_cargo_rail(&ws.path, &["rail", "config", "migrate", "apply", "--plan", plan])?;
+        assert!(!drifted.status.success(), "{drifted:?}");
+        assert!(path.exists(), "drift must leave the file in place");
+
+        fs::write(&path, "[unify]\ncompiler_targets = []\n\n[surface]\nenabled = false\n")?;
+        let applied = run_cargo_rail(&ws.path, &["rail", "config", "migrate", "apply", "--plan", plan])?;
+        assert!(applied.status.success(), "{applied:?}");
+        assert!(!path.exists(), "a default-only file is deleted");
+        Ok(())
+    })();
+    crate::helpers::finish_test(result);
+}
