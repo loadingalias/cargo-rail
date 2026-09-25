@@ -13,7 +13,6 @@ const CARGO_CACHE_DIRECTORY_TAG: &[u8] = b"Signature: 8a477f597d28d172789f068868
 pub(crate) struct SandboxCompatibility {
     compiler: Box<str>,
     target: Box<str>,
-    profile: Box<str>,
     environment: Box<str>,
     wrapper: Box<str>,
 }
@@ -22,14 +21,12 @@ impl SandboxCompatibility {
     pub(crate) fn new(
         compiler: impl Into<Box<str>>,
         target: impl Into<Box<str>>,
-        profile: impl Into<Box<str>>,
         environment: impl Into<Box<str>>,
         wrapper: impl Into<Box<str>>,
     ) -> Self {
         Self {
             compiler: compiler.into(),
             target: target.into(),
-            profile: profile.into(),
             environment: environment.into(),
             wrapper: wrapper.into(),
         }
@@ -334,7 +331,7 @@ mod tests {
     use std::fs;
 
     fn compatibility(target: &str) -> SandboxCompatibility {
-        SandboxCompatibility::new("compiler", target, "check", "environment", "diagnostic")
+        SandboxCompatibility::new("compiler", target, "environment", "diagnostic")
     }
 
     #[test]

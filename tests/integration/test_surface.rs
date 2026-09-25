@@ -1245,3 +1245,86 @@ fn surface_reuses_facts_with_build_scripts_and_proc_macros_until_a_declared_inpu
     })();
     super::helpers::finish_test(result);
 }
+
+/// Typed views share one sandbox. A package compiled earlier as another view's dependency is
+/// removed before its own view, so it yields complete facts, and no dependency unit compiles twice.
+#[cfg(unix)]
+#[test]
+fn surface_views_share_one_sandbox_and_compile_each_dependency_once() {
+    let result: Result<()> = (|| {
+        let workspace = TestWorkspace::new_named("surface-shared-sandbox")?;
+        let base = workspace.add_crate("surface-base", "0.1.0", &[])?;
+        fs::write(
+            base.join("src/lib.rs"),
+            "/// Return the base value.\n///\n/// ```\n/// assert_eq!(surface_base::base(), 1);\n/// ```\npub fn base() -> u8 { 1 }\n",
+        )?;
+        for app in ["app-one", "app-two"] {
+            let package = workspace.add_crate(app, "0.1.0", &[("surface-base", "{ path = \"../surface-base\" }")])?;
+            fs::write(
+                package.join("src/lib.rs"),
+                "pub fn value() -> u8 { surface_base::base() }\n",
+            )?;
+        }
+        fs::write(
+            workspace.path.join(".config/rail.toml"),
+            r#"[surface]
+consumer_scope = "workspace"
+crate_visibility = "allow"
+
+[[surface.product]]
+package = "app-one"
+lib = "app_one"
+reason = "fixture product"
+
+[[surface.product]]
+package = "app-two"
+lib = "app_two"
+reason = "fixture product"
+"#,
+        )?;
+        fs::write(
+            workspace.path.join("rust-toolchain.toml"),
+            include_str!("../../rust-toolchain.toml"),
+        )?;
+        workspace.commit("Share a member dependency across Surface views")?;
+
+        let diagnostics = tempfile::TempDir::new()?;
+        let counters_path = diagnostics.path().join("surface.json");
+        let output = run_cargo_rail(
+            &workspace.path,
+            &[
+                "rail",
+                "--diagnostics-file",
+                counters_path
+                    .to_str()
+                    .ok_or_else(|| anyhow!("non-UTF-8 diagnostics path"))?,
+                "surface",
+                "--format",
+                "json",
+            ],
+        )?;
+        assert!(
+            output.status.success(),
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let schema: serde_json::Value = serde_json::from_str(SURFACE_V4_SCHEMA)?;
+        let validator =
+            jsonschema::validator_for(&schema).map_err(|error| anyhow!("invalid surface schema: {error}"))?;
+        assert!(validator.is_valid(&report), "surface report failed its schema");
+        let acquisition = &report["metrics"]["acquisition"];
+        assert!(
+            acquisition["analysis_views"].as_u64().is_some_and(|views| views >= 4),
+            "three check views and the base doctest view: {acquisition:#}"
+        );
+        assert_eq!(acquisition["repeated_dependency_compilations"], 0, "{acquisition:#}");
+        let counters: serde_json::Value = serde_json::from_slice(&fs::read(&counters_path)?)?;
+        let sandboxes = &counters["compiler_acquisition"];
+        assert_eq!(sandboxes["sandboxes_created"], 1, "{sandboxes:#}");
+        assert_eq!(sandboxes["max_live_cargo_processes"], 1, "{sandboxes:#}");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}

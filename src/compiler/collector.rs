@@ -2353,20 +2353,13 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                             let sandbox = match sandbox_pool.lease(SandboxCompatibility::new(
                                 self.identity.toolchain_fingerprint.clone(),
                                 view.platform(),
-                                view.command_class(),
                                 format!(
                                     "{}:{}",
                                     self.identity.compiler_env_fingerprint, self.identity.cargo_config_fingerprint
                                 ),
-                                if prepared.collect_typed {
-                                    if view.compiles_doctests() {
-                                        "typed-doctest"
-                                    } else {
-                                        "typed"
-                                    }
-                                } else {
-                                    "diagnostic"
-                                },
+                                // Check and doctest views share one sandbox, as `cargo check` and
+                                // `cargo test` share a target directory, so host units compile once.
+                                if prepared.collect_typed { "typed" } else { "diagnostic" },
                             )) {
                                 Ok(sandbox) => sandbox,
                                 Err(error) => {
@@ -3815,14 +3808,19 @@ fn run_workspace_check(
     {
         context.insert(INNER_WRAPPER_ENV, inner_wrapper);
     }
-    // Typed views stage private wrappers: the fresh path makes Cargo recompile each workspace
-    // unit, so the fact driver emits facts for all of them. Diagnostic views share the command's
-    // stable wrappers, keeping Cargo's `-C metadata` and native results reusable across runs.
-    let typed_wrappers = typed
-        .map(|_| crate::compiler::view_context::stage(&wrapper, observation_directory.path()))
-        .transpose()?;
-    let staged = typed_wrappers.as_ref().unwrap_or(wrappers);
-    let _view_context = staged.begin_view(&context)?;
+    // A typed view needs facts from its own package's targets, so Cargo must compile them here.
+    // Removing only that package from the shared sandbox keeps every other unit fresh.
+    if typed.is_some() && !view.compiles_doctests() {
+        remove_view_package_units(
+            identity,
+            workspace_root,
+            view.package(),
+            package_to_member,
+            &cargo_target,
+            &cargo_build,
+        )?;
+    }
+    let _view_context = wrappers.begin_view(&context)?;
 
     let mut command = typed.map_or_else(
         || Command::new(&identity.cargo_program),
@@ -3831,7 +3829,7 @@ fn run_workspace_check(
     crate::compiler::native_cache::remove_observation_environment(&mut command);
     command
         .current_dir(workspace_root)
-        .env("RUSTC_WORKSPACE_WRAPPER", &staged.rustc)
+        .env("RUSTC_WORKSPACE_WRAPPER", &wrappers.rustc)
         .env("CARGO_TARGET_DIR", &cargo_target)
         .env("CARGO_BUILD_BUILD_DIR", &cargo_build)
         .env_remove(CACHE_WRAPPER_MARKER)
@@ -3845,7 +3843,7 @@ fn run_workspace_check(
         command.env("RUSTC", &identity.rustc_program);
     }
     if view.compiles_doctests() {
-        command.env("RUSTDOC", &staged.rustdoc);
+        command.env("RUSTDOC", &wrappers.rustdoc);
     }
 
     let bounded = run_artifact_bounded_command(
@@ -3948,10 +3946,41 @@ fn run_workspace_check(
     })
 }
 
+/// Remove one workspace package's compiled units from a view's private sandbox.
+fn remove_view_package_units(
+    identity: &CompilerCacheIdentity,
+    workspace_root: &Path,
+    package: &str,
+    package_to_member: &HashMap<String, String>,
+    cargo_target: &Path,
+    cargo_build: &Path,
+) -> RailResult<()> {
+    let package_id = package_to_member
+        .iter()
+        .find_map(|(id, member)| (member == package).then_some(id.as_str()))
+        .ok_or_else(|| RailError::message(format!("compiler view package '{package}' is not a workspace member")))?;
+    let mut command = Command::new(&identity.cargo_program);
+    crate::compiler::native_cache::remove_observation_environment(&mut command);
+    let output = command
+        .current_dir(workspace_root)
+        .env("CARGO_TARGET_DIR", cargo_target)
+        .env("CARGO_BUILD_BUILD_DIR", cargo_build)
+        .args(["clean", "--quiet", "--offline", "--package", package_id])
+        .output()
+        .with_context(|| format!("removing compiled units of '{package}' from its compiler sandbox"))?;
+    if !output.status.success() {
+        return Err(RailError::message(format!(
+            "cargo clean failed for '{package}' in its private compiler sandbox: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
 /// Exact dependency units Cargo compiled in one view.
 ///
-/// Artifact file names carry Cargo's `-C metadata` hash, so one key names one unit
-/// configuration: a dependency rebuilt with different features is a different unit.
+/// Artifact paths carry Cargo's `-C metadata` hash, so one key names one unit configuration:
+/// a dependency rebuilt with different features is a different unit.
 fn dependency_compilations(stdout: &[u8], package_to_member: &HashMap<String, String>) -> Vec<String> {
     Message::parse_stream(BufReader::new(stdout))
         .filter_map(Result::ok)
@@ -3959,10 +3988,11 @@ fn dependency_compilations(stdout: &[u8], package_to_member: &HashMap<String, St
             Message::CompilerArtifact(artifact)
                 if !artifact.fresh && !package_to_member.contains_key(artifact.package_id.repr.as_str()) =>
             {
+                // A build-script binary has a fixed name; its unit hash is the parent directory.
                 let mut files = artifact
                     .filenames
                     .iter()
-                    .filter_map(|path| path.file_name())
+                    .filter_map(|path| Some(format!("{}/{}", path.parent()?.file_name()?, path.file_name()?)))
                     .collect::<Vec<_>>();
                 files.sort_unstable();
                 Some(format!(
@@ -7524,7 +7554,6 @@ mod tests {
             .lease(SandboxCompatibility::new(
                 "compiler",
                 "default",
-                "check",
                 "environment",
                 "wrapper",
             ))
@@ -7636,7 +7665,6 @@ mod tests {
             .lease(SandboxCompatibility::new(
                 "compiler",
                 "default",
-                "check",
                 "environment",
                 "wrapper",
             ))
