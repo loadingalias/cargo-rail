@@ -87,6 +87,19 @@ impl DigestMemo {
         }
     }
 
+    /// Whether a readiness proof was recorded for exactly this content identity.
+    ///
+    /// Readiness keys start with a versioned text domain, so they cannot equal a file generation.
+    pub(crate) fn readiness_recorded(&self, key: &[u8]) -> bool {
+        self.lookup(key)
+            .is_some_and(|(digest, bytes)| bytes == 0 && digest == readiness_digest(key))
+    }
+
+    /// Record that the operation identified by `key` succeeded; retention expires it like any entry.
+    pub(crate) fn record_readiness(&self, key: &[u8]) {
+        drop(self.write(key, &readiness_digest(key), 0));
+    }
+
     fn write(&self, generation: &[u8], digest: &str, bytes: u64) -> std::io::Result<()> {
         let path = self.entry_path(generation);
         let shard = path.parent().unwrap_or(&self.directory);
@@ -168,6 +181,10 @@ pub(crate) fn prune(store_root: &Path) -> std::io::Result<u64> {
     Ok(removed)
 }
 
+fn readiness_digest(key: &[u8]) -> String {
+    format!("sha256:{}", ContentDigest::sha256(key))
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -175,6 +192,28 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readiness_binds_its_exact_key_and_never_answers_a_digest_lookup() {
+        let root = tempfile::tempdir().expect("store root");
+        let memo = DigestMemo {
+            directory: root.path().join(DIGEST_MEMO_DIRECTORY),
+        };
+        let key = b"cargo-rail-native-driver-readiness-v1\0driver\0library\0";
+        assert!(!memo.readiness_recorded(key));
+        memo.record_readiness(key);
+        assert!(memo.readiness_recorded(key), "a recorded probe is reused");
+        assert!(
+            !memo.readiness_recorded(b"cargo-rail-native-driver-readiness-v1\0other-driver\0library\0"),
+            "another driver or library identity must probe again"
+        );
+        let digest = format!("sha256:{}", "ab".repeat(32));
+        memo.write(b"generation", &digest, 7).expect("digest entry");
+        assert!(
+            !memo.readiness_recorded(b"generation"),
+            "a file digest entry is not a readiness proof"
+        );
+    }
 
     #[test]
     fn entries_bind_the_exact_generation_and_respect_the_racy_window() {

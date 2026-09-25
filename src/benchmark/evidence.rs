@@ -354,7 +354,7 @@ mod tests {
         let arguments = vec!["--version".to_string()];
         let action = CompilerOperation::capture("rustc", &arguments)?;
         let event = json!({
-            "schema_version": 10, "lane": "cargo-rail", "compiler": "rustc", "arguments": arguments,
+            "schema_version": BENCH_COVERAGE_VERSION, "lane": "cargo-rail", "compiler": "rustc", "arguments": arguments,
             "action": action, "action_id": action.identity()?, "remote_request_attempts": 0,
             "remote_coordinator_requests": 0, "remote_payload_bytes_read": 0, "remote_payload_bytes_written": 0,
         });
@@ -366,7 +366,7 @@ mod tests {
         remote["remote_request_attempts"] = json!(1);
         anyhow::ensure!(validate_event(&remote).is_err());
         let mut unknown = event;
-        unknown["schema_version"] = json!(11);
+        unknown["schema_version"] = json!(BENCH_COVERAGE_VERSION + 1);
         anyhow::ensure!(validate_event(&unknown).is_err());
         Ok(())
     }
@@ -381,7 +381,7 @@ mod tests {
         ];
         let action = CompilerOperation::capture("rustc", &arguments)?;
         let event = json!({
-            "schema_version": 10, "lane": "cargo-rail", "compiler": "rustc", "arguments": arguments,
+            "schema_version": BENCH_COVERAGE_VERSION, "lane": "cargo-rail", "compiler": "rustc", "arguments": arguments,
             "action": action, "action_id": action.identity()?, "remote_request_attempts": 0,
             "remote_coordinator_requests": 0, "remote_payload_bytes_read": 0, "remote_payload_bytes_written": 0,
             "recording_identity": format!("sha256:{}", ContentDigest::sha256(directory.as_os_str().as_encoded_bytes())),

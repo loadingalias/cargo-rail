@@ -198,8 +198,9 @@ pub(crate) struct CompilerFactDriverExecutionCapability {
     _directory_file: File,
     #[cfg(windows)]
     _directory: tempfile::TempDir,
+    /// A per-invocation staging directory, removed on drop; `None` for a store-owned stable stage.
     #[cfg(target_os = "macos")]
-    _directory: tempfile::TempDir,
+    _directory: Option<tempfile::TempDir>,
     #[cfg(target_os = "macos")]
     sandbox_profile: String,
 }
@@ -1755,6 +1756,7 @@ impl PreparedNativeCompilerDriver {
         rustc_verbose: &str,
         rustc_sysroot: &Path,
         staging_parent: &Path,
+        stable_stage_root: Option<&Path>,
     ) -> RailResult<Option<Self>> {
         if !cfg!(any(target_os = "macos", target_os = "linux")) {
             return Ok(None);
@@ -1787,7 +1789,13 @@ impl PreparedNativeCompilerDriver {
                 .parent()
                 .ok_or_else(|| RailError::message("native compiler runtime library has no parent"))?
                 .to_path_buf();
-            CompilerFactDriverComponent::discover_with_authority(&authority, &executable, compiler_library_directory)?
+            crate::compiler::native_cache::bench_phase("driver_component_discover", || {
+                CompilerFactDriverComponent::discover_with_authority(
+                    &authority,
+                    &executable,
+                    compiler_library_directory,
+                )
+            })?
         } else if let Some(source) = source {
             let cargo = rustc_sysroot
                 .join("bin")
@@ -1803,25 +1811,42 @@ impl PreparedNativeCompilerDriver {
         } else {
             return Ok(None);
         };
-        let compiler_library = authenticate_compiler_library(
-            &component.compiler_library_path,
-            &component.authority.compiler_library_digest,
-        )?;
-        let Some(execution) = stage_native_component(&component, staging_parent)? else {
+        let compiler_library = crate::compiler::native_cache::bench_phase("compiler_library_authenticate", || {
+            authenticate_compiler_library(
+                &component.compiler_library_path,
+                &component.authority.compiler_library_digest,
+            )
+        })?;
+        let Some(execution) = crate::compiler::native_cache::bench_phase("driver_stage", || {
+            stage_native_component(&component, staging_parent, stable_stage_root)
+        })?
+        else {
             return Ok(None);
         };
-        let output = execution
-            .native_command(std::env::var_os("DYLD_FALLBACK_LIBRARY_PATH").as_deref())
-            .arg(NATIVE_INPUT_PROTOCOL_VERSION_ARGUMENT)
-            .output()?;
-        let expected_protocol = NATIVE_INPUT_PROTOCOL_VERSION.to_string();
-        if !output.status.success()
-            || !output.stderr.is_empty()
-            || std::str::from_utf8(&output.stdout).map(str::trim) != Ok(expected_protocol.as_str())
-        {
-            return Err(RailError::message(
-                "native compiler driver failed its transparent protocol readiness probe",
-            ));
+        // The probe proves that these exact driver bytes load against these exact compiler-library
+        // bytes on this host and speak this protocol. Both are digest-authenticated above, so one
+        // successful probe is recorded under those identities and later cold compilations reuse it.
+        let readiness = driver_readiness_key(&component);
+        let ready = crate::cache::digest_memo::active().is_some_and(|memo| memo.readiness_recorded(&readiness));
+        if !ready {
+            let output = crate::compiler::native_cache::bench_phase("driver_protocol_probe", || {
+                execution
+                    .native_command(std::env::var_os("DYLD_FALLBACK_LIBRARY_PATH").as_deref())
+                    .arg(NATIVE_INPUT_PROTOCOL_VERSION_ARGUMENT)
+                    .output()
+            })?;
+            let expected_protocol = NATIVE_INPUT_PROTOCOL_VERSION.to_string();
+            if !output.status.success()
+                || !output.stderr.is_empty()
+                || std::str::from_utf8(&output.stdout).map(str::trim) != Ok(expected_protocol.as_str())
+            {
+                return Err(RailError::message(
+                    "native compiler driver failed its transparent protocol readiness probe",
+                ));
+            }
+            if let Some(memo) = crate::cache::digest_memo::active() {
+                memo.record_readiness(&readiness);
+            }
         }
         let prepared = Self {
             execution,
@@ -2380,6 +2405,22 @@ fn authenticate_component_file(path: &Path, expected_digest: &str) -> RailResult
     transfer_authenticated_component(path, expected_digest, None)
 }
 
+/// Identity of one native driver probe: driver bytes, compiler-library bytes, protocol, and host.
+fn driver_readiness_key(component: &CompilerFactDriverComponent) -> Vec<u8> {
+    let mut key = b"cargo-rail-native-driver-readiness-v1\0".to_vec();
+    for part in [
+        component.authority.content_digest.as_str(),
+        component.authority.compiler_library_digest.as_str(),
+        &NATIVE_INPUT_PROTOCOL_VERSION.to_string(),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    ] {
+        key.extend_from_slice(part.as_bytes());
+        key.push(0);
+    }
+    key
+}
+
 fn authenticate_compiler_library(path: &Path, expected_digest: &str) -> RailResult<AuthenticatedCompilerLibrary> {
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         RailError::message(format!(
@@ -2404,6 +2445,24 @@ fn authenticate_compiler_library(path: &Path, expected_digest: &str) -> RailResu
         return Err(RailError::message(
             "compiler fact runtime library changed before it was opened",
         ));
+    }
+    // The library is tens of megabytes and every cold compilation authenticates it. A memo entry
+    // binds its digest to the file's complete stable generation, so an unchanged file skips the read.
+    #[cfg(unix)]
+    if let (Some(memo), Some(generation)) = (
+        crate::cache::digest_memo::active(),
+        crate::utils::stable_open_file_generation(&file),
+    ) && memo
+        .lookup(&generation)
+        .is_some_and(|(digest, bytes)| digest == expected_digest && bytes == metadata.len())
+        && crate::utils::opened_file_matches_path(&file, path, metadata.len())?
+    {
+        return Ok(AuthenticatedCompilerLibrary {
+            path: path.to_path_buf(),
+            file,
+            generation,
+            bytes: metadata.len(),
+        });
     }
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
@@ -2445,6 +2504,10 @@ fn authenticate_compiler_library(path: &Path, expected_digest: &str) -> RailResu
         }
         generation
     };
+    #[cfg(unix)]
+    if let (Some(memo), Ok(modified)) = (crate::cache::digest_memo::active(), metadata.modified()) {
+        memo.record(&generation, modified, &actual, bytes);
+    }
     Ok(AuthenticatedCompilerLibrary {
         path: path.to_path_buf(),
         file,
@@ -2524,6 +2587,7 @@ fn stage_component(component: &CompilerFactDriverComponent) -> RailResult<Compil
 fn stage_native_component(
     component: &CompilerFactDriverComponent,
     staging_parent: &Path,
+    _stable_root: Option<&Path>,
 ) -> RailResult<Option<CompilerFactDriverExecutionCapability>> {
     stage_linux_component(component, Some(staging_parent)).map(Some)
 }
@@ -2606,14 +2670,19 @@ fn stage_component(component: &CompilerFactDriverComponent) -> RailResult<Compil
 fn stage_native_component(
     component: &CompilerFactDriverComponent,
     staging_parent: &Path,
+    stable_root: Option<&Path>,
 ) -> RailResult<Option<CompilerFactDriverExecutionCapability>> {
-    stage_macos_component(component, Some(staging_parent)).map(Some)
+    match stable_root {
+        Some(root) => stage_stable_macos_component(component, root).map(Some),
+        None => stage_macos_component(component, Some(staging_parent)).map(Some),
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn stage_native_component(
     _component: &CompilerFactDriverComponent,
     _staging_parent: &Path,
+    _stable_root: Option<&Path>,
 ) -> RailResult<Option<CompilerFactDriverExecutionCapability>> {
     Ok(None)
 }
@@ -2668,7 +2737,96 @@ fn stage_macos_component(
         program,
         identity: component.authority.identity.clone(),
         _file: file,
-        _directory: directory,
+        _directory: Some(directory),
+        sandbox_profile,
+    })
+}
+
+/// Directory beside the local stores that holds one verified driver stage per driver and compiler library.
+///
+/// It lives in the Cargo-Rail owner directory rather than inside a store, because each stage links its
+/// compiler library and a store admits no symbolic links.
+const NATIVE_DRIVER_STAGE_DIRECTORY: &str = "native-driver-stages-v1";
+
+/// Stage the driver once beside the store at `store_root` and reuse that exact file for every cold compilation.
+///
+/// macOS scans each new executable file on its first launch. A per-invocation copy therefore paid
+/// that scan on every cache miss, serialized behind the scanner (12 concurrent first launches took
+/// 3.3 s against 0.2 s for an already-launched file). The stable stage keeps the staged file's single
+/// link and the sandbox that denies writes to its directory, and every use re-authenticates its bytes.
+#[cfg(target_os = "macos")]
+fn stage_stable_macos_component(
+    component: &CompilerFactDriverComponent,
+    store_root: &Path,
+) -> RailResult<CompilerFactDriverExecutionCapability> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let owner = store_root
+        .parent()
+        .ok_or_else(|| RailError::message("local store has no owner directory for the driver stage"))?;
+    let stages = create_private_real_directory(owner, NATIVE_DRIVER_STAGE_DIRECTORY)?;
+    let mut name = component.authority.content_digest.as_bytes().to_vec();
+    name.push(0);
+    name.extend_from_slice(component.compiler_library_directory.as_os_str().as_encoded_bytes());
+    let directory = stages.join(ContentDigest::sha256(&name).to_string());
+    if fs::symlink_metadata(&directory).is_err() {
+        let pending = tempfile::Builder::new().prefix(".stage-").tempdir_in(&stages)?;
+        fs::create_dir(pending.path().join("bin"))?;
+        std::os::unix::fs::symlink(&component.compiler_library_directory, pending.path().join("lib"))?;
+        let path = pending.path().join("bin").join(compiler_driver_file_name());
+        let mut destination = fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
+        transfer_authenticated_component(
+            &component.path,
+            &component.authority.content_digest,
+            Some(&mut destination),
+        )?;
+        destination.flush()?;
+        destination.set_permissions(fs::Permissions::from_mode(0o500))?;
+        drop(destination);
+        let pending = pending.keep();
+        if let Err(error) = fs::rename(&pending, &directory) {
+            // Another invocation published the same stage first; use it after verification.
+            drop(fs::remove_dir_all(&pending));
+            if fs::symlink_metadata(&directory).is_err() {
+                return Err(error.into());
+            }
+        }
+    }
+    let metadata = fs::symlink_metadata(&directory)?;
+    if !metadata.is_dir() || crate::utils::is_symlink_or_reparse(&metadata) {
+        return Err(RailError::message(
+            "stable compiler fact driver stage is not a real directory",
+        ));
+    }
+    if fs::read_link(directory.join("lib"))? != component.compiler_library_directory {
+        return Err(RailError::message(
+            "stable compiler fact driver stage selects another compiler library",
+        ));
+    }
+    let path = directory.join("bin").join(compiler_driver_file_name());
+    let file = File::open(&path)?;
+    let bytes = transfer_authenticated_component(&path, &component.authority.content_digest, None)?;
+    if !crate::utils::private_file_matches_path(&file, &path, bytes)? {
+        return Err(RailError::message(
+            "stable compiler fact driver changed before its execution handle was opened",
+        ));
+    }
+    let program = crate::utils::canonicalize_existing(&path)?;
+    let directory_path = crate::utils::canonicalize_existing(&directory)?;
+    let directory_text = directory_path
+        .to_str()
+        .filter(|path| !path.contains(['"', '\\', '\n', '\r']))
+        .ok_or_else(|| {
+            RailError::message("staged compiler fact driver path cannot be expressed in a sandbox profile")
+        })?;
+    let sandbox_profile = format!(
+        "(version 1)\n(allow default)\n(deny file-write-data file-write-create file-write-unlink (literal \"{directory_text}\"))\n(deny file-write-data file-write-create file-write-unlink (subpath \"{directory_text}\"))\n"
+    );
+    Ok(CompilerFactDriverExecutionCapability {
+        program,
+        identity: component.authority.identity.clone(),
+        _file: file,
+        _directory: None,
         sandbox_profile,
     })
 }

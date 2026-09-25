@@ -48,7 +48,7 @@ pub(crate) const BASE_ACTION_KEY_PREFIX: &str = "compiler-base-v11-sha256-";
 pub(crate) const CANDIDATE_SELECTOR_PREFIX: &str = "compiler-candidate-v7-sha256-";
 pub(crate) const SESSION_ENV: &str = "CARGO_RAIL_NATIVE_COMPILER_CACHE_SESSION";
 pub(crate) const DISPOSITION_ENV: &str = "CARGO_RAIL_NATIVE_COMPILER_CACHE_DISPOSITION";
-pub(crate) const BENCH_COVERAGE_VERSION: u32 = 10;
+pub(crate) const BENCH_COVERAGE_VERSION: u32 = 11;
 pub(crate) const BENCH_COVERAGE_DIRECTORY_ENV: &str = "CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY";
 pub(crate) const APPLE_LINK_ADAPTER_ENV: &str = "CARGO_RAIL_APPLE_LINK_ADAPTER";
 pub(crate) const APPLE_LINK_DRIVER_ENV: &str = "CARGO_RAIL_APPLE_LINK_DRIVER";
@@ -16279,7 +16279,7 @@ impl NativeCompilerExecution {
         context: &NativeCacheContext,
     ) -> Result<Self, NativeInputFailure> {
         let failure = |error| NativeInputFailure::new("compiler_native_input_evidence_unavailable", error);
-        context.session_inputs.revalidate().map_err(failure)?;
+        bench_phase("session_inputs_revalidate", || context.session_inputs.revalidate()).map_err(failure)?;
         let session = &context.session;
         let current_directory = command
             .get_current_dir()
@@ -16322,12 +16322,15 @@ impl NativeCompilerExecution {
             None
         } else {
             Some(
-                crate::compiler::driver::PreparedNativeCompilerDriver::prepare(
-                    &current_directory,
-                    &session.rustc_verbose,
-                    &session.rustc_sysroot,
-                    &context.observation_directory,
-                )
+                bench_phase("native_driver_prepare", || {
+                    crate::compiler::driver::PreparedNativeCompilerDriver::prepare(
+                        &current_directory,
+                        &session.rustc_verbose,
+                        &session.rustc_sysroot,
+                        &context.observation_directory,
+                        context.local_cas.as_ref().map(LocalCas::root),
+                    )
+                })
                 .map_err(failure)?
                 .ok_or_else(|| {
                     NativeInputFailure::new(
@@ -16337,19 +16340,21 @@ impl NativeCompilerExecution {
                 })?,
             )
         };
-        let inputs = ColdRustInputGuard::capture(
-            observation,
-            &context.source_root_spelling,
-            &session
-                .rustc_sysroot
-                .join("lib/rustlib")
-                .join(&session.class.host_target)
-                .join("lib"),
-            capture
-                .toolchain
-                .as_ref()
-                .map(NativeToolchainInputs::target_library_directory),
-        )
+        let inputs = bench_phase("cold_rust_input_guard", || {
+            ColdRustInputGuard::capture(
+                observation,
+                &context.source_root_spelling,
+                &session
+                    .rustc_sysroot
+                    .join("lib/rustlib")
+                    .join(&session.class.host_target)
+                    .join("lib"),
+                capture
+                    .toolchain
+                    .as_ref()
+                    .map(NativeToolchainInputs::target_library_directory),
+            )
+        })
         .map_err(failure)?;
         let mut capability = tempfile::Builder::new()
             .prefix("native-input-")
@@ -16498,13 +16503,15 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
     };
     let source_root = &cache_context.source_root;
     let source_root_spelling = &cache_context.source_root_spelling;
-    let native_execution = NativeCompilerExecution::prepare(
-        &mut command,
-        recorder.observation(),
-        &capture,
-        &base_action_key,
-        cache_context,
-    );
+    let native_execution = bench_phase("native_execution_prepare", || {
+        NativeCompilerExecution::prepare(
+            &mut command,
+            recorder.observation(),
+            &capture,
+            &base_action_key,
+            cache_context,
+        )
+    });
     let compiler_started = Instant::now();
     let output = match run_compiler_with_live_streams(command) {
         Ok(output) => output,
@@ -16514,6 +16521,7 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
         }
     };
     let compiler_elapsed = compiler_started.elapsed();
+    record_benchmark_compiler_timing(Instant::now(), compiler_elapsed);
     let CapturedCompilerOutput { status, stdout, stderr } = output;
 
     if status.success()
@@ -18045,6 +18053,45 @@ struct NativeBenchmarkCoverageEvent<'a> {
     durability: NativeDurabilitySnapshot,
     #[serde(skip_serializing_if = "Option::is_none")]
     remote_error: Option<String>,
+    /// Wall time from benchmark activation, just after argument parsing, to this event.
+    wrapper_elapsed_ns: u64,
+    /// Wall time of the compiler child, when this invocation ran one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compiler_elapsed_ns: Option<u64>,
+    /// Wall time from the compiler child's exit to this event: capture, hashing, and publication.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    after_compiler_ns: Option<u64>,
+    /// Named steps timed within this invocation, in execution order.
+    phases_ns: Vec<(&'static str, u64)>,
+}
+
+/// Benchmark-only process timing for the one invocation this wrapper serves.
+static BENCH_WRAPPER_STARTED: OnceLock<Instant> = OnceLock::new();
+static BENCH_PHASES: std::sync::Mutex<Vec<(&'static str, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Time one named step for benchmark coverage; a no-op unless coverage is active.
+pub(crate) fn bench_phase<T>(name: &'static str, step: impl FnOnce() -> T) -> T {
+    if BENCH_COVERAGE_DIRECTORY.get().is_none() {
+        return step();
+    }
+    let started = Instant::now();
+    let value = step();
+    if let Ok(mut phases) = BENCH_PHASES.lock() {
+        phases.push((name, nanos(started.elapsed())));
+    }
+    value
+}
+static BENCH_COMPILER_FINISHED: OnceLock<(Instant, Duration)> = OnceLock::new();
+
+/// Record when the compiler child exited; used only by benchmark coverage events.
+fn record_benchmark_compiler_timing(finished: Instant, elapsed: Duration) {
+    if BENCH_COVERAGE_DIRECTORY.get().is_some() {
+        BENCH_COMPILER_FINISHED.get_or_init(|| (finished, elapsed));
+    }
+}
+
+fn nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// Retain benchmark-only per-invocation evidence after ordinary cache outcome recording.
@@ -18185,6 +18232,14 @@ fn write_benchmark_coverage_invocation(invocation: BenchmarkCoverageInvocation<'
         distributed_timing: metrics.distributed_timing,
         durability: native_durability_snapshot(),
         remote_error,
+        wrapper_elapsed_ns: BENCH_WRAPPER_STARTED
+            .get()
+            .map_or(0, |started| nanos(started.elapsed())),
+        compiler_elapsed_ns: BENCH_COMPILER_FINISHED.get().map(|(_, elapsed)| nanos(*elapsed)),
+        after_compiler_ns: BENCH_COMPILER_FINISHED
+            .get()
+            .map(|(finished, _)| nanos(finished.elapsed())),
+        phases_ns: BENCH_PHASES.lock().map(|phases| phases.clone()).unwrap_or_default(),
     })?;
     if encoded.len() > MAX_BENCH_COVERAGE_EVENT_BYTES {
         return Err(RailError::message(
@@ -18235,6 +18290,7 @@ pub(crate) fn activate_benchmark_coverage() {
     }
     BENCH_COVERAGE_DIRECTORY.get_or_init(|| directory);
     BENCH_DURABILITY_COUNTERS.get_or_init(NativeDurabilityCounters::new);
+    BENCH_WRAPPER_STARTED.get_or_init(Instant::now);
 }
 
 /// Record one acquisition-free direct-wrapper bypass for the explicit benchmark census.

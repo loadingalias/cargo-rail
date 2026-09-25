@@ -686,6 +686,7 @@ impl WorkerNativeInvocation {
             &captured.capability.rustc_verbose_version,
             &captured.sysroot,
             attempt,
+            None,
         )?
         else {
             return Ok(None);

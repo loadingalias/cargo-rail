@@ -562,7 +562,7 @@ fn ensure_typed_benchmark_events(directory: &Path) -> Result<()> {
     ensure!(!events.is_empty(), "benchmark compiler operation inventory is empty");
     for event in events {
         ensure!(
-            event["schema_version"] == 10,
+            event["schema_version"] == 11,
             "benchmark compiler operation has an incompatible schema: {event}"
         );
         if event["status"] == "hit" || (event["status"] == "miss" && event.get("result_key").is_some()) {
