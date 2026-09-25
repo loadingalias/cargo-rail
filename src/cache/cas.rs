@@ -321,21 +321,6 @@ pub(crate) struct NativeRestoreLock {
     _lifecycle: LocalCasLifecycleLock,
 }
 
-/// One fixed-shard compiler execution claim.
-///
-/// The claim suppresses work only. It grants no cache lookup, restore, or
-/// publication authority and therefore retains no CAS lifecycle lock while
-/// compiler execution or publication is active.
-pub(crate) struct NativeExecutionClaim {
-    _file: File,
-}
-
-/// Result of one non-blocking fixed-shard compiler execution claim attempt.
-pub(crate) enum NativeExecutionClaimAttempt {
-    Acquired(NativeExecutionClaim),
-    Contended,
-}
-
 impl NativeActionHit<'_> {
     fn refresh_access_if_stale(&self) {
         if !self.refresh_access {
@@ -904,62 +889,6 @@ impl LocalCas {
             _file: file,
             _lifecycle: lifecycle,
         })
-    }
-
-    /// Try to suppress duplicate compiler execution for one command-local
-    /// candidate identity without growing the synchronization namespace.
-    ///
-    /// This claim is deliberately weaker than cache authority. Callers must
-    /// repeat exact native-action and analysis-evidence lookup after acquiring
-    /// it, and must release it before starting any restore transaction.
-    pub(crate) fn try_native_execution_claim(
-        &self,
-        identity: &crate::source::ContentDigest,
-    ) -> RailResult<NativeExecutionClaimAttempt> {
-        let (file, path) = self.native_execution_claim_file(identity)?;
-        match file.try_lock() {
-            Ok(()) => {}
-            Err(fs::TryLockError::WouldBlock) => return Ok(NativeExecutionClaimAttempt::Contended),
-            Err(fs::TryLockError::Error(error)) => return Err(error.into()),
-        }
-        if !crate::utils::private_file_matches_path(&file, &path, 0)? {
-            return Err(RailError::message(
-                "native execution-claim shard changed while it was acquired",
-            ));
-        }
-        Ok(NativeExecutionClaimAttempt::Acquired(NativeExecutionClaim {
-            _file: file,
-        }))
-    }
-
-    /// Wait for one fixed-shard compiler execution claim after the caller has
-    /// yielded its active-work permit.
-    pub(crate) fn native_execution_claim(
-        &self,
-        identity: &crate::source::ContentDigest,
-    ) -> RailResult<NativeExecutionClaim> {
-        let (file, path) = self.native_execution_claim_file(identity)?;
-        file.lock()?;
-        if !crate::utils::private_file_matches_path(&file, &path, 0)? {
-            return Err(RailError::message(
-                "native execution-claim shard changed while it was acquired",
-            ));
-        }
-        Ok(NativeExecutionClaim { _file: file })
-    }
-
-    fn native_execution_claim_file(&self, identity: &crate::source::ContentDigest) -> RailResult<(File, PathBuf)> {
-        let claims = native_execution_claim_directory(&self.root)?;
-        validate_real_directory(&claims, "local CAS native execution claims")?;
-        let shard = identity.as_bytes()[0] % NATIVE_EXECUTION_CLAIM_SHARDS;
-        let path = claims.join(format!("{shard:02x}.lock"));
-        let file = crate::utils::open_cache_lock_file(&path, false)?;
-        if !crate::utils::private_file_matches_path(&file, &path, 0)? {
-            return Err(RailError::message(
-                "native execution-claim shard is not a private empty file",
-            ));
-        }
-        Ok((file, path))
     }
 
     /// Load the compiler-selected dynamic inputs for one portable base action.
@@ -8512,89 +8441,6 @@ mod tests {
     }
 
     #[test]
-    fn native_execution_claims_use_a_bounded_shard_set() {
-        let cache = tempfile::tempdir().expect("cache base");
-        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
-        for candidate in 0..4096_u64 {
-            let identity = ContentDigest::sha256(&candidate.to_le_bytes());
-            let NativeExecutionClaimAttempt::Acquired(claim) = cas
-                .try_native_execution_claim(&identity)
-                .expect("execution claim attempt")
-            else {
-                panic!("uncontended execution claim must be acquired");
-            };
-            drop(claim);
-        }
-        let claims = native_execution_claim_directory(&cas.root).expect("execution-claim directory");
-        assert!(
-            !claims
-                .file_name()
-                .expect("execution-claim directory name")
-                .to_string_lossy()
-                .starts_with(CAS_ROOT_NAME),
-            "execution-claim infrastructure must not impersonate a local CAS root"
-        );
-        let entries =
-            bounded_directory_entries(&claims, "test execution claims").expect("bounded execution-claim directory");
-        assert_eq!(entries.len(), usize::from(NATIVE_EXECUTION_CLAIM_SHARDS));
-        assert_eq!(status(&cas).expect("CAS status").staging_entries, 0);
-    }
-
-    #[test]
-    fn native_execution_claim_hash_collisions_only_serialize_work() {
-        let cache = tempfile::tempdir().expect("cache base");
-        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
-        let first = ContentDigest::sha256(b"first unrelated compiler action");
-        let second = (0_u64..)
-            .map(|candidate| ContentDigest::sha256(&candidate.to_le_bytes()))
-            .find(|candidate| {
-                candidate != &first
-                    && candidate.as_bytes()[0] % NATIVE_EXECUTION_CLAIM_SHARDS
-                        == first.as_bytes()[0] % NATIVE_EXECUTION_CLAIM_SHARDS
-            })
-            .expect("a bounded shard set must have a collision");
-
-        let NativeExecutionClaimAttempt::Acquired(first_claim) =
-            cas.try_native_execution_claim(&first).expect("first execution claim")
-        else {
-            panic!("first execution claim must be uncontended");
-        };
-        assert!(matches!(
-            cas.try_native_execution_claim(&second)
-                .expect("colliding execution claim"),
-            NativeExecutionClaimAttempt::Contended
-        ));
-        drop(first_claim);
-        assert!(matches!(
-            cas.try_native_execution_claim(&second)
-                .expect("released colliding execution claim"),
-            NativeExecutionClaimAttempt::Acquired(_)
-        ));
-    }
-
-    #[test]
-    fn native_execution_claim_does_not_retain_cas_lifecycle_authority() {
-        let cache = tempfile::tempdir().expect("cache base");
-        let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
-        let identity = ContentDigest::sha256(b"publication must not self-deadlock");
-        let claim = cas.native_execution_claim(&identity).expect("execution claim");
-        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
-        let writer = cas;
-        std::thread::scope(|scope| {
-            let handle = scope.spawn(move || {
-                let lifecycle = writer.lock().expect("exclusive lifecycle lock");
-                finished_tx.send(()).expect("lifecycle signal");
-                drop(lifecycle);
-            });
-            finished_rx
-                .recv_timeout(std::time::Duration::from_secs(2))
-                .expect("execution claim must not block native publication's lifecycle lock");
-            drop(claim);
-            handle.join().expect("lifecycle writer");
-        });
-    }
-
-    #[test]
     fn cache_cleanup_preserves_the_fixed_execution_claim_namespace() {
         let cache = tempfile::tempdir().expect("cache base");
         let cas = open_cas(cache.path(), 1024 * 1024).expect("CAS should open");
@@ -8614,76 +8460,6 @@ mod tests {
             native_execution_claim_directory(&reopened.root).expect("reopened execution-claim directory"),
             claims
         );
-    }
-
-    #[test]
-    fn native_execution_claim_serializes_across_processes() {
-        const CACHE_ENV: &str = "CARGO_RAIL_TEST_NATIVE_EXECUTION_CLAIM_CACHE";
-        const CONTROL_ENV: &str = "CARGO_RAIL_TEST_NATIVE_EXECUTION_CLAIM_CONTROL";
-
-        let root = tempfile::tempdir().expect("execution-claim test root");
-        let cache = root.path().join("cache");
-        let control = root.path().join("control");
-        fs::create_dir(&cache).expect("cache base");
-        fs::create_dir(&control).expect("control directory");
-        let cas = open_cas(&cache, 1024 * 1024).expect("CAS should open");
-        let identity = ContentDigest::sha256(b"shared compiler candidate");
-        let claim = cas.native_execution_claim(&identity).expect("parent execution claim");
-        let mut child = std::process::Command::new(std::env::current_exe().expect("current test executable"))
-            .args([
-                "--exact",
-                "cache::cas::tests::native_execution_claim_contention_worker",
-                "--nocapture",
-            ])
-            .env(CACHE_ENV, &cache)
-            .env(CONTROL_ENV, &control)
-            .spawn()
-            .expect("execution-claim worker should start");
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !control.join("waiting").is_file() {
-            assert!(
-                child.try_wait().expect("worker status").is_none(),
-                "execution-claim worker exited before contention"
-            );
-            assert!(
-                std::time::Instant::now() < deadline,
-                "execution-claim worker did not start"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(control.join("contended").is_file());
-        assert!(!control.join("acquired").is_file());
-        drop(claim);
-
-        let status = child.wait().expect("execution-claim worker status");
-        assert!(status.success(), "execution-claim worker failed: {status}");
-        assert!(control.join("acquired").is_file());
-    }
-
-    #[test]
-    fn native_execution_claim_contention_worker() {
-        const CACHE_ENV: &str = "CARGO_RAIL_TEST_NATIVE_EXECUTION_CLAIM_CACHE";
-        const CONTROL_ENV: &str = "CARGO_RAIL_TEST_NATIVE_EXECUTION_CLAIM_CONTROL";
-        let (Some(cache), Some(control)) = (std::env::var_os(CACHE_ENV), std::env::var_os(CONTROL_ENV)) else {
-            return;
-        };
-        let cache = fs::canonicalize(cache).expect("canonical cache base");
-        let control = PathBuf::from(control);
-        let cas = LocalCas::open_initialized_at(&cache, 1024 * 1024, None).expect("initialized CAS should open");
-        let identity = ContentDigest::sha256(b"shared compiler candidate");
-        match cas
-            .try_native_execution_claim(&identity)
-            .expect("non-blocking execution claim")
-        {
-            NativeExecutionClaimAttempt::Contended => {
-                fs::write(control.join("contended"), b"contended\n").expect("contention signal");
-            }
-            NativeExecutionClaimAttempt::Acquired(_) => panic!("held execution claim must contend"),
-        }
-        fs::write(control.join("waiting"), b"waiting\n").expect("wait signal");
-        let _claim = cas.native_execution_claim(&identity).expect("blocking execution claim");
-        fs::write(control.join("acquired"), b"acquired\n").expect("acquisition signal");
     }
 
     #[test]
@@ -8969,23 +8745,9 @@ mod tests {
             }
             let wrapper = LocalCas::open_initialized_selected(&selection).expect("open without scanning shards");
             drop(wrapper.native_restore_lock(&other).expect("unaffected restore shard"));
-            assert!(matches!(
-                wrapper
-                    .try_native_execution_claim(&other)
-                    .expect("unaffected claim shard"),
-                NativeExecutionClaimAttempt::Acquired(_)
-            ));
             assert!(
                 wrapper.native_restore_lock(&selected).is_err(),
                 "accepted {damage:?} restore lock"
-            );
-            assert!(
-                wrapper.try_native_execution_claim(&selected).is_err(),
-                "accepted {damage:?} claim"
-            );
-            assert!(
-                wrapper.native_execution_claim(&selected).is_err(),
-                "accepted {damage:?} blocking claim"
             );
             assert!(status(&wrapper).is_err(), "status must audit every shard: {damage:?}");
             assert_eq!(

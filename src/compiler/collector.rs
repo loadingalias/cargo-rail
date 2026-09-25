@@ -113,7 +113,6 @@ impl CompilerArtifactBudget {
 pub(crate) struct CompilerAcquisitionPreview {
     pub(crate) view_count: usize,
     pub(crate) process_slots: usize,
-    pub(crate) work_permits: usize,
     pub(crate) sandbox_count: usize,
     pub(crate) feature_profiles: Vec<String>,
     pub(crate) doctest_profiles: Vec<CompilerDoctestProfile>,
@@ -293,7 +292,6 @@ pub(crate) struct CompilerCacheIdentity {
     wrapper_chain: Vec<CompilerWrapperIdentity>,
     cache_wrapper: CompilerCacheWrapperMetadata,
     analysis_cache: Option<CompilerAnalysisCache>,
-    explicit_build_jobs: Option<usize>,
     executable_bypasses: BTreeSet<String>,
     /// Why no compiler evidence or typed facts can be reused for this snapshot.
     cache_bypass_reason: Option<CompilerCacheBypass>,
@@ -1348,7 +1346,6 @@ impl CompilerCacheIdentity {
                     _selection: selection,
                 })
             });
-        let explicit_build_jobs = snapshot.cargo_config().explicit_build_jobs();
 
         Ok(Self {
             rustc_version,
@@ -1375,7 +1372,6 @@ impl CompilerCacheIdentity {
             wrapper_chain,
             cache_wrapper,
             analysis_cache,
-            explicit_build_jobs,
             executable_bypasses,
             cache_bypass_reason,
             package_roots,
@@ -1690,11 +1686,7 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
         features: Option<&[FeatureSelection]>,
     ) -> RailResult<CompilerAcquisitionPreview> {
         let plan = self.acquisition_plan(&[], typed_packages, doctest_packages, features)?;
-        let execution = ExecutionPolicy::derive(
-            plan.view_count(),
-            self.identity.analysis_cache.is_some(),
-            self.identity.explicit_build_jobs,
-        );
+        let execution = ExecutionPolicy::derive(plan.view_count());
         let feature_profiles = plan
             .views()
             .map(|view| view.features().label())
@@ -1715,7 +1707,6 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
         Ok(CompilerAcquisitionPreview {
             view_count: plan.view_count(),
             process_slots: execution.process_slots(),
-            work_permits: execution.work_permits(),
             sandbox_count: execution.sandbox_count(),
             feature_profiles,
             doctest_profiles,
@@ -1815,15 +1806,8 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                 metrics,
             });
         }
-        let execution_policy = ExecutionPolicy::derive(
-            plan.view_count(),
-            self.identity.analysis_cache.is_some(),
-            self.identity.explicit_build_jobs,
-        );
-        crate::instrumentation::record_compiler_acquisition_execution_policy(
-            execution_policy.process_slots(),
-            execution_policy.work_permits(),
-        );
+        let execution_policy = ExecutionPolicy::derive(plan.view_count());
+        crate::instrumentation::record_compiler_acquisition_execution_policy(execution_policy.process_slots());
         let acquisition_request = self.acquisition.as_ref();
         let typed_snapshot = if typed_packages.is_empty() {
             None
@@ -1839,10 +1823,9 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
             .transpose()?;
         let mut sandbox_pool = SandboxPool::prepare(self.workspace_root, execution_policy.sandbox_count())?;
         progress!(
-            "  Compiler sandbox pool: {} (up to {} Cargo processes; {} work permits; {} planned views; {} bytes soft; {} bytes hard)",
+            "  Compiler sandbox pool: {} (one Cargo process at a time; up to {} resident sandboxes; {} planned views; {} bytes soft; {} bytes hard)",
             sandbox_pool.root().display(),
-            execution_policy.process_slots(),
-            execution_policy.work_permits(),
+            execution_policy.sandbox_count(),
             plan.view_count(),
             self.artifact_budget.soft_limit_bytes,
             self.artifact_budget.hard_limit_bytes,
@@ -2117,20 +2100,6 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
             );
         }
 
-        let acquisition_broker = if runtime_specs.is_empty() {
-            None
-        } else {
-            self.identity
-                .analysis_cache
-                .as_ref()
-                .map(|cache| {
-                    crate::compiler::acquisition::broker::AcquisitionBroker::start(
-                        execution_policy.work_permits(),
-                        cache.cas.clone(),
-                    )
-                })
-                .transpose()?
-        };
         let mut runtime = RuntimeState::new(execution_policy, plan.view_count(), runtime_specs)?;
         let mut acquisition_journal = acquisition_request
             .map(|request| {
@@ -2193,7 +2162,6 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                 package_to_member: &package_to_member,
                 cancellation: &cancellation,
                 artifact_usage: &artifact_usage,
-                broker: acquisition_broker.as_ref(),
             };
             let execution = std::thread::scope(|scope| -> RailResult<()> {
                 let (outcome_tx, outcome_rx) = mpsc::sync_channel(worker_count.saturating_mul(2).max(1));
@@ -2758,11 +2726,6 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
         }
         let (_, command_artifact_peak_bytes) = artifact_usage.snapshot();
         metrics.artifact_high_water_bytes = metrics.artifact_high_water_bytes.max(command_artifact_peak_bytes);
-        if let Some(broker) = acquisition_broker
-            && let Err(error) = broker.close()
-        {
-            failures.push(AcquisitionFailure::global(FailureClass::Broker, error));
-        }
         if let Err(error) = sandbox_pool.close() {
             failures.push(AcquisitionFailure::global(FailureClass::Sandbox, error));
         }
@@ -3206,7 +3169,6 @@ struct AcquisitionWorkerContext<'a> {
     package_to_member: &'a HashMap<String, String>,
     cancellation: &'a AtomicBool,
     artifact_usage: &'a ArtifactUsageLedger,
-    broker: Option<&'a crate::compiler::acquisition::broker::AcquisitionBroker>,
 }
 
 struct AcquisitionOutcome<'plan> {
@@ -3218,7 +3180,6 @@ struct AcquisitionOutcome<'plan> {
 struct AcquisitionCompletion<'plan> {
     prepared: PreparedAcquisitionView<'plan>,
     diagnostic_members: Vec<String>,
-    broker_view: Option<crate::compiler::acquisition::broker::BrokerView>,
     started: Option<Instant>,
     failed_cargo_targets: Vec<CompilerAcquisitionCargoTarget>,
     result: RailResult<WorkspaceCheckOutput>,
@@ -3388,37 +3349,24 @@ fn execute_acquisition_job<'plan>(
         packages: &prepared.typed_members,
     });
     let mut failed_cargo_targets = Vec::new();
-    let broker_view = context
-        .broker
-        .map(|broker| broker.begin_view(prepared.view.index()))
-        .transpose();
-    let (broker_view, result) = match broker_view {
-        Ok(broker_view) if !context.cancellation.load(std::sync::atomic::Ordering::Acquire) => {
-            let result = run_workspace_check(
-                context.workspace_root,
-                context.identity,
-                prepared.view,
-                &active_members,
-                &sandbox,
-                typed.as_ref(),
-                context.artifact_budget,
-                context.package_to_member,
-                &mut failed_cargo_targets,
-                broker_view
-                    .as_ref()
-                    .map(crate::compiler::acquisition::broker::BrokerView::environment),
-                context.cancellation,
-                context.artifact_usage,
-            );
-            (broker_view, result)
-        }
-        Ok(broker_view) => (
-            broker_view,
-            Err(RailError::message(
-                "compiler acquisition was cancelled before Cargo started",
-            )),
-        ),
-        Err(error) => (None, Err(error)),
+    let result = if context.cancellation.load(std::sync::atomic::Ordering::Acquire) {
+        Err(RailError::message(
+            "compiler acquisition was cancelled before Cargo started",
+        ))
+    } else {
+        run_workspace_check(
+            context.workspace_root,
+            context.identity,
+            prepared.view,
+            &active_members,
+            &sandbox,
+            typed.as_ref(),
+            context.artifact_budget,
+            context.package_to_member,
+            &mut failed_cargo_targets,
+            context.cancellation,
+            context.artifact_usage,
+        )
     };
     let sandbox = if result.is_ok() {
         sandbox.finish()
@@ -3431,7 +3379,6 @@ fn execute_acquisition_job<'plan>(
         completion: AcquisitionCompletion {
             prepared,
             diagnostic_members,
-            broker_view,
             started,
             failed_cargo_targets,
             result,
@@ -3462,7 +3409,6 @@ fn integrate_completed_acquisition(
     let AcquisitionCompletion {
         prepared,
         diagnostic_members,
-        broker_view,
         started,
         failed_cargo_targets: _,
         result: run,
@@ -3473,7 +3419,6 @@ fn integrate_completed_acquisition(
         collector,
         prepared,
         diagnostic_members,
-        broker_view,
         started,
         run?,
         candidates,
@@ -3505,7 +3450,6 @@ fn integrate_acquisition_outcome(
     collector: &CompilerDiagnosticsCollector<'_>,
     prepared: PreparedAcquisitionView<'_>,
     diagnostic_members: Vec<String>,
-    broker_view: Option<crate::compiler::acquisition::broker::BrokerView>,
     started: Option<Instant>,
     mut run: WorkspaceCheckOutput,
     candidates: &[CompilerCandidate],
@@ -3749,9 +3693,6 @@ fn integrate_acquisition_outcome(
     {
         progress!("    Native analysis binding publication bypassed: {error}");
     }
-    if let Some(broker_view) = broker_view {
-        broker_view.finish()?;
-    }
     Ok(
         (!prepared.collect_typed || fact_set_published && fact_store.durability_available())
             && (!diagnostics_must_publish || store.durability_available()),
@@ -3772,7 +3713,6 @@ fn run_workspace_check(
     artifact_budget: CompilerArtifactBudget,
     package_to_member: &HashMap<String, String>,
     failed_cargo_targets: &mut Vec<CompilerAcquisitionCargoTarget>,
-    broker_environment: Option<&crate::compiler::acquisition::broker::BrokerEnvironment>,
     cancellation: &AtomicBool,
     artifact_usage: &ArtifactUsageLedger,
 ) -> RailResult<WorkspaceCheckOutput> {
@@ -3850,7 +3790,6 @@ fn run_workspace_check(
         source_root,
         analysis_contract.clone(),
         typed_session.clone(),
-        broker_environment.cloned(),
     )?;
     let args = view.cargo_arguments();
 
@@ -3868,8 +3807,7 @@ fn run_workspace_check(
         .env("CARGO_TARGET_DIR", &cargo_target)
         .env("CARGO_BUILD_BUILD_DIR", &cargo_build)
         .env_remove(CACHE_WRAPPER_MARKER)
-        .args(&args)
-        .args(["--jobs", "1"]);
+        .args(&args);
     if let Some(wrapper) = identity.rustc_wrapper.as_ref() {
         // Execute the global wrapper captured by the authoritative workspace
         // snapshot instead of asking this later Cargo process to re-resolve it.
@@ -3897,7 +3835,6 @@ fn run_workspace_check(
         sandbox.artifact_root(),
         artifact_budget,
         cancellation,
-        broker_environment.is_some(),
         artifact_usage,
     )
     .with_context(|| {
@@ -4098,7 +4035,6 @@ fn run_artifact_bounded_command(
     artifact_root: &Path,
     budget: CompilerArtifactBudget,
     cancellation: &AtomicBool,
-    broker_enabled: bool,
     artifact_usage: &ArtifactUsageLedger,
 ) -> RailResult<ArtifactBoundedCommandOutput> {
     if budget.soft_limit_bytes == 0 || budget.hard_limit_bytes < budget.soft_limit_bytes {
@@ -4144,7 +4080,7 @@ fn run_artifact_bounded_command(
         ));
     }
     let mut process = ProcessTree::spawn(command)?;
-    let _live_process = crate::instrumentation::compiler_acquisition_process_started(!broker_enabled);
+    let _live_process = crate::instrumentation::compiler_acquisition_process_started();
     let stdout = process.take_stdout()?;
     let stderr = process.take_stderr()?;
     let stream_failed = Arc::new(AtomicBool::new(false));
@@ -7530,7 +7466,6 @@ mod tests {
             root.path(),
             CompilerArtifactBudget::new(512 * 1024, 1024 * 1024),
             &AtomicBool::new(false),
-            false,
             &ArtifactUsageLedger::default(),
         )
         .expect_err("artifact growth must exceed the hard limit");
@@ -7555,7 +7490,6 @@ mod tests {
             root.path(),
             CompilerArtifactBudget::default(),
             &AtomicBool::new(false),
-            false,
             &ArtifactUsageLedger::default(),
         )
         .expect_err("malformed Cargo output must fail");
@@ -7600,7 +7534,6 @@ mod tests {
             lease.artifact_root(),
             CompilerArtifactBudget::default(),
             &cancellation,
-            false,
             &ArtifactUsageLedger::default(),
         )
         .expect_err("cancellation must stop the owned process tree");
@@ -7638,7 +7571,6 @@ mod tests {
             root.path(),
             CompilerArtifactBudget::default(),
             &AtomicBool::new(false),
-            false,
             &ArtifactUsageLedger::default(),
         )
         .expect("bounded noisy stderr");
@@ -7715,7 +7647,6 @@ mod tests {
             lease.artifact_root(),
             CompilerArtifactBudget::new(512, 1024),
             &AtomicBool::new(false),
-            false,
             &ArtifactUsageLedger::default(),
         )
         .expect_err("final logical bytes must remain bounded");

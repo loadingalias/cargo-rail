@@ -8635,139 +8635,6 @@ pub(crate) struct OuterCacheStore {
     pub(crate) base_action_key: String,
     pub(crate) cache_bytes_read: u64,
     pub(crate) distributed_placement: Option<crate::compiler::distributed::PlacementObservation>,
-    pub(crate) coordination: Option<CoordinatedExecution>,
-}
-
-pub(crate) struct CoordinatedExecution {
-    leader: crate::compiler::acquisition::broker::BrokerLeader,
-    contract: String,
-}
-
-enum CoordinationClaim {
-    Leader(CoordinatedExecution),
-    Follower(crate::compiler::acquisition::broker::CandidateResult),
-}
-
-impl CoordinatedExecution {
-    fn candidate(
-        &self,
-        action: &str,
-        result: &str,
-    ) -> RailResult<crate::compiler::acquisition::broker::CandidateResult> {
-        let evidence_candidate = crate::compiler::diagnostics_store::NativeEvidenceBindingValidation::candidate_key(
-            action,
-            result,
-            &self.contract,
-        );
-        crate::compiler::acquisition::broker::CandidateResult::new(
-            action.to_string(),
-            result.to_string(),
-            evidence_candidate,
-        )
-    }
-
-    fn complete(self, action: &str, result: &str) -> RailResult<()> {
-        let candidate = self.candidate(action, result)?;
-        self.leader.complete(candidate)
-    }
-
-    fn fail(self, class: crate::compiler::acquisition::broker::BrokerFailureClass) -> RailResult<()> {
-        self.leader.fail(class)
-    }
-}
-
-fn coordinate_analysis_execution(
-    context: &NativeCacheContext,
-    execution: crate::compiler::acquisition::broker::ExecutionClaimKey,
-) -> RailResult<Option<CoordinationClaim>> {
-    let Some(session) = context.analysis_session.as_ref() else {
-        return Ok(None);
-    };
-    let Some(environment) = session.acquisition() else {
-        return Ok(None);
-    };
-    let contract = session.analysis_contract().identity()?;
-    let key = crate::compiler::acquisition::broker::CandidateFlightKey::new(execution, contract.clone())?;
-    match crate::compiler::acquisition::broker::BrokerClaim::connect(environment, key)? {
-        crate::compiler::acquisition::broker::BrokerClaim::Follower(follower) => {
-            let Some(candidate) = follower.wait()? else {
-                return Ok(None);
-            };
-            let expected = crate::compiler::diagnostics_store::NativeEvidenceBindingValidation::candidate_key(
-                candidate.action(),
-                candidate.result(),
-                &contract,
-            );
-            if candidate.evidence_candidate() != expected {
-                return Err(RailError::message(
-                    "compiler acquisition follower candidate does not match its exact analysis contract",
-                ));
-            }
-            Ok(Some(CoordinationClaim::Follower(candidate)))
-        }
-        crate::compiler::acquisition::broker::BrokerClaim::Leader(mut leader) => {
-            if !leader.acquire_execution_claim()? {
-                return Ok(None);
-            }
-            Ok(Some(CoordinationClaim::Leader(CoordinatedExecution {
-                leader,
-                contract,
-            })))
-        }
-        crate::compiler::acquisition::broker::BrokerClaim::Unavailable => Ok(None),
-    }
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "coordinated revalidation must retain the exact native selection authority"
-)]
-fn revalidated_coordinated_candidate(
-    context: &NativeCacheContext,
-    cas: &LocalCas,
-    session: &NativeCompilerSession,
-    lookup_key: &str,
-    pre_link_action: &str,
-    capture: &NativeActionCapture,
-    observation: &RawCompilerInvocation,
-    linked: bool,
-) -> Option<(String, String)> {
-    let (lookup, _) = lookup_native_action(
-        cas,
-        session,
-        lookup_key,
-        pre_link_action,
-        capture,
-        observation,
-        context
-            .installation
-            .as_ref()
-            .map(crate::cache::installation::InstallationReceipt::authority),
-    )
-    .ok()?;
-    let crate::cache::cas::NativeActionLookup::Hit(cached) = lookup else {
-        return None;
-    };
-    if cached.validation.session_identity != session.identity
-        || cached.validation.class != session.class
-        || (linked
-            && !platform_linker_witness_is_valid(
-                observation,
-                capture.target_format(),
-                &cached.validation.witness,
-                cached.validation.linker_generations.as_ref(),
-            ))
-        || (!linked && cached.validation.action_key != pre_link_action)
-        || !capture.validates_witness(&cached.validation.witness, observation)
-        || !resolve_analysis_evidence(context, cached.validation.action_key(), cached.validation.result_key())
-            .is_ok_and(|evidence| evidence.is_some())
-    {
-        return None;
-    }
-    Some((
-        cached.validation.action_key().to_string(),
-        cached.validation.result_key().to_string(),
-    ))
 }
 
 /// Attempt native reuse and configure the cold child without changing Cargo's wrapper order.
@@ -8776,15 +8643,6 @@ fn revalidated_coordinated_candidate(
 /// workspace-wrapper slot. A returned code means verified outputs and streams
 /// were already restored; `Execute` preserves the ordinary child execution.
 pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: &mut Command) -> OuterCacheAction {
-    configure_outer_inner(program, arguments, command, 0)
-}
-
-fn configure_outer_inner(
-    program: &OsStr,
-    arguments: &[OsString],
-    command: &mut Command,
-    coordination_depth: u8,
-) -> OuterCacheAction {
     command.env_remove(DISPOSITION_ENV);
     let Some(context) = active_context() else {
         return OuterCacheAction::Execute;
@@ -9358,7 +9216,6 @@ fn configure_outer_inner(
                 base_action_key: base_action,
                 cache_bytes_read: 0,
                 distributed_placement,
-                coordination: None,
             }));
         }
     };
@@ -9531,49 +9388,7 @@ fn configure_outer_inner(
                 Err(_) => Some("analysis_evidence_binding_rejected"),
             };
             if let Some(reason) = analysis_miss_reason {
-                let action = cached.validation.action_key().to_string();
                 drop(cached);
-                let mut coordination = None;
-                if context
-                    .analysis_session
-                    .as_ref()
-                    .is_some_and(|session| session.acquisition().is_some())
-                {
-                    if coordination_depth >= 2 {
-                        return OuterCacheAction::OperationalFailure(RailError::message(
-                            "compiler acquisition candidate diverged repeatedly during coordinated revalidation",
-                        ));
-                    }
-                    match coordinate_analysis_execution(
-                        context,
-                        crate::compiler::acquisition::broker::ExecutionClaimKey::Selected(action),
-                    ) {
-                        Ok(Some(CoordinationClaim::Follower(candidate))) => {
-                            drop(candidate);
-                            return configure_outer_inner(program, arguments, command, coordination_depth + 1);
-                        }
-                        Ok(Some(CoordinationClaim::Leader(coordinated))) => {
-                            if let Some((action, result)) = revalidated_coordinated_candidate(
-                                context,
-                                &cas,
-                                session,
-                                &lookup_key,
-                                &pre_link_action,
-                                &capture,
-                                observation,
-                                linked,
-                            ) {
-                                if let Err(error) = coordinated.complete(&action, &result) {
-                                    return OuterCacheAction::OperationalFailure(error);
-                                }
-                                return configure_outer_inner(program, arguments, command, coordination_depth + 1);
-                            }
-                            coordination = Some(coordinated);
-                        }
-                        Ok(None) => {}
-                        Err(error) => return OuterCacheAction::OperationalFailure(error),
-                    }
-                }
                 return configure_analysis_miss(
                     command,
                     recorder,
@@ -9586,7 +9401,6 @@ fn configure_outer_inner(
                     observation_directory,
                     reason,
                     distributed_placement,
-                    coordination,
                 );
             }
             let analysis = analysis_resolution.ok().flatten();
@@ -9644,51 +9458,6 @@ fn configure_outer_inner(
             (miss.reason, true)
         }
     };
-    let mut coordination = None;
-    if local_miss
-        && context
-            .analysis_session
-            .as_ref()
-            .is_some_and(|session| session.acquisition().is_some())
-    {
-        if coordination_depth >= 2 {
-            return OuterCacheAction::OperationalFailure(RailError::message(
-                "compiler acquisition candidate diverged repeatedly during coordinated revalidation",
-            ));
-        }
-        let execution = if linked {
-            crate::compiler::acquisition::broker::ExecutionClaimKey::LinkCandidate(lookup_key.clone())
-        } else {
-            crate::compiler::acquisition::broker::ExecutionClaimKey::Selected(pre_link_action.clone())
-        };
-        match coordinate_analysis_execution(context, execution) {
-            Ok(Some(CoordinationClaim::Follower(candidate))) => {
-                drop(candidate);
-                return configure_outer_inner(program, arguments, command, coordination_depth + 1);
-            }
-            Ok(Some(CoordinationClaim::Leader(coordinated))) => {
-                let complete = revalidated_coordinated_candidate(
-                    context,
-                    &cas,
-                    session,
-                    &lookup_key,
-                    &pre_link_action,
-                    &capture,
-                    observation,
-                    linked,
-                );
-                if let Some((action, result)) = complete {
-                    if let Err(error) = coordinated.complete(&action, &result) {
-                        return OuterCacheAction::OperationalFailure(error);
-                    }
-                    return configure_outer_inner(program, arguments, command, coordination_depth + 1);
-                }
-                coordination = Some(coordinated);
-            }
-            Ok(None) => {}
-            Err(error) => return OuterCacheAction::OperationalFailure(error),
-        }
-    }
     if local_miss
         && external_miss_authority.remote_result_reuse
         && let Some(selection) = active_remote_selection()
@@ -9929,7 +9698,6 @@ fn configure_outer_inner(
         base_action_key: base_action,
         cache_bytes_read: metrics.cache_bytes_read,
         distributed_placement,
-        coordination,
     }))
 }
 
@@ -9949,7 +9717,6 @@ fn configure_analysis_miss(
     observation_directory: &Path,
     reason: &'static str,
     distributed_placement: Option<crate::compiler::distributed::PlacementObservation>,
-    coordination: Option<CoordinatedExecution>,
 ) -> OuterCacheAction {
     let metadata = configure_cold(
         command,
@@ -9980,7 +9747,6 @@ fn configure_analysis_miss(
         base_action_key,
         cache_bytes_read,
         distributed_placement,
-        coordination,
     }))
 }
 
@@ -16702,11 +16468,9 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
         base_action_key,
         cache_bytes_read,
         distributed_placement,
-        coordination,
     } = store;
     let mut recorder = recorder;
     let mut capture = capture;
-    let mut coordination = coordination;
     let Some(cache_context) = active_context() else {
         eprintln!("{context}: native compiler cache context disappeared before execution");
         return 2;
@@ -17101,10 +16865,8 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
             Ok((validation, final_capture_bytes))
         })()
     });
-    let mut coordinated_result = None;
     match publication {
         Ok((validation, final_capture_bytes)) => {
-            coordinated_result = Some((validation.action_key.clone(), validation.result_key.clone()));
             let remote_reason = cas
                 .as_ref()
                 .ok()
@@ -17187,27 +16949,8 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
         cache_context.observation_directory.as_path(),
         crate::compiler::session::CompilerFactSession::observation_directory,
     );
-    let publication_error = crate::compiler::observation::publish_raw(publication_directory, &raw).err();
-    let coordinated = coordination.is_some();
-    let coordination_failure =
-        coordination.take().and_then(
-            |coordination| match (publication_error.as_ref(), coordinated_result.as_ref()) {
-                (None, Some((action, result))) => coordination.complete(action, result).err(),
-                (Some(_), _) | (None, None) => coordination
-                    .fail(crate::compiler::acquisition::broker::BrokerFailureClass::Publication)
-                    .err(),
-            },
-        );
-    if coordinated && let Some(error) = publication_error {
-        record_active_failure();
-        eprintln!("{context}: coordinated compiler observation publication failed: {error}");
-        return 2;
-    }
-    if let Some(error) = coordination_failure {
-        record_active_failure();
-        eprintln!("{context}: coordinated compiler publication failed: {error}");
-        return 2;
-    }
+    // An unpublished invocation is recorded as `rustc_invocation_unavailable`, which bypasses reuse.
+    drop(crate::compiler::observation::publish_raw(publication_directory, &raw));
     status.code().unwrap_or(1)
 }
 

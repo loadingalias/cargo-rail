@@ -471,28 +471,6 @@ impl CargoConfigSnapshot {
         &self.environment
     }
 
-    /// Return Cargo's explicitly captured positive build-job limit.
-    ///
-    /// Invalid, negative, and symbolic values remain Cargo's authority and are
-    /// deliberately not interpreted here. Callers must retain a bounded safe
-    /// fallback when this returns `None`.
-    pub(crate) fn explicit_build_jobs(&self) -> Option<usize> {
-        if let Some((_, value)) = self
-            .environment
-            .iter()
-            .find(|(name, _)| environment_names_equal(name, "CARGO_BUILD_JOBS"))
-        {
-            return value
-                .parse::<std::num::NonZeroUsize>()
-                .ok()
-                .map(std::num::NonZeroUsize::get);
-        }
-        json_value_at(&self.effective_file_settings, &["build", "jobs"])
-            .and_then(JsonValue::as_u64)
-            .and_then(|jobs| usize::try_from(jobs).ok())
-            .filter(|jobs| *jobs > 0)
-    }
-
     /// Return sanitized configuration files in lowest-to-highest precedence order.
     pub fn provenance(&self) -> &[CargoConfigSource] {
         &self.provenance
@@ -3383,49 +3361,6 @@ mod tests {
         "RUSTC_WORKSPACE_WRAPPER",
         "RUSTDOC",
     ];
-
-    fn cargo_config_with_jobs(file_jobs: JsonValue, environment_jobs: Option<&str>) -> CargoConfigSnapshot {
-        CargoConfigSnapshot {
-            digest: ContentDigest::sha256(b"test-config"),
-            effective_file_settings: serde_json::json!({"build": {"jobs": file_jobs}}),
-            environment: environment_jobs
-                .map(|jobs| BTreeMap::from([("CARGO_BUILD_JOBS".to_string(), jobs.to_string())]))
-                .unwrap_or_default(),
-            provenance: Vec::new(),
-            credential_capabilities: JsonValue::Object(JsonMap::new()),
-            credential_provenance: None,
-            unmodeled_settings: BTreeSet::new(),
-        }
-    }
-
-    #[test]
-    fn explicit_build_jobs_preserves_cargo_environment_precedence() {
-        let configured = cargo_config_with_jobs(serde_json::json!(7), None);
-        assert_eq!(configured.explicit_build_jobs(), Some(7));
-
-        let overridden = cargo_config_with_jobs(serde_json::json!(7), Some("3"));
-        assert_eq!(overridden.explicit_build_jobs(), Some(3));
-
-        for invalid in ["0", "-2", "default", "not-a-number"] {
-            let invalid_override = cargo_config_with_jobs(serde_json::json!(7), Some(invalid));
-            assert_eq!(
-                invalid_override.explicit_build_jobs(),
-                None,
-                "higher-precedence Cargo build jobs value '{invalid}' must fail closed"
-            );
-        }
-    }
-
-    #[test]
-    fn explicit_build_jobs_rejects_nonpositive_or_symbolic_file_values() {
-        for invalid in [
-            serde_json::json!(0),
-            serde_json::json!(-2),
-            serde_json::json!("default"),
-        ] {
-            assert_eq!(cargo_config_with_jobs(invalid, None).explicit_build_jobs(), None);
-        }
-    }
 
     fn rustc_host() -> &'static str {
         static HOST: OnceLock<String> = OnceLock::new();

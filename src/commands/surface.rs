@@ -39,7 +39,7 @@ use crate::surface::{
 use crate::workspace::{CargoState, WorkspaceContext, WorkspaceSnapshot};
 
 const SURFACE_CONTRACT_VERSION: u32 = 4;
-const SURFACE_PREPARATION_CONTRACT_VERSION: u32 = 2;
+const SURFACE_PREPARATION_CONTRACT_VERSION: u32 = 3;
 const SURFACE_SCHEMA_JSON: &str = include_str!("../../schemas/surface-v4.schema.json");
 
 /// Options for the `surface` domain command.
@@ -85,7 +85,6 @@ struct SurfaceAcquisitionPlanReport {
     doctest_profiles: Vec<CompilerDoctestProfile>,
     exact_view_count: usize,
     process_slots: usize,
-    work_permits: usize,
     sandbox_count: usize,
     current_retained_bytes: u64,
     soft_retained_bytes: u64,
@@ -508,7 +507,7 @@ fn surface_driver_readiness_report(readiness: CompilerFactDriverReadiness) -> Su
 fn render_preparation_report(report: &SurfacePreparationReport, format: SurfaceOutputFormat) -> RailResult<String> {
     match format {
         SurfaceOutputFormat::Text => Ok(format!(
-            "surface: ready\nrustc: {} ({}, {})\ndriver: {}\nprotocol: {}\nviews: {}\nconcurrency: {} Cargo processes / {} work permits\nretained bytes: {} current / {} maximum",
+            "surface: ready\nrustc: {} ({}, {})\ndriver: {}\nprotocol: {}\nviews: {}\nconcurrency: {} Cargo process at a time\nretained bytes: {} current / {} maximum",
             report.driver.rustc_release,
             report.driver.rustc_commit,
             report.driver.rustc_host,
@@ -516,7 +515,6 @@ fn render_preparation_report(report: &SurfacePreparationReport, format: SurfaceO
             report.driver.protocol,
             report.acquisition.exact_view_count,
             report.acquisition.process_slots,
-            report.acquisition.work_permits,
             report.acquisition.current_retained_bytes,
             report.acquisition.maximum_retained_bytes,
         )),
@@ -580,12 +578,11 @@ fn analyze_surface(
     )?;
     let acquisition_plan = surface_acquisition_plan_report(ctx.workspace_root(), targets.clone(), products, preview)?;
     progress!(
-        "Surface acquisition: {} exact views across {} target(s) and {} product(s); up to {} Cargo processes / {} work permits; {} current retained bytes / {} maximum",
+        "Surface acquisition: {} exact views across {} target(s) and {} product(s); {} Cargo process at a time; {} current retained bytes / {} maximum",
         acquisition_plan.exact_view_count,
         acquisition_plan.targets.len(),
         acquisition_plan.products.len(),
         acquisition_plan.process_slots,
-        acquisition_plan.work_permits,
         acquisition_plan.current_retained_bytes,
         acquisition_plan.maximum_retained_bytes,
     );
@@ -678,7 +675,6 @@ fn surface_acquisition_plan_report(
         doctest_profiles: preview.doctest_profiles,
         exact_view_count: preview.view_count,
         process_slots: preview.process_slots,
-        work_permits: preview.work_permits,
         sandbox_count: preview.sandbox_count,
         current_retained_bytes,
         soft_retained_bytes: preview.artifact_soft_limit_bytes,
@@ -2310,8 +2306,7 @@ mod tests {
                     features: "default-features".to_string(),
                 }],
                 exact_view_count: 2,
-                process_slots: 2,
-                work_permits: 2,
+                process_slots: 1,
                 sandbox_count: 2,
                 current_retained_bytes: 1024,
                 soft_retained_bytes: 2048,

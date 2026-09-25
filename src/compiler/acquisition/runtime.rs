@@ -7,84 +7,29 @@ use std::num::NonZeroUsize;
 use crate::compiler::scheduler::{CandidateIx, ViewIx};
 use crate::error::{RailError, RailResult};
 
-const MAX_WORK_PERMITS: usize = 16;
-const MAX_PROCESS_SLOTS: usize = 32;
-const MAX_JOURNAL_BATCH: usize = 8;
+/// Resident sandbox generations: one per compatibility class a command alternates between.
+const MAX_RESIDENT_SANDBOXES: usize = 4;
 
+/// One Cargo process at a time; Cargo owns job parallelism inside it.
+///
+/// Views of one compatibility class run in turn in one sandbox, so each compiled dependency
+/// unit is reused by Cargo's own freshness check instead of being rebuilt in a parallel
+/// sandbox. Cargo applies `build.jobs`, `CARGO_BUILD_JOBS`, and an inherited jobserver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ExecutionPolicy {
-    process_slots: NonZeroUsize,
-    work_permits: NonZeroUsize,
     sandbox_count: NonZeroUsize,
-    journal_batch: NonZeroUsize,
 }
 
 impl ExecutionPolicy {
-    pub(crate) fn derive(view_count: usize, broker_enabled: bool, explicit_jobs: Option<usize>) -> Self {
-        let inherited_jobserver = ["CARGO_MAKEFLAGS", "MAKEFLAGS"]
-            .into_iter()
-            .filter_map(std::env::var_os)
-            .any(|value| {
-                let value = value.to_string_lossy();
-                value.contains("--jobserver-auth=") || value.contains("--jobserver-fds=")
-            });
-        let qualified_host = crate::compiler::capability::host_is_qualified();
-        let available_parallelism = if inherited_jobserver || !qualified_host {
-            1
-        } else {
-            std::thread::available_parallelism().map_or(1, NonZeroUsize::get)
-        };
-        Self::derive_for(
-            view_count,
-            broker_enabled,
-            explicit_jobs,
-            inherited_jobserver,
-            available_parallelism,
-            qualified_host,
-        )
-    }
-
-    fn derive_for(
-        view_count: usize,
-        broker_enabled: bool,
-        explicit_jobs: Option<usize>,
-        inherited_jobserver: bool,
-        available_parallelism: usize,
-        qualified_host: bool,
-    ) -> Self {
-        let bounded_views = view_count.clamp(1, MAX_PROCESS_SLOTS);
-        let serial_fallback = inherited_jobserver || !qualified_host;
-        let effective_jobs = if serial_fallback {
-            1
-        } else {
-            explicit_jobs.unwrap_or(available_parallelism)
-        }
-        .clamp(1, MAX_WORK_PERMITS)
-        .min(bounded_views);
-        let process_slots = if serial_fallback {
-            1
-        } else if broker_enabled {
-            effective_jobs.saturating_mul(2)
-        } else {
-            effective_jobs
-        }
-        .clamp(1, MAX_PROCESS_SLOTS)
-        .min(bounded_views);
+    pub(crate) fn derive(view_count: usize) -> Self {
         Self {
-            process_slots: NonZeroUsize::new(process_slots).expect("process slots are clamped to one"),
-            work_permits: NonZeroUsize::new(effective_jobs).expect("work permits are clamped to one"),
-            sandbox_count: NonZeroUsize::new(process_slots).expect("sandbox count follows process slots"),
-            journal_batch: NonZeroUsize::new(process_slots.min(MAX_JOURNAL_BATCH))
-                .expect("journal batch follows non-zero process slots"),
+            sandbox_count: NonZeroUsize::new(view_count.clamp(1, MAX_RESIDENT_SANDBOXES))
+                .expect("sandbox count is clamped to one"),
         }
     }
 
     pub(crate) const fn process_slots(self) -> usize {
-        self.process_slots.get()
-    }
-
-    pub(crate) const fn work_permits(self) -> usize {
-        self.work_permits.get()
+        1
     }
 
     pub(crate) const fn sandbox_count(self) -> usize {
@@ -92,7 +37,7 @@ impl ExecutionPolicy {
     }
 
     pub(crate) const fn journal_batch(self) -> usize {
-        self.journal_batch.get()
+        1
     }
 }
 
@@ -421,25 +366,18 @@ mod tests {
     use super::{ExecutionPolicy, RuntimeState, RuntimeViewSpec};
 
     #[test]
-    fn unqualified_or_jobserver_hosts_force_the_complete_one_slot_fallback() {
-        for (inherited_jobserver, qualified_host) in [(false, false), (true, true), (true, false)] {
-            let policy = ExecutionPolicy::derive_for(32, true, Some(16), inherited_jobserver, 16, qualified_host);
+    fn one_cargo_process_runs_at_a_time_with_bounded_resident_sandboxes() {
+        for (views, sandboxes) in [(0, 1), (1, 1), (3, 3), (32, 4)] {
+            let policy = ExecutionPolicy::derive(views);
             assert_eq!(policy.process_slots(), 1);
-            assert_eq!(policy.work_permits(), 1);
-            assert_eq!(policy.sandbox_count(), 1);
+            assert_eq!(policy.sandbox_count(), sandboxes, "{views} views");
             assert_eq!(policy.journal_batch(), 1);
         }
-
-        let qualified = ExecutionPolicy::derive_for(32, true, Some(4), false, 16, true);
-        assert_eq!(qualified.process_slots(), 8);
-        assert_eq!(qualified.work_permits(), 4);
-        assert_eq!(qualified.sandbox_count(), 8);
-        assert_eq!(qualified.journal_batch(), 8);
     }
 
     #[test]
     fn required_views_precede_disjoint_conditionals_and_respect_process_slots() {
-        let policy = ExecutionPolicy::derive_for(2, true, Some(1), false, 2, true);
+        let policy = ExecutionPolicy::derive(3);
         let specs = [
             RuntimeViewSpec::new(
                 super::ViewIx::checked(0).unwrap(),
@@ -464,30 +402,31 @@ mod tests {
         assert!(runtime.refresh(|_| true).expect("admit").is_empty());
 
         let required = runtime.start_next().expect("start required").expect("required view");
+        assert_eq!(required.offset(), 1);
+        assert!(runtime.start_next().expect("bounded start").is_none());
+        runtime.executed(required).expect("required execution");
+        runtime.complete(required).expect("required integration");
+
         let independent = runtime
             .start_next()
             .expect("start conditional")
             .expect("independent conditional");
-        assert_eq!((required.offset(), independent.offset()), (1, 2));
-        assert!(runtime.start_next().expect("bounded start").is_none());
+        assert_eq!(independent.offset(), 2);
+        runtime.executed(independent).expect("conditional execution");
+        runtime.complete(independent).expect("conditional integration");
 
-        runtime.executed(required).expect("required execution");
-        runtime.complete(required).expect("required integration");
         assert!(runtime.refresh(|_| true).expect("unblock overlap").is_empty());
         let overlapping = runtime.start_next().expect("start overlap").expect("overlap view");
         assert_eq!(overlapping.offset(), 0);
-        assert_eq!(runtime.running(), 2);
-
-        for view in [independent, overlapping] {
-            runtime.executed(view).expect("execution");
-            runtime.complete(view).expect("integration");
-        }
+        assert_eq!(runtime.running(), 1);
+        runtime.executed(overlapping).expect("execution");
+        runtime.complete(overlapping).expect("integration");
         assert!(runtime.all_terminal());
     }
 
     #[test]
     fn conditional_frontier_is_admitted_once_and_cancelled_when_false() {
-        let policy = ExecutionPolicy::derive_for(1, false, Some(1), false, 1, true);
+        let policy = ExecutionPolicy::derive(1);
         let specs = [
             RuntimeViewSpec::new(
                 super::ViewIx::checked(0).unwrap(),
@@ -518,7 +457,7 @@ mod tests {
 
     #[test]
     fn failure_cancels_queued_and_integrated_work_without_leaking_slots() {
-        let policy = ExecutionPolicy::derive_for(2, true, Some(1), false, 2, true);
+        let policy = ExecutionPolicy::derive(2);
         let specs = [
             RuntimeViewSpec::new(
                 super::ViewIx::checked(0).unwrap(),
@@ -542,8 +481,8 @@ mod tests {
         let mut runtime = RuntimeState::new(policy, 3, specs).expect("runtime");
         runtime.refresh(|_| true).expect("admit");
         let first = runtime.start_next().expect("first").expect("first view");
-        let second = runtime.start_next().expect("second").expect("second view");
         runtime.executed(first).expect("first executed");
+        let second = runtime.start_next().expect("second").expect("second view");
         runtime.fail_integration(first).expect("integration failure");
         assert!(runtime.cancelled());
         runtime.discard_running(second).expect("discard sibling");
@@ -554,7 +493,7 @@ mod tests {
 
     #[test]
     fn invalid_terminal_transitions_fail_closed() {
-        let policy = ExecutionPolicy::derive_for(1, false, Some(1), false, 1, true);
+        let policy = ExecutionPolicy::derive(1);
         let spec = RuntimeViewSpec::new(
             super::ViewIx::checked(0).unwrap(),
             0,

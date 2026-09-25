@@ -14,359 +14,37 @@ use std::os::windows::process::CommandExt as _;
 use std::path::Path;
 use std::process::{Child, Command};
 
-use windows_sys::Win32::Foundation::{
-    ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_NO_MORE_FILES, ERROR_NOT_FOUND, ERROR_PIPE_BUSY,
-    ERROR_PIPE_CONNECTED, FILETIME, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
-};
+use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, FILETIME, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TEMPORARY, FILE_BASIC_INFO,
-    FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_FLAG_OVERLAPPED, FILE_FLAG_POSIX_SEMANTICS, FILE_FLAG_SEQUENTIAL_SCAN, FILE_NAME_NORMALIZED,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileBasicInfo, FileDispositionInfo,
-    GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
-    MAXIMUM_REPARSE_DATA_BUFFER_SIZE, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    PIPE_ACCESS_DUPLEX, ReadFile, SetFileInformationByHandle, VOLUME_NAME_GUID, WriteFile,
+    FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_POSIX_SEMANTICS,
+    FILE_FLAG_SEQUENTIAL_SCAN, FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FileBasicInfo, FileDispositionInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    GetFinalPathNameByHandleW, GetVolumeInformationByHandleW, MAXIMUM_REPARSE_DATA_BUFFER_SIZE,
+    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, SetFileInformationByHandle, VOLUME_NAME_GUID,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
-use windows_sys::Win32::System::IO::{CancelIoEx, DeviceIoControl, GetOverlappedResult, OVERLAPPED};
+use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{FSCTL_GET_REPARSE_POINT, FSCTL_SET_REPARSE_POINT};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
     JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 };
-use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
-};
 use windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_MOUNT_POINT;
-use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, CreateEventW, INFINITE, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME, WaitForSingleObject,
-};
+use windows_sys::Win32::System::Threading::{CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
 
 const FILE_SYSTEM_NAME_CAPACITY: usize = 32;
 const MAX_FINAL_PATH_UNITS: u32 = 32_768;
 const MAX_PATH_ARGUMENT_UNITS: usize = 32_766;
 const MOUNT_POINT_PATH_UNITS: usize = MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize / size_of::<u16>();
-const LOCAL_PIPE_PREFIX: &str = r"\\.\pipe\cargo-rail-acquisition-";
-const LOCAL_PIPE_BUFFER_BYTES: u32 = 16 * 1024;
 
 /// One kill-on-close Job Object owning a spawned process and all descendants.
 #[derive(Debug)]
 pub(crate) struct ProcessJob {
     handle: OwnedHandle,
-}
-
-/// One overlapped, byte-oriented local named-pipe connection.
-///
-/// All I/O stays behind safe methods that keep each buffer, event, and
-/// `OVERLAPPED` value alive until Windows reports completion or cancellation.
-#[derive(Debug)]
-pub(crate) struct LocalNamedPipe {
-    handle: OwnedHandle,
-}
-
-impl LocalNamedPipe {
-    pub(crate) fn read_with_timeout(
-        &mut self,
-        buffer: &mut [u8],
-        timeout: Option<std::time::Duration>,
-    ) -> io::Result<usize> {
-        if buffer.is_empty() {
-            return Ok(0);
-        }
-        let length = u32::try_from(buffer.len().min(u32::MAX as usize))
-            .map_err(|_| invalid_data("Windows named-pipe read length exceeds 32 bits"))?;
-        run_overlapped(self.raw_handle(), timeout, |overlapped| {
-            // SAFETY: `self` owns an overlapped-capable duplex pipe handle;
-            // `buffer` is writable for `length` bytes and outlives the complete
-            // or cancelled operation; `overlapped` is initialized, unique to
-            // this operation, and remains live until `run_overlapped` returns.
-            unsafe {
-                ReadFile(
-                    self.raw_handle(),
-                    buffer.as_mut_ptr(),
-                    length,
-                    std::ptr::null_mut(),
-                    overlapped,
-                )
-            }
-        })
-        .and_then(|read| {
-            usize::try_from(read).map_err(|_| invalid_data("Windows named-pipe read length exceeds usize"))
-        })
-    }
-
-    pub(crate) fn write_with_timeout(&mut self, buffer: &[u8], timeout: std::time::Duration) -> io::Result<usize> {
-        if buffer.is_empty() {
-            return Ok(0);
-        }
-        let length = u32::try_from(buffer.len().min(u32::MAX as usize))
-            .map_err(|_| invalid_data("Windows named-pipe write length exceeds 32 bits"))?;
-        run_overlapped(self.raw_handle(), Some(timeout), |overlapped| {
-            // SAFETY: `self` owns an overlapped-capable duplex pipe handle;
-            // `buffer` is readable for `length` bytes and outlives the complete
-            // or cancelled operation; `overlapped` is initialized, unique to
-            // this operation, and remains live until `run_overlapped` returns.
-            unsafe {
-                WriteFile(
-                    self.raw_handle(),
-                    buffer.as_ptr(),
-                    length,
-                    std::ptr::null_mut(),
-                    overlapped,
-                )
-            }
-        })
-        .and_then(|written| {
-            usize::try_from(written).map_err(|_| invalid_data("Windows named-pipe write length exceeds usize"))
-        })
-    }
-
-    fn raw_handle(&self) -> HANDLE {
-        self.handle.as_raw_handle().cast()
-    }
-}
-
-/// One blocking-accept, overlapped-I/O local named-pipe listener.
-///
-/// The constructor accepts only Cargo-Rail's random endpoint namespace. The
-/// first-instance flag prevents an existing process from pre-creating that
-/// exact name, and every instance rejects remote clients.
-#[derive(Debug)]
-pub(crate) struct LocalNamedPipeListener {
-    name: Vec<u16>,
-    max_instances: u32,
-    first: Option<LocalNamedPipe>,
-}
-
-impl LocalNamedPipeListener {
-    pub(crate) fn bind(name: &str, max_instances: usize) -> io::Result<Self> {
-        let name = encode_local_pipe_name(name)?;
-        let max_instances = u32::try_from(max_instances)
-            .ok()
-            .filter(|instances| *instances > 0 && *instances <= 255)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Windows broker instance bound is invalid"))?;
-        let first = create_local_pipe_instance(&name, max_instances, true)?;
-        Ok(Self {
-            name,
-            max_instances,
-            first: Some(first),
-        })
-    }
-
-    pub(crate) fn accept(&mut self) -> io::Result<LocalNamedPipe> {
-        let pipe = match self.first.take() {
-            Some(first) => first,
-            None => create_local_pipe_instance(&self.name, self.max_instances, false)?,
-        };
-        // Heap ownership keeps the OVERLAPPED address stable for the complete
-        // asynchronous connect operation.
-        let mut operation = Box::new(OverlappedOperation::new()?);
-        // SAFETY: `pipe` owns an overlapped-capable server pipe; `operation`
-        // owns an initialized OVERLAPPED and event that remain live through the
-        // completion wait. Windows retains neither after completion.
-        let connected = unsafe { ConnectNamedPipe(pipe.raw_handle(), operation.overlapped_mut()) };
-        if connected == 0 {
-            let error = io::Error::last_os_error();
-            match windows_error_code(&error) {
-                Some(ERROR_PIPE_CONNECTED) => {}
-                Some(ERROR_IO_PENDING) => {
-                    operation.wait(pipe.raw_handle(), None)?;
-                }
-                _ => return Err(error),
-            }
-        }
-        Ok(pipe)
-    }
-}
-
-/// Connect to one local Cargo-Rail broker pipe within a bounded deadline.
-pub(crate) fn connect_local_named_pipe(name: &str, timeout: std::time::Duration) -> io::Result<LocalNamedPipe> {
-    drop(encode_local_pipe_name(name)?);
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(FILE_FLAG_OVERLAPPED)
-            .open(name)
-        {
-            Ok(pipe) => return Ok(LocalNamedPipe { handle: pipe.into() }),
-            Err(error)
-                if windows_error_code(&error)
-                    .is_some_and(|code| matches!(code, ERROR_PIPE_BUSY | ERROR_FILE_NOT_FOUND))
-                    && std::time::Instant::now() < deadline =>
-            {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-fn create_local_pipe_instance(name: &[u16], max_instances: u32, first: bool) -> io::Result<LocalNamedPipe> {
-    let open_mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | if first { FILE_FLAG_FIRST_PIPE_INSTANCE } else { 0 };
-    let pipe_mode = PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS;
-    // SAFETY: `name` is a nonempty NUL-terminated UTF-16 local pipe name with
-    // no interior NUL and remains live for the call. Buffer sizes and instance
-    // count are bounded above, security attributes are null for the process's
-    // default descriptor, and Windows retains no pointer.
-    let handle = unsafe {
-        CreateNamedPipeW(
-            name.as_ptr(),
-            open_mode,
-            pipe_mode,
-            max_instances,
-            LOCAL_PIPE_BUFFER_BYTES,
-            LOCAL_PIPE_BUFFER_BYTES,
-            5_000,
-            std::ptr::null(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `handle` is the unique valid server-end handle returned above;
-    // ownership transfers exactly once and closes on drop.
-    let handle = unsafe { OwnedHandle::from_raw_handle(handle.cast()) };
-    Ok(LocalNamedPipe { handle })
-}
-
-struct OverlappedOperation {
-    _event: OwnedHandle,
-    overlapped: OVERLAPPED,
-}
-
-impl OverlappedOperation {
-    fn new() -> io::Result<Self> {
-        // SAFETY: all optional pointers are null, so Windows creates one
-        // unnamed manual-reset event and retains no caller-owned memory.
-        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
-        if event.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: `event` is the unique valid event handle returned above and
-        // ownership transfers exactly once to `OwnedHandle`.
-        let event = unsafe { OwnedHandle::from_raw_handle(event.cast()) };
-        let overlapped = OVERLAPPED {
-            hEvent: event.as_raw_handle().cast(),
-            ..OVERLAPPED::default()
-        };
-        Ok(Self {
-            _event: event,
-            overlapped,
-        })
-    }
-
-    fn overlapped_mut(&mut self) -> *mut OVERLAPPED {
-        &raw mut self.overlapped
-    }
-
-    fn wait(&mut self, handle: HANDLE, timeout: Option<std::time::Duration>) -> io::Result<u32> {
-        // SAFETY: the event handle is owned by `self` and remains live for the
-        // wait. The call retains no handle or pointer.
-        let waited = unsafe { WaitForSingleObject(self.overlapped.hEvent, wait_milliseconds(timeout)) };
-        if waited == WAIT_OBJECT_0 {
-            return self.result(handle, false);
-        }
-        if waited == WAIT_TIMEOUT {
-            // SAFETY: `handle` owns the still-live operation named by the exact
-            // OVERLAPPED pointer. `self` remains pinned on this stack through
-            // the cancellation drain below; Windows retains no pointer after
-            // the operation reaches a terminal state.
-            let cancelled = unsafe { CancelIoEx(handle, &raw const self.overlapped) };
-            if cancelled == 0 {
-                let error = io::Error::last_os_error();
-                if windows_error_code(&error) == Some(ERROR_NOT_FOUND) {
-                    // The operation won the timeout race. Preserve its bytes;
-                    // returning a timeout here would desynchronize the stream.
-                    return self.result(handle, true);
-                }
-                drop(self.result(handle, true));
-                return Err(error);
-            }
-            drop(self.result(handle, true));
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "Windows named-pipe operation timed out",
-            ));
-        }
-
-        let error = io::Error::last_os_error();
-        // SAFETY: identical to the timeout cancellation above. Draining after
-        // cancellation is required before the stack OVERLAPPED or borrowed I/O
-        // buffer can cease to exist.
-        unsafe { CancelIoEx(handle, &raw const self.overlapped) };
-        drop(self.result(handle, true));
-        Err(error)
-    }
-
-    fn result(&mut self, handle: HANDLE, wait: bool) -> io::Result<u32> {
-        let mut transferred = 0_u32;
-        // SAFETY: `handle` owns the operation described by `self.overlapped`,
-        // which remains live and exclusive for this call. `transferred` is
-        // writable aligned storage, and Windows retains no pointer.
-        let succeeded = unsafe {
-            GetOverlappedResult(
-                handle,
-                &raw const self.overlapped,
-                &raw mut transferred,
-                i32::from(wait),
-            )
-        };
-        if succeeded == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(transferred)
-        }
-    }
-}
-
-fn run_overlapped(
-    handle: HANDLE,
-    timeout: Option<std::time::Duration>,
-    start: impl FnOnce(*mut OVERLAPPED) -> i32,
-) -> io::Result<u32> {
-    // Heap ownership keeps the OVERLAPPED address stable while Windows may
-    // retain it asynchronously.
-    let mut operation = Box::new(OverlappedOperation::new()?);
-    if start(operation.overlapped_mut()) != 0 {
-        return operation.result(handle, false);
-    }
-    let error = io::Error::last_os_error();
-    if windows_error_code(&error) != Some(ERROR_IO_PENDING) {
-        return Err(error);
-    }
-    operation.wait(handle, timeout)
-}
-
-fn wait_milliseconds(timeout: Option<std::time::Duration>) -> u32 {
-    let Some(timeout) = timeout else {
-        return INFINITE;
-    };
-    let milliseconds = timeout.as_nanos().div_ceil(1_000_000).max(1);
-    u32::try_from(milliseconds.min(u128::from(INFINITE - 1))).unwrap_or(INFINITE - 1)
-}
-
-fn windows_error_code(error: &io::Error) -> Option<u32> {
-    error.raw_os_error().and_then(|code| u32::try_from(code).ok())
-}
-
-fn encode_local_pipe_name(name: &str) -> io::Result<Vec<u16>> {
-    let _suffix = name
-        .strip_prefix(LOCAL_PIPE_PREFIX)
-        .filter(|suffix| suffix.len() == 64)
-        .filter(|suffix| {
-            suffix
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        })
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Windows broker pipe name is not canonical"))?;
-    let mut encoded = name.encode_utf16().collect::<Vec<_>>();
-    encoded.push(0);
-    Ok(encoded)
 }
 
 /// Spawn `command` suspended, assign its process to a kill-on-close Job Object,

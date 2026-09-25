@@ -31,7 +31,6 @@ pub(crate) struct CompilerFactSession {
     source_root: PathBuf,
     contract: AnalysisContract,
     typed: Option<CompilerFactTypedSession>,
-    acquisition: Option<crate::compiler::acquisition::broker::BrokerEnvironment>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -50,8 +49,6 @@ struct AnalysisSessionEnvelope {
     source_root_identity: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     typed: Option<CompilerFactTypedSession>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    acquisition: Option<crate::compiler::acquisition::broker::BrokerEnvironment>,
 }
 
 /// Exact driver, compiler, view, and Cargo-target authority for typed facts.
@@ -91,7 +88,6 @@ impl CompilerFactSession {
         source_root: &Path,
         contract: AnalysisContract,
         typed: Option<CompilerFactTypedSession>,
-        acquisition: Option<crate::compiler::acquisition::broker::BrokerEnvironment>,
     ) -> RailResult<PathBuf> {
         contract.validate()?;
         if contract.requires_typed_facts() != typed.is_some() {
@@ -109,9 +105,6 @@ impl CompilerFactSession {
                 ));
             }
         }
-        if let Some(acquisition) = &acquisition {
-            acquisition.validate()?;
-        }
         let observation_directory = crate::utils::canonicalize_existing(observation_directory)?;
         let source_root = crate::utils::canonicalize_existing(source_root)?;
         let record = CompilerFactSessionRecord {
@@ -121,7 +114,6 @@ impl CompilerFactSession {
                 observation_directory_identity: path_identity(&observation_directory),
                 source_root_identity: path_identity(&source_root),
                 typed,
-                acquisition,
             },
         };
         let encoded = serde_json::to_vec(&record)?;
@@ -177,7 +169,6 @@ impl CompilerFactSession {
         let record: CompilerFactSessionRecord = serde_json::from_slice(&encoded)?;
         record.contract.validate()?;
         if !matches!(record.version, LEGACY_FACT_SESSION_VERSION | FACT_SESSION_VERSION)
-            || (record.version == LEGACY_FACT_SESSION_VERSION && record.session.acquisition.is_some())
             || record.session.observation_directory_identity != path_identity(&canonical_observation_directory)
             || record.session.source_root_identity != path_identity(&canonical_source_root)
             || record.contract.requires_typed_facts() != record.session.typed.is_some()
@@ -196,15 +187,11 @@ impl CompilerFactSession {
                 ));
             }
         }
-        if let Some(acquisition) = &record.session.acquisition {
-            acquisition.validate()?;
-        }
         Ok(Self {
             observation_directory: observation_directory.to_path_buf(),
             source_root: source_root.to_path_buf(),
             contract: record.contract,
             typed: record.session.typed,
-            acquisition: record.session.acquisition,
         })
     }
 
@@ -226,10 +213,6 @@ impl CompilerFactSession {
 
     pub(crate) fn typed(&self) -> Option<&CompilerFactTypedSession> {
         self.typed.as_ref()
-    }
-
-    pub(crate) fn acquisition(&self) -> Option<&crate::compiler::acquisition::broker::BrokerEnvironment> {
-        self.acquisition.as_ref()
     }
 }
 
@@ -539,7 +522,6 @@ mod tests {
                 BTreeSet::new(),
             )
             .unwrap(),
-            None,
             None,
         )
         .expect("fact capability");

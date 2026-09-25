@@ -693,16 +693,15 @@ reason = "resume fixture product"
                 ("MAKEFLAGS", ""),
             ],
         )?;
-        assert!(cold.status.success(), "concurrent acquisition: {cold:?}");
+        assert!(cold.status.success(), "parallel Cargo acquisition: {cold:?}");
         let counters: serde_json::Value = serde_json::from_slice(&fs::read(&diagnostics)?)?;
         let acquisition = &counters["compiler_acquisition"];
-        assert_eq!(acquisition["configured_process_slots"], 3, "{counters}");
+        // Cargo applies the configured jobs inside each view; views still share one sandbox.
+        assert_eq!(acquisition["configured_process_slots"], 1, "{counters}");
         assert_eq!(acquisition["cargo_views"], 3, "{counters}");
         assert_eq!(acquisition["live_cargo_processes"], 0, "{counters}");
-        assert!(
-            matches!(acquisition["max_live_cargo_processes"].as_u64(), Some(2 | 3)),
-            "{counters}"
-        );
+        assert_eq!(acquisition["max_live_cargo_processes"], 1, "{counters}");
+        assert_eq!(acquisition["sandboxes_created"], 1, "{counters}");
         let mut cold_report: serde_json::Value = serde_json::from_slice(&cold.stdout)?;
         assert_ne!(
             resumed_report["snapshot"], cold_report["snapshot"],

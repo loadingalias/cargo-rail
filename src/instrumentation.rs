@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use crate::error::{RailError, RailResult};
 
-const SCHEMA_VERSION: u32 = 16;
+const SCHEMA_VERSION: u32 = 17;
 /// Completed progress phases retained in one diagnostic snapshot.
 const MAX_PROGRESS_PHASES: usize = 256;
 
@@ -115,13 +115,8 @@ struct CompilerAcquisitionCounters {
     cargo_views: AtomicU64,
     cargo_elapsed_ns: AtomicU64,
     configured_process_slots: AtomicU64,
-    configured_work_permits: AtomicU64,
     live_cargo_processes: AtomicU64,
     max_live_cargo_processes: AtomicU64,
-    max_nonwaiting_cargo_views: AtomicU64,
-    work_permit_start_waits: AtomicU64,
-    work_permit_yields: AtomicU64,
-    work_permit_resumes: AtomicU64,
     compiler_actions: AtomicU64,
     cargo_messages_read: AtomicU64,
     stdout_bytes_read: AtomicU64,
@@ -163,13 +158,8 @@ impl CompilerAcquisitionCounters {
             cargo_views: AtomicU64::new(0),
             cargo_elapsed_ns: AtomicU64::new(0),
             configured_process_slots: AtomicU64::new(0),
-            configured_work_permits: AtomicU64::new(0),
             live_cargo_processes: AtomicU64::new(0),
             max_live_cargo_processes: AtomicU64::new(0),
-            max_nonwaiting_cargo_views: AtomicU64::new(0),
-            work_permit_start_waits: AtomicU64::new(0),
-            work_permit_yields: AtomicU64::new(0),
-            work_permit_resumes: AtomicU64::new(0),
             compiler_actions: AtomicU64::new(0),
             cargo_messages_read: AtomicU64::new(0),
             stdout_bytes_read: AtomicU64::new(0),
@@ -211,13 +201,8 @@ impl CompilerAcquisitionCounters {
             cargo_views: self.cargo_views.load(Ordering::Relaxed),
             cargo_elapsed_ns: self.cargo_elapsed_ns.load(Ordering::Relaxed),
             configured_process_slots: self.configured_process_slots.load(Ordering::Relaxed),
-            configured_work_permits: self.configured_work_permits.load(Ordering::Relaxed),
             live_cargo_processes: self.live_cargo_processes.load(Ordering::Relaxed),
             max_live_cargo_processes: self.max_live_cargo_processes.load(Ordering::Relaxed),
-            max_nonwaiting_cargo_views: self.max_nonwaiting_cargo_views.load(Ordering::Relaxed),
-            work_permit_start_waits: self.work_permit_start_waits.load(Ordering::Relaxed),
-            work_permit_yields: self.work_permit_yields.load(Ordering::Relaxed),
-            work_permit_resumes: self.work_permit_resumes.load(Ordering::Relaxed),
             compiler_actions: self.compiler_actions.load(Ordering::Relaxed),
             cargo_messages_read: self.cargo_messages_read.load(Ordering::Relaxed),
             stdout_bytes_read: self.stdout_bytes_read.load(Ordering::Relaxed),
@@ -378,13 +363,8 @@ struct CompilerAcquisitionSnapshot {
     cargo_views: u64,
     cargo_elapsed_ns: u64,
     configured_process_slots: u64,
-    configured_work_permits: u64,
     live_cargo_processes: u64,
     max_live_cargo_processes: u64,
-    max_nonwaiting_cargo_views: u64,
-    work_permit_start_waits: u64,
-    work_permit_yields: u64,
-    work_permit_resumes: u64,
     compiler_actions: u64,
     cargo_messages_read: u64,
     stdout_bytes_read: u64,
@@ -610,15 +590,12 @@ pub(crate) fn compiler_acquisition_timer() -> Option<Instant> {
     COUNTERS.get().map(|_| Instant::now())
 }
 
-pub(crate) fn record_compiler_acquisition_execution_policy(process_slots: usize, work_permits: usize) {
+pub(crate) fn record_compiler_acquisition_execution_policy(process_slots: usize) {
     if let Some(counters) = COUNTERS.get() {
-        let acquisition = &counters.compiler_acquisition;
-        acquisition
+        counters
+            .compiler_acquisition
             .configured_process_slots
             .fetch_max(amount(process_slots), Ordering::Relaxed);
-        acquisition
-            .configured_work_permits
-            .fetch_max(amount(work_permits), Ordering::Relaxed);
     }
 }
 
@@ -627,18 +604,11 @@ pub(crate) struct CompilerAcquisitionProcessGuard {
     measured: bool,
 }
 
-pub(crate) fn compiler_acquisition_process_started(
-    counts_as_nonwaiting_without_broker: bool,
-) -> CompilerAcquisitionProcessGuard {
+pub(crate) fn compiler_acquisition_process_started() -> CompilerAcquisitionProcessGuard {
     let measured = if let Some(counters) = COUNTERS.get() {
         let acquisition = &counters.compiler_acquisition;
         let live = acquisition.live_cargo_processes.fetch_add(1, Ordering::Relaxed) + 1;
         acquisition.max_live_cargo_processes.fetch_max(live, Ordering::Relaxed);
-        if counts_as_nonwaiting_without_broker {
-            acquisition
-                .max_nonwaiting_cargo_views
-                .fetch_max(live, Ordering::Relaxed);
-        }
         true
     } else {
         false
@@ -658,27 +628,6 @@ impl Drop for CompilerAcquisitionProcessGuard {
             debug_assert!(previous > 0, "compiler acquisition live-process counter underflowed");
         }
     }
-}
-
-pub(crate) fn record_compiler_acquisition_nonwaiting_views(views: usize) {
-    if let Some(counters) = COUNTERS.get() {
-        counters
-            .compiler_acquisition
-            .max_nonwaiting_cargo_views
-            .fetch_max(amount(views), Ordering::Relaxed);
-    }
-}
-
-pub(crate) fn record_compiler_acquisition_work_permit_wait() {
-    add(|counters| &counters.compiler_acquisition.work_permit_start_waits, 1);
-}
-
-pub(crate) fn record_compiler_acquisition_work_permit_yield() {
-    add(|counters| &counters.compiler_acquisition.work_permit_yields, 1);
-}
-
-pub(crate) fn record_compiler_acquisition_work_permit_resume() {
-    add(|counters| &counters.compiler_acquisition.work_permit_resumes, 1);
 }
 
 pub(crate) fn record_compiler_acquisition_plan(

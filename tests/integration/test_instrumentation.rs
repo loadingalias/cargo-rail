@@ -54,7 +54,7 @@ fn plan_diagnostics_are_out_of_band_and_count_real_boundaries() {
         assert_eq!(measured.stderr, expected.stderr, "diagnostics changed normal stderr");
 
         let counters = read_counters(&diagnostics)?;
-        assert_eq!(counters["schema_version"], 16);
+        assert_eq!(counters["schema_version"], 17);
         assert_eq!(counters["phases"]["cli_pre_context_preparation"]["invocations"], 1);
         assert!(
             counters["phases"]["cli_pre_context_preparation"]["elapsed_ns"]
@@ -376,7 +376,7 @@ fn unify_diagnostics_measure_bounded_compiler_acquisition_and_warm_outcome() {
         );
         let cold = read_counters(&cold_path)?;
         let acquisition = &cold["compiler_acquisition"];
-        assert_eq!(cold["schema_version"], 16);
+        assert_eq!(cold["schema_version"], 17);
         assert_eq!(acquisition["plans"], 1);
         assert!(
             acquisition["plan_identity"]
@@ -385,29 +385,11 @@ fn unify_diagnostics_measure_bounded_compiler_acquisition_and_warm_outcome() {
         );
         assert!(acquisition["views"].as_u64().is_some_and(|views| views >= 3));
         assert!(acquisition["cargo_views"].as_u64().is_some_and(|views| views > 0));
-        assert!(
-            acquisition["configured_process_slots"]
-                .as_u64()
-                .is_some_and(|slots| slots > 0)
-        );
-        assert!(
-            acquisition["configured_work_permits"]
-                .as_u64()
-                .is_some_and(|permits| permits > 0)
-        );
+        // Views share one sandbox in turn; Cargo owns parallelism inside each view.
+        assert_eq!(acquisition["configured_process_slots"], 1);
         assert_eq!(acquisition["live_cargo_processes"], 0);
-        assert!(
-            acquisition["max_live_cargo_processes"]
-                .as_u64()
-                .is_some_and(|processes| processes > 0)
-        );
-        assert!(
-            acquisition["max_nonwaiting_cargo_views"]
-                .as_u64()
-                .is_some_and(|views| views > 0)
-        );
-        assert!(acquisition["max_live_cargo_processes"].as_u64() <= acquisition["configured_process_slots"].as_u64());
-        assert!(acquisition["max_nonwaiting_cargo_views"].as_u64() <= acquisition["configured_work_permits"].as_u64());
+        assert_eq!(acquisition["max_live_cargo_processes"], 1);
+        assert_eq!(acquisition["sandboxes_created"], 1);
         assert!(
             acquisition["compiler_actions"]
                 .as_u64()
@@ -552,7 +534,7 @@ fn pre_context_diagnostics_have_one_fixed_phase_schema() {
         ensure!(measured.status.success(), "schema output failed");
 
         let counters = read_counters(&diagnostics)?;
-        assert_eq!(counters["schema_version"], 16);
+        assert_eq!(counters["schema_version"], 17);
         assert_eq!(counters["phases"]["cli_pre_context_preparation"]["invocations"], 1);
         assert_eq!(counters["phases"]["workspace_capture_cargo_metadata"]["invocations"], 0);
         assert_eq!(

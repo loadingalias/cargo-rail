@@ -418,7 +418,7 @@ fn diagnostics_record_each_progress_phase_and_its_activity() {
         );
 
         let counters: serde_json::Value = serde_json::from_slice(&fs::read(&file)?)?;
-        assert_eq!(counters["schema_version"], 16);
+        assert_eq!(counters["schema_version"], 17);
         let phases = counters["progress_phases"].as_array().context("progress phases")?;
         let find = |phase: &str| phases.iter().find(|entry| entry["phase"] == phase);
         for (phase, activity) in [
