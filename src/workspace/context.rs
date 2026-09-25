@@ -1093,6 +1093,15 @@ impl WorkspaceContext {
         }
     }
 
+    /// Return the selected Cargo, compiler, and compiler-wrapper programs.
+    pub(crate) fn toolchain_identity(&self) -> RailResult<crate::cargo::resolution::ToolchainIdentity> {
+        if let Some(snapshot) = &self.snapshot {
+            Ok(snapshot.toolchain().clone())
+        } else {
+            self.derived_views.toolchain()
+        }
+    }
+
     /// Return the authoritative snapshot captured by [`Self::build_with_snapshot`].
     ///
     /// Other constructors intentionally avoid this work until command consumers

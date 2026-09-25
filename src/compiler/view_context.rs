@@ -23,6 +23,10 @@ const CONTEXT_VERSION: u32 = 1;
 const MAX_CONTEXT_BYTES: u64 = 64 * 1024;
 const RUSTC_WRAPPER_STEM: &str = "cargo-rail-rustc-observer";
 const RUSTDOC_WRAPPER_STEM: &str = "cargo-rail-rustdoc-observer";
+const EVIDENCE_RECORDER_STEM: &str = "cargo-rail-evidence-recorder";
+
+/// Marker for the planning-evidence recorder that Cargo runs as `RUSTC_WRAPPER`.
+pub(crate) const EVIDENCE_RECORDER_MARKER: &str = "CARGO_RAIL_EVIDENCE_RECORDER";
 
 static ACTIVE: OnceLock<BTreeMap<String, OsString>> = OnceLock::new();
 
@@ -53,6 +57,11 @@ pub(crate) fn stage(wrapper: &Path, directory: &Path) -> RailResult<StagedWrappe
     })
 }
 
+/// Stage the planning-evidence recorder in `directory`, beside its future context.
+pub(crate) fn stage_evidence_recorder(wrapper: &Path, directory: &Path) -> RailResult<PathBuf> {
+    stage_wrapper(wrapper, directory, EVIDENCE_RECORDER_STEM)
+}
+
 /// One view's private context, removed when the view's Cargo process has finished.
 pub(crate) struct ViewContext {
     path: PathBuf,
@@ -63,29 +72,36 @@ impl StagedWrappers {
     ///
     /// Creation is exclusive: a second concurrent view in the same directory fails closed.
     pub(crate) fn begin_view(&self, values: &BTreeMap<&str, &OsStr>) -> RailResult<ViewContext> {
-        let record = ContextRecord {
-            version: CONTEXT_VERSION,
-            values: values
-                .iter()
-                .map(|(name, value)| ((*name).to_string(), encode(value)))
-                .collect(),
-        };
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let path = self.directory.join(CONTEXT_FILE);
-        let mut file = options.open(&path).map_err(|error| {
-            RailError::message(format!("creating compiler view context '{}': {error}", path.display()))
-        })?;
-        let context = ViewContext { path };
-        file.write_all(&serde_json::to_vec(&record)?)?;
-        file.sync_all()?;
-        Ok(context)
+        begin_context(&self.directory, values)
     }
+}
+
+/// Write the private context read by the wrappers staged in `directory`.
+///
+/// Creation is exclusive: a second concurrent context in the same directory fails closed.
+pub(crate) fn begin_context(directory: &Path, values: &BTreeMap<&str, &OsStr>) -> RailResult<ViewContext> {
+    let record = ContextRecord {
+        version: CONTEXT_VERSION,
+        values: values
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), encode(value)))
+            .collect(),
+    };
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let path = directory.join(CONTEXT_FILE);
+    let mut file = options
+        .open(&path)
+        .map_err(|error| RailError::message(format!("creating compiler view context '{}': {error}", path.display())))?;
+    let context = ViewContext { path };
+    file.write_all(&serde_json::to_vec(&record)?)?;
+    file.sync_all()?;
+    Ok(context)
 }
 
 impl Drop for ViewContext {
@@ -127,6 +143,11 @@ pub(crate) fn activate() -> RailResult<()> {
     Ok(())
 }
 
+/// Read one private variable only from the active view context, never the environment.
+pub(crate) fn context_var_os(name: &str) -> Option<OsString> {
+    ACTIVE.get().and_then(|context| context.get(name).cloned())
+}
+
 /// Read one private invocation variable from the active view context, else the environment.
 pub(crate) fn var_os(name: &str) -> Option<OsString> {
     ACTIVE
@@ -142,6 +163,7 @@ fn load(candidate: &Path) -> RailResult<Option<BTreeMap<String, OsString>>> {
     let marker = match stem {
         RUSTC_WRAPPER_STEM => WRAPPER_MARKER,
         RUSTDOC_WRAPPER_STEM => RUSTDOC_WRAPPER_MARKER,
+        EVIDENCE_RECORDER_STEM => EVIDENCE_RECORDER_MARKER,
         _ => return Ok(None),
     };
     let Some(directory) = candidate.parent().filter(|directory| !directory.as_os_str().is_empty()) else {

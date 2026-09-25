@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::evidence::{
-    EvidenceBindings, ObservedInput, PlanningEvidenceState, PortableBaseEdgeDomain, PortableBaseModel,
-    required_capabilities,
+    EvidenceBindings, PlanningEvidenceState, PortableBaseEdge, PortableBaseEdgeDomain, PortableBaseModel,
+    PortableBasePackage, PortableBaseTarget, required_capabilities,
 };
 use super::source_features::{SourceActivation, expanded_features, source_activation};
 use super::{ConfigDelta, IndexedFileChange, PlanningIndex};
@@ -396,6 +396,11 @@ pub(crate) fn format_work_plan(
                     output.push_str(&format!(" [{input}]"));
                 }
                 output.push('\n');
+                if evidence.code.starts_with("observed_input") {
+                    for identity in &plan.inputs.evidence {
+                        output.push_str(&format!("      from {identity}\n"));
+                    }
+                }
             }
         }
     }
@@ -846,6 +851,34 @@ struct Evaluator<'a> {
     decisions: BTreeMap<String, WorkDecision>,
     report_inputs: BTreeMap<String, BTreeSet<WorkInput>>,
     variant_relations: BTreeMap<String, Vec<SelectionAttribution>>,
+    /// Originating package of each dependent selected through observed evidence, by work.
+    observed_origins: BTreeMap<String, BTreeMap<PackageId, String>>,
+}
+
+enum ObservedResolution {
+    /// Complete evidence attributed these uncertain paths; an empty list proves disjointness.
+    Resolved(Vec<ObservedMatch>),
+    Unusable {
+        code: String,
+        input: Option<String>,
+        description: String,
+    },
+}
+
+/// One uncertain path matched by an observed file or directory input.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ObservedMatch {
+    path: String,
+    /// Base identity of the file, or `directory:PATH` for a directory input.
+    source: String,
+    package: Option<String>,
+    target: Option<String>,
+}
+
+impl ObservedMatch {
+    fn evidence_text(&self) -> String {
+        format!("{}@{}", self.path, self.source)
+    }
 }
 
 pub(crate) fn build_work_plan(
@@ -853,7 +886,7 @@ pub(crate) fn build_work_plan(
     index: PlanningIndex,
     authority: WorkPlanAuthority,
     semantic_changes: &BTreeMap<String, SemanticFileChange>,
-    evidence_path: Option<&Path>,
+    evidence_paths: &[std::path::PathBuf],
     force_all: bool,
 ) -> RailResult<WorkPlan> {
     let mut cargo_model = PlanningCargoModel::new(ctx)?;
@@ -861,7 +894,7 @@ pub(crate) fn build_work_plan(
     let cargo_identity = cargo_model.identity()?;
     let catalog = catalog_identity(&specs)?;
     let observed = PlanningEvidenceState::load(
-        evidence_path,
+        evidence_paths,
         EvidenceBindings {
             source_base: &authority.base,
             cargo_configuration_identity: &authority.cargo_configuration_identity,
@@ -889,6 +922,7 @@ pub(crate) fn build_work_plan(
             decisions: BTreeMap::new(),
             report_inputs: BTreeMap::new(),
             variant_relations: BTreeMap::new(),
+            observed_origins: BTreeMap::new(),
         };
 
         for spec in specs.iter().filter(|spec| spec.origin == "builtin") {
@@ -927,7 +961,7 @@ pub(crate) fn build_work_plan(
             target: authority.target_identity,
             platform: host_platform(),
             catalog,
-            evidence: observed.identity().map(str::to_string).into_iter().collect(),
+            evidence: observed.identities(),
             r#override: if force_all {
                 PlanOverride::All
             } else {
@@ -946,6 +980,142 @@ pub(crate) fn build_work_plan(
     };
     plan.identity = plan_identity(&plan)?;
     Ok(plan)
+}
+
+/// Return the Cargo resolution identity a plan of this checkout binds to.
+pub(super) fn planning_cargo_identity(ctx: &WorkspaceContext) -> RailResult<String> {
+    let mut cargo_model = PlanningCargoModel::new(ctx)?;
+    build_catalog(ctx, &mut cargo_model)?;
+    cargo_model.identity()
+}
+
+/// Return the structural Cargo facts that planning evidence records for its base source.
+///
+/// Only local packages inside the workspace whose manifest and target sources are tracked
+/// are modeled, because the planner revalidates every modeled path against the base tree.
+pub(super) fn portable_base_model(ctx: &WorkspaceContext) -> RailResult<PortableBaseModel> {
+    let workspace_root = ctx.workspace_root();
+    let relative = |path: &Path| {
+        path.strip_prefix(workspace_root)
+            .ok()
+            .map(crate::utils::path_to_git_format)
+    };
+    let candidates = ctx
+        .cargo()
+        .metadata()
+        .packages
+        .iter()
+        .filter(|package| package.source.is_none())
+        .filter_map(|package| {
+            let root = relative(package.manifest_path.parent()?.as_std_path())?;
+            let targets = package
+                .targets
+                .iter()
+                .map(|target| {
+                    let mut kind = target.kind.iter().map(ToString::to_string).collect::<Vec<_>>();
+                    kind.sort_unstable();
+                    Some(PortableBaseTarget {
+                        name: target.name.clone(),
+                        kind,
+                        src_path: relative(target.src_path.as_std_path())?,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some((package, root, targets))
+        })
+        .collect::<Vec<_>>();
+    let paths = candidates
+        .iter()
+        .flat_map(|(_, root, targets)| {
+            let manifest = if root.is_empty() {
+                "Cargo.toml".to_string()
+            } else {
+                format!("{root}/Cargo.toml")
+            };
+            std::iter::once(manifest).chain(targets.iter().map(|target| target.src_path.clone()))
+        })
+        .collect::<BTreeSet<_>>();
+    let repository_path = |path: &str| {
+        ctx.workspace_prefix()
+            .map_or_else(|| std::path::PathBuf::from(path), |prefix| prefix.join(path))
+    };
+    let head = ctx.git()?.git().head_commit()?;
+    let tracked = ctx
+        .git()?
+        .git()
+        .collect_tree_entries_for_paths(
+            &head,
+            &paths.iter().map(|path| repository_path(path)).collect::<Vec<_>>(),
+        )?
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect::<BTreeSet<_>>();
+    let mut model = PortableBaseModel::default();
+    let mut modeled = BTreeMap::new();
+    for (package, root, targets) in candidates {
+        let manifest = if root.is_empty() {
+            "Cargo.toml".to_string()
+        } else {
+            format!("{root}/Cargo.toml")
+        };
+        if !std::iter::once(manifest.as_str())
+            .chain(targets.iter().map(|target| target.src_path.as_str()))
+            .all(|path| tracked.contains(&repository_path(path)))
+        {
+            continue;
+        }
+        let key = portable_package_key(ctx, package);
+        modeled.insert(
+            package
+                .manifest_path
+                .parent()
+                .map(|root| root.as_std_path().to_path_buf()),
+            key.clone(),
+        );
+        model.packages.push(PortableBasePackage {
+            key,
+            name: package.name.to_string(),
+            root,
+            targets,
+        });
+    }
+    let mut edges = BTreeSet::new();
+    for package in ctx
+        .cargo()
+        .metadata()
+        .packages
+        .iter()
+        .filter(|package| package.source.is_none())
+    {
+        let Some(dependent) = modeled.get(
+            &package
+                .manifest_path
+                .parent()
+                .map(|root| root.as_std_path().to_path_buf()),
+        ) else {
+            continue;
+        };
+        for dependency in &package.dependencies {
+            let Some(dependency_key) = dependency
+                .path
+                .as_ref()
+                .and_then(|path| modeled.get(&Some(path.as_std_path().to_path_buf())))
+            else {
+                continue;
+            };
+            edges.insert(PortableBaseEdge {
+                dependency: dependency_key.clone(),
+                dependent: dependent.clone(),
+                domain: if dependency.kind == cargo_metadata::DependencyKind::Development {
+                    PortableBaseEdgeDomain::Development
+                } else {
+                    PortableBaseEdgeDomain::Build
+                },
+            });
+        }
+    }
+    model.edges = edges.into_iter().collect();
+    Ok(model)
 }
 
 /// Return the host label that plans and planning evidence bind to.
@@ -1842,12 +2012,20 @@ impl Evaluator<'_> {
                                         work.inputs.iter().any(|input| {
                                             input.package.as_deref() == Some(selector.key.as_str())
                                                 && self.paths.contains(&input.path.as_str())
+                                        }) || work.directories.iter().any(|directory| {
+                                            directory.package == selector.key
+                                                && self.paths.iter().any(|path| directory.covers(path))
                                         })
                                     });
                                 let origin = self
                                     .structural_impact
                                     .current_build_origins
                                     .get(&package.id)
+                                    .or_else(|| {
+                                        self.observed_origins
+                                            .get(id)
+                                            .and_then(|origins| origins.get(&package.id))
+                                    })
                                     .or_else(|| self.structural_impact.current_development_origins.get(&package.id))
                                     .or_else(|| self.structural_impact.historical_build_origins.get(&package.id))
                                     .or_else(|| self.structural_impact.historical_development_origins.get(&package.id));
@@ -2032,7 +2210,24 @@ impl Evaluator<'_> {
             );
         }
 
-        if !direct.is_empty() {
+        let uncertain = if BUILTIN_CARGO_WORK.binary_search(&spec.id.as_str()).is_ok() {
+            let direct_paths = direct
+                .iter()
+                .filter(|input| input.kind == WorkInputKind::Path)
+                .map(|input| input.value.as_str())
+                .collect::<BTreeSet<_>>();
+            paths
+                .iter()
+                .copied()
+                .filter(|path| !direct_paths.contains(path) && cargo_membership_uncertain(self.ctx, path))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        let direct_evidence = if direct.is_empty() {
+            None
+        } else {
             self.report_inputs
                 .insert(spec.id.clone(), direct.iter().cloned().collect());
             let input = direct
@@ -2040,158 +2235,282 @@ impl Evaluator<'_> {
                 .map(WorkInput::evidence_text)
                 .collect::<Vec<_>>()
                 .join(",");
-            let evidence = self.add_evidence(
+            Some(self.add_evidence(
                 "changed_input",
                 &spec.id,
                 Some(&input),
                 true,
                 format!("{} authoritative input(s) changed", direct.len()),
+            )?)
+        };
+
+        if uncertain.is_empty() {
+            if let Some(evidence) = direct_evidence {
+                let scope = self.scope_for(spec, paths, evidence.clone(), None)?;
+                self.decisions.insert(
+                    spec.id.clone(),
+                    WorkDecision::Required {
+                        cause: WorkCause::ChangedInput,
+                        scope,
+                        evidence: vec![evidence],
+                    },
+                );
+                return Ok(());
+            }
+            let evidence = self.add_evidence(
+                "complete_disjoint",
+                &spec.id,
+                Some(&paths.join(",")),
+                true,
+                "captured structural inputs are complete and disjoint from this work".to_string(),
             )?;
-            let scope = self.scope_for(spec, paths, evidence.clone(), None)?;
             self.decisions.insert(
                 spec.id.clone(),
-                WorkDecision::Required {
-                    cause: WorkCause::ChangedInput,
-                    scope,
+                WorkDecision::Skipped {
                     evidence: vec![evidence],
                 },
             );
             return Ok(());
         }
 
-        if BUILTIN_CARGO_WORK.binary_search(&spec.id.as_str()).is_ok() && cargo_membership_uncertain(self.ctx, paths) {
-            if let Some(decision) = self.observed_cargo_decision(spec, paths)? {
-                self.decisions.insert(spec.id.clone(), decision);
-                return Ok(());
+        // Only compiler observation can attribute the uncertain paths. Direct inputs keep
+        // their structural scope; the observed or widened scope is added to it.
+        let decision = match self.observed_resolution(spec, &uncertain)? {
+            ObservedResolution::Resolved(matched) => {
+                let mut evidence = direct_evidence.into_iter().collect::<Vec<_>>();
+                if evidence.is_empty() && matched.is_empty() {
+                    let evidence = self.add_evidence(
+                        "observed_inputs_complete_disjoint",
+                        &spec.id,
+                        Some(&uncertain.join(",")),
+                        true,
+                        "compatible compiler, build-script, and proc-macro inputs are complete and disjoint"
+                            .to_string(),
+                    )?;
+                    self.decisions.insert(
+                        spec.id.clone(),
+                        WorkDecision::Skipped {
+                            evidence: vec![evidence],
+                        },
+                    );
+                    return Ok(());
+                }
+                let mut selections = Vec::new();
+                if !evidence.is_empty() {
+                    selections.push(cargo_selection(self.ctx, self.structural_impact, &spec.id, paths)?);
+                }
+                if !matched.is_empty() {
+                    self.report_inputs
+                        .entry(spec.id.clone())
+                        .or_default()
+                        .extend(matched.iter().map(|input| WorkInput::path(input.path.clone())));
+                    let input = matched
+                        .iter()
+                        .map(ObservedMatch::evidence_text)
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    evidence.push(self.add_evidence(
+                        "observed_input_changed",
+                        &spec.id,
+                        Some(&input),
+                        true,
+                        "a compatible observed compiler input changed".to_string(),
+                    )?);
+                    selections.push(self.observed_selection(&spec.id, &matched)?);
+                }
+                evidence.sort();
+                WorkDecision::Required {
+                    cause: WorkCause::ChangedInput,
+                    scope: WorkScope::Cargo {
+                        selection: self.add_prerequisite_source_roots(&spec.id, merge_cargo_selections(selections)?)?,
+                    },
+                    evidence,
+                }
             }
-            let input = paths.join(",");
-            let evidence = self.add_evidence(
-                "compiler_inputs_incomplete",
-                &spec.id,
-                Some(&input),
-                false,
-                "portable compiler, build-script, or proc-macro negative evidence is unavailable".to_string(),
-            )?;
-            let selection = self.cargo_selection(&spec.id, paths)?;
-            self.decisions.insert(
-                spec.id.clone(),
+            ObservedResolution::Unusable {
+                code,
+                input,
+                description,
+            } => {
+                let mut evidence = direct_evidence.into_iter().collect::<Vec<_>>();
+                evidence.push(self.add_evidence(&code, &spec.id, input.as_deref(), false, description)?);
+                evidence.sort();
+                // An unattributed non-Rust file can be read by any unit. A Rust module keeps
+                // the structural attribution to the package that contains it.
+                let selection = if uncertain.iter().any(|path| !path.ends_with(".rs")) {
+                    self.add_prerequisite_source_roots(
+                        &spec.id,
+                        CargoSelection::Workspace {
+                            cargo_args: Vec::new(),
+                            targets: Vec::new(),
+                        },
+                    )?
+                } else {
+                    self.cargo_selection(&spec.id, paths)?
+                };
                 WorkDecision::Required {
                     cause: WorkCause::IncompleteEvidence,
                     scope: WorkScope::Cargo { selection },
-                    evidence: vec![evidence],
-                },
-            );
-            return Ok(());
-        }
-
-        let evidence = self.add_evidence(
-            "complete_disjoint",
-            &spec.id,
-            Some(&paths.join(",")),
-            true,
-            "captured structural inputs are complete and disjoint from this work".to_string(),
-        )?;
-        self.decisions.insert(
-            spec.id.clone(),
-            WorkDecision::Skipped {
-                evidence: vec![evidence],
-            },
-        );
+                    evidence,
+                }
+            }
+        };
+        self.decisions.insert(spec.id.clone(), decision);
         Ok(())
     }
 
-    fn observed_cargo_decision(&mut self, spec: &WorkSpec, paths: &[&str]) -> RailResult<Option<WorkDecision>> {
-        if let Some((code, description)) = self.observed.incompatibility() {
-            let code = code.to_string();
-            let description = description.to_string();
-            let evidence = self.add_evidence(&code, &spec.id, None, false, description)?;
-            let selection = self.cargo_selection(&spec.id, paths)?;
-            return Ok(Some(WorkDecision::Required {
-                cause: WorkCause::IncompleteEvidence,
-                scope: WorkScope::Cargo { selection },
-                evidence: vec![evidence],
-            }));
-        }
-        let Some(observed) = self.observed.work(&spec.id).cloned() else {
-            return Ok(None);
+    /// Resolve uncertain paths against compatible observed-input evidence.
+    fn observed_resolution(&self, spec: &WorkSpec, uncertain: &[&str]) -> RailResult<ObservedResolution> {
+        let Some(observed) = self.observed.work(&spec.id) else {
+            if let Some((code, description)) = self.observed.unusable(&spec.id) {
+                return Ok(ObservedResolution::Unusable {
+                    code: code.to_string(),
+                    input: None,
+                    description: description.to_string(),
+                });
+            }
+            return Ok(ObservedResolution::Unusable {
+                code: "compiler_inputs_incomplete".to_string(),
+                input: Some(uncertain.join(",")),
+                description: "portable compiler, build-script, or proc-macro negative evidence is unavailable"
+                    .to_string(),
+            });
         };
-        let capabilities = self.observed.capabilities().cloned().unwrap_or_default();
+        let capabilities = self.observed.capabilities(&spec.id).cloned().unwrap_or_default();
         let missing = required_capabilities(&spec.id)
             .iter()
             .filter(|capability| !capabilities.contains(**capability))
             .copied()
             .collect::<Vec<_>>();
         if !observed.complete || !observed.bypasses.is_empty() || !missing.is_empty() {
-            let input = format!(
-                "complete={},bypasses={},missing_capabilities={}",
-                observed.complete,
-                observed.bypasses.join("|"),
-                missing.join("|")
-            );
-            let evidence = self.add_evidence(
-                "observed_inputs_incomplete",
-                &spec.id,
-                Some(&input),
-                false,
-                "observed input evidence lacks a complete compiler, build-script, proc-macro, or process boundary"
-                    .to_string(),
-            )?;
-            let selection = self.cargo_selection(&spec.id, paths)?;
-            return Ok(Some(WorkDecision::Required {
-                cause: WorkCause::IncompleteEvidence,
-                scope: WorkScope::Cargo { selection },
-                evidence: vec![evidence],
-            }));
+            return Ok(ObservedResolution::Unusable {
+                code: "observed_inputs_incomplete".to_string(),
+                input: Some(format!(
+                    "complete={},bypasses={},missing_capabilities={}",
+                    observed.complete,
+                    observed.bypasses.join("|"),
+                    missing.join("|")
+                )),
+                description:
+                    "observed input evidence lacks a complete compiler, build-script, proc-macro, or process boundary"
+                        .to_string(),
+            });
         }
 
-        let changed = observed
+        let mut matched = observed
             .inputs
             .iter()
-            .filter(|input| paths.contains(&input.path.as_str()))
-            .cloned()
+            .filter(|input| uncertain.contains(&input.path.as_str()))
+            .map(|input| ObservedMatch {
+                path: input.path.clone(),
+                source: input.identity.clone(),
+                package: input.package.clone(),
+                target: input.target.clone(),
+            })
             .collect::<Vec<_>>();
-        if changed.is_empty() {
-            let evidence = self.add_evidence(
-                "observed_inputs_complete_disjoint",
-                &spec.id,
-                Some(&paths.join(",")),
-                true,
-                "compatible compiler, build-script, and proc-macro inputs are complete and disjoint".to_string(),
-            )?;
-            return Ok(Some(WorkDecision::Skipped {
-                evidence: vec![evidence],
-            }));
+        for directory in &observed.directories {
+            matched.extend(
+                uncertain
+                    .iter()
+                    .filter(|path| directory.covers(path))
+                    .map(|path| ObservedMatch {
+                        path: (*path).to_string(),
+                        source: format!("directory:{}", directory.path),
+                        package: Some(directory.package.clone()),
+                        target: None,
+                    }),
+            );
         }
+        matched.sort();
+        matched.dedup();
+        Ok(ObservedResolution::Resolved(matched))
+    }
 
-        self.report_inputs.insert(
-            spec.id.clone(),
-            changed
-                .iter()
-                .map(|input| WorkInput::path(input.path.clone()))
-                .collect(),
-        );
-        let input = changed
-            .iter()
-            .map(|input| format!("{}@{}", input.path, input.identity))
-            .collect::<Vec<_>>()
-            .join(",");
-        let evidence = self.add_evidence(
-            "observed_input_changed",
-            &spec.id,
-            Some(&input),
-            true,
-            "a compatible observed compiler input changed".to_string(),
-        )?;
-        let selection = observed_cargo_selection(self.ctx, &changed).unwrap_or(CargoSelection::Workspace {
+    /// Select the observed reading packages and every package whose build they can change.
+    fn observed_selection(&mut self, work: &str, matched: &[ObservedMatch]) -> RailResult<CargoSelection> {
+        let workspace = CargoSelection::Workspace {
             cargo_args: Vec::new(),
             targets: Vec::new(),
-        });
-        let selection = self.add_prerequisite_source_roots(&spec.id, selection)?;
-        Ok(Some(WorkDecision::Required {
-            cause: WorkCause::ChangedInput,
-            scope: WorkScope::Cargo { selection },
-            evidence: vec![evidence],
-        }))
+        };
+        let local = self
+            .ctx
+            .cargo()
+            .metadata()
+            .packages
+            .iter()
+            .filter(|package| package.source.is_none())
+            .map(|package| (portable_package_key(self.ctx, package), package))
+            .collect::<BTreeMap<_, _>>();
+        let mut seeds = HashSet::new();
+        for input in matched {
+            let Some(package) = input.package.as_ref().and_then(|key| local.get(key)) else {
+                return Ok(workspace);
+            };
+            seeds.insert(package.id.clone());
+        }
+        let propagation = self.cargo_model.propagate(&seeds)?;
+        let mut selected = seeds.iter().cloned().collect::<BTreeSet<_>>();
+        selected.extend(propagation.build.iter().cloned());
+        if matches!(work, "cargo.clippy" | "cargo.test") {
+            selected.extend(propagation.development.iter().cloned());
+        }
+        let origins = self.observed_origins.entry(work.to_string()).or_default();
+        for (package, origin) in propagation
+            .build_origins
+            .iter()
+            .chain(propagation.development_origins.iter())
+        {
+            if !seeds.contains(package)
+                && let Some(origin) = self.cargo_model.package_key(self.ctx, origin)
+            {
+                origins.entry(package.clone()).or_insert(origin);
+            }
+        }
+        let mut packages = self
+            .ctx
+            .cargo()
+            .metadata()
+            .workspace_packages()
+            .iter()
+            .filter(|package| selected.contains(&package.id))
+            .copied()
+            .collect::<Vec<_>>();
+        if packages.is_empty() {
+            return Ok(workspace);
+        }
+        let exact_targets = selected.iter().all(|package| seeds.contains(package))
+            && matched.iter().all(|input| input.target.is_some());
+        let selectors = portable_package_selectors(self.ctx, &mut packages)?;
+        let mut targets = Vec::new();
+        if exact_targets {
+            for input in matched {
+                let (Some(key), Some(name)) = (&input.package, &input.target) else {
+                    continue;
+                };
+                let Some(target) = packages
+                    .iter()
+                    .find(|package| portable_package_key(self.ctx, package) == *key)
+                    .and_then(|package| package.targets.iter().find(|target| target.name == *name))
+                else {
+                    targets.clear();
+                    break;
+                };
+                let mut kind = target.kind.iter().map(ToString::to_string).collect::<Vec<_>>();
+                kind.sort_unstable();
+                targets.push(CargoTargetSelector {
+                    package: key.clone(),
+                    name: name.clone(),
+                    kind,
+                });
+            }
+        }
+        targets.sort();
+        targets.dedup();
+        Ok(CargoSelection::Packages {
+            cargo_args: cargo_package_args(&selectors),
+            packages: selectors,
+            targets,
+        })
     }
 
     fn evaluate_declared(&mut self, spec: &WorkSpec) -> RailResult<()> {
@@ -2710,6 +3029,9 @@ fn cargo_direct_inputs(
             if is_cargo_structural_input(path) {
                 return semantic_path_changed(semantic_changes, path);
             }
+            if id == "cargo.clippy" && is_clippy_configuration(path) {
+                return true;
+            }
             if id == "cargo.package"
                 && ctx
                     .graph()
@@ -2760,13 +3082,18 @@ fn is_test_only_path(path: &str) -> bool {
     path.starts_with("tests/") || path.contains("/tests/") || path.starts_with("benches/") || path.contains("/benches/")
 }
 
-fn cargo_membership_uncertain(ctx: &WorkspaceContext, paths: &[&str]) -> bool {
-    paths.iter().any(|path| {
-        !is_cargo_structural_input(path)
-            && !(path.ends_with(".rs") && is_current_target_root(ctx, path))
-            && !path.ends_with("rustfmt.toml")
-            && !path.ends_with("deny.toml")
-    })
+/// Whether only compiler observation can decide which Cargo units read `path`.
+fn cargo_membership_uncertain(ctx: &WorkspaceContext, path: &str) -> bool {
+    !is_cargo_structural_input(path)
+        && !(path.ends_with(".rs") && is_current_target_root(ctx, path))
+        && !path.ends_with("rustfmt.toml")
+        && !path.ends_with("deny.toml")
+}
+
+/// Clippy reads the nearest configuration file, but dep-info names only one that
+/// already existed, so an added file must select Clippy directly.
+fn is_clippy_configuration(path: &str) -> bool {
+    matches!(path.rsplit('/').next(), Some("clippy.toml" | ".clippy.toml"))
 }
 
 fn is_current_target_root(ctx: &WorkspaceContext, path: &str) -> bool {
@@ -2818,6 +3145,18 @@ fn cargo_selection(
             selected.extend(impact.development.iter().cloned());
             selected
         }
+        // Packaging owns every file in a member directory, not only compiler reads.
+        "cargo.package" => impact
+            .seeds
+            .iter()
+            .cloned()
+            .chain(paths.iter().filter_map(|path| {
+                ctx.graph()
+                    .file_to_package(Path::new(path))
+                    .filter(|package| package.is_workspace_member)
+                    .map(|package| package.id.clone())
+            }))
+            .collect(),
         _ => impact.seeds.iter().cloned().collect(),
     };
 
@@ -3000,7 +3339,7 @@ fn portable_package_selector(
     })
 }
 
-fn portable_package_key(ctx: &WorkspaceContext, package: &Package) -> String {
+pub(super) fn portable_package_key(ctx: &WorkspaceContext, package: &Package) -> String {
     if let Some(source) = &package.source {
         return format!("{}@{}#{}", package.name, package.version, source.repr);
     }
@@ -3106,53 +3445,6 @@ fn cargo_structural_deltas(
         left.package == right.package && left.target == right.target && left.kind == right.kind
     });
     deltas
-}
-
-fn observed_cargo_selection(ctx: &WorkspaceContext, inputs: &[ObservedInput]) -> Option<CargoSelection> {
-    let package_keys = inputs
-        .iter()
-        .map(|input| input.package.as_deref())
-        .collect::<Option<BTreeSet<_>>>()?;
-    if package_keys.is_empty() {
-        return None;
-    }
-    let mut packages = ctx
-        .cargo()
-        .metadata()
-        .workspace_packages()
-        .iter()
-        .filter(|package| package_keys.contains(portable_package_key(ctx, package).as_str()))
-        .copied()
-        .collect::<Vec<_>>();
-    if packages.len() != package_keys.len() {
-        return None;
-    }
-    let selectors = portable_package_selectors(ctx, &mut packages).ok()?;
-    let cargo_args = cargo_package_args(&selectors);
-    let mut targets = inputs
-        .iter()
-        .filter_map(|input| input.package.as_ref().zip(input.target.as_ref()))
-        .filter_map(|(package_key, target_name)| {
-            let package = packages
-                .iter()
-                .find(|package| portable_package_key(ctx, package) == *package_key)?;
-            let target = package.targets.iter().find(|target| target.name == *target_name)?;
-            let mut kind = target.kind.iter().map(ToString::to_string).collect::<Vec<_>>();
-            kind.sort_unstable();
-            Some(CargoTargetSelector {
-                package: package_key.clone(),
-                name: target_name.clone(),
-                kind,
-            })
-        })
-        .collect::<Vec<_>>();
-    targets.sort();
-    targets.dedup();
-    Some(CargoSelection::Packages {
-        packages: selectors,
-        cargo_args,
-        targets,
-    })
 }
 
 fn catalog_identity(specs: &[WorkSpec]) -> RailResult<String> {

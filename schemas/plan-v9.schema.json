@@ -146,7 +146,7 @@
           "uniqueItems": true,
           "items": {
             "type": "string",
-            "pattern": "^planning-evidence-v1:sha256:[0-9a-f]{64}$"
+            "pattern": "^planning-evidence-v2:sha256:[0-9a-f]{64}$"
           }
         },
         "override": {

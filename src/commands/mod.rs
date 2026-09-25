@@ -173,7 +173,16 @@ pub fn try_dispatch_pre_context(
             Ok(PreContextDispatch::Handled)
         }
 
+        command @ Commands::Plan {
+            command: Some(cli::PlanCommand::Evidence { .. }),
+            ..
+        } => Ok(PreContextDispatch::NeedsContext(PreparedContext::new(
+            command,
+            config_override,
+        )?)),
+
         Commands::Plan {
+            command: None,
             since,
             from,
             to,
@@ -188,6 +197,7 @@ pub fn try_dispatch_pre_context(
         } => {
             let comparison = plan::PlanComparison::from_cli(&since, &from, &to)?;
             let command = Commands::Plan {
+                command: None,
                 since,
                 from,
                 to,
@@ -501,6 +511,17 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext, prepared_plan: Option<Pla
         Commands::Doctor {
             command: cli::DoctorCommand::NativeCache { format },
         } => run_native_cache_doctor(ctx, format),
+
+        Commands::Plan {
+            command:
+                Some(cli::PlanCommand::Evidence {
+                    work,
+                    output,
+                    cargo_args,
+                }),
+            json,
+            ..
+        } => plan::run_plan_evidence(ctx, &work, &output, &cargo_args, json),
 
         Commands::Plan { .. } => run_plan(
             ctx,

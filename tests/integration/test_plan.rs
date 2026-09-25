@@ -13,7 +13,7 @@ use crate::helpers::{TestWorkspace, cargo_rail_command, git, run_cargo_rail, run
 
 const PLAN_V9_SCHEMA: &str = include_str!("../../schemas/plan-v9.schema.json");
 const PLAN_VARIANTS_V2_SCHEMA: &str = include_str!("../../schemas/plan-variants-v2.schema.json");
-const PLANNING_EVIDENCE_V1_SCHEMA: &str = include_str!("../../schemas/planning-evidence-v1.schema.json");
+const PLANNING_EVIDENCE_SCHEMA: &str = include_str!("../../schemas/planning-evidence-v2.schema.json");
 
 const CARGO_WORK: [&str; 6] = [
     "cargo.build",
@@ -329,7 +329,7 @@ fn sign_planning_evidence(mut manifest: Value) -> Result<Value> {
     let encoded = serde_json::to_vec(&canonicalize(manifest.clone()))?;
     let digest = Sha256::digest(&encoded);
     manifest["identity"] = Value::String(format!(
-        "planning-evidence-v1:sha256:{}",
+        "planning-evidence-v2:sha256:{}",
         digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
     ));
     Ok(manifest)
@@ -353,12 +353,13 @@ fn complete_evidence_with_base_model(
                     "complete": true,
                     "bypasses": [],
                     "inputs": inputs.get(id).cloned().unwrap_or_default(),
+                    "directories": [],
                 }),
             )
         })
         .collect::<serde_json::Map<_, _>>();
     sign_planning_evidence(serde_json::json!({
-        "planning_evidence_version": 1,
+        "planning_evidence_version": 2,
         "identity": "",
         "provider": {
             "identity": "cargo-rail-synthetic-test-provider-v1",
@@ -381,6 +382,15 @@ fn complete_evidence_with_base_model(
         "base_model": base_model,
         "work": work,
     }))
+}
+
+fn warm_path(ws: &TestWorkspace) -> Result<String> {
+    Ok(ws
+        .path
+        .join("target/warm-evidence.json")
+        .to_str()
+        .context("non-UTF-8 evidence path")?
+        .to_string())
 }
 
 fn git_input_identity(ws: &TestWorkspace, revision: &str, path: &str) -> Result<String> {
@@ -539,7 +549,7 @@ paths = ["distribution/**"]
         assert_eq!(warm["required"], serde_json::json!(["release.semver"]));
         assert_eq!(warm["inputs"]["evidence"], serde_json::json!([evidence["identity"]]));
 
-        let schema: Value = serde_json::from_str(PLANNING_EVIDENCE_V1_SCHEMA)?;
+        let schema: Value = serde_json::from_str(PLANNING_EVIDENCE_SCHEMA)?;
         let validator = jsonschema::validator_for(&schema).map_err(|error| anyhow!("invalid schema: {error}"))?;
         assert!(validator.is_valid(&evidence));
         Ok(())
@@ -1342,7 +1352,9 @@ fn test_plan_object_pair_uses_only_to_tree_authority() {
         assert_eq!(expected["inputs"]["head"], head);
         assert_eq!(expected["work"]["historical"]["state"], "required");
         assert_eq!(expected["work"]["historical"]["scope"]["selection"]["kind"], "all");
-        let selected_packages = expected["work"]["cargo.test"]["scope"]["selection"]["packages"]
+        // Unattributed non-Rust inputs widen Cargo work, so the semver selection carries the
+        // head-only package membership.
+        let selected_packages = expected["work"]["release.semver"]["scope"]["selection"]["packages"]
             .as_array()
             .context("historical Cargo package selection missing")?;
         assert!(selected_packages.iter().any(|package| package["name"] == "head-member"));
@@ -2788,6 +2800,212 @@ cargo_prerequisites = [
             "the failure must come from the loading test: {caught_stdout}"
         );
         std::fs::write(&plugin_source, original_plugin)?;
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_plan_direct_change_keeps_an_unobserved_compiler_input_in_scope() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("plan-direct-and-unobserved")?;
+        let direct = ws.add_crate("direct", "0.1.0", &[])?;
+        let reader = ws.add_crate("reader", "0.1.0", &[])?;
+        std::fs::write(
+            reader.join("src/lib.rs"),
+            "pub const DATA: &str = include_str!(\"data.txt\");\n",
+        )?;
+        std::fs::write(reader.join("src/data.txt"), "before\n")?;
+        ws.commit("establish independent packages")?;
+
+        std::fs::write(direct.join("src/lib.rs"), "pub fn changed() {}\n")?;
+        std::fs::write(reader.join("src/data.txt"), "after\n")?;
+        let plan = plan(&ws, &["--since", "HEAD"])?;
+        for id in ["cargo.build", "cargo.test"] {
+            let selection = &plan["work"][id]["scope"]["selection"];
+            let covers_reader = selection["kind"] == "workspace"
+                || selection["packages"]
+                    .as_array()
+                    .is_some_and(|packages| packages.iter().any(|package| package["name"] == "reader"));
+            assert!(
+                covers_reader,
+                "{id} dropped the package that reads the changed file: {selection}"
+            );
+        }
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_plan_recorded_evidence_skips_unread_files_and_selects_observed_readers() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("plan-recorded-evidence")?;
+        let data = ws.add_crate("data", "0.1.0", &[])?;
+        std::fs::create_dir_all(data.join("assets"))?;
+        std::fs::write(
+            data.join("src/lib.rs"),
+            "pub const BANNER: &str = include_str!(\"../assets/banner.txt\");\n",
+        )?;
+        std::fs::write(data.join("assets/banner.txt"), "before\n")?;
+        let app = ws.add_crate("app", "0.1.0", &[("data", "{ path = \"../data\" }")])?;
+        std::fs::write(
+            app.join("src/lib.rs"),
+            "pub fn banner() -> &'static str { data::BANNER }\n",
+        )?;
+        let scripted = ws.add_crate("scripted", "0.1.0", &[])?;
+        std::fs::write(scripted.join("build.rs"), "fn main() {}\n")?;
+        std::fs::write(ws.path.join("README.md"), "# Fixture\n")?;
+        generate_lockfile(&ws)?;
+        ws.commit("establish recorded workspace")?;
+
+        let record_work = |work: &str, output: &str, cargo: &[&str]| -> Result<Value> {
+            let path = ws.path.join("target").join(output);
+            let path = path.to_str().context("non-UTF-8 evidence path")?.to_string();
+            let mut command = vec!["rail", "plan", "evidence", "--work", work, "--output", &path, "--"];
+            command.extend_from_slice(cargo);
+            let output = run_cargo_rail(&ws.path, &command)?;
+            ensure!(
+                output.status.success(),
+                "recording failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Ok(serde_json::from_slice(&std::fs::read(&path)?)?)
+        };
+        let record = |output: &str, packages: &[&str]| -> Result<Value> {
+            let mut cargo = vec!["test", "--no-run", "--offline"];
+            cargo.extend_from_slice(packages);
+            record_work("cargo.test", output, &cargo)
+        };
+        let evidence = record("planning-evidence.json", &["--workspace"])?;
+        let schema: Value = serde_json::from_str(PLANNING_EVIDENCE_SCHEMA)?;
+        let validator = jsonschema::validator_for(&schema).map_err(|error| anyhow!("invalid schema: {error}"))?;
+        assert!(validator.is_valid(&evidence), "{evidence:#}");
+        assert_eq!(evidence["work"]["cargo.test"]["complete"], true, "{evidence:#}");
+        let evidence_path = ws.path.join("target/planning-evidence.json");
+        let evidence_path = evidence_path.to_str().context("non-UTF-8 evidence path")?;
+        let explain = |work: &str| -> Result<String> {
+            let output = run_cargo_rail(
+                &ws.path,
+                &[
+                    "rail",
+                    "plan",
+                    "--since",
+                    "HEAD",
+                    "--evidence",
+                    evidence_path,
+                    "--explain-work",
+                    work,
+                ],
+            )?;
+            ensure!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            Ok(String::from_utf8(output.stdout)?)
+        };
+        let restore = || git(&ws.path, &["checkout", "--quiet", "--", "."]).map(drop);
+
+        std::fs::write(ws.path.join("README.md"), "# Fixture\n\nMore.\n")?;
+        let cold = plan(&ws, &["--since", "HEAD"])?;
+        assert_eq!(cold["work"]["cargo.test"]["cause"], "incomplete_evidence");
+        let unrelated = plan(&ws, &["--since", "HEAD", "--evidence", evidence_path])?;
+        assert_eq!(unrelated["work"]["cargo.test"]["state"], "skipped");
+        assert_eq!(
+            unrelated["inputs"]["evidence"],
+            serde_json::json!([evidence["identity"]])
+        );
+        let proof = explain("cargo.test")?;
+        assert!(
+            proof.contains("complete and disjoint [README.md]")
+                && proof.contains(evidence["identity"].as_str().context("identity")?),
+            "{proof}"
+        );
+        restore()?;
+
+        std::fs::write(data.join("assets/banner.txt"), "after\n")?;
+        let selected = plan(&ws, &["--since", "HEAD", "--evidence", evidence_path])?;
+        assert_eq!(selected["work"]["cargo.test"]["cause"], "changed_input");
+        let names = selected["work"]["cargo.test"]["scope"]["selection"]["packages"]
+            .as_array()
+            .context("observed selection has no packages")?
+            .iter()
+            .map(|package| package["name"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["app", "data"], "the reader and its dependent are selected");
+        assert!(explain("cargo.test")?.contains("crates/data/assets/banner.txt@git:"));
+        restore()?;
+
+        std::fs::write(
+            scripted.join("NOTES.md"),
+            "A new package file reruns its build script.\n",
+        )?;
+        let scripted_plan = plan(&ws, &["--since", "HEAD", "--evidence", evidence_path])?;
+        assert_eq!(
+            scripted_plan["work"]["cargo.test"]["scope"]["selection"]["packages"][0]["name"],
+            "scripted"
+        );
+        std::fs::remove_file(scripted.join("NOTES.md"))?;
+
+        let warm = record("warm-evidence.json", &["--workspace"])?;
+        assert_eq!(warm["work"], evidence["work"], "fresh units keep their recorded inputs");
+        // Each job records its own work item; a stale file widens only the work it names.
+        let build = record_work(
+            "cargo.build",
+            "build-evidence.json",
+            &["build", "--workspace", "--offline"],
+        )?;
+        assert_eq!(build["work"]["cargo.build"]["complete"], true, "{build:#}");
+        let mut stale = build;
+        stale["source_base"] = Value::String("0".repeat(40));
+        let stale = sign_planning_evidence(stale)?;
+        let stale_path = write_evidence(&ws, "stale-build-evidence.json", &stale)?;
+        let build_path = ws.path.join("target/build-evidence.json");
+        let build_path = build_path.to_str().context("non-UTF-8 evidence path")?;
+        std::fs::write(ws.path.join("README.md"), "# Fixture\n\nMore.\n")?;
+        let combined = plan(
+            &ws,
+            &["--since", "HEAD", "--evidence", evidence_path, "--evidence", build_path],
+        )?;
+        assert_eq!(combined["work"]["cargo.test"]["state"], "skipped");
+        assert_eq!(combined["work"]["cargo.build"]["state"], "skipped");
+        assert_eq!(combined["inputs"]["evidence"].as_array().map(Vec::len), Some(2));
+        let widened = plan(
+            &ws,
+            &[
+                "--since",
+                "HEAD",
+                "--evidence",
+                evidence_path,
+                "--evidence",
+                &stale_path,
+            ],
+        )?;
+        assert_eq!(widened["work"]["cargo.test"]["state"], "skipped");
+        assert_eq!(widened["work"]["cargo.build"]["cause"], "incomplete_evidence");
+        let duplicated = plan(
+            &ws,
+            &[
+                "--since",
+                "HEAD",
+                "--evidence",
+                evidence_path,
+                "--evidence",
+                &warm_path(&ws)?,
+            ],
+        )?;
+        assert_eq!(
+            duplicated["work"]["cargo.test"]["state"], "skipped",
+            "identical manifests are one"
+        );
+        restore()?;
+
+        let partial = record("partial-evidence.json", &["-p", "data"])?;
+        assert_eq!(partial["work"]["cargo.test"]["complete"], false);
+        assert!(
+            partial["work"]["cargo.test"]["bypasses"]
+                .as_array()
+                .is_some_and(|bypasses| bypasses.iter().any(|reason| reason == "workspace_member_unobserved")),
+            "{partial:#}"
+        );
         Ok(())
     })();
     super::helpers::finish_test(result);

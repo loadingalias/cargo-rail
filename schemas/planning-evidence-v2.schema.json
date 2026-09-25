@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/loadingalias/cargo-rail/main/schemas/planning-evidence-v1.schema.json",
-  "title": "cargo-rail portable planning evidence v1",
+  "$id": "https://raw.githubusercontent.com/loadingalias/cargo-rail/main/schemas/planning-evidence-v2.schema.json",
+  "title": "cargo-rail portable planning evidence v2",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -19,8 +19,8 @@
     "work"
   ],
   "properties": {
-    "planning_evidence_version": { "const": 1 },
-    "identity": { "type": "string", "pattern": "^planning-evidence-v1:sha256:[0-9a-f]{64}$" },
+    "planning_evidence_version": { "const": 2 },
+    "identity": { "type": "string", "pattern": "^planning-evidence-v2:sha256:[0-9a-f]{64}$" },
     "provider": { "$ref": "#/$defs/provider" },
     "source_base": { "type": "string", "minLength": 1 },
     "cargo_identity": { "type": "string", "pattern": "^resolution-universe-v[0-9]+:sha256:[0-9a-f]{64}$" },
@@ -115,7 +115,7 @@
     "work": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["complete", "bypasses", "inputs"],
+      "required": ["complete", "bypasses", "inputs", "directories"],
       "properties": {
         "complete": { "type": "boolean" },
         "bypasses": { "$ref": "#/$defs/string_array" },
@@ -123,7 +123,22 @@
           "type": "array",
           "maxItems": 100000,
           "items": { "$ref": "#/$defs/input" }
+        },
+        "directories": {
+          "type": "array",
+          "maxItems": 100000,
+          "items": { "$ref": "#/$defs/directory" }
         }
+      }
+    },
+    "directory": {
+      "description": "A directory whose every current and future entry is an input; '.' names the whole workspace.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "package"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "package": { "type": "string", "minLength": 1 }
       }
     },
     "input": {

@@ -15,9 +15,11 @@ use crate::source::{ChangeSet, SourceContentIdentity};
 use crate::workspace::WorkspaceContext;
 
 mod evidence;
+mod record;
 mod source_features;
 mod work;
 
+pub(crate) use record::{RECORD_INNER_WRAPPER, RecordBindings, record_compiler_invocation, record_planning_evidence};
 pub(crate) use work::{
     WorkCause, WorkDecision, WorkInputKind, WorkPlan, WorkPlanAuthority, build_work_plan, format_work_plan,
     host_platform, validate_saved_work_plan,

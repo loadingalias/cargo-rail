@@ -181,16 +181,98 @@ Store a transferred plan outside the checkout; an unignored plan file inside it 
 
 ## Observed-input evidence
 
-Pass compatible evidence explicitly:
+Without evidence, a changed file that a compiler, build script,
+or procedural macro could read widens every built-in Cargo work item, even a README.
+Record portable evidence from the ordinary build of the commit that later changes compare against:
 
 ```bash
-cargo rail plan --evidence planning-evidence.json --json
+cargo rail plan evidence --work cargo.test --output target/planning-evidence/cargo.test.json \
+  -- test --workspace --locked --no-run
+cargo rail plan --evidence target/planning-evidence/cargo.test.json --explain-work cargo.test
 ```
 
-[`planning-evidence-v1.schema.json`](../schemas/planning-evidence-v1.schema.json) binds evidence to its source, Cargo universe, configuration,
-toolchain, target, platform, provider capabilities, and work kind.
-Evidence proves a skip only when every relevant input class is complete and has no bypass.
-Missing, stale, malformed, or cross-platform evidence widens only its owning work.
+The command runs Cargo with a recorder as `RUSTC_WRAPPER`.
+The recorder notes each workspace compiler invocation and runs the compiler unchanged, so outputs,
+Cargo freshness, and any configured wrapper, such as the compiler cache, behave as usual.
+Afterward Cargo-Rail reads the dep-info file rustc wrote for every workspace unit
+and the rerun declarations of every build script.
+A unit that Cargo reports as fresh keeps the dep-info of its last compile,
+which is the input set Cargo just checked, so recording also works on a warm target directory.
+Each input is bound to its Git object at `HEAD`.
+The command fails without writing evidence when the build fails or a tracked file differs from `HEAD`.
+Cargo diagnostics and test output go to standard error.
+
+Record `cargo.build`, `cargo.clippy`, and `cargo.test`, one work item per run.
+Use the packages, targets, features, and profile of the command the job runs:
+evidence covers only what the recorded build compiled,
+and the planner applies it to the whole work item.
+Every workspace member must compile at least one unit, or the evidence is incomplete.
+Writing to an existing file keeps its other work items when the bindings match.
+Documentation, doctest, and packaging work have no recorder and keep widening.
+
+The evidence follows Cargo's own rebuild model:
+
+- A changed file selects every package whose units read it,
+  plus the packages whose builds depend on them.
+  A changed integration-test input selects only that test target.
+- A build script's `rerun-if-changed` paths are inputs; a declared directory also covers files added to it.
+  A script that declares no path depends on every file in its package.
+- A procedural macro's reads count only when the macro reports them to the compiler,
+  as Cargo requires.
+  A macro that reads a file without reporting it can go stale under Cargo too.
+- An added `clippy.toml` or `.clippy.toml` always selects `cargo.clippy`, because dep-info names only files that exist.
+- Test runtime reads, such as a fixture a test opens, are not compiler inputs.
+  Declare them as repository work.
+
+Cargo-Rail marks the work item incomplete, and the planner keeps widening it,
+when a unit's dep-info is unavailable, a unit reads an untracked file that Git does not ignore,
+a unit reads a repository file outside the workspace,
+a build script declares a missing path or a directory with no tracked files,
+or an input names a secret-like environment variable.
+The command lists what it could not observe.
+
+Pass one `--evidence` per file.
+[`planning-evidence-v2.schema.json`](../schemas/planning-evidence-v2.schema.json) binds each manifest to its source commit, Cargo universe,
+Cargo configuration, toolchain, target, platform, provider capabilities, and work items.
+Each file is validated separately.
+A missing, stale, malformed, or foreign file, or two files for one work item,
+widens only the work items without other compatible evidence.
+The plan lists the identities of the manifests it used,
+and `--explain-work` names the manifest behind each observed decision.
+
+### Transfer evidence in CI
+
+Record in the jobs that already build on the default branch, and save the file by commit:
+
+```yaml
+- name: Build tests and record planning evidence
+  run: >
+    cargo rail plan evidence --work cargo.test
+    --output target/planning-evidence/cargo.test.json
+    -- test --workspace --locked --no-run
+- run: cargo test --workspace --locked
+- uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+  if: github.event_name == 'push'
+  with:
+    path: target/planning-evidence/cargo.test.json
+    key: cargo-rail-evidence-${{ runner.os }}-${{ runner.arch }}-cargo.test-${{ github.sha }}
+```
+
+The later test run finds every unit fresh, so recording adds no compilation.
+Before planning, restore the evidence of the comparison base.
+For the default pull-request checkout, a merge commit, the base is the pull request's base commit:
+
+```yaml
+- uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+  with:
+    path: target/planning-evidence/cargo.test.json
+    key: cargo-rail-evidence-${{ runner.os }}-${{ runner.arch }}-cargo.test-${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+```
+
+Repeat the save and restore for each recorded work item,
+and pass the directory to the [companion Action](https://github.com/loadingalias/cargo-rail-action)'s `evidence` input.
+A cache miss, or evidence for a different base, only widens.
+Keep the directory ignored by Git; an unignored file would be a changed path.
 
 A plan identity compares decisions.
 It is not a cache key and never authorizes compiler-result reuse.
@@ -263,15 +345,16 @@ A passing case is diagnostic.
 It never becomes evidence that work can be skipped.
 Without compatible portable evidence, an unrelated file can still widen Cargo work,
 because compiler macros, build scripts, and procedural macros can read repository files.
-Record that expansion as a limitation, not as a routing failure to work around with path patterns.
+Record [observed-input evidence](#observed-input-evidence) to skip it; do not work around the expansion with path patterns.
 
 Each check proves one claim:
 
-| Command                                  | Proves |
-| ---------------------------------------- | ------ |
-| `cargo rail config validate --strict`    | Policy is valid for this workspace's Cargo graph. |
-| `cargo rail plan --all --json`           | Every registered work item has valid full scope. It proves no routing decision. |
-| `cargo rail plan --cases FILE`           | The reviewed path cases route as expected from `HEAD`. |
-| `cargo rail plan --explain-work WORK_ID` | Why one work item was required or skipped, including its paths and evidence. |
+| Command                                   | Proves |
+| ----------------------------------------- | ------ |
+| `cargo rail config validate --strict`     | Policy is valid for this workspace's Cargo graph. |
+| `cargo rail plan --all --json`            | Every registered work item has valid full scope. It proves no routing decision. |
+| `cargo rail plan --cases FILE`            | The reviewed path cases route as expected from `HEAD`. |
+| `cargo rail plan --explain-work WORK_ID`  | Why one work item was required or skipped, including its paths and evidence. |
+| `cargo rail plan evidence --work WORK_ID` | Which workspace files the recorded build read, bound to `HEAD`. |
 
 Start with `--explain-work` when one job runs or skips unexpectedly.

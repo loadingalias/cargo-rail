@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rscrypto::Sha256;
 use serde::{Deserialize, Serialize};
@@ -18,7 +18,7 @@ pub(super) struct EvidenceBindings<'a> {
     pub(super) target_identity: &'a str,
 }
 
-const EVIDENCE_VERSION: u32 = 1;
+pub(super) const EVIDENCE_VERSION: u32 = 2;
 const EVIDENCE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const EVIDENCE_MAX_WORK: usize = 256;
 const EVIDENCE_MAX_INPUTS: usize = 100_000;
@@ -52,7 +52,7 @@ pub(super) struct PlanningEvidenceManifest {
 }
 
 /// Source-bound structural Cargo facts retained for historical scope.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct PortableBaseModel {
     pub(super) packages: Vec<PortableBasePackage>,
@@ -95,10 +95,11 @@ pub(super) enum PortableBaseEdgeDomain {
 #[serde(deny_unknown_fields)]
 pub(super) struct ObservedWorkEvidence {
     pub(super) complete: bool,
-    #[serde(default)]
     pub(super) bypasses: Vec<String>,
-    #[serde(default)]
     pub(super) inputs: Vec<ObservedInput>,
+    /// Directories whose every current and future entry is an input, such as the package
+    /// sources of a build script that declares no `rerun-if-changed` path.
+    pub(super) directories: Vec<ObservedDirectory>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -110,86 +111,158 @@ pub(super) struct ObservedInput {
     pub(super) target: Option<String>,
 }
 
-#[derive(Debug)]
-pub(super) enum PlanningEvidenceState {
-    Absent,
-    Compatible(Box<PlanningEvidenceManifest>),
-    Incompatible { code: String, description: String },
+/// A directory input. `.` names the whole workspace.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ObservedDirectory {
+    pub(super) path: String,
+    pub(super) package: String,
+}
+
+impl ObservedDirectory {
+    /// Whether a changed workspace-relative path is this directory or lies below it.
+    pub(super) fn covers(&self, path: &str) -> bool {
+        self.path == "."
+            || path == self.path
+            || path
+                .strip_prefix(self.path.as_str())
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    }
+}
+
+/// Every supplied manifest, validated independently.
+///
+/// A compatible manifest contributes its work items. An incompatible manifest, or two
+/// manifests that both describe one work item, leave the affected work without evidence,
+/// so that work widens while other work keeps its compatible evidence.
+#[derive(Debug, Default)]
+pub(super) struct PlanningEvidenceState {
+    manifests: Vec<PlanningEvidenceManifest>,
+    work: BTreeMap<String, usize>,
+    duplicates: BTreeSet<String>,
+    incompatibility: Option<(String, String)>,
 }
 
 impl PlanningEvidenceState {
     pub(super) fn load(
-        path: Option<&Path>,
+        paths: &[PathBuf],
         bindings: EvidenceBindings<'_>,
         cargo_identity: &str,
         ctx: &WorkspaceContext,
     ) -> Self {
-        let Some(path) = path else {
-            return Self::Absent;
-        };
-        let bytes = match read_bounded(path) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                return Self::Incompatible {
-                    code: "planning_evidence_unreadable".to_string(),
-                    description: format!("cannot read planning evidence '{}': {error}", path.display()),
-                };
+        let mut state = Self::default();
+        for path in paths {
+            match load_compatible(path, &bindings, cargo_identity, ctx) {
+                Ok(manifest) => state.admit(manifest),
+                Err((code, description)) => {
+                    state.incompatibility.get_or_insert((code, description));
+                }
             }
-        };
-        let manifest = match serde_json::from_slice::<PlanningEvidenceManifest>(&bytes) {
-            Ok(manifest) => manifest,
-            Err(error) => {
-                return Self::Incompatible {
-                    code: "planning_evidence_malformed".to_string(),
-                    description: format!("cannot parse planning evidence '{}': {error}", path.display()),
-                };
-            }
-        };
-        match validate(manifest, bindings, cargo_identity, ctx) {
-            Ok(manifest) => Self::Compatible(Box::new(manifest)),
-            Err((code, description)) => Self::Incompatible { code, description },
         }
+        state
     }
 
-    pub(super) fn identity(&self) -> Option<&str> {
-        match self {
-            Self::Compatible(manifest) => Some(&manifest.identity),
-            Self::Absent | Self::Incompatible { .. } => None,
+    fn admit(&mut self, manifest: PlanningEvidenceManifest) {
+        if self
+            .manifests
+            .first()
+            .is_some_and(|first| first.base_model != manifest.base_model)
+        {
+            self.incompatibility.get_or_insert_with(|| {
+                (
+                    "planning_evidence_base_model_conflict".to_string(),
+                    "planning evidence manifests describe different base Cargo models".to_string(),
+                )
+            });
+            return;
         }
+        if self
+            .manifests
+            .iter()
+            .any(|existing| existing.identity == manifest.identity)
+        {
+            return;
+        }
+        let index = self.manifests.len();
+        for work in manifest.work.keys() {
+            if self.work.insert(work.clone(), index).is_some() {
+                self.duplicates.insert(work.clone());
+            }
+        }
+        self.manifests.push(manifest);
+    }
+
+    /// Identities of every compatible manifest, in canonical order.
+    pub(super) fn identities(&self) -> Vec<String> {
+        let mut identities = self
+            .manifests
+            .iter()
+            .map(|manifest| manifest.identity.clone())
+            .collect::<Vec<_>>();
+        identities.sort();
+        identities
     }
 
     pub(super) fn work(&self, id: &str) -> Option<&ObservedWorkEvidence> {
-        match self {
-            Self::Compatible(manifest) => manifest.work.get(id),
-            Self::Absent | Self::Incompatible { .. } => None,
+        if self.duplicates.contains(id) {
+            return None;
         }
+        self.work.get(id).and_then(|index| self.manifests[*index].work.get(id))
     }
 
-    pub(super) fn capabilities(&self) -> Option<&BTreeSet<String>> {
-        match self {
-            Self::Compatible(manifest) => Some(&manifest.provider.capabilities),
-            Self::Absent | Self::Incompatible { .. } => None,
-        }
+    /// Capabilities of the manifest that describes `id`.
+    pub(super) fn capabilities(&self, id: &str) -> Option<&BTreeSet<String>> {
+        self.work(id)?;
+        self.work
+            .get(id)
+            .map(|index| &self.manifests[*index].provider.capabilities)
     }
 
     pub(super) fn base_model(&self) -> Option<&PortableBaseModel> {
-        match self {
-            Self::Compatible(manifest) => Some(&manifest.base_model),
-            Self::Absent | Self::Incompatible { .. } => None,
-        }
+        self.manifests.first().map(|manifest| &manifest.base_model)
     }
 
-    pub(super) fn incompatibility(&self) -> Option<(&str, &str)> {
-        match self {
-            Self::Incompatible { code, description } => Some((code, description)),
-            Self::Absent | Self::Compatible(_) => None,
+    /// Why no compatible evidence describes `id`, when a supplied manifest could have.
+    pub(super) fn unusable(&self, id: &str) -> Option<(&str, &str)> {
+        if self.duplicates.contains(id) {
+            return Some((
+                "planning_evidence_work_duplicate",
+                "more than one planning evidence manifest describes this work",
+            ));
         }
+        if self.work.contains_key(id) {
+            return None;
+        }
+        self.incompatibility
+            .as_ref()
+            .map(|(code, description)| (code.as_str(), description.as_str()))
     }
+}
+
+fn load_compatible(
+    path: &Path,
+    bindings: &EvidenceBindings<'_>,
+    cargo_identity: &str,
+    ctx: &WorkspaceContext,
+) -> Result<PlanningEvidenceManifest, (String, String)> {
+    let bytes = read_bounded(path).map_err(|error| {
+        incompatible(
+            "planning_evidence_unreadable",
+            format!("cannot read planning evidence '{}': {error}", path.display()),
+        )
+    })?;
+    let manifest = serde_json::from_slice::<PlanningEvidenceManifest>(&bytes).map_err(|error| {
+        incompatible(
+            "planning_evidence_malformed",
+            format!("cannot parse planning evidence '{}': {error}", path.display()),
+        )
+    })?;
+    validate(manifest, bindings, cargo_identity, ctx)
 }
 
 fn validate(
     mut manifest: PlanningEvidenceManifest,
-    bindings: EvidenceBindings<'_>,
+    bindings: &EvidenceBindings<'_>,
     cargo_identity: &str,
     ctx: &WorkspaceContext,
 ) -> Result<PlanningEvidenceManifest, (String, String)> {
@@ -214,7 +287,13 @@ fn validate(
             format!("planning evidence names more than {EVIDENCE_MAX_WORK} work items"),
         ));
     }
-    if manifest.work.values().map(|work| work.inputs.len()).sum::<usize>() > EVIDENCE_MAX_INPUTS {
+    if manifest
+        .work
+        .values()
+        .map(|work| work.inputs.len() + work.directories.len())
+        .sum::<usize>()
+        > EVIDENCE_MAX_INPUTS
+    {
         return Err(incompatible(
             "planning_evidence_size_invalid",
             format!("planning evidence names more than {EVIDENCE_MAX_INPUTS} observed inputs"),
@@ -341,9 +420,89 @@ fn validate(
             }
         }
     }
+    for (work, evidence) in &manifest.work {
+        for directory in &evidence.directories {
+            if directory.path != "."
+                && crate::config::plan::validate_positive_path(&directory.path, "planning evidence directory", false)
+                    .is_err()
+            {
+                return Err(incompatible(
+                    "planning_evidence_input_invalid",
+                    format!(
+                        "planning evidence for '{work}' contains invalid directory '{}'",
+                        directory.path
+                    ),
+                ));
+            }
+            if !manifest
+                .base_model
+                .packages
+                .iter()
+                .any(|candidate| candidate.key == directory.package)
+            {
+                return Err(incompatible(
+                    "planning_evidence_input_invalid",
+                    format!(
+                        "planning evidence for '{work}' names unknown base package '{}'",
+                        directory.package
+                    ),
+                ));
+            }
+        }
+    }
     revalidate_base_model(ctx, &manifest.source_base, &manifest.base_model)?;
     revalidate_observed_inputs(ctx, &manifest.source_base, &manifest.work)?;
+    revalidate_observed_directories(ctx, &manifest.source_base, &manifest.work)?;
     Ok(manifest)
+}
+
+/// Normalize a producer's manifest and attach its canonical identity.
+pub(super) fn sign_manifest(
+    mut manifest: PlanningEvidenceManifest,
+) -> Result<PlanningEvidenceManifest, (String, String)> {
+    normalize_manifest(&mut manifest)?;
+    manifest.identity = String::new();
+    let encoded = canonical_bytes(&manifest)
+        .map_err(|description| incompatible("planning_evidence_identity_invalid", description))?;
+    manifest.identity = digest_identity(&encoded);
+    Ok(manifest)
+}
+
+/// Read one manifest and verify its contract and identity, without checkout bindings.
+pub(super) fn load_signed_manifest(path: &Path) -> Result<PlanningEvidenceManifest, (String, String)> {
+    let bytes = read_bounded(path).map_err(|error| {
+        incompatible(
+            "planning_evidence_unreadable",
+            format!("cannot read planning evidence '{}': {error}", path.display()),
+        )
+    })?;
+    let manifest = serde_json::from_slice::<PlanningEvidenceManifest>(&bytes).map_err(|error| {
+        incompatible(
+            "planning_evidence_malformed",
+            format!("cannot parse planning evidence '{}': {error}", path.display()),
+        )
+    })?;
+    if manifest.planning_evidence_version != EVIDENCE_VERSION {
+        return Err(incompatible(
+            "planning_evidence_contract_unknown",
+            format!(
+                "planning evidence contract {} is unsupported",
+                manifest.planning_evidence_version
+            ),
+        ));
+    }
+    let claimed = manifest.identity.clone();
+    let signed = sign_manifest(manifest)?;
+    if signed.identity != claimed {
+        return Err(incompatible(
+            "planning_evidence_identity_invalid",
+            format!(
+                "planning evidence identity '{claimed}' does not match '{}'",
+                signed.identity
+            ),
+        ));
+    }
+    Ok(signed)
 }
 
 fn read_bounded(path: &Path) -> std::io::Result<Vec<u8>> {
@@ -368,7 +527,10 @@ fn normalize_manifest(manifest: &mut PlanningEvidenceManifest) -> Result<(), (St
     for (work, evidence) in &mut manifest.work {
         sort_unique(&mut evidence.bypasses, &format!("{work} bypasses"))?;
         evidence.inputs.sort();
-        if evidence.inputs.windows(2).any(|pair| pair[0] == pair[1]) {
+        evidence.directories.sort();
+        if evidence.inputs.windows(2).any(|pair| pair[0] == pair[1])
+            || evidence.directories.windows(2).any(|pair| pair[0] == pair[1])
+        {
             return Err(incompatible(
                 "planning_evidence_input_invalid",
                 format!("planning evidence for '{work}' contains a duplicate input"),
@@ -633,6 +795,51 @@ fn revalidate_observed_inputs(
     Ok(())
 }
 
+/// Require every named directory to hold at least one tracked entry at the base source.
+fn revalidate_observed_directories(
+    ctx: &WorkspaceContext,
+    source_base: &str,
+    work: &BTreeMap<String, ObservedWorkEvidence>,
+) -> Result<(), (String, String)> {
+    let directories = work
+        .values()
+        .flat_map(|evidence| &evidence.directories)
+        .filter(|directory| directory.path != ".")
+        .map(|directory| directory.path.as_str())
+        .collect::<BTreeSet<_>>();
+    if directories.is_empty() {
+        return Ok(());
+    }
+    let repository_path = |path: &str| {
+        ctx.workspace_prefix()
+            .map_or_else(|| std::path::PathBuf::from(path), |prefix| prefix.join(path))
+    };
+    let entries = ctx
+        .git()
+        .and_then(|git| {
+            git.git().collect_tree_entries_for_paths(
+                source_base,
+                &directories.iter().map(|path| repository_path(path)).collect::<Vec<_>>(),
+            )
+        })
+        .map_err(|error| {
+            incompatible(
+                "planning_evidence_input_unverifiable",
+                format!("cannot verify observed directories against the base source: {error}"),
+            )
+        })?;
+    for directory in directories {
+        let root = repository_path(directory);
+        if !entries.iter().any(|entry| entry.path.starts_with(&root)) {
+            return Err(incompatible(
+                "planning_evidence_input_identity_invalid",
+                format!("observed directory '{directory}' has no entries in base source '{source_base}'"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn valid_sha256_identity(identity: &str) -> bool {
     identity
         .strip_prefix("sha256:")
@@ -658,7 +865,7 @@ pub(super) fn required_capabilities(work: &str) -> &'static [&'static str] {
     }
 }
 
-fn secret_capability_name(name: &str) -> bool {
+pub(super) fn secret_capability_name(name: &str) -> bool {
     let normalized = name.to_ascii_lowercase();
     ["credential", "password", "secret", "token"]
         .iter()
@@ -700,12 +907,29 @@ fn digest_identity(bytes: &[u8]) -> String {
         hex.push(char::from(HEX[usize::from(byte >> 4)]));
         hex.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
-    format!("planning-evidence-v1:sha256:{hex}")
+    format!("planning-evidence-v{EVIDENCE_VERSION}:sha256:{hex}")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::secret_capability_name;
+    use super::{ObservedDirectory, secret_capability_name};
+
+    #[test]
+    fn directory_inputs_cover_their_entries_and_the_workspace_root_covers_everything() {
+        let directory = ObservedDirectory {
+            path: "crates/gen/schema".to_string(),
+            package: "gen@0.1.0#path:crates/gen".to_string(),
+        };
+        assert!(directory.covers("crates/gen/schema/new.json"));
+        assert!(directory.covers("crates/gen/schema"));
+        assert!(!directory.covers("crates/gen/schema-old/new.json"));
+        assert!(!directory.covers("crates/gen/build.rs"));
+        let root = ObservedDirectory {
+            path: ".".to_string(),
+            package: "root@0.1.0#path:".to_string(),
+        };
+        assert!(root.covers("README.md"));
+    }
 
     #[test]
     fn secret_capability_environment_names_are_rejected() {

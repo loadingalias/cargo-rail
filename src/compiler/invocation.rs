@@ -225,6 +225,12 @@ pub fn dispatch() -> PreClapDispatch {
         eprintln!("cargo-rail compiler invocation: {error}");
         return PreClapDispatch::Exit(2);
     }
+    // The staged recorder is identified by its private context alone, which no inherited
+    // marker can forge, so it runs before any other compiler role is classified.
+    if crate::compiler::view_context::context_var_os(crate::compiler::view_context::EVIDENCE_RECORDER_MARKER).is_some()
+    {
+        return PreClapDispatch::Exit(run_evidence_recorder());
+    }
     if let Some(exit_code) = crate::remote_cache::run_coordinator_if_requested() {
         return PreClapDispatch::Exit(exit_code);
     }
@@ -669,6 +675,29 @@ fn run_transparently(mut command: Command, context: &str) -> i32 {
             1
         }
     }
+}
+
+/// Record one compiler invocation for planning evidence, then run it unchanged.
+fn run_evidence_recorder() -> i32 {
+    const CONTEXT: &str = "cargo-rail evidence recorder";
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let Some((program, compiler_arguments)) = arguments.split_first() else {
+        eprintln!("{CONTEXT}: missing compiler executable");
+        return 2;
+    };
+    if let Err(error) = crate::planning::record_compiler_invocation(&arguments) {
+        eprintln!("{CONTEXT}: {error}");
+        return 2;
+    }
+    let command = match crate::compiler::view_context::context_var_os(crate::planning::RECORD_INNER_WRAPPER) {
+        Some(inner) => {
+            let mut command = Command::new(inner);
+            command.arg(program).args(compiler_arguments);
+            command
+        }
+        None => CompilerInvocation::selected(program.clone(), compiler_arguments.to_vec()).command(),
+    };
+    run_transparently(command, CONTEXT)
 }
 
 fn is_unmarked_recursive_wrapper_invocation() -> bool {

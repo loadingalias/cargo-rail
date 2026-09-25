@@ -86,6 +86,18 @@ Without comparison flags, use changes since the default-branch merge base.
 
 Use --verify - to read the saved plan from standard input.";
 
+const PLAN_EVIDENCE_HELP: &str = "\
+Record the build the job runs, with the same packages, targets, features, and profile,
+on the commit that later changes compare against. Units that are already fresh are read
+from the dep-info Cargo keeps for them, so the build can run on a warm target directory.
+Evidence stays incomplete when a workspace member or a unit's inputs are not observed.
+The command writes no evidence when the build fails or tracked files differ from HEAD.
+Cargo diagnostics and program output go to standard error.
+
+  cargo rail plan evidence --work cargo.test -o planning-evidence.json -- test --workspace --no-run
+  cargo rail plan evidence --work cargo.clippy -o planning-evidence.json -- clippy --workspace --all-targets
+  cargo rail plan --evidence planning-evidence.json --explain-work cargo.test";
+
 const SURFACE_HELP: &str = "\
 Set `[surface] enabled = true` to include this gate in planner-selected CI.
 Use `consumer_scope = \"workspace\"` only when each closed compiler crate has no
@@ -220,8 +232,11 @@ pub enum Commands {
     },
 
     /// Build an evidence-backed named-work plan
-    #[command(after_long_help = PLAN_HELP)]
+    #[command(after_long_help = PLAN_HELP, args_conflicts_with_subcommands = true)]
     Plan {
+        /// Produce portable planning evidence instead of a plan
+        #[command(subcommand)]
+        command: Option<PlanCommand>,
         /// Compare against this Git ref (default: default-branch merge base)
         #[arg(long)]
         since: Option<String>,
@@ -243,9 +258,9 @@ pub enum Commands {
         /// Require every registered work item with full valid scope
         #[arg(long)]
         all: bool,
-        /// Load compatible observed-input evidence from a file
+        /// Load compatible observed-input evidence from a file; repeat for one file per work item
         #[arg(long, value_name = "PATH")]
-        evidence: Option<PathBuf>,
+        evidence: Vec<PathBuf>,
         /// Validate one saved plan and its checkout binding; use `-` for standard input
         #[arg(
             long,
@@ -525,6 +540,29 @@ impl Commands {
             _ => false,
         }
     }
+}
+
+/// Subcommands for `cargo rail plan`.
+#[derive(Subcommand, Debug, Clone)]
+pub enum PlanCommand {
+    /// Record portable planning evidence from one ordinary Cargo build of HEAD
+    ///
+    /// Cargo runs the build with a recorder as its rustc wrapper. The evidence lists the
+    /// workspace files each compiled unit read and the rerun inputs of each build script,
+    /// bound to HEAD, the Cargo universe, configuration, toolchain, target, and platform.
+    /// Pass it to `cargo rail plan --evidence` for a later change based on this commit.
+    #[command(after_long_help = PLAN_EVIDENCE_HELP)]
+    Evidence {
+        /// Built-in Cargo work item this build executes
+        #[arg(long, value_name = "WORK_ID")]
+        work: String,
+        /// Evidence file to write; evidence for other work items in it is kept
+        #[arg(long, short = 'o', value_name = "PATH")]
+        output: PathBuf,
+        /// The Cargo subcommand and arguments of the build, after `--`
+        #[arg(last = true, required = true, value_name = "CARGO_ARGS")]
+        cargo_args: Vec<String>,
+    },
 }
 
 /// Subcommands for `cargo rail doctor`.

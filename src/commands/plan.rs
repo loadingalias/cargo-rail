@@ -24,8 +24,8 @@ pub struct PlanOptions {
     pub explain_work: Option<String>,
     /// Monotonically require every registered work item.
     pub all: bool,
-    /// Optional portable observed-input evidence.
-    pub evidence: Option<PathBuf>,
+    /// Portable observed-input evidence manifests.
+    pub evidence: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -263,6 +263,70 @@ pub fn run_plan(ctx: &WorkspaceContext, opts: PlanOptions) -> RailResult<()> {
     Ok(())
 }
 
+/// Record portable planning evidence from one ordinary Cargo build of HEAD.
+pub fn run_plan_evidence(
+    ctx: &WorkspaceContext,
+    work: &str,
+    output: &std::path::Path,
+    cargo_args: &[String],
+    json: bool,
+) -> RailResult<()> {
+    let started = std::time::Instant::now();
+    let cargo_configuration_identity = ctx.planning_cargo_configuration_identity()?;
+    let toolchain_identity = planning_toolchain_identity(ctx)?;
+    let summary = crate::planning::record_planning_evidence(
+        ctx,
+        work,
+        output,
+        cargo_args,
+        crate::planning::RecordBindings {
+            target_identity: planning_target_identity(&cargo_configuration_identity, &toolchain_identity),
+            cargo_configuration_identity,
+            toolchain_identity,
+        },
+    )?;
+    let elapsed = started.elapsed();
+    let mut stdout = std::io::stdout().lock();
+    if json {
+        let mut value = serde_json::to_value(&summary)?;
+        value["elapsed_ms"] = serde_json::Value::from(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX));
+        writeln!(stdout, "{}", serde_json::to_string_pretty(&value)?)?;
+        return Ok(());
+    }
+    writeln!(
+        stdout,
+        "Recorded {} evidence for {} in {} ({} bytes, {:.1}s)",
+        summary.work,
+        summary.source_base.get(..12).unwrap_or(&summary.source_base),
+        summary.output.display(),
+        summary.bytes,
+        elapsed.as_secs_f64()
+    )?;
+    writeln!(
+        stdout,
+        "  {} compiled unit(s), {} file input(s), {} directory input(s)",
+        summary.units, summary.inputs, summary.directories
+    )?;
+    if summary.complete {
+        writeln!(
+            stdout,
+            "  Complete: a later plan can skip {} when no input changed",
+            summary.work
+        )?;
+    } else {
+        writeln!(
+            stdout,
+            "  Incomplete ({}): plans keep widening {}",
+            summary.bypasses.join(", "),
+            summary.work
+        )?;
+        for unit in &summary.unobserved_units {
+            writeln!(stdout, "    not observed: {unit}")?;
+        }
+    }
+    Ok(())
+}
+
 fn build_work_plan(ctx: &WorkspaceContext, opts: &PlanOptions) -> RailResult<crate::planning::WorkPlan> {
     let comparison = opts.comparison.clone().resolve(ctx, opts.all)?;
     let planning_index = collect_planning_index(ctx, &comparison)?;
@@ -302,7 +366,7 @@ fn build_work_plan(ctx: &WorkspaceContext, opts: &PlanOptions) -> RailResult<cra
         planning_index,
         authority,
         &semantic_changes,
-        opts.evidence.as_deref(),
+        &opts.evidence,
         opts.all,
     )
 }

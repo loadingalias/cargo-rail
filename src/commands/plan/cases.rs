@@ -81,7 +81,7 @@ pub(crate) fn run_plan_cases(
                 explain: false,
                 explain_work: None,
                 all: false,
-                evidence: None,
+                evidence: Vec::new(),
             },
         )?;
         let outcome = evaluate(case, &plan)?;

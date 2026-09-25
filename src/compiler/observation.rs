@@ -2619,7 +2619,7 @@ pub(crate) fn is_secret_name(name: &str) -> bool {
 
 /// Variables Cargo sets for each compilation. Package identity is keyed, and the location
 /// variables name sandbox or checkout paths whose contents are bound elsewhere.
-fn is_cargo_provided_environment(name: &str) -> bool {
+pub(crate) fn is_cargo_provided_environment(name: &str) -> bool {
     name.starts_with("CARGO_PKG_")
         || name.starts_with("CARGO_BIN_EXE_")
         || matches!(
