@@ -79,6 +79,7 @@ else:
                 self.assertEqual([call['args'] for call in calls], [
                     ['cargo', 'fmt', '--all', '--', '--check'],
                     ['cargo', 'clippy', '--workspace', '--all-targets', '--all-features', '--locked'],
+                    ['cargo', 'clippy', '--workspace', '--all-targets', '--locked'],
                     ['cargo', 'deny', '--locked', '--workspace', '--all-features', 'check', '-D', 'warnings', 'all'],
                     ['cargo', 'rail', 'unify', '--check', '--explain'],
                     ['cargo', 'doc', '--workspace', '--no-deps', '--all-features', '--locked'],
@@ -86,8 +87,8 @@ else:
                     ['cargo', 'clippy', '--manifest-path', driver, '--all-targets', '--all-features', '--locked', '--', '-D', 'warnings'],
                     ['cargo', 'test', '--manifest-path', driver, '--all-targets', '--all-features', '--locked'],
                 ])
-                self.assertEqual(calls[4]['rustdocflags'], '-C debuginfo=0 -D warnings')
-                self.assertEqual([call['bootstrap'] for call in calls[5:]], ['cargo_rail_fact_driver'] * 3)
+                self.assertEqual(calls[5]['rustdocflags'], '-C debuginfo=0 -D warnings')
+                self.assertEqual([call['bootstrap'] for call in calls[6:]], ['cargo_rail_fact_driver'] * 3)
 
     def test_local_check_runs_only_shared_tests_and_workstation_checks(self):
         shared = self.run_recipe('ci-check')
@@ -166,7 +167,7 @@ else:
     def test_shared_failure_stops_local_cross_checks_and_dogfooding(self):
         self.environment['CHECK_FAIL_COMMAND'] = 'deny'
         calls = self.run_recipe('check', success=False)
-        self.assertEqual([call['args'][1] for call in calls], ['fmt', 'clippy', 'deny'])
+        self.assertEqual([call['args'][1] for call in calls], ['fmt', 'clippy', 'clippy', 'deny'])
 
 
 if __name__ == '__main__':

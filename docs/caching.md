@@ -250,6 +250,11 @@ r2://ACCOUNT_ID/BUCKET/PREFIX
 azure://ACCOUNT/CONTAINER/PREFIX
 ```
 
+Native release archives include both providers.
+A source build includes them only with Cargo features: `s3` covers S3 and R2, and `azure` covers Azure Blob,
+as in `cargo install cargo-rail --locked --features s3,azure`.
+A build without the provider rejects its URL during setup and names the missing feature.
+
 ### Cloudflare R2
 
 Use a private, [default-jurisdiction bucket](https://developers.cloudflare.com/r2/reference/data-location/) with public access disabled.

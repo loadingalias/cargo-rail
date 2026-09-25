@@ -782,7 +782,7 @@ pub(crate) fn plan_setup(
         None
     } else if let Some(remote_url) = request.remote_url {
         let selection = RemoteCacheSelection::parse(remote_url, request.remote_mode, request.remote_environment)
-            .map_err(|error| RailError::message(format!("remote cache URL is invalid: {error}")))?;
+            .map_err(|error| RailError::message(format!("cannot use remote cache URL: {error}")))?;
         Some(InstalledRemoteCache::from_selection(&selection))
     } else if request.remote_mode.is_some() || !request.remote_environment.is_empty() {
         return Err(RailError::message(

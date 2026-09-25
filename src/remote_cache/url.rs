@@ -58,6 +58,14 @@ pub(super) struct RemoteCacheAuthority {
     identity: RemoteAuthorityId,
 }
 
+/// A remote provider this build omits; release archives include every provider.
+pub(super) fn provider_not_built(feature: &str) -> RemoteStoreError {
+    RemoteStoreError::configuration(format!(
+        "this cargo-rail build omits the `{feature}` remote cache provider; \
+         install a native release archive, or run `cargo install cargo-rail --locked --features {feature}`"
+    ))
+}
+
 impl RemoteCacheAuthority {
     pub(super) fn parse(value: &str) -> RemoteStoreResult<Self> {
         validate_url_bytes(value)?;
@@ -79,6 +87,8 @@ impl RemoteCacheAuthority {
             ));
         }
         match scheme {
+            "s3" | "r2" | "s3+http" if !cfg!(feature = "s3") => Err(provider_not_built("s3")),
+            "azure" if !cfg!(feature = "azure") => Err(provider_not_built("azure")),
             "s3" => Self::parse_aws(authority, path, query),
             "azure" => Self::parse_azure(authority, path, query),
             "r2" => Self::parse_r2(authority, path, query),

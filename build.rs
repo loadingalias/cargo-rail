@@ -2,7 +2,9 @@
 
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");
-    if let Err(error) = embed_benchmark_workload() {
+    if std::env::var_os("CARGO_FEATURE_BENCH").is_some()
+        && let Err(error) = embed_benchmark_workload()
+    {
         println!("cargo::error=failed to embed cache benchmark workload: {error}");
         return;
     }

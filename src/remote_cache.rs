@@ -4,10 +4,12 @@
 //! private transparent-cache setup receipt. Repository configuration cannot
 //! name, enable, or promote remote storage.
 
+#[cfg(feature = "azure")]
 mod azure;
 mod coordinator;
 mod evidence;
 mod object;
+#[cfg(feature = "s3")]
 mod s3;
 mod url;
 

@@ -6,9 +6,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-use super::{
-    RemoteCacheMode, RemoteCacheSelection, RemoteProtocolMarkerState, RemoteStoreError, RemoteStoreResult, azure, s3,
-};
+#[cfg(feature = "azure")]
+use super::azure;
+#[cfg(feature = "s3")]
+use super::s3;
+use super::{RemoteCacheMode, RemoteCacheSelection, RemoteProtocolMarkerState, RemoteStoreError, RemoteStoreResult};
 use crate::compiler::native_cache::pack::NativeAssociation;
 
 pub(super) const OBJECT_NAMESPACE: &str = "native-v6";
@@ -255,16 +257,27 @@ pub(super) enum PutOutcome {
 }
 
 enum Backend {
+    #[cfg(feature = "azure")]
     Azure(Box<azure::AzureBackend>),
+    #[cfg(feature = "s3")]
     S3(s3::S3Backend),
+    /// Never constructed: without a provider, parsing and `connect` reject every remote.
+    #[cfg(not(any(feature = "s3", feature = "azure")))]
+    Unavailable,
 }
 
 impl Backend {
     fn connect(selection: &RemoteCacheSelection) -> RemoteStoreResult<Self> {
         if selection.authority.is_azure_blob() {
-            azure::connect(selection).map(Box::new).map(Self::Azure)
+            #[cfg(feature = "azure")]
+            return azure::connect(selection).map(Box::new).map(Self::Azure);
+            #[cfg(not(feature = "azure"))]
+            return Err(super::url::provider_not_built("azure"));
         } else if selection.authority.supports_s3_transport() {
-            s3::connect(selection).map(Self::S3)
+            #[cfg(feature = "s3")]
+            return s3::connect(selection).map(Self::S3);
+            #[cfg(not(feature = "s3"))]
+            return Err(super::url::provider_not_built("s3"));
         } else {
             Err(RemoteStoreError::configuration(
                 "selected remote provider is not qualified for direct transport",
@@ -274,50 +287,88 @@ impl Backend {
 
     fn metrics(&self) -> TransferMetrics {
         match self {
+            #[cfg(feature = "azure")]
             Self::Azure(store) => store.metrics(),
+            #[cfg(feature = "s3")]
             Self::S3(store) => store.metrics(),
+            #[cfg(not(any(feature = "s3", feature = "azure")))]
+            Self::Unavailable => TransferMetrics::default(),
         }
     }
 
     fn take_metrics(&self) -> TransferMetrics {
         match self {
+            #[cfg(feature = "azure")]
             Self::Azure(store) => store.take_metrics(),
+            #[cfg(feature = "s3")]
             Self::S3(store) => store.take_metrics(),
+            #[cfg(not(any(feature = "s3", feature = "azure")))]
+            Self::Unavailable => TransferMetrics::default(),
         }
     }
 
     fn get_marker(&self, key: &str) -> RemoteStoreResult<Option<Vec<u8>>> {
         match self {
+            #[cfg(feature = "azure")]
             Self::Azure(store) => store.get_marker(key),
+            #[cfg(feature = "s3")]
             Self::S3(store) => store.get_marker(key),
+            #[cfg(not(any(feature = "s3", feature = "azure")))]
+            Self::Unavailable => Err(RemoteStoreError::configuration(
+                "this cargo-rail build has no remote cache provider",
+            )),
         }
     }
 
     fn get_entry(&self, key: &str, base_action_key: &str) -> RemoteStoreResult<Option<StoredEntry>> {
         match self {
+            #[cfg(feature = "azure")]
             Self::Azure(store) => store.get_entry(key, base_action_key),
+            #[cfg(feature = "s3")]
             Self::S3(store) => store.get_entry(key, base_action_key),
+            #[cfg(not(any(feature = "s3", feature = "azure")))]
+            Self::Unavailable => Err(RemoteStoreError::configuration(
+                "this cargo-rail build has no remote cache provider",
+            )),
         }
     }
 
     fn get_bytes(&self, key: &str, maximum: u64) -> RemoteStoreResult<Option<StoredBytes>> {
         match self {
+            #[cfg(feature = "azure")]
             Self::Azure(store) => store.get_bytes(key, maximum),
+            #[cfg(feature = "s3")]
             Self::S3(store) => store.get_bytes(key, maximum),
+            #[cfg(not(any(feature = "s3", feature = "azure")))]
+            Self::Unavailable => Err(RemoteStoreError::configuration(
+                "this cargo-rail build has no remote cache provider",
+            )),
         }
     }
 
     fn put_bytes(&self, key: &str, body: &[u8], condition: PutCondition) -> RemoteStoreResult<PutOutcome> {
         match self {
+            #[cfg(feature = "azure")]
             Self::Azure(store) => store.put_bytes(key, body, condition),
+            #[cfg(feature = "s3")]
             Self::S3(store) => store.put_bytes(key, body, condition),
+            #[cfg(not(any(feature = "s3", feature = "azure")))]
+            Self::Unavailable => Err(RemoteStoreError::configuration(
+                "this cargo-rail build has no remote cache provider",
+            )),
         }
     }
 
     fn put_file(&self, key: &str, body: File, bytes: u64, condition: PutCondition) -> RemoteStoreResult<PutOutcome> {
         match self {
+            #[cfg(feature = "azure")]
             Self::Azure(store) => store.put_file(key, body, bytes, condition),
+            #[cfg(feature = "s3")]
             Self::S3(store) => store.put_file(key, body, bytes, condition),
+            #[cfg(not(any(feature = "s3", feature = "azure")))]
+            Self::Unavailable => Err(RemoteStoreError::configuration(
+                "this cargo-rail build has no remote cache provider",
+            )),
         }
     }
 }

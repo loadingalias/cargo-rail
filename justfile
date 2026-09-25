@@ -48,6 +48,8 @@ check-markdown:
 
 check-clippy:
     cargo clippy --workspace --all-targets --all-features --locked
+    # Plain builds omit the remote providers and the benchmark; keep that build warning-free.
+    cargo clippy --workspace --all-targets --locked
 
 check-dependencies:
     cargo deny --locked --workspace --all-features check -D warnings all

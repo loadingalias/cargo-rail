@@ -54,7 +54,8 @@ GNU Linux archives require glibc 2.39 or newer.
 The workflow does not publish standalone shell or PowerShell installers, musl archives,
 or archives for every host eligible for native caching.
 
-`cargo install cargo-rail --locked` builds the general CLI.
+`cargo install cargo-rail --locked` builds the general CLI without the remote cache providers; add `--features s3,azure` to include them.
+Native archives include both.
 `cargo binstall cargo-rail` can obtain a prebuilt CLI, but does not install the complete companion component set.
 Use the full native archive for immediately available Surface and authenticated compiler reuse,
 or select an independently authenticated [compiler adapter pack](docs/caching.md#select-an-independent-compiler-adapter).

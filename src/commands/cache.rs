@@ -19,7 +19,7 @@ pub(crate) fn run_normalize(
     format: TextJsonOutputFormat,
 ) -> RailResult<()> {
     let selection = crate::remote_cache::RemoteCacheSelection::parse(remote_url, mode, &environment)
-        .map_err(|error| RailError::message(format!("remote cache URL is invalid: {error}")))?;
+        .map_err(|error| RailError::message(format!("cannot use remote cache URL: {error}")))?;
     let status = crate::remote_cache::RemoteCacheConfigurationStatus::from_selection(&selection);
     if format.is_json() {
         let output = crate::output::machine_json_envelope(

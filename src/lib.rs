@@ -24,6 +24,7 @@ macro_rules! println {
 /// Backup and restore for undo operations.
 pub mod backup;
 /// Reproducible cache benchmark workload preparation and execution.
+#[cfg(feature = "bench")]
 pub mod benchmark;
 pub(crate) mod build_script;
 pub(crate) mod cache;
@@ -53,6 +54,14 @@ pub mod output;
 pub(crate) mod planning;
 /// Release planning and publishing.
 pub mod release;
+#[cfg_attr(
+    not(all(feature = "s3", feature = "azure")),
+    expect(dead_code, reason = "a remote provider this build omits leaves its helpers unused")
+)]
+#[cfg_attr(
+    not(any(feature = "s3", feature = "azure")),
+    expect(unused_variables, reason = "without a provider the object backend has no transport")
+)]
 pub(crate) mod remote_cache;
 /// Canonical Git-backed or filesystem-backed source state.
 pub mod source;
