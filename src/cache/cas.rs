@@ -213,6 +213,11 @@ impl LocalCacheSelection {
         })
     }
 
+    /// Whether the machine selected a cache base explicitly, which takes precedence over enrollment.
+    pub(crate) fn explicitly_selected() -> bool {
+        std::env::var_os(CACHE_BASE_ENV).is_some()
+    }
+
     pub(crate) fn from_environment() -> RailResult<Self> {
         let trust_domain = std::env::var_os(CACHE_TRUST_DOMAIN_ENV)
             .map(|value| {

@@ -696,6 +696,7 @@ fn unify_compiles_each_shared_dependency_unit_once() {
 
         let run = |name: &str| -> Result<serde_json::Value> {
             let diagnostics = ws.path.join(name);
+            let started = std::time::Instant::now();
             let output = run_cargo_rail(
                 &ws.path,
                 &[
@@ -712,7 +713,10 @@ fn unify_compiles_each_shared_dependency_unit_once() {
                 "unify must plan removals: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            Ok(read_counters(&diagnostics)?["compiler_acquisition"].clone())
+            let mut acquisition = read_counters(&diagnostics)?["compiler_acquisition"].clone();
+            acquisition["wall_ns"] =
+                serde_json::Value::from(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+            Ok(acquisition)
         };
 
         let cold = run("cold-shared.json")?;
@@ -738,6 +742,24 @@ fn unify_compiles_each_shared_dependency_unit_once() {
         let warm = run("warm-shared.json")?;
         assert_eq!(warm["cargo_views"], 0, "{warm:#}");
         assert_eq!(warm["dependency_compilations"], 0, "{warm:#}");
+        // Budgets: on a quiet native macOS arm64 host (2026-09-25) the cold run took 7.1-7.7 s,
+        // of which Cargo took 2.4-2.6 s, and the warm run took 1.2 s. Acquisition overhead outside
+        // Cargo and the warm run get about three times that, so a loaded host passes while a
+        // return to per-view rebuilds or warm reacquisition fails.
+        const COLD_OVERHEAD_BUDGET_MS: u64 = 15_000;
+        const WARM_WALL_BUDGET_MS: u64 = 4_000;
+        let milliseconds =
+            |value: &serde_json::Value, field: &str| value[field].as_u64().unwrap_or(u64::MAX) / 1_000_000;
+        let cold_overhead = milliseconds(&cold, "wall_ns").saturating_sub(milliseconds(&cold, "cargo_elapsed_ns"));
+        assert!(
+            cold_overhead <= COLD_OVERHEAD_BUDGET_MS,
+            "cold acquisition spent {cold_overhead} ms outside Cargo, above the {COLD_OVERHEAD_BUDGET_MS} ms budget: {cold:#}"
+        );
+        let warm_wall = milliseconds(&warm, "wall_ns");
+        assert!(
+            warm_wall <= WARM_WALL_BUDGET_MS,
+            "warm Unify took {warm_wall} ms, above the {WARM_WALL_BUDGET_MS} ms budget: {warm:#}"
+        );
         Ok(())
     })();
     super::helpers::finish_test(result);

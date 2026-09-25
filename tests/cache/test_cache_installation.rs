@@ -4950,6 +4950,14 @@ fn compiler_analysis_reuses_native_result_only_after_an_exact_binding() {
 
         let cold = run(None)?;
         assert_eq!(cold.status.code(), Some(1), "cold analysis failed: {cold:?}");
+        // An enrolled workspace keeps its compiler evidence in its own profile store;
+        // the unbound default store is neither created nor rewritten.
+        let unbound = cargo_home.path().join("cargo-rail/local-cas-v3");
+        assert!(
+            !unbound.exists(),
+            "enrolled analysis wrote the unbound default store: {}",
+            unbound.display()
+        );
         let usage = || -> Result<serde_json::Value> {
             let status = rail(
                 &workspace.path,

@@ -296,6 +296,9 @@ pub(crate) struct CompilerCacheIdentity {
     wrapper_chain: Vec<CompilerWrapperIdentity>,
     cache_wrapper: CompilerCacheWrapperMetadata,
     analysis_cache: Option<CompilerAnalysisCache>,
+    /// The workspace may be enrolled in a cache profile, so evidence must not fall back to the
+    /// unbound default store when that profile's store is unavailable.
+    cache_profile_possible: bool,
     executable_bypasses: BTreeSet<String>,
     /// Why no compiler evidence or typed facts can be reused for this snapshot.
     cache_bypass_reason: Option<CompilerCacheBypass>,
@@ -1263,8 +1266,10 @@ impl CompilerCacheIdentity {
                 (package.id.clone(), (label, root, package.source.is_some()))
             })
             .collect();
+        let installed = crate::cache::installation::installed_local(snapshot.source_root());
+        let memo_store = SysrootMemoStore::for_installation(&installed);
         let toolchain_fingerprint =
-            executable_toolchain_fingerprint(snapshot.toolchain(), executables, &cargo_rail_executable)?;
+            executable_toolchain_fingerprint(snapshot.toolchain(), executables, &cargo_rail_executable, &memo_store)?;
         let target_fingerprints = target_fingerprints(snapshot)?;
         let lock_fingerprint = snapshot.lockfile_fingerprint();
         let mut lock_closures = HashMap::new();
@@ -1355,12 +1360,9 @@ impl CompilerCacheIdentity {
             CompilerCacheWrapperStatus::Disabled,
             "transparent_cache_owned_by_cargo_configuration",
         );
+        let cache_profile_possible = !matches!(installed, Ok(None));
         let analysis_cache = crate::compiler::capability::host_is_qualified()
-            .then(|| {
-                crate::cache::installation::installed_local(snapshot.source_root())
-                    .ok()
-                    .flatten()
-            })
+            .then(|| installed.ok().flatten())
             .flatten()
             .and_then(|selection| {
                 let cas = LocalCas::open_initialized_selected(selection.cache()).ok()?;
@@ -1405,6 +1407,7 @@ impl CompilerCacheIdentity {
             wrapper_chain,
             cache_wrapper,
             analysis_cache,
+            cache_profile_possible,
             executable_bypasses,
             cache_bypass_reason,
             package_roots,
@@ -1487,7 +1490,7 @@ pub(crate) fn capture_transparent_native_session(
         ExecutableIdentity::capture(rustc_implementation.as_os_str(), &source_root, &source_root)?
             .content_digest()
             .to_string();
-    let memo_path = compiler_sysroot_memo_path(&rustc_sysroot, host_target, Some(cache));
+    let memo_path = compiler_sysroot_memo_path(&rustc_sysroot, host_target, &SysrootMemoStore::Selected(cache));
     let (sysroot_identity, bytes_hashed) =
         compiler_sysroot_fingerprint(&rustc_sysroot, host_target, memo_path.as_deref())?;
     guard.revalidate()?;
@@ -1873,7 +1876,14 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
             .analysis_cache
             .as_ref()
             .and_then(|cache| cache.remote.clone());
-        let cas = LocalCas::open().ok();
+        // An explicit `CARGO_RAIL_CACHE_DIR` wins; otherwise an enrolled workspace keeps evidence
+        // in its profile store, and only a workspace with no profile uses the unbound default store.
+        let cas = match &self.identity.analysis_cache {
+            _ if LocalCacheSelection::explicitly_selected() => LocalCas::open().ok(),
+            Some(cache) => Some(cache.cas.clone()),
+            None if self.identity.cache_profile_possible => None,
+            None => LocalCas::open().ok(),
+        };
         let mut store = CompilerDiagnosticsStore::load_with_cas_and_remote(cas.clone(), remote.clone());
         let fact_store = CompilerFactStore::load_with_cas_and_remote(cas, remote);
         let package_to_member = build_package_member_index(&self.manifests.members);
@@ -5311,12 +5321,18 @@ fn reconcile_exact_artifact_observations(
 /// Capture the exact native-cache toolchain identity for operator inspection.
 pub(crate) fn native_cache_capability(snapshot: &WorkspaceSnapshot) -> RailResult<NativeToolchainCapability> {
     let executables = snapshot.executable_identities()?;
-    capture_native_toolchain_capability(snapshot.toolchain(), executables)
+    let installed = crate::cache::installation::installed_local(snapshot.source_root());
+    capture_native_toolchain_capability(
+        snapshot.toolchain(),
+        executables,
+        &SysrootMemoStore::for_installation(&installed),
+    )
 }
 
 fn capture_native_toolchain_capability(
     toolchain: &ToolchainIdentity,
     executables: &ToolchainExecutableIdentities,
+    memo_store: &SysrootMemoStore<'_>,
 ) -> RailResult<NativeToolchainCapability> {
     fn implementation_digest<'a>(executable: Option<&'a ExecutableIdentity>, name: &str) -> RailResult<&'a str> {
         executable.map(ExecutableIdentity::content_digest).ok_or_else(|| {
@@ -5333,7 +5349,7 @@ fn capture_native_toolchain_capability(
         std::env::consts::ARCH
     );
     let rustc_content_digest = implementation_digest(executables.rustc_implementation(), "rustc")?.to_string();
-    let memo_path = compiler_sysroot_memo_path(toolchain.rustc_sysroot(), toolchain.host_target(), None);
+    let memo_path = compiler_sysroot_memo_path(toolchain.rustc_sysroot(), toolchain.host_target(), memo_store);
     let (sysroot_identity, _) =
         compiler_sysroot_fingerprint(toolchain.rustc_sysroot(), toolchain.host_target(), memo_path.as_deref())?;
 
@@ -5381,8 +5397,9 @@ fn executable_toolchain_fingerprint(
     toolchain: &ToolchainIdentity,
     executables: &ToolchainExecutableIdentities,
     cargo_rail_executable: &ExecutableIdentity,
+    memo_store: &SysrootMemoStore<'_>,
 ) -> RailResult<String> {
-    let memo_path = compiler_sysroot_memo_path(toolchain.rustc_sysroot(), toolchain.host_target(), None);
+    let memo_path = compiler_sysroot_memo_path(toolchain.rustc_sysroot(), toolchain.host_target(), memo_store);
     let (sysroot_identity, _) =
         compiler_sysroot_fingerprint(toolchain.rustc_sysroot(), toolchain.host_target(), memo_path.as_deref())?;
     let mut framed = Vec::from(&b"cargo-rail-executable-toolchain-v3\0"[..]);
@@ -5689,17 +5706,41 @@ fn compiler_sysroot_memo_lookup(sysroot: &Path, host_target: &str) -> Option<Con
     Some(ContentDigest::sha256(&framed))
 }
 
+/// The store that owns the sysroot identity memo for one command.
+pub(crate) enum SysrootMemoStore<'a> {
+    /// The enrolled workspace's profile store.
+    Selected(&'a LocalCacheSelection),
+    /// The store named by `CARGO_RAIL_CACHE_DIR`, or the unbound default store of a
+    /// workspace with no cache profile.
+    Environment,
+    /// Enrollment is unknown; rehash rather than write a store the workspace may not own.
+    Unavailable,
+}
+
+impl<'a> SysrootMemoStore<'a> {
+    pub(crate) fn for_installation(
+        installed: &'a RailResult<Option<crate::cache::installation::InstalledLocalSelection>>,
+    ) -> Self {
+        if LocalCacheSelection::explicitly_selected() {
+            return Self::Environment;
+        }
+        match installed {
+            Ok(Some(selection)) => Self::Selected(selection.cache()),
+            Ok(None) => Self::Environment,
+            Err(_) => Self::Unavailable,
+        }
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn compiler_sysroot_memo_path(
-    sysroot: &Path,
-    host_target: &str,
-    selection: Option<&LocalCacheSelection>,
-) -> Option<PathBuf> {
+fn compiler_sysroot_memo_path(sysroot: &Path, host_target: &str, store: &SysrootMemoStore<'_>) -> Option<PathBuf> {
     let lookup = compiler_sysroot_memo_lookup(sysroot, host_target)?;
-    selection
-        .map_or_else(LocalCas::open, LocalCas::open_initialized_selected)
-        .ok()
-        .map(|cas| cas.sysroot_identity_memo_path(&lookup))
+    match store {
+        SysrootMemoStore::Selected(selection) => LocalCas::open_initialized_selected(selection).ok(),
+        SysrootMemoStore::Environment => LocalCas::open().ok(),
+        SysrootMemoStore::Unavailable => None,
+    }
+    .map(|cas| cas.sysroot_identity_memo_path(&lookup))
 }
 
 /// Select the sysroot identity memo owned by one already open local cache.
@@ -5713,11 +5754,7 @@ pub(crate) fn compiler_sysroot_memo_path_in(cas: &LocalCas, sysroot: &Path, host
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn compiler_sysroot_memo_path(
-    _sysroot: &Path,
-    _host_target: &str,
-    _selection: Option<&LocalCacheSelection>,
-) -> Option<PathBuf> {
+fn compiler_sysroot_memo_path(_sysroot: &Path, _host_target: &str, _store: &SysrootMemoStore<'_>) -> Option<PathBuf> {
     None
 }
 
