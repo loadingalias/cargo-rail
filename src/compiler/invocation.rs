@@ -61,7 +61,7 @@ pub const OBSERVATION_PROTOCOL_ARGUMENT: &str = "--cargo-rail-observation-protoc
 
 /// Compiler-observation process contract implemented by this build.
 #[doc(hidden)]
-pub const OBSERVATION_PROTOCOL_VERSION: u32 = 1;
+pub const OBSERVATION_PROTOCOL_VERSION: u32 = 2;
 
 /// Result of classifying the process before Clap or workspace acquisition.
 #[derive(Debug)]
@@ -221,6 +221,10 @@ pub(crate) fn rustc_command(
 /// Classify and run compiler roles before Clap or workspace acquisition.
 #[must_use]
 pub fn dispatch() -> PreClapDispatch {
+    if let Err(error) = crate::compiler::view_context::activate() {
+        eprintln!("cargo-rail compiler invocation: {error}");
+        return PreClapDispatch::Exit(2);
+    }
     if let Some(exit_code) = crate::remote_cache::run_coordinator_if_requested() {
         return PreClapDispatch::Exit(exit_code);
     }
@@ -230,8 +234,8 @@ pub fn dispatch() -> PreClapDispatch {
             || std::env::var_os(crate::compiler::native_cache::coff::ADAPTER_ENV).is_some(),
         direct_cache: crate::compiler::native_cache::NativeCacheContext::is_direct_invocation(),
         marked_cache: std::env::var_os(CACHE_WRAPPER_MARKER).is_some(),
-        rustc_observation: std::env::var_os(WRAPPER_MARKER).is_some(),
-        rustdoc_observation: std::env::var_os(RUSTDOC_WRAPPER_MARKER).is_some(),
+        rustc_observation: crate::compiler::view_context::var_os(WRAPPER_MARKER).is_some(),
+        rustdoc_observation: crate::compiler::view_context::var_os(RUSTDOC_WRAPPER_MARKER).is_some(),
         rustc_wrapper_argv: rustc_wrapper_argument_shape(),
         doctest_builder: std::env::var_os(FACT_DOCTEST_BUILDER_ENV).is_some() && direct_rustc_argument_shape(),
         doctest_runner: std::env::var_os(FACT_DOCTEST_RUNNER_ENV).is_some(),
@@ -382,13 +386,17 @@ pub fn dispatch_required() -> i32 {
 /// paths from its linked image.
 #[must_use]
 pub fn dispatch_observation_required() -> i32 {
+    if let Err(error) = crate::compiler::view_context::activate() {
+        eprintln!("cargo-rail compiler invocation: {error}");
+        return 2;
+    }
     let signals = InvocationSignals {
         link_adapter: std::env::var_os("CARGO_RAIL_APPLE_LINK_ADAPTER").is_some()
             || std::env::var_os("CARGO_RAIL_ELF_LINK_ADAPTER").is_some()
             || std::env::var_os("CARGO_RAIL_COFF_LINK_ADAPTER").is_some(),
         marked_cache: std::env::var_os(CACHE_WRAPPER_MARKER).is_some(),
-        rustc_observation: std::env::var_os(WRAPPER_MARKER).is_some(),
-        rustdoc_observation: std::env::var_os(RUSTDOC_WRAPPER_MARKER).is_some(),
+        rustc_observation: crate::compiler::view_context::var_os(WRAPPER_MARKER).is_some(),
+        rustdoc_observation: crate::compiler::view_context::var_os(RUSTDOC_WRAPPER_MARKER).is_some(),
         rustc_wrapper_argv: rustc_program_argument_shape(),
         doctest_builder: std::env::var_os(FACT_DOCTEST_BUILDER_ENV).is_some() && direct_rustc_argument_shape(),
         doctest_runner: std::env::var_os(FACT_DOCTEST_RUNNER_ENV).is_some(),
@@ -453,8 +461,8 @@ fn run_direct_cache() -> i32 {
     let configured_workspace_wrapper = std::env::var_os("RUSTC_WORKSPACE_WRAPPER");
     let observation_wrapper = direct_fact_observation_wrapper(
         &invocation,
-        std::env::var_os(WRAPPER_MARKER).is_some(),
-        std::env::var_os(crate::compiler::session::FACT_SESSION_ENV).is_some(),
+        crate::compiler::view_context::var_os(WRAPPER_MARKER).is_some(),
+        crate::compiler::view_context::var_os(crate::compiler::session::FACT_SESSION_ENV).is_some(),
         configured_workspace_wrapper.as_deref(),
     );
     if let Some(reason) = cache_fast_bypass_reason(&invocation, observation_wrapper) {
@@ -678,7 +686,7 @@ fn run_rustc() -> i32 {
         Ok(invocation) => invocation,
         Err(exit_code) => return exit_code,
     };
-    let inner_wrapper = std::env::var_os(INNER_WRAPPER_ENV);
+    let inner_wrapper = crate::compiler::view_context::var_os(INNER_WRAPPER_ENV);
     if is_rustc_information_request(&invocation.arguments) {
         return run_rustc_bypass(invocation, inner_wrapper.as_deref());
     }
@@ -905,7 +913,7 @@ fn is_rustc_information_request(arguments: &[OsString]) -> bool {
 }
 
 fn run_rustdoc() -> i32 {
-    let Some(rustdoc) = std::env::var_os(INNER_RUSTDOC_ENV) else {
+    let Some(rustdoc) = crate::compiler::view_context::var_os(INNER_RUSTDOC_ENV) else {
         eprintln!("cargo-rail rustdoc proxy: missing selected rustdoc executable");
         return 1;
     };
@@ -1003,7 +1011,7 @@ fn run_rustdoc() -> i32 {
         .env_remove(OBSERVATION_SOURCE_ROOT_ENV);
     crate::compiler::native_cache::remove_private_environment(&mut command);
     if let Some(typed) = fact_session.typed().filter(|typed| typed.doctest) {
-        let Some(capability) = std::env::var_os(crate::compiler::session::FACT_SESSION_ENV) else {
+        let Some(capability) = crate::compiler::view_context::var_os(crate::compiler::session::FACT_SESSION_ENV) else {
             eprintln!("cargo-rail rustdoc proxy: typed doctest session capability disappeared");
             return 2;
         };
@@ -1167,9 +1175,10 @@ fn compiler_status_code(status: std::process::ExitStatus) -> i32 {
 }
 
 fn fact_session() -> crate::error::RailResult<Option<crate::compiler::session::CompilerFactSession>> {
-    let capability = std::env::var_os(crate::compiler::session::FACT_SESSION_ENV).map(PathBuf::from);
-    let observation_directory = std::env::var_os(OBSERVATION_DIRECTORY_ENV).map(PathBuf::from);
-    let source_root = std::env::var_os(OBSERVATION_SOURCE_ROOT_ENV).map(PathBuf::from);
+    let capability =
+        crate::compiler::view_context::var_os(crate::compiler::session::FACT_SESSION_ENV).map(PathBuf::from);
+    let observation_directory = crate::compiler::view_context::var_os(OBSERVATION_DIRECTORY_ENV).map(PathBuf::from);
+    let source_root = crate::compiler::view_context::var_os(OBSERVATION_SOURCE_ROOT_ENV).map(PathBuf::from);
     match (capability, observation_directory, source_root) {
         (None, None, None) => Ok(None),
         (Some(capability), Some(observation_directory), Some(source_root)) => {

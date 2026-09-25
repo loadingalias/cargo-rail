@@ -31,7 +31,6 @@ use crate::compiler::facts::{
 use crate::compiler::input_proof::CompilerInputProof;
 use crate::compiler::invocation::{
     CACHE_WRAPPER_MARKER, INNER_RUSTDOC_ENV, INNER_WRAPPER_ENV, OBSERVATION_DIRECTORY_ENV, OBSERVATION_SOURCE_ROOT_ENV,
-    RUSTDOC_WRAPPER_MARKER, WRAPPER_MARKER,
 };
 use crate::compiler::model::{
     COLLECTOR_VERSION, CargoTargetKind, CompilationUnitEvidence, CompilationUnitId, CompilerDiagEntry, CompilerDiagKey,
@@ -1823,6 +1822,8 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
             })
             .transpose()?;
         let mut sandbox_pool = SandboxPool::prepare(self.workspace_root, execution_policy.sandbox_count())?;
+        let shared_wrappers =
+            crate::compiler::view_context::stage(&compiler_observation_wrapper()?, &sandbox_pool.wrapper_directory()?)?;
         progress!(
             "  Compiler sandbox pool: {} (one Cargo process at a time; up to {} resident sandboxes; {} planned views; {} bytes soft; {} bytes hard)",
             sandbox_pool.root().display(),
@@ -2163,6 +2164,7 @@ impl<'a> CompilerDiagnosticsCollector<'a> {
                 package_to_member: &package_to_member,
                 cancellation: &cancellation,
                 artifact_usage: &artifact_usage,
+                wrappers: &shared_wrappers,
             };
             let execution = std::thread::scope(|scope| -> RailResult<()> {
                 let (outcome_tx, outcome_rx) = mpsc::sync_channel(worker_count.saturating_mul(2).max(1));
@@ -3170,6 +3172,7 @@ struct AcquisitionWorkerContext<'a> {
     package_to_member: &'a HashMap<String, String>,
     cancellation: &'a AtomicBool,
     artifact_usage: &'a ArtifactUsageLedger,
+    wrappers: &'a crate::compiler::view_context::StagedWrappers,
 }
 
 struct AcquisitionOutcome<'plan> {
@@ -3367,6 +3370,7 @@ fn execute_acquisition_job<'plan>(
             &mut failed_cargo_targets,
             context.cancellation,
             context.artifact_usage,
+            context.wrappers,
         )
     };
     let sandbox = if result.is_ok() {
@@ -3716,6 +3720,7 @@ fn run_workspace_check(
     failed_cargo_targets: &mut Vec<CompilerAcquisitionCargoTarget>,
     cancellation: &AtomicBool,
     artifact_usage: &ArtifactUsageLedger,
+    wrappers: &crate::compiler::view_context::StagedWrappers,
 ) -> RailResult<WorkspaceCheckOutput> {
     if members != [view.package()] {
         return Err(RailError::message(
@@ -3730,11 +3735,6 @@ fn run_workspace_check(
         .prefix("cargo-rail-compiler-observations-")
         .tempdir()
         .with_context(|| "creating compiler observation directory".to_string())?;
-    let workspace_wrapper = if typed.is_some() {
-        stage_view_workspace_wrapper(&wrapper, observation_directory.path())?
-    } else {
-        wrapper.clone()
-    };
     let doctest_sysroot = if view.compiles_doctests() {
         let typed =
             typed.ok_or_else(|| RailError::message("compile-only doctest view has no typed compiler authority"))?;
@@ -3794,17 +3794,39 @@ fn run_workspace_check(
     )?;
     let args = view.cargo_arguments();
 
+    // Cargo gives its environment to every build script, so the view's private context
+    // travels beside its staged wrappers instead.
+    let mut context = BTreeMap::from([
+        (OBSERVATION_DIRECTORY_ENV, observation_directory.path().as_os_str()),
+        (OBSERVATION_SOURCE_ROOT_ENV, source_root.as_os_str()),
+        (FACT_SESSION_ENV, fact_session.as_os_str()),
+    ]);
+    if view.compiles_doctests() {
+        context.insert(INNER_RUSTDOC_ENV, identity.rustdoc_program.as_os_str());
+    }
+    if typed.is_none()
+        && let Some(inner_wrapper) = existing_workspace_wrapper
+        && inner_wrapper != wrapper.as_os_str()
+    {
+        context.insert(INNER_WRAPPER_ENV, inner_wrapper);
+    }
+    // Typed views stage private wrappers: the fresh path makes Cargo recompile each workspace
+    // unit, so the fact driver emits facts for all of them. Diagnostic views share the command's
+    // stable wrappers, keeping Cargo's `-C metadata` and native results reusable across runs.
+    let typed_wrappers = typed
+        .map(|_| crate::compiler::view_context::stage(&wrapper, observation_directory.path()))
+        .transpose()?;
+    let staged = typed_wrappers.as_ref().unwrap_or(wrappers);
+    let _view_context = staged.begin_view(&context)?;
+
     let mut command = typed.map_or_else(
         || Command::new(&identity.cargo_program),
         |typed| typed.driver.cargo_command(&identity.cargo_program),
     );
+    crate::compiler::native_cache::remove_observation_environment(&mut command);
     command
         .current_dir(workspace_root)
-        .env("RUSTC_WORKSPACE_WRAPPER", &workspace_wrapper)
-        .env(WRAPPER_MARKER, "1")
-        .env(OBSERVATION_DIRECTORY_ENV, observation_directory.path())
-        .env(OBSERVATION_SOURCE_ROOT_ENV, source_root)
-        .env(FACT_SESSION_ENV, fact_session)
+        .env("RUSTC_WORKSPACE_WRAPPER", &staged.rustc)
         .env("CARGO_TARGET_DIR", &cargo_target)
         .env("CARGO_BUILD_BUILD_DIR", &cargo_build)
         .env_remove(CACHE_WRAPPER_MARKER)
@@ -3818,16 +3840,7 @@ fn run_workspace_check(
         command.env("RUSTC", &identity.rustc_program);
     }
     if view.compiles_doctests() {
-        command
-            .env("RUSTDOC", &workspace_wrapper)
-            .env(INNER_RUSTDOC_ENV, &identity.rustdoc_program)
-            .env(RUSTDOC_WRAPPER_MARKER, "1");
-    }
-    if typed.is_none()
-        && let Some(inner_wrapper) = existing_workspace_wrapper
-        && inner_wrapper != wrapper.as_os_str()
-    {
-        command.env(INNER_WRAPPER_ENV, inner_wrapper);
+        command.env("RUSTDOC", &staged.rustdoc);
     }
 
     let bounded = run_artifact_bounded_command(
@@ -4361,20 +4374,6 @@ fn acquisition_interrupted() -> RailError {
 
 fn terminate_process_tree(process: &mut ProcessTree) -> std::io::Result<ProcessTermination> {
     process.terminate()
-}
-
-fn stage_view_workspace_wrapper(wrapper: &Path, directory: &Path) -> RailResult<PathBuf> {
-    let staged = directory.join(format!("cargo-rail-compiler-wrapper{}", std::env::consts::EXE_SUFFIX));
-    fs::hard_link(wrapper, &staged)
-        .or_else(|_| fs::copy(wrapper, &staged).map(|_| ()))
-        .with_context(|| {
-            format!(
-                "staging compiler-observation wrapper '{}' as '{}'",
-                wrapper.display(),
-                staged.display()
-            )
-        })?;
-    Ok(staged)
 }
 
 fn fact_invocation_cache_bypasses(

@@ -23,6 +23,7 @@ pub(crate) mod operation;
 pub(crate) mod scheduler;
 pub(crate) mod session;
 pub(crate) mod target_preflight;
+pub(crate) mod view_context;
 
 pub(crate) use collector::{
     CompilerAcquisitionPreview, CompilerAnalysisMetrics, CompilerArtifactBudget, CompilerCacheIdentity,

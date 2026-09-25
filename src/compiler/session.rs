@@ -488,14 +488,14 @@ fn path_identity(path: &Path) -> String {
 }
 
 #[cfg(unix)]
-fn private_mode(metadata: &fs::Metadata) -> bool {
+pub(crate) fn private_mode(metadata: &fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
 
     metadata.permissions().mode() & 0o077 == 0
 }
 
 #[cfg(not(unix))]
-fn private_mode(_metadata: &fs::Metadata) -> bool {
+pub(crate) fn private_mode(_metadata: &fs::Metadata) -> bool {
     true
 }
 

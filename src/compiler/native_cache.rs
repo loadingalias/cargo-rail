@@ -5534,10 +5534,13 @@ fn active_context() -> Option<&'static NativeCacheContext> {
 }
 
 fn load_analysis_session() -> RailResult<Option<crate::compiler::session::CompilerFactSession>> {
-    let capability = std::env::var_os(crate::compiler::session::FACT_SESSION_ENV).map(PathBuf::from);
+    let capability =
+        crate::compiler::view_context::var_os(crate::compiler::session::FACT_SESSION_ENV).map(PathBuf::from);
     let observation_directory =
-        std::env::var_os(crate::compiler::invocation::OBSERVATION_DIRECTORY_ENV).map(PathBuf::from);
-    let source_root = std::env::var_os(crate::compiler::invocation::OBSERVATION_SOURCE_ROOT_ENV).map(PathBuf::from);
+        crate::compiler::view_context::var_os(crate::compiler::invocation::OBSERVATION_DIRECTORY_ENV)
+            .map(PathBuf::from);
+    let source_root = crate::compiler::view_context::var_os(crate::compiler::invocation::OBSERVATION_SOURCE_ROOT_ENV)
+        .map(PathBuf::from);
     match (capability, observation_directory, source_root) {
         (None, None, None) => Ok(None),
         (Some(capability), Some(observation_directory), Some(source_root)) => {
@@ -8651,7 +8654,9 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
 
     let diagnostic_wrapper = is_diagnostic_workspace_wrapper(program);
     prepare_original_child(command, diagnostic_wrapper);
-    if diagnostic_wrapper && std::env::var_os(crate::compiler::invocation::INNER_WRAPPER_ENV).is_some() {
+    if diagnostic_wrapper
+        && crate::compiler::view_context::var_os(crate::compiler::invocation::INNER_WRAPPER_ENV).is_some()
+    {
         configure_cold(
             command,
             CompilerCacheWrapperStatus::Bypassed,
@@ -10871,10 +10876,10 @@ fn configure_cold(
 }
 
 fn is_diagnostic_workspace_wrapper(program: &OsStr) -> bool {
-    if std::env::var_os(crate::compiler::invocation::WRAPPER_MARKER).is_none() {
+    if crate::compiler::view_context::var_os(crate::compiler::invocation::WRAPPER_MARKER).is_none() {
         return false;
     }
-    if std::env::var_os(crate::compiler::session::FACT_SESSION_ENV).is_some()
+    if crate::compiler::view_context::var_os(crate::compiler::session::FACT_SESSION_ENV).is_some()
         && std::env::var_os("RUSTC_WORKSPACE_WRAPPER").as_deref() == Some(program)
     {
         return true;
@@ -13372,7 +13377,7 @@ pub(crate) fn remove_private_environment(command: &mut Command) {
         .env_remove(coff::EVIDENCE_ENV);
 }
 
-fn remove_observation_environment(command: &mut Command) {
+pub(crate) fn remove_observation_environment(command: &mut Command) {
     command
         .env_remove(crate::compiler::invocation::WRAPPER_MARKER)
         .env_remove(crate::compiler::invocation::INNER_WRAPPER_ENV)

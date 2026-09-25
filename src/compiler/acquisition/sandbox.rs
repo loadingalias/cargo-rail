@@ -179,6 +179,13 @@ impl SandboxPool {
         &self.root
     }
 
+    /// Create the command's observation-wrapper directory, whose path is the same on every run.
+    pub(crate) fn wrapper_directory(&self) -> RailResult<PathBuf> {
+        let directory = self.root.join("wrappers");
+        create_private_directory(&directory)?;
+        Ok(directory)
+    }
+
     pub(crate) fn close(mut self) -> RailResult<()> {
         self.remove_all()?;
         self.closed = true;

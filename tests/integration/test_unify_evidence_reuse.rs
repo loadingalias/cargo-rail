@@ -359,6 +359,54 @@ fn a_dependency_build_script_input_invalidates_its_consumers() {
     crate::helpers::finish_test(result);
 }
 
+/// Compiler evidence runs build scripts with the environment plain Cargo would give them:
+/// no Cargo-Rail session state reaches them, and they can still run their own compiler probes.
+#[test]
+#[expect(
+    clippy::literal_string_with_formatting_args,
+    reason = "the literal is the fixture's build-script source"
+)]
+fn build_scripts_see_no_private_cargo_rail_environment() {
+    let result: Result<()> = (|| {
+        let ws = reuse_workspace()?;
+        fs::write(
+            ws.path.join("crates/other/build.rs"),
+            r#"fn main() {
+    let leaked = [
+        "CARGO_RAIL_RUSTC_WRAPPER",
+        "CARGO_RAIL_RUSTDOC_WRAPPER",
+        "CARGO_RAIL_COMPILER_CACHE_WRAPPER",
+        "CARGO_RAIL_COMPILER_FACT_SESSION",
+        "CARGO_RAIL_COMPILER_OBSERVATION_DIRECTORY",
+        "CARGO_RAIL_COMPILER_OBSERVATION_SOURCE_ROOT",
+        "CARGO_RAIL_COMPILER_OBSERVATION_ONLY",
+        "CARGO_RAIL_INNER_WORKSPACE_WRAPPER",
+        "CARGO_RAIL_INNER_RUSTDOC",
+    ]
+    .into_iter()
+    .filter(|name| std::env::var_os(name).is_some())
+    .collect::<Vec<_>>();
+    assert!(leaked.is_empty(), "private Cargo-Rail environment reached a build script: {leaked:?}");
+    let rustc = std::env::var_os("RUSTC").expect("Cargo sets RUSTC");
+    let probe = match std::env::var_os("RUSTC_WORKSPACE_WRAPPER") {
+        Some(wrapper) => std::process::Command::new(wrapper).arg(rustc).arg("-vV").output(),
+        None => std::process::Command::new(rustc).arg("-vV").output(),
+    }
+    .expect("compiler probe starts");
+    assert!(probe.status.success(), "compiler probe failed: {probe:?}");
+}
+"#,
+        )?;
+        ws.commit("Assert the build-script environment")?;
+
+        let run = unify(&ws, &["unify", "--check"], &[])?;
+        assert_eq!(run.status, Some(1), "{:#}\n{}", run.value, run.stderr);
+        assert!(run.helper_cache("other").is_some(), "{:#}", run.value["evidence_cache"]);
+        Ok(())
+    })();
+    crate::helpers::finish_test(result);
+}
+
 /// A dependency enabled only by a feature is absent from Cargo's default resolution. A view that
 /// enables it still runs its build script, and that view's evidence must be stored and reused.
 #[test]
