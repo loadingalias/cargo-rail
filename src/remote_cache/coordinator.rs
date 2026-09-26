@@ -1090,7 +1090,7 @@ mod tests {
 
     #[test]
     fn dynamic_input_selector_round_trips_over_the_coordinator_protocol() {
-        const SELECTOR: &[u8] = br#"{"version":2,"environment_names":["CARGO_PKG_NAME"],"repository_paths":[".config/target-matrix.json"],"rust_inputs":{"crates":[{"name":"dependency","selected":[{"root":"repository","path":"deps/libdependency.rlib"}]}],"searches":[{"directory":{"root":"repository","path":"deps"},"patterns":[{"prefix":"libdependency","suffix":".rlib"}]}]}}"#;
+        const SELECTOR: &[u8] = br#"{"version":3,"environment_names":["CARGO_PKG_NAME"],"repository_paths":[".config/target-matrix.json"],"rust_inputs":{"crates":[{"name":"dependency","selected":[{"root":"repository","path":"deps/libdependency.rlib"}]}],"searches":[{"directory":{"root":"repository","path":"deps"},"patterns":[{"prefix":"libdependency","suffix":".rlib"}]}]}}"#;
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind listener");
         let selector: crate::compiler::native_cache::NativeDynamicInputSelector =
             serde_json::from_slice(SELECTOR).expect("independent complete selector fixture");
@@ -1125,7 +1125,7 @@ mod tests {
             (&b""[..], Some(object::MAX_METADATA_BYTES + 1), "empty or exceeds its byte bound"),
             (&b"{"[..], None, "selector is malformed"),
             (
-                &br#"{"version":2, "environment_names":[],"repository_paths":[],"rust_inputs":{"crates":[],"searches":[]}}"#[..],
+                &br#"{"version":3, "environment_names":[],"repository_paths":[],"rust_inputs":{"crates":[],"searches":[]}}"#[..],
                 None,
                 "selector is not canonically encoded",
             ),
@@ -1135,7 +1135,7 @@ mod tests {
                 "selector is invalid",
             ),
             (
-                &br#"{"version":2,"environment_names":["A=B"],"repository_paths":[],"rust_inputs":{"crates":[],"searches":[]}}"#[..],
+                &br#"{"version":3,"environment_names":["A=B"],"repository_paths":[],"rust_inputs":{"crates":[],"searches":[]}}"#[..],
                 None,
                 "selector is invalid",
             ),

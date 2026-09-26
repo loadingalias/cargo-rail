@@ -7421,7 +7421,7 @@ mod tests {
         let path = cas.native_environment_selector_path(&key).expect("selector path");
         assert_eq!(
             fs::read(&path).expect("selector bytes"),
-            br#"{"version":2,"environment_names":["CARGO_CFG_TARGET_ARCH","P73_SELECTED"],"repository_paths":[".config/target-matrix.json"],"rust_inputs":{"crates":[],"searches":[]}}"#
+            br#"{"version":3,"environment_names":["CARGO_CFG_TARGET_ARCH","P73_SELECTED"],"repository_paths":[".config/target-matrix.json"],"rust_inputs":{"crates":[],"searches":[]}}"#
         );
         let file = File::open(&path).expect("selector file");
         assert!(
@@ -7827,7 +7827,7 @@ mod tests {
             .expect("noncanonical selector path");
         fs::write(
             &noncanonical_path,
-            br#"{"version":2, "environment_names":["VALID"],"repository_paths":[],"rust_inputs":{"crates":[],"searches":[]}}"#,
+            br#"{"version":3, "environment_names":["VALID"],"repository_paths":[],"rust_inputs":{"crates":[],"searches":[]}}"#,
         )
         .expect("noncanonical selector");
         let error = cas
@@ -7878,7 +7878,7 @@ mod tests {
             .expect("private selector path");
         fs::write(
             private_path,
-            format!(r#"{{"version":2,"environment_names":["{CACHE_BASE_ENV}"],"repository_paths":[],"rust_inputs":{{"crates":[],"searches":[]}}}}"#),
+            format!(r#"{{"version":3,"environment_names":["{CACHE_BASE_ENV}"],"repository_paths":[],"rust_inputs":{{"crates":[],"searches":[]}}}}"#),
         )
         .expect("private selector bytes");
         let error = cas
@@ -7894,7 +7894,7 @@ mod tests {
         let too_many = serde_json::to_string(&too_many).expect("canonical oversized names");
         fs::write(
             too_many_path,
-            format!(r#"{{"version":2,"environment_names":{too_many},"repository_paths":[],"rust_inputs":{{"crates":[],"searches":[]}}}}"#),
+            format!(r#"{{"version":3,"environment_names":{too_many},"repository_paths":[],"rust_inputs":{{"crates":[],"searches":[]}}}}"#),
         )
         .expect("oversized selector bytes");
         let error = cas

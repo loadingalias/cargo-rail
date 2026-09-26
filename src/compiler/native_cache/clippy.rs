@@ -21,11 +21,13 @@ use std::time::Instant;
 use serde::Serialize;
 
 use crate::error::{RailError, RailResult};
-use crate::source::ContentDigest;
 
+use super::cargo_inputs::{
+    CargoInputs, EnvironmentValue, PathKind, PathState, PortableRoots, environment_value, file_state, path_state,
+};
 use super::{NativeCaptureBudget, NativeInputFailure, NativeMetadataGuard, capture_guarded_file};
 
-const CLIPPY_CAPTURE_VERSION: u32 = 1;
+const CLIPPY_CAPTURE_VERSION: u32 = 2;
 /// `cargo clippy` joins the arguments after `--` with this separator in `CLIPPY_ARGS`.
 const CLIPPY_ARGUMENT_SEPARATOR: &str = "__CLIPPY_HACKERY__";
 /// Clippy checks both names in each directory, in this order.
@@ -38,18 +40,6 @@ const CLIPPY_ENVIRONMENT: [&str; 5] = [
     "CARGO_PKG_RUST_VERSION",
     "CARGO_MANIFEST_DIR",
 ];
-/// Compiler selections that `cargo metadata` reads when it queries rustc.
-const CARGO_TOOLCHAIN_ENVIRONMENT: [&str; 2] = ["RUSTC", "RUSTUP_TOOLCHAIN"];
-const DEPENDENCY_TABLES: [&str; 5] = [
-    "dependencies",
-    "dev-dependencies",
-    "dev_dependencies",
-    "build-dependencies",
-    "build_dependencies",
-];
-const MAX_CARGO_MANIFESTS: usize = 4096;
-const MAX_CARGO_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
-
 pub(super) const SYSROOT_OVERRIDE_REASON: &str = "clippy_sysroot_override_unavailable";
 const DRIVER_REASON: &str = "clippy_driver_identity_unavailable";
 const CONFIGURATION_REASON: &str = "clippy_configuration_unavailable";
@@ -65,9 +55,8 @@ pub(super) struct ClippyActionCapture {
     appended_arguments: Vec<String>,
     environment: Vec<EnvironmentValue>,
     configuration: Vec<PathState>,
-    cargo_executable: PathState,
-    cargo_environment: Vec<EnvironmentValue>,
-    cargo_inputs: Vec<PathState>,
+    /// What `cargo metadata` reads when a `clippy::cargo` lint runs it from the package.
+    cargo: CargoInputs,
     /// Generations of every bound file, so revalidation also rejects a change that restores the old bytes.
     #[serde(skip)]
     guards: BTreeMap<PathBuf, NativeMetadataGuard>,
@@ -82,39 +71,21 @@ struct ClippyCaptureAuthority {
     sysroot: PathBuf,
     workspace_root: PathBuf,
     compiler_arguments: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-struct EnvironmentValue {
-    name: String,
-    value_digest: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-struct PathState {
-    path: String,
-    state: PathKind,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum PathKind {
-    Absent,
-    Directory,
-    File {
-        target: String,
-        content_digest: String,
-        bytes: u64,
-    },
+    portable: Option<PathBuf>,
 }
 
 impl ClippyActionCapture {
     /// Capture Clippy's inputs for one invocation run from the current directory and environment.
+    ///
+    /// `portable` names the installed compiler wrapper when `--root-portability remap` shares results across
+    /// checkout roots; paths below the repository, the Cargo home, and the sysroot are then spelled relative
+    /// to those roots.
     pub(super) fn capture(
         driver: &Path,
         sysroot: &Path,
         workspace_root: &Path,
         compiler_arguments: &[String],
+        portable: Option<&Path>,
         budget: &mut NativeCaptureBudget,
     ) -> Result<Self, NativeInputFailure> {
         let started = Instant::now();
@@ -125,6 +96,14 @@ impl ClippyActionCapture {
             ));
         }
         let current_directory = std::env::current_dir().map_err(|error| failure_from(CONFIGURATION_REASON, error))?;
+        let roots = portable
+            .map(|installed_wrapper| {
+                crate::cargo::CargoConfigSnapshot::cargo_home(&current_directory)
+                    .and_then(|cargo_home| PortableRoots::new(workspace_root, &cargo_home, sysroot, installed_wrapper))
+            })
+            .transpose()
+            .map_err(|error| failure_from(CARGO_REASON, error))?;
+        let roots = roots.as_ref();
         let mut guards = BTreeMap::new();
         let driver_digest = capture_driver(driver, sysroot, &current_directory, started, budget, &mut guards)?;
         let (lints, appended_arguments) = clippy_arguments(
@@ -134,7 +113,7 @@ impl ClippyActionCapture {
         );
         let environment = CLIPPY_ENVIRONMENT
             .iter()
-            .map(|name| environment_value(name))
+            .map(|name| environment_value(name, roots))
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
@@ -145,18 +124,16 @@ impl ClippyActionCapture {
                 .or_else(|| std::env::var_os("CARGO_MANIFEST_DIR"))
                 .map_or_else(|| PathBuf::from("."), PathBuf::from),
         );
-        let configuration = configuration_trail(&configuration_start, &workspace, started, budget, &mut guards)?;
-        let (cargo_executable, cargo_inputs) = (|| {
+        let configuration = configuration_trail(&configuration_start, &workspace, roots, started, budget, &mut guards)?;
+        let cargo = (|| {
             // Cargo gives every compiler process its own executable; without it Clippy searches PATH.
             let cargo = std::env::var_os("CARGO")
                 .map(PathBuf::from)
                 .filter(|path| path.is_absolute())
                 .ok_or_else(|| RailError::message("Clippy's cargo executable is not an absolute CARGO path"))?;
-            let cargo_home = crate::cargo::CargoConfigSnapshot::cargo_home(&current_directory)?;
-            cargo_metadata_inputs(&current_directory, &cargo, &cargo_home, started, budget, &mut guards)
+            CargoInputs::capture(&current_directory, &current_directory, &cargo, roots, budget)
         })()
         .map_err(|error| failure_from(CARGO_REASON, error))?;
-        let cargo_environment = cargo_environment(std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()));
         Ok(Self {
             version: CLIPPY_CAPTURE_VERSION,
             driver_digest,
@@ -164,15 +141,14 @@ impl ClippyActionCapture {
             appended_arguments,
             environment,
             configuration,
-            cargo_executable,
-            cargo_environment,
-            cargo_inputs,
+            cargo,
             guards,
             authority: ClippyCaptureAuthority {
                 driver: driver.to_path_buf(),
                 sysroot: sysroot.to_path_buf(),
                 workspace_root: workspace_root.to_path_buf(),
                 compiler_arguments: compiler_arguments.to_vec(),
+                portable: portable.map(Path::to_path_buf),
             },
         })
     }
@@ -193,6 +169,7 @@ impl ClippyActionCapture {
             &self.authority.sysroot,
             &self.authority.workspace_root,
             &self.authority.compiler_arguments,
+            self.authority.portable.as_deref(),
             budget,
         )
         .map_err(RailError::from)?;
@@ -280,6 +257,7 @@ fn capture_driver(
 fn configuration_trail(
     start: &Path,
     workspace_root: &Path,
+    roots: Option<&PortableRoots>,
     started: Instant,
     budget: &mut NativeCaptureBudget,
     guards: &mut BTreeMap<PathBuf, NativeMetadataGuard>,
@@ -296,7 +274,7 @@ fn configuration_trail(
                 Ok(target) => match fs::metadata(&target) {
                     Ok(metadata) if metadata.is_dir() => PathKind::Directory,
                     Ok(_) => {
-                        let state = file_state(&target, started, budget, guards)
+                        let state = file_state(&target, roots, started, budget, guards)
                             .map_err(|error| failure_from(CONFIGURATION_REASON, error))?;
                         loaded.get_or_insert(target);
                         state
@@ -306,10 +284,9 @@ fn configuration_trail(
                 },
                 Err(_) => PathKind::Absent,
             };
-            trail.push(PathState {
-                path: utf8_path(&candidate).map_err(|error| failure_from(CONFIGURATION_REASON, error))?,
-                state,
-            });
+            trail.extend(
+                path_state(&candidate, state, roots).map_err(|error| failure_from(CONFIGURATION_REASON, error))?,
+            );
         }
         if let Some(loaded) = loaded {
             if !loaded.starts_with(workspace_root) {
@@ -324,247 +301,6 @@ fn configuration_trail(
             return Ok(trail);
         }
     }
-}
-
-type CargoMetadataInputs = (PathState, Vec<PathState>);
-
-/// Bind what `cargo metadata` reads when a `clippy::cargo` lint runs it from this package.
-///
-/// These are the `cargo` executable, Cargo configuration from files and non-secret `CARGO_*`
-/// variables, the workspace manifests with every path dependency they reach, and the lockfile.
-/// The lockfile pins registry and Git packages, whose sources are immutable once unpacked.
-fn cargo_metadata_inputs(
-    current_directory: &Path,
-    cargo: &Path,
-    cargo_home: &Path,
-    started: Instant,
-    budget: &mut NativeCaptureBudget,
-    guards: &mut BTreeMap<PathBuf, NativeMetadataGuard>,
-) -> RailResult<CargoMetadataInputs> {
-    let cargo_executable = PathState {
-        path: utf8_path(cargo)?,
-        state: file_state(cargo, started, budget, guards)?,
-    };
-
-    let mut inputs = BTreeMap::new();
-    let mut record = |path: PathBuf, budget: &mut NativeCaptureBudget| -> RailResult<()> {
-        if let std::collections::btree_map::Entry::Vacant(entry) = inputs.entry(path) {
-            let state = file_state(entry.key(), started, budget, guards)?;
-            entry.insert(state);
-        }
-        Ok(())
-    };
-    for directory in current_directory.ancestors() {
-        for name in [".cargo/config", ".cargo/config.toml"] {
-            record(directory.join(name), budget)?;
-        }
-    }
-    for name in ["config", "config.toml"] {
-        record(cargo_home.join(name), budget)?;
-    }
-
-    // Cargo walks up from the package manifest to the first manifest that declares a workspace.
-    let mut root = None;
-    let mut package_root = None;
-    for directory in current_directory.ancestors() {
-        let manifest = directory.join("Cargo.toml");
-        record(manifest.clone(), budget)?;
-        let Some(document) = read_manifest(&manifest)? else {
-            continue;
-        };
-        if package_root.is_none() {
-            if document
-                .get("package")
-                .and_then(|package| package.get("workspace"))
-                .is_some()
-            {
-                return Err(RailError::message(
-                    "a package that names its workspace root is not modeled",
-                ));
-            }
-            package_root = Some(directory.to_path_buf());
-        }
-        if document.get("workspace").is_some() {
-            root = Some(directory.to_path_buf());
-            break;
-        }
-    }
-    let root = root
-        .or(package_root)
-        .ok_or_else(|| RailError::message("Clippy's package has no Cargo manifest"))?;
-    record(root.join("Cargo.lock"), budget)?;
-
-    let mut pending = vec![root.join("Cargo.toml")];
-    let mut visited = BTreeSet::new();
-    while let Some(manifest) = pending.pop() {
-        if !visited.insert(manifest.clone()) {
-            continue;
-        }
-        if visited.len() > MAX_CARGO_MANIFESTS {
-            return Err(RailError::message("the workspace manifest closure exceeds its bound"));
-        }
-        record(manifest.clone(), budget)?;
-        let Some(document) = read_manifest(&manifest)? else {
-            continue;
-        };
-        let directory = manifest
-            .parent()
-            .ok_or_else(|| RailError::message("Cargo manifest has no directory"))?;
-        if manifest == root.join("Cargo.toml")
-            && let Some(members) = document
-                .get("workspace")
-                .and_then(|workspace| workspace.get("members"))
-                .and_then(toml_edit::Item::as_array)
-        {
-            for member in members.iter() {
-                let member = member
-                    .as_str()
-                    .ok_or_else(|| RailError::message("workspace member is not a string"))?;
-                // Only the member entry is a pattern; the workspace path is matched literally.
-                let pattern = format!("{}/{member}", glob::Pattern::escape(&utf8_path(directory)?));
-                for matched in glob::glob(&pattern).map_err(|error| RailError::message(error.to_string()))? {
-                    let matched = matched.map_err(|error| RailError::message(error.to_string()))?;
-                    if matched.is_dir() {
-                        pending.push(normalized_directory(&matched).join("Cargo.toml"));
-                    }
-                }
-            }
-        }
-        for path in path_dependencies(&document) {
-            pending.push(normalized_directory(&directory.join(path)).join("Cargo.toml"));
-        }
-    }
-    let cargo_inputs = inputs
-        .into_iter()
-        .map(|(path, state)| {
-            Ok(PathState {
-                path: utf8_path(&path)?,
-                state,
-            })
-        })
-        .collect::<RailResult<Vec<_>>>()?;
-    Ok((cargo_executable, cargo_inputs))
-}
-
-/// Cargo reads any `CARGO_*` variable as configuration. Secret-named values, Cargo-Rail's
-/// private variables, the jobserver, and Clippy's primary-package flag stay out of the key.
-fn cargo_environment(names: impl Iterator<Item = String>) -> Vec<EnvironmentValue> {
-    names
-        .filter(|name| {
-            name.starts_with("CARGO_")
-                && !name.starts_with("CARGO_RAIL_")
-                && !matches!(name.as_str(), "CARGO_MAKEFLAGS" | "CARGO_PRIMARY_PACKAGE")
-                && !crate::compiler::observation::is_secret_name(name)
-        })
-        .chain(CARGO_TOOLCHAIN_ENVIRONMENT.iter().map(|name| (*name).to_string()))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .map(|name| environment_value(&name))
-        .collect()
-}
-
-fn path_dependencies(document: &toml_edit::DocumentMut) -> Vec<String> {
-    fn dependency_paths(table: Option<&dyn toml_edit::TableLike>, paths: &mut Vec<String>) {
-        let Some(table) = table else {
-            return;
-        };
-        for (_, dependency) in table.iter() {
-            if let Some(path) = dependency
-                .as_table_like()
-                .and_then(|dependency| dependency.get("path"))
-                .and_then(toml_edit::Item::as_str)
-            {
-                paths.push(path.to_string());
-            }
-        }
-    }
-
-    let mut paths = Vec::new();
-    let item = document.as_item();
-    for name in DEPENDENCY_TABLES {
-        dependency_paths(item.get(name).and_then(toml_edit::Item::as_table_like), &mut paths);
-    }
-    if let Some(targets) = item.get("target").and_then(toml_edit::Item::as_table_like) {
-        for (_, target) in targets.iter() {
-            for name in DEPENDENCY_TABLES {
-                dependency_paths(target.get(name).and_then(toml_edit::Item::as_table_like), &mut paths);
-            }
-        }
-    }
-    dependency_paths(
-        item.get("workspace")
-            .and_then(|workspace| workspace.get("dependencies"))
-            .and_then(toml_edit::Item::as_table_like),
-        &mut paths,
-    );
-    if let Some(patches) = item.get("patch").and_then(toml_edit::Item::as_table_like) {
-        for (_, source) in patches.iter() {
-            dependency_paths(source.as_table_like(), &mut paths);
-        }
-    }
-    dependency_paths(item.get("replace").and_then(toml_edit::Item::as_table_like), &mut paths);
-    paths
-}
-
-fn read_manifest(path: &Path) -> RailResult<Option<toml_edit::DocumentMut>> {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    if !metadata.is_file() {
-        return Ok(None);
-    }
-    if metadata.len() > MAX_CARGO_MANIFEST_BYTES {
-        return Err(RailError::message("Cargo manifest exceeds its byte bound"));
-    }
-    let text = fs::read_to_string(path)?;
-    text.parse::<toml_edit::DocumentMut>()
-        .map(Some)
-        .map_err(|error| RailError::message(format!("Cargo manifest '{}' is not TOML: {error}", path.display())))
-}
-
-/// Resolve a directory through symlinks when it exists, as Cargo reads it.
-fn normalized_directory(directory: &Path) -> PathBuf {
-    crate::utils::canonicalize_existing(directory).unwrap_or_else(|_| directory.to_path_buf())
-}
-
-fn file_state(
-    path: &Path,
-    started: Instant,
-    budget: &mut NativeCaptureBudget,
-    guards: &mut BTreeMap<PathBuf, NativeMetadataGuard>,
-) -> RailResult<PathKind> {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(PathKind::Absent),
-        Err(error) => return Err(error.into()),
-    };
-    if metadata.is_dir() {
-        return Ok(PathKind::Directory);
-    }
-    let target = crate::utils::canonicalize_existing(path)?;
-    let (content_digest, guard, bytes) = capture_guarded_file(&target, started, budget)?;
-    guards.insert(target.clone(), guard);
-    Ok(PathKind::File {
-        target: utf8_path(&target)?,
-        content_digest,
-        bytes,
-    })
-}
-
-fn environment_value(name: &str) -> EnvironmentValue {
-    EnvironmentValue {
-        name: name.to_string(),
-        value_digest: std::env::var_os(name)
-            .map(|value| format!("sha256:{}", ContentDigest::sha256(value.as_encoded_bytes()))),
-    }
-}
-
-fn utf8_path(path: &Path) -> RailResult<String> {
-    path.to_str()
-        .map(str::to_string)
-        .ok_or_else(|| RailError::message("Clippy input path is not UTF-8"))
 }
 
 fn failure(reason: &'static str, message: &str) -> NativeInputFailure {
@@ -622,11 +358,11 @@ mod tests {
     fn configuration_trail_binds_every_candidate_up_to_the_loaded_file() {
         let root = tempfile::tempdir().expect("root");
         let workspace = crate::utils::canonicalize_existing(root.path()).expect("workspace");
-        let member = workspace.join("crates/member");
+        let member = workspace.join("crates").join("member");
         fs::create_dir_all(&member).expect("member");
         write(&workspace.join("clippy.toml"), "msrv = \"1.80\"\n");
         let trail = |start: &Path, root: &Path| {
-            configuration_trail(start, root, Instant::now(), &mut budget(), &mut BTreeMap::new())
+            configuration_trail(start, root, None, Instant::now(), &mut budget(), &mut BTreeMap::new())
         };
 
         let loaded = trail(&member, &workspace).expect("trail");
@@ -666,118 +402,6 @@ mod tests {
 
         let failure = trail(&member, &member).expect_err("configuration outside the repository");
         assert_eq!(failure.reason, EXTERNAL_CONFIGURATION_REASON);
-    }
-
-    #[test]
-    fn cargo_metadata_inputs_bind_manifests_lockfile_and_configuration() {
-        let root = tempfile::tempdir().expect("root");
-        let base = crate::utils::canonicalize_existing(root.path()).expect("base");
-        let workspace = base.join("workspace");
-        write(
-            &workspace.join("Cargo.toml"),
-            "[workspace]\nmembers = [\"crates/*\"]\n\n[workspace.dependencies]\noutside = { path = \"../outside\" }\n",
-        );
-        write(
-            &workspace.join("crates/a/Cargo.toml"),
-            "[package]\nname = \"a\"\n\n[target.'cfg(unix)'.dependencies]\nb = { path = \"../b\" }\n",
-        );
-        write(&workspace.join("crates/b/Cargo.toml"), "[package]\nname = \"b\"\n");
-        write(&base.join("outside/Cargo.toml"), "[package]\nname = \"outside\"\n");
-        write(&workspace.join("Cargo.lock"), "version = 4\n");
-        write(&workspace.join(".cargo/config.toml"), "[build]\njobs = 2\n");
-        write(&base.join("toolchain/cargo"), "cargo executable");
-        let cargo_home = base.join("cargo-home");
-        fs::create_dir(&cargo_home).expect("Cargo home");
-        let package = workspace.join("crates/a");
-        let capture = || {
-            cargo_metadata_inputs(
-                &package,
-                &base.join("toolchain/cargo"),
-                &cargo_home,
-                Instant::now(),
-                &mut budget(),
-                &mut BTreeMap::new(),
-            )
-        };
-
-        let (executable, inputs) = capture().expect("Cargo inputs");
-        assert!(matches!(executable.state, PathKind::File { .. }));
-        let bound = |inputs: &[PathState], path: &Path| {
-            inputs
-                .iter()
-                .find(|entry| entry.path == path.to_str().unwrap())
-                .map(|entry| entry.state.clone())
-        };
-        for file in [
-            workspace.join("Cargo.toml"),
-            workspace.join("Cargo.lock"),
-            workspace.join(".cargo/config.toml"),
-            workspace.join("crates/a/Cargo.toml"),
-            workspace.join("crates/b/Cargo.toml"),
-            base.join("outside/Cargo.toml"),
-        ] {
-            assert!(
-                matches!(bound(&inputs, &file), Some(PathKind::File { .. })),
-                "{} is bound",
-                file.display()
-            );
-        }
-        for absent in [
-            package.join(".cargo/config.toml"),
-            base.join(".cargo/config.toml"),
-            cargo_home.join("config.toml"),
-            workspace.join("crates/Cargo.toml"),
-        ] {
-            assert_eq!(bound(&inputs, &absent), Some(PathKind::Absent), "{}", absent.display());
-        }
-        assert_eq!(
-            bound(&inputs, &base.join("Cargo.toml")),
-            None,
-            "Cargo stops its manifest search at the workspace root"
-        );
-
-        for (label, change) in [
-            ("lockfile", workspace.join("Cargo.lock")),
-            ("path dependency outside the workspace", base.join("outside/Cargo.toml")),
-            ("configuration", cargo_home.join("config.toml")),
-            ("new member", workspace.join("crates/c/Cargo.toml")),
-        ] {
-            let before = capture().expect("before").1;
-            write(&change, "[package]\nname = \"changed\"\n");
-            assert_ne!(capture().expect("after").1, before, "{label} is bound");
-        }
-
-        write(
-            &package.join("Cargo.toml"),
-            "[package]\nname = \"a\"\nworkspace = \"../..\"\n",
-        );
-        assert!(capture().is_err(), "an explicit workspace pointer is not modeled");
-    }
-
-    #[test]
-    fn cargo_environment_excludes_private_secret_and_per_process_values() {
-        let names = [
-            "CARGO_HOME",
-            "CARGO_BUILD_TARGET_DIR",
-            "CARGO_PKG_RUST_VERSION",
-            "CARGO_RAIL_CACHE",
-            "CARGO_MAKEFLAGS",
-            "CARGO_PRIMARY_PACKAGE",
-            "CARGO_REGISTRY_TOKEN",
-            "CARGO_REGISTRIES_PRIVATE_TOKEN",
-            "PATH",
-        ];
-        let environment = cargo_environment(names.iter().map(|name| (*name).to_string()));
-        assert_eq!(
-            environment.iter().map(|value| value.name.as_str()).collect::<Vec<_>>(),
-            [
-                "CARGO_BUILD_TARGET_DIR",
-                "CARGO_HOME",
-                "CARGO_PKG_RUST_VERSION",
-                "RUSTC",
-                "RUSTUP_TOOLCHAIN",
-            ]
-        );
     }
 
     #[test]

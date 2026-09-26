@@ -35,8 +35,10 @@ use crate::compiler::observation::{
 use crate::error::{RailError, RailResult};
 use crate::source::ContentDigest;
 
+mod cargo_inputs;
 mod clippy;
 pub(crate) mod coff;
+pub(crate) mod macro_inputs;
 pub(crate) mod pack;
 mod rust_inputs;
 
@@ -669,28 +671,33 @@ pub(crate) struct NativeDynamicInputSelector {
     /// Earlier execution rendered diagnostics, whose text depends on `--diagnostic-width`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     diagnostic_width: bool,
+    /// Repository paths that loaded procedural macros read during an earlier execution.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    macro_paths: Vec<macro_inputs::MacroPathSelector>,
 }
 
 impl NativeDynamicInputSelector {
     pub(crate) fn new(environment_names: Vec<String>, repository_paths: Vec<String>) -> RailResult<Self> {
         let selector = Self {
-            version: 2,
+            version: 3,
             environment_names,
             repository_paths,
             rust_inputs: RustInputSelector::default(),
             diagnostic_width: false,
+            macro_paths: Vec::new(),
         };
         selector.validate()?;
         Ok(selector)
     }
 
     pub(crate) fn validate(&self) -> RailResult<()> {
-        if self.version != 2 {
+        if self.version != 3 {
             return Err(RailError::message(
                 "native dynamic-input selector has an incompatible schema",
             ));
         }
         self.rust_inputs.validate()?;
+        macro_inputs::validate_selectors(&self.macro_paths)?;
         validate_environment_selector_names(self.environment_names.iter().map(String::as_str))?;
         let mut total_bytes = 0usize;
         let mut previous = None::<&str>;
@@ -1192,8 +1199,8 @@ pub(crate) struct NativeActionCapture {
     diagnostic_width: Option<Option<String>>,
     /// Inputs Clippy reads beyond this rustc action, when Clippy runs it.
     clippy: Option<clippy::ClippyActionCapture>,
-    /// Cargo's rerun inputs for the unit's build script, bound when the unit loads a procedural macro.
-    build_script_rerun: Option<crate::build_script::freshness::BuildScriptFreshness>,
+    /// Repository paths that loaded procedural macros read, with their captured states.
+    macro_inputs: Vec<macro_inputs::MacroPathInput>,
     guard: NativeCaptureGuard,
     capture_entries: usize,
     capture_path_bytes: usize,
@@ -1241,6 +1248,8 @@ struct NativePublicationProof {
     environment_bytes_hashed: u64,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     diagnostic_width: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    macro_paths: Vec<macro_inputs::MacroPathSelector>,
 }
 
 #[derive(Debug)]
@@ -1598,6 +1607,7 @@ impl NativeActionCapture {
         if let Some(inputs) = &self.rust_inputs {
             selector.rust_inputs = inputs.witness().selector().clone();
         }
+        selector.macro_paths = self.macro_inputs.iter().map(|input| input.selector()).collect();
         selector.diagnostic_width = self.diagnostic_width.is_some();
         Ok(selector)
     }
@@ -1608,55 +1618,16 @@ impl NativeActionCapture {
             rendered.then(|| diagnostic_width_argument(&observation.compiler_arguments).map(str::to_string));
     }
 
-    /// Bind the unit's build-script rerun inputs when the unit loads a procedural macro.
-    ///
-    /// A macro can read files and variables that rustc does not record. Cargo's contract for such reads is the
-    /// build script's `rerun-if-changed` and `rerun-if-env-changed` declarations: when one changes, Cargo reruns
-    /// the script and recompiles this unit. Binding them keeps a hit as fresh as Cargo's own build.
-    /// Call after the Rust inputs are selected, because they show whether a macro is loaded.
-    fn bind_build_script_rerun(
+    /// Capture the current state of each repository path that loaded procedural macros read.
+    fn select_macro_inputs(
         &mut self,
-        observation: &RawCompilerInvocation,
-        source_root: &Path,
-    ) -> Result<(), NativeInputFailure> {
-        self.build_script_rerun = None;
-        let loads_macro = observation.dependency_artifacts.iter().any(|(_, artifact)| {
-            observation_path_basename(&artifact.path).is_some_and(|name| dynamic_library_path(Path::new(name)))
-        }) || self
-            .rust_inputs
-            .as_ref()
-            .is_some_and(|inputs| inputs.witness().selector().selects_dynamic_library());
-        if !loads_macro {
-            return Ok(());
-        }
-        let failure = |reason: &'static str| NativeInputFailure::new(reason, RailError::message(reason));
-        let package = std::env::var("CARGO_PKG_NAME").map_err(|_| failure("build_script_package_unavailable"))?;
-        // Without a build script, Cargo recompiles the unit only for inputs the action already binds.
-        let Some(out_dir) = package_build_script_output(observation, source_root, &package) else {
-            return Ok(());
-        };
-        let package_root = std::env::var_os("CARGO_MANIFEST_DIR")
-            .map(PathBuf::from)
-            .ok_or_else(|| failure("build_script_package_root_unavailable"))?;
-        // Cargo marks an unpacked registry or Git package with `.cargo-ok`; its files cannot change.
-        let immutable_source = package_root.join(".cargo-ok").is_file();
-        let freshness = crate::build_script::freshness::capture(
-            &crate::build_script::freshness::ExecutedBuildScript {
-                package: &package,
-                out_dir: &out_dir,
-                package_root: &package_root,
-                immutable_source,
-                rustc_environment: &[],
-            },
-            source_root,
-        )
-        .map_err(failure)?;
-        if !immutable_source && freshness.declares_no_rerun_input() {
-            // Cargo then reruns the script for any file its package listing selects. That listing honors
-            // version-control ignore rules and package include rules, which this action does not model.
-            return Err(failure("build_script_package_rerun_unmodeled"));
-        }
-        self.build_script_rerun = Some(freshness);
+        workspace_root: &Path,
+        selectors: &[macro_inputs::MacroPathSelector],
+    ) -> RailResult<()> {
+        let mut budget = NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS);
+        let inputs = macro_inputs::capture(workspace_root, selectors, Instant::now(), &mut budget)?;
+        self.bytes_hashed = self.bytes_hashed.saturating_add(budget.bytes_hashed);
+        self.macro_inputs = inputs;
         Ok(())
     }
 
@@ -1782,7 +1753,7 @@ impl NativeActionCapture {
         )?;
         capture.select_rust_inputs(observation, source_root, &proof.rust_inputs)?;
         capture.bind_diagnostic_width(proof.diagnostic_width, observation);
-        capture.bind_build_script_rerun(observation, source_root)?;
+        capture.select_macro_inputs(source_root, &proof.macro_paths)?;
         Ok(capture)
     }
 
@@ -1833,6 +1804,13 @@ impl NativeActionCapture {
                 &context.session.rustc_sysroot,
                 source_root,
                 &observation.compiler_arguments,
+                context
+                    .installation
+                    .as_ref()
+                    .filter(|_| {
+                        context.session.root_portability == crate::cache::installation::InstalledRootPortability::Remap
+                    })
+                    .map(crate::cache::installation::InstallationReceipt::wrapper_path),
                 &mut budget,
             )?;
             capture.bytes_hashed = capture.bytes_hashed.saturating_add(budget.bytes_hashed);
@@ -1970,7 +1948,7 @@ impl NativeActionCapture {
             rust_inputs: None,
             diagnostic_width: None,
             clippy: None,
-            build_script_rerun: None,
+            macro_inputs: Vec::new(),
             guard: NativeCaptureGuard { entries: guard_entries },
             capture_entries: budget.entries,
             capture_path_bytes: budget.path_bytes,
@@ -2122,13 +2100,7 @@ impl NativeActionCapture {
         if let Some(clippy) = &self.clippy {
             clippy.revalidate(&mut NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS))?;
         }
-        if let Some(reason) = self
-            .build_script_rerun
-            .as_ref()
-            .and_then(|freshness| freshness.revalidation_reason(workspace_root))
-        {
-            return Err(RailError::message(reason));
-        }
+        macro_inputs::revalidate(workspace_root, &self.macro_inputs)?;
 
         let environment_names = self
             .approved_environment
@@ -5888,9 +5860,9 @@ pub(crate) struct NativeCompilerValidation {
     /// The action binds `--diagnostic-width` because its stored stderr renders diagnostics.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     diagnostic_width_bound: bool,
-    /// The build-script rerun inputs bound because the action loads a procedural macro.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    build_script_rerun: Option<crate::build_script::freshness::BuildScriptFreshness>,
+    /// Repository paths that loaded procedural macros read, with their captured states.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    macro_inputs: Vec<macro_inputs::MacroPathInput>,
 }
 
 impl NativeCompilerValidation {
@@ -5914,7 +5886,7 @@ impl NativeCompilerValidation {
             stderr_bytes,
         } = descriptor;
         let validation = Self {
-            version: 18,
+            version: 19,
             action_key,
             result_key,
             session_identity: session.identity.clone(),
@@ -5935,7 +5907,7 @@ impl NativeCompilerValidation {
             stderr_digest,
             stderr_bytes,
             diagnostic_width_bound: capture.diagnostic_width.is_some(),
-            build_script_rerun: capture.build_script_rerun.clone(),
+            macro_inputs: capture.macro_inputs.clone(),
         };
         validation.validate_object()?;
         Ok(validation)
@@ -5983,7 +5955,7 @@ impl NativeCompilerValidation {
             &self.selected_repository_inputs,
             Some(&self.witness.rust_inputs),
             diagnostic_width.as_ref(),
-            self.build_script_rerun.as_ref(),
+            &self.macro_inputs,
         )?;
         let selected_action = if linked_observation(&self.observation) {
             witnessed_action_key(&pre_link_action, &self.witness)?
@@ -6004,6 +5976,7 @@ impl NativeCompilerValidation {
         )?;
         selector.rust_inputs = self.witness.rust_inputs.selector().clone();
         selector.diagnostic_width = self.diagnostic_width_bound;
+        selector.macro_paths = self.macro_inputs.iter().map(|input| input.selector()).collect();
         selector.validate()?;
         Ok(selector)
     }
@@ -6104,11 +6077,12 @@ impl NativeCompilerValidation {
     }
 
     pub(crate) fn validate_object(&self) -> RailResult<()> {
-        if self.version != 18 {
+        if self.version != 19 {
             return Err(RailError::message(
                 "native compiler observation has an incompatible schema",
             ));
         }
+        macro_inputs::validate_inputs(&self.macro_inputs)?;
         validate_identity(&self.action_key, ACTION_KEY_PREFIX)?;
         validate_identity(&self.result_key, RESULT_KEY_PREFIX)?;
         for digest in [&self.session_identity, &self.stdout_digest, &self.stderr_digest] {
@@ -6251,11 +6225,12 @@ impl NativeCompilerValidation {
 
 impl NativePublicationProof {
     fn validate_object(&self) -> RailResult<()> {
-        if self.version != 7 {
+        if self.version != 8 {
             return Err(RailError::message(
                 "native publication proof has an incompatible schema",
             ));
         }
+        macro_inputs::validate_selectors(&self.macro_paths)?;
         validate_native_source_state(&self.source_state)?;
         match (&self.source_state.root, &self.package_binding) {
             (ObservationPath::Repository(_), None) => {}
@@ -6423,7 +6398,7 @@ fn action_key(
         &capture.selected_repository_inputs,
         capture.rust_inputs.as_ref().map(RustInputCapture::witness),
         capture.diagnostic_width.as_ref(),
-        capture.build_script_rerun.as_ref(),
+        &capture.macro_inputs,
     )
 }
 
@@ -6499,7 +6474,7 @@ fn action_key_from_base(
     selected_repository_inputs: &[NativeSelectedRepositoryInput],
     rust_inputs: Option<&RustInputWitness>,
     diagnostic_width: Option<&Option<String>>,
-    build_script_rerun: Option<&crate::build_script::freshness::BuildScriptFreshness>,
+    macro_inputs: &[macro_inputs::MacroPathInput],
 ) -> RailResult<String> {
     validate_identity(base_action, BASE_ACTION_KEY_PREFIX)?;
     approved_environment.validate_object()?;
@@ -6512,7 +6487,7 @@ fn action_key_from_base(
     let rust_inputs = serde_json::to_vec(&rust_inputs)?;
     // The base action omits the width; rendered diagnostics alone make it an input.
     let diagnostic_width = serde_json::to_vec(&diagnostic_width)?;
-    let version = 16_u32.to_le_bytes();
+    let version = 17_u32.to_le_bytes();
     let unconditional: [(&[u8], &[u8]); 6] = [
         (b"version", &version),
         (b"base-action", base_action.as_bytes()),
@@ -6522,10 +6497,13 @@ fn action_key_from_base(
         (b"diagnostic-width", &diagnostic_width),
     ];
     let mut frames = unconditional.to_vec();
-    // Only units that load a procedural macro bind build-script rerun inputs; other identities are unchanged.
-    let build_script_rerun = build_script_rerun.map(serde_json::to_vec).transpose()?;
-    if let Some(build_script_rerun) = &build_script_rerun {
-        frames.push((b"build-script-rerun", build_script_rerun));
+    // Only actions whose procedural macros read repository paths bind them.
+    macro_inputs::validate_inputs(macro_inputs)?;
+    let macro_inputs = (!macro_inputs.is_empty())
+        .then(|| serde_json::to_vec(macro_inputs))
+        .transpose()?;
+    if let Some(macro_inputs) = &macro_inputs {
+        frames.push((b"procedural-macro-inputs", macro_inputs));
     }
     Ok(sha256_identity(
         ACTION_KEY_PREFIX,
@@ -8726,42 +8704,12 @@ fn distributed_workspace_remap_at(value: &str, current_directory: Option<&Path>)
 }
 
 /// Rust libraries and procedural macros are bound by their exact bytes. A macro's execution is bound
-/// by what rustc records and by the unit's build-script rerun inputs; see `bind_build_script_rerun`.
+/// by what rustc records and by what the compiler driver observes it read; see `macro_inputs`.
 fn dependency_artifact_bypass_reason(extension: Option<&str>) -> Option<&'static str> {
     match extension {
         Some("rmeta" | "rlib" | "dll" | "dylib" | "so") => None,
         _ => Some("dependency_artifact_format_observation_unavailable"),
     }
-}
-
-/// The `OUT_DIR` that Cargo assigned to this unit's package build script, if the package has one.
-///
-/// Cargo sets `OUT_DIR` to `<profile>/build/<package>-<hash>/out` beside the unit's `<profile>/deps`
-/// output directory. It does not clear an inherited value for a package without a build script,
-/// so any other value names no build script of this package.
-fn package_build_script_output(
-    observation: &RawCompilerInvocation,
-    source_root: &Path,
-    package: &str,
-) -> Option<PathBuf> {
-    let out_dir = crate::utils::canonicalize_existing(Path::new(&std::env::var_os("OUT_DIR")?)).ok()?;
-    let current_directory = std::env::current_dir().ok()?;
-    let deps = compiler_output_directory(&observation.compiler_arguments, &current_directory, source_root).ok()??;
-    let profile = crate::utils::canonicalize_existing(&deps).ok()?.parent()?.to_path_buf();
-    let script = out_dir.parent()?;
-    let assigned = out_dir.file_name() == Some(OsStr::new("out"))
-        && script.parent() == Some(profile.join("build").as_path())
-        && script
-            .file_name()
-            .and_then(OsStr::to_str)
-            .and_then(|name| name.strip_prefix(package))
-            .and_then(|suffix| suffix.strip_prefix('-'))
-            .is_some_and(|hash| !hash.is_empty() && hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
-    assigned.then_some(out_dir)
-}
-
-fn dynamic_library_path(path: &Path) -> bool {
-    matches!(path.extension().and_then(OsStr::to_str), Some("dll" | "dylib" | "so"))
 }
 
 fn native_library_bypass_reason(value: &str) -> &'static str {
@@ -8964,17 +8912,15 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
         );
         return OuterCacheAction::Execute;
     }
-    // Clippy results bind host paths, so they reuse only at the enrolled physical root.
-    if let Some(reason) = clippy_driver.and_then(|_| {
-        if context.analysis_session.is_some() {
-            Some("clippy_analysis_session_unavailable")
-        } else if session.root_portability == crate::cache::installation::InstalledRootPortability::Remap {
-            Some("clippy_root_portability_unavailable")
-        } else {
-            None
-        }
-    }) {
-        configure_cold(command, CompilerCacheWrapperStatus::Bypassed, reason, None, 0, false);
+    if clippy_driver.is_some() && context.analysis_session.is_some() {
+        configure_cold(
+            command,
+            CompilerCacheWrapperStatus::Bypassed,
+            "clippy_analysis_session_unavailable",
+            None,
+            0,
+            false,
+        );
         return OuterCacheAction::Execute;
     }
     if session.authority != NativeSessionAuthority::Exact {
@@ -9490,6 +9436,7 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
         capture
             .select_repository_inputs(source_root, &dynamic_selector.repository_paths)
             .and_then(|()| capture.select_rust_inputs(observation, source_root, &dynamic_selector.rust_inputs))
+            .and_then(|()| capture.select_macro_inputs(source_root, &dynamic_selector.macro_paths))
     })
     .inspect_err(|error| report_native_action_diagnostic("compiler dynamic input selection", error))
     {
@@ -9566,17 +9513,6 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
             );
             return OuterCacheAction::Execute;
         }
-    }
-    if let Err(failure) = capture.bind_build_script_rerun(observation, source_root) {
-        configure_cold(
-            command,
-            CompilerCacheWrapperStatus::Bypassed,
-            failure.reason,
-            Some(provisional_action),
-            metrics.bytes_hashed,
-            diagnostic_wrapper,
-        );
-        return OuterCacheAction::Execute;
     }
     let pre_link_action = match action_key(&session.identity, &session.class, observation, &capture) {
         Ok(action) => action,
@@ -16767,7 +16703,15 @@ impl NativeCompilerExecution {
         })
     }
 
-    fn complete(mut self) -> Result<RustInputCapture, NativeInputFailure> {
+    fn complete(
+        mut self,
+    ) -> Result<
+        (
+            RustInputCapture,
+            Option<crate::compiler::native_input_protocol::NativeMacroObservation>,
+        ),
+        NativeInputFailure,
+    > {
         let failure = |error| NativeInputFailure::new("compiler_native_input_evidence_unavailable", error);
         if let Some(resolution) = self.resolution.take() {
             let status = bench_phase("clippy_resolution_wait", || resolution.wait()).map_err(failure)?;
@@ -16825,7 +16769,8 @@ impl NativeCompilerExecution {
                 RailError::message("completed compiler modules do not certify backend tool execution"),
             ));
         }
-        self.inputs.complete(&observation).map_err(failure)
+        let inputs = self.inputs.complete(&observation).map_err(failure)?;
+        Ok((inputs, observation.macros))
     }
 }
 
@@ -16900,13 +16845,14 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
         ));
         return status.code().unwrap_or(1);
     }
-    match native_execution.and_then(NativeCompilerExecution::complete) {
-        Ok(inputs) => {
+    let macro_observation = match native_execution.and_then(NativeCompilerExecution::complete) {
+        Ok((inputs, macros)) => {
             capture.bytes_hashed = capture
                 .bytes_hashed
                 .saturating_sub(capture.rust_inputs.as_ref().map_or(0, RustInputCapture::bytes_hashed))
                 .saturating_add(inputs.bytes_hashed());
             capture.rust_inputs = Some(inputs);
+            macros
         }
         Err(error) => {
             report_native_action_diagnostic(
@@ -16925,6 +16871,35 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
                 cache_bytes_read,
             ));
             return status.code().unwrap_or(1);
+        }
+    };
+    // Macro variable reads bind as compiler environment reads; macro path reads bind below.
+    let mut macro_paths = Vec::new();
+    if let Some(macros) = &macro_observation {
+        let generated = capture.generated.as_ref().map(|generated| generated.root.as_path());
+        let captured = std::iter::once(capture.source_root.as_path())
+            .chain(generated)
+            .collect::<Vec<_>>();
+        let selected = match macro_inputs::bypass_reason(macros) {
+            Some(reason) => Err(reason),
+            None => macro_inputs::path_selectors(macros, source_root, source_root_spelling, &captured),
+        };
+        match selected {
+            Ok(selected) => {
+                raw.environment_reads.extend(macro_inputs::environment_reads(macros));
+                macro_paths = selected;
+            }
+            Err(reason) => {
+                drop(publish_and_record_cold_observation(
+                    &mut raw,
+                    reason,
+                    None,
+                    None,
+                    capture.bytes_hashed,
+                    cache_bytes_read,
+                ));
+                return status.code().unwrap_or(1);
+            }
         }
     }
     let Some(output_paths) = output_paths else {
@@ -16983,7 +16958,11 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
         .as_ref()
         .map(|inputs| inputs.witness().selector().clone())
         .unwrap_or_default();
-    capture = match capture.select_repository_inputs(source_root, &dynamic_selector.repository_paths) {
+    dynamic_selector.macro_paths = macro_paths;
+    capture = match capture
+        .select_repository_inputs(source_root, &dynamic_selector.repository_paths)
+        .and_then(|()| capture.select_macro_inputs(source_root, &dynamic_selector.macro_paths))
+    {
         Ok(()) => capture,
         Err(error) => {
             report_native_action_diagnostic("selected repository input capture", &error);
@@ -17051,18 +17030,6 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
     let rendered_diagnostics = stderr_depends_on_diagnostic_width(&stderr);
     capture.bind_diagnostic_width(rendered_diagnostics, &raw);
     dynamic_selector.diagnostic_width = rendered_diagnostics;
-    if let Err(failure) = capture.bind_build_script_rerun(&raw, source_root) {
-        let bytes_hashed = cold_input_bytes(&raw, source_root, selected_environment_bytes);
-        drop(publish_and_record_cold_observation(
-            &mut raw,
-            failure.reason,
-            None,
-            None,
-            bytes_hashed,
-            cache_bytes_read,
-        ));
-        return status.code().unwrap_or(1);
-    }
     if !crate::compiler::native_cache::base_action_key(&session.identity, &session.class, &raw, &capture)
         .is_ok_and(|current| current == base_action_key)
     {
@@ -17870,7 +17837,7 @@ fn native_publication_proof(
         return Err("cold_inputs_changed_before_admission");
     }
     Ok(NativePublicationProof {
-        version: 7,
+        version: 8,
         source_state: initial_capture.source_state.clone(),
         package_binding: initial_capture.package_binding.clone(),
         approved_environment,
@@ -17887,6 +17854,11 @@ fn native_publication_proof(
             .map_err(|_| "cold_final_capture_failed")?,
         environment_bytes_hashed,
         diagnostic_width: initial_capture.diagnostic_width.is_some(),
+        macro_paths: initial_capture
+            .macro_inputs
+            .iter()
+            .map(|input| input.selector())
+            .collect(),
     })
 }
 
@@ -21001,7 +20973,7 @@ pub(crate) mod tests {
             ),
             diagnostic_width: None,
             clippy: None,
-            build_script_rerun: None,
+            macro_inputs: Vec::new(),
             guard: NativeCaptureGuard { entries: Vec::new() },
             capture_entries: 0,
             capture_path_bytes: 0,

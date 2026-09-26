@@ -112,8 +112,10 @@ pub(crate) fn collect(
     };
     let current_directory = std::env::current_dir().map_err(|error| error.to_string())?;
     let mut crates = Vec::new();
+    let mut dynamic_crate_loaded = false;
     for &crate_num in tcx.crates(()) {
         let source = tcx.used_crate_source(crate_num);
+        dynamic_crate_loaded |= source.dylib.is_some();
         let mut files = source
             .dylib
             .iter()
@@ -139,6 +141,8 @@ pub(crate) fn collect(
         searches,
         assembly,
         codegen: NativeCodegenObservation::NotRun,
+        // Expansion is complete, so no macro code runs again.
+        macros: crate::macro_observation::finish(dynamic_crate_loaded),
     };
     Ok(observation)
 }

@@ -7017,7 +7017,226 @@ fn workspace_member_clippy_replays_only_while_every_clippy_input_is_unchanged() 
 
 #[cfg(unix)]
 #[test]
-fn procedural_macro_consumers_reuse_only_while_cargo_would_keep_their_build_script() {
+fn remapped_clippy_results_restore_across_checkout_roots_until_an_input_changes() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let result: Result<()> = (|| {
+        let layout = |root: &Path| -> Result<PathBuf> {
+            let workspace = root.join("workspace");
+            let member = workspace.join("member");
+            fs::create_dir_all(member.join("src"))?;
+            fs::write(
+                workspace.join("Cargo.toml"),
+                "[workspace]\nmembers = [\"member\"]\nresolver = \"3\"\n",
+            )?;
+            fs::write(workspace.join("clippy.toml"), "too-many-arguments-threshold = 8\n")?;
+            fs::write(
+                member.join("Cargo.toml"),
+                "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            )?;
+            // `needless_return` warns, so a restored result must reproduce a diagnostic.
+            fs::write(member.join("src/lib.rs"), "pub fn value() -> u8 {\n    return 1;\n}\n")?;
+            for arguments in [vec!["init", "--quiet"], vec!["add", "."]] {
+                let output = Command::new("git").current_dir(&workspace).args(arguments).output()?;
+                anyhow::ensure!(output.status.success(), "git: {output:?}");
+            }
+            let lock = Command::new("cargo")
+                .current_dir(&workspace)
+                .args(["generate-lockfile", "--offline"])
+                .output()?;
+            anyhow::ensure!(lock.status.success(), "lockfile: {lock:?}");
+            Ok(cargo_rail::utils::canonicalize_existing(&workspace)?)
+        };
+        let (first_root, second_root) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let first = layout(first_root.path())?;
+        let second = layout(second_root.path())?;
+        let (first_home, second_home) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let remote = LoopbackS3::start()?;
+        let remote_url = remote.remote_url();
+        for (workspace, cargo_home, mode) in [
+            (&first, first_home.path(), "read-write"),
+            (&second, second_home.path(), "read"),
+        ] {
+            let setup = rail(
+                workspace,
+                cargo_home,
+                &[
+                    "rail",
+                    "cache",
+                    "setup",
+                    "--remote",
+                    &remote_url,
+                    "--remote-mode",
+                    mode,
+                    "--root-portability",
+                    "remap",
+                    "--remote-environment",
+                    "CLIPPY_ARGS",
+                    "--remote-environment",
+                    "CLIPPY_CONF_DIR",
+                ],
+            )?;
+            anyhow::ensure!(setup.status.success(), "remapped setup: {setup:?}");
+        }
+
+        // Each run starts from `cargo clean`, so only the cache can skip Clippy.
+        let clippy =
+            |workspace: &Path, cargo_home: &Path, clippy_arguments: &[&str]| -> Result<(String, String, Vec<String>)> {
+                let coverage = tempfile::tempdir()?;
+                fs::set_permissions(coverage.path(), fs::Permissions::from_mode(0o700))?;
+                let coverage_path = cargo_rail::utils::canonicalize_existing(coverage.path())?;
+                let clean = Command::new("cargo")
+                    .current_dir(workspace)
+                    .args(["clean", "--quiet"])
+                    .env("CARGO_HOME", cargo_home)
+                    .output()?;
+                anyhow::ensure!(clean.status.success(), "clean: {clean:?}");
+                let mut command = Command::new("cargo");
+                command
+                    .current_dir(workspace)
+                    .args(["clippy", "--offline", "--workspace", "--message-format=json"])
+                    .env("CARGO_HOME", cargo_home)
+                    .env("CARGO_INCREMENTAL", "0")
+                    .env("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1")
+                    .env("CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY", &coverage_path)
+                    .env("AWS_ACCESS_KEY_ID", "fixture-access-key")
+                    .env("AWS_SECRET_ACCESS_KEY", "fixture-secret-key")
+                    .env("AWS_SESSION_TOKEN", "fixture-session-token")
+                    .env("AWS_EC2_METADATA_DISABLED", "true")
+                    .env("AWS_CONFIG_FILE", workspace.join("missing-aws-config"))
+                    .env("AWS_SHARED_CREDENTIALS_FILE", workspace.join("missing-aws-credentials"));
+                for name in [
+                    "AWS_ENDPOINT_URL",
+                    "AWS_ENDPOINT_URL_S3",
+                    "AWS_PROFILE",
+                    "AWS_DEFAULT_PROFILE",
+                    "OUT_DIR",
+                    "RUSTC_WRAPPER",
+                    "RUSTC_WORKSPACE_WRAPPER",
+                    "CARGO_BUILD_RUSTC_WRAPPER",
+                    "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+                    "RUSTFLAGS",
+                    "CARGO_ENCODED_RUSTFLAGS",
+                    "CLIPPY_ARGS",
+                    "CLIPPY_CONF_DIR",
+                    "CLIPPY_DISABLE_DOCS_LINKS",
+                    "CARGO_RAIL_CACHE_REMOTE",
+                    "CARGO_RAIL_CACHE_MODE",
+                    "CARGO_RAIL_CACHE_REMOTE_ENVIRONMENT",
+                    "CARGO_RAIL_CACHE_REPORT",
+                ] {
+                    command.env_remove(name);
+                }
+                if !clippy_arguments.is_empty() {
+                    command.arg("--").args(clippy_arguments);
+                }
+                let output = command.output()?;
+                anyhow::ensure!(output.status.success(), "clippy: {output:?}");
+                let event = coverage_events(&coverage_path)?
+                    .into_iter()
+                    .find(|event| event["action"]["crate_name"] == "member")
+                    .context("no coverage event for the member")?;
+                anyhow::ensure!(event["action"]["driver"] == "clippy", "{event}");
+                let diagnostics = String::from_utf8(output.stdout)?
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .filter(|message| message["reason"] == "compiler-message")
+                    .map(|message| message["message"]["rendered"].as_str().unwrap_or_default().to_string())
+                    .collect::<Vec<_>>();
+                Ok((
+                    event["status"].as_str().unwrap_or_default().to_string(),
+                    format!(
+                        "{}; {}",
+                        event["reason"].as_str().unwrap_or_default(),
+                        String::from_utf8_lossy(&output.stderr)
+                    ),
+                    diagnostics,
+                ))
+            };
+
+        let (status, reason, seeded) = clippy(&first, first_home.path(), &[])?;
+        assert_eq!(status, "miss", "the producer must store its Clippy result: {reason}");
+        assert!(
+            seeded.iter().any(|rendered| rendered.contains("needless_return")),
+            "{seeded:?}"
+        );
+        // The first restore reads the remote result; the local store then keeps it.
+        let restore = |label: &str, source: &str| -> Result<()> {
+            let (status, reason, restored) = clippy(&second, second_home.path(), &[])?;
+            assert_eq!(
+                status, "hit",
+                "{label}: the other checkout must restore the result: {reason}"
+            );
+            assert!(
+                reason.starts_with(source) && reason.contains("root_portability_remap_eligible"),
+                "{label}: {reason}"
+            );
+            assert_eq!(
+                restored
+                    .iter()
+                    .filter(|rendered| rendered.contains("needless_return"))
+                    .count(),
+                1,
+                "{label}: {restored:?}"
+            );
+            let first_spelling = first.to_string_lossy();
+            assert!(
+                restored
+                    .iter()
+                    .all(|rendered| !rendered.contains(first_spelling.as_ref())),
+                "{label}: the producer root leaked: {restored:?}"
+            );
+            Ok(())
+        };
+        restore("unchanged inputs", "verified_remote_result")?;
+
+        let changed = |input: &str, clippy_arguments: &[&str]| -> Result<()> {
+            let (status, reason, _) = clippy(&second, second_home.path(), clippy_arguments)?;
+            assert_eq!(
+                status, "miss",
+                "a changed {input} must not restore the shared result: {reason}"
+            );
+            Ok(())
+        };
+        changed("CLIPPY_ARGS", &["-W", "clippy::pedantic"])?;
+        let edit = |path: &Path, contents: &str| -> Result<String> {
+            let before = fs::read_to_string(path).unwrap_or_default();
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(path, contents)?;
+            Ok(before)
+        };
+        let configuration = second.join("clippy.toml");
+        let before = edit(&configuration, "too-many-arguments-threshold = 9\n")?;
+        changed("loaded configuration", &[])?;
+        fs::write(&configuration, before)?;
+        let manifest = second.join("member/Cargo.toml");
+        let before = edit(
+            &manifest,
+            &format!("{}description = \"changed\"\n", fs::read_to_string(&manifest)?),
+        )?;
+        changed("workspace manifest", &[])?;
+        fs::write(&manifest, before)?;
+        let cargo_configuration = second.join(".cargo/config.toml");
+        edit(&cargo_configuration, "[term]\nverbose = false\n")?;
+        changed("repository Cargo configuration", &[])?;
+        fs::remove_file(&cargo_configuration)?;
+        // Setup enrolled the wrapper in this file, so the change appends to it.
+        let home_configuration = second_home.path().join("config.toml");
+        let enrolled = fs::read_to_string(&home_configuration)?;
+        let before = edit(&home_configuration, &format!("{enrolled}\n[term]\nverbose = false\n"))?;
+        changed("Cargo home configuration", &[])?;
+        fs::write(&home_configuration, before)?;
+        restore("restored inputs", "verified_local_result")?;
+        Ok(())
+    })();
+    crate::helpers::finish_test(result);
+}
+
+#[cfg(unix)]
+#[test]
+fn procedural_macro_consumers_reuse_only_while_every_observed_read_is_unchanged() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let result: Result<()> = (|| {
@@ -7030,10 +7249,10 @@ fn procedural_macro_consumers_reuse_only_while_cargo_would_keep_their_build_scri
         };
         write(
             "Cargo.toml",
-            "[workspace]\nmembers = [\"reader\", \"facade\", \"direct\", \"reexport\", \"undeclared\"]\nresolver = \"3\"\n",
+            "[workspace]\nmembers = [\"reader\", \"facade\", \"direct\", \"reexport\", \"scriptless\", \"spawner\", \"spawning\", \"locator\", \"locating\"]\nresolver = \"3\"\n",
         )?;
-        // The macro reads a file that rustc cannot see; the consumers' build scripts declare it,
-        // which is Cargo's contract for recompiling them when it changes.
+        // The macro reads a file, a directory listing, a missing path, and a variable. Rustc records none of
+        // them, and no build script declares them.
         write(
             "reader/Cargo.toml",
             "[package]\nname = \"reader\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\nproc-macro = true\n",
@@ -7044,9 +7263,13 @@ fn procedural_macro_consumers_reuse_only_while_cargo_would_keep_their_build_scri
 
 #[proc_macro]
 pub fn data(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
-    let package = std::env::var("CARGO_MANIFEST_DIR").expect("package directory");
-    let data = std::fs::read_to_string(std::path::Path::new(&package).join("data.txt")).expect("data");
-    proc_macro::TokenTree::Literal(proc_macro::Literal::string(data.trim())).into()
+    let workspace = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").expect("package")).join("..");
+    let setting = std::fs::read_to_string(workspace.join("shared/setting.txt")).expect("setting");
+    let templates = std::fs::read_dir(workspace.join("shared/templates")).expect("templates").count();
+    let optional = workspace.join("shared/optional.txt").exists();
+    let variable = std::env::var("CARGO_RAIL_TEST_MACRO_SETTING").unwrap_or_default();
+    let value = format!("{}|{}|{}|{}", setting.trim(), templates, optional, variable);
+    proc_macro::TokenTree::Literal(proc_macro::Literal::string(&value)).into()
 }
 "#,
         )?;
@@ -7055,10 +7278,54 @@ pub fn data(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
             "[package]\nname = \"facade\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nreader = { path = \"../reader\" }\n",
         )?;
         write("facade/src/lib.rs", "pub use reader::data;\n")?;
+        // Starting an unmodeled process has effects no key binds.
+        write(
+            "spawner/Cargo.toml",
+            "[package]\nname = \"spawner\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\nproc-macro = true\n",
+        )?;
+        write(
+            "spawner/src/lib.rs",
+            r#"extern crate proc_macro;
+
+#[proc_macro]
+pub fn data(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let cargo = std::env::var("CARGO").expect("cargo");
+    let status = std::process::Command::new(cargo).arg("--version").output().expect("cargo").status;
+    proc_macro::TokenTree::Literal(proc_macro::Literal::string(&status.success().to_string())).into()
+}
+"#,
+        )?;
+        // `proc-macro-crate` asks Cargo for the workspace root with exactly this query.
+        write(
+            "locator/Cargo.toml",
+            "[package]\nname = \"locator\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\nproc-macro = true\n",
+        )?;
+        write(
+            "locator/src/lib.rs",
+            r#"extern crate proc_macro;
+
+#[proc_macro]
+pub fn data(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let cargo = std::env::var("CARGO").expect("cargo");
+    let manifest = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").expect("package")).join("Cargo.toml");
+    let output = std::process::Command::new(cargo)
+        .arg("locate-project")
+        .args(["--workspace", "--message-format=plain"])
+        .arg(format!("--manifest-path={}", manifest.display()))
+        .output()
+        .expect("cargo locate-project");
+    let root = String::from_utf8(output.stdout).expect("root");
+    let found = std::path::Path::new(root.trim()).ends_with("workspace/Cargo.toml");
+    proc_macro::TokenTree::Literal(proc_macro::Literal::string(&found.to_string())).into()
+}
+"#,
+        )?;
         for (package, dependency, build_script) in [
-            ("direct", "reader", "println!(\"cargo::rerun-if-changed=data.txt\");"),
-            ("reexport", "facade", "println!(\"cargo::rerun-if-changed=data.txt\");"),
-            ("undeclared", "reader", ""),
+            ("direct", "reader", true),
+            ("reexport", "facade", true),
+            ("scriptless", "reader", false),
+            ("spawning", "spawner", false),
+            ("locating", "locator", false),
         ] {
             write(
                 &format!("{package}/Cargo.toml"),
@@ -7066,16 +7333,17 @@ pub fn data(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
                     "[package]\nname = \"{package}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n{dependency} = {{ path = \"../{dependency}\" }}\n"
                 ),
             )?;
-            write(
-                &format!("{package}/build.rs"),
-                &format!("fn main() {{ {build_script} }}\n"),
-            )?;
-            write(&format!("{package}/data.txt"), "one\n")?;
+            if build_script {
+                // A build script that declares nothing: Cargo would not recompile for any macro input.
+                write(&format!("{package}/build.rs"), "fn main() {}\n")?;
+            }
             write(
                 &format!("{package}/src/main.rs"),
                 &format!("fn main() {{ println!(\"{{}}\", {dependency}::data!()); }}\n"),
             )?;
         }
+        write("shared/setting.txt", "one\n")?;
+        write("shared/templates/first.txt", "")?;
         for arguments in [vec!["init", "--quiet"], vec!["add", "."]] {
             let output = Command::new("git").current_dir(&workspace).args(arguments).output()?;
             anyhow::ensure!(output.status.success(), "git: {output:?}");
@@ -7089,7 +7357,7 @@ pub fn data(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
         let setup = rail(&workspace, cargo_home.path(), &["rail", "cache", "setup"])?;
         anyhow::ensure!(setup.status.success(), "cache setup: {setup:?}");
 
-        let build = |label: &str, clean: bool| -> Result<BTreeMap<String, (String, String)>> {
+        let build = |label: &str, clean: bool, variable: &str| -> Result<BTreeMap<String, (String, String)>> {
             if clean {
                 let clean = Command::new("cargo")
                     .current_dir(&workspace)
@@ -7108,6 +7376,7 @@ pub fn data(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
                 .env("CARGO_INCREMENTAL", "0")
                 .env("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1")
                 .env("CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY", &coverage_path)
+                .env("CARGO_RAIL_TEST_MACRO_SETTING", variable)
                 .env_remove("RUSTC_WRAPPER")
                 .env_remove("RUSTC_WORKSPACE_WRAPPER")
                 .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
@@ -7121,7 +7390,7 @@ pub fn data(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
             anyhow::ensure!(output.status.success(), "{label} build: {output:?}");
             let events = coverage_events(&coverage_path)?;
             let mut outcomes = BTreeMap::new();
-            for package in ["direct", "reexport", "undeclared"] {
+            for package in ["direct", "reexport", "scriptless", "spawning", "locating"] {
                 let event = events
                     .iter()
                     .find(|event| {
@@ -7146,38 +7415,64 @@ pub fn data(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
             }
             Ok(outcomes)
         };
-        let expect = |outcomes: &BTreeMap<String, (String, String)>, package: &str, status: &str, value: &str| {
-            assert_eq!(
-                outcomes.get(package),
-                Some(&(status.to_string(), value.to_string())),
-                "{package}: {outcomes:?}"
-            );
+        let consumers = ["direct", "reexport", "scriptless"];
+        let expect_all = |outcomes: &BTreeMap<String, (String, String)>, status: &str, value: &str| {
+            for package in consumers {
+                assert_eq!(
+                    outcomes.get(package),
+                    Some(&(status.to_string(), value.to_string())),
+                    "{package}: {outcomes:?}"
+                );
+            }
         };
 
-        let cold = build("cold", true)?;
-        expect(&cold, "direct", "miss", "one");
-        expect(&cold, "reexport", "miss", "one");
-        expect(&cold, "undeclared", "bypassed", "one");
+        let located = |outcomes: &BTreeMap<String, (String, String)>, status: &str| {
+            assert_eq!(
+                outcomes.get("locating"),
+                Some(&(status.to_string(), "true".to_string())),
+                "{outcomes:?}"
+            );
+        };
+        let cold = build("cold", true, "a")?;
+        expect_all(&cold, "miss", "one|1|false|a");
+        located(&cold, "miss");
         assert_eq!(
-            cold.get("undeclared reason").map(|(reason, _)| reason.as_str()),
-            Some("build_script_package_rerun_unmodeled"),
-            "a script without rerun declarations reruns for any package file: {cold:?}"
+            cold.get("spawning reason").map(|(reason, _)| reason.as_str()),
+            Some("procedural_macro_process_unmodeled"),
+            "{cold:?}"
         );
-        let warm = build("warm", true)?;
-        expect(&warm, "direct", "hit", "one");
-        expect(&warm, "reexport", "hit", "one");
+        let warm = build("warm", true, "a")?;
+        expect_all(&warm, "hit", "one|1|false|a");
+        located(&warm, "hit");
 
-        // Cargo reruns both build scripts and recompiles their packages. A hit would restore "one".
-        for package in ["direct", "reexport", "undeclared"] {
-            fs::write(workspace.join(package).join("data.txt"), "two\n")?;
+        // The Cargo query binds the workspace manifest; the file reads do not.
+        let manifest = fs::read_to_string(workspace.join("Cargo.toml"))?;
+        write("Cargo.toml", &format!("{manifest}# changed\n"))?;
+        let changed = build("manifest", true, "a")?;
+        expect_all(&changed, "hit", "one|1|false|a");
+        located(&changed, "miss");
+        located(&build("manifest recovered", true, "a")?, "hit");
+
+        // Each change misses with the new value, and the next clean build restores the stored result.
+        // A hit instead of a miss would print the previous value.
+        let steps = [
+            ("contents", Some(("shared/setting.txt", "two\n")), "a", "two|1|false|a"),
+            (
+                "listing",
+                Some(("shared/templates/second.txt", "")),
+                "a",
+                "two|2|false|a",
+            ),
+            ("absence", Some(("shared/optional.txt", "")), "a", "two|2|true|a"),
+            ("variable", None, "b", "two|2|true|b"),
+        ];
+        for (label, change, variable, value) in steps {
+            if let Some((path, contents)) = change {
+                write(path, contents)?;
+            }
+            expect_all(&build(label, true, variable)?, "miss", value);
+            expect_all(&build(&format!("{label} recovered"), true, variable)?, "hit", value);
         }
-        let changed = build("changed", false)?;
-        expect(&changed, "direct", "miss", "two");
-        expect(&changed, "reexport", "miss", "two");
-        let recovered = build("recovered", true)?;
-        expect(&recovered, "direct", "hit", "two");
-        expect(&recovered, "reexport", "hit", "two");
-        expect(&recovered, "undeclared", "bypassed", "two");
         Ok(())
     })();
     crate::helpers::finish_test(result);

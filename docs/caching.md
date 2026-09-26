@@ -187,7 +187,7 @@ A Clippy action binds its rustc-equivalent action and every input that Clippy ad
   including every absent candidate;
 - the inputs of `cargo metadata`, which `clippy::cargo` lints run during linting:
   the `cargo` executable, non-secret `CARGO_*` variables, `RUSTC`, `RUSTUP_TOOLCHAIN`,
-  each `.cargo/config.toml` and `.cargo/config` that Cargo reads,
+  each `.cargo/config.toml` and `.cargo/config` that Cargo reads, including those in the Cargo home,
   the workspace manifests with every path dependency they reach, and `Cargo.lock`.
 
 A source attribute can enable a `clippy::cargo` lint, so every Clippy action binds the Cargo inputs.
@@ -216,11 +216,22 @@ These Clippy invocations execute normally:
 | `clippy_configuration_outside_repository` | Clippy loads a configuration file outside the repository |
 | `clippy_configuration_unavailable`        | Clippy's configuration lookup cannot be observed |
 | `clippy_cargo_inputs_unavailable`         | Cargo's inputs cannot be enumerated, for example a manifest that sets `package.workspace` |
-| `clippy_root_portability_unavailable`     | The profile uses `--root-portability remap`; Clippy inputs bind host paths |
 
 The rustc bypass classes also apply.
 Dep-info records `CLIPPY_ARGS` and `CLIPPY_CONF_DIR`, so an L2 selection shares Clippy results only
-after setup approves both names with `--remote-environment`.
+after setup approves both names with `--remote-environment`, as for every compiler environment read.
+
+Under `--root-portability remap`, Clippy results are shared across checkout roots.
+A bound path below the repository, the Cargo home,
+or the compiler sysroot is spelled relative to that root,
+and so is a bound variable whose value names such a path.
+An absent candidate outside those roots is not bound: Cargo and Clippy read nothing there,
+and every lookup captures the inputs again.
+A present input outside them keeps its host path, so its result is reused only at its own root.
+Cache setup writes the installed wrapper's absolute path into the Cargo home configuration.
+A configuration file is bound without that entry when the entry selects the installed wrapper,
+which passes Cargo's compiler queries through unchanged;
+a file that selects any other wrapper is bound whole.
 
 ## Procedural macros
 
@@ -229,26 +240,67 @@ whether the crate depends on the macro directly or reaches it through a re-expor
 Rustc records what the expanded code includes and the environment it reads through `env!`, `option_env!`,
 and tracked environment; the action binds those records.
 
-A macro can also read files or variables that rustc does not record.
-Cargo's contract for such reads is the package build script: when a `rerun-if-changed` path or a `rerun-if-env-changed` variable changes,
-Cargo reruns the script and recompiles the package.
-A unit that loads a procedural macro therefore also binds its package build script's declarations:
-the content of every declared path, every entry of a declared directory,
-and the value of every declared variable.
-A hit is valid exactly while Cargo itself would keep the unit.
+A macro can also read files, list directories, and read variables that rustc never records.
+On every miss, including Clippy's resolution phase,
+the compiler driver observes what each loaded macro does through the C library and, on Linux,
+through the kernel.
+The action then binds each observed read:
+
+- A variable read joins the compiler's own environment reads,
+  so it binds and shares exactly as an `env!` read does.
+- A repository path binds its state when the action was captured:
+  the file's content and mode, the path's absence, or a directory's entry names and kinds.
+- A read inside what the action already captures whole,
+  such as the crate's own sources or its build-script output, is already bound.
+- `cargo locate-project`, which `proc-macro-crate` runs to find the workspace,
+  binds the Cargo inputs that answer it.
+
+A hit is therefore stricter than Cargo's own freshness,
+which misses a macro read that no build script declares.
 
 These units execute normally:
 
-| Reason                                 | Condition |
-| -------------------------------------- | --------- |
-| `build_script_package_rerun_unmodeled` | The package's build script declares no rerun input, so Cargo reruns it when any package file changes |
-| `build_script_rerun_path_missing`      | A declared path is missing, so Cargo reruns the script on every build |
-| `build_script_secret_environment`      | A declared variable has a secret-like name |
+| Reason                                     | Condition |
+| ------------------------------------------ | --------- |
+| `procedural_macro_read_outside_repository` | The macro reads a path outside the repository and outside the captured namespaces |
+| `procedural_macro_read_through_symlink`    | The macro reads a repository path through a symbolic link |
+| `procedural_macro_process_unmodeled`       | The macro starts a process other than a modeled `cargo locate-project` query |
+| `procedural_macro_process_control`         | The macro forks, replaces its process, or starts a process with a changed environment, directory, or descriptors |
+| `procedural_macro_secret_environment`      | The macro reads a variable with a secret-like name |
+| `procedural_macro_environment_enumeration` | The macro walks the whole environment |
+| `procedural_macro_environment_write`       | The macro changes the environment |
+| `procedural_macro_file_write`              | The macro creates, writes, renames, or removes a file |
+| `procedural_macro_network`                 | The macro opens a network connection |
+| `procedural_macro_host_state`              | The macro reads host state, such as the host name, kernel identity, or file-system statistics |
+| `procedural_macro_working_directory`       | The macro changes the working directory |
+| `procedural_macro_dynamic_load`            | The macro loads a library at run time |
+| `procedural_macro_executable_memory`       | The macro maps or generates executable memory |
+| `procedural_macro_dynamic_dependency`      | The macro links a shared library other than the system C library |
+| `procedural_macro_import_unclassified`     | The macro imports a C library function that the driver does not classify |
+| `procedural_macro_initializer`             | The macro ran initialization code before the driver could observe it |
+| `procedural_macro_raw_system_call`         | The macro issues a system call without the C library, and the platform cannot observe it |
+| `procedural_macro_path_unavailable`        | A path the macro used cannot be resolved to a stable name |
+| `procedural_macro_observation_limit`       | The macro reads more paths or variables than an action binds |
+| `procedural_macro_observation_unavailable` | The platform cannot observe macros, as described below |
 
-A macro that reads files or variables it never declares is outside this boundary,
-as it is for Cargo's own incremental builds.
-Cargo would miss that change until `cargo clean`; a hit can restore the earlier result after a clean.
-Declare such inputs in the build script, or run that build with `CARGO_RAIL_CACHE=off`.
+Observation depends on the host:
+
+- Linux: the driver rebinds each macro image's C library imports after rustc loads it,
+  and a per-thread seccomp user-notification filter reports system calls
+  that the macro's own code issues.
+  Kernels older than 5.5, and containers whose seccomp profile blocks that filter, report `procedural_macro_observation_unavailable`.
+  An image whose initializers do more than the C runtime's
+  and the Rust standard library's setup reports `procedural_macro_initializer`,
+  because those initializers ran before instrumentation.
+- macOS: the driver instruments each macro image
+  before its initializers run. macOS has no unprivileged system-call observer,
+  so an image that contains a system-call instruction bypasses.
+  On Apple silicon the check is exact.
+  On x86-64 it checks every byte offset, and ordinary code often contains those bytes,
+  so most macro images bypass there.
+- Windows and other hosts: every unit that loads a procedural macro reports `procedural_macro_observation_unavailable`.
+  Windows native result reuse is not yet implemented, so this changes no Windows result.
+
 Distributed workers never run procedural macros; those units stay local.
 
 ## Build-script execution

@@ -90,6 +90,16 @@ impl Driver {
         args: &[String],
         phase: NativeInputPhase,
     ) -> (Output, Option<NativeInputObservation>) {
+        self.run_phase_with(name, args, phase, &[])
+    }
+
+    fn run_phase_with(
+        &self,
+        name: &str,
+        args: &[String],
+        phase: NativeInputPhase,
+        environment: &[(&str, &str)],
+    ) -> (Output, Option<NativeInputObservation>) {
         let request_path = self.root.join(format!("{name}-request.json"));
         let result_path = self.root.join(format!("{name}-result.json"));
         let request = NativeInputInvocation {
@@ -104,6 +114,7 @@ impl Driver {
         fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
         let output = self
             .command(true)
+            .envs(environment.iter().copied())
             .arg(NATIVE_INPUT_INVOCATION_ARGUMENT)
             .arg(&request_path)
             .arg(&self.rustc)
@@ -134,10 +145,12 @@ impl Driver {
     }
 }
 
+#[track_caller]
 fn assert_success(output: &Output) {
     assert!(
         output.status.success(),
-        "compiler failed: {}",
+        "compiler failed ({}): {}",
+        output.status,
         String::from_utf8_lossy(&output.stderr)
     );
 }
@@ -802,4 +815,286 @@ fn native_and_analysis_observations_share_one_unchanged_compilation() {
         NativeInputObservation::decode(&fs::read(&native_request.result_path).unwrap(), &native_request).unwrap();
     assert_eq!(native.assembly, NativeAssemblyObservation::NoCodegen);
     assert!(native.crates.iter().any(|source| source.name == "std"));
+}
+
+/// Compile a procedural macro with the ordinary compiler and return its library path.
+#[cfg(unix)]
+fn compile_procedural_macro(driver: &Driver, name: &str, source: &str) -> PathBuf {
+    let input = driver.root.join(format!("{name}.rs"));
+    let output = driver.root.join(format!(
+        "{}{name}{}",
+        std::env::consts::DLL_PREFIX,
+        std::env::consts::DLL_SUFFIX
+    ));
+    fs::write(&input, source).unwrap();
+    let result = driver
+        .command(false)
+        .arg(&input)
+        .args([
+            "--crate-type=proc-macro",
+            "--edition=2024",
+            "--extern",
+            "proc_macro",
+            "-o",
+        ])
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert_success(&result);
+    output
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn procedural_macro_reads_are_observed_without_changing_compilation() {
+    use native_input_protocol::{NativeMacroObservation, NativeMacroPathAccess, NativeMacroPathRead};
+
+    let driver = Driver::new();
+    let macro_library = compile_procedural_macro(
+        &driver,
+        "probe_macro",
+        r#"
+extern crate proc_macro;
+use proc_macro::TokenStream;
+
+#[proc_macro]
+pub fn probe(_input: TokenStream) -> TokenStream {
+    let contents = std::fs::read_to_string("input.txt").unwrap_or_default();
+    let variable = std::env::var("CARGO_RAIL_MACRO_PROBE").unwrap_or_default();
+    let entries = std::fs::read_dir("listing").map(|entries| entries.count()).unwrap_or(0);
+    let absent = std::path::Path::new("absent.txt").exists();
+    let canonical = std::fs::canonicalize("input.txt").is_ok();
+    format!("pub const PROBE: &str = {:?};", format!("{contents}|{variable}|{entries}|{absent}|{canonical}"))
+        .parse()
+        .unwrap()
+}
+"#,
+    );
+    fs::write(driver.root.join("input.txt"), "undeclared").unwrap();
+    fs::create_dir(driver.root.join("listing")).unwrap();
+    fs::write(driver.root.join("listing/entry"), "").unwrap();
+    fs::write(driver.root.join("consumer.rs"), "probe_macro::probe!();\n").unwrap();
+    let mut args = arguments("consumer.rs", "consumer.rmeta", "--emit=metadata");
+    args.extend(["--extern".into(), format!("probe_macro={}", macro_library.display())]);
+    let baseline = driver
+        .command(false)
+        .env("CARGO_RAIL_MACRO_PROBE", "value")
+        .args(&args)
+        .output()
+        .unwrap();
+    assert_success(&baseline);
+    let baseline_bytes = fs::read(driver.root.join("consumer.rmeta")).unwrap();
+    fs::remove_file(driver.root.join("consumer.rmeta")).unwrap();
+
+    let root = driver.root.display().to_string();
+    let expected = NativeMacroObservation {
+        paths: vec![
+            NativeMacroPathRead {
+                path: format!("{root}/absent.txt"),
+                access: NativeMacroPathAccess::Entry,
+            },
+            NativeMacroPathRead {
+                path: format!("{root}/input.txt"),
+                access: NativeMacroPathAccess::Contents,
+            },
+            NativeMacroPathRead {
+                path: format!("{root}/input.txt"),
+                access: NativeMacroPathAccess::Resolution,
+            },
+            NativeMacroPathRead {
+                path: format!("{root}/listing"),
+                access: NativeMacroPathAccess::Listing,
+            },
+        ],
+        environment: vec!["CARGO_RAIL_MACRO_PROBE".into()],
+        spawns: Vec::new(),
+        unobservable: Vec::new(),
+    };
+    for phase in [NativeInputPhase::Compilation, NativeInputPhase::Resolution] {
+        let (observed, observation) = driver.run_phase_with(
+            &format!("macro-{phase:?}"),
+            &args,
+            phase,
+            &[("CARGO_RAIL_MACRO_PROBE", "value")],
+        );
+        assert_success(&observed);
+        assert_eq!(observed.stdout, baseline.stdout);
+        assert_eq!(observed.stderr, baseline.stderr);
+        if phase == NativeInputPhase::Compilation {
+            assert_eq!(fs::read(driver.root.join("consumer.rmeta")).unwrap(), baseline_bytes);
+        }
+        let observation = observation.expect("complete native observation");
+        let mut macros = observation.macros.expect("procedural-macro observation");
+        // The standard library may also consult its own configuration variables.
+        macros.environment.retain(|name| !name.starts_with("RUST_"));
+        assert_eq!(macros, expected, "{phase:?}");
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn procedural_macro_process_start_records_the_program_and_arguments() {
+    let driver = Driver::new();
+    let cargo = String::from_utf8(
+        Command::new("rustup")
+            .args(["which", "cargo"])
+            .output()
+            .expect("selected cargo")
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+    let macro_library = compile_procedural_macro(
+        &driver,
+        "query_macro",
+        r#"
+extern crate proc_macro;
+use proc_macro::TokenStream;
+
+#[proc_macro]
+pub fn query(_input: TokenStream) -> TokenStream {
+    let cargo = std::env::var("CARGO").unwrap();
+    let output = std::process::Command::new(cargo).args(["locate-project", "--workspace"]).output().unwrap();
+    format!("pub const QUERIED: bool = {};", output.status.code().is_some()).parse().unwrap()
+}
+"#,
+    );
+    fs::write(driver.root.join("consumer.rs"), "query_macro::query!();\n").unwrap();
+    let mut args = arguments("consumer.rs", "consumer.rmeta", "--emit=metadata");
+    args.extend(["--extern".into(), format!("query_macro={}", macro_library.display())]);
+    let (observed, observation) = driver.run_phase_with(
+        "macro-query",
+        &args,
+        NativeInputPhase::Compilation,
+        &[("CARGO", &cargo)],
+    );
+    assert_success(&observed);
+    let macros = observation
+        .expect("native observation")
+        .macros
+        .expect("macro observation");
+    assert_eq!(macros.unobservable, Vec::new());
+    assert_eq!(macros.environment, ["CARGO"]);
+    // `Command::output` gives the child `/dev/null` as standard input.
+    assert_eq!(
+        macros.paths.iter().map(|read| read.path.as_str()).collect::<Vec<_>>(),
+        ["/dev/null"]
+    );
+    assert_eq!(macros.spawns.len(), 1);
+    assert_eq!(macros.spawns[0].program, cargo);
+    assert_eq!(
+        macros.spawns[0].arguments,
+        [cargo.as_str(), "locate-project", "--workspace"]
+    );
+}
+
+/// Kernel observation: a macro that enters the kernel without the C library, as `rustix` does with its
+/// `linux_raw` backend, is still observed.
+#[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[test]
+fn procedural_macro_raw_system_calls_are_observed_by_the_kernel() {
+    use native_input_protocol::{NativeMacroPathAccess, NativeMacroPathRead};
+
+    let driver = Driver::new();
+    let macro_library = compile_procedural_macro(
+        &driver,
+        "raw_macro",
+        r#"
+extern crate proc_macro;
+use proc_macro::TokenStream;
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn open_directly(path: *const u8) -> isize {
+    let result: isize;
+    unsafe {
+        core::arch::asm!("svc 0", in("x8") 56usize, inlateout("x0") -100isize => result,
+            in("x1") path, in("x2") 0usize, in("x3") 0usize, options(nostack));
+    }
+    result
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn open_directly(path: *const u8) -> isize {
+    let result: isize;
+    unsafe {
+        core::arch::asm!("syscall", inlateout("rax") 257isize => result, in("rdi") -100isize,
+            in("rsi") path, in("rdx") 0usize, in("r10") 0usize, lateout("rcx") _, lateout("r11") _,
+            options(nostack));
+    }
+    result
+}
+
+#[proc_macro]
+pub fn raw(_input: TokenStream) -> TokenStream {
+    let descriptor = unsafe { open_directly(b"raw.txt\0".as_ptr()) };
+    format!("pub const OPENED: bool = {};", descriptor >= 0).parse().unwrap()
+}
+"#,
+    );
+    fs::write(driver.root.join("raw.txt"), "undeclared").unwrap();
+    fs::write(driver.root.join("consumer.rs"), "raw_macro::raw!();\n").unwrap();
+    let mut args = arguments("consumer.rs", "consumer.rmeta", "--emit=metadata");
+    args.extend(["--extern".into(), format!("raw_macro={}", macro_library.display())]);
+    let (observed, observation) = driver.run("macro-raw", &args);
+    assert_success(&observed);
+    let macros = observation
+        .expect("native observation")
+        .macros
+        .expect("macro observation");
+    assert_eq!(macros.unobservable, Vec::new());
+    assert_eq!(
+        macros.paths,
+        [NativeMacroPathRead {
+            path: format!("{}/raw.txt", driver.root.display()),
+            access: NativeMacroPathAccess::Contents,
+        }]
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn procedural_macro_effects_that_no_key_binds_are_reported() {
+    use native_input_protocol::NativeMacroUnobservable;
+
+    let driver = Driver::new();
+    let macro_library = compile_procedural_macro(
+        &driver,
+        "effect_macro",
+        r#"
+extern crate proc_macro;
+use proc_macro::TokenStream;
+
+#[proc_macro]
+pub fn effect(input: TokenStream) -> TokenStream {
+    match input.to_string().as_str() {
+        "enumerate" => drop(std::env::vars_os().count()),
+        "write" => drop(std::fs::write("written.txt", "effect")),
+        "connect" => drop(std::net::TcpStream::connect("127.0.0.1:9")),
+        other => panic!("unknown effect {other}"),
+    }
+    TokenStream::new()
+}
+"#,
+    );
+    for (effect, expected) in [
+        ("enumerate", NativeMacroUnobservable::EnvironmentEnumeration),
+        ("write", NativeMacroUnobservable::FileWrite),
+        ("connect", NativeMacroUnobservable::Network),
+    ] {
+        fs::write(
+            driver.root.join("consumer.rs"),
+            format!("effect_macro::effect!({effect});\n"),
+        )
+        .unwrap();
+        let mut args = arguments("consumer.rs", "consumer.rmeta", "--emit=metadata");
+        args.extend(["--extern".into(), format!("effect_macro={}", macro_library.display())]);
+        let (observed, observation) = driver.run(&format!("macro-{effect}"), &args);
+        assert_success(&observed);
+        let macros = observation
+            .expect("native observation")
+            .macros
+            .expect("macro observation");
+        assert_eq!(macros.unobservable, [expected], "{effect}");
+    }
 }

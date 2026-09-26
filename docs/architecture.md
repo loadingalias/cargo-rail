@@ -95,6 +95,8 @@ and do not build a workspace context inside a compiler process.
 
 `src/windows_fs.rs` is the only production `unsafe` and Win32 FFI boundary.
 Its safe API remains crate-private.
+The separately built compiler driver has one `unsafe` module, `macro_observation`,
+which instruments procedural-macro images on Linux and macOS to record what they read.
 
 ## Module ownership
 

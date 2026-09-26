@@ -108,16 +108,6 @@ pub(super) struct RustInputSelector {
 }
 
 impl RustInputSelector {
-    /// Whether rustc selected a dynamic Rust library built outside the toolchain, which is how it loads
-    /// a procedural macro. The sysroot also offers dynamic standard libraries for every crate.
-    pub(super) fn selects_dynamic_library(&self) -> bool {
-        self.crates
-            .iter()
-            .flat_map(|source| &source.selected)
-            .filter(|path| matches!(path, RustInputPath::Repository(_) | RustInputPath::OutputDirectory(_)))
-            .any(|path| super::dynamic_library_path(Path::new(path.relative())))
-    }
-
     pub(super) fn validate(&self) -> RailResult<()> {
         if self.crates.len() > 4096
             || self.searches.len() > 512
@@ -1312,6 +1302,7 @@ mod tests {
                 }],
                 assembly: NativeAssemblyObservation::NoCodegen,
                 codegen: crate::compiler::native_input_protocol::NativeCodegenObservation::NotRun,
+                macros: None,
             };
             Self {
                 _temporary: temporary,

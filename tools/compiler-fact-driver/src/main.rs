@@ -5,7 +5,10 @@
 //! then authenticated and distributed beside the stable cargo-rail binary.
 
 #![feature(rustc_private)]
-#![forbid(unsafe_code)]
+// The macro observation hooks forward variadic C functions such as `open`.
+#![cfg_attr(any(target_os = "linux", target_os = "macos"), feature(c_variadic))]
+// Only `macro_observation` opts in: it rebinds a loaded macro image's imports.
+#![deny(unsafe_code)]
 
 extern crate rustc_codegen_ssa;
 extern crate rustc_driver;
@@ -35,6 +38,11 @@ mod native_input_protocol;
 mod codegen;
 mod collection;
 mod digest;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod macro_observation;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[path = "macro_observation/unavailable.rs"]
+mod macro_observation;
 mod native_inputs;
 mod output;
 
@@ -169,6 +177,10 @@ fn main() -> ExitCode {
     let native_invocation = native_path
         .as_ref()
         .and_then(|path| native_inputs::load_invocation(path, &arguments[2..]).ok());
+    if native_invocation.is_some() {
+        // Before rustc can load a procedural macro, so every macro image is instrumented as it loads.
+        macro_observation::install();
+    }
     let fact_invocation = match std::env::var_os(fact_protocol::COMPILER_FACT_INVOCATION_ENV) {
         Some(path) => match load_invocation(Path::new(&path)) {
             Ok(invocation) => Some(invocation),

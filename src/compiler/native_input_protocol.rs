@@ -10,7 +10,7 @@ use std::path::{Component, Path};
 use rscrypto::Sha256;
 use serde::{Deserialize, Serialize};
 
-pub(crate) const NATIVE_INPUT_PROTOCOL_VERSION: u32 = 3;
+pub(crate) const NATIVE_INPUT_PROTOCOL_VERSION: u32 = 4;
 pub(crate) const NATIVE_INPUT_PROTOCOL_VERSION_ARGUMENT: &str = "--cargo-rail-native-input-protocol-version";
 pub(crate) const NATIVE_INPUT_INVOCATION_ENV: &str = "CARGO_RAIL_NATIVE_INPUT_INVOCATION";
 pub(crate) const NATIVE_INPUT_INVOCATION_ARGUMENT: &str = "--cargo-rail-native-input-invocation";
@@ -163,6 +163,120 @@ impl NativeCodegenObservation {
     }
 }
 
+pub(crate) const MAX_MACRO_PATH_READS: usize = 4096;
+pub(crate) const MAX_MACRO_PATH_BYTES: usize = 4096;
+pub(crate) const MAX_MACRO_ENVIRONMENT_READS: usize = 1024;
+pub(crate) const MAX_MACRO_ENVIRONMENT_NAME_BYTES: usize = 1024;
+pub(crate) const MAX_MACRO_SPAWNS: usize = 64;
+pub(crate) const MAX_MACRO_SPAWN_ARGUMENTS: usize = 256;
+
+/// How a procedural macro reached one path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeMacroPathAccess {
+    /// Existence, type, or link target, such as `stat`, `access`, or `readlink`.
+    Entry,
+    /// Contents opened for reading.
+    Contents,
+    /// Directory entries listed.
+    Listing,
+    /// Canonical resolution, which follows the link state of every ancestor.
+    Resolution,
+}
+
+/// One path a procedural macro read, spelled as the absolute path the operating system resolved.
+/// The spelling can contain `..` components, because resolving them lexically ignores symbolic links.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeMacroPathRead {
+    pub(crate) path: String,
+    pub(crate) access: NativeMacroPathAccess,
+}
+
+/// A process a procedural macro started with the inherited environment and working directory.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeMacroSpawn {
+    pub(crate) program: String,
+    pub(crate) arguments: Vec<String>,
+}
+
+/// An effect of procedural-macro execution that no observation can bind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeMacroUnobservable {
+    /// The host cannot observe a loaded macro, for example a kernel without seccomp user notification.
+    ObservationUnavailable,
+    /// The macro imports a function outside the classified set.
+    ImportUnclassified,
+    /// The macro loads a shared library other than the system C library.
+    DynamicDependency,
+    /// The macro runs load-time initializers that execute before observation.
+    Initializer,
+    /// The macro issues system calls without the C library, and the host cannot observe them.
+    RawSystemCall,
+    /// The macro forks, executes, or starts a process with a changed environment or directory.
+    ProcessControl,
+    Network,
+    FileWrite,
+    EnvironmentWrite,
+    /// The macro read the whole environment instead of named variables.
+    EnvironmentEnumeration,
+    DynamicLoad,
+    ExecutableMemory,
+    WorkingDirectory,
+    /// The macro read host identity, such as the host name or user database.
+    HostState,
+    /// A path is not UTF-8 or names an open descriptor that cannot be resolved.
+    PathUnavailable,
+    ObservationLimit,
+}
+
+/// Everything loaded procedural macros read during one compiler run.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeMacroObservation {
+    pub(crate) paths: Vec<NativeMacroPathRead>,
+    pub(crate) environment: Vec<String>,
+    pub(crate) spawns: Vec<NativeMacroSpawn>,
+    pub(crate) unobservable: Vec<NativeMacroUnobservable>,
+}
+
+impl NativeMacroObservation {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        let valid = self.paths.len() <= MAX_MACRO_PATH_READS
+            && self.paths.windows(2).all(|pair| pair[0] < pair[1])
+            && self.paths.iter().all(|read| {
+                read.path.len() <= MAX_MACRO_PATH_BYTES
+                    && !read.path.contains('\0')
+                    && Path::new(&read.path).is_absolute()
+            })
+            && self.environment.len() <= MAX_MACRO_ENVIRONMENT_READS
+            && self.environment.windows(2).all(|pair| pair[0] < pair[1])
+            && self.environment.iter().all(|name| {
+                !name.is_empty() && name.len() <= MAX_MACRO_ENVIRONMENT_NAME_BYTES && !name.contains(['\0', '='])
+            })
+            && self.spawns.len() <= MAX_MACRO_SPAWNS
+            && self.spawns.windows(2).all(|pair| pair[0] < pair[1])
+            && self.spawns.iter().all(|spawn| {
+                !spawn.program.is_empty()
+                    && spawn.program.len() <= MAX_MACRO_PATH_BYTES
+                    && !spawn.program.contains('\0')
+                    && spawn.arguments.len() <= MAX_MACRO_SPAWN_ARGUMENTS
+                    && spawn
+                        .arguments
+                        .iter()
+                        .all(|argument| argument.len() <= MAX_MACRO_PATH_BYTES && !argument.contains('\0'))
+            })
+            && self.unobservable.windows(2).all(|pair| pair[0] < pair[1]);
+        if valid {
+            Ok(())
+        } else {
+            Err("procedural-macro observation has incompatible authority".into())
+        }
+    }
+}
+
 /// Complete selected crate sources and assembly coverage from one compiler run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -173,6 +287,8 @@ pub(crate) struct NativeInputObservation {
     pub(crate) searches: Vec<NativeCrateSearch>,
     pub(crate) assembly: NativeAssemblyObservation,
     pub(crate) codegen: NativeCodegenObservation,
+    /// `None` when the compiler loaded no procedural macro.
+    pub(crate) macros: Option<NativeMacroObservation>,
 }
 
 impl NativeInputObservation {
@@ -225,6 +341,9 @@ impl NativeInputObservation {
             })
         {
             return Err("native input observation has incompatible authority".into());
+        }
+        if let Some(macros) = &self.macros {
+            macros.validate()?;
         }
         let bytes = serde_json::to_vec(self).map_err(|error| error.to_string())?;
         if bytes.len() as u64 > MAX_NATIVE_INPUT_OBSERVATION_BYTES {
@@ -314,6 +433,7 @@ mod tests {
             searches: vec![],
             assembly: NativeAssemblyObservation::NoCodegen,
             codegen: NativeCodegenObservation::NotRun,
+            macros: None,
         };
         let bytes = observation.encode(&invocation).unwrap();
         invocation.nonce = "3".repeat(64);

@@ -771,6 +771,10 @@ impl WorkerNativeInvocation {
             .read_to_end(&mut bytes)?;
         let mut observation = NativeInputObservation::decode(&bytes, &self.invocation).map_err(RailError::message)?;
         validate_native_assembly(&observation, &request.operation)?;
+        if observation.macros.is_some() {
+            // Units that load a procedural macro stay local, where the driver observes what the macro reads.
+            return Err(RailError::message("distributed compiler loaded a procedural macro"));
+        }
         let host_library_directory = captured
             .sysroot
             .join("lib/rustlib")
@@ -1081,6 +1085,9 @@ impl StagedExecutionResult {
             .encode(&record.invocation)
             .map_err(RailError::message)?;
         validate_native_assembly(&record.observation, &self.operation)?;
+        if record.observation.macros.is_some() {
+            return Err(RailError::message("distributed compiler loaded a procedural macro"));
+        }
         map_native_inputs(&mut record.observation, |path, directory| {
             let path = Path::new(path);
             for (portable, local) in [
@@ -7834,6 +7841,7 @@ pub(crate) mod tests {
                     files: vec![format!("{VIRTUAL_HOST_LIBRARIES}/libcore-exact.rlib")],
                 }],
                 searches: Vec::new(),
+                macros: None,
             };
             let mut record = WorkerNativeInputs {
                 invocation,
