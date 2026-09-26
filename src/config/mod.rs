@@ -109,15 +109,24 @@ pub(crate) fn decode(bytes: &[u8]) -> RailResult<DecodedConfig> {
 
 /// Decode captured input, treating retired keys as `retired` selects.
 pub(crate) fn decode_with(bytes: &[u8], retired: RetiredKeys) -> RailResult<DecodedConfig> {
+    decode_all(bytes, retired).map_err(|errors| match combine_errors(errors) {
+        Err(error) => error,
+        Ok(()) => RailError::message("configuration failed to decode"),
+    })
+}
+
+/// Decode captured input and return every independent decode error, so validation can report each one.
+pub(crate) fn decode_all(bytes: &[u8], retired: RetiredKeys) -> Result<DecodedConfig, Vec<RailError>> {
     let content = std::str::from_utf8(bytes)
-        .map_err(|error| RailError::message(format!("configuration is not valid UTF-8: {error}")))?;
+        .map_err(|error| vec![RailError::message(format!("configuration is not valid UTF-8: {error}"))])?;
     let mut document: toml_edit::DocumentMut = content
         .parse()
-        .map_err(|error: toml_edit::TomlError| RailError::message(error.to_string()))?;
+        .map_err(|error: toml_edit::TomlError| vec![RailError::message(error.to_string())])?;
     if retired == RetiredKeys::Strip {
         migration::strip_retired(&mut document);
     }
-    let config = RailConfig::from_document(document.clone()).map_err(RailError::message)?;
+    let config = RailConfig::from_document(document.clone())
+        .map_err(|errors| errors.into_iter().map(RailError::message).collect::<Vec<_>>())?;
     Ok(DecodedConfig { config, document })
 }
 
@@ -158,7 +167,7 @@ pub(crate) fn workspace_context_required(field: &str) -> RailError {
 }
 
 impl RailConfig {
-    fn from_document(doc: toml_edit::DocumentMut) -> Result<Self, String> {
+    fn from_document(doc: toml_edit::DocumentMut) -> Result<Self, Vec<String>> {
         // Report every unknown key at once; a key below a reported one adds nothing.
         let mut errors = Vec::new();
         let mut reported = Vec::<schema::ConfigPath>::new();
@@ -188,21 +197,10 @@ impl RailConfig {
                 reported.push(path);
             }
         }
-        match errors.len() {
-            0 => {}
-            1 => return Err(errors.remove(0)),
-            count => {
-                return Err(format!(
-                    "{count} configuration errors:\n{}",
-                    errors
-                        .iter()
-                        .map(|error| format!("  - {error}"))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                ));
-            }
+        if !errors.is_empty() {
+            return Err(errors);
         }
-        toml_edit::de::from_document(doc).map_err(|error| error.to_string())
+        toml_edit::de::from_document(doc).map_err(|error| vec![error.to_string()])
     }
 
     /// Validate policy independently of any filesystem or workspace membership.

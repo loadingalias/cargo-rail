@@ -18,6 +18,31 @@ fn stdin_validation(workspace: &std::path::Path, input: &[u8]) -> Result<std::pr
 }
 
 #[test]
+fn strict_validation_counts_each_independent_configuration_error() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("independent-configuration-errors")?;
+        ws.add_crate("test-crate", "0.1.0", &[])?;
+        ws.commit("fixture")?;
+        fs::write(
+            ws.path.join(".config/rail.toml"),
+            "targtes = []\n\n[unify]\nbogus = 1\nmsrv = 3\n",
+        )?;
+        let output = run_cargo_rail(&ws.path, &["rail", "config", "validate", "--strict"])?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{stderr}");
+        assert!(stderr.contains("configuration has 3 error(s)"), "{stderr}");
+        for key in ["'targtes'", "'unify.bogus'", "'unify.msrv'"] {
+            assert_eq!(stderr.matches(key).count(), 1, "{key} is one issue:\n{stderr}");
+        }
+        let output = run_cargo_rail(&ws.path, &["rail", "config", "validate", "--strict", "-f", "json"])?;
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(value["errors"].as_array().map(Vec::len), Some(3), "{value:#}");
+        Ok(())
+    })();
+    crate::helpers::finish_test(result);
+}
+
+#[test]
 fn current_configuration_loads_without_writes() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("current-configuration")?;

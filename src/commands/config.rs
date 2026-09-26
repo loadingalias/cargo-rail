@@ -584,7 +584,7 @@ fn inspect_config_source(
     source: ConfigSource,
 ) -> Result<(ConfigSource, DecodedConfig, Vec<String>), InspectionFailure> {
     let inspect = || -> Result<Inspection, Vec<RailError>> {
-        let decoded = config::decode(&source.bytes).map_err(|error| vec![error])?;
+        let decoded = config::decode_all(&source.bytes, config::RetiredKeys::Reject)?;
         // Intrinsic errors remain diagnostic even if the surrounding Cargo workspace is broken.
         let policy_errors = decoded.config.policy_errors();
         if !policy_errors.is_empty() {
