@@ -777,6 +777,7 @@ const PURE: &[&str] = &[
     "nanosleep",
     "nextafter",
     "nextafterf",
+    "pause",
     "pipe",
     "poll",
     "posix_memalign",

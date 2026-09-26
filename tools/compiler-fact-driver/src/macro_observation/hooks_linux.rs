@@ -196,6 +196,7 @@ pub(in super::super) const PLATFORM_PURE: &[&str] = &[
     "__stack_chk_fail",
     "__tls_get_addr",
     // s390x resolves thread-local storage through this entry point.
+    "__tls_get_addr_opt",
     "__tls_get_offset",
     "__xpg_strerror_r",
     "dl_iterate_phdr",
