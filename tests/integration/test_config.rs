@@ -1068,7 +1068,7 @@ fn inspection_from_a_member_uses_the_workspace_policy_like_consuming_commands() 
         fs::create_dir_all(member.join(".config"))?;
         fs::write(member.join(".config/rail.toml"), "targtes = []\n")?;
         ws.commit("Add member-local non-workspace configuration")?;
-        let workspace_policy = fs::canonicalize(ws.path.join(".config/rail.toml"))?
+        let workspace_policy = cargo_rail::utils::canonicalize_existing(&ws.path.join(".config/rail.toml"))?
             .display()
             .to_string();
 
@@ -1690,7 +1690,7 @@ fn removed_configuration_keys_name_their_release_everywhere_and_migrate_away() {
                 assert!(text.contains(message), "{arguments:?} omits `{message}`:\n{text}");
             }
             assert!(
-                text.contains(".config/rail.toml"),
+                text.contains(&std::path::Path::new(".config").join("rail.toml").display().to_string()),
                 "{arguments:?} names the file:\n{text}"
             );
         }

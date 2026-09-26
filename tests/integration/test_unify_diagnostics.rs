@@ -99,7 +99,8 @@ fn failing_build_script_reports_one_safe_cause_in_text_json_and_wrapped_runs() {
             "rerun with --verbose to see Cargo's output",
             "the build script reported:\nnative SDK prerequisite missing; stdout=<env:D2_INHERITED_SECRET>",
             "reproduce with Cargo: cd ",
-            "cargo check --locked --all-targets",
+            // The selected Cargo is an absolute path, quoted when it holds shell-special bytes.
+            " check --locked --all-targets",
             "--package consumer",
         ] {
             assert!(stderr.contains(expected), "missing `{expected}`:\n{stderr}");
@@ -627,7 +628,7 @@ fn a_foreign_compiler_target_names_its_missing_cross_compiler() {
         let target = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
             .into_iter()
             .find(|target| *target != host && installed.lines().any(|line| line == *target))
-            .context("install a foreign Linux target: rustup target add x86_64-unknown-linux-gnu")?;
+            .context("install a foreign Linux target: rustup target add x86_64-unknown-linux-gnu or aarch64-unknown-linux-gnu")?;
         let ws = consumer_workspace(
             Some(
                 r#"use std::io::Write as _;

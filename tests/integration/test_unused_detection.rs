@@ -636,7 +636,13 @@ log = "0.4"
         assert!(
             stderr.contains(
                 "error: `test-crate` (lib `test_crate`) did not compile in compiler evidence view `test-crate / "
-            ) && stderr.contains("crates/test-crate/src/lib.rs:1:"),
+            ) && stderr.contains(&format!(
+                "{}:1:",
+                std::path::Path::new("crates/test-crate/src/lib.rs")
+                    .components()
+                    .collect::<std::path::PathBuf>()
+                    .display()
+            )),
             "the failed view and its compiler diagnostic were not reported:\n{stderr}"
         );
         let json = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--format", "json"])?;

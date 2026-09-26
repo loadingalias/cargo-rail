@@ -97,8 +97,24 @@ fn normalize(text: &str, workspace: &Path, cargo_home: &Path) -> String {
         text = text.replace(&host, "<host>");
     }
     text = mask_numbers_after(&text, "\"rustc_release\": \"");
-    // Windows renders the same paths with backslashes.
+    // Windows renders the same paths with backslashes, and a `file://` URL spells them with slashes.
     text = text.replace('\\', "/");
+    for (path, label) in [(workspace, "<workspace>"), (cargo_home, "<cargo-home>")] {
+        for spelling in [
+            Some(path.to_path_buf()),
+            cargo_rail::utils::canonicalize_existing(path).ok(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let spelling = spelling.display().to_string().replace('\\', "/");
+            // A Windows `file:///C:/...` URL puts one more slash before the drive.
+            if !spelling.starts_with('/') {
+                text = text.replace(&format!("/{spelling}"), label);
+            }
+            text = text.replace(&spelling, label);
+        }
+    }
     // The selected Cargo executable lives in the host's toolchain directory.
     text = text
         .split(' ')

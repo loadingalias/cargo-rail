@@ -745,9 +745,10 @@ fn unify_compiles_each_shared_dependency_unit_once() {
         // Budgets: on a quiet native macOS arm64 host (2026-09-25) the cold run took 7.1-7.7 s,
         // of which Cargo took 2.4-2.6 s, and the warm run took 1.2 s. Acquisition overhead outside
         // Cargo and the warm run get about three times that, so a loaded host passes while a
-        // return to per-view rebuilds or warm reacquisition fails.
+        // return to per-view rebuilds or warm reacquisition fails. Native Windows x86-64
+        // (c8i.2xlarge, 2026-09-26) took 4.6 s for the warm run, mostly outside acquisition.
         const COLD_OVERHEAD_BUDGET_MS: u64 = 15_000;
-        const WARM_WALL_BUDGET_MS: u64 = 4_000;
+        const WARM_WALL_BUDGET_MS: u64 = if cfg!(windows) { 14_000 } else { 4_000 };
         let milliseconds =
             |value: &serde_json::Value, field: &str| value[field].as_u64().unwrap_or(u64::MAX) / 1_000_000;
         let cold_overhead = milliseconds(&cold, "wall_ns").saturating_sub(milliseconds(&cold, "cargo_elapsed_ns"));

@@ -441,10 +441,9 @@ fn test_unify_apply_restores_manifests_and_lockfile_when_a_late_output_fails() {
         )?;
         assert!(!apply.status.success(), "late report failure must fail apply");
         let error: serde_json::Value = serde_json::from_slice(&apply.stdout)?;
+        // The operating system decides whether the path appears in the message or in its context.
         assert!(
-            error["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("late-report")),
+            error.to_string().contains("late-report"),
             "the report-path filesystem error must be the late failure: {error:#?}"
         );
         assert!(
