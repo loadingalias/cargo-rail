@@ -314,7 +314,11 @@ cargo_prerequisites = [
 
 `when` selects execution packages or targets.
 `require` emits a separate build selector and adds the declared execution root when an artifact changes.
-Package and target identities must resolve uniquely in captured Cargo metadata.
+`require_target_kinds` requires every workspace target of the named Cargo kinds,
+such as `["cdylib"]` for plugins that tests load at run time,
+so a new target joins the edge without a configuration edit.
+Package and target identities must resolve uniquely in captured Cargo metadata,
+and each named kind must select at least one workspace target.
 This is not a command hook or task graph.
 
 Absolute paths, parent traversal, negative globs, commands, unknown fields,

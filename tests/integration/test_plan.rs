@@ -2806,6 +2806,86 @@ cargo_prerequisites = [
 }
 
 #[test]
+fn prerequisite_target_kinds_select_every_workspace_target_of_that_kind() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("plan-prerequisite-kinds")?;
+        let integration = ws.add_crate("integration", "0.1.0", &[])?;
+        let add_plugin = |name: &str| -> Result<()> {
+            let plugin = ws.add_crate(name, "0.1.0", &[])?;
+            let manifest = plugin.join("Cargo.toml");
+            let text = std::fs::read_to_string(&manifest)?;
+            std::fs::write(&manifest, format!("{text}\n[lib]\ncrate-type = [\"cdylib\"]\n"))?;
+            Ok(())
+        };
+        add_plugin("plugin-a")?;
+        add_plugin("plugin-b")?;
+        ws.add_crate("library", "0.1.0", &[])?;
+        std::fs::write(
+            ws.path.join(".config/rail.toml"),
+            r#"[plan.work.runtime-artifacts]
+scope = "cargo"
+cargo_prerequisites = [
+  { source_work = "cargo.test", when = [{ package = "integration" }], require_target_kinds = ["cdylib"] },
+]
+"#,
+        )?;
+        generate_lockfile(&ws)?;
+        ws.commit("load every cdylib plugin from the integration tests")?;
+
+        let artifacts = |label: &str| -> Result<BTreeSet<String>> {
+            std::fs::write(integration.join("src/lib.rs"), format!("pub fn {label}() {{}}\n"))?;
+            let planned = plan(&ws, &["--since", "HEAD"])?;
+            Ok(planned["work"]["runtime-artifacts"]["scope"]["selection"]["targets"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|target| {
+                    assert_eq!(target["kind"], serde_json::json!(["cdylib"]), "{target}");
+                    target["name"].as_str().unwrap_or_default().to_string()
+                })
+                .collect())
+        };
+        assert_eq!(
+            artifacts("first")?,
+            BTreeSet::from(["plugin_a".to_string(), "plugin_b".to_string()])
+        );
+
+        // A new plugin joins the prerequisite without another configuration edit.
+        add_plugin("plugin-c")?;
+        generate_lockfile(&ws)?;
+        ws.commit("add another plugin")?;
+        assert_eq!(
+            artifacts("second")?,
+            BTreeSet::from(["plugin_a".to_string(), "plugin_b".to_string(), "plugin_c".to_string()])
+        );
+
+        std::fs::write(
+            ws.path.join(".config/rail.toml"),
+            r#"[plan.work.runtime-artifacts]
+scope = "cargo"
+cargo_prerequisites = [
+  { source_work = "cargo.test", when = [{ package = "integration" }], require_target_kinds = ["staticlib"] },
+]
+"#,
+        )?;
+        let output = run_cargo_rail(&ws.path, &["rail", "plan", "--since", "HEAD", "--json"])?;
+        // Machine output carries the error as one JSON value on stdout.
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.status.code(), Some(2), "{text}");
+        assert!(
+            text.contains("require_target_kinds") && text.contains("staticlib"),
+            "a kind without workspace targets is rejected: {text}"
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
 fn test_plan_direct_change_keeps_an_unobserved_compiler_input_in_scope() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("plan-direct-and-unobserved")?;

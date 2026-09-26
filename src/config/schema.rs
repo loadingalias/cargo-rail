@@ -588,6 +588,10 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
         "Selects prerequisite packages or exact targets emitted by this named work item.",
     ),
     policy(
+        "plan.work.<name>.cargo_prerequisites.<index>.require_target_kinds",
+        "Selects every workspace target of these Cargo kinds as a prerequisite, so a new target needs no edit.",
+    ),
+    policy(
         "plan.work.<name>.cargo_prerequisites.<index>.require.<index>.package",
         "Names an exact prerequisite workspace package.",
     ),

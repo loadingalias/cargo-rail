@@ -1669,8 +1669,59 @@ fn resolve_cargo_prerequisite(
             .iter()
             .enumerate()
             .map(|(root, value)| resolve_cargo_root(ctx, value, &format!("{subject}.require.{root}")))
-            .collect::<RailResult<Vec<_>>>()?,
+            .chain(
+                resolve_target_kinds(
+                    ctx,
+                    &prerequisite.require_target_kinds,
+                    &format!("{subject}.require_target_kinds"),
+                )?
+                .into_iter()
+                .map(Ok),
+            )
+            .try_fold(Vec::new(), |mut roots, root| {
+                // A kind can select a target that `require` also names.
+                let root = root?;
+                if !roots.contains(&root) {
+                    roots.push(root);
+                }
+                RailResult::Ok(roots)
+            })?,
     })
+}
+
+/// Every workspace target whose Cargo kinds include one of `kinds`. A kind that selects no target is
+/// rejected, like an unknown package name.
+fn resolve_target_kinds(ctx: &WorkspaceContext, kinds: &[String], subject: &str) -> RailResult<Vec<ResolvedCargoRoot>> {
+    let metadata = ctx.cargo().metadata();
+    let mut resolved = Vec::new();
+    for kind in kinds {
+        let before = resolved.len();
+        for package in metadata.workspace_packages() {
+            for target in &package.targets {
+                let mut target_kinds = target.kind.iter().map(ToString::to_string).collect::<Vec<_>>();
+                target_kinds.sort_unstable();
+                target_kinds.dedup();
+                if target_kinds.contains(kind) {
+                    resolved.push(ResolvedCargoRoot {
+                        domain: PRIMARY_CARGO_DOMAIN.to_string(),
+                        package: package.id.clone(),
+                        package_key: portable_package_key(ctx, package),
+                        target: Some(ResolvedCargoTarget {
+                            name: target.name.clone(),
+                            kinds: target_kinds,
+                        }),
+                        features: None,
+                    });
+                }
+            }
+        }
+        if resolved.len() == before {
+            return Err(RailError::message(format!(
+                "{subject} names target kind '{kind}', which no workspace target has"
+            )));
+        }
+    }
+    Ok(resolved)
 }
 
 fn resolve_cargo_root(ctx: &WorkspaceContext, root: &CargoRootConfig, subject: &str) -> RailResult<ResolvedCargoRoot> {

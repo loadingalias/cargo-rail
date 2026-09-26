@@ -48,7 +48,11 @@ pub struct CargoPrerequisiteConfig {
     /// Selected source packages or targets that activate the edge.
     pub when: Vec<CargoRootConfig>,
     /// Packages or exact targets that must be built first.
+    #[serde(default)]
     pub require: Vec<CargoRootConfig>,
+    /// Cargo target kinds, such as `cdylib`, whose every workspace target must be built first.
+    #[serde(default)]
+    pub require_target_kinds: Vec<String>,
 }
 
 /// A workspace package or one exact target within that package.
@@ -167,11 +171,22 @@ impl PlanWorkConfig {
                     &format!("'{}' is not a code-owned Cargo work ID", prerequisite.source_work),
                 ));
             }
-            if prerequisite.when.is_empty() || prerequisite.require.is_empty() {
+            if prerequisite.when.is_empty()
+                || prerequisite.require.is_empty() && prerequisite.require_target_kinds.is_empty()
+            {
                 return Err(invalid(
                     &item,
-                    "when and require must each name at least one Cargo root",
+                    "when must name a Cargo root, and require or require_target_kinds must name a prerequisite",
                 ));
+            }
+            let mut kinds = BTreeSet::new();
+            for kind in &prerequisite.require_target_kinds {
+                if kind.is_empty() || kind.starts_with('-') || !kinds.insert(kind) {
+                    return Err(invalid(
+                        &format!("{item}.require_target_kinds"),
+                        "target kinds must be non-empty, not option-like, and unique",
+                    ));
+                }
             }
             validate_cargo_roots(&prerequisite.when, &format!("{item}.when"))?;
             validate_cargo_roots(&prerequisite.require, &format!("{item}.require"))?;
