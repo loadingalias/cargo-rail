@@ -21,9 +21,11 @@ tomlkit = "0.15.1"
 
 [operations.ci]
 components = ["clippy", "rustfmt", "rustc-dev", "llvm-tools"]
+# Integration tests build a foreign Linux target to prove cross-compiler diagnostics.
+targets = ["aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
 cargo = ["cargo-deny", "cargo-nextest", "just"]
 assets = ["rustup", "cargo-binstall", "cmake", "llvm", "git", "python", "actionlint", "cargo-nextest"]
-packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "linux-tools-common", "openssl", "pkgconf", "python3", "python3-venv", "ripgrep", "shellcheck", "unzip", "xz-utils", "zstd"]
+packages = ["build-essential", "ca-certificates", "cmake", "curl", "git", "git-man", "linux-tools-common", "openssl", "pkgconf", "python3", "python3-venv", "ripgrep", "shellcheck", "unzip", "xz-utils", "zstd"]
 
 [operations.package]
 components = ["rustc-dev", "llvm-tools"]
@@ -69,6 +71,7 @@ packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "lin
 os = "Ubuntu 24.04 LTS"
 rust-host = "aarch64-unknown-linux-gnu"
 components = ["clippy", "rustfmt", "rustc-dev", "llvm-tools"]
+targets = ["x86_64-unknown-linux-gnu"]
 cargo = ["cargo-deny", "cargo-nextest", "just"]
 
 [aarch64-linux.assets.rustup]
@@ -88,6 +91,7 @@ packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "lin
 os = "Ubuntu 24.04 LTS"
 rust-host = "x86_64-unknown-linux-gnu"
 components = ["clippy", "rustfmt", "rustc-dev", "llvm-tools"]
+targets = ["aarch64-unknown-linux-gnu"]
 cargo = ["cargo-deny", "cargo-nextest", "just"]
 
 [x86_64-linux.assets.actionlint]
@@ -110,6 +114,7 @@ sha256 = "d6c83076c575bc00b823522ac974bda66d0af05d6ddc30e739c12385cf32c6cc"
 os = "Windows 11 Enterprise ARM64"
 rust-host = "aarch64-pc-windows-msvc"
 components = ["clippy", "rustfmt", "rustc-dev", "llvm-tools"]
+targets = ["x86_64-unknown-linux-gnu"]
 cargo = ["cargo-deny", "cargo-nextest", "just"]
 
 [aarch64-win.assets.rustup]
@@ -140,6 +145,7 @@ sha256 = "c955de342b1465bc637f0e71fddf4e28e8d0b829668ec1866ab32a839303e8e3"
 os = "Windows Server 2025"
 rust-host = "x86_64-pc-windows-msvc"
 components = ["clippy", "rustfmt", "rustc-dev", "llvm-tools"]
+targets = ["aarch64-unknown-linux-gnu"]
 cargo = ["cargo-deny", "cargo-nextest", "just"]
 
 [x86_64-win.assets.rustup]
@@ -173,9 +179,10 @@ os = "Ubuntu 24.04 LTS"
 ubuntu = "24.04"
 codename = "noble"
 rust-host = "riscv64gc-unknown-linux-gnu"
-components = ["rustc-dev", "llvm-tools"]
-cargo = []
-packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "openssl", "python3"]
+components = ["clippy", "rustfmt", "rustc-dev", "llvm-tools"]
+targets = ["x86_64-unknown-linux-gnu"]
+cargo = ["just"]
+packages = ["build-essential", "ca-certificates", "cmake", "curl", "git", "git-man", "openssl", "pkgconf", "python3"]
 
 [riscv64-linux.assets.rustup]
 url = "https://static.rust-lang.org/rustup/archive/1.29.1/riscv64gc-unknown-linux-gnu/rustup-init"
@@ -190,9 +197,10 @@ os = "Ubuntu 24.04 LTS"
 ubuntu = "24.04"
 codename = "noble"
 rust-host = "s390x-unknown-linux-gnu"
-components = ["rustc-dev", "llvm-tools"]
-cargo = []
-packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "openssl", "python3"]
+components = ["clippy", "rustfmt", "rustc-dev", "llvm-tools"]
+targets = ["x86_64-unknown-linux-gnu"]
+cargo = ["cargo-nextest", "just"]
+packages = ["build-essential", "ca-certificates", "cmake", "curl", "git", "git-man", "openssl", "pkgconf", "python3"]
 
 [s390x-linux.assets.rustup]
 url = "https://static.rust-lang.org/rustup/archive/1.29.1/s390x-unknown-linux-gnu/rustup-init"
@@ -203,9 +211,10 @@ os = "Ubuntu 24.04 LTS"
 ubuntu = "24.04"
 codename = "noble"
 rust-host = "powerpc64le-unknown-linux-gnu"
-components = ["rustc-dev", "llvm-tools"]
-cargo = []
-packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "openssl", "python3"]
+components = ["clippy", "rustfmt", "rustc-dev", "llvm-tools"]
+targets = ["x86_64-unknown-linux-gnu"]
+cargo = ["cargo-nextest", "just"]
+packages = ["build-essential", "ca-certificates", "cmake", "curl", "git", "git-man", "openssl", "pkgconf", "python3"]
 
 [powerpc64le-linux.assets.rustup]
 url = "https://static.rust-lang.org/rustup/archive/1.29.1/powerpc64le-unknown-linux-gnu/rustup-init"

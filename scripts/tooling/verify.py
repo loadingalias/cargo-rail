@@ -53,6 +53,10 @@ def verify(platform, operation):
     for component in native['components']:
         if not any(line.startswith(component + '-') for line in installed):
             raise ValueError(f'missing Rust component: {component}')
+    targets = run('rustup', 'target', 'list', '--installed').splitlines()
+    for target in native['targets']:
+        if target not in targets:
+            raise ValueError(f'missing Rust target: {target}')
     pinned_commands = [('rustup', ['rustup', '--version'])]
     for name, command in (
         ('actionlint', ['actionlint', '--version']),

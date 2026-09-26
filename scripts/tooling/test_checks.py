@@ -48,7 +48,7 @@ else:
     if sys.argv[1:2] == [os.environ.get('CHECK_FAIL_COMMAND')]:
         sys.exit(23)
 '''
-        for name in ['cargo', 'cargo-zigbuild', 'cargo-xwin', 'zig', 'uname']:
+        for name in ['cargo', 'cargo-zigbuild', 'cargo-xwin', 'rumdl', 'zig', 'uname']:
             binary = binaries / name
             binary.write_text(recorder)
             binary.chmod(0o755)
@@ -78,6 +78,7 @@ else:
                 calls = self.run_recipe('ci-check')
                 self.assertEqual([call['args'] for call in calls], [
                     ['cargo', 'fmt', '--all', '--', '--check'],
+                    ['rumdl', 'check', '.'],
                     ['cargo', 'clippy', '--workspace', '--all-targets', '--all-features', '--locked'],
                     ['cargo', 'clippy', '--workspace', '--all-targets', '--locked'],
                     ['cargo', 'deny', '--locked', '--workspace', '--all-features', 'check', '-D', 'warnings', 'all'],
@@ -87,8 +88,8 @@ else:
                     ['cargo', 'clippy', '--manifest-path', driver, '--all-targets', '--all-features', '--locked', '--', '-D', 'warnings'],
                     ['cargo', 'test', '--manifest-path', driver, '--all-targets', '--all-features', '--locked'],
                 ])
-                self.assertEqual(calls[5]['rustdocflags'], '-C debuginfo=0 -D warnings')
-                self.assertEqual([call['bootstrap'] for call in calls[6:]], ['cargo_rail_fact_driver'] * 3)
+                self.assertEqual(calls[6]['rustdocflags'], '-C debuginfo=0 -D warnings')
+                self.assertEqual([call['bootstrap'] for call in calls[7:]], ['cargo_rail_fact_driver'] * 3)
 
     def test_local_check_runs_only_shared_tests_and_workstation_checks(self):
         shared = self.run_recipe('ci-check')
@@ -162,12 +163,12 @@ else:
     def test_shared_check_failure_stops_later_checks(self):
         self.environment['CHECK_FAIL_COMMAND'] = 'clippy'
         calls = self.run_recipe('ci-check', success=False)
-        self.assertEqual([call['args'][1] for call in calls], ['fmt', 'clippy'])
+        self.assertEqual([call['args'][1] for call in calls], ['fmt', 'check', 'clippy'])
 
     def test_shared_failure_stops_local_cross_checks_and_dogfooding(self):
         self.environment['CHECK_FAIL_COMMAND'] = 'deny'
         calls = self.run_recipe('check', success=False)
-        self.assertEqual([call['args'][1] for call in calls], ['fmt', 'clippy', 'clippy', 'deny'])
+        self.assertEqual([call['args'][1] for call in calls], ['fmt', 'check', 'clippy', 'clippy', 'deny'])
 
 
 if __name__ == '__main__':

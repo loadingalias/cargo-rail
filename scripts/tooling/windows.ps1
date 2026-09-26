@@ -143,6 +143,7 @@ try {
     Invoke-Native $rustupInstaller @('-y', '--no-modify-path', '--default-host', $native.'rust-host', '--default-toolchain', 'none')
     $rustArguments = @('toolchain', 'install', $channel, '--profile', 'minimal')
     foreach ($component in $native.components) { $rustArguments += @('--component', $component) }
+    foreach ($target in $native.targets) { $rustArguments += @('--target', $target) }
     Invoke-Native 'rustup' $rustArguments
     $env:RUSTUP_TOOLCHAIN = $channel
     $env:CARGO_BUILD_JOBS = [string]$catalog.windows.'cargo-build-jobs'

@@ -38,7 +38,7 @@ class RepositoryHygiene(unittest.TestCase):
 class CatalogCommand(unittest.TestCase):
     def test_empty_tool_inventory_emits_no_shell_array_element(self):
         output = subprocess.run(
-            [sys.executable, str(Path(catalog.__file__).resolve()), 'select', 'riscv64-linux', 'ci', 'cargo'],
+            [sys.executable, str(Path(catalog.__file__).resolve()), 'select', 'aarch64-linux', 'package', 'targets'],
             check=True, capture_output=True,
         )
         self.assertEqual(output.stdout, b'')
@@ -234,17 +234,25 @@ class CatalogPolicy(unittest.TestCase):
                     self.assertIn('ripgrep', ci['packages'], 'tooling tests execute real manifest discovery through rg')
                 if platform.endswith('-linux'):
                     self.assertFalse({'shellcheck', 'python3-venv', 'ripgrep', 'jq'} & set(package['packages']))
+                # Integration tests build a foreign Linux target to prove cross-compiler diagnostics.
+                foreign = {'x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu'} - {data[platform]['rust-host']}
+                self.assertTrue(foreign & set(ci['targets']), 'ci installs a foreign Linux target')
+                self.assertEqual(package['targets'], [])
         self.assertEqual(data, catalog.read(), 'selection mutated the catalog')
 
-    def test_cache_hosts_keep_their_small_ci_selection(self):
-        for platform in ('riscv64-linux', 's390x-linux', 'powerpc64le-linux'):
-            selected = catalog.selection(catalog.read(), platform, 'ci')
-            self.assertEqual(selected['cargo'], [])
-            self.assertEqual(selected['components'], ['rustc-dev', 'llvm-tools'])
-            self.assertIn('openssl', selected['packages'])
-            self.assertEqual(set(selected['assets']), {'rustup', 'cargo-nextest'} if platform == 'riscv64-linux' else {'rustup'})
-            with self.assertRaisesRegex(ValueError, 'no package tool selection'):
-                catalog.selection(catalog.read(), platform, 'package')
+    def test_cache_hosts_install_the_complete_native_validation_lane(self):
+        for platform in catalog.CACHE_HOSTS:
+            with self.subTest(platform=platform):
+                selected = catalog.selection(catalog.read(), platform, 'ci')
+                self.assertEqual(set(selected['components']), {'clippy', 'rustfmt', 'rustc-dev', 'llvm-tools'})
+                # cargo-binstall publishes no release here, so Cargo tools build from source.
+                self.assertNotIn('cargo-binstall', selected['assets'])
+                self.assertIn('just', selected['cargo'])
+                self.assertTrue('cargo-nextest' in selected['cargo'] or 'cargo-nextest' in selected['assets'])
+                self.assertTrue({'cmake', 'openssl'} <= set(selected['packages']))
+                self.assertEqual(selected['targets'], ['x86_64-unknown-linux-gnu'])
+                with self.assertRaisesRegex(ValueError, 'no package tool selection'):
+                    catalog.selection(catalog.read(), platform, 'package')
 
     def test_riscv_build_installs_only_cross_build_tools(self):
         self.assertEqual(catalog.rust_channel('x86_64-linux', 'riscv-build'), catalog.rust_channel('riscv64-linux'))

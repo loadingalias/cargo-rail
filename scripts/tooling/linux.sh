@@ -91,6 +91,8 @@ export PATH="$HOME/.cargo/bin:$PATH"
 mapfile -t components < <(catalog_select components)
 toolchain_args=()
 for component in "${components[@]}"; do toolchain_args+=(--component "$component"); done
+mapfile -t targets < <(catalog_select targets)
+for target in "${targets[@]}"; do toolchain_args+=(--target "$target"); done
 if [[ "$operation" == riscv-build ]]; then
   toolchain_args+=(--target "$(catalog_get riscv64-linux rust-host)")
 fi
@@ -117,8 +119,14 @@ mapfile -t cargo_tools < <(catalog_select cargo)
 for tool in "${cargo_tools[@]}"; do
   version="$(catalog_get cargo "$tool")"
   # Cargo's install registry verifies exact installed package versions on reruns.
-  env -u RUSTC_WRAPPER -u CARGO_ENCODED_RUSTFLAGS \
-    cargo +"$channel" binstall --locked --no-confirm --targets "$(catalog_get "$platform" rust-host)" "$tool@$version"
+  if command -v cargo-binstall >/dev/null; then
+    env -u RUSTC_WRAPPER -u CARGO_ENCODED_RUSTFLAGS \
+      cargo +"$channel" binstall --locked --no-confirm --targets "$(catalog_get "$platform" rust-host)" "$tool@$version"
+  else
+    # No cargo-binstall release exists for this host; build the pinned version from its locked sources.
+    env -u RUSTC_WRAPPER -u CARGO_ENCODED_RUSTFLAGS \
+      cargo +"$channel" install --locked "$tool" --version "$version"
+  fi
 done
 python3 "$SCRIPT_DIR/verify.py" "$platform" "$operation"
 # Persistent paths are shared by interactive shells and non-interactive Bash recipes.

@@ -18,6 +18,8 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[2]
 CATALOG = ROOT / '.config/tooling.toml'
 PLATFORMS = ('aarch64-linux', 'x86_64-linux', 'aarch64-win', 'x86_64-win', 'riscv64-linux', 's390x-linux', 'powerpc64le-linux')
+# Native validation hosts without release archives.
+CACHE_HOSTS = ('riscv64-linux', 's390x-linux', 'powerpc64le-linux')
 
 
 def read(path=CATALOG):
@@ -41,13 +43,14 @@ def selection(data, platform, operation):
     if operation == 'riscv-build' and platform != 'x86_64-linux':
         raise ValueError('riscv-build requires x86_64-linux')
     native = data[platform]
-    if operation == 'package' and 'just' not in native['cargo']:
+    if operation == 'package' and ('just' not in native['cargo'] or platform in CACHE_HOSTS):
         raise ValueError(f'{platform}: no package tool selection')
     policy = data['operations'][operation]
     selected = dict(native)
     for field in ('cargo', 'components', 'packages'):
         if field in native:
             selected[field] = [name for name in native[field] if name in policy[field]]
+    selected['targets'] = [name for name in native.get('targets', []) if name in policy.get('targets', [])]
     selected['assets'] = {name: asset for name, asset in native['assets'].items() if name in policy['assets']}
     return selected
 
@@ -141,7 +144,7 @@ def validate(data):
         for name, asset in config['assets'].items():
             if not asset['url'].startswith('https://') or not re.fullmatch('[0-9a-f]{64}', asset['sha256']):
                 raise ValueError(f'{platform}: invalid {name} asset')
-        for operation in ('ci', 'package') if config['cargo'] else ('ci',):
+        for operation in () if platform in CACHE_HOSTS else ('ci', 'package') if config['cargo'] else ('ci',):
             selected = selection(data, platform, operation)
             if platform == 'x86_64-linux' and operation == 'ci' and 'ripgrep' not in selected['packages']:
                 raise ValueError('x86_64-linux/ci: tooling checks require ripgrep')
@@ -150,6 +153,10 @@ def validate(data):
                 components |= {'clippy', 'rustfmt'}
             if not components <= set(selected['components']):
                 raise ValueError(f'{platform}/{operation}: missing compiler components')
+            if operation == 'ci' and config['cargo'] and not selected['targets']:
+                raise ValueError(f'{platform}/ci: integration tests require a foreign Linux target')
+            if config['rust-host'] in selected['targets']:
+                raise ValueError(f'{platform}/{operation}: the native host is not an added target')
             required = {'just', 'cargo-deny', 'cargo-nextest'} if operation == 'ci' else {'just'}
             if config['cargo'] and not required <= set(selected['cargo']):
                 raise ValueError(f'{platform}/{operation}: missing required Cargo tools')
@@ -158,11 +165,18 @@ def validate(data):
                 raise ValueError(f'{platform}/{operation}: missing native build/bootstrap asset')
             if platform.endswith('-linux') and not {'build-essential', 'ca-certificates', 'curl', 'git', 'git-man', 'python3'} <= set(selected['packages']):
                 raise ValueError(f'{platform}/{operation}: missing native build/bootstrap package')
-    for platform in ('riscv64-linux', 's390x-linux', 'powerpc64le-linux'):
+    # Hosts without a cargo-binstall release build their Cargo tools from source and run the same lane.
+    for platform in CACHE_HOSTS:
         config = data[platform]
-        if config['cargo'] or set(config['components']) != {'rustc-dev', 'llvm-tools'} or set(config['assets']) != ({'rustup', 'cargo-nextest'} if platform == 'riscv64-linux' else {'rustup'}):
-            raise ValueError(f'{platform}: native cache validation requires its minimal compiler and runner tools')
-        if not {'build-essential', 'ca-certificates', 'curl', 'git', 'python3'} <= set(config['packages']):
+        selected = selection(data, platform, 'ci')
+        if not selected['targets'] or config['rust-host'] in selected['targets']:
+            raise ValueError(f'{platform}/ci: integration tests require a foreign Linux target')
+        nextest = 'cargo-nextest' in config['cargo'] or 'cargo-nextest' in config['assets']
+        if not {'clippy', 'rustfmt', 'rustc-dev', 'llvm-tools'} <= set(config['components']) or 'just' not in config['cargo'] or not nextest:
+            raise ValueError(f'{platform}: the native validation lane requires the complete compiler and runner tools')
+        if 'cargo-binstall' in config['assets']:
+            raise ValueError(f'{platform}: cargo-binstall publishes no release for this host')
+        if not {'build-essential', 'ca-certificates', 'cmake', 'curl', 'git', 'python3'} <= set(config['packages']):
             raise ValueError(f'{platform}: missing native build/bootstrap package')
 
     cross = selection(data, 'x86_64-linux', 'riscv-build')
