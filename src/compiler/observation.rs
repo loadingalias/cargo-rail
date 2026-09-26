@@ -241,10 +241,17 @@ impl FileObservation {
         // Inside a cache invocation, an unchanged file generation reuses its recorded digest.
         let memo = crate::cache::digest_memo::active();
         let generation = memo.and_then(|_| crate::utils::stable_file_generation(&absolute));
-        if let (Some(memo), Some(generation)) = (memo, generation.as_deref())
-            && let Some((content_digest, bytes)) = memo.lookup(generation)
-            && bytes == metadata.len()
-        {
+        let remembered = generation.as_deref().and_then(|generation| {
+            crate::cache::digest_memo::directory_digest(&absolute, generation, metadata.len()).or_else(|| {
+                let (digest, bytes) = memo?.lookup(generation).filter(|(_, bytes)| *bytes == metadata.len())?;
+                crate::cache::digest_memo::remember_in_directory(
+                    &absolute,
+                    crate::cache::digest_memo::RememberedFile::recorded(generation, &digest, bytes),
+                );
+                Some((digest, bytes))
+            })
+        });
+        if let Some((content_digest, _)) = remembered {
             return Ok((
                 Self {
                     path: ObservationPath::capture(&absolute, current_dir, source_root),
@@ -263,6 +270,11 @@ impl FileObservation {
             && let Ok(modified) = metadata.modified()
         {
             memo.record(&generation, modified, &content_digest, bytes_read);
+            if let Some(file) =
+                crate::cache::digest_memo::RememberedFile::settled(&generation, modified, &content_digest, bytes_read)
+            {
+                crate::cache::digest_memo::remember_in_directory(&absolute, file);
+            }
         }
         Ok((
             Self {

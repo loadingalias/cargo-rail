@@ -12,7 +12,7 @@ mod native_input_protocol;
 use native_input_protocol::{
     NATIVE_INPUT_INVOCATION_ARGUMENT, NATIVE_INPUT_INVOCATION_ENV, NATIVE_INPUT_PROTOCOL_VERSION,
     NATIVE_INPUT_PROTOCOL_VERSION_ARGUMENT, NativeAssemblyObservation, NativeCodegenObservation, NativeInputInvocation,
-    NativeInputObservation, native_invocation_digest,
+    NativeInputObservation, NativeInputPhase, native_invocation_digest,
 };
 
 struct Driver {
@@ -81,10 +81,20 @@ impl Driver {
     }
 
     fn run(&self, name: &str, args: &[String]) -> (Output, Option<NativeInputObservation>) {
+        self.run_phase(name, args, NativeInputPhase::Compilation)
+    }
+
+    fn run_phase(
+        &self,
+        name: &str,
+        args: &[String],
+        phase: NativeInputPhase,
+    ) -> (Output, Option<NativeInputObservation>) {
         let request_path = self.root.join(format!("{name}-request.json"));
         let result_path = self.root.join(format!("{name}-result.json"));
         let request = NativeInputInvocation {
             version: NATIVE_INPUT_PROTOCOL_VERSION,
+            phase,
             source_working_directory: None,
             nonce: "1".repeat(64),
             action_identity: name.into(),
@@ -183,6 +193,7 @@ fn relocated_execution_preserves_unremapped_source_identity_and_reads_only_stage
     fs::remove_dir_all(original.join("src")).unwrap();
     let request = NativeInputInvocation {
         version: NATIVE_INPUT_PROTOCOL_VERSION,
+        phase: NativeInputPhase::Compilation,
         nonce: "1".repeat(64),
         action_identity: "relocated-source".into(),
         invocation_digest: native_invocation_digest(&args, &staged).unwrap(),
@@ -289,6 +300,87 @@ fn native_observation_binds_transitive_crates_and_preserves_compiler_outputs() {
     assert_eq!(observed.stderr, baseline.stderr);
     assert_eq!(observed.stdout, baseline.stdout);
     assert_eq!(observation, None);
+}
+
+#[test]
+fn resolution_phase_records_the_compiled_crate_selection_without_writing_outputs() {
+    let driver = Driver::new();
+    let a = driver.compile_dependency("dependency_a", "pub fn value() -> u8 { 41 }", &[]);
+    let b = driver.compile_dependency(
+        "dependency_b",
+        "pub fn value() -> u8 { dependency_a::value() }",
+        &["--extern".into(), format!("dependency_a={}", a.display())],
+    );
+    let c = driver.compile_dependency("dependency_c", "pub fn value() -> u8 { 43 }", &[]);
+    // A configuration-gated crate proves that the phase follows the exact arguments,
+    // such as the `--cfg clippy` that Clippy appends.
+    fs::write(
+        driver.root.join("consumer.rs"),
+        "#[cfg(clippy)] extern crate dependency_c;\npub fn value() -> u8 { dependency_b::value() }\n",
+    )
+    .unwrap();
+    let mut args = [
+        "consumer.rs",
+        "--crate-type=rlib",
+        "--edition=2024",
+        "--crate-name=consumer",
+        "--emit=dep-info,metadata",
+        "--out-dir=out",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    fs::create_dir(driver.root.join("out")).unwrap();
+    args.extend([
+        "--extern".into(),
+        format!("dependency_b={}", b.display()),
+        "--extern".into(),
+        format!("dependency_c={}", c.display()),
+        format!("-Ldependency={}", driver.root.display()),
+    ]);
+    for gated in [false, true] {
+        let mut args = args.clone();
+        if gated {
+            args.extend(["--cfg".into(), "clippy".into()]);
+        }
+        let (compiled, compilation) = driver.run(&format!("compilation-{gated}"), &args);
+        assert_success(&compiled);
+        let compilation = compilation.expect("complete compilation observation");
+        for output in ["out/libconsumer.rmeta", "out/consumer.d"] {
+            fs::remove_file(driver.root.join(output)).unwrap();
+        }
+        let (resolved, resolution) =
+            driver.run_phase(&format!("resolution-{gated}"), &args, NativeInputPhase::Resolution);
+        assert_success(&resolved);
+        assert!(resolved.stdout.is_empty());
+        assert_eq!(
+            fs::read_dir(driver.root.join("out")).unwrap().count(),
+            0,
+            "resolution wrote an output"
+        );
+        let resolution = resolution.expect("complete resolution observation");
+        assert_eq!(resolution.crates, compilation.crates);
+        assert_eq!(resolution.searches, compilation.searches);
+        assert_eq!(resolution.assembly, NativeAssemblyObservation::NoCodegen);
+        assert_eq!(resolution.codegen, NativeCodegenObservation::NotRun);
+        assert_eq!(
+            resolution.crates.iter().any(|source| source.name == "dependency_c"),
+            gated
+        );
+    }
+
+    // The phase cannot certify backend inputs, so it declines codegen requests.
+    let linked = arguments("consumer.rs", "consumer.rlib", "--emit=metadata,link")
+        .into_iter()
+        .chain([
+            "--extern".into(),
+            format!("dependency_b={}", b.display()),
+            format!("-Ldependency={}", driver.root.display()),
+        ])
+        .collect::<Vec<_>>();
+    let (resolved, resolution) = driver.run_phase("resolution-linked", &linked, NativeInputPhase::Resolution);
+    assert_success(&resolved);
+    assert_eq!(resolution, None);
+    assert!(!driver.root.join("consumer.rlib").exists());
 }
 
 #[test]
@@ -615,7 +707,7 @@ fn invalid_native_capability_preserves_diagnostics_and_does_not_publish() {
         .output()
         .unwrap();
     assert_success(&protocol);
-    assert_eq!(protocol.stdout, b"2\n");
+    assert_eq!(protocol.stdout, format!("{NATIVE_INPUT_PROTOCOL_VERSION}\n").as_bytes());
     fs::write(
         driver.root.join("warning.rs"),
         "fn unused() {}\npub fn value() -> u8 { 42 }\nconst _: () = assert!(option_env!(\"CARGO_RAIL_NATIVE_INPUT_INVOCATION\").is_none());",
@@ -677,6 +769,7 @@ fn native_and_analysis_observations_share_one_unchanged_compilation() {
     let baseline_bytes = fs::read(driver.root.join("combined.rmeta")).unwrap();
     let native_request = NativeInputInvocation {
         version: NATIVE_INPUT_PROTOCOL_VERSION,
+        phase: NativeInputPhase::Compilation,
         source_working_directory: None,
         nonce: "2".repeat(64),
         action_identity: "combined".into(),

@@ -122,6 +122,13 @@ impl BuildScriptFreshness {
         self.rustc_environment.iter().map(String::as_str)
     }
 
+    /// Whether the script declared no retained rerun input.
+    ///
+    /// For a mutable package, Cargo then reruns the script whenever any package file changes.
+    pub(crate) fn declares_no_rerun_input(&self) -> bool {
+        self.paths.is_empty() && self.environment.is_empty()
+    }
+
     /// Why Cargo would now rerun this build script, if it would.
     pub(crate) fn revalidation_reason(&self, source_root: &Path) -> Option<&'static str> {
         for path in &self.paths {
@@ -313,7 +320,7 @@ mod tests {
     fn no_declared_path_leaves_freshness_to_the_package_sources() {
         let fixture = Fixture::new("cargo:rustc-cfg=fast\n");
         let freshness = fixture.capture(false).expect("fresh");
-        assert!(freshness.paths.is_empty() && freshness.environment.is_empty());
+        assert!(freshness.declares_no_rerun_input());
         assert_eq!(freshness.revalidation_reason(fixture.root.path()), None);
     }
 }

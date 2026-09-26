@@ -29,7 +29,8 @@ use crate::compiler::native_cache::NativePhaseMeasurement;
 use crate::compiler::native_cache::pack::NativeResultStaging;
 use crate::compiler::native_input_protocol::{
     MAX_NATIVE_INPUT_OBSERVATION_BYTES, NATIVE_INPUT_INVOCATION_ARGUMENT, NATIVE_INPUT_PROTOCOL_VERSION,
-    NativeAssemblyObservation, NativeInputInvocation, NativeInputObservation, native_invocation_digest,
+    NativeAssemblyObservation, NativeInputInvocation, NativeInputObservation, NativeInputPhase,
+    native_invocation_digest,
 };
 use crate::error::{RailError, RailResult};
 use crate::source::ContentDigest;
@@ -705,6 +706,7 @@ impl WorkerNativeInvocation {
             .ok_or_else(|| RailError::message("distributed compiler working directory is unavailable"))?;
         let invocation = NativeInputInvocation {
             version: NATIVE_INPUT_PROTOCOL_VERSION,
+            phase: NativeInputPhase::Compilation,
             source_working_directory: envelope.request.operation.source_working_directory.clone(),
             nonce: ContentDigest::sha256(envelope.request.lease_id.as_bytes()).to_string(),
             action_identity: native_input_action_identity(&envelope.request.operation, &envelope.request.inputs)?,
@@ -7815,6 +7817,7 @@ pub(crate) mod tests {
                 .expect_err("ordinary outputs must not substitute for native compiler evidence");
             let invocation = NativeInputInvocation {
                 version: NATIVE_INPUT_PROTOCOL_VERSION,
+                phase: NativeInputPhase::Compilation,
                 source_working_directory: None,
                 nonce: "1".repeat(64),
                 action_identity: native_input_action_identity(&candidate.operation, &candidate.input_frames())?,

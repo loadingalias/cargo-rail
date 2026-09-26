@@ -25,7 +25,7 @@ use crate::compiler::collector::{CompilerInputGuard, NativeTargetFormat, NativeT
 use crate::compiler::native_input_protocol::{
     MAX_NATIVE_INPUT_OBSERVATION_BYTES, NATIVE_INPUT_INVOCATION_ARGUMENT, NATIVE_INPUT_INVOCATION_ENV,
     NATIVE_INPUT_PROTOCOL_VERSION, NativeAssemblyObservation, NativeInputInvocation, NativeInputObservation,
-    native_invocation_digest,
+    NativeInputPhase, native_invocation_digest,
 };
 use crate::compiler::observation::{
     CompilerCacheWrapperMetadata, CompilerCacheWrapperStatus, CompilerMode, EnvironmentObservation, FileObservation,
@@ -35,6 +35,7 @@ use crate::compiler::observation::{
 use crate::error::{RailError, RailResult};
 use crate::source::ContentDigest;
 
+mod clippy;
 pub(crate) mod coff;
 pub(crate) mod pack;
 mod rust_inputs;
@@ -206,6 +207,8 @@ pub(crate) struct NativeCacheContext {
     remote_store: OnceLock<Result<crate::remote_cache::RemoteStore, crate::remote_cache::RemoteStoreError>>,
     installation: Option<crate::cache::installation::InstallationReceipt>,
     runtime: Option<tempfile::TempDir>,
+    /// Cargo's workspace-wrapper `clippy-driver` when this invocation runs Clippy over rustc.
+    clippy_driver: Option<PathBuf>,
 }
 
 /// Process-local scratch ownership that must not enter the global cache context.
@@ -1187,6 +1190,10 @@ pub(crate) struct NativeActionCapture {
     rust_inputs: Option<RustInputCapture>,
     /// `Some` when rendered diagnostics bind the invocation's `--diagnostic-width` value.
     diagnostic_width: Option<Option<String>>,
+    /// Inputs Clippy reads beyond this rustc action, when Clippy runs it.
+    clippy: Option<clippy::ClippyActionCapture>,
+    /// Cargo's rerun inputs for the unit's build script, bound when the unit loads a procedural macro.
+    build_script_rerun: Option<crate::build_script::freshness::BuildScriptFreshness>,
     guard: NativeCaptureGuard,
     capture_entries: usize,
     capture_path_bytes: usize,
@@ -1601,6 +1608,58 @@ impl NativeActionCapture {
             rendered.then(|| diagnostic_width_argument(&observation.compiler_arguments).map(str::to_string));
     }
 
+    /// Bind the unit's build-script rerun inputs when the unit loads a procedural macro.
+    ///
+    /// A macro can read files and variables that rustc does not record. Cargo's contract for such reads is the
+    /// build script's `rerun-if-changed` and `rerun-if-env-changed` declarations: when one changes, Cargo reruns
+    /// the script and recompiles this unit. Binding them keeps a hit as fresh as Cargo's own build.
+    /// Call after the Rust inputs are selected, because they show whether a macro is loaded.
+    fn bind_build_script_rerun(
+        &mut self,
+        observation: &RawCompilerInvocation,
+        source_root: &Path,
+    ) -> Result<(), NativeInputFailure> {
+        self.build_script_rerun = None;
+        let loads_macro = observation.dependency_artifacts.iter().any(|(_, artifact)| {
+            observation_path_basename(&artifact.path).is_some_and(|name| dynamic_library_path(Path::new(name)))
+        }) || self
+            .rust_inputs
+            .as_ref()
+            .is_some_and(|inputs| inputs.witness().selector().selects_dynamic_library());
+        if !loads_macro {
+            return Ok(());
+        }
+        let failure = |reason: &'static str| NativeInputFailure::new(reason, RailError::message(reason));
+        let package = std::env::var("CARGO_PKG_NAME").map_err(|_| failure("build_script_package_unavailable"))?;
+        // Without a build script, Cargo recompiles the unit only for inputs the action already binds.
+        let Some(out_dir) = package_build_script_output(observation, source_root, &package) else {
+            return Ok(());
+        };
+        let package_root = std::env::var_os("CARGO_MANIFEST_DIR")
+            .map(PathBuf::from)
+            .ok_or_else(|| failure("build_script_package_root_unavailable"))?;
+        // Cargo marks an unpacked registry or Git package with `.cargo-ok`; its files cannot change.
+        let immutable_source = package_root.join(".cargo-ok").is_file();
+        let freshness = crate::build_script::freshness::capture(
+            &crate::build_script::freshness::ExecutedBuildScript {
+                package: &package,
+                out_dir: &out_dir,
+                package_root: &package_root,
+                immutable_source,
+                rustc_environment: &[],
+            },
+            source_root,
+        )
+        .map_err(failure)?;
+        if !immutable_source && freshness.declares_no_rerun_input() {
+            // Cargo then reruns the script for any file its package listing selects. That listing honors
+            // version-control ignore rules and package include rules, which this action does not model.
+            return Err(failure("build_script_package_rerun_unmodeled"));
+        }
+        self.build_script_rerun = Some(freshness);
+        Ok(())
+    }
+
     fn capture(observation: &RawCompilerInvocation, source_root: &Path) -> Result<Self, NativeInputFailure> {
         Self::capture_with_environment(observation, source_root, None, None, &[])
     }
@@ -1723,6 +1782,7 @@ impl NativeActionCapture {
         )?;
         capture.select_rust_inputs(observation, source_root, &proof.rust_inputs)?;
         capture.bind_diagnostic_width(proof.diagnostic_width, observation);
+        capture.bind_build_script_rerun(observation, source_root)?;
         Ok(capture)
     }
 
@@ -1756,15 +1816,29 @@ impl NativeActionCapture {
         } else {
             None
         };
-        Self::capture_source_with_environment(
+        let mut capture = Self::capture_source_with_environment(
             observation,
             source_root,
             approved_environment,
             package_binding,
             selected_repository_paths,
             toolchain,
-        )
-        .map_err(Into::into)
+        )?;
+        if let Some(context) = active_context()
+            && let Some(driver) = &context.clippy_driver
+        {
+            let mut budget = NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS);
+            let clippy = clippy::ClippyActionCapture::capture(
+                driver,
+                &context.session.rustc_sysroot,
+                source_root,
+                &observation.compiler_arguments,
+                &mut budget,
+            )?;
+            capture.bytes_hashed = capture.bytes_hashed.saturating_add(budget.bytes_hashed);
+            capture.clippy = Some(clippy);
+        }
+        Ok(capture)
     }
 
     fn capture_source_with_environment(
@@ -1895,6 +1969,8 @@ impl NativeActionCapture {
             selected_repository_inputs,
             rust_inputs: None,
             diagnostic_width: None,
+            clippy: None,
+            build_script_rerun: None,
             guard: NativeCaptureGuard { entries: guard_entries },
             capture_entries: budget.entries,
             capture_path_bytes: budget.path_bytes,
@@ -2043,6 +2119,16 @@ impl NativeActionCapture {
         self.revalidate_generated_before_restore_commit(workspace_root, std::env::var_os("OUT_DIR"))?;
         self.revalidate_native_searches_before_restore_commit(observation, workspace_root)?;
         self.revalidate_pathless_extern_searches_before_restore_commit(observation, workspace_root)?;
+        if let Some(clippy) = &self.clippy {
+            clippy.revalidate(&mut NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS))?;
+        }
+        if let Some(reason) = self
+            .build_script_rerun
+            .as_ref()
+            .and_then(|freshness| freshness.revalidation_reason(workspace_root))
+        {
+            return Err(RailError::message(reason));
+        }
 
         let environment_names = self
             .approved_environment
@@ -4321,6 +4407,13 @@ fn capture_native_source_namespace(
     let mut pending = vec![(PathBuf::new(), 0usize)];
     let mut found_required_file = required_file.is_none();
     budget.account_entry("")?;
+    // Namespaces such as a large crate or a native build tree hold hundreds of files that every
+    // dependent unit captures again. One tree record replaces one memo read per unchanged file.
+    let memo = crate::cache::digest_memo::active();
+    let remembered = memo
+        .map(|memo| memo.tree(namespace, crate::cache::digest_memo::TreeRecord::Namespace))
+        .unwrap_or_default();
+    let mut settled = BTreeMap::new();
 
     while let Some((relative_directory, depth)) = pending.pop() {
         budget.check(depth, started.elapsed())?;
@@ -4383,7 +4476,23 @@ fn capture_native_source_namespace(
                 )));
             }
             let mode = semantic_mode(&metadata);
-            let (content_digest, guard, bytes) = capture_guarded_file(&absolute, started, budget)?;
+            let generation = memo.and_then(|_| crate::utils::stable_metadata_generation(&metadata));
+            let recorded = generation.as_deref().and_then(|generation| {
+                remembered
+                    .get(&relative)
+                    .and_then(|file| file.digest_for(generation, metadata.len()))
+            });
+            let (content_digest, guard, bytes) = match recorded {
+                Some((digest, bytes)) => (digest.to_string(), native_metadata_guard(&absolute, &metadata)?, bytes),
+                None => capture_guarded_file(&absolute, started, budget)?,
+            };
+            if let (Some(generation), Ok(modified)) = (generation.as_deref(), metadata.modified())
+                && native_metadata_guard(&absolute, &metadata)? == guard
+                && let Some(file) =
+                    crate::cache::digest_memo::RememberedFile::settled(generation, modified, &content_digest, bytes)
+            {
+                settled.insert(relative.clone(), file);
+            }
             if required_file.is_some_and(|required| absolute == required) {
                 found_required_file = true;
             }
@@ -4406,6 +4515,11 @@ fn capture_native_source_namespace(
         return Err(RailError::message(
             "declared crate root disappeared from its source namespace",
         ));
+    }
+    if let Some(memo) = memo
+        && settled != remembered
+    {
+        memo.record_tree(namespace, crate::cache::digest_memo::TreeRecord::Namespace, settled);
     }
     entries.sort_unstable_by(|left, right| left.path.cmp(&right.path));
     guards.sort_unstable_by(|left, right| left.path.cmp(&right.path));
@@ -4914,11 +5028,20 @@ fn capture_guarded_file(
     }
     let before = native_metadata_guard(path, &before_metadata)?;
     let memo = crate::cache::digest_memo::active();
-    let generation = memo.and_then(|_| crate::utils::stable_file_generation(path));
+    let generation = memo.and_then(|_| crate::utils::stable_metadata_generation(&before_metadata));
+    if let Some(generation) = generation.as_deref()
+        && let Some((content_digest, bytes)) = crate::cache::digest_memo::directory_digest(path, generation, before.len)
+    {
+        return Ok((content_digest, before, bytes));
+    }
     if let (Some(memo), Some(generation)) = (memo, generation.as_deref())
         && let Some((content_digest, bytes)) = memo.lookup(generation)
         && bytes == before.len
     {
+        crate::cache::digest_memo::remember_in_directory(
+            path,
+            crate::cache::digest_memo::RememberedFile::recorded(generation, &content_digest, bytes),
+        );
         return Ok((content_digest, before, bytes));
     }
     #[cfg(windows)]
@@ -4955,6 +5078,11 @@ fn capture_guarded_file(
         && let Ok(modified) = after_metadata.modified()
     {
         memo.record(&generation, modified, &content_digest, bytes);
+        if let Some(file) =
+            crate::cache::digest_memo::RememberedFile::settled(&generation, modified, &content_digest, bytes)
+        {
+            crate::cache::digest_memo::remember_in_directory(path, file);
+        }
     }
     Ok((content_digest, before, bytes))
 }
@@ -5335,18 +5463,22 @@ impl NativeCacheContext {
     }
 
     /// Load the direct wrapper context after acquisition-free controls are resolved.
+    ///
+    /// `clippy_driver` is Cargo's workspace wrapper when Clippy runs this rustc invocation.
     pub(crate) fn load_direct_invocation(
         rustc_program: &OsStr,
         rustc_arguments: &[OsString],
+        clippy_driver: Option<&OsStr>,
     ) -> Result<Self, &'static str> {
         let invoked = std::env::current_exe().map_err(|_| "native_cache_worker_unavailable");
-        invoked.and_then(|invoked| Self::load_installed(&invoked, rustc_program, rustc_arguments))
+        invoked.and_then(|invoked| Self::load_installed(&invoked, rustc_program, rustc_arguments, clippy_driver))
     }
 
     fn load_installed(
         invoked: &Path,
         rustc_program: &OsStr,
         rustc_arguments: &[OsString],
+        clippy_driver: Option<&OsStr>,
     ) -> Result<Self, &'static str> {
         let current_directory = std::env::current_dir().map_err(|_| "compiler_working_directory_unavailable")?;
         let target_directory = std::env::var_os("CARGO_TARGET_DIR");
@@ -5359,14 +5491,19 @@ impl NativeCacheContext {
                 build_directory.as_deref(),
             )
             .map_err(|_| "compiler_output_root_unavailable")?;
-        let receipt = crate::cache::installation::load_for_wrapper(invoked, &source_root)
-            .map_err(|_| "native_cache_installation_unavailable")?;
-        let local_cas = LocalCas::open_initialized_selected(receipt.cache().map_err(|_| "local_cache_unavailable")?)
-            .map_err(|_| "local_cache_unavailable")?;
+        let receipt = bench_phase("installation_load", || {
+            crate::cache::installation::load_for_wrapper(invoked, &source_root)
+        })
+        .map_err(|_| "native_cache_installation_unavailable")?;
+        let local_cas = bench_phase("local_cache_open", || {
+            LocalCas::open_initialized_selected(receipt.cache().map_err(|_| RailError::message("local cache"))?)
+        })
+        .map_err(|_| "local_cache_unavailable")?;
         crate::cache::digest_memo::activate(local_cas.root());
-        let (session, session_inputs) =
+        let (session, session_inputs) = bench_phase("native_session_load", || {
             installed_native_session(&receipt, &source_root, &target_root_authority, rustc_program)
-                .map_err(|_| "native_cache_session_unavailable")?;
+        })
+        .map_err(|_| "native_cache_session_unavailable")?;
         let runtime = private_command_directory().map_err(|_| "native_cache_runtime_unavailable")?;
         let remote = crate::remote_cache::RemoteCacheSelection::from_environment_or_installed(receipt.remote())
             .ok()
@@ -5385,6 +5522,7 @@ impl NativeCacheContext {
             remote_store: OnceLock::new(),
             installation: Some(receipt),
             runtime: Some(runtime),
+            clippy_driver: clippy_driver.map(PathBuf::from),
         })
     }
 }
@@ -5750,6 +5888,9 @@ pub(crate) struct NativeCompilerValidation {
     /// The action binds `--diagnostic-width` because its stored stderr renders diagnostics.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     diagnostic_width_bound: bool,
+    /// The build-script rerun inputs bound because the action loads a procedural macro.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    build_script_rerun: Option<crate::build_script::freshness::BuildScriptFreshness>,
 }
 
 impl NativeCompilerValidation {
@@ -5794,6 +5935,7 @@ impl NativeCompilerValidation {
             stderr_digest,
             stderr_bytes,
             diagnostic_width_bound: capture.diagnostic_width.is_some(),
+            build_script_rerun: capture.build_script_rerun.clone(),
         };
         validation.validate_object()?;
         Ok(validation)
@@ -5841,6 +5983,7 @@ impl NativeCompilerValidation {
             &self.selected_repository_inputs,
             Some(&self.witness.rust_inputs),
             diagnostic_width.as_ref(),
+            self.build_script_rerun.as_ref(),
         )?;
         let selected_action = if linked_observation(&self.observation) {
             witnessed_action_key(&pre_link_action, &self.witness)?
@@ -6280,6 +6423,7 @@ fn action_key(
         &capture.selected_repository_inputs,
         capture.rust_inputs.as_ref().map(RustInputCapture::witness),
         capture.diagnostic_width.as_ref(),
+        capture.build_script_rerun.as_ref(),
     )
 }
 
@@ -6355,6 +6499,7 @@ fn action_key_from_base(
     selected_repository_inputs: &[NativeSelectedRepositoryInput],
     rust_inputs: Option<&RustInputWitness>,
     diagnostic_width: Option<&Option<String>>,
+    build_script_rerun: Option<&crate::build_script::freshness::BuildScriptFreshness>,
 ) -> RailResult<String> {
     validate_identity(base_action, BASE_ACTION_KEY_PREFIX)?;
     approved_environment.validate_object()?;
@@ -6367,17 +6512,25 @@ fn action_key_from_base(
     let rust_inputs = serde_json::to_vec(&rust_inputs)?;
     // The base action omits the width; rendered diagnostics alone make it an input.
     let diagnostic_width = serde_json::to_vec(&diagnostic_width)?;
+    let version = 16_u32.to_le_bytes();
+    let unconditional: [(&[u8], &[u8]); 6] = [
+        (b"version", &version),
+        (b"base-action", base_action.as_bytes()),
+        (b"approved-environment", &approved_environment),
+        (b"selected-repository-inputs", &selected_repository_inputs),
+        (b"compiler-selected-rust-inputs", &rust_inputs),
+        (b"diagnostic-width", &diagnostic_width),
+    ];
+    let mut frames = unconditional.to_vec();
+    // Only units that load a procedural macro bind build-script rerun inputs; other identities are unchanged.
+    let build_script_rerun = build_script_rerun.map(serde_json::to_vec).transpose()?;
+    if let Some(build_script_rerun) = &build_script_rerun {
+        frames.push((b"build-script-rerun", build_script_rerun));
+    }
     Ok(sha256_identity(
         ACTION_KEY_PREFIX,
         b"cargo-rail-native-compiler-action\0",
-        &[
-            (b"version", &16_u32.to_le_bytes()),
-            (b"base-action", base_action.as_bytes()),
-            (b"approved-environment", &approved_environment),
-            (b"selected-repository-inputs", &selected_repository_inputs),
-            (b"compiler-selected-rust-inputs", &rust_inputs),
-            (b"diagnostic-width", &diagnostic_width),
-        ],
+        &frames,
     ))
 }
 
@@ -6437,24 +6590,30 @@ fn base_action_key(
             .map(|captured| &captured.entries)
             .collect::<Vec<_>>(),
     )?;
+    let compilation_root = capture.compilation_root_identity(observation)?;
+    let version = 12_u32.to_le_bytes();
+    let rustc_frames: [(&[u8], &[u8]); 10] = [
+        (b"version", &version),
+        (b"session", session_identity.as_bytes()),
+        (b"target-toolchain", &toolchain_identity),
+        (b"class", &class),
+        (b"compilation-root", compilation_root.as_bytes()),
+        (b"pre-execution", &pre_execution),
+        (b"source-state", &source_state),
+        (b"generated-state", &generated_state),
+        (b"native-search-states", &native_search_states),
+        (b"pathless-extern-search-states", &pathless_extern_search_states),
+    ];
+    let mut frames = rustc_frames.to_vec();
+    // Only Clippy actions carry this frame, so rustc action identities are unchanged.
+    let clippy = capture.clippy.as_ref().map(serde_json::to_vec).transpose()?;
+    if let Some(clippy) = &clippy {
+        frames.push((b"clippy", clippy));
+    }
     Ok(sha256_identity(
         BASE_ACTION_KEY_PREFIX,
         b"cargo-rail-native-compiler-base-action\0",
-        &[
-            (b"version", &12_u32.to_le_bytes()),
-            (b"session", session_identity.as_bytes()),
-            (b"target-toolchain", &toolchain_identity),
-            (b"class", &class),
-            (
-                b"compilation-root",
-                capture.compilation_root_identity(observation)?.as_bytes(),
-            ),
-            (b"pre-execution", &pre_execution),
-            (b"source-state", &source_state),
-            (b"generated-state", &generated_state),
-            (b"native-search-states", &native_search_states),
-            (b"pathless-extern-search-states", &pathless_extern_search_states),
-        ],
+        &frames,
     ))
 }
 
@@ -8119,9 +8278,44 @@ fn invocation_bypass_reason(
 /// recognizes shapes that cannot enter the graduated class, so it can never
 /// turn an eligible invocation into a cache hit or store under a second rule.
 pub(crate) fn fast_bypass_reason(program: &OsStr, arguments: &[OsString]) -> Option<&'static str> {
-    if let Some(reason) = crate::compiler::capability::native_reuse_program_bypass_reason(program) {
-        return Some(reason);
+    match crate::compiler::capability::native_reuse_program(program) {
+        Ok(crate::compiler::capability::NativeReuseProgram::Rustc) => rustc_fast_bypass_reason(arguments),
+        Ok(crate::compiler::capability::NativeReuseProgram::Clippy) => clippy_fast_bypass_reason(arguments),
+        Err(reason) => Some(reason),
     }
+}
+
+/// Clippy reuse covers its metadata-only checks, which is every `cargo clippy` unit except linked
+/// build scripts. Linked output would need backend evidence that Clippy's process cannot provide.
+fn clippy_fast_bypass_reason(arguments: &[OsString]) -> Option<&'static str> {
+    // Cargo passes rustc after its workspace wrapper; Clippy drops that argument only when its stem is `rustc`.
+    let Some((rustc, compiler_arguments)) = arguments.split_first() else {
+        return Some("compiler_argv_unavailable");
+    };
+    if Path::new(rustc).file_stem() != Some(OsStr::new("rustc")) {
+        return Some("clippy_rustc_program_unavailable");
+    }
+    if std::env::var_os("SYSROOT").is_some() {
+        return Some(clippy::SYSROOT_OVERRIDE_REASON);
+    }
+    let links = compiler_arguments.iter().enumerate().any(|(index, argument)| {
+        let next = compiler_arguments.get(index + 1).and_then(|next| next.to_str());
+        argument
+            .to_str()
+            .and_then(|argument| inline_or_next(argument, next, "--emit"))
+            .is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|mode| mode.split_once('=').map_or(mode, |(name, _)| name) == "link")
+            })
+    });
+    if links {
+        return Some("clippy_linked_output_unavailable");
+    }
+    rustc_fast_bypass_reason(compiler_arguments)
+}
+
+fn rustc_fast_bypass_reason(arguments: &[OsString]) -> Option<&'static str> {
     let mut crate_types = BTreeSet::new();
     let mut emit_seen = false;
     let mut emits_dep_info = false;
@@ -8531,12 +8725,43 @@ fn distributed_workspace_remap_at(value: &str, current_directory: Option<&Path>)
         })
 }
 
+/// Rust libraries and procedural macros are bound by their exact bytes. A macro's execution is bound
+/// by what rustc records and by the unit's build-script rerun inputs; see `bind_build_script_rerun`.
 fn dependency_artifact_bypass_reason(extension: Option<&str>) -> Option<&'static str> {
     match extension {
-        Some("rmeta" | "rlib") => None,
-        Some("dll" | "dylib" | "so") => Some("dynamic_dependency_execution_observation_unavailable"),
+        Some("rmeta" | "rlib" | "dll" | "dylib" | "so") => None,
         _ => Some("dependency_artifact_format_observation_unavailable"),
     }
+}
+
+/// The `OUT_DIR` that Cargo assigned to this unit's package build script, if the package has one.
+///
+/// Cargo sets `OUT_DIR` to `<profile>/build/<package>-<hash>/out` beside the unit's `<profile>/deps`
+/// output directory. It does not clear an inherited value for a package without a build script,
+/// so any other value names no build script of this package.
+fn package_build_script_output(
+    observation: &RawCompilerInvocation,
+    source_root: &Path,
+    package: &str,
+) -> Option<PathBuf> {
+    let out_dir = crate::utils::canonicalize_existing(Path::new(&std::env::var_os("OUT_DIR")?)).ok()?;
+    let current_directory = std::env::current_dir().ok()?;
+    let deps = compiler_output_directory(&observation.compiler_arguments, &current_directory, source_root).ok()??;
+    let profile = crate::utils::canonicalize_existing(&deps).ok()?.parent()?.to_path_buf();
+    let script = out_dir.parent()?;
+    let assigned = out_dir.file_name() == Some(OsStr::new("out"))
+        && script.parent() == Some(profile.join("build").as_path())
+        && script
+            .file_name()
+            .and_then(OsStr::to_str)
+            .and_then(|name| name.strip_prefix(package))
+            .and_then(|suffix| suffix.strip_prefix('-'))
+            .is_some_and(|hash| !hash.is_empty() && hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assigned.then_some(out_dir)
+}
+
+fn dynamic_library_path(path: &Path) -> bool {
+    matches!(path.extension().and_then(OsStr::to_str), Some("dll" | "dylib" | "so"))
 }
 
 fn native_library_bypass_reason(value: &str) -> &'static str {
@@ -8694,7 +8919,8 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
         );
         return OuterCacheAction::Execute;
     }
-    let invocation = if diagnostic_wrapper {
+    let clippy_driver = context.clippy_driver.as_deref();
+    let invocation = if diagnostic_wrapper || clippy_driver.is_some() {
         arguments
             .split_first()
             .map(|(rustc, compiler_arguments)| (rustc.as_os_str(), compiler_arguments))
@@ -8736,6 +8962,19 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
             0,
             diagnostic_wrapper,
         );
+        return OuterCacheAction::Execute;
+    }
+    // Clippy results bind host paths, so they reuse only at the enrolled physical root.
+    if let Some(reason) = clippy_driver.and_then(|_| {
+        if context.analysis_session.is_some() {
+            Some("clippy_analysis_session_unavailable")
+        } else if session.root_portability == crate::cache::installation::InstalledRootPortability::Remap {
+            Some("clippy_root_portability_unavailable")
+        } else {
+            None
+        }
+    }) {
+        configure_cold(command, CompilerCacheWrapperStatus::Bypassed, reason, None, 0, false);
         return OuterCacheAction::Execute;
     }
     if session.authority != NativeSessionAuthority::Exact {
@@ -8786,13 +9025,15 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
     } else {
         compiler_arguments
     };
-    let mut recorder = match crate::compiler::observation::begin_invocation_in(
-        transaction_directory,
-        source_root,
-        &original_current_dir,
-        rustc,
-        compiler_arguments,
-    ) {
+    let mut recorder = match bench_phase("invocation_record", || {
+        crate::compiler::observation::begin_invocation_in(
+            transaction_directory,
+            source_root,
+            &original_current_dir,
+            rustc,
+            compiler_arguments,
+        )
+    }) {
         Ok(recorder) => recorder,
         Err(_) => {
             configure_cold(
@@ -8846,7 +9087,9 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
         );
         return OuterCacheAction::Execute;
     }
-    let capture = NativeActionCapture::capture(recorder.observation(), source_root);
+    let capture = bench_phase("action_capture", || {
+        NativeActionCapture::capture(recorder.observation(), source_root)
+    });
     let capture_bytes = capture.as_ref().map_or(0, |capture| capture.bytes_hashed);
     let mut capture = match capture {
         Ok(capture) => capture,
@@ -9005,7 +9248,9 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
     let mut distributed_candidate = None;
     let mut distributed_execution_qualified = false;
     let mut normalization_bytes = 0_u64;
+    // Distributed workers execute rustc, never Clippy.
     if (distributed_worker.is_some() || distributed_remote.is_some())
+        && clippy_driver.is_none()
         && (!diagnostic_wrapper || context.analysis_session.is_some())
     {
         let normalized = (|| -> Result<_, &'static str> {
@@ -9109,7 +9354,7 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
     };
     let mut remote_entry = None;
     let mut selector_miss_reason = "environment_selector_not_found";
-    let mut dynamic_selector = match cas.native_environment_selector(&base_action) {
+    let mut dynamic_selector = match bench_phase("selector_lookup", || cas.native_environment_selector(&base_action)) {
         Ok(Some(selector)) => Some(selector),
         Ok(None) => None,
         Err(_) => {
@@ -9221,6 +9466,7 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
             if distributed_candidate.is_none() {
                 prepare_observed_cold_child(
                     command,
+                    clippy_driver,
                     rustc,
                     compiler_arguments,
                     diagnostic_wrapper,
@@ -9240,10 +9486,12 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
             }));
         }
     };
-    capture = match capture
-        .select_repository_inputs(source_root, &dynamic_selector.repository_paths)
-        .and_then(|()| capture.select_rust_inputs(observation, source_root, &dynamic_selector.rust_inputs))
-        .inspect_err(|error| report_native_action_diagnostic("compiler dynamic input selection", error))
+    capture = match bench_phase("dynamic_input_selection", || {
+        capture
+            .select_repository_inputs(source_root, &dynamic_selector.repository_paths)
+            .and_then(|()| capture.select_rust_inputs(observation, source_root, &dynamic_selector.rust_inputs))
+    })
+    .inspect_err(|error| report_native_action_diagnostic("compiler dynamic input selection", error))
     {
         Ok(())
             if base_action_key(&session.identity, &session.class, observation, &capture)
@@ -9319,6 +9567,17 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
             return OuterCacheAction::Execute;
         }
     }
+    if let Err(failure) = capture.bind_build_script_rerun(observation, source_root) {
+        configure_cold(
+            command,
+            CompilerCacheWrapperStatus::Bypassed,
+            failure.reason,
+            Some(provisional_action),
+            metrics.bytes_hashed,
+            diagnostic_wrapper,
+        );
+        return OuterCacheAction::Execute;
+    }
     let pre_link_action = match action_key(&session.identity, &session.class, observation, &capture) {
         Ok(action) => action,
         Err(error) => {
@@ -9353,18 +9612,20 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
     } else {
         pre_link_action.clone()
     };
-    let cached = lookup_native_action(
-        &cas,
-        session,
-        &lookup_key,
-        &pre_link_action,
-        &capture,
-        observation,
-        context
-            .installation
-            .as_ref()
-            .map(crate::cache::installation::InstallationReceipt::authority),
-    );
+    let cached = bench_phase("action_lookup", || {
+        lookup_native_action(
+            &cas,
+            session,
+            &lookup_key,
+            &pre_link_action,
+            &capture,
+            observation,
+            context
+                .installation
+                .as_ref()
+                .map(crate::cache::installation::InstallationReceipt::authority),
+        )
+    });
     if let Ok((_, bytes_hashed)) = &cached {
         metrics.bytes_hashed = metrics.bytes_hashed.saturating_add(*bytes_hashed);
     }
@@ -9425,19 +9686,21 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
                 );
             }
             let analysis = analysis_resolution.ok().flatten();
-            match restore_and_publish(
-                context,
-                &cas,
-                NativeRestoreSource::Materialized {
-                    cached: &cached,
-                    hit_source: NativeHitSource::Local,
-                },
-                &capture,
-                observation,
-                &output_paths,
-                &mut metrics,
-                analysis.as_ref(),
-            ) {
+            match bench_phase("local_restore", || {
+                restore_and_publish(
+                    context,
+                    &cas,
+                    NativeRestoreSource::Materialized {
+                        cached: &cached,
+                        hit_source: NativeHitSource::Local,
+                    },
+                    &capture,
+                    observation,
+                    &output_paths,
+                    &mut metrics,
+                    analysis.as_ref(),
+                )
+            }) {
                 Ok(()) => return OuterCacheAction::Hit(0),
                 Err(RestorePublishFailure::BeforeEffect(error)) => {
                     report_native_action_diagnostic("verified result materialization", &error);
@@ -9703,6 +9966,7 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
     if distributed_candidate.is_none() {
         prepare_observed_cold_child(
             command,
+            clippy_driver,
             rustc,
             compiler_arguments,
             diagnostic_wrapper,
@@ -9753,6 +10017,7 @@ fn configure_analysis_miss(
     recorder.set_cache_wrapper(metadata);
     prepare_observed_cold_child(
         command,
+        None,
         rustc,
         compiler_arguments,
         diagnostic_wrapper,
@@ -10684,6 +10949,7 @@ fn linker_configuration_bypass_reason(
 )]
 fn prepare_observed_cold_child(
     command: &mut Command,
+    clippy_driver: Option<&Path>,
     rustc: &OsStr,
     compiler_arguments: &[OsString],
     diagnostic_wrapper: bool,
@@ -10697,7 +10963,14 @@ fn prepare_observed_cold_child(
         command.env(ANALYSIS_OUTER_OBSERVATION_ENV, "1");
         return;
     }
-    *command = Command::new(rustc);
+    *command = match clippy_driver {
+        Some(driver) => {
+            let mut clippy = Command::new(driver);
+            clippy.arg(rustc);
+            clippy
+        }
+        None => Command::new(rustc),
+    };
     command.args(compiler_arguments);
     if diagnostic_wrapper {
         command.arg(crate::compiler::invocation::UNUSED_CRATE_DEPENDENCIES_DIAGNOSTIC_ARGUMENT);
@@ -16268,6 +16541,30 @@ struct NativeCompilerExecution {
     invocation: NativeInputInvocation,
     _invocation_path: tempfile::TempPath,
     inputs: ColdRustInputGuard,
+    /// The driver's resolution phase, running beside Clippy for the same arguments.
+    resolution: Option<ResolutionProcess>,
+}
+
+/// A resolution-phase driver process that is stopped if its compiler result is not stored.
+struct ResolutionProcess(Option<std::process::Child>);
+
+impl ResolutionProcess {
+    fn wait(mut self) -> RailResult<ExitStatus> {
+        let mut child = self
+            .0
+            .take()
+            .ok_or_else(|| RailError::message("native resolution process was already collected"))?;
+        Ok(child.wait()?)
+    }
+}
+
+impl Drop for ResolutionProcess {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            drop(child.kill());
+            drop(child.wait());
+        }
+    }
 }
 
 impl NativeCompilerExecution {
@@ -16290,6 +16587,16 @@ impl NativeCompilerExecution {
         let analysis = is_diagnostic_workspace_wrapper(command.get_program())
             .then_some(context.analysis_session.as_ref())
             .flatten();
+        let clippy = context
+            .clippy_driver
+            .as_ref()
+            .map(|_| {
+                capture
+                    .clippy
+                    .as_ref()
+                    .ok_or_else(|| failure(RailError::message("Clippy invocation has no captured Clippy inputs")))
+            })
+            .transpose()?;
         let mut arguments = command
             .get_args()
             .map(|argument| {
@@ -16315,9 +16622,18 @@ impl NativeCompilerExecution {
                 arguments.push(crate::compiler::invocation::UNUSED_CRATE_DEPENDENCIES_DIAGNOSTIC_ARGUMENT.into());
             }
             OsString::from(compiler_program)
+        } else if clippy.is_some() {
+            if arguments.is_empty() {
+                return Err(failure(RailError::message("Clippy invocation has no rustc program")));
+            }
+            OsString::from(arguments.remove(0))
         } else {
             command.get_program().to_os_string()
         };
+        // Clippy compiles its own argument list; the resolution phase must load crates for exactly that list.
+        if let Some(clippy) = clippy {
+            arguments = clippy.effective_arguments(&arguments);
+        }
         let driver = if analysis.is_some_and(|analysis| analysis.typed().is_some()) {
             None
         } else {
@@ -16364,6 +16680,11 @@ impl NativeCompilerExecution {
         let result_path = capability.path().with_extension("result");
         let invocation = NativeInputInvocation {
             version: NATIVE_INPUT_PROTOCOL_VERSION,
+            phase: if clippy.is_some() {
+                NativeInputPhase::Resolution
+            } else {
+                NativeInputPhase::Compilation
+            },
             source_working_directory: None,
             nonce: ContentDigest::sha256(capability.path().as_os_str().as_encoded_bytes()).to_string(),
             action_identity: base_action.to_string(),
@@ -16391,6 +16712,7 @@ impl NativeCompilerExecution {
             .set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o400))
             .map_err(RailError::from)
             .map_err(failure)?;
+        let mut resolution = None;
         if let Some(driver) = &driver {
             let fallback_library_path = command
                 .get_envs()
@@ -16421,7 +16743,18 @@ impl NativeCompilerExecution {
             if analysis.is_some() {
                 remove_observation_environment(&mut observed);
             }
-            *command = observed;
+            if clippy.is_some() {
+                // Clippy produces the outputs and diagnostics. The resolution phase writes nothing,
+                // runs concurrently, and its own diagnostics duplicate Clippy's, so they are discarded.
+                observed
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                let child = observed.spawn().map_err(RailError::from).map_err(failure)?;
+                resolution = Some(ResolutionProcess(Some(child)));
+            } else {
+                *command = observed;
+            }
         } else {
             command.env(NATIVE_INPUT_INVOCATION_ENV, capability.path());
         }
@@ -16430,11 +16763,20 @@ impl NativeCompilerExecution {
             invocation,
             _invocation_path: capability.into_temp_path(),
             inputs,
+            resolution,
         })
     }
 
-    fn complete(self) -> Result<RustInputCapture, NativeInputFailure> {
+    fn complete(mut self) -> Result<RustInputCapture, NativeInputFailure> {
         let failure = |error| NativeInputFailure::new("compiler_native_input_evidence_unavailable", error);
+        if let Some(resolution) = self.resolution.take() {
+            let status = bench_phase("clippy_resolution_wait", || resolution.wait()).map_err(failure)?;
+            if !status.success() {
+                return Err(failure(RailError::message(
+                    "native resolution phase failed for a successful Clippy compilation",
+                )));
+            }
+        }
         if let Some(driver) = &self.driver {
             driver.revalidate().map_err(failure)?;
         }
@@ -16709,6 +17051,18 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
     let rendered_diagnostics = stderr_depends_on_diagnostic_width(&stderr);
     capture.bind_diagnostic_width(rendered_diagnostics, &raw);
     dynamic_selector.diagnostic_width = rendered_diagnostics;
+    if let Err(failure) = capture.bind_build_script_rerun(&raw, source_root) {
+        let bytes_hashed = cold_input_bytes(&raw, source_root, selected_environment_bytes);
+        drop(publish_and_record_cold_observation(
+            &mut raw,
+            failure.reason,
+            None,
+            None,
+            bytes_hashed,
+            cache_bytes_read,
+        ));
+        return status.code().unwrap_or(1);
+    }
     if !crate::compiler::native_cache::base_action_key(&session.identity, &session.class, &raw, &capture)
         .is_ok_and(|current| current == base_action_key)
     {
@@ -20298,6 +20652,7 @@ pub(crate) mod tests {
                 remote_store: OnceLock::new(),
                 installation: None,
                 runtime: None,
+                clippy_driver: None,
             };
             let mut metrics = NativeCacheMetrics::default();
             match cas.native_action(validation.action_key())? {
@@ -20457,23 +20812,25 @@ pub(crate) mod tests {
             );
         }
 
-        for (dependency, reason) in [
-            (
-                ["--extern", "derive=target/debug/deps/libderive.dylib"],
-                "dynamic_dependency_execution_observation_unavailable",
-            ),
-            (
-                ["--extern=derive=target/debug/deps/libderive.wasm", ""],
-                "dependency_artifact_format_observation_unavailable",
-            ),
+        for procedural_macro in [
+            "derive=target/debug/deps/libderive.dylib",
+            "derive=target/debug/deps/libderive.so",
+            "derive=target/debug/deps/derive.dll",
         ] {
-            let mut unsupported = eligible.to_vec();
-            unsupported.push(dependency[0].into());
-            if !dependency[1].is_empty() {
-                unsupported.push(dependency[1].into());
-            }
-            assert_eq!(fast_bypass_reason(OsStr::new("rustc"), &unsupported), Some(reason));
+            let mut supported = eligible.to_vec();
+            supported.extend([OsString::from("--extern"), OsString::from(procedural_macro)]);
+            assert_eq!(
+                fast_bypass_reason(OsStr::new("rustc"), &supported),
+                None,
+                "{procedural_macro}"
+            );
         }
+        let mut unsupported_format = eligible.to_vec();
+        unsupported_format.push("--extern=derive=target/debug/deps/libderive.wasm".into());
+        assert_eq!(
+            fast_bypass_reason(OsStr::new("rustc"), &unsupported_format),
+            Some("dependency_artifact_format_observation_unavailable")
+        );
         let mut missing_dependency_path = eligible.to_vec();
         missing_dependency_path.extend([OsString::from("--extern"), OsString::from("derive")]);
         assert_eq!(
@@ -20509,9 +20866,29 @@ pub(crate) mod tests {
             unsupported.push(argument.into());
             assert_eq!(fast_bypass_reason(OsStr::new("rustc"), &unsupported), Some(reason));
         }
+
+        // Cargo invokes Clippy as its workspace wrapper with rustc first.
+        let clippy = |rustc: &str, arguments: &[OsString]| {
+            let mut wrapped = vec![OsString::from(rustc)];
+            wrapped.extend_from_slice(arguments);
+            fast_bypass_reason(OsStr::new("/toolchain/bin/clippy-driver"), &wrapped)
+        };
+        assert_eq!(clippy("/toolchain/bin/rustc", &eligible), None);
+        assert_eq!(clippy("rustc", &test), Some("clippy_linked_output_unavailable"));
+        assert_eq!(
+            clippy("/toolchain/bin/rustc-real", &eligible),
+            Some("clippy_rustc_program_unavailable"),
+            "Clippy drops only a program whose stem is rustc"
+        );
         assert_eq!(
             fast_bypass_reason(OsStr::new("clippy-driver"), &eligible),
-            Some("clippy_diagnostic_result_authority_unavailable")
+            Some("clippy_rustc_program_unavailable")
+        );
+        let mut incremental = eligible.to_vec();
+        incremental.push("-Cincremental=target/incremental".into());
+        assert_eq!(
+            clippy("rustc", &incremental),
+            Some("incremental_work_product_observation_unavailable")
         );
     }
 
@@ -20623,6 +21000,8 @@ pub(crate) mod tests {
                 .expect("empty selected Rust input capture"),
             ),
             diagnostic_width: None,
+            clippy: None,
+            build_script_rerun: None,
             guard: NativeCaptureGuard { entries: Vec::new() },
             capture_entries: 0,
             capture_path_bytes: 0,
@@ -22583,12 +22962,6 @@ pub(crate) mod tests {
                 .compiler_arguments
                 .push("-Zcodegen-backend=/opt/backend.so".to_string());
         });
-        assert_bypass("dynamic_dependency_execution_observation_unavailable", |value| {
-            value.dependency_artifacts.push((
-                "dep".to_string(),
-                observed_file("target/debug/deps/libdep.dylib", b"dylib"),
-            ));
-        });
         assert_bypass("secret_compiler_environment", |value| {
             value.environment_reads.insert(EnvironmentObservation {
                 name: "TOKEN".to_string(),
@@ -24175,6 +24548,7 @@ pub(crate) mod tests {
         let directory = tempfile::tempdir().expect("observation directory");
         prepare_observed_cold_child(
             &mut command,
+            None,
             OsStr::new("rustc"),
             &compiler_arguments,
             false,
@@ -24186,6 +24560,23 @@ pub(crate) mod tests {
         );
         let arguments = command.get_args().collect::<Vec<_>>();
         assert_eq!(arguments, [OsStr::new("src/lib.rs")]);
+
+        let mut command = Command::new("clippy-driver");
+        prepare_observed_cold_child(
+            &mut command,
+            Some(Path::new("clippy-driver")),
+            OsStr::new("rustc"),
+            &compiler_arguments,
+            false,
+            &observation,
+            NativeTargetFormat::host(),
+            None,
+            directory.path(),
+            false,
+        );
+        assert_eq!(command.get_program(), OsStr::new("clippy-driver"));
+        let arguments = command.get_args().collect::<Vec<_>>();
+        assert_eq!(arguments, [OsStr::new("rustc"), OsStr::new("src/lib.rs")]);
     }
 
     #[test]

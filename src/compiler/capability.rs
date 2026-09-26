@@ -8,8 +8,8 @@ use serde::Serialize;
 use crate::error::RailResult;
 use crate::source::ContentDigest;
 
-const LOCAL_COMPILER_SET_VERSION: u32 = 1;
-const LOCAL_COMPILER_SET_IDENTITY_PREFIX: &str = "local-compiler-set-v1-sha256-";
+const LOCAL_COMPILER_SET_VERSION: u32 = 2;
+const LOCAL_COMPILER_SET_IDENTITY_PREFIX: &str = "local-compiler-set-v2-sha256-";
 
 /// Every pre-CLI compiler role implemented by the local runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -96,6 +96,7 @@ fn local_compiler_set_identity_for(host_os: &str, host_arch: &str) -> RailResult
         host_arch,
         unqualified_host_reason_for(host_os, host_arch),
         roles,
+        NativeReuseProgram::ALL,
     ))?;
     Ok(format!(
         "{LOCAL_COMPILER_SET_IDENTITY_PREFIX}{}",
@@ -103,21 +104,35 @@ fn local_compiler_set_identity_for(host_os: &str, host_arch: &str) -> RailResult
     ))
 }
 
-/// Reject compiler programs outside the exact native-result role before cache authority loads.
-pub(crate) fn native_reuse_program_bypass_reason(program: &OsStr) -> Option<&'static str> {
+/// Compiler programs whose exact results the native cache can reuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeReuseProgram {
+    /// The rustc family that Cargo selects as its compiler.
+    Rustc,
+    /// Cargo's `clippy-driver` workspace wrapper, which receives rustc as its first argument.
+    Clippy,
+}
+
+impl NativeReuseProgram {
+    const ALL: [Self; 2] = [Self::Rustc, Self::Clippy];
+}
+
+/// Classify the program Cargo invoked before cache authority loads.
+pub(crate) fn native_reuse_program(program: &OsStr) -> Result<NativeReuseProgram, &'static str> {
     let Some(name) = Path::new(program).file_stem().and_then(OsStr::to_str) else {
-        return Some("alternate_compiler_program_identity_unavailable");
+        return Err("alternate_compiler_program_identity_unavailable");
     };
     if name.eq_ignore_ascii_case("clippy-driver") {
-        return Some("clippy_diagnostic_result_authority_unavailable");
+        return Ok(NativeReuseProgram::Clippy);
     }
     if name.eq_ignore_ascii_case("rustdoc") {
-        return Some("rustdoc_output_tree_observation_unavailable");
+        return Err("rustdoc_output_tree_observation_unavailable");
     }
     if name.eq_ignore_ascii_case("rustc") || name.get(..5).is_some_and(|prefix| prefix.eq_ignore_ascii_case("rustc")) {
-        return None;
+        return Ok(NativeReuseProgram::Rustc);
     }
-    Some("alternate_compiler_program_identity_unavailable")
+    Err("alternate_compiler_program_identity_unavailable")
 }
 
 #[cfg(test)]
@@ -179,25 +194,28 @@ mod tests {
     }
 
     #[test]
-    fn native_reuse_accepts_only_the_declared_rustc_family() {
+    fn native_reuse_accepts_only_the_declared_program_families() {
         for program in ["rustc", "rustc.exe", "rustc-real", "rustc-clif"] {
             assert_eq!(
-                native_reuse_program_bypass_reason(OsStr::new(program)),
-                None,
+                native_reuse_program(OsStr::new(program)),
+                Ok(NativeReuseProgram::Rustc),
+                "{program}"
+            );
+        }
+        for program in ["clippy-driver", "/toolchain/bin/clippy-driver", "clippy-driver.exe"] {
+            assert_eq!(
+                native_reuse_program(OsStr::new(program)),
+                Ok(NativeReuseProgram::Clippy),
                 "{program}"
             );
         }
         assert_eq!(
-            native_reuse_program_bypass_reason(OsStr::new("clippy-driver")),
-            Some("clippy_diagnostic_result_authority_unavailable")
+            native_reuse_program(OsStr::new("rustdoc")),
+            Err("rustdoc_output_tree_observation_unavailable")
         );
         assert_eq!(
-            native_reuse_program_bypass_reason(OsStr::new("rustdoc")),
-            Some("rustdoc_output_tree_observation_unavailable")
-        );
-        assert_eq!(
-            native_reuse_program_bypass_reason(OsStr::new("alternate-rust-compiler")),
-            Some("alternate_compiler_program_identity_unavailable")
+            native_reuse_program(OsStr::new("alternate-rust-compiler")),
+            Err("alternate_compiler_program_identity_unavailable")
         );
     }
 }

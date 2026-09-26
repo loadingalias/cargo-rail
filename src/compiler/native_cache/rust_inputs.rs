@@ -37,6 +37,36 @@ impl RustInputPath {
         }
     }
 
+    fn with_relative(&self, relative: String) -> Self {
+        match self {
+            Self::Repository(_) => Self::Repository(relative),
+            Self::OutputDirectory(_) => Self::OutputDirectory(relative),
+            Self::HostToolchain(_) => Self::HostToolchain(relative),
+            Self::TargetLibrary(_) => Self::TargetLibrary(relative),
+        }
+    }
+
+    /// Split a validated path into its directory and entry name without touching the filesystem.
+    fn split_file(&self) -> RailResult<(Self, &str)> {
+        self.validate()?;
+        let relative = Path::new(self.relative());
+        let name = relative
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| RailError::message("Rust input path names no directory entry"))?;
+        let parent = native_relative_path(relative.parent().unwrap_or_else(|| Path::new("")))?;
+        Ok((self.with_relative(parent), name))
+    }
+
+    fn child(&self, name: &str) -> Self {
+        let relative = self.relative();
+        self.with_relative(if relative.is_empty() {
+            name.to_string()
+        } else {
+            format!("{relative}/{name}")
+        })
+    }
+
     fn validate(&self) -> RailResult<()> {
         let path = self.relative();
         if path.len() > super::MAX_DYNAMIC_REPOSITORY_PATH_BYTES
@@ -78,6 +108,16 @@ pub(super) struct RustInputSelector {
 }
 
 impl RustInputSelector {
+    /// Whether rustc selected a dynamic Rust library built outside the toolchain, which is how it loads
+    /// a procedural macro. The sysroot also offers dynamic standard libraries for every crate.
+    pub(super) fn selects_dynamic_library(&self) -> bool {
+        self.crates
+            .iter()
+            .flat_map(|source| &source.selected)
+            .filter(|path| matches!(path, RustInputPath::Repository(_) | RustInputPath::OutputDirectory(_)))
+            .any(|path| super::dynamic_library_path(Path::new(path.relative())))
+    }
+
     pub(super) fn validate(&self) -> RailResult<()> {
         if self.crates.len() > 4096
             || self.searches.len() > 512
@@ -373,6 +413,80 @@ struct DirectorySnapshot {
     files: BTreeMap<String, Option<NativeMetadataGuard>>,
 }
 
+/// Rustc's filename queries for one directory, indexed by prefix.
+///
+/// A dependency directory holds thousands of entries and a large crate searches it with thousands of
+/// queries. Matching each entry against the prefixes it actually starts with keeps a listing linear in
+/// its entries instead of proportional to entries times queries.
+struct PatternIndex<'a> {
+    suffixes: std::collections::HashMap<&'a str, Vec<&'a str>>,
+    prefix_lengths: Vec<usize>,
+}
+
+impl<'a> PatternIndex<'a> {
+    fn new(patterns: impl IntoIterator<Item = &'a NativeCratePattern>) -> Self {
+        let mut suffixes = std::collections::HashMap::<&str, Vec<&str>>::new();
+        for pattern in patterns {
+            suffixes.entry(&pattern.prefix).or_default().push(&pattern.suffix);
+        }
+        let mut prefix_lengths = suffixes.keys().map(|prefix| prefix.len()).collect::<Vec<_>>();
+        prefix_lengths.sort_unstable();
+        prefix_lengths.dedup();
+        Self {
+            suffixes,
+            prefix_lengths,
+        }
+    }
+
+    /// Exactly `NativeCratePattern::matches` for any of the indexed queries.
+    fn matches(&self, name: &str) -> bool {
+        self.prefix_lengths
+            .iter()
+            .take_while(|length| **length <= name.len())
+            .filter_map(|length| name.get(..*length).map(|prefix| (*length, prefix)))
+            .any(|(length, prefix)| {
+                self.suffixes.get(prefix).is_some_and(|suffixes| {
+                    suffixes
+                        .iter()
+                        .any(|suffix| name.len() >= length + suffix.len() && name.ends_with(suffix))
+                })
+            })
+    }
+}
+
+/// Resolve each captured directory once, then name its entries lexically.
+///
+/// A directory resolution proves the directory is canonical within its root. Callers still read each
+/// entry's own metadata and reject a symbolic link, so an entry needs no separate canonicalization.
+struct DirectoryResolver<'a> {
+    roots: &'a Roots,
+    resolved: BTreeMap<RustInputPath, PathBuf>,
+}
+
+impl<'a> DirectoryResolver<'a> {
+    fn new(roots: &'a Roots) -> Self {
+        Self {
+            roots,
+            resolved: BTreeMap::new(),
+        }
+    }
+
+    fn directory(&mut self, directory: &RustInputPath) -> RailResult<PathBuf> {
+        if let Some(physical) = self.resolved.get(directory) {
+            return Ok(physical.clone());
+        }
+        let physical = self.roots.resolve(directory)?;
+        self.resolved.insert(directory.clone(), physical.clone());
+        Ok(physical)
+    }
+
+    /// The physical path, directory, and entry name of one file input.
+    fn file<'p>(&mut self, path: &'p RustInputPath) -> RailResult<(PathBuf, RustInputPath, &'p str)> {
+        let (directory, name) = path.split_file()?;
+        Ok((self.directory(&directory)?.join(name), directory, name))
+    }
+}
+
 /// All candidate generations before rustc knows which crate names it will load.
 pub(crate) struct ColdRustInputGuard {
     roots: Roots,
@@ -440,13 +554,7 @@ impl ColdRustInputGuard {
         if let Some(selector) = selector {
             directories.extend(selector.searches.iter().map(|search| search.directory.clone()));
             for selected in selector.crates.iter().flat_map(|source| &source.selected) {
-                let path = roots.resolve(selected)?;
-                directories.insert(
-                    roots.encode(
-                        path.parent()
-                            .ok_or_else(|| RailError::message("Rust selected input has no parent"))?,
-                    )?,
-                );
+                directories.insert(selected.split_file()?.0);
             }
         } else {
             for path in search_paths {
@@ -477,12 +585,13 @@ impl ColdRustInputGuard {
             .into_iter()
             .map(|directory| {
                 let patterns = selector.map(|selector| {
-                    selector
-                        .searches
-                        .iter()
-                        .filter(|search| search.directory == directory)
-                        .flat_map(|search| search.patterns.iter())
-                        .collect::<Vec<_>>()
+                    PatternIndex::new(
+                        selector
+                            .searches
+                            .iter()
+                            .filter(|search| search.directory == directory)
+                            .flat_map(|search| search.patterns.iter()),
+                    )
                 });
                 let selected = selector.map(|selector| {
                     selector
@@ -499,7 +608,7 @@ impl ColdRustInputGuard {
                 });
                 let snapshot = snapshot_directory(
                     &roots.resolve(&directory)?,
-                    patterns.as_deref(),
+                    patterns.as_ref(),
                     selected.as_ref(),
                     started,
                     &mut budget,
@@ -565,10 +674,11 @@ impl ColdRustInputGuard {
                 .directories
                 .get(&directory)
                 .ok_or_else(|| RailError::message("compiler searched an uncaptured Rust library directory"))?;
+            let patterns = PatternIndex::new(&search.patterns);
             let names = before
                 .files
                 .keys()
-                .filter(|name| search.patterns.iter().any(|pattern| pattern.matches(name)))
+                .filter(|name| patterns.matches(name))
                 .cloned()
                 .collect::<Vec<_>>();
             if names != search.files {
@@ -589,14 +699,15 @@ impl ColdRustInputGuard {
             .flat_map(|source| source.selected.iter().cloned())
             .collect::<BTreeSet<_>>();
         let mut searches = Vec::new();
+        let mut resolver = DirectoryResolver::new(&self.roots);
         for search in &selector.searches {
             let before = self
                 .directories
                 .get(&search.directory)
                 .ok_or_else(|| RailError::message("Rust search selector names an uncaptured directory"))?;
-            let patterns = search.patterns.iter().collect::<Vec<_>>();
+            let patterns = PatternIndex::new(&search.patterns);
             let current = snapshot_directory(
-                &self.roots.resolve(&search.directory)?,
+                &resolver.directory(&search.directory)?,
                 Some(&patterns),
                 None,
                 started,
@@ -605,7 +716,7 @@ impl ColdRustInputGuard {
             let expected = before
                 .files
                 .keys()
-                .filter(|name| search.patterns.iter().any(|pattern| pattern.matches(name)))
+                .filter(|name| patterns.matches(name))
                 .collect::<Vec<_>>();
             if current.present != before.present || current.files.keys().ne(expected.iter().copied()) {
                 let changed = current.files.keys().find(|name| !expected.contains(name)).or_else(|| {
@@ -616,15 +727,15 @@ impl ColdRustInputGuard {
                 });
                 return Err(RailError::message(format!(
                     "Rust library search candidates changed during compilation in '{}': {}",
-                    self.roots.resolve(&search.directory)?.display(),
+                    resolver.directory(&search.directory)?.display(),
                     changed.map_or("directory presence changed", String::as_str),
                 )));
             }
             let candidates = current
                 .files
                 .keys()
-                .map(|name| self.roots.encode(&self.roots.resolve(&search.directory)?.join(name)))
-                .collect::<RailResult<Vec<_>>>()?;
+                .map(|name| search.directory.child(name))
+                .collect::<Vec<_>>();
             paths.extend(candidates.iter().cloned());
             searches.push(RustInputSearch {
                 directory: search.directory.clone(),
@@ -637,14 +748,7 @@ impl ColdRustInputGuard {
         // files need generation guards against a same-name directory swap.
         let file_directories = paths
             .iter()
-            .map(|path| {
-                let physical = self.roots.resolve(path)?;
-                self.roots.encode(
-                    physical
-                        .parent()
-                        .ok_or_else(|| RailError::message("Rust input has no parent"))?,
-                )
-            })
+            .map(|path| path.split_file().map(|(directory, _)| directory))
             .collect::<RailResult<BTreeSet<_>>>()?;
         let required_bindings = binding_paths(&self.roots, &file_directories)?;
         if required_bindings.keys().any(|path| !self.bindings.contains_key(path)) {
@@ -656,16 +760,7 @@ impl ColdRustInputGuard {
         let mut files = Vec::new();
         let mut guards = BTreeMap::new();
         for path in paths {
-            let physical = self.roots.resolve(&path)?;
-            let parent = self.roots.encode(
-                physical
-                    .parent()
-                    .ok_or_else(|| RailError::message("Rust library input has no parent"))?,
-            )?;
-            let name = physical
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| RailError::message("Rust input filename is unavailable"))?;
+            let (physical, parent, name) = resolver.file(&path)?;
             let expected = self
                 .directories
                 .get(&parent)
@@ -761,10 +856,11 @@ impl RustInputCapture {
         revalidate_bindings(&self.bindings)?;
         let started = Instant::now();
         let mut budget = NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS);
+        let mut resolver = DirectoryResolver::new(&self.roots);
         for (search, selector) in self.witness.searches.iter().zip(&self.witness.selector.searches) {
-            let patterns = selector.patterns.iter().collect::<Vec<_>>();
+            let patterns = PatternIndex::new(&selector.patterns);
             let current = snapshot_directory(
-                &self.roots.resolve(&search.directory)?,
+                &resolver.directory(&search.directory)?,
                 Some(&patterns),
                 None,
                 started,
@@ -788,7 +884,7 @@ impl RustInputCapture {
             }
         }
         for (path, expected) in &self.guards {
-            let physical = self.roots.resolve(path)?;
+            let (physical, _, _) = resolver.file(path)?;
             let metadata = fs::symlink_metadata(&physical)?;
             if !metadata.is_file()
                 || crate::utils::is_symlink_or_reparse(&metadata)
@@ -1040,7 +1136,7 @@ fn revalidate_bindings(bindings: &BTreeMap<PathBuf, DirectoryBinding>) -> RailRe
 
 fn snapshot_directory(
     path: &Path,
-    patterns: Option<&[&NativeCratePattern]>,
+    patterns: Option<&PatternIndex<'_>>,
     selected: Option<&BTreeSet<&str>>,
     started: Instant,
     budget: &mut NativeCaptureBudget,
@@ -1072,7 +1168,7 @@ fn snapshot_directory(
             continue;
         };
         budget.account_entry(name)?;
-        if patterns.is_some_and(|patterns| !patterns.iter().any(|pattern| pattern.matches(name)))
+        if patterns.is_some_and(|patterns| !patterns.matches(name))
             && !selected.is_some_and(|selected| selected.contains(name))
         {
             continue;
@@ -1097,6 +1193,61 @@ fn snapshot_directory(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pattern_index_matches_exactly_the_queries_it_indexes() {
+        let pattern = |prefix: &str, suffix: &str| NativeCratePattern {
+            prefix: prefix.into(),
+            suffix: suffix.into(),
+        };
+        let patterns = [
+            pattern("libserde", ".rlib"),
+            pattern("libserde", ".rmeta"),
+            pattern("libserde_derive-0f1e2d", ".dylib"),
+            pattern("libaa", "aa.rlib"),
+            pattern("libé", ".rlib"),
+        ];
+        let index = PatternIndex::new(&patterns);
+        for name in [
+            "libserde.rlib",
+            "libserde-1234.rmeta",
+            "libserde_derive-0f1e2d.dylib",
+            "libserde_derive-0f1e2d.rlib",
+            "libserde.rlib.d",
+            "libser.rlib",
+            "libaaa.rlib",
+            "libaaaa.rlib",
+            "libé-01.rlib",
+            "libe.rlib",
+            "",
+        ] {
+            assert_eq!(
+                index.matches(name),
+                patterns.iter().any(|pattern| pattern.matches(name)),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn lexical_directory_split_names_the_resolved_entry() {
+        let path = RustInputPath::Repository("target/debug/deps/libfixture-01.rlib".into());
+        let (directory, name) = path.split_file().unwrap();
+        assert_eq!(directory, RustInputPath::Repository("target/debug/deps".into()));
+        assert_eq!(name, "libfixture-01.rlib");
+        assert_eq!(directory.child(name), path);
+        let output = RustInputPath::OutputDirectory("libfixture-01.rmeta".into());
+        let (directory, name) = output.split_file().unwrap();
+        assert_eq!(directory, RustInputPath::OutputDirectory(String::new()));
+        assert_eq!(directory.child(name), output);
+        let toolchain = RustInputPath::HostToolchain("libstd-01.rlib".into());
+        let (directory, name) = toolchain.split_file().unwrap();
+        assert_eq!(directory, RustInputPath::HostToolchain(String::new()));
+        assert_eq!(directory.child(name), toolchain);
+        RustInputPath::Repository("../escape.rlib".into())
+            .split_file()
+            .expect_err("a parent component is not a directory entry");
+    }
     use crate::compiler::native_input_protocol::{NATIVE_INPUT_PROTOCOL_VERSION, NativeCrateSearch, NativeCrateSource};
     use std::ffi::OsStr;
 

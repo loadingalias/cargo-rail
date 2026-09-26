@@ -23,7 +23,7 @@ use crate::compiler::facts::{
 };
 use crate::compiler::native_input_protocol::{
     NATIVE_INPUT_INVOCATION_ARGUMENT, NativeAssemblyObservation, NativeCodegenObservation, NativeInputInvocation,
-    NativeInputObservation, native_invocation_digest,
+    NativeInputObservation, NativeInputPhase, native_invocation_digest,
 };
 use crate::compiler::native_input_protocol::{NATIVE_INPUT_PROTOCOL_VERSION, NATIVE_INPUT_PROTOCOL_VERSION_ARGUMENT};
 use crate::error::{RailError, RailResult};
@@ -1020,6 +1020,7 @@ fn calibrate_runtime_driver(component: &CompilerFactDriverComponent, rustc: &Pat
     ];
     let invocation = NativeInputInvocation {
         version: NATIVE_INPUT_PROTOCOL_VERSION,
+        phase: NativeInputPhase::Compilation,
         nonce: ContentDigest::sha256(b"cargo-rail-adapter-calibration-v1").to_string(),
         action_identity: "compiler-adapter-calibration-v1".to_string(),
         invocation_digest: native_invocation_digest(&arguments, root).map_err(RailError::message)?,
@@ -2746,6 +2747,7 @@ fn stage_macos_component(
 ///
 /// It lives in the Cargo-Rail owner directory rather than inside a store, because each stage links its
 /// compiler library and a store admits no symbolic links.
+#[cfg(target_os = "macos")]
 const NATIVE_DRIVER_STAGE_DIRECTORY: &str = "native-driver-stages-v1";
 
 /// Stage the driver once beside the store at `store_root` and reuse that exact file for every cold compilation.

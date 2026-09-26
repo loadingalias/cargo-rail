@@ -8,6 +8,7 @@
 
 use crate::source::ContentDigest;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -22,6 +23,29 @@ const RACY_WINDOW: Duration = Duration::from_secs(2);
 const RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const ENTRY_VERSION: u32 = 1;
 const MAX_ENTRY_BYTES: u64 = 4 * 1024;
+const TREE_VERSION: u32 = 1;
+const MAX_TREE_BYTES: u64 = 32 * 1024 * 1024;
+/// Record keys start with a versioned text domain, so they cannot equal a file generation.
+const TREE_KEY_DOMAIN: &[u8] = b"cargo-rail-tree-memo-v1\0";
+const DIRECTORY_KEY_DOMAIN: &[u8] = b"cargo-rail-directory-memo-v1\0";
+/// A directory record keeps at most this many files; a merge drops older names beyond it.
+const MAX_DIRECTORY_FILES: usize = 16 * 1024;
+
+/// Which directory record a tree names: a recursive namespace, or the direct files of one directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TreeRecord {
+    Namespace,
+    Directory,
+}
+
+/// Directory records this process loaded, with the files it digested since.
+static DIRECTORIES: std::sync::Mutex<BTreeMap<PathBuf, LoadedDirectory>> = std::sync::Mutex::new(BTreeMap::new());
+
+#[derive(Default)]
+struct LoadedDirectory {
+    files: BTreeMap<String, RememberedFile>,
+    added: BTreeMap<String, RememberedFile>,
+}
 
 static ACTIVE: OnceLock<DigestMemo> = OnceLock::new();
 
@@ -60,18 +84,99 @@ pub(crate) fn active() -> Option<&'static DigestMemo> {
     }
 }
 
+/// One regular file's digest, valid only while its complete generation is unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RememberedFile {
+    generation: String,
+    digest: String,
+    bytes: u64,
+}
+
+impl RememberedFile {
+    /// Remember a digest computed from a file whose generation was identical before and after the read,
+    /// unless a coarse timestamp could hide a same-tick rewrite.
+    pub(crate) fn settled(generation: &[u8], modified: SystemTime, digest: &str, bytes: u64) -> Option<Self> {
+        SystemTime::now()
+            .duration_since(modified)
+            .is_ok_and(|age| age >= RACY_WINDOW)
+            .then(|| Self {
+                generation: hex(generation),
+                digest: digest.to_string(),
+                bytes,
+            })
+    }
+
+    /// A digest the per-file memo already recorded under the settled-generation rule.
+    pub(crate) fn recorded(generation: &[u8], digest: &str, bytes: u64) -> Self {
+        Self {
+            generation: hex(generation),
+            digest: digest.to_string(),
+            bytes,
+        }
+    }
+
+    /// The recorded digest and length, if this record describes exactly this generation.
+    pub(crate) fn digest_for(&self, generation: &[u8], bytes: u64) -> Option<(&str, u64)> {
+        (self.bytes == bytes && self.generation == hex(generation) && valid_digest(&self.digest))
+            .then_some((self.digest.as_str(), self.bytes))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TreeEntry {
+    version: u32,
+    root: String,
+    files: BTreeMap<String, RememberedFile>,
+}
+
 impl DigestMemo {
+    /// Digests recorded for the regular files below `root`, keyed by their root-relative path.
+    ///
+    /// One record per directory tree spares a capture one memo read per file. Each digest still
+    /// applies only to a file whose current generation matches its record.
+    pub(crate) fn tree(&self, root: &Path, record: TreeRecord) -> BTreeMap<String, RememberedFile> {
+        let Some(key) = tree_key(root, record) else {
+            return BTreeMap::new();
+        };
+        let Ok(file) = fs::File::open(self.entry_path(&key)) else {
+            return BTreeMap::new();
+        };
+        let mut bytes = Vec::new();
+        if file.take(MAX_TREE_BYTES + 1).read_to_end(&mut bytes).is_err() || bytes.len() as u64 > MAX_TREE_BYTES {
+            return BTreeMap::new();
+        }
+        match serde_json::from_slice::<TreeEntry>(&bytes) {
+            Ok(entry) if entry.version == TREE_VERSION && Some(entry.root.as_str()) == root.to_str() => entry.files,
+            _ => BTreeMap::new(),
+        }
+    }
+
+    /// Replace the record for `root`. Recording is best-effort, like every memo write.
+    pub(crate) fn record_tree(&self, root: &Path, record: TreeRecord, files: BTreeMap<String, RememberedFile>) {
+        let (Some(key), Some(root)) = (tree_key(root, record), root.to_str()) else {
+            return;
+        };
+        let Ok(entry) = serde_json::to_vec(&TreeEntry {
+            version: TREE_VERSION,
+            root: root.to_string(),
+            files,
+        }) else {
+            return;
+        };
+        if entry.len() as u64 <= MAX_TREE_BYTES {
+            drop(self.write_bytes(&key, &entry));
+        }
+    }
+
     /// Return the `sha256:` digest and byte length recorded for exactly this generation.
     pub(crate) fn lookup(&self, generation: &[u8]) -> Option<(String, u64)> {
         let file = fs::File::open(self.entry_path(generation)).ok()?;
         let mut bytes = Vec::new();
         file.take(MAX_ENTRY_BYTES + 1).read_to_end(&mut bytes).ok()?;
         let entry: MemoEntry = serde_json::from_slice(&bytes).ok()?;
-        let valid_digest = entry
-            .digest
-            .strip_prefix("sha256:")
-            .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')));
-        (entry.version == ENTRY_VERSION && entry.generation == hex(generation) && valid_digest)
+        (entry.version == ENTRY_VERSION && entry.generation == hex(generation) && valid_digest(&entry.digest))
             .then_some((entry.digest, entry.bytes))
     }
 
@@ -101,17 +206,21 @@ impl DigestMemo {
     }
 
     fn write(&self, generation: &[u8], digest: &str, bytes: u64) -> std::io::Result<()> {
-        let path = self.entry_path(generation);
-        let shard = path.parent().unwrap_or(&self.directory);
-        fs::create_dir_all(shard)?;
         let entry = serde_json::to_vec(&MemoEntry {
             version: ENTRY_VERSION,
             generation: hex(generation),
             digest: digest.to_string(),
             bytes,
         })?;
+        self.write_bytes(generation, &entry)
+    }
+
+    fn write_bytes(&self, key: &[u8], entry: &[u8]) -> std::io::Result<()> {
+        let path = self.entry_path(key);
+        let shard = path.parent().unwrap_or(&self.directory);
+        fs::create_dir_all(shard)?;
         let mut temporary = tempfile::NamedTempFile::new_in(shard)?;
-        temporary.write_all(&entry)?;
+        temporary.write_all(entry)?;
         temporary.persist(&path).map_err(|error| error.error)?;
         Ok(())
     }
@@ -119,6 +228,67 @@ impl DigestMemo {
     fn entry_path(&self, generation: &[u8]) -> PathBuf {
         let key = ContentDigest::sha256(generation).to_string();
         self.directory.join(key.get(..2).unwrap_or(&key)).join(key)
+    }
+}
+
+/// The digest recorded for `path` in its directory's record, if it describes exactly this generation.
+///
+/// A dependency directory holds hundreds of files that each invocation reads. The first lookup in a
+/// directory loads its one record; later lookups in this process are in memory.
+pub(crate) fn directory_digest(path: &Path, generation: &[u8], bytes: u64) -> Option<(String, u64)> {
+    let memo = active()?;
+    let (directory, name) = (path.parent()?, path.file_name()?.to_str()?);
+    let mut directories = DIRECTORIES.lock().ok()?;
+    let loaded = directories
+        .entry(directory.to_path_buf())
+        .or_insert_with(|| LoadedDirectory {
+            files: memo.tree(directory, TreeRecord::Directory),
+            added: BTreeMap::new(),
+        });
+    loaded
+        .files
+        .get(name)
+        .and_then(|file| file.digest_for(generation, bytes))
+        .map(|(digest, bytes)| (digest.to_string(), bytes))
+}
+
+/// Remember a settled digest for `path` in its directory's record at the next flush.
+pub(crate) fn remember_in_directory(path: &Path, file: RememberedFile) {
+    if active().is_none() {
+        return;
+    }
+    let (Some(directory), Some(name)) = (path.parent(), path.file_name().and_then(|name| name.to_str())) else {
+        return;
+    };
+    let Ok(mut directories) = DIRECTORIES.lock() else {
+        return;
+    };
+    let loaded = directories.entry(directory.to_path_buf()).or_default();
+    if loaded.files.get(name) != Some(&file) {
+        loaded.files.insert(name.to_string(), file.clone());
+        loaded.added.insert(name.to_string(), file);
+    }
+}
+
+/// Merge this process's new digests into their directory records. Concurrent writers can drop each
+/// other's additions, which only costs a later lookup its fallback read.
+pub(crate) fn flush_directories() {
+    let Some(memo) = active() else {
+        return;
+    };
+    let Ok(mut directories) = DIRECTORIES.lock() else {
+        return;
+    };
+    for (directory, loaded) in directories.iter_mut() {
+        if loaded.added.is_empty() {
+            continue;
+        }
+        let mut files = memo.tree(directory, TreeRecord::Directory);
+        if files.len() + loaded.added.len() > MAX_DIRECTORY_FILES {
+            files.clear();
+        }
+        files.append(&mut loaded.added);
+        memo.record_tree(directory, TreeRecord::Directory, files);
     }
 }
 
@@ -142,6 +312,7 @@ pub(crate) fn seed_verified(opened: &fs::File, path: &Path, digest: &str, bytes:
         .is_ok_and(|metadata| metadata.len() == bytes && metadata.ctime_nsec() != 0);
     if exact && crate::utils::stable_file_generation(path).as_deref() == Some(generation.as_slice()) {
         drop(memo.write(&generation, digest, bytes));
+        remember_in_directory(path, RememberedFile::recorded(&generation, digest, bytes));
     }
 }
 
@@ -179,6 +350,22 @@ pub(crate) fn prune(store_root: &Path) -> std::io::Result<u64> {
         }
     }
     Ok(removed)
+}
+
+fn tree_key(root: &Path, record: TreeRecord) -> Option<Vec<u8>> {
+    let mut key = match record {
+        TreeRecord::Namespace => TREE_KEY_DOMAIN,
+        TreeRecord::Directory => DIRECTORY_KEY_DOMAIN,
+    }
+    .to_vec();
+    key.extend_from_slice(root.to_str()?.as_bytes());
+    Some(key)
+}
+
+fn valid_digest(digest: &str) -> bool {
+    digest
+        .strip_prefix("sha256:")
+        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')))
 }
 
 fn readiness_digest(key: &[u8]) -> String {
@@ -282,6 +469,93 @@ mod tests {
             expected,
             "a just-written verified file is seeded exactly when its change time is sub-second"
         );
+    }
+
+    #[test]
+    fn tree_records_bind_each_file_generation_and_their_root() {
+        let root = tempfile::tempdir().expect("store root");
+        let memo = DigestMemo {
+            directory: root.path().join(DIGEST_MEMO_DIRECTORY),
+        };
+        let digest = format!("sha256:{}", "ef".repeat(32));
+        let settled = SystemTime::now()
+            .checked_sub(Duration::from_secs(60))
+            .expect("settled time");
+        assert_eq!(
+            RememberedFile::settled(b"generation", SystemTime::now(), &digest, 3),
+            None,
+            "a just-modified file is not remembered"
+        );
+        let file = RememberedFile::settled(b"generation", settled, &digest, 3).expect("settled file");
+        let namespace = Path::new("/workspace/src");
+        memo.record_tree(
+            namespace,
+            TreeRecord::Namespace,
+            BTreeMap::from([("lib.rs".to_string(), file)]),
+        );
+
+        let tree = memo.tree(namespace, TreeRecord::Namespace);
+        let recorded = tree.get("lib.rs").expect("recorded file");
+        assert_eq!(recorded.digest_for(b"generation", 3), Some((digest.as_str(), 3)));
+        assert_eq!(recorded.digest_for(b"other-generation", 3), None);
+        assert_eq!(recorded.digest_for(b"generation", 4), None);
+        assert!(
+            memo.tree(Path::new("/workspace/other"), TreeRecord::Namespace)
+                .is_empty(),
+            "another root never reads this record"
+        );
+        assert!(
+            memo.tree(namespace, TreeRecord::Directory).is_empty(),
+            "a directory record never reads a namespace record"
+        );
+        assert_eq!(
+            memo.lookup(&tree_key(namespace, TreeRecord::Namespace).expect("key")),
+            None,
+            "a tree is not a file digest"
+        );
+    }
+
+    /// nextest runs each test in its own process, so this activation cannot leak into other tests.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn directory_records_serve_later_lookups_and_merge_on_flush() {
+        let store = tempfile::tempdir().expect("store root");
+        activate(store.path());
+        let memo = active().expect("active memo");
+        let directory = Path::new("/workspace/target/debug/deps");
+        let digest = format!("sha256:{}", "12".repeat(32));
+        let existing = RememberedFile::recorded(b"existing-generation", &digest, 9);
+        memo.record_tree(
+            directory,
+            TreeRecord::Directory,
+            BTreeMap::from([("libexisting.rlib".to_string(), existing.clone())]),
+        );
+
+        let path = directory.join("libexisting.rlib");
+        assert_eq!(
+            directory_digest(&path, b"existing-generation", 9),
+            Some((digest.clone(), 9)),
+            "the first lookup loads the directory record"
+        );
+        assert_eq!(directory_digest(&path, b"replaced-generation", 9), None);
+
+        remember_in_directory(
+            &directory.join("libadded.rlib"),
+            RememberedFile::recorded(b"added-generation", &digest, 4),
+        );
+        assert_eq!(
+            directory_digest(&directory.join("libadded.rlib"), b"added-generation", 4),
+            Some((digest, 4)),
+            "an addition serves this process immediately"
+        );
+        flush_directories();
+        let persisted = memo.tree(directory, TreeRecord::Directory);
+        assert_eq!(
+            persisted.get("libexisting.rlib"),
+            Some(&existing),
+            "a flush keeps recorded files"
+        );
+        assert!(persisted.contains_key("libadded.rlib"), "a flush merges additions");
     }
 
     #[test]

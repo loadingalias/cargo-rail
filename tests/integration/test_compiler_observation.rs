@@ -848,7 +848,7 @@ fn benchmark_coverage_records_compiler_mode_cold_boundaries() {
             .collect::<Result<Vec<_>>>()?;
         events.sort_by(|left, right| left["reason"].as_str().cmp(&right["reason"].as_str()));
         assert_eq!(events.len(), 4);
-        assert_eq!(events[0]["reason"], "clippy_diagnostic_result_authority_unavailable");
+        assert_eq!(events[0]["reason"], "compiler_emit_contract_unavailable");
         assert_eq!(events[0]["action"]["driver"], "clippy");
         assert_eq!(events[0]["action"]["test"], false);
         assert_eq!(events[1]["reason"], "compiler_information_request");

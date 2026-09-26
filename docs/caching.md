@@ -173,6 +173,97 @@ Disable reuse for one process tree without changing setup:
 CARGO_RAIL_CACHE=off cargo check --locked
 ```
 
+## Reuse Clippy results
+
+`cargo clippy` runs `clippy-driver` as Cargo's workspace wrapper for each workspace member.
+Cargo-Rail reuses those results under the same exact rule as rustc results.
+A Clippy action binds its rustc-equivalent action and every input that Clippy adds:
+
+- the bytes of `clippy-driver`, which must be the matched sysroot's driver;
+- whether Clippy runs lints, and the arguments it appends, including `CLIPPY_ARGS` and `--cfg clippy`;
+- `CLIPPY_ARGS`, `CLIPPY_CONF_DIR`, `CLIPPY_DISABLE_DOCS_LINKS`, `CARGO_PKG_RUST_VERSION`, and `CARGO_MANIFEST_DIR`;
+- each `.clippy.toml` and `clippy.toml` candidate that Clippy checks,
+  from `CLIPPY_CONF_DIR`, else the package directory, up to the first directory that holds one,
+  including every absent candidate;
+- the inputs of `cargo metadata`, which `clippy::cargo` lints run during linting:
+  the `cargo` executable, non-secret `CARGO_*` variables, `RUSTC`, `RUSTUP_TOOLCHAIN`,
+  each `.cargo/config.toml` and `.cargo/config` that Cargo reads,
+  the workspace manifests with every path dependency they reach, and `Cargo.lock`.
+
+A source attribute can enable a `clippy::cargo` lint, so every Clippy action binds the Cargo inputs.
+A change to a workspace manifest, the lockfile,
+or Cargo configuration therefore misses every Clippy result in that workspace.
+`CLIPPY_TERMINAL_WIDTH` is not bound: Clippy uses it only to lay out configuration errors,
+and a failed result is never stored.
+
+On a cold miss, the authenticated compiler driver runs a resolution phase beside Clippy with
+Clippy's exact arguments.
+It records the Rust libraries and search candidates rustc selects, stops when crate loading freezes,
+and writes nothing.
+That record is the same Rust-input witness that a rustc result keeps.
+The phase ends before analysis,
+so it adds parsing and macro expansion to a miss but no wall time on the critical path
+when Clippy runs longer.
+
+These Clippy invocations execute normally:
+
+| Reason                                    | Condition |
+| ----------------------------------------- | --------- |
+| `clippy_linked_output_unavailable`        | Clippy links output, such as a workspace member's build script |
+| `clippy_sysroot_override_unavailable`     | `SYSROOT` is set, so Clippy selects another sysroot |
+| `clippy_driver_identity_unavailable`      | `clippy-driver` is not the matched sysroot's driver |
+| `clippy_rustc_program_unavailable`        | The rustc argument's file stem is not `rustc`, so Clippy does not run in wrapper mode |
+| `clippy_configuration_outside_repository` | Clippy loads a configuration file outside the repository |
+| `clippy_configuration_unavailable`        | Clippy's configuration lookup cannot be observed |
+| `clippy_cargo_inputs_unavailable`         | Cargo's inputs cannot be enumerated, for example a manifest that sets `package.workspace` |
+| `clippy_root_portability_unavailable`     | The profile uses `--root-portability remap`; Clippy inputs bind host paths |
+
+The rustc bypass classes also apply.
+Dep-info records `CLIPPY_ARGS` and `CLIPPY_CONF_DIR`, so an L2 selection shares Clippy results only
+after setup approves both names with `--remote-environment`.
+
+## Procedural macros
+
+A procedural macro is a bound input: its exact library bytes enter the action,
+whether the crate depends on the macro directly or reaches it through a re-export.
+Rustc records what the expanded code includes and the environment it reads through `env!`, `option_env!`,
+and tracked environment; the action binds those records.
+
+A macro can also read files or variables that rustc does not record.
+Cargo's contract for such reads is the package build script: when a `rerun-if-changed` path or a `rerun-if-env-changed` variable changes,
+Cargo reruns the script and recompiles the package.
+A unit that loads a procedural macro therefore also binds its package build script's declarations:
+the content of every declared path, every entry of a declared directory,
+and the value of every declared variable.
+A hit is valid exactly while Cargo itself would keep the unit.
+
+These units execute normally:
+
+| Reason                                 | Condition |
+| -------------------------------------- | --------- |
+| `build_script_package_rerun_unmodeled` | The package's build script declares no rerun input, so Cargo reruns it when any package file changes |
+| `build_script_rerun_path_missing`      | A declared path is missing, so Cargo reruns the script on every build |
+| `build_script_secret_environment`      | A declared variable has a secret-like name |
+
+A macro that reads files or variables it never declares is outside this boundary,
+as it is for Cargo's own incremental builds.
+Cargo would miss that change until `cargo clean`; a hit can restore the earlier result after a clean.
+Declare such inputs in the build script, or run that build with `CARGO_RAIL_CACHE=off`.
+Distributed workers never run procedural macros; those units stay local.
+
+## Build-script execution
+
+Cargo-Rail does not reuse the output of a build script's execution.
+Compiling the build script is an ordinary rustc action and can hit.
+Running it can compile native code, as `aws-lc-sys` does with cmake and a C compiler.
+That output depends on everything that cmake, the C compiler, and the platform SDK read,
+and `rerun-if-changed` and `rerun-if-env-changed` declare only part of it.
+Exact reuse would need file tracing of the whole build-script process tree on every supported host.
+Build scripts therefore run normally when Cargo decides they must run,
+and Cargo's own freshness still skips them while their declared inputs are unchanged.
+The crates that consume their output remain reusable,
+because each consumer's action binds the generated files and native search directories it reads.
+
 ## Native host eligibility
 
 Cache setup accepts these operating-system and architecture pairs:
@@ -464,6 +555,9 @@ Results held by an active reader are not evicted.
 On Linux and macOS, the store also remembers each input file's SHA-256 while its device, inode,
 size, and modification and change times are unchanged,
 so dependents do not rehash the same dependency artifacts.
+It keeps one record per captured source tree and per dependency directory,
+so an invocation reads one record instead of one entry per file.
+A record applies to a file only while that file's generation matches.
 Files modified within the last two seconds are always rehashed, and entries expire after seven days.
 Windows always hashes, because its file generation does not include a change time.
 

@@ -10,18 +10,30 @@ use std::path::{Component, Path};
 use rscrypto::Sha256;
 use serde::{Deserialize, Serialize};
 
-pub(crate) const NATIVE_INPUT_PROTOCOL_VERSION: u32 = 2;
+pub(crate) const NATIVE_INPUT_PROTOCOL_VERSION: u32 = 3;
 pub(crate) const NATIVE_INPUT_PROTOCOL_VERSION_ARGUMENT: &str = "--cargo-rail-native-input-protocol-version";
 pub(crate) const NATIVE_INPUT_INVOCATION_ENV: &str = "CARGO_RAIL_NATIVE_INPUT_INVOCATION";
 pub(crate) const NATIVE_INPUT_INVOCATION_ARGUMENT: &str = "--cargo-rail-native-input-invocation";
 pub(crate) const MAX_NATIVE_INPUT_INVOCATION_BYTES: u64 = 64 * 1024;
 pub(crate) const MAX_NATIVE_INPUT_OBSERVATION_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Where the driver records the compiler's crate selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeInputPhase {
+    /// The driver performs the complete compilation and records its inputs after analysis.
+    Compilation,
+    /// The driver records the crate selection when rustc freezes crate loading, then stops
+    /// before writing any output. Another compiler, such as Clippy, produces the outputs.
+    Resolution,
+}
+
 /// One-shot capability for the actual compiler arguments and result destination.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NativeInputInvocation {
     pub(crate) version: u32,
+    pub(crate) phase: NativeInputPhase,
     pub(crate) nonce: String,
     pub(crate) action_identity: String,
     pub(crate) invocation_digest: String,
@@ -265,6 +277,7 @@ mod tests {
     fn invocation() -> NativeInputInvocation {
         NativeInputInvocation {
             version: NATIVE_INPUT_PROTOCOL_VERSION,
+            phase: NativeInputPhase::Compilation,
             source_working_directory: None,
             nonce: "1".repeat(64),
             action_identity: "native-action".into(),
@@ -321,6 +334,18 @@ mod tests {
             duplicated.encode(&invocation).unwrap_err(),
             "native input observation has incompatible authority"
         );
+    }
+
+    #[test]
+    fn invocation_identity_binds_the_observation_phase() {
+        let compilation = invocation();
+        let resolution = NativeInputInvocation {
+            phase: NativeInputPhase::Resolution,
+            ..compilation.clone()
+        };
+        assert_ne!(compilation.identity().unwrap(), resolution.identity().unwrap());
+        let encoded = serde_json::to_vec(&resolution).unwrap();
+        assert_eq!(NativeInputInvocation::decode(&encoded).unwrap(), resolution);
     }
 
     #[test]

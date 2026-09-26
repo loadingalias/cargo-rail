@@ -16,7 +16,7 @@ use rustc_span::source_map::{FileLoader, FilePathMapping, RealFileLoader};
 use crate::native_input_protocol::{
     MAX_NATIVE_INPUT_INVOCATION_BYTES, NATIVE_INPUT_PROTOCOL_VERSION, NativeAssemblyObservation,
     NativeCodegenObservation, NativeCratePattern, NativeCrateSearch, NativeCrateSource, NativeInputInvocation,
-    NativeInputObservation, native_invocation_digest,
+    NativeInputObservation, NativeInputPhase, native_invocation_digest,
 };
 
 pub(crate) fn configure_source_directory(
@@ -101,8 +101,15 @@ pub(crate) fn collect(
     requests: &Arc<Mutex<DependencyRequests>>,
 ) -> Result<NativeInputObservation, String> {
     // Collect after monomorphization so dependencies loaded by imported generic
-    // bodies are included in the final crate-source list.
-    let assembly = assembly_observation(tcx);
+    // bodies are included in the final crate-source list. A resolution phase
+    // runs no backend, so it can only certify a compilation without codegen.
+    let assembly = match invocation.phase {
+        NativeInputPhase::Compilation => assembly_observation(tcx),
+        NativeInputPhase::Resolution if !tcx.sess.opts.output_types.should_codegen() => {
+            NativeAssemblyObservation::NoCodegen
+        }
+        NativeInputPhase::Resolution => return Err("resolution observation requires metadata-only output".into()),
+    };
     let current_directory = std::env::current_dir().map_err(|error| error.to_string())?;
     let mut crates = Vec::new();
     for &crate_num in tcx.crates(()) {

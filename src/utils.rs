@@ -140,6 +140,21 @@ pub(crate) fn try_clone_regular_file(_source: &fs::File, _destination: &Path) ->
     None
 }
 
+/// Generation evidence from metadata a caller already read with `symlink_metadata`.
+///
+/// Only Linux and macOS generations include the change time, so only they support digest reuse.
+pub(crate) fn stable_metadata_generation(metadata: &fs::Metadata) -> Option<Vec<u8>> {
+    if !metadata.is_file() || is_symlink_or_reparse(metadata) {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    return macos_file_generation(metadata);
+    #[cfg(target_os = "linux")]
+    return linux_file_generation(metadata);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    None
+}
+
 /// Capture stable local filesystem generation evidence without reading file
 /// contents. Callers may reuse a previously verified digest only while this
 /// evidence remains exact.

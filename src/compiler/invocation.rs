@@ -491,7 +491,19 @@ fn run_direct_cache() -> i32 {
         .compiler_selection(observation_wrapper)
         .ok_or("compiler_argv_unavailable")
         .and_then(|(program, arguments)| {
-            crate::compiler::native_cache::NativeCacheContext::load_direct_invocation(program, arguments)
+            // Clippy runs the rustc it receives first; the session belongs to that rustc.
+            match clippy_rustc_selection(program, arguments) {
+                Some((rustc, rustc_arguments)) => {
+                    crate::compiler::native_cache::NativeCacheContext::load_direct_invocation(
+                        rustc,
+                        rustc_arguments,
+                        Some(program),
+                    )
+                }
+                None => {
+                    crate::compiler::native_cache::NativeCacheContext::load_direct_invocation(program, arguments, None)
+                }
+            }
         });
     match context {
         Ok(context) => run_cache_invocation(invocation, Some(context)),
@@ -553,7 +565,7 @@ fn cache_fast_bypass_reason(invocation: &CompilerInvocation, observation_wrapper
         return Some("compiler_argv_unavailable");
     };
     crate::compiler::native_cache::fast_bypass_reason(program, arguments).or_else(|| {
-        if observation_wrapper {
+        if observation_wrapper || clippy_rustc_selection(program, arguments).is_some() {
             return None;
         }
         workspace_wrapper_bypass_reason(
@@ -563,8 +575,21 @@ fn cache_fast_bypass_reason(invocation: &CompilerInvocation, observation_wrapper
     })
 }
 
+/// Split Cargo's `clippy-driver rustc ARGS` workspace-wrapper argv into the rustc it names.
+fn clippy_rustc_selection<'a>(
+    program: &std::ffi::OsStr,
+    arguments: &'a [OsString],
+) -> Option<(&'a std::ffi::OsStr, &'a [OsString])> {
+    (crate::compiler::capability::native_reuse_program(program)
+        == Ok(crate::compiler::capability::NativeReuseProgram::Clippy))
+    .then(|| arguments.split_first())
+    .flatten()
+    .map(|(rustc, arguments)| (rustc.as_os_str(), arguments))
+}
+
 /// Cargo routes workspace members through `RUSTC_WORKSPACE_WRAPPER`, which then owns their outputs.
 /// Action identity binds rustc, not that wrapper, so those units never enter the cache.
+/// Clippy is the modeled exception: its action binds the driver and every input it adds.
 fn workspace_wrapper_bypass_reason(
     program: &std::ffi::OsStr,
     configured: Option<&std::ffi::OsStr>,
@@ -630,6 +655,7 @@ fn run_cache_invocation(
     command.env_remove(CACHE_WRAPPER_MARKER).env_remove(CACHE_CONTROL_ENV);
     let action =
         crate::compiler::native_cache::configure_outer(&invocation.program, &invocation.arguments, &mut command);
+    crate::cache::digest_memo::flush_directories();
     if let Some(exit_code) = benchmark_coverage_failure("cargo-rail compiler cache wrapper") {
         return exit_code;
     }
@@ -638,6 +664,7 @@ fn run_cache_invocation(
         crate::compiler::native_cache::OuterCacheAction::Store(store) => {
             let exit_code =
                 crate::compiler::native_cache::run_and_store(command, *store, "cargo-rail compiler cache wrapper");
+            crate::cache::digest_memo::flush_directories();
             benchmark_coverage_failure("cargo-rail compiler cache wrapper").unwrap_or(exit_code)
         }
         crate::compiler::native_cache::OuterCacheAction::OperationalFailure(error) => {

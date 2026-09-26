@@ -53,8 +53,10 @@ impl Callbacks for CompilerCallbacks {
         // Keep the compiler-owned defaults used by ordinary rustc, including
         // options that contribute to the emitted crate hash.
         rustc_driver::TimePassesCallbacks::default().config(config);
-        if self.native_invocation.is_some() {
-            codegen::configure(config, self.codegen.clone());
+        if let Some(invocation) = &self.native_invocation {
+            if invocation.phase == native_input_protocol::NativeInputPhase::Compilation {
+                codegen::configure(config, self.codegen.clone());
+            }
             self.dependency_requests = Some(native_inputs::observe_dependency_requests());
         }
         if let Some(directory) = self
@@ -67,6 +69,23 @@ impl Callbacks for CompilerCallbacks {
         }
     }
 
+    fn after_expansion<'tcx>(&mut self, _compiler: &interface::Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
+        let Some(invocation) = self
+            .native_invocation
+            .as_ref()
+            .filter(|invocation| invocation.phase == native_input_protocol::NativeInputPhase::Resolution)
+        else {
+            return Compilation::Continue;
+        };
+        // Rustc freezes crate loading before this callback, so the selection is final.
+        // Stopping here writes no dep-info or output and skips analysis entirely.
+        self.native_observation = self
+            .dependency_requests
+            .as_ref()
+            .and_then(|requests| native_inputs::collect(tcx, invocation, requests).ok());
+        Compilation::Stop
+    }
+
     fn after_analysis<'tcx>(&mut self, _compiler: &interface::Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
         if let Some(invocation) = &self.fact_invocation {
             let result = collection::collect(tcx, invocation).and_then(|object| output::publish(invocation, object));
@@ -76,7 +95,11 @@ impl Callbacks for CompilerCallbacks {
                 ));
             }
         }
-        if let Some(invocation) = &self.native_invocation {
+        if let Some(invocation) = self
+            .native_invocation
+            .as_ref()
+            .filter(|invocation| invocation.phase == native_input_protocol::NativeInputPhase::Compilation)
+        {
             // Cache observation cannot turn a successful ordinary compilation
             // into failure. The wrapper requires a complete result to publish.
             self.native_observation = self
