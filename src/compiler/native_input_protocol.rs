@@ -169,6 +169,8 @@ pub(crate) const MAX_MACRO_ENVIRONMENT_READS: usize = 1024;
 pub(crate) const MAX_MACRO_ENVIRONMENT_NAME_BYTES: usize = 1024;
 pub(crate) const MAX_MACRO_SPAWNS: usize = 64;
 pub(crate) const MAX_MACRO_SPAWN_ARGUMENTS: usize = 256;
+pub(crate) const MAX_MACRO_UNOBSERVABLE_IMPORTS: usize = 64;
+pub(crate) const MAX_MACRO_IMPORT_NAME_BYTES: usize = 256;
 
 /// How a procedural macro reached one path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -240,6 +242,9 @@ pub(crate) struct NativeMacroObservation {
     pub(crate) environment: Vec<String>,
     pub(crate) spawns: Vec<NativeMacroSpawn>,
     pub(crate) unobservable: Vec<NativeMacroUnobservable>,
+    /// Imported symbols that made the observation incomplete, so an `import_unclassified` bypass names them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) unobservable_imports: Vec<String>,
 }
 
 impl NativeMacroObservation {
@@ -268,7 +273,15 @@ impl NativeMacroObservation {
                         .iter()
                         .all(|argument| argument.len() <= MAX_MACRO_PATH_BYTES && !argument.contains('\0'))
             })
-            && self.unobservable.windows(2).all(|pair| pair[0] < pair[1]);
+            && self.unobservable.windows(2).all(|pair| pair[0] < pair[1])
+            && self.unobservable_imports.len() <= MAX_MACRO_UNOBSERVABLE_IMPORTS
+            && self.unobservable_imports.windows(2).all(|pair| pair[0] < pair[1])
+            && self
+                .unobservable_imports
+                .iter()
+                .all(|name| !name.is_empty() && name.len() <= MAX_MACRO_IMPORT_NAME_BYTES && !name.contains('\0'))
+            && (self.unobservable_imports.is_empty()
+                || self.unobservable.contains(&NativeMacroUnobservable::ImportUnclassified));
         if valid {
             Ok(())
         } else {

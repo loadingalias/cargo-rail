@@ -13,5 +13,6 @@ pub(crate) fn finish(dynamic_crate_loaded: bool) -> Option<NativeMacroObservatio
         environment: Vec::new(),
         spawns: Vec::new(),
         unobservable: vec![NativeMacroUnobservable::ObservationUnavailable],
+        unobservable_imports: Vec::new(),
     })
 }

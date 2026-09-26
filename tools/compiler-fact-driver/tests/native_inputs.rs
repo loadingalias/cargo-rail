@@ -916,6 +916,7 @@ pub fn probe(_input: TokenStream) -> TokenStream {
         environment: vec!["CARGO_RAIL_MACRO_PROBE".into()],
         spawns: Vec::new(),
         unobservable: Vec::new(),
+        unobservable_imports: Vec::new(),
     };
     for phase in [NativeInputPhase::Compilation, NativeInputPhase::Resolution] {
         let (observed, observation) = driver.run_phase_with(
@@ -981,7 +982,7 @@ pub fn query(_input: TokenStream) -> TokenStream {
         .expect("native observation")
         .macros
         .expect("macro observation");
-    assert_eq!(macros.unobservable, Vec::new());
+    assert_eq!(macros.unobservable, Vec::new(), "{:?}", macros.unobservable_imports);
     assert_eq!(macros.environment, ["CARGO"]);
     // `Command::output` gives the child `/dev/null` as standard input.
     assert_eq!(
@@ -1102,6 +1103,11 @@ pub fn effect(input: TokenStream) -> TokenStream {
             .expect("native observation")
             .macros
             .expect("macro observation");
-        assert_eq!(macros.unobservable, [expected], "{effect}");
+        assert_eq!(
+            macros.unobservable,
+            [expected],
+            "{effect}: {:?}",
+            macros.unobservable_imports
+        );
     }
 }

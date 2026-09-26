@@ -33,9 +33,9 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use crate::native_input_protocol::{
-    MAX_MACRO_ENVIRONMENT_NAME_BYTES, MAX_MACRO_ENVIRONMENT_READS, MAX_MACRO_PATH_BYTES, MAX_MACRO_PATH_READS,
-    MAX_MACRO_SPAWN_ARGUMENTS, MAX_MACRO_SPAWNS, NativeMacroObservation, NativeMacroPathAccess, NativeMacroPathRead,
-    NativeMacroSpawn, NativeMacroUnobservable,
+    MAX_MACRO_ENVIRONMENT_NAME_BYTES, MAX_MACRO_ENVIRONMENT_READS, MAX_MACRO_IMPORT_NAME_BYTES, MAX_MACRO_PATH_BYTES,
+    MAX_MACRO_PATH_READS, MAX_MACRO_SPAWN_ARGUMENTS, MAX_MACRO_SPAWNS, MAX_MACRO_UNOBSERVABLE_IMPORTS,
+    NativeMacroObservation, NativeMacroPathAccess, NativeMacroPathRead, NativeMacroSpawn, NativeMacroUnobservable,
 };
 
 #[cfg(target_os = "linux")]
@@ -57,6 +57,8 @@ struct Recorder {
     environment: BTreeSet<String>,
     spawns: BTreeSet<NativeMacroSpawn>,
     unobservable: BTreeSet<NativeMacroUnobservable>,
+    /// Imports that made the observation incomplete.
+    imports: BTreeSet<String>,
     /// Canonical paths of instrumented macro images.
     images: BTreeSet<String>,
 }
@@ -73,6 +75,20 @@ fn with_recorder(record: impl FnOnce(&mut Recorder)) {
 fn record_unobservable(reason: Unobservable) {
     with_recorder(|recorder| {
         recorder.unobservable.insert(reason);
+    });
+}
+
+/// Record an import that cannot be classified or rebound, naming it within the protocol's bounds.
+fn record_unobservable_import(name: String) {
+    with_recorder(|recorder| {
+        recorder.unobservable.insert(Unobservable::ImportUnclassified);
+        if !name.is_empty()
+            && name.len() <= MAX_MACRO_IMPORT_NAME_BYTES
+            && !name.contains('\0')
+            && recorder.imports.len() < MAX_MACRO_UNOBSERVABLE_IMPORTS
+        {
+            recorder.imports.insert(name);
+        }
     });
 }
 
@@ -177,6 +193,7 @@ pub(crate) fn finish(dynamic_crate_loaded: bool) -> Option<NativeMacroObservatio
         environment: recorder.environment.into_iter().collect(),
         spawns: recorder.spawns.into_iter().collect(),
         unobservable: recorder.unobservable.into_iter().collect(),
+        unobservable_imports: recorder.imports.into_iter().collect(),
     })
 }
 
@@ -237,17 +254,14 @@ fn instrument(image: MacroImage, allowed_dependency: impl Fn(&str) -> bool) {
     if image.unobserved_system_calls {
         reasons.insert(Unobservable::RawSystemCall);
     }
+    let mut imports = Vec::new();
     for import in &image.imports {
         match hooks::classify(&import.name) {
             hooks::Class::Pure => {}
-            hooks::Class::Unclassified => {
-                reasons.insert(Unobservable::ImportUnclassified);
-            }
+            hooks::Class::Unclassified => imports.push(import.name.clone()),
             hooks::Class::Hooked(hook) => {
-                for &slot in &import.slots {
-                    if hooks::rebind(slot, hook).is_err() {
-                        reasons.insert(Unobservable::ImportUnclassified);
-                    }
+                if import.slots.iter().any(|&slot| hooks::rebind(slot, hook).is_err()) {
+                    imports.push(format!("{} (slot not rebound)", import.name));
                 }
             }
         }
@@ -256,6 +270,9 @@ fn instrument(image: MacroImage, allowed_dependency: impl Fn(&str) -> bool) {
         recorder.images.insert(image.path);
         recorder.unobservable.extend(reasons);
     });
+    for name in imports {
+        record_unobservable_import(name);
+    }
 }
 
 /// Resolve a path argument against the working directory or an open directory descriptor.

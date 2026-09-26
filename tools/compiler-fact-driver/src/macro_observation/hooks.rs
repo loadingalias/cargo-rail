@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use super::{
     ENVIRONMENT_GUARD, Unobservable, absolute_path, argument_vector, c_string, c_string_bytes, descriptor_path,
-    page_size, record_environment, record_path, record_spawn, record_unobservable,
+    page_size, record_environment, record_path, record_spawn, record_unobservable, record_unobservable_import,
 };
 use crate::native_input_protocol::NativeMacroPathAccess as Access;
 
@@ -606,7 +606,7 @@ mod explicit {
             Class::Pure => resolved,
             Class::Hooked(hook) if original(hook.original) == resolved as usize => hook.replacement() as *mut c_void,
             Class::Hooked(_) | Class::Unclassified => {
-                record_unobservable(Unobservable::ImportUnclassified);
+                record_unobservable_import(format!("{symbol} (dlsym)"));
                 resolved
             }
         }
