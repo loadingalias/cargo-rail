@@ -209,6 +209,11 @@ fn b_sentinel() { eprintln!("remaining case executed"); }
         self.assertEqual(linux['cache'], darwin['cache'])
         self.assertEqual(linux['cargo_rail'][1:], darwin['cargo_rail'])
 
+    def test_windows_selection_names_the_missing_native_reuse(self):
+        for target in ('x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc'):
+            with self.subTest(target=target), self.assertRaisesRegex(ValueError, 'native result reuse is not implemented'):
+                cache.cases_for(target)
+
 
 if __name__ == '__main__':
     unittest.main()

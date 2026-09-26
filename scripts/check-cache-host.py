@@ -45,6 +45,10 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def cases_for(target):
+    if '-windows-' in target:
+        # The required cases prove native result reuse, which Windows does not implement yet.
+        raise ValueError('native cache qualification is unavailable on Windows: native result reuse is not implemented '
+                         '(docs/caching.md#native-host-eligibility)')
     cases = {name: list(tests) for name, tests in CASES.items()}
     if '-linux-' in target:
         cases['cargo_rail'].insert(
