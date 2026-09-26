@@ -206,7 +206,7 @@ fn filter(allowed: &[(usize, usize)]) -> Vec<libc::sock_filter> {
     }
     // Memory mappings are pure unless they create executable code.
     let (protection_low, _) = words(DATA_ARGS + 2 * 8);
-    for number in [libc::SYS_mmap, libc::SYS_mprotect, libc::SYS_pkey_mprotect] {
+    for number in MEMORY_PROTECTION {
         program.extend([
             jump(BPF_JEQ_K, number as u32, 0, 4),
             statement(BPF_LD_W_ABS, protection_low),
@@ -401,6 +401,14 @@ fn observe_listing(descriptor: u64) {
 #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
 const AT_FDCWD: u64 = libc::AT_FDCWD as i64 as u64;
 
+// Architectures offer different system calls. A call that no list here names is always notified,
+// and `observe_system_call` bypasses a notified call that it does not classify.
+/// System calls that set memory protection; `libc` names no `pkey_mprotect` on s390x or POWER.
+#[cfg(not(any(target_arch = "s390x", target_arch = "powerpc64")))]
+const MEMORY_PROTECTION: [c_long; 3] = [libc::SYS_mmap, libc::SYS_mprotect, libc::SYS_pkey_mprotect];
+#[cfg(any(target_arch = "s390x", target_arch = "powerpc64"))]
+const MEMORY_PROTECTION: [c_long; 2] = [libc::SYS_mmap, libc::SYS_mprotect];
+
 /// Record what one system call from macro code reads, or why it cannot be bound.
 pub(super) fn observe_system_call(number: c_long, a: [u64; 6]) {
     use Unobservable::{
@@ -433,7 +441,7 @@ pub(super) fn observe_system_call(number: c_long, a: [u64; 6]) {
         }
         libc::SYS_faccessat | libc::SYS_faccessat2 | libc::SYS_readlinkat => observe_path(a[0], a[1], Access::Entry),
         libc::SYS_getdents64 => observe_listing(a[0]),
-        libc::SYS_mmap | libc::SYS_mprotect | libc::SYS_pkey_mprotect => {
+        number if MEMORY_PROTECTION.contains(&number) => {
             if a[2] as c_int & libc::PROT_EXEC != 0 {
                 record_unobservable(ExecutableMemory);
             }
@@ -456,14 +464,16 @@ pub(super) fn observe_system_call(number: c_long, a: [u64; 6]) {
         | libc::SYS_connect
         | libc::SYS_bind
         | libc::SYS_listen
-        | libc::SYS_accept
         | libc::SYS_accept4
         | libc::SYS_sendto
         | libc::SYS_sendmsg
         | libc::SYS_recvfrom
         | libc::SYS_recvmsg => record_unobservable(Network),
+        #[cfg(not(target_arch = "s390x"))]
+        libc::SYS_accept => record_unobservable(Network),
+        #[cfg(not(target_arch = "riscv64"))]
+        libc::SYS_renameat => record_unobservable(FileWrite),
         libc::SYS_unlinkat
-        | libc::SYS_renameat
         | libc::SYS_renameat2
         | libc::SYS_mkdirat
         | libc::SYS_mknodat
