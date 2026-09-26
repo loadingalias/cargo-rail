@@ -171,3 +171,45 @@ bench *args: build-release
             python3 -c 'import json, pathlib, sys; print((pathlib.Path(json.load(sys.stdin)["target_directory"]) / "release").as_posix())'
     )"
     exec "$component_directory/cargo-rail-bench" local "$@"
+
+# Remote dev. Generated command shape; provider mechanics live in ~/dev-machines.
+
+dev_machine := env_var_or_default("DEV_MACHINE_BIN", env_var_or_default("HOME", env_var_or_default("USERPROFILE", ".")) + "/dev-machines/dev-machine")
+
+ssh target *args="":
+    @"{{ dev_machine }}" ssh cargo-rail "{{ target }}" {{ args }}
+
+ssh-check target *args="":
+    @"{{ dev_machine }}" ssh cargo-rail "{{ target }}" --check {{ args }}
+
+ssh-create target *args="":
+    @"{{ dev_machine }}" create cargo-rail "{{ target }}" {{ args }}
+
+ssh-start target:
+    @"{{ dev_machine }}" start cargo-rail "{{ target }}"
+
+ssh-deallocate target:
+    @"{{ dev_machine }}" deallocate cargo-rail "{{ target }}"
+
+ssh-kill target:
+    @"{{ dev_machine }}" kill cargo-rail "{{ target }}"
+
+ssh-status target="":
+    @if [ -n "{{ target }}" ]; then "{{ dev_machine }}" status cargo-rail "{{ target }}"; else "{{ dev_machine }}" status cargo-rail; fi
+
+ssh-bootstrap target:
+    @"{{ dev_machine }}" bootstrap cargo-rail "{{ target }}"
+
+ssh-preflight target:
+    @"{{ dev_machine }}" preflight cargo-rail "{{ target }}"
+
+[positional-arguments]
+ssh-just target *args="":
+    @"{{ dev_machine }}" just cargo-rail "$@"
+
+[positional-arguments]
+ssh-collect-bench target +args:
+    @"{{ dev_machine }}" collect-bench cargo-rail "$@"
+
+ssh-list:
+    @"{{ dev_machine }}" list cargo-rail
