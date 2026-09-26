@@ -474,6 +474,7 @@ pub(super) fn observe_system_call(number: c_long, a: [u64; 6]) {
         #[cfg(not(target_arch = "riscv64"))]
         libc::SYS_renameat => record_unobservable(FileWrite),
         libc::SYS_unlinkat
+        | libc::SYS_copy_file_range
         | libc::SYS_renameat2
         | libc::SYS_mkdirat
         | libc::SYS_mknodat

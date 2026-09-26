@@ -555,6 +555,17 @@ fn transitive_search_uses_requested_suffix_and_retains_renamed_fallback() {
 #[test]
 fn native_observation_distinguishes_metadata_and_actual_monomorphized_assembly() {
     let driver = Driver::new();
+    // The naked function returns with the host's own return instruction.
+    let naked = format!(
+        "#[unsafe(naked)] pub unsafe extern \"C\" fn value() {{ core::arch::naked_asm!(\"{}\"); }}",
+        if cfg!(target_arch = "s390x") {
+            "br %r14"
+        } else if cfg!(target_arch = "powerpc64") {
+            "blr"
+        } else {
+            "ret"
+        }
+    );
     for (name, source, expected) in [
         (
             "plain",
@@ -571,11 +582,7 @@ fn native_observation_distinguishes_metadata_and_actual_monomorphized_assembly()
             "macro_rules! make { () => { pub fn value() { unsafe { core::arch::asm!(\"\"); } } } } make!();",
             NativeAssemblyObservation::Present,
         ),
-        (
-            "naked",
-            "#[unsafe(naked)] pub unsafe extern \"C\" fn value() { core::arch::naked_asm!(\"ret\"); }",
-            NativeAssemblyObservation::Present,
-        ),
+        ("naked", naked.as_str(), NativeAssemblyObservation::Present),
     ] {
         let input = format!("{name}.rs");
         fs::write(driver.root.join(&input), source).unwrap();

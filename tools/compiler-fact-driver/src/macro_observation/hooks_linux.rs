@@ -64,6 +64,8 @@ hooks! {
         res_init = "res_init" => |_a| record_unobservable(Unobservable::Network);
         res_init_internal = "__res_init" => |_a| record_unobservable(Unobservable::Network);
         gethostbyname2_r = "gethostbyname2_r" => |_a| record_unobservable(Unobservable::Network);
+        // Its output must be a regular file open for writing.
+        copy_file_range = "copy_file_range" => |_a| record_unobservable(Unobservable::FileWrite);
         sysinfo = "sysinfo" => |_a| record_unobservable(Unobservable::HostState);
         statvfs64 = "statvfs64" => |_a| record_unobservable(Unobservable::HostState);
         fstatvfs64 = "fstatvfs64" => |_a| record_unobservable(Unobservable::HostState);
@@ -193,6 +195,8 @@ pub(in super::super) const PLATFORM_PURE: &[&str] = &[
     "__pthread_get_minstack",
     "__stack_chk_fail",
     "__tls_get_addr",
+    // s390x resolves thread-local storage through this entry point.
+    "__tls_get_offset",
     "__xpg_strerror_r",
     "dl_iterate_phdr",
     "fstat64",
