@@ -1,5 +1,5 @@
 ---
-"cargo-rail" = "minor"
+"cargo-rail" = "major"
 ---
 
 Report a failed Unify compiler-evidence view with one cause, one recovery section,
@@ -15,3 +15,4 @@ and prints a `Still running:` line when a phase is silent for 30 seconds.
 An interrupted compiler acquisition reports the `interrupted` class and the phase it stopped.
 `--diagnostics-file` output moves to schema 16 and adds `progress_phases` with per-phase durations.
 The library adds `RailError::Failure` and `FailureClass`.
+Adding `RailError::Failure` breaks exhaustive matches on `RailError`.

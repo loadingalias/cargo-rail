@@ -1,5 +1,5 @@
 ---
-"cargo-rail" = "minor"
+"cargo-rail" = "major"
 ---
 
 Reuse Unify compiler evidence in workspaces with build scripts and proc macros.
@@ -10,3 +10,4 @@ Views are stored as they complete, so a failed or interrupted run keeps them for
 and a corrupt stored view no longer hides valid ones.
 `evidence_cache` entries add `publication_bypasses`, which name why a view was not stored.
 Stored compiler evidence starts cold once after upgrading.
+The library's `DependencyProof` and `EvidenceCacheSummary` add public fields, which breaks struct literals.
