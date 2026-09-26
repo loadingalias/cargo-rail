@@ -24,6 +24,8 @@ It does not repair source; run `just fix` explicitly and review its diff.
 
 Cross-compilation proves that code builds for a target.
 Run on that target to prove runtime, filesystem, architecture, or performance behavior.
+Maintainers run native Linux and Windows lanes on temporary remote hosts through the `just ssh-*` recipes,
+which require the maintainer's private `dev-machines` tool and delete each host after its run.
 
 ## Set up the selected lane
 
@@ -77,10 +79,11 @@ including its matched development files and backend.
 The first run may download these components; later runs reuse the installed toolchain.
 Advance that separate nightly pin only after the focused lane passes.
 
-Local work and CI use the same `just ci-check` lane: formatting, host Clippy with all Cargo targets and features,
+`just ci-check` runs formatting, Markdown lint, host Clippy with all Cargo targets and features,
 dependency policy using `deny.toml`'s target scope, documentation,
 and the excluded compiler driver's dedicated checks.
-CI calls this lane directly; workstation cross-compilation and dogfooding remain outside it.
+CI runs the same recipes one at a time, as the change's plan selects them;
+Markdown lint runs only on the workstation, where the pinned `rumdl` is installed.
 
 Run `just test` separately for runtime tests, including native cache tests and doctests.
 Local work and CI use the default nextest profile and the same concurrency policy
@@ -90,26 +93,24 @@ and runs Actionlint over the workflows without updating tooling.
 CI runs it once on Linux x64 and runs `scripts/tooling/check.ps1`
 once with Windows' existing PowerShell runtime to check PowerShell syntax.
 Use `just test-cache-host` for the native local-cache, remote-storage, and mTLS distributed-worker qualification.
-IBM Z and POWER qualification is manual and remains deferred until runner access is available;
-a green default CI run does not qualify these hosts.
 It builds the library test harness and the separate `cache` integration target with the `cache-host` Cargo profile
 (debug information disabled; assertions retained),
 then runs required cases serially and stops on the first failure.
 The same cases remain in `just test`; the cache-only lane does not run doctests or unrelated integration tests.
-CI invokes `scripts/check-cache-host.sh` directly so IBM Z and POWER do not need Just or Nextest installed.
 
-RISC-V builds the same cache harnesses and Cargo binaries on x86-64,
-then runs them through Nextest on the native runner.
+IBM Z, IBM POWER, and RISC-V have no release archives.
+On every push to `main` and every dispatched run, which release validation uses, CI runs Clippy,
+documentation, the compiler driver checks, `just test`, and `scripts/check-cache-host.sh` natively on each of them.
+Pull requests do not run these hosts.
+
+RISC-V can also run the cache lane from harnesses built on x86-64.
 Install `scripts/tooling/x86_64-linux.sh riscv-build`, source the emitted tooling environment, and run `just test-cache-host prepare riscv64gc-unknown-linux-gnu target/riscv-cache`.
-Transfer that directory to the same source checkout on RISC-V, install its `ci` tooling,
-and run `just test-cache-host run target/riscv-cache` locally or `scripts/check-cache-host.sh run target/riscv-cache` in CI.
+Transfer that directory to the same source checkout on RISC-V, install its `ci` tooling, and run `just test-cache-host run target/riscv-cache`.
 The transfer requires the same source, compiler release and commit, Nextest build,
 and exact test selection; missing or ignored cases fail.
-The native runner installs prebuilt Nextest and retains Rust, compiler development components,
-a linker, and OpenSSL for the cache fixtures.
 The authenticated compiler-driver source travels in the archive
 and bootstraps against the native compiler.
-No doctests or unrelated integration tests enter this lane.
+
 Use `just check-compiler-driver` to run only the excluded compiler driver's checks.
 
 ## Work on compiler integration
