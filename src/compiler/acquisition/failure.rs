@@ -308,11 +308,12 @@ fn cause(stderr: &str, diagnostics: &[String], error_targets: &[String]) -> Caus
         {
             return Cause::MissingLinker(linker.to_string());
         }
-        // The OS wording varies; error 2 is "not found" on every supported platform.
+        // The OS wording varies; error 2 is "not found" on every supported platform, and Windows reports a
+        // missing directory component as error 3.
         if let Some(path) = first
             .strip_prefix("error: couldn't read `")
             .and_then(|rest| rest.split_once("`: "))
-            .filter(|(_, reason)| reason.ends_with("(os error 2)"))
+            .filter(|(_, reason)| reason.ends_with("(os error 2)") || cfg!(windows) && reason.ends_with("(os error 3)"))
             .and_then(|(path, _)| named_input(path))
         {
             return Cause::MissingSourceFile(lexically_normal(&path));
@@ -370,10 +371,12 @@ fn named_input(value: &str) -> Option<String> {
     .then(|| value.to_string())
 }
 
-/// Remove `.` and `name/..` components without touching the filesystem.
+/// Remove `.` and `name/..` components without touching the filesystem, and join with `/`.
+///
+/// Windows also separates components with `\`; elsewhere it is an ordinary file-name byte.
 fn lexically_normal(path: &str) -> String {
     let mut parts = Vec::<&str>::new();
-    for part in path.split('/') {
+    for part in path.split(|character| character == '/' || cfg!(windows) && character == '\\') {
         match part {
             "." => {}
             ".." if parts.last().is_some_and(|last| !last.is_empty() && *last != "..") => {
@@ -623,6 +626,24 @@ Caused by:
             "crates/a/generated/data.bin"
         );
         assert_eq!(lexically_normal("../outside/./x"), "../outside/x");
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                lexically_normal("crates\\a\\src\\../generated/data.bin"),
+                "crates/a/generated/data.bin"
+            );
+            let targets = vec!["a (lib)".to_string()];
+            let missing = message(
+                "error: couldn't read `a\\src\\../generated/data.bin`: The system cannot find the path specified. (os error 3)\n --> a\\src\\lib.rs:1:26\n",
+            );
+            let error = classify(&view(missing.as_bytes(), b"", &targets, &arguments()));
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("a (lib) reads `a/generated/data.bin`, which does not exist"),
+                "{error}"
+            );
+        }
 
         let arguments = arguments();
         let targets = vec!["a (lib)".to_string()];
