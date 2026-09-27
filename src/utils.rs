@@ -191,20 +191,13 @@ fn change_time_tick() -> std::time::Duration {
 }
 
 /// Whether a file's last change is at least two clock ticks old, so any later change stamps a later time.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn change_time_settled(metadata: &fs::Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        change_time(metadata).is_some_and(|changed| {
-            std::time::SystemTime::now()
-                .duration_since(changed)
-                .is_ok_and(|age| age >= 2 * change_time_tick())
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = metadata;
-        false
-    }
+    change_time(metadata).is_some_and(|changed| {
+        std::time::SystemTime::now()
+            .duration_since(changed)
+            .is_ok_and(|age| age >= 2 * change_time_tick())
+    })
 }
 
 /// Wait until a file's last change is settled before a capture reads its bytes.

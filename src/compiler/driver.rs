@@ -2506,7 +2506,10 @@ fn authenticate_compiler_library(path: &Path, expected_digest: &str) -> RailResu
         generation
     };
     #[cfg(unix)]
-    if let (Some(memo), Some(changed)) = (crate::cache::digest_memo::active(), crate::utils::change_time(&metadata)) {
+    if let (Some(memo), Some(changed)) = (
+        crate::cache::digest_memo::active(),
+        crate::utils::change_time(&metadata),
+    ) {
         memo.record(&generation, changed, &actual, bytes);
     }
     Ok(AuthenticatedCompilerLibrary {

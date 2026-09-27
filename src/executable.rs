@@ -1282,7 +1282,12 @@ mod tests {
             std::fs::write(&path, name).expect("fixture file");
             path
         });
-        for image in ["linux-vdso.so.1", "linux-vdso32.so.1", "linux-vdso64.so.1", "linux-gate.so.1"] {
+        for image in [
+            "linux-vdso.so.1",
+            "linux-vdso32.so.1",
+            "linux-vdso64.so.1",
+            "linux-gate.so.1",
+        ] {
             let listing = format!(
                 "\t{image} (0x00007fff00000000)\n\tlibc.so.6 => {} (0x00007f0000000000)\n\t{} (0x00007f1000000000)\n",
                 library.display(),

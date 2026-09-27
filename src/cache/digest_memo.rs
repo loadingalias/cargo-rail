@@ -469,7 +469,7 @@ mod tests {
         seed_verified(&opened, &restored, &digest, 14);
         assert_eq!(
             memo.lookup(&generation),
-            Some((digest.clone(), 14)),
+            Some((digest, 14)),
             "a settled verified file is seeded"
         );
     }
