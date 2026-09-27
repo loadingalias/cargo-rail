@@ -9,8 +9,10 @@ on:
 permissions:
   contents: read
 
+# A pull request replaces its older run. Each commit on main keeps its own run, so the hours-long
+# IBM and RISC-V lanes finish for every commit that release validation may select.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: true
 
 defaults:
