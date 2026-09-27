@@ -427,7 +427,11 @@ fn parse_glibc_runtime_selection(program: &Path, bytes: &[u8]) -> RailResult<Exe
         }
         let path = if let Some((_, path)) = selection.split_once(" => ") {
             path
-        } else if matches!(selection, "linux-vdso.so.1" | "linux-gate.so.1") {
+        } else if matches!(
+            selection,
+            // The kernel's virtual shared objects: s390x and 64-bit POWER name theirs `linux-vdso64.so.1`.
+            "linux-vdso.so.1" | "linux-vdso32.so.1" | "linux-vdso64.so.1" | "linux-gate.so.1"
+        ) {
             platform_images.insert(selection.to_string());
             continue;
         } else {
@@ -1269,6 +1273,26 @@ fn portable_path(path: &Path, source_root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loader_selection_accepts_every_kernel_virtual_shared_object() {
+        let root = tempfile::tempdir().expect("root");
+        let [program, library, loader] = ["program", "libc.so.6", "ld64.so.1"].map(|name| {
+            let path = root.path().join(name);
+            std::fs::write(&path, name).expect("fixture file");
+            path
+        });
+        for image in ["linux-vdso.so.1", "linux-vdso32.so.1", "linux-vdso64.so.1", "linux-gate.so.1"] {
+            let listing = format!(
+                "\t{image} (0x00007fff00000000)\n\tlibc.so.6 => {} (0x00007f0000000000)\n\t{} (0x00007f1000000000)\n",
+                library.display(),
+                loader.display()
+            );
+            let selection = parse_glibc_runtime_selection(&program, listing.as_bytes()).expect(image);
+            assert_eq!(selection.platform_images, [image.to_string()], "{image}");
+            assert_eq!(selection.files.len(), 3, "{image}");
+        }
+    }
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[test]
