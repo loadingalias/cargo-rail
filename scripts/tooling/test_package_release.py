@@ -36,6 +36,7 @@ class ReleasePackage(unittest.TestCase):
         self.version = self.package['version']
         (self.root / 'Cargo.toml').write_text(f'[package]\nversion = "{self.version}"\n')
         (self.root / 'LICENSE').write_bytes(b'MIT license fixture\n')
+        (self.root / 'rust-toolchain.toml').write_text('[toolchain]\nchannel = "fixture-release"\n')
         self.packages = [copy.deepcopy(self.package)]
         self.packages[0]['manifest_path'] = str(self.root / 'Cargo.toml')
         self.metadata = {'target_directory': str(self.root / 'target'), 'packages': self.packages}
@@ -110,6 +111,13 @@ class ReleasePackage(unittest.TestCase):
                     (self.destination / 'SHA256SUMS').read_bytes(),
                     f'{hashlib.sha256(archive_path.read_bytes()).hexdigest()}  {archive_path.name}\n'.encode(),
                 )
+
+    def test_archives_require_the_pinned_compiler(self):
+        self.prepare('aarch64-apple-darwin')
+        (self.root / 'rust-toolchain.toml').write_text('[toolchain]\nchannel = "other-release"\n')
+        with self.assertRaisesRegex(ValueError, 'release archives require rustc other-release'):
+            self.package_release()
+        self.assertFalse(self.destination.exists())
 
     def test_mandatory_binary_omission_rejects_packaging_before_output(self):
         self.prepare('aarch64-apple-darwin')

@@ -34,6 +34,10 @@ def package(destination):
         ['rustc', '-vV'], text=True, cwd=root
     ).splitlines() if ': ' in line)
     target = identity['host']
+    # A release archive carries the driver built by the repository's pinned compiler.
+    pinned = tomllib.loads((root / 'rust-toolchain.toml').read_text())['toolchain']['channel']
+    if identity['release'] != pinned:
+        raise ValueError(f'release archives require rustc {pinned} from rust-toolchain.toml; found rustc {identity["release"]}')
     version = tomllib.loads((root / 'Cargo.toml').read_text())['package']['version']
     suffix = '.exe' if target.endswith('windows-msvc') else ''
     names = {

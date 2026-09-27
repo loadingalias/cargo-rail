@@ -37,23 +37,16 @@ def _date_key(value):
     return parsed
 
 
-def validate_compiler_support(identity, support, target, native_release):
-    selected_release = _release_key(identity['release'])
-    minimum_release = _release_key(support['minimum_release'])
-    native_release_key = _release_key(native_release)
-    selected_date = _date_key(identity['commit-date'])
-    minimum_date = _date_key(support['minimum_commit_date'])
-    if native_release_key < minimum_release:
-        raise ValueError('native release compiler is below the compiler adapter minimum')
-    if target == identity['host']:
-        if selected_release != native_release_key:
-            raise ValueError(
-                'native release compiler must match rust-toolchain.toml: '
-                f'expected rustc {native_release}; found rustc {identity["release"]}'
-            )
-    elif selected_release < minimum_release or selected_date < minimum_date:
+def validate_compiler_support(identity, support):
+    """Accept any stable or nightly compiler at or above the compiler adapter's floor.
+
+    The driver is built for, and bound to, the exact compiler selected here, so a newer stable release or
+    nightly works as well as the repository pin. Release archives separately require the pin.
+    """
+    if (_release_key(identity['release']) < _release_key(support['minimum_release'])
+            or _date_key(identity['commit-date']) < _date_key(support['minimum_commit_date'])):
         raise ValueError(
-            'cross compiler is below the compiler adapter minimum: '
+            'compiler is below the compiler adapter minimum: '
             f'expected rustc {support["minimum_release"]} or newer '
             f'from {support["minimum_commit_date"]} or later; '
             f'found rustc {identity["release"]} ({identity["commit-date"]})'

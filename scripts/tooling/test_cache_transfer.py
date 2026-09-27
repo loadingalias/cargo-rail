@@ -35,23 +35,21 @@ class CacheTransfer(unittest.TestCase):
             'commit-date': '2026-07-05',
             'host': 'x86_64-unknown-linux-gnu',
         }
-        native_release = '1.98.1'
-        compiler_support.validate_compiler_support(stable, support, stable['host'], native_release)
-        compiler_support.validate_compiler_support(
-            nightly, support, 'riscv64gc-unknown-linux-gnu', native_release
-        )
-        for changed in ({**stable, 'release': '1.98.0'},):
-            with self.subTest(native=changed), self.assertRaisesRegex(ValueError, 'native release compiler must match'):
-                compiler_support.validate_compiler_support(changed, support, changed['host'], native_release)
-        before_interval = {**nightly, 'commit-date': '2026-06-29'}
-        with self.assertRaisesRegex(ValueError, 'cross compiler is below'):
-            compiler_support.validate_compiler_support(
-                before_interval, support, 'riscv64gc-unknown-linux-gnu', native_release
-            )
-        newer = {**nightly, 'release': '2.0.0', 'commit-date': '2027-01-01'}
-        compiler_support.validate_compiler_support(
-            newer, support, 'riscv64gc-unknown-linux-gnu', native_release
-        )
+        # Any stable or nightly compiler at or above the floor builds the driver, native or cross.
+        for supported in (
+            stable,
+            {**stable, 'release': '1.99.0', 'commit-date': '2026-10-15'},
+            {**nightly, 'commit-date': '2026-09-25'},
+            {**nightly, 'release': '2.0.0', 'commit-date': '2027-01-01'},
+        ):
+            with self.subTest(supported=supported):
+                compiler_support.validate_compiler_support(supported, support)
+        for unsupported in (
+            {**stable, 'release': '1.97.1', 'commit-date': '2026-07-10'},
+            {**nightly, 'commit-date': '2026-06-29'},
+        ):
+            with self.subTest(unsupported=unsupported), self.assertRaisesRegex(ValueError, 'below the compiler adapter minimum'):
+                compiler_support.validate_compiler_support(unsupported, support)
 
     def test_driver_preparation_rejects_an_unsupported_target_without_publishing(self):
         with tempfile.TemporaryDirectory() as temporary:
