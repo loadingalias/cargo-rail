@@ -221,7 +221,7 @@ fn snapshot_identity_records_credential_capability_not_raw_token_material() {
         let first_diagnostics = output_dir.path().join("first.json");
         let second_diagnostics = output_dir.path().join("second.json");
         let run = |diagnostics: &Path| -> Result<std::process::Output> {
-            Ok(Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+            Ok(Command::new(crate::helpers::cargo_binary("cargo-rail"))
                 .current_dir(&ws.path)
                 .env("CARGO_HOME", cargo_home.path())
                 .args([

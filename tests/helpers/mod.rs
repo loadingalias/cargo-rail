@@ -39,13 +39,17 @@ pub fn assert_native_driver_unavailable_bypass(events: &[serde_json::Value], pha
 }
 
 /// Resolve Cargo's runtime binary location, including Nextest archive relocation.
+/// The workspace root. Nextest remaps it at run time when tests run from an archive on another host.
+pub fn manifest_directory() -> PathBuf {
+    PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo test workspace location"))
+}
+
 pub fn cargo_binary(name: &str) -> PathBuf {
     PathBuf::from(std::env::var_os(format!("CARGO_BIN_EXE_{name}")).expect("Cargo test binary location"))
 }
 
 fn isolated_git_config() -> PathBuf {
-    PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo test workspace location"))
-        .join("tests/fixtures/isolated.gitconfig")
+    manifest_directory().join("tests/fixtures/isolated.gitconfig")
 }
 
 fn apply_isolated_git_environment(command: &mut Command) {

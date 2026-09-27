@@ -551,8 +551,10 @@ mod tests {
 
     #[test]
     fn lock_checksum_diff_maps_to_exact_resolved_package_id() {
-        let ctx = WorkspaceContext::build(std::path::Path::new(env!("CARGO_MANIFEST_DIR")))
-            .expect("workspace context should load");
+        let ctx = WorkspaceContext::build(&std::path::PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"),
+        ))
+        .expect("workspace context should load");
         let package = ctx
             .cargo()
             .metadata()
@@ -578,8 +580,10 @@ mod tests {
 
     #[test]
     fn lock_dependency_diff_maps_to_exact_resolved_package_id() {
-        let ctx = WorkspaceContext::build(std::path::Path::new(env!("CARGO_MANIFEST_DIR")))
-            .expect("workspace context should load");
+        let ctx = WorkspaceContext::build(&std::path::PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"),
+        ))
+        .expect("workspace context should load");
         let workspace_packages = ctx.cargo().metadata().workspace_packages();
         let package = workspace_packages
             .iter()

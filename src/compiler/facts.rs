@@ -1525,7 +1525,7 @@ mod tests {
         let driver = std::env::var_os("CARGO_RAIL_TEST_FACT_DRIVER")
             .map(std::path::PathBuf::from)
             .expect("CARGO_RAIL_TEST_FACT_DRIVER");
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let root = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"))
             .canonicalize()
             .expect("repository root");
         let temporary = tempfile::tempdir().expect("temporary driver tree");

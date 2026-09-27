@@ -295,9 +295,9 @@ fn stable_wrapper_typed_fixture(doctest: bool) -> Result<Vec<serde_json::Value>>
     let output = Command::new("cargo")
         .current_dir(&source_root)
         .args(cargo_arguments)
-        .env("RUSTC_WORKSPACE_WRAPPER", env!("CARGO_BIN_EXE_cargo-rail"))
+        .env("RUSTC_WORKSPACE_WRAPPER", crate::helpers::cargo_binary("cargo-rail"))
         .env("CARGO_RAIL_RUSTC_WRAPPER", "1")
-        .env("RUSTDOC", env!("CARGO_BIN_EXE_cargo-rail"))
+        .env("RUSTDOC", crate::helpers::cargo_binary("cargo-rail"))
         .env("CARGO_RAIL_INNER_RUSTDOC", fs::canonicalize(which_rustdoc()?)?)
         .env("CARGO_RAIL_RUSTDOC_WRAPPER", "1")
         .env("CARGO_RAIL_COMPILER_OBSERVATION_DIRECTORY", &observation_directory)
@@ -559,7 +559,7 @@ fn stage_test_doctest_sysroot(source_root: &Path, toolchain_sysroot: &Path) -> R
     fs::create_dir(&root)?;
     fs::create_dir(root.join("bin"))?;
     fs::create_dir(root.join("lib"))?;
-    symlink(env!("CARGO_BIN_EXE_cargo-rail"), root.join("bin/rustc"))?;
+    symlink(crate::helpers::cargo_binary("cargo-rail"), root.join("bin/rustc"))?;
     // Like the production sysroot, a copy loads the staged compiler library: through a symlink, an ELF `DT_RPATH`
     // of `$ORIGIN/../lib` names the shared toolchain before `LD_LIBRARY_PATH`.
     fs::copy(fs::canonicalize(which_rustdoc()?)?, root.join("bin/rustdoc"))?;
@@ -615,7 +615,7 @@ fn cache_off_bypasses_direct_wrapper_context_and_cas_acquisition() {
         let absent_session = state.path().join("session-must-not-be-read.json");
         let absent_coverage = state.path().join("coverage-must-not-exist");
 
-        let output = Command::new(env!("CARGO_BIN_EXE_cargo-rail-native-rustc-wrapper"))
+        let output = Command::new(crate::helpers::cargo_binary("cargo-rail-native-rustc-wrapper"))
             .args(["rustc", "--version"])
             .env(CACHE_CONTROL_ENV, "off")
             .env("CARGO_RAIL_CACHE_DIR", &absent_cache)
@@ -651,7 +651,7 @@ fn cache_off_preserves_the_rustdoc_proxy_role() {
         let state = tempfile::tempdir()?;
         let absent_cache = state.path().join("cache-must-not-exist");
 
-        let output = Command::new(env!("CARGO_BIN_EXE_cargo-rail-native-rustc-wrapper"))
+        let output = Command::new(crate::helpers::cargo_binary("cargo-rail-native-rustc-wrapper"))
             .arg("--version")
             .env(CACHE_CONTROL_ENV, "off")
             .env("CARGO_RAIL_CACHE_DIR", &absent_cache)
@@ -681,7 +681,7 @@ fn unsupported_incremental_invocation_bypasses_before_direct_context_load() {
         fs::write(state.path().join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n")?;
         let absent_cache = state.path().join("cache-must-not-exist");
 
-        let output = Command::new(env!("CARGO_BIN_EXE_cargo-rail-native-rustc-wrapper"))
+        let output = Command::new(crate::helpers::cargo_binary("cargo-rail-native-rustc-wrapper"))
             .current_dir(state.path())
             .args([
                 "rustc",
@@ -726,7 +726,7 @@ fn benchmark_coverage_records_fast_bypass_without_cache_context() {
         }
         let absent_cache = state_root.join("cache-must-not-exist");
 
-        let output = Command::new(env!("CARGO_BIN_EXE_cargo-rail-native-rustc-wrapper"))
+        let output = Command::new(crate::helpers::cargo_binary("cargo-rail-native-rustc-wrapper"))
             .args(["rustc", "--version"])
             .env(CACHE_CONTROL_ENV, BENCH_COVERAGE_CONTROL)
             .env(BENCH_COVERAGE_DIRECTORY_ENV, &coverage)
@@ -769,7 +769,7 @@ fn benchmark_coverage_records_compiler_mode_cold_boundaries() {
             "/// Returns seven.\n///\n/// ```\n/// assert_eq!(7, 7);\n/// ```\npub fn value() -> u8 { 7 }\n",
         )?;
         let absent_cache = state_root.join("cache-must-not-exist");
-        let wrapper = env!("CARGO_BIN_EXE_cargo-rail-native-rustc-wrapper");
+        let wrapper = &crate::helpers::cargo_binary("cargo-rail-native-rustc-wrapper");
         let run_rustdoc = |arguments: &[&str]| -> Result<std::process::Output> {
             Ok(Command::new(wrapper)
                 .current_dir(&state_root)
@@ -893,7 +893,7 @@ fn benchmark_coverage_rejects_a_symlink_before_compiler_execution() {
         symlink(&real, &selected)?;
         write_executable(&compiler, "#!/bin/sh\nprintf executed > \"$1\"\n")?;
 
-        let output = Command::new(env!("CARGO_BIN_EXE_cargo-rail-native-rustc-wrapper"))
+        let output = Command::new(crate::helpers::cargo_binary("cargo-rail-native-rustc-wrapper"))
             .arg(&compiler)
             .arg(&compiler_marker)
             .env(CACHE_CONTROL_ENV, BENCH_COVERAGE_CONTROL)
@@ -934,7 +934,7 @@ fn cache_off_bypass_preserves_compiler_signal_status() {
         let compiler = state.path().join("signal-compiler");
         write_executable(&compiler, "#!/bin/sh\nkill -TERM $$\n")?;
 
-        let status = Command::new(env!("CARGO_BIN_EXE_cargo-rail-native-rustc-wrapper"))
+        let status = Command::new(crate::helpers::cargo_binary("cargo-rail-native-rustc-wrapper"))
             .arg(&compiler)
             .env(CACHE_CONTROL_ENV, "off")
             .env_remove(CACHE_WRAPPER_MARKER)
@@ -961,7 +961,7 @@ fn cache_off_bypass_preserves_non_utf8_argument_bytes() {
         write_executable(&compiler, "#!/bin/sh\nprintf '%s' \"$1\" > \"$CAPTURE_PATH\"\n")?;
         let argument = vec![b'a', b'r', b'g', b'-', 0x80, 0xff];
 
-        let status = Command::new(env!("CARGO_BIN_EXE_cargo-rail-native-rustc-wrapper"))
+        let status = Command::new(crate::helpers::cargo_binary("cargo-rail-native-rustc-wrapper"))
             .arg(&compiler)
             .arg(OsString::from_vec(argument.clone()))
             .env(CACHE_CONTROL_ENV, "off")
@@ -993,7 +993,7 @@ fn fact_driver_preserves_compiler_signal_status_after_publication() {
         let observations = state.path().join("observations");
         let fact_capability = write_compiler_fact_capability(&observations, state.path())?;
 
-        let status = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+        let status = Command::new(crate::helpers::cargo_binary("cargo-rail"))
             .current_dir(state.path())
             .arg(&compiler)
             .args([
@@ -1037,7 +1037,7 @@ fn overlapping_observation_markers_dispatch_by_cargo_wrapper_shape() {
             expected_rustdoc.status.success(),
             "selected rustdoc failed: {expected_rustdoc:?}"
         );
-        let rustdoc = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+        let rustdoc = Command::new(crate::helpers::cargo_binary("cargo-rail"))
             .arg("--version")
             .env("CARGO_RAIL_RUSTC_WRAPPER", "1")
             .env("CARGO_RAIL_RUSTDOC_WRAPPER", "1")
@@ -1065,7 +1065,7 @@ fn overlapping_observation_markers_dispatch_by_cargo_wrapper_shape() {
             expected_rustc.status.success(),
             "selected rustc failed: {expected_rustc:?}"
         );
-        let rustc = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+        let rustc = Command::new(crate::helpers::cargo_binary("cargo-rail"))
             .arg(rustc_program)
             .arg("--version")
             .env("CARGO_RAIL_RUSTC_WRAPPER", "1")
@@ -1091,7 +1091,7 @@ fn absent_fact_capability_executes_the_original_compiler_without_collection() {
         fs::create_dir_all(state.path().join("out"))?;
         fs::write(state.path().join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n")?;
 
-        let output = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+        let output = Command::new(crate::helpers::cargo_binary("cargo-rail"))
             .current_dir(state.path())
             .args([
                 "rustc",
@@ -1133,7 +1133,7 @@ fn absent_fact_capability_preserves_the_inner_workspace_wrapper() {
             "#!/bin/sh\nprintf 'called\\n' >> \"$INNER_WRAPPER_LOG\"\nexec \"$@\"\n",
         )?;
 
-        let output = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+        let output = Command::new(crate::helpers::cargo_binary("cargo-rail"))
             .current_dir(state.path())
             .args([
                 "rustc",
@@ -1171,7 +1171,7 @@ fn incomplete_fact_capability_fails_before_compiler_execution() {
         fs::create_dir_all(state.path().join("out"))?;
         fs::write(state.path().join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n")?;
 
-        let output = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+        let output = Command::new(crate::helpers::cargo_binary("cargo-rail"))
             .current_dir(state.path())
             .args([
                 "rustc",
@@ -1219,7 +1219,7 @@ fn rustdoc_proxy_preserves_cargo_docs_and_records_dep_info() {
             .current_dir(&workspace.path)
             .args(["doc", "--no-deps", "--message-format=json", "--target-dir"])
             .arg(&target_directory)
-            .env("RUSTDOC", env!("CARGO_BIN_EXE_cargo-rail"))
+            .env("RUSTDOC", crate::helpers::cargo_binary("cargo-rail"))
             .env("CARGO_RAIL_RUSTDOC_WRAPPER", "1")
             .env("CARGO_RAIL_INNER_RUSTDOC", "rustdoc")
             .env("CARGO_RAIL_COMPILER_OBSERVATION_DIRECTORY", &observation_directory)

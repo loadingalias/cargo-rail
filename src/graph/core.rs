@@ -1157,7 +1157,7 @@ mod tests {
     #[test]
     fn duplicate_workspace_package_roots_fail_graph_construction() {
         let mut metadata = MetadataCommand::new()
-            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .current_dir(std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"))
             .no_deps()
             .other_options(vec!["--offline".into(), "--locked".into()])
             .exec()
@@ -1181,7 +1181,7 @@ mod tests {
     #[test]
     fn graph_preserves_same_name_packages_by_exact_package_id() {
         let mut metadata = MetadataCommand::new()
-            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .current_dir(std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"))
             .no_deps()
             .other_options(vec!["--offline".into(), "--locked".into()])
             .exec()

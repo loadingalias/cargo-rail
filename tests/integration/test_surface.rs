@@ -9,7 +9,7 @@ const SURFACE_V4_SCHEMA: &str = include_str!("../../schemas/surface-v4.schema.js
 
 #[test]
 fn compiler_observation_process_reports_its_private_protocol() {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cargo-rail-compiler-observation"))
+    let output = std::process::Command::new(crate::helpers::cargo_binary("cargo-rail-compiler-observation"))
         .arg(cargo_rail::compiler::invocation::OBSERVATION_PROTOCOL_ARGUMENT)
         .output()
         .expect("run compiler observation protocol probe");

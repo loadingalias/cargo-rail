@@ -12,7 +12,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 fn snapshot_directory() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/output")
+    crate::helpers::manifest_directory().join("tests/fixtures/output")
 }
 
 /// A member with an unused path dependency and a restated workspace package field.

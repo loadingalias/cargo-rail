@@ -19611,6 +19611,20 @@ pub(crate) mod tests {
         );
     }
 
+    /// `graduated_observation` compiled from `root`: Cargo runs rustc from the workspace root, where the relative
+    /// output directory already exists, so the fixture must not borrow the test process's working directory.
+    fn rooted_graduated_observation(root: &Path) -> RawCompilerInvocation {
+        let output = root.join("target/debug/deps");
+        fs::create_dir_all(&output).expect("compiler output directory");
+        let mut observation = graduated_observation();
+        for argument in &mut observation.compiler_arguments {
+            if argument == "target/debug/deps" {
+                *argument = output.to_str().expect("UTF-8 output directory").to_string();
+            }
+        }
+        observation
+    }
+
     fn graduated_observation() -> RawCompilerInvocation {
         let source = observed_file("src/lib.rs", b"pub fn value() -> u8 { 1 }\n");
         RawCompilerInvocation {
@@ -19762,7 +19776,7 @@ pub(crate) mod tests {
             .expect("ordinary external package");
         assert_eq!(ordinary.source_relative, "src");
 
-        let mut observation = graduated_observation();
+        let mut observation = rooted_graduated_observation(workspace.path());
         observation.declared_inputs =
             vec![FileObservation::capture(&source, workspace.path(), workspace.path()).expect("declared source")];
         let sibling_spelling = source_directory.join("../../stdarch/mod.rs");
@@ -20408,8 +20422,8 @@ pub(crate) mod tests {
         use std::os::unix::fs::symlink;
 
         let result: RailResult<()> = (|| {
-            let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
-            let canonical = crate::utils::canonicalize_existing(repository)?;
+            let repository = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+            let canonical = crate::utils::canonicalize_existing(&repository)?;
             let directory = tempfile::tempdir()?;
             let spelling = directory.path().join("checkout-spelling");
             symlink(repository, &spelling)?;
@@ -21564,7 +21578,7 @@ pub(crate) mod tests {
         let source = root.path().join("src/lib.rs");
         fs::write(&source, b"pub const VALUE: u8 = 1;\n").expect("source");
         let captured = FileObservation::capture(&source, root.path(), root.path()).expect("source observation");
-        let mut observation = graduated_observation();
+        let mut observation = rooted_graduated_observation(root.path());
         observation.declared_inputs = vec![captured.clone()];
         observation.observed_reads = vec![captured];
         let session = graduated_session(path_identity(root.path()).expect("root identity"));
@@ -21630,7 +21644,7 @@ pub(crate) mod tests {
             FileObservation::capture(&source, root.path(), root.path()).expect("source observation");
         let generated_observation =
             FileObservation::capture(&generated, root.path(), root.path()).expect("generated observation");
-        let mut observation = graduated_observation();
+        let mut observation = rooted_graduated_observation(root.path());
         observation.declared_inputs = vec![source_observation.clone()];
         observation.observed_reads = vec![source_observation, generated_observation];
         let session = graduated_session(path_identity(root.path()).expect("root identity"));
@@ -21671,7 +21685,7 @@ pub(crate) mod tests {
 
         let source_observation =
             FileObservation::capture(&source, root.path(), root.path()).expect("source observation");
-        let mut observation = graduated_observation();
+        let mut observation = rooted_graduated_observation(root.path());
         observation.declared_inputs = vec![source_observation.clone()];
         observation.observed_reads = vec![source_observation];
         let session = graduated_session(path_identity(root.path()).expect("root identity"));
@@ -21829,7 +21843,7 @@ pub(crate) mod tests {
             FileObservation::capture(&source, root.path(), root.path()).expect("source observation");
         let output_observation =
             FileObservation::capture(&compiler_output, root.path(), root.path()).expect("output observation");
-        let mut observation = graduated_observation();
+        let mut observation = rooted_graduated_observation(root.path());
         observation.declared_inputs = vec![source_observation.clone()];
         observation.observed_reads = vec![source_observation, output_observation];
         let mut capture = NativeActionCapture::capture(&observation, root.path()).expect("source capture");
@@ -21859,7 +21873,7 @@ pub(crate) mod tests {
 
         let source_observation =
             FileObservation::capture(&source, root.path(), root.path()).expect("source observation");
-        let mut observation = graduated_observation();
+        let mut observation = rooted_graduated_observation(root.path());
         observation.declared_inputs = vec![source_observation.clone()];
         observation.observed_reads = vec![source_observation];
         let initial = NativeActionCapture::capture(&observation, root.path()).expect("initial build-script capture");
@@ -21895,7 +21909,7 @@ pub(crate) mod tests {
     fn fixture_source_observation(root: &Path) -> RawCompilerInvocation {
         let source = root.join("src/lib.rs");
         let source_observation = FileObservation::capture(&source, root, root).expect("source observation");
-        let mut observation = graduated_observation();
+        let mut observation = rooted_graduated_observation(root);
         observation.declared_inputs = vec![source_observation.clone()];
         observation.observed_reads = vec![source_observation];
         let output_directory = root.join("target/debug/deps");
@@ -22055,7 +22069,7 @@ pub(crate) mod tests {
 
         let source_observation =
             FileObservation::capture(&source, root.path(), root.path()).expect("source observation");
-        let mut observation = graduated_observation();
+        let mut observation = rooted_graduated_observation(root.path());
         observation.compiler_arguments.extend([
             "-L".to_string(),
             format!("dependency={}", dependency_root.display()),
@@ -22738,7 +22752,7 @@ pub(crate) mod tests {
         let source = FileObservation::capture(&source, root.path(), root.path()).expect("source observation");
         let dependency_observation =
             FileObservation::capture(&dependency, root.path(), root.path()).expect("dependency observation");
-        let mut observation = graduated_observation();
+        let mut observation = rooted_graduated_observation(root.path());
         observation.declared_inputs = vec![source.clone()];
         observation.observed_reads = vec![source];
         observation.dependency_artifacts = vec![("dependency".to_string(), dependency_observation)];

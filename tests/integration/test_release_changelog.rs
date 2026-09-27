@@ -1290,7 +1290,7 @@ registry_publication = "crates-io"
 #[test]
 fn release_package_excludes_finder_metadata() {
     let result: Result<()> = (|| {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = crate::helpers::manifest_directory();
         let manifest: toml_edit::DocumentMut = std::fs::read_to_string(root.join("Cargo.toml"))?.parse()?;
         let include = manifest["package"]["include"]
             .as_array()
@@ -6878,7 +6878,7 @@ fn release_confirmation_pty_accepts_only_yes_and_keeps_the_prompt_on_stderr() {
             Mode::empty(),
         )?;
         let mut master = std::fs::File::from(master);
-        let mut child = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+        let mut child = Command::new(crate::helpers::cargo_binary("cargo-rail"))
             .args(["rail", "release", "run", "lib-a", "--bump", "patch", "--skip-tag"])
             .current_dir(&ws.path)
             .stdin(Stdio::from(std::fs::File::from(slave)))

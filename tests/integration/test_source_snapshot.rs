@@ -704,7 +704,7 @@ exec "$CARGO_RAIL_TEST_REAL_GIT" "$@"
         )?;
         let counter = ws.path.join(".git/rail-drift-count");
 
-        let output = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+        let output = Command::new(crate::helpers::cargo_binary("cargo-rail"))
             .current_dir(&ws.path)
             .env("PATH", path)
             .env("CARGO_RAIL_TEST_REAL_GIT", real_git)
@@ -763,7 +763,7 @@ exec "$CARGO_RAIL_TEST_REAL_GIT" "$@"
         let path = std::env::join_paths(
             std::iter::once(wrapper_dir).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())),
         )?;
-        let output = Command::new(env!("CARGO_BIN_EXE_cargo-rail"))
+        let output = Command::new(crate::helpers::cargo_binary("cargo-rail"))
             .current_dir(&ws.path)
             .env("PATH", path)
             .env("CARGO_RAIL_TEST_REAL_GIT", real_git)
