@@ -117,7 +117,8 @@ cargo rail cache status
 
 `cache setup --check` previews enrollment and exits `1` when work is pending.
 `cache setup` installs the global Cargo wrapper and enrolls this workspace.
-`cache ready` proves one cold miss and one verified warm restore.
+`cache ready` proves one cold miss and one verified warm restore,
+after it installs `rustc-dev` for the selected rustup toolchain when that component is missing.
 After setup, ordinary Cargo, nextest, Just, IDE,
 and CI commands on that machine use the same verified cache path.
 

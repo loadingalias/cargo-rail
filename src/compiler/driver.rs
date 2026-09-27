@@ -1483,6 +1483,27 @@ fn ensure_authority_compiler_library(
     Ok(directory)
 }
 
+/// Install `rustc-dev` for the exact selected toolchain when its sysroot lacks compiler development
+/// support, so the compiler-matched driver can be built for any supported stable or nightly compiler.
+///
+/// Compiler wrappers never install components mid-build; `cache ready` and Surface prepare them first.
+pub(crate) fn prepare_selected_development_support(
+    current_directory: &Path,
+    rustc_verbose: &str,
+    rustc_sysroot: &Path,
+) -> RailResult<()> {
+    let sysroot = crate::utils::canonicalize_existing(rustc_sysroot)?;
+    let rustc_host = rustc_verbose
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .ok_or_else(|| RailError::message("selected rustc reports no host target"))?;
+    if !compiler_libraries(&sysroot)?.is_empty() && compiler_development_support_present(&sysroot, rustc_host)? {
+        return Ok(());
+    }
+    let toolchain = rustup_toolchain_for_sysroot(current_directory, &sysroot)?;
+    install_selected_rustc_dev(current_directory, &sysroot, toolchain.as_deref())
+}
+
 fn install_selected_rustc_dev(
     current_directory: &Path,
     sysroot: &Path,
@@ -1494,7 +1515,7 @@ fn install_selected_rustc_dev(
                 "selected rustc sysroot '{}' has no rustc-dev compiler library",
                 sysroot.display()
             ),
-            "install rustc-dev for the exact selected toolchain and retry Surface",
+            "install rustc-dev for the exact selected toolchain and retry",
         )
     })?;
     let output = Command::new("rustup")
@@ -1508,7 +1529,7 @@ fn install_selected_rustc_dev(
                 "rustup could not install rustc-dev for exact selected toolchain '{toolchain}': {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             ),
-            "install that exact rustc-dev component and retry Surface; cargo-rail did not change the default toolchain",
+            "install that exact rustc-dev component and retry; cargo-rail did not change the default toolchain",
         ));
     }
     Ok(())

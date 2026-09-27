@@ -129,6 +129,12 @@ pub(crate) fn run_ready(current_dir: &Path, format: TextJsonOutputFormat) -> Rai
 
     let cargo_config = Arc::new(crate::cargo::CargoConfigSnapshot::capture(current_dir)?);
     let inputs = crate::cargo::resolution::ResolutionInputs::capture_with_config(current_dir, cargo_config)?;
+    // The compiler-matched driver needs rustc-dev for the workspace's selected toolchain.
+    crate::compiler::driver::prepare_selected_development_support(
+        current_dir,
+        inputs.toolchain.direct_rustc_verbose_version(),
+        inputs.toolchain.direct_rustc_sysroot(),
+    )?;
     let probe_parent = crate::cache::readiness_probe_parent(current_dir)?;
     let directory = tempfile::Builder::new()
         .prefix("cargo-rail-cache-readiness-")

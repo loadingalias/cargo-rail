@@ -65,6 +65,8 @@ Plain Cargo builds do not perform this preparation.
 
 `cache ready` runs one isolated uncached build, one cold cached build,
 and one verified warm restore with the selected toolchain.
+When that rustup toolchain lacks `rustc-dev`, `cache ready` installs it first;
+compiler wrappers never install components during a build.
 It requires an enrolled, authenticated profile and forces those three builds to use only L1.
 An L2 selection remains installed but receives no requests from this probe.
 A successful probe records readiness for that exact profile and rustc identity;

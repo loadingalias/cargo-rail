@@ -6426,17 +6426,19 @@ fn validate_inputs(inputs: &[InputFrame], operation: &RustLibraryOperation) -> R
             }
         }
     }
-    if operation
-        .dependencies
-        .iter()
-        .filter_map(|dependency| dependency.extern_name.as_deref())
-        .collect::<BTreeSet<_>>()
-        .len()
-        != operation
-            .dependencies
-            .iter()
-            .filter(|dependency| dependency.extern_name.is_some())
-            .count()
+    let mut externs = BTreeMap::<&str, Vec<&str>>::new();
+    for dependency in &operation.dependencies {
+        if let Some(extern_name) = dependency.extern_name.as_deref() {
+            let artifact = Path::new(&dependency.virtual_path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            externs.entry(extern_name).or_default().push(artifact);
+        }
+    }
+    if !externs
+        .values()
+        .all(|artifacts| crate::compiler::native_cache::paired_extern_artifacts(artifacts))
     {
         return Err(RailError::message("distributed execution repeats an extern name"));
     }

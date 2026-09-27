@@ -7655,14 +7655,18 @@ fn cache_key_compiler_arguments(
     arguments: &[String],
     dependencies: &[NativeDependencyArtifactKey<'_>],
 ) -> RailResult<Vec<String>> {
-    let mut dependency_names = BTreeMap::new();
+    let mut dependency_names = BTreeMap::<&str, Vec<&str>>::new();
     for dependency in dependencies {
-        if dependency_names
-            .insert(dependency.extern_name, dependency.artifact_name)
-            .is_some()
-        {
-            return Err(RailError::message("native compiler invocation repeats an extern name"));
-        }
+        dependency_names
+            .entry(dependency.extern_name)
+            .or_default()
+            .push(dependency.artifact_name);
+    }
+    if !dependency_names
+        .values()
+        .all(|artifacts| paired_extern_artifacts(artifacts))
+    {
+        return Err(RailError::message("native compiler invocation repeats an extern name"));
     }
     let relocatable_directories = cache_key_relocatable_directories(arguments);
 
@@ -7780,18 +7784,16 @@ fn cache_key_emit_argument(value: &str) -> RailResult<String> {
         .map(|emits| emits.join(","))
 }
 
-fn cache_key_extern_argument(value: &str, dependencies: &BTreeMap<&str, &str>) -> RailResult<String> {
+fn cache_key_extern_argument(value: &str, dependencies: &BTreeMap<&str, Vec<&str>>) -> RailResult<String> {
     let Some((name, path)) = value.split_once('=') else {
         return Ok(value.to_string());
     };
-    let artifact_name = dependencies
+    let artifacts = dependencies
         .get(name)
         .ok_or_else(|| RailError::message("native compiler extern is missing exact artifact evidence"))?;
-    if portable_path_basename(path) != Some(*artifact_name) {
-        return Err(RailError::message(
-            "native compiler extern path disagrees with its exact artifact evidence",
-        ));
-    }
+    let artifact_name = portable_path_basename(path)
+        .filter(|basename| artifacts.contains(basename))
+        .ok_or_else(|| RailError::message("native compiler extern path disagrees with its exact artifact evidence"))?;
     Ok(format!("{name}=\0cargo-rail-native-dependency:{artifact_name}"))
 }
 
@@ -8713,6 +8715,30 @@ fn dependency_artifact_bypass_reason(extension: Option<&str>) -> Option<&'static
     }
 }
 
+/// One extern name selects one library, or, when Cargo builds rlibs without embedded metadata,
+/// that library's rlib and its separate rmeta.
+pub(crate) fn paired_extern_artifacts(artifacts: &[&str]) -> bool {
+    match artifacts {
+        [_] => true,
+        [first, second] => {
+            let stem = |name: &str| {
+                name.rsplit_once('.')
+                    .map(|(stem, extension)| (stem.to_owned(), extension.to_owned()))
+            };
+            matches!(
+                (stem(first), stem(second)),
+                (Some((first_stem, first_extension)), Some((second_stem, second_extension)))
+                    if first_stem == second_stem
+                        && matches!(
+                            (first_extension.as_str(), second_extension.as_str()),
+                            ("rlib", "rmeta") | ("rmeta", "rlib")
+                        )
+            )
+        }
+        _ => false,
+    }
+}
+
 fn native_library_bypass_reason(value: &str) -> &'static str {
     if value.starts_with("dylib=") || value.starts_with("framework=") {
         "dynamic_native_library_search_evidence_unavailable"
@@ -8749,7 +8775,12 @@ fn supported_native_library(value: &str) -> bool {
 }
 
 fn supported_unstable_option(option: &str) -> bool {
-    if matches!(option, "unstable-options" | "force-unstable-if-unmarked") {
+    // Nightly Cargo passes `embed-metadata=no`: the rlib omits metadata that the separate rmeta holds.
+    // The option reads nothing, and the action binds both outputs.
+    if matches!(
+        option,
+        "unstable-options" | "force-unstable-if-unmarked" | "embed-metadata=yes" | "embed-metadata=no"
+    ) {
         return true;
     }
     if let Some(attribute) = option.strip_prefix("crate-attr=") {
@@ -21918,6 +21949,20 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn extern_names_repeat_only_as_one_rlib_and_its_separate_rmeta() {
+        assert!(paired_extern_artifacts(&["libfoo-1.rlib"]));
+        assert!(paired_extern_artifacts(&["libfoo-1.rlib", "libfoo-1.rmeta"]));
+        assert!(paired_extern_artifacts(&["libfoo-1.rmeta", "libfoo-1.rlib"]));
+        assert!(!paired_extern_artifacts(&["libfoo-1.rlib", "libbar-1.rmeta"]));
+        assert!(!paired_extern_artifacts(&["libfoo-1.rlib", "libfoo-1.rlib"]));
+        assert!(!paired_extern_artifacts(&[
+            "libfoo-1.rlib",
+            "libfoo-1.rmeta",
+            "libfoo-1.so"
+        ]));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn pathless_proc_macro_extern_binds_ordered_search_candidates() {
@@ -22888,6 +22933,15 @@ pub(crate) mod tests {
             None,
             "the exact compiler arguments and linked witness bind LTO mode"
         );
+        for embedded in ["-Zembed-metadata=no", "-Zembed-metadata=yes"] {
+            let mut metadata = baseline.clone();
+            metadata.compiler_arguments.push(embedded.to_string());
+            assert_eq!(
+                invocation_bypass_reason(&metadata, true, &session.class.host_target),
+                None,
+                "nightly Cargo's metadata placement reads nothing and the action binds both outputs: {embedded}"
+            );
+        }
         let mut prefer_dynamic = baseline.clone();
         prefer_dynamic
             .compiler_arguments
