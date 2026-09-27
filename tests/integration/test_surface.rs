@@ -580,7 +580,7 @@ reason = "resume fixture product"
                 unavailable
                     .to_str()
                     .ok_or_else(|| anyhow!("fixture path is not UTF-8"))?,
-                env!("CARGO"),
+                crate::helpers::cargo_program(),
             ),
         )?;
         let compiled = std::process::Command::new("rustc")
@@ -791,7 +791,7 @@ fn main() {{
     std::process::exit(status.code().unwrap_or(1));
 }}
 "#,
-                cargo = env!("CARGO"),
+                cargo = crate::helpers::cargo_program(),
             ),
         )?;
         let compiled = std::process::Command::new("rustc")

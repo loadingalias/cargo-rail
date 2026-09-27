@@ -3092,7 +3092,7 @@ mode = "single"
         );
         std::fs::write(ws.path.join("rail.toml"), config)?;
         std::fs::write(ws.path.join(".gitignore"), "ignored-state/\n")?;
-        let status = std::process::Command::new(env!("CARGO"))
+        let status = std::process::Command::new(crate::helpers::cargo_program())
             .args(["generate-lockfile", "--offline"])
             .current_dir(&ws.path)
             .status()?;

@@ -44,6 +44,12 @@ pub fn manifest_directory() -> PathBuf {
     PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo test workspace location"))
 }
 
+/// The Cargo running these tests. Cargo and Nextest set `CARGO` at run time; an archive built on another host cannot
+/// use the build host's compile-time path.
+pub fn cargo_program() -> String {
+    std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string())
+}
+
 pub fn cargo_binary(name: &str) -> PathBuf {
     PathBuf::from(std::env::var_os(format!("CARGO_BIN_EXE_{name}")).expect("Cargo test binary location"))
 }
