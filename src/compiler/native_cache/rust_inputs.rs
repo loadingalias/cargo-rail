@@ -1006,6 +1006,14 @@ fn capture_bindings(
             }
             #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             let _ = alias_parent;
+            // A link replaced within one tick of the coarse change clock leaves its parent's generation unchanged,
+            // so the binding waits until the parent's last change is settled and must survive the wait.
+            crate::utils::settle_change_time(&metadata);
+            if native_metadata_guard(&path, &fs::symlink_metadata(&path)?)? != generation {
+                return Err(RailError::message(
+                    "Rust library directory parent changed while its generation settled",
+                ));
+            }
             Ok((path, DirectoryBinding::Generation(generation)))
         })
         .collect()

@@ -2674,6 +2674,14 @@ fn stage_linux_component(
             let file = File::open(directory.path())?;
             let generation = crate::utils::stable_open_directory_generation(&file)
                 .ok_or_else(|| RailError::message("native compiler runtime layout has no stable generation"))?;
+            // A link replaced within one tick of the coarse change clock leaves the layout's generation unchanged,
+            // so the binding waits until the layout's last change is settled and must survive the wait.
+            crate::utils::settle_change_time(&file.metadata()?);
+            if crate::utils::stable_open_directory_generation(&file).as_ref() != Some(&generation) {
+                return Err(RailError::message(
+                    "native compiler runtime layout changed while its generation settled",
+                ));
+            }
             Ok::<_, RailError>((file, generation))
         })
         .transpose()?;
