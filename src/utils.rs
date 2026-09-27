@@ -220,6 +220,26 @@ pub(crate) fn settle_change_time(metadata: &fs::Metadata) {
     let _ = metadata;
 }
 
+/// A file's generation once its last change is settled, for a site that binds the generation.
+///
+/// A change within one tick of the coarse change clock can keep a just-changed file's generation, so a binding
+/// taken then could miss a later same-size rewrite. Comparisons read `stable_file_generation` directly.
+pub(crate) fn settled_file_generation(path: &Path) -> Option<Vec<u8>> {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        settle_change_time(&metadata);
+    }
+    stable_file_generation(path)
+}
+
+/// An open file's generation once its last change is settled; see `settled_file_generation`.
+#[cfg(unix)]
+pub(crate) fn settled_open_file_generation(file: &fs::File) -> Option<Vec<u8>> {
+    if let Ok(metadata) = file.metadata() {
+        settle_change_time(&metadata);
+    }
+    stable_open_file_generation(file)
+}
+
 /// Capture stable local filesystem generation evidence without reading file
 /// contents. Callers may reuse a previously verified digest only while this
 /// evidence remains exact.

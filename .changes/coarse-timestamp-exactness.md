@@ -10,3 +10,5 @@ or hide from revalidation.
 The same wait applies to the directories that bind a followed root link
 and to the native compiler driver's runtime layout,
 so a link replaced within one tick is rejected.
+Cache setup, the distributed worker, and the compiler driver likewise settle each installed component,
+certificate, and compiler library before binding its generation.

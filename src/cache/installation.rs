@@ -1424,7 +1424,7 @@ pub(crate) fn plan_setup(current_dir: &Path, request: &SetupRequest) -> RailResu
     {
         let installed_generation = |path: &Path, digest: &str| -> RailResult<Vec<u8>> {
             if optional_file_digest(path)?.as_deref() == Some(digest) {
-                crate::utils::stable_file_generation(path).ok_or_else(|| {
+                crate::utils::settled_file_generation(path).ok_or_else(|| {
                     RailError::message("installed distributed TLS identity has no stable file generation")
                 })
             } else {
@@ -1786,7 +1786,7 @@ pub(crate) fn apply_setup(mut plan: SetupPlan) -> RailResult<()> {
         {
             return Err(RailError::message("installed compiler component failed verification"));
         }
-        component.generation = crate::utils::stable_file_generation(&component.path)
+        component.generation = crate::utils::settled_file_generation(&component.path)
             .ok_or_else(|| RailError::message("installed compiler component has no stable local file generation"))?;
     }
     for (component, expected) in &plan.retired_compiler_components {
@@ -1826,14 +1826,14 @@ pub(crate) fn apply_setup(mut plan: SetupPlan) -> RailResult<()> {
             "installed compiler wrapper failed content verification",
         ));
     }
-    plan.receipt.wrapper_generation = crate::utils::stable_file_generation(&plan.receipt.wrapper_path)
+    plan.receipt.wrapper_generation = crate::utils::settled_file_generation(&plan.receipt.wrapper_path)
         .ok_or_else(|| RailError::message("installed compiler wrapper has no stable local file generation"))?;
     if file_digest(&plan.receipt.worker_path)? != plan.receipt.worker_digest {
         return Err(RailError::message(
             "installed compiler worker failed content verification",
         ));
     }
-    plan.receipt.worker_generation = crate::utils::stable_file_generation(&plan.receipt.worker_path)
+    plan.receipt.worker_generation = crate::utils::settled_file_generation(&plan.receipt.worker_path)
         .ok_or_else(|| RailError::message("installed compiler worker has no stable local file generation"))?;
     if let Some(distributed) = plan.receipt.distributed.as_mut() {
         if plan
@@ -1848,7 +1848,7 @@ pub(crate) fn apply_setup(mut plan: SetupPlan) -> RailResult<()> {
             ));
         }
         distributed.worker_generation =
-            crate::utils::stable_file_generation(&distributed.worker_path).ok_or_else(|| {
+            crate::utils::settled_file_generation(&distributed.worker_path).ok_or_else(|| {
                 RailError::message("installed distributed compiler worker has no stable local file generation")
             })?;
         if let Some(mutual_tls) = distributed.mutual_tls.as_mut() {
@@ -1863,16 +1863,16 @@ pub(crate) fn apply_setup(mut plan: SetupPlan) -> RailResult<()> {
                     ));
                 }
             }
-            mutual_tls.authority_generation = crate::utils::stable_file_generation(&mutual_tls.authority_certificate)
+            mutual_tls.authority_generation = crate::utils::settled_file_generation(&mutual_tls.authority_certificate)
                 .ok_or_else(|| {
-                RailError::message("installed distributed TLS authority has no stable file generation")
-            })?;
+                    RailError::message("installed distributed TLS authority has no stable file generation")
+                })?;
             mutual_tls.client_certificate_generation =
-                crate::utils::stable_file_generation(&mutual_tls.client_certificate).ok_or_else(|| {
+                crate::utils::settled_file_generation(&mutual_tls.client_certificate).ok_or_else(|| {
                     RailError::message("installed distributed TLS client certificate has no stable file generation")
                 })?;
             mutual_tls.client_private_key_generation =
-                crate::utils::stable_file_generation(&mutual_tls.client_private_key).ok_or_else(|| {
+                crate::utils::settled_file_generation(&mutual_tls.client_private_key).ok_or_else(|| {
                     RailError::message("installed distributed TLS client key has no stable file generation")
                 })?;
             crate::compiler::distributed::validate_mutual_tls_client_identity(
@@ -3320,7 +3320,7 @@ fn revalidate_compiler_component_removal(
 fn observe_installed_executable(path: &Path, description: &str) -> RailResult<Option<InstalledExecutable>> {
     match fs::symlink_metadata(path) {
         Ok(_) => {
-            let generation_before = crate::utils::stable_file_generation(path)
+            let generation_before = crate::utils::settled_file_generation(path)
                 .ok_or_else(|| RailError::message(format!("{description} has no stable local file generation")))?;
             let digest = file_digest(path)?;
             let generation = crate::utils::stable_file_generation(path)

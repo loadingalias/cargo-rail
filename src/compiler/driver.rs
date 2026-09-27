@@ -1995,7 +1995,7 @@ impl CompilerFactDoctestSysroot {
         // toolchain, and an ELF `DT_RPATH` (as on IBM Z) takes precedence over `LD_LIBRARY_PATH`.
         let rustdoc_path = bin.join("rustdoc");
         let rustdoc_file = stage_unix_execution_file(&rustdoc, &rustdoc_path, rustdoc_digest, "selected rustdoc")?;
-        let rustdoc_generation = crate::utils::stable_open_file_generation(&rustdoc_file)
+        let rustdoc_generation = crate::utils::settled_open_file_generation(&rustdoc_file)
             .ok_or_else(|| RailError::message("private doctest rustdoc has no stable filesystem generation"))?;
         let rustdoc_bytes = rustdoc_file.metadata()?.len();
         symlink(toolchain_sysroot.join("lib/rustlib"), library.join("rustlib"))?;
@@ -2007,7 +2007,7 @@ impl CompilerFactDoctestSysroot {
         );
         let runtime_library_file = clone_or_copy_runtime_library(compiler_library, &runtime_library)?;
         runtime_library_file.set_permissions(fs::Permissions::from_mode(0o400))?;
-        let runtime_library_generation = crate::utils::stable_open_file_generation(&runtime_library_file)
+        let runtime_library_generation = crate::utils::settled_open_file_generation(&runtime_library_file)
             .ok_or_else(|| RailError::message("private doctest runtime library has no stable filesystem generation"))?;
         if crate::utils::stable_file_generation(&runtime_library).as_ref() != Some(&runtime_library_generation)
             || !crate::utils::opened_file_matches_path(&runtime_library_file, &runtime_library, compiler_library.bytes)?
@@ -2540,6 +2540,8 @@ fn authenticate_compiler_library(path: &Path, expected_digest: &str) -> RailResu
             "compiler fact runtime library is not a bounded real file; install the exact rustc-dev component",
         ));
     }
+    // The retained generation must reveal any later change, so a just-changed library settles before its read.
+    crate::utils::settle_change_time(&metadata);
     #[cfg(windows)]
     let mut file = crate::windows_fs::open_for_execution_guard(path)?;
     #[cfg(not(windows))]

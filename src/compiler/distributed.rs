@@ -4119,7 +4119,7 @@ fn capture_bubblewrap_worker_capability(rustc: &OsStr, bubblewrap: &OsStr) -> Ra
             "distributed Bubblewrap executable must be a root-owned, non-setid, non-writable regular file",
         ));
     }
-    let generation = crate::utils::stable_file_generation(&executable)
+    let generation = crate::utils::settled_file_generation(&executable)
         .ok_or_else(|| RailError::message("distributed Bubblewrap executable has no stable file generation"))?;
     let version = exact_command_output(&executable, &["--version"], "Bubblewrap version identity")?;
     let version = String::from_utf8(version)
@@ -4137,7 +4137,7 @@ fn capture_bubblewrap_worker_capability(rustc: &OsStr, bubblewrap: &OsStr) -> Ra
             "distributed worker executable is not a real regular file",
         ));
     }
-    let worker_generation = crate::utils::stable_file_generation(&worker)
+    let worker_generation = crate::utils::settled_file_generation(&worker)
         .ok_or_else(|| RailError::message("distributed worker executable has no stable file generation"))?;
     let worker_digest = digest_file(&worker, worker_metadata.len())?;
     let isolation = canonical_json(&(
@@ -4218,7 +4218,7 @@ fn capture_worker_capability_for_runtime(
             "distributed worker rustc is not a real regular file",
         ));
     }
-    let rustc_generation = crate::utils::stable_file_generation(&rustc)
+    let rustc_generation = crate::utils::settled_file_generation(&rustc)
         .ok_or_else(|| RailError::message("distributed worker rustc has no stable file generation"))?;
     let verbose = String::from_utf8(implementation_verbose)
         .map_err(|_| RailError::message("distributed worker rustc identity is not UTF-8"))?;
