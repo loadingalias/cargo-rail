@@ -28,9 +28,9 @@ def verify_version(name, version, command):
         raise ValueError(f'{name} does not match its pinned version')
 
 
-def verify_rust(platform, operation=None):
+def verify_rust(platform, operation=None, target=None):
     native = catalog.read()[platform]
-    channel = catalog.rust_channel(platform, operation)
+    channel = catalog.rust_channel(platform, operation, target)
     version = run('rustc', '-vV')
     if f'host: {native["rust-host"]}\n' not in version:
         raise ValueError('active Rust compiler does not match the native host')
@@ -40,7 +40,7 @@ def verify_rust(platform, operation=None):
             raise ValueError(f'active {tool} does not match the pinned toolchain {channel}')
 
 
-def verify(platform, operation):
+def verify(platform, operation, target=None):
     data = catalog.read()
     native = catalog.selection(data, platform, operation)
     jobs = data['windows']['cargo-build-jobs'] if platform.endswith('-win') else data[platform].get('cargo-build-jobs')
@@ -48,15 +48,24 @@ def verify(platform, operation):
         raise ValueError(f'CARGO_BUILD_JOBS does not match the {platform} tooling bound')
     if 'linux-tools-common' in native.get('packages', []):
         run('perf', '--version')
-    verify_rust(platform, operation)
+    verify_rust(platform, operation, target)
     installed = run('rustup', 'component', 'list', '--installed').splitlines()
     for component in native['components']:
         if not any(line.startswith(component + '-') for line in installed):
             raise ValueError(f'missing Rust component: {component}')
     targets = run('rustup', 'target', 'list', '--installed').splitlines()
-    for target in native['targets']:
-        if target not in targets:
-            raise ValueError(f'missing Rust target: {target}')
+    for name in native['targets']:
+        if name not in targets:
+            raise ValueError(f'missing Rust target: {name}')
+    if operation == 'cross-build':
+        # The archive's compiler driver links against the target toolchain's compiler internals.
+        host = data[catalog.cross_target(target)]['rust-host']
+        channel = catalog.rust_channel(platform, operation, target)
+        if host not in targets:
+            raise ValueError(f'missing Rust target: {host}')
+        target_components = run('rustup', 'component', 'list', '--installed', '--toolchain', f'{channel}-{host}')
+        if not any(line.startswith('rustc-dev-') for line in target_components.splitlines()):
+            raise ValueError(f'missing rustc-dev for the {host} toolchain')
     pinned_commands = [('rustup', ['rustup', '--version'])]
     for name, command in (
         ('actionlint', ['actionlint', '--version']),

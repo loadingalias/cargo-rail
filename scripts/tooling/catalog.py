@@ -20,6 +20,15 @@ CATALOG = ROOT / '.config/tooling.toml'
 PLATFORMS = ('aarch64-linux', 'x86_64-linux', 'aarch64-win', 'x86_64-win', 'riscv64-linux', 's390x-linux', 'powerpc64le-linux')
 # Native validation hosts without release archives.
 CACHE_HOSTS = ('riscv64-linux', 's390x-linux', 'powerpc64le-linux')
+# GNU tool prefix of each host whose test archive x86-64 cross-builds.
+CROSS_PREFIXES = {'riscv64-linux': 'riscv64-linux-gnu', 's390x-linux': 's390x-linux-gnu',
+                  'powerpc64le-linux': 'powerpc64le-linux-gnu'}
+
+
+def cross_target(target):
+    if target not in CROSS_PREFIXES:
+        raise ValueError(f'cross-build targets are {", ".join(CROSS_PREFIXES)}; found {target}')
+    return target
 
 
 def read(path=CATALOG):
@@ -27,9 +36,9 @@ def read(path=CATALOG):
         return tomllib.load(stream)
 
 
-def rust_channel(platform=None, operation=None):
-    if operation == 'riscv-build':
-        platform = 'riscv64-linux'
+def rust_channel(platform=None, operation=None, target=None):
+    if operation == 'cross-build':
+        platform = cross_target(target)
     if platform is not None:
         override = read()[platform].get('rust-channel')
         if override is not None:
@@ -40,8 +49,8 @@ def rust_channel(platform=None, operation=None):
 def selection(data, platform, operation):
     if operation not in data['operations']:
         raise ValueError(f'unknown tooling operation: {operation}')
-    if operation == 'riscv-build' and platform != 'x86_64-linux':
-        raise ValueError('riscv-build requires x86_64-linux')
+    if operation == 'cross-build' and platform != 'x86_64-linux':
+        raise ValueError('cross-build requires x86_64-linux')
     native = data[platform]
     if operation == 'package' and ('just' not in native['cargo'] or platform in CACHE_HOSTS):
         raise ValueError(f'{platform}: no package tool selection')
@@ -121,10 +130,10 @@ def validate(data):
             raise ValueError(f'{platform}: cargo-build-jobs must be a positive integer')
     if 'cargo-build-jobs' not in data['windows']:
         raise ValueError('windows: cargo-build-jobs must be a positive integer')
-    if set(data['operations']) != {'ci', 'package', 'riscv-build'}:
-        raise ValueError('tooling operations must be ci, package, and riscv-build')
+    if set(data['operations']) != {'ci', 'package', 'cross-build'}:
+        raise ValueError('tooling operations must be ci, package, and cross-build')
     for operation, policy in data['operations'].items():
-        if operation != 'riscv-build' and not {'rustc-dev', 'llvm-tools'} <= set(policy['components']):
+        if operation != 'cross-build' and not {'rustc-dev', 'llvm-tools'} <= set(policy['components']):
             raise ValueError(f'{operation}: missing compiler components')
         for tool in policy['cargo']:
             if tool not in data['cargo']:
@@ -179,12 +188,13 @@ def validate(data):
         if not {'build-essential', 'ca-certificates', 'cmake', 'curl', 'git', 'python3'} <= set(config['packages']):
             raise ValueError(f'{platform}: missing native build/bootstrap package')
 
-    cross = selection(data, 'x86_64-linux', 'riscv-build')
-    if set(cross['components']) != {'rustc-dev'} or set(cross['cargo']) != {'just', 'cargo-nextest'} or set(cross['assets']) != {'rustup', 'cargo-binstall', 'cmake'}:
-        raise ValueError('riscv-build must install only archive build tools')
-    if not {'build-essential', 'ca-certificates', 'curl', 'git', 'git-man', 'python3', 'perl', 'gcc-riscv64-linux-gnu',
-            'g++-riscv64-linux-gnu', 'libc6-dev-riscv64-cross'} <= set(cross['packages']):
-        raise ValueError('riscv-build is missing cross compiler prerequisites')
+    cross = selection(data, 'x86_64-linux', 'cross-build')
+    if set(cross['components']) != {'clippy', 'rustc-dev'} or set(cross['cargo']) != {'just', 'cargo-nextest'} or set(cross['assets']) != {'rustup', 'cargo-binstall', 'cmake'}:
+        raise ValueError('cross-build must install only archive build tools')
+    compilers = {f'{tool}-{prefix}' for prefix in CROSS_PREFIXES.values() for tool in ('gcc', 'g++')}
+    libraries = {'libc6-dev-riscv64-cross', 'libc6-dev-s390x-cross', 'libc6-dev-ppc64el-cross'}
+    if not {'build-essential', 'ca-certificates', 'curl', 'git', 'git-man', 'python3', 'perl'} | compilers | libraries <= set(cross['packages']):
+        raise ValueError('cross-build is missing cross compiler prerequisites')
 
 
 def main():
@@ -215,6 +225,8 @@ def main():
             print(json.dumps(value))
     elif command == 'rust-channel':
         print(rust_channel(*args))
+    elif command == 'cross-prefix':
+        print(CROSS_PREFIXES[cross_target(*args)])
     elif command == 'validate':
         validate(data)
         print('Tooling catalog passed')

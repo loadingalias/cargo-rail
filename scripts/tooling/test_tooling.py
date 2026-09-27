@@ -254,23 +254,29 @@ class CatalogPolicy(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'no package tool selection'):
                     catalog.selection(catalog.read(), platform, 'package')
 
-    def test_riscv_build_installs_only_cross_build_tools(self):
-        self.assertEqual(catalog.rust_channel('x86_64-linux', 'riscv-build'), catalog.rust_channel('riscv64-linux'))
+    def test_cross_build_installs_only_archive_build_tools_for_each_runner(self):
+        for target in ('riscv64-linux', 's390x-linux', 'powerpc64le-linux'):
+            with self.subTest(target=target):
+                self.assertEqual(catalog.rust_channel('x86_64-linux', 'cross-build', target), catalog.rust_channel(target))
         self.assertEqual(catalog.rust_channel('x86_64-linux', 'ci'), catalog.rust_channel())
-        selected = catalog.selection(catalog.read(), 'x86_64-linux', 'riscv-build')
-        self.assertEqual(selected['components'], ['rustc-dev'])
+        with self.assertRaisesRegex(ValueError, 'cross-build targets'):
+            catalog.rust_channel('x86_64-linux', 'cross-build', 'aarch64-linux')
+        selected = catalog.selection(catalog.read(), 'x86_64-linux', 'cross-build')
+        self.assertEqual(selected['components'], ['clippy', 'rustc-dev'])
         self.assertEqual(selected['cargo'], ['cargo-nextest', 'just'])
         self.assertEqual(set(selected['assets']), {'rustup', 'cargo-binstall', 'cmake'})
         self.assertTrue({'git', 'git-man'} <= set(selected['packages']),
                         'snapshot Git and its version-coupled manual package must be installed together')
-        self.assertTrue({'gcc-riscv64-linux-gnu', 'g++-riscv64-linux-gnu', 'libc6-dev-riscv64-cross'} <= set(selected['packages']))
+        for prefix in ('riscv64-linux-gnu', 's390x-linux-gnu', 'powerpc64le-linux-gnu'):
+            self.assertTrue({f'gcc-{prefix}', f'g++-{prefix}'} <= set(selected['packages']), prefix)
+        self.assertTrue({'libc6-dev-riscv64-cross', 'libc6-dev-s390x-cross', 'libc6-dev-ppc64el-cross'} <= set(selected['packages']))
         self.assertFalse({'shellcheck', 'python3-venv', 'ripgrep', 'openssl'} & set(selected['packages']))
         missing = catalog.read()
-        missing['operations']['riscv-build']['components'] = []
-        with self.assertRaisesRegex(ValueError, 'riscv-build must install'):
+        missing['operations']['cross-build']['components'] = ['rustc-dev']
+        with self.assertRaisesRegex(ValueError, 'cross-build must install'):
             catalog.validate(missing)
         with self.assertRaisesRegex(ValueError, 'requires x86_64-linux'):
-            catalog.selection(catalog.read(), 'riscv64-linux', 'riscv-build')
+            catalog.selection(catalog.read(), 'riscv64-linux', 'cross-build')
 
     def test_unknown_operation_is_rejected(self):
         with self.assertRaisesRegex(ValueError, 'unknown tooling operation'):
@@ -288,7 +294,8 @@ class CatalogPolicy(unittest.TestCase):
                                        ('ci', 'packages', 'git-man'),
                                        ('ci', 'packages', 'ripgrep'),
                                        ('package', 'packages', 'git-man'),
-                                       ('riscv-build', 'packages', 'git-man')]:
+                                       ('cross-build', 'packages', 'git-man'),
+                                       ('cross-build', 'packages', 'gcc-s390x-linux-gnu')]:
             with self.subTest(operation=operation, field=field, name=name):
                 data = catalog.read()
                 data['operations'][operation][field].remove(name)

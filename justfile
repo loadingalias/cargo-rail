@@ -84,7 +84,7 @@ test profile="default":
     # Fixtures own remote authority; machine enrollment must not supply cache hits.
     unset CARGO_RAIL_CACHE_REMOTE CARGO_RAIL_CACHE_MODE CARGO_RAIL_CACHE_REMOTE_ENVIRONMENT
     profile={{quote(profile)}}
-    [[ "$profile" == default || "$profile" == slow-host || "$profile" == cranelift ]] || { echo 'unknown test profile' >&2; exit 2; }
+    [[ "$profile" == default || "$profile" == cranelift ]] || { echo 'unknown test profile' >&2; exit 2; }
     if [[ "$profile" == cranelift && "$(uname -s)" != Darwin ]]; then
         echo 'the Cranelift integration lane requires a native macOS host' >&2
         exit 1

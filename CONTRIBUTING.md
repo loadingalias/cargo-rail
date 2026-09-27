@@ -99,17 +99,21 @@ then runs required cases serially and stops on the first failure.
 The same cases remain in `just test`; the cache-only lane does not run doctests or unrelated integration tests.
 
 IBM Z, IBM POWER, and RISC-V have no release archives.
-On every push to `main` and every dispatched run, which release validation uses, CI runs Clippy,
-documentation, the compiler driver checks, `just test`, and `scripts/check-cache-host.sh` natively on each of them.
+On every push to `main` and every dispatched run, which release validation uses,
+an x86-64 runner cross-builds each one's test archive and runs its Clippy and documentation checks;
+the native runner then runs the compiler driver checks, the complete archived suite, the doctests,
+and the native cache qualification.
 Pull requests do not run these hosts.
 
-RISC-V can also run the cache lane from harnesses built on x86-64.
-Install `scripts/tooling/x86_64-linux.sh riscv-build`, source the emitted tooling environment, and run `just test-cache-host prepare riscv64gc-unknown-linux-gnu target/riscv-cache`.
-Transfer that directory to the same source checkout on RISC-V, install its `ci` tooling, and run `just test-cache-host run target/riscv-cache`.
-The transfer requires the same source, compiler release and commit, Nextest build,
-and exact test selection; missing or ignored cases fail.
-The authenticated compiler-driver source travels in the archive
-and bootstraps against the native compiler.
+To reproduce that transfer, install `scripts/tooling/x86_64-linux.sh cross-build PLATFORM`
+(`riscv64-linux`, `s390x-linux`, or `powerpc64le-linux`), source the emitted tooling environment,
+and run `just test-cache-host check TARGET` and `just test-cache-host prepare TARGET target/transfer`.
+Move that directory to the same source checkout on the native host, install its `ci` tooling,
+and run `just test-cache-host run-suite target/transfer` and `just test-cache-host run target/transfer`.
+The archive is built with the optimized `cache-host` profile and carries the compiler driver
+and the source-installation CLI.
+The transfer requires the same source, compiler release and commit, and Nextest build;
+qualification also requires its exact test selection, and missing or ignored cases fail.
 
 Use `just check-compiler-driver` to run only the excluded compiler driver's checks.
 

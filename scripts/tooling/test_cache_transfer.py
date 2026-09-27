@@ -71,7 +71,8 @@ class CacheTransfer(unittest.TestCase):
             config = (cache.ROOT / '.config/nextest.toml').read_text()
             (root / '.config/nextest.toml').write_text(
                 config.splitlines()[0] + '\n[profile.cache-host]' + config.split('[profile.cache-host]', 1)[1] +
-                '\n[[profile.cache-host.overrides]]\nfilter = "test(=a_failure)"\npriority = 100\n')
+                '\n[[profile.cache-host.overrides]]\nfilter = "test(=a_failure)"\npriority = 100\n'
+                '\n[profile.slow-host]\n')
             shutil.copyfile(cache.ROOT / '.config/tooling.toml', root / '.config/tooling.toml')
             (root / '.gitignore').write_text('/target\n')
             (root / 'Cargo.toml').write_text('[package]\nname = "transfer-fixture"\nversion = "0.0.0"\nedition = "2024"\n')
@@ -108,7 +109,7 @@ fn b_sentinel() { eprintln!("remaining case executed"); }
                 run('cargo', 'nextest', 'archive', '--locked', '--target', compiler['host'],
                     '--archive-file', str(directory / 'tests.tar.zst'))
                 import hashlib
-                manifest = {'schema': 1, 'target': compiler['host'], 'source': cache.source_identity(),
+                manifest = {'schema': 2, 'target': compiler['host'], 'source': cache.source_identity(),
                             'nextest': cache.nextest_identity(),
                             'rustc': {key: compiler[key] for key in ('release', 'commit-hash')}, 'cases': cases,
                             'archive_sha256': hashlib.sha256((directory / 'tests.tar.zst').read_bytes()).hexdigest()}
@@ -137,6 +138,15 @@ fn b_sentinel() { eprintln!("remaining case executed"); }
                     suites = ET.parse(out / 'junit.xml').getroot()
                     self.assertEqual(int(suites.attrib['tests']), 2)
                     self.assertEqual(int(suites.attrib['failures']), int(failed))
+                # The complete suite runs from the same archive without a case filter.
+                with patch('sys.stdout', new=io.StringIO()):
+                    cache.execute(directory, suite=True)
+                out, = (root / 'target/suite-results').glob('run-*')
+                summary = json.loads((out / 'summary.json').read_text())
+                self.assertEqual((summary['status'], summary['selection']), ('passed', 'workspace'))
+                log = (out / 'nextest.log').read_text()
+                self.assertIn('a_failure', log)
+                self.assertIn('b_sentinel', log)
 
     def test_exact_required_tests_cannot_be_missing_ignored_or_supplemented(self):
         report = {'rust-suites': {'cargo-rail::cache': {'binary-name': 'cache', 'testcases': {
@@ -165,7 +175,7 @@ fn b_sentinel() { eprintln!("remaining case executed"); }
             archive = directory / 'tests.tar.zst'
             archive.write_bytes(b'archive contents')
             compiler = {'host': 'riscv64gc-unknown-linux-gnu', 'release': 'test-release', 'commit-hash': 'test-commit'}
-            manifest = {'schema': 1, 'target': compiler['host'], 'source': {'commit': 'checkout', 'sha256': 'source'},
+            manifest = {'schema': 2, 'target': compiler['host'], 'source': {'commit': 'checkout', 'sha256': 'source'},
                         'nextest': ['pinned-nextest'], 'rustc': {'release': 'test-release', 'commit-hash': 'test-commit'},
                         'cases': cache.cases_for(compiler['host']),
                         'archive_sha256': ''}
@@ -179,7 +189,7 @@ fn b_sentinel() { eprintln!("remaining case executed"); }
                  patch.object(cache, 'source_identity', return_value=manifest['source']), \
                  patch.object(cache.subprocess, 'run') as run:
                 self.assertEqual(cache.verify_archive(directory), manifest)
-                for field, invalid in [('schema', 2), ('target', 'x86_64-unknown-linux-gnu'),
+                for field, invalid in [('schema', 1), ('target', 'x86_64-unknown-linux-gnu'),
                                        ('source', {}), ('nextest', []), ('rustc', {}), ('cases', {}),
                                        ('archive_sha256', '0' * 64)]:
                     with self.subTest(field=field), self.assertRaises(ValueError):

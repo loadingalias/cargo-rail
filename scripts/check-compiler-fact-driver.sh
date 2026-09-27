@@ -51,9 +51,12 @@ sysroot = Path(run(['rustc', '--print', 'sysroot'])).resolve()
 target_sysroot = sysroot
 distribution = None
 if target != identity['host']:
-    if (identity['host'], target) != ('x86_64-unknown-linux-gnu', 'riscv64gc-unknown-linux-gnu'):
-        raise SystemExit('compiler driver cross preparation requires x86-64 Linux to RISC-V Linux')
-    channel = tomllib.loads((root / '.config/tooling.toml').read_text())['riscv64-linux']['rust-channel']
+    platforms = {'riscv64gc-unknown-linux-gnu': 'riscv64-linux', 's390x-unknown-linux-gnu': 's390x-linux',
+                 'powerpc64le-unknown-linux-gnu': 'powerpc64le-linux'}
+    if identity['host'] != 'x86_64-unknown-linux-gnu' or target not in platforms:
+        raise SystemExit('compiler driver cross preparation requires x86-64 Linux to RISC-V, IBM Z, or IBM POWER Linux')
+    channel = (tomllib.loads((root / '.config/tooling.toml').read_text())[platforms[target]].get('rust-channel')
+               or tomllib.loads((root / 'rust-toolchain.toml').read_text())['toolchain']['channel'])
     target_rustc = Path(run(['rustup', 'which', '--toolchain', f'{channel}-{target}', 'rustc']))
     target_sysroot = target_rustc.resolve().parents[1]
     # Both sysroots must come from the same distribution manifest. The target
@@ -64,6 +67,9 @@ if target != identity['host']:
         raise SystemExit('build and target compiler distributions differ')
     # Host proc-macro dependencies must load the host LLVM runtime during the build.
     environment['LD_LIBRARY_PATH'] = str(sysroot / 'lib')
+    # `-Z dual-proc-macros` is a Cargo and rustc flag for every crate of this private offline snapshot, so a stable
+    # channel needs the unscoped opt-in that a nightly channel (RISC-V's) already grants.
+    environment['RUSTC_BOOTSTRAP'] = '1'
 suffix = '.exe' if os.name == 'nt' else ''
 driver_name = 'cargo-rail-fact-driver' + suffix
 library_digest = None

@@ -42,6 +42,14 @@ CASES = {
 }
 
 ROOT = Path(__file__).resolve().parents[1]
+# Runners without release archives execute suites that x86-64 Linux builds: tooling platform and GNU prefix.
+CROSS_TARGETS = {
+    'riscv64gc-unknown-linux-gnu': ('riscv64-linux', 'riscv64-linux-gnu'),
+    's390x-unknown-linux-gnu': ('s390x-linux', 's390x-linux-gnu'),
+    'powerpc64le-unknown-linux-gnu': ('powerpc64le-linux', 'powerpc64le-linux-gnu'),
+}
+# Test harnesses find these components by the paths `just test` exports; the archive carries them.
+SOURCE_INSTALLATION = 'source-installation-test'
 
 
 def cases_for(target):
@@ -142,22 +150,39 @@ def transfer_environment():
     return dict(os.environ)
 
 
-def prepare(target, directory):
+def cross_environment(target):
+    """The build environment for `target`: its runner's toolchain channel and GNU cross tools on x86-64 Linux."""
     env = transfer_environment()
     host = rustc_identity(env)['host']
-    if target == 'riscv64gc-unknown-linux-gnu':
+    if target in CROSS_TARGETS:
         if host != 'x86_64-unknown-linux-gnu':
-            raise ValueError('RISC-V archives must be prepared on native x86-64 Linux')
-        channel = tomllib.loads((ROOT / '.config/tooling.toml').read_text())['riscv64-linux']['rust-channel']
-        env['RUSTUP_TOOLCHAIN'] = channel
-        env.update(CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER='riscv64-linux-gnu-gcc',
-                   CC_riscv64gc_unknown_linux_gnu='riscv64-linux-gnu-gcc',
-                   CXX_riscv64gc_unknown_linux_gnu='riscv64-linux-gnu-g++',
-                   AR_riscv64gc_unknown_linux_gnu='riscv64-linux-gnu-ar')
-        if shutil.which('riscv64-linux-gnu-gcc') is None:
-            raise ValueError('install the riscv-build tooling before preparing RISC-V tests')
+            raise ValueError('cross-built test archives must be prepared on native x86-64 Linux')
+        platform, prefix = CROSS_TARGETS[target]
+        env['RUSTUP_TOOLCHAIN'] = (tomllib.loads((ROOT / '.config/tooling.toml').read_text())[platform].get('rust-channel')
+                                   or tomllib.loads((ROOT / 'rust-toolchain.toml').read_text())['toolchain']['channel'])
+        normalized = target.replace('-', '_')
+        env.update({f'CARGO_TARGET_{normalized.upper()}_LINKER': f'{prefix}-gcc', f'CC_{normalized}': f'{prefix}-gcc',
+                    f'CXX_{normalized}': f'{prefix}-g++', f'AR_{normalized}': f'{prefix}-ar'})
+        if shutil.which(f'{prefix}-gcc') is None:
+            raise ValueError(f'install the x86_64-linux cross-build {platform} tooling before preparing its tests')
     elif target != host:
-        raise ValueError('cache archives support the native host or the RISC-V cross toolchain')
+        raise ValueError('test archives support the native host or a cross-built runner target')
+    return env
+
+
+def check(target):
+    """Run the workspace Clippy and documentation checks for `target` without executing its code."""
+    env = cross_environment(target)
+    for features in (['--all-features'], []):
+        subprocess.run(['cargo', 'clippy', '--target', target, '--workspace', '--all-targets', *features, '--locked'],
+                       cwd=ROOT, env=env, check=True)
+    docs = dict(env, RUSTDOCFLAGS=' '.join(filter(None, (env.get('RUSTDOCFLAGS'), '-D warnings'))))
+    subprocess.run(['cargo', 'doc', '--target', target, '--workspace', '--no-deps', '--all-features', '--locked'],
+                   cwd=ROOT, env=docs, check=True)
+
+
+def prepare(target, directory):
+    env = cross_environment(target)
     version = nextest_identity()
     identity = source_identity()
     compiler = rustc_identity(env)
@@ -183,6 +208,9 @@ def prepare(target, directory):
         raise ValueError('component preparation requires complete compiler and source authority')
     if authority['CARGO_RAIL_FACT_DRIVER_RUSTC_HOST'] != target:
         raise ValueError('prepared compiler driver does not match the archive target')
+    # The component-free CLI that source-installation tests run; `check-source-installation.sh` builds it natively.
+    subprocess.run(['cargo', 'build', '--bin', 'cargo-rail', '--all-features', '--locked', '--profile', 'cache-host',
+                    '--target', target, '--target-dir', str(build / SOURCE_INSTALLATION)], cwd=ROOT, env=env, check=True)
     env.update({name: authority[name] for name in required})
     names = [authority['CARGO_RAIL_FACT_DRIVER_FILE'], authority['CARGO_RAIL_FACT_DRIVER_SOURCE_FILE']]
     (components / 'deps').mkdir(exist_ok=True)
@@ -191,6 +219,8 @@ def prepare(target, directory):
     # Library harnesses and Cargo binaries discover authenticated components beside themselves.
     include = [{'path': f'{target}/cache-host/{prefix}{name}', 'relative-to': 'target', 'on-missing': 'error'}
                for prefix in ('', 'deps/') for name in names]
+    include.append({'path': f'{SOURCE_INSTALLATION}/{target}/cache-host/cargo-rail', 'relative-to': 'target',
+                    'on-missing': 'error'})
     with tempfile.TemporaryDirectory(prefix='.cache-transfer-', dir=directory.parent) as temporary:
         config = Path(temporary) / 'nextest.toml'
         pending = Path(temporary) / 'bundle'
@@ -200,12 +230,12 @@ def prepare(target, directory):
                           '[' + ', '.join('{ ' + ', '.join(f'{key} = {json.dumps(value)}' for key, value in item.items()) + ' }'
                                           for item in include) + ']\n')
         subprocess.run(['cargo', 'nextest', 'archive', '--config-file', str(config), '--profile', 'cache-host',
-                        '--cargo-profile', 'cache-host', '--target', target, '--target-dir', str(build), '--lib', '--test', 'cache',
+                        '--cargo-profile', 'cache-host', '--target', target, '--target-dir', str(build), '--workspace',
                         '--all-features', '--locked', '--archive-file', str(pending / 'tests.tar.zst')],
                        cwd=ROOT, env=env, check=True)
         if source_identity() != identity:
             raise ValueError('source changed during archive preparation; prepare again')
-        manifest = {'schema': 1, 'target': target, 'source': identity, 'nextest': version,
+        manifest = {'schema': 2, 'target': target, 'source': identity, 'nextest': version,
                     'rustc': {key: compiler[key] for key in ('release', 'commit-hash')},
                     'cases': cases_for(target), 'archive_sha256': digest(pending / 'tests.tar.zst')}
         (pending / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
@@ -220,7 +250,7 @@ def verify_archive(directory):
         raise ValueError('cache transfer inputs must be regular files')
     manifest = json.loads((directory / 'manifest.json').read_text())
     compiler = rustc_identity()
-    expected = {'schema': 1, 'target': compiler['host'], 'source': source_identity(),
+    expected = {'schema': 2, 'target': compiler['host'], 'source': source_identity(),
                 'nextest': nextest_identity(), 'rustc': {key: compiler[key] for key in ('release', 'commit-hash')},
                 'cases': cases_for(compiler['host']), 'archive_sha256': digest(directory / 'tests.tar.zst')}
     if manifest != expected:
@@ -240,14 +270,14 @@ def validate_nextest_cases(report, cases):
         raise ValueError('required cache tests are missing, duplicated, or supplemented')
 
 
-def execute(directory):
+def execute(directory, suite=False):
+    """Run the required qualification cases, or with `suite` the complete workspace suite, from an archive."""
     env = transfer_environment()
     env['CARGO_BUILD_JOBS'] = env.get('CARGO_BUILD_JOBS', '2')
     manifest = verify_archive(directory)
     cases = manifest['cases']
-    filters = ' | '.join(f'(binary(={binary}) & test(={case}))'
-                         for binary, tests in cases.items() for case in tests)
-    results = ROOT / 'target/cache-host-results'
+    profile = 'slow-host' if suite else 'cache-host'
+    results = ROOT / ('target/suite-results' if suite else 'target/cache-host-results')
     results.mkdir(parents=True, exist_ok=True)
     out = Path(tempfile.mkdtemp(prefix='run-', dir=results))
     (out / 'extracted').mkdir()
@@ -257,12 +287,14 @@ def execute(directory):
     shutil.copyfile(directory / 'manifest.json', out / 'manifest.json')
     started = time.monotonic()
     summary = {'status': 'failed', 'source': manifest['source'], 'target': manifest['target'],
-               'cases': cases, 'nextest': manifest['nextest'], 'rustc': manifest['rustc']}
-    junit = out / 'store/cache-host/junit.xml'
-    print(f'Native cache qualification evidence: {out}', flush=True)
+               'selection': 'workspace' if suite else cases, 'nextest': manifest['nextest'], 'rustc': manifest['rustc']}
+    junit = out / f'store/{profile}/junit.xml'
+    print(f'{"Test suite" if suite else "Native cache qualification"} evidence: {out}', flush=True)
     try:
-        args = ['--workspace-remap', str(ROOT), '--config-file', str(config),
-                '--profile', 'cache-host', '-E', filters]
+        args = ['--workspace-remap', str(ROOT), '--config-file', str(config), '--profile', profile]
+        if not suite:
+            args += ['-E', ' | '.join(f'(binary(={binary}) & test(={case}))'
+                                      for binary, tests in cases.items() for case in tests)]
         listing = subprocess.run(['cargo', 'nextest', 'list', *args, '--archive-file', str(directory / 'tests.tar.zst'),
                                   '--extract-to', str(out / 'extracted'), '--message-format', 'json'],
                                  cwd=ROOT, env=env, text=True, capture_output=True, check=False)
@@ -270,13 +302,20 @@ def execute(directory):
         (out / 'tests.json').write_text(listing.stdout)
         print(listing.stderr, end='', flush=True)
         listing.check_returncode()
-        report = json.loads(listing.stdout)
-        validate_nextest_cases(report, cases)
+        if not suite:
+            validate_nextest_cases(json.loads(listing.stdout), cases)
         target = out / 'extracted/target'
+        # The paths `just test` exports after preparing these components, inside the extracted archive.
+        components = target / manifest['target'] / 'cache-host'
+        env.update(CARGO_RAIL_TEST_FACT_DRIVER=str(components / 'cargo-rail-fact-driver'),
+                   CARGO_RAIL_TEST_COMPONENT_BINARY=str(components / 'cargo-rail'),
+                   CARGO_RAIL_TEST_SOURCE_BINARY=str(target / SOURCE_INSTALLATION / manifest['target'] / 'cache-host/cargo-rail'))
         command = ['cargo', 'nextest', 'run', *args,
                    '--cargo-metadata', str(target / 'nextest/cargo-metadata.json'),
                    '--binaries-metadata', str(target / 'nextest/binaries-metadata.json'),
-                   '--target-dir-remap', str(target), '--no-tests', 'fail', '--no-capture']
+                   '--target-dir-remap', str(target), '--no-tests', 'fail']
+        if not suite:
+            command.append('--no-capture')
         with (out / 'nextest.log').open('w') as log, subprocess.Popen(
             command, cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         ) as process:
@@ -289,7 +328,7 @@ def execute(directory):
         verify_archive(directory)
         if summary['exit_code']:
             raise subprocess.CalledProcessError(summary['exit_code'], command)
-        if not junit.is_file():
+        if not suite and not junit.is_file():
             raise ValueError('native cache qualification did not produce its JUnit report')
         summary['status'] = 'passed'
     finally:
@@ -297,7 +336,10 @@ def execute(directory):
         (out / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
         if junit.is_file():
             shutil.copyfile(junit, out / 'junit.xml')
-    print(f'Native cache qualification passed: {sum(map(len, cases.values()))} required cases.', flush=True)
+    if suite:
+        print('Transferred test suite passed.', flush=True)
+    else:
+        print(f'Native cache qualification passed: {sum(map(len, cases.values()))} required cases.', flush=True)
 
 
 if __name__ == '__main__':
@@ -305,15 +347,23 @@ if __name__ == '__main__':
     commands = parser.add_subparsers(dest='operation', required=True)
     native = commands.add_parser('native')
     native.add_argument('directory')
+    check_parser = commands.add_parser('check')
+    check_parser.add_argument('target')
     archive = commands.add_parser('prepare')
     archive.add_argument('target')
     archive.add_argument('directory', type=Path)
     execute_parser = commands.add_parser('run')
     execute_parser.add_argument('directory', type=Path)
+    suite_parser = commands.add_parser('run-suite')
+    suite_parser.add_argument('directory', type=Path)
     args = parser.parse_args()
     if args.operation == 'native':
         run(args.directory)
+    elif args.operation == 'check':
+        check(args.target)
     elif args.operation == 'prepare':
         prepare(args.target, args.directory.resolve())
+    elif args.operation == 'run-suite':
+        execute(args.directory.resolve(), suite=True)
     else:
         execute(args.directory.resolve())

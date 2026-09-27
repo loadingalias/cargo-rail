@@ -5,10 +5,13 @@ export PYTHONDONTWRITEBYTECODE=1
 
 platform="${1:?native platform is required}"
 shift
-[[ "$#" -eq 1 && ( "$1" == ci || "$1" == package || "$1" == riscv-build ) ]] || { echo "usage: scripts/tooling/$platform.sh {ci|package|riscv-build}" >&2; exit 64; }
+[[ ( "$#" -eq 1 && ( "$1" == ci || "$1" == package ) ) || ( "$#" -eq 2 && "$1" == cross-build ) ]] || {
+  echo "usage: scripts/tooling/$platform.sh {ci|package|cross-build TARGET-PLATFORM}" >&2; exit 64;
+}
 operation="$1"
-if [[ "$operation" == riscv-build && "$platform" != x86_64-linux ]]; then
-  echo "riscv-build requires x86_64-linux" >&2; exit 64
+cross_platform="${2:-}"
+if [[ "$operation" == cross-build && "$platform" != x86_64-linux ]]; then
+  echo "cross-build requires x86_64-linux" >&2; exit 64
 fi
 case "$platform" in
   aarch64-linux|x86_64-linux|riscv64-linux|s390x-linux) machine="${platform%-linux}" ;;
@@ -85,7 +88,7 @@ prefix="$HOME/.local/share/cargo-rail-tooling"
 mkdir -p "$prefix"
 python3 "$SCRIPT_DIR/catalog.py" download "$platform" rustup "$temporary/rustup-init"
 chmod +x "$temporary/rustup-init"
-channel="$(python3 "$SCRIPT_DIR/catalog.py" rust-channel "$platform" "$operation")"
+channel="$(python3 "$SCRIPT_DIR/catalog.py" rust-channel "$platform" "$operation" ${cross_platform:+"$cross_platform"})"
 "$temporary/rustup-init" -y --no-modify-path --default-host "$(catalog_get "$platform" rust-host)" --default-toolchain none
 export PATH="$HOME/.cargo/bin:$PATH"
 mapfile -t components < <(catalog_select components)
@@ -93,13 +96,13 @@ toolchain_args=()
 for component in "${components[@]}"; do toolchain_args+=(--component "$component"); done
 mapfile -t targets < <(catalog_select targets)
 for target in "${targets[@]}"; do toolchain_args+=(--target "$target"); done
-if [[ "$operation" == riscv-build ]]; then
-  toolchain_args+=(--target "$(catalog_get riscv64-linux rust-host)")
+if [[ "$operation" == cross-build ]]; then
+  toolchain_args+=(--target "$(catalog_get "$cross_platform" rust-host)")
 fi
 rustup toolchain install "$channel" --profile minimal "${toolchain_args[@]}"
-if [[ "$operation" == riscv-build ]]; then
+if [[ "$operation" == cross-build ]]; then
   # Keep target compiler internals separate from the executable build-host sysroot.
-  rustup toolchain install "$channel-$(catalog_get riscv64-linux rust-host)" \
+  rustup toolchain install "$channel-$(catalog_get "$cross_platform" rust-host)" \
     --force-non-host --profile minimal --component rustc-dev
 fi
 # Explicit toolchain selection avoids auto-installing rust-toolchain.toml's
@@ -128,7 +131,7 @@ for tool in "${cargo_tools[@]}"; do
       cargo +"$channel" install --locked "$tool" --version "$version"
   fi
 done
-python3 "$SCRIPT_DIR/verify.py" "$platform" "$operation"
+python3 "$SCRIPT_DIR/verify.py" "$platform" "$operation" ${cross_platform:+"$cross_platform"}
 # Persistent paths are shared by interactive shells and non-interactive Bash recipes.
 environment="$prefix/environment.sh"
 {

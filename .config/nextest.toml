@@ -85,8 +85,9 @@ test-group = 'integration-subprocess'
 filter = 'test(/test_compiler_observation::stable_(wrapper_authorizes_the_matched_driver_per_compilation_unit|rustdoc_proxy_authorizes_generated_doctest_units)$/) | test(=compiler::facts::tests::manufactured_driver_fragment_passes_the_stable_admission_boundary)'
 test-group = 'integration-subprocess'
 
-# GitHub's IBM Z runner compiles a median 4.7 times slower than the arm64 runner in the cache suite, so
-# compile-heavy tests exceed the default bound without stalling. Only the bound changes.
+# Transferred suites on IBM Z, IBM POWER, and RISC-V (`scripts/check-cache-host.py run-suite`). IBM Z compiled
+# the cache suite's fixtures a median 4.7 times slower than the arm64 runner, so compile-heavy tests exceeded the
+# default bound without stalling. Only the bound changes.
 [profile.slow-host]
 slow-timeout = { period = "60s", terminate-after = 6 }
 
