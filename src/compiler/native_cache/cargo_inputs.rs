@@ -167,10 +167,12 @@ impl CargoInputs {
                 pending.push(normalized_directory(&directory.join(path)).join("Cargo.toml"));
             }
         }
-        let inputs = inputs
+        let mut inputs = inputs
             .into_iter()
             .filter_map(|(path, state)| path_state(&path, state, roots).transpose())
             .collect::<RailResult<Vec<_>>>()?;
+        // Order by the spelled path: host paths order the roots differently on each checkout.
+        inputs.sort();
         Ok(Self {
             executable,
             environment: cargo_environment(
@@ -705,6 +707,38 @@ mod tests {
             capture(&first, true),
             capture(&second, true),
             "an outside input is never shared"
+        );
+    }
+
+    #[test]
+    fn portable_identity_is_independent_of_how_host_roots_sort() {
+        let base = tempfile::tempdir().expect("base");
+        let base = crate::utils::canonicalize_existing(base.path()).expect("canonical base");
+        // The first checkout's repository sorts before its Cargo home, the second's after it.
+        let capture = |repository: &str, home: &str| {
+            let (workspace, home) = (base.join(repository), base.join(home));
+            write(&workspace.join("Cargo.toml"), "[workspace]\nmembers = [\"a\"]\n");
+            write(&workspace.join("a/Cargo.toml"), "[package]\nname = \"a\"\n");
+            write(&workspace.join("Cargo.lock"), "version = 4\n");
+            write(&home.join("config.toml"), "[net]\nretry = 3\n");
+            let toolchain = base.join("toolchain");
+            write(&toolchain.join("bin/cargo"), "cargo executable");
+            let roots = PortableRoots::new(&workspace, &home, &toolchain, &home.join("wrapper")).expect("roots");
+            let inputs = CargoInputs::capture_with_home(
+                &workspace,
+                &workspace,
+                &toolchain.join("bin/cargo"),
+                &home,
+                Some(&roots),
+                &mut budget(),
+            )
+            .expect("Cargo inputs");
+            serde_json::to_string(&inputs).expect("identity")
+        };
+        assert_eq!(
+            capture("a-repository", "b-home"),
+            capture("c-repository", "a-home"),
+            "the portable identity orders inputs by their portable spelling"
         );
     }
 }
