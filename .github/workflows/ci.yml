@@ -185,7 +185,28 @@ jobs:
       - name: Check compiler driver
         run: just check-compiler-driver
       - name: Test
-        run: just test
+        run: just test slow-host
+      # IBM POWER spent about 95 s in every `unify` command before compiler acquisition, which no other host
+      # did. Record each host's shape and unify phases, even when tests fail, so the hosts can be compared.
+      - name: Describe host and time unify
+        if: always()
+        run: |
+          nproc
+          getconf PAGESIZE
+          uname -r
+          lscpu | head -20 || true
+          binary="$(pwd -P)/target/debug/cargo-rail"
+          [[ -x "$binary" ]] || exit 0
+          workspace="$RUNNER_TEMP/unify-probe"
+          mkdir -p "$workspace/member/src"
+          printf '[workspace]\nmembers = ["member"]\nresolver = "3"\n' > "$workspace/Cargo.toml"
+          printf '[package]\nname = "member"\nversion = "0.1.0"\nedition = "2024"\n' > "$workspace/member/Cargo.toml"
+          printf 'pub fn value() -> u8 { 1 }\n' > "$workspace/member/src/lib.rs"
+          cd "$workspace"
+          cargo generate-lockfile --offline
+          git init --quiet && git add . && git -c user.name=probe -c user.email=probe@example.invalid commit --quiet -m probe
+          time "$binary" rail unify --check --diagnostics-file "$RUNNER_TEMP/unify-probe.json" || true
+          python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); print(json.dumps({"phases": d["phases"], "progress": d["progress_phases"]}, indent=1))' "$RUNNER_TEMP/unify-probe.json" || true
       - name: Qualify native cache
         run: scripts/check-cache-host.sh
       - name: Check worktree
