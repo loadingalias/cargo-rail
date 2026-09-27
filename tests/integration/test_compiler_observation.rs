@@ -560,7 +560,9 @@ fn stage_test_doctest_sysroot(source_root: &Path, toolchain_sysroot: &Path) -> R
     fs::create_dir(root.join("bin"))?;
     fs::create_dir(root.join("lib"))?;
     symlink(env!("CARGO_BIN_EXE_cargo-rail"), root.join("bin/rustc"))?;
-    symlink(fs::canonicalize(which_rustdoc()?)?, root.join("bin/rustdoc"))?;
+    // Like the production sysroot, a copy loads the staged compiler library: through a symlink, an ELF `DT_RPATH`
+    // of `$ORIGIN/../lib` names the shared toolchain before `LD_LIBRARY_PATH`.
+    fs::copy(fs::canonicalize(which_rustdoc()?)?, root.join("bin/rustdoc"))?;
     for entry in fs::read_dir(toolchain_sysroot.join("lib"))? {
         let entry = entry?;
         let destination = root.join("lib").join(entry.file_name());

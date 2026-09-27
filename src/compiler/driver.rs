@@ -35,7 +35,6 @@ const MAX_FACT_DRIVER_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_COMPILER_LIBRARY_BYTES: u64 = 1024 * 1024 * 1024;
 const FACT_DRIVER_PROTOCOL_ARGUMENT: &str = "--cargo-rail-fact-protocol-version";
 const COMPILER_ADAPTER_CALIBRATION_VERSION: u32 = 1;
-#[cfg(windows)]
 const MAX_DOCTEST_EXECUTABLE_BYTES: u64 = 1024 * 1024 * 1024;
 const COMPILED_TARGET: &str = env!("CARGO_RAIL_COMPILED_TARGET");
 pub(crate) const COMPILER_DRIVER_SOURCE_FILE_NAME: &str = "cargo-rail-fact-driver-source-v1.json";
@@ -226,7 +225,11 @@ pub(crate) struct CompilerFactDoctestSysroot {
     #[cfg(unix)]
     rustc_target: PathBuf,
     #[cfg(unix)]
-    rustdoc_target: PathBuf,
+    rustdoc_generation: Vec<u8>,
+    #[cfg(unix)]
+    rustdoc_bytes: u64,
+    #[cfg(unix)]
+    _rustdoc_file: File,
     library_target: PathBuf,
     runtime_library: PathBuf,
     #[cfg(unix)]
@@ -1969,7 +1972,7 @@ impl CompilerFactDoctestSysroot {
         wrapper: &Path,
         _wrapper_digest: &str,
         rustdoc: &Path,
-        _rustdoc_digest: &str,
+        rustdoc_digest: &str,
         compiler_library: &AuthenticatedCompilerLibrary,
         _compiler_library_digest: &str,
     ) -> RailResult<Self> {
@@ -1987,7 +1990,14 @@ impl CompilerFactDoctestSysroot {
         fs::create_dir(&bin)?;
         fs::create_dir(&library)?;
         symlink(&wrapper, bin.join("rustc"))?;
-        symlink(&rustdoc, bin.join("rustdoc"))?;
+        // rustdoc derives the sysroot whose `bin/rustc` builds doctests from the compiler library it loaded.
+        // A copy loads the private library through `$ORIGIN/../lib`; through a symlink, `$ORIGIN` names the shared
+        // toolchain, and an ELF `DT_RPATH` (as on IBM Z) takes precedence over `LD_LIBRARY_PATH`.
+        let rustdoc_path = bin.join("rustdoc");
+        let rustdoc_file = stage_unix_execution_file(&rustdoc, &rustdoc_path, rustdoc_digest, "selected rustdoc")?;
+        let rustdoc_generation = crate::utils::stable_open_file_generation(&rustdoc_file)
+            .ok_or_else(|| RailError::message("private doctest rustdoc has no stable filesystem generation"))?;
+        let rustdoc_bytes = rustdoc_file.metadata()?.len();
         symlink(toolchain_sysroot.join("lib/rustlib"), library.join("rustlib"))?;
         let runtime_library = library.join(
             compiler_library
@@ -2012,7 +2022,9 @@ impl CompilerFactDoctestSysroot {
         let capability = Self {
             root,
             rustc_target: wrapper,
-            rustdoc_target: rustdoc,
+            rustdoc_generation,
+            rustdoc_bytes,
+            _rustdoc_file: rustdoc_file,
             library_target: toolchain_sysroot.join("lib/rustlib"),
             runtime_library,
             runtime_library_generation: Some(runtime_library_generation),
@@ -2157,8 +2169,12 @@ impl CompilerFactDoctestSysroot {
     pub(crate) fn revalidate(&self) -> RailResult<()> {
         #[cfg(unix)]
         {
+            let rustdoc = self.root.join("bin/rustdoc");
             if fs::read_link(self.root.join("bin/rustc"))? != self.rustc_target
-                || fs::read_link(self.root.join("bin/rustdoc"))? != self.rustdoc_target
+                || crate::utils::stable_open_file_generation(&self._rustdoc_file).as_ref()
+                    != Some(&self.rustdoc_generation)
+                || crate::utils::stable_file_generation(&rustdoc).as_ref() != Some(&self.rustdoc_generation)
+                || !crate::utils::opened_file_matches_path(&self._rustdoc_file, &rustdoc, self.rustdoc_bytes)?
                 || fs::read_link(self.root.join("lib/rustlib"))? != self.library_target
                 || self.runtime_library_generation != crate::utils::stable_file_generation(&self.runtime_library)
                 || !crate::utils::opened_file_matches_path(
@@ -2214,6 +2230,71 @@ impl Drop for CompilerFactDoctestSysroot {
             drop(fs::set_permissions(&self.root, fs::Permissions::from_mode(0o700)));
         }
     }
+}
+
+/// Copy an executable into a private staging directory and return a read-only handle to the copy after its bytes
+/// match `expected_digest`.
+///
+/// The writer is closed before authentication: Linux refuses to execute a file that any process holds open for
+/// writing.
+#[cfg(unix)]
+fn stage_unix_execution_file(
+    source: &Path,
+    destination: &Path,
+    expected_digest: &str,
+    description: &str,
+) -> RailResult<File> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+    let metadata = fs::symlink_metadata(source)?;
+    if !metadata.is_file() || metadata.len() > MAX_DOCTEST_EXECUTABLE_BYTES {
+        return Err(RailError::message(format!(
+            "{description} is not a bounded regular file"
+        )));
+    }
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(destination)?;
+    let copied = io::copy(
+        &mut File::open(source)?.take(metadata.len().saturating_add(1)),
+        &mut output,
+    )?;
+    if copied != metadata.len() {
+        return Err(RailError::message(format!(
+            "{description} changed during private doctest staging"
+        )));
+    }
+    output.sync_all()?;
+    drop(output);
+    fs::set_permissions(destination, fs::Permissions::from_mode(0o500))?;
+    let mut staged = File::open(destination)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut hashed = 0_u64;
+    loop {
+        let read = match staged.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
+        hashed = hashed.saturating_add(read as u64);
+        hasher.update(&buffer[..read]);
+    }
+    let actual = format!("sha256:{}", ContentDigest::from_sha256_bytes(hasher.finalize()));
+    if hashed != copied || actual != expected_digest {
+        return Err(RailError::message(format!(
+            "private {description} copy does not match its captured identity"
+        )));
+    }
+    if !crate::utils::private_file_matches_path(&staged, destination, copied)? {
+        return Err(RailError::message(format!(
+            "private {description} copy does not have exact single-file ownership"
+        )));
+    }
+    Ok(staged)
 }
 
 #[cfg(unix)]
