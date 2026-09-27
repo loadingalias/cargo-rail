@@ -6165,6 +6165,8 @@ fn capture_exact_sysroot_evidence(inventory: &CompilerSysrootInventory) -> Optio
         if !valid_kind || crate::utils::is_symlink_or_reparse(&metadata) {
             return None;
         }
+        // Toolchain files are old; a just-changed one waits so that a later change stamps a later time.
+        crate::utils::settle_change_time(&metadata);
         let mut generation_identifier = Vec::from(&b"macos-stat-v1\0"[..]);
         for value in [
             metadata.st_dev(),
@@ -6213,6 +6215,8 @@ fn capture_exact_sysroot_evidence(inventory: &CompilerSysrootInventory) -> Optio
         if !valid_kind || crate::utils::is_symlink_or_reparse(&metadata) {
             return None;
         }
+        // Toolchain files are old; a just-changed one waits so that a later change stamps a later time.
+        crate::utils::settle_change_time(&metadata);
         let mut generation_identifier = Vec::from(&b"linux-stat-v1\0"[..]);
         for value in [
             metadata.dev(),

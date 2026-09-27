@@ -4458,10 +4458,10 @@ fn capture_native_source_namespace(
                 Some((digest, bytes)) => (digest.to_string(), native_metadata_guard(&absolute, &metadata)?, bytes),
                 None => capture_guarded_file(&absolute, started, budget)?,
             };
-            if let (Some(generation), Ok(modified)) = (generation.as_deref(), metadata.modified())
+            if let (Some(generation), Some(changed)) = (generation.as_deref(), crate::utils::change_time(&metadata))
                 && native_metadata_guard(&absolute, &metadata)? == guard
                 && let Some(file) =
-                    crate::cache::digest_memo::RememberedFile::settled(generation, modified, &content_digest, bytes)
+                    crate::cache::digest_memo::RememberedFile::settled(generation, changed, &content_digest, bytes)
             {
                 settled.insert(relative.clone(), file);
             }
@@ -4998,6 +4998,7 @@ fn capture_guarded_file(
     if !before_metadata.is_file() || crate::utils::is_symlink_or_reparse(&before_metadata) {
         return Err(RailError::message("native source entry is not a real regular file"));
     }
+    crate::utils::settle_change_time(&before_metadata);
     let before = native_metadata_guard(path, &before_metadata)?;
     let memo = crate::cache::digest_memo::active();
     let generation = memo.and_then(|_| crate::utils::stable_metadata_generation(&before_metadata));
@@ -5047,11 +5048,11 @@ fn capture_guarded_file(
     let content_digest = format!("sha256:{}", ContentDigest::from_sha256_bytes(hasher.finalize()));
     if let (Some(memo), Some(generation)) = (memo, generation)
         && crate::utils::stable_file_generation(path).as_deref() == Some(generation.as_slice())
-        && let Ok(modified) = after_metadata.modified()
+        && let Some(changed) = crate::utils::change_time(&after_metadata)
     {
-        memo.record(&generation, modified, &content_digest, bytes);
+        memo.record(&generation, changed, &content_digest, bytes);
         if let Some(file) =
-            crate::cache::digest_memo::RememberedFile::settled(&generation, modified, &content_digest, bytes)
+            crate::cache::digest_memo::RememberedFile::settled(&generation, changed, &content_digest, bytes)
         {
             crate::cache::digest_memo::remember_in_directory(path, file);
         }

@@ -155,6 +155,78 @@ pub(crate) fn stable_metadata_generation(metadata: &fs::Metadata) -> Option<Vec<
     None
 }
 
+/// When the kernel last changed a file's inode. Unlike the modification time, no user can set it.
+pub(crate) fn change_time(metadata: &fs::Metadata) -> Option<std::time::SystemTime> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let seconds = u64::try_from(metadata.ctime()).ok()?;
+        let nanoseconds = u32::try_from(metadata.ctime_nsec()).ok()?;
+        std::time::SystemTime::UNIX_EPOCH.checked_add(std::time::Duration::new(seconds, nanoseconds))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
+/// The step of the clock the kernel stamps file changes with, between one microsecond and one second.
+#[cfg(unix)]
+fn change_time_tick() -> std::time::Duration {
+    static TICK: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *TICK.get_or_init(|| {
+        // Linux stamps changes from the coarse real-time clock, which advances once per scheduler tick.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let clock = rustix::time::ClockId::RealtimeCoarse;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let clock = rustix::time::ClockId::Realtime;
+        let resolution = rustix::time::clock_getres(clock);
+        std::time::Duration::new(
+            u64::try_from(resolution.tv_sec).unwrap_or(1),
+            u32::try_from(resolution.tv_nsec).unwrap_or(0),
+        )
+        .clamp(std::time::Duration::from_micros(1), std::time::Duration::from_secs(1))
+    })
+}
+
+/// Whether a file's last change is at least two clock ticks old, so any later change stamps a later time.
+pub(crate) fn change_time_settled(metadata: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        change_time(metadata).is_some_and(|changed| {
+            std::time::SystemTime::now()
+                .duration_since(changed)
+                .is_ok_and(|age| age >= 2 * change_time_tick())
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+/// Wait until a file's last change is settled before a capture reads its bytes.
+///
+/// The kernel stamps a change with a coarse clock, so two changes within one tick can share a change time
+/// and a generation. A capture binds the bytes it reads to the generation it saw, so it waits until that
+/// generation's change is two ticks old: any later change then stamps a later time. Nearly every input is
+/// already older and returns at once; the wait is bounded by two ticks.
+pub(crate) fn settle_change_time(metadata: &fs::Metadata) {
+    #[cfg(unix)]
+    if let Some(changed) = change_time(metadata) {
+        let bound = 2 * change_time_tick();
+        let settled = changed + bound;
+        if let Ok(remaining) = settled.duration_since(std::time::SystemTime::now()) {
+            // A change stamped by a clock set ahead waits no longer than the bound.
+            std::thread::sleep(remaining.min(bound));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = metadata;
+}
+
 /// Capture stable local filesystem generation evidence without reading file
 /// contents. Callers may reuse a previously verified digest only while this
 /// evidence remains exact.

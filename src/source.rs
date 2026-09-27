@@ -1270,6 +1270,7 @@ fn capture_filesystem_tree(root: &Path, exclusions: &SourceExclusions) -> RailRe
                 error
             ))
         })?;
+        crate::utils::settle_change_time(&before);
         let before = FilesystemMetadata::from_metadata(display_path, &before)?;
         if before.entry_type != FilesystemEntryType::Directory {
             return Err(filesystem_capture_drift_error(format!(
@@ -1659,6 +1660,7 @@ fn capture_filesystem_entry(
             )));
         }
     };
+    crate::utils::settle_change_time(&metadata);
     let before = FilesystemMetadata::from_metadata(path.as_path(), &metadata)?;
 
     let entry = if metadata.file_type().is_symlink() {

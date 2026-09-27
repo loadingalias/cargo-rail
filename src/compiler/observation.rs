@@ -238,6 +238,7 @@ impl FileObservation {
                 absolute.display()
             )));
         }
+        crate::utils::settle_change_time(&metadata);
         // Inside a cache invocation, an unchanged file generation reuses its recorded digest.
         let memo = crate::cache::digest_memo::active();
         let generation = memo.and_then(|_| crate::utils::stable_file_generation(&absolute));
@@ -267,11 +268,11 @@ impl FileObservation {
         let content_digest = format!("sha256:{}", ContentDigest::sha256(&bytes));
         if let (Some(memo), Some(generation)) = (memo, generation)
             && crate::utils::stable_file_generation(&absolute).as_deref() == Some(generation.as_slice())
-            && let Ok(modified) = metadata.modified()
+            && let Some(changed) = crate::utils::change_time(&metadata)
         {
-            memo.record(&generation, modified, &content_digest, bytes_read);
+            memo.record(&generation, changed, &content_digest, bytes_read);
             if let Some(file) =
-                crate::cache::digest_memo::RememberedFile::settled(&generation, modified, &content_digest, bytes_read)
+                crate::cache::digest_memo::RememberedFile::settled(&generation, changed, &content_digest, bytes_read)
             {
                 crate::cache::digest_memo::remember_in_directory(&absolute, file);
             }
@@ -2675,6 +2676,7 @@ mod tests {
         let settled = std::time::SystemTime::now()
             .checked_sub(std::time::Duration::from_secs(60))
             .expect("settled time");
+        // The memo measures age from the change time, which a user cannot set back, so the test waits for it.
         let write_settled = |bytes: &[u8]| {
             fs::write(&path, bytes).expect("artifact");
             fs::File::options()
@@ -2683,6 +2685,7 @@ mod tests {
                 .expect("artifact")
                 .set_modified(settled)
                 .expect("settle artifact");
+            std::thread::sleep(std::time::Duration::from_millis(2100));
         };
         let capture = || FileObservation::capture_counted(&path, workspace.path(), workspace.path()).expect("capture");
 

@@ -95,10 +95,11 @@ pub(crate) struct RememberedFile {
 
 impl RememberedFile {
     /// Remember a digest computed from a file whose generation was identical before and after the read,
-    /// unless a coarse timestamp could hide a same-tick rewrite.
-    pub(crate) fn settled(generation: &[u8], modified: SystemTime, digest: &str, bytes: u64) -> Option<Self> {
+    /// unless a coarse timestamp could hide a same-tick rewrite. `changed` is the file's change time,
+    /// which no user can set back.
+    pub(crate) fn settled(generation: &[u8], changed: SystemTime, digest: &str, bytes: u64) -> Option<Self> {
         SystemTime::now()
-            .duration_since(modified)
+            .duration_since(changed)
             .is_ok_and(|age| age >= RACY_WINDOW)
             .then(|| Self {
                 generation: hex(generation),
@@ -183,9 +184,9 @@ impl DigestMemo {
     /// Record a digest computed from a file whose generation was identical before and after the read.
     ///
     /// Recording is best-effort: a memo that cannot be written only costs a later rehash.
-    pub(crate) fn record(&self, generation: &[u8], modified: SystemTime, digest: &str, bytes: u64) {
+    pub(crate) fn record(&self, generation: &[u8], changed: SystemTime, digest: &str, bytes: u64) {
         if SystemTime::now()
-            .duration_since(modified)
+            .duration_since(changed)
             .is_ok_and(|age| age >= RACY_WINDOW)
         {
             drop(self.write(generation, digest, bytes));
@@ -295,12 +296,10 @@ pub(crate) fn flush_directories() {
 /// Record the digest of a file this process just published and verified through `opened`.
 ///
 /// The racy window protects coarse timestamps. A verified restore bypasses it only when the file's
-/// change time has sub-second resolution, and only when the path still names the opened file with
-/// an identical generation. Otherwise the first settled read records the entry instead.
+/// change is already settled, so a later change stamps a later time, and only when the path still names
+/// the opened file with an identical generation. Otherwise the first settled read records the entry instead.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn seed_verified(opened: &fs::File, path: &Path, digest: &str, bytes: u64) {
-    use std::os::unix::fs::MetadataExt as _;
-
     let Some(memo) = active() else {
         return;
     };
@@ -309,7 +308,7 @@ pub(crate) fn seed_verified(opened: &fs::File, path: &Path, digest: &str, bytes:
     };
     let exact = opened
         .metadata()
-        .is_ok_and(|metadata| metadata.len() == bytes && metadata.ctime_nsec() != 0);
+        .is_ok_and(|metadata| metadata.len() == bytes && crate::utils::change_time_settled(&metadata));
     if exact && crate::utils::stable_file_generation(path).as_deref() == Some(generation.as_slice()) {
         drop(memo.write(&generation, digest, bytes));
         remember_in_directory(path, RememberedFile::recorded(&generation, digest, bytes));
@@ -450,10 +449,6 @@ mod tests {
         let opened = fs::File::open(&restored).expect("opened output");
         let digest = format!("sha256:{}", ContentDigest::sha256(b"restored bytes"));
         let generation = crate::utils::stable_file_generation(&restored).expect("generation");
-        let fine_grained = {
-            use std::os::unix::fs::MetadataExt as _;
-            opened.metadata().expect("metadata").ctime_nsec() != 0
-        };
 
         seed_verified(&opened, &outputs.path().join("elsewhere.rlib"), &digest, 14);
         assert_eq!(
@@ -463,11 +458,19 @@ mod tests {
         );
 
         seed_verified(&opened, &restored, &digest, 14);
-        let expected = fine_grained.then(|| (digest.clone(), 14));
+        // A coarse host leaves a just-written file unseeded; a fine clock settles it within microseconds.
+        if memo.lookup(&generation).is_some() {
+            assert!(
+                crate::utils::change_time_settled(&opened.metadata().expect("metadata")),
+                "only a settled file is seeded"
+            );
+        }
+        crate::utils::settle_change_time(&opened.metadata().expect("metadata"));
+        seed_verified(&opened, &restored, &digest, 14);
         assert_eq!(
             memo.lookup(&generation),
-            expected,
-            "a just-written verified file is seeded exactly when its change time is sub-second"
+            Some((digest.clone(), 14)),
+            "a settled verified file is seeded"
         );
     }
 
