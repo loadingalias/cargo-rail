@@ -7146,8 +7146,9 @@ fn remapped_clippy_results_restore_across_checkout_roots_until_an_input_changes(
                 Ok((
                     event["status"].as_str().unwrap_or_default().to_string(),
                     format!(
-                        "{}; {}",
+                        "{}; remote base action {}; {}",
                         event["reason"].as_str().unwrap_or_default(),
+                        event["remote_base_action_key"].as_str().unwrap_or("absent"),
                         String::from_utf8_lossy(&output.stderr)
                     ),
                     diagnostics,
@@ -7157,6 +7158,11 @@ fn remapped_clippy_results_restore_across_checkout_roots_until_an_input_changes(
         let (status, reason, seeded) = clippy(&first, first_home.path(), &[])?;
         assert_eq!(status, "miss", "the producer must store its Clippy result: {reason}");
         assert!(
+            reason.contains(";remote_published;"),
+            "the producer must publish its Clippy result: {reason}"
+        );
+        let published = reason;
+        assert!(
             seeded.iter().any(|rendered| rendered.contains("needless_return")),
             "{seeded:?}"
         );
@@ -7165,7 +7171,7 @@ fn remapped_clippy_results_restore_across_checkout_roots_until_an_input_changes(
             let (status, reason, restored) = clippy(&second, second_home.path(), &[])?;
             assert_eq!(
                 status, "hit",
-                "{label}: the other checkout must restore the result: {reason}"
+                "{label}: the other checkout must restore the result: {reason}; producer: {published}"
             );
             assert!(
                 reason.starts_with(source) && reason.contains("root_portability_remap_eligible"),
