@@ -92,6 +92,9 @@ Limits:
 
 - Distributed execution does not accept nightly Cargo's metadata split;
   those actions compile locally.
+- With nightly Cargo's per-unit build directories and a target directory outside the repository,
+  a crate that has dependencies compiles without reuse (`compiler_native_input_evidence_unavailable`):
+  each dependency's directory is outside every root the input witness can name.
 - A nightly newer than the last one CI built can change the compiler's internal API.
   When the driver no longer builds for it, `cache ready` fails, and compiler work runs without reuse.
 
