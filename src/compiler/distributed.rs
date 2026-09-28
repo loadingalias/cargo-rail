@@ -4669,6 +4669,7 @@ fn execute_sandboxed(rustc: &OsStr) -> RailResult<()> {
         sysroot_guard: selected.sysroot_guard,
         runtime: WorkerRuntime::ProcessOnly,
         sysroot: selected.sysroot,
+        sysroot_memo: selected.sysroot_memo,
     };
     let (cancellation_sender, cancellation_receiver) = mpsc::sync_channel(1);
     let lease = envelope.request.lease_id.clone();
