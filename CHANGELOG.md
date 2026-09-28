@@ -3,6 +3,308 @@
 Published versions are recorded below. Pending release intent lives in [`.changes/`](.changes/);
 see [releasing a workspace](docs/releases.md) for the current preparation and publication workflow.
 
+## [0.30.0](https://github.com/loadingalias/cargo-rail/compare/v0.29.0...v0.30.0) - 2026-09-28
+- Report every Cargo metadata failure with one named cause, one recovery,
+  and the exact reproduction command.
+  Named causes are a stale `Cargo.lock`, an unloadable manifest, an unavailable target or `rustc`,
+  and a missing Cargo executable.
+  Cargo's output stays withheld when a credential capability is active, except for manifest failures,
+  which Cargo reports before it contacts a registry.
+  `config validate` now resolves an existing lockfile with `--locked`, so a stale lockfile fails validation.
+  It reports whether it checked the Cargo workspace or only the schema,
+  in text and in the JSON `evidence` field, and adds `help` to each issue.
+
+- Workspace-member `cargo clippy` results are now stored and replayed,
+  so Clippy after `cargo clean` restores the member diagnostics instead of linting every member again.
+  A Clippy result binds the `clippy-driver` bytes, the arguments Clippy appends, the environment it reads,
+  every configuration file candidate it checks up to the one it loads, and the manifests, lockfile,
+  and Cargo configuration that `clippy::cargo` lints read through `cargo metadata`.
+  A cold miss runs a new resolution phase of the compiler driver beside Clippy to record the crates it
+  selects.
+  That phase needs the new native input protocol,
+  so independent compiler adapter packs from earlier releases are rejected until they are republished.
+  Under `--root-portability remap`, a Clippy result is shared across checkout roots: paths below the repository, the Cargo home,
+  and the compiler sysroot are bound relative to those roots.
+  Linked Clippy output, such as a member's build script, a `SYSROOT` override,
+  and a configuration file outside the repository keep running Clippy normally.
+
+- On hosts whose kernel stamps file changes with a coarse clock, such as IBM Z,
+  a capture waits until a just-changed input is settled,
+  and the digest memo measures age from the change time, which no user can set back.
+  A same-size rewrite within one clock tick can no longer reuse a stale digest
+  or hide from revalidation.
+  The same wait applies to the directories that bind a followed root link
+  and to the native compiler driver's runtime layout, so a link replaced within one tick is rejected.
+  Cache setup, the distributed worker,
+  and the compiler driver likewise settle each installed component, certificate,
+  and compiler library before binding its generation.
+
+- Cold compilations on macOS start rustc sooner.
+  Each cache miss used to stage a fresh copy of the native input driver, probe it,
+  and rehash the compiler library before running the compiler;
+  macOS also scanned every new driver copy on its first launch.
+  The driver is now staged once per store and re-authenticated on every use,
+  one successful probe is recorded under the exact driver and compiler-library digests,
+  and the library digest is memoized by its stable file generation.
+  Across cross-target Clippy, the wrapper's work
+  before rustc fell from a median of 1,069 ms to 137 ms per miss.
+
+- `unify.compiler_targets` accepts `"all"` (the default), an exact target list, or `"none"`.
+  `"none"` keeps every resolution target but acquires no compiler evidence,
+  so a host that cannot compile a foreign target can still run Unify without deleting that target.
+  An empty list, which earlier releases printed as the default, still selects every target,
+  and `config print` now writes `"all"`.
+  Unify checks each target that needs new evidence before acquisition: an uninstalled target library,
+  or a doctest target whose linker cannot link a probe, stops with the target, the cause,
+  and the recovery choices.
+  `unify doctor` reports per-target readiness and the targets left unobserved.
+
+- Add `cargo rail config migrate` to reduce a configuration file to intentional policy.
+  It removes a setting only when removing it leaves the effective policy unchanged,
+  which covers explicit defaults, saved `config print` output, and older spellings such as `unify.compiler_targets = []`.
+  Comments, ordering, and every other setting are kept.
+  A file containing only defaults is deleted when no other configuration file would take its place.
+  The command previews by default; `--check` exits 1 when a migration is pending,
+  and `config migrate apply` revalidates drift before writing.
+  `apply --plan` accepts the saved JSON preview.
+
+- Replace the local compiler cache with one deduplicated `local-cas-v3` store: identical outputs are stored once,
+  a miss no longer scans the whole store, and a full store collects to 90% of its budget,
+  least recently used first.
+  `cargo build`, `cargo test`, and `cargo clippy` now share dependency results,
+  and terminal width affects a result only when it rendered diagnostics.
+  On Linux and macOS, unchanged input files are not rehashed.
+  `cache profiles` reports each profile's usage against its budget, `cache setup` applies a lowered budget immediately,
+  and `cache clean --scope local` previews and removes the retired v2 store.
+  Cache keys changed, so the first build and remote caches start cold once after upgrading.
+
+- Reject invalid configuration before any Git or Cargo subprocess starts,
+  for explicit and discovered policy alike.
+  `config validate`, `print`, `explain`, `locate`, and `clean` now read the Cargo workspace root's policy, like consuming commands,
+  and independent configuration errors are reported together.
+
+- Unify and Surface keep compiler evidence
+  and the sysroot fingerprint memo in the enrolled workspace's cache profile instead of rewriting the
+  unbound default store on every run.
+  An explicit `CARGO_RAIL_CACHE_DIR` still selects its own store,
+  a workspace without a profile still uses the default store,
+  and a command that cannot read its enrollment rehashes instead of writing either store.
+
+- Registry and git dependencies reuse results under an explicit `CARGO_TARGET_DIR` or build directory.
+  Cargo compiles those packages inside their unpacked source,
+  so the wrapper found no enrolled workspace and every one of them bypassed;
+  it now uses the workspace Cargo started in (`PWD`).
+
+- Handle dependencies that only a feature enables when Unify and Surface acquire compiler evidence.
+  Cargo's default resolution omits them,
+  but a view that enables the feature compiles them and runs their build scripts.
+  Unify no longer fails with "absent from the captured package graph"
+  for an optional local path dependency,
+  and views that run such a build script are now stored and reused.
+  The extra all-features resolution is loaded only
+  when the lockfile names packages the default resolution lacks.
+
+- Keep Unify and Surface compiler evidence reusable in workspaces with Git dependencies.
+  A Git source pinned to its exact resolved commit now identifies its content
+  as a registry checksum does.
+  Before, one Git dependency made every view in the workspace miss with `external_source_digest_unavailable`.
+  Other external sources without a checksum still bypass reuse.
+
+- Runtime evidence recognizes the `linux-vdso64.so.1` image that IBM Z and 64-bit IBM POWER kernels map,
+  so native reuse no longer rejects every executable probe on those hosts.
+
+- Unify and Surface compiler evidence now binds each view to the locked packages its package can
+  reach, instead of the whole `Cargo.lock`.
+  Updating a dependency that only one member uses reacquires that member's views and reuses the rest.
+  A lockfile whose references Cargo-Rail cannot resolve exactly, or a v1 lockfile,
+  still binds the whole file.
+  Stored evidence starts cold once after upgrading, because its keys changed.
+
+- Every stable, beta, and nightly compiler at
+  or above the compiler adapter's minimum now reuses results:
+  the compiler driver builds against each compiler's internal API,
+  and CI builds and tests it against the current stable, beta, and nightly.
+  `cargo rail cache ready` installs `rustc-dev` for the workspace-selected rustup toolchain when it is missing,
+  so the compiler driver can be prepared for that toolchain.
+  Nightly Cargo builds rlibs without embedded metadata
+  (`-Z embed-metadata=no`)
+  and passes each linked dependency as an rlib and its rmeta; the native cache binds that pair,
+  so crates that link a library reuse results instead of bypassing,
+  and a result without its rmeta is refused.
+  Planning evidence locates a fresh binary's own dep-info in nightly Cargo's per-unit build
+  directories instead of widening to Cargo's dependency superset.
+
+- Make the remote cache providers and the cache benchmark optional Cargo features.
+  `cargo install cargo-rail` no longer builds the AWS and Azure SDKs: 88 of 327 dependency packages existed only for them.
+  On Apple silicon a clean release build of `cargo-rail` used 32% less CPU,
+  and the binary shrank from 45 MB to 31 MB.
+  Native release archives still include both providers.
+  Add `--features s3` for S3 and R2 or `--features azure` for Azure Blob to a source build that needs a remote cache;
+  a build without the provider rejects its URL during setup and names the missing feature.
+  The `benchmark` library module and its embedded workload now require the `bench` feature,
+  as the benchmark binary already did.
+
+- `cargo rail plan --cases FILE` compares reviewed path cases with planner decisions before a CI migration.
+  Each case is planned as an unreferenced commit on top of `HEAD`, so the worktree, index, refs,
+  and untracked files neither change nor affect the result.
+  The report marks each required item as direct or conservatively expanded and names the reasons.
+  A false negative names the missing work ID and exits `1`.
+
+- Keep package-wide planner work when target selectors cover only part of the selected packages,
+  and compare `plan --all` against `HEAD`.
+  Bind a `--config` override into release drift checks, and fail Surface closed when compiler facts are absent.
+
+- Keep every Cargo unit in scope when one change edits both a target root and a non-Rust file
+  that no evidence attributes: the unattributed file now widens Cargo work to the workspace instead of
+  only the edited package.
+  Packaging work also selects each workspace member whose directory holds a changed file.
+
+- `cargo rail plan evidence --work WORK_ID --output FILE -- CARGO_ARGS` records portable planning evidence from the ordinary build of `HEAD`:
+  the workspace files each compiled unit read, and each build script's rerun inputs.
+  With that evidence, `cargo rail plan` skips `cargo.build`, `cargo.clippy`, or `cargo.test` for a change that no recorded unit reads, such as a README,
+  and selects the readers of a changed input and their dependents.
+  Recording runs Cargo with a recorder as `RUSTC_WRAPPER` and changes neither outputs nor freshness,
+  so it can replace the job's build step; fresh units are read from the dep-info Cargo keeps.
+  An unobserved member or unit, an untracked read,
+  or a missing build-script input leaves the work item incomplete.
+  
+  The evidence contract is now `planning-evidence-v2`,
+  which adds directory inputs for build-script rerun directories and package sources.
+  Plans list `planning-evidence-v2` identities, and v1 evidence is rejected.
+  `--evidence` can be repeated, one file per work item; each file is validated separately,
+  so a stale or foreign file widens only the work it describes.
+  An added or changed `clippy.toml` or `.clippy.toml` now selects `cargo.clippy`.
+
+- A Cargo prerequisite edge can require every workspace target of a kind:
+  `require_target_kinds = ["cdylib"]` builds each plugin library that a test loads at run time,
+  so a new plugin needs no configuration edit.
+  A kind that selects no workspace target is rejected.
+  The library's `CargoPrerequisiteConfig` adds the public `require_target_kinds` field, which breaks struct literals.
+
+- Run build scripts during Unify
+  and Surface compiler evidence with the environment plain Cargo gives them.
+  Cargo-Rail's private session variables, such as `CARGO_RAIL_COMPILER_OBSERVATION_DIRECTORY`, no longer reach build scripts;
+  each view's wrappers read a private context file instead.
+  Unify views also keep a stable workspace-wrapper path, which Cargo hashes into each unit's `-C metadata`,
+  so compiled units and native cache results stay reusable across runs.
+
+- Crates that depend directly on a procedural macro, such as `async-trait` or `paste`,
+  are now stored and reused like crates that use a macro through a re-export.
+  On every miss, the compiler driver observes what each loaded macro reads through the C library and,
+  on Linux, through the kernel.
+  A result then binds every file, directory listing, absent path, and variable the macro read,
+  so a hit stays valid even when the macro reads an input that no build script declares,
+  which Cargo's own freshness misses.
+  A macro that writes files, opens network connections, starts an unmodeled process,
+  reads outside the repository, or cannot be observed keeps compiling normally
+  and names the reason (`procedural_macro_*`).
+  Linux kernels older than 5.5, containers that block seccomp user notification,
+  and hosts other than Linux and macOS keep macro consumers on the normal compiler path.
+  This needs native input protocol 4,
+  so independent compiler adapter packs from earlier releases are rejected until they are republished,
+  and results of units that load a procedural macro start cold once.
+  Cache hits are also faster: captured source trees
+  and dependency directories each keep one digest record, native search directories reuse it,
+  and Rust library selection resolves each directory once.
+  A workspace-member Clippy hit in this repository fell from a median of 330 ms to 130–185 ms.
+
+- Compiler results for registry crates that read a package file outside their source directory,
+  such as `#![doc = include_str!("../README.md")]`, are now stored and reused instead of bypassing,
+  because the whole unpacked package is part of their key.
+  Registry dependency results start cold once.
+  `cache status` reports `recent_evictions` and a budget-pressure line when collection evicts results within a day of their last use,
+  which means the budget did not hold the working set in use.
+
+- `cargo rail plan --verify` now rejects a saved plan whose `inputs.platform` differs from the current host.
+  Before, a plan's platform label was checked only through its target identity,
+  so a plan re-signed with another platform label still verified.
+
+- Compile each shared dependency once when Unify and Surface acquire compiler evidence.
+  Views now run one Cargo process at a time in a shared sandbox,
+  and Cargo applies its own job parallelism, including `build.jobs`, `CARGO_BUILD_JOBS`, and an inherited jobserver.
+  Before, parallel views each rebuilt the shared dependency graph in a private sandbox.
+  On a 14-package workspace with 20 evidence views,
+  a cold Unify check used about 5.5 times less CPU with the same decisions.
+  The `--diagnostics-file` schema is now version 17: it removes `configured_work_permits`, `max_nonwaiting_cargo_views`, and the `work_permit_*` counters, and adds `dependency_compilations`, `repeated_dependency_compilations`, and `artifact_high_water_bytes` to `compiler_acquisition`.
+  A repeated compilation now means the same unit configuration compiled again;
+  a dependency rebuilt with other features is a different unit.
+  `surface --prepare` output is contract version 3: its `acquisition` object removes `work_permits`.
+
+- Surface fact reuse now follows the same input proof as Unify evidence.
+  A stored fact set records the files and environment variables rustc read for its units
+  and the declared rerun inputs of every build script in its view, and is reused only while they hold.
+  This fixes stale Surface reports after a change to a file included from outside the package,
+  and lets Surface reuse facts in workspaces with build scripts and proc macros.
+  Non-empty fact sets stored by earlier versions are not reused.
+  Unify and Surface also reuse evidence in a workspace below its repository root;
+  rustc invocations there were recorded against the wrong root and never matched their Cargo units.
+
+- Compile each unit once when Surface acquires typed compiler facts.
+  Typed views, including doctest views, now share one sandbox and a stable workspace wrapper.
+  Before each view, Cargo-Rail removes only that view's package from the sandbox,
+  so Cargo recompiles the targets whose facts the view needs and keeps every other unit fresh.
+  Before, each view used a new wrapper path, which Cargo hashes into `-C metadata`,
+  so every view recompiled every workspace member in its graph.
+  On a 14-package workspace, a cold `surface` run fell from 287 to 148 compiler invocations
+  and from 124 s to 84 s of CPU, with an identical report.
+
+- Cargo-Rail now finds its release components beside the real executable
+  when it runs through a symlink.
+  Before, on macOS, `cargo rail cache setup` through a launcher symlink on `PATH` reported the compiler worker as unavailable
+  and asked for a reinstall.
+
+- Typed doctest collection stages a private copy of `rustdoc` instead of a symlink.
+  Where `rustdoc` finds its compiler library through an ELF `DT_RPATH`, as on IBM Z,
+  the symlink loaded the shared toolchain's library,
+  so doctests compiled with the shared `rustc` and produced no compiler facts.
+
+- Reuse Unify compiler evidence in workspaces with build scripts and proc macros.
+  Each view records the `rerun-if-changed` paths and `rerun-if-env-changed` values of every build script in its Cargo graph,
+  and is reused while Cargo would keep those scripts' output.
+  A changed declared input reruns only the affected views.
+  Views are stored as they complete, so a failed or interrupted run keeps them for the retry,
+  and a corrupt stored view no longer hides valid ones.
+  `evidence_cache` entries add `publication_bypasses`, which name why a view was not stored.
+  Stored compiler evidence starts cold once after upgrading.
+  The library's `DependencyProof` and `EvidenceCacheSummary` add public fields, which breaks struct literals.
+
+- Report a failed Unify compiler-evidence view with one cause, one recovery section,
+  and the view's Cargo command as a reproduction.
+  JSON errors add `failure_class`: `build_script`, `source`, `toolchain`, `cargo_rail`, or `cargo` for compiler evidence, and `lockfile`, `manifest`, `toolchain`, or `cargo` for Cargo metadata.
+  JSON errors no longer contain Cargo or build-script output.
+  Text mode shows the last lines of a failing build script's stderr,
+  with inherited environment values replaced by their names,
+  and Cargo's complete output with `--verbose` unless a Cargo credential capability is active.
+  A build-script failure names the environment variables the script declares, never their values.
+  Unify keeps progress on stderr in JSON mode, reports Cargo file-lock waits as they happen,
+  and prints a `Still running:` line when a phase is silent for 30 seconds.
+  An interrupted compiler acquisition reports the `interrupted` class and the phase it stopped.
+  `--diagnostics-file` output adds `progress_phases` with per-phase durations.
+  The library adds `RailError::Failure` and `FailureClass`.
+  Adding `RailError::Failure` breaks exhaustive matches on `RailError`.
+
+- `cargo rail unify` names every pending edit class on one screen: dependencies, inherited package fields,
+  pruned features, and the `rust-version` it writes.
+  Declarations that Unify keeps on purpose are no longer reported as warnings; `--explain` groups them by reason,
+  and JSON reports them with kind `Preserved` and severity `Info`.
+  A build script that cannot find a native tool through the `cc`, `cmake`, or `pkg-config` crates,
+  or source that reads a missing file, now names that tool or file and the recovery.
+  Identical compiler errors from one view appear once.
+  After `unify apply`, the next step no longer names this repository's own test profile.
+  The library's `UnifyIssueKind::Preserved` and `IssueSeverity::Info` variants break exhaustive matches.
+
+- Upgrades now explain what earlier releases removed.
+  A removed command such as `cargo rail run` or `cargo rail release finalize` names the release that removed it and what to run instead.
+  A removed configuration key names its release and replacement in every command,
+  and `cargo rail config migrate` previews and applies its removal alongside default pruning.
+  Every unknown or removed key in a file is reported at once.
+  Planning a change that migrates such keys away no longer fails on the base commit's policy.
+
+- `cargo rail config validate` reports each independent configuration error as its own issue,
+  so the summary count and JSON `errors` match the listed errors.
+
+- On Windows, a Unify compiler-evidence view whose source reads a missing file now names that file
+  and its recovery, as on other hosts, instead of reporting only the compiler error.
 ## [0.29.0](https://github.com/loadingalias/cargo-rail/compare/v0.28.1...v0.29.0) - 2026-09-19
 - Add independently authenticated compiler adapter packs for toolchains beyond the embedded driver,
   while keeping native cache failures fail-open and Surface acquisition fail-closed.
