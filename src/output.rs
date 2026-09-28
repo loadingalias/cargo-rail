@@ -607,20 +607,27 @@ macro_rules! verbose_progress {
 mod tests {
     use super::{Activity, Heartbeat, InvocationOutput, OutputProtocol};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn heartbeat_fills_each_quiet_interval_and_names_the_current_activity() {
-        // Long enough that a delayed wakeup on a loaded host stays inside one interval.
         const INTERVAL: Duration = Duration::from_millis(100);
         let lines = Arc::new(Mutex::new(Vec::<String>::new()));
         let sink = Arc::clone(&lines);
         let taken = || std::mem::take(&mut *lines.lock().unwrap());
+        // A loaded host can wake the heartbeat thread late, so wait for the required lines
+        // instead of assuming how many a fixed sleep produces.
+        let taken_once = |done: &dyn Fn(&[String]) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !done(&lines.lock().unwrap()) && Instant::now() < deadline {
+                std::thread::sleep(INTERVAL / 10);
+            }
+            taken()
+        };
         let heartbeat = Heartbeat::start_with(INTERVAL, move |line| sink.lock().unwrap().push(line));
 
         crate::phase!(Activity::Analysis, "Detecting unused dependencies...");
-        std::thread::sleep(INTERVAL * 3);
-        let analysis = taken();
+        let analysis = taken_once(&|lines| lines.len() >= 2);
         assert!(analysis.len() >= 2, "each quiet interval needs one line: {analysis:?}");
         assert!(
             analysis
@@ -629,25 +636,18 @@ mod tests {
             "{analysis:?}"
         );
 
+        let subprocess = |line: &String| line.contains("running cargo metadata (waiting for a Cargo subprocess;");
+        let lock =
+            |line: &String| line.contains("running cargo metadata (waiting for Cargo's file lock on package cache;");
+        let mut nested = Vec::new();
         {
             let _metadata = super::nested_phase(Activity::Cargo, "running cargo metadata");
-            std::thread::sleep(INTERVAL * 2);
+            nested.extend(taken_once(&|lines| lines.iter().any(subprocess)));
             super::report_lock_wait("cargo metadata", "package cache");
-            std::thread::sleep(INTERVAL * 2);
+            nested.extend(taken_once(&|lines| lines.iter().any(lock)));
         }
-        let nested = taken();
-        assert!(
-            nested
-                .iter()
-                .any(|line| line.contains("running cargo metadata (waiting for a Cargo subprocess;")),
-            "{nested:?}"
-        );
-        assert!(
-            nested
-                .iter()
-                .any(|line| line.contains("running cargo metadata (waiting for Cargo's file lock on package cache;")),
-            "{nested:?}"
-        );
+        assert!(nested.iter().any(subprocess), "{nested:?}");
+        assert!(nested.iter().any(lock), "{nested:?}");
 
         // Other progress output resets the quiet interval. A heartbeat may already have fired for the
         // preceding quiet phase, so resume progress before discarding it.
@@ -672,12 +672,13 @@ mod tests {
             );
         }
 
-        std::thread::sleep(INTERVAL * 2);
+        let resumed = taken_once(&|lines| !lines.is_empty());
         assert!(
-            taken()
-                .iter()
-                .all(|line| line.contains("Detecting unused dependencies (in-process analysis;")),
-            "the enclosing phase resumes when the nested phase ends"
+            !resumed.is_empty()
+                && resumed
+                    .iter()
+                    .all(|line| line.contains("Detecting unused dependencies (in-process analysis;")),
+            "the enclosing phase resumes when the nested phase ends: {resumed:?}"
         );
         drop(heartbeat);
         std::thread::sleep(INTERVAL * 2);
