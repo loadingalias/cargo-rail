@@ -194,6 +194,25 @@ struct CapturedWorkerCapability {
     sysroot_guard: crate::compiler::collector::CompilerInputGuard,
     runtime: WorkerRuntime,
     sysroot: PathBuf,
+    sysroot_memo: Option<PathBuf>,
+}
+
+/// Where a capability capture keeps its revalidating sysroot identity memo.
+#[derive(Clone, Copy)]
+enum SysrootMemo<'a> {
+    None,
+    Cache(&'a crate::cache::cas::LocalCas),
+    Path(&'a Path),
+}
+
+/// The exact memo file a local client hands its one-shot worker, so the worker revalidates the fingerprint the
+/// client just captured instead of rehashing the whole sysroot inside its bounded query.
+const LOCAL_WORKER_SYSROOT_MEMO_ENV: &str = "CARGO_RAIL_DISTRIBUTED_SYSROOT_MEMO";
+
+fn local_worker_sysroot_memo() -> Option<PathBuf> {
+    std::env::var_os(LOCAL_WORKER_SYSROOT_MEMO_ENV)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
 }
 
 enum WorkerRuntime {
@@ -2063,7 +2082,14 @@ pub(crate) fn execute_local_worker(
     cache: Option<&crate::cache::cas::LocalCas>,
     timing: &mut DistributedTiming,
 ) -> LocalWorkerAttempt {
-    match execute_local_worker_inner(worker, rustc, candidate, staging, cache, timing) {
+    match execute_local_worker_inner(
+        worker,
+        rustc,
+        candidate,
+        staging,
+        cache.map_or(SysrootMemo::None, SysrootMemo::Cache),
+        timing,
+    ) {
         Ok(DecodedExecution::Success(result)) => LocalWorkerAttempt::Success(result),
         Ok(DecodedExecution::CompilerFailed { termination, result }) => {
             LocalWorkerAttempt::CompilerFailed { termination, result }
@@ -2117,7 +2143,7 @@ fn execute_mutual_tls_worker_inner(
     timing: &mut DistributedTiming,
 ) -> RailResult<DecodedExecution> {
     let capability_started = Instant::now();
-    let expected = capture_selected_worker_capability(rustc, cache)?;
+    let expected = capture_selected_worker_capability(rustc, cache.map_or(SysrootMemo::None, SysrootMemo::Cache))?;
     timing.capability_capture.record(capability_started);
     let connect_started = Instant::now();
     let socket = connect_worker_endpoint(identity.endpoint)?;
@@ -2335,12 +2361,14 @@ fn execute_local_worker_inner(
     rustc: &OsStr,
     candidate: &RustLibraryCandidate,
     staging: NativeResultStaging,
-    cache: Option<&crate::cache::cas::LocalCas>,
+    memo: SysrootMemo<'_>,
     timing: &mut DistributedTiming,
 ) -> RailResult<DecodedExecution> {
     let capability_started = Instant::now();
-    let capability = query_local_worker_capability(worker, rustc)?;
-    let expected = capture_selected_worker_capability(rustc, cache)?;
+    // The client fingerprints the sysroot without a deadline and publishes the memo that the worker revalidates,
+    // so the worker's bounded query never rehashes the sysroot, even on hosts without SHA-256 instructions.
+    let expected = capture_selected_worker_capability(rustc, memo)?;
+    let capability = query_local_worker_capability(worker, rustc, expected.sysroot_memo.as_deref())?;
     timing.capability_capture.record(capability_started);
     if capability != expected.capability {
         return Err(RailError::message(
@@ -2355,6 +2383,7 @@ fn execute_local_worker_inner(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    share_sysroot_memo(&mut command, expected.sysroot_memo.as_deref());
     let mut child = command.spawn()?;
     let Some(mut stdin) = child.stdin.take() else {
         terminate_child(&mut child);
@@ -2456,7 +2485,14 @@ fn execute_local_worker_inner(
     Ok(response)
 }
 
-fn query_local_worker_capability(worker: &Path, rustc: &OsStr) -> RailResult<WorkerCapability> {
+fn share_sysroot_memo(command: &mut Command, memo: Option<&Path>) {
+    match memo {
+        Some(memo) => command.env(LOCAL_WORKER_SYSROOT_MEMO_ENV, memo),
+        None => command.env_remove(LOCAL_WORKER_SYSROOT_MEMO_ENV),
+    };
+}
+
+fn query_local_worker_capability(worker: &Path, rustc: &OsStr, memo: Option<&Path>) -> RailResult<WorkerCapability> {
     let mut command = Command::new(worker);
     command
         .arg("capability")
@@ -2464,7 +2500,15 @@ fn query_local_worker_capability(worker: &Path, rustc: &OsStr) -> RailResult<Wor
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = run_bounded_command(command, Duration::from_secs(30), MAX_HEADER_BYTES as u64)?;
+    share_sysroot_memo(&mut command, memo);
+    // Without a memo the worker fingerprints the complete compiler sysroot, which takes longer than 30 s on hosts
+    // without SHA-256 instructions, so the query shares the bound of the work it precedes.
+    let output = run_bounded_command(
+        command,
+        Duration::from_millis(MAX_WALL_TIME_MS),
+        MAX_HEADER_BYTES as u64,
+    )
+    .map_err(|error| RailError::message(format!("local distributed capability query failed: {error}")))?;
     if !output.status.success() || !output.stderr.is_empty() || output.stdout.last() != Some(&b'\n') {
         return Err(RailError::message("local distributed capability query failed"));
     }
@@ -2622,7 +2666,9 @@ fn run_worker_command(arguments: Vec<OsString>) -> RailResult<()> {
             Ok(())
         }
         [command, rustc] if command == "capability" => {
-            let captured = capture_worker_capability(rustc, None)?;
+            let memo = local_worker_sysroot_memo();
+            let captured =
+                capture_worker_capability(rustc, memo.as_deref().map_or(SysrootMemo::None, SysrootMemo::Path))?;
             let encoded = canonical_json(&captured.capability)?;
             std::io::stdout().write_all(&encoded)?;
             std::io::stdout().write_all(b"\n")?;
@@ -2957,7 +3003,7 @@ fn serve_mutual_tls(
     max_concurrency: u32,
 ) -> RailResult<()> {
     serve_mutual_tls_with_capability(
-        capture_worker_capability(rustc, None)?,
+        capture_worker_capability(rustc, SysrootMemo::None)?,
         bind,
         server_certificate,
         server_private_key,
@@ -3550,6 +3596,7 @@ fn qualify_local_client(rustc: &OsStr) -> RailResult<()> {
         .prefix("cargo-rail-distributed-client-qualification-")
         .tempdir()?;
     let staging = NativeResultStaging::temporary_in(staging_parent.path())?;
+    let memo = staging_parent.path().join("sysroot-identity-memo");
     let candidate = RustLibraryCandidate::new(
         RustLibraryCandidateInput {
             crate_name: "cargo_rail_distributed_qualification".to_string(),
@@ -3571,12 +3618,19 @@ fn qualify_local_client(rustc: &OsStr) -> RailResult<()> {
     )?;
     let mut timing = DistributedTiming::default();
     // Qualification names the cause that an ordinary attempt collapses into a cold outcome.
-    let DecodedExecution::Success(result) =
-        execute_local_worker_inner(&worker, rustc, &candidate, staging, None, &mut timing).map_err(|error| {
-            RailError::message(format!(
-                "local distributed client qualification did not produce a successful staged result: {error}"
-            ))
-        })?
+    let DecodedExecution::Success(result) = execute_local_worker_inner(
+        &worker,
+        rustc,
+        &candidate,
+        staging,
+        SysrootMemo::Path(&memo),
+        &mut timing,
+    )
+    .map_err(|error| {
+        RailError::message(format!(
+            "local distributed client qualification did not produce a successful staged result: {error}"
+        ))
+    })?
     else {
         return Err(RailError::message(
             "local distributed client qualification did not produce a successful staged result",
@@ -3603,7 +3657,7 @@ fn qualify_local_client(rustc: &OsStr) -> RailResult<()> {
         }
     }
     drop(result);
-    let capability = query_local_worker_capability(&worker, rustc)?;
+    let capability = query_local_worker_capability(&worker, rustc, Some(&memo))?;
     if let Some(analysis) = capability.analysis.as_ref() {
         qualify_local_analysis_client(&worker, rustc, candidate, analysis)?;
     }
@@ -3732,27 +3786,19 @@ fn qualify_local_analysis_client(
 
 /// Capture the exact local compiler capability the worker must match.
 ///
-/// `cache` is the caller's already open local cache. Supplying it selects the
-/// existing revalidating sysroot identity memo instead of rehashing the whole
-/// sysroot on every attempt; the memo is only trusted when the exact sysroot
-/// evidence still matches, so this is the same authority the native cache
-/// session already uses for the same fact. Contexts without a local cache, such
-/// as the worker itself, capture once per process and pass `None`.
-fn capture_worker_capability(
-    rustc: &OsStr,
-    cache: Option<&crate::cache::cas::LocalCas>,
-) -> RailResult<CapturedWorkerCapability> {
-    capture_worker_capability_for_runtime(rustc, WorkerRuntime::ProcessOnly, cache, true)
+/// `memo` selects a revalidating sysroot identity memo instead of rehashing the whole sysroot;
+/// the memo is only trusted when the exact sysroot evidence still matches, so this is the same
+/// authority the native cache session already uses for the same fact. A local one-shot worker
+/// uses the memo its client names; a served worker captures once per process without one.
+fn capture_worker_capability(rustc: &OsStr, memo: SysrootMemo<'_>) -> RailResult<CapturedWorkerCapability> {
+    capture_worker_capability_for_runtime(rustc, WorkerRuntime::ProcessOnly, memo, true)
 }
 
 /// Capture client-side selection facts without staging or probing the fact
 /// driver on every cache miss. The worker must still advertise a separately
 /// authenticated matching capability before an analysis request can be sent.
-fn capture_selected_worker_capability(
-    rustc: &OsStr,
-    cache: Option<&crate::cache::cas::LocalCas>,
-) -> RailResult<CapturedWorkerCapability> {
-    capture_worker_capability_for_runtime(rustc, WorkerRuntime::ProcessOnly, cache, false)
+fn capture_selected_worker_capability(rustc: &OsStr, memo: SysrootMemo<'_>) -> RailResult<CapturedWorkerCapability> {
+    capture_worker_capability_for_runtime(rustc, WorkerRuntime::ProcessOnly, memo, false)
 }
 
 #[cfg(target_os = "linux")]
@@ -4172,7 +4218,7 @@ fn capture_bubblewrap_worker_capability(rustc: &OsStr, bubblewrap: &OsStr) -> Ra
             worker,
             worker_generation,
         },
-        None,
+        SysrootMemo::None,
         true,
     )
     .and_then(|mut captured| {
@@ -4198,7 +4244,7 @@ fn capture_bubblewrap_worker_capability(rustc: &OsStr, bubblewrap: &OsStr) -> Ra
 fn capture_worker_capability_for_runtime(
     rustc: &OsStr,
     runtime: WorkerRuntime,
-    cache: Option<&crate::cache::cas::LocalCas>,
+    memo: SysrootMemo<'_>,
     authenticate_analysis_driver: bool,
 ) -> RailResult<CapturedWorkerCapability> {
     let current = std::env::current_dir()?;
@@ -4243,8 +4289,13 @@ fn capture_worker_capability_for_runtime(
         .filter(|target| !target.is_empty())
         .ok_or_else(|| RailError::message("distributed worker rustc identity has no host target"))?
         .to_string();
-    let memo = cache
-        .and_then(|cache| crate::compiler::collector::compiler_sysroot_memo_path_in(cache, &sysroot, &host_target));
+    let memo = match memo {
+        SysrootMemo::None => None,
+        SysrootMemo::Cache(cache) => {
+            crate::compiler::collector::compiler_sysroot_memo_path_in(cache, &sysroot, &host_target)
+        }
+        SysrootMemo::Path(path) => Some(path.to_path_buf()),
+    };
     let sysroot_guard = crate::compiler::collector::CompilerInputGuard::capture_sysroot(&sysroot, &host_target)?;
     let (sysroot_identity, _) =
         crate::compiler::collector::compiler_sysroot_fingerprint(&sysroot, &host_target, memo.as_deref())?;
@@ -4317,6 +4368,7 @@ fn capture_worker_capability_for_runtime(
         sysroot_guard,
         runtime,
         sysroot,
+        sysroot_memo: memo,
     })
 }
 
@@ -4535,7 +4587,8 @@ fn canonical_json<T: Serialize>(value: &T) -> RailResult<Vec<u8>> {
 }
 
 fn execute_once(rustc: &OsStr) -> RailResult<()> {
-    let captured = capture_worker_capability(rustc, None)?;
+    let memo = local_worker_sysroot_memo();
+    let captured = capture_worker_capability(rustc, memo.as_deref().map_or(SysrootMemo::None, SysrootMemo::Path))?;
     let stdin = std::io::stdin();
     let mut reader = stdin.lock();
     let envelope = read_request(&mut reader)?;
@@ -4598,7 +4651,7 @@ fn execute_sandboxed(rustc: &OsStr) -> RailResult<()> {
     let envelope = read_request_with_staging_parent(&mut reader, Some(Path::new(VIRTUAL_ROOT)))?;
     drop(reader);
     validate_request(&envelope.request, &capability)?;
-    let selected = capture_worker_capability(rustc, None)?;
+    let selected = capture_worker_capability(rustc, SysrootMemo::None)?;
     if !worker_execution_environment_matches(
         &capability,
         &selected.capability,
@@ -8910,7 +8963,7 @@ pub(crate) mod tests {
             let rustc =
                 String::from_utf8(selected.stdout).map_err(|_| RailError::message("test rustc path was not UTF-8"))?;
             let rustc = PathBuf::from(rustc.trim());
-            let capability = capture_worker_capability(rustc.as_os_str(), None)?.capability;
+            let capability = capture_worker_capability(rustc.as_os_str(), SysrootMemo::None)?.capability;
             let capability_path = root.path().join("capability.json");
             fs::write(&capability_path, canonical_json(&capability)?)?;
             let worker = root.path().join("malformed-worker");
