@@ -33,6 +33,14 @@ cargo = ["just"]
 assets = ["rustup", "cargo-binstall", "cmake", "llvm", "git", "python"]
 packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "pkgconf", "python3", "unzip", "xz-utils", "zstd"]
 
+# IBM Z, IBM POWER, and RISC-V runners execute the cache tests that x86-64 cross-builds, with the runner tools
+# x86-64 also cross-builds. They compile only the compiler driver and the fixtures those tests build.
+[operations.cache-host]
+components = ["clippy", "rustc-dev"]
+cargo = []
+assets = ["rustup"]
+packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "python3"]
+
 # x86-64 builds the complete IBM Z, IBM POWER, and RISC-V test archives; those runners only execute them.
 [operations.cross-build]
 components = ["clippy", "rustc-dev"]
@@ -180,28 +188,22 @@ os = "Ubuntu 24.04 LTS"
 ubuntu = "24.04"
 codename = "noble"
 rust-host = "riscv64gc-unknown-linux-gnu"
-components = ["clippy", "rustfmt", "rustc-dev", "llvm-tools"]
-targets = ["x86_64-unknown-linux-gnu"]
-cargo = ["just"]
-packages = ["build-essential", "ca-certificates", "cmake", "curl", "git", "git-man", "openssl", "pkgconf", "python3"]
+components = ["clippy", "rustc-dev"]
+cargo = []
+packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "python3"]
 
 [riscv64-linux.assets.rustup]
 url = "https://static.rust-lang.org/rustup/archive/1.29.1/riscv64gc-unknown-linux-gnu/rustup-init"
 sha256 = "e94134ed99fed1a3a1f13a3bf0a05d616fc1c2496ec0b557aaee4856cd34b2f2"
-
-[riscv64-linux.assets.cargo-nextest]
-url = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.146/cargo-nextest-0.9.146-riscv64gc-unknown-linux-gnu.tar.gz"
-sha256 = "c89fd7a2793c316b191f33b42b4ef76c1deb83635bb2c7a4723d8cc97a041d95"
 
 [s390x-linux]
 os = "Ubuntu 24.04 LTS"
 ubuntu = "24.04"
 codename = "noble"
 rust-host = "s390x-unknown-linux-gnu"
-components = ["clippy", "rustfmt", "rustc-dev", "llvm-tools"]
-targets = ["x86_64-unknown-linux-gnu"]
-cargo = ["cargo-nextest", "just"]
-packages = ["build-essential", "ca-certificates", "cmake", "curl", "git", "git-man", "openssl", "pkgconf", "python3"]
+components = ["clippy", "rustc-dev"]
+cargo = []
+packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "python3"]
 
 [s390x-linux.assets.rustup]
 url = "https://static.rust-lang.org/rustup/archive/1.29.1/s390x-unknown-linux-gnu/rustup-init"
@@ -212,10 +214,9 @@ os = "Ubuntu 24.04 LTS"
 ubuntu = "24.04"
 codename = "noble"
 rust-host = "powerpc64le-unknown-linux-gnu"
-components = ["clippy", "rustfmt", "rustc-dev", "llvm-tools"]
-targets = ["x86_64-unknown-linux-gnu"]
-cargo = ["cargo-nextest", "just"]
-packages = ["build-essential", "ca-certificates", "cmake", "curl", "git", "git-man", "openssl", "pkgconf", "python3"]
+components = ["clippy", "rustc-dev"]
+cargo = []
+packages = ["build-essential", "ca-certificates", "curl", "git", "git-man", "python3"]
 
 [powerpc64le-linux.assets.rustup]
 url = "https://static.rust-lang.org/rustup/archive/1.29.1/powerpc64le-unknown-linux-gnu/rustup-init"

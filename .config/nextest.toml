@@ -86,10 +86,15 @@ filter = 'test(/test_compiler_observation::stable_(wrapper_authorizes_the_matche
 test-group = 'integration-subprocess'
 
 # Transferred suites on IBM Z, IBM POWER, and RISC-V (`scripts/check-cache-host.py run-suite`). IBM Z compiled
-# the cache suite's fixtures a median 4.7 times slower than the arm64 runner, so compile-heavy tests exceeded the
-# default bound without stalling. Only the bound changes.
+# the cache suite's fixtures a median 4.7 times slower than the arm64 runner, and RISC-V slower still, so
+# compile-heavy tests exceeded the default bounds without stalling. Only the bound changes; this override
+# precedes the default profile's per-test bounds.
 [profile.slow-host]
-slow-timeout = { period = "60s", terminate-after = 6 }
+slow-timeout = { period = "60s", terminate-after = 15 }
+
+[[profile.slow-host.overrides]]
+filter = 'all()'
+slow-timeout = { period = "60s", terminate-after = 15 }
 
 [profile.cache-host]
 fail-fast = false

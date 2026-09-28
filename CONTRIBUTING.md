@@ -99,20 +99,26 @@ then runs required cases serially and stops on the first failure.
 The same cases remain in `just test`; the cache-only lane does not run doctests or unrelated integration tests.
 
 IBM Z, IBM POWER, and RISC-V have no release archives.
+Their runners prove native caching on the real architecture, not a Cargo-Rail release for it.
 On every push to `main` and every dispatched run, which release validation uses,
-an x86-64 runner cross-builds each one's test archive and runs its Clippy and documentation checks;
-the native runner then runs the compiler driver checks, the complete archived suite, the doctests,
-and the native cache qualification.
+an x86-64 runner cross-builds each one's test archive and the runner's `cargo-nextest`,
+and runs the target's Clippy and documentation checks.
+The native runner installs only its compiler, Clippy, and `rustc-dev`
+(`cache-host` tooling),
+builds and tests the compiler driver, and runs the library and `cache` suites from the archive,
+which must include every required qualification case.
+Planning, Unify, release, and other integration suites, and doctests, run on x86-64, arm64,
+and Windows.
 Pull requests do not run these hosts.
 
-To reproduce that transfer, install `scripts/tooling/x86_64-linux.sh cross-build PLATFORM`
-(`riscv64-linux`, `s390x-linux`, or `powerpc64le-linux`), source the emitted tooling environment, and run `just test-cache-host check TARGET` and `just test-cache-host prepare TARGET target/transfer`.
-Move that directory to the same source checkout on the native host, install its `ci` tooling,
-and run `just test-cache-host run-suite target/transfer` and `just test-cache-host run target/transfer`.
+To reproduce that transfer, install `scripts/tooling/x86_64-linux.sh cross-build PLATFORM` (`riscv64-linux`, `s390x-linux`, or `powerpc64le-linux`) and source the emitted tooling environment.
+Run `just test-cache-host check TARGET`, `just test-cache-host prepare TARGET target/transfer`, and `just test-cache-host runner-tools TARGET target/runner-tools`.
+Move both directories to the same source checkout on the native host, install its `cache-host` tooling,
+put `target/runner-tools/bin` on `PATH`, and run `scripts/check-compiler-fact-driver.sh --channel "$RUSTUP_TOOLCHAIN"` and `scripts/check-cache-host.sh run-suite target/transfer`.
 The archive is built with the optimized `cache-host` profile and carries the compiler driver
 and the source-installation CLI.
 The transfer requires the same source, compiler release and commit, and Nextest build;
-qualification also requires its exact test selection, and missing or ignored cases fail.
+missing or ignored qualification cases fail.
 
 Use `just check-compiler-driver` to run only the excluded compiler driver's checks.
 

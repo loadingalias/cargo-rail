@@ -54,6 +54,9 @@ def selection(data, platform, operation):
     native = data[platform]
     if operation == 'package' and ('just' not in native['cargo'] or platform in CACHE_HOSTS):
         raise ValueError(f'{platform}: no package tool selection')
+    if (operation == 'cache-host') != (platform in CACHE_HOSTS) and operation != 'cross-build':
+        raise ValueError(f'{platform}: {operation} tooling is for '
+                         + ('the IBM Z, IBM POWER, and RISC-V cache hosts' if operation == 'cache-host' else 'hosts that build'))
     policy = data['operations'][operation]
     selected = dict(native)
     for field in ('cargo', 'components', 'packages'):
@@ -130,10 +133,10 @@ def validate(data):
             raise ValueError(f'{platform}: cargo-build-jobs must be a positive integer')
     if 'cargo-build-jobs' not in data['windows']:
         raise ValueError('windows: cargo-build-jobs must be a positive integer')
-    if set(data['operations']) != {'ci', 'package', 'cross-build'}:
-        raise ValueError('tooling operations must be ci, package, and cross-build')
+    if set(data['operations']) != {'ci', 'package', 'cross-build', 'cache-host'}:
+        raise ValueError('tooling operations must be ci, package, cross-build, and cache-host')
     for operation, policy in data['operations'].items():
-        if operation != 'cross-build' and not {'rustc-dev', 'llvm-tools'} <= set(policy['components']):
+        if operation not in ('cross-build', 'cache-host') and not {'rustc-dev', 'llvm-tools'} <= set(policy['components']):
             raise ValueError(f'{operation}: missing compiler components')
         for tool in policy['cargo']:
             if tool not in data['cargo']:
@@ -174,19 +177,19 @@ def validate(data):
                 raise ValueError(f'{platform}/{operation}: missing native build/bootstrap asset')
             if platform.endswith('-linux') and not {'build-essential', 'ca-certificates', 'curl', 'git', 'git-man', 'python3'} <= set(selected['packages']):
                 raise ValueError(f'{platform}/{operation}: missing native build/bootstrap package')
-    # Hosts without a cargo-binstall release build their Cargo tools from source and run the same lane.
+    # Cache hosts run tests and tools that x86-64 cross-builds; they compile only the driver and test fixtures.
+    runner_components = {'clippy', 'rustc-dev'}
+    runner_packages = {'build-essential', 'ca-certificates', 'curl', 'git', 'git-man', 'python3'}
+    policy = data['operations']['cache-host']
+    if (set(policy['components']) != runner_components or policy['cargo'] or set(policy['assets']) != {'rustup'}
+            or set(policy['packages']) != runner_packages or policy.get('targets')):
+        raise ValueError('cache-host must install only the runner compiler, Clippy, rustc-dev, and build packages')
     for platform in CACHE_HOSTS:
         config = data[platform]
-        selected = selection(data, platform, 'ci')
-        if not selected['targets'] or config['rust-host'] in selected['targets']:
-            raise ValueError(f'{platform}/ci: integration tests require a foreign Linux target')
-        nextest = 'cargo-nextest' in config['cargo'] or 'cargo-nextest' in config['assets']
-        if not {'clippy', 'rustfmt', 'rustc-dev', 'llvm-tools'} <= set(config['components']) or 'just' not in config['cargo'] or not nextest:
-            raise ValueError(f'{platform}: the native validation lane requires the complete compiler and runner tools')
-        if 'cargo-binstall' in config['assets']:
-            raise ValueError(f'{platform}: cargo-binstall publishes no release for this host')
-        if not {'build-essential', 'ca-certificates', 'cmake', 'curl', 'git', 'python3'} <= set(config['packages']):
-            raise ValueError(f'{platform}: missing native build/bootstrap package')
+        if (set(config['components']) != runner_components or config['cargo'] or config.get('targets')
+                or set(config['assets']) != {'rustup'} or set(config['packages']) != runner_packages):
+            raise ValueError(f'{platform}: the cache host installs only its compiler, Clippy, rustc-dev, and build packages')
+        selection(data, platform, 'cache-host')
 
     cross = selection(data, 'x86_64-linux', 'cross-build')
     if set(cross['components']) != {'clippy', 'rustc-dev'} or set(cross['cargo']) != {'just', 'cargo-nextest'} or set(cross['assets']) != {'rustup', 'cargo-binstall', 'cmake'}:

@@ -50,6 +50,10 @@ CROSS_TARGETS = {
 }
 # Test harnesses find these components by the paths `just test` exports; the archive carries them.
 SOURCE_INSTALLATION = 'source-installation-test'
+# What IBM Z, IBM POWER, and RISC-V runners test: the library, which holds the cache and compiler internals,
+# and the cache suite. Planning, Unify, release, and other integration behavior is not architecture-specific;
+# the x86-64, arm64, and Windows jobs run it.
+SUITE_FILTER = 'binary_id(cargo-rail) | binary_id(cargo-rail::cache)'
 
 
 def cases_for(target):
@@ -258,6 +262,28 @@ def verify_archive(directory):
     return manifest
 
 
+def validate_required_cases(report, cases):
+    """Every required qualification case must be selected by the suite and not ignored."""
+    selected = {(suite['binary-name'], name) for suite in report['rust-suites'].values()
+                for name, test in suite['testcases'].items()
+                if test['filter-match']['status'] == 'matches' and not test['ignored']}
+    missing = [f'{binary}::{case}' for binary, tests in cases.items() for case in tests if (binary, case) not in selected]
+    if missing:
+        raise ValueError(f'the cache suite omits required cases: {missing}')
+
+
+def runner_tools(target, directory):
+    """Cross-build the pinned cargo-nextest for a runner that has no release of it."""
+    env = cross_environment(target)
+    if directory.exists():
+        raise ValueError(f'refusing to overwrite existing runner tools: {directory}')
+    version = tomllib.loads((ROOT / '.config/tooling.toml').read_text())['cargo']['cargo-nextest']
+    subprocess.run(['cargo', 'install', 'cargo-nextest', '--version', version, '--locked', '--target', target,
+                    '--no-default-features', '--features', 'default-no-update', '--root', str(directory)],
+                   cwd=ROOT, env=env, check=True)
+    print(f'Prepared cargo-nextest {version} for {target}: {directory / "bin"}', flush=True)
+
+
 def validate_nextest_cases(report, cases):
     selected = {}
     for suite in report['rust-suites'].values():
@@ -271,7 +297,7 @@ def validate_nextest_cases(report, cases):
 
 
 def execute(directory, suite=False):
-    """Run the required qualification cases, or with `suite` the complete workspace suite, from an archive."""
+    """Run the required qualification cases, or with `suite` the cache suite that contains them, from an archive."""
     env = transfer_environment()
     env['CARGO_BUILD_JOBS'] = env.get('CARGO_BUILD_JOBS', '2')
     manifest = verify_archive(directory)
@@ -287,14 +313,13 @@ def execute(directory, suite=False):
     shutil.copyfile(directory / 'manifest.json', out / 'manifest.json')
     started = time.monotonic()
     summary = {'status': 'failed', 'source': manifest['source'], 'target': manifest['target'],
-               'selection': 'workspace' if suite else cases, 'nextest': manifest['nextest'], 'rustc': manifest['rustc']}
+               'selection': SUITE_FILTER if suite else cases, 'nextest': manifest['nextest'], 'rustc': manifest['rustc']}
     junit = out / f'store/{profile}/junit.xml'
     print(f'{"Test suite" if suite else "Native cache qualification"} evidence: {out}', flush=True)
     try:
         args = ['--workspace-remap', str(ROOT), '--config-file', str(config), '--profile', profile]
-        if not suite:
-            args += ['-E', ' | '.join(f'(binary(={binary}) & test(={case}))'
-                                      for binary, tests in cases.items() for case in tests)]
+        args += ['-E', SUITE_FILTER if suite else ' | '.join(f'(binary(={binary}) & test(={case}))'
+                                                              for binary, tests in cases.items() for case in tests)]
         listing = subprocess.run(['cargo', 'nextest', 'list', *args, '--archive-file', str(directory / 'tests.tar.zst'),
                                   '--extract-to', str(out / 'extracted'), '--message-format', 'json'],
                                  cwd=ROOT, env=env, text=True, capture_output=True, check=False)
@@ -302,7 +327,9 @@ def execute(directory, suite=False):
         (out / 'tests.json').write_text(listing.stdout)
         print(listing.stderr, end='', flush=True)
         listing.check_returncode()
-        if not suite:
+        if suite:
+            validate_required_cases(json.loads(listing.stdout), cases)
+        else:
             validate_nextest_cases(json.loads(listing.stdout), cases)
         target = out / 'extracted/target'
         # The paths `just test` exports after preparing these components, inside the extracted archive.
@@ -337,7 +364,7 @@ def execute(directory, suite=False):
         if junit.is_file():
             shutil.copyfile(junit, out / 'junit.xml')
     if suite:
-        print('Transferred test suite passed.', flush=True)
+        print(f'Transferred cache suite passed, including {sum(map(len, cases.values()))} required cases.', flush=True)
     else:
         print(f'Native cache qualification passed: {sum(map(len, cases.values()))} required cases.', flush=True)
 
@@ -356,6 +383,9 @@ if __name__ == '__main__':
     execute_parser.add_argument('directory', type=Path)
     suite_parser = commands.add_parser('run-suite')
     suite_parser.add_argument('directory', type=Path)
+    tools_parser = commands.add_parser('runner-tools')
+    tools_parser.add_argument('target')
+    tools_parser.add_argument('directory', type=Path)
     args = parser.parse_args()
     if args.operation == 'native':
         run(args.directory)
@@ -365,5 +395,7 @@ if __name__ == '__main__':
         prepare(args.target, args.directory.resolve())
     elif args.operation == 'run-suite':
         execute(args.directory.resolve(), suite=True)
+    elif args.operation == 'runner-tools':
+        runner_tools(args.target, args.directory.resolve())
     else:
         execute(args.directory.resolve())

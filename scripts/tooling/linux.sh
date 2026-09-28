@@ -5,8 +5,8 @@ export PYTHONDONTWRITEBYTECODE=1
 
 platform="${1:?native platform is required}"
 shift
-[[ ( "$#" -eq 1 && ( "$1" == ci || "$1" == package ) ) || ( "$#" -eq 2 && "$1" == cross-build ) ]] || {
-  echo "usage: scripts/tooling/$platform.sh {ci|package|cross-build TARGET-PLATFORM}" >&2; exit 64;
+[[ ( "$#" -eq 1 && ( "$1" == ci || "$1" == package || "$1" == cache-host ) ) || ( "$#" -eq 2 && "$1" == cross-build ) ]] || {
+  echo "usage: scripts/tooling/$platform.sh {ci|package|cache-host|cross-build TARGET-PLATFORM}" >&2; exit 64;
 }
 operation="$1"
 cross_platform="${2:-}"

@@ -240,19 +240,22 @@ class CatalogPolicy(unittest.TestCase):
                 self.assertEqual(package['targets'], [])
         self.assertEqual(data, catalog.read(), 'selection mutated the catalog')
 
-    def test_cache_hosts_install_the_complete_native_validation_lane(self):
+    def test_cache_hosts_install_only_what_their_transferred_cache_tests_run(self):
         for platform in catalog.CACHE_HOSTS:
             with self.subTest(platform=platform):
-                selected = catalog.selection(catalog.read(), platform, 'ci')
-                self.assertEqual(set(selected['components']), {'clippy', 'rustfmt', 'rustc-dev', 'llvm-tools'})
-                # cargo-binstall publishes no release here, so Cargo tools build from source.
-                self.assertNotIn('cargo-binstall', selected['assets'])
-                self.assertIn('just', selected['cargo'])
-                self.assertTrue('cargo-nextest' in selected['cargo'] or 'cargo-nextest' in selected['assets'])
-                self.assertTrue({'cmake', 'openssl'} <= set(selected['packages']))
-                self.assertEqual(selected['targets'], ['x86_64-unknown-linux-gnu'])
-                with self.assertRaisesRegex(ValueError, 'no package tool selection'):
-                    catalog.selection(catalog.read(), platform, 'package')
+                selected = catalog.selection(catalog.read(), platform, 'cache-host')
+                # Clippy replays results; rustc-dev builds the driver. Tests and nextest arrive cross-built.
+                self.assertEqual(set(selected['components']), {'clippy', 'rustc-dev'})
+                self.assertEqual(selected['cargo'], [])
+                self.assertEqual(selected['targets'], [])
+                self.assertEqual(set(selected['assets']), {'rustup'})
+                self.assertEqual(set(selected['packages']),
+                                 {'build-essential', 'ca-certificates', 'curl', 'git', 'git-man', 'python3'})
+                for operation in ('ci', 'package'):
+                    with self.assertRaises(ValueError):
+                        catalog.selection(catalog.read(), platform, operation)
+        with self.assertRaisesRegex(ValueError, 'cache hosts'):
+            catalog.selection(catalog.read(), 'x86_64-linux', 'cache-host')
 
     def test_cross_build_installs_only_archive_build_tools_for_each_runner(self):
         for target in ('riscv64-linux', 's390x-linux', 'powerpc64le-linux'):
@@ -317,11 +320,15 @@ class CatalogPolicy(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'dated nightly'):
                 catalog.validate(data)
 
-    def test_native_profiles_are_complete_and_cannot_inherit_full_tooling(self):
+    def test_cache_host_profiles_are_exact_and_cannot_grow_full_tooling(self):
         data = catalog.read()
         catalog.validate(data)
         for name in ('riscv64-linux', 's390x-linux', 'powerpc64le-linux'):
-            for field, value in [('cargo', ['cargo-nextest']), ('components', []), ('components', ['rustc-dev']), ('components', ['rustc-dev', 'llvm-tools', 'clippy']), ('packages', []), ('rust-host', 'x86_64-unknown-linux-gnu')]:
+            for field, value in [('cargo', ['cargo-nextest']), ('cargo', ['just']), ('components', []),
+                                 ('components', ['rustc-dev']), ('components', ['rustc-dev', 'llvm-tools', 'clippy']),
+                                 ('packages', []), ('packages', ['build-essential', 'ca-certificates', 'cmake', 'curl',
+                                                                 'git', 'git-man', 'python3']),
+                                 ('targets', ['x86_64-unknown-linux-gnu']), ('rust-host', 'x86_64-unknown-linux-gnu')]:
                 changed = copy.deepcopy(data)
                 changed[name][field] = value
                 with self.assertRaises(ValueError): catalog.validate(changed)

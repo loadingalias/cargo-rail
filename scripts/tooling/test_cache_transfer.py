@@ -138,12 +138,17 @@ fn b_sentinel() { eprintln!("remaining case executed"); }
                     suites = ET.parse(out / 'junit.xml').getroot()
                     self.assertEqual(int(suites.attrib['tests']), 2)
                     self.assertEqual(int(suites.attrib['failures']), int(failed))
-                # The complete suite runs from the same archive without a case filter.
-                with patch('sys.stdout', new=io.StringIO()):
+                # The cache suite runs from the same archive and must contain every required case.
+                suite = 'binary_id(transfer-fixture)'
+                with patch('sys.stdout', new=io.StringIO()), patch.object(cache, 'SUITE_FILTER', suite):
                     cache.execute(directory, suite=True)
                 out, = (root / 'target/suite-results').glob('run-*')
                 summary = json.loads((out / 'summary.json').read_text())
-                self.assertEqual((summary['status'], summary['selection']), ('passed', 'workspace'))
+                self.assertEqual((summary['status'], summary['selection']), ('passed', suite))
+                with patch('sys.stdout', new=io.StringIO()), \
+                     patch.object(cache, 'SUITE_FILTER', 'binary_id(transfer-fixture) & test(=b_sentinel)'), \
+                     self.assertRaisesRegex(ValueError, 'omits required cases'):
+                    cache.execute(directory, suite=True)
                 log = (out / 'nextest.log').read_text()
                 self.assertIn('a_failure', log)
                 self.assertIn('b_sentinel', log)
