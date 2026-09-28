@@ -2441,7 +2441,17 @@ fn execute_local_worker_inner(
         .map_err(|_| RailError::message("local distributed stderr reader panicked"))??
         .ok_or_else(|| RailError::message("local distributed worker stderr exceeded its byte bound"))?;
     if !status.success() || !stderr.is_empty() {
-        return Err(RailError::message("local distributed worker process failed"));
+        let excerpt = String::from_utf8_lossy(&stderr[..stderr.len().min(512)])
+            .trim()
+            .to_string();
+        return Err(RailError::message(format!(
+            "local distributed worker process failed ({status}){}",
+            if excerpt.is_empty() {
+                String::new()
+            } else {
+                format!(": {excerpt}")
+            }
+        )));
     }
     Ok(response)
 }
@@ -3560,8 +3570,13 @@ fn qualify_local_client(rustc: &OsStr) -> RailResult<()> {
         b"#![forbid(unsafe_code)]\npub fn qualified() -> bool { true }\n".to_vec(),
     )?;
     let mut timing = DistributedTiming::default();
-    let LocalWorkerAttempt::Success(result) =
-        execute_local_worker(&worker, rustc, &candidate, staging, None, &mut timing)
+    // Qualification names the cause that an ordinary attempt collapses into a cold outcome.
+    let DecodedExecution::Success(result) =
+        execute_local_worker_inner(&worker, rustc, &candidate, staging, None, &mut timing).map_err(|error| {
+            RailError::message(format!(
+                "local distributed client qualification did not produce a successful staged result: {error}"
+            ))
+        })?
     else {
         return Err(RailError::message(
             "local distributed client qualification did not produce a successful staged result",
