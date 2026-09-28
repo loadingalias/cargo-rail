@@ -205,6 +205,14 @@ Use `cache profiles` and `cache drop-profile --profile PROFILE_ID --check` for e
 Resolve receipt, wrapper, profile,
 or ownership drift instead of deleting cache files or Cargo configuration by hand.
 
+Upgrading to 0.30.0 starts every cache cold once: action keys, registry dependency results,
+stored compiler evidence, and units that load a procedural macro all changed identity,
+and remote caches start cold too.
+Before the first build, `cargo rail cache clean --scope local --check` previews removing the current store and the retired `local-cas-v2` store;
+run it without `--check`, then rerun `cargo rail cache setup`.
+Independent compiler adapter packs from earlier releases are rejected
+(native input protocol 4); republish them for 0.30.0.
+
 If setup reports an unsupported installation receipt version,
 preserve the installation and the executable that created it.
 Use that executable to preview and perform removal, then run the current `cargo rail cache setup`.

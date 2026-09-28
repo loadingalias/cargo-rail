@@ -218,10 +218,12 @@ and compiler-fact acquisition are supported.
 Runtime eligibility does not imply that a release archive exists for that host.
 See [native host eligibility](docs/caching.md#native-host-eligibility).
 
-**IBM validation is incomplete.**
-Native caching and execution remain implemented for IBM Z (`s390x`) and little-endian IBM POWER (`powerpc64le`) Linux,
-but end-to-end validation on these hosts is deferred while repository runner access is resolved.
-Treat these targets as unvalidated until their native qualification checks pass.
+CI qualifies native caching on real IBM Z (`s390x`), little-endian IBM POWER (`powerpc64le`),
+and RISC-V 64 Linux runners on every push to `main`:
+each runs the compiler driver's tests and the library
+and cache suites from an archive built on x86-64.
+No release archive exists for these hosts;
+install from source and select an [adapter pack](docs/caching.md#select-an-independent-compiler-adapter) for native reuse.
 
 ## Audit product reachability
 
@@ -297,6 +299,8 @@ Both actions install the exact Cargo-Rail release recorded by the Action by defa
 Set an exact `version` only when the workflow needs a reproducible pin.
 Its `mode` input is required.
 Do not provide remote credentials to untrusted jobs.
+Read access does not protect confidentiality:
+a job that can read the remote cache can read every result in it.
 Use `read` for trusted jobs that must not publish, and grant `read-write` only to trusted seed jobs.
 The Action exposes typed root portability and an optional strict authenticated provider probe.
 See the [Action guide](https://github.com/loadingalias/cargo-rail-action).

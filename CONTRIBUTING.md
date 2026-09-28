@@ -121,6 +121,9 @@ The transfer requires the same source, compiler release and commit, and Nextest 
 missing or ignored qualification cases fail.
 
 Use `just check-compiler-driver` to run only the excluded compiler driver's checks.
+`just check-compiler-driver-channel TOOLCHAIN` builds and tests the driver with another installed toolchain that has `rustc-dev`;
+CI runs it for the current stable, beta, and nightly.
+When a new nightly changes the compiler's internal API, gate the driver on that change in `tools/compiler-fact-driver/build.rs`.
 
 ## Work on compiler integration
 

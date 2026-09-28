@@ -13,6 +13,6 @@ A build-script failure names the environment variables the script declares, neve
 Unify keeps progress on stderr in JSON mode, reports Cargo file-lock waits as they happen,
 and prints a `Still running:` line when a phase is silent for 30 seconds.
 An interrupted compiler acquisition reports the `interrupted` class and the phase it stopped.
-`--diagnostics-file` output moves to schema 16 and adds `progress_phases` with per-phase durations.
+`--diagnostics-file` output adds `progress_phases` with per-phase durations.
 The library adds `RailError::Failure` and `FailureClass`.
 Adding `RailError::Failure` breaks exhaustive matches on `RailError`.

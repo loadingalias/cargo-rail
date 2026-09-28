@@ -11,4 +11,4 @@ a cold Unify check used about 5.5 times less CPU with the same decisions.
 The `--diagnostics-file` schema is now version 17: it removes `configured_work_permits`, `max_nonwaiting_cargo_views`, and the `work_permit_*` counters, and adds `dependency_compilations`, `repeated_dependency_compilations`, and `artifact_high_water_bytes` to `compiler_acquisition`.
 A repeated compilation now means the same unit configuration compiled again;
 a dependency rebuilt with other features is a different unit.
-`surface prepare` output is contract version 3: its `acquisition` object removes `work_permits`.
+`surface --prepare` output is contract version 3: its `acquisition` object removes `work_permits`.
