@@ -106,8 +106,7 @@ and the native cache qualification.
 Pull requests do not run these hosts.
 
 To reproduce that transfer, install `scripts/tooling/x86_64-linux.sh cross-build PLATFORM`
-(`riscv64-linux`, `s390x-linux`, or `powerpc64le-linux`), source the emitted tooling environment,
-and run `just test-cache-host check TARGET` and `just test-cache-host prepare TARGET target/transfer`.
+(`riscv64-linux`, `s390x-linux`, or `powerpc64le-linux`), source the emitted tooling environment, and run `just test-cache-host check TARGET` and `just test-cache-host prepare TARGET target/transfer`.
 Move that directory to the same source checkout on the native host, install its `ci` tooling,
 and run `just test-cache-host run-suite target/transfer` and `just test-cache-host run target/transfer`.
 The archive is built with the optimized `cache-host` profile and carries the compiler driver
