@@ -518,6 +518,10 @@ native-search inputs, ambiguous roots, user-selected remaps,
 and unsupported output classes bypass cross-root reuse.
 
 External `CARGO_TARGET_DIR` locations are supported for eligible native results.
+Cargo compiles registry and git packages inside their unpacked source,
+which belongs to no workspace; under an explicit target or build directory,
+those units use the workspace that Cargo started in, as the shell exports it in `PWD`.
+Without `PWD`, they compile normally without reuse.
 The cache identity uses one stable logical output directory,
 while local compilation and restore continue to use Cargo's exact physical output parent.
 Changing a checkout or target root preserves portable identity when selected input paths

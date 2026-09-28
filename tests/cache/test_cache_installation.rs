@@ -5458,6 +5458,133 @@ fn custom_target_and_deterministic_flags_reuse_without_runtime_residue() {
     super::helpers::finish_test(result);
 }
 
+/// Cargo compiles a registry or git package inside its unpacked source, not in the workspace.
+/// With an explicit target directory the wrapper still selects the workspace that Cargo was started in.
+#[cfg(unix)]
+#[test]
+fn non_local_dependencies_reuse_under_an_explicit_target_directory() {
+    let result: Result<()> = (|| {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir()?;
+        let root_path = cargo_rail::utils::canonicalize_existing(root.path())?;
+        let git = |directory: &Path, arguments: &[&str]| -> Result<()> {
+            let output = Command::new("git")
+                .current_dir(directory)
+                .args(["-c", "user.name=Cache Test", "-c", "user.email=cache@example.invalid"])
+                .args(["-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"])
+                .args(arguments)
+                .output()?;
+            anyhow::ensure!(output.status.success(), "git {arguments:?}: {output:?}");
+            Ok(())
+        };
+        let dependency = root_path.join("remote-dep");
+        fs::create_dir_all(dependency.join("src"))?;
+        fs::write(
+            dependency.join("Cargo.toml"),
+            "[package]\nname = \"remote-dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )?;
+        fs::write(dependency.join("src/lib.rs"), "pub fn value() -> u8 { 7 }\n")?;
+        git(&dependency, &["init", "--quiet", "--initial-branch=main"])?;
+        git(&dependency, &["add", "."])?;
+        git(&dependency, &["commit", "--quiet", "-m", "dependency"])?;
+
+        let workspace = root_path.join("workspace");
+        fs::create_dir_all(workspace.join("src"))?;
+        fs::write(
+            workspace.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"remote-consumer\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                 [dependencies]\nremote-dep = {{ git = \"file://{}\" }}\n",
+                dependency.display()
+            ),
+        )?;
+        fs::write(
+            workspace.join("src/lib.rs"),
+            "pub fn value() -> u8 { remote_dep::value() }\n",
+        )?;
+        let cargo_home = tempfile::tempdir()?;
+        let lock = Command::new("cargo")
+            .current_dir(&workspace)
+            .args(["generate-lockfile", "--quiet"])
+            .env("CARGO_HOME", cargo_home.path())
+            .output()?;
+        anyhow::ensure!(lock.status.success(), "lockfile: {lock:?}");
+        git(&workspace, &["init", "--quiet", "--initial-branch=main"])?;
+        git(&workspace, &["add", "."])?;
+        let setup = rail(&workspace, cargo_home.path(), &["rail", "cache", "setup"])?;
+        anyhow::ensure!(setup.status.success(), "cache setup: {setup:?}");
+
+        let check = |label: &str, target: Option<&Path>| -> Result<String> {
+            let coverage = tempfile::tempdir()?;
+            fs::set_permissions(coverage.path(), fs::Permissions::from_mode(0o700))?;
+            let coverage_path = cargo_rail::utils::canonicalize_existing(coverage.path())?;
+            let mut command = Command::new("cargo");
+            command
+                .current_dir(&workspace)
+                .args(["check", "--offline", "--quiet"])
+                // What a shell exports for the directory Cargo starts in.
+                .env("PWD", &workspace)
+                .env("CARGO_HOME", cargo_home.path())
+                .env("CARGO_INCREMENTAL", "0")
+                .env("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1")
+                .env("CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY", &coverage_path)
+                .env_remove("CARGO_TARGET_DIR")
+                .env_remove("CARGO_BUILD_BUILD_DIR")
+                .env_remove("RUSTC_WRAPPER")
+                .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+                .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("RUSTFLAGS")
+                .env_remove("CARGO_ENCODED_RUSTFLAGS")
+                .env_remove("CARGO_RAIL_CACHE_REMOTE")
+                .env_remove("CARGO_RAIL_CACHE_MODE")
+                .env_remove("CARGO_RAIL_CACHE_REMOTE_ENVIRONMENT")
+                .env_remove("CARGO_RAIL_CACHE_REPORT");
+            if let Some(target) = target {
+                command.env("CARGO_TARGET_DIR", target);
+            }
+            let output = command.output()?;
+            anyhow::ensure!(output.status.success(), "{label} check: {output:?}");
+            let event = coverage_events(&coverage_path)?
+                .into_iter()
+                .find(|event| event["action"]["crate_name"] == "remote_dep")
+                .with_context(|| format!("{label}: no coverage event for remote_dep"))?;
+            Ok(format!(
+                "{} {}",
+                event["status"].as_str().unwrap_or_default(),
+                event["reason"].as_str().unwrap_or_default()
+            ))
+        };
+        let external = root_path.join("external-target");
+        for (label, target) in [
+            ("default target", None),
+            ("explicit in-workspace target", Some(workspace.join("target-explicit"))),
+            ("explicit external target", Some(external)),
+        ] {
+            let directory = target.clone().unwrap_or_else(|| workspace.join("target"));
+            for phase in ["cold", "warm"] {
+                if directory.exists() {
+                    fs::remove_dir_all(&directory)?;
+                }
+                let outcome = check(&format!("{label} {phase}"), target.as_deref())?;
+                let expected = if phase == "warm" || label != "default target" {
+                    "hit"
+                } else {
+                    "miss"
+                };
+                // Every target layout shares one store, so only the first cold build compiles.
+                anyhow::ensure!(
+                    outcome.starts_with(expected),
+                    "{label} {phase}: expected {expected}, found {outcome}"
+                );
+            }
+        }
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
 #[cfg(unix)]
 fn assert_no_native_runtime_residue(directory: &Path) -> Result<()> {
     let residue = fs::read_dir(directory)?

@@ -5537,7 +5537,7 @@ fn direct_compilation_root(
             .into_iter()
             .find(|root| canonical_output.starts_with(root))
             .ok_or_else(|| RailError::message("transparent compiler output escaped Cargo's selected output roots"))?;
-        let (spelling, canonical) = direct_source_root(current_directory)?;
+        let (spelling, canonical) = explicit_output_source_root(current_directory, std::env::var_os("PWD").as_deref())?;
         (spelling, canonical, canonical_target)
     } else if let Some(target) = standard_target {
         let spelling = target
@@ -5567,21 +5567,47 @@ fn direct_compilation_root(
     Ok((spelling, canonical, canonical_target, canonical_output))
 }
 
+/// The workspace that owns a compilation under an explicit target or build directory.
+///
+/// Cargo runs rustc for a registry or git package inside its unpacked source, which Cargo marks with
+/// `.cargo-ok` and which belongs to no workspace. The default layout names the workspace by its `target`
+/// directory; an explicit directory does not, so the workspace is the one Cargo started in, which the
+/// shell exports as `PWD`.
+fn explicit_output_source_root(current_directory: &Path, started: Option<&OsStr>) -> RailResult<(PathBuf, PathBuf)> {
+    let current_directory = crate::utils::canonicalize_existing(current_directory)?;
+    let package = current_directory
+        .ancestors()
+        .find(|candidate| real_manifest(&candidate.join("Cargo.toml")).is_some());
+    if !package.is_some_and(|package| package.join(".cargo-ok").is_file()) {
+        return direct_source_root(&current_directory);
+    }
+    let started = started
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| {
+            RailError::message(
+                "a registry or git package names no workspace, and Cargo's starting directory is unavailable",
+            )
+        })?;
+    direct_source_root(&started)
+}
+
+fn real_manifest(manifest: &Path) -> Option<toml_edit::DocumentMut> {
+    let metadata = fs::symlink_metadata(manifest).ok()?;
+    if !metadata.is_file() || crate::utils::is_symlink_or_reparse(&metadata) {
+        return None;
+    }
+    fs::read_to_string(manifest)
+        .ok()?
+        .parse::<toml_edit::DocumentMut>()
+        .ok()
+}
+
 fn direct_source_root(current_directory: &Path) -> RailResult<(PathBuf, PathBuf)> {
     let current_directory = crate::utils::canonicalize_existing(current_directory)?;
     let mut package_root = None;
     for candidate in current_directory.ancestors() {
-        let manifest = candidate.join("Cargo.toml");
-        let Ok(metadata) = fs::symlink_metadata(&manifest) else {
-            continue;
-        };
-        if !metadata.is_file() || crate::utils::is_symlink_or_reparse(&metadata) {
-            continue;
-        }
-        let Ok(contents) = fs::read_to_string(&manifest) else {
-            continue;
-        };
-        let Ok(document) = contents.parse::<toml_edit::DocumentMut>() else {
+        let Some(document) = real_manifest(&candidate.join("Cargo.toml")) else {
             continue;
         };
         package_root.get_or_insert_with(|| candidate.to_path_buf());
@@ -21961,6 +21987,37 @@ pub(crate) mod tests {
             action_key(&session.identity, &session.class, &observation, &changed).expect("changed action"),
             initial_action
         );
+    }
+
+    #[test]
+    fn explicit_output_roots_take_a_non_local_package_workspace_from_the_starting_directory() {
+        let root = tempfile::tempdir().expect("roots");
+        let root = crate::utils::canonicalize_existing(root.path()).expect("canonical roots");
+        let workspace = root.join("workspace");
+        let member = workspace.join("member/src");
+        let registry = root.join("cargo-home/registry/src/index/dep-0.1.0");
+        for directory in [&member, &registry] {
+            fs::create_dir_all(directory).expect("directory");
+        }
+        fs::write(workspace.join("Cargo.toml"), "[workspace]\nmembers = [\"member\"]\n").expect("workspace");
+        fs::write(workspace.join("member/Cargo.toml"), "[package]\nname = \"member\"\n").expect("member");
+        fs::write(registry.join("Cargo.toml"), "[package]\nname = \"dep\"\n").expect("registry package");
+        let expected = (workspace.clone(), workspace);
+
+        // A local package keeps its own workspace wherever Cargo started.
+        assert_eq!(
+            explicit_output_source_root(&member, Some(OsStr::new("/"))).expect("member"),
+            expected
+        );
+        // An unpacked registry or git package names the workspace Cargo started in.
+        fs::write(registry.join(".cargo-ok"), "{\"v\":1}").expect("unpack marker");
+        assert_eq!(
+            explicit_output_source_root(&registry, Some(member.as_os_str())).expect("registry"),
+            expected
+        );
+        explicit_output_source_root(&registry, None).expect_err("no starting directory names no workspace");
+        explicit_output_source_root(&registry, Some(OsStr::new("relative")))
+            .expect_err("a relative start is ambiguous");
     }
 
     #[test]
