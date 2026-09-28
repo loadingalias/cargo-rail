@@ -1451,6 +1451,53 @@ mod tests {
     }
 
     #[test]
+    fn dependency_search_binds_a_stub_rlib_and_its_separate_metadata() {
+        // Nightly Cargo reaches transitive dependencies only through `-L dependency=`,
+        // where each library is a stub rlib and a separate rmeta.
+        let mut fixture = Fixture::new();
+        fs::write(fixture.dependencies.join("libdependency-a.rmeta"), b"META").unwrap();
+        fixture.observed.searches[0].patterns.push(NativeCratePattern {
+            prefix: "libdependency".into(),
+            suffix: ".rmeta".into(),
+        });
+        fixture.observed.searches[0]
+            .files
+            .insert(1, "libdependency-a.rmeta".into());
+        let capture = fixture.cold().complete(&fixture.observed).unwrap();
+        assert_eq!(
+            capture
+                .witness
+                .files
+                .iter()
+                .map(|file| file.path.clone())
+                .collect::<Vec<_>>(),
+            [
+                RustInputPath::OutputDirectory("libdependency-a.rlib".into()),
+                RustInputPath::OutputDirectory("libdependency-a.rmeta".into()),
+                RustInputPath::OutputDirectory("libdependency-b.rlib".into()),
+            ]
+        );
+        for (file, changed) in [("libdependency-a.rmeta", b"ATEM"), ("libdependency-a.rlib", b"BUTS")] {
+            let original = fs::read(fixture.dependencies.join(file)).unwrap();
+            fs::write(fixture.dependencies.join(file), changed).unwrap();
+            assert!(
+                capture.revalidate().is_err(),
+                "a change to only {file} invalidates reuse"
+            );
+            let recaptured = RustInputCapture::capture(
+                capture.witness.selector(),
+                &fixture.raw,
+                &fixture.workspace,
+                &fixture.host,
+                None,
+            )
+            .unwrap();
+            assert_ne!(recaptured.witness(), capture.witness(), "{file} is bound");
+            fs::write(fixture.dependencies.join(file), original).unwrap();
+        }
+    }
+
+    #[test]
     fn unselected_matching_candidate_content_changes_the_warm_witness() {
         let fixture = Fixture::new();
         let capture = fixture.cold().complete(&fixture.observed).unwrap();

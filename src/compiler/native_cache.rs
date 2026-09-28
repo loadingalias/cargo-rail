@@ -2506,17 +2506,8 @@ impl NativeActionCapture {
             ));
         }
 
-        let mut dependency_names = observation
-            .dependency_artifacts
-            .iter()
-            .map(|(name, _)| name.clone())
-            .collect::<Vec<_>>();
-        dependency_names.sort_unstable();
-        if dependency_names.windows(2).any(|pair| pair[0] == pair[1]) {
-            return Err(RailError::message(
-                "compiler invocation contains duplicate dependency capabilities",
-            ));
-        }
+        let dependency_names = witness_dependency_names(observation)
+            .ok_or_else(|| RailError::message("compiler invocation contains duplicate dependency capabilities"))?;
 
         let mut environment_names = Vec::with_capacity(observation.environment_reads.len());
         for observed in &observation.environment_reads {
@@ -2565,12 +2556,6 @@ impl NativeActionCapture {
     }
 
     fn validates_witness(&self, witness: &NativeCompilerWitness, observation: &RawCompilerInvocation) -> bool {
-        let mut dependencies = observation
-            .dependency_artifacts
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .collect::<Vec<_>>();
-        dependencies.sort_unstable();
         witness.version == 8
             && witness.target_format == self.target_format()
             && witness.complete
@@ -2584,7 +2569,7 @@ impl NativeActionCapture {
             && strictly_sorted_unique_strings(&witness.repository_paths)
             && strictly_sorted_unique_strings(&witness.dependency_names)
             && validate_environment_selector_names(witness.environment_names.iter().map(String::as_str)).is_ok()
-            && witness.dependency_names.iter().map(String::as_str).eq(dependencies)
+            && witness_dependency_names(observation).is_some_and(|names| witness.dependency_names == names)
             && witness.source_paths.iter().all(|path| {
                 self.source_state
                     .entries
@@ -8737,6 +8722,21 @@ pub(crate) fn paired_extern_artifacts(artifacts: &[&str]) -> bool {
         }
         _ => false,
     }
+}
+
+/// Each extern name of `observation` once, sorted; a repeated name must be one rlib and its separate rmeta.
+fn witness_dependency_names(observation: &RawCompilerInvocation) -> Option<Vec<String>> {
+    let mut artifacts = BTreeMap::<&str, Vec<&str>>::new();
+    for (name, artifact) in &observation.dependency_artifacts {
+        artifacts
+            .entry(name.as_str())
+            .or_default()
+            .push(observation_path_basename(&artifact.path)?);
+    }
+    artifacts
+        .values()
+        .all(|artifacts| paired_extern_artifacts(artifacts))
+        .then(|| artifacts.into_keys().map(str::to_string).collect())
 }
 
 fn native_library_bypass_reason(value: &str) -> &'static str {
@@ -24695,6 +24695,130 @@ pub(crate) mod tests {
         let mut forged = validation;
         forged.outputs[2].content_digest = digest(b"same-size-forgery");
         forged.validate_object().expect_err("rlib bytes remain action-bound");
+    }
+
+    #[test]
+    fn stub_rlib_result_is_refused_without_its_separate_metadata() {
+        // Nightly Cargo's `-Zembed-metadata=no` rlib is a stub; dependents read the separate rmeta.
+        let session = graduated_session(digest(b"source-root"));
+        let mut observation = graduated_observation();
+        observation.emit_modes.insert("link".to_string());
+        for argument in &mut observation.compiler_arguments {
+            if argument == "--emit=dep-info,metadata" {
+                *argument = "--emit=dep-info,metadata,link".to_string();
+            }
+        }
+        observation.compiler_arguments.push("-Zembed-metadata=no".to_string());
+        observation.emitted_outputs.push(observed_file(
+            "target/debug/deps/libfixture-0123456789abcdef.rlib",
+            b"stub",
+        ));
+        observation.emitted_outputs.sort();
+        let output = |role: &str, slot: &str, file_name: &str, bytes: &[u8]| NativeCompilerOutput {
+            role: role.to_string(),
+            slot: slot.to_string(),
+            file_name: file_name.to_string(),
+            content_digest: digest(bytes),
+            bytes: bytes.len() as u64,
+            mode: 0o644,
+        };
+        let dep_info = output("dep_info", DEP_INFO_SLOT, "fixture-0123456789abcdef.d", b"dep-info");
+        let metadata = output(
+            "metadata",
+            METADATA_SLOT,
+            "libfixture-0123456789abcdef.rmeta",
+            b"metadata",
+        );
+        let rlib = output("rlib", RLIB_SLOT, "libfixture-0123456789abcdef.rlib", b"stub");
+        let capture = synthetic_capture(&observation);
+        let action = action_key(&session.identity, &session.class, &observation, &capture).expect("action");
+        let validation = |outputs: Vec<NativeCompilerOutput>| {
+            NativeCompilerValidation::new(
+                &session,
+                observation.clone(),
+                &capture,
+                None,
+                pack::NativeResultDescriptor {
+                    action_key: action.clone(),
+                    witness: synthetic_witness(&observation),
+                    outputs,
+                    stdout_digest: digest(b""),
+                    stdout_bytes: 0,
+                    stderr_digest: digest(b""),
+                    stderr_bytes: 0,
+                },
+            )
+            .and_then(|validation| validation.validate_object().map(|()| validation))
+        };
+        let complete = validation(vec![dep_info.clone(), metadata, rlib.clone()]).expect("stub rlib and its rmeta");
+
+        validation(vec![dep_info, rlib]).expect_err("a stub rlib result cannot omit its metadata");
+        let mut stored = complete;
+        stored.outputs.remove(1);
+        result_key(
+            &stored.action_key,
+            &stored.witness,
+            &stored.outputs,
+            &stored.stdout_digest,
+            stored.stdout_bytes,
+            &stored.stderr_digest,
+            stored.stderr_bytes,
+        )
+        .expect_err("no result identity names a stub rlib without its metadata");
+        stored
+            .validate_object()
+            .expect_err("a stored stub rlib result without its metadata is refused");
+    }
+
+    #[test]
+    fn paired_extern_binds_its_rlib_and_rmeta_separately() {
+        let session = graduated_session(digest(b"source-root"));
+        let mut paired = graduated_observation();
+        paired.compiler_arguments.extend([
+            "-Zembed-metadata=no".to_string(),
+            "--extern".to_string(),
+            "dep=target/debug/deps/libdep-0123456789abcdef.rlib".to_string(),
+            "--extern".to_string(),
+            "dep=target/debug/deps/libdep-0123456789abcdef.rmeta".to_string(),
+            "-Ldependency=target/debug/deps".to_string(),
+        ]);
+        paired.dependency_artifacts = vec![
+            (
+                "dep".to_string(),
+                observed_file("target/debug/deps/libdep-0123456789abcdef.rlib", b"stub"),
+            ),
+            (
+                "dep".to_string(),
+                observed_file("target/debug/deps/libdep-0123456789abcdef.rmeta", b"metadata"),
+            ),
+        ];
+        let key = |observation: &RawCompilerInvocation| {
+            action_key(
+                &session.identity,
+                &session.class,
+                observation,
+                &synthetic_capture(observation),
+            )
+        };
+        let baseline = key(&paired).expect("paired extern action");
+        for (index, file) in [(0, "rlib"), (1, "rmeta")] {
+            let mut changed = paired.clone();
+            changed.dependency_artifacts[index].1.content_digest = digest(b"changed");
+            assert_ne!(
+                key(&changed).expect("changed paired extern action"),
+                baseline,
+                "a change to only the {file} misses"
+            );
+        }
+        let mut unrelated = paired;
+        unrelated.dependency_artifacts[1].1 =
+            observed_file("target/debug/deps/libother-0123456789abcdef.rmeta", b"metadata");
+        *unrelated
+            .compiler_arguments
+            .iter_mut()
+            .find(|argument| argument.ends_with(".rmeta"))
+            .expect("rmeta extern") = "dep=target/debug/deps/libother-0123456789abcdef.rmeta".to_string();
+        key(&unrelated).expect_err("one extern name cannot pair two libraries");
     }
 
     #[test]

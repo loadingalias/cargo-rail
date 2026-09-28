@@ -69,6 +69,10 @@ plan *args:
 check-compiler-driver:
     @scripts/check-compiler-fact-driver.sh
 
+# Build and test the compiler driver with another installed toolchain that has rustc-dev.
+check-compiler-driver-channel toolchain:
+    @scripts/check-compiler-fact-driver.sh --channel {{quote(toolchain)}}
+
 check-cross:
     @scripts/check-cross.sh
 

@@ -6,12 +6,18 @@ use std::sync::{Arc, Mutex};
 use rustc_codegen_ssa::{CompiledModules, CrateInfo, TargetConfig, traits::CodegenBackend};
 use rustc_metadata::{EncodedMetadata, creader::MetadataLoaderDyn};
 use rustc_middle::{dep_graph::WorkProductMap, ty::TyCtxt, util::Providers};
+#[cfg(rail_incremental_session)]
+use rustc_session::IncrCompSession;
+#[cfg(rail_early_session_backend)]
+use rustc_session::{CodegenBackendInit, EarlySession};
 use rustc_session::{
     Session,
-    config::{CrateType, OutputFilenames, PrintRequest},
+    config::{OutputFilenames, PrintRequest},
 };
+#[cfg(not(rail_early_session_backend))]
 use rustc_span::Symbol;
 
+use crate::CrateType;
 use crate::native_input_protocol::NativeCodegenObservation;
 
 pub(crate) fn configure(
@@ -40,7 +46,13 @@ impl CodegenBackend for ObservedBackend {
         self.inner.name()
     }
 
+    #[cfg(not(rail_early_session_backend))]
     fn init(&self, sess: &Session) {
+        self.inner.init(sess)
+    }
+
+    #[cfg(rail_early_session_backend)]
+    fn init(&mut self, sess: &EarlySession) -> CodegenBackendInit {
         self.inner.init(sess)
     }
 
@@ -48,7 +60,13 @@ impl CodegenBackend for ObservedBackend {
         self.inner.print(req, out, sess)
     }
 
+    #[cfg(not(rail_early_session_backend))]
     fn target_config(&self, sess: &Session) -> TargetConfig {
+        self.inner.target_config(sess)
+    }
+
+    #[cfg(rail_early_session_backend)]
+    fn target_config(&self, sess: &EarlySession) -> TargetConfig {
         self.inner.target_config(sess)
     }
 
@@ -64,14 +82,17 @@ impl CodegenBackend for ObservedBackend {
         self.inner.print_version()
     }
 
+    #[cfg(not(rail_early_session_backend))]
     fn replaced_intrinsics(&self) -> Vec<Symbol> {
         self.inner.replaced_intrinsics()
     }
 
+    #[cfg(not(rail_early_session_backend))]
     fn fallback_intrinsics(&self) -> Vec<Symbol> {
         self.inner.fallback_intrinsics()
     }
 
+    #[cfg(not(rail_early_session_backend))]
     fn thin_lto_supported(&self) -> bool {
         self.inner.thin_lto_supported()
     }
@@ -127,10 +148,14 @@ impl CodegenBackend for ObservedBackend {
         &self,
         ongoing: Box<dyn Any>,
         sess: &Session,
+        #[cfg(rail_incremental_session)] incremental: Option<&IncrCompSession>,
         outputs: &OutputFilenames,
         info: &CrateInfo,
     ) -> (CompiledModules, WorkProductMap) {
+        #[cfg(not(rail_incremental_session))]
         let (modules, products) = self.inner.join_codegen(ongoing, sess, outputs, info);
+        #[cfg(rail_incremental_session)]
+        let (modules, products) = self.inner.join_codegen(ongoing, sess, incremental, outputs, info);
         let observed = match self.inner.name() {
             "llvm" => NativeCodegenObservation::Llvm,
             "cranelift" => NativeCodegenObservation::Cranelift {

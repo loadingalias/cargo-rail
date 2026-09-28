@@ -73,6 +73,28 @@ A successful probe records readiness for that exact profile and rustc identity;
 a profile or toolchain change makes the recorded readiness stale.
 Qualify remote transport separately with `cache probe` and an explicit machine-owned authority.
 
+### Stable, beta, and nightly compilers
+
+Every stable, beta, or nightly compiler at or above the adapter's minimum reuses results.
+The driver is built for the exact selected compiler and chooses that compiler's internal API
+when it is built; CI builds and tests it against the current stable, beta, and nightly.
+A compiler below the minimum is refused with the required release and commit date.
+
+Nightly Cargo builds libraries without embedded metadata (`-Zembed-metadata=no`): each rlib is a stub,
+its metadata is a separate rmeta,
+and a crate that links a library receives both files under one extern name.
+A result binds both outputs, and a result without its rmeta is refused.
+Each file of a paired extern, and each rlib and rmeta found through `-L dependency=`,
+enters the action identity separately, so a change to either one misses.
+Nightly Cargo's per-unit build directories (`build/PACKAGE/HASH/out`) restore like the classic layout.
+
+Limits:
+
+- Distributed execution does not accept nightly Cargo's metadata split;
+  those actions compile locally.
+- A nightly newer than the last one CI built can change the compiler's internal API.
+  When the driver no longer builds for it, `cache ready` fails, and compiler work runs without reuse.
+
 ## Select an independent compiler adapter
 
 An adapter pack contains the closed,

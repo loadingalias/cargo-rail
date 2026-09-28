@@ -6516,7 +6516,10 @@ fn external_macho_order_file_invalidates_reuse_without_changing_source() {
     super::helpers::finish_test(result);
 }
 
-/// Qualify native reuse with tiny, dependency-free Cargo workloads on each host.
+/// Qualify native reuse with tiny, dependency-free Cargo workloads on each host,
+/// with embedded metadata and with nightly Cargo's separate metadata
+/// (`-Zno-embed-metadata`: stub rlibs, and each linked library passed as its rlib and rmeta),
+/// also in its per-unit build directories (`-Zbuild-dir-new-layout`: `build/PACKAGE/HASH/out`).
 #[cfg(unix)]
 #[test]
 fn native_host_restores_and_executes_small_cargo_outputs() {
@@ -6585,8 +6588,11 @@ host_macros = { path = "../macros" }
         )?;
         let cargo_home = tempfile::tempdir()?;
         let target = workspace.path.join("target");
-        let compile = |coverage: Option<&Path>| -> Result<Output> {
+        let compile = |coverage: Option<&Path>, unstable: &[&str]| -> Result<Output> {
             let mut command = Command::new("cargo");
+            if !unstable.is_empty() {
+                command.args(unstable).env("RUSTC_BOOTSTRAP", "1");
+            }
             command
                 .current_dir(&workspace.path)
                 .args(["build", "--workspace", "--quiet"])
@@ -6604,8 +6610,6 @@ host_macros = { path = "../macros" }
             }
             Ok(command.output()?)
         };
-        let baseline = compile(None)?;
-        assert!(baseline.status.success(), "uncached build failed: {baseline:?}");
         let executable = target.join("debug/cache_host");
         let artifacts = || -> Result<BTreeMap<PathBuf, (Vec<u8>, u32)>> {
             directory_snapshot(&target)?
@@ -6615,7 +6619,9 @@ host_macros = { path = "../macros" }
                         path.extension().and_then(|value| value.to_str()),
                         Some("rlib" | "rmeta" | "so" | "dylib")
                     ) || path == Path::new("debug/cache_host")
-                        || path.file_name().is_some_and(|name| name == "build-script-build")
+                        || path
+                            .file_name()
+                            .is_some_and(|name| name == "build-script-build" || name == "build_script_build")
                 })
                 .map(|(path, bytes)| {
                     let mode = fs::metadata(target.join(&path))?.permissions().mode();
@@ -6623,15 +6629,34 @@ host_macros = { path = "../macros" }
                 })
                 .collect()
         };
-        let expected = artifacts()?;
         let setup = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "setup"])?;
         assert!(setup.status.success(), "cache setup failed: {setup:?}");
-        for (phase, expected_status) in [("cold", "miss"), ("warm", "hit")] {
+        let separate_metadata = ["-Zno-embed-metadata"].as_slice();
+        let unit_layout = ["-Zno-embed-metadata", "-Zbuild-dir-new-layout"].as_slice();
+        for (unstable, phase, expected_status) in [
+            ([].as_slice(), "cold", "miss"),
+            ([].as_slice(), "warm", "hit"),
+            (separate_metadata, "cold separate-metadata", "miss"),
+            (separate_metadata, "warm separate-metadata", "hit"),
+            (unit_layout, "cold unit-layout", "miss"),
+            (unit_layout, "warm unit-layout", "hit"),
+        ] {
+            if expected_status == "miss" {
+                if target.exists() {
+                    fs::remove_dir_all(&target)?;
+                }
+                let baseline = compile(None, unstable)?;
+                assert!(
+                    baseline.status.success(),
+                    "{phase}: uncached build failed: {baseline:?}"
+                );
+            }
+            let expected = artifacts()?;
             fs::remove_dir_all(&target)?;
             let coverage = tempfile::tempdir()?;
             fs::set_permissions(coverage.path(), fs::Permissions::from_mode(0o700))?;
             let coverage_path = cargo_rail::utils::canonicalize_existing(coverage.path())?;
-            let output = compile(Some(&coverage_path))?;
+            let output = compile(Some(&coverage_path), unstable)?;
             assert!(output.status.success(), "{phase} build failed: {output:?}");
             eprintln!(
                 "{phase} compiler diagnostics:\n{}",

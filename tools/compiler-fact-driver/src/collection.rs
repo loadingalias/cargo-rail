@@ -16,10 +16,10 @@ use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::middle::privacy::Level as PrivacyLevel;
 use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::{self, TyCtxt};
-use rustc_session::config::CrateType;
 use rustc_span::def_id::LOCAL_CRATE;
 use rustc_span::{FileName, Pos};
 
+use crate::CrateType;
 use crate::digest::hex_digest;
 use crate::fact_protocol::{
     COMPILER_FACT_PROTOCOL_VERSION, CompilerFactCompletion, CompilerFactCoverage, CompilerFactEdge,
@@ -137,6 +137,20 @@ impl<'tcx> Collector<'tcx> {
                     for variant in enumeration.variants {
                         definitions.insert(variant.def_id);
                         definitions.extend(variant.data.fields().iter().map(|field| field.def_id));
+                    }
+                }
+                #[cfg(rail_nested_use_trees)]
+                hir::ItemKind::Use(tree) => {
+                    let mut pending = vec![&tree];
+                    while let Some(tree) = pending.pop() {
+                        if let hir::UseKind::Nested { items } = tree.kind {
+                            for (nested, _, def_id) in items {
+                                if collectible_definition(self.tcx, *def_id) {
+                                    definitions.insert(*def_id);
+                                }
+                                pending.push(nested);
+                            }
+                        }
                     }
                 }
                 _ => {}
@@ -375,17 +389,11 @@ impl<'tcx> Collector<'tcx> {
             .unwrap_or(CompilerFactVisibility::Private);
         let kind = fact_kind(self.tcx, def_id).ok_or_else(|| "definition kind disappeared".to_string())?;
         let diagnostic_path = with_no_trimmed_paths!(self.tcx.def_path_str(def_id.to_def_id()));
-        let name = self
-            .tcx
-            .hir_node_by_def_id(def_id)
-            .ident()
+        let name = definition_name(self.tcx, def_id)
             .map(|ident| ident.to_string())
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| diagnostic_path.clone());
-        let parent = self
-            .tcx
-            .opt_local_parent(def_id)
-            .and_then(|parent| defined_ids.get(&parent).copied());
+        let parent = definition_parent(self.tcx, def_id).and_then(|parent| defined_ids.get(&parent).copied());
         let repository_source = matches!(raw_span.path, CompilerFactSourcePath::Repository(_));
         let macro_provenance = if span.from_expansion() {
             let call_site = span.source_callsite();
@@ -525,9 +533,9 @@ impl<'tcx> Collector<'tcx> {
                 None,
                 false,
             );
-            visitor.visit_node(self.tcx.hir_node_by_def_id(*def_id));
+            visitor.visit_definition(*def_id);
             let _ = visitor.finish(edges);
-            if let Some(parent) = self.tcx.opt_local_parent(*def_id)
+            if let Some(parent) = definition_parent(self.tcx, *def_id)
                 && definitions.contains(&parent)
             {
                 edges.push(CompilerFactEdge {
@@ -562,10 +570,7 @@ impl<'tcx> Collector<'tcx> {
         let mut retentions = Vec::new();
         for def_id in definitions {
             let item = item_id(self.tcx, def_id.to_def_id());
-            let parent_kind = self
-                .tcx
-                .opt_local_parent(*def_id)
-                .map(|parent| self.tcx.def_kind(parent));
+            let parent_kind = definition_parent(self.tcx, *def_id).map(|parent| self.tcx.def_kind(parent));
             if matches!(parent_kind, Some(DefKind::Trait | DefKind::Impl { of_trait: true })) {
                 retentions.push(CompilerFactRetention {
                     item,
@@ -597,7 +602,7 @@ impl<'tcx> Collector<'tcx> {
                 .tcx
                 .lint_level_spec_at_node(DEAD_CODE, self.tcx.local_def_id_to_hir_id(*def_id))
                 .level()
-                == rustc_session::lint::Level::Allow
+                == rustc_lint_defs::Level::Allow
             {
                 retentions.push(CompilerFactRetention {
                     item,
@@ -826,9 +831,55 @@ fn def_path_component(data: DefPathData) -> (u8, Option<rustc_span::symbol::Symb
         DefPathData::AnonAssocTy(name) => (14, Some(name)),
         DefPathData::SyntheticCoroutineBody => (15, None),
         DefPathData::NestedStatic => (16, None),
+        #[cfg(rail_test_binder_constraints)]
+        DefPathData::TestBinderConstraints => (17, None),
     }
 }
 
+/// The name `def_id` declares.
+fn definition_name(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<rustc_span::Ident> {
+    let name = tcx.hir_node_by_def_id(def_id).ident()?;
+    #[cfg(rail_nested_use_trees)]
+    if name.name == rustc_span::symbol::kw::SelfLower
+        && let Node::NestedUseTree(_) = tcx.hir_node_by_def_id(def_id)
+    {
+        // `a::{self}` binds `a`, the last segment of the enclosing tree's prefix.
+        let owner = tcx.local_def_id_to_hir_id(def_id).owner.def_id;
+        let hir::ItemKind::Use(tree) = &tcx.hir_expect_item(owner).kind else {
+            return None;
+        };
+        let mut pending = vec![tree];
+        while let Some(tree) = pending.pop() {
+            if let hir::UseKind::Nested { items } = tree.kind {
+                for (nested, _, nested_def_id) in items {
+                    if *nested_def_id == def_id {
+                        return tree.prefix.segments.last().map(|segment| segment.ident);
+                    }
+                    pending.push(nested);
+                }
+            }
+        }
+        return None;
+    }
+    Some(name)
+}
+
+/// The definition that contains `def_id` for visibility and dispatch.
+///
+/// Since rust-lang/rust#161349 a nested import is a child of its `use` item; before, it was a sibling item, and no
+/// definition had a `use` parent. Both shapes resolve to the module or block that declares the `use`.
+fn definition_parent(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<LocalDefId> {
+    let mut parent = tcx.opt_local_parent(def_id)?;
+    while tcx.def_kind(parent) == DefKind::Use {
+        parent = tcx.opt_local_parent(parent)?;
+    }
+    Some(parent)
+}
+
+#[allow(
+    clippy::unneeded_struct_pattern,
+    reason = "older supported compilers give `DefKind::Const` and `DefKind::AssocConst` fields"
+)]
 fn fact_kind(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<CompilerFactItemKind> {
     let foreign = tcx
         .opt_local_parent(def_id)
@@ -862,10 +913,24 @@ fn collectible_definition(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
     if span.is_dummy() || span.lo() >= span.hi() {
         return false;
     }
-    !matches!(
-      tcx.hir_node_by_def_id(def_id),
-      Node::Item(item) if matches!(item.kind, hir::ItemKind::Use(_, kind) if !matches!(kind, hir::UseKind::Single(_)))
-    )
+    #[cfg(not(rail_nested_use_trees))]
+    let use_kind = match tcx.hir_node_by_def_id(def_id) {
+        Node::Item(hir::Item {
+            kind: hir::ItemKind::Use(_, kind),
+            ..
+        }) => Some(*kind),
+        _ => None,
+    };
+    #[cfg(rail_nested_use_trees)]
+    let use_kind = match tcx.hir_node_by_def_id(def_id) {
+        Node::Item(hir::Item {
+            kind: hir::ItemKind::Use(tree),
+            ..
+        })
+        | Node::NestedUseTree(tree) => Some(tree.kind),
+        _ => None,
+    };
+    !use_kind.is_some_and(|kind| !matches!(kind, hir::UseKind::Single(_)))
 }
 
 fn namespace(kind: CompilerFactItemKind) -> CompilerFactNamespace {
@@ -891,6 +956,14 @@ fn node_span(tcx: TyCtxt<'_>, def_id: LocalDefId) -> rustc_span::Span {
         Node::ForeignItem(item) => item.span,
         Node::Variant(variant) => variant.span,
         Node::Field(field) => field.span,
+        // The written import, including a rename; rustc's own span is the enclosing tree.
+        #[cfg(rail_nested_use_trees)]
+        Node::NestedUseTree(hir::UseTree {
+            prefix,
+            kind: hir::UseKind::Single(name),
+        }) if prefix.span.eq_ctxt(name.span) && name.span.lo() >= prefix.span.hi() => prefix.span.to(name.span),
+        #[cfg(rail_nested_use_trees)]
+        Node::NestedUseTree(tree) => tree.prefix.span,
         _ => tcx.def_span(def_id),
     }
 }
@@ -900,6 +973,12 @@ fn visibility_span(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<rustc_span::Sp
         Node::Item(item) => Some(item.vis_span),
         Node::ImplItem(item) => item.vis_span(),
         Node::Field(field) => Some(field.vis_span),
+        // A nested import shares the visibility written on its `use` item.
+        #[cfg(rail_nested_use_trees)]
+        Node::NestedUseTree(_) => Some(
+            tcx.hir_expect_item(tcx.local_def_id_to_hir_id(def_id).owner.def_id)
+                .vis_span,
+        ),
         _ => None,
     }
 }
@@ -1028,9 +1107,11 @@ impl<'tcx> ReferenceVisitor<'tcx> {
         }
     }
 
-    fn visit_node(&mut self, node: Node<'tcx>) {
-        match node {
+    fn visit_definition(&mut self, def_id: LocalDefId) {
+        match self.tcx.hir_node_by_def_id(def_id) {
             Node::Item(item) => self.visit_item(item),
+            #[cfg(rail_nested_use_trees)]
+            Node::NestedUseTree(tree) => self.visit_use(tree, self.tcx.local_def_id_to_hir_id(def_id), def_id),
             Node::ImplItem(item) => self.visit_impl_item(item),
             Node::TraitItem(item) => self.visit_trait_item(item),
             Node::ForeignItem(item) => self.visit_foreign_item(item),

@@ -6,7 +6,10 @@
 
 #![feature(rustc_private)]
 // The macro observation hooks forward variadic C functions such as `open`.
-#![cfg_attr(any(target_os = "linux", target_os = "macos"), feature(c_variadic))]
+#![cfg_attr(
+    all(any(target_os = "linux", target_os = "macos"), not(rail_stable_c_variadic)),
+    feature(c_variadic)
+)]
 // Only `macro_observation` opts in: it rebinds a loaded macro image's imports.
 #![deny(unsafe_code)]
 
@@ -19,6 +22,8 @@ extern crate rustc_metadata;
 extern crate rustc_middle;
 extern crate rustc_session;
 extern crate rustc_span;
+#[cfg(rail_structures_crate_type)]
+extern crate rustc_structures;
 extern crate tracing;
 extern crate tracing_subscriber;
 
@@ -29,6 +34,10 @@ use std::process::ExitCode;
 use rustc_driver::{Callbacks, Compilation};
 use rustc_interface::interface;
 use rustc_middle::ty::TyCtxt;
+#[cfg(not(rail_structures_crate_type))]
+use rustc_session::config::CrateType;
+#[cfg(rail_structures_crate_type)]
+use rustc_structures::CrateType;
 
 #[path = "../../../src/compiler/fact_protocol.rs"]
 mod fact_protocol;
@@ -39,6 +48,13 @@ mod codegen;
 mod collection;
 mod digest;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg_attr(
+    rail_stable_c_variadic,
+    allow(
+        clippy::incompatible_msrv,
+        reason = "the 1.98 floor reads C variadic arguments through `feature(c_variadic)`"
+    )
+)]
 mod macro_observation;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[path = "macro_observation/unavailable.rs"]

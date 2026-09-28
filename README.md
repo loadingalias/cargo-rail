@@ -92,7 +92,8 @@ Three Rust versions stay separate:
   For another workspace compiler,
   Cargo-Rail builds the authenticated driver source or an adapter pack with that exact compiler,
   which needs its `rustc-dev` component.
-  A pack sets a minimum compiler release and no maximum.
+  A pack sets a minimum compiler release and no maximum;
+  CI builds and tests the driver against the current stable, beta, and nightly.
   Without a working driver, compiler work runs normally without reuse, and Surface fails.
 
 ## Start here

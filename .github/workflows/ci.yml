@@ -150,6 +150,38 @@ jobs:
           path: ${{ steps.cache-record.outputs.record-file }}
           if-no-files-found: error
 
+  compiler-channels:
+    # `cache ready` builds the compiler driver for the project's own toolchain, so every current channel must
+    # build and pass it. This job runs on every commit because a new nightly can break it without a change here.
+    name: Compiler driver on ${{ matrix.channel }}
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [stable, beta, nightly]
+    runs-on: runs-on=${{ github.run_id }}-driver-${{ matrix.channel }}/runner=x86_64-linux/env=production
+    timeout-minutes: 45
+    env:
+      CHANNEL: ${{ matrix.channel }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Linux tooling
+        run: scripts/tooling/x86_64-linux.sh ci
+      - name: Install the current ${{ matrix.channel }} compiler
+        run: rustup toolchain install "$CHANNEL" --profile minimal --component rustc-dev
+      - name: Check compiler driver
+        run: just check-compiler-driver-channel "$CHANNEL"
+      - name: Check worktree
+        if: always()
+        run: |
+          git diff --exit-code HEAD
+          status="$(git status --porcelain=v1 --untracked-files=all)"
+          if [[ -n "$status" ]]; then
+            printf '%s\n' "$status"
+            exit 1
+          fi
+
   extended-build:
     # IBM Z, IBM POWER, and RISC-V runners only execute. x86-64 cross-builds each one's optimized test archive,
     # with its compiler driver and source-installation CLI, and runs its Clippy and documentation checks.

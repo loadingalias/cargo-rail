@@ -9,10 +9,12 @@ use std::sync::{Arc, Mutex};
 use tracing_subscriber::prelude::*;
 
 use rustc_middle::{mir::TerminatorKind, mono::MonoItem, ty::TyCtxt};
-use rustc_session::config::{CrateType, LtoCli};
-use rustc_session::search_paths::PathKind;
+use rustc_session::config::LtoCli;
+use rustc_session::filesearch::FileSearch;
+use rustc_session::search_paths::{PathKind, SearchPath};
 use rustc_span::source_map::{FileLoader, FilePathMapping, RealFileLoader};
 
+use crate::CrateType;
 use crate::native_input_protocol::{
     MAX_NATIVE_INPUT_INVOCATION_BYTES, NATIVE_INPUT_PROTOCOL_VERSION, NativeAssemblyObservation,
     NativeCodegenObservation, NativeCratePattern, NativeCrateSearch, NativeCrateSource, NativeInputInvocation,
@@ -237,16 +239,13 @@ fn search_observations(
             let directory = absolute_spelling(&search.dir, current_directory)?;
             let (queries, files) = searches.entry(directory).or_default();
             for pattern in &patterns {
-                if let Some(matches) = search.files.query(&pattern.prefix, &pattern.suffix) {
-                    for (_, file) in matches {
-                        let path = file.path(&search.dir);
-                        files.insert(
-                            path.file_name()
-                                .and_then(|name| name.to_str())
-                                .ok_or_else(|| "native crate search filename is unavailable".to_string())?
-                                .into(),
-                        );
-                    }
+                for path in search_candidates(filesearch, search, pattern) {
+                    files.insert(
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .ok_or_else(|| "native crate search filename is unavailable".to_string())?
+                            .into(),
+                    );
                 }
             }
             queries.extend(patterns.iter().cloned());
@@ -260,6 +259,30 @@ fn search_observations(
             files: files.into_iter().collect(),
         })
         .collect())
+}
+
+/// The files rustc indexed in `search` whose names match `pattern`.
+#[cfg(not(rail_flat_file_search))]
+fn search_candidates(_filesearch: &FileSearch, search: &SearchPath, pattern: &NativeCratePattern) -> Vec<PathBuf> {
+    search
+        .files
+        .query(&pattern.prefix, &pattern.suffix)
+        .into_iter()
+        .flatten()
+        .map(|(_, file)| file.path(&search.dir))
+        .collect()
+}
+
+/// The files rustc indexed in `search` whose names match `pattern`.
+///
+/// rustc indexes every search path in one list, so this keeps the candidates from `search`'s own directory.
+#[cfg(rail_flat_file_search)]
+fn search_candidates(filesearch: &FileSearch, search: &SearchPath, pattern: &NativeCratePattern) -> Vec<PathBuf> {
+    filesearch
+        .get_library_candidates(&pattern.prefix, &pattern.suffix, search.kind)
+        .map(|(_, path)| path)
+        .filter(|path| path.parent() == Some(&*search.dir))
+        .collect()
 }
 
 struct CrateSearchPrefixes {

@@ -116,6 +116,7 @@ fn matched_driver_emits_canonical_typed_fragment() {
             String::from_utf8_lossy(&result.stderr)
         );
         let stdout = String::from_utf8(result.stdout).expect("UTF-8 Cargo messages");
+        let stderr = String::from_utf8(result.stderr).expect("UTF-8 Cargo diagnostics");
         let diagnostic = stdout
             .lines()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
@@ -139,16 +140,21 @@ fn matched_driver_emits_canonical_typed_fragment() {
         let bytes = fs::read(fragment_path).expect("fact fragment");
         assert_eq!(bytes.len() as u64, announcement.bytes);
         let fragment: CompilerFactFragment = serde_json::from_slice(&bytes).expect("decode fragment");
-        (stdout, bytes, fragment)
+        (stdout, stderr, bytes, fragment)
     };
 
-    let (stdout, first_bytes, fragment) = acquire(&first_target);
+    let (stdout, stderr, first_bytes, fragment) = acquire(&first_target);
+    // Fact collection must leave rustc's unused-extern accounting intact. Cargo
+    // relays rustc's lint, or, since its own `unused_dependencies` lint, reports
+    // the externs rustc found unused.
     assert!(
         stdout
             .lines()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
             .any(|value| value["reason"] == "compiler-message"
                 && value["message"]["code"]["code"] == "unused_crate_dependencies")
+            || stderr.contains("unused dependency `unused`"),
+        "the unused dependency was not reported\nstderr:\n{stderr}"
     );
     assert_eq!(serde_json::to_vec(&fragment).expect("canonical fragment"), first_bytes);
     assert_eq!(fragment.object.unit.crate_name, "fact_probe");
@@ -165,9 +171,10 @@ fn matched_driver_emits_canonical_typed_fragment() {
 
     assert_compiler_item_identities(&fragment);
     assert_task_local_expansion(&fragment);
+    assert_nested_reexports(&fragment);
     assert_std_thread_local_expansion(&fragment);
 
-    let (_, second_bytes, second_fragment) = acquire(&second_target);
+    let (_, _, second_bytes, second_fragment) = acquire(&second_target);
     assert_eq!(second_bytes, first_bytes);
     assert_eq!(second_fragment, fragment);
 }
@@ -366,6 +373,68 @@ fn assert_compiler_item_identities(fragment: &CompilerFactFragment) {
     // physical declaration rather than trusting Cargo's root-sensitive
     // `-Cmetadata` disambiguator.
     assert_eq!(external_targets.len(), 1);
+}
+
+/// Each name a nested `use` list imports is one re-export of the module that declares the `use`.
+fn assert_nested_reexports(fragment: &CompilerFactFragment) {
+    const SOURCE: &str = include_str!("fixtures/basic.rs");
+    let object = &fragment.object;
+    let named = |kind: CompilerFactItemKind, name: &str| {
+        let matches = items(fragment)
+            .filter(|item| item.physical.kind == kind && item_name(fragment, item) == name)
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1, "one {kind:?} named {name}");
+        matches[0]
+    };
+    let module = named(CompilerFactItemKind::Module, "nested_reexports").id;
+    let reexports = items(fragment)
+        .filter(|item| item.physical.kind == CompilerFactItemKind::Reexport && item.parent == Some(module))
+        .map(|item| item_name(fragment, item))
+        .collect::<BTreeSet<_>>();
+    // Neither the list stems nor the glob import re-export one name.
+    assert_eq!(reexports, BTreeSet::from(["Deep", "alias", "deeper", "listed"]));
+    for (name, target, written) in [
+        ("Deep", named(CompilerFactItemKind::Struct, "Deep").id, "Deep"),
+        (
+            "alias",
+            named(CompilerFactItemKind::Function, "renamed").id,
+            "renamed as alias",
+        ),
+        ("deeper", named(CompilerFactItemKind::Module, "deeper").id, "self"),
+        ("listed", named(CompilerFactItemKind::Function, "listed").id, "listed"),
+    ] {
+        let reexport = named(CompilerFactItemKind::Reexport, name);
+        let span = reexport.physical.span;
+        assert!(matches!(
+            &object.sources[span.source as usize].path,
+            CompilerFactSourcePath::Repository(path) if path.ends_with("fixtures/basic.rs")
+        ));
+        // A declaration span extends back to its written visibility.
+        let text = &SOURCE[span.start as usize..span.end as usize];
+        assert!(
+            text.starts_with("pub use crate::nested_origin::{") && text.ends_with(written) && !text.contains('\n'),
+            "{name} span: {text:?}"
+        );
+        assert_eq!(
+            reexport.written_visibility,
+            CompilerFactVisibility::Public,
+            "{name} visibility"
+        );
+        let visibility = reexport.visibility_span.expect("written visibility span");
+        assert_eq!(&SOURCE[visibility.start as usize..visibility.end as usize], "pub");
+        for (kind, expected) in [
+            (CompilerFactEdgeKind::Reexport, target),
+            (CompilerFactEdgeKind::VisibilityParent, module),
+        ] {
+            let targets = object
+                .edges
+                .iter()
+                .filter(|edge| edge.source == reexport.id && edge.kind == kind)
+                .map(|edge| edge.target)
+                .collect::<Vec<_>>();
+            assert_eq!(targets, [expected], "{name} {kind:?} edges");
+        }
+    }
 }
 
 fn items(fragment: &CompilerFactFragment) -> impl Iterator<Item = &CompilerItemFact> {

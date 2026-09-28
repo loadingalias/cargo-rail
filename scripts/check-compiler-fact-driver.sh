@@ -218,14 +218,22 @@ print(f'Prepared authenticated compiler components. Source {shlex.quote(str(env_
 PYTHON
   exit 0
 fi
-if [[ $# != 0 ]]; then
-  echo "usage: $0 [--prepare <component-dir> [target] | --prepare-source <component-dir>]" >&2
-  exit 2
-fi
-
+usage="usage: $0 [--prepare <component-dir> [target] | --prepare-source <component-dir> | --channel <toolchain>]"
 # rustc-dev must already be installed for the selected toolchain.
 export RUSTC_BOOTSTRAP=cargo_rail_fact_driver
 manifest=tools/compiler-fact-driver/Cargo.toml
+if [[ ${1:-} == --channel && $# == 2 ]]; then
+  # Build and test against another compiler. Format and Clippy policy stay with the pinned toolchain.
+  [[ $2 =~ ^[A-Za-z0-9._-]+$ ]] || { echo "$usage" >&2; exit 2; }
+  CARGO_TARGET_DIR="tools/compiler-fact-driver/target/channel-$2" \
+    cargo +"$2" test --manifest-path "$manifest" --all-targets --all-features --locked
+  exit 0
+fi
+if [[ $# != 0 ]]; then
+  echo "$usage" >&2
+  exit 2
+fi
+
 cargo fmt --manifest-path "$manifest" --all -- --check
 cargo clippy --manifest-path "$manifest" --all-targets --all-features --locked -- -D warnings
 cargo test --manifest-path "$manifest" --all-targets --all-features --locked

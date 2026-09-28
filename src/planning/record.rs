@@ -470,9 +470,11 @@ fn canonical_or_lexical(path: &Path) -> PathBuf {
 /// Hashed artifacts (`deps/libNAME-HASH.rmeta`, `deps/NAME-HASH`, and
 /// `build/PACKAGE-HASH/build-script-build`) name rustc's own dep-info file. Cargo uplifts a
 /// binary by linking its hashed `deps/NAME-HASH` file, so the same file there recovers the hash.
-/// Otherwise Cargo's dep-info beside an uplifted artifact lists the unit's inputs and those of
-/// its local dependencies: a superset that can only widen selection.
-fn located_dep_info(artifact: &cargo_metadata::Artifact) -> Option<PathBuf> {
+/// Nightly Cargo builds each unit in `build/PACKAGE/HASH/out`, where a binary keeps its unhashed
+/// crate name, so the same file there names its unit. Otherwise Cargo's dep-info beside an
+/// uplifted artifact lists the unit's inputs and those of its local dependencies: a superset that
+/// can only widen selection.
+fn located_dep_info(artifact: &cargo_metadata::Artifact, package_name: &str) -> Option<PathBuf> {
     let crate_name = artifact.target.name.replace('-', "_");
     let files = artifact
         .filenames
@@ -529,6 +531,25 @@ fn located_dep_info(artifact: &cargo_metadata::Artifact) -> Option<PathBuf> {
             };
             let candidate = deps.join(format!("{crate_name}-{hash}.d"));
             if candidate.is_file() && same_file(file, &entry.path()) {
+                return Some(candidate);
+            }
+        }
+    }
+    let unit_binary = format!("{crate_name}{}", std::env::consts::EXE_SUFFIX);
+    for file in &files {
+        let Some(units) = file
+            .parent()
+            .map(|directory| directory.join("build").join(package_name))
+        else {
+            continue;
+        };
+        let Ok(entries) = fs::read_dir(&units) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let out = entry.path().join("out");
+            let candidate = out.join(format!("{crate_name}.d"));
+            if candidate.is_file() && same_file(file, &out.join(&unit_binary)) {
                 return Some(candidate);
             }
         }
@@ -723,7 +744,7 @@ impl Observation {
             };
             let sources = if artifact.fresh {
                 // Cargo resolves a local unit's relative paths from the workspace root.
-                located_dep_info(artifact)
+                located_dep_info(artifact, &package.name)
                     .map(|dep_info| vec![(roots.workspace.clone(), Some(dep_info))])
                     .unwrap_or_default()
             } else {
@@ -1199,6 +1220,46 @@ mod tests {
             parsed.dep_info.as_deref(),
             Some(Path::new("/work/target/debug/deps/demo-0123.d"))
         );
+    }
+
+    #[test]
+    fn fresh_uplifted_binary_locates_its_unit_dep_info_in_the_per_unit_build_layout() {
+        // Nightly Cargo builds each unit in `build/PACKAGE/HASH/out` and names a binary there without a hash.
+        let root = tempfile::tempdir().expect("target root");
+        let profile = root.path().join("debug");
+        let out = profile.join("build/demo-app/0123456789abcdef/out");
+        let other = profile.join("build/other/fedcba9876543210/out");
+        for directory in [&out, &other] {
+            fs::create_dir_all(directory).expect("unit directory");
+        }
+        let executable = format!("demo_app{}", std::env::consts::EXE_SUFFIX);
+        fs::write(out.join(&executable), b"linked binary").expect("unit binary");
+        fs::write(out.join("demo_app.d"), "demo_app: app/src/main.rs\n").expect("unit dep-info");
+        fs::write(other.join(&executable), b"linked binary").expect("same-named binary of another package");
+        fs::write(other.join("demo_app.d"), "demo_app: other/src/main.rs\n").expect("other dep-info");
+        let uplifted = profile.join(format!("demo-app{}", std::env::consts::EXE_SUFFIX));
+        fs::hard_link(out.join(&executable), &uplifted).expect("uplifted binary");
+        fs::write(
+            profile.join("demo-app.d"),
+            "demo-app: app/src/main.rs core/src/lib.rs\n",
+        )
+        .expect("Cargo superset");
+        let artifact = serde_json::from_value::<cargo_metadata::Artifact>(serde_json::json!({
+            "package_id": "path+file:///work/app#demo-app@0.1.0",
+            "manifest_path": "/work/app/Cargo.toml",
+            "target": {
+                "name": "demo-app", "kind": ["bin"], "crate_types": ["bin"], "required-features": [],
+                "src_path": "/work/app/src/main.rs", "edition": "2024", "doctest": false, "test": true, "doc": true
+            },
+            "profile": { "opt_level": "0", "debuginfo": 2, "debug_assertions": true, "overflow_checks": true, "test": false },
+            "features": [],
+            "filenames": [uplifted.to_str().expect("UTF-8 path")],
+            "executable": uplifted.to_str().expect("UTF-8 path"),
+            "fresh": true
+        }))
+        .expect("Cargo artifact message");
+
+        assert_eq!(located_dep_info(&artifact, "demo-app"), Some(out.join("demo_app.d")));
     }
 
     #[test]

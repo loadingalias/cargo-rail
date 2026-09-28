@@ -96,3 +96,18 @@ pub fn dependency_versions() {
   same_dependency_v1::marker();
   same_dependency_v2::marker();
 }
+
+pub mod nested_origin {
+  pub fn listed() {}
+  pub fn renamed() {}
+  pub mod deeper {
+    pub struct Deep {
+      pub value: u8,
+    }
+  }
+}
+
+pub mod nested_reexports {
+  pub use crate::nested_origin::{deeper::{self, Deep}, listed, renamed as alias};
+  pub use crate::nested_origin::*;
+}
