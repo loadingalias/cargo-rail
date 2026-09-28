@@ -40,11 +40,14 @@ jobs:
       - name: Install Windows tooling
         if: runner.os == 'Windows'
         shell: powershell
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # Authenticates cargo-binstall's GitHub API lookups.
         run: ./scripts/tooling/x86_64-win.ps1 -Operation package
       - name: Install native release tooling
         if: runner.os != 'Windows'
         env:
           TARGET: ${{ matrix.target }}
+          GITHUB_TOKEN: ${{ github.token }} # Authenticates cargo-binstall's GitHub API lookups.
         run: scripts/tooling/package-unix.sh "$TARGET"
       - uses: loadingalias/cargo-rail-action/cache@e706767c343acb6a2ab1917f243b1616ae9eb05b # v10.0.0
         id: cache

@@ -48,6 +48,7 @@ jobs:
         if: runner.os == 'Linux'
         env:
           PLATFORM: ${{ matrix.platform }}
+          GITHUB_TOKEN: ${{ github.token }} # Authenticates cargo-binstall's GitHub API lookups.
         run: scripts/tooling/"$PLATFORM".sh ci
       - name: Check PowerShell syntax
         if: runner.os == 'Windows'
@@ -56,6 +57,8 @@ jobs:
       - name: Install Windows tooling
         if: runner.os == 'Windows'
         shell: powershell
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # Authenticates cargo-binstall's GitHub API lookups.
         run: ./scripts/tooling/x86_64-win.ps1 -Operation ci
       # Cache setup changes Cargo configuration, so planning must capture it afterward.
       - uses: loadingalias/cargo-rail-action/cache@e706767c343acb6a2ab1917f243b1616ae9eb05b # v10.0.0
@@ -167,6 +170,8 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Linux tooling
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # Authenticates cargo-binstall's GitHub API lookups.
         run: scripts/tooling/x86_64-linux.sh ci
       - name: Install the current ${{ matrix.channel }} compiler
         run: rustup toolchain install "$CHANNEL" --profile minimal --component rustc-dev
@@ -210,6 +215,8 @@ jobs:
         with:
           persist-credentials: false
       - name: Install cross-build tooling
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # Authenticates cargo-binstall's GitHub API lookups.
         run: scripts/tooling/x86_64-linux.sh cross-build "$PLATFORM"
       - uses: loadingalias/cargo-rail-action/cache@e706767c343acb6a2ab1917f243b1616ae9eb05b # v10.0.0
         with:
