@@ -49,7 +49,7 @@ jobs:
           TARGET: ${{ matrix.target }}
           GITHUB_TOKEN: ${{ github.token }} # Authenticates cargo-binstall's GitHub API lookups.
         run: scripts/tooling/package-unix.sh "$TARGET"
-      - uses: loadingalias/cargo-rail-action/cache@e706767c343acb6a2ab1917f243b1616ae9eb05b # v10.0.0
+      - uses: loadingalias/cargo-rail-action/cache@4d7bebe671430eee0db376de3f943d8de26e78de # v10.1.0
         id: cache
         with:
           remote: ${{ vars.CARGO_RAIL_CACHE_REMOTE }}
@@ -76,7 +76,7 @@ jobs:
         run: python3 scripts/check-release-install.py "$RUNNER_TEMP/release"
       - name: Require unchanged sources
         run: git diff --exit-code HEAD
-      - uses: loadingalias/cargo-rail-action/cache/collect@e706767c343acb6a2ab1917f243b1616ae9eb05b # v10.0.0
+      - uses: loadingalias/cargo-rail-action/cache/collect@4d7bebe671430eee0db376de3f943d8de26e78de # v10.1.0
         if: always() && steps.cache.outcome == 'success'
         id: cache-record
         with:
@@ -148,7 +148,7 @@ jobs:
           pattern: cache-record-package-*
           merge-multiple: true
           path: ${{ runner.temp }}/cache-records
-      - uses: loadingalias/cargo-rail-action/cache/report@e706767c343acb6a2ab1917f243b1616ae9eb05b # v10.0.0
+      - uses: loadingalias/cargo-rail-action/cache/report@4d7bebe671430eee0db376de3f943d8de26e78de # v10.1.0
         with:
           records-directory: ${{ runner.temp }}/cache-records
           expected-jobs: '["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]'

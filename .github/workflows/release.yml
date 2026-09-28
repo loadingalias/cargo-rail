@@ -52,7 +52,7 @@ jobs:
           fetch-depth: 0
       - name: Install release tooling
         run: scripts/tooling/package-unix.sh x86_64-unknown-linux-gnu
-      - uses: loadingalias/cargo-rail-action/cache@e706767c343acb6a2ab1917f243b1616ae9eb05b # v10.0.0
+      - uses: loadingalias/cargo-rail-action/cache@4d7bebe671430eee0db376de3f943d8de26e78de # v10.1.0
         id: cache
         with:
           remote: ${{ vars.CARGO_RAIL_CACHE_REMOTE }}
@@ -83,13 +83,13 @@ jobs:
             if [[ -n "$TRANSACTION" ]]; then args+=("$TRANSACTION"); fi
           fi
           "$core" "${args[@]}"
-      - uses: loadingalias/cargo-rail-action/cache/collect@e706767c343acb6a2ab1917f243b1616ae9eb05b # v10.0.0
+      - uses: loadingalias/cargo-rail-action/cache/collect@4d7bebe671430eee0db376de3f943d8de26e78de # v10.1.0
         if: always() && steps.cache.outcome == 'success'
         id: cache-record
         with:
           job: release
           output-directory: ${{ runner.temp }}/cache-records
-      - uses: loadingalias/cargo-rail-action/cache/report@e706767c343acb6a2ab1917f243b1616ae9eb05b # v10.0.0
+      - uses: loadingalias/cargo-rail-action/cache/report@4d7bebe671430eee0db376de3f943d8de26e78de # v10.1.0
         if: always() && steps.cache-record.outcome == 'success'
         with:
           records-directory: ${{ runner.temp }}/cache-records

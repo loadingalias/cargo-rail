@@ -61,7 +61,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }} # Authenticates cargo-binstall's GitHub API lookups.
         run: ./scripts/tooling/x86_64-win.ps1 -Operation ci
       # Cache setup changes Cargo configuration, so planning must capture it afterward.
-      - uses: loadingalias/cargo-rail-action/cache@e706767c343acb6a2ab1917f243b1616ae9eb05b # v10.0.0
+      - uses: loadingalias/cargo-rail-action/cache@4d7bebe671430eee0db376de3f943d8de26e78de # v10.1.0
         if: github.event_name != 'pull_request'
         id: cache
         with:
@@ -70,7 +70,7 @@ jobs:
           max-size: 10GiB
           root-portability: remap
           verify-remote: true
-      - uses: loadingalias/cargo-rail-action@e706767c343acb6a2ab1917f243b1616ae9eb05b # v10.0.0
+      - uses: loadingalias/cargo-rail-action@4d7bebe671430eee0db376de3f943d8de26e78de # v10.1.0
         id: rail
         with:
           all: ${{ github.event_name == 'workflow_dispatch' }}
@@ -140,7 +140,7 @@ jobs:
             printf '%s\n' "$status"
             exit 1
           fi
-      - uses: loadingalias/cargo-rail-action/cache/collect@e706767c343acb6a2ab1917f243b1616ae9eb05b # v10.0.0
+      - uses: loadingalias/cargo-rail-action/cache/collect@4d7bebe671430eee0db376de3f943d8de26e78de # v10.1.0
         if: always() && github.event_name != 'pull_request' && steps.cache.outcome == 'success'
         id: cache-record
         with:
@@ -218,7 +218,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }} # Authenticates cargo-binstall's GitHub API lookups.
         run: scripts/tooling/x86_64-linux.sh cross-build "$PLATFORM"
-      - uses: loadingalias/cargo-rail-action/cache@e706767c343acb6a2ab1917f243b1616ae9eb05b # v10.0.0
+      - uses: loadingalias/cargo-rail-action/cache@4d7bebe671430eee0db376de3f943d8de26e78de # v10.1.0
         with:
           remote: ${{ vars.CARGO_RAIL_CACHE_REMOTE }}
           mode: read-write
@@ -313,7 +313,7 @@ jobs:
           pattern: cache-record-*
           merge-multiple: true
           path: ${{ runner.temp }}/cache-records
-      - uses: loadingalias/cargo-rail-action/cache/report@e706767c343acb6a2ab1917f243b1616ae9eb05b # v10.0.0
+      - uses: loadingalias/cargo-rail-action/cache/report@4d7bebe671430eee0db376de3f943d8de26e78de # v10.1.0
         with:
           records-directory: ${{ runner.temp }}/cache-records
           expected-jobs: '["x86_64-linux", "aarch64-linux", "x86_64-win"]'
