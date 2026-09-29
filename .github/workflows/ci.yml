@@ -130,51 +130,69 @@ jobs:
           PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
         run: |
           set +e
-          # Git Bash passes its raw environment block; the Action runtime's Rust Command rebuilds it.
-          # Verify under both and print how the blocks differ.
-          python3 - "$PLAN_FILE" <<'PY'
-          import collections, json, os, re, shutil, subprocess, sys
-
-          DUMP = r'''
-          import ctypes, json, sys
-          kernel32 = ctypes.windll.kernel32
-          kernel32.GetEnvironmentStringsW.restype = ctypes.c_void_p
-          base = kernel32.GetEnvironmentStringsW()
-          entries, offset = [], 0
-          while True:
-              entry = ctypes.wstring_at(base + offset * 2)
-              if not entry:
-                  break
-              entries.append(entry)
-              offset += len(entry) + 1
-          json.dump(entries, sys.stdout)
-          '''
+          # The Action's runtime launches `cargo-rail` and verification passes; a direct launch fails.
+          # A probe named cargo-rail.exe records what each launch receives, then runs the real binary.
+          probe="$RUNNER_TEMP/verify-probe"
+          mkdir -p "$probe/out"
+          real="$(cygpath -w "$(type -P cargo-rail)")"
+          out="$(cygpath -w "$probe/out")"
+          cat > "$probe/probe.rs" <<RS
+          use std::ffi::c_void;
+          #[link(name = "kernel32")]
+          extern "system" {
+              fn GetEnvironmentStringsW() -> *mut u16;
+              fn GetStdHandle(handle: u32) -> *mut c_void;
+              fn GetFileType(handle: *mut c_void) -> u32;
+          }
+          fn main() {
+              let mut lines = vec![
+                  format!("args {:?}", std::env::args_os().skip(1).collect::<Vec<_>>()),
+                  format!("cwd {:?}", std::env::current_dir()),
+              ];
+              for (name, handle) in [("stdin", -10i32), ("stdout", -11), ("stderr", -12)] {
+                  lines.push(format!("{name} type {}", unsafe { GetFileType(GetStdHandle(handle as u32)) }));
+              }
+              unsafe {
+                  let mut entry = GetEnvironmentStringsW();
+                  loop {
+                      let mut length = 0;
+                      while *entry.add(length) != 0 {
+                          length += 1;
+                      }
+                      if length == 0 {
+                          break;
+                      }
+                      lines.push(format!("env {}", String::from_utf16_lossy(std::slice::from_raw_parts(entry, length))));
+                      entry = entry.add(length + 1);
+                  }
+              }
+              std::fs::write(format!(r"$out\{}.txt", std::process::id()), lines.join("\n")).unwrap();
+              let status = std::process::Command::new(r"$real").args(std::env::args_os().skip(1)).status().unwrap();
+              std::process::exit(status.code().unwrap_or(1));
+          }
+          RS
+          rustc --edition 2021 -O "$probe/probe.rs" -o "$probe/cargo-rail.exe" || exit 0
+          PATH="$probe:$PATH" cargo-rail rail plan --verify - < "$PLAN_FILE"; echo "direct rc=$?"
+          mv "$probe"/out/*.txt "$probe/direct.txt"
+          PATH="$probe:$PATH" cargo-rail-action plan is-required "$PLAN_FILE" cargo.test; echo "action rc=$?"
+          mv "$probe"/out/*.txt "$probe/action.txt"
+          python3 - "$probe/direct.txt" "$probe/action.txt" <<'PY'
+          import re, sys
           SHOWN = re.compile(r'(?i)^(=.*|path|pathext|cargo.*|rust.*|home|userprofile|homedrive|homepath|tmp|temp|msystem|systemroot|windir)$')
-
-          def show(entry):
-              name = entry.split('=', 1)[0] if not entry.startswith('=') else '=' + entry[1:].split('=', 1)[0]
-              return entry if SHOWN.match(name) else f'{name}=<hidden>'
-
-          plan = open(sys.argv[1], 'rb').read()
-          cargo_rail = shutil.which('cargo-rail')
-          blocks = {}
-          for label, env in (('raw', None), ('rebuilt', dict(os.environ))):
-              dump = subprocess.run([sys.executable, '-c', DUMP], env=env, capture_output=True, text=True)
-              blocks[label] = json.loads(dump.stdout)
-              verify = subprocess.run([cargo_rail, 'rail', 'plan', '--verify', '-'], input=plan, env=env, capture_output=True)
-              print(f'== {label}: {len(blocks[label])} entries; verify rc={verify.returncode}')
-              print(verify.stderr.decode(errors='replace').strip())
-
-          raw, rebuilt = set(blocks['raw']), set(blocks['rebuilt'])
-          print('== only in raw'); [print('  ' + show(entry)) for entry in sorted(raw - rebuilt)]
-          print('== only in rebuilt'); [print('  ' + show(entry)) for entry in sorted(rebuilt - raw)]
-          groups = collections.defaultdict(list)
-          for entry in blocks['raw']:
-              groups[entry.split('=', 1)[0].upper()].append(entry)
-          print('== case-insensitive duplicate names in raw')
-          for entries in groups.values():
-              if len(entries) > 1:
-                  [print('  ' + show(entry)) for entry in entries]
+          def show(line):
+              if not line.startswith('env '):
+                  return line
+              entry = line[4:]
+              name = '=' + entry[1:].split('=', 1)[0] if entry.startswith('=') else entry.split('=', 1)[0]
+              return line if SHOWN.match(name) else f'env {name}=<hidden>'
+          direct, action = (open(path, encoding='utf-8').read().splitlines() for path in sys.argv[1:])
+          print('== non-environment facts')
+          for label, lines in (('direct', direct), ('action', action)):
+              [print(f'  {label}: {line}') for line in lines if not line.startswith('env ')]
+          print('== environment only in the direct launch')
+          [print('  ' + show(line)) for line in sorted(set(direct) - set(action)) if line.startswith('env ')]
+          print('== environment only in the Action launch')
+          [print('  ' + show(line)) for line in sorted(set(action) - set(direct)) if line.startswith('env ')]
           PY
       - name: Test
         if: (contains(fromJSON(steps.rail.outputs.required-work), 'cargo.test') || contains(fromJSON(steps.rail.outputs.required-work), 'cargo.doctest'))
