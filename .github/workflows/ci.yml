@@ -130,69 +130,46 @@ jobs:
           PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
         run: |
           set +e
-          # The Action's runtime launches `cargo-rail` and verification passes; a direct launch fails.
-          # A probe named cargo-rail.exe records what each launch receives, then runs the real binary.
-          probe="$RUNNER_TEMP/verify-probe"
-          mkdir -p "$probe/out"
-          real="$(cygpath -w "$(type -P cargo-rail)")"
-          out="$(cygpath -w "$probe/out")"
-          cat > "$probe/probe.rs" <<RS
-          use std::ffi::c_void;
-          #[link(name = "kernel32")]
-          extern "system" {
-              fn GetEnvironmentStringsW() -> *mut u16;
-              fn GetStdHandle(handle: u32) -> *mut c_void;
-              fn GetFileType(handle: *mut c_void) -> u32;
-          }
+          # A Rust-launched cargo-rail accepts the plan and a Bash-launched one rejects it with identical
+          # arguments, directory, and environment. Print the identity preimage from both launches.
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/cargo/resolution.rs')
+          source = path.read_text()
+          anchor = '            &config.portable_snapshot_identity(source_root)?,\n        );\n        Ok(identity)'
+          assert source.count(anchor) == 1
+          debug = 'if std::env::var_os("RAIL_DEBUG_PLANNING_IDENTITY").is_some() {\n            eprintln!("identity-preimage {}", String::from_utf8_lossy(&identity).escape_debug());\n        }\n        Ok(identity)'
+          path.write_text(source.replace(anchor, anchor.replace('Ok(identity)', debug)))
+          PY
+          source target/debug/compiler-driver-authority.env
+          cargo build --bin cargo-rail --all-features --locked 2>&1 | tail -2
+          cp target/debug/cargo-rail.exe "$RUNNER_TEMP/rail-diag.exe"
+          git checkout -- src/cargo/resolution.rs
+          cat > "$RUNNER_TEMP/launch.rs" <<'RS'
           fn main() {
-              let mut lines = vec![
-                  format!("args {:?}", std::env::args_os().skip(1).collect::<Vec<_>>()),
-                  format!("cwd {:?}", std::env::current_dir()),
-              ];
-              for (name, handle) in [("stdin", -10i32), ("stdout", -11), ("stderr", -12)] {
-                  lines.push(format!("{name} type {}", unsafe { GetFileType(GetStdHandle(handle as u32)) }));
-              }
-              unsafe {
-                  let mut entry = GetEnvironmentStringsW();
-                  loop {
-                      let mut length = 0;
-                      while *entry.add(length) != 0 {
-                          length += 1;
-                      }
-                      if length == 0 {
-                          break;
-                      }
-                      lines.push(format!("env {}", String::from_utf16_lossy(std::slice::from_raw_parts(entry, length))));
-                      entry = entry.add(length + 1);
-                  }
-              }
-              std::fs::write(format!(r"$out\{}.txt", std::process::id()), lines.join("\n")).unwrap();
-              let status = std::process::Command::new(r"$real").args(std::env::args_os().skip(1)).status().unwrap();
+              let mut arguments = std::env::args_os().skip(1);
+              let program = arguments.next().unwrap();
+              let status = std::process::Command::new(program).args(arguments).status().unwrap();
               std::process::exit(status.code().unwrap_or(1));
           }
           RS
-          rustc --edition 2021 -O "$probe/probe.rs" -o "$probe/cargo-rail.exe" || exit 0
-          PATH="$probe:$PATH" cargo-rail rail plan --verify - < "$PLAN_FILE"; echo "direct rc=$?"
-          mv "$probe"/out/*.txt "$probe/direct.txt"
-          PATH="$probe:$PATH" cargo-rail-action plan is-required "$PLAN_FILE" cargo.test; echo "action rc=$?"
-          mv "$probe"/out/*.txt "$probe/action.txt"
-          python3 - "$probe/direct.txt" "$probe/action.txt" <<'PY'
-          import re, sys
-          SHOWN = re.compile(r'(?i)^(=.*|path|pathext|cargo.*|rust.*|home|userprofile|homedrive|homepath|tmp|temp|msystem|systemroot|windir)$')
-          def show(line):
-              if not line.startswith('env '):
-                  return line
-              entry = line[4:]
-              name = '=' + entry[1:].split('=', 1)[0] if entry.startswith('=') else entry.split('=', 1)[0]
-              return line if SHOWN.match(name) else f'env {name}=<hidden>'
-          direct, action = (open(path, encoding='utf-8').read().splitlines() for path in sys.argv[1:])
-          print('== non-environment facts')
-          for label, lines in (('direct', direct), ('action', action)):
-              [print(f'  {label}: {line}') for line in lines if not line.startswith('env ')]
-          print('== environment only in the direct launch')
-          [print('  ' + show(line)) for line in sorted(set(direct) - set(action)) if line.startswith('env ')]
-          print('== environment only in the Action launch')
-          [print('  ' + show(line)) for line in sorted(set(action) - set(direct)) if line.startswith('env ')]
+          rustc --edition 2021 -O "$RUNNER_TEMP/launch.rs" -o "$RUNNER_TEMP/launch.exe"
+          diag="$(cygpath -w "$RUNNER_TEMP/rail-diag.exe")"
+          export RAIL_DEBUG_PLANNING_IDENTITY=1
+          "$RUNNER_TEMP/rail-diag.exe" rail plan --verify - < "$PLAN_FILE" 2> "$RUNNER_TEMP/bash.txt"; echo "bash launch rc=$?"
+          "$RUNNER_TEMP/launch.exe" "$diag" rail plan --verify - < "$PLAN_FILE" 2> "$RUNNER_TEMP/rust.txt"; echo "rust launch rc=$?"
+          python3 - "$RUNNER_TEMP/bash.txt" "$RUNNER_TEMP/rust.txt" <<'PY'
+          import difflib, re, sys
+          def tokens(path):
+              text = open(path, encoding='utf-8', errors='replace').read()
+              preimage = [line for line in text.splitlines() if line.startswith('identity-preimage ')]
+              print(f'== {path}: {len(preimage)} preimage line(s)')
+              [print('  ' + line) for line in text.splitlines() if not line.startswith('identity-preimage ')]
+              return [token for token in re.split(r'(?:\\0|\\u\{[0-9a-f]+\}|\\[tnr])+|,', preimage[-1] if preimage else '') if token]
+          bash, rust = tokens(sys.argv[1]), tokens(sys.argv[2])
+          print('== preimage difference (bash launch vs rust launch)')
+          for line in difflib.unified_diff(bash, rust, 'bash', 'rust', n=3, lineterm=''):
+              print('  ' + line)
           PY
       - name: Test
         if: (contains(fromJSON(steps.rail.outputs.required-work), 'cargo.test') || contains(fromJSON(steps.rail.outputs.required-work), 'cargo.doctest'))
