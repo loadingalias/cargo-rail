@@ -151,7 +151,8 @@ jobs:
           mkdir -p "$diag/bin" "$diag/out"
           cp target/debug/cargo-rail.exe "$diag/bin/cargo-rail.exe"
           git checkout -- src/cargo/resolution.rs
-          export RAIL_DEBUG_PLANNING_IDENTITY="$(cygpath -w "$diag/out")"
+          RAIL_DEBUG_PLANNING_IDENTITY="$(cygpath -w "$diag/out")"
+          export RAIL_DEBUG_PLANNING_IDENTITY
           capture() {
             local label="$1"; shift
             "$@" < "$PLAN_FILE"; echo "$label rc=$?"
