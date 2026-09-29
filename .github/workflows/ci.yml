@@ -130,46 +130,53 @@ jobs:
           PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
         run: |
           set +e
-          # A Rust-launched cargo-rail accepts the plan and a Bash-launched one rejects it with identical
-          # arguments, directory, and environment. Print the identity preimage from both launches.
+          # Verification passed when cargo-rail was resolved from a directory first on PATH (probe and Action)
+          # and failed when launched by path. Capture the identity preimage from three launches.
           python3 - <<'PY'
           from pathlib import Path
           path = Path('src/cargo/resolution.rs')
           source = path.read_text()
           anchor = '            &config.portable_snapshot_identity(source_root)?,\n        );\n        Ok(identity)'
           assert source.count(anchor) == 1
-          debug = 'if std::env::var_os("RAIL_DEBUG_PLANNING_IDENTITY").is_some() {\n            eprintln!("identity-preimage {}", String::from_utf8_lossy(&identity).escape_debug());\n        }\n        Ok(identity)'
+          debug = (
+              'if let Some(directory) = std::env::var_os("RAIL_DEBUG_PLANNING_IDENTITY") {\n'
+              '            let _ = std::fs::write(std::path::Path::new(&directory).join(format!("{}.txt", std::process::id())), String::from_utf8_lossy(&identity).escape_debug().to_string());\n'
+              '        }\n        Ok(identity)'
+          )
           path.write_text(source.replace(anchor, anchor.replace('Ok(identity)', debug)))
           PY
           source target/debug/compiler-driver-authority.env
-          cargo build --bin cargo-rail --all-features --locked 2>&1 | tail -2
-          cp target/debug/cargo-rail.exe "$RUNNER_TEMP/rail-diag.exe"
+          cargo build --bin cargo-rail --all-features --locked 2>&1 | tail -1
+          diag="$RUNNER_TEMP/rail-diag"
+          mkdir -p "$diag/bin" "$diag/out"
+          cp target/debug/cargo-rail.exe "$diag/bin/cargo-rail.exe"
           git checkout -- src/cargo/resolution.rs
-          cat > "$RUNNER_TEMP/launch.rs" <<'RS'
-          fn main() {
-              let mut arguments = std::env::args_os().skip(1);
-              let program = arguments.next().unwrap();
-              let status = std::process::Command::new(program).args(arguments).status().unwrap();
-              std::process::exit(status.code().unwrap_or(1));
+          export RAIL_DEBUG_PLANNING_IDENTITY="$(cygpath -w "$diag/out")"
+          capture() {
+            local label="$1"; shift
+            "$@" < "$PLAN_FILE"; echo "$label rc=$?"
+            mv "$diag"/out/*.txt "$diag/$label.txt"
           }
-          RS
-          rustc --edition 2021 -O "$RUNNER_TEMP/launch.rs" -o "$RUNNER_TEMP/launch.exe"
-          diag="$(cygpath -w "$RUNNER_TEMP/rail-diag.exe")"
-          export RAIL_DEBUG_PLANNING_IDENTITY=1
-          "$RUNNER_TEMP/rail-diag.exe" rail plan --verify - < "$PLAN_FILE" 2> "$RUNNER_TEMP/bash.txt"; echo "bash launch rc=$?"
-          "$RUNNER_TEMP/launch.exe" "$diag" rail plan --verify - < "$PLAN_FILE" 2> "$RUNNER_TEMP/rust.txt"; echo "rust launch rc=$?"
-          python3 - "$RUNNER_TEMP/bash.txt" "$RUNNER_TEMP/rust.txt" <<'PY'
+          capture by-path "$diag/bin/cargo-rail.exe" rail plan --verify -
+          PATH="$diag/bin:$PATH" capture on-path cargo-rail rail plan --verify -
+          PATH="$diag/bin:$PATH" capture action cargo-rail-action plan is-required "$PLAN_FILE" cargo.test
+          python3 - "$diag" <<'PY'
           import difflib, re, sys
-          def tokens(path):
-              text = open(path, encoding='utf-8', errors='replace').read()
-              preimage = [line for line in text.splitlines() if line.startswith('identity-preimage ')]
-              print(f'== {path}: {len(preimage)} preimage line(s)')
-              [print('  ' + line) for line in text.splitlines() if not line.startswith('identity-preimage ')]
-              return [token for token in re.split(r'(?:\\0|\\u\{[0-9a-f]+\}|\\[tnr])+|,', preimage[-1] if preimage else '') if token]
-          bash, rust = tokens(sys.argv[1]), tokens(sys.argv[2])
-          print('== preimage difference (bash launch vs rust launch)')
-          for line in difflib.unified_diff(bash, rust, 'bash', 'rust', n=3, lineterm=''):
-              print('  ' + line)
+          from pathlib import Path
+          def tokens(label):
+              path = Path(sys.argv[1], f'{label}.txt')
+              if not path.exists():
+                  print(f'== {label}: no preimage captured')
+                  return []
+              text = path.read_text(encoding='utf-8', errors='replace')
+              return [token for token in re.split(r'(?:\\0|\\u\{[0-9a-f]+\}|\\[tnr])+|,', text) if token]
+          by_path, on_path, action = tokens('by-path'), tokens('on-path'), tokens('action')
+          print('== by-path preimage')
+          [print('  ' + token) for token in by_path]
+          for label, other in (('on-path', on_path), ('action', action)):
+              print(f'== preimage difference: by-path vs {label}')
+              for line in difflib.unified_diff(by_path, other, 'by-path', label, n=2, lineterm=''):
+                  print('  ' + line)
           PY
       - name: Test
         if: (contains(fromJSON(steps.rail.outputs.required-work), 'cargo.test') || contains(fromJSON(steps.rail.outputs.required-work), 'cargo.doctest'))
