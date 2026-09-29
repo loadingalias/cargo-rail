@@ -123,6 +123,25 @@ jobs:
         run: |
           [[ "$(cargo-rail-action plan is-required "$PLAN_FILE" check-compiler-driver)" == true ]]
           just check-compiler-driver
+      # Temporary: find why direct saved-plan verification rejects the Action's plan on Windows.
+      - name: Diagnose saved-plan verification
+        if: runner.os == 'Windows' && (contains(fromJSON(steps.rail.outputs.required-work), 'cargo.test') || contains(fromJSON(steps.rail.outputs.required-work), 'cargo.doctest'))
+        env:
+          PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
+        run: |
+          set +e
+          echo "== PATH"; tr ':' '\n' <<< "$PATH"
+          echo "== Cargo and Rust environment"; env | grep -E '^(CARGO|RUST)' | sort
+          echo "== cargo"; type -a -p cargo; rustup which cargo; rustup show active-toolchain
+          echo "== Action selector verification"
+          cargo-rail-action plan is-required "$PLAN_FILE" cargo.test; echo "rc=$?"
+          while IFS= read -r candidate; do
+            echo "== cargo-rail candidate: $candidate"
+            "$candidate" rail --version
+            sha256sum "$candidate"
+            "$candidate" rail plan --verify - < "$PLAN_FILE"; echo "stdin rc=$?"
+            "$candidate" rail plan --verify "$PLAN_FILE"; echo "file rc=$?"
+          done < <(type -a -p cargo-rail)
       - name: Test
         if: (contains(fromJSON(steps.rail.outputs.required-work), 'cargo.test') || contains(fromJSON(steps.rail.outputs.required-work), 'cargo.doctest'))
         env:
