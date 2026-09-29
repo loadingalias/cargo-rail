@@ -130,18 +130,52 @@ jobs:
           PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
         run: |
           set +e
-          echo "== PATH"; tr ':' '\n' <<< "$PATH"
-          echo "== Cargo and Rust environment"; env | grep -E '^(CARGO|RUST)' | sort
-          echo "== cargo"; type -a -p cargo; rustup which cargo; rustup show active-toolchain
-          echo "== Action selector verification"
-          cargo-rail-action plan is-required "$PLAN_FILE" cargo.test; echo "rc=$?"
-          while IFS= read -r candidate; do
-            echo "== cargo-rail candidate: $candidate"
-            "$candidate" rail --version
-            sha256sum "$candidate"
-            "$candidate" rail plan --verify - < "$PLAN_FILE"; echo "stdin rc=$?"
-            "$candidate" rail plan --verify "$PLAN_FILE"; echo "file rc=$?"
-          done < <(type -a -p cargo-rail)
+          # Git Bash passes its raw environment block; the Action runtime's Rust Command rebuilds it.
+          # Verify under both and print how the blocks differ.
+          python3 - "$PLAN_FILE" <<'PY'
+          import collections, json, os, re, shutil, subprocess, sys
+
+          DUMP = r'''
+          import ctypes, json, sys
+          kernel32 = ctypes.windll.kernel32
+          kernel32.GetEnvironmentStringsW.restype = ctypes.c_void_p
+          base = kernel32.GetEnvironmentStringsW()
+          entries, offset = [], 0
+          while True:
+              entry = ctypes.wstring_at(base + offset * 2)
+              if not entry:
+                  break
+              entries.append(entry)
+              offset += len(entry) + 1
+          json.dump(entries, sys.stdout)
+          '''
+          SHOWN = re.compile(r'(?i)^(=.*|path|pathext|cargo.*|rust.*|home|userprofile|homedrive|homepath|tmp|temp|msystem|systemroot|windir)$')
+
+          def show(entry):
+              name = entry.split('=', 1)[0] if not entry.startswith('=') else '=' + entry[1:].split('=', 1)[0]
+              return entry if SHOWN.match(name) else f'{name}=<hidden>'
+
+          plan = open(sys.argv[1], 'rb').read()
+          cargo_rail = shutil.which('cargo-rail')
+          blocks = {}
+          for label, env in (('raw', None), ('rebuilt', dict(os.environ))):
+              dump = subprocess.run([sys.executable, '-c', DUMP], env=env, capture_output=True, text=True)
+              blocks[label] = json.loads(dump.stdout)
+              verify = subprocess.run([cargo_rail, 'rail', 'plan', '--verify', '-'], input=plan, env=env, capture_output=True)
+              print(f'== {label}: {len(blocks[label])} entries; verify rc={verify.returncode}')
+              print(verify.stderr.decode(errors='replace').strip())
+
+          raw, rebuilt = set(blocks['raw']), set(blocks['rebuilt'])
+          print('== only in raw'); [print('  ' + show(entry)) for entry in sorted(raw - rebuilt)]
+          print('== only in rebuilt'); [print('  ' + show(entry)) for entry in sorted(rebuilt - raw)]
+          groups = collections.defaultdict(list)
+          for entry in blocks['raw']:
+              groups[entry.split('=', 1)[0].upper()].append(entry)
+          print('== case-insensitive duplicate names in raw')
+          for entries in groups.values():
+              if len(entries) > 1:
+                  [print('  ' + show(entry)) for entry in entries]
+          PY
       - name: Test
         if: (contains(fromJSON(steps.rail.outputs.required-work), 'cargo.test') || contains(fromJSON(steps.rail.outputs.required-work), 'cargo.doctest'))
         env:
