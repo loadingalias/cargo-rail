@@ -65,7 +65,7 @@ priority = 80
 slow-timeout = { period = "60s", terminate-after = 6 }
 
 [[profile.default.overrides]]
-filter = 'binary(cache) & test(/test_cache_installation::(workspace_member_clippy_replays|procedural_macro_consumers_reuse)_/)'
+filter = 'binary(cache) & test(/test_cache_installation::(workspace_member_clippy_replays|procedural_macro_consumers_reuse|cross_windows_link)_/)'
 test-group = 'cache-subprocess'
 slow-timeout = { period = "60s", terminate-after = 6 }
 

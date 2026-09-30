@@ -1717,20 +1717,25 @@ fn test_split_initialized_unborn_target_publishes_by_exact_url_and_rechecks_with
             .stdout,
         )?;
         assert_eq!(local_head.trim(), remote_head.trim());
-        assert!(
+
+        // Git 2.56 records a tracking ref when a push URL matches a configured remote.
+        // Point it at a decoy: the recheck must read the exact URL, not the tracking ref.
+        let decoy = String::from_utf8(
             git(
                 target.path(),
-                &["for-each-ref", "--format=%(refname)", "refs/remotes/origin/main",],
+                &["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "decoy tracking head"],
             )?
-            .stdout
-            .is_empty(),
-            "exact-URL publication must not make a tracking ref authoritative"
-        );
+            .stdout,
+        )?;
+        git(target.path(), &["update-ref", "refs/remotes/origin/main", decoy.trim()])?;
 
         let check = run_cargo_rail(&ws.path, &["rail", "split", "run", "mylib", "--check", "--json"])?;
         assert!(check.status.success(), "{}", String::from_utf8_lossy(&check.stderr));
         let json: serde_json::Value = serde_json::from_slice(&check.stdout)?;
-        assert_eq!(json["crates"][0]["pending_commits"], 0);
+        assert_eq!(
+            json["crates"][0]["pending_commits"], 0,
+            "exact-URL publication must not make a tracking ref authoritative"
+        );
         Ok(())
     })();
     super::helpers::finish_test(result);
