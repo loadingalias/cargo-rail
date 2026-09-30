@@ -822,7 +822,7 @@ dependencies = [
 
 [[package]]
 name = "cargo-rail"
-version = "0.30.0"
+version = "0.30.1"
 dependencies = [
  "anyhow",
  "async-trait",
