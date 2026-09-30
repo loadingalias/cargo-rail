@@ -1192,17 +1192,23 @@ pub(crate) fn resolve_program(selection: &OsStr, current_dir: &Path) -> RailResu
             selected.display()
         ))
     })?;
-    for directory in std::env::split_paths(&path) {
-        for candidate in program_candidates(&directory, selection) {
-            if candidate.is_file() {
-                return Ok(candidate);
-            }
-        }
-    }
-    Err(RailError::message(format!(
-        "executable '{}' was not found in PATH",
-        selected.display()
-    )))
+    search_path(selection, &path)
+        .ok_or_else(|| RailError::message(format!("executable '{}' was not found in PATH", selected.display())))
+}
+
+/// Return the first PATH match, spelled independently of how PATH spells its directories.
+///
+/// Parents can pass one PATH with different spellings, such as a doubled separator in a
+/// Windows entry that one shell preserves and another rebuilds. Identities record this
+/// path, so equal files must resolve to equal spellings. The final component is kept
+/// because multicall programs such as the rustup proxies dispatch by their basename.
+fn search_path(selection: &OsStr, path: &OsStr) -> Option<PathBuf> {
+    std::env::split_paths(path).find_map(|directory| {
+        let directory = directory.components().collect::<PathBuf>();
+        program_candidates(&directory, selection)
+            .into_iter()
+            .find(|candidate| candidate.is_file())
+    })
 }
 
 #[cfg(not(windows))]
@@ -1217,11 +1223,19 @@ fn program_candidates(directory: &Path, selection: &OsStr) -> Vec<PathBuf> {
         return vec![directory.join(selected)];
     }
     let extensions = std::env::var_os("PATHEXT").unwrap_or_else(|| std::ffi::OsString::from(".COM;.EXE;.BAT;.CMD"));
+    // Windows matches extensions case-insensitively, so PATHEXT's spelling must not
+    // reach the resolved path.
     extensions
         .to_string_lossy()
         .split(';')
         .filter(|extension| !extension.is_empty())
-        .map(|extension| directory.join(format!("{}{}", selected.to_string_lossy(), extension)))
+        .map(|extension| {
+            directory.join(format!(
+                "{}{}",
+                selected.to_string_lossy(),
+                extension.to_ascii_lowercase()
+            ))
+        })
         .collect()
 }
 
@@ -1273,6 +1287,32 @@ fn portable_path(path: &Path, source_root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_search_spells_one_file_one_way_for_every_path_spelling() {
+        let root = tempfile::tempdir().expect("root");
+        std::fs::create_dir(root.path().join("bin")).expect("bin directory");
+        let file_name = if cfg!(windows) { "tool.exe" } else { "tool" };
+        std::fs::write(root.path().join("bin").join(file_name), b"tool").expect("tool");
+        let separator = std::path::MAIN_SEPARATOR_STR;
+        let spellings = [
+            root.path().join("bin").into_os_string(),
+            format!("{}{separator}{separator}bin", root.path().display()).into(),
+            format!("{}{separator}.{separator}bin{separator}", root.path().display()).into(),
+        ];
+
+        let resolved = spellings
+            .iter()
+            .map(|path| search_path(OsStr::new("tool"), path).expect("tool on PATH"))
+            .collect::<Vec<_>>();
+
+        // Path equality ignores separators; identities serialize the spelling itself.
+        let expected = root.path().join("bin").join(file_name);
+        assert!(
+            resolved.iter().all(|path| path.as_os_str() == expected.as_os_str()),
+            "{resolved:?}"
+        );
+    }
 
     #[test]
     fn loader_selection_accepts_every_kernel_virtual_shared_object() {

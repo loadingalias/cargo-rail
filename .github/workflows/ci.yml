@@ -123,62 +123,25 @@ jobs:
         run: |
           [[ "$(cargo-rail-action plan is-required "$PLAN_FILE" check-compiler-driver)" == true ]]
           just check-compiler-driver
-      # Temporary: find why direct saved-plan verification rejects the Action's plan on Windows.
+      # Temporary: prove that saved-plan identity no longer depends on how PATH is spelled.
       - name: Diagnose saved-plan verification
         if: runner.os == 'Windows' && (contains(fromJSON(steps.rail.outputs.required-work), 'cargo.test') || contains(fromJSON(steps.rail.outputs.required-work), 'cargo.doctest'))
         env:
           PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
         run: |
           set +e
-          # Verification passed when cargo-rail was resolved from a directory first on PATH (probe and Action)
-          # and failed when launched by path. Capture the identity preimage from three launches.
-          python3 - <<'PY'
-          from pathlib import Path
-          path = Path('src/cargo/resolution.rs')
-          source = path.read_text()
-          anchor = '            &config.portable_snapshot_identity(source_root)?,\n        );\n        Ok(identity)'
-          assert source.count(anchor) == 1
-          debug = (
-              'if let Some(directory) = std::env::var_os("RAIL_DEBUG_PLANNING_IDENTITY") {\n'
-              '            let _ = std::fs::write(std::path::Path::new(&directory).join(format!("{}.txt", std::process::id())), String::from_utf8_lossy(&identity).escape_debug().to_string());\n'
-              '        }\n        Ok(identity)'
-          )
-          path.write_text(source.replace(anchor, anchor.replace('Ok(identity)', debug)))
-          PY
-          source target/debug/compiler-driver-authority.env
-          cargo build --bin cargo-rail --all-features --locked 2>&1 | tail -1
-          diag="$RUNNER_TEMP/rail-diag"
-          mkdir -p "$diag/bin" "$diag/out"
-          cp target/debug/cargo-rail.exe "$diag/bin/cargo-rail.exe"
-          git checkout -- src/cargo/resolution.rs
-          RAIL_DEBUG_PLANNING_IDENTITY="$(cygpath -w "$diag/out")"
-          export RAIL_DEBUG_PLANNING_IDENTITY
-          capture() {
-            local label="$1"; shift
-            "$@" < "$PLAN_FILE"; echo "$label rc=$?"
-            mv "$diag"/out/*.txt "$diag/$label.txt"
+          # Each build plans by path, then verifies from every launch. 0.30.0 is the control.
+          prove() {
+            local label="$1" directory="$RUNNER_TEMP/verify-$1"
+            mkdir -p "$directory"
+            cp "$2" "$directory/cargo-rail.exe"
+            "$directory/cargo-rail.exe" rail plan --all --json > "$directory/plan.json"; echo "$label plan rc=$?"
+            "$directory/cargo-rail.exe" rail plan --verify "$directory/plan.json"; echo "$label by-path rc=$?"
+            PATH="$directory:$PATH" cargo-rail rail plan --verify "$directory/plan.json"; echo "$label on-path rc=$?"
+            PATH="$directory:$PATH" cargo-rail-action plan is-required "$directory/plan.json" cargo.test; echo "$label action rc=$?"
           }
-          capture by-path "$diag/bin/cargo-rail.exe" rail plan --verify -
-          PATH="$diag/bin:$PATH" capture on-path cargo-rail rail plan --verify -
-          PATH="$diag/bin:$PATH" capture action cargo-rail-action plan is-required "$PLAN_FILE" cargo.test
-          python3 - "$diag" <<'PY'
-          import difflib, re, sys
-          from pathlib import Path
-          def tokens(label):
-              path = Path(sys.argv[1], f'{label}.txt')
-              if not path.exists():
-                  print(f'== {label}: no preimage captured')
-                  return []
-              text = path.read_text(encoding='utf-8', errors='replace')
-              return [token for token in re.split(r'(?:\\0|\\u\{[0-9a-f]+\}|\\[tnr])+|,', text) if token]
-          by_path, on_path, action = tokens('by-path'), tokens('on-path'), tokens('action')
-          print('== by-path preimage')
-          [print('  ' + token) for token in by_path]
-          for label, other in (('on-path', on_path), ('action', action)):
-              print(f'== preimage difference: by-path vs {label}')
-              for line in difflib.unified_diff(by_path, other, 'by-path', label, n=2, lineterm=''):
-                  print('  ' + line)
-          PY
+          prove release "$(type -P cargo-rail)"
+          prove source target/debug/cargo-rail.exe
       - name: Test
         if: (contains(fromJSON(steps.rail.outputs.required-work), 'cargo.test') || contains(fromJSON(steps.rail.outputs.required-work), 'cargo.doctest'))
         env:
