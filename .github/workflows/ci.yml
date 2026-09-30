@@ -65,6 +65,7 @@ jobs:
         if: github.event_name != 'pull_request'
         id: cache
         with:
+          version: 0.30.1
           remote: ${{ vars.CARGO_RAIL_CACHE_REMOTE }}
           mode: read-write
           max-size: 10GiB
@@ -73,6 +74,7 @@ jobs:
       - uses: loadingalias/cargo-rail-action@4d7bebe671430eee0db376de3f943d8de26e78de # v10.1.0
         id: rail
         with:
+          version: 0.30.1
           all: ${{ github.event_name == 'workflow_dispatch' }}
       - name: Check tooling and workflows
         if: matrix.platform == 'x86_64-linux' && contains(fromJSON(steps.rail.outputs.required-work), 'check-tooling')
@@ -127,11 +129,10 @@ jobs:
         if: (contains(fromJSON(steps.rail.outputs.required-work), 'cargo.test') || contains(fromJSON(steps.rail.outputs.required-work), 'cargo.doctest'))
         env:
           PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
-        # Verify through the Action until CI installs a Cargo-Rail with the PATH-spelling fix (0.30.1).
         run: |
-          [[ "$(cargo-rail-action plan is-required "$PLAN_FILE" cargo.test)" == true || "$(cargo-rail-action plan is-required "$PLAN_FILE" cargo.doctest)" == true ]]
+          cargo-rail rail plan --verify "$PLAN_FILE"
           just test
-          cargo-rail-action plan is-required "$PLAN_FILE" cargo.test > /dev/null
+          cargo-rail rail plan --verify "$PLAN_FILE"
       - name: Check worktree
         if: always()
         run: |
@@ -221,6 +222,7 @@ jobs:
         run: scripts/tooling/x86_64-linux.sh cross-build "$PLATFORM"
       - uses: loadingalias/cargo-rail-action/cache@4d7bebe671430eee0db376de3f943d8de26e78de # v10.1.0
         with:
+          version: 0.30.1
           remote: ${{ vars.CARGO_RAIL_CACHE_REMOTE }}
           mode: read-write
           max-size: 10GiB

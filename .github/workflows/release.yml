@@ -55,6 +55,7 @@ jobs:
       - uses: loadingalias/cargo-rail-action/cache@4d7bebe671430eee0db376de3f943d8de26e78de # v10.1.0
         id: cache
         with:
+          version: 0.30.1
           remote: ${{ vars.CARGO_RAIL_CACHE_REMOTE }}
           mode: read-write
           max-size: 10GiB
