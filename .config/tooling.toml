@@ -60,7 +60,7 @@ python = "3.14.7"
 [linux]
 ubuntu = "24.04"
 codename = "noble"
-snapshot = "20260924T015341Z"
+snapshot = "20260930T120000Z"
 
 [windows]
 # Bound simultaneous Rust links on the smallest provisioned Windows runner.
